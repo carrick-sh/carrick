@@ -1364,7 +1364,7 @@ chunks and preserve Linux short-count semantics. Concurrent unmap may produce
 a genuine EFAULT and the appropriate partial count. This supersedes the
 initial recommendation to migrate enclosing handler continuations.
 
-**Outstanding owner-admission decision:** physical pins alone do not establish
+**Owner-admission seam:** physical pins alone do not establish
 that non-suspending copy guarantee. In
 `carrick-el1/src/personality/mm_portal/production.rs:470`, `try_begin_edit`
 refusal returns `Ok(None)` even when mapping and physical custody are unchanged.
@@ -1374,13 +1374,25 @@ Retaining the current editor across source I/O contradicts the transport's
 no-MM-lock-across-host-I/O rule; lowering editor contention to EFAULT contradicts
 the director's suspension ruling.
 
-Recommendation posted as a blocker: introduce a bounded EL1-issued prepared
-copy permit retaining semantic admission separately from the descriptor editor,
-with conflicting edits deferred until commit/cancel. Alternatively the director
-must explicitly allow a post-consumption completion continuation for editor
-contention. This is an owner lifetime protocol decision, not a proposed retry,
-timeout, host fallback or permission-mirror repair. Do not delete the mirror
-before the prepared-copy lifetime protocol and scheduler read service are bound.
+The director chose the bounded EL1-issued prepared-copy permit, resolving this
+decision. It retains semantic admission separately from the descriptor editor:
+
+- Admission is range-scoped. Only overlapping edits defer; unrelated edits of
+  the same MM proceed.
+- Size is limited to the existing transfer chunk and lifetime to consumption
+  of already-ready bytes plus memcpy. Never acquire it before a blocking host
+  wait; prepare after source readiness or restart without consuming bytes.
+- Conflicting munmap/mprotect/remap operations park on EL1-owned continuations
+  and resume at commit/cancel, without spinning or parking host workers.
+- Every failure cancels; commit checks the exact generation, refusing stale
+  permits.
+- Required reds: overlapping munmap waits during receive then applies;
+  non-overlapping edits proceed; cancel releases waiters.
+
+Post-consumption handler continuations were explicitly not chosen. This ruling
+is not an implemented permit or verified non-suspension guarantee. Do not
+delete the mirror before the prepared-copy lifetime protocol and scheduler read
+service are bound. All implementation and verification below remain open.
 
 The requested production reds remain unimplemented and unrun. `mmapv8align`
 must bind to the EL1-map/mirror-unmapped checked-host-read witness;
