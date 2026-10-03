@@ -270,11 +270,12 @@ fn run_el1_service_effect_on<C: Aarch64Vcpu>(
         };
     }
     for (&reg, &value) in regs.iter().zip(&saved) {
-        vcpu.set_reg(reg, value).map_err(|error| {
-            TrapError::Hypervisor(format!(
+        if let Err(error) = vcpu.set_reg(reg, value) {
+            carrick_fatal!(
+                "aarch64::el1_service",
                 "restore {reg:?} after host-driven EL1 call: {error}"
-            ))
-        })?;
+            );
+        }
     }
     result
 }
@@ -665,6 +666,70 @@ impl<V: Aarch64Vmm> crate::vmm::Stage1Services for EngineStage1Services<'_, V> {
         crate::descriptor_drain::apply_guest_descriptor_txns_now(self, slots, &[*txn])?
             .pop()
             .ok_or_else(|| TrapError::Hypervisor("COW descriptor receipt absent".to_owned()).into())
+    }
+}
+
+/// Exclusive loan of the scheduler-owned CPU for one host owner operation.
+/// Constructed before inspecting registers or mutating any shared transport.
+pub(crate) struct TransferServiceLoan<'a, V: Aarch64Vmm> {
+    engine: &'a Aarch64EngineCore<V>,
+    cpu: std::cell::RefMut<'a, V::Vcpu>,
+}
+impl<V: Aarch64Vmm> TransferServiceLoan<'_, V> {
+    pub(crate) fn slot(&self) -> Result<usize, TrapError> {
+        self.cpu
+            .mailbox_slot()
+            .map(|slot| slot as usize)
+            .ok_or_else(|| TrapError::Hypervisor("owner service caller has no EL1 slot".into()))
+    }
+    pub(crate) fn run_fork(
+        &mut self,
+        mut frame: carrick_el1_abi::TrapFrame,
+        effect: &mut dyn FnMut() -> bool,
+    ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+        frame.slot = self.slot()? as u64;
+        let suspended = self.engine.suspended_el1_sp;
+        crate::descriptor_drain::run_drain_call(frame, suspended, |entry, frame_va| {
+            run_el1_service_effect_on::<V::Vcpu>(&mut self.cpu, entry, frame_va, true, effect)
+        })
+    }
+    pub(crate) fn run_parent(
+        &mut self,
+        frame: carrick_el1_abi::TrapFrame,
+        target: crate::user_transfer::TransferTarget,
+        sequence: core::num::NonZeroU64,
+        effect: &mut dyn FnMut() -> bool,
+    ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+        let operation = self
+            .engine
+            .pending_owner_fork_operation()
+            .ok_or_else(|| TrapError::Hypervisor("parent transfer has no retained Fork".into()))?;
+        let current = self.cpu.get_sys_reg(SysReg::Ttbr0)?;
+        if operation.sequence != sequence
+            || operation.carrier != target.handle().carrier()
+            || operation.mm != target.handle().mm()
+            || operation.incarnation != target.handle().incarnation()
+            || current != target.ttbr0()
+        {
+            return Err(TrapError::Hypervisor(
+                "parent transfer differs from exact pending Fork root".into(),
+            ));
+        }
+        self.run_fork(frame, effect)
+    }
+    pub(crate) fn run_user(
+        &mut self,
+        mut frame: carrick_el1_abi::TrapFrame,
+        effect: &mut dyn FnMut() -> bool,
+    ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+        let root = self.engine.vm.carrier_maintenance_root()?;
+        frame.slot = self.slot()? as u64;
+        let suspended = self.engine.suspended_el1_sp;
+        with_maintenance_transfer_root(&mut *self.cpu, root, |cpu| {
+            crate::descriptor_drain::run_drain_call(frame, suspended, |entry, frame_va| {
+                run_el1_service_effect_on::<V::Vcpu>(cpu, entry, frame_va, true, effect)
+            })
+        })
     }
 }
 
@@ -7850,21 +7915,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         sequence: core::num::NonZeroU64,
         effect: &mut dyn FnMut() -> bool,
     ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
-        let operation = self
-            .pending_owner_fork_operation()
-            .ok_or_else(|| TrapError::Hypervisor("parent transfer has no retained Fork".into()))?;
-        let current = self.vcpu.borrow().get_sys_reg(SysReg::Ttbr0)?;
-        if operation.sequence != sequence
-            || operation.carrier != target.handle().carrier()
-            || operation.mm != target.handle().mm()
-            || operation.incarnation != target.handle().incarnation()
-            || current != target.ttbr0()
-        {
-            return Err(TrapError::Hypervisor(
-                "parent transfer differs from exact pending Fork root".into(),
-            ));
-        }
-        self.run_owner_fork_service(frame, effect)
+        self.transfer_service_loan()?
+            .run_parent(frame, target, sequence, effect)
     }
 
     pub fn pending_owner_fork_operation(&self) -> Option<carrick_el1_abi::PortalOperation> {
@@ -8045,23 +8097,20 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
     }
 
-    pub fn run_owner_fork_service(
-        &self,
-        mut frame: carrick_el1_abi::TrapFrame,
-        effect: &mut dyn FnMut() -> bool,
-    ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
-        frame.slot =
-            self.vcpu.borrow().mailbox_slot().ok_or_else(|| {
-                TrapError::Hypervisor("Fork caller has no EL1 service slot".into())
-            })? as u64;
-        let suspended = self.suspended_el1_sp;
-        let mut cpu = self
+    pub(crate) fn transfer_service_loan(&self) -> Result<TransferServiceLoan<'_, V>, TrapError> {
+        let cpu = self
             .vcpu
             .try_borrow_mut()
-            .map_err(|_| TrapError::Hypervisor("EL1 service CPU is already borrowed".into()))?;
-        crate::descriptor_drain::run_drain_call(frame, suspended, |entry, frame_va| {
-            run_el1_service_effect_on::<V::Vcpu>(&mut cpu, entry, frame_va, true, effect)
-        })
+            .map_err(|_| TrapError::Hypervisor("owner service CPU is already borrowed".into()))?;
+        Ok(TransferServiceLoan { engine: self, cpu })
+    }
+
+    pub fn run_owner_fork_service(
+        &self,
+        frame: carrick_el1_abi::TrapFrame,
+        effect: &mut dyn FnMut() -> bool,
+    ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+        self.transfer_service_loan()?.run_fork(frame, effect)
     }
 
     /// Borrow the current executor exclusively and run the owner on the
@@ -8070,24 +8119,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// the same suspended EL1 stack must resume before register restoration.
     pub fn run_user_transfer_service(
         &self,
-        mut frame: carrick_el1_abi::TrapFrame,
+        frame: carrick_el1_abi::TrapFrame,
         effect: &mut dyn FnMut() -> bool,
     ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
-        let root = self.vm.carrier_maintenance_root()?;
-        let mut cpu = self
-            .vcpu
-            .try_borrow_mut()
-            .map_err(|_| TrapError::Hypervisor("UserTransfer CPU is already borrowed".into()))?;
-        frame.slot = cpu
-            .mailbox_slot()
-            .ok_or_else(|| TrapError::Hypervisor("transfer caller has no EL1 slot".into()))?
-            as u64;
-        let suspended = self.suspended_el1_sp;
-        with_maintenance_transfer_root(&mut *cpu, root, |cpu| {
-            crate::descriptor_drain::run_drain_call(frame, suspended, |entry, frame_va| {
-                run_el1_service_effect_on::<V::Vcpu>(cpu, entry, frame_va, true, effect)
-            })
-        })
+        self.transfer_service_loan()?.run_user(frame, effect)
     }
 }
 
@@ -8098,6 +8133,7 @@ mod transfer_service_tests {
         regs: Vec<(Reg, u64)>,
         runs: usize,
         ttbr0: u64,
+        fail_restore: bool,
     }
     impl Aarch64Vcpu for Cpu {
         fn get_reg(&self, r: Reg) -> Result<u64, TrapError> {
@@ -8108,6 +8144,9 @@ mod transfer_service_tests {
                 .map_or(0, |(_, value)| *value))
         }
         fn set_reg(&mut self, r: Reg, v: u64) -> Result<(), TrapError> {
+            if self.fail_restore && self.runs > 0 && r == Reg::X(0) {
+                return Err(TrapError::Hypervisor("injected restore failure".into()));
+            }
             if let Some((_, value)) = self.regs.iter_mut().find(|(reg, _)| *reg == r) {
                 *value = v
             } else {
@@ -8172,6 +8211,298 @@ mod transfer_service_tests {
             Ok(Aarch64Exit::MaintenanceDone)
         }
     }
+
+    use crate::vmm::*;
+    use carrick_hal::*;
+    struct Vm;
+    #[derive(Clone)]
+    struct Kick;
+    impl VcpuKick for Kick {
+        fn kick(&self) {}
+    }
+    impl GuestVmBackend for Vm {
+        fn host_ptr(&self, _: u64, _: usize) -> Option<*mut u8> {
+            None
+        }
+        fn write_gpa(&self, _: u64, _: &[u8]) -> Result<(), TrapError> {
+            panic!("no frame write expected")
+        }
+        fn fork_ram_strategy(&self) -> ForkRamStrategy {
+            panic!("unused")
+        }
+    }
+    #[allow(unused_variables)]
+    impl Aarch64Vmm for Vm {
+        type Vcpu = Cpu;
+        type AnonymousDiscard = ();
+        type KickHandle = Kick;
+        type SiblingBuilder = ();
+        type ProcessBuilder = ();
+        fn carrier_maintenance_root(
+            &self,
+        ) -> Result<carrick_mem::memory::CarrierMaintenanceRoot, TrapError> {
+            Ok(carrick_mem::memory::CarrierMaintenanceRoot::new(Gpa(
+                carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
+            )))
+        }
+        fn publish_user_executable(
+            &self,
+            output: u64,
+            len: u64,
+        ) -> Result<(), carrick_mmu_core::aarch64::PageTableError> {
+            panic!("unused backend method")
+        }
+        fn map_stage2(
+            &mut self,
+            ipa: u64,
+            host: *mut u8,
+            len: u64,
+            perms: MemPerms,
+        ) -> Result<(), TrapError> {
+            panic!("unused backend method")
+        }
+        fn read_gpa(&self, gpa: u64, len: usize) -> Result<Vec<u8>, TrapError> {
+            panic!("unused backend method")
+        }
+        fn protections(&self) -> Option<&MemoryProtections> {
+            panic!("unused backend method")
+        }
+        fn translated_read(&self, va: u64, ipa: u64, len: usize) -> Result<Vec<u8>, MemoryError> {
+            panic!("unused backend method")
+        }
+        fn translated_write(&mut self, va: u64, ipa: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            panic!("unused backend method")
+        }
+        fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
+            panic!("unused backend method")
+        }
+        fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+            panic!("unused backend method")
+        }
+        fn add_alias(
+            &mut self,
+            va: u64,
+            ipa: u64,
+            len: u64,
+            payload: &[u8],
+            backing: HostAliasBacking,
+        ) -> Result<(u64, bool), TrapError> {
+            panic!("unused backend method")
+        }
+        fn add_vcpu(&mut self) -> Result<Self::Vcpu, TrapError> {
+            panic!("unused backend method")
+        }
+        fn execve_rebuild(
+            &mut self,
+            vcpu: &mut Self::Vcpu,
+            new_image: &AddressSpace,
+        ) -> Result<(), TrapError> {
+            panic!("unused backend method")
+        }
+        fn kick_handle(&self) -> Self::KickHandle {
+            panic!("unused backend method")
+        }
+        fn build_sibling_builder(
+            &self,
+            vcpu: &Self::Vcpu,
+            entry: GuestEntryRegs,
+        ) -> Result<Self::SiblingBuilder, TrapError> {
+            panic!("unused backend method")
+        }
+        fn materialize_sibling(
+            builder: Self::SiblingBuilder,
+        ) -> Result<(Self, Self::Vcpu), TrapError> {
+            panic!("unused backend method")
+        }
+        fn set_guest_sp(&self, vcpu: &Self::Vcpu, sp: u64) -> Result<(), TrapError> {
+            panic!("unused backend method")
+        }
+        fn fresh_fork_kicker(&self) -> Arc<dyn VcpuRegistry> {
+            panic!("unused backend method")
+        }
+    }
+    fn engine_fixture() -> Aarch64EngineCore<Vm> {
+        Aarch64EngineCore::from_injected_task_only_backend(
+            Vm,
+            Cpu {
+                regs: Vec::new(),
+                runs: 0,
+                ttbr0: 0x7000_0080_0000_0000,
+                fail_restore: false,
+            },
+            Stage1Authority::new(),
+            Arc::new(MemoryProtections::default()),
+            None,
+            0,
+            0,
+        )
+    }
+    struct Custody;
+    impl crate::user_transfer::TransferCustody for Custody {
+        type Pin = Box<dyn crate::user_transfer::TransferPin>;
+        fn carrier(&self) -> core::num::NonZeroU64 {
+            core::num::NonZeroU64::new(17).unwrap()
+        }
+        fn prepare(
+            &self,
+            _: crate::user_transfer::TransferTarget,
+            _: carrick_el1_abi::PortalGrantWindow,
+        ) -> Result<Option<Box<dyn crate::user_transfer::TransferGrant>>, TrapError> {
+            panic!("no grant expected")
+        }
+        fn publish_executable(
+            &self,
+            _: crate::user_transfer::TransferTarget,
+            _: carrick_el1_abi::PortalExecutablePublication,
+        ) -> bool {
+            panic!("no publication expected")
+        }
+        fn refill_cow(
+            &self,
+            _: crate::user_transfer::TransferTarget,
+            _: carrick_el1_abi::PortalGrantWindow,
+        ) -> Result<bool, TrapError> {
+            panic!("no refill expected")
+        }
+        fn retain(
+            &self,
+            _: carrick_el1_abi::PortalSelectedData,
+            _: usize,
+            _: carrick_el1_abi::PortalTransferIntent,
+        ) -> Result<Option<Self::Pin>, TrapError> {
+            panic!("no pin expected")
+        }
+    }
+    #[test]
+    fn nested_shared_service_entry_refuses_without_panicking_or_effects() {
+        let engine = engine_fixture();
+        let mut outer = engine.vcpu.borrow_mut();
+        let saved = outer.regs.clone();
+        let mut calls = 0;
+        run_el1_service_effect_on(&mut *outer, 0x1000, 0x3000, true, &mut || {
+            calls += 1;
+            let nested = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine.run_owner_fork_service(carrick_el1_abi::TrapFrame::default(), &mut || {
+                    panic!("nested effect")
+                })
+            }));
+            assert!(
+                nested.is_ok(),
+                "nested service must return checked busy, not panic"
+            );
+            assert!(nested.unwrap().is_err());
+            assert!(
+                engine
+                    .run_user_transfer_service(
+                        carrick_el1_abi::TrapFrame::default(),
+                        &mut || panic!("nested effect")
+                    )
+                    .is_err()
+            );
+            false
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert!(saved.is_empty());
+        assert!(outer.regs.iter().all(|(_, value)| *value == 0));
+    }
+    // Installs the shared ABI region pointer; must run on the serial host lane.
+    #[test]
+    fn serial_host_busy_transfer_admission_keeps_carrier_unbound() {
+        use crate::user_transfer::{
+            OwnedUserTransfer, TransferCustody, TransferTarget, UserTransfer,
+        };
+        let engine = engine_fixture();
+        let slots = Box::new(carrick_el1_abi::MmPortalSlots::new());
+        let previous = carrick_el1_abi::get_el1_region_host_ptr();
+        struct Restore(usize);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                carrick_el1_abi::record_el1_region_host_ptr(self.0);
+            }
+        }
+        let _restore = Restore(previous);
+        // Binding only authenticates the slot address; busy admission must
+        // refuse before dereferencing any other part of this synthetic region.
+        carrick_el1_abi::record_el1_region_host_ptr(
+            (&*slots as *const _ as usize) - carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize,
+        );
+        let custody = Custody;
+        let mm = carrick_el1_abi::ReservationMm::new(1).unwrap();
+        let held = engine.vcpu.borrow();
+        assert!(TransferTarget::bind(&engine, mm, 0x9000, &custody, &slots).is_err());
+        assert_eq!(
+            slots.carrier(),
+            None,
+            "busy service must not permanently bind carrier"
+        );
+        drop(held);
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                custody.carrier(),
+                mm,
+                core::num::NonZeroU64::new(1).unwrap(),
+            )
+        };
+        let target = TransferTarget::from_handle(handle, 0x9000);
+        let mut transfer = OwnedUserTransfer::new(
+            target,
+            UserTransfer::CopyOut {
+                address: 0x4000,
+                bytes: vec![1],
+            },
+        )
+        .unwrap();
+        let held = engine.vcpu.borrow_mut();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            transfer.advance(&engine, &custody, &slots)
+        }));
+        assert!(result.is_ok(), "advance must refuse checked CPU admission");
+        assert!(result.unwrap().is_err());
+        assert_eq!(slots.carrier(), None);
+        assert!(
+            engine
+                .run_owner_parent_transfer(
+                    carrick_el1_abi::TrapFrame::default(),
+                    target,
+                    core::num::NonZeroU64::new(1).unwrap(),
+                    &mut || panic!("nested parent effect")
+                )
+                .is_err()
+        );
+        assert_eq!(held.runs, 0);
+    }
+
+    #[test]
+    fn serial_host_transfer_restore_failure_is_terminal() {
+        const CHILD: &str = "CARRICK_TEST_TRANSFER_RESTORE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut cpu = Cpu {
+                regs: Vec::new(),
+                runs: 0,
+                ttbr0: 0x7000_0080_0000_0000,
+                fail_restore: true,
+            };
+            let result = run_el1_service_effect_on(&mut cpu, 0x1000, 0x3000, true, &mut || false);
+            assert!(result.is_err());
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("engine::transfer_service_tests::serial_host_transfer_restore_failure_is_terminal")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGABRT),
+            "partially restored CPU must never return a recoverable result: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn maintenance_transfer_uses_current_cpu_and_restores_root_after_failure() {
         let original = 0x1700_009a_0020_0000;
@@ -8179,6 +8510,7 @@ mod transfer_service_tests {
             regs: Vec::new(),
             runs: 0,
             ttbr0: original,
+            fail_restore: false,
         };
         let root = carrick_mem::memory::CarrierMaintenanceRoot::new(Gpa(
             carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
@@ -8205,6 +8537,7 @@ mod transfer_service_tests {
                 regs: Vec::new(),
                 runs: 0,
                 ttbr0: 0x7000_0080_0000_0000,
+                fail_restore: false,
             };
             let mut regs: Vec<_> = (0..31).map(Reg::X).collect();
             regs.extend([Reg::Pc, Reg::Pstate, Reg::ElrEl1, Reg::SpsrEl1, Reg::SpEl1]);
