@@ -27,6 +27,30 @@ pub struct MmPortal<'a, P: PinnedMetadataExtent> {
     pub(super) vma_visits: core::sync::atomic::AtomicUsize,
 }
 
+/// Authenticated before effects, while dropping the claim can restore LIVE.
+/// Publication cannot reject a prepared settlement afterward.
+enum PreparedDelivery<'a> {
+    Standalone,
+    Scheduler {
+        zone: &'a carrick_sched_core::ZoneTables,
+        key: carrick_sched_core::object_wait::ObjectWaitKey,
+        waker: carrick_sched_core::SlotId,
+    },
+}
+impl PreparedDelivery<'_> {
+    fn publish(self) {
+        if let Self::Scheduler { zone, key, waker } = self {
+            let completion =
+                |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+                    crate::substrate::sched::object_wait::deliver_completion(zone, waker, effects)
+                };
+            // SAFETY: this capability came from the exact claimed node's
+            // retained PREPARE admission, before that claim was released.
+            unsafe { zone.retained_object_notification(key) }.publish(waker, &completion);
+        }
+    }
+}
+
 /// Owned request position. Suspension never discards already copied bytes.
 pub struct TransferContinuation {
     pub handle: El1MmHandle,
@@ -178,23 +202,18 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         )
         .ok_or(MmError::Stale)
     }
-    fn notify_prepared(
+    fn prepared_delivery(
         &self,
-        key: Option<carrick_sched_core::object_wait::ObjectWaitKey>,
+        claim: &crate::memory::reservations::ClaimedPreparedCopy<'_>,
         slot: u32,
-    ) -> Result<(), MmError> {
-        let Some(key) = key else {
-            return Ok(());
+    ) -> Result<PreparedDelivery<'_>, MmError> {
+        let Some(key) = claim.notification() else {
+            return Ok(PreparedDelivery::Standalone);
         };
         let zone = self.zone.ok_or(MmError::Core)?;
         let waker =
             carrick_sched_core::SlotId::from_index(slot as usize).ok_or(MmError::Invalid)?;
-        let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
-            crate::substrate::sched::object_wait::deliver_completion(zone, waker, effects)
-        };
-        // SAFETY: the exact node claim transfers the detached PREPARE admission.
-        unsafe { zone.retained_object_notification(key) }.publish(waker, &completion);
-        Ok(())
+        Ok(PreparedDelivery::Scheduler { zone, key, waker })
     }
     /// Release semantic custody by exact atomic identity. This does not
     /// acquire the root or descriptor editor, even while either is held.
@@ -210,11 +229,12 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             return Err(MmError::Stale);
         }
         let claim = self.roots.claim_prepared(self.nodes, permit, request)?;
-        let notification = claim.notification();
+        let delivery = self.prepared_delivery(&claim, slot)?;
         if !claim.release() {
             return Err(MmError::Stale);
         }
-        self.notify_prepared(notification, slot)
+        delivery.publish();
+        Ok(())
     }
     pub(super) fn root(&self, mm: ReservationMm, slot: u32) -> Result<Reservations<'_>, MmError> {
         let index = self.spaces.find(mm.raw()).ok_or(MmError::Stale)?.index();
@@ -797,15 +817,24 @@ pub(super) fn settle_prepared_service<P: PinnedMetadataExtent>(
             return Err(error.into());
         }
     };
+    let delivery = match portal.prepared_delivery(&claim, slot) {
+        Ok(delivery) => delivery,
+        Err(error) => {
+            // Claim Drop restores exact LIVE custody. Refusal completes the
+            // wire request without copying or releasing the retained permit.
+            drop(claim);
+            service.complete(0, error.errno());
+            return Err(error);
+        }
+    };
     let cancel = service.phase() == carrick_el1_abi::PortalTransferPhase::Cancel;
     let copied = !cancel && (service.copy_len() == 0 || service.copy_with(host_copy));
     let completed = if copied { service.copy_len() } else { 0 };
     let errno = if copied || cancel { 0 } else { 125 };
-    let notification = claim.notification();
     if !claim.release() {
         return Err(MmError::Stale);
     }
-    portal.notify_prepared(notification, slot)?;
+    delivery.publish();
     if !service.complete(completed, errno) {
         return Err(MmError::Stale);
     }
