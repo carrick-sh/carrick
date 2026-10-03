@@ -509,6 +509,46 @@ fn admitted_private_file_retains_owner_backing_before_fork() {
         mapping.host_backing.is_some(),
         "admitted private file has no owner backing identity; fork still needs the host private_file_maps projection"
     );
+    let identity = mapping.host_backing.unwrap();
+    assert_eq!(
+        dispatcher
+            .mem_view()
+            .read_host_backing(identity, PAGE as usize)
+            .unwrap(),
+        vec![0x5a; PAGE as usize]
+    );
+    let stale = carrick_el1_abi::HostBackingIdentity::new(
+        identity.handle(),
+        core::num::NonZeroU64::new(identity.generation().get() + 1).unwrap(),
+        identity.offset(),
+    );
+    assert!(
+        dispatcher
+            .mem_view()
+            .read_host_backing(stale, PAGE as usize)
+            .is_err()
+    );
+}
+
+#[test]
+fn admitted_private_file_mmap_publishes_owner_backing_before_fork() {
+    let mut dispatcher = SyscallDispatcher::new();
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; 2 * PAGE as usize]);
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    let file = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        0,
+        2 * PAGE,
+        LINUX_PROT_READ | LINUX_PROT_WRITE,
+        LINUX_MAP_PRIVATE,
+        FILE_FD,
+    )) as u64;
+    assert!(
+        root.lock().mapping(file).unwrap().host_backing.is_some(),
+        "post-admission private mmap loses its retained source in the owner tree"
+    );
 }
 
 #[test]

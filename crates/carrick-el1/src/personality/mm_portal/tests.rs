@@ -828,6 +828,86 @@ fn kernel_only_write_denial_is_a_fault_without_supply() {
 }
 
 #[test]
+fn untouched_private_file_selects_only_owner_retained_source() {
+    use crate::memory::reservations::Layout;
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = ReservationMm::new(77).unwrap();
+    let index = spaces.publish_closed(mm.raw(), ROOT, ROOT).unwrap();
+    region
+        .table()
+        .publish(
+            index.index(),
+            mm,
+            Layout {
+                heap: ReservationRange::new(4096, VA).unwrap(),
+                arena: ReservationRange::new(VA, VA + 0x1000_0000).unwrap(),
+                brk: 4096,
+                address_limit: u64::MAX,
+                data_limit: u64::MAX,
+                external_address_bytes: 0,
+                external_data_bytes: 0,
+            },
+        )
+        .unwrap();
+    let view = nodes(&region);
+    let source = carrick_el1_abi::HostBackingIdentity::new(
+        NonZeroU64::new(71).unwrap(),
+        NonZeroU64::new(4).unwrap(),
+        8192,
+    );
+    let mut root = region
+        .table()
+        .lock_el1_resolved(index.index(), mm, &view, 0)
+        .unwrap();
+    root.import_with_backing(
+        ReservationRange::new(VA, VA + 8192).unwrap(),
+        ReservationProtection::READ_WRITE,
+        carrick_el1_abi::ReservationNodeFlags::PRIVATE,
+        source,
+    )
+    .unwrap();
+    root.finish_import().unwrap();
+    drop(root);
+    spaces.open(index);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA + 4096),
+            4,
+            TransferIntent::UserRead,
+            0,
+        )
+        .unwrap();
+    let tables = Tables::new(ROOT, IPA, 0);
+    let TransferStep::Supply(window) = select(&portal, &transfer, &tables) else {
+        panic!("no retained file supply")
+    };
+    assert_eq!(window.host_backing, Some(source));
+    assert_eq!(window.range, ReservationRange::new(VA, VA + 8192).unwrap());
+    let mut root = region
+        .table()
+        .lock_el1_resolved(index.index(), mm, &view, 0)
+        .unwrap();
+    let plan = crate::memory::reservations::ReservationFaultPlan {
+        mm,
+        generation: window.generation,
+        range: window.range,
+        protection: window.protection,
+        fault_page: window.fault_page,
+    };
+    assert!(root.authenticate_transfer_fault(plan, window.host_backing));
+    let wrong = carrick_el1_abi::HostBackingIdentity::new(
+        source.handle(),
+        NonZeroU64::new(5).unwrap(),
+        source.offset(),
+    );
+    assert!(!root.authenticate_transfer_fault(plan, Some(wrong)));
+    assert!(!root.authenticate_transfer_fault(plan, None));
+}
+
+#[test]
 fn cow_without_publication_capability_refuses_exec_and_instruction_reads_work() {
     use crate::memory::reservations::Decision;
     let region = Region::new();
