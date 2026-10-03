@@ -201,7 +201,20 @@ mod tests {
         queue.publish(2, false);
         assert_eq!(queue.take(), Some(1));
         queue.publish(3, true);
-        assert_eq!(queue.take(), Some(3));
+        assert_eq!(queue.take(), Some(2));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn standard_coalescing_retains_first_payload_including_absence() {
+        let mut queue = PendingQueue::default();
+        queue.publish(Some(1), true);
+        queue.publish(Some(2), true);
+        assert_eq!(queue.take(), Some(Some(1)));
+        assert!(queue.is_empty());
+        queue.publish(None, true);
+        queue.publish(Some(3), true);
+        assert_eq!(queue.take(), Some(None));
         assert!(queue.is_empty());
     }
 }
