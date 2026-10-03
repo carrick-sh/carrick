@@ -15,6 +15,41 @@ use carrick_sched_core::object_wait::{
 use carrick_sched_core::{BoundedSpin, Claim, RecordId, WakeEffects, ZoneTables};
 use core::sync::atomic::Ordering;
 
+/// Required completion venue for EL1-held queues. Detached handbacks use
+/// the carrier boundary; SGIs and pending work are delivered after unlock.
+pub(crate) fn deliver_completion(
+    zone: &ZoneTables,
+    venue: SlotId,
+    owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects,
+) {
+    let (waker, effects, deferred) = owned.defer_handbacks();
+    #[cfg(target_os = "none")]
+    {
+        let mut cpu = crate::substrate::sched::hw::HardwareCpu;
+        for slot in effects
+            .sgi_slots()
+            .chain((effects.queued_own && waker != venue).then_some(waker))
+        {
+            let target = zone.slot(slot).sgi_target();
+            if target != 0 {
+                cpu.send_sgi(target | (u64::from(carrick_el1_abi::GIC_RESCHED_INTID) << 24));
+            }
+        }
+        if effects.misplaced
+            && let Some(task) = carrick_el1_abi::current_task_guest(usize::from(waker.raw()))
+        {
+            task.mark_pending_host_work();
+        }
+        if (deferred || (effects.queued_own && waker == venue))
+            && let Some(task) = carrick_el1_abi::current_task_guest(usize::from(venue.raw()))
+        {
+            task.mark_pending_host_work();
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = (waker, effects, deferred, venue, zone);
+}
+
 /// Adapter-selected guest re-entry PC, distinct from a syscall return value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OperationResumePc(u64);
@@ -44,10 +79,20 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         &self,
         key: ObjectWaitKey,
     ) -> Result<ObjectWaitSnapshot, ObjectWaitError> {
-        Ok(self
-            .zone
-            .object_wait(key, &BoundedSpin(EL1_ZONE_LOCK_SPINS))?
-            .snapshot())
+        let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+            deliver_completion(self.zone, self.slot, effects)
+        };
+        let guard = if self.zone.completion_enabled(key) {
+            self.zone.object_wait_with_completion(
+                key,
+                &BoundedSpin(EL1_ZONE_LOCK_SPINS),
+                &completion,
+            )?
+        } else {
+            self.zone
+                .object_wait(key, &BoundedSpin(EL1_ZONE_LOCK_SPINS))?
+        };
+        Ok(guard.snapshot())
     }
 
     /// Whether a park of the running thread may carry a deadline: the
@@ -87,7 +132,15 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         if deadline.is_some() && !self.may_time_park() {
             return Err((ObjectWaitError::Occupied, operation));
         }
-        let guard = match zone.object_wait(key, &BoundedSpin(EL1_ZONE_LOCK_SPINS)) {
+        let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+            deliver_completion(zone, self.slot, effects)
+        };
+        let result = if zone.completion_enabled(key) {
+            zone.object_wait_with_completion(key, &BoundedSpin(EL1_ZONE_LOCK_SPINS), &completion)
+        } else {
+            zone.object_wait(key, &BoundedSpin(EL1_ZONE_LOCK_SPINS))
+        };
+        let guard = match result {
             Ok(guard) => guard,
             Err(error) => return Err((error, operation)),
         };
