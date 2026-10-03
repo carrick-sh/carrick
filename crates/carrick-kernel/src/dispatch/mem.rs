@@ -65,6 +65,7 @@ pub(crate) mod anonymous;
 mod settled;
 pub(crate) use self::anonymous::RootAliasProposal;
 pub mod el1_reservations;
+mod host_backing;
 mod host_first_touch;
 pub use host_first_touch::{HostFirstTouchDescriptorReceipt, HostFirstTouchIntent};
 pub mod fault;
@@ -480,6 +481,8 @@ pub struct MemState {
     /// File identity retained by private mmap, independent of descriptor lifetime
     /// and pathname replacement. Discard must return to this original source.
     pub(super) private_file_maps: Vec<PrivateFileMapEntry>,
+    host_backing_custody: Arc<host_backing::HostBackingCustody>,
+    host_backing_leases: Vec<host_backing::HostBackingLease>,
     /// VA ranges of live MAP_SHARED mappings backed by a `memfd_secret(2)` fd.
     /// Secret memory is hidden from the kernel's own view of the process, so
     /// `/proc/<pid>/mem` reads that touch one of these ranges fail EIO
@@ -587,6 +590,8 @@ impl MemState {
             writable_memfd_maps: Vec::new(),
             shared_file_alias_maps: Vec::new(),
             private_file_maps: Vec::new(),
+            host_backing_custody: Arc::default(),
+            host_backing_leases: Vec::new(),
             secretmem_maps: Vec::new(),
             linux_auxv_image: Vec::new(),
             core_file_mappings: Vec::new(),

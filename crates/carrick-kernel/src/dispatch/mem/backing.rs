@@ -857,6 +857,51 @@ pub(crate) fn alloc_alias_ipa_for_publication_with(
 }
 
 impl<'a> MemView<'a> {
+    pub fn read_host_backing(
+        &self,
+        identity: carrick_el1_abi::HostBackingIdentity,
+        length: usize,
+    ) -> Result<Vec<u8>, LinuxErrno> {
+        if length as u64 > carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE
+            || identity.advance(length as u64).is_none()
+        {
+            return Err(LINUX_EINVAL);
+        }
+        let source = self
+            .mem()
+            .lock()
+            .host_backing_custody
+            .source(identity)
+            .ok_or(LINUX_EBADF)?;
+        match source {
+            PrivateFileBacking::Description(description) => self
+                .snapshot_private_mmap_description(
+                    description.description(),
+                    identity.offset(),
+                    length,
+                )
+                .map(|snapshot| snapshot.bytes),
+            PrivateFileBacking::LoadedImage {
+                initialized_offset,
+                bytes,
+            } => {
+                let mut result = vec![0; length];
+                let initialized_end = initialized_offset
+                    .checked_add(bytes.len() as u64)
+                    .ok_or(LINUX_EINVAL)?;
+                let start = identity.offset().max(initialized_offset);
+                let end = (identity.offset() + length as u64).min(initialized_end);
+                if start < end {
+                    let target = (start - identity.offset()) as usize;
+                    let source = (start - initialized_offset) as usize;
+                    let count = (end - start) as usize;
+                    result[target..target + count].copy_from_slice(&bytes[source..source + count]);
+                }
+                Ok(result)
+            }
+        }
+    }
+
     pub(in crate::dispatch::mem) fn recover_private_repoint_failure(
         &self,
         candidate: u64,
