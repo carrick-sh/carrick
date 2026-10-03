@@ -2439,6 +2439,18 @@ fn prepared_copy_commit_and_cancel_never_acquire_held_root_or_editor() {
         .unwrap();
     assert_ne!(permit.generation, successor.generation);
     assert!(portal.cancel_prepared(permit, request, 0).is_err());
+    assert!(
+        portal
+            .cancel_prepared(successor, successor_request, u32::MAX)
+            .is_err()
+    );
+    let foreign_carrier =
+        MmPortal::new(NonZeroU64::new(99).unwrap(), region.table(), &spaces, &view);
+    assert!(
+        foreign_carrier
+            .cancel_prepared(successor, successor_request, 0)
+            .is_err()
+    );
     let held_root = portal.root(mm, 1).unwrap();
     let held_editor = spaces
         .try_begin_edit(
