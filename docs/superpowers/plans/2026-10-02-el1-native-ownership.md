@@ -976,7 +976,9 @@ Director-approved scope implemented here:
   physical owner authenticate existing I2 publish_user_executable. No new cache
   mechanism, metadata callback or host policy decision is introduced. Ordinary
   COW has zero publication crossings. Executable UserTransfer writes dirty-mark
-  before memcpy and invoke I2 before completion. The guest editor remains held
+  after memcpy and invoke I2 before completion. Non-executable writes also
+  dirty completed bytes for executable aliases; per-backing bounded I2
+  serialization covers dirty claim through actual invalidation. The guest editor remains held
   for the bounded effect (maximum existing 16 KiB COW run).
 
 Current implementation map (line numbers at this checkpoint):
@@ -985,21 +987,21 @@ Current implementation map (line numbers at this checkpoint):
 |---|---|
 | Sealed host target and owned request | `crates/carrick-aarch64/src/user_transfer.rs`, `TransferTarget::bind`, `OwnedUserTransfer::advance` |
 | Production selection/revalidation | `crates/carrick-el1/src/personality/mm_portal/production.rs:232`, `MmPortal::select` / `revalidate` |
-| Guard-retaining copy/completion | `production.rs:527`, `serve_transfer` |
-| Exact lazy root/descriptor settlement | `production.rs:776`, `serve_grant` |
-| Admitted target bind service | `production.rs:964`, `bind_transfer_hw` |
+| Guard-retaining copy/completion | `production.rs:513`, `serve_transfer` |
+| Exact lazy root/descriptor settlement | `production.rs:762`, `serve_grant` |
+| Admitted target bind service | `production.rs:950`, `bind_transfer_hw` |
 | Same-frame service runner | `crates/carrick-aarch64/src/engine.rs:232`, `run_el1_service_effect_on`; `:7739`, `run_user_transfer_service` |
 | Host physical selection and memcpy | `crates/carrick-vmm-hvf/src/trap/user_transfer.rs`, `retain_exact`, `TransferPin::copy` |
-| Claimed executable publication | `user_transfer.rs:178`, `publish_claimed_executable` |
-| Exact-target physical adapter | `crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs:873`, `PublicationContext::for_transfer`; `:2297`, `prepare_transfer` |
-| Exact-target COW supply | `sparse_materialization.rs:2280`, `refill_transfer_cow` |
+| Claimed executable publication | `user_transfer.rs:261`, `publish_claimed_executable` |
+| Exact-target physical adapter | `crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs:889`, `PublicationContext::for_transfer`; `:2315`, `prepare_transfer` |
+| Exact-target COW supply | `sparse_materialization.rs:2298`, `refill_transfer_cow` |
 
 Evidence replaces the selection-only draft, not the retained whole-N1 red:
 `native_owner_matrix` copies real bytes through the production service for
 both live MMs at every 16/64/256-page × 16/512-unrelated-node point, with all
 default slots occupied, target parked/open, ≤8 descriptor reads/page and
-≤4*ilog2(unrelated+1) reservation visits/page. The physical suite separately
-proves actual data pins, stale pin/refused copy, source allocation lifetime,
+≤4*ilog2(unrelated+1) reservation visits/page. Every matrix operation checks actual retained physical pins and zero pins
+after completion. The physical suite additionally proves, stale pin/refused copy, source allocation lifetime,
 Owned/CopyOnly/private/shared file bytes, exact rollback/successor retention,
 dirty pool reuse and same-compound partial replacement. These are compositional
 VM-free witnesses: the fake inventory authority models kernel unmap receipt
@@ -1018,3 +1020,84 @@ Final worker commands/results and limits are in
 Docker run occurred in the quiet window. Public bulk Capacity, Fork rebinding,
 GuestMemory venue 3, existing production-admission reds, signed guest TLBI and
 end-to-end artifact acceptance remain outside this UserTransfer receipt.
+
+
+#### N1 review fix receipt (supersedes 4f7a6d89a review gaps)
+
+The independent review's four Important findings are addressed in the same
+production paths. Pending physical grant cleanup carries the already-held
+FrameRegistryGuard, avoiding recursive acquisition on descriptor preparation
+refusal. Completed UserWrite copies re-dirty their exact backing bytes even
+when selected through a non-executable MM. Existing I2 serializes dirty claim
+and actual invalidation under a backing-local lock, with at most 16 KiB cache
+work per acquisition and no writer/content drain, metadata or I/O callback.
+
+The restored matrix lives in `crates/carrick-el1/src/personality/mm_portal/test_support.rs:302`
+and is driven by real HVF custody in `crates/carrick-vmm-hvf/src/trap/user_transfer.rs:474`.
+Every 16/64/256-page × 16/512-unrelated-node point retains both live roots and
+writes A, writes B, reads A, reads B through production selection, physical
+retention, EL1 revalidation, memcpy and completion. Limits remain ≤8 descriptor
+loads/page and ≤4*ilog2(unrelated+1) reservation visits/page per operation.
+Actual reservation mprotect to RO/NONE and retirement reject A writes/reads
+with errno14 as appropriate while B's bytes remain intact. Restoring writes
+first exposed an extra execute-policy table walk; reading executable permission
+from the same translated leaf removed it without weakening either budget.
+
+The director additionally licensed retained external CopyOnly input before
+admission, with the existing kernel publication owner guarding preparation and
+normal admission as one transaction. `PreAdmissionGuard` in
+`crates/carrick-kernel/src/kernel/mm_occupancy.rs:835` owns existing SPACES_LOCK;
+`with_address_space_admission` in `dispatch/mem/el1_reservations.rs:454` first
+acquires exact MM mutation authority, then publication ownership, and releases
+the raw publication only after the owner lock drops. Mutable brk/mmap/rlimit
+inputs are sampled under mutation admission by `AddressSpacePublicationOwner::publish`
+in `dispatch/mm_authority.rs:1539`. Refusal consumes publication using the held
+lock; a prepared publication is RAII-owned before any fallible root admission.
+This also closes the prior publish-before-mutation concurrent-edit window.
+
+`UserTransferCustody::retain_import_source` (`trap/user_transfer.rs:18`) retains
+an exact source stage-2 generation and its mapping allocation. A retained source
+may survive directory destruction/retirement; fresh stale acquisition refuses.
+`prepare_import` (`trap/sparse_materialization.rs:2801`) uses existing SeededAnon
+allocation, frame inventory and CarrierVmCustody under the borrowed kernel
+permit. PendingImport owns the existing host-setup descriptor undo journal and
+physical receipt immediately, installs/syncs the exact alias, and rolls loader
+descriptors back before physical release on refusal. Successful normal root
+admission authenticates commit. Executable seeded input uses existing I2 before
+descriptor publication. No host protection snapshot, second table graph, new
+publication lock or post-admission host editor is introduced.
+
+Covering tests and observed reds:
+
+- `foreign_mm/tests.rs:12884`, pending descriptor-preparation refusal previously
+  hung in recursive registry acquisition (exact test process bounded/killed at
+  5 seconds); it now returns and preserves exact successor custody/inventory.
+- `user_transfer.rs:542` and `:607`, peer publication between write admission
+  and memcpy previously left completed executable bytes clean (I2 count1 vs2,
+  and non-executable peer publication0 vs1). Both are green.
+- `code_content.rs:420`, a peer publication previously returned while the dirty
+  claimant's actual invalidation was paused; bounded rendezvous now proves it
+  cannot return before the original I2 completes.
+- `foreign_mm/tests.rs:13377`, external retained source outlives source owner;
+  stale acquisition cannot publish a root. Loader-refusal red retained the new
+  IPA665719930880 after physical rollback; green restores the exact original
+  descriptor before release, then admits/copies a fresh successor. This fixture
+  explicitly models kernel permit issuance, while exercising production physical
+  custody/allocation/descriptor undo/reservation admission/copy. The real guard
+  is separately covered by kernel `mm_occupancy/tests.rs:827`.
+- `dispatch/mem/el1_reservations.rs:965`, executing the old publish-before-
+  mutation sequence failed with `old publish-before-mutation order admitted
+  concurrent edit`; production ordering denies the same intervening editor.
+
+New fatal inventory rows describe only uncertain descriptor/physical custody,
+completion or exact identity invariants; recoverable refusal remains typed.
+The seven publish_frame_grant rows retain their classification after factoring
+into publish_frame_grant_backing; the borrowed runner rename retains its prior
+classification. NEXT_CARRIER is a monotonic physical custody identity allocator,
+not guest process state. Existing inventory row order is preserved. These edits
+add no cataloged host identity/process operation; clean compiler capture and
+line-position reconciliation remain the director's final gate.
+
+Scoped receipts are recorded in the worker report. No guest/Docker execution
+was performed. Fork, bulk Capacity and GuestMemory venue3 remain OPEN; this
+review fix does not confer whole-N1 or signed-artifact acceptance.

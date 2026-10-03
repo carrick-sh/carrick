@@ -594,12 +594,22 @@ impl CarrierVmCustody {
                     (unsafe { host.add(offset) }, chunk, true)
                 }
                 Some(ExecutableBacking::Tracked(mapping, base, extent)) => {
-                    let chunk = end.min(base.saturating_add(extent)) - cursor;
+                    // The completion lock is shared across aliases. Keep
+                    // every lock hold to one bounded physical cache run.
+                    let chunk = (end.min(base.saturating_add(extent)) - cursor).min(16 * 1024);
                     let offset =
                         usize::try_from(cursor - base).map_err(|_| PageTableError::BadAddress)?;
                     let size = usize::try_from(chunk).map_err(|_| PageTableError::BadAddress)?;
-                    let dirty = mapping.code_content.take_icache_dirty(offset, size);
-                    (unsafe { mapping.host_base().add(offset) }, chunk, dirty)
+                    if mapping.code_content.publish_icache(offset, size, || {
+                        super::cow_engine::invalidate_instruction_cache(
+                            unsafe { mapping.host_base().add(offset) },
+                            chunk,
+                        );
+                    }) {
+                        invalidations += 1;
+                    }
+                    cursor += chunk;
+                    continue;
                 }
                 None => {
                     let chunk = (end - cursor).min(4096 - (cursor & 0xfff));

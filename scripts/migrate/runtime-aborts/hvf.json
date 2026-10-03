@@ -1820,7 +1820,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish_frame_grant",
+      "function": "publish_frame_grant_backing",
       "ordinal_in_function": 1,
       "fingerprint": "bb857b24e31f03aed23ca6b4b15430815d850bd97d6a61cdfda61e9751bbb9ad",
       "verdict": "carrier_fault",
@@ -1831,7 +1831,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish_frame_grant",
+      "function": "publish_frame_grant_backing",
       "ordinal_in_function": 2,
       "fingerprint": "a250c98437b9d3d9d5954829afa36ffb0b3def59654f95fe731ec0672c5e67c8",
       "verdict": "carrier_fault",
@@ -1842,7 +1842,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish_frame_grant",
+      "function": "publish_frame_grant_backing",
       "ordinal_in_function": 3,
       "fingerprint": "6a8d04f40275867091402bedffecafab85f852f2e8a8fd8513c2afb13c5aa806",
       "verdict": "carrier_fault",
@@ -1853,7 +1853,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish_frame_grant",
+      "function": "publish_frame_grant_backing",
       "ordinal_in_function": 4,
       "fingerprint": "2b5f839985243c9f9d113f02d3cded1a667b6463e62648900e75c17dc1f0d490",
       "verdict": "carrier_fault",
@@ -1864,7 +1864,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish_frame_grant",
+      "function": "publish_frame_grant_backing",
       "ordinal_in_function": 5,
       "fingerprint": "3fc96b7fb1c3254c3d2955fab1a3abf2ab0845d930b714577c096f15dd94fc01",
       "verdict": "carrier_fault",
@@ -1875,7 +1875,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish_frame_grant",
+      "function": "publish_frame_grant_backing",
       "ordinal_in_function": 6,
       "fingerprint": "3fc96b7fb1c3254c3d2955fab1a3abf2ab0845d930b714577c096f15dd94fc01",
       "verdict": "carrier_fault",
@@ -1886,7 +1886,7 @@
     },
     {
       "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
-      "function": "publish_frame_grant",
+      "function": "publish_frame_grant_backing",
       "ordinal_in_function": 7,
       "fingerprint": "3fc96b7fb1c3254c3d2955fab1a3abf2ab0845d930b714577c096f15dd94fc01",
       "verdict": "carrier_fault",
@@ -2499,6 +2499,270 @@
       "rationale": "After the Kernel applied a lease retirement, committing it to the backend frame inventory ledger failed; the two authorities disagree and cannot be reconciled. Moved from try_commit_process_alias_retirement when the Kernel apply and backend commit became one step.",
       "sink": "fatal",
       "domain": "hvpatch::frame_inventory"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/carrier_custody.rs",
+      "function": "CarrierVmCustody::new",
+      "ordinal_in_function": 1,
+      "fingerprint": "5234530c80c1b8a7060dc0c7211954c97e5fa658afc82b87a0e9a68ecb102abc",
+      "sink": "fatal",
+      "domain": "hvf::transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvf::transfer",
+      "rationale": "Carrier identity allocator exhausted; reusing an identity could authenticate physical receipts from another live carrier."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/carrier_custody.rs",
+      "function": "CarrierVmCustody::new",
+      "ordinal_in_function": 2,
+      "fingerprint": "18dbbdd0e3c19dcd7f369d0d7c3d0d6c87ec74e099d0909b82f9f0a3c0f31e39",
+      "sink": "fatal",
+      "domain": "hvf::transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvf::transfer",
+      "rationale": "Zero carrier identity cannot seal an exact carrier-bound transfer handle."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingImport<'_> as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "828ac41cd429ec13ccf27931b642a48496f3f71729fb74e763dcdbcc77fe9b67",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "An admitted root may name the uncommitted import; fail-stop instead of revoking visible physical backing."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingImport<'_> as Drop>::drop",
+      "ordinal_in_function": 2,
+      "fingerprint": "cc71c9dc59d4405482787e9427101321353ece1f46c8518b669d3d915ebf21d7",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Host-setup descriptor rollback lost its retained exact target resolver; physical release cannot proceed."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingImport<'_> as Drop>::drop",
+      "ordinal_in_function": 3,
+      "fingerprint": "cc71c9dc59d4405482787e9427101321353ece1f46c8518b669d3d915ebf21d7",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Host-setup descriptor rollback failed; physical grant must remain owned while descriptors may still name it."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingTransferGrant as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "a11f84760398d0d711d34a1752061042ed92797297dccabc785eccd7f94b2c84",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Descriptor transaction abandonment failed; releasing its retained tables could invalidate an in-flight owner."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingTransferGrant as Drop>::drop",
+      "ordinal_in_function": 2,
+      "fingerprint": "94f4bd3a8ce3b27177842244cf0fec229fb1543649be581b12d71c11a27811b2",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Pending grant lost exact target physical authority needed for authenticated rollback."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingTransferGrant as Drop>::drop",
+      "ordinal_in_function": 3,
+      "fingerprint": "1b052a0436f83aa6d6e65a5e1a826efda9cf10b837a1ea1ea220974e4b64618b",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Empty physical extent violates the immediately retained grant receipt invariant."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingTransferGrant as Drop>::drop",
+      "ordinal_in_function": 4,
+      "fingerprint": "3a505d4a19751f5bd4659532be88e78903b72f699c4a05c5f3b6792e81cdd7f9",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Inventory liveness query failed; absent alias alone cannot authenticate retired mapping generation."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingTransferGrant as Drop>::drop",
+      "ordinal_in_function": 5,
+      "fingerprint": "0c50a63183c55f17631114ea934e311ca738e08b5559e2dfe28544256dcb3585",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Exact grant remains kernel-live after rollback failed; physical release would create dangling descriptors."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingTransferGrant as Drop>::drop",
+      "ordinal_in_function": 6,
+      "fingerprint": "0c50a63183c55f17631114ea934e311ca738e08b5559e2dfe28544256dcb3585",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Backend rollback failed after exact kernel settlement; physical custody cannot be released with uncertain inventory."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingTransferGrant as Drop>::drop",
+      "ordinal_in_function": 7,
+      "fingerprint": "dede1552cf8206692cf3ee77e2194e5e4f87ad6f8b6b5c260931d4464a22d2ef",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Neither exact live inventory nor authenticated retired mapping plus retained owner proves safe settlement; successor ownership must be preserved."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingTransferGrant as carrick_aarch64::user_transfer::TransferGrant>::settle",
+      "ordinal_in_function": 1,
+      "fingerprint": "cc1c1044b1afcec6a21e64722b886e3fc04af5160fdba1def369cd25a84d3442",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Pending physical grant lost its descriptor transaction before settlement."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingTransferGrant as carrick_aarch64::user_transfer::TransferGrant>::settle",
+      "ordinal_in_function": 2,
+      "fingerprint": "35e486bc9ee4232b87a40cb40a059c12ed70997f3af2c4ec7b560afce4e11169",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Mismatched or indeterminate descriptor receipt cannot authorize releasing possibly visible physical backing."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingTransferGrant as carrick_aarch64::user_transfer::TransferGrant>::settle",
+      "ordinal_in_function": 3,
+      "fingerprint": "37f9fbe67634828b79e1e1ac90ce4e23239725e0998a47e571d119675e6812ce",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Applied descriptors name the physical grant; settlement bookkeeping failure must retain ownership rather than roll back visible backing."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingTransferGrant as carrick_aarch64::user_transfer::TransferGrant>::settle",
+      "ordinal_in_function": 4,
+      "fingerprint": "d6487dfd282e90b0f74fa3b419cdf8d36c0c546fb2f5bce7637b7c1d932d7f91",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Unsettled refusal cannot prove that descriptors stopped naming the retained physical grant."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "<PendingTransferGrant as carrick_aarch64::user_transfer::TransferGrant>::transaction",
+      "ordinal_in_function": 1,
+      "fingerprint": "3cdb43a1b9b8f28ede2b504d12d46baea9683defef2fb3eeef7fcb601dced70c",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "A published pending grant must retain the exact descriptor transaction until settlement."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "PendingImport<'_>::commit",
+      "ordinal_in_function": 1,
+      "fingerprint": "bb017ab836cbeb4616a348e53d500a953ae570015d9626482996c96291d8fdfc",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Authenticated admission completed but its retained physical publication receipt is missing."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "PendingImport<'_>::ready",
+      "ordinal_in_function": 1,
+      "fingerprint": "5d6a19fce5a1a78dcec73636d46a1117a278c1f27af25f8328e8191833d90a95",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Pending source import lost its immediately retained physical publication receipt."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "PublicationContext<'static>::prepare_import",
+      "ordinal_in_function": 1,
+      "fingerprint": "efe57bbd3c4aa416ac626eb9665f40831efd1f103438db292cb776742514f6f9",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "New seeded import lost the physical receipt installed before any fallible pin or descriptor operation."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "PublicationContext<'static>::prepare_transfer",
+      "ordinal_in_function": 1,
+      "fingerprint": "5bbd94bb9fe115750e3ef4a538fb6e22d6c01f07f81164c1dab4e414bb96e72a",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "New pending grant lost its immediately installed physical rollback receipt."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "PublicationContext<'static>::prepare_transfer",
+      "ordinal_in_function": 2,
+      "fingerprint": "13ec9f39475cb5744cd9461d535c7531ce218ab090bf6643f8740676aa29c5cd",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Zero authenticated physical grant identity cannot safely authorize EL1 descriptor publication."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/user_transfer.rs",
+      "function": "<RetainedUserData as TransferPin>::copy",
+      "ordinal_in_function": 1,
+      "fingerprint": "594b341711c8a5161dc284e2e1898027ca388a3370553ecacf695c09231730b1",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "A completed write lost the retained content owner required to record instruction-cache dirtiness."
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/user_transfer.rs",
+      "function": "<RetainedUserData as TransferPin>::copy",
+      "ordinal_in_function": 2,
+      "fingerprint": "d70e7a1df887d150640e27eba952d0fdddc82e5415b80019596e2e33f7cdf16b",
+      "sink": "fatal",
+      "domain": "hvpatch::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::user_transfer",
+      "rationale": "Executable copy completed but existing I2 publication failed; returning completion could expose incoherent executable bytes."
     }
   ]
 }

@@ -822,3 +822,77 @@ fn every_host_exclusion_settles_guest_cow_after_the_editor_leaves() {
     drop(exclusion);
     drop(publication);
 }
+
+#[test]
+fn pre_admission_owner_blocks_publication_and_refuses_without_relocking() {
+    let (spaces, occupancy) = space_tables();
+    let tables = SpaceTables {
+        spaces,
+        occupancy,
+        zone: false,
+    };
+    let key = mm(42_901);
+    let guard = PreAdmissionGuard::acquire_in(tables, key).unwrap();
+    let permit = guard.permit().unwrap();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (published_tx, published_rx) = std::sync::mpsc::channel();
+    let successor = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let published = publish_for_test(spaces, occupancy, key, &fence(), 0x9000).unwrap();
+        published_tx.send(()).unwrap();
+        published
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(
+        published_rx
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_err()
+    );
+    assert!(permit.unpublished());
+    let mm_fence = fence();
+    // This is the same stage-1 mutation pause acquired BEFORE publication by
+    // BoundAddressSpaceAdmission. A guest edit arriving between publication
+    // and root import sees the already-raised gate.
+    mm_fence.set_quiescing();
+    let publication = guard
+        .publish(
+            &mm_fence,
+            0x1000,
+            0x1000,
+            0,
+            0,
+            ReservationRootPublication {
+                limits: ReservationLimits {
+                    address: u64::MAX,
+                    data: u64::MAX,
+                },
+                provider: None,
+            },
+        )
+        .unwrap();
+    let index = spaces.find(key.raw()).unwrap();
+    let editing = std::thread::spawn(move || {
+        spaces
+            .try_begin_edit(index, key.raw(), std::num::NonZeroU64::new(1).unwrap())
+            .is_some()
+    });
+    assert!(
+        !editing.join().unwrap(),
+        "concurrent edit entered publication/admission gap"
+    );
+    assert!(!permit.unpublished());
+    guard.refuse(publication);
+    assert!(permit.unpublished());
+    assert!(spaces.find(key.raw()).is_none());
+    drop(guard);
+    mm_fence.end();
+    published_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let successor = successor.join().unwrap();
+    let index = spaces.find(key.raw()).unwrap();
+    assert_eq!(spaces.grant(index, key.raw()).unwrap().ttbr0, 0x9000);
+    drop(successor);
+}
