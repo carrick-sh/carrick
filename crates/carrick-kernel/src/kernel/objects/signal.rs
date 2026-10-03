@@ -7,7 +7,7 @@
 //! pending queues.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use parking_lot::Mutex;
 
@@ -18,7 +18,7 @@ use carrick_guest_mem::CurrentMmMemory;
 use crate::kernel::ids::{LinuxSignal, LinuxTid, SighandId};
 use crate::kernel::operations::KernelOperationError;
 
-use super::{JobControlStopInvalidationGeneration, ObjectRevision, TaskRef, ThreadRef};
+use super::{JobControlStopInvalidationGeneration, ObjectRevision, TaskRef, ThreadKey, ThreadRef};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SignalDisposition {
@@ -342,7 +342,13 @@ pub struct TaskPendingSignals {
 #[derive(Debug, Default)]
 struct TaskPendingQueue {
     queue: PendingQueue,
-    named_recipients: BTreeMap<LinuxSignal, LinuxTid>,
+    named_recipients: BTreeMap<LinuxSignal, NamedRecipient>,
+}
+
+#[derive(Debug)]
+struct NamedRecipient {
+    key: ThreadKey,
+    thread: Weak<super::Thread>,
 }
 
 impl std::ops::Deref for TaskPendingQueue {
@@ -360,16 +366,30 @@ impl std::ops::DerefMut for TaskPendingQueue {
 }
 
 impl TaskPendingQueue {
+    fn take_lowest_in(&mut self, wanted: SigSet) -> Option<PendingSignal> {
+        let pending = self.queue.take_lowest_in(wanted)?;
+        if !self.queue.present().contains(pending.signal.raw()) {
+            self.named_recipients.remove(&pending.signal);
+        }
+        Some(pending)
+    }
+
     /// Record who receives `signal` when this enqueue made it pending. A
     /// signal already pending keeps its recipient: a coalesced standard signal
     /// is not sent again, and later real-time instances follow the first.
-    fn designate(&mut self, signal: LinuxSignal, was_pending: bool, named: Option<LinuxTid>) {
+    fn designate(&mut self, signal: LinuxSignal, was_pending: bool, named: Option<ThreadRef>) {
         if was_pending {
             return;
         }
         match named {
-            Some(tid) => {
-                self.named_recipients.insert(signal, tid);
+            Some(thread) => {
+                self.named_recipients.insert(
+                    signal,
+                    NamedRecipient {
+                        key: thread.key(),
+                        thread: Arc::downgrade(&thread),
+                    },
+                );
             }
             None => {
                 self.named_recipients.remove(&signal);
@@ -382,7 +402,7 @@ impl TaskPendingQueue {
     fn recipient(&self, signal: LinuxSignal, leader: LinuxTid) -> LinuxTid {
         self.named_recipients
             .get(&signal)
-            .copied()
+            .map(|recipient| recipient.key.tid)
             .unwrap_or(leader)
     }
 
@@ -400,7 +420,21 @@ impl TaskPendingQueue {
         self.named_recipients
             .iter()
             .filter(|(signal, _)| self.queue.present().contains(signal.raw()))
-            .map(|(&signal, &recipient)| (signal, recipient))
+            .map(|(&signal, recipient)| (signal, recipient.key.tid))
+            .collect()
+    }
+
+    fn named_threads(&self) -> BTreeMap<LinuxTid, ThreadRef> {
+        self.named_recipients
+            .iter()
+            .filter(|(signal, _)| self.queue.present().contains(signal.raw()))
+            .filter_map(|(_, recipient)| {
+                recipient
+                    .thread
+                    .upgrade()
+                    .filter(|thread| thread.key() == recipient.key)
+                    .map(|thread| (recipient.key.tid, thread))
+            })
             .collect()
     }
 }
@@ -516,12 +550,17 @@ impl TaskPendingSignals {
         &self,
         signal: LinuxSignal,
         siginfo: Option<LinuxSiginfo>,
-        named: LinuxTid,
+        named: ThreadRef,
     ) {
         self.enqueue(signal, siginfo, Some(named));
     }
 
-    fn enqueue(&self, signal: LinuxSignal, siginfo: Option<LinuxSiginfo>, named: Option<LinuxTid>) {
+    fn enqueue(
+        &self,
+        signal: LinuxSignal,
+        siginfo: Option<LinuxSiginfo>,
+        named: Option<ThreadRef>,
+    ) {
         let mut queue = self.queue.lock();
         let was_pending = queue.present().contains(signal.raw());
         if signal.is_realtime() {
@@ -1166,11 +1205,15 @@ impl SignalAuthority {
     /// action carries the exact stop-invalidation epoch in which it left
     /// pending state.
     pub fn take_lowest_in(&self, wanted: SigSet) -> Option<SignalDequeue> {
+        let recipients = self.foreign_named_task_recipients();
         let generation_guard = self.task.lock_signal_generation();
         let mut thread = self.thread.signal_state.lock();
         let mut task = self.task_pending.queue.lock();
         let thread_signal = thread.pending().intersect(wanted).lowest_signum();
-        let task_signal = task.present().intersect(wanted).lowest_signum();
+        let task_signal = recipients
+            .available_named(&task, self.thread.key().tid)
+            .intersect(wanted)
+            .lowest_signum();
         let owner = match (thread_signal, task_signal) {
             (None, None) => return None,
             (Some(_), None) => SignalPendingOwner::Thread,
@@ -1236,6 +1279,7 @@ impl SignalAuthority {
     fn foreign_task_recipients(&self) -> TaskRecipientSnapshot {
         let leader = LinuxTid::for_task_leader(self.task.key().id);
         let me = self.thread.key().tid;
+        let named_threads = self.task_pending.queue.lock().named_threads();
         let mut snapshot = TaskRecipientSnapshot {
             leader,
             recipients: self.task_pending.recipients(leader),
@@ -1247,8 +1291,10 @@ impl SignalAuthority {
                 continue;
             }
             let blocked = *masks.entry(recipient).or_insert_with(|| {
-                self.task
-                    .thread(recipient)
+                named_threads
+                    .get(&recipient)
+                    .cloned()
+                    .or_else(|| self.task.thread(recipient))
                     .map(|thread| thread.blocked_mask())
             });
             // A live recipient that does not block the signal receives it. A
@@ -1263,9 +1309,13 @@ impl SignalAuthority {
     fn foreign_named_task_recipients(&self) -> TaskRecipientSnapshot {
         let leader = LinuxTid::for_task_leader(self.task.key().id);
         let me = self.thread.key().tid;
+        let (recipients, named_threads) = {
+            let queue = self.task_pending.queue.lock();
+            (queue.named_recipients(), queue.named_threads())
+        };
         let mut snapshot = TaskRecipientSnapshot {
             leader,
-            recipients: self.task_pending.queue.lock().named_recipients(),
+            recipients,
             claimed: SigSet::EMPTY,
         };
         let mut masks: BTreeMap<LinuxTid, Option<SigSet>> = BTreeMap::new();
@@ -1274,8 +1324,8 @@ impl SignalAuthority {
                 continue;
             }
             let blocked = *masks.entry(recipient).or_insert_with(|| {
-                self.task
-                    .thread(recipient)
+                named_threads
+                    .get(&recipient)
                     .map(|thread| thread.blocked_mask())
             });
             if blocked.is_some_and(|blocked| !blocked.contains(signal.raw())) {

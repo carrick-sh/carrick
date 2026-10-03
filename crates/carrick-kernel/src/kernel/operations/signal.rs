@@ -66,7 +66,7 @@ pub struct AuthorizedSignalTarget {
     /// A process-directed signal whose sender named this non-leader thread
     /// (`kill(tid)`): delivery stays process-directed, the thread is its
     /// recipient ([`crate::kernel::TaskPendingSignals::enqueue_named`]).
-    named_recipient: Option<LinuxTid>,
+    named_recipient: Option<Weak<crate::kernel::objects::Thread>>,
 }
 
 impl Kernel {
@@ -203,9 +203,10 @@ impl Kernel {
     ) -> ExactSignalTargetAuthorization {
         match self.authorize_signal_target_exact(caller, target_task, Some(named), signal) {
             ExactSignalTargetAuthorization::Allowed(ticket) => {
+                let named_recipient = ticket.thread.clone();
                 ExactSignalTargetAuthorization::Allowed(AuthorizedSignalTarget {
                     thread: None,
-                    named_recipient: Some(named.tid),
+                    named_recipient,
                     ..ticket
                 })
             }
@@ -802,11 +803,27 @@ impl Kernel {
             }
             None => None,
         };
+        let named_recipient = match &target.named_recipient {
+            Some(thread) => {
+                let Some(thread) = thread.upgrade() else {
+                    return ExactThreadSignalPost::Missing;
+                };
+                Some(thread)
+            }
+            None => None,
+        };
         let generation = task.lock_signal_generation();
         if task.lifecycle() != TaskLifecycle::Live {
             return ExactThreadSignalPost::Missing;
         }
         if let Some(thread) = &thread
+            && task
+                .thread(thread.key().tid)
+                .is_none_or(|current| !Arc::ptr_eq(&current, thread))
+        {
+            return ExactThreadSignalPost::Missing;
+        }
+        if let Some(thread) = &named_recipient
             && task
                 .thread(thread.key().tid)
                 .is_none_or(|current| !Arc::ptr_eq(&current, thread))
@@ -847,7 +864,7 @@ impl Kernel {
             });
         } else {
             let pending = task.shared().pending_signals();
-            match target.named_recipient {
+            match named_recipient {
                 Some(named) => pending.enqueue_named(signal, siginfo, named),
                 None if signal.is_realtime() => pending.enqueue_realtime(signal, siginfo),
                 None => pending.enqueue_standard(signal, siginfo),
