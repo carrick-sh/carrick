@@ -311,6 +311,15 @@ impl CowGrantPool {
         None
     }
 
+    /// Authenticate the exact in-progress guest claim before physical cache
+    /// publication. A ready, settled or recycled record cannot authorize it.
+    pub fn authenticates_claimed(&self, grant: &CowGrant) -> bool {
+        let Some(record) = self.records.get(grant.slot) else {
+            return false;
+        };
+        let state = record.state.load(Ordering::Acquire);
+        state == (grant.epoch | CLAIMED) && record.grant(grant.slot, state) == Some(*grant)
+    }
     /// EL1, still holding the editor: the claimed grant was not used (the
     /// repoint refused before storing anything); it is ready again.
     pub fn abandon(&self, grant: &CowGrant) -> bool {
