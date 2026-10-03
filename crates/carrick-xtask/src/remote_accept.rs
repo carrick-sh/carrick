@@ -252,6 +252,7 @@ pub fn build_detached_start_cmd(
     run_dir: &str,
     log_file: &str,
     exit_file: &str,
+    lock_dir: &str,
 ) -> String {
     let q_worktree = shell_quote(worktree_dir);
     let q_run_dir = shell_quote(run_dir);
@@ -259,9 +260,10 @@ pub fn build_detached_start_cmd(
     let q_exit = shell_quote(exit_file);
     let exit_tmp = format!("{exit_file}.tmp");
     let q_exit_tmp = shell_quote(&exit_tmp);
+    let q_lock = shell_quote(lock_dir);
 
     format!(
-        "mkdir -p {q_run_dir} && nohup sh -c '[ -f /Volumes/carrick/dev/env.sh ] && . /Volumes/carrick/dev/env.sh; cd {q_worktree} && just accept --phase {phase} > {q_log} 2>&1; echo $? > {q_exit_tmp} && mv {q_exit_tmp} {q_exit}' >/dev/null 2>&1 </dev/null &"
+        "mkdir -p {q_run_dir} && nohup sh -c '[ -f /Volumes/carrick/dev/env.sh ] && . /Volumes/carrick/dev/env.sh; cd {q_worktree} && just accept --phase {phase} > {q_log} 2>&1; echo $? > {q_exit_tmp} && mv {q_exit_tmp} {q_exit}; rm -rf {q_lock}' >/dev/null 2>&1 </dev/null &"
     )
 }
 
@@ -329,8 +331,18 @@ pub fn run_ssh_command(host: &str, script: &str) -> Result<String, RemoteAcceptE
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+pub fn build_stale_lock_recovery_cmd(exit_file: &str, lock_dir: &str, new_run_id: &str) -> String {
+    let q_exit = shell_quote(exit_file);
+    let q_lock = shell_quote(lock_dir);
+    let q_run_id = shell_quote(new_run_id);
+    format!(
+        "if [ -f {q_exit} ]; then rm -rf {q_lock} && if mkdir {q_lock} 2>/dev/null; then echo {q_run_id} > {q_lock}/run_id && echo RECOVERED; else echo RECOVERY_FAILED; fi; else echo ACTIVE; fi"
+    )
+}
+
 pub fn acquire_remote_lock(
     host: &str,
+    remote_root: &str,
     lock_dir: &str,
     run_id: &str,
 ) -> Result<(), RemoteAcceptError> {
@@ -344,6 +356,20 @@ pub fn acquire_remote_lock(
         if let Some(holder) = trimmed.strip_prefix("HELD:") {
             let holder = holder.trim();
             let holder_str = if holder.is_empty() { "unknown" } else { holder };
+
+            // Stale lock recovery: when acquisition finds the lock held, read its run_id.
+            // If <remote_root>/gate-runs/<run_id>/exit exists, the holder finished without releasing,
+            // so remove the lock and acquire it (print a notice). Otherwise fail with LockHeld as today.
+            let holder_exit = format!("{remote_root}/gate-runs/{holder_str}/exit");
+            let stale_cmd = build_stale_lock_recovery_cmd(&holder_exit, lock_dir, run_id);
+            let recovery_out = run_ssh_command(host, &stale_cmd)?;
+            if recovery_out.lines().any(|l| l.trim() == "RECOVERED") {
+                println!(
+                    "Notice: stale worktree lock held by finished run '{holder_str}' recovered (lock removed and re-acquired)"
+                );
+                return Ok(());
+            }
+
             return Err(RemoteAcceptError::LockHeld {
                 host: host.to_string(),
                 run_id: holder_str.to_string(),
@@ -372,6 +398,14 @@ impl<'a> RemoteLockGuard<'a> {
         }
     }
 
+    pub fn disarm(&mut self) {
+        self.active = false;
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
     pub fn release(&mut self) {
         if self.active {
             let cmd = build_lock_release_cmd(&self.lock_dir);
@@ -389,6 +423,18 @@ impl<'a> RemoteLockGuard<'a> {
 impl<'a> Drop for RemoteLockGuard<'a> {
     fn drop(&mut self) {
         self.release();
+    }
+}
+
+pub fn create_lock_guard_for_run<'a>(
+    host: &'a str,
+    lock_dir: String,
+    attach: Option<&str>,
+) -> Option<RemoteLockGuard<'a>> {
+    if attach.is_some() {
+        None
+    } else {
+        Some(RemoteLockGuard::new(host, lock_dir))
     }
 }
 
@@ -516,11 +562,10 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         .to_string_lossy()
         .to_string();
 
-    let (run_id, sha12, mut lock_guard) = if let Some(existing_run_id) = &args.attach {
+    let (run_id, sha12) = if let Some(existing_run_id) = &args.attach {
         let (parsed_sha, _) = parse_run_id(existing_run_id)?;
         println!("Attaching to remote run: {existing_run_id}");
-        let guard = RemoteLockGuard::new(&host, lock_dir);
-        (existing_run_id.clone(), parsed_sha.to_string(), guard)
+        (existing_run_id.clone(), parsed_sha.to_string())
     } else {
         // Step 1: Resolve the ref to a full SHA locally. Refuse if local tracked tree is dirty AND ref is HEAD.
         let full_sha_out =
@@ -549,8 +594,8 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         let run_id = generate_run_id(&sha12, &timestamp);
 
         // Exclusive lock on remote worktree
-        acquire_remote_lock(&host, &lock_dir, &run_id)?;
-        let guard = RemoteLockGuard::new(&host, lock_dir);
+        acquire_remote_lock(&host, &remote_root, &lock_dir, &run_id)?;
+        let mut lock_guard = RemoteLockGuard::new(&host, lock_dir.clone());
 
         // Step 2: Push it to the bare repo as refs/heads/gate/<sha12>
         let push_target = if host == DEFAULT_HOST && remote_root == DEFAULT_REMOTE_ROOT {
@@ -584,13 +629,23 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         let run_dir = format!("{remote_root}/gate-runs/{run_id}");
         let log_file = format!("{run_dir}/accept.log");
         let exit_file = format!("{run_dir}/exit");
-        let start_cmd =
-            build_detached_start_cmd(&worktree_dir, args.phase, &run_dir, &log_file, &exit_file);
+        let start_cmd = build_detached_start_cmd(
+            &worktree_dir,
+            args.phase,
+            &run_dir,
+            &log_file,
+            &exit_file,
+            &lock_dir,
+        );
 
         println!("Starting detached accept gate on {host}...");
         run_ssh_command(&host, &start_cmd)?;
 
-        (run_id, sha12, guard)
+        // The remote detached job now owns removing the lock when it finishes.
+        // Disarm the local guard so it never removes the lock on drop.
+        lock_guard.disarm();
+
+        (run_id, sha12)
     };
 
     let gate_runs_dir = format!("{remote_root}/gate-runs");
@@ -702,8 +757,6 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
     let local_receipt = local_receipt_path(&local_root, &run_id);
     println!("Local receipt path: {}", local_receipt.display());
 
-    lock_guard.release();
-
     let prune_cmd = build_prune_runs_cmd(&gate_runs_dir, MAX_RECENT_GATE_RUNS);
     if let Err(e) = run_ssh_command(&host, &prune_cmd) {
         eprintln!("Warning: failed to prune old gate-runs: {e}");
@@ -744,9 +797,16 @@ mod tests {
         let run_dir = "/Volumes/carrick/gate runs/123";
         let log_file = "/Volumes/carrick/gate runs/123/accept.log";
         let exit_file = "/Volumes/carrick/gate runs/123/exit";
+        let lock_dir = "/Volumes/carrick/gate-worktree.lock";
 
-        let start_cmd =
-            build_detached_start_cmd(worktree, AcceptPhase::Host, run_dir, log_file, exit_file);
+        let start_cmd = build_detached_start_cmd(
+            worktree,
+            AcceptPhase::Host,
+            run_dir,
+            log_file,
+            exit_file,
+            lock_dir,
+        );
 
         assert!(start_cmd.starts_with("mkdir -p '/Volumes/carrick/gate runs/123' && nohup sh -c "));
         assert!(start_cmd.contains("cd '/Volumes/carrick/work tree with spaces'"));
@@ -756,6 +816,17 @@ mod tests {
         assert!(start_cmd.contains(
             "mv '/Volumes/carrick/gate runs/123/exit.tmp' '/Volumes/carrick/gate runs/123/exit'"
         ));
+        assert!(start_cmd.contains("; rm -rf '/Volumes/carrick/gate-worktree.lock'"));
+        let mv_idx = start_cmd
+            .find("mv '/Volumes/carrick/gate runs/123/exit.tmp' '/Volumes/carrick/gate runs/123/exit'")
+            .expect("mv in start_cmd");
+        let rm_idx = start_cmd
+            .find("rm -rf '/Volumes/carrick/gate-worktree.lock'")
+            .expect("rm lock in start_cmd");
+        assert!(
+            mv_idx < rm_idx,
+            "lock removal must occur after exit-file move"
+        );
         assert!(start_cmd.ends_with(" >/dev/null 2>&1 </dev/null &"));
 
         let bare = "/Volumes/carrick/bare repo.git";
@@ -967,5 +1038,48 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
         assert_eq!(resolve_remote_root(None), DEFAULT_REMOTE_ROOT);
         assert_eq!(resolve_remote_root(Some("/custom/root")), "/custom/root");
         assert_eq!(resolve_remote_root(Some("   ")), DEFAULT_REMOTE_ROOT);
+    }
+
+    #[test]
+    fn test_attach_path_constructs_no_guard() {
+        let guard_attach = create_lock_guard_for_run(
+            "rentamac@cloudmac",
+            "/Volumes/carrick/dev/gate-worktree.lock".to_string(),
+            Some("0123456789ab-20261003-120000"),
+        );
+        assert!(
+            guard_attach.is_none(),
+            "attach path must construct no guard"
+        );
+
+        let guard_fresh = create_lock_guard_for_run(
+            "rentamac@cloudmac",
+            "/Volumes/carrick/dev/gate-worktree.lock".to_string(),
+            None,
+        );
+        assert!(guard_fresh.is_some(), "fresh path must construct a guard");
+        let mut g = guard_fresh.unwrap();
+        assert!(g.is_active());
+        g.disarm();
+        assert!(!g.is_active());
+    }
+
+    #[test]
+    fn test_stale_lock_branch_command_text() {
+        let exit_file = "/Volumes/carrick/dev/gate-runs/0123456789ab-20261003-120000/exit";
+        let lock_dir = "/Volumes/carrick/dev/gate-worktree.lock";
+        let new_run_id = "cdef01234567-20261003-130000";
+
+        let cmd = build_stale_lock_recovery_cmd(exit_file, lock_dir, new_run_id);
+        assert!(cmd.starts_with(
+            "if [ -f '/Volumes/carrick/dev/gate-runs/0123456789ab-20261003-120000/exit' ]; then"
+        ));
+        assert!(cmd.contains("rm -rf '/Volumes/carrick/dev/gate-worktree.lock'"));
+        assert!(cmd.contains("mkdir '/Volumes/carrick/dev/gate-worktree.lock'"));
+        assert!(cmd.contains(
+            "echo 'cdef01234567-20261003-130000' > '/Volumes/carrick/dev/gate-worktree.lock'/run_id"
+        ));
+        assert!(cmd.contains("echo RECOVERED"));
+        assert!(cmd.contains("echo ACTIVE"));
     }
 }
