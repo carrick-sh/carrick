@@ -706,7 +706,7 @@ per-venue failure counts, so an exact frequency ranking is unavailable.
 
 | Checkpoint | Venues | Red-first witnesses and landing boundary |
 | --- | --- | --- |
-| N1a: live host buffer transfers | 3, 4, 5, 7, 28 | Signed musl `mmapv8align` and separately reached `mmapprivatefiletrack`; inverse EL1 munmap/PROT_NONE then host read must return EFAULT (14), with two live MMs at the same VA. Bind checked GuestMemory entries and every raw escape to UserTransfer; delete admitted protection-mirror storage, host permission/COW selection and guessed VA-to-IPA copyout. Internal control-window reads use a distinct bounded intent. Physical content pins/coherence remain. Production transport required. |
+| N1a: live host buffer transfers | 3, 4, 5, 7, 28 | Signed musl `mmapv8align` and separately reached `mmapprivatefiletrack`; inverse EL1 munmap/PROT_NONE then host read must return EFAULT (14), with two live MMs at the same VA. Consume resident/file backing at seal with exact-generation owned pins, retaining transferable frames and HostBacking aliases and copying only CopyOnly input. Bind checked GuestMemory entries and every raw escape to UserTransfer; delete admitted protection-mirror storage, host permission/COW selection and guessed VA-to-IPA copyout. Internal control-window reads use a distinct bounded intent. Physical content pins/coherence remain. Production transport required. |
 | N1b: memory policy and physical backing | 6, 12, 13, 14, 15, 16, 17, 18, 19, 20 | Frozen `coredumpbit`, `mmapcluster`, `forkfault`, `roprotect`, `msyncalign`, `rlimitasdata`; signed `el1_anonymous_reservations_stay_in_guest` and `el1_delegated_root_map_fixed_over_cow_pages`. Include all VMA kinds, partial-compound reuse, stale/duplicate grants, failure rollback and live fault classification. Reuse N1a transport for Capacity/HostBacking; no host policy proposals for admitted roots. These tests' causal assignment is provisional. |
 | N1c: fork, exec and sealed root lifecycle | 1, 2, 10, 11, 21, 22, 23, 29 | N0 `red_until_n1_production_admission_retains_host_semantic_venue` must become a positive exclusive-owner assertion; compiler fences plus owner matrix fork/child isolation, outstanding-copy refusal, stale completion and exec rollback. Frozen `nxwritableimage`, `forkexecstorm`, `exitgroupthreads`, `futexforkwakegroups` are composition witnesses, with N2 task/wait failures separately retained. Delete projection/snapshot/edit/pause capabilities; preserve task birth and root occupancy proofs. Reuse transport for Fork/Exec. |
 | N1d: exceptional readers and writers | 8, 9, 24, 25, 26, 27, 30 | Two-MM stopped-target ptrace/process_vm and /proc/mem permission/prefix witnesses; live maps/residency, parked-thread core snapshot, signal-frame fault and native activation revocation under protect/unmap/exec. Owner matrix stopped-target/default-slot and delayed completion proofs must bind to signed production. Reuse transport for UserTransfer/Observe/Snapshot; ReadInstruction, NativeData and authorized POKE remain distinct intents. |
@@ -764,3 +764,17 @@ reservation/reader/fork contracts, preserving all budgets. Run host and signed
 signed commands take `just lease carrick`, exact CARRICK_RUN_ID and scoped
 `scripts/sudo/kill.sh` cleanup. Record signed artifact identities and generic
 shard remaining-DIFF delta. No Docker is authorized for this execution task.
+
+N1a resident-import checkpoint: `BootMmBuilder<P>` consumes exact physical
+pins before sealing. Owned and shared HostBacking imports retain source bytes;
+private HostBacking aliases arm the existing EL1 COW classifier, and CopyOnly
+input copies into owner-granted pages. Imported physical frames never enter
+the anonymous reuse free set. Pin generation/address authentication precedes
+publication; failed sealing rolls back unpublished roots/references and new
+non-metadata grants. This is an owner-core checkpoint, not production admission
+or hardware TLBI/cache acceptance. The live-byte red is green (`live`), the
+two-MM inverse remains green, all four import modes preserve bytes, private
+file writes preserve source bytes, stale generation refuses before MM
+publication, and a read-only input leaf grants no guest write. Full N0 matrix
+scales remain green. Receipts: `/tmp/carrick-n1a-portal.log`,
+`/tmp/carrick-n1a-import-clippy.log`, `/tmp/carrick-n1a-import-target.log`.
