@@ -83,6 +83,7 @@
 #[cfg(test)]
 extern crate std;
 
+pub mod completion_queue;
 pub mod object_wait;
 pub mod occupancy;
 pub mod spaces;
@@ -1042,6 +1043,9 @@ pub struct ZoneTables {
     /// Address spaces EL1 may install itself, with their gates.
     pub spaces: AddressSpaces,
     object_waits: [object_wait::ObjectQueue; object_wait::OBJECT_WAIT_QUEUES],
+    /// Carrier-owned completion handbacks, appended after existing tables.
+    completion_handbacks: completion_queue::CompletionQueue,
+    completion_consumer: AtomicU32,
 }
 
 /// How a bucket lock waits: EL1 gives up after a bounded spin (and forwards
@@ -1049,6 +1053,15 @@ pub struct ZoneTables {
 pub trait LockWait {
     /// Called after the `attempt`-th failed acquisition; false gives up.
     fn wait(&self, attempt: u32) -> bool;
+    /// Mandatory delivery venue when internal unlink holds a completion-enabled
+    /// queue. Legacy venues fail closed rather than silently dropping effects.
+    fn complete_object_wake(
+        &self,
+        _zone: &ZoneTables,
+        _effects: object_wait::OwnedObjectWakeEffects,
+    ) {
+        _effects.missing_venue();
+    }
 }
 
 /// Spin at most `0` times, then give up.
@@ -1056,6 +1069,9 @@ pub struct BoundedSpin(pub u32);
 
 impl LockWait for BoundedSpin {
     fn wait(&self, attempt: u32) -> bool {
+        if self.0 == 0 {
+            return false;
+        }
         core::hint::spin_loop();
         attempt < self.0
     }
@@ -2108,11 +2124,25 @@ impl ZoneTables {
         effects: &mut WakeEffects,
         unlink_wait: impl FnOnce(),
     ) -> bool {
+        self.claim_for_el1_with_wait((record, seq, index), waker, effects, unlink_wait, false)
+    }
+    fn claim_for_el1_with_wait(
+        &self,
+        claim: (RecordId, u32, u64),
+        waker: SlotId,
+        effects: &mut WakeEffects,
+        unlink_wait: impl FnOnce(),
+        nonblocking: bool,
+    ) -> bool {
+        let (record, seq, index) = claim;
         let rec = self.record(record);
         let home = rec.home();
         if let Some(target) = self.placement(record, waker)
             && target != waker
-            && let Some(slot_guard) = self.slot_lock(target, &BoundedSpin(EL1_SLOT_LOCK_SPINS))
+            && let Some(slot_guard) = self.slot_lock(
+                target,
+                &BoundedSpin(if nonblocking { 0 } else { EL1_SLOT_LOCK_SPINS }),
+            )
         {
             let is_home = home == Some(target);
             let takes = if is_home {
@@ -2141,9 +2171,17 @@ impl ZoneTables {
         }
         // The waker's own run queue: the placement chose it, or the chosen
         // slot changed since the plan.
-        let Some(slot_guard) = self.slot_lock(waker, &SpinForever) else {
+        let slot_guard = if nonblocking {
+            self.slot_lock(waker, &BoundedSpin(0))
+        } else {
+            self.slot_lock(waker, &SpinForever)
+        };
+        let Some(slot_guard) = slot_guard else {
             return false;
         };
+        if nonblocking && !self.slot(waker).state().in_guest() {
+            return false;
+        }
         if !rec.cas(Claim::Parked { seq }, Claim::Queued { slot: waker, seq }) {
             return false;
         }
@@ -3547,6 +3585,11 @@ impl ZoneTables {
 
     /// The run loop of `slot`'s vCPU takes the reschedule SGI a host
     /// placement owes it.
+    /// Record the interrupt a host completion venue must deliver on re-entry.
+    pub fn owe_resched(&self, slot: SlotId) {
+        self.slot(slot).resched_owed.store(1, Ordering::Release);
+    }
+
     pub fn take_resched(&self, slot: SlotId) -> bool {
         self.slot(slot).resched_owed.swap(0, Ordering::AcqRel) != 0
     }
