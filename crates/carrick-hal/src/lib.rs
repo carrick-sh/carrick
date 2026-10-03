@@ -127,3 +127,6 @@ pub use scheduler::{
 };
 pub mod vcpu_census;
 pub use vcpu_census::{VcpuCensus, VcpuLiveGuard};
+
+pub mod pre_admission;
+pub use pre_admission::{PreAdmissionOwner, PreAdmissionPermit, PreAdmissionReceipt};
