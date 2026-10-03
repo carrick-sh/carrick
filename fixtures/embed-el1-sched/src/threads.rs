@@ -1050,6 +1050,7 @@ enum ReportFailure {
     ShortRead { have: usize, errno: i32 },
 }
 
+#[derive(Debug)]
 enum ReapOutcome {
     Exited(i32),
     Signaled(i32),
