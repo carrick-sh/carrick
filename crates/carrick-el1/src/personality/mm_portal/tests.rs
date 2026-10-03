@@ -285,8 +285,8 @@ fn native_owner_matrix() {
                 )
                 .unwrap();
             }
-            // Real scheduler records remain parked, including the stopped target;
-            // the owner entry does not consume or unpark a service slot.
+            // Real scheduler drivers are away on blocking waits, with a service
+            // record waiting on each slot; the target itself remains parked.
             let raw = unsafe {
                 std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_sched_core::ZoneTables>())
             };
@@ -300,6 +300,19 @@ fn native_owner_matrix() {
                 .unwrap();
             assert!(!zone.spaces.is_open(1));
             let gate = zone.spaces.gate(stopped);
+            let target_record = zone
+                .alloc_record(carrick_sched_core::ThreadIdentity {
+                    tid: 1000,
+                    serial: 1,
+                    mm: 1,
+                    file_table: 1,
+                    generation: 1,
+                    affinity: 0,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
+            zone.publish_park(target_record, zone.next_seq(target_record));
             let mut waiting = Vec::new();
             for n in 0..carrick_sched_core::ZONE_SLOTS {
                 let record = zone
@@ -314,9 +327,19 @@ fn native_owner_matrix() {
                         control_slot: 0,
                     })
                     .unwrap();
-                let seq = zone.next_seq(record);
-                zone.publish_park(record, seq);
-                waiting.push(record);
+                let slot = carrick_sched_core::SlotId::from_index(n).unwrap();
+                let driver = n as u64 + 1;
+                zone.publish_slot(slot, 1, None, 0);
+                zone.drive(slot, driver);
+                let mut taken = Vec::new();
+                let mut placed = Vec::new();
+                assert!(
+                    zone.step_away(slot, driver, &mut |r| taken.push(r), &mut |p| placed
+                        .push(p))
+                );
+                assert!(taken.is_empty() && placed.is_empty());
+                assert!(zone.requeue_on(slot, record));
+                waiting.push((slot, record, driver));
             }
             let initial = p.work();
             let payload = vec![0x31; pages as usize * PAGE_BYTES as usize];
@@ -326,12 +349,19 @@ fn native_owner_matrix() {
             read(&mut p, a, VA, &mut bytes).unwrap();
             assert_eq!(bytes, payload);
             let transfer = p.work();
-            for record in &waiting {
-                assert!(matches!(
-                    zone.record(*record).claim(),
-                    carrick_sched_core::Claim::Parked { .. }
-                ));
+            for (slot, record, driver) in &waiting {
+                assert!(!zone.slot(*slot).is_live());
+                assert_eq!(zone.slot(*slot).driver(), Some(*driver));
+                assert_eq!(zone.slot(*slot).queued(), 1);
+                assert!(zone.record(*record).needs_host());
+                assert!(
+                    matches!(zone.record(*record).claim(), carrick_sched_core::Claim::Queued { slot: queued, .. } if queued == *slot)
+                );
             }
+            assert!(matches!(
+                zone.record(target_record).claim(),
+                carrick_sched_core::Claim::Parked { .. }
+            ));
             assert_eq!(zone.spaces.gate(stopped), gate);
             assert!(!zone.spaces.is_open(1));
             assert_eq!(transfer.el0_entries + transfer.host_worker_parks, 0);
