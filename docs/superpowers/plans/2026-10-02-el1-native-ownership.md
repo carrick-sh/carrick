@@ -1258,3 +1258,72 @@ reservation arena. `Reservations::first_fit` refuses placement and the syscall
 lowers it to `ENOMEM`. This fork checkpoint inherits the owner's layout; it
 does not lift that placement bound. Those capacity witnesses remain OPEN for
 N1's bulk Capacity/reservation-model work. No guest run is claimed here.
+
+#### N1c production-owner fork checkpoint — 2026-10-03
+
+Admitted copied MMs now fork through the production portal from live descriptor
+words and the owner's reservation tree. Fork authenticates carrier, MM,
+incarnation, sequence and generation; retains exact physical custody; and keeps
+child execution closed until owner completion. Parent undo and child admission
+are settled together. Outstanding UserTransfer refuses admission, stale
+completion refuses publication, and two MMs at the same VA remain independent.
+Parent deferred physical returns remain parent-owned; retired leaves are omitted
+from the child. The director approved this choice, with explicit regression
+coverage, rather than introducing host projection or forced settlement.
+
+Private-file reservations retain HostBacking handle token, offset and generation.
+Fork inherits that identity from the owner, including untouched MAP_PRIVATE
+pages. Host custody serves bytes but supplies no fork VA/protection decisions.
+The production fixture proves child file reads and private child writes with
+parent and file bytes unchanged. Source lifetime is owner-counted in a bounded
+AVL index and retirement queue; split, erase, revival and lookup budgets are
+covered. EOF and partial-page handling use the owner's source identity.
+
+The admitted path deletes TaskOnlyRuntimeAuthorities/clone_authorities and
+process_plan child protection projection. Its MemState child inherits neither
+private_file_maps nor deferred_anonymous.fork_private; the remaining projection
+is explicitly confined to pre-admission setup. Runtime task TID/pidfd copy work
+uses ordinary or scoped owner capabilities through preparation and settlement.
+Executable structural copies retain bounded I2 publication before acknowledgement.
+The neutral HAL dependency on carrick-el1-abi is documented in crates/README.md.
+
+Red-first commits 8ed756c52, 23db4cad4, 5e31b831e and 6a8b0292e record host
+protection projection, lost file source identity, child host source projection
+and independent-custodian identity failures before implementation. The production
+matrix now covers live child COW, parent unchanged on rollback, outstanding copy,
+stale custody/completion, same-VA MM isolation, untouched private file, owner
+DONTFORK/WIPEONFORK, exact retained tables and pending parent COW rollback. The
+N0 admission assertion is positive specifically for Fork; the separate non-fork
+host-semantic venue witness remains open. No broader exclusive-owner claim is
+made from this checkpoint.
+
+Final foreground verification on source 4f305b2f7 (all exit zero):
+
+| Command | Result |
+|---|---|
+| `cargo test -p carrick-el1` | 231 passed |
+| `cargo test -p carrick-el1-abi` | 118 passed and two sealing doctests passed |
+| `RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib` | 717 passed, three pre-existing ignored |
+| `just test-kernel` | Kernel 2399 passed, one pre-existing ignored, 155 serial-host filtered; selected kernel-semantics suites passed |
+| `just clippy` | Workspace/all-targets warnings and no-panic gate passed |
+| `just lint-domains` | Full recipe passed on the clean committed tree |
+
+Additional host-only checks passed: check-layering; aarch64 Linux HAL/KVM/host
+closure and closure-assert-no-hvf; x86_64 NetBSD NVMM all-targets check. The
+pre-existing KVM missing dependency was fixed separately in 43b9b0e7a. The
+FreeBSD cross check on macOS remains unavailable because the existing USDT
+proc-macro expands host x0/x1 registers; the director approved recording that
+limitation without changing unrelated observability code. No FreeBSD runtime
+acceptance is claimed.
+
+Inventory review preserves all 601 host-operation classifications and reconciles
+five positions. Three macOS compiler profiles are executed receipts; six foreign
+profiles remain pending. New abort and K1 operation rows were explicitly reviewed,
+without allowances or gate weakening. The final HVC effect call is shared through
+the existing reviewed production portal boundary, not a new assembly exemption.
+
+No guest or Docker runs occurred. Hardware coherence/TLBI, signed end-to-end
+acceptance, public bulk Capacity (including the frozen 64 GiB/16 TiB witnesses),
+GuestMemory venue 3 and remaining non-fork ownership transitions remain OPEN.
+This is a review-ready fork implementation checkpoint, not whole-N1 acceptance
+or a claim of adversarial security hardening.
