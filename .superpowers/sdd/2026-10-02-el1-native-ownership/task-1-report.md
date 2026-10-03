@@ -171,3 +171,36 @@ review. No guests or Docker run.
 - `cargo test -p carrick-vmm-hvf --lib user_transfer -- --test-threads=1`: 8 passed.
 - `cargo clippy -p carrick-vmm-hvf --all-targets -- -D warnings`: exit 0.
 - `cargo fmt --all --check` and `git diff --check`: pass.
+
+## Final whole-branch review fix wave
+
+Both findings in final-branch-review.md are implemented. Product changes are
+limited to atomic fresh undo acquisition in the existing manager/editor and a
+non-clone ImportDescriptorUndo retaining the exact stage-1 authority/resolver
+through preparation, sync, commit and rollback. The claim precedes source
+snapshot and physical allocation; rejection never joins an existing journal.
+The contract now binds the actual physical HVF matrix test.
+
+Behavioral reds (`cargo test -p carrick-vmm-hvf --lib transfer_import_refuses -- --test-threads=1`):
+
+- `second pending import joined the first journal`;
+- `import joined an existing loader journal`.
+
+Both now pass. Competing-import tests preserve first descriptors, actual `away`
+bytes, pin count one, exact inventory and allocator identity counter; then first
+refusal and first commit both work. Loader-journal rejection preserves its
+modified descriptor and rollback capability with unchanged physical counters.
+
+Focused green commands:
+
+- `cargo test -p carrick-vmm-hvf --lib transfer_ -- --test-threads=1`: 9 passed.
+- `cargo test -p carrick-vmm-hvf --lib trap::user_transfer::tests::native_owner_matrix_moves_bytes_with_balanced_physical_pins -- --exact --list`: exactly 1 test discovered.
+- Same exact test with `--exact --test-threads=1`: 1 passed.
+- `cargo clippy -p carrick-vmm-hvf -p carrick-aarch64 -p carrick-mmu-core --all-targets -- -D warnings`: exit 0.
+- `cargo run -p carrick-conformance-contract --bin check-contracts -- --root .`: 92 contracts, 15 claims, 164 surfaces checked.
+
+Plan final receipt maps the exact new ownership/witness boundaries and moved/
+retired fatal rationale. Parent retains final foreground gates, clean inventory
+positions and one scoped review; no broad suite was duplicated in this wave.
+- `python3 scripts/migrate/check-runtime-aborts.py --check --only hvf`: 250 reviewed carrier-fault sites valid; one retired missing-resolver site, one moved rollback site.
+- `cargo fmt --all --check` and `git diff --check`: pass.

@@ -1384,6 +1384,11 @@ impl<'a> Stage1Editor<'a> {
         self.arena_source.is_some()
     }
 
+    /// Claim a new transaction while the authority's manager lock is held.
+    pub fn begin_fresh_undo(&mut self) -> Result<bool, PageTableError> {
+        self.manager.begin_fresh_undo()
+    }
+
     pub fn begin_undo(&mut self) -> Result<(), PageTableError> {
         self.manager.begin_undo()
     }
