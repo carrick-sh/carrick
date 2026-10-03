@@ -1280,6 +1280,31 @@ fn an_executor_sweeps_cancelled_records_and_takes_its_service_head() {
     assert_eq!(zone.slot(SLOT).queued(), 0);
 }
 
+/// A stop interrupts the thread, but cannot replace the custody of its
+/// scheduler row. The host must still recognize and claim that exact row.
+#[test]
+fn group_stop_preserves_queued_service_custody() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let service = zone.alloc_host_runnable(identity(2)).unwrap();
+    let record = zone.record_ref(service);
+    assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(SLOT));
+    assert_eq!(
+        zone.claim_for_host(record, None, Handback::GroupStop, &HostWait),
+        HostClaim::Claimed
+    );
+    let rec = zone.live(record).unwrap();
+    assert_eq!(rec.handback(), Some(Handback::Service));
+    assert_eq!(
+        rec.host_wanted.kind(record.incarnation),
+        Some(Handback::GroupStop)
+    );
+    assert!(matches!(rec.claim(), Claim::Host { .. }));
+    assert_eq!(zone.runnable_head(SLOT), None);
+    zone.free_record(service);
+    assert!(zone.live(record).is_none());
+}
+
 // ---------------------------------------------------------------------------
 // EL1 plan 1d: the host places ready threads in the guest, never through a
 // host-owned state a claimant could take for runnable.
