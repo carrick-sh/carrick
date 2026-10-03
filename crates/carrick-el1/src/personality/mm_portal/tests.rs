@@ -790,3 +790,115 @@ fn n1a_import_readonly_leaf_never_grants_guest_write() {
         )
     );
 }
+
+#[test]
+fn n1a_wire_service_uses_exact_owner_live_permissions_and_storage() {
+    use carrick_el1_abi::{
+        PortalByteRange, PortalOperation, PortalTransferIntent, PortalTransferRequest,
+        PortalTransferSlot,
+    };
+    let (mut p, _) = portal();
+    let a = boot(16).seal(&mut p).unwrap();
+    let b = boot(16).seal(&mut p).unwrap();
+    for (handle, value) in [(a, b'A'), (b, b'B')] {
+        p.user_transfer(
+            handle,
+            UserTransfer::MapLazy {
+                range: range(VA, PAGE_BYTES),
+                protection: ReservationProtection::READ_WRITE,
+            },
+        )
+        .unwrap();
+        write(&mut p, handle, VA, &[value]).unwrap();
+    }
+    let storage = p.transfer_storage().unwrap();
+    let slot = PortalTransferSlot::new();
+    let request = |h: El1MmHandle, sequence, address, intent| {
+        PortalTransferRequest::new(
+            PortalOperation {
+                carrier: h.carrier,
+                mm: h.mm,
+                incarnation: h.incarnation,
+                sequence: NonZeroU64::new(sequence).unwrap(),
+            },
+            PortalByteRange::new(address, 1).unwrap(),
+            intent,
+            storage.extent,
+            0,
+        )
+        .unwrap()
+    };
+    let mut ticket = slot
+        .submit(request(a, 1, VA, PortalTransferIntent::UserRead))
+        .unwrap();
+    assert!(p.serve_user_transfer(slot.claim().unwrap()));
+    assert_eq!(ticket.take_completion().unwrap().errno, 0);
+    let mut bytes = [0];
+    p.backend.read(storage.extent, 0, &mut bytes).unwrap();
+    assert_eq!(bytes, [b'A']);
+    p.user_transfer(
+        a,
+        UserTransfer::Protect {
+            range: range(VA, PAGE_BYTES),
+            protection: ReservationProtection::NONE,
+        },
+    )
+    .unwrap();
+    let mut ticket = slot
+        .submit(request(a, 2, VA, PortalTransferIntent::UserRead))
+        .unwrap();
+    assert!(p.serve_user_transfer(slot.claim().unwrap()));
+    assert_eq!(ticket.take_completion().unwrap().errno, 14);
+    let mut ticket = slot
+        .submit(request(b, 1, VA, PortalTransferIntent::UserRead))
+        .unwrap();
+    assert!(p.serve_user_transfer(slot.claim().unwrap()));
+    assert_eq!(ticket.take_completion().unwrap().errno, 0);
+    p.backend.read(storage.extent, 0, &mut bytes).unwrap();
+    assert_eq!(bytes, [b'B']);
+    let mut ticket = slot
+        .submit(request(b, 1, VA, PortalTransferIntent::UserRead))
+        .unwrap();
+    assert!(p.serve_user_transfer(slot.claim().unwrap()));
+    assert_eq!(ticket.take_completion().unwrap().errno, 3);
+    let mut ticket = slot
+        .submit(request(
+            b,
+            2,
+            INTERNAL_VA + 4,
+            PortalTransferIntent::CarrickInternalRead,
+        ))
+        .unwrap();
+    assert!(p.serve_user_transfer(slot.claim().unwrap()));
+    assert_eq!(ticket.take_completion().unwrap().errno, 0);
+    let mut ticket = slot
+        .submit(request(b, 3, VA, PortalTransferIntent::CarrickInternalRead))
+        .unwrap();
+    assert!(p.serve_user_transfer(slot.claim().unwrap()));
+    assert_eq!(ticket.take_completion().unwrap().errno, 14);
+}
+
+#[test]
+fn n1a_copy_only_import_accepts_pinned_nontransferable_source() {
+    let source_pin = {
+        let (mut source, _) = portal();
+        let grant = source.grant(ExtentKind::Data, None).unwrap();
+        source.backend.write(grant.extent, 0, b"away").unwrap();
+        source.pin(grant.extent).unwrap()
+    };
+    let (mut destination, _) = portal();
+    let mut input = boot(16);
+    input.map_lazy(range(VA, PAGE_BYTES), ReservationProtection::READ_WRITE);
+    input
+        .import_resident(
+            range(VA, PAGE_BYTES),
+            source_pin,
+            0,
+            ResidentBacking::CopyOnly,
+        )
+        .unwrap();
+    let h = input.seal(&mut destination).unwrap();
+    let mut bytes = [0; 4];
+    read(&mut destination, h, VA, &mut bytes).unwrap();
+    assert_eq!(bytes, *b"away");
+}

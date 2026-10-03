@@ -696,9 +696,11 @@ contract, runtime result, branch acceptance or performance forecast.
 
 ### N1 execution order
 
-These four checkpoints partition all 30 section-2 venues. Each can land with
-its own red-first witnesses and acceptance receipt; none accepts the complete
-MM cutover until all four close. Ordering follows the frozen admission report's
+These four checkpoints partition all 30 section-2 venues. Each is an internal
+checkpoint with its own red-first witnesses and acceptance receipt. Per director
+review, none lands to main before all N1 venues close; production must have
+one MM owner throughout the cutover. N1a includes the fork/attach binding
+required by mirror deletion, moved from N1c. Ordering follows the frozen admission report's
 observed failure groups, not a claimed causal ranking: buffer authorization
 blocks probe output and later shard coverage, policy has four observed DIFFs,
 and fork/observer attribution remains mixed with N2. The report did not measure
@@ -706,9 +708,9 @@ per-venue failure counts, so an exact frequency ranking is unavailable.
 
 | Checkpoint | Venues | Red-first witnesses and landing boundary |
 | --- | --- | --- |
-| N1a: live host buffer transfers | 3, 4, 5, 7, 28 | Signed musl `mmapv8align` and separately reached `mmapprivatefiletrack`; inverse EL1 munmap/PROT_NONE then host read must return EFAULT (14), with two live MMs at the same VA. Consume resident/file backing at seal with exact-generation owned pins, retaining transferable frames and HostBacking aliases and copying only CopyOnly input. Bind checked GuestMemory entries and every raw escape to UserTransfer; delete admitted protection-mirror storage, host permission/COW selection and guessed VA-to-IPA copyout. Internal control-window reads use a distinct bounded intent. Physical content pins/coherence remain. Production transport required. |
+| N1a: live host buffer transfers and required fork/attach binding | 3, 4, 5, 7, 10, 11, 28, 29 | Signed musl `mmapv8align` and separately reached `mmapprivatefiletrack`; inverse EL1 munmap/PROT_NONE then host read must return EFAULT (14), with two live MMs at the same VA. Consume resident/file backing at seal with exact-generation owned pins, retaining transferable frames and HostBacking aliases and copying only CopyOnly input. Bind checked GuestMemory entries and every raw escape to UserTransfer; delete admitted protection-mirror storage, host permission/COW selection and guessed VA-to-IPA copyout. Internal control-window reads use a distinct bounded intent. Physical content pins/coherence remain. Replace TaskOnlyRuntimeAuthorities/clone_authorities and child protection snapshots with owner Fork completion; no mirror remains as a fork input. Production transport required. |
 | N1b: memory policy and physical backing | 6, 12, 13, 14, 15, 16, 17, 18, 19, 20 | Frozen `coredumpbit`, `mmapcluster`, `forkfault`, `roprotect`, `msyncalign`, `rlimitasdata`; signed `el1_anonymous_reservations_stay_in_guest` and `el1_delegated_root_map_fixed_over_cow_pages`. Include all VMA kinds, partial-compound reuse, stale/duplicate grants, failure rollback and live fault classification. Reuse N1a transport for Capacity/HostBacking; no host policy proposals for admitted roots. These tests' causal assignment is provisional. |
-| N1c: fork, exec and sealed root lifecycle | 1, 2, 10, 11, 21, 22, 23, 29 | N0 `red_until_n1_production_admission_retains_host_semantic_venue` must become a positive exclusive-owner assertion; compiler fences plus owner matrix fork/child isolation, outstanding-copy refusal, stale completion and exec rollback. Frozen `nxwritableimage`, `forkexecstorm`, `exitgroupthreads`, `futexforkwakegroups` are composition witnesses, with N2 task/wait failures separately retained. Delete projection/snapshot/edit/pause capabilities; preserve task birth and root occupancy proofs. Reuse transport for Fork/Exec. |
+| N1c: exec and remaining sealed root lifecycle | 1, 2, 21, 22, 23 | N0 `red_until_n1_production_admission_retains_host_semantic_venue` must become a positive exclusive-owner assertion; compiler fences plus owner matrix fork/child isolation, outstanding-copy refusal, stale completion and exec rollback. Frozen `nxwritableimage`, `forkexecstorm`, `exitgroupthreads`, `futexforkwakegroups` are composition witnesses, with N2 task/wait failures separately retained. Delete projection/snapshot/edit/pause capabilities; preserve task birth and root occupancy proofs. Reuse transport for Fork/Exec. |
 | N1d: exceptional readers and writers | 8, 9, 24, 25, 26, 27, 30 | Two-MM stopped-target ptrace/process_vm and /proc/mem permission/prefix witnesses; live maps/residency, parked-thread core snapshot, signal-frame fault and native activation revocation under protect/unmap/exec. Owner matrix stopped-target/default-slot and delayed completion proofs must bind to signed production. Reuse transport for UserTransfer/Observe/Snapshot; ReadInstruction, NativeData and authorized POKE remain distinct intents. |
 
 `killrt`, `splicepipeempty` and deadline failure `epollstopcont` remain explicit
@@ -778,3 +780,39 @@ file writes preserve source bytes, stale generation refuses before MM
 publication, and a read-only input leaf grants no guest write. Full N0 matrix
 scales remain green. Receipts: `/tmp/carrick-n1a-portal.log`,
 `/tmp/carrick-n1a-import-clippy.log`, `/tmp/carrick-n1a-import-target.log`.
+
+N1a wire/core checkpoint: `carrick-el1-abi::mm_portal` defines bounded,
+versioned UserTransfer request/completion slots in the existing region's unused
+counters tail. Layout/protocol/bounds participate in the image ABI hash. No
+host pointer or unchecked enum discriminant crosses this record. A slot is
+single-flight until its exact completion settles; dropping a ticket never
+reuses its storage. The runtime custodian must retain pins independently and
+settle cancellation before reclaim; that runtime binding is not implemented
+by the ABI record alone.
+
+The existing owner core services these records through `serve_user_transfer`:
+exact carrier/MM/incarnation and monotonic per-MM operation sequence, separately
+registered physical transfer storage, live permission/translation, distinct
+internal intent, and existing UserTransfer/COW machinery. Owner tests cover
+same-VA isolation, PROT_NONE EFAULT, repeated operation refusal and internal
+read confinement. CopyOnly now reads the consumed source pin directly, never
+resolving it in the destination's physical namespace; a source whose original
+backend has been destroyed remains readable through that pin. Bootstrap
+rollback work visits only imported spans and newly granted extents, rather
+than snapshotting unrelated frame populations.
+
+Receipts: `/tmp/carrick-n1a-portal-abi.log` (3 tests),
+`/tmp/carrick-n1a-portal-service.log` (9 tests including N0 matrix),
+`/tmp/carrick-n1a-portal-abi-clippy.log`,
+`/tmp/carrick-n1a-service-clippy.log`, and
+`/tmp/carrick-n1a-service-target.log`. Main's official xtask is built at
+`target/n1-gate-driver/debug/carrick-xtask` for subsequent `--root` acceptance.
+
+**Remaining N1a acceptance work:** production physical adapter and real-root
+admission (the core still assigns experiment MM identities), scheduler-owned
+transfer capability and maintenance-root service entry, Fork wire/binding and
+fork/attach handle replacement, admitted GuestMemory/raw-escape cutover and
+mirror deletion, hardware TLBI/cache binding, then host+signed acceptance and
+the frozen-baseline generic/case probe delta. These checkpoints do not establish
+production ownership, signed runtime behavior or review-ready status. No
+known-red entry is removed and no Docker or signed run is claimed here.
