@@ -4001,6 +4001,26 @@ pub static ALIAS_REMAP_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::
 pub(crate) fn register_shared_alias(b: AliasBacking) {
     // Single lock over alias_registry() guarding rows, replay set, and version chains.
     let mut registry = alias_registry_write(AliasRegistryWriter::SharedAliasRegistration);
+    register_shared_alias_locked(&mut registry, b);
+}
+
+pub(crate) fn register_shared_alias_if_vacant(
+    b: AliasBacking,
+    root: Option<(u64, u64)>,
+    container: ContainerRootToken,
+) -> bool {
+    let mut registry = alias_registry_write(AliasRegistryWriter::SharedAliasRegistration);
+    if !registry
+        .overlapping_process_aliases(b.start, b.size, root, container)
+        .is_empty()
+    {
+        return false;
+    }
+    register_shared_alias_locked(&mut registry, b);
+    true
+}
+
+fn register_shared_alias_locked(registry: &mut AliasRegistry, b: AliasBacking) {
     let scope = b.ownership_scope;
     let key = replay_mapping_key(b);
     let bucket = registry.by_scope.entry(scope).or_default();

@@ -1990,6 +1990,9 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
         }
         let covers_entry = self.start <= base && base + span <= self.end;
         if let DescriptorOp::Terminal { edit, .. } = self.op {
+            if level > 0 && level < 3 && descriptor != 0 && edit.rule.requires_private_pages() {
+                return self.descend(level, loc, descriptor, base);
+            }
             let Some(armed) =
                 super::terminal_rule_edit(edit.asid_scoped, edit.rule, descriptor, level, base)
                     .map_err(|refusal| match refusal {
