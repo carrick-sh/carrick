@@ -273,6 +273,28 @@ impl SharedReservations {
         self.lock_using(index, mm, Some(nodes), false, wait, RootHolder::Host.word())
     }
 
+    /// EL1's single-attempt owner venue over authenticated elastic banks.
+    /// Resolution and capacity provision must precede this acquisition.
+    pub fn lock_el1_resolved<'a, P: PinnedMetadataExtent>(
+        &'a self,
+        index: usize,
+        mm: ReservationMm,
+        nodes: &'a ResolvedReservationNodes<P>,
+        slot: u32,
+    ) -> Result<Reservations<'a>, Refusal> {
+        if !core::ptr::eq(nodes.table, self) {
+            return Err(Refusal::Stale);
+        }
+        self.lock_using(
+            index,
+            mm,
+            Some(nodes),
+            false,
+            &NoRootWait,
+            RootHolder::El1Slot(slot).word(),
+        )
+    }
+
     #[cfg(test)]
     pub(super) fn lock_identity_for_test(
         &self,
