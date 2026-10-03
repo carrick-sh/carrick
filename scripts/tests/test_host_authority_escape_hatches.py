@@ -318,6 +318,10 @@ macro_rules! compiler_catalog_owned {
                 'pub unsafe fn emit() { core::arch::asm!("nop"); }\n'
             ),
         }
+        for boundary in ("fault.rs", "personality/mm_portal/production.rs"):
+            fixtures[f"crates/nested/crates/carrick-el1/src/{boundary}"] = (
+                'pub unsafe fn emit() { core::arch::asm!("hvc #1"); }\n'
+            )
         for relative, body in fixtures.items():
             with self.subTest(relative=relative):
                 result = self.run_lint({relative: body})
@@ -364,7 +368,9 @@ macro_rules! compiler_catalog_owned {
                 )
 
     def test_checked_boundary_modules_are_path_specific_exemptions(self):
-        result = self.run_lint(
+        # This fixture exercises the two assembly reviewers. The separate
+        # carrier topology checker requires the real repository population.
+        result = self.run_escape_semgrep_only(
             {
                 "crates/carrick-portable/src/lib.rs": (
                     "pub unsafe fn call() { let _ = libc::syscall(1); }\n"
@@ -372,12 +378,26 @@ macro_rules! compiler_catalog_owned {
                 "crates/carrick-vmm-hvf/src/trap/sysreg.rs": (
                     'pub unsafe fn emit() { core::arch::asm!("nop"); }\n'
                 ),
+                "crates/carrick-el1/src/fault.rs": (
+                    'pub unsafe fn emit() { core::arch::asm!("hvc #1"); }\n'
+                ),
+                "crates/carrick-el1/src/personality/mm_portal/production.rs": (
+                    'pub unsafe fn emit() { core::arch::asm!("mrs x0, ttbr0_el1"); }\n'
+                ),
                 "crates/carrick-host/src/host_proc.rs": (
                     'unsafe extern "C" { fn mach_vm_region(task: i32) -> i32; }\n'
                 ),
             }
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        token_result = subprocess.run(
+            ["python3", str(ROOT / "scripts/migrate/check-host-authority-escape-hatches.py"),
+             "--root", str(self.root)],
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(token_result.returncode, 0, token_result.stdout + token_result.stderr)
 
     def test_launcher_requires_each_checked_semgrep_config(self):
         for config_name in (TYPED_CONFIG.name, ESCAPE_CONFIG.name):
