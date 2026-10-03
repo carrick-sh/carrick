@@ -1563,7 +1563,12 @@ where
                 if let Some((completion, _)) = owner_receipt {
                     let publication = owner_child_publication
                         .take()
-                        .unwrap()
+                        .unwrap_or_else(|| {
+                            carrick_fatal!(
+                                "hvpatch::fork_commit",
+                                "owner Fork lost its closed child publication"
+                            )
+                        })
                         .into_admitted_publication(completion.child)
                         .unwrap_or_else(|_| {
                             carrick_fatal!(
