@@ -1015,8 +1015,9 @@ witness now passes. The executable witness additionally executes a host ARM64
 RX view of the retained bytes (7 before write, 9 afterward), after independent
 I2-clean assertions; mprotect is test-only W^X capability, not cache authority.
 
-Final worker commands/results and limits are in
-`.superpowers/sdd/2026-10-02-el1-native-ownership/task-1-report.md`. No guest or
+Final commands/results and limits are recorded in the implementation and
+controller receipts here and the Why/What/Verified commit bodies. The temporary
+review workspace is removed after review closure. No guest or
 Docker run occurred in the quiet window. Public bulk Capacity, Fork rebinding,
 GuestMemory venue 3, existing production-admission reds, signed guest TLBI and
 end-to-end artifact acceptance remain outside this UserTransfer receipt.
@@ -1210,3 +1211,41 @@ shared helper. All three `#[test]` wrappers now acquire that existing lock at
 entry; the helper no longer acquires it, avoiding recursive locking. This
 preserves the original runtime exclusion and restores its mechanical binding.
 Focused census and all three import cases pass; no production source changed.
+
+
+#### N1 controller verification and review receipt — 2026-10-03
+
+The production UserTransfer slice is review-ready. The full branch review
+covered `bb98e7aff..8eaa9baf3` and inventory/assembly tails. Its Important import
+journal ownership finding and Minor executable contract binding were fixed in
+`473c44253`; scoped re-review through `126641bd4` closes both and the observed
+test-lock census regression, with no remaining findings or parked minors.
+The earlier task review's four Important findings are also closed.
+
+All requested foreground gates exited zero after the final production fix:
+
+| Command | Final result |
+|---|---|
+| `cargo test -p carrick-el1` | 214 unit tests passed |
+| `cargo test -p carrick-el1-abi` | 116 unit tests and two sealing doctests passed |
+| `RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib` | 714 passed, three pre-existing ignored |
+| `just test-kernel` | Kernel 2391 passed, one pre-existing ignored, 155 serial-host filtered; all selected kernel-semantics suites passed |
+| `just clippy` | Workspace/all-targets warnings and no-panic gate passed |
+| `just lint-domains` | Full recipe passed on clean committed `f9cf95018` |
+
+Clean-tree inventory reconciliation at source `126641bd4` reports zero position
+or identity drift: 601 host-operation rows retain their digest and reviewed
+classifications. Only capture provenance was refreshed. The macOS compiler
+census is a subset receipt; other-host runtime/profile acceptance is unclaimed.
+
+The final receipt/temporary-workspace cleanup changes no production code or
+verification input. The already-tracked scratch worker report is removed; its
+implementation evidence remains in these receipts and prior commit history.
+All fourteen controller ledger rulings were collected before removing only
+this plan's scratch directory. Branch `work/n1` and its worktree are preserved.
+
+No guest or Docker runs occurred. Fork rebinding, public bulk Capacity,
+GuestMemory venue 3, prior production-admission reds/WorkObservation, signed
+hardware coherence/TLBI and end-to-end N1/N2 acceptance remain OPEN. This
+receipt is production-owner UserTransfer groundwork, not whole-N1 closure,
+other-host runtime acceptance or adversarial security hardening.
