@@ -63,6 +63,7 @@ pub enum PortalForkCustody {
         source_ipa: u64,
         destination_ipa: u64,
         len: u64,
+        executable: bool,
     },
     HostBacking {
         handle: core::num::NonZeroU64,
@@ -213,14 +214,16 @@ impl PortalForkSlot {
                     shared: tag == 4,
                 }
             }
-            3 if words[3] != 0
-                && words[1].checked_add(words[3]).is_some()
-                && words[2].checked_add(words[3]).is_some() =>
+            tag @ (3 | 5)
+                if words[3] != 0
+                    && words[1].checked_add(words[3]).is_some()
+                    && words[2].checked_add(words[3]).is_some() =>
             {
                 PortalForkCustody::StructuralCopy {
                     source_ipa: words[1],
                     destination_ipa: words[2],
                     len: words[3],
+                    executable: tag == 5,
                 }
             }
             2 if words[3] == 0 => PortalForkCustody::HostBacking {
@@ -285,6 +288,30 @@ impl PortalForkSlot {
             self.load_request()?,
             self.acknowledgment.load(Ordering::Relaxed) == 1,
         ))
+    }
+    pub fn complete_finish_receipt(&self, completion: PortalForkCompletion) -> bool {
+        if self.state.load(Ordering::Acquire) != FINISH
+            || self.load_request() != Some(completion.request)
+            || completion.child_tables_used > completion.request.child_tables.len
+            || completion.parent_tables_used > completion.request.parent_tables.len
+        {
+            return false;
+        }
+        if completion.child.mm() != completion.request.child_mm
+            || completion.child.carrier() != completion.request.operation.carrier
+            || completion.child.incarnation().get() != self.completion[0].load(Ordering::Relaxed)
+        {
+            return false;
+        }
+        for (target, value) in self.completion.iter().zip([
+            completion.child.incarnation().get(),
+            completion.parent_generation.raw(),
+            completion.child_tables_used,
+            completion.parent_tables_used,
+        ]) {
+            target.store(value, Ordering::Relaxed);
+        }
+        self.complete_finish(0)
     }
     pub fn complete_finish(&self, errno: u32) -> bool {
         if errno > 4095 || self.state.load(Ordering::Acquire) != FINISH {
@@ -363,7 +390,13 @@ impl PortalForkService<'_> {
                 source_ipa,
                 destination_ipa,
                 len,
-            } => [3, source_ipa, destination_ipa, len],
+                executable,
+            } => [
+                if executable { 5 } else { 3 },
+                source_ipa,
+                destination_ipa,
+                len,
+            ],
             PortalForkCustody::HostBacking { handle, generation } => {
                 [2, handle.get(), generation.get(), 0]
             }
