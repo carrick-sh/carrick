@@ -114,8 +114,15 @@ fn a_lost_wake_fails_inside_the_bound() {
         .expect_err("a lost wake must fail the run");
     let elapsed = started.elapsed();
     assert!(
-        matches!(error, ExampleError::WaitTimedOut("wait4")),
-        "expected the parent's wait4 to time out, got: {error}"
+        matches!(
+            &error,
+            ExampleError::Task {
+                pid: 2,
+                tid: 2,
+                error: child_err,
+            } if matches!(**child_err, ExampleError::WaitTimedOut("read"))
+        ),
+        "expected child task 2 read to time out, got: {error}"
     );
     assert!(
         elapsed >= WAIT_BOUND && elapsed < WAIT_BOUND * 3,
