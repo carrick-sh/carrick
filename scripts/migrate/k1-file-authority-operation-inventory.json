@@ -13683,7 +13683,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/signal.rs",
-      "line": 1566,
+      "line": 1562,
       "categories": [
         "mapping"
       ],
@@ -13692,7 +13692,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/signal.rs",
-      "line": 1869,
+      "line": 1863,
       "categories": [
         "description_guard"
       ],

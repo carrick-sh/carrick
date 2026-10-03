@@ -1872,6 +1872,7 @@
       "handler": "signal",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.signal-delivery-owner",
         "kernel.el1.thread-lifecycle",
         "kernel.signal.lease-gap"
       ],
@@ -1887,7 +1888,9 @@
       "support": "bring_up",
       "handler": "signal",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.signal-delivery-owner"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "emulated in bring-up without explicit contract claim"
@@ -2007,6 +2010,7 @@
       "handler": "signal",
       "authority": "guest",
       "contracts": [
+        "kernel.el1.signal-delivery-owner",
         "kernel.el1.thread-lifecycle"
       ],
       "claims": [],
@@ -3468,7 +3472,9 @@
       "support": "deferred",
       "handler": "unimplemented",
       "authority": "guest",
-      "contracts": [],
+      "contracts": [
+        "kernel.el1.signal-delivery-owner"
+      ],
       "claims": [],
       "uncovered_behaviors": [
         "deferred refusal behavior unverified by contract"
