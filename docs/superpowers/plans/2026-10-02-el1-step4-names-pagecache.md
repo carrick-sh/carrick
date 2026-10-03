@@ -178,7 +178,11 @@ final landing. Old-artifact comparison remains available afterward; no runtime
 fallback to a retired owner. Errors, resource pressure and unsupported I/O
 shapes still use the same authority and a backend request.
 
-### 0. Stage 2a: bounded host namespace primitives (Sol)
+### 0. Stage 2a: bounded host namespace primitives (Sol) — LANDED `f1681c228` (2026-10-02)
+
+Landed with the full `just el1-gate` green; census and before/after tables in
+`docs/perf-results/2026-10-02-stage2a-scoped-census-red.md`. The text below is
+the original milestone brief.
 
 Entry: current namespace work contract and a fresh contained-parent census.
 Extend `kernel.vfs.host-namespace-mutation-work` with signed binding and
