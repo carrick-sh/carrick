@@ -33,6 +33,8 @@ SECTIONS
 
     . = ALIGN(16);
     _image_end = .;
+    ASSERT(_image_end <= _image_start + 0x100000,
+           "EL1 image overlaps the ABI counters and service-table region")
 
     /DISCARD/ : {
         *(.comment)

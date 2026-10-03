@@ -856,6 +856,14 @@ unsafe impl PinnedMetadataExtent for GuestMetadataPin {
 
 #[cfg(target_os = "none")]
 pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
+    let Some(executor_slot) = carrick_el1_abi::service_slot_from_stack(
+        crate::substrate::sched::hw::read_current_sp(),
+        frame.slot,
+    ) else {
+        frame.x[0] = 3;
+        return;
+    };
+    let _ = executor_slot;
     use carrick_mmu_core::aarch64::descriptor_txn::{CallerInvalidatesAsid, PrimaryTableWords};
     let slots =
         unsafe { &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots) };
@@ -907,15 +915,15 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     unsafe {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) live_ttbr, options(nomem, nostack));
     }
-    if live_ttbr != grant.ttbr0 {
+    let Some(table) = carrick_el1_abi::service_target_table_window(live_ttbr, grant.ttbr0) else {
         service.complete(0, 3);
         return;
-    }
+    };
     let maintenance = CallerInvalidatesAsid;
     let words = unsafe {
         PrimaryTableWords::new(
-            carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut core::sync::atomic::AtomicU64,
-            live_ttbr & PA,
+            table.words,
+            table.physical_base,
             carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
             &maintenance,
         )
@@ -947,6 +955,14 @@ pub(super) fn yield_host_effect() {
 /// Output x0 is errno; x8..x10 is sequence, policy generation, selected IPA.
 #[cfg(target_os = "none")]
 pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
+    let Some(executor_slot) = carrick_el1_abi::service_slot_from_stack(
+        crate::substrate::sched::hw::read_current_sp(),
+        frame.slot,
+    ) else {
+        frame.x[0] = 3;
+        return;
+    };
+    let _ = executor_slot;
     use carrick_mmu_core::aarch64::descriptor_txn::{CallerInvalidatesAsid, PrimaryTableWords};
     let run = |frame: &mut carrick_el1_abi::TrapFrame| -> Result<(), MmError> {
         let slots = unsafe {
@@ -966,9 +982,8 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         unsafe {
             core::arch::asm!("mrs {}, ttbr0_el1", out(reg) live_ttbr, options(nomem, nostack));
         }
-        if live_ttbr != grant.ttbr0 {
-            return Err(MmError::Stale);
-        }
+        let table = carrick_el1_abi::service_target_table_window(live_ttbr, grant.ttbr0)
+            .ok_or(MmError::Stale)?;
         let portal = MmPortal::<GuestMetadataPin> {
             carrier,
             roots: crate::memory::reservations::shared_guest(),
@@ -1007,9 +1022,8 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let maintenance = CallerInvalidatesAsid;
         let words = unsafe {
             PrimaryTableWords::new(
-                carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE
-                    as *mut core::sync::atomic::AtomicU64,
-                live_ttbr & PA,
+                table.words,
+                table.physical_base,
                 carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
                 &maintenance,
             )
@@ -1025,6 +1039,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             &mut crate::fault::HardwareCowResolver {
                 publication: slots.executable(frame.slot as usize),
                 completion: None,
+                service_slot: Some(executor_slot),
             },
             carrick_el1_abi::frame_grant_residency_guest(),
             mailbox,
@@ -1208,6 +1223,14 @@ pub fn serve_grant<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
 
 #[cfg(target_os = "none")]
 pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
+    let Some(executor_slot) = carrick_el1_abi::service_slot_from_stack(
+        crate::substrate::sched::hw::read_current_sp(),
+        frame.slot,
+    ) else {
+        frame.x[0] = 3;
+        return;
+    };
+    let _ = executor_slot;
     use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
     let slots =
         unsafe { &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots) };
@@ -1222,11 +1245,21 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     unsafe {
         core::arch::asm!("mrs {}, ttbr0_el1",out(reg)ttbr,options(nomem,nostack));
     }
-    let maintenance = crate::fault::El1TableMaintenance { ttbr0: ttbr };
+    let Some(grant) = zone
+        .spaces
+        .find(window.operation.mm.raw())
+        .and_then(|index| zone.spaces.grant(index, window.operation.mm.raw()))
+    else {
+        return;
+    };
+    let Some(table) = carrick_el1_abi::service_target_table_window(ttbr, grant.ttbr0) else {
+        return;
+    };
+    let maintenance = crate::fault::El1TableMaintenance { ttbr0: grant.ttbr0 };
     let Ok(words) = (unsafe {
         PrimaryTableWords::new(
-            carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE as *mut core::sync::atomic::AtomicU64,
-            ttbr & PA,
+            table.words,
+            table.physical_base,
             carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
             &maintenance,
         )
@@ -1248,7 +1281,7 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         .spaces
         .find(window.operation.mm.raw())
         .and_then(|index| zone.spaces.grant(index, window.operation.mm.raw()))
-        .is_none_or(|grant| grant.ttbr0 != ttbr)
+        .is_none_or(|current| current.ttbr0 != grant.ttbr0)
     {
         return;
     }
@@ -1259,13 +1292,21 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         carrick_el1_abi::frame_grant_residency_guest(),
         frame.slot as u32,
         || {
-            crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, ttbr);
+            crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, grant.ttbr0);
         },
     );
 }
 
 #[cfg(target_os = "none")]
 pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
+    let Some(executor_slot) = carrick_el1_abi::service_slot_from_stack(
+        crate::substrate::sched::hw::read_current_sp(),
+        frame.slot,
+    ) else {
+        frame.x[0] = 3;
+        return;
+    };
+    let _ = executor_slot;
     let result = (|| -> Result<(), MmError> {
         let slots = unsafe {
             &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
@@ -1283,7 +1324,7 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         unsafe {
             core::arch::asm!("mrs {}, ttbr0_el1",out(reg)live,options(nomem,nostack));
         }
-        if live != grant.ttbr0 {
+        if carrick_el1_abi::service_target_table_window(live, grant.ttbr0).is_none() {
             return Err(MmError::Stale);
         }
         let portal = MmPortal::<GuestMetadataPin> {

@@ -12199,7 +12199,7 @@ mod guest_cow {
     use super::*;
     use crate::trap::guest_cow::{provision_guest_cow_grants, settle_guest_cow_completions};
     use carrick_el1::cow::{GuestCowOutcome, GuestCowVenue, resolve_guest_cow};
-    use carrick_el1_abi::{AddressSpaces, CowGrantPool, CowGrantSettlement, EL1_COW_COPY_BASE};
+    use carrick_el1_abi::{AddressSpaces, CowGrantPool, CowGrantSettlement};
     use carrick_mmu_core::aarch64::SubstrateGpa;
     use carrick_mmu_core::aarch64::descriptor_txn::{PrimaryTableWords, TableMaintenance};
 
@@ -12347,7 +12347,7 @@ mod guest_cow {
                 root: SubstrateGpa(root),
                 pool,
                 residency: &std::boxed::Box::new(carrick_el1_abi::FrameGrantResidencyTable::new()),
-                copy_base: EL1_COW_COPY_BASE,
+                copy_window: carrick_el1::cow::CowCopyWindow::target(&words, SubstrateGpa(root)),
             },
             child.snapshot.mm.get(),
             va,
