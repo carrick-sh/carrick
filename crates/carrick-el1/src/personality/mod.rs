@@ -15,5 +15,7 @@ pub mod ipc;
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub mod lifecycle;
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+pub mod mm_portal;
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub mod sched;
 pub mod thread_setup;
