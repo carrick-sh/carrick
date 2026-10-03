@@ -45,9 +45,6 @@ pub struct RemoteAcceptArgs {
 
     #[arg(long, help = "Attach to an existing run-id and resume polling")]
     pub attach: Option<String>,
-
-    #[arg(long, help = "Keep the remote worktree after completion")]
-    pub keep_worktree: bool,
 }
 
 #[derive(Debug, Error)]
@@ -68,6 +65,12 @@ pub enum RemoteAcceptError {
     Ssh { host: String, details: String },
     #[error("remote disk space error on host '{host}': {details}")]
     DiskSpace { host: String, details: String },
+    #[error("remote worktree lock at '{lock_path}' on host '{host}' is held by run-id '{run_id}'")]
+    LockHeld {
+        host: String,
+        run_id: String,
+        lock_path: String,
+    },
     #[error("invalid run-id '{0}': {1}")]
     InvalidRunId(String, String),
 }
@@ -178,8 +181,12 @@ pub fn local_receipt_path(local_root: &Path, run_id: &str) -> PathBuf {
     local_run_dir(local_root, run_id).join("receipt.json")
 }
 
-pub fn remote_worktree_dir(remote_root: &Path, sha12: &str) -> PathBuf {
-    remote_root.join("gate-worktrees").join(sha12)
+pub fn remote_worktree_dir(remote_root: &Path) -> PathBuf {
+    remote_root.join("gate-worktree")
+}
+
+pub fn remote_lock_dir(remote_root: &Path) -> PathBuf {
+    remote_root.join("gate-worktree.lock")
 }
 
 pub fn remote_run_dir(remote_root: &Path, run_id: &str) -> PathBuf {
@@ -188,6 +195,19 @@ pub fn remote_run_dir(remote_root: &Path, run_id: &str) -> PathBuf {
 
 pub fn remote_el1_gate_dir(worktree_dir: &Path, short_sha: &str) -> PathBuf {
     worktree_dir.join("target/el1-gate").join(short_sha)
+}
+
+pub fn build_lock_acquire_cmd(lock_dir: &str, run_id: &str) -> String {
+    let q_lock = shell_quote(lock_dir);
+    let q_run_id = shell_quote(run_id);
+    format!(
+        "if mkdir {q_lock} 2>/dev/null; then echo {q_run_id} > {q_lock}/run_id && echo LOCKED; else holder=$(cat {q_lock}/run_id 2>/dev/null || echo unknown); echo \"HELD:$holder\"; fi"
+    )
+}
+
+pub fn build_lock_release_cmd(lock_dir: &str) -> String {
+    let q_lock = shell_quote(lock_dir);
+    format!("rm -rf {q_lock}")
 }
 
 pub fn extract_summary(log: &str) -> Option<String> {
@@ -241,7 +261,7 @@ pub fn build_detached_start_cmd(
     let q_exit_tmp = shell_quote(&exit_tmp);
 
     format!(
-        "mkdir -p {q_run_dir} && nohup sh -c '[ -f /Volumes/carrick/dev/env.sh ] && . /Volumes/carrick/dev/env.sh; cd {q_worktree} && just accept --profile no-docker --phase {phase} > {q_log} 2>&1; echo $? > {q_exit_tmp} && mv {q_exit_tmp} {q_exit}' >/dev/null 2>&1 </dev/null &"
+        "mkdir -p {q_run_dir} && nohup sh -c '[ -f /Volumes/carrick/dev/env.sh ] && . /Volumes/carrick/dev/env.sh; cd {q_worktree} && just accept --phase {phase} > {q_log} 2>&1; echo $? > {q_exit_tmp} && mv {q_exit_tmp} {q_exit}' >/dev/null 2>&1 </dev/null &"
     )
 }
 
@@ -251,15 +271,7 @@ pub fn build_worktree_setup_cmd(bare_repo: &str, worktree_dir: &str, full_sha: &
     let q_sha = shell_quote(full_sha);
 
     format!(
-        "if [ -d {q_wt} ]; then cur_head=$(git -C {q_wt} rev-parse HEAD 2>/dev/null || echo ''); if [ \"$cur_head\" = {q_sha} ]; then echo 'REUSE'; exit 0; else git -C {q_bare} worktree remove --force {q_wt} 2>/dev/null || rm -rf {q_wt}; git -C {q_bare} worktree prune 2>/dev/null || true; fi; fi; mkdir -p $(dirname {q_wt}) && git -C {q_bare} worktree add --detach {q_wt} {q_sha}"
-    )
-}
-
-pub fn build_worktree_cleanup_cmd(bare_repo: &str, worktree_dir: &str) -> String {
-    let q_bare = shell_quote(bare_repo);
-    let q_wt = shell_quote(worktree_dir);
-    format!(
-        "git -C {q_bare} worktree remove --force {q_wt} 2>/dev/null || rm -rf {q_wt}; git -C {q_bare} worktree prune 2>/dev/null || true"
+        "if [ ! -d {q_wt} ]; then git -C {q_bare} worktree add --detach {q_wt} {q_sha}; else git -C {q_wt} checkout --detach --force {q_sha} && git -C {q_wt} clean -fdx -e target -e conformance-probes/target; fi"
     )
 }
 
@@ -315,6 +327,97 @@ pub fn run_ssh_command(host: &str, script: &str) -> Result<String, RemoteAcceptE
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+pub fn acquire_remote_lock(
+    host: &str,
+    lock_dir: &str,
+    run_id: &str,
+) -> Result<(), RemoteAcceptError> {
+    let cmd = build_lock_acquire_cmd(lock_dir, run_id);
+    let output = run_ssh_command(host, &cmd)?;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed == "LOCKED" {
+            return Ok(());
+        }
+        if let Some(holder) = trimmed.strip_prefix("HELD:") {
+            let holder = holder.trim();
+            let holder_str = if holder.is_empty() { "unknown" } else { holder };
+            return Err(RemoteAcceptError::LockHeld {
+                host: host.to_string(),
+                run_id: holder_str.to_string(),
+                lock_path: lock_dir.to_string(),
+            });
+        }
+    }
+    Err(RemoteAcceptError::Ssh {
+        host: host.to_string(),
+        details: format!("unexpected output when acquiring lock {lock_dir}: {output}"),
+    })
+}
+
+pub struct RemoteLockGuard<'a> {
+    host: &'a str,
+    lock_dir: String,
+    active: bool,
+}
+
+impl<'a> RemoteLockGuard<'a> {
+    pub fn new(host: &'a str, lock_dir: String) -> Self {
+        Self {
+            host,
+            lock_dir,
+            active: true,
+        }
+    }
+
+    pub fn release(&mut self) {
+        if self.active {
+            let cmd = build_lock_release_cmd(&self.lock_dir);
+            if let Err(e) = run_ssh_command(self.host, &cmd) {
+                eprintln!(
+                    "Warning: failed to release remote worktree lock {}: {e}",
+                    self.lock_dir
+                );
+            }
+            self.active = false;
+        }
+    }
+}
+
+impl<'a> Drop for RemoteLockGuard<'a> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+pub fn resolve_short_sha_for_receipt(
+    host: &str,
+    worktree_dir: &str,
+    sha12: &str,
+    local_root: Option<&Path>,
+) -> String {
+    let remote_cmd = format!(
+        "git -C {} rev-parse --short {}",
+        shell_quote(worktree_dir),
+        shell_quote(sha12)
+    );
+    if let Ok(out) = run_ssh_command(host, &remote_cmd) {
+        let trimmed = out.trim();
+        if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            return trimmed.to_string();
+        }
+    }
+    if let Some(out) = local_root.and_then(|root| {
+        command::run_checked("git", ["rev-parse", "--short", sha12], Some(root)).ok()
+    }) {
+        let trimmed = out.stdout.trim();
+        if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+            return trimmed.to_string();
+        }
+    }
+    sha12[..9.min(sha12.len())].to_string()
 }
 
 fn copy_probe_executables(
@@ -405,11 +508,19 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
 
     let host = resolve_host(args.host.as_deref());
     let remote_root = resolve_remote_root(args.remote_root.as_deref());
+    let remote_root_path = Path::new(&remote_root);
+    let worktree_dir = remote_worktree_dir(remote_root_path)
+        .to_string_lossy()
+        .to_string();
+    let lock_dir = remote_lock_dir(remote_root_path)
+        .to_string_lossy()
+        .to_string();
 
-    let (run_id, sha12) = if let Some(existing_run_id) = &args.attach {
+    let (run_id, sha12, mut lock_guard) = if let Some(existing_run_id) = &args.attach {
         let (parsed_sha, _) = parse_run_id(existing_run_id)?;
         println!("Attaching to remote run: {existing_run_id}");
-        (existing_run_id.clone(), parsed_sha.to_string())
+        let guard = RemoteLockGuard::new(&host, lock_dir);
+        (existing_run_id.clone(), parsed_sha.to_string(), guard)
     } else {
         // Step 1: Resolve the ref to a full SHA locally. Refuse if local tracked tree is dirty AND ref is HEAD.
         let full_sha_out =
@@ -434,6 +545,13 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         // Step 8: Check remote free space on remote volume (df). Refuse below 40 GiB free.
         check_remote_disk_space(&host, &remote_root)?;
 
+        let timestamp = accept::generate_timestamp();
+        let run_id = generate_run_id(&sha12, &timestamp);
+
+        // Exclusive lock on remote worktree
+        acquire_remote_lock(&host, &lock_dir, &run_id)?;
+        let guard = RemoteLockGuard::new(&host, lock_dir);
+
         // Step 2: Push it to the bare repo as refs/heads/gate/<sha12>
         let push_target = if host == DEFAULT_HOST && remote_root == DEFAULT_REMOTE_ROOT {
             let remotes = command::run_checked("git", ["remote"], Some(&local_root))?;
@@ -450,23 +568,17 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         println!("Pushing {full_sha} to {push_target} as refs/heads/gate/{sha12}...");
         command::run_checked("git", ["push", &push_target, &refspec], Some(&local_root))?;
 
-        // Step 3: Create worktree <root>/gate-worktrees/<sha12> from the bare repo
+        // Step 3: Setup persistent worktree <root>/gate-worktree from the bare repo
         let bare_repo = format!("{remote_root}/carrick.git");
-        let worktree_dir = format!("{remote_root}/gate-worktrees/{sha12}");
         let setup_cmd = build_worktree_setup_cmd(&bare_repo, &worktree_dir, &full_sha);
         println!("Setting up remote worktree at {worktree_dir}...");
-        let setup_out = run_ssh_command(&host, &setup_cmd)?;
-        if setup_out.trim() == "REUSE" {
-            println!("Reusing existing remote worktree at {worktree_dir}");
-        }
+        run_ssh_command(&host, &setup_cmd)?;
 
         // Copy probe executables
         println!("Syncing probe executables to remote worktree...");
         copy_probe_executables(&local_root, &host, &worktree_dir)?;
 
-        // Step 4: Start `just accept --profile no-docker --phase <phase>` detached
-        let timestamp = accept::generate_timestamp();
-        let run_id = generate_run_id(&sha12, &timestamp);
+        // Step 4: Start detached accept gate on remote
         println!("run-id: {run_id}");
 
         let run_dir = format!("{remote_root}/gate-runs/{run_id}");
@@ -478,11 +590,9 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         println!("Starting detached accept gate on {host}...");
         run_ssh_command(&host, &start_cmd)?;
 
-        (run_id, sha12)
+        (run_id, sha12, guard)
     };
 
-    let worktree_dir = format!("{remote_root}/gate-worktrees/{sha12}");
-    let bare_repo = format!("{remote_root}/carrick.git");
     let gate_runs_dir = format!("{remote_root}/gate-runs");
     let remote_run_dir_path = format!("{gate_runs_dir}/{run_id}");
     let remote_exit_file = format!("{remote_run_dir_path}/exit");
@@ -538,37 +648,19 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         source: e,
     })?;
 
-    // Find remote el1-gate directory inside worktree
-    let list_el1_cmd = format!(
-        "ls -1 {}/target/el1-gate 2>/dev/null",
-        shell_quote(&worktree_dir)
-    );
-    let remote_subdir = match run_ssh_command(&host, &list_el1_cmd) {
-        Ok(out) => out
-            .lines()
-            .map(|l| l.trim().to_string())
-            .find(|d| !d.is_empty() && (sha12.starts_with(d) || d.starts_with(&sha12)))
-            .or_else(|| {
-                out.lines()
-                    .map(|l| l.trim().to_string())
-                    .find(|d| !d.is_empty())
-            }),
-        Err(_) => None,
-    };
-
-    if let Some(subdir) = remote_subdir {
-        let remote_receipt_src = format!("{worktree_dir}/target/el1-gate/{subdir}/");
-        let local_receipt_dest = format!("{}/", local_dest.display());
-        let _ = Command::new("rsync")
-            .args([
-                "-avz",
-                "-e",
-                "ssh -o BatchMode=yes -o ConnectTimeout=10",
-                &format!("{host}:\"{remote_receipt_src}\""),
-                &local_receipt_dest,
-            ])
-            .output();
-    }
+    // Copy only target/el1-gate/<short_sha>/ for THIS sha
+    let short_sha = resolve_short_sha_for_receipt(&host, &worktree_dir, &sha12, Some(&local_root));
+    let remote_receipt_src = format!("{worktree_dir}/target/el1-gate/{short_sha}/");
+    let local_receipt_dest = format!("{}/", local_dest.display());
+    let _ = Command::new("rsync")
+        .args([
+            "-avz",
+            "-e",
+            "ssh -o BatchMode=yes -o ConnectTimeout=10",
+            &format!("{host}:\"{remote_receipt_src}\""),
+            &local_receipt_dest,
+        ])
+        .output();
 
     let remote_log_src = format!("{remote_run_dir_path}/accept.log");
     let local_log_dest = local_dest.join("accept.log");
@@ -582,30 +674,35 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         ])
         .output();
 
+    let mut exit_code = exit_code;
     if let Ok(log_content) = fs::read_to_string(&local_log_dest) {
         if let Some(summary) = extract_summary(&log_content) {
             println!("\n{summary}");
         } else {
             eprintln!("Warning: no ACCEPT GATE SUMMARY block found in accept.log");
+            let lines: Vec<&str> = log_content.lines().collect();
+            let start = lines.len().saturating_sub(40);
+            for line in &lines[start..] {
+                eprintln!("{line}");
+            }
+            if exit_code == 0 {
+                exit_code = 1;
+            }
         }
     } else {
         eprintln!(
             "Warning: could not read local accept.log at {}",
             local_log_dest.display()
         );
+        if exit_code == 0 {
+            exit_code = 1;
+        }
     }
 
     let local_receipt = local_receipt_path(&local_root, &run_id);
     println!("Local receipt path: {}", local_receipt.display());
 
-    // Step 7: Unless `--keep-worktree`, remove remote worktree; prune gate-runs older than 20
-    if !args.keep_worktree {
-        println!("Removing remote worktree at {worktree_dir}...");
-        let cleanup_cmd = build_worktree_cleanup_cmd(&bare_repo, &worktree_dir);
-        if let Err(e) = run_ssh_command(&host, &cleanup_cmd) {
-            eprintln!("Warning: failed to clean up remote worktree: {e}");
-        }
-    }
+    lock_guard.release();
 
     let prune_cmd = build_prune_runs_cmd(&gate_runs_dir, MAX_RECENT_GATE_RUNS);
     if let Err(e) = run_ssh_command(&host, &prune_cmd) {
@@ -653,7 +750,8 @@ mod tests {
 
         assert!(start_cmd.starts_with("mkdir -p '/Volumes/carrick/gate runs/123' && nohup sh -c "));
         assert!(start_cmd.contains("cd '/Volumes/carrick/work tree with spaces'"));
-        assert!(start_cmd.contains("just accept --profile no-docker --phase host"));
+        assert!(start_cmd.contains("just accept --phase host"));
+        assert!(!start_cmd.contains("--profile"));
         assert!(start_cmd.contains("> '/Volumes/carrick/gate runs/123/accept.log' 2>&1"));
         assert!(start_cmd.contains(
             "mv '/Volumes/carrick/gate runs/123/exit.tmp' '/Volumes/carrick/gate runs/123/exit'"
@@ -661,17 +759,21 @@ mod tests {
         assert!(start_cmd.ends_with(" >/dev/null 2>&1 </dev/null &"));
 
         let bare = "/Volumes/carrick/bare repo.git";
-        let setup_cmd = build_worktree_setup_cmd(bare, worktree, "abcdef1234567890");
-        assert!(
-            setup_cmd.contains(
-                "cur_head=$(git -C '/Volumes/carrick/work tree with spaces' rev-parse HEAD"
-            )
+        let wt = "/Volumes/carrick/gate-worktree";
+        let setup_cmd = build_worktree_setup_cmd(bare, wt, "abcdef1234567890");
+        assert_eq!(
+            setup_cmd,
+            "if [ ! -d '/Volumes/carrick/gate-worktree' ]; then git -C '/Volumes/carrick/bare repo.git' worktree add --detach '/Volumes/carrick/gate-worktree' 'abcdef1234567890'; else git -C '/Volumes/carrick/gate-worktree' checkout --detach --force 'abcdef1234567890' && git -C '/Volumes/carrick/gate-worktree' clean -fdx -e target -e conformance-probes/target; fi"
         );
-        assert!(setup_cmd.contains("git -C '/Volumes/carrick/bare repo.git' worktree add --detach '/Volumes/carrick/work tree with spaces' 'abcdef1234567890'"));
 
-        let cleanup_cmd = build_worktree_cleanup_cmd(bare, worktree);
-        assert!(cleanup_cmd.contains("git -C '/Volumes/carrick/bare repo.git' worktree remove --force '/Volumes/carrick/work tree with spaces'"));
-        assert!(cleanup_cmd.contains("git -C '/Volumes/carrick/bare repo.git' worktree prune"));
+        let lock_cmd = build_lock_acquire_cmd("/Volumes/carrick/gate-worktree.lock", "run-123");
+        assert!(lock_cmd.contains("mkdir '/Volumes/carrick/gate-worktree.lock'"));
+        assert!(lock_cmd.contains("echo 'run-123' > '/Volumes/carrick/gate-worktree.lock'/run_id"));
+        assert!(lock_cmd.contains("echo LOCKED"));
+        assert!(lock_cmd.contains("echo \"HELD:$holder\""));
+
+        let release_cmd = build_lock_release_cmd("/Volumes/carrick/gate-worktree.lock");
+        assert_eq!(release_cmd, "rm -rf '/Volumes/carrick/gate-worktree.lock'");
 
         let prune_cmd = build_prune_runs_cmd("/Volumes/carrick/runs with spaces", 20);
         assert!(prune_cmd.contains("ls -1dt '/Volumes/carrick/runs with spaces'/*/"));
@@ -736,10 +838,16 @@ mod tests {
         );
 
         let remote_root = Path::new("/Volumes/carrick/dev with spaces");
-        let remote_wt = remote_worktree_dir(remote_root, "0123456789ab");
+        let remote_wt = remote_worktree_dir(remote_root);
         assert_eq!(
             remote_wt,
-            PathBuf::from("/Volumes/carrick/dev with spaces/gate-worktrees/0123456789ab")
+            PathBuf::from("/Volumes/carrick/dev with spaces/gate-worktree")
+        );
+
+        let remote_lock = remote_lock_dir(remote_root);
+        assert_eq!(
+            remote_lock,
+            PathBuf::from("/Volumes/carrick/dev with spaces/gate-worktree.lock")
         );
 
         let remote_run = remote_run_dir(remote_root, run_id);
@@ -754,9 +862,22 @@ mod tests {
         assert_eq!(
             el1_gate,
             PathBuf::from(
-                "/Volumes/carrick/dev with spaces/gate-worktrees/0123456789ab/target/el1-gate/0123456789ab"
+                "/Volumes/carrick/dev with spaces/gate-worktree/target/el1-gate/0123456789ab"
             )
         );
+    }
+
+    #[test]
+    fn test_lock_held_error() {
+        let err = RemoteAcceptError::LockHeld {
+            host: "rentamac@cloudmac".to_string(),
+            run_id: "0123456789ab-20261003-120000".to_string(),
+            lock_path: "/Volumes/carrick/dev/gate-worktree.lock".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("0123456789ab-20261003-120000"));
+        assert!(msg.contains("rentamac@cloudmac"));
+        assert!(msg.contains("/Volumes/carrick/dev/gate-worktree.lock"));
     }
 
     #[test]

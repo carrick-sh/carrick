@@ -220,5 +220,5 @@ fn remote_accept_cli_help() {
     assert!(combined.contains("--host"));
     assert!(combined.contains("--remote-root"));
     assert!(combined.contains("--attach"));
-    assert!(combined.contains("--keep-worktree"));
+    assert!(!combined.contains("--keep-worktree"));
 }
