@@ -197,7 +197,7 @@ impl Root {
 
     /// Publish a fork child's root in this carrier (its provider is the
     /// parent's, inherited by the fork).
-    fn publish_child(&self, child: &SyscallDispatcher) -> Self {
+    pub(in crate::dispatch) fn publish_child(&self, child: &SyscallDispatcher) -> Self {
         Self {
             carrier: self.carrier.clone(),
             mm: self.carrier.publish(child),
@@ -531,6 +531,36 @@ fn admitted_private_file_retains_owner_backing_before_fork() {
 }
 
 #[test]
+fn admitted_file_byte_service_preserves_last_page_and_refuses_beyond_eof() {
+    let mut dispatcher = SyscallDispatcher::new();
+    install_host_file_fd(&dispatcher, FILE_FD, b"file tail");
+    let mut memory = arena_memory();
+    let file = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        0,
+        2 * PAGE,
+        LINUX_PROT_READ | LINUX_PROT_WRITE,
+        LINUX_MAP_PRIVATE,
+        FILE_FD,
+    )) as u64;
+    let root = Root::admit(&dispatcher);
+    let source = root.lock().mapping(file).unwrap().host_backing.unwrap();
+    let page = dispatcher
+        .mem_view()
+        .read_host_backing(source, PAGE as usize)
+        .unwrap();
+    assert_eq!(&page[..9], b"file tail");
+    assert!(page[9..].iter().all(|byte| *byte == 0));
+    assert_eq!(
+        dispatcher
+            .mem_view()
+            .read_host_backing(source.advance(PAGE).unwrap(), PAGE as usize),
+        Err(LINUX_EFAULT)
+    );
+}
+
+#[test]
 fn admitted_private_file_mmap_publishes_owner_backing_before_fork() {
     let mut dispatcher = SyscallDispatcher::new();
     install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; 2 * PAGE as usize]);
@@ -567,7 +597,7 @@ fn admitted_private_file_fork_has_no_host_source_projection() {
         FILE_FD,
     )) as u64;
     let source = root.lock().mapping(file).unwrap().host_backing.unwrap();
-    let child = fork_child(&parent);
+    let mut child = fork_child(&parent);
     assert!(
         child.mem().lock().private_file_maps.is_empty(),
         "admitted fork clones host private_file_maps instead of inheriting owner HostBacking"
@@ -580,6 +610,53 @@ fn admitted_private_file_fork_has_no_host_source_projection() {
     );
     assert_eq!(
         child
+            .mem_view()
+            .read_host_backing(source, PAGE as usize)
+            .unwrap(),
+        vec![0x5a; PAGE as usize]
+    );
+    assert_eq!(
+        returned(call(
+            &mut child,
+            &mut memory,
+            SYS_MPROTECT,
+            [file, PAGE, LINUX_PROT_READ, 0, 0, 0]
+        )),
+        0
+    );
+    assert_eq!(
+        child_root.lock().mapping(file).unwrap().host_backing,
+        Some(source)
+    );
+    let row = proc_row_at(&child, file).unwrap();
+    assert!(row.read && !row.write);
+    assert_eq!(
+        root.lock().mapping(file).unwrap().protection,
+        ReservationProtection::READ_WRITE
+    );
+    assert_eq!(
+        returned(call(
+            &mut child,
+            &mut memory,
+            SYS_MUNMAP,
+            [file, 2 * PAGE, 0, 0, 0, 0]
+        )),
+        0
+    );
+    assert!(child_root.lock().mapping(file).is_none());
+    assert!(proc_row_at(&child, file).is_none());
+    assert!(
+        !child
+            .mem_view()
+            .retains_host_backing(source.handle(), source.generation())
+    );
+    assert!(
+        parent
+            .mem_view()
+            .retains_host_backing(source.handle(), source.generation())
+    );
+    assert_eq!(
+        parent
             .mem_view()
             .read_host_backing(source, PAGE as usize)
             .unwrap(),
@@ -651,7 +728,7 @@ fn delegated_rlimit_as_counts_every_mapping_exactly_once() {
 /// Fork preparation (before the child's root is published): the child's
 /// host-setup twin holds the parent root's rows as its own host facts.
 #[test]
-fn delegated_fork_twin_owns_the_parents_rows_until_its_fork_commit() {
+fn admitted_fork_pending_child_contains_no_host_projection() {
     let dispatcher = SyscallDispatcher::new();
     let root = Root::admit(&dispatcher);
     let first = root
@@ -661,42 +738,18 @@ fn delegated_fork_twin_owns_the_parents_rows_until_its_fork_commit() {
             ReservationProtection::READ_WRITE,
         )
         .unwrap();
-    let gap = first + 2 * PAGE;
-    let second = root
-        .guest_mmap(
-            Placement::Fixed(gap + PAGE),
-            PAGE,
-            ReservationProtection::READ_WRITE,
-        )
-        .unwrap();
-
     let child_mm = crate::kernel::MmId::from_registry_allocation(
         std::num::NonZeroU64::new(root.mm.raw() + 1).unwrap(),
     );
     let child = dispatcher.mm_authority().fork_private(child_mm);
-    let arena = child
-        .lock()
-        .host_arena()
-        .expect("a fork twin is in host setup until its fork commit")
-        .clone();
-    assert_eq!(arena.mmap_next, second + PAGE);
-    assert_eq!(arena.free_regions, vec![(gap, PAGE)]);
-    let row = |authority: &crate::dispatch::mm_authority::DispatchMmAuthority, at: u64| {
-        authority.lock().semantic_vmas.find(at).cloned()
-    };
+    let child_mem = child.lock();
+    assert!(child_mem.host_arena().unwrap().fork_seed.is_some());
     assert!(
-        row(&child, first).is_some_and(|vma| vma.provenance.is_private_anonymous() && vma.write),
-        "the child owns the parent's anonymous rows"
+        child_mem.semantic_vmas.find(first).is_none(),
+        "pending fork must inherit owner receipt rather than host projected rows"
     );
-    // The child's rows are its own: the parent's root moves on alone.
-    let mut view = root.lock();
-    let decision = view
-        .munmap(ReservationRange::new(first, first + 2 * PAGE).unwrap())
-        .unwrap();
-    commit(&mut view, decision);
-    drop(view);
-    assert!(row(&child, first).is_some());
-    assert!(root.lock().mapping(first).is_none());
+    assert!(child_mem.private_file_maps.is_empty());
+    assert!(root.lock().mapping(first).is_some());
 }
 
 // S1d: every host reader of placement on a delegated MM answers from the
@@ -1610,14 +1663,14 @@ fn delegated_madvise_attributes_stay_on_the_root_node() {
     );
     assert!(host_owns_no_anonymous_row(&dispatcher, a, a + 2 * PAGE));
     assert!(
-        dispatcher
-            .mem()
-            .lock()
-            .semantic_vmas
-            .find(file)
-            .is_some_and(|vma| vma.fork_policy.copy == carrick_abi::VmaForkCopyPolicy::Omit),
-        "the host file row takes the advice"
+        root.lock()
+            .mapping(file)
+            .unwrap()
+            .flags
+            .contains(carrick_el1_abi::ReservationNodeFlags::DONTFORK),
+        "retained file advice belongs to the owner's reservation"
     );
+    assert!(dispatcher.mem().lock().semantic_vmas.find(file).is_none());
     // The guest venue still edits the attributed range.
     root.guest_mprotect(a + PAGE, PAGE, ReservationProtection::NONE);
     assert_eq!(
@@ -1625,22 +1678,15 @@ fn delegated_madvise_attributes_stay_on_the_root_node() {
         Some(ANON_FLAGS | DONTFORK)
     );
     // The fork child omits it (MADV_DONTFORK) and keeps the rest.
-    let child_mm = crate::kernel::MmId::from_registry_allocation(
-        std::num::NonZeroU64::new(root.mm.raw() + 1).unwrap(),
+    let child = fork_child(&dispatcher);
+    let child_root = root.publish_child(&child);
+    assert_eq!(
+        fork_commit(&dispatcher, &child),
+        Ok(El1Admission::Delegated)
     );
-    let (projection_revision, projection) = dispatcher
-        .mm_authority()
-        .fork_projection_with_revision()
-        .unwrap();
-    let _ = (child_mm, projection_revision);
-    assert!(
-        projection.iter().any(|range| range.va == a + PAGE
-            && range.disposition == carrick_hal::ForkLeafDisposition::Omit)
-    );
-    assert!(
-        projection.iter().any(|range| range.va == a
-            && range.disposition == carrick_hal::ForkLeafDisposition::Preserve)
-    );
+    assert!(child_root.node(a).is_some());
+    assert!(child_root.node(a + PAGE).is_none());
+    assert!(child_root.node(file).is_none());
 }
 
 #[test]
@@ -2277,15 +2323,15 @@ fn host_rows_and_mirror(
     start: u64,
     end: u64,
 ) -> (Vec<Row>, Vec<Row>) {
-    let rows = dispatcher
-        .mem()
-        .lock()
-        .semantic_vmas
-        .overlapping(start, end)
-        .map(|vma| {
-            let prot =
-                u64::from(vma.read) | (u64::from(vma.write) << 1) | (u64::from(vma.execute) << 2);
-            (vma.start, vma.end, prot)
+    let rows = proc_rows(dispatcher)
+        .into_iter()
+        .filter(|row| row.start < end && row.end > start)
+        .map(|row| {
+            (
+                row.start,
+                row.end,
+                u64::from(row.read) | (u64::from(row.write) << 1) | (u64::from(row.execute) << 2),
+            )
         })
         .collect();
     let mut mirror = Vec::new();
@@ -2661,7 +2707,10 @@ fn delegated_node_exhaustion_answers_enomem_or_succeeds_never_aborts() {
         );
         answers.push(outcome);
         let (rows, mirror) = host_rows_and_mirror(&dispatcher, &root, file, file + pages * PAGE);
-        assert_eq!(rows, mirror, "the root mirrors the host rows");
+        assert_eq!(
+            rows, mirror,
+            "public observations reflect owner protections"
+        );
     }
     assert!(
         answers.contains(&DispatchOutcome::errno(LINUX_ENOMEM)),
@@ -2862,10 +2911,12 @@ fn delegated_fork_then_protect_restore_leaves_one_row_in_both_mms() {
             ReservationProtection::READ_WRITE,
         )
         .unwrap();
-    let child_mm = crate::kernel::MmId::from_registry_allocation(
-        std::num::NonZeroU64::new(root.mm.raw() + 1).unwrap(),
+    let child = fork_child(&dispatcher);
+    let child_root = root.publish_child(&child);
+    assert_eq!(
+        fork_commit(&dispatcher, &child),
+        Ok(El1Admission::Delegated)
     );
-    let child = dispatcher.mm_authority().fork_private(child_mm);
     let rows = |regions: Vec<ProcMapsEntry>| {
         regions
             .into_iter()
@@ -2874,17 +2925,19 @@ fn delegated_fork_then_protect_restore_leaves_one_row_in_both_mms() {
             .collect::<Vec<_>>()
     };
     let whole = vec![(shared, shared + 8 * PAGE)];
-    assert_eq!(rows(child.lock().proc_regions().unwrap()), whole);
+    assert_eq!(rows(proc_rows(&child)), whole);
     for prot in [
         LinuxProtFlags::READ,
         LinuxProtFlags::READ | LinuxProtFlags::WRITE,
     ] {
-        child
-            .lock()
-            .set_mapping_prot(shared + PAGE, shared + 2 * PAGE, prot);
+        child_root.guest_mprotect(
+            shared + PAGE,
+            PAGE,
+            ReservationProtection::from_bits(u64::from(prot.bits())).unwrap(),
+        );
     }
     assert_eq!(
-        rows(child.lock().proc_regions().unwrap()),
+        rows(proc_rows(&child)),
         whole,
         "child after protect+restore"
     );
@@ -2902,7 +2955,7 @@ fn delegated_fork_then_protect_restore_leaves_one_row_in_both_mms() {
 
 /// A copied-MM fork of `dispatcher` through the production prepare/commit
 /// pair: the child dispatcher, its root not yet published.
-fn fork_child(dispatcher: &SyscallDispatcher) -> SyscallDispatcher {
+pub(in crate::dispatch) fn fork_child(dispatcher: &SyscallDispatcher) -> SyscallDispatcher {
     let parent_mm = dispatcher.mm_authority().mm_id;
     let child_mm = crate::kernel::MmId::from_registry_allocation(
         std::num::NonZeroU64::new(parent_mm.raw() + 1).unwrap(),
@@ -2916,12 +2969,116 @@ fn fork_child(dispatcher: &SyscallDispatcher) -> SyscallDispatcher {
         .unwrap()
 }
 
-/// The fork-commit admission of `child`, holding both MM permits.
-fn fork_commit(
+/// Reservation-only owner effect for these VM-free kernel metadata fixtures.
+/// The production descriptor/COW transaction is exercised in carrick-el1's
+/// owner matrix; this fixture supplies its exact origin receipt to attachment.
+fn fixture_owner_fork(
+    parent: &SyscallDispatcher,
+    child: &SyscallDispatcher,
+) -> Result<
+    (
+        carrick_el1_abi::PortalForkCompletion,
+        Vec<(std::num::NonZeroU64, std::num::NonZeroU64)>,
+    ),
+    Refusal,
+> {
+    let parent_authority = parent.mm_authority();
+    let child_authority = child.mm_authority();
+    let seed = child
+        .mem()
+        .lock()
+        .host_arena()
+        .and_then(|arena| arena.fork_seed)
+        .ok_or(Refusal::Stale)?;
+    let provider = parent_authority
+        .reservation_provider_for_publication()
+        .ok_or(Refusal::Stale)?;
+    let view = provider.prepare()?;
+    let mut parent_root =
+        view.lock(ReservationMm::new(parent_authority.mm_id.raw()).ok_or(Refusal::Stale)?)?;
+    if parent_root.generation() != seed.generation || parent_root.mm() != seed.parent {
+        return Err(Refusal::Stale);
+    }
+    let mut child_root =
+        view.lock(ReservationMm::new(child_authority.mm_id.raw()).ok_or(Refusal::Stale)?)?;
+    let nz = |value| std::num::NonZeroU64::new(value).unwrap();
+    let request = carrick_el1_abi::PortalForkRequest {
+        operation: carrick_el1_abi::PortalOperation {
+            carrier: nz(1),
+            mm: parent_root.mm(),
+            incarnation: nz(parent_root.incarnation().raw()),
+            sequence: parent_root.next_transfer_sequence()?,
+        },
+        parent_generation: parent_root.generation(),
+        child_mm: child_root.mm(),
+        child_tables: carrick_el1_abi::PortalForkTableArena::new(0x800000, 0x200000).unwrap(),
+        parent_tables: carrick_el1_abi::PortalForkTableArena::new(0xa00000, 0x200000).unwrap(),
+        kernel_control_ipa: 0xc00000,
+    };
+    let mut sources = Vec::new();
+    parent_root.observe_mappings(&mut |mapping| {
+        if !mapping.flags.intersects(
+            carrick_el1_abi::ReservationNodeFlags::DONTFORK
+                .union(carrick_el1_abi::ReservationNodeFlags::WIPEONFORK),
+        ) && let Some(source) = mapping.host_backing
+        {
+            sources.push((source.handle(), source.generation()));
+        }
+    })?;
+    child_root.set_fork_origin(request)?;
+    parent_root.clone_into(&mut child_root)?;
+    parent_root.begin_fork_publication(request)?;
+    child_root.begin_fork_publication(request)?;
+    let generation = parent_root.commit_fork_generation()?;
+    let child_handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(
+            request.operation.carrier,
+            request.child_mm,
+            nz(child_root.incarnation().raw()),
+        )
+    };
+    Ok((
+        carrick_el1_abi::PortalForkCompletion {
+            request,
+            child: child_handle,
+            parent_generation: generation,
+            child_tables_used: 0x4000,
+            parent_tables_used: 0,
+        },
+        sources,
+    ))
+}
+fn fixture_finish_owner_fork(
+    parent: &SyscallDispatcher,
+    child: &SyscallDispatcher,
+    completion: carrick_el1_abi::PortalForkCompletion,
+) {
+    let provider = parent
+        .mm_authority()
+        .reservation_provider_for_publication()
+        .unwrap();
+    let view = provider.prepare().unwrap();
+    view.lock(completion.request.operation.mm)
+        .unwrap()
+        .finish_fork_publication(completion.request.operation)
+        .unwrap();
+    view.lock(completion.request.child_mm)
+        .unwrap()
+        .finish_fork_publication(completion.request.operation)
+        .unwrap();
+    let _ = child;
+}
+/// The fork-commit admission of `child`, holding both MM permits and consuming
+/// a root the owner already cloned, never a host projection/seed operation.
+pub(in crate::dispatch) fn fork_commit(
     parent: &SyscallDispatcher,
     child: &SyscallDispatcher,
 ) -> Result<El1Admission, Refusal> {
-    crate::dispatch::mm_mutation::test_support::with_permit(
+    if child.mem().lock().delegated_root().is_some() {
+        return Ok(El1Admission::Delegated);
+    }
+    let (completion, sources) = fixture_owner_fork(parent, child)?;
+    let result = crate::dispatch::mm_mutation::test_support::with_permit(
         parent.mm_mutation_coordinator(),
         |parent_permit| {
             crate::dispatch::mm_mutation::test_support::with_permit(
@@ -2929,16 +3086,22 @@ fn fork_commit(
                 |permit| {
                     child.mem_view().admit_el1_reservations(
                         permit,
-                        El1AdmissionOrigin::ForkCommit {
+                        El1AdmissionOrigin::OwnerForkCommit {
                             parent,
                             parent_permit,
+                            completion: &completion,
+                            inherited_sources: &sources,
                         },
                         true,
                     )
                 },
             )
         },
-    )
+    );
+    if result.is_ok() {
+        fixture_finish_owner_fork(parent, child, completion);
+    }
+    result
 }
 
 /// Every placement, `/proc` and charge answer an MM gives. `/proc` is read
@@ -2995,7 +3158,27 @@ fn populated_host_setup_mm() -> (SyscallDispatcher, CountingMmapMemory, u64) {
         path: path.to_owned(),
     };
     // The boot image and the heap backing row the loader publishes.
-    dispatcher.mem().lock().address_space_regions = Some(vec![
+    {
+        let authority = dispatcher.mem();
+        let mut mem = authority.lock();
+        mem.core_file_mappings.push(crate::core_dump::FileMapping {
+            start: IMAGE,
+            end: IMAGE + 2 * PAGE,
+            file_page_offset: 0,
+            path: "/bin/image".into(),
+        });
+        mem.private_file_maps
+            .push(super::backing::PrivateFileMapEntry {
+                start: IMAGE,
+                end: IMAGE + 2 * PAGE,
+                offset: 0,
+                backing: super::backing::PrivateFileBacking::LoadedImage {
+                    initialized_offset: 0,
+                    bytes: Arc::new(vec![0; (2 * PAGE) as usize]),
+                },
+            });
+    }
+    dispatcher.set_address_space_regions(vec![
         region(IMAGE, IMAGE + 2 * PAGE, "/bin/image"),
         region(layout.heap_base, layout.heap_base + layout.heap_size, ""),
     ]);
@@ -3094,12 +3277,12 @@ fn delegated_bind_admission_seals_the_exact_external_charges() {
         admit(&dispatcher, El1AdmissionOrigin::Bind, true),
         Ok(El1Admission::Delegated)
     );
-    // The boot image is the only mapping the root does not hold: two
-    // private writable pages of address space and of data.
+    // Canonical boot image rows retain their source in the owner as well;
+    // no address or data charges remain external to the reservation tree.
     let layout = root.lock().layout();
     assert_eq!(
         (layout.external_address_bytes, layout.external_data_bytes),
-        (2 * PAGE, 2 * PAGE)
+        (0, 0)
     );
     let charges = root.lock().charges();
     let answers = mm_answers(&dispatcher, a);
@@ -3486,7 +3669,12 @@ fn fork_commit_admits_the_published_child_root() {
         // The carrier publishes the child's root (production:
         // `publish_child_address_space` from its `Stage1MmLease`).
         let child_root = root.publish_child(&child);
-        (commit.admit_child_root(&parent), child_root)
+        let (completion, sources) = fixture_owner_fork(&parent, &child).unwrap();
+        let admission = commit.admit_owner_child_root(&parent, &completion, &sources);
+        if admission.is_ok() {
+            fixture_finish_owner_fork(&parent, &child, completion);
+        }
+        (admission, child_root)
     });
     let (admission, child_root) = admitted;
     assert_eq!(admission, Ok(El1Admission::Delegated));
@@ -3607,21 +3795,23 @@ fn delegated_fork_twin_keeps_pristine_provenance_of_untouched_root_pages() {
     // The parent touches one page through the host fault path.
     dispatcher
         .with_resident_fault_plan_for_test(base, |plan| dispatcher.commit_resident_fault(plan));
-    let child_mm = crate::kernel::MmId::from_registry_allocation(
-        std::num::NonZeroU64::new(root.mm.raw() + 1).unwrap(),
+    let child = fork_child(&dispatcher);
+    let child_root = root.publish_child(&child);
+    assert_eq!(
+        fork_commit(&dispatcher, &child),
+        Ok(El1Admission::Delegated)
     );
-    let child = dispatcher.mm_authority().fork_private(child_mm);
-    let pristine = |at: u64, len: u64| {
+    assert!(child_root.node(base + PAGE).is_some());
+    assert!(
         child
+            .mem()
             .lock()
             .deferred_anonymous
-            .covers_pristine(carrick_guest_mem::GuestVa(at), len as usize)
-    };
-    assert!(
-        pristine(base + PAGE, 3 * PAGE),
-        "the twin's untouched root pages are fresh zero"
+            .snapshot()
+            .pristine
+            .is_empty()
     );
-    assert!(!pristine(base, PAGE), "a touched page is never pristine");
+    assert!(child.mem().lock().semantic_vmas.find(base).is_none());
 }
 
 const STOCK_WINDOW: u64 = 16 * PAGE;
@@ -3765,33 +3955,24 @@ fn delegated_fork_materialized_drops_unconsumed_stock_provenance_only_in_child()
         .unwrap();
     let parent = dispatcher.mem();
     let before = parent.lock().deferred_anonymous.snapshot();
-    let forked = parent.lock().fork_materialized();
-    assert!(forked.first_touch_stock.is_empty());
-    for (start, pages) in [(base, 2), (base + 4 * PAGE, 4)] {
-        assert!(
-            forked
-                .deferred_anonymous
-                .materialized_within(GuestVa(start), (pages * PAGE) as usize)
-                .is_empty(),
-            "a child cannot retain the parent's unconsumed Prepared stock"
-        );
-        forked
-            .deferred_anonymous
-            .adopt_pristine(GuestVa(start), (pages * PAGE) as usize)
-            .unwrap();
-        assert!(
-            forked
-                .deferred_anonymous
-                .covers_pristine(GuestVa(start), (pages * PAGE) as usize)
-        );
-    }
+    let child = fork_child(&dispatcher);
+    let child_root = root.publish_child(&child);
     assert_eq!(
-        forked
-            .deferred_anonymous
-            .materialized_within(GuestVa(base + 2 * PAGE), (2 * PAGE) as usize),
-        vec![GuestVa(base + 2 * PAGE)..GuestVa(base + 4 * PAGE)],
-        "mapped backing is inherited"
+        fork_commit(&dispatcher, &child),
+        Ok(El1Admission::Delegated)
     );
+    assert!(child.mem().lock().first_touch_stock.is_empty());
+    assert!(
+        child
+            .mem()
+            .lock()
+            .deferred_anonymous
+            .snapshot()
+            .pristine
+            .is_empty()
+    );
+    assert!(child_root.node(base + 2 * PAGE).is_some());
+    assert!(child_root.node(base).is_none());
     assert_eq!(
         parent.lock().deferred_anonymous.snapshot(),
         before,
@@ -3801,7 +3982,7 @@ fn delegated_fork_materialized_drops_unconsumed_stock_provenance_only_in_child()
 }
 
 #[test]
-fn delegated_fork_requires_stock_and_owed_returns_settled_before_snapshot() {
+fn delegated_fork_owner_refuses_stock_and_owed_returns_before_publication() {
     let dispatcher = SyscallDispatcher::new();
     let root = Root::admit(&dispatcher);
     let base = LINUX_MMAP_BASE + STOCK_WINDOW;
@@ -3825,8 +4006,12 @@ fn delegated_fork_requires_stock_and_owed_returns_settled_before_snapshot() {
     assert!(
         dispatcher
             .prepare_fork_mm(parent_mm, child_mm, crate::kernel::CloneObjectMode::Copy)
-            .is_err(),
-        "an unsettled parent must not mint a fork snapshot"
+            .is_ok(),
+        "preparation creates only an unswitchable child identity, not a host snapshot"
+    );
+    assert!(
+        !root.lock().fork_settled(),
+        "only the owner decides whether its outstanding stock/returns permit publication"
     );
     let mut memory = CountingMmapMemory::new(base, (2 * STOCK_WINDOW) as usize);
     reconcile(&dispatcher, &mut memory).unwrap();
@@ -3846,12 +4031,12 @@ fn delegated_fork_requires_stock_and_owed_returns_settled_before_snapshot() {
     assert!(child.mem().lock().first_touch_stock.is_empty());
     assert!(proc_row_at(&child, base).is_none());
     assert!(proc_row_at(&child, retired).is_none());
-    assert!(proc_row_at(&child, base + 2 * PAGE).is_some());
     let child_root = root.publish_child(&child);
     assert_eq!(
         fork_commit(&dispatcher, &child),
         Ok(El1Admission::Delegated)
     );
+    assert!(proc_row_at(&child, base + 2 * PAGE).is_some());
     for address in [base, retired] {
         child_root
             .guest_mmap(Placement::Fixed(address), PAGE, rw)

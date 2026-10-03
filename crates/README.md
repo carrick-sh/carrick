@@ -40,7 +40,7 @@ Platform code is selected by Cargo features. The default feature is
 | `carrick-kernel-arena` | The per-run kernel arena: a file-backed `MAP_SHARED` region holding the Linux-visible cross-process delta (identity, leases, shared kernel objects) the host kernel cannot express, with no authority daemon -- processes operate on it via atomics and robust bucket locks. |
 | `carrick-mem` | Guest address-space construction: ELF layout, boot identity/hvpatch tables, trampolines, VDSO/vvar, region helpers. |
 | `carrick-mmu-core` | `no_std` + `alloc` MMU management substrate and stage-1 page-table manipulation algorithms (AArch64 `PageTableManager`). |
-| `carrick-hal` | OS/VMM-neutral traits and shared types: trap contract, hypervisor traits, guest-arch tables, event/futex/threaded-loop/signal/timer surfaces. |
+| `carrick-hal` | OS/VMM-neutral traits and shared types: trap contract, hypervisor traits, guest-arch tables, event/futex/threaded-loop/signal/timer surfaces. Depends on the platform-neutral `no_std` `carrick-el1-abi` for exact owner Fork completion receipts; it takes no EL1 implementation or VMM dependency. |
 | `carrick-thread` | Thread registry, private-futex park table, and fork/page-table quiesce barriers. |
 | `carrick-signal-core` | Platform-neutral pending-signal bookkeeping. |
 | `carrick-timer-core` | Platform-neutral interval/POSIX timer slot bookkeeping and timer due-time decisions. |
