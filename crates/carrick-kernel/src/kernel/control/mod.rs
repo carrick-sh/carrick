@@ -281,30 +281,30 @@ impl CarrierControlServer {
         let join = match std::thread::Builder::new()
             .name("carrick-carrier-control".to_owned())
             .spawn(move || {
-                while !thread_shutdown.load(Ordering::Acquire) {
-                    let Ok((mut stream, _)) = listener.accept() else {
-                        continue;
-                    };
-                    if thread_shutdown.load(Ordering::Acquire) {
-                        break;
-                    }
-                    if let Err(_error) = handle(
-                        &mut stream,
-                        &kernel,
+                // Accept loop offloads all incoming
+                // connections to worker threads so that
+                // stalled clients cannot monopolize
+                // the control endpoint or block any
+                // status probes. The tracker records
+                // live client socket handles and their
+                // worker joins across execution.
+                // On shutdown, all active sockets are
+                // shut down (Shutdown::Both) to
+                // abort pending reads promptly, and
+                // all spawned workers are joined.
+                // This preserves liveness under stall.
+                connection::run_accept_loop(
+                    listener,
+                    thread_shutdown,
+                    connection::ControlServerContext {
+                        kernel,
                         init,
                         nonce,
-                        thread_exec.as_ref(),
-                        thread_archive.as_ref(),
-                    ) {
-                        #[cfg(test)]
-                        eprintln!("carrier control test connection failed: {_error}");
-                    }
-                }
-                // Ownership of the record is the server's, not the accept
-                // loop's: `shutdown` releases it, and a teardown quiesce keeps
-                // it (marked `TearingDown`) until the terminal receipt is
-                // durable.
-                drop(thread_endpoint);
+                        exec: thread_exec,
+                        archive: thread_archive,
+                    },
+                    thread_endpoint,
+                );
             }) {
             Ok(join) => join,
             Err(error) => {
@@ -569,7 +569,7 @@ fn operation_response_deadline(operation: &ControlOperation) -> Duration {
     }
 }
 
-fn handle(
+pub(super) fn handle(
     stream: &mut UnixStream,
     kernel: &Arc<super::Kernel>,
     init: super::TaskKey,
@@ -578,7 +578,7 @@ fn handle(
     archive: &dyn CarrierArchiveControl,
 ) -> Result<(), ControlError> {
     authenticate(stream)?;
-    wait_readable(stream)?; // await readable
+    // Per-connection request wait
     stream.set_write_timeout(Some(DEADLINE))?;
     let request: ControlRequest = serde_json::from_slice(&read_frame(stream)?).map_err(protocol)?;
     let request_id = request.request_id;
@@ -738,27 +738,6 @@ fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), ControlError
     Ok(())
 }
 
-fn wait_readable(stream: &UnixStream) -> Result<(), ControlError> {
-    let mut pollfd = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    loop {
-        let rc = unsafe { libc::poll(&mut pollfd, 1, -1) };
-        if rc > 0 {
-            return Ok(());
-        }
-        if rc < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(ControlError::Io(err));
-        }
-    }
-}
-
 fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, ControlError> {
     let mut prefix = [0_u8; 4];
     stream.read_exact(&mut prefix)?;
@@ -790,6 +769,8 @@ fn read_frame_with_deadline(
 fn protocol(error: impl ToString) -> ControlError {
     ControlError::Protocol(error.to_string())
 }
+
+mod connection;
 
 #[cfg(test)]
 mod tests {
@@ -1693,5 +1674,60 @@ mod tests {
             );
             server.shutdown();
         }
+    }
+
+    #[test]
+    fn stalled_client_does_not_block_other_connections() {
+        let (_temp, endpoint) = endpoint::test_endpoint("control-stalled-client");
+        let (kernel, init) = kernel_with_init();
+        let mut server = CarrierControlServer::start_at(
+            Arc::clone(&kernel),
+            init.task().key(),
+            endpoint.clone(),
+        )
+        .expect("server");
+        let state = server.state();
+
+        let _stalled = UnixStream::connect(endpoint.socket_path()).expect("connect stalled");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let test_endpoint = endpoint.clone();
+        let test_state = state.clone();
+        std::thread::spawn(move || {
+            let res = send_at(&test_endpoint, &test_state, ControlOperation::Status);
+            let _ = tx.send(res);
+        });
+
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("second client Status timed out behind stalled client")
+            .expect("status");
+        assert_eq!(outcome, ControlOutcome::Alive);
+        server.shutdown();
+    }
+
+    #[test]
+    fn shutdown_completes_with_stalled_client_connected() {
+        let (_temp, endpoint) = endpoint::test_endpoint("control-stalled-shutdown");
+        let (kernel, init) = kernel_with_init();
+        let mut server = CarrierControlServer::start_at(
+            Arc::clone(&kernel),
+            init.task().key(),
+            endpoint.clone(),
+        )
+        .expect("server");
+
+        let _stalled = UnixStream::connect(endpoint.socket_path()).expect("connect stalled");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            server.shutdown();
+            let _ = tx.send(());
+        });
+
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server shutdown timed out with stalled client connected");
     }
 }
