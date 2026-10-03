@@ -474,6 +474,95 @@ No signed/HVF test, Docker or `just accept` runs on this Linux preparation box.
 - **Accept:** `cargo test -p carrick-signal-core`; `just test-kernel`;
   `just test-embed el1_ --nocapture`; `just conformance-probes`; A/common gates.
 
+#### C-prep handoff
+
+The `work/n2c-core` preparation extends only `carrick-signal-core` (plus
+this subsection). No kernel, EL1 personality, HAL or shared registry wiring
+is changed. This is a VM-free policy binding for
+`kernel.el1.signal-delivery-owner`, not acceptance of landing C.
+
+- `policy` extracts the kernel object's first-standard/FIFO-real-time pending
+  algorithm using the existing core payload queue and set. It adds typed Linux
+  signal/action/mask policy, handler entry, fork/exec reducers, child decisions
+  and exact-key inboxes. `ActionInheritance::Shared` returns the existing
+  sighand key for CLONE_SIGHAND; `Copied` returns independent actions. The
+  production graph must publish that edge, not create another authority.
+- The crate remains `no_std` with no dependencies. Its minimal `Signal` and
+  block-mask equivalents use Linux asm-generic numbering; `carrick-abi` remains
+  the wire-ABI source of truth, but currently has a std dependency closure.
+  AArch64 and x86_64 share numbers. `HandlerReturnPolicy` distinguishes the
+  AArch64 kernel/vDSO fallback from x86_64's required registered restorer.
+  Restorer preflight happens before handler entry; the HAL still validates
+  and builds frames. Unsupported wire fields remain the adapter's concern.
+- `wait` returns continue, committed readiness, successful byte prefix,
+  restart or EINTR. The syscall adapter supplies the operation's restart
+  class (including socket timeout state) and the original caught handler's
+  SA_RESTART. A readiness *hint* is not committed completion. The real wait
+  authority must arbitrate the race and preserve its continuation/cursor.
+- `timer` owns one ITIMER_REAL state per exact process key. Injected elapsed
+  real-time values and typed spans use nanoseconds. `set` returns old state
+  and a completion ticket; `expire` authenticates owner, arm sequence and
+  deadline and returns one SIGALRM-generation effect plus the next ticket.
+  The adapter enqueues SIGALRM into this same process pending owner. Delayed
+  expiry advances periodic phase with constant arithmetic, never a tick loop.
+  Cancel/rearm reject old tickets; fork is disarmed and exec retains the timer.
+  Overflow/sequence exhaustion are explicit refusals with unchanged state.
+  Preserve the timer authority across rearm/exec; recreating it for the same
+  live key would discard its arm sequence. Task/thread keys must include the
+  existing graph generation, not just a reusable PID/TID.
+
+The `policy_contract` fixtures cover 1/8/32 target populations with two
+independent process owners, immediate exact-thread enqueue, masked SIGCHLD,
+CLONE_SIGHAND, fork/exec, reused IDs, duplicate/stale/foreign timer completion,
+temporary-mask handler restoration, nested masks, partial I/O and restart.
+Target selection counts actual inspected rows and asserts `examined <= N`
+(the last-eligible case is exactly N); no unrelated process may be chosen.
+Pending summaries/counts select in O(1), queues cost O(log 64) plus affected
+payload destruction, and timer catch-up does not scale with missed ticks.
+These are pure fixtures, not scheduled tgkill-birth or guest frame proofs.
+
+Red evidence on main `ad3e127a9` with tests only: `cargo test -p
+carrick-signal-core` exits 101 because `payload_policy_is_caller_selected`
+returns 3 instead of retained 2 and
+`standard_coalescing_retains_first_payload_including_absence` returns the
+second payload instead of the first. The policy contracts separately produce
+capability compile reds (missing policy/timer/wait modules and typed set
+operations); they are not claimed as executable semantic reds. During
+preparation the one-shot metadata assertion also caught an over-broad reset
+before it was aligned with the existing kernel test. Architecture restorer
+fixtures were added before their API (capability compile red).
+
+Findings for the integrating owner (source inspection, no kernel changes):
+
+| Current representation/behavior | Core policy / handoff decision | Linux authority |
+| --- | --- | --- |
+| Core `PendingQueue::publish(coalesce=true)` replaced the old payload, unlike kernel `PendingQueue::enqueue_standard`. Its existing child-watch caller uses this for standard signals. | Coalescing now keeps the first pending instance, including no payload; FIFO remains FIFO. The existing generic queue test was corrected red-first. | [signal(7), standard queueing](https://man7.org/linux/man-pages/man7/signal.7.html) |
+| `TaskPendingQueue::recipient` defaults to the leader and keeps a named recipient per signal; other kernel wait logic can retarget. | Pure process-target selection uses the first live, unblocked exact key in caller order. Revalidate and publish under admission; leave pending when all eligible threads block it. This is a selection-interface difference, not proof the full kernel path violates Linux. | [signal(7), process-directed delivery](https://man7.org/linux/man-pages/man7/signal.7.html) |
+| Kernel default delivery folds SIGCONT into Ignore and all fatal defaults into Terminate. | Core returns Continue and distinguishes core-dump defaults. Generation-time SIGCONT resume/stop cancellation must occur even with a caught/ignored disposition; this slice does not implement job-control graph mutation or dump production. | [signal(7), default actions](https://man7.org/linux/man-pages/man7/signal.7.html) |
+| `Sighand::autoreaps_children` and child-exit notification are separate helpers; the latter has no stop/continue event parameter. | `child_decision` returns independent auto-reap and notification data, including SA_NOCLDWAIT's caught notification and SA_NOCLDSTOP's stop/continue suppression. This must not remove waitable stop/continue events. | [sigaction(2)](https://man7.org/linux/man-pages/man2/sigaction.2.html), [wait(2)](https://man7.org/linux/man-pages/man2/wait.2.html) |
+| Kernel thread `set_blocked` accepts an arbitrary set; dispatch currently sanitizes and separately arms the restore mask. | Core block-mask construction removes SIGKILL/SIGSTOP. Temporary replacement and handler restore-mask selection are one transition; caller must enroll the wait atomically with it. | [sigprocmask(2)](https://man7.org/linux/man-pages/man2/sigprocmask.2.html), [sigsuspend(2)](https://man7.org/linux/man-pages/man2/sigsuspend.2.html) |
+| Current `dispatch/time.rs::setitimer` treats null `new_address` as None and only mutates inside `if let Some(v)`, leaving an armed timer unchanged. It stores `Instant` and invokes backend timer delivery. | Adapter must translate null new-value to a zero spec (disarm), then use the exact process timer transition and injected clock. ABI-pointer validation/old-value copy faults remain adapter work. | [setitimer(2), Linux null-new-value behavior and process timer rules](https://man7.org/linux/man-pages/man2/setitimer.2.html) |
+| Runtime restart uses syscall-number classification, boundary/EINTR predicates and continuation restart state. | Core takes a restart class and committed progress explicitly. Never restart ppoll/pselect/sigsuspend; interrupted slow I/O with a prefix succeeds with that prefix. Preserve the owned endpoint/cursor in integration. | [signal(7), syscall interruption](https://man7.org/linux/man-pages/man7/signal.7.html) |
+
+Fork/exec/sharing rules follow [fork(2)](https://man7.org/linux/man-pages/man2/fork.2.html),
+[execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html),
+[clone(2)](https://man7.org/linux/man-pages/man2/clone.2.html) and signal(7).
+SA_RESETHAND preserves flags/mask/restorer while changing disposition, matching
+the kernel's existing `sa_resethand_resets_disposition_to_default_on_handler_entry`
+test; exec keeps only ignored action records, matching `Sighand::for_exec`.
+Pending process/thread owners survive exec and clear on fork. Masks stay
+independent even when sighand is shared.
+
+Portable verification: `cargo test -p carrick-signal-core` (12 unit tests,
+18 policy contracts), `cargo clippy -p carrick-signal-core --all-targets -- -D
+warnings`, and `just fmt-check`. Clippy exits zero but reports the existing
+Linux-invalid `libc::proc_listallpids` catalog entry in root `clippy.toml`.
+No signed/HVF, Docker, `just accept`, kernel or EL1 binding gate was run on this
+Linux box, as instructed. Frame/protection/sigreturn, altstack, job-control,
+permission/sender validation, RLIMIT_SIGPENDING admission, shared publication,
+wait races and signed exact-artifact promotion remain integration work under
+section 3; no new graph, lock, host timer or scheduler is supplied here.
+
 ### D. Task birth, process exit and child waits execute in EL1
 
 - **Fence:** kernel `kernel/{operations.rs,operations/thread.rs,operations/exit.rs,operations/wait.rs,thread_ledger.rs}`,
