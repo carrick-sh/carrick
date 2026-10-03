@@ -5786,7 +5786,7 @@ impl HvpatchTaskRegistration {
         retain_shared_predecessor_authority: bool,
     ) -> Result<(), TrapError> {
         let new_mm_key = HvpatchMmAuthorityKey {
-            task_serial: 0,
+            task_serial: self.expected_identity.task_serial,
             mm_root_slot: Some(replacement_mm_root_slot),
             shared_kernel_mm: None,
         };
@@ -6204,13 +6204,15 @@ impl HvpatchCarrierTaskStateDirectory {
             ));
         }
         let mm_key = HvpatchMmAuthorityKey {
-            // A concrete root slot is the exact MM identity and is shared by
-            // every thread binding. Root/no-slot tasks fall back to the task
-            // serial so unrelated roots never alias one MM authority.
+            // Root slots are recycled at logical MM retirement, before every
+            // captured thread backend necessarily drops. The exact process
+            // incarnation distinguishes an owner from such retained predecessors;
+            // its thread bindings share this same serial and slot. CLONE_VM
+            // projections instead name their explicit shared Kernel MM.
             task_serial: if task.shared_kernel_mm.is_some() {
                 0
             } else {
-                task.mm_root_slot.map_or(identity.task_serial, |_| 0)
+                identity.task_serial
             },
             mm_root_slot: task.mm_root_slot,
             shared_kernel_mm: task.shared_kernel_mm,
