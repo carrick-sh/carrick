@@ -1421,10 +1421,10 @@ impl OwnerForkTableArena {
         if used > 2 * 1024 * 1024 {
             return Err("owner Fork exceeded table capacity".into());
         }
-        if used != 0 {
-            if let Some(base) = self.base.take() {
-                self.authority.inner.lock().published_arenas.push(base.0);
-            }
+        if used != 0
+            && let Some(base) = self.base.take()
+        {
+            self.authority.inner.lock().published_arenas.push(base.0);
         }
         Ok(())
     }
