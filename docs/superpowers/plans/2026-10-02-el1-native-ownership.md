@@ -1401,3 +1401,23 @@ with two live same-VA MMs. Neither assignment is a passing receipt. Inverse
 EL1 unmap/PROT_NONE EFAULT 14, raw-escape closure, internal-window confinement,
 mirror storage deletion and all requested verification remain open. No signed,
 guest or Docker execution occurred during this inspection.
+
+#### Venue-3 atomic-record implementation ruling — 2026-10-03
+
+The director approved an aggregate of page permits for datagram/SEQPACKET
+receives. Prepare all pages covering `min(user buffer, record length)` after
+readiness and before the nonblocking consume, with all-or-cancel preparation.
+The record's socket maximum must be represented by a typed bound and asserted;
+an oversized record fails closed. The existing chunk limit still applies to
+each stream step. No permit may survive a blocking host wait. Truncation is
+determined by the user's buffer, never by an internal permit-page boundary.
+The added regression must deliver a record larger than one permit page and
+smaller than the user's buffer whole. This ruling is not a test receipt.
+
+Implementation scope includes a narrow `carrick-sched-core::object_wait`
+extension: MM edit continuations need a queue identity distinct from IPC,
+authenticated by exact address-space incarnation. IPC queue capacity remains
+unchanged; any scheduler storage-layout change enters the ABI layout hash.
+This out-of-fence support implements the required EL1-owned park/wake boundary,
+not a host-worker wait or a polling substitute. Implementation and all venue-3
+acceptance gates remain pending.
