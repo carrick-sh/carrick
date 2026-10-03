@@ -193,6 +193,10 @@ macro_rules! host_open {
     }};
 }
 
+/// Test-only hook invoked before publishing a lower entry to the dentry cache.
+#[cfg(any(test, feature = "test-support"))]
+pub type LowerEntryPublishHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 /// Real-filesystem FsBackend rooted at a scratch directory on disk.
 ///
 /// All host syscalls go through a [`std::os::fd::OwnedFd`] root handle and
@@ -210,10 +214,6 @@ macro_rules! host_open {
 /// guest deleted that still exist in the read-only rootfs layer
 /// underneath. The dispatcher's layered lookup consults this to shadow
 /// the rootfs, just like for the memory backend.
-/// Test-only hook invoked before publishing a lower entry to the dentry cache.
-#[cfg(any(test, feature = "test-support"))]
-pub type LowerEntryPublishHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
-
 // `root_prefix`/`fast_fs`/`cache_pid` drive the macOS `--fs host` fast-stat
 // path only; on non-macOS those fields are populated but never read.
 #[allow(dead_code)]
