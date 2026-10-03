@@ -22,6 +22,7 @@ pub struct MmPortal<'a, P: PinnedMetadataExtent> {
     pub(super) roots: &'a SharedReservations,
     pub(super) spaces: &'a AddressSpaces,
     pub(super) nodes: Option<&'a ResolvedReservationNodes<P>>,
+    pub(super) zone: Option<&'a carrick_sched_core::ZoneTables>,
     #[cfg(any(test, feature = "host-test"))]
     pub(super) vma_visits: core::sync::atomic::AtomicUsize,
 }
@@ -146,9 +147,69 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             roots,
             spaces,
             nodes: Some(nodes),
+            zone: None,
             #[cfg(any(test, feature = "host-test"))]
             vma_visits: core::sync::atomic::AtomicUsize::new(0),
         }
+    }
+    /// Add the production scheduler, using the same address-space authority.
+    pub fn with_zone(mut self, zone: &'a carrick_sched_core::ZoneTables) -> Result<Self, MmError> {
+        if !core::ptr::eq(self.spaces, &zone.spaces) {
+            return Err(MmError::Stale);
+        }
+        self.zone = Some(zone);
+        Ok(self)
+    }
+    pub fn prepared_wait_key(
+        &self,
+        handle: El1MmHandle,
+    ) -> Result<carrick_sched_core::object_wait::ObjectWaitKey, MmError> {
+        if handle.carrier() != self.carrier {
+            return Err(MmError::Stale);
+        }
+        let index = self
+            .spaces
+            .find(handle.mm().raw())
+            .ok_or(MmError::Stale)?
+            .index();
+        carrick_sched_core::object_wait::ObjectWaitKey::address_space(
+            index,
+            handle.incarnation().get(),
+        )
+        .ok_or(MmError::Stale)
+    }
+    fn notify_prepared(
+        &self,
+        key: Option<carrick_sched_core::object_wait::ObjectWaitKey>,
+        slot: u32,
+    ) -> Result<(), MmError> {
+        let Some(key) = key else {
+            return Ok(());
+        };
+        let zone = self.zone.ok_or(MmError::Core)?;
+        let waker =
+            carrick_sched_core::SlotId::from_index(slot as usize).ok_or(MmError::Invalid)?;
+        let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+            crate::substrate::sched::object_wait::deliver_completion(zone, waker, effects)
+        };
+        // SAFETY: the exact node claim transfers the detached PREPARE admission.
+        unsafe { zone.retained_object_notification(key) }.publish(waker, &completion);
+        Ok(())
+    }
+    /// Release semantic custody by exact atomic identity. This does not
+    /// acquire the root or descriptor editor, even while either is held.
+    pub fn cancel_prepared(
+        &self,
+        permit: carrick_el1_abi::PortalPreparedPermit,
+        request: carrick_el1_abi::PortalTransferRequest,
+        slot: u32,
+    ) -> Result<(), MmError> {
+        let claim = self.roots.claim_prepared(self.nodes, permit, request)?;
+        let notification = claim.notification();
+        if !claim.release() {
+            return Err(MmError::Stale);
+        }
+        self.notify_prepared(notification, slot)
     }
     pub(super) fn root(&self, mm: ReservationMm, slot: u32) -> Result<Reservations<'_>, MmError> {
         let index = self.spaces.find(mm.raw()).ok_or(MmError::Stale)?.index();
@@ -581,17 +642,14 @@ impl SelectedChunk {
     }
 }
 
-/// The actual EL1 copy phase: reconstruct the selected operation, revalidate
-/// against the live owner, and keep its Rust editor on this stack throughout
-/// the host effect and exact completion. No root lock crosses `host_copy`.
-pub fn serve_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
+/// PREPARE finishes all fault/supply work and authenticates physical custody
+/// before publishing semantic admission. A refusal occurs before consumption.
+pub fn prepare_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
     portal: &MmPortal<'_, P>,
-    service: carrick_el1_abi::PortalTransferService<'_>,
+    request: carrick_el1_abi::PortalTransferRequest,
     words: &W,
     slot: u32,
-    host_copy: impl FnOnce(),
-) -> Result<(), MmError> {
-    let request = service.request();
+) -> Result<Option<carrick_el1_abi::PortalPreparedPermit>, MmError> {
     // SAFETY: revalidate below authenticates every field before any effect.
     let handle = unsafe {
         El1MmHandle::from_admitted_owner(
@@ -605,7 +663,7 @@ pub fn serve_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
         .address()
         .checked_sub(request.selected.offset)
         .ok_or(MmError::Invalid)?;
-    let mut continuation = TransferContinuation {
+    let continuation = TransferContinuation {
         handle,
         intent: request.intent,
         address: GuestVa::new(address),
@@ -625,28 +683,126 @@ pub fn serve_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
         executable: request.selected.executable,
         len: request.range.len(),
     };
-    let fence = match portal.revalidate(&continuation, selected, words, slot) {
-        Ok(Some(fence)) => fence,
-        Ok(None) => {
-            service.complete(0, 11);
-            return Ok(());
+    let Some(fence) = portal.revalidate(&continuation, selected, words, slot)? else {
+        return Ok(None);
+    };
+    let mut root = portal.root(handle.mm(), slot)?;
+    let notification = if let Some(zone) = portal.zone {
+        let key = root.prepared_wait_key().ok_or(MmError::Stale)?;
+        let waker =
+            carrick_sched_core::SlotId::from_index(slot as usize).ok_or(MmError::Invalid)?;
+        let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+            crate::substrate::sched::object_wait::deliver_completion(zone, waker, effects)
+        };
+        if zone
+            .object_wait_with_completion(key, &carrick_sched_core::BoundedSpin(256), &completion)
+            .is_err()
+        {
+            zone.bind_object_wait_with_completion(
+                key,
+                &carrick_sched_core::BoundedSpin(256),
+                &completion,
+            )
+            .map_err(|_| MmError::Busy)?;
         }
-        Err(error) => {
-            service.complete(0, error.errno());
-            return Err(error);
+        Some(
+            zone.admit_object_notification(key, &carrick_sched_core::BoundedSpin(256), &completion)
+                .map_err(|_| MmError::Busy)?,
+        )
+    } else {
+        None
+    };
+    // On allocation refusal the ticket cancels its admission before returning.
+    let key = notification.as_ref().map(|ticket| ticket.key());
+    let permit = root.prepare_copy(request, key)?;
+    if let Some(ticket) = notification {
+        let _ = ticket.detach();
+    }
+    drop(root);
+    drop(fence);
+    Ok(Some(permit))
+}
+
+/// One-shot transfers and two-phase ready-source copies share the same owner
+/// permit. COMMIT never revalidates or reacquires a root/editor after consuming.
+pub fn serve_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
+    portal: &MmPortal<'_, P>,
+    service: carrick_el1_abi::PortalTransferService<'_>,
+    words: &W,
+    slot: u32,
+    host_copy: impl FnOnce(),
+) -> Result<(), MmError> {
+    use carrick_el1_abi::PortalTransferPhase;
+    let request = service.request();
+    let permit = match service.phase() {
+        PortalTransferPhase::Transfer | PortalTransferPhase::Prepare => {
+            match prepare_transfer(portal, request, words, slot) {
+                Ok(Some(permit)) => permit,
+                Ok(None) => {
+                    service.suspend_prepare(
+                        carrick_el1_abi::PortalPrepareSuspension::SelectionChanged,
+                    );
+                    return Ok(());
+                }
+                Err(MmError::MetadataRequired) => {
+                    service.suspend_prepare(
+                        carrick_el1_abi::PortalPrepareSuspension::ReservationMetadata,
+                    );
+                    return Ok(());
+                }
+                Err(error) => {
+                    service.complete(0, error.errno());
+                    return Err(error);
+                }
+            }
+        }
+        PortalTransferPhase::Commit | PortalTransferPhase::Cancel => {
+            service.permit().ok_or(MmError::Stale)?
         }
     };
-    let copied = service.copy_with(host_copy);
-    if !service.complete(
-        if copied { request.range.len() } else { 0 },
-        if copied { 0 } else { 125 },
-    ) {
+    if service.phase() == PortalTransferPhase::Prepare {
+        if !service.complete_prepared(permit) {
+            portal.cancel_prepared(permit, request, slot)?;
+            return Err(MmError::Stale);
+        }
+        return Ok(());
+    }
+    settle_prepared_service(portal, service, permit, slot, host_copy)
+}
+
+/// Exact prepared settlement has no descriptor-table or live-MM gate input.
+pub(super) fn settle_prepared_service<P: PinnedMetadataExtent>(
+    portal: &MmPortal<'_, P>,
+    service: carrick_el1_abi::PortalTransferService<'_>,
+    permit: carrick_el1_abi::PortalPreparedPermit,
+    slot: u32,
+    host_copy: impl FnOnce(),
+) -> Result<(), MmError> {
+    let request = service.request();
+    if request.operation.carrier != portal.carrier
+        || carrick_sched_core::SlotId::from_index(slot as usize).is_none()
+    {
+        service.complete(0, MmError::Stale.errno());
         return Err(MmError::Stale);
     }
-    if copied {
-        fence.complete(&mut continuation)?;
-    } else {
-        drop(fence);
+    let claim = match portal.roots.claim_prepared(portal.nodes, permit, request) {
+        Ok(claim) => claim,
+        Err(error) => {
+            service.complete(0, MmError::from(error).errno());
+            return Err(error.into());
+        }
+    };
+    let cancel = service.phase() == carrick_el1_abi::PortalTransferPhase::Cancel;
+    let copied = !cancel && (service.copy_len() == 0 || service.copy_with(host_copy));
+    let completed = if copied { service.copy_len() } else { 0 };
+    let errno = if copied || cancel { 0 } else { 125 };
+    let notification = claim.notification();
+    if !claim.release() {
+        return Err(MmError::Stale);
+    }
+    portal.notify_prepared(notification, slot)?;
+    if !service.complete(completed, errno) {
+        return Err(MmError::Stale);
     }
     Ok(())
 }
@@ -681,6 +837,30 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         return;
     }
     let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
+    let portal = MmPortal::<GuestMetadataPin> {
+        carrier: request.operation.carrier,
+        roots: crate::memory::reservations::shared_guest(),
+        spaces: &zone.spaces,
+        nodes: None,
+        zone: Some(zone),
+    };
+    if matches!(
+        service.phase(),
+        carrick_el1_abi::PortalTransferPhase::Commit | carrick_el1_abi::PortalTransferPhase::Cancel
+    ) {
+        let Some(permit) = service.permit() else {
+            service.complete(0, 3);
+            return;
+        };
+        let _ = settle_prepared_service(
+            &portal,
+            service,
+            permit,
+            frame.slot as u32,
+            yield_host_effect,
+        );
+        return;
+    }
     let Some(grant) = zone
         .spaces
         .find(request.operation.mm.raw())
@@ -697,12 +877,6 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         service.complete(0, 3);
         return;
     }
-    let portal = MmPortal::<GuestMetadataPin> {
-        carrier: request.operation.carrier,
-        roots: crate::memory::reservations::shared_guest(),
-        spaces: &zone.spaces,
-        nodes: None,
-    };
     let maintenance = CallerInvalidatesAsid;
     let words = unsafe {
         PrimaryTableWords::new(
@@ -719,14 +893,14 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     };
     let _ = serve_transfer(&portal, service, &words, frame.slot as u32, || {
         // The host resumes this exact stack after copy OR cancellation. The
-        // editor cannot be abandoned by resetting the service-call registers.
+        // permit cannot be abandoned by resetting service-call registers.
         yield_host_effect();
     });
 }
 
 /// Suspend the current portal service stack for an authenticated host effect.
 /// The host must resume this exact stack after servicing or cancelling the
-/// effect; the portal keeps its operation and editor custody across the yield.
+/// effect; the portal keeps its operation and semantic permit across the yield.
 #[cfg(target_os = "none")]
 pub(super) fn yield_host_effect() {
     unsafe {
@@ -766,6 +940,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             roots: crate::memory::reservations::shared_guest(),
             spaces: &zone.spaces,
             nodes: None,
+            zone: Some(zone),
         };
         let handle = portal.admitted_handle(mm, frame.slot as u32)?;
         if frame.x[3] != handle.incarnation().get() {
@@ -1033,6 +1208,7 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         roots: crate::memory::reservations::shared_guest(),
         spaces: &zone.spaces,
         nodes: None,
+        zone: Some(zone),
     };
     if zone
         .spaces
@@ -1081,6 +1257,7 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             roots: crate::memory::reservations::shared_guest(),
             spaces: &zone.spaces,
             nodes: None,
+            zone: Some(zone),
         };
         frame.x[3] = portal
             .admitted_handle(mm, frame.slot as u32)?
