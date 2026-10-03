@@ -147,3 +147,27 @@ identity operation is introduced by kernel admission locking; authoritative
 compiler capture and line-position reconciliation require the clean final tree
 and remain parent gates. This is VM-free composition, not signed guest syscall
 or whole-N1 acceptance. Fork, bulk Capacity, GuestMemory venue3 remain OPEN.
+
+## Review fix2 receipt
+
+The scoped rereview accepted findings 1/3/4 but retained finding 2: page-granule
+dirty state was claimed while only caller bytes were invalidated. Existing
+CodeContent publication now expands to complete dirty pages, clamps to backing
+bounds, and splits into at most 16 KiB per claim/invalidation lock hold. The
+carrier forwards the authority's exact ranges to existing I2. Raw bit claiming
+is private. No new cache mechanism, owner, inventory classification or policy.
+
+Behavioral reds from `cargo test -p carrick-vmm-hvf --lib executable_publication_ -- --test-threads=1`:
+
+- disjoint same-page cache lines at 0/0x200: invalidated `[(0,4)]`, expected `[(0,4096)]`;
+- unaligned 16 KiB: invalidated `[(1,16384)]`, expected `[(0,16384),(16384,4096)]`.
+
+The new boundary test also proves final partial backing-page clamping and
+out-of-bounds refusal. Exact function/witness anchors are in the plan's fix2
+receipt. Final scoped results follow; parent retains full gates and independent
+review. No guests or Docker run.
+
+- `cargo test -p carrick-vmm-hvf --lib executable_ -- --test-threads=1`: 8 passed, one preexisting signed-only negative control ignored.
+- `cargo test -p carrick-vmm-hvf --lib user_transfer -- --test-threads=1`: 8 passed.
+- `cargo clippy -p carrick-vmm-hvf --all-targets -- -D warnings`: exit 0.
+- `cargo fmt --all --check` and `git diff --check`: pass.
