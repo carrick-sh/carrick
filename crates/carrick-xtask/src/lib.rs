@@ -7,3 +7,4 @@ pub mod ledger_merge;
 pub mod probe_coverage;
 pub mod probe_inventory;
 pub mod provision;
+pub mod remote_accept;

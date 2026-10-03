@@ -82,6 +82,7 @@ with **`HV_DENIED` (`0xfae94007`)**.
 | `just kvm-smoke` / `just kvm-smoke-lima` | KVM smoke (`/dev/kvm`, lima from macOS). |
 | `just install-hooks` | Install git hooks (once per clone). |
 | `just accept [ARGS]` | Run host and/or signed landing gate (no Docker). |
+| `just remote-accept [ARGS]` | Run `just accept` (no Docker) on the remote gate Mac and fetch the receipt. |
 | `just lease MODE +CMD` | Run command under host flock lease (carrick shared, docker exclusive). |
 
 **Toolchain:** pin, edition, members, `deny`ed lints: [`rust-toolchain.toml`](rust-toolchain.toml) and

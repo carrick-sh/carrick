@@ -26,6 +26,7 @@ pub struct AcceptArgs {
         long,
         value_enum,
         default_value = "no-docker",
+        overrides_with = "profile",
         help = "Acceptance profile: no-docker (default for workers) or full (director)"
     )]
     pub profile: AcceptProfile,
