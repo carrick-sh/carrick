@@ -1,15 +1,15 @@
 schema_version = 1
 id = "kernel.el1.signal-delivery-owner"
 title = "Signal payload queues and delivery have one shared owner"
-guest_surfaces = ["signal:asynchronous-delivery", "syscall:rt_sigreturn", "syscall:rt_sigaction", "syscall:tgkill"]
-semantic_authority = ["man 7 signal", "man 2 sigaction", "man 2 sigreturn"]
+guest_surfaces = ["signal:asynchronous-delivery", "syscall:rt_sigreturn", "syscall:rt_sigaction", "syscall:tgkill", "syscall:tkill", "syscall:kill", "syscall:rt_sigqueueinfo", "syscall:rt_tgsigqueueinfo"]
+semantic_authority = ["man 7 signal", "man 2 sigaction", "man 2 sigreturn", "man 2 tgkill", "man 2 kill", "man 2 rt_sigqueueinfo"]
 fixture = "VM-free scoped two-owner seam; see M2-M5 witness ledger"
 scale_points = [1, 8, 32, 128]
 rationale = "Two live tasks with separate containers retain independent realtime queues. Clearing shared pending summary leaves host payload authority; this preparation witness does not treat summary clear as a valid delivery transaction. FIFO and lifecycle reducers remain positive semantic requirements. Exact routing population work and EL1 frame ownership remain unresolved; signed EL0 frame semantics are bound separately."
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-kernel::dispatch::signal::tests::{m5_two_process_exact_thread_routing_isolated_at_four_populations,red_until_step3_m5_peer_tgkill_selects_dispatcher_self_task}; carrick-kernel::kernel::objects::signal::tests::{red_until_step3_m5_shared_pending_clear_does_not_consume_host_queue,pending_queue_coalesces_standard_and_preserves_realtime_fifo_payloads,thread_signal_lifecycle_transforms_preserve_linux_owners,sighand_retains_full_actions_and_exec_preserves_only_ignore,signal_authority_preserves_thread_first_same_signum_provenance}"
+vm_free = "carrick-kernel::dispatch::signal::tests::{m5_two_process_exact_thread_routing_isolated_at_four_populations,m5_peer_tgkill_targets_root_group,m5_peer_tkill_targets_root_group,m5_peer_rt_tgsigqueueinfo_targets_root_group,serial_host::m5_peer_kill_targets_root_group,serial_host::m5_peer_rt_sigqueueinfo_targets_root_group,serial_host::m5_peer_rt_sigqueueinfo_rejects_forged_code_targets_root_group,serial_host::m5_peer_rt_tgsigqueueinfo_rejects_forged_code_targets_root_group}; carrick-kernel::kernel::objects::signal::tests::{red_until_step3_m5_shared_pending_clear_does_not_consume_host_queue,pending_queue_coalesces_standard_and_preserves_realtime_fifo_payloads,thread_signal_lifecycle_transforms_preserve_linux_owners,sighand_retains_full_actions_and_exec_preserves_only_ignore,signal_authority_preserves_thread_first_same_signum_provenance}"
 
 embed = "carrick-conformance-next::probes_shard_0::m5_el0_nested_altstack_and_fault_frame_bindings; carrick-embed::el1_sched::el1_sched_pstate_seen_by_the_guest_is_unchanged"
 
