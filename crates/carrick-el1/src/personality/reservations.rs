@@ -947,7 +947,7 @@ impl Reservations<'_> {
             return Err(Refusal::Busy);
         }
         let mapping = self.mapping(page).ok_or(Refusal::Hole)?;
-        if !mapping.anonymous && !(allow_backing && mapping.host_backing.is_some()) {
+        if !(mapping.anonymous || allow_backing && mapping.host_backing.is_some()) {
             return Err(Refusal::ForeignMapping);
         }
         if !mapping.protection.permits(access) {
