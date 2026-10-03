@@ -1466,7 +1466,21 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                             )?;
                             eprintln!("{}", summary.render_human());
                         } else {
-                            bail!("unsupported trace profile {:?}", requested_profile);
+                            if requested_profile
+                                != crate::trace_profile::TraceProfileKind::HvpatchMmReuseIsolation
+                            {
+                                bail!("unsupported trace profile {:?}", requested_profile);
+                            }
+                            if summary_jsonl.is_some() {
+                                bail!("MM reuse isolation retains raw diagnostic evidence only");
+                            }
+                            if custom_trace_report_is_rejected(report, true) {
+                                bail!("MM reuse isolation capture was lossy or incomplete");
+                            }
+                            eprintln!(
+                                "MM reuse isolation raw script sha256={}",
+                                requested_profile.script_sha256()
+                            );
                         }
                     }
                     #[cfg(target_os = "freebsd")]

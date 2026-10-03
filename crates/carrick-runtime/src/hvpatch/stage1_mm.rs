@@ -652,6 +652,12 @@ impl Stage1MmPool {
             }
         };
         let lease = Arc::new(Stage1MmLease::new(asid, stage1_root, Some(root_slot)));
+        carrick_observability::probes::hvpatch_mm_slot(
+            0,
+            u32::from(asid.asid().raw()),
+            asid.generation(),
+            root_slot.base(),
+        );
         drop(inner);
         Ok(PreparedStage1Mm {
             pool: self.clone(),
@@ -1127,6 +1133,13 @@ impl Stage1MmRetirement {
         }
         let mut inner = self.pool.inner.lock();
         inner.asids.acknowledge_tlb_flush(self.asid)?;
+        let generation = self.residency.generation();
+        carrick_observability::probes::hvpatch_mm_slot(
+            1,
+            u32::from(generation.asid().raw()),
+            generation.generation(),
+            self.root_slot.map_or(0, |slot| slot.base()),
+        );
         if let Some(root_slot) = self.root_slot {
             inner.free_root_slots.insert(root_slot);
         }

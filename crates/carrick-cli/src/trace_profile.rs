@@ -237,6 +237,7 @@ impl V2ProfileAuthority {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum TraceProfileKind {
+    HvpatchMmReuseIsolation,
     HvpatchCarrierCpuLowRate,
     HvpatchCarrierCpuAttribution,
     HvpatchExitAttribution,
@@ -251,8 +252,19 @@ pub(crate) enum TraceProfileKind {
 }
 
 impl TraceProfileKind {
+    pub(crate) fn script_sha256(self) -> String {
+        #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+        {
+            format!("{:x}", Sha256::digest(self.bundled_script().as_bytes()))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        {
+            String::new()
+        }
+    }
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
+            Self::HvpatchMmReuseIsolation => "hvpatch-mm-reuse-isolation",
             Self::HvpatchCarrierCpuLowRate => "hvpatch-carrier-cpu-low-rate",
             Self::HvpatchCarrierCpuAttribution => "hvpatch-carrier-cpu-attribution",
             Self::HvpatchExitAttribution => "hvpatch-exit-attribution",
@@ -282,6 +294,7 @@ impl TraceProfileKind {
                 Some(crate::hvpatch_exit_attribution_profile::BOUND_PLACEHOLDER)
             }
             Self::HvpatchCarrierCpuLowRate
+            | Self::HvpatchMmReuseIsolation
             | Self::HvpatchInotify09Population
             | Self::HostNamespaceWork
             | Self::HvpatchFrameCow
@@ -295,6 +308,9 @@ impl TraceProfileKind {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     pub(crate) fn bundled_script(self) -> &'static str {
         match self {
+            Self::HvpatchMmReuseIsolation => {
+                include_str!("../../../scripts/dtrace/hvpatch-mm-reuse-isolation.d")
+            }
             Self::HvpatchCarrierCpuLowRate => {
                 carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_CARRIER_CPU_LOW_RATE_D
             }
@@ -330,6 +346,7 @@ impl TraceProfileKind {
     #[allow(dead_code)]
     fn parse_protocol(value: &str) -> Result<Self> {
         match value {
+            "hvpatch-mm-reuse-isolation" => Ok(Self::HvpatchMmReuseIsolation),
             "hvpatch-carrier-cpu-low-rate" => Ok(Self::HvpatchCarrierCpuLowRate),
             "hvpatch-carrier-cpu-attribution" => Ok(Self::HvpatchCarrierCpuAttribution),
             "hvpatch-exit-attribution" => Ok(Self::HvpatchExitAttribution),
@@ -543,6 +560,10 @@ mod tests {
     #[test]
     fn trace_profile_kind_strings_and_runtime_profile() {
         for (kind, expected) in [
+            (
+                TraceProfileKind::HvpatchMmReuseIsolation,
+                "hvpatch-mm-reuse-isolation",
+            ),
             (
                 TraceProfileKind::HvpatchCarrierCpuLowRate,
                 "hvpatch-carrier-cpu-low-rate",
