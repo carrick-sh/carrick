@@ -40,6 +40,7 @@ pub struct GuestCowRun {
     pub len: u64,
     /// Output of the run's first page in the old compound.
     pub old_ipa: SubstrateGpa,
+    pub executable: bool,
 }
 
 impl GuestCowRun {
@@ -78,9 +79,9 @@ pub enum GuestCowNotArmed {
     /// protection fault).
     NoWriteIntent,
     /// An EL0-executable page. Its copy lands on a fresh frame whose
-    /// instruction cache must be made coherent before the leaf executes,
-    /// which is the host's single executable-publication authority
-    /// (`HostArenaResolver::publish_user_executable`), not EL1's.
+    /// instruction cache must be made coherent before the leaf executes.
+    /// A caller without the bounded physical publication capability cannot
+    /// use the host's I2 authority (`HostArenaResolver::publish_user_executable`).
     Executable,
 }
 
@@ -119,11 +120,14 @@ pub fn is_guest_cow_write_leaf(level: usize, descriptor: u64) -> bool {
 }
 
 /// Classify an EL0 write permission fault at `far` against the live graph at
-/// `root`. The caller holds the MM's exact editor.
+/// `root`. The caller holds the MM's exact editor. `executable_publication`
+/// means the caller can publish the exact replacement through existing I2
+/// after copying and before its executable descriptor becomes visible.
 pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
     words: &W,
     root: SubstrateGpa,
     far: u64,
+    executable_publication: bool,
 ) -> Result<GuestCowRun, GuestCowClass> {
     let page = far & !(PT_PAGE - 1);
     let leaf = l3_leaf(words, root, page)
@@ -147,7 +151,7 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
     if !is_guest_cow_write_leaf(3, leaf) {
         return Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed));
     }
-    if leaf & UXN == 0 {
+    if leaf & UXN == 0 && !executable_publication {
         return Err(GuestCowClass::NotArmed(GuestCowNotArmed::Executable));
     }
     let output = leaf & PA_MASK_4KIB;
@@ -170,7 +174,7 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
             .map_err(GuestCowClass::Unreachable)?
             .is_some_and(|neighbour| {
                 armed_page(neighbour)
-                    && neighbour & UXN != 0
+                    && (neighbour & UXN == leaf & UXN)
                     && neighbour & PA_MASK_4KIB == compound + index * PT_PAGE
             }))
     };
@@ -185,6 +189,7 @@ pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
     Ok(GuestCowRun {
         va: page - (lane - first) * PT_PAGE,
         len: (last - first + 1) * PT_PAGE,
+        executable: leaf & UXN == 0,
         old_ipa: SubstrateGpa(compound + first * PT_PAGE),
     })
 }
@@ -258,13 +263,14 @@ mod tests {
         let words = Words::new();
         words.leaf_at(VA, armed(OLD, true) & !NX);
         assert_eq!(
-            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA),
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA, false),
             Err(GuestCowClass::NotArmed(GuestCowNotArmed::Executable))
         );
         words.leaf_at(VA + PT_PAGE, armed(OLD + PT_PAGE, true));
         assert_eq!(
-            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + PT_PAGE),
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + PT_PAGE, false),
             Ok(GuestCowRun {
+                executable: false,
                 va: VA + PT_PAGE,
                 len: PT_PAGE,
                 old_ipa: SubstrateGpa(OLD + PT_PAGE),
@@ -278,10 +284,11 @@ mod tests {
         for lane in 0..4 {
             words.leaf_at(VA + lane * PT_PAGE, armed(OLD + lane * PT_PAGE, lane != 3));
         }
-        let run = classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 0x2abc).unwrap();
+        let run = classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 0x2abc, false).unwrap();
         assert_eq!(
             run,
             GuestCowRun {
+                executable: false,
                 va: VA,
                 len: 4 * PT_PAGE,
                 old_ipa: SubstrateGpa(OLD),
@@ -303,10 +310,12 @@ mod tests {
             VA + 3 * PT_PAGE,
             (OLD + 2 * PT_PAGE) | 2 | PRIVATE | MAY_WRITE,
         );
-        let run = classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + PT_PAGE).unwrap();
+        let run =
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + PT_PAGE, false).unwrap();
         assert_eq!(
             run,
             GuestCowRun {
+                executable: false,
                 va: VA + PT_PAGE,
                 len: 2 * PT_PAGE,
                 old_ipa: SubstrateGpa(OLD),
@@ -321,10 +330,12 @@ mod tests {
         words.leaf_at(VA + 2 * PT_PAGE, armed(OLD + 2 * PT_PAGE, true));
         // Lane 0 maps the right compound at the wrong page: not moved.
         words.leaf_at(VA, armed(OLD + 3 * PT_PAGE, true));
-        let run = classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 2 * PT_PAGE).unwrap();
+        let run =
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 2 * PT_PAGE, false).unwrap();
         assert_eq!(
             run,
             GuestCowRun {
+                executable: false,
                 va: VA + PT_PAGE,
                 len: 2 * PT_PAGE,
                 old_ipa: SubstrateGpa(OLD + PT_PAGE),
@@ -340,19 +351,23 @@ mod tests {
         for lane in 0..4 {
             words.leaf_at(VA + (lane + 2) * PT_PAGE, armed(OLD + lane * PT_PAGE, true));
         }
-        let run = classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 2 * PT_PAGE).unwrap();
+        let run =
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 2 * PT_PAGE, false).unwrap();
         assert_eq!(
             run,
             GuestCowRun {
+                executable: false,
                 va: VA + 2 * PT_PAGE,
                 len: 2 * PT_PAGE,
                 old_ipa: SubstrateGpa(OLD),
             }
         );
-        let run = classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 4 * PT_PAGE).unwrap();
+        let run =
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 4 * PT_PAGE, false).unwrap();
         assert_eq!(
             run,
             GuestCowRun {
+                executable: false,
                 va: VA + 4 * PT_PAGE,
                 len: 2 * PT_PAGE,
                 old_ipa: SubstrateGpa(OLD + 2 * PT_PAGE),
@@ -366,30 +381,30 @@ mod tests {
         // Untagged backend leaf, read-only: host metadata owns it.
         words.leaf_at(VA, OLD | 3 | AF | AP_RO_EL0 | NG);
         assert_eq!(
-            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA),
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA, false),
             Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotEl1Private))
         );
         // Armed page without Linux write intent: a real protection fault.
         words.leaf_at(VA, armed(OLD, false));
         assert_eq!(
-            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA),
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA, false),
             Err(GuestCowClass::NotArmed(GuestCowNotArmed::NoWriteIntent))
         );
         // mprotect(PROT_READ) of a private page (not COW-armed).
         words.leaf_at(VA, OLD | 3 | AF | AP_RO_EL0 | NG | PRIVATE | MAY_WRITE);
         assert_eq!(
-            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA),
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA, false),
             Err(GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed))
         );
         // Nothing mapped.
         assert_eq!(
-            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 0x10_0000),
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 0x10_0000, false),
             Err(GuestCowClass::NotArmed(GuestCowNotArmed::Unmapped))
         );
         // A block terminal above L3 needs a split: not EL1's.
         words.set(0x3000 + ((VA >> 21) & 511) * 8, OLD | 1 | AF);
         assert_eq!(
-            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA),
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA, false),
             Err(GuestCowClass::NotArmed(GuestCowNotArmed::Unmapped))
         );
     }
@@ -399,7 +414,7 @@ mod tests {
         let words = Words::new();
         words.leaf_at(VA, (armed(OLD, true) & !COW & !AP_MASK) | AP_RW);
         assert_eq!(
-            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 8),
+            classify_guest_cow_write(&words, SubstrateGpa(ROOT), VA + 8, false),
             Err(GuestCowClass::AlreadyWritable)
         );
     }
