@@ -602,7 +602,7 @@ impl MemState {
     pub(super) fn owner_observed_rows(&self) -> Vec<SemanticVma> {
         let root = self
             .delegated_root()
-            .expect("owner observation requires admission");
+            .unwrap_or_else(|| broken_root("owner observation admission", Refusal::Stale));
         let mut rows = Vec::new();
         root.with_root(|model| model.observe_mappings(&mut |mapping| rows.push(mapping)))
             .unwrap_or_else(|refusal| broken_root("fork VMA observation", refusal));
@@ -729,10 +729,12 @@ impl MemState {
         start: u64,
         end: u64,
     ) -> Vec<SemanticVma> {
-        if self.owner_rows_exclusive && self.delegated_root().is_some() {
+        if self.owner_rows_exclusive
+            && let Some(root) = self.delegated_root()
+        {
             let page_start = start & !(LINUX_PAGE_SIZE - 1);
             let page_end = align_up_u64(end, LINUX_PAGE_SIZE).unwrap_or(!(LINUX_PAGE_SIZE - 1));
-            return Self::root_mappings(self.delegated_root().unwrap(), page_start, page_end)
+            return Self::root_mappings(root, page_start, page_end)
                 .iter()
                 .map(|mapping| self.owner_observed_row(mapping))
                 .collect();
@@ -949,7 +951,7 @@ impl MemState {
                     mapping.range.start().max(start),
                     mapping.range.end().min(end),
                 )
-                .unwrap();
+                .unwrap_or_else(|refusal| broken_root("attribute range clipping", refusal));
                 mapping
             })
             .collect();
