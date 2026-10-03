@@ -5044,7 +5044,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     };
 
     let plan = parent_runtime
-        .build_process_plan(
+        .build_setup_process_plan(
             request,
             &mut child_page_tables,
             &[],
@@ -5700,7 +5700,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         .expect("parent structural vvar owner");
     let mut overlay_child_page_tables = make_child_page_tables(overlay_ipa);
     let overlay_plan = parent
-        .build_process_plan(
+        .build_setup_process_plan(
             make_request(),
             &mut overlay_child_page_tables,
             &cow_ranges,
@@ -5725,7 +5725,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
     drop(overlay_plan);
 
     let mut arbitrary_child_page_tables = make_child_page_tables(overlay_ipa + vvar_len);
-    let error = match parent.build_process_plan(
+    let error = match parent.build_setup_process_plan(
         make_request(),
         &mut arbitrary_child_page_tables,
         &cow_ranges,
@@ -5753,7 +5753,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
     );
 
     let mut unauthenticated_child_page_tables = make_child_page_tables(vvar_ipa);
-    let error = match parent.build_process_plan(
+    let error = match parent.build_setup_process_plan(
         make_request(),
         &mut unauthenticated_child_page_tables,
         &cow_ranges,
@@ -5786,7 +5786,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
 
     let mut child_page_tables = make_child_page_tables(vvar_ipa);
     let mut plan = parent
-        .build_process_plan(
+        .build_setup_process_plan(
             make_request(),
             &mut child_page_tables,
             &cow_ranges,
@@ -6060,7 +6060,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         .rebase(grandchild_root_slot, None)
         .expect("rebase refreshed child page tables for grandchild");
     let grandchild_plan = child_task
-        .build_process_plan(
+        .build_setup_process_plan(
             carrick_hal::ProcessForkRequest {
                 entry: carrick_hal::GuestEntryRegs::default(),
                 child_ttbr0: grandchild_root_slot,
@@ -7686,7 +7686,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     }];
 
     let mut plan = parent_task
-        .build_process_plan(
+        .build_setup_process_plan(
             request,
             &mut child_pt,
             &cow_ranges,
@@ -12993,6 +12993,7 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
         );
         let start = TEST_VA + 0x10_0000;
         let window = carrick_el1_abi::PortalGrantWindow {
+            fork_sequence: None,
             operation: carrick_el1_abi::PortalOperation {
                 carrier: custody.transfer_carrier,
                 mm,
@@ -13277,6 +13278,7 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         (u64::from(installed.snapshot.asid.get()) << 48) | root.0,
     );
     let window = carrick_el1_abi::PortalGrantWindow {
+        fork_sequence: None,
         operation: carrick_el1_abi::PortalOperation {
             carrier: custody.transfer_carrier,
             mm,
@@ -13395,6 +13397,7 @@ fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
     );
     let start = TEST_VA + 0x10_0000;
     let window = carrick_el1_abi::PortalGrantWindow {
+        fork_sequence: None,
         operation: carrick_el1_abi::PortalOperation {
             carrier: custody.transfer_carrier,
             mm,
