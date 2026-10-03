@@ -471,7 +471,7 @@ pub fn persistent_vcpu_identity(vcpu: &HvfAarch64Vcpu) -> u64 {
 pub fn persistent_hardware_kick(
     engine: &HvfAarch64Engine,
 ) -> (crate::vcpu_kick::VcpuKickHandle, u64, u32) {
-    persistent_vcpu_hardware_kick(engine.vcpu())
+    persistent_vcpu_hardware_kick(&engine.vcpu())
 }
 
 pub fn persistent_vcpu_hardware_kick(
