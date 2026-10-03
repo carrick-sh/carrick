@@ -371,14 +371,15 @@ V2 models. Maintain personality/substrate separation and compiler inventories.
 | Step-3/step-4 design plans | **Keep as coverage ledgers, reorder implementation briefs** per table. Do not “stop” full AF_UNIX/cache work permanently. One fd/name/page authority must serve both the slice and later callers. |
 | Older paused branches | Preserve separately; no blanket merge, stash, reset or cleanup. Use only reviewed red witnesses/core work after rebasing onto accepted source. |
 
-### Acceptance and the missing `just accept`
+### Acceptance: `just accept` and `just el1-gate`
 
 Each N1–N4 behavioral milestone requires **`just accept` and `just el1-gate`**,
-including after hatch deletion and clean integration. At this snapshot
-`justfile` has `el1-gate` (693–727) but **no `accept` recipe**. Do not report
-that nonexistent command green or substitute a focused test. N0 must define
-the canonical acceptance recipe/controller contract before implementation
-promotion; until then `just accept` is an explicit tooling blocker. Proposed
+including after hatch deletion and clean integration. Both exist on main
+since `38b7578e6`/`062f98959`/`b0d8743ee` (2026-10-02): `just accept` runs the
+host phase and the Docker-free signed phase against the committed known-red
+list `scripts/conformance/el1-known-red.txt`; `just el1-gate` is the same tool
+with the full profile (retained probes, LTP subset, inotify09 comparison),
+holding the exclusive Docker lease for steps that may start Docker. The
 recipe composes existing checks, fails closed on incomplete observations,
 and does not relax budgets or relabel report-only impact output as a pass.
 
