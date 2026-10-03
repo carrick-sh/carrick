@@ -12342,9 +12342,11 @@ mod guest_cow {
         .unwrap();
         resolve_guest_cow(
             &GuestCowVenue {
+                publish_executable: None,
                 words: &words,
                 root: SubstrateGpa(root),
                 pool,
+                residency: &std::boxed::Box::new(carrick_el1_abi::FrameGrantResidencyTable::new()),
                 copy_base: EL1_COW_COPY_BASE,
             },
             child.snapshot.mm.get(),
@@ -12876,5 +12878,471 @@ fn sole_owner_cow_reuse_adopts_guest_published_live_leaves() {
     assert_eq!(
         tables.with_manager(|m| m.debug_walk(TEST_VA)[3] & (3 << 6)),
         Some(3 << 6)
+    );
+}
+
+#[test]
+// VM-free model of kernel unmap receipt ordering. The fake inventory authority
+// supplies exact receipts; real publication, retirement, pin and rollback helpers
+// must leave successor inventory, stage-2 custody and bytes intact.
+fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        DescriptorOp, DescriptorOutcome, DescriptorReceipt, DescriptorRefusal,
+    };
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    for retired in [0, 1, 2] {
+        let _stub = ScopedStage2MapTestStub::enable();
+        let transport = CarrierForeignMmTransport::new();
+        let installed = install_mm(
+            &transport,
+            297,
+            0x9a00_6100_0000,
+            0x9b00_6100_0000,
+            *b"keep",
+        );
+        let (authority, _lease, _invalidator) = prepare_foreign_cow(&installed);
+        installed
+            .state
+            .page_tables_authority()
+            .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+        let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let mm = carrick_el1_abi::ReservationMm::new(installed.snapshot.mm.get()).unwrap();
+        // Model receipt of the borrowed target's admitted owner.
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                custody.transfer_carrier,
+                mm,
+                nonzero(1),
+            )
+        };
+        let target = carrick_aarch64::user_transfer::TransferTarget::from_handle(
+            handle,
+            (u64::from(installed.snapshot.asid.get()) << 48) | installed.snapshot.stage1_root.0,
+        );
+        let start = TEST_VA + 0x10_0000;
+        let window = carrick_el1_abi::PortalGrantWindow {
+            operation: carrick_el1_abi::PortalOperation {
+                carrier: custody.transfer_carrier,
+                mm,
+                incarnation: nonzero(1),
+                sequence: nonzero(1),
+            },
+            generation: carrick_el1_abi::ReservationGeneration::new(1).unwrap(),
+            range: carrick_el1_abi::ReservationRange::new(start, start + 4096).unwrap(),
+            protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
+            fault_page: start,
+        };
+        let context = sparse_materialization::PublicationContext::for_transfer(
+            installed.state.clone(),
+            custody.clone(),
+            target,
+            window,
+        )
+        .unwrap();
+        let mut pending = context.prepare_transfer(window).unwrap().unwrap();
+        let txn = *pending.transaction();
+        let DescriptorOp::Prepare {
+            publication,
+            backing,
+            ..
+        } = txn.op
+        else {
+            panic!()
+        };
+        let alias = alias_registry().lock().overlapping_process_aliases(
+            start,
+            4096,
+            Some(installed.owners.0[0]),
+            ContainerRootToken::ROOT,
+        )[0]
+        .1;
+        let key = (alias.physical_ipa, alias.physical_size as u64);
+        let owner = custody
+            .global_frame_host_owners
+            .lock()
+            .get(&key)
+            .unwrap()
+            .owner()
+            .clone();
+        assert_eq!(
+            custody
+                .stage2_record_snapshot(owner.record_identity.record_id)
+                .unwrap()
+                .pin_count,
+            1
+        );
+        assert_eq!(publication.ipa, alias.ipa);
+        let mut successor = alias_registry().lock().overlapping_process_aliases(
+            TEST_VA,
+            4096,
+            Some(installed.owners.0[0]),
+            ContainerRootToken::ROOT,
+        )[0]
+        .1;
+        successor.start = start;
+        successor.size = 4096;
+        if retired != 0 {
+            let published = authority.published.lock().take().unwrap();
+            assert_eq!(published.0.raw(), backing.mapping_id.get());
+            assert_eq!(published.1.raw(), backing.frame_id.get());
+            authority
+                .live
+                .write()
+                .mapping_ids
+                .retain(|mapping| mapping.raw() != backing.mapping_id.get());
+            alias_registry()
+                .lock()
+                .remove_exact_values_in_batch(&[alias]);
+            if retired == 2 {
+                let mut inventory = installed.state.frame_inventory.ledger.lock();
+                let extent = *inventory.extents.get(&key).unwrap();
+                HvfVmState::rollback_unpublished_mappings(&mut inventory, &[(key, extent)])
+                    .unwrap();
+                let _ = custody.request_stage2_record_retirement(owner.record_identity);
+            }
+            register_shared_alias(successor);
+        }
+        let receipt = DescriptorReceipt {
+            id: txn.id,
+            digest: txn.digest(),
+            outcome: DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot),
+        };
+        assert!(!pending.settle(&receipt).unwrap());
+        drop(pending);
+        assert!(
+            !installed
+                .state
+                .frame_inventory
+                .ledger
+                .lock()
+                .extents
+                .contains_key(&key)
+        );
+        if retired != 0 {
+            let aliases = alias_registry().lock().overlapping_process_aliases(
+                start,
+                4096,
+                Some(installed.owners.0[0]),
+                ContainerRootToken::ROOT,
+            );
+            assert!(aliases.iter().any(|(_, alias)| *alias == successor));
+            let successor_key = (successor.physical_ipa, successor.physical_size as u64);
+            let next = custody
+                .global_frame_host_owners
+                .lock()
+                .get(&successor_key)
+                .unwrap()
+                .owner()
+                .clone();
+            let record = custody
+                .stage2_record_snapshot(next.record_identity.record_id)
+                .unwrap();
+            assert!(record.mapped && !record.retirement_requested);
+            assert_eq!(record.logical_owner, next.record_identity.logical_owner);
+            assert_eq!(next.generation(), successor.owner_generation);
+            let extent = *installed
+                .state
+                .frame_inventory
+                .ledger
+                .lock()
+                .extents
+                .get(&successor_key)
+                .unwrap();
+            assert!(authority.live.read().mapping_ids.contains(&extent.mapping));
+            assert_eq!(extent.stage2_owner.generation, successor.owner_generation);
+            assert_eq!(
+                unsafe { std::slice::from_raw_parts(next.mapping.host_base(), 4) },
+                b"keep"
+            );
+
+            alias_registry()
+                .lock()
+                .remove_exact_values_in_batch(&[successor]);
+        }
+        assert_eq!(
+            custody
+                .stage2_record_snapshot(owner.record_identity.record_id)
+                .unwrap()
+                .pin_count,
+            0
+        );
+        let _ = retire_global_frame_host_owner_if_generation_in(
+            &custody,
+            key.0,
+            key.1,
+            alias.owner_generation,
+        );
+    }
+}
+
+/// Exact-target physical half of the EL1 partial-retirement witness. This
+/// models the completed kernel partial-unmap association receipt, then uses
+/// the real pending grant allocator, journal, custody and bounded copy API.
+#[test]
+fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
+    use carrick_el1_abi::PortalTransferIntent;
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, PrimaryTableWords,
+        execute_descriptor_txn,
+    };
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut installed = install_mm_with_data_len(
+        &transport,
+        298,
+        0x9a00_6200_0000,
+        0x9b00_6200_0000,
+        OWNER_LEN,
+        &vec![0x5a; OWNER_LEN],
+    );
+    let (_authority, _lease, _invalidator) = prepare_foreign_cow(&installed);
+    let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+    let tables = installed.state.page_tables_authority();
+    tables.select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let root = installed.owners.0[0];
+    let (host, _) = global_frame_host_owner_identity(root.0, root.1).unwrap();
+    let maintenance = RetainedReuseMaintenance(std::cell::Cell::new(0));
+    let words =
+        unsafe { PrimaryTableWords::new(host as *mut _, root.0, root.1 as usize, &maintenance) }
+            .unwrap();
+    let admission = tables
+        .prepare_guest_descriptor_txn(
+            installed.snapshot.mm,
+            DescriptorOp::Terminal {
+                span: PageSpan::new(TEST_VA, OWNER_LEN as u64),
+                edit: carrick_mmu_core::aarch64::descriptor_txn::TerminalEdit {
+                    rule: carrick_mmu_core::aarch64::TerminalRule::Pt {
+                        op: Some(carrick_mmu_core::aarch64::PtOp::ReadWrite { exec: false }),
+                        reset_retired: false,
+                        deny_host_buffers: false,
+                        fork_arm: true,
+                        adopt_private: true,
+                    },
+                    asid_scoped: true,
+                    excluded_ipa: 0,
+                    excluded_len: 0,
+                    reclaim_budget: 0,
+                },
+            },
+        )
+        .unwrap();
+    let receipt = execute_descriptor_txn(
+        &words,
+        carrick_mmu_core::aarch64::SubstrateGpa(root.0),
+        &admission,
+        &mut InlineJournal::new(),
+    );
+    tables
+        .settle_guest_descriptor_receipt(&admission, &receipt)
+        .unwrap();
+    let retired = tables
+        .prepare_guest_descriptor_txn(
+            installed.snapshot.mm,
+            DescriptorOp::Retire(PageSpan::new(TEST_VA, 4096)),
+        )
+        .unwrap();
+    let receipt = execute_descriptor_txn(
+        &words,
+        carrick_mmu_core::aarch64::SubstrateGpa(root.0),
+        &retired,
+        &mut InlineJournal::new(),
+    );
+    tables
+        .settle_guest_descriptor_receipt(&retired, &receipt)
+        .unwrap();
+    let source = alias_registry().lock().overlapping_process_aliases(
+        TEST_VA,
+        4096,
+        Some(root),
+        ContainerRootToken::ROOT,
+    )[0]
+    .1;
+    assert!(source.physical_size >= 8192);
+    let mut neighbor = source;
+    neighbor.start += 4096;
+    neighbor.ipa += 4096;
+    neighbor.host_addr += 4096;
+    neighbor.size -= 4096;
+    alias_registry()
+        .lock()
+        .remove_exact_values_in_batch(&[source]);
+    register_shared_alias(neighbor);
+    let mm = carrick_el1_abi::ReservationMm::new(installed.snapshot.mm.get()).unwrap();
+    let handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(custody.transfer_carrier, mm, nonzero(1))
+    };
+    let target = carrick_aarch64::user_transfer::TransferTarget::from_handle(
+        handle,
+        (u64::from(installed.snapshot.asid.get()) << 48) | root.0,
+    );
+    let window = carrick_el1_abi::PortalGrantWindow {
+        operation: carrick_el1_abi::PortalOperation {
+            carrier: custody.transfer_carrier,
+            mm,
+            incarnation: nonzero(1),
+            sequence: nonzero(2),
+        },
+        generation: carrick_el1_abi::ReservationGeneration::new(2).unwrap(),
+        range: carrick_el1_abi::ReservationRange::new(TEST_VA, TEST_VA + 4096).unwrap(),
+        protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
+        fault_page: TEST_VA,
+    };
+    let context = sparse_materialization::PublicationContext::for_transfer(
+        installed.state.clone(),
+        custody.clone(),
+        target,
+        window,
+    )
+    .unwrap();
+    let mut pending = context.prepare_transfer(window).unwrap().unwrap();
+    let txn = *pending.transaction();
+    let DescriptorOp::Prepare { publication, .. } = txn.op else {
+        panic!()
+    };
+    assert_ne!(
+        publication.ipa, source.ipa,
+        "the still-live old compound cannot be reused"
+    );
+    let receipt = execute_descriptor_txn(
+        &words,
+        carrick_mmu_core::aarch64::SubstrateGpa(root.0),
+        &txn,
+        &mut InlineJournal::new(),
+    );
+    assert!(
+        matches!(receipt.outcome, DescriptorOutcome::Applied(_)),
+        "{receipt:?}"
+    );
+    assert!(pending.settle(&receipt).unwrap());
+    drop(pending);
+    let new_alias = alias_registry().lock().overlapping_process_aliases(
+        TEST_VA,
+        4096,
+        Some(root),
+        ContainerRootToken::ROOT,
+    )[0]
+    .1;
+    installed
+        .owners
+        .0
+        .push((new_alias.physical_ipa, new_alias.physical_size as u64));
+    let physical = super::super::user_transfer::UserTransferCustody::new(custody.clone());
+    let mut zero = [1; 4096];
+    super::super::user_transfer::tests::copy_bytes(
+        &physical,
+        publication.ipa,
+        PortalTransferIntent::UserRead,
+        &mut zero,
+    );
+    assert_eq!(zero, [0; 4096]);
+    let mut old = [0; 4096];
+    super::super::user_transfer::tests::copy_bytes(
+        &physical,
+        source.ipa + 4096,
+        PortalTransferIntent::UserRead,
+        &mut old,
+    );
+    assert_eq!(old, [0x5a; 4096]);
+    super::super::user_transfer::tests::copy_bytes(
+        &physical,
+        publication.ipa,
+        PortalTransferIntent::UserWrite,
+        &mut [0x42],
+    );
+    super::super::user_transfer::tests::copy_bytes(
+        &physical,
+        source.ipa + 4096,
+        PortalTransferIntent::UserRead,
+        &mut old,
+    );
+    assert_eq!(old, [0x5a; 4096]);
+    assert_eq!(
+        tables.with_manager(|m| m.translate(TEST_VA + 4096)),
+        Some(Some(source.ipa + 4096))
+    );
+    assert!(alias_registry().lock().contains(&neighbor));
+}
+
+#[test]
+fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut installed = install_mm(
+        &transport,
+        299,
+        0x9a00_6300_0000,
+        0x9b00_6300_0000,
+        *b"keep",
+    );
+    let (_authority, _lease, _invalidator) = prepare_foreign_cow(&installed);
+    installed
+        .state
+        .page_tables_authority()
+        .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+    let mm = carrick_el1_abi::ReservationMm::new(installed.snapshot.mm.get()).unwrap();
+    // Model receipt of the borrowed target's admitted owner.
+    let handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(custody.transfer_carrier, mm, nonzero(1))
+    };
+    let target = carrick_aarch64::user_transfer::TransferTarget::from_handle(
+        handle,
+        (u64::from(installed.snapshot.asid.get()) << 48) | installed.snapshot.stage1_root.0,
+    );
+    let start = TEST_VA + 0x10_0000;
+    let window = carrick_el1_abi::PortalGrantWindow {
+        operation: carrick_el1_abi::PortalOperation {
+            carrier: custody.transfer_carrier,
+            mm,
+            incarnation: nonzero(1),
+            sequence: nonzero(1),
+        },
+        generation: carrick_el1_abi::ReservationGeneration::new(1).unwrap(),
+        range: carrick_el1_abi::ReservationRange::new(start, start + 4096).unwrap(),
+        protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
+        fault_page: start,
+    };
+    let context = sparse_materialization::PublicationContext::for_transfer(
+        installed.state.clone(),
+        custody.clone(),
+        target,
+        window,
+    )
+    .unwrap();
+
+    let pool = carrick_el1_abi::CowGrantPool::new();
+    assert!(context.refill_transfer_cow_in(&pool).unwrap());
+    let grants = pool.ready(mm.raw()).collect::<Vec<_>>();
+    assert_eq!(grants.len(), 1);
+    assert!(pool.ready(mm.raw() + 1).next().is_none());
+    let grant = grants[0];
+    installed
+        .owners
+        .0
+        .push((grant.physical_ipa, carrick_el1_abi::COW_GRANT_SIZE));
+    let extent = *installed
+        .state
+        .frame_inventory
+        .ledger
+        .lock()
+        .extents
+        .get(&(grant.physical_ipa, carrick_el1_abi::COW_GRANT_SIZE))
+        .unwrap();
+    assert_eq!(extent.frame.raw(), grant.backing.frame_id.get());
+    assert_eq!(extent.mapping.raw(), grant.backing.mapping_id.get());
+    assert_eq!(
+        extent.stage2_owner.generation,
+        grant.backing.owner_generation.get()
+    );
+    assert!(context.refill_transfer_cow_in(&pool).unwrap());
+    assert_eq!(
+        pool.ready(mm.raw()).collect::<Vec<_>>(),
+        grants,
+        "ready target never allocates duplicate supply"
     );
 }

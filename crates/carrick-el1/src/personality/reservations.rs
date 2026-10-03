@@ -721,6 +721,19 @@ impl Reservations<'_> {
     pub fn mm(&self) -> ReservationMm {
         self.mm
     }
+    /// Allocate a transfer identity from the admitted owner, never from a
+    /// portal-local MM vector or caller-reusable counter.
+    pub fn next_transfer_sequence(&mut self) -> Result<core::num::NonZeroU64, Refusal> {
+        let next = self.state().sequence.checked_add(1).ok_or(Refusal::Stale)?;
+        self.state_mut().sequence = next;
+        core::num::NonZeroU64::new(next).ok_or(Refusal::Stale)
+    }
+    /// Stable occupancy identity. Policy edits change `generation`, while
+    /// this value changes only when a retired slot is published again.
+    pub fn incarnation(&self) -> ReservationGeneration {
+        ReservationGeneration::new(self.root.epoch.load(Ordering::Acquire) + 1)
+            .expect("published root incarnation")
+    }
     pub fn generation(&self) -> ReservationGeneration {
         ReservationGeneration::new(self.state().generation).expect("published generation")
     }
