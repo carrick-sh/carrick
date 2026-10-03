@@ -115,10 +115,11 @@ pub enum LifecycleDecline {
     ExitDispatchHostWork,
     CloneDispatchHostWork,
     ClonePoolEmpty,
+    ExitHostAdopted,
 }
 
 impl LifecycleDecline {
-    pub const COUNT: usize = Self::ClonePoolEmpty as usize + 1;
+    pub const COUNT: usize = Self::ExitHostAdopted as usize + 1;
     pub const ALL: [Self; Self::COUNT] = [
         Self::ExitDisabled,
         Self::ExitGate,
@@ -143,6 +144,7 @@ impl LifecycleDecline {
         Self::ExitDispatchHostWork,
         Self::CloneDispatchHostWork,
         Self::ClonePoolEmpty,
+        Self::ExitHostAdopted,
     ];
 }
 

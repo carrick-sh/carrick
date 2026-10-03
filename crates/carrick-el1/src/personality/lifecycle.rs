@@ -589,6 +589,13 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
         return decline(LifecycleDecline::ExitHome);
     }
     let rec = zone.record(record);
+    // Adoption creates a host logical job, even if its zone wait later runs
+    // on another slot. ExitedInZone settles the graph and pool custody; it
+    // cannot publish that job's terminal completion. Its exit stays with
+    // the job owner until that retirement authority can be transferred too.
+    if !rec.is_unadopted_birth() {
+        return decline(LifecycleDecline::ExitHostAdopted);
+    }
     if !matches!(rec.claim(), Claim::OnCpu { slot: owner, .. } if owner == zslot) {
         return decline(LifecycleDecline::ExitClaim);
     }
