@@ -1874,6 +1874,13 @@ fn owner_fork_live_store_failure_restores_parent_and_refuses_child() {
 
 #[test]
 fn owner_fork_parent_copyout_cow_reconciles_exact_pending_rollback() {
+    owner_parent_copyout_rollback(false);
+}
+#[test]
+fn owner_fork_parent_copyout_abort_retains_live_split_arena() {
+    owner_parent_copyout_rollback(true);
+}
+fn owner_parent_copyout_rollback(mixed_block: bool) {
     use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
     let region = Region::new();
     let spaces = AddressSpaces::new();
@@ -1890,6 +1897,9 @@ fn owner_fork_parent_copyout_cow_reconciles_exact_pending_rollback() {
     for page in 0..2 {
         parent_tables.words[2560 + indices[3] + page]
             .store(copy_base + page as u64 * 4096, Ordering::Release);
+    }
+    if mixed_block {
+        parent_tables.words[1024].store(IPA | (RW & !2), Ordering::Release);
     }
     let request = fork_request(&region, &spaces, parent, 78, &child, &supply);
     let arenas = [&parent_tables, &child, &supply];
@@ -1986,6 +1996,8 @@ fn owner_fork_parent_copyout_cow_reconciles_exact_pending_rollback() {
     assert_eq!(fork_translate(&words, child.base, VA), IPA);
     pending.abort(&portal, &words, 0).unwrap();
     assert_eq!(fork_translate(&words, ROOT, VA), replacement_ipa);
+    assert_eq!(pending.completion().parent_tables_used != 0, mixed_block);
+    assert_eq!(pending.completion().child_tables_used, 0);
     assert!(
         !region
             .table()
@@ -2071,6 +2083,118 @@ fn owner_fork_dontfork_omits_and_wipeonfork_retains_zero_reservation() {
             parent_tables.words[1537].load(Ordering::Acquire)
         ],
         before
+    );
+}
+
+#[test]
+fn owner_fork_preserves_parent_owed_return_and_omits_retired_child_leaf() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let parent = admit(&region, &spaces, 77, ROOT, 2, 0);
+    let view = nodes(&region);
+    let retired_range = ReservationRange::new(VA, VA + 4096).unwrap();
+    let sequence;
+    {
+        let mut root = region
+            .table()
+            .lock_el1_resolved(spaces.find(77).unwrap().index(), parent, &view, 0)
+            .unwrap();
+        let crate::memory::reservations::Decision::Work(request) =
+            root.munmap(retired_range).unwrap()
+        else {
+            panic!()
+        };
+        sequence = request.sequence;
+        let slot = root.reserve_return(retired_range).unwrap();
+        let completion = unsafe {
+            carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                carrick_el1_abi::ReservationBackingReceipt {
+                    receipt: sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        root.complete_deferring_return(completion, slot).unwrap();
+        assert!(root.fork_ready());
+        assert!(!root.fork_settled());
+    }
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let parent_tables = Tables::new(ROOT, IPA, 2);
+    // The retired owner terminal retains its physical address until the
+    // parent's physical acknowledgement; Fork must not inherit it.
+    parent_tables.words[1536].store(IPA | (1 << 56) | (1 << 55), Ordering::Release);
+    let child = Tables::new(ROOT + 0x100000, 0, 0);
+    let supply = Tables::new(ROOT + 0x200000, 0, 0);
+    let request = fork_request(&region, &spaces, parent, 78, &child, &supply);
+    let arenas = [&parent_tables, &child, &supply];
+    let words = ForkWords {
+        arenas: &arenas,
+        loads: core::cell::Cell::new(0),
+    };
+    let plan = portal
+        .prepare_fork(
+            request,
+            ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
+            &words,
+            0,
+        )
+        .unwrap();
+    portal
+        .publish_fork(plan, &words, 0)
+        .unwrap()
+        .commit(&portal, 0)
+        .unwrap();
+    assert_eq!(child.words[1536].load(Ordering::Acquire), 0);
+    {
+        let mut child_root = region
+            .table()
+            .lock_el1_resolved(spaces.find(78).unwrap().index(), request.child_mm, &view, 0)
+            .unwrap();
+        assert!(child_root.authenticate_fork_origin(request));
+        let mut wrong = request;
+        wrong.operation.carrier = NonZeroU64::new(99).unwrap();
+        assert!(!child_root.authenticate_fork_origin(wrong));
+        let handle = unsafe {
+            El1MmHandle::from_admitted_owner(
+                request.operation.carrier,
+                request.child_mm,
+                NonZeroU64::new(child_root.incarnation().raw()).unwrap(),
+            )
+        };
+        assert!(child_root.authenticate_fork_handle(handle));
+        let wrong = unsafe {
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(99).unwrap(),
+                handle.mm(),
+                handle.incarnation(),
+            )
+        };
+        assert!(!child_root.authenticate_fork_handle(wrong));
+    }
+    let mut parent_root = region
+        .table()
+        .lock_el1_resolved(spaces.find(77).unwrap().index(), parent, &view, 0)
+        .unwrap();
+    let mut owed = Vec::new();
+    parent_root.observe_deferred_returns(&mut |row| owed.push(row));
+    assert_eq!(owed.len(), 1);
+    assert_eq!(owed[0].range, retired_range);
+    assert_eq!(owed[0].sequence, sequence);
+    let child_root = region
+        .table()
+        .lock_el1_resolved(spaces.find(78).unwrap().index(), request.child_mm, &view, 0)
+        .unwrap();
+    child_root.observe_deferred_returns(&mut |_| panic!("parent return leaked into child"));
+    assert_eq!(
+        parent_root.acknowledge_deferred_returns(sequence).unwrap(),
+        1
+    );
+    assert_eq!(
+        parent_root.acknowledge_deferred_returns(sequence).unwrap(),
+        0
     );
 }
 
