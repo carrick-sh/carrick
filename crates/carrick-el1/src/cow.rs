@@ -6,11 +6,12 @@
 //! pages from the still-shared compound into the grant through the MM's
 //! two temporary copy-window aliases, repoints the run with the shared
 //! descriptor executor, invalidates the MM's ASID and only then records the
-//! completion for the host. Nothing here exits to the host; anything EL1
-//! cannot classify, or a pool with no grant for the MM, is left to the host
-//! fault path unchanged.
+//! completion for the host. Data-only runs make no host crossing. A caller
+//! with a bounded executable-publication capability invokes the existing host
+//! I2 cache authority after the copy and before an executable repoint. Other
+//! fault callers retain their existing decline path.
 
-use carrick_el1_abi::{CowDecline, CowGrantCompletion, CowGrantPool};
+use carrick_el1_abi::{CowDecline, CowGrantCompletion, CowGrantPool, FrameGrantResidencyTable};
 use carrick_mmu_core::aarch64::SubstrateGpa;
 use carrick_mmu_core::aarch64::descriptor_txn::copy_window::with_cow_copy_aliases;
 use carrick_mmu_core::aarch64::descriptor_txn::guest_cow::{
@@ -41,7 +42,9 @@ pub struct GuestCowVenue<'a, W: ?Sized> {
     pub words: &'a W,
     pub root: SubstrateGpa,
     pub pool: &'a CowGrantPool,
+    pub residency: &'a FrameGrantResidencyTable,
     pub copy_base: u64,
+    pub publish_executable: Option<&'a dyn Fn(carrick_el1_abi::CowGrant, u64, u64) -> bool>,
 }
 
 /// Resolve one EL0 write permission fault at `far` for `mm_key` in `venue`.
@@ -70,9 +73,11 @@ where
         words,
         root,
         pool,
+        residency,
         copy_base,
+        publish_executable,
     } = *venue;
-    let run = match classify_guest_cow_write(words, root, far) {
+    let run = match classify_guest_cow_write(words, root, far, publish_executable.is_some()) {
         Ok(run) => run,
         Err(GuestCowClass::AlreadyWritable) => {
             invalidate_asid();
@@ -120,6 +125,12 @@ where
         Ok(plan) if plan.table_grants == 0 => {}
         _ => return decline(pool),
     }
+    // Revoke old grant-window tokens before changing their translation. A
+    // failed copy may lose residency acceleration, but cannot leave an old
+    // token authorizing a replacement frame. Physical custody stays on host.
+    if !residency.retire_small_span(mm_key, run.va, run.len) {
+        return decline(pool);
+    }
     for offset in (0..run.len).step_by(PAGE as usize) {
         let copied = with_cow_copy_aliases(
             words,
@@ -137,11 +148,35 @@ where
             Err(_) => return decline(pool),
         }
     }
+    if run.executable && !publish_executable.is_some_and(|publish| publish(grant, new_ipa, run.len))
+    {
+        return decline(pool);
+    }
     let mut journal = InlineJournal::new();
     match execute_descriptor_op(words, root, op, &TableGrants::NONE, &mut journal) {
         DescriptorOutcome::Applied(applied) => {
             if applied.flush_required {
                 invalidate_asid();
+            }
+            let replacement = carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key,
+                semantic_base: run.va,
+                physical_ipa: new_ipa,
+                len: run.len,
+                mapping_id: grant.backing.mapping_id.get(),
+                frame_id: grant.backing.frame_id.get(),
+                owner_generation: grant.backing.owner_generation.get(),
+                inventory_revision: grant.backing.inventory_revision.get(),
+            };
+            // Saturation only declines acceleration; the descriptor and COW
+            // completion retain their existing production authority.
+            if residency.publish(replacement).is_some() {
+                for offset in (0..run.len).step_by(PAGE as usize) {
+                    let page = residency
+                        .lookup(mm_key, run.va + offset)
+                        .expect("published COW grant window disappeared under its editor");
+                    assert!(residency.record_commit(page));
+                }
             }
             let completion = CowGrantCompletion {
                 grant,
@@ -328,6 +363,17 @@ mod tests {
             | if may_write { MAY_WRITE } else { 0 }
     }
 
+    fn residency_table() -> std::boxed::Box<FrameGrantResidencyTable> {
+        let layout = std::alloc::Layout::new::<FrameGrantResidencyTable>();
+        // SAFETY: the production shared index supports zero initialization;
+        // the allocation has its exact size/alignment and one Box owner.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<FrameGrantResidencyTable>();
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        unsafe { std::boxed::Box::from_raw(ptr) }
+    }
+
     /// A forked private compound: four armed pages, lane 3 read-only in
     /// Linux, each page holding distinct bytes.
     fn forked(window: bool) -> (Arena, Memory) {
@@ -352,9 +398,11 @@ mod tests {
     ) -> GuestCowOutcome {
         resolve_guest_cow(
             &GuestCowVenue {
+                publish_executable: None,
                 words: &arena.words(),
                 root: SubstrateGpa(ROOT),
                 pool,
+                residency: &residency_table(),
                 copy_base: EL1_COW_COPY_BASE,
             },
             MM,
@@ -362,6 +410,105 @@ mod tests {
             |source, destination| memory.copy_through(arena, source, destination),
             || invalidations.set(invalidations.get() + 1),
         )
+    }
+
+    #[test]
+    fn cow_replaces_the_residency_identity_with_the_granted_owner() {
+        let (arena, memory) = forked(true);
+        let pool = CowGrantPool::new();
+        let grant = pool.publish(MM, GRANT, backing()).unwrap();
+        let residency = residency_table();
+        let old = carrick_el1_abi::FrameGrantResidencyIdentity {
+            mm_key: MM,
+            semantic_base: VA,
+            physical_ipa: OLD,
+            len: 4 * PAGE,
+            mapping_id: 101,
+            frame_id: 102,
+            owner_generation: 103,
+            inventory_revision: 104,
+        };
+        residency.publish(old).unwrap();
+        let stale = residency.lookup(MM, VA).unwrap();
+        assert!(residency.record_commit(stale));
+        let outcome = resolve_guest_cow(
+            &GuestCowVenue {
+                publish_executable: None,
+                words: &arena.words(),
+                root: SubstrateGpa(ROOT),
+                pool: &pool,
+                residency: &residency,
+                copy_base: EL1_COW_COPY_BASE,
+            },
+            MM,
+            VA,
+            |source, destination| memory.copy_through(&arena, source, destination),
+            || {},
+        );
+        assert!(matches!(outcome, GuestCowOutcome::Resolved(_)));
+        assert!(!residency.record_commit(stale));
+        for offset in (0..4 * PAGE).step_by(PAGE as usize) {
+            let page = residency.lookup(MM, VA + offset).unwrap();
+            assert_eq!(page.expected_ipa, GRANT + offset);
+            assert_eq!(
+                page.identity.owner_generation,
+                grant.backing.owner_generation.get()
+            );
+            assert_eq!(page.identity.frame_id, grant.backing.frame_id.get());
+            assert!(residency.is_guest_committed(MM, VA + offset));
+        }
+    }
+
+    #[test]
+    fn cow_defers_before_copying_a_leased_grant_window() {
+        let (arena, memory) = forked(true);
+        let pool = CowGrantPool::new();
+        pool.publish(MM, GRANT, backing()).unwrap();
+        let residency = residency_table();
+        let identity = carrick_el1_abi::FrameGrantResidencyIdentity {
+            mm_key: MM,
+            semantic_base: VA,
+            physical_ipa: OLD,
+            len: 4 * PAGE,
+            mapping_id: 101,
+            frame_id: 102,
+            owner_generation: 103,
+            inventory_revision: 104,
+        };
+        residency.publish(identity).unwrap();
+        let page = residency.lookup(MM, VA).unwrap();
+        let lease = residency.pin_transfer(page).unwrap();
+        let venue = GuestCowVenue {
+            publish_executable: None,
+            words: &arena.words(),
+            root: SubstrateGpa(ROOT),
+            pool: &pool,
+            residency: &residency,
+            copy_base: EL1_COW_COPY_BASE,
+        };
+        assert_eq!(
+            resolve_guest_cow(
+                &venue,
+                MM,
+                VA,
+                |_, _| panic!("leased grant must not be copied"),
+                || panic!("unchanged leaves")
+            ),
+            GuestCowOutcome::Declined(CowDecline::Refused)
+        );
+        assert_eq!(arena.leaf(VA) & PA, OLD);
+        assert_eq!(residency.lookup(MM, VA).unwrap(), page);
+        drop(lease);
+        assert!(matches!(
+            resolve_guest_cow(
+                &venue,
+                MM,
+                VA,
+                |source, destination| memory.copy_through(&arena, source, destination),
+                || {}
+            ),
+            GuestCowOutcome::Resolved(_)
+        ));
     }
 
     #[test]
@@ -547,9 +694,11 @@ mod tests {
             assert_eq!(ttbr0 & PA, ROOT);
             let outcome = resolve_guest_cow(
                 &GuestCowVenue {
+                    publish_executable: None,
                     words: &self.arena.words(),
                     root: SubstrateGpa(ttbr0 & PA),
                     pool: self.pool,
+                    residency: &residency_table(),
                     copy_base: EL1_COW_COPY_BASE,
                 },
                 mm_key,
@@ -613,5 +762,67 @@ mod tests {
         assert_eq!(pool.completions(&excluded).count(), 1);
         assert_eq!(arena.leaf(VA) & PA, GRANT);
         const _: () = assert!(GRANT.is_multiple_of(COW_GRANT_SIZE));
+    }
+    #[test]
+    fn admitted_private_file_source_resolves_in_el1_and_preserves_source_bytes() {
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, InlineJournal,
+            PageSpan, TableGrants, TerminalEdit, execute_descriptor_txn,
+        };
+        use carrick_mmu_core::aarch64::{PtOp, TerminalRule};
+        let (arena, memory) = forked(true);
+        for lane in 0..4 {
+            arena.set_leaf(
+                VA + lane * 4096,
+                (OLD + lane * 4096) | 3 | AF | SH | AP_RO_EL0 | NG | XN,
+            );
+        }
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: nz(MM),
+                generation: nz(1),
+            },
+            root: SubstrateGpa(ROOT),
+            tables: TableGrants::new(&[]).unwrap(),
+            op: DescriptorOp::Terminal {
+                span: PageSpan::new(VA, 4 * 4096),
+                edit: TerminalEdit {
+                    rule: TerminalRule::Pt {
+                        op: Some(PtOp::ReadWrite { exec: false }),
+                        reset_retired: false,
+                        deny_host_buffers: false,
+                        fork_arm: true,
+                        adopt_private: true,
+                    },
+                    asid_scoped: true,
+                    excluded_ipa: 0,
+                    excluded_len: 0,
+                    reclaim_budget: 0,
+                },
+            },
+        };
+        assert!(matches!(
+            execute_descriptor_txn(
+                &arena.words(),
+                SubstrateGpa(ROOT),
+                &txn,
+                &mut InlineJournal::new()
+            )
+            .outcome,
+            DescriptorOutcome::Applied(_)
+        ));
+        let source = memory.page(OLD + 4096);
+        let adjacent = memory.page(OLD);
+        let pool = CowGrantPool::new();
+        pool.publish(MM, GRANT, backing()).unwrap();
+        assert!(matches!(
+            resolve(&arena, &memory, &pool, VA + 4096, &Cell::new(0)),
+            GuestCowOutcome::Resolved(_)
+        ));
+        assert_eq!(memory.page(GRANT + 4096), source);
+        memory.0.borrow_mut().get_mut(&(GRANT + 4096)).unwrap()[..4].copy_from_slice(b"edit");
+        assert_eq!(memory.page(OLD + 4096), source);
+        assert_eq!(memory.page(OLD), adjacent);
+        assert_eq!(&memory.page(GRANT + 4096)[..4], b"edit");
     }
 }
