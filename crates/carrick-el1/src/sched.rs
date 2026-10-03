@@ -131,13 +131,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             identity_of(self.task, self.zone.slot(self.slot).affinity()),
         )?;
         #[cfg(target_os = "none")]
-        {
-            use crate::personality::lifecycle::LifecycleVenue;
-            if let Some(thread) =
-                crate::personality::lifecycle::GuestLifecycleVenue.thread(self.task)
-            {
-                thread.slot.bind_zone_record(self.zone.record_ref(record));
-            }
+        if let Some((_, slot)) = self.task.lifecycle_refs() {
+            slot.bind_zone_record(self.zone.record_ref(record));
         }
         Ok(record)
     }

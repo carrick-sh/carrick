@@ -669,30 +669,8 @@ pub struct GuestLifecycleVenue;
 #[cfg(target_os = "none")]
 impl LifecycleVenue for GuestLifecycleVenue {
     fn thread(&self, task: &CurrentTask) -> Option<LifecycleThread<'_>> {
-        let page = task.lifecycle_page.load(Ordering::Acquire);
-        let slot = task.control_slot.load(Ordering::Acquire);
-        let contains = |address: u64, len: usize| {
-            address >= carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
-                && address.checked_add(len as u64).is_some_and(|end| {
-                    end <= carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
-                        + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE
-                })
-        };
-        if !page.is_multiple_of(16384)
-            || !slot.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)
-            || !contains(page, core::mem::size_of::<ThreadLifecyclePage>())
-            || !contains(slot, core::mem::size_of::<ThreadControlSlot>())
-        {
-            return None;
-        }
-        // SAFETY: only the runtime publishes these EL1-only addresses; its
-        // carrier owner pins both allocations across every zone record.
-        Some(unsafe {
-            LifecycleThread {
-                page: &*(page as *const ThreadLifecyclePage),
-                slot: &*(slot as *const ThreadControlSlot),
-            }
-        })
+        let (page, slot) = task.lifecycle_refs()?;
+        Some(LifecycleThread { page, slot })
     }
     fn born_slot(&self, page: &ThreadLifecyclePage, entry: EntryRef) -> Option<&ThreadControlSlot> {
         let address = page.control_address(entry)?;
