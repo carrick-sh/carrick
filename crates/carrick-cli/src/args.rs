@@ -845,6 +845,8 @@ pub(crate) enum Commands {
         /// Internal: original supplementary groups before auto-sudo.
         #[arg(long = "trace-groups", hide = true, value_delimiter = ',')]
         trace_groups: Vec<u32>,
+        /// Carrick subcommand, or `--external EXECUTABLE ARGS...` to trace a
+        /// signed test launcher after dropping to the caller's identity.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -1273,6 +1275,45 @@ pub(crate) enum NetworkCommand {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn trace_external_preserves_signed_launcher_arguments() {
+        let cli = Cli::try_parse_from([
+            "carrick",
+            "trace",
+            "--require-script-exit",
+            "--script",
+            "witness.d",
+            "--",
+            "--external",
+            "/bin/bash",
+            "./scripts/test-signed.sh",
+            "carrick-embed",
+            "el1_fork_cow_resolves_in_guest",
+            "--nocapture",
+        ])
+        .expect("external signed witness should parse");
+        let Commands::Trace {
+            command,
+            require_script_exit,
+            ..
+        } = cli.command
+        else {
+            panic!("expected trace command");
+        };
+        assert!(require_script_exit);
+        assert_eq!(
+            command,
+            [
+                "--external",
+                "/bin/bash",
+                "./scripts/test-signed.sh",
+                "carrick-embed",
+                "el1_fork_cow_resolves_in_guest",
+                "--nocapture"
+            ]
+        );
+    }
     use super::{Cli, Commands, DebugCommand};
     use crate::trace_profile::TraceProfileKind;
     use clap::Parser;

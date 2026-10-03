@@ -123,6 +123,10 @@ REVIEWED_OPERATOR_LIMITS = {
         "process_command",
     ): 1,
     (PurePosixPath("crates/carrick-cli/src/trace_cli.rs"), "exec_trace_under_sudo", "process_command"): 1,
+    # Explicit trace-only witness launcher, after the trace child's credential
+    # drop. This runs an operator-selected signed test, never a guest fork or
+    # clone; the stable wrapper remains the libdtrace target until it settles.
+    (PurePosixPath("crates/carrick-cli/src/trace_cli.rs"), "exec_trace_child", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/trace_profile.rs"), "git_dirty", "process_command"): 1,
     (PurePosixPath("crates/carrick-cli/src/trace_profile.rs"), "command_output", "process_command"): 1,
     # The wedge capture's `sudo -n lldb`: the same operator tool the CLI's

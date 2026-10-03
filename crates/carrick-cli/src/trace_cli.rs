@@ -272,6 +272,22 @@ pub(crate) fn exec_trace_child(
     )
     .context("trace child failed to publish its post-drop identity")?;
 
+    // Trace signed test launchers through the same libdtrace consumer and
+    // post-sudo identity boundary as product commands. The explicit marker
+    // keeps executable argv separate from Carrick subcommand parsing.
+    if command.first().is_some_and(|arg| arg == "--external") {
+        let executable = command
+            .get(1)
+            .context("--external requires an executable")?;
+        let status = std::process::Command::new(executable)
+            .args(&command[2..])
+            .status()
+            .context("trace child failed to launch external witness")?;
+        if !status.success() {
+            bail!("external trace witness exited with {status}");
+        }
+        return Ok(());
+    }
     crate::commands::run_cli(Cli::parse_from(trace_child_argv(store, command)))
 }
 
