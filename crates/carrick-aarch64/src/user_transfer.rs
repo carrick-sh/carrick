@@ -1,5 +1,6 @@
 //! Owned host bytes and exact retained-data handshake for the production EL1
-//! service. Selection and copy borrow the driving vCPU; neither runs target EL0.
+//! service. Selection and copy borrow the current executor on its maintenance
+//! root; neither installs target user translations or needs a spare CPU.
 use crate::vmm::Aarch64Vcpu;
 use crate::{Aarch64EngineCore, Aarch64Vmm};
 use carrick_el1_abi::{
@@ -77,10 +78,9 @@ impl TransferTarget {
         self.ttbr0
     }
     pub fn bind<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
-        engine: &mut Aarch64EngineCore<V>,
+        engine: &Aarch64EngineCore<V>,
         mm: ReservationMm,
         ttbr0: u64,
-        admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
         custody: &C,
         slots: &MmPortalSlots,
     ) -> Result<Option<Self>, TrapError> {
@@ -100,14 +100,14 @@ impl TransferTarget {
         };
         frame.x[1] = custody.carrier().get();
         frame.x[2] = mm.raw();
-        let receipt = engine.run_user_transfer_service(frame, ttbr0, admission, &mut || false)?;
+        let receipt = engine.run_user_transfer_service(frame, &mut || false)?;
         if receipt.x[0] != 0 {
             return Ok(None);
         }
         let incarnation = NonZeroU64::new(receipt.x[3])
             .ok_or_else(|| TrapError::Hypervisor("EL1 bind returned zero incarnation".into()))?;
-        // SAFETY: exact carrier service completed under the borrowed target
-        // TTBR0 admission; EL1 authenticated its live root before this receipt.
+        // SAFETY: exact carrier service authenticated the admitted MM root
+        // while executing on the carrier maintenance root.
         let handle = unsafe {
             carrick_el1_abi::El1MmHandle::from_admitted_owner(custody.carrier(), mm, incarnation)
         };
@@ -201,8 +201,7 @@ impl OwnedUserTransfer {
     /// a grant/refill, a scheduler suspension, or host I/O.
     pub fn advance<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
         &mut self,
-        engine: &mut Aarch64EngineCore<V>,
-        admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+        engine: &Aarch64EngineCore<V>,
         custody: &C,
         slots: &MmPortalSlots,
     ) -> Result<TransferProgress, TrapError> {
@@ -243,14 +242,10 @@ impl OwnedUserTransfer {
         let executable = slots
             .executable(caller)
             .ok_or_else(|| error("invalid publication slot"))?;
-        let selected_frame = run_selected_service(
-            engine,
-            frame,
-            self.target,
-            self.fork_sequence,
-            admission,
-            &mut || executable.handle(|request| custody.publish_executable(self.target, request)),
-        )?;
+        let selected_frame =
+            run_selected_service(engine, frame, self.target, self.fork_sequence, &mut || {
+                executable.handle(|request| custody.publish_executable(self.target, request))
+            })?;
         match selected_frame.x[0] {
             11 => {
                 if matches!(selected_frame.x[14], 1 | 2) {
@@ -329,7 +324,6 @@ impl OwnedUserTransfer {
                                 frame,
                                 self.target,
                                 self.fork_sequence,
-                                admission,
                                 &mut || false,
                             );
                             if let Some(receipt) = slot.take_receipt(window, grant.transaction()) {
@@ -393,13 +387,8 @@ impl OwnedUserTransfer {
             esr: carrick_el1_abi::MM_PORTAL_SERVICE_ESR,
             ..TrapFrame::default()
         };
-        if let Err(failure) = run_selected_service(
-            engine,
-            frame,
-            self.target,
-            self.fork_sequence,
-            admission,
-            &mut || {
+        if let Err(failure) =
+            run_selected_service(engine, frame, self.target, self.fork_sequence, &mut || {
                 let handled = ticket.copy_requested(|exact| {
                     pin.copy(exact, &mut self.bytes[self.offset..self.offset + len])
                 });
@@ -410,8 +399,8 @@ impl OwnedUserTransfer {
                     );
                 }
                 handled
-            },
-        ) {
+            })
+        {
             if !ticket.cancel_unclaimed() && ticket.take_completion().is_none() {
                 carrick_fatal::carrick_fatal!(
                     "aarch64::user_transfer",
@@ -446,17 +435,16 @@ impl OwnedUserTransfer {
 }
 
 fn run_selected_service<V: Aarch64Vmm>(
-    engine: &mut Aarch64EngineCore<V>,
+    engine: &Aarch64EngineCore<V>,
     frame: TrapFrame,
     target: TransferTarget,
     fork_sequence: Option<NonZeroU64>,
-    admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
     effect: &mut dyn FnMut() -> bool,
 ) -> Result<TrapFrame, TrapError> {
     if let Some(sequence) = fork_sequence {
         engine.run_owner_parent_transfer(frame, target, sequence, effect)
     } else {
-        engine.run_user_transfer_service(frame, target.ttbr0, admission, effect)
+        engine.run_user_transfer_service(frame, effect)
     }
 }
 
