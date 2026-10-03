@@ -676,10 +676,10 @@ impl Drop for HostFsBackend {
             // (docs/perf-results/container-lifecycle-split.jsonl) - pure wall
             // the user waits through for a tree nobody will read again.
             if let Some(scratch) = self._scratch.take() {
-                defer_remove_tree(scratch.keep());
+                let _ = defer_remove_tree(scratch.keep());
             }
             if let Some(path) = self._attached_cleanup_path.take() {
-                defer_remove_tree(path);
+                let _ = defer_remove_tree(path);
             }
         }
     }
@@ -691,15 +691,17 @@ impl Drop for HostFsBackend {
 /// alive. The worker deliberately has no shutdown join: process exit is the
 /// latency boundary, and the next startup sweep is the durable fallback for a
 /// partly removed or merely queued tree.
-pub(crate) fn defer_remove_tree(path: PathBuf) {
+pub(crate) fn defer_remove_tree(path: PathBuf) -> ScratchCleanupReceipts {
+    let mut receipts = ScratchCleanupReceipts::default();
     let Some(parent) = path.parent().map(Path::to_path_buf) else {
-        return;
+        return receipts;
     };
     let retired = rename_scratch_to_trash(&path);
     cleanup_oldest_trash_checkpoint(&parent);
     if let Some(retired) = retired {
-        enqueue_scratch_cleanup(retired);
+        receipts.push(enqueue_scratch_cleanup(retired));
     }
+    receipts
 }
 
 fn rename_scratch_to_trash(path: &Path) -> Option<PathBuf> {
@@ -934,12 +936,55 @@ fn is_retired_scratch(path: &Path) -> bool {
 }
 
 enum ScratchCleanupWork {
-    Remove(PathBuf),
+    Remove {
+        path: PathBuf,
+        completion: std::sync::mpsc::SyncSender<ScratchCleanupCompletion>,
+    },
     Discover {
         root: PathBuf,
         #[cfg(test)]
         observer: Option<ScratchDiscoveryObserver>,
     },
+}
+
+/// Proof that the cleanup worker finished one queued reclaim: which retired
+/// tree it was and which thread ran the recursive delete (never the caller's
+/// exit path).
+#[derive(Debug)]
+pub(crate) struct ScratchCleanupCompletion {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) retired: PathBuf,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) worker: std::thread::ThreadId,
+}
+
+/// Outcome of handing one retired tree to the cleanup worker. Production
+/// callers drop it (exit latency must not wait on reclaim); tests wait on the
+/// exact completion event instead of polling wall-clock time.
+#[derive(Debug)]
+pub(crate) enum ScratchCleanupReceipt {
+    Queued(
+        #[cfg_attr(not(test), allow(dead_code))]
+        std::sync::mpsc::Receiver<ScratchCleanupCompletion>,
+    ),
+    /// Queue saturated or worker unavailable; the next startup sweep owns the
+    /// retired name.
+    NotQueued(#[cfg_attr(not(test), allow(dead_code))] PathBuf),
+}
+
+/// Every reclaim enqueued by one retirement call, in enqueue order.
+#[derive(Debug, Default)]
+pub(crate) struct ScratchCleanupReceipts(Vec<ScratchCleanupReceipt>);
+
+impl ScratchCleanupReceipts {
+    fn push(&mut self, receipt: ScratchCleanupReceipt) {
+        self.0.push(receipt);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_vec(self) -> Vec<ScratchCleanupReceipt> {
+        self.0
+    }
 }
 
 #[cfg(test)]
@@ -958,8 +1003,14 @@ fn scratch_cleanup_sender() -> &'static Option<std::sync::mpsc::SyncSender<Scrat
             .spawn(move || {
                 while let Ok(work) = receiver.recv() {
                     match work {
-                        ScratchCleanupWork::Remove(path) => {
-                            let _ = std::fs::remove_dir_all(path);
+                        ScratchCleanupWork::Remove { path, completion } => {
+                            let _ = std::fs::remove_dir_all(&path);
+                            // Capacity-1 channel owned by this item: never
+                            // blocks; a dropped receipt is a closed channel.
+                            let _ = completion.try_send(ScratchCleanupCompletion {
+                                retired: path,
+                                worker: std::thread::current().id(),
+                            });
                         }
                         ScratchCleanupWork::Discover {
                             root,
@@ -986,15 +1037,27 @@ fn scratch_cleanup_sender() -> &'static Option<std::sync::mpsc::SyncSender<Scrat
     })
 }
 
-fn enqueue_scratch_cleanup(path: PathBuf) {
-    if let Some(sender) = scratch_cleanup_sender() {
-        // Never let a saturated cleanup queue become guest exit latency. A
-        // dropped enqueue is still durable because the retired name is one the
-        // next startup sweep owns unconditionally.
-        let _ = sender.try_send(ScratchCleanupWork::Remove(path));
+fn enqueue_scratch_cleanup(path: PathBuf) -> ScratchCleanupReceipt {
+    let Some(sender) = scratch_cleanup_sender() else {
+        return ScratchCleanupReceipt::NotQueued(path);
+    };
+    let (completion, receipt) = std::sync::mpsc::sync_channel(1);
+    // Never let a saturated cleanup queue become guest exit latency. A
+    // dropped enqueue is still durable because the retired name is one the
+    // next startup sweep owns unconditionally.
+    match sender.try_send(ScratchCleanupWork::Remove { path, completion }) {
+        Ok(()) => ScratchCleanupReceipt::Queued(receipt),
+        Err(
+            std::sync::mpsc::TrySendError::Full(work)
+            | std::sync::mpsc::TrySendError::Disconnected(work),
+        ) => match work {
+            ScratchCleanupWork::Remove { path, .. }
+            | ScratchCleanupWork::Discover { root: path, .. } => {
+                ScratchCleanupReceipt::NotQueued(path)
+            }
+        },
     }
 }
-
 fn enqueue_orphan_discovery(root: PathBuf) {
     if let Some(sender) = scratch_cleanup_sender() {
         let _ = sender.try_send(ScratchCleanupWork::Discover {
@@ -1077,7 +1140,7 @@ impl HostFsBackend {
             .open(&root_lock_path)?;
         let mut root_lock = fd_lock::RwLock::new(root_lock_file);
         let root_guard = root_lock.write()?;
-        sweep_orphans(scratch_root);
+        let _ = sweep_orphans(scratch_root);
 
         let scratch = tempfile::TempDir::new_in(scratch_root)?;
         let lock = acquire_lockfile(scratch.path())?;
@@ -7124,13 +7187,14 @@ pub(crate) fn acquire_lockfile(
     Ok(lock)
 }
 
-pub(crate) fn sweep_orphans(scratch_root: &Path) {
+pub(crate) fn sweep_orphans(scratch_root: &Path) -> ScratchCleanupReceipts {
     const STARTUP_DISCOVERY_LIMIT: usize = 64;
     let retired_scratch = discover_orphans(scratch_root, Some(STARTUP_DISCOVERY_LIMIT));
     cleanup_oldest_trash_checkpoint(scratch_root);
+    let mut receipts = ScratchCleanupReceipts::default();
     for retired in retired_scratch {
         if retired.exists() {
-            enqueue_scratch_cleanup(retired);
+            receipts.push(enqueue_scratch_cleanup(retired));
         }
     }
 
@@ -7138,6 +7202,7 @@ pub(crate) fn sweep_orphans(scratch_root: &Path) {
     // trash namespace makes normal retirement immediately discoverable; this
     // background pass is only for crashed live-name trees and legacy trash.
     enqueue_orphan_discovery(scratch_root.to_path_buf());
+    receipts
 }
 
 fn discover_orphans(scratch_root: &Path, limit: Option<usize>) -> Vec<PathBuf> {
