@@ -1597,3 +1597,13 @@ currently returns ENOMEM instead of replacement (work/tlb-budget
 `93d2d0568`, `docs/perf-results/2026-10-03-tlb-budget/forced-gap-red.log`).
 This remains an open N1b memory-policy/host-backing venue obligation; this
 maintenance-root change does not claim to cover that witness.
+
+Venue-3 physical short-count binding:
+`prepared_short_commit_copies_only_actual_prefix_with_exact_physical_pin`
+prepares 4096 bytes and commits 23, retaining exact physical identity and pin
+lifetime while leaving the unconsumed tail unchanged. It failed before the
+physical adapter fix because the copy required the prepared full length.
+The production owner matrix now checks that COMMIT admits another editor
+while its exact prepared range still overlaps; the previous matrix assertion
+incorrectly required the old editor-held one-shot behavior. Host checked-memory
+consumers and the full cutover remain pending.

@@ -413,15 +413,24 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
                     let mut ticket = slot.submit(request).unwrap();
                     serve_transfer(&portal, slot.claim().unwrap(), &counted, 0, || {
                         assert!(region.table().el1_slot_holding(0).is_none());
+                        // COMMIT retains exact range admission, not the MM
+                        // editor: unrelated edits must remain possible.
+                        let editor = spaces
+                            .try_begin_edit(
+                                spaces.find(mm.raw()).unwrap(),
+                                mm.raw(),
+                                NonZeroU64::new(2).unwrap(),
+                            )
+                            .expect("prepared COMMIT must not hold the MM editor");
+                        let mut root = portal.root(mm, 1).unwrap();
                         assert!(
-                            spaces
-                                .try_begin_edit(
-                                    spaces.find(mm.raw()).unwrap(),
-                                    mm.raw(),
-                                    NonZeroU64::new(2).unwrap()
-                                )
-                                .is_none()
+                            root.prepared_overlaps(
+                                ReservationRange::new(chunk.va.raw(), chunk.va.raw() + chunk.len)
+                                    .unwrap()
+                            )
                         );
+                        drop(root);
+                        drop(editor);
                         assert!(ticket.copy_requested(|authorization| {
                             let selected = authorization.request().selected;
                             let start = (selected.ipa - ipa) as usize;
