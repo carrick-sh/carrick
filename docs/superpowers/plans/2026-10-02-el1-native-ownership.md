@@ -1203,3 +1203,10 @@ missing-resolver abort: resolver absence now refuses before journal acquisition,
 and successful preparation retains the resolver through cleanup. Parent owns
 clean position reconciliation, final gates and the one scoped fix review.
 No guest/Docker run or deferred Fork/Capacity/venue3 acceptance is claimed.
+
+Final-wave verification correction: the serial HVF census rejected the import
+wrapper extraction because FOREIGN_MM_TEST_LOCK was acquired only inside the
+shared helper. All three `#[test]` wrappers now acquire that existing lock at
+entry; the helper no longer acquires it, avoiding recursive locking. This
+preserves the original runtime exclusion and restores its mechanical binding.
+Focused census and all three import cases pass; no production source changed.
