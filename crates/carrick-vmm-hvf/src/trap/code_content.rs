@@ -139,6 +139,11 @@ pub(crate) struct CodeContent {
     /// first publication of the page as EL0-executable consults and clears
     /// it ([`Self::take_icache_dirty`]); data-only pages are never cleaned.
     icache_dirty: Box<[AtomicU64]>,
+    // Serializes only a bounded physical I2 invalidation, never content
+    // revocation, metadata, I/O, or a retained writer lifetime.
+    icache_publication: Mutex<()>,
+    #[cfg(test)]
+    pub(super) icache_publications: AtomicUsize,
 }
 
 /// Bits `[first, last]` of the 64-bit word `index` (page numbers).
@@ -164,6 +169,9 @@ impl CodeContent {
             writers: AtomicUsize::new(0),
             observed: AtomicBool::new(false),
             registry: OnceLock::new(),
+            icache_publication: Mutex::new(()),
+            #[cfg(test)]
+            icache_publications: AtomicUsize::new(0),
             icache_dirty: (0..pages.div_ceil(64))
                 .map(|_| AtomicU64::new(u64::MAX))
                 .collect(),
@@ -197,6 +205,25 @@ impl CodeContent {
         for index in first / 64..=last / 64 {
             let mask = page_word_mask(index, first, last);
             dirty |= self.icache_dirty[index].fetch_and(!mask, Ordering::SeqCst) & mask != 0;
+        }
+        dirty
+    }
+
+    /// Complete existing I2 cache maintenance for this physical backing.
+    /// The caller bounds the range to 16 KiB. Dirty claim and invalidation
+    /// finish together: a peer cannot mistake claimed work for completed I2.
+    pub(crate) fn publish_icache(
+        &self,
+        offset: usize,
+        len: usize,
+        invalidate: impl FnOnce(),
+    ) -> bool {
+        let _publication = self.icache_publication.lock();
+        let dirty = self.take_icache_dirty(offset, len);
+        if dirty {
+            invalidate();
+            #[cfg(test)]
+            self.icache_publications.fetch_add(1, Ordering::Relaxed);
         }
         dirty
     }
@@ -388,6 +415,49 @@ impl<O: Deref<Target = CodeContent>> Drop for ContentWrite<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executable_publication_waits_for_claimed_invalidation_completion() {
+        let content = Arc::new(CodeContent::new(4096));
+        let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let first_content = &content;
+            let first_finished = &finished;
+            let first = scope.spawn(move || {
+                first_content.publish_icache(0, 4096, || {
+                    claimed_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .unwrap();
+                    first_finished.store(true, Ordering::SeqCst);
+                });
+            });
+            claimed_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let content = &content;
+            let finished = &finished;
+            scope.spawn(move || {
+                content.publish_icache(0, 4096, || panic!("already claimed"));
+                done_tx.send(finished.load(Ordering::SeqCst)).unwrap();
+            });
+            let premature = done_rx.recv_timeout(std::time::Duration::from_millis(100));
+            release_tx.send(()).unwrap();
+            first.join().unwrap();
+            assert!(
+                premature.is_err(),
+                "publication returned before claimed I2 finished: {premature:?}"
+            );
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap()
+            );
+        });
+    }
 
     /// A new backing incarnation is dirty everywhere (its physical pages may
     /// have held any code); each page is claimed exactly once.
