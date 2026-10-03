@@ -1668,3 +1668,10 @@ Real SpaceEditor/root/gate/pending release hooks, authenticated production
 region binding, cause-specific revisions, sample/enroll/reprobe, metadata
 supply distinction and host-versus-EL1 publication are still OPEN. This source
 primitive alone does not close PREPARE suspension or enable any consumer.
+
+Cursor review round2 closes the caught-payload destruction edge: bind the
+caught Err payload and forget it immediately before fatal termination. A
+payload whose Drop panics can no longer escape before the fatal branch.
+The actual custom-payload subprocess red caught that second panic, observed
+successor wake0 versus1, and returned without SIGABRT. Its same terminal
+regression now includes both ordinary string and panicking-Drop payloads.
