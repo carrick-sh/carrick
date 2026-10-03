@@ -197,8 +197,8 @@ const _: () = assert!(
     EL1_DESCRIPTOR_TXN_OFFSET + core::mem::size_of::<DescriptorTxnSlots>() as u64
         <= EL1_COUNTERS_OFFSET + EL1_COUNTERS_SIZE
 );
-// Counters-area assignment: counters [0x100000, 0x120000), shared
-// reservations [0x120000, 0x180000), descriptor-txn slots [0x180000, 0x1A0000).
+// Counters-area assignment: counters [0x100000, 0x118000), shared
+// reservations [0x118000, 0x180000), descriptor-txn slots [0x180000, 0x1A0000).
 const _: () = assert!(EL1_DESCRIPTOR_TXN_OFFSET >= EL1_COUNTERS_OFFSET + 0x8_0000);
 const _: () = assert!(
     EL1_DESCRIPTOR_TXN_OFFSET + core::mem::size_of::<DescriptorTxnSlots>() as u64
