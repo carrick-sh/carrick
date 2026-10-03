@@ -105,7 +105,7 @@ const ROBUST_LIST_HEAD_SIZE: u64 = 24;
 pub trait LifecycleVenue {
     /// The lifecycle page of `task`'s process and `task`'s own control
     /// slot, or `None` when EL1 serves no lifecycle call for it.
-    fn thread(&self, task: &CurrentTask) -> Option<LifecycleThread<'_>>;
+    fn thread<'a>(&'a self, task: &'a CurrentTask) -> Option<LifecycleThread<'a>>;
     /// The control slot a thread born into `entry` of `page` will own.
     fn born_slot(&self, page: &ThreadLifecyclePage, entry: EntryRef) -> Option<&ThreadControlSlot>;
 }
@@ -668,7 +668,7 @@ pub struct GuestLifecycleVenue;
 
 #[cfg(target_os = "none")]
 impl LifecycleVenue for GuestLifecycleVenue {
-    fn thread(&self, task: &CurrentTask) -> Option<LifecycleThread<'_>> {
+    fn thread<'a>(&'a self, task: &'a CurrentTask) -> Option<LifecycleThread<'a>> {
         let (page, slot) = task.lifecycle_refs()?;
         Some(LifecycleThread { page, slot })
     }

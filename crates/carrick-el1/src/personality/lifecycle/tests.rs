@@ -79,7 +79,7 @@ impl Venue {
 }
 
 impl LifecycleVenue for Venue {
-    fn thread(&self, task: &CurrentTask) -> Option<LifecycleThread<'_>> {
+    fn thread<'a>(&'a self, task: &'a CurrentTask) -> Option<LifecycleThread<'a>> {
         let tid = task.task_id.load(Ordering::Relaxed);
         let slot = if tid == self.leader {
             &self.slots[0]
