@@ -1459,7 +1459,9 @@ Actual green owner bindings in `mm_portal/tests.rs`:
   `prepared_copy_releases_editor_for_unrelated_edit` close those two reds.
 - `prepared_copy_commit_and_cancel_never_acquire_held_root_or_editor`
   covers held root/editor, actual short-copy length, unrelated MM generation
-  changes and stale receipt refusal.
+  changes and stale receipt refusal. An additional red-first assertion caught
+  direct cancellation accepting an invalid slot; carrier/slot validation now
+  precedes the claim, preserving the successor for legitimate cancellation.
 - `prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall`
   covers munmap/mprotect/remap, both commit and cancel, and a queue held across
   settlement. Saved arguments/PC/token resume and the owner edit actually
@@ -1503,7 +1505,7 @@ The global EL1 ABI hash incorporates both layout receipts.
 Task 2 remains responsible for current-executor host service binding and
 owner-authenticated target table access on the maintenance root. PREPARE/
 select/one-shot still check target TTBR and use the primary-table alias
-(`production.rs:876`, `:883`, `:888`); the maintenance mapping needs the
+(`production.rs:881`, `:888`, `:893`); the maintenance mapping needs the
 stage-1 pool window. Removing TTBR equality alone would authenticate the
 wrong primary table. Host consuming paths, socket-derived aggregate bounds,
 mirror deletion, inverse EFAULT/raw-escape proofs and signed acceptance
