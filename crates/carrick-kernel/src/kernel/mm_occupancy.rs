@@ -776,6 +776,46 @@ pub struct AddressSpacePublication {
         Option<Arc<dyn crate::dispatch::mem::el1_reservations::HostReservationProvider>>,
 }
 
+/// A fork root exists for owner construction but is not installable by EL1.
+/// Dropping this proof uses normal exact-MM publication retirement.
+pub struct UnpublishedForkAddressSpace(AddressSpacePublication);
+impl UnpublishedForkAddressSpace {
+    pub fn mm(&self) -> MmId {
+        self.0.mm
+    }
+    /// Consume only an exact admitted owner child; a stale result retains the
+    /// closed publication for rollback and cannot make the child runnable.
+    pub fn into_admitted_publication(
+        self,
+        child: carrick_el1_abi::El1MmHandle,
+    ) -> Result<AddressSpacePublication, Self> {
+        use carrick_el1::memory::reservations::shared_host;
+        if child.mm().raw() != self.0.mm.raw() {
+            return Err(self);
+        }
+        let Some(roots) = shared_host() else {
+            return Err(self);
+        };
+        if !roots.admitted(self.0.index.index(), child.mm()) {
+            return Err(self);
+        }
+        let valid = roots
+            .lock(self.0.index.index(), child.mm())
+            .is_ok_and(|mut root| root.authenticate_fork_handle(child) && !root.fork_pending());
+        if !valid {
+            return Err(self);
+        }
+        self.0.tables.spaces.open(self.0.index);
+        Ok(self.0)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PublicationAdmission {
+    Open,
+    OwnerForkClosed,
+}
+
 impl std::fmt::Debug for AddressSpacePublication {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -916,6 +956,7 @@ impl PreAdmissionGuard {
                 limits: root.limits,
                 reservation_provider: root.provider,
             },
+            PublicationAdmission::Open,
         )
     }
     /// Refused admission removes the exact root while its original owner is
@@ -934,6 +975,36 @@ impl PreAdmissionGuard {
             drop(core::ptr::read(&publication.reservation_provider));
         }
     }
+}
+
+/// Publish an empty child root while keeping its installation gate closed.
+/// Geometry and physical roots are bootstrap inputs; owner Fork supplies all
+/// inherited reservations, protections, backing identities and real anchors.
+#[allow(clippy::too_many_arguments)]
+pub fn publish_closed_fork_address_space(
+    mm: MmId,
+    fence: &MmFence,
+    ttbr0: u64,
+    ttbr1: u64,
+    brk_current: u64,
+    mmap_next: u64,
+    root: ReservationRootPublication,
+) -> Option<UnpublishedForkAddressSpace> {
+    let guard = PreAdmissionGuard::acquire(mm)?;
+    publish_in_held(
+        &guard,
+        fence,
+        ttbr0,
+        ttbr1,
+        Anchors {
+            brk_current,
+            mmap_next,
+            limits: root.limits,
+            reservation_provider: root.provider,
+        },
+        PublicationAdmission::OwnerForkClosed,
+    )
+    .map(UnpublishedForkAddressSpace)
 }
 
 /// Publish `mm`, whose translation roots are `ttbr0`/`ttbr1`, with initial
@@ -1015,7 +1086,14 @@ fn publish_in_with_layout(
     anchors: Anchors,
 ) -> Option<AddressSpacePublication> {
     let guard = PreAdmissionGuard::acquire_in(tables, mm)?;
-    publish_in_held(&guard, fence, ttbr0, ttbr1, anchors)
+    publish_in_held(
+        &guard,
+        fence,
+        ttbr0,
+        ttbr1,
+        anchors,
+        PublicationAdmission::Open,
+    )
 }
 
 fn publish_in_held(
@@ -1024,6 +1102,7 @@ fn publish_in_held(
     ttbr0: u64,
     ttbr1: u64,
     anchors: Anchors,
+    admission: PublicationAdmission,
 ) -> Option<AddressSpacePublication> {
     let tables = guard.tables;
     let mm = guard.mm;
@@ -1086,7 +1165,9 @@ fn publish_in_held(
         spaces.free(index);
         return None;
     }
-    spaces.open(index);
+    if matches!(admission, PublicationAdmission::Open) {
+        spaces.open(index);
+    }
     Some(AddressSpacePublication {
         tables,
         index,
