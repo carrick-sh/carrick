@@ -1147,3 +1147,25 @@ CDHash `3aa1b20e329586fe13e1876eb28d7c5c7bc58772`, LC_UUID
 core executable (SHA-256
 `8085ddd797131e2ab6c4b5d28039ee0691a7c22ba7c7229ec4ba44e8f7b14ef4`).
 These are failure receipts, not lifecycle acceptance.
+
+The retained core's directory was authenticated from the saved
+`run_executor_loop` prologue (resolver ArcInner at frame SP + 0x120).
+It contains exactly `(tid=1, serial=6, generation=767)` and
+`(tid=1052, serial=5815, generation=2)`. The orphan binding remains active;
+its job is suspended on BlockedContinuation, with runtime withdrawal
+false. The matching dSYM's DWARF variant discriminant `0x0b` identifies
+its production phase as ResumeZone. Thus its host logical job was still
+parked when graph retirement removed its live thread. The ledger's
+ExitedInZone path retires graph/pool custody but does not complete such
+a host job.
+
+The ownership guard retains exit on the host whenever a non-home record
+has already acquired a host execution generation. This uses the existing
+unadopted-birth identity predicate, preserves the home-record decline,
+and leaves generation-zero Born/Published records eligible for EL1 exit.
+A red-first paired-process-venue contract observed Served instead of
+Forward for the migrated host job; with the guard, its Published entry,
+CLEARTID and current record remain intact, while the other process's
+unadopted birth exits in EL1. All 187 EL1 and 112 ABI unit tests pass.
+Fresh signed watchdog and slope checks remain required; this guard does
+not claim the exit budget is fixed.

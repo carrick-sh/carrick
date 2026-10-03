@@ -867,6 +867,56 @@ fn exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it() {
 }
 
 #[test]
+fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
+    let mut hosted = World::new(LifecycleHatches::ON);
+    let mut peer = World::new(LifecycleHatches::ON);
+    let hosted_word = Box::new(0_u32);
+    let peer_word = Box::new(0_u32);
+    let mut hosted_frame = clone_then_join(&mut hosted, &hosted_word);
+    let mut peer_frame = clone_then_join(&mut peer, &peer_word);
+    let entry = hosted.venue.child_slot(0).entry().unwrap();
+    hosted.page().publish(entry).unwrap();
+    let record = hosted.zone.slot(SLOT).current().unwrap();
+    assert_ne!(Some(record), hosted.zone.slot(SLOT).host_record());
+    let mut identity = hosted.zone.record(record).identity();
+    identity.generation = 2;
+    hosted.zone.release_current(
+        SLOT,
+        record,
+        &carrick_sched_core::BoundedSpin(carrick_el1_abi::EL1_GUEST_LOCK_SPINS),
+    );
+    let record = hosted.zone.alloc_record(identity).unwrap();
+    hosted.zone.requeue_preempted(SLOT, record);
+    assert_eq!(hosted.zone.switch_in(SLOT), Some(record));
+    assert_eq!(hosted.page().live(), 2);
+    assert_eq!(peer.page().live(), 2);
+
+    assert_eq!(
+        hosted.call(&mut hosted_frame, SYS_EXIT, &[0]),
+        Action::Forward
+    );
+    assert_eq!(
+        hosted.page().state(entry.index()).unwrap().1,
+        EntryState::Published
+    );
+    assert_eq!(hosted.page().live(), 2);
+    assert_eq!(
+        *hosted_word, CHILD_VISIBLE,
+        "host retirement still owns CLEARTID"
+    );
+    assert_eq!(hosted.zone.slot(SLOT).current(), Some(record));
+    assert_eq!(
+        hosted.counters.lifecycle_declines
+            [carrick_el1_abi::LifecycleDecline::ExitHostAdopted as usize]
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(peer.call(&mut peer_frame, SYS_EXIT, &[0]), Action::Served);
+    assert_eq!(peer.page().live(), 1);
+    assert_eq!(*peer_word, 0);
+}
+
+#[test]
 fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
     // (label, setup applied after the child is switched in)
     type Setup = fn(&World);
