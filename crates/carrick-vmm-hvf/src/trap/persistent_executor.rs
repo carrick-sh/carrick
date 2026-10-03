@@ -1218,7 +1218,7 @@ impl HvfVmState {
         cow_ranges: &[carrick_aarch64::vmm::ForkCowRange],
     ) -> Result<ProcessSpec, TrapError> {
         let cached_snapshot = self.cached_fork_alias_snapshot.lock().clone();
-        let plan = self.task.build_process_plan(
+        let plan = self.task.build_setup_process_plan(
             request,
             page_tables,
             cow_ranges,

@@ -520,15 +520,16 @@ impl SyscallDispatcher {
             }
             _ => {}
         }
-        // Fork preparation reads an exact revision and produces a private
-        // projection. Publication validates the revision below; no host alias
-        // is acquired while taking this snapshot.
-        if mode == crate::kernel::CloneObjectMode::Copy
+        let parent_mm = self.mm_binding.current.load_full();
+        let owner_fork = parent_mm.lock().delegated_root().is_some();
+        // Setup validates its host backing snapshot. An admitted Fork asks
+        // the production owner to settle/refuse its exact live state.
+        if !owner_fork
+            && mode == crate::kernel::CloneObjectMode::Copy
             && self.mem_view().fork_backing_is_unsettled()
         {
             return Err(PrepareDispatchMmForkError::UnsettledEl1Backing);
         }
-        let parent_mm = self.mm_binding.current.load_full();
         let (parent_revision, child_mm, backend_plan) = match mode {
             crate::kernel::CloneObjectMode::Share => {
                 let (revision, ranges) = parent_mm.fork_projection_with_revision()?;
@@ -547,6 +548,7 @@ impl SyscallDispatcher {
             mode,
             child_mm,
             backend_plan,
+            owner_fork,
         })
     }
 

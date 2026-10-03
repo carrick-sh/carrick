@@ -88,6 +88,47 @@ impl MmMutationGuard<'_> {
     }
 }
 
+impl super::OwnerMmTopologyGuard<'_> {
+    /// Compose task birth with an owner-built, still closed child root.
+    pub fn fork_commit<'fork>(
+        &'fork self,
+        transaction: &'fork MmTransactionGuard<'_>,
+        child: &'fork SyscallDispatcher,
+    ) -> Result<ForkCommit<'fork>, ForkCommitRefusal> {
+        let parent = &self.inner;
+        if transaction.mm != Some(parent.mm) {
+            return Err(ForkCommitRefusal::ForeignTransaction);
+        }
+        let authority = child.mm_authority();
+        if authority.mm_id == parent.mm
+            || Arc::ptr_eq(&authority.mutation_coordinator, &parent.coordinator)
+        {
+            return Err(ForkCommitRefusal::SharedMm);
+        }
+        if !child.mem_view().is_fork_twin_of(parent.mm) {
+            return Err(ForkCommitRefusal::NotThisParentsChild);
+        }
+        if let Some(zone) = crate::el1_zone::zone() {
+            let index = zone
+                .spaces
+                .find(authority.mm_id.raw())
+                .ok_or(ForkCommitRefusal::ChildPublished)?;
+            if zone.spaces.gate(index) != carrick_sched_core::GATE_CLOSED {
+                return Err(ForkCommitRefusal::ChildPublished);
+            }
+        }
+        Ok(ForkCommit {
+            _parent: PhantomData,
+            parent_coordinator: Arc::clone(&parent.coordinator),
+            parent_mm: parent.mm,
+            child,
+            child_coordinator: Arc::clone(&authority.mutation_coordinator),
+            child_mm: authority.mm_id,
+            _transaction: PhantomData,
+        })
+    }
+}
+
 impl ForkCommit<'_> {
     /// The child MM this commit covers.
     pub fn child_mm(&self) -> MmId {
@@ -124,7 +165,7 @@ impl ForkCommit<'_> {
 
     /// Admit the child's published root as the owner of its anonymous
     /// memory, seeded from the parent's committed root
-    /// ([`El1AdmissionOrigin::ForkCommit`]). `parent` is the dispatcher of
+    /// ([`El1AdmissionOrigin::SetupForkCommit`]). `parent` is the dispatcher of
     /// the MM whose guard minted this commit.
     pub(crate) fn admit_child_root(
         &self,
@@ -140,9 +181,34 @@ impl ForkCommit<'_> {
         let permit = self.child_permit();
         self.child.admit_el1_reservations(
             &permit,
-            El1AdmissionOrigin::ForkCommit {
+            El1AdmissionOrigin::SetupForkCommit {
                 parent,
                 parent_permit: &parent_permit,
+            },
+        )
+    }
+
+    /// Attach only the child's production owner Fork completion. Its root
+    /// already contains owner-selected tables, VMAs and source identities.
+    pub fn admit_owner_child_root(
+        &self,
+        parent: &SyscallDispatcher,
+        completion: &carrick_el1_abi::PortalForkCompletion,
+        inherited_sources: &[(core::num::NonZeroU64, core::num::NonZeroU64)],
+    ) -> Result<El1Admission, Refusal> {
+        let parent_permit = HostAliasPermit {
+            coordinator: Arc::clone(&self.parent_coordinator),
+            mm: self.parent_mm,
+            guest_tid: None,
+            _guard: PhantomData,
+        };
+        self.child.admit_el1_reservations(
+            &self.child_permit(),
+            El1AdmissionOrigin::OwnerForkCommit {
+                parent,
+                parent_permit: &parent_permit,
+                completion,
+                inherited_sources,
             },
         )
     }
@@ -166,6 +232,9 @@ impl ForkCommit<'_> {
         parent: &SyscallDispatcher,
         child_ttbr0: u64,
     ) -> Option<crate::kernel::AddressSpacePublication> {
+        if parent.mem().lock().delegated_root().is_some() {
+            return None;
+        }
         if !crate::kernel::is_address_space_published(self.parent_mm) {
             return None;
         }

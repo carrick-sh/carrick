@@ -20,6 +20,9 @@ test-support = []
 [dependencies]
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-abi = { path = "../carrick-abi" }
+# Neutral sealed owner receipts carry Fork across task/backend publication.
+# el1-abi is no_std and has no HAL or platform dependency.
+carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-fatal.workspace = true
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }

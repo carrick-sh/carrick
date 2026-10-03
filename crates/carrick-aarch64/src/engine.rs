@@ -166,56 +166,6 @@ fn guest_frame_grant_submission(
     }
 }
 
-/// The guest-owned lane's parent fork-COW arm: one EL1 transaction per newly
-/// armed range, each with the host editor's exact per-descriptor rule and
-/// exactly the table grants it needs. Nothing is stored. A refusal returns
-/// every grant already reserved and fails the fork before it commits.
-fn guest_fork_arm_txns(
-    page_tables: &Stage1Authority,
-    mm_key: u64,
-    ranges: &[crate::vmm::ForkCowRange],
-) -> Result<Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>, TrapError> {
-    let mm_key = std::num::NonZeroU64::new(mm_key).ok_or_else(|| {
-        TrapError::Hypervisor("guest fork arm lacks the parent MM identity".to_owned())
-    })?;
-    let mut txns = Vec::new();
-    for range in ranges {
-        let op = page_tables
-            .with_manager(|manager| {
-                manager.fork_arm_op(
-                    range.va,
-                    range.len as u64,
-                    range.kernel_only,
-                    range.executable,
-                    range.el1_adoptable(),
-                )
-            })
-            .ok_or_else(|| {
-                TrapError::Hypervisor("guest fork arm lost the parent stage-1 image".to_owned())
-            });
-        let txn = op.and_then(|op| {
-            page_tables
-                .prepare_guest_descriptor_txn(mm_key, op)
-                .map_err(|error| {
-                    TrapError::Hypervisor(format!(
-                        "prepare guest fork arm at VA 0x{:x}: {error:?}",
-                        range.va
-                    ))
-                })
-        });
-        match txn {
-            Ok(txn) => txns.push(txn),
-            Err(error) => {
-                for txn in &txns {
-                    let _ = page_tables.abandon_guest_descriptor_txn(txn);
-                }
-                return Err(error);
-            }
-        }
-    }
-    Ok(txns)
-}
-
 /// The maintenance trampoline's closing `hvc #1`, used as the return address
 /// of a host-driven EL1 call so its `ret` completes as `MaintenanceDone`.
 const EL1_SERVICE_CALL_RETURN: u64 = carrick_mem::memory::LINUX_EL1_MAINT_BASE + 16;
@@ -483,6 +433,7 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
     /// window of an in-process fork. Runtime commits it only after the child is
     /// materialized; a recoverable failure restores both authorities.
     pending_process_fork: Option<ParentForkCowRollback>,
+    pending_owner_fork: Option<OwnerForkTransaction<V::ProcessBuilder>>,
 
     /// When set, records the runtime's exec predecessor-sharing expectation
     /// (`mark_exec_predecessor_shared`) to cross-check against the stage-1
@@ -516,6 +467,7 @@ pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
     page_tables: Stage1Authority,
     protections: Arc<MemoryProtections>,
     pending_process_fork: Option<ParentForkCowRollback>,
+    pending_owner_fork: Option<OwnerForkTransaction<V::ProcessBuilder>>,
     owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance,
 }
 
@@ -743,6 +695,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_new_mapping: None,
             pending_process_fork: None,
+            pending_owner_fork: None,
             exec_predecessor_shared: None,
             owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
             owed_resume_invalidation: None,
@@ -922,6 +875,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page_tables,
             protections,
             pending_process_fork,
+            pending_owner_fork,
             mut owed_stage1_maintenance,
             ..
         } = self;
@@ -942,6 +896,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 page_tables,
                 protections,
                 pending_process_fork,
+                pending_owner_fork,
                 owed_stage1_maintenance,
             },
             vcpu,
@@ -964,6 +919,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             page_tables,
             protections,
             pending_process_fork,
+            pending_owner_fork,
             owed_stage1_maintenance,
         } = state;
         Self {
@@ -987,6 +943,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_new_mapping: None,
             pending_process_fork,
+            pending_owner_fork,
             exec_predecessor_shared: None,
             owed_stage1_maintenance,
             owed_resume_invalidation: None,
@@ -1029,16 +986,14 @@ fn ensure_sparse_page_table_editor(
     if editor_present { Ok(()) } else { bootstrap() }
 }
 
+struct OwnerForkTransaction<B> {
+    pending: crate::fork::PendingOwnerFork<'static, Box<dyn Send>>,
+    physical: Box<dyn crate::fork::PhysicalForkBuilder<B>>,
+    parent_tables: crate::stage1_authority::OwnerForkTableArena,
+}
+
 struct ParentForkCowRollback {
     armed_ranges: Vec<crate::vmm::ForkCowRange>,
-    /// Guest-owned lane: the parent's fork-COW arm as EL1 transactions, one
-    /// per newly armed range. Nothing was stored; rollback returns their
-    /// grants, and commit refuses unless the runtime took them for EL1.
-    guest_arm: Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>,
-    /// The runtime took the guest arm for EL1: the parent's leaves are armed,
-    /// so a failed fork keeps the armed-range record that matches them (an
-    /// armed span only costs a private copy on the next write).
-    guest_arm_taken: bool,
 }
 
 fn aarch64_task_state_from_snapshot(
@@ -1312,6 +1267,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_new_mapping: None,
             pending_process_fork: None,
+            pending_owner_fork: None,
             exec_predecessor_shared: None,
             owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
             owed_resume_invalidation: None,
@@ -1436,6 +1392,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             protections,
             pending_new_mapping: None,
             pending_process_fork: None,
+            pending_owner_fork: None,
             exec_predecessor_shared: None,
             owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance::default(),
             owed_resume_invalidation: None,
@@ -4752,6 +4709,94 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.bind_frame_cow(authority, identity);
     }
 
+    fn service_owner_file_fault(
+        &mut self,
+        mm_key: u64,
+        request_generation: u64,
+    ) -> Result<Option<carrick_hal::OwnerFileFaultOutcome>, TrapError> {
+        let Some(slot_index) = self.vcpu.mailbox_slot() else {
+            return Ok(None);
+        };
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            return Ok(None);
+        }
+        // SAFETY: the driving engine retains the installed carrier metadata
+        // region, whose versioned layout owns this aligned slot table.
+        let slots = unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        };
+        let Some(slot) = slots.grant(slot_index) else {
+            return Ok(None);
+        };
+        let Some(window) = slot.fault_selection(mm_key, request_generation) else {
+            return Ok(None);
+        };
+        if mm_key != self.mm_generation || window.host_backing.is_none() {
+            return Err(TrapError::Hypervisor(
+                "owner file fault selection names another MM or source".into(),
+            ));
+        }
+        let ttbr0 = self.vcpu.get_sys_reg(SysReg::Ttbr0)?;
+        // SAFETY: this exact window was published by the production owner in
+        // this carrier's immutable fault-selection slot.
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                window.operation.carrier,
+                window.operation.mm,
+                window.operation.incarnation,
+            )
+        };
+        let target = crate::user_transfer::TransferTarget::from_handle(handle, ttbr0);
+        let prepared = match self.vm.prepare_owner_frame_grant(target, window) {
+            Err(TrapError::HostBackingEof) => {
+                if !slot.cancel_fault_selection(window, request_generation) {
+                    return Err(TrapError::Hypervisor("owner EOF selection is stale".into()));
+                }
+                return Ok(Some(carrick_hal::OwnerFileFaultOutcome::BusFault));
+            }
+            other => other?,
+        };
+        let Some(mut grant) = prepared else {
+            if !slot.cancel_fault_selection(window, request_generation) {
+                return Err(TrapError::Hypervisor(
+                    "owner file fault cancellation is stale".into(),
+                ));
+            }
+            return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused));
+        };
+        if !slot.submit(window, grant.transaction()) {
+            return Err(TrapError::Hypervisor(
+                "owner file fault grant selection was displaced".into(),
+            ));
+        }
+        let outcome = self.run_owner_fork_service(
+            carrick_el1_abi::TrapFrame {
+                esr: carrick_el1_abi::MM_PORTAL_GRANT_ESR,
+                ..carrick_el1_abi::TrapFrame::default()
+            },
+            &mut || false,
+        );
+        if let Some(receipt) = slot.take_receipt(window, grant.transaction()) {
+            let settled = grant.settle(&receipt)?;
+            outcome?;
+            Ok(Some(if settled {
+                carrick_hal::OwnerFileFaultOutcome::Resolved
+            } else {
+                carrick_hal::OwnerFileFaultOutcome::Refused
+            }))
+        } else if slot.withdraw(window, grant.transaction()) {
+            outcome?;
+            Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused))
+        } else {
+            carrick_fatal::carrick_fatal!(
+                "aarch64::user_transfer",
+                "unsettled owner file fault retains physical custody"
+            );
+        }
+    }
+
     fn prepare_el1_frame_grant(
         &mut self,
         request: carrick_hal::El1FrameGrantRequest,
@@ -5346,6 +5391,9 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             HvpatchForkProcessSpecStage, HvpatchForkProcessSpecStagePhase,
         };
 
+        if request.plan.owner_target().is_some() {
+            return self.build_owner_process_spec(request);
+        }
         if self.pending_process_fork.is_some() {
             return Err(TrapError::Hypervisor(
                 "overlapping in-process parent fork transaction".to_owned(),
@@ -5379,13 +5427,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             crate::stage1_authority::GuestLaneSite::ForkPlan,
             &self.page_tables,
         );
-        let guest_lane = self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest;
-        let page_tables_absent = self.page_tables.is_none();
-        if page_tables_absent && guest_lane {
+        if self.page_tables.live_descriptor_owner() == LiveDescriptorOwner::Guest {
             return Err(TrapError::Hypervisor(
-                "guest-owned MM forked before its live stage-1 manager exists".to_owned(),
+                "admitted root requires an owner Fork request".into(),
             ));
         }
+        let page_tables_absent = self.page_tables.is_none();
         if page_tables_absent {
             self.pt_edit(|_| Ok(PageTableApplyOutcome::default()))
                 .map_err(|error| {
@@ -5423,22 +5470,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // directly (a live image has nothing to adopt), and the live edit
         // funnel refuses there.
         const USER_ADDRESS_SPACE: usize = 1 << 48;
-        if !guest_lane {
-            self.pt_edit_locked_after_adopting(Some((0, USER_ADDRESS_SPACE)), |_| {
-                Ok(PageTableApplyOutcome::default())
-            })
-            .map_err(|error| {
-                memory_error_to_trap_error(error, "adopt live stage-1 tables before fork")
-            })?;
-        } else if !self
-            .page_tables
-            .with_manager(PageTableManager::is_live)
-            .unwrap_or(false)
-        {
-            return Err(TrapError::Hypervisor(
-                "guest-owned MM fork requires a live stage-1 manager".to_owned(),
-            ));
-        }
+        self.pt_edit_locked_after_adopting(Some((0, USER_ADDRESS_SPACE)), |_| {
+            Ok(PageTableApplyOutcome::default())
+        })
+        .map_err(|error| {
+            memory_error_to_trap_error(error, "adopt setup stage-1 tables before fork")
+        })?;
         let cow_ranges = if request.shares_mm() {
             Vec::new()
         } else {
@@ -5523,16 +5560,6 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                             "prepare hvpatch child kernel fork leaves read-only: {error:?}"
                         ))
                     })?;
-            } else if guest_lane && range.el1_adoptable() {
-                // The child image inherits the parent's lane; adopt exactly
-                // what the parent's guest arm adopts so both see one state.
-                page_tables
-                    .set_fork_readonly_adopting(range.va, range.len, child_source.as_deref_mut())
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "prepare hvpatch child private fork leaves read-only: {error:?}"
-                        ))
-                    })?;
             } else {
                 page_tables
                     .set_fork_readonly(range.va, range.len, child_source.as_deref_mut())
@@ -5612,22 +5639,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             process_asid: child_asid,
         };
 
-        if !cow_ranges.is_empty() && guest_lane {
-            let stage_started = std::time::Instant::now();
-            let guest_arm =
-                guest_fork_arm_txns(&self.page_tables, self.mm_generation, &unarmed_ranges)?;
-            self.vm.arm_frame_cow_ranges(&unarmed_ranges);
-            self.pending_process_fork = Some(ParentForkCowRollback {
-                armed_ranges: parent_armed_snapshot,
-                guest_arm,
-                guest_arm_taken: false,
-            });
-            emit_stage(
-                HvpatchForkProcessSpecStagePhase::ParentCowPublication,
-                stage_started,
-                unarmed_ranges.len() as u64,
-            );
-        } else if !cow_ranges.is_empty() {
+        if !cow_ranges.is_empty() {
             let stage_started = std::time::Instant::now();
             // Final publication transaction. All child allocation, mapping-plan,
             // ASID, snapshot, and wrapper work is complete. Open an undo journal
@@ -5745,8 +5757,6 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             self.vm.arm_frame_cow_ranges(&unarmed_ranges);
             self.pending_process_fork = Some(ParentForkCowRollback {
                 armed_ranges: parent_armed_snapshot,
-                guest_arm: Vec::new(),
-                guest_arm_taken: false,
             });
             emit_stage(
                 HvpatchForkProcessSpecStagePhase::ParentCowPublication,
@@ -5787,61 +5797,83 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         Ok(engine)
     }
 
+    fn read_owner_fork_parent_bytes(
+        &mut self,
+        address: u64,
+        len: usize,
+        admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+    ) -> Result<Vec<u8>, TrapError> {
+        self.transfer_owner_fork_parent_bytes(
+            crate::user_transfer::UserTransfer::CopyIn {
+                address,
+                len,
+                intent: carrick_el1_abi::PortalTransferIntent::UserRead,
+            },
+            admission,
+        )
+    }
+
+    fn write_owner_fork_parent_bytes(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+    ) -> Result<(), TrapError> {
+        self.transfer_owner_fork_parent_bytes(
+            crate::user_transfer::UserTransfer::CopyOut {
+                address,
+                bytes: bytes.to_vec(),
+            },
+            admission,
+        )
+        .map(|_| ())
+    }
+
+    fn pending_owner_fork_receipt(&self) -> Option<carrick_hal::threaded::PendingOwnerForkReceipt> {
+        self.pending_owner_fork.as_ref().map(|pending| {
+            (
+                pending.pending.completion(),
+                pending.pending.inherited_host_backing().to_vec(),
+            )
+        })
+    }
+
     fn commit_process_fork(&mut self) -> Result<(), TrapError> {
-        if self
-            .pending_process_fork
-            .as_ref()
-            .is_some_and(|pending| !pending.guest_arm.is_empty())
-        {
-            // Committing without handing the arm to EL1 would let the parent
-            // write frames the child shares. Refuse; the caller rolls back.
-            return Err(TrapError::Hypervisor(
-                "guest-owned fork committed before its parent arm was submitted to EL1".to_owned(),
-            ));
+        if let Some(owner) = self.pending_owner_fork.take() {
+            let used = owner.pending.completion().parent_tables_used;
+            let receipt = owner.pending.finish(true, |frame, effect| {
+                self.run_owner_fork_service(frame, effect)
+            })?;
+            owner
+                .parent_tables
+                .settle(used)
+                .map_err(TrapError::Hypervisor)?;
+            owner.physical.settle(true)?;
+            drop(receipt);
+            return Ok(());
         }
         let _ = self.pending_process_fork.take();
         self.page_tables.commit_undo();
         Ok(())
     }
 
-    fn take_guest_fork_arm_txns(
-        &mut self,
-    ) -> Vec<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn> {
-        self.pending_process_fork
-            .as_mut()
-            .map(|pending| {
-                let arm = std::mem::take(&mut pending.guest_arm);
-                pending.guest_arm_taken |= !arm.is_empty();
-                arm
-            })
-            .unwrap_or_default()
-    }
-
     fn rollback_process_fork(&mut self) -> Result<(), TrapError> {
+        if let Some(owner) = self.pending_owner_fork.take() {
+            let receipt = owner.pending.finish(false, |frame, effect| {
+                self.run_owner_fork_service(frame, effect)
+            })?;
+            let retained_parent_tables = receipt.completion().parent_tables_used;
+            drop(receipt);
+            owner.physical.settle(false)?;
+            owner
+                .parent_tables
+                .settle(retained_parent_tables)
+                .map_err(TrapError::Hypervisor)?;
+            return Ok(());
+        }
         let Some(rollback) = self.pending_process_fork.take() else {
             return Ok(());
         };
-        if rollback.guest_arm_taken {
-            // EL1 armed the parent's leaves: keep the record that matches
-            // them, so every later guest COW of them settles.
-            return Ok(());
-        }
-        if !rollback.guest_arm.is_empty() {
-            // Nothing reached the live tables: return the grants and restore
-            // the backend's armed-range metadata.
-            for txn in &rollback.guest_arm {
-                self.page_tables
-                    .abandon_guest_descriptor_txn(txn)
-                    .map_err(|error| {
-                        TrapError::Hypervisor(format!(
-                            "return guest fork-arm grants after failed fork: {error:?}"
-                        ))
-                    })?;
-            }
-            self.vm
-                .restore_frame_cow_arm_snapshot(rollback.armed_ranges);
-            return Ok(());
-        }
         self.pt_rollback_undo_and_flush().map_err(|error| {
             TrapError::Hypervisor(format!(
                 "restore parent after failed in-process fork: {error}"
@@ -6547,33 +6579,13 @@ mod tests {
         assert!(!submit_body.contains("pt_edit"));
         assert!(!submit_body.contains("sync_to_host"));
 
-        // Fork: the guest lane arms the parent with EL1 transactions, before
-        // and instead of the host publication edit, and commit refuses while
-        // the arm has not been handed to EL1.
-        let fork = production
-            .split("fn build_process_spec(")
-            .nth(1)
-            .and_then(|tail| tail.split("\n    fn materialize_process").next())
-            .expect("fork spec");
-        let guest_arm = fork
-            .find("guest_fork_arm_txns(")
-            .expect("guest lane builds fork-arm transactions");
-        let host_arm = fork.find("self.pt_edit_and_flush(").expect("host lane arm");
-        assert!(guest_arm < host_arm);
-        assert!(fork.contains("if !guest_lane {"));
-        let arm_body = production
-            .split("fn guest_fork_arm_txns")
-            .nth(1)
-            .and_then(|tail| tail.split("\n}\n").next())
-            .expect("guest fork arm");
-        assert!(arm_body.contains("fork_arm_op("));
-        assert!(!arm_body.contains("pt_edit"));
-        let commit = production
-            .split("fn commit_process_fork")
-            .nth(1)
-            .and_then(|tail| tail.split("\n    fn ").next())
-            .expect("commit");
-        assert!(commit.contains("guest_arm.is_empty()"));
+        // Admitted Fork leaves the setup projection before its first snapshot.
+        let fork = production.split("fn build_process_spec(").nth(1).unwrap();
+        assert!(
+            fork.find("build_owner_process_spec(request)").unwrap()
+                < fork.find("snapshot_image_recycled()").unwrap()
+        );
+        assert!(!production.contains("fn guest_fork_arm_txns"));
     }
 
     #[test]
@@ -7731,6 +7743,290 @@ mod tests {
 }
 
 impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
+    fn transfer_owner_fork_parent_bytes(
+        &mut self,
+        request: crate::user_transfer::UserTransfer,
+        admission: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+    ) -> Result<Vec<u8>, TrapError> {
+        let operation = self.pending_owner_fork_operation();
+        let custody = self
+            .vm
+            .owner_transfer_custody()
+            .ok_or(TrapError::UnsupportedPlatform)?;
+        let ttbr0 = self.vcpu.get_sys_reg(SysReg::Ttbr0)?;
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            return Err(TrapError::UnsupportedPlatform);
+        }
+        // SAFETY: the live engine retains its carrier metadata region.
+        let slots = unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        };
+        admission.arm().map_err(TrapError::Hypervisor)?;
+        let target = if let Some(operation) = operation {
+            // SAFETY: the retained operation authenticates the parent root.
+            let handle = unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    operation.carrier,
+                    operation.mm,
+                    operation.incarnation,
+                )
+            };
+            crate::user_transfer::TransferTarget::from_handle(handle, ttbr0)
+        } else {
+            let mm = carrick_el1_abi::ReservationMm::new(self.mm_generation)
+                .ok_or(TrapError::UnsupportedPlatform)?;
+            crate::user_transfer::TransferTarget::bind(
+                self,
+                mm,
+                ttbr0,
+                admission,
+                custody.as_ref(),
+                slots,
+            )?
+            .ok_or(TrapError::UnsupportedPlatform)?
+        };
+        let mut transfer = crate::user_transfer::OwnedUserTransfer::new(target, request)
+            .ok_or_else(|| TrapError::Hypervisor("owner parent transfer range overflow".into()))?;
+        if let Some(operation) = operation
+            && !transfer.authorize_fork_parent_write(operation)
+        {
+            return Err(TrapError::UnsupportedPlatform);
+        }
+        loop {
+            match transfer.advance(self, admission, custody.as_ref(), slots)? {
+                crate::user_transfer::TransferProgress::Complete => {
+                    return Ok(transfer.into_bytes());
+                }
+                crate::user_transfer::TransferProgress::Advanced => {}
+                crate::user_transfer::TransferProgress::Suspended
+                | crate::user_transfer::TransferProgress::Refused(_) => {
+                    return Err(TrapError::Hypervisor(
+                        "owner parent transfer refused".into(),
+                    ));
+                }
+            }
+        }
+    }
+    /// Run a Fork exchange on the driving task's retained service stack. The
+    /// request names both roots exactly; no host descriptor editor is lent.
+    pub fn run_owner_parent_transfer(
+        &mut self,
+        frame: carrick_el1_abi::TrapFrame,
+        target: crate::user_transfer::TransferTarget,
+        sequence: core::num::NonZeroU64,
+        effect: &mut dyn FnMut() -> bool,
+    ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+        let operation = self
+            .pending_owner_fork_operation()
+            .ok_or_else(|| TrapError::Hypervisor("parent transfer has no retained Fork".into()))?;
+        let current = self.vcpu.get_sys_reg(SysReg::Ttbr0)?;
+        if operation.sequence != sequence
+            || operation.carrier != target.handle().carrier()
+            || operation.mm != target.handle().mm()
+            || operation.incarnation != target.handle().incarnation()
+            || current != target.ttbr0()
+        {
+            return Err(TrapError::Hypervisor(
+                "parent transfer differs from exact pending Fork root".into(),
+            ));
+        }
+        self.run_owner_fork_service(frame, effect)
+    }
+
+    pub fn pending_owner_fork_operation(&self) -> Option<carrick_el1_abi::PortalOperation> {
+        self.pending_owner_fork
+            .as_ref()
+            .map(|owner| owner.pending.completion().request.operation)
+    }
+
+    fn build_owner_process_spec(
+        &mut self,
+        mut request: ProcessForkRequest,
+    ) -> Result<Aarch64ProcessSpec<V>, TrapError> {
+        if self.pending_process_fork.is_some() || self.pending_owner_fork.is_some() {
+            return Err(TrapError::Hypervisor(
+                "overlapping owner Fork transaction".into(),
+            ));
+        }
+        if request.shares_mm() {
+            return Err(TrapError::Hypervisor(
+                "shared owner roots use the shared task lifetime adapter".into(),
+            ));
+        }
+        let (parent_mm, child_mm) = request.plan.owner_target().ok_or_else(|| {
+            TrapError::Hypervisor("owner Fork request lost exact MM identity".into())
+        })?;
+        let mut physical = self.vm.prepare_owner_fork_builder(&mut request)?;
+        let parent_tables = self
+            .page_tables
+            .reserve_owner_fork_arena()
+            .map_err(TrapError::Hypervisor)?;
+        let parent_arena = parent_tables
+            .arena()
+            .ok_or_else(|| TrapError::Hypervisor("owner Fork parent capacity is absent".into()))?;
+        let mut bind = carrick_el1_abi::TrapFrame {
+            esr: carrick_el1_abi::MM_PORTAL_BIND_ESR,
+            ..Default::default()
+        };
+        bind.x[1] = physical.carrier().get();
+        bind.x[2] = parent_mm;
+        let bound = self.run_owner_fork_service(bind, &mut || false)?;
+        if bound.x[0] != 0 {
+            physical.settle(false)?;
+            return Err(TrapError::Hypervisor(format!(
+                "owner Fork parent bind refused: {}",
+                bound.x[0]
+            )));
+        }
+        let operation = carrick_el1_abi::PortalOperation {
+            carrier: physical.carrier(),
+            mm: carrick_el1_abi::ReservationMm::new(parent_mm)
+                .ok_or_else(|| TrapError::Hypervisor("zero parent MM".into()))?,
+            incarnation: core::num::NonZeroU64::new(bound.x[3]).ok_or_else(|| {
+                TrapError::Hypervisor("owner bind returned zero incarnation".into())
+            })?,
+            sequence: core::num::NonZeroU64::new(bound.x[5])
+                .ok_or_else(|| TrapError::Hypervisor("owner bind returned zero sequence".into()))?,
+        };
+        let fork = carrick_el1_abi::PortalForkRequest {
+            operation,
+            parent_generation: carrick_el1_abi::ReservationGeneration::new(bound.x[4]).ok_or_else(
+                || TrapError::Hypervisor("owner bind returned zero generation".into()),
+            )?,
+            child_mm: carrick_el1_abi::ReservationMm::new(child_mm)
+                .ok_or_else(|| TrapError::Hypervisor("zero child MM".into()))?,
+            child_tables: physical.child_tables(),
+            parent_tables: parent_arena,
+            kernel_control_ipa: physical.kernel_control_ipa(),
+        };
+        let index = self
+            .vcpu
+            .mailbox_slot()
+            .ok_or_else(|| TrapError::Hypervisor("owner Fork has no executor slot".into()))?;
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            return Err(TrapError::Hypervisor(
+                "owner Fork has no retained carrier region".into(),
+            ));
+        }
+        // SAFETY: this engine's VM retains the carrier metadata region for the
+        // full pending operation; the exact slot survives task commit or abort.
+        let slots = unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        };
+        let slot = slots
+            .fork(index)
+            .ok_or_else(|| TrapError::Hypervisor("owner Fork slot is invalid".into()))?;
+        let pending = match crate::fork::prepare(fork, slot, physical.as_ref(), |frame, effect| {
+            self.run_owner_fork_service(frame, effect)
+        })? {
+            Ok(pending) => pending,
+            Err(errno) => {
+                physical.settle(false)?;
+                return Err(TrapError::OwnerForkRefused {
+                    errno: carrick_abi::LinuxErrno::new(i32::try_from(errno).map_err(|_| {
+                        TrapError::Hypervisor("owner Fork returned invalid errno".into())
+                    })?),
+                });
+            }
+        };
+        let result = (|| {
+            let builder = physical.consume_owner_fork_completion(
+                &request,
+                pending.completion(),
+                pending.selected(),
+            )?;
+            let root = request.child_ttbr0 & 0x0000_ffff_ffff_f000;
+            let layout = self
+                .page_tables
+                .with_manager(PageTableManager::layout)
+                .ok_or_else(|| {
+                    TrapError::Hypervisor("owner parent live observer is absent".into())
+                })?;
+            let resolver = physical.child_resolver();
+            // SAFETY: physical preparation retains every table arena selected
+            // by the owner; the resolver owns those exact allocations.
+            let manager = unsafe {
+                PageTableManager::new_live(
+                    root,
+                    layout,
+                    fork.child_tables.len as usize,
+                    Arc::clone(&resolver),
+                )
+            }
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("observe owner child tables: {error:?}"))
+            })?;
+            let authority = Stage1Authority::new_with_manager(Some(manager));
+            unsafe {
+                authority.bind_live_backing(resolver);
+            }
+            authority.select_guest_descriptor_owner().map_err(|error| {
+                TrapError::Hypervisor(format!("select owner child descriptor lane: {error:?}"))
+            })?;
+            if let Some(source) = request.table_arena_source.take() {
+                authority.install_source(source).map_err(|error| {
+                    TrapError::Hypervisor(format!("install owner child physical source: {error:?}"))
+                })?;
+            }
+            let parent = self.vcpu.snapshot()?;
+            let mut snapshot = seed_sibling_snapshot(&parent, request.entry);
+            snapshot.ttbr0 = request.child_ttbr0;
+            snapshot.ttbr1 = request.child_ttbr0;
+            let process_asid = (request.child_ttbr0 >> 48) as u16;
+            if process_asid == 0 {
+                return Err(TrapError::Hypervisor("owner child ASID is zero".into()));
+            }
+            Ok(Aarch64ProcessSpec {
+                builder,
+                snapshot,
+                page_tables: authority,
+                protections: Arc::new(MemoryProtections::default()),
+                process_asid,
+            })
+        })();
+        match result {
+            Ok(spec) => {
+                self.pending_owner_fork = Some(OwnerForkTransaction {
+                    pending,
+                    physical,
+                    parent_tables,
+                });
+                Ok(spec)
+            }
+            Err(error) => {
+                let receipt = pending.finish(false, |frame, effect| {
+                    self.run_owner_fork_service(frame, effect)
+                })?;
+                let retained_parent_tables = receipt.completion().parent_tables_used;
+                drop(receipt);
+                physical.settle(false)?;
+                parent_tables
+                    .settle(retained_parent_tables)
+                    .map_err(TrapError::Hypervisor)?;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn run_owner_fork_service(
+        &mut self,
+        mut frame: carrick_el1_abi::TrapFrame,
+        effect: &mut dyn FnMut() -> bool,
+    ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
+        frame.slot =
+            self.vcpu.mailbox_slot().ok_or_else(|| {
+                TrapError::Hypervisor("Fork caller has no EL1 service slot".into())
+            })? as u64;
+        let suspended = self.suspended_el1_sp;
+        crate::descriptor_drain::run_drain_call(frame, suspended, |entry, frame_va| {
+            run_el1_service_effect_on::<V::Vcpu>(&mut self.vcpu, entry, frame_va, true, effect)
+        })
+    }
+
     /// Run the transfer owner's service on the borrowed driving vCPU. The
     /// target never enters EL0; its ASID admission brackets the entire call.
     /// A true effect result means the intermediate copy was acknowledged and
