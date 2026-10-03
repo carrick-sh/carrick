@@ -1317,6 +1317,17 @@ impl TerminalRule {
         }
     }
 
+    pub(crate) fn requires_private_pages(self) -> bool {
+        matches!(
+            self,
+            Self::Pt {
+                fork_arm: true,
+                adopt_private: true,
+                ..
+            }
+        )
+    }
+
     /// Fork COW arming of a private range, optionally adopting host-published
     /// leaves as EL1-private so EL1 resolves their COW itself.
     #[must_use]
@@ -1410,6 +1421,11 @@ pub(crate) fn terminal_rule_edit(
                 && current & AP_MASK != AP_PRIV_RO
             {
                 current = (current & !AP_MASK) | AP_PRIV_RO;
+            }
+            // Imported private backing can arrive restricted. Its admitted
+            // permission operation supplies the write intent before COW arming.
+            if adopt_private && fork_arm {
+                current = adopt_host_leaf_as_el1_private(current, level);
             }
             if fork_arm
                 && let Some(armed) = pt_terminal_edit(
@@ -5381,12 +5397,14 @@ impl PageTableManager {
             let edited =
                 terminal_rule_edit(self.asid_scoped_leaves, rule, desc, level, block_start)
                     .map_err(|_| PageTableError::BadAddress)?;
-            if edited.is_none() {
+            let split_private = level < 3 && desc != 0 && rule.requires_private_pages();
+            if edited.is_none() && !split_private {
                 // The covering block is ALREADY at the target — skip its whole
                 // span with no split (this is what keeps RW-on-already-RW, and a
                 // re-protect of an unchanged range, free).
                 cur = block_end;
-            } else if let Some(new_desc) = edited.filter(|_| block_start >= va && block_end <= end)
+            } else if let Some(new_desc) =
+                edited.filter(|_| !split_private && block_start >= va && block_end <= end)
             {
                 // The whole covering block is inside the range and needs the
                 // change: edit it in place at this level (no split).
@@ -13057,6 +13075,63 @@ mod tests {
         let leaf = terminal_descriptor(ro.debug_walk(ro_va + PT_PAGE));
         assert_eq!(leaf & SW_EL1_PRIVATE, 0);
         let _ = (GuestCowClass::AlreadyWritable, GuestCowNotArmed::Unmapped);
+    }
+
+    #[test]
+    fn imported_private_block_admission_uses_one_table_and_preserves_neighbor() {
+        let mut image = hvpatch_manager();
+        let va = LINUX_MMAP_BASE + 32 * (1 << 21);
+        let len = 1 << 21;
+        image.set_rw(va, 2 * len, false, None).unwrap();
+        let neighbor = terminal_descriptor(image.debug_walk(va + len as u64));
+        let before = image.pool_stats().0;
+        image
+            .apply_rule(
+                va,
+                len,
+                TerminalRule::Pt {
+                    op: Some(PtOp::ReadWrite { exec: false }),
+                    reset_retired: false,
+                    deny_host_buffers: false,
+                    fork_arm: true,
+                    adopt_private: true,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(image.pool_stats().0 - before, 1);
+        for page in 0..512 {
+            assert!(descriptor_txn::guest_cow::is_guest_cow_write_leaf(
+                3,
+                terminal_descriptor(image.debug_walk(va + page * 4096))
+            ));
+        }
+        assert_eq!(
+            terminal_descriptor(image.debug_walk(va + len as u64)),
+            neighbor
+        );
+    }
+
+    #[test]
+    fn imported_private_source_is_armed_after_permission_admission() {
+        use descriptor_txn::guest_cow::is_guest_cow_write_leaf;
+        let source = 0x9000_0000 | USER_PAGE_FLAGS | AP_RO | UXN;
+        let rule = TerminalRule::Pt {
+            op: Some(PtOp::ReadWrite { exec: false }),
+            reset_retired: false,
+            deny_host_buffers: false,
+            fork_arm: true,
+            adopt_private: true,
+        };
+        let admitted = terminal_rule_edit(true, rule, source, 3, 0x4000_0000)
+            .unwrap()
+            .unwrap();
+        assert!(
+            is_guest_cow_write_leaf(3, admitted),
+            "private import must enter guest COW: {admitted:#x}"
+        );
+        assert_eq!(admitted & PA_MASK_4KIB, source & PA_MASK_4KIB);
+        assert_eq!(admitted & AP_MASK, AP_RO);
     }
 
     /// A recycled image is overwritten by `snapshot_into`, whose result must

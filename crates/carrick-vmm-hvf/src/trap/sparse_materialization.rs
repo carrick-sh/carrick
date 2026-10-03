@@ -23,6 +23,8 @@ pub(super) struct PublishedFrameGrant {
     pub(super) region: HvfMappedRegion,
     pub(super) alias: AliasBacking,
     pub(super) ready: carrick_hal::El1FrameGrantReady,
+    pub(super) receipt: carrick_hal::FrameInventoryApplyReceipt,
+    pub(super) inventory_entry: ((u64, u64), InventoryExtent),
 }
 
 pub(super) fn frame_grant_local_lease_is_current(
@@ -493,6 +495,8 @@ pub(super) fn publish_frame_grant(
         region,
         alias,
         ready,
+        receipt,
+        inventory_entry,
     })
 }
 
@@ -863,6 +867,50 @@ pub(super) struct PublicationContext<'a> {
 }
 
 impl<'a> PublicationContext<'a> {
+    /// A physical grant selected by the target EL1 owner. No host policy
+    /// snapshot or caller-vCPU identity can authorize this constructor. The
+    /// guest revalidates the generation and window before exposing leaves.
+    pub(super) fn for_transfer(
+        state: std::sync::Arc<MmAccessState>,
+        custody: std::sync::Arc<CarrierVmCustody>,
+        target: carrick_aarch64::user_transfer::TransferTarget,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<Self, TrapError> {
+        let invalid =
+            || TrapError::Hypervisor("EL1 transfer grant target authority mismatch".to_owned());
+        if target.handle().carrier() != custody.transfer_carrier
+            || window.operation.carrier != target.handle().carrier()
+            || window.operation.mm != target.handle().mm()
+            || window.operation.incarnation != target.handle().incarnation()
+            || !window.valid()
+        {
+            return Err(invalid());
+        }
+        let binding = state.cow_runtime.read().clone().ok_or_else(invalid)?;
+        let root = target.ttbr0() & 0x0000_ffff_ffff_f000;
+        let asid = (target.ttbr0() >> 48) as u16;
+        if binding.identity.mm != target.handle().mm().raw()
+            || binding.identity.asid != asid
+            || binding.mm_root_slot.map(|root| root.0) != Some(root)
+            || !binding.persistent_vm_lifecycle
+            || state.page_tables_authority().live_descriptor_owner()
+                != carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            mm_key: std::num::NonZeroU64::new(target.handle().mm().raw()).ok_or_else(invalid)?,
+            state,
+            custody,
+            authority: binding.authority,
+            mm_root_slot: binding.mm_root_slot,
+            container_root: binding.container_root,
+            _exclusion: None,
+            _invocation: None,
+            foreign: None,
+        })
+    }
+
     pub(super) fn for_foreign(
         state: std::sync::Arc<MmAccessState>,
         custody: std::sync::Arc<CarrierVmCustody>,
@@ -2222,5 +2270,351 @@ mod arena_pin_tests {
             custody.retire_stage2_record_using(identity, |_, _| Ok(())),
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
+    }
+}
+
+/// A target-selected grant owns its exact physical and inventory receipts
+/// before a descriptor can name it. Drop settles only those identities.
+pub(super) struct PendingTransferGrant {
+    context: PublicationContext<'static>,
+    publication: Option<PublishedFrameGrant>,
+    pin: Option<CarrierStage2Pin>,
+    record: Option<CarrierStage2RecordIdentity>,
+    txn: Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn>,
+    descriptor_settled: bool,
+}
+impl PublicationContext<'static> {
+    pub(super) fn refill_transfer_cow(&self) -> Result<bool, TrapError> {
+        let Some(pool) = carrick_el1_abi::cow_grant_pool_host() else {
+            return Ok(false);
+        };
+        self.refill_transfer_cow_in(pool)
+    }
+    pub(super) fn refill_transfer_cow_in(
+        &self,
+        pool: &carrick_el1_abi::CowGrantPool,
+    ) -> Result<bool, TrapError> {
+        if pool.ready(self.mm_key.get()).next().is_some() {
+            return Ok(true);
+        }
+        // The exact EL1 receipt classified a live COW run. Supply physical
+        // inventory only; do not reclassify through the host table mirror.
+        Ok(super::guest_cow::provision_guest_cow_grants(&self.state, &self.custody, pool, 1)? != 0)
+    }
+    pub(super) fn prepare_transfer(
+        self,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<Option<Box<dyn carrick_aarch64::user_transfer::TransferGrant>>, TrapError> {
+        use carrick_mmu_core::aarch64::descriptor_txn::{BackingIdentity, DescriptorOp, PageSpan};
+        let failure = |message: String| TrapError::Hypervisor(format!("target grant: {message}"));
+        let binding = self
+            .state
+            .cow_runtime
+            .read()
+            .clone()
+            .ok_or_else(|| failure("missing binding".into()))?;
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
+            binding.identity.linux_pid,
+            binding.identity.linux_tid,
+        );
+        // This adapter supplies an unpublished window; a resident predecessor
+        // requires its own owner retirement, never an overwrite of its alias.
+        if !alias_registry()
+            .lock()
+            .overlapping_process_aliases(
+                window.range.start(),
+                window.range.len() as usize,
+                self.mm_root_slot,
+                self.container_root,
+            )
+            .is_empty()
+        {
+            return Ok(None);
+        }
+        let publication = publish_frame_grant(
+            &self,
+            carrick_hal::El1FrameGrantRequest {
+                mm_key: window.operation.mm.raw(),
+                fault_va: window.fault_page,
+                access: 1,
+                semantic_base: window.range.start(),
+                len: window.range.len(),
+                permissions: window.protection.bits(),
+            },
+            None,
+            &registry,
+        )?;
+        let mut pending = PendingTransferGrant {
+            context: self,
+            publication: Some(publication),
+            pin: None,
+            record: None,
+            txn: None,
+            descriptor_settled: false,
+        };
+        let publication = pending.publication.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::user_transfer",
+                "new pending grant has no publication"
+            )
+        });
+        let owner = pending
+            .context
+            .custody
+            .global_frame_host_owners
+            .lock()
+            .get(&publication.inventory_entry.0)
+            .and_then(GlobalFrameOwnerEntry::live_owner)
+            .cloned()
+            .ok_or_else(|| failure("new owner missing".into()))?;
+        pending.record = Some(owner.record_identity);
+        pending.pin = Some(
+            pending
+                .context
+                .custody
+                .pin_stage2_record(owner.record_identity)
+                .map_err(|error| failure(format!("pin new owner: {error:?}")))?,
+        );
+
+        let ready = publication.ready;
+        let nz = |value| {
+            std::num::NonZeroU64::new(value).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "zero authenticated grant identity"
+                )
+            })
+        };
+        let op = DescriptorOp::Prepare {
+            publication: carrick_mmu_core::aarch64::GuestLeafPublication {
+                va: window.range.start(),
+                ipa: ready.physical_ipa,
+                len: window.range.len(),
+                writable: window.protection.bits() & 2 != 0,
+                executable: window.protection.bits() & 4 != 0,
+            },
+            resident: PageSpan::new(window.fault_page, 4096),
+            backing: BackingIdentity {
+                frame_id: nz(ready.frame_id),
+                mapping_id: nz(ready.mapping_id),
+                owner_generation: nz(ready.owner_generation),
+                inventory_revision: nz(ready.inventory_revision),
+            },
+        };
+        // Build before exposing the semantic association. If preparation fails,
+        // the new physical publication is rolled back by the exact receipt.
+        pending.txn = Some(
+            pending
+                .context
+                .state
+                .page_tables_authority()
+                .prepare_guest_descriptor_txn(nz(window.operation.mm.raw()), op)
+                .map_err(|error| failure(format!("descriptor preparation: {error:?}")))?,
+        );
+        // The bytes are final zero-fill before EL1 can expose an executable
+        // leaf. Reuse I2's existing first-executable-publication authority,
+        // exactly as the normal EL1 lazy-grant path does.
+        if window.protection.bits() & carrick_abi::LINUX_PROT_EXEC != 0 {
+            pending
+                .context
+                .custody
+                .publish_user_executable(
+                    publication.alias.physical_ipa,
+                    publication.alias.physical_size as u64,
+                    |_, _| None,
+                    |_, _| None,
+                )
+                .map_err(|error| failure(format!("executable grant publication: {error:?}")))?;
+        }
+        if !global_frame::register_shared_alias_if_vacant(
+            publication.alias,
+            pending.context.mm_root_slot,
+            pending.context.container_root,
+        ) {
+            return Ok(None);
+        }
+        drop(registry);
+        Ok(Some(Box::new(pending)))
+    }
+}
+impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
+    fn transaction(&self) -> &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn {
+        self.txn.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::user_transfer",
+                "published pending grant has no descriptor transaction"
+            )
+        })
+    }
+    fn settle(
+        &mut self,
+        receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
+    ) -> Result<bool, TrapError> {
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+        let txn = self.txn.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::user_transfer",
+                "published pending grant has no descriptor transaction"
+            )
+        });
+        if receipt.id != txn.id
+            || receipt.digest != txn.digest()
+            || matches!(receipt.outcome, DescriptorOutcome::Indeterminate(_))
+        {
+            carrick_fatal!(
+                "hvpatch::user_transfer",
+                "grant completion cannot release uncertain descriptor-visible ownership"
+            );
+        }
+        let applied = matches!(receipt.outcome, DescriptorOutcome::Applied(_));
+        let result = self
+            .context
+            .state
+            .page_tables_authority()
+            .settle_guest_descriptor_receipt(txn, receipt);
+        if applied {
+            result.unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "applied grant failed exact settlement; physical ownership retained: {error:?}"
+                )
+            });
+            self.publication.take();
+        } else if let Err(error) = result {
+            if let carrick_aarch64::descriptor_drain::GuestPublishError::Unsettled(error) =
+                carrick_aarch64::descriptor_drain::GuestPublishError::from_settle(
+                    error,
+                    "transfer grant refusal settlement",
+                )
+            {
+                carrick_fatal!("hvpatch::user_transfer", "uncertain grant refusal: {error}");
+            }
+        }
+        self.descriptor_settled = true;
+        Ok(applied)
+    }
+}
+impl Drop for PendingTransferGrant {
+    fn drop(&mut self) {
+        if !self.descriptor_settled
+            && let Some(txn) = self.txn.as_ref()
+        {
+            self.context
+                .state
+                .page_tables_authority()
+                .abandon_guest_descriptor_txn(txn)
+                .unwrap_or_else(|error| {
+                    carrick_fatal!(
+                        "hvpatch::user_transfer",
+                        "abandon exact grant tables: {error:?}"
+                    )
+                });
+        }
+        let Some(publication) = self.publication.take() else {
+            return;
+        };
+        let binding = self
+            .context
+            .state
+            .cow_runtime
+            .read()
+            .clone()
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "pending target lost physical authority"
+                )
+            });
+        let _registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
+            binding.identity.linux_pid,
+            binding.identity.linux_tid,
+        );
+        let (key, expected) = publication.inventory_entry;
+        let mut inventory = self.context.state.frame_inventory.ledger.lock();
+        let actual = inventory.extents.get(&key).copied();
+        let length = carrick_hal::FrameLength::from_mapping_extent(
+            std::num::NonZeroU64::new(key.1).unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "pending grant has empty physical extent"
+                )
+            }),
+        );
+        let exact_live = || {
+            self.context
+                .authority
+                .mapping_is_live(
+                    expected.mapping,
+                    expected.frame,
+                    carrick_guest_mem::Gpa(key.0),
+                    length,
+                )
+                .unwrap_or_else(|error| {
+                    carrick_fatal!(
+                        "hvpatch::user_transfer",
+                        "authenticate target grant inventory: {error}"
+                    )
+                })
+        };
+        let kernel_live = exact_live();
+        let record_current = self
+            .record
+            .and_then(|identity| {
+                self.context
+                    .custody
+                    .stage2_record_snapshot(identity.record_id)
+                    .map(|record| (identity, record))
+            })
+            .is_some_and(|(identity, record)| {
+                record.vm_generation == identity.vm_generation
+                    && record.logical_owner == identity.logical_owner
+            });
+        if actual == Some(expected) {
+            // Backend retirement can lag the kernel. A receipt-authenticated
+            // absent mapping is already retired; never remove any successor.
+            if kernel_live
+                && let Err(error) = self
+                    .context
+                    .authority
+                    .rollback_frame_grant(&publication.receipt)
+            {
+                if exact_live() {
+                    carrick_fatal!(
+                        "hvpatch::user_transfer",
+                        "rollback exact target grant: {error}"
+                    );
+                }
+            }
+            alias_registry()
+                .lock()
+                .remove_exact_values_in_batch(&[publication.alias]);
+            HvfVmState::rollback_unpublished_mappings(&mut inventory, &[(key, expected)])
+                .unwrap_or_else(|error| {
+                    carrick_fatal!("hvpatch::user_transfer", "rollback target backend: {error}")
+                });
+            drop(inventory);
+            retire_global_frame_host_owner_if_generation_in(
+                &self.context.custody,
+                key.0,
+                key.1,
+                publication.ready.owner_generation,
+            );
+        } else {
+            if kernel_live || !record_current {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "pending grant retirement lacks exact inventory and retained owner evidence"
+                );
+            }
+            // The old receipt is retired and the retained generation cannot
+            // have been reused. A replacement backend entry belongs to its
+            // successor and is untouched.
+            alias_registry()
+                .lock()
+                .remove_exact_values_in_batch(&[publication.alias]);
+        }
+        let _ = &self.pin;
     }
 }

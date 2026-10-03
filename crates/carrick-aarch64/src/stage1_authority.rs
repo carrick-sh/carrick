@@ -1237,13 +1237,16 @@ impl Stage1Authority {
 /// One host `mprotect` of `[address, address+len)` as shared terminal rules,
 /// in the order they must apply. Both lanes use this one plan: the host
 /// editor applies it with `apply_rule`, the guest lane submits each entry as
-/// an EL1 `DescriptorOp::Terminal`. It reproduces the host's historical
-/// sequence exactly (retired-leaf reset for a new mapping, then the
+/// an EL1 `DescriptorOp::Terminal`. It preserves the historical ordering
+/// (retired-leaf reset for a new mapping, then the
 /// protection over the whole range, then fork re-arming of every
 /// overlapping armed range, in full) by composing those passes per
 /// terminal: armed intersections carry `fork_arm`, armed parts outside the
 /// range get a plain fork arm. Every span in the plan is disjoint, so each
-/// guest transaction takes its pages straight to their final state.
+/// guest transaction takes its pages straight to their final state. Imported
+/// page-granule private sources additionally acquire EL1-private authority
+/// from their admitted permissions before COW is armed; compound-only ranges
+/// keep their existing coarse-descriptor policy.
 pub fn protection_terminal_rules(
     address: u64,
     len: usize,
@@ -1263,26 +1266,31 @@ pub fn protection_terminal_rules(
     };
     let start = address;
     let end = address.saturating_add(len as u64);
-    // Merge the armed ranges into disjoint, sorted intervals.
-    let mut armed: Vec<(u64, u64)> = armed_cow
-        .iter()
-        .filter(|range| range.len != 0)
-        .map(|range| (range.va, range.va.saturating_add(range.len as u64)))
-        .collect();
-    armed.sort_unstable();
-    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(armed.len());
-    for (lo, hi) in armed {
-        match merged.last_mut() {
-            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
-            _ => merged.push((lo, hi)),
-        }
+    // Sweep range edges, preserving the imported-file page granule through
+    // overlap merging. Compound arming must not eagerly split its blocks.
+    let mut events = Vec::with_capacity(armed_cow.len() * 2);
+    for range in armed_cow.iter().filter(|range| range.len != 0) {
+        let page = i32::from(range.granule == crate::vmm::CowGranule::Page);
+        events.push((range.va, 1i32, page));
+        events.push((range.va.saturating_add(range.len as u64), -1i32, -page));
     }
-    let rule = |fork_arm| TerminalRule::Pt {
+    events.sort_unstable();
+    let mut merged = Vec::with_capacity(events.len());
+    let (mut active, mut pages, mut previous) = (0, 0, 0);
+    for (edge, delta, page_delta) in events {
+        if active > 0 && previous < edge {
+            merged.push((previous, edge, pages > 0));
+        }
+        active += delta;
+        pages += page_delta;
+        previous = edge;
+    }
+    let rule = |fork_arm, adopt_private| TerminalRule::Pt {
         op: Some(op),
         reset_retired: new_mapping,
         deny_host_buffers,
         fork_arm,
-        adopt_private: false,
+        adopt_private,
     };
     let arm_only = TerminalRule::pt(PtOp::ForkReadOnly);
     let mut plan = Vec::new();
@@ -1292,19 +1300,19 @@ pub fn protection_terminal_rules(
         }
     };
     let mut cursor = start;
-    for &(lo, hi) in &merged {
+    for &(lo, hi, page_private) in &merged {
         // Armed part before the protected range: re-arm only.
         push(lo, hi.min(start), arm_only);
         let (in_lo, in_hi) = (lo.max(start), hi.min(end));
         if in_lo < in_hi {
-            push(cursor, in_lo, rule(false));
-            push(in_lo, in_hi, rule(true));
+            push(cursor, in_lo, rule(false, false));
+            push(in_lo, in_hi, rule(true, page_private));
             cursor = cursor.max(in_hi);
         }
         // Armed part after the protected range: re-arm only.
         push(lo.max(end), hi, arm_only);
     }
-    push(cursor, end, rule(false));
+    push(cursor, end, rule(false, false));
     plan
 }
 
@@ -1846,6 +1854,21 @@ mod tests {
                 vec![],
                 true,
             ),
+            // Mixed granules overlap: only the page subrange is adopted;
+            // compound-only portions retain the existing coarse policy.
+            (
+                block,
+                8 * PAGE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                vec![
+                    crate::vmm::ForkCowRange {
+                        granule: crate::vmm::CowGranule::Compound,
+                        ..armed(block, 8 * PAGE)
+                    },
+                    armed(block + 2 * PAGE, 2 * PAGE),
+                ],
+                false,
+            ),
             // Bisected coarse block, with an armed range inside it.
             (
                 block + 3 * PAGE,
@@ -1863,6 +1886,14 @@ mod tests {
                     .clear_retired_for_new_mapping(address, len, None)
                     .unwrap();
             }
+            for range in armed_cow
+                .iter()
+                .filter(|range| range.granule == crate::vmm::CowGranule::Page)
+            {
+                sequential
+                    .set_fork_readonly_adopting(range.va, range.len, None)
+                    .unwrap();
+            }
             let exec = prot & LINUX_PROT_EXEC != 0;
             if prot & LINUX_PROT_WRITE != 0 {
                 sequential.set_rw(address, len, exec, None).unwrap();
@@ -1875,7 +1906,18 @@ mod tests {
             }
             for range in armed_cow {
                 sequential
-                    .set_fork_readonly(range.va, range.len, None)
+                    .apply_rule(
+                        range.va,
+                        range.len,
+                        TerminalRule::Pt {
+                            op: None,
+                            reset_retired: false,
+                            deny_host_buffers: false,
+                            fork_arm: true,
+                            adopt_private: range.granule == crate::vmm::CowGranule::Page,
+                        },
+                        None,
+                    )
                     .unwrap();
             }
 
