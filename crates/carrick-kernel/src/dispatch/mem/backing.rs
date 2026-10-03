@@ -857,6 +857,17 @@ pub(crate) fn alloc_alias_ipa_for_publication_with(
 }
 
 impl<'a> MemView<'a> {
+    /// Check physical source custody without byte I/O or a VMA lookup.
+    pub fn retains_host_backing(
+        &self,
+        handle: core::num::NonZeroU64,
+        generation: core::num::NonZeroU64,
+    ) -> bool {
+        self.mem()
+            .lock()
+            .host_backing_leases
+            .contains_key(&(handle, generation))
+    }
     pub fn read_host_backing(
         &self,
         identity: carrick_el1_abi::HostBackingIdentity,
@@ -880,7 +891,13 @@ impl<'a> MemView<'a> {
                     identity.offset(),
                     length,
                 )
-                .map(|snapshot| snapshot.bytes),
+                .and_then(|snapshot| {
+                    if snapshot.bus_fault_offset == Some(0) {
+                        Err(LINUX_EFAULT)
+                    } else {
+                        Ok(snapshot.bytes)
+                    }
+                }),
             PrivateFileBacking::LoadedImage {
                 initialized_offset,
                 bytes,

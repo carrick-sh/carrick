@@ -764,8 +764,31 @@ impl MmAccessState {
         root_perms: applevisor::memory::MemPerms,
         published: &mut Vec<HvfMappedRegion>,
     ) -> Result<(), TrapError> {
+        self.publish_raw_stage1_arenas_into(
+            custody,
+            &manager.extension_arena_bases(),
+            root_perms,
+            published,
+        )
+    }
+
+    pub(super) fn publish_raw_stage1_arenas_into(
+        &self,
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        bases: &[u64],
+        root_perms: applevisor::memory::MemPerms,
+        published: &mut Vec<HvfMappedRegion>,
+    ) -> Result<(), TrapError> {
         const TWO_MIB: usize = 2 * 1024 * 1024;
-        for base in manager.extension_arena_bases() {
+        for &base in bases {
+            if base == 0
+                || !base.is_multiple_of(TWO_MIB as u64)
+                || base.checked_add(TWO_MIB as u64).is_none()
+            {
+                return Err(TrapError::Hypervisor(
+                    "invalid raw Fork table capacity".into(),
+                ));
+            }
             if self.structural_owners.read().contains_key(&(base, TWO_MIB)) {
                 continue;
             }
@@ -2339,7 +2362,13 @@ impl PublicationContext<'static> {
                 binding
                     .authority
                     .read_host_backing(identity, window.range.len() as usize)
-                    .map_err(|error| failure(format!("retained byte source: {error:?}")))
+                    .map_err(|error| {
+                        if error == carrick_abi::LINUX_EFAULT {
+                            TrapError::HostBackingEof
+                        } else {
+                            failure(format!("retained byte source: {error:?}"))
+                        }
+                    })
             })
             .transpose()?;
         let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(

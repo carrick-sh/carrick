@@ -414,6 +414,18 @@ impl HvfAarch64Vmm {
         )
     }
 
+    /// Physical Fork custody; source tokens are checked against retained
+    /// handles only, without projecting guest mappings or permissions.
+    pub fn owner_fork_custody(
+        &self,
+        source: Arc<dyn Fn(core::num::NonZeroU64, core::num::NonZeroU64) -> bool + Send + Sync>,
+    ) -> crate::trap::ForkPhysicalCustody {
+        crate::trap::ForkPhysicalCustody::new(
+            Arc::clone(&self.state.carrier_foreign_mm_transport.custody),
+            source,
+        )
+    }
+
     /// Exact-MM COW accounting; retain the handle before detaching the MM.
     pub fn host_cow_stats(&self) -> HostCowStats {
         self.state.task.mm_access_authority().host_cow_stats.clone()
@@ -1078,8 +1090,6 @@ struct TaskOnlyRuntimeProjectionSlot {
     projection: parking_lot::Mutex<Option<carrick_aarch64::Aarch64TaskRuntimeProjection>>,
 }
 
-type TaskOnlyRuntimeAuthorities = (carrick_aarch64::Stage1Authority, Arc<MemoryProtections>);
-
 impl TaskOnlyRuntimeProjectionSlot {
     fn new(projection: carrick_aarch64::Aarch64TaskRuntimeProjection) -> Self {
         Self {
@@ -1112,15 +1122,20 @@ impl TaskOnlyRuntimeProjectionSlot {
         Ok(())
     }
 
-    fn clone_authorities(&self) -> Result<TaskOnlyRuntimeAuthorities, TrapError> {
+    /// Bind runtime lifetime directly under the slot lock. No fork caller can
+    /// extract a pair of host authorities as a child policy input.
+    fn prepare_runtime_task(
+        &self,
+        backend: &HvpatchTaskOnlyBackendState,
+    ) -> Result<HvfTaskState, TrapError> {
         let slot = self.projection.lock();
         let projection = slot.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch task runtime projection is loaded".to_owned())
         })?;
-        Ok((
+        backend.runtime_task_state(
             projection.page_tables.clone(),
             Arc::clone(&projection.protections),
-        ))
+        )
     }
 
     fn validate_cpu(&self, cpu: &carrick_hal::threaded::GuestCpuState) -> Result<(), TrapError> {
@@ -1131,7 +1146,6 @@ impl TaskOnlyRuntimeProjectionSlot {
         validate_task_only_runtime_projection(projection, cpu)
     }
 
-    #[cfg(test)]
     fn validate_parked_task(&self, parked: &HvfTaskState) -> Result<(), TrapError> {
         let slot = self.projection.lock();
         let projection = slot.as_ref().ok_or_else(|| {
@@ -1261,17 +1275,11 @@ impl HvpatchTaskOnlyEngineState {
         cpu: &carrick_hal::threaded::GuestCpuState,
     ) -> Result<(), TrapError> {
         self.runtime_projection.validate_cpu(cpu)?;
-        let (page_tables, protections) = self.runtime_projection.clone_authorities()?;
         let parked = self.parked_task.lock();
         let parked = parked.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("HVPatch task runtime state is already loaded".to_owned())
         })?;
-        let mm_access = parked.mm_access_authority();
-        if !parked.runtime_authorities_match(&mm_access, &page_tables, &protections) {
-            return Err(TrapError::Hypervisor(
-                "HVPatch task runtime projection does not match parked task state".to_owned(),
-            ));
-        }
+        self.runtime_projection.validate_parked_task(parked)?;
         Ok(())
     }
 
@@ -1347,8 +1355,9 @@ impl HvpatchTaskOnlyEngineState {
                 "HVPatch task runtime state was activated twice".to_owned(),
             ));
         }
-        let (page_tables, protections) = self.runtime_projection.clone_authorities()?;
-        let mut task = self._backend.runtime_task_state(page_tables, protections)?;
+        let mut task = self
+            .runtime_projection
+            .prepare_runtime_task(&self._backend)?;
         self._backend.register_foreign_mm(&task)?;
         if let Err(error) = self._backend.activate() {
             self._backend.unregister_foreign_mm();
@@ -2814,6 +2823,34 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         ))
     }
 
+    fn owner_transfer_custody(
+        &self,
+    ) -> Option<Box<carrick_aarch64::user_transfer::ErasedPhysicalCustody>> {
+        Some(Box::new(
+            carrick_aarch64::user_transfer::ErasedTransferCustody(self.user_transfer_custody()),
+        ))
+    }
+
+    fn prepare_owner_frame_grant(
+        &self,
+        target: carrick_aarch64::user_transfer::TransferTarget,
+        window: carrick_el1_abi::PortalGrantWindow,
+    ) -> Result<Option<Box<dyn carrick_aarch64::user_transfer::TransferGrant>>, TrapError> {
+        carrick_aarch64::user_transfer::TransferCustody::prepare(
+            &self.user_transfer_custody(),
+            target,
+            window,
+        )
+    }
+
+    fn prepare_owner_fork_builder(
+        &self,
+        request: &mut ProcessForkRequest,
+    ) -> Result<Box<dyn carrick_aarch64::fork::PhysicalForkBuilder<Self::ProcessBuilder>>, TrapError>
+    {
+        self.state.prepare_owner_fork_builder(request)
+    }
+
     fn build_process_builder(
         &self,
         request: ProcessForkRequest,
@@ -3078,32 +3115,18 @@ mod task_only_materializer_tests {
     }
 
     #[test]
-    fn task_only_runtime_projection_clones_the_exact_mm_authorities() {
+    fn task_only_runtime_projection_retains_one_exact_mm_binding() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let root = 0x9a_0000_0000;
         let projection = runtime_projection(root, 2);
         let expected_page_tables = projection.page_tables.clone();
         let expected_protections = std::sync::Arc::clone(&projection.protections);
         let slot = super::TaskOnlyRuntimeProjectionSlot::new(projection);
-
-        let (first_page_tables, first_protections) = slot
-            .clone_authorities()
-            .expect("clone first runtime authorities");
-        let (second_page_tables, second_protections) = slot
-            .clone_authorities()
-            .expect("clone second runtime authorities");
-
-        assert!(expected_page_tables.shares_exact_authority(&first_page_tables));
-        assert!(first_page_tables.shares_exact_authority(&second_page_tables));
-        assert!(std::sync::Arc::ptr_eq(
-            &expected_protections,
-            &first_protections
-        ));
-        assert!(std::sync::Arc::ptr_eq(
-            &first_protections,
-            &second_protections
-        ));
-        assert_eq!(second_page_tables.root_base(), Some(root));
+        let retained = slot.take().expect("take exact runtime binding");
+        assert!(retained.shares_exact_mm_authority(&expected_page_tables, &expected_protections));
+        assert_eq!(retained.page_tables.root_base(), Some(root));
+        assert!(slot.take().is_err());
+        slot.put(retained).expect("republish same runtime binding");
     }
 
     #[test]

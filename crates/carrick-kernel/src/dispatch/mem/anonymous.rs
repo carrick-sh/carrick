@@ -229,7 +229,14 @@ fn proc_row(vma: &SemanticVma) -> ProcMapsEntry {
         read: vma.read,
         write: vma.write,
         execute: vma.execute,
-        sharing: ProcMapSharing::Private,
+        sharing: if matches!(
+            vma.provenance,
+            VmaBackingProvenance::SharedAnonymous | VmaBackingProvenance::SharedFile
+        ) {
+            ProcMapSharing::Shared
+        } else {
+            ProcMapSharing::Private
+        },
         path: vma.path.clone(),
     }
 }
@@ -303,7 +310,13 @@ fn uncovered_segments(start: u64, end: u64, covered: &[(u64, u64)]) -> Vec<(u64,
 /// Insertion-time attributes of a host-owned row: `RLIMIT_DATA` and fork read
 /// them from the root.
 pub(in crate::dispatch) fn opaque_flags(vma: &SemanticVma, mem: &MemState) -> ReservationNodeFlags {
-    let mut flags = ReservationNodeFlags::EMPTY;
+    let mut flags = match vma.provenance {
+        VmaBackingProvenance::PrivateFile | VmaBackingProvenance::SharedFile => {
+            ReservationNodeFlags::FILE
+        }
+        VmaBackingProvenance::SharedAnonymous => ReservationNodeFlags::SHARED_ANONYMOUS,
+        _ => ReservationNodeFlags::EMPTY,
+    };
     if matches!(
         vma.provenance,
         VmaBackingProvenance::PrivateAnonymous
@@ -532,24 +545,95 @@ impl MemState {
         }
     }
 
-    /// The root's anonymous rows (none in host setup), in address order.
+    /// Return unused byte custody after owner publication. No placement or
+    /// protection decision is made by this physical reference accounting.
+    pub(in crate::dispatch) fn reconcile_host_backing_leases(&mut self) {
+        let Some(root) = self.delegated_root().cloned() else {
+            return;
+        };
+        let retired = root
+            .with_root(|model| {
+                let mut retired = Vec::new();
+                while let Some(identity) = model.take_retired_host_backing() {
+                    retired.push(identity);
+                }
+                Ok(retired)
+            })
+            .unwrap_or_else(|refusal| broken_root("source custody reconciliation", refusal));
+        for identity in retired {
+            self.host_backing_leases.remove(&identity);
+        }
+    }
+
+    /// Render immutable source labels while taking every VMA fact from EL1.
+    fn owner_observed_row(&self, mapping: &Mapping) -> SemanticVma {
+        let mut row = anonymous_row(mapping, self.layout);
+        row.provenance = if mapping.flags.contains(ReservationNodeFlags::FILE) {
+            if mapping.flags.contains(ReservationNodeFlags::PRIVATE) {
+                VmaBackingProvenance::PrivateFile
+            } else {
+                VmaBackingProvenance::SharedFile
+            }
+        } else if mapping
+            .flags
+            .contains(ReservationNodeFlags::SHARED_ANONYMOUS)
+        {
+            VmaBackingProvenance::SharedAnonymous
+        } else if mapping.flags.contains(ReservationNodeFlags::ANONYMOUS) {
+            if mapping.flags.contains(ReservationNodeFlags::PRIVATE) {
+                VmaBackingProvenance::PrivateAnonymous
+            } else {
+                VmaBackingProvenance::SharedAnonymous
+            }
+        } else {
+            VmaBackingProvenance::SpecialKernelSynthetic
+        };
+        row.file_page_offset = mapping
+            .host_backing
+            .map(|source| source.offset() / LINUX_PAGE_SIZE);
+        if let Some(source) = mapping.host_backing {
+            row.path = self.host_backing_custody.label(source).unwrap_or_default();
+        } else if mapping.flags.contains(ReservationNodeFlags::GROWSDOWN) {
+            row.path = "[stack]".into();
+        }
+        row
+    }
+
+    pub(super) fn owner_observed_rows(&self) -> Vec<SemanticVma> {
+        let root = self
+            .delegated_root()
+            .expect("owner observation requires admission");
+        let mut rows = Vec::new();
+        root.with_root(|model| model.observe_mappings(&mut |mapping| rows.push(mapping)))
+            .unwrap_or_else(|refusal| broken_root("fork VMA observation", refusal));
+        rows.iter()
+            .map(|mapping| self.owner_observed_row(mapping))
+            .collect()
+    }
+
+    /// Rows whose policy is exclusively owned by the admitted root.
     pub(in crate::dispatch) fn root_anonymous_rows(&self) -> Vec<SemanticVma> {
-        let AnonymousAuthority::Delegated(delegated) = &self.anonymous else {
+        let Some(root) = self.delegated_root() else {
             return Vec::new();
         };
-        let layout = self.layout;
-        let mut rows = Vec::new();
-        delegated
-            .root
-            .with_root(|model| {
-                model.observe_mappings(&mut |mapping| {
-                    if mapping.anonymous {
-                        rows.push(anonymous_row(&mapping, layout));
-                    }
-                })
+        let mut mappings = Vec::new();
+        root.with_root(|model| {
+            model.observe_mappings(&mut |mapping| {
+                if mapping.anonymous
+                    || (mapping.host_backing.is_some()
+                        && mapping.flags.contains(
+                            ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+                        ))
+                {
+                    mappings.push(mapping);
+                }
             })
-            .unwrap_or_else(|refusal| broken_root("an anonymous observation", refusal));
-        rows
+        })
+        .unwrap_or_else(|refusal| broken_root("owned VMA observation", refusal));
+        mappings
+            .iter()
+            .map(|mapping| self.owner_observed_row(mapping))
+            .collect()
     }
 
     /// The `/proc/<pid>/maps` region list: boot regions and host rows, and
@@ -582,6 +666,9 @@ impl MemState {
         };
         if self.delegated_root().is_none() {
             return host();
+        }
+        if self.owner_rows_exclusive {
+            return Some(self.owner_observed_rows().iter().map(proc_row).collect());
         }
         let layout = self.layout;
         let mut host_rows: Vec<ProcMapsEntry> = self
@@ -622,6 +709,9 @@ impl MemState {
     pub(in crate::dispatch) fn observed_vmas(&self) -> Cow<'_, VmaMap> {
         match &self.anonymous {
             AnonymousAuthority::HostSetup(_) => Cow::Borrowed(&self.semantic_vmas),
+            AnonymousAuthority::Delegated(_) if self.owner_rows_exclusive => {
+                Cow::Owned(VmaMap::from_vec(self.owner_observed_rows()))
+            }
             AnonymousAuthority::Delegated(_) => {
                 let mut rows = self.semantic_vmas.as_slice().to_vec();
                 rows.extend(self.root_anonymous_rows());
@@ -639,6 +729,14 @@ impl MemState {
         start: u64,
         end: u64,
     ) -> Vec<SemanticVma> {
+        if self.owner_rows_exclusive && self.delegated_root().is_some() {
+            let page_start = start & !(LINUX_PAGE_SIZE - 1);
+            let page_end = align_up_u64(end, LINUX_PAGE_SIZE).unwrap_or(!(LINUX_PAGE_SIZE - 1));
+            return Self::root_mappings(self.delegated_root().unwrap(), page_start, page_end)
+                .iter()
+                .map(|mapping| self.owner_observed_row(mapping))
+                .collect();
+        }
         let mut rows: Vec<SemanticVma> = self
             .semantic_vmas
             .overlapping(start, end)
@@ -647,14 +745,18 @@ impl MemState {
         if let Some(root) = self.delegated_root()
             && start < end
         {
-            let layout = self.layout;
             let (page_start, page_end) = (
                 start & !(LINUX_PAGE_SIZE - 1),
                 align_up_u64(end, LINUX_PAGE_SIZE).unwrap_or(!(LINUX_PAGE_SIZE - 1)),
             );
             for mapping in Self::root_mappings(root, page_start, page_end) {
-                if mapping.anonymous {
-                    rows.push(anonymous_row(&mapping, layout));
+                if mapping.anonymous
+                    || (mapping.host_backing.is_some()
+                        && mapping.flags.contains(
+                            ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+                        ))
+                {
+                    rows.push(self.owner_observed_row(&mapping));
                 }
             }
             rows.sort_by_key(|vma| vma.start);
@@ -755,7 +857,11 @@ impl MemState {
         let mut ranges = self.locked_ranges.clone();
         root.with_root(|model| {
             model.observe_mappings(&mut |mapping| {
-                if mapping.anonymous
+                if (mapping.anonymous
+                    || (mapping.host_backing.is_some()
+                        && mapping.flags.contains(
+                            ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+                        )))
                     && mapping.flags.contains(ReservationNodeFlags::LOCKED)
                     && let Some(range) = guest_range(mapping.range.start(), mapping.range.end())
                 {
@@ -829,7 +935,24 @@ impl MemState {
         if start >= end {
             return Vec::new();
         }
-        let pieces = Self::root_anonymous_pieces(&root, start, end);
+        let pieces: Vec<_> = Self::root_mappings(&root, start, end)
+            .into_iter()
+            .filter(|mapping| {
+                mapping.anonymous
+                    || (mapping.host_backing.is_some()
+                        && mapping.flags.contains(
+                            ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+                        ))
+            })
+            .map(|mut mapping| {
+                mapping.range = reservation_range(
+                    mapping.range.start().max(start),
+                    mapping.range.end().min(end),
+                )
+                .unwrap();
+                mapping
+            })
+            .collect();
         if !pieces.is_empty() {
             root.with_root(|model| {
                 for piece in &pieces {
@@ -881,7 +1004,13 @@ impl MemState {
         let mut locked = Vec::new();
         root.with_root(|model| {
             model.observe_mappings(&mut |mapping| {
-                if mapping.anonymous && mapping.flags.contains(ReservationNodeFlags::LOCKED) {
+                if (mapping.anonymous
+                    || (mapping.host_backing.is_some()
+                        && mapping.flags.contains(
+                            ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+                        )))
+                    && mapping.flags.contains(ReservationNodeFlags::LOCKED)
+                {
                     locked.push(mapping.range);
                 }
             })?;
@@ -1025,7 +1154,7 @@ impl MemState {
                         .map(|source| {
                             let lease = self
                                 .host_backing_custody
-                                .retain_source(source.backing.clone())
+                                .retain_labeled_source(source.backing.clone(), vma.path.clone())
                                 .unwrap_or_else(|| {
                                     broken_root(
                                         "retained file source capacity",
@@ -1067,7 +1196,25 @@ impl MemState {
             Ok(())
         })
         .unwrap_or_else(|refusal| broken_root("a host row mirror", refusal));
-        self.host_backing_leases.extend(backing_leases);
+        self.host_backing_leases
+            .extend(backing_leases.into_iter().map(|lease| {
+                let id = lease.identity(0);
+                ((id.handle(), id.generation()), lease)
+            }));
+        self.reconcile_host_backing_leases();
+        for mapping in Self::root_mappings(&root, start, end) {
+            if mapping.host_backing.is_some()
+                && mapping
+                    .flags
+                    .contains(ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE))
+            {
+                let start = mapping.range.start();
+                let end = mapping.range.end();
+                self.semantic_vmas.remove_range(start, end);
+                trim_dynamic_maps_for_range(&mut self.dynamic_maps, start, end - start);
+                trim_live_boot_regions_for_range(self, start, end - start);
+            }
+        }
     }
 
     /// Demote the root-owned anonymous nodes overlapping `[start, end)` into
@@ -1129,91 +1276,40 @@ impl MemState {
         }
     }
 
-    /// The state a fork child starts from, before its own root is published.
-    /// A host-setup parent's child is its clone. A delegated parent's child
-    /// is its host-setup twin: the parent root's rows, break and arena
-    /// occupancy as host facts (the fork projection is derived from them),
-    /// stamped with the parent root generation they came from. The fork
-    /// commit then seeds the child's root from exactly that generation
-    /// (`El1AdmissionOrigin::ForkCommit`), so the child stays delegated; the
-    /// child never names the parent's root.
+    /// A copied MM awaiting owner Fork. No reservation, protection, residency
+    /// or source-VA projection is inherited from an admitted parent's host.
+    /// Retained leases are provisional physical custody until the owner receipt
+    /// selects the child's sources; the child cannot run before attachment.
     pub(in crate::dispatch) fn fork_materialized(&self) -> MemState {
-        let mut forked = self.clone();
-        // The child's own provenance, before any root fact is handed over.
-        forked.deferred_anonymous = std::sync::Arc::new(self.deferred_anonymous.fork_private());
-        // The parent's grants, stock included, stay the parent's.
-        forked.first_touch_stock.clear();
-        let AnonymousAuthority::Delegated(delegated) = &self.anonymous else {
-            // A twin's clone is no fork twin of its own.
-            if let Some(arena) = forked.host_arena_mut() {
-                arena.fork_seed = None;
-            }
-            return forked;
-        };
-        let layout = self.layout;
-        let brk = self.program_break();
-        let mut mappings = Vec::new();
-        let mut stock_holes = Vec::new();
-        let generation = delegated
-            .root
-            .with_root(|model| {
-                model.observe_mappings(&mut |mapping| mappings.push(mapping))?;
-                for span in &self.first_touch_stock {
-                    stock_holes.extend(super::fault::root_holes(model, *span)?);
-                }
-                Ok(model.generation())
-            })
-            .unwrap_or_else(|refusal| broken_root("a fork observation", refusal));
-        // A cloned provenance ledger is not authority to inherit the parent's
-        // unconsumed backing. Mapped pieces keep their fork snapshot; holes
-        // must obtain the child's own zero-backed grant when later mapped.
-        forked.retire_stale_first_touch(&stock_holes);
-        let arena_start = layout.mmap_base;
-        let arena_end = arena_start.saturating_add(layout.mmap_size);
-        let mut mmap_next = arena_start;
-        let mut free_regions = Vec::new();
-        for mapping in &mappings {
-            let (start, end) = (mapping.range.start(), mapping.range.end());
-            if mapping.anonymous {
-                let row = anonymous_row(mapping, layout);
-                let entry = proc_row(&row);
-                let heap = row.path == "[heap]";
-                forked.semantic_vmas.insert_replacing(row);
-                if !heap {
-                    insert_dynamic_map_coalescing(&mut forked, entry);
-                }
-                // The host-setup child keeps locks where a host-setup fork
-                // does: in its host lock table (cloned with `MemState`).
-                if mapping.flags.contains(ReservationNodeFlags::LOCKED)
-                    && let Some(range) = guest_range(start, end)
-                {
-                    super::locked_ranges_insert(&mut forked.locked_ranges, range);
-                }
-            }
-            if start >= arena_start && end <= arena_end {
-                if start > mmap_next {
-                    free_regions_insert(&mut free_regions, mmap_next, start - mmap_next);
-                }
-                mmap_next = mmap_next.max(end);
-            }
+        if let AnonymousAuthority::Delegated(delegated) = &self.anonymous {
+            let generation = delegated
+                .root
+                .with_root(|model| Ok(model.generation()))
+                .unwrap_or_else(|refusal| broken_root("a fork identity", refusal));
+            let mut child = MemState::new_with_layout(self.layout);
+            child.host_backing_custody = Arc::clone(&self.host_backing_custody);
+            child.host_backing_leases = self.host_backing_leases.clone();
+            child.owner_rows_exclusive = true;
+            child.linux_auxv_image = self.linux_auxv_image.clone();
+            child.anonymous = AnonymousAuthority::HostSetup(HostArena {
+                brk: self.layout.heap_base,
+                mmap_next: self.layout.mmap_base,
+                free_regions: Vec::new(),
+                fork_seed: Some(ForkSeed {
+                    parent: delegated.root.mm(),
+                    generation,
+                }),
+            });
+            return child;
         }
-        // Captured before the twin leaves the root: the residency facts the
-        // child inherits name the parent's (and the seeded root's)
-        // incarnations; in host setup they answer as host facts.
-        let pieces = self.root_first_touch_pieces(arena_start, arena_end);
-        forked.anonymous = AnonymousAuthority::HostSetup(HostArena {
-            brk,
-            mmap_next,
-            free_regions,
-            fork_seed: Some(ForkSeed {
-                parent: delegated.root.mm(),
-                generation,
-            }),
-        });
-        for piece in &pieces {
-            forked.adopt_root_first_touch(piece);
+        // The setup venue is the only remaining host fork projection.
+        let mut child = self.clone();
+        child.deferred_anonymous = Arc::new(self.deferred_anonymous.fork_private());
+        child.first_touch_stock.clear();
+        if let Some(arena) = child.host_arena_mut() {
+            arena.fork_seed = None;
         }
-        forked
+        child
     }
 
     fn take_venue(&mut self) -> Option<(DelegatedRoot, HostVenue)> {
@@ -1745,6 +1841,9 @@ impl MemView<'_> {
             HostVenue::Proposal(request) => {
                 if matches!(outcome, Ok(outcome) if succeeded(outcome, &request)) {
                     complete_delegated(&root, request)?;
+                    if request.operation == ReservationOperation::Retire {
+                        mem.reconcile_host_backing_leases();
+                    }
                     if matches!(
                         request.operation,
                         ReservationOperation::Prepare | ReservationOperation::Move
@@ -1786,7 +1885,23 @@ impl MemView<'_> {
                 root.with_root(|model| model.refuse(request))
                     .map_err(root_refusal)?;
             }
-            HostVenue::Reserved(range) => mem.mirror_host_rows(range.start(), range.end()),
+            HostVenue::Reserved(range) => {
+                mem.mirror_host_rows(range.start(), range.end());
+                let owned: Vec<_> = MemState::root_mappings(&root, range.start(), range.end())
+                    .into_iter()
+                    .filter(|mapping| {
+                        mapping.host_backing.is_some()
+                            && mapping.flags.contains(
+                                ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+                            )
+                    })
+                    .map(|mapping| mapping.range)
+                    .collect();
+                drop(mem);
+                for range in owned {
+                    memory.release_root_facts(range.start(), range.len() as usize);
+                }
+            }
         }
         Ok(())
     }
