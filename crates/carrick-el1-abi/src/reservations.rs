@@ -124,6 +124,10 @@ impl ReservationNodeFlags {
     pub const WIPEONFORK: Self = Self(1 << 5);
     /// `MADV_DONTDUMP`.
     pub const DONTDUMP: Self = Self(1 << 6);
+    /// File-backed mapping provenance; source custody remains in HostBacking.
+    pub const FILE: Self = Self(1 << 7);
+    /// Shared anonymous provenance without private anonymous edit authority.
+    pub const SHARED_ANONYMOUS: Self = Self(1 << 8);
     pub const ANONYMOUS_PRIVATE: Self = Self(Self::ANONYMOUS.0 | Self::PRIVATE.0);
     /// Attributes the host sets with `set_flags` (`mlock`, `madvise`).
     pub const ATTRIBUTES: Self = Self(
@@ -138,7 +142,8 @@ impl ReservationNodeFlags {
     /// host-owned. `GROWSDOWN` is not one of them (a stack is host-owned).
     pub const CARRIED: Self =
         Self(Self::LOCKED.0 | Self::DONTFORK.0 | Self::WIPEONFORK.0 | Self::DONTDUMP.0);
-    const ALL: u32 = Self::ANONYMOUS_PRIVATE.0 | Self::ATTRIBUTES.0;
+    const ALL: u32 =
+        Self::ANONYMOUS_PRIVATE.0 | Self::ATTRIBUTES.0 | Self::FILE.0 | Self::SHARED_ANONYMOUS.0;
 
     pub const fn from_bits(bits: u32) -> Option<Self> {
         if bits & !Self::ALL == 0 {
@@ -162,10 +167,12 @@ impl ReservationNodeFlags {
     pub const fn difference(self, other: Self) -> Self {
         Self(self.0 & !other.0)
     }
-    /// EL1 may propose edits only over private anonymous nodes, whatever
-    /// [`Self::CARRIED`] attributes they hold.
+    /// EL1 may edit private anonymous or retained private file nodes,
+    /// preserving their carried attributes. File nodes additionally require
+    /// a retained source in the production reservation node.
     pub const fn root_editable(self) -> bool {
-        self.0 & !Self::CARRIED.0 == Self::ANONYMOUS_PRIVATE.0
+        let kind = self.0 & !Self::CARRIED.0;
+        kind == Self::ANONYMOUS_PRIVATE.0 || kind == (Self::PRIVATE.0 | Self::FILE.0)
     }
     /// `RLIMIT_DATA` covers private writable non-stack mappings (getrlimit(2),
     /// mmap(2)); shared, stack and read-only nodes are not charged.
@@ -334,6 +341,6 @@ mod flag_tests {
             assert!(ReservationNodeFlags::ATTRIBUTES.contains(flag));
             assert!(!ReservationNodeFlags::PRIVATE.union(flag).root_editable());
         }
-        assert_eq!(ReservationNodeFlags::from_bits(1 << 7), None);
+        assert_eq!(ReservationNodeFlags::from_bits(1 << 9), None);
     }
 }
