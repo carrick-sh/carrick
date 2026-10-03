@@ -1743,9 +1743,10 @@ mod tests {
                     ),
                     Err(Refusal::Busy)
                 );
-                // Fork and teardown plan from settled memory only.
+                // Fork inherits live memory; owed physical returns stay on parent.
                 let mut child_root = root(&spaces, &table, &child);
-                assert_eq!(model.clone_into(&mut child_root), Err(Refusal::Busy));
+                model.clone_into(&mut child_root).unwrap();
+                assert!(owed_returns(&child_root).is_empty());
                 let owed = owed_returns(&model);
                 assert_eq!(owed.len(), 1);
                 assert_eq!(
