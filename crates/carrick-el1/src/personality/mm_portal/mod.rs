@@ -14,7 +14,8 @@ use crate::memory::reservations::{
 };
 use carrick_el1_abi::{
     MetadataExtent, MetadataExtentResolver, PinnedMetadataExtent, ReservationBackingReceipt,
-    ReservationCompletion, ReservationMm, ReservationProtection, ReservationRange,
+    ReservationCompletion, ReservationMm, ReservationNodeFlags, ReservationProtection,
+    ReservationRange,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::guest_cow::{
     GuestCowClass, classify_guest_cow_write,
@@ -308,14 +309,16 @@ struct Frame {
     extent: MetadataExtent,
     owner: usize,
     counts: Arc<Counts>,
+    imported: bool,
 }
-struct Mm {
+struct Mm<P> {
     transaction_generation: u64,
     pending: Arc<AtomicU64>,
     handle: El1MmHandle,
     tables: PageTableManager,
     free: BTreeSet<u64>,
     internal: u64,
+    imports: Arc<Vec<P>>,
 }
 struct Extent {
     grant: ExtentGrant,
@@ -363,25 +366,76 @@ impl UnpublishedEl1Child {
 }
 /// Pre-admission declarations only; this type cannot take an admitted handle
 /// or obtain the owner's manager. Seal consumes the declarations.
-pub struct BootMmBuilder {
+/// Backing provenance supplied once before admission, never inferred from VA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidentBacking {
+    Owned,
+    HostBackingPrivate,
+    HostBackingShared,
+    CopyOnly,
+}
+
+struct ResidentImport<P> {
+    range: ReservationRange,
+    pin: P,
+    offset: u64,
+    backing: ResidentBacking,
+}
+
+pub struct BootMmBuilder<P> {
     image: Vec<u8>,
     image_base: u64,
     layout: Layout,
     seeds: Vec<(ReservationRange, ReservationProtection)>,
+    resident: Vec<ResidentImport<P>>,
 }
-impl BootMmBuilder {
+impl<P: PinnedMetadataExtent + Send + Sync + 'static> BootMmBuilder<P> {
     pub fn new(layout: Layout, image: Vec<u8>, image_base: u64) -> Self {
         Self {
             image,
             image_base,
             layout,
             seeds: Vec::new(),
+            resident: Vec::new(),
         }
     }
     pub fn map_lazy(&mut self, range: ReservationRange, protection: ReservationProtection) {
         self.seeds.push((range, protection));
     }
-    pub fn seal<B: PhysicalExtentBackend>(
+    /// Consume exact-generation physical custody before admission. The pin
+    /// keeps input bytes alive until the owner has adopted or copied them.
+    pub fn import_resident(
+        &mut self,
+        range: ReservationRange,
+        pin: P,
+        offset: u64,
+        backing: ResidentBacking,
+    ) -> Result<(), MmError> {
+        let extent = pin.extent();
+        if !range.start().is_multiple_of(PAGE_BYTES)
+            || !range.len().is_multiple_of(PAGE_BYTES)
+            || !offset.is_multiple_of(PAGE_BYTES)
+            || !extent.base().is_multiple_of(PAGE_BYTES)
+            || extent
+                .base()
+                .checked_add(offset)
+                .is_none_or(|start| !extent.contains(start, range.len()))
+            || self
+                .resident
+                .iter()
+                .any(|old| old.range.start() < range.end() && range.start() < old.range.end())
+        {
+            return Err(MmError::Invalid);
+        }
+        self.resident.push(ResidentImport {
+            range,
+            pin,
+            offset,
+            backing,
+        });
+        Ok(())
+    }
+    pub fn seal<B: PhysicalExtentBackend<Pin = P>>(
         self,
         portal: &mut MmPortal<B>,
     ) -> Result<El1MmHandle, MmError>
@@ -404,7 +458,7 @@ where
     table: Box<SharedReservations>,
     nodes: ResolvedReservationNodes<B::Pin>,
     backend: B,
-    mms: Vec<Mm>,
+    mms: Vec<Mm<B::Pin>>,
     extents: BTreeMap<u64, Extent>,
     frames: BTreeMap<u64, Frame>,
     retired: BTreeSet<u64>,
@@ -480,6 +534,7 @@ where
                         extent: grant.extent,
                         owner: i,
                         counts: Arc::new(Counts::default()),
+                        imported: false,
                     },
                 );
                 self.mms[i].free.insert(page);
@@ -541,8 +596,62 @@ where
         }
         Ok(tables)
     }
-    fn seal(&mut self, boot: BootMmBuilder) -> Result<El1MmHandle, MmError> {
+    fn seal(&mut self, boot: BootMmBuilder<B::Pin>) -> Result<El1MmHandle, MmError> {
         let i = self.mms.len();
+        let prior_extents: BTreeSet<_> = self.extents.keys().copied().collect();
+        let prior_frames: BTreeMap<_, _> = self
+            .frames
+            .iter()
+            .map(|(page, frame)| (*page, frame.counts.references.load(Ordering::Acquire)))
+            .collect();
+        let result = self.seal_inner(boot);
+        if result.is_err() {
+            // No handle/task was published. Restore semantic references before
+            // dropping table pins and returning newly allocated physical data.
+            let mm = ReservationMm::new(i as u64 + 1).ok_or(MmError::Invalid)?;
+            if let Ok(root) = self.table.lock_el1_resolved(i, mm, &self.nodes, 0) {
+                root.retire()?;
+            }
+            self.mms.truncate(i);
+            self.frames.retain(|page, frame| {
+                if let Some(references) = prior_frames.get(page) {
+                    frame
+                        .counts
+                        .references
+                        .store(*references, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            });
+            let rollback: Vec<_> = self
+                .extents
+                .values()
+                .filter(|extent| {
+                    !prior_extents.contains(&extent.grant.extent.base())
+                        && extent.grant.kind != ExtentKind::Metadata
+                })
+                .map(|extent| extent.grant)
+                .collect();
+            for grant in rollback {
+                self.backend.return_extent(grant)?;
+                self.extents.remove(&grant.extent.base());
+                self.work.capacity_returns += 1;
+            }
+        }
+        result
+    }
+    fn seal_inner(&mut self, boot: BootMmBuilder<B::Pin>) -> Result<El1MmHandle, MmError> {
+        let i = self.mms.len();
+        for import in &boot.resident {
+            if !boot.seeds.iter().any(|(range, _)| *range == import.range) {
+                return Err(MmError::Invalid);
+            }
+            let live = self.pin(import.pin.extent())?;
+            if live.host_base() != import.pin.host_base() {
+                return Err(MmError::Stale);
+            }
+        }
         let mm = ReservationMm::new(i as u64 + 1).ok_or(MmError::Invalid)?;
         let h = El1MmHandle {
             carrier: self.carrier,
@@ -559,10 +668,21 @@ where
             tables,
             free: BTreeSet::new(),
             internal: 0,
+            imports: Arc::new(Vec::new()),
         });
         let mut root = self.root(i)?;
         for (range, protection) in boot.seeds {
-            root.import(range, protection, true)?;
+            let backing = boot
+                .resident
+                .iter()
+                .find(|r| r.range == range)
+                .map(|r| r.backing);
+            let flags = match backing {
+                Some(ResidentBacking::HostBackingPrivate) => ReservationNodeFlags::PRIVATE,
+                Some(ResidentBacking::HostBackingShared) => ReservationNodeFlags::EMPTY,
+                _ => ReservationNodeFlags::ANONYMOUS_PRIVATE,
+            };
+            root.import_with(range, protection, flags)?;
         }
         root.finish_import()?;
         let visits = root.work as u64;
@@ -584,6 +704,83 @@ where
             .tables
             .set_live_descriptor_owner(LiveDescriptorOwner::Guest);
         self.mms[i].internal = internal;
+        let mut imports = Vec::new();
+        for import in boot.resident {
+            let extent = import.pin.extent();
+            // Authenticate exact backend generation while the consumed source
+            // pin still owns custody. No source VA or host permission query.
+            let authenticated = self.pin(extent)?;
+            if authenticated.host_base() != import.pin.host_base() {
+                return Err(MmError::Stale);
+            }
+            for offset in (0..import.range.len()).step_by(PAGE_BYTES as usize) {
+                let va = import.range.start() + offset;
+                let source = extent.base() + import.offset + offset;
+                let page = if import.backing == ResidentBacking::CopyOnly {
+                    let page = self.page(i)?;
+                    let target = self.frames[&page].extent;
+                    let mut bytes = [0; PAGE_BYTES as usize];
+                    self.backend
+                        .read(extent, source - extent.base(), &mut bytes)?;
+                    self.backend.write(target, page - target.base(), &bytes)?;
+                    page
+                } else {
+                    if let Some(frame) = self.frames.get(&source) {
+                        if frame.extent != extent {
+                            return Err(MmError::Stale);
+                        }
+                        frame.counts.references.fetch_add(1, Ordering::AcqRel);
+                    } else {
+                        self.frames.insert(
+                            source,
+                            Frame {
+                                extent,
+                                owner: i,
+                                imported: true,
+                                counts: Arc::new(Counts {
+                                    references: AtomicU64::new(1),
+                                    pins: AtomicU64::new(0),
+                                }),
+                            },
+                        );
+                    }
+                    source
+                };
+                let protection = self.root(i)?.mapping(va).ok_or(MmError::Fault)?.protection;
+                // The unpublished owner installs exact Linux protection before
+                // its handle escapes; read-only input never acquires write intent.
+                self.publish(
+                    i,
+                    va,
+                    page,
+                    protection.permits(ReservationProtection::READ_WRITE),
+                )?;
+                let exec = protection.bits() & 4 != 0;
+                let permissions = if protection == ReservationProtection::NONE {
+                    PtOp::KernelReadOnly { exec }
+                } else if protection.permits(ReservationProtection::READ_WRITE) {
+                    PtOp::ReadWrite { exec }
+                } else {
+                    PtOp::ReadOnly { exec }
+                };
+                let op =
+                    self.mms[i]
+                        .tables
+                        .terminal_op(va, PAGE_BYTES, TerminalRule::pt(permissions));
+                self.transaction(i, op)?;
+                // Private host-file aliases must COW before any guest write.
+                if import.backing == ResidentBacking::HostBackingPrivate {
+                    let op = self.mms[i]
+                        .tables
+                        .fork_arm_op(va, PAGE_BYTES, false, exec, false);
+                    self.transaction(i, op)?;
+                }
+            }
+            if import.backing != ResidentBacking::CopyOnly {
+                imports.push(import.pin);
+            }
+        }
+        self.mms[i].imports = Arc::new(imports);
         Ok(h)
     }
     fn reap(&mut self) {
@@ -603,7 +800,9 @@ where
         self.work.retired_frame_visits += self.retired.len() as u64;
         for page in ready {
             self.retired.remove(&page);
-            self.mms[self.frames[&page].owner].free.insert(page);
+            if !self.frames[&page].imported {
+                self.mms[self.frames[&page].owner].free.insert(page);
+            }
         }
     }
     fn page(&mut self, i: usize) -> Result<u64, MmError> {
@@ -627,7 +826,9 @@ where
         }
         if f.counts.references.fetch_sub(1, Ordering::AcqRel) == 1 {
             if f.counts.pins.load(Ordering::Acquire) == 0 {
-                self.mms[f.owner].free.insert(page);
+                if !f.imported {
+                    self.mms[f.owner].free.insert(page);
+                }
             } else {
                 self.retired.insert(page);
             }
@@ -1185,7 +1386,7 @@ where
         });
         let mut ranges = Vec::new();
         let mut root = self.root(parent)?;
-        root.observe_nodes(layout.arena, &mut |m, _| ranges.push(m.range))?;
+        root.observe_nodes(layout.arena, &mut |m, _| ranges.push((m.range, m.flags)))?;
         let mut child_root = self.table.lock_el1_resolved(child, mm, &self.nodes, 0)?;
         root.clone_into(&mut child_root)?;
         let visits = root.work as u64 + child_root.work as u64;
@@ -1194,7 +1395,10 @@ where
         self.work.vma_nodes += visits;
         // This snapshot is made by the EL1 owner from its live tables. There
         // is no host VMA/refcount input or host exclusion/pause capability.
-        for range in &ranges {
+        for (range, flags) in &ranges {
+            if !flags.contains(ReservationNodeFlags::PRIVATE) {
+                continue;
+            }
             let op = self.mms[parent].tables.fork_arm_op(
                 range.start(),
                 range.len(),
@@ -1213,7 +1417,7 @@ where
         }
         tables.set_live_descriptor_owner(LiveDescriptorOwner::Guest);
         let internal = self.mms[parent].internal;
-        for range in ranges {
+        for (range, _) in ranges {
             for (_, page) in self.mapped_frames(parent, range) {
                 self.frames[&page]
                     .counts
@@ -1232,6 +1436,7 @@ where
             tables,
             free: BTreeSet::new(),
             internal,
+            imports: self.mms[parent].imports.clone(),
         });
         Ok(UnpublishedEl1Child { handle })
     }
