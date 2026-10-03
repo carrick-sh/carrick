@@ -1107,7 +1107,7 @@ impl MmAccessState {
         // through backend retirement and pool release. A cached owner Arc keeps
         // storage resident, but does not stop a pooled slot being reissued.
         let page_tables = self.page_tables.read();
-        page_tables.with_retirement_exclusion(|manager| {
+        page_tables.retire_with_exclusion(|manager| {
             // Descriptor publication records the root high-water mark while
             // holding this authority, then takes mm_root_stage2. Match that
             // order so retirement cannot wait for the publisher while holding
