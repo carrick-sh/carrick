@@ -192,11 +192,11 @@ impl CodeContent {
 
     /// Claim the pages of `[offset, offset + len)` whose instruction cache
     /// must be invalidated before they first execute: clears their dirty
-    /// bits and returns whether any was set. The caller invalidates the
-    /// whole range when it returns true (one invalidation per publication,
-    /// whatever the dirty count). Out-of-range is answered dirty, so a
-    /// caller can never skip maintenance on an unproven range.
-    pub(crate) fn take_icache_dirty(&self, offset: usize, len: usize) -> bool {
+    /// bits and returns whether any was set. Only publish_icache may use
+    /// this primitive in production: it holds publication exclusion and
+    /// invalidates every claimed page before releasing that exclusion.
+    /// Out-of-range is answered dirty for fail-closed low-level tests.
+    fn take_icache_dirty(&self, offset: usize, len: usize) -> bool {
         let Ok(range) = self.pages(offset, len) else {
             return true;
         };
@@ -209,23 +209,36 @@ impl CodeContent {
         dirty
     }
 
-    /// Complete existing I2 cache maintenance for this physical backing.
-    /// The caller bounds the range to 16 KiB. Dirty claim and invalidation
-    /// finish together: a peer cannot mistake claimed work for completed I2.
+    /// Complete existing I2 maintenance for every page whose dirty bit is
+    /// claimed. A byte-range publication covers whole 4 KiB dirty pages,
+    /// clamped at the backing's end. Each lock hold covers at most 16 KiB,
+    /// including rounding; peers cannot mistake claimed work for completed I2.
     pub(crate) fn publish_icache(
         &self,
         offset: usize,
         len: usize,
-        invalidate: impl FnOnce(),
-    ) -> bool {
-        let _publication = self.icache_publication.lock();
-        let dirty = self.take_icache_dirty(offset, len);
-        if dirty {
-            invalidate();
-            #[cfg(test)]
-            self.icache_publications.fetch_add(1, Ordering::Relaxed);
+        mut invalidate: impl FnMut(usize, usize),
+    ) -> Result<usize, ContentError> {
+        let pages = self.pages(offset, len)?;
+        let mut cursor = *pages.start() << PAGE_SHIFT;
+        let end = (*pages.end() << PAGE_SHIFT)
+            .saturating_add(1 << PAGE_SHIFT)
+            .min(self.len);
+        let mut invalidations = 0;
+        while cursor < end {
+            let size = (end - cursor).min(16 * 1024);
+            // Page-aligned chunk starts ensure expansion can never turn a
+            // 16 KiB byte request into a 20 KiB critical section.
+            let _publication = self.icache_publication.lock();
+            if self.take_icache_dirty(cursor, size) {
+                invalidate(cursor, size);
+                invalidations += 1;
+                #[cfg(test)]
+                self.icache_publications.fetch_add(1, Ordering::Relaxed);
+            }
+            cursor += size;
         }
-        dirty
+        Ok(invalidations)
     }
 
     fn pages(&self, offset: usize, len: usize) -> Result<RangeInclusive<usize>, ContentError> {
@@ -417,6 +430,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn executable_publication_covers_disjoint_lines_on_one_dirty_page() {
+        let content = CodeContent::new(4096);
+        assert!(content.take_icache_dirty(0, 4096));
+        // Two MM aliases complete writes on distinct cache lines of the
+        // same physical page before either publishes executable content.
+        content.mark_icache_dirty(0x200, 4);
+        content.mark_icache_dirty(0, 4);
+        let mut invalidated = Vec::new();
+        content
+            .publish_icache(0, 4, |offset, len| invalidated.push((offset, len)))
+            .unwrap();
+        content
+            .publish_icache(0x200, 4, |offset, len| invalidated.push((offset, len)))
+            .unwrap();
+        assert_eq!(
+            invalidated,
+            [(0, 4096)],
+            "the first claimant must invalidate the other writer's cache line too"
+        );
+    }
+
+    #[test]
+    fn executable_publication_rounding_respects_backing_and_lock_budget() {
+        let content = CodeContent::new(5 * 4096 + 123);
+        let mut invalidated = Vec::new();
+        content
+            .publish_icache(1, 16 * 1024, |offset, len| invalidated.push((offset, len)))
+            .unwrap();
+        assert_eq!(invalidated, [(0, 16 * 1024), (16 * 1024, 4096)]);
+        content
+            .publish_icache(5 * 4096 + 100, 23, |offset, len| {
+                invalidated.push((offset, len))
+            })
+            .unwrap();
+        assert_eq!(invalidated.last(), Some(&(5 * 4096, 123)));
+        assert_eq!(
+            content.publish_icache(5 * 4096 + 100, 24, |_, _| panic!("outside backing")),
+            Err(ContentError::OutOfBounds)
+        );
+        assert!(invalidated.iter().all(|(offset, len)| offset % 4096 == 0
+            && *len <= 16 * 1024
+            && offset + len <= content.len));
+    }
+
+    #[test]
     fn executable_publication_waits_for_claimed_invalidation_completion() {
         let content = Arc::new(CodeContent::new(4096));
         let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
@@ -426,13 +484,15 @@ mod tests {
             let first_content = &content;
             let first_finished = &finished;
             let first = scope.spawn(move || {
-                first_content.publish_icache(0, 4096, || {
-                    claimed_tx.send(()).unwrap();
-                    release_rx
-                        .recv_timeout(std::time::Duration::from_secs(5))
-                        .unwrap();
-                    first_finished.store(true, Ordering::SeqCst);
-                });
+                first_content
+                    .publish_icache(0, 4096, |_, _| {
+                        claimed_tx.send(()).unwrap();
+                        release_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                        first_finished.store(true, Ordering::SeqCst);
+                    })
+                    .unwrap();
             });
             claimed_rx
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -441,7 +501,9 @@ mod tests {
             let content = &content;
             let finished = &finished;
             scope.spawn(move || {
-                content.publish_icache(0, 4096, || panic!("already claimed"));
+                content
+                    .publish_icache(0, 4096, |_, _| panic!("already claimed"))
+                    .unwrap();
                 done_tx.send(finished.load(Ordering::SeqCst)).unwrap();
             });
             let premature = done_rx.recv_timeout(std::time::Duration::from_millis(100));
