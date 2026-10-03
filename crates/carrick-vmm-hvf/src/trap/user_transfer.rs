@@ -131,19 +131,20 @@ impl TransferPin for RetainedUserData {
             || request.retained != self.identity
             || request.selected != self.selected
             || request.intent != self.intent
-            || request.range.len() != self.len as u64
-            || bytes.len() != self.len
+            || request.range.len() > self.len as u64
+            || request.range.len() != bytes.len() as u64
         {
             return false;
         }
         // SAFETY: the exact stage-2 pin and retained backing keep this checked
         // bounded physical interval alive. The caller invokes this only from
-        // the EL1 revalidated copy effect while that exact MM editor is held.
+        // owner-authorized copy effect. The exact prepared permit remains live
+        // through COMMIT; a short copy may consume only its authenticated prefix.
         unsafe {
             if self.intent == PortalTransferIntent::UserWrite {
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.pointer, self.len);
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.pointer, bytes.len());
             } else {
-                core::ptr::copy_nonoverlapping(self.pointer, bytes.as_mut_ptr(), self.len);
+                core::ptr::copy_nonoverlapping(self.pointer, bytes.as_mut_ptr(), bytes.len());
             }
         }
         if self.intent == PortalTransferIntent::UserWrite {
@@ -156,13 +157,13 @@ impl TransferPin for RetainedUserData {
                 )
             });
             let offset = self.pointer as usize - mapping.host_base() as usize;
-            mapping.code_content.mark_icache_dirty(offset, self.len);
+            mapping.code_content.mark_icache_dirty(offset, bytes.len());
         }
         if self.intent == PortalTransferIntent::UserWrite && self.selected.executable {
             self.custody
                 .publish_user_executable(
                     self.selected.ipa,
-                    self.len as u64,
+                    bytes.len() as u64,
                     |_, _| None,
                     |_, _| None,
                 )
@@ -752,6 +753,74 @@ pub(super) mod tests {
             CarrierStage2RetireOutcome::RetiredUnmapped
         );
     }
+    #[test]
+    fn prepared_short_commit_copies_only_actual_prefix_with_exact_physical_pin() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let owner = backing(&custody, 0xa085_0000_0000);
+        let physical = UserTransferCustody::new(Arc::clone(&custody));
+        let selected = selection(0xa085_0000_0000 + 4096);
+        let mut pin = physical
+            .retain(selected, 4096, PortalTransferIntent::UserWrite)
+            .unwrap()
+            .unwrap();
+        let request = carrick_el1_abi::PortalTransferRequest::new(
+            PortalOperation {
+                carrier: physical.carrier(),
+                mm: ReservationMm::new(77).unwrap(),
+                incarnation: NonZeroU64::new(1).unwrap(),
+                sequence: NonZeroU64::new(1).unwrap(),
+            },
+            PortalByteRange::new(0x4000_1000, 4096).unwrap(),
+            PortalTransferIntent::UserWrite,
+            selected,
+            pin.identity(),
+        )
+        .unwrap();
+        let permit = carrick_el1_abi::PortalPreparedPermit {
+            index: 11,
+            generation: NonZeroU64::new(21).unwrap(),
+            operation: request.operation,
+        };
+        let slot = PortalTransferSlot::new();
+        let mut prepare = slot.submit_prepare(request).unwrap();
+        assert!(slot.claim().unwrap().complete_prepared(permit));
+        assert_eq!(prepare.take_prepared(), Some(permit));
+        let mut bytes = [0x5a; 23];
+        let mut ticket = slot
+            .submit_commit(request, permit, bytes.len() as u64)
+            .unwrap();
+        let service = slot.claim().unwrap();
+        assert!(
+            service.copy_with(|| assert!(
+                ticket.copy_requested(|authorization| pin.copy(authorization, &mut bytes))
+            )),
+            "a short committed prefix must retain the full prepared identity"
+        );
+        assert!(service.complete(bytes.len() as u64, 0));
+        assert_eq!(ticket.take_completion().unwrap().completed, 23);
+        // SAFETY: owner and exact pin retain this entire physical interval.
+        let actual =
+            unsafe { core::slice::from_raw_parts(owner.mapping.host_base().add(4096), 4096) };
+        assert_eq!(&actual[..23], &bytes);
+        assert!(actual[23..].iter().all(|byte| *byte == 0));
+        assert_eq!(
+            custody
+                .stage2_record_snapshot(owner.record_identity.record_id)
+                .unwrap()
+                .pin_count,
+            1
+        );
+        drop(pin);
+        assert_eq!(
+            custody
+                .stage2_record_snapshot(owner.record_identity.record_id)
+                .unwrap()
+                .pin_count,
+            0
+        );
+    }
+
     #[test]
     fn independent_carriers_cannot_cross_feed_identical_mm_and_vm_generations() {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
