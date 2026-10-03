@@ -11441,6 +11441,10 @@ fn live_resolver_cached_retirement_and_extension_removal_fail_closed() {
         retirement_excluded_access,
         "root retirement released the page-table access guard before retiring backing"
     );
+    assert!(
+        table_authority.is_none(),
+        "terminal root retirement must revoke the software image before pooled backing reuse"
+    );
     assert_eq!(retired_root.proof.root_slot_base(), root_slot.0);
     assert_eq!(retired_root.proof.root_slot_size(), root_slot.1);
     assert!(

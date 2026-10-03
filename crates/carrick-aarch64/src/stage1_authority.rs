@@ -732,6 +732,29 @@ impl Stage1Authority {
         f(inner.manager.as_ref())
     }
 
+    /// Run terminal backing retirement while excluding descriptor access,
+    /// then revoke this authority's software image before the backing can be
+    /// recycled. On error the authority remains intact for rollback/retry.
+    pub fn retire_with_exclusion<R, E>(
+        &self,
+        f: impl FnOnce(Option<&PageTableManager>) -> Result<R, E>,
+    ) -> Result<R, E> {
+        let (result, image, source) = {
+            let mut inner = self.inner.lock();
+            let result = f(inner.manager.as_ref())?;
+            let image = inner.manager.take();
+            let source = inner.arena_source.take();
+            inner.host_resolver = None;
+            inner.published_arenas.clear();
+            (result, image, source)
+        };
+        if let Some(image) = image {
+            self.inner.lock().image_pool.recycle(image);
+        }
+        drop(source);
+        Ok(result)
+    }
+
     /// Execute a closure with a reference to the inner `PageTableManager` if acquired before deadline.
     pub fn try_with_manager_until<F, R, E>(
         &self,
