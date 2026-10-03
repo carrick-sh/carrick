@@ -161,6 +161,7 @@ struct State {
     version: u64,
     generation: u64,
     sequence: u64,
+    fork_origin_node: u32,
     tree: u32,
     /// Head of this root's host-venue node reserve (linked through
     /// `Node::next_free`, private to this root while reserved).
@@ -168,6 +169,7 @@ struct State {
     layout: Layout,
     pending: Option<Pending>,
     admitted: bool,
+    fork_pending: bool,
     /// Nodes in the host-venue reserve.
     host_reserved: u32,
     /// Last minted [`ReservationIncarnation`].
@@ -267,11 +269,15 @@ struct NodeData {
 const fn pack_prot(prot: ReservationProtection) -> u16 {
     prot.bits() as u16
 }
-/// Lossless: validated node flags use seven bits.
+/// Lossless: validated node flags use nine bits.
 const fn pack_flags(flags: ReservationNodeFlags) -> u16 {
     flags.bits() as u16
 }
 impl NodeData {
+    fn root_editable(&self) -> bool {
+        self.flags().root_editable()
+            && (!self.flags().contains(ReservationNodeFlags::FILE) || self.host_backing.is_some())
+    }
     fn flags(&self) -> ReservationNodeFlags {
         // Nodes are only written from validated flags.
         ReservationNodeFlags::from_bits(u32::from(self.flags))
@@ -505,11 +511,13 @@ impl SharedReservations {
                     version: VERSION,
                     generation: root.epoch.load(Ordering::Relaxed) + 1,
                     sequence: 0,
+                    fork_origin_node: 0,
                     tree: 0,
                     host_reserve_head: 0,
                     layout,
                     pending: None,
                     admitted: false,
+                    fork_pending: false,
                     host_reserved: 0,
                     minted: 0,
                     retired_below: 0,
@@ -739,6 +747,9 @@ impl Reservations<'_> {
     /// Allocate a transfer identity from the admitted owner, never from a
     /// portal-local MM vector or caller-reusable counter.
     pub fn next_transfer_sequence(&mut self) -> Result<core::num::NonZeroU64, Refusal> {
+        if self.state().fork_pending {
+            return Err(Refusal::Busy);
+        }
         let next = self.state().sequence.checked_add(1).ok_or(Refusal::Stale)?;
         self.state_mut().sequence = next;
         core::num::NonZeroU64::new(next).ok_or(Refusal::Stale)
@@ -749,6 +760,145 @@ impl Reservations<'_> {
         ReservationGeneration::new(self.root.epoch.load(Ordering::Acquire) + 1)
             .expect("published root incarnation")
     }
+    pub fn operation_sequence(&self) -> u64 {
+        self.state().sequence
+    }
+    pub fn fork_write_authorized(&mut self, sequence: Option<core::num::NonZeroU64>) -> bool {
+        self.state().fork_pending
+            && sequence.is_some_and(|seq| {
+                self.state().fork_origin_node != 0
+                    && self.read(self.state().fork_origin_node).last == seq.get()
+            })
+    }
+    pub fn next_fork_write_sequence(
+        &mut self,
+        sequence: core::num::NonZeroU64,
+    ) -> Result<core::num::NonZeroU64, Refusal> {
+        if !self.fork_write_authorized(Some(sequence)) {
+            return Err(Refusal::Stale);
+        }
+        let next = self.state().sequence.checked_add(1).ok_or(Refusal::Stale)?;
+        self.state_mut().sequence = next;
+        core::num::NonZeroU64::new(next).ok_or(Refusal::Stale)
+    }
+    pub fn reserve_fork_certificate(
+        &mut self,
+        request: carrick_el1_abi::PortalForkRequest,
+    ) -> Result<(), Refusal> {
+        if self.state().fork_origin_node == 0 {
+            self.set_fork_origin(request)?;
+        }
+        let node = self.state().fork_origin_node;
+        let mut data = self.read(node);
+        data.last = request.operation.sequence.get();
+        self.write(node, data);
+        Ok(())
+    }
+    pub fn fork_pending(&self) -> bool {
+        self.state().fork_pending
+    }
+    /// The descriptor owner checked generation headroom and holds both root
+    /// guards and editors. No fallible metadata effect follows publication.
+    pub(crate) fn publish_fork_parent(
+        &mut self,
+        request: carrick_el1_abi::PortalForkRequest,
+    ) -> ReservationGeneration {
+        debug_assert!(!self.state().fork_pending && self.pending().is_none());
+        debug_assert!(self.state().generation < u64::MAX);
+        self.state_mut().fork_pending = true;
+        self.state_mut().sequence = request.operation.sequence.get();
+        self.state_mut().generation += 1;
+        self.generation()
+    }
+    pub(crate) fn publish_fork_child(&mut self, request: carrick_el1_abi::PortalForkRequest) {
+        debug_assert!(self.is_admitted() && self.pending().is_none() && !self.state().fork_pending);
+        self.state_mut().fork_pending = true;
+        self.state_mut().sequence = request.operation.sequence.get();
+    }
+    pub fn begin_fork_publication(
+        &mut self,
+        request: carrick_el1_abi::PortalForkRequest,
+    ) -> Result<(), Refusal> {
+        if self.state().fork_pending || self.pending().is_some() || self.deferred().next().is_some()
+        {
+            return Err(Refusal::Busy);
+        }
+        self.reserve_fork_certificate(request)?;
+        self.state_mut().fork_pending = true;
+        self.state_mut().sequence = request.operation.sequence.get();
+        Ok(())
+    }
+    pub fn set_fork_origin(
+        &mut self,
+        request: carrick_el1_abi::PortalForkRequest,
+    ) -> Result<(), Refusal> {
+        if self.state().fork_origin_node != 0 {
+            return Err(Refusal::Stale);
+        }
+        let node = self.pool_node()?;
+        let data = NodeData {
+            start: request.operation.mm.raw(),
+            end: request.operation.incarnation.get(),
+            incarnation: request.parent_generation.raw(),
+            first: request.operation.sequence.get(),
+            last: request.operation.sequence.get(),
+            ..NodeData::default()
+        };
+        self.write(node, data);
+        self.state_mut().fork_origin_node = node;
+        Ok(())
+    }
+    pub fn clear_fork_origin(&mut self) {
+        let node = self.state().fork_origin_node;
+        if node != 0 {
+            self.table.release(node, self.banks);
+            self.state_mut().fork_origin_node = 0;
+        }
+    }
+    pub fn finish_fork_publication(
+        &mut self,
+        operation: carrick_el1_abi::PortalOperation,
+    ) -> Result<(), Refusal> {
+        if !self.fork_write_authorized(Some(operation.sequence)) {
+            return Err(Refusal::Stale);
+        }
+        self.state_mut().fork_pending = false;
+        Ok(())
+    }
+    pub fn authenticate_fork_origin(
+        &mut self,
+        request: carrick_el1_abi::PortalForkRequest,
+    ) -> bool {
+        if !self.is_admitted()
+            || self.mm() != request.child_mm
+            || self.state().fork_origin_node == 0
+        {
+            return false;
+        }
+        let node = self.read(self.state().fork_origin_node);
+        [node.start, node.end, node.incarnation, node.first]
+            == [
+                request.operation.mm.raw(),
+                request.operation.incarnation.get(),
+                request.parent_generation.raw(),
+                request.operation.sequence.get(),
+            ]
+    }
+
+    /// Advance policy visibility when fork replaces live descriptor authority.
+    pub fn commit_fork_generation(&mut self) -> Result<ReservationGeneration, Refusal> {
+        let next = self
+            .state()
+            .generation
+            .checked_add(1)
+            .ok_or(Refusal::Stale)?;
+        self.state_mut().generation = next;
+        Ok(self.generation())
+    }
+    pub fn fork_settled(&self) -> bool {
+        self.pending().is_none() && !self.state().fork_pending && self.deferred().next().is_none()
+    }
+
     pub fn generation(&self) -> ReservationGeneration {
         ReservationGeneration::new(self.state().generation).expect("published generation")
     }
@@ -917,7 +1067,7 @@ impl Reservations<'_> {
         max_len: u64,
         access: ReservationProtection,
     ) -> Result<ReservationFaultPlan, Refusal> {
-        self.fault_plan_for_source(address, max_len, access, false)
+        self.fault_plan_for_source(address, max_len, access, false, None)
     }
     /// Transfer materialization may consume an explicitly retained byte
     /// source. Ordinary anonymous fault planning keeps its existing boundary.
@@ -927,7 +1077,16 @@ impl Reservations<'_> {
         max_len: u64,
         access: ReservationProtection,
     ) -> Result<ReservationFaultPlan, Refusal> {
-        self.fault_plan_for_source(address, max_len, access, true)
+        self.fault_plan_for_source(address, max_len, access, true, None)
+    }
+    pub fn fork_transfer_fault_plan(
+        &mut self,
+        address: u64,
+        max_len: u64,
+        access: ReservationProtection,
+        sequence: Option<core::num::NonZeroU64>,
+    ) -> Result<ReservationFaultPlan, Refusal> {
+        self.fault_plan_for_source(address, max_len, access, true, sequence)
     }
     fn fault_plan_for_source(
         &mut self,
@@ -935,9 +1094,13 @@ impl Reservations<'_> {
         max_len: u64,
         access: ReservationProtection,
         allow_backing: bool,
+        fork_sequence: Option<core::num::NonZeroU64>,
     ) -> Result<ReservationFaultPlan, Refusal> {
         if !self.is_admitted() {
             return Err(Refusal::Stale);
+        }
+        if self.state().fork_pending && !self.fork_write_authorized(fork_sequence) {
+            return Err(Refusal::Busy);
         }
         if max_len == 0 || !max_len.is_multiple_of(4096) || access.bits() == 0 {
             return Err(Refusal::Invalid);
@@ -976,7 +1139,16 @@ impl Reservations<'_> {
         plan: ReservationFaultPlan,
         backing: Option<HostBackingIdentity>,
     ) -> bool {
-        plan.mm == self.mm
+        self.authenticate_fork_transfer_fault(plan, backing, None)
+    }
+    pub fn authenticate_fork_transfer_fault(
+        &mut self,
+        plan: ReservationFaultPlan,
+        backing: Option<HostBackingIdentity>,
+        sequence: Option<core::num::NonZeroU64>,
+    ) -> bool {
+        (!self.state().fork_pending || self.fork_write_authorized(sequence))
+            && plan.mm == self.mm
             && plan.generation == self.generation()
             && self.pending().is_none_or(|p| {
                 p.range.end() <= plan.range.start() || p.range.start() >= plan.range.end()
@@ -1177,7 +1349,7 @@ impl Reservations<'_> {
         if !self.state().admitted {
             return Err(Refusal::Stale);
         }
-        if self.pending().is_some() {
+        if self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Busy);
         }
         if !self.in_layout(range) {
@@ -1200,7 +1372,7 @@ impl Reservations<'_> {
                 break;
             }
             // Opaque and attributed nodes are host-owned: forward the edit.
-            if !n.flags().root_editable() {
+            if !n.root_editable() {
                 return Err(Refusal::ForeignMapping);
             }
             if require_coverage && n.start > cursor {
@@ -1396,7 +1568,7 @@ impl Reservations<'_> {
     /// A host-forwarded proposal consumes the same nodes secured by host
     /// admission. Guest proposals must never consume that reserved capacity.
     pub fn begin_host_proposal(&mut self) -> Result<(), Refusal> {
-        if !self.host_holder || self.pending().is_some() {
+        if !self.host_holder || self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Invalid);
         }
         self.host_venue = true;
@@ -1542,7 +1714,7 @@ impl Reservations<'_> {
         len: u64,
         prot: ReservationProtection,
     ) -> Result<Decision, Refusal> {
-        if self.pending().is_some() {
+        if self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Busy);
         }
         let range = self.place(placement, len)?;
@@ -1606,10 +1778,53 @@ impl Reservations<'_> {
         new_len: u64,
         target: MoveTarget,
     ) -> Result<Decision, Refusal> {
+        let backing = self.mapping(source.start()).and_then(|mapping| {
+            mapping.host_backing.and_then(|source_backing| {
+                source_backing.advance(source.start() - mapping.range.start())
+            })
+        });
+        let decision = self.mremap_inner(source, new_len, target)?;
+        if let (Some(backing), Decision::Work(request)) = (backing, decision)
+            && matches!(
+                request.operation,
+                ReservationOperation::Prepare | ReservationOperation::Move
+            )
+        {
+            let pending = self.state().pending.ok_or(Refusal::Stale)?;
+            let backing =
+                if pending.result == source.start() && request.range.start() == source.end() {
+                    backing.advance(source.len()).ok_or(Refusal::Invalid)?
+                } else {
+                    backing
+                };
+            if backing.advance(request.range.len()).is_none() {
+                self.refuse(request)?;
+                return Err(Refusal::Invalid);
+            }
+            let id = pending.nodes[0];
+            if id == 0 {
+                return Err(Refusal::Stale);
+            }
+            self.write(
+                id,
+                NodeData {
+                    host_backing: Some(backing),
+                    ..NodeData::default()
+                },
+            );
+        }
+        Ok(decision)
+    }
+    fn mremap_inner(
+        &mut self,
+        source: ReservationRange,
+        new_len: u64,
+        target: MoveTarget,
+    ) -> Result<Decision, Refusal> {
         if !self.state().admitted {
             return Err(Refusal::Stale);
         }
-        if self.pending().is_some() {
+        if self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Busy);
         }
         let fixed = match target {
@@ -1630,7 +1845,7 @@ impl Reservations<'_> {
         let node = self
             .run_covering(source.start(), source.end())
             .ok_or(Refusal::Hole)?;
-        if !node.flags().root_editable() {
+        if !node.root_editable() {
             return Err(Refusal::ForeignMapping);
         }
         let prot = node.protection();
@@ -1700,7 +1915,7 @@ impl Reservations<'_> {
         if !self.state().admitted {
             return Err(Refusal::Stale);
         }
-        if self.pending().is_some() {
+        if self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Busy);
         }
         let old = self.brk_current();
@@ -1856,6 +2071,18 @@ impl Reservations<'_> {
             created_flags = created_flags.difference(ReservationNodeFlags::ANONYMOUS);
         }
         let creates = pending.request.operation != ReservationOperation::Retire;
+        let created_backing = if created_flags.contains(ReservationNodeFlags::FILE)
+            && matches!(
+                pending.request.operation,
+                ReservationOperation::Prepare | ReservationOperation::Move
+            ) {
+            self.read(pending.nodes[0])
+                .host_backing
+                .ok_or(Refusal::Stale)
+                .map(Some)?
+        } else {
+            None
+        };
         let mut spares = Spares(pending.nodes);
         // The pending proposal excluded every other edit, so these are the
         // splits counted at proposal time; prove it before mutating.
@@ -1881,6 +2108,7 @@ impl Reservations<'_> {
                 end: range.end(),
                 prot: pack_prot(pending.request.protection),
                 flags: pack_flags(created_flags),
+                host_backing: created_backing,
                 ..NodeData::default()
             };
             node.incarnation = self.incarnation_for(&node);
@@ -2151,7 +2379,7 @@ impl Reservations<'_> {
         if host_backing.is_some_and(|backing| backing.advance(range.len()).is_none()) {
             return Err(Refusal::Invalid);
         }
-        if self.pending().is_some() {
+        if self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Busy);
         }
         if self
@@ -2179,7 +2407,7 @@ impl Reservations<'_> {
         if !self.state().admitted {
             return Err(Refusal::Stale);
         }
-        if self.pending().is_some() {
+        if self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Busy);
         }
         self.state().generation.checked_add(1).ok_or(Refusal::Stale)
@@ -2241,6 +2469,11 @@ impl Reservations<'_> {
         let generation = self.host_edit_admitted()?;
         let mut cursor = range.start();
         while let Some(n) = self.next(cursor).filter(|n| n.start < range.end()) {
+            if set.contains(ReservationNodeFlags::WIPEONFORK)
+                && !n.flags().contains(ReservationNodeFlags::ANONYMOUS_PRIVATE)
+            {
+                return Err(Refusal::Invalid);
+            }
             if n.start > cursor {
                 return Err(Refusal::Hole);
             }
@@ -2293,7 +2526,8 @@ impl Reservations<'_> {
         }
         // Fork plans from settled memory only: retired extents whose
         // frames the host has not reconciled are not settled.
-        if self.pending().is_some() || self.deferred().next().is_some() {
+        if self.pending().is_some() || self.state().fork_pending || self.deferred().next().is_some()
+        {
             return Err(Refusal::Busy);
         }
         if child.state().admitted || child.state().tree != 0 || child.pending().is_some() {
@@ -2434,6 +2668,7 @@ impl Reservations<'_> {
             return Err(Refusal::Stale);
         }
         self.release_tree(self.state().tree);
+        self.clear_fork_origin();
         self.state_mut().tree = 0;
         self.drain_host_reserve();
         Ok(())
@@ -2442,13 +2677,15 @@ impl Reservations<'_> {
     /// Owed returns must be reconciled first: the MM's frames are only
     /// settled once every EL1-retired extent has its inventory receipt.
     pub fn retire(mut self) -> Result<(), Refusal> {
-        if self.pending().is_some() || self.deferred().next().is_some() {
+        if self.pending().is_some() || self.state().fork_pending || self.deferred().next().is_some()
+        {
             return Err(Refusal::Busy);
         }
         for slot in self.deferred_slots() {
             slot.mm.store(0, Ordering::Release);
         }
         self.release_tree(self.state().tree);
+        self.clear_fork_origin();
         self.state_mut().tree = 0;
         self.drain_host_reserve();
         self.root
@@ -3835,6 +4072,100 @@ mod tests {
         let Decision::Work(request) = d else { panic!() };
         assert_eq!(request.operation, ReservationOperation::Move);
         g.refuse(request).unwrap();
+    }
+
+    #[test]
+    fn owner_file_child_protect_and_unmap_preserve_retained_source() {
+        use core::num::NonZeroU64;
+        let table = table();
+        let parent_mm = ReservationMm::new(40).unwrap();
+        let child_mm = ReservationMm::new(41).unwrap();
+        table.publish(0, parent_mm, layout()).unwrap();
+        table.publish(1, child_mm, layout()).unwrap();
+        let source = HostBackingIdentity::new(
+            NonZeroU64::new(17).unwrap(),
+            NonZeroU64::new(3).unwrap(),
+            0x8000,
+        );
+        let mut parent = table.lock(0, parent_mm).unwrap();
+        parent
+            .import_with_backing(
+                range(0x100000, 0x104000),
+                ReservationProtection::READ_WRITE,
+                ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+                source,
+            )
+            .unwrap();
+        parent.finish_import().unwrap();
+        let mut child = table.lock(1, child_mm).unwrap();
+        parent.clone_into(&mut child).unwrap();
+        let protection = child
+            .mprotect(
+                range(0x101000, 0x102000),
+                ReservationProtection::from_bits(1).unwrap(),
+            )
+            .unwrap();
+        complete(&mut child, protection);
+        assert_eq!(
+            child.mapping(0x101000).unwrap().host_backing,
+            source.advance(0x1000)
+        );
+        let retirement = child.munmap(range(0x102000, 0x103000)).unwrap();
+        complete(&mut child, retirement);
+        assert!(child.mapping(0x102000).is_none());
+        assert_eq!(
+            child.mapping(0x103000).unwrap().host_backing,
+            source.advance(0x3000)
+        );
+        let moved = child
+            .mremap(
+                range(0x103000, 0x104000),
+                0x2000,
+                MoveTarget::Fixed(0x110000),
+            )
+            .unwrap();
+        complete(&mut child, moved);
+        assert!(child.mapping(0x103000).is_none());
+        assert_eq!(
+            child.mapping(0x110000).unwrap().host_backing,
+            source.advance(0x3000)
+        );
+        let copied = child
+            .mremap(
+                range(0x110000, 0x112000),
+                0x2000,
+                MoveTarget::KeepSource(Some(0x120000)),
+            )
+            .unwrap();
+        complete(&mut child, copied);
+        assert_eq!(
+            child.mapping(0x120000).unwrap().host_backing,
+            source.advance(0x3000)
+        );
+        let grown = child
+            .mremap(range(0x110000, 0x112000), 0x3000, MoveTarget::InPlace)
+            .unwrap();
+        complete(&mut child, grown);
+        let grown = child.mapping(0x112000).unwrap();
+        assert_eq!(
+            grown
+                .host_backing
+                .and_then(|backing| backing.advance(0x112000 - grown.range.start())),
+            source.advance(0x5000)
+        );
+        assert_eq!(
+            child.set_flags(
+                range(0x110000, 0x113000),
+                ReservationNodeFlags::WIPEONFORK,
+                ReservationNodeFlags::EMPTY
+            ),
+            Err(Refusal::Invalid)
+        );
+        assert_eq!(
+            parent.mapping(0x101000).unwrap().protection,
+            ReservationProtection::READ_WRITE
+        );
+        assert!(parent.mapping(0x102000).is_some());
     }
 
     #[test]
