@@ -360,6 +360,108 @@ there to reject this commitment before that port. Core extractions can land
 on the host first only if they replace the previous implementation, not add
 V2 models. Maintain personality/substrate separation and compiler inventories.
 
+### N0 experiment receipt (2026-10-02)
+
+**Verdict: PASS for the bounded VM-free experiment; no section 6 seam
+rejection was observed. Production ownership and the workload exit thesis
+remain unaccepted.** This supersedes the incomplete preparation verdict below,
+which is retained as historical production-red evidence.
+
+`carrick-el1::personality::mm_portal` owns the actual reservation table,
+resolved elastic node bank, live `PageTableManager` images and exact physical
+frame references. Boot declarations and the production HVPatch initial image
+are consumed before `finish_import`; the only admitted identity is
+`El1MmHandle { carrier, mm, incarnation }`, with private fields and no Deref.
+The three families are UserTransfer (including owner map/protect/unmap/remap
+and asynchronous pinned completion), Fork (unpublished task identity), and
+Capacity (generation-authenticated grant/return/settlement). Internal reads
+have their own closed intent, confined to the boot control page at
+`0x2d001e4000`; they do not weaken user authorization.
+
+After admission the managers select `LiveDescriptorOwner::Guest`. Publication,
+retirement, protection and fork arming use the existing shared descriptor
+planner/executor/receipt settlement; COW uses its real compound classifier
+and journaled repoint operation. No manager host publication is enabled to
+make tests pass. Fork copies the owner's own live table image and clones the
+owner reservation tree; no host VMA/reference snapshot is an input. The fake
+backend authenticates only physical extents, generations, pins and byte spans.
+It records every callback and checks the real root-holder census at each one.
+It contains no protection, predecessor, VMA, COW or projection decision API.
+
+Both MMs have the SAME VA and the full 16/512 unrelated-node population.
+`native_owner_matrix` covers lazy copyout/read, RO and PROT_NONE errno **14**,
+unmap/remap, moved bytes, child COW with unchanged parent and peer, actual
+zeroing/reuse of a dirty physical page in a partial 16 KiB compound with an
+unchanged adjacent page, and stale pinned completion refusal. The target's
+real scheduler address-space gate stays closed, and all **256** scheduler
+records are parked service records throughout transfer. No record is unparked,
+no EL0 entry occurs and no host worker is parked by this owner entry. This is
+an owner-core progress proof, not a production service transport binding.
+
+| Pages | Unrelated nodes in each MM | Transfer table visits | Transfer VMA visits | Fork VMA visits | Logical pins acquired/released | Physical pins acquired/released at teardown | Grants/returns | Backend callbacks | Dirty-page zero/reuses |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 16 | 16 | 928 | 240 | 260 | 58/58 | 138/138 | 8/1 | 14630 | 1 |
+| 16 | 512 | 928 | 480 | 9779 | 58/58 | 138/138 | 8/1 | 25559 | 1 |
+| 64 | 16 | 3712 | 960 | 260 | 202/202 | 426/426 | 8/1 | 22310 | 1 |
+| 64 | 512 | 3712 | 1920 | 9779 | 202/202 | 426/426 | 8/1 | 33239 | 1 |
+| 256 | 16 | 14848 | 3840 | 260 | 778/778 | 1582/1582 | 10/1 | 53034 | 1 |
+| 256 | 512 | 14848 | 7680 | 9779 | 778/778 | 1582/1582 | 10/1 | 63963 | 1 |
+
+A table visit counts one live descriptor/range resolution, not every byte of
+an extent authenticated by that resolution. Fork also copies **7168/7680**
+words at 16/512 nodes. Total VMA work includes bootstrap imports (4239/158005,
+4959/159445, 7839/165205 respectively); it is not substituted for the measured
+operation windows. Portal physical-dispatch counts and backend callback counts
+are different layers: the latter also includes backend-internal validation
+pins and raw pinned-span resolutions, and is the complete backend census.
+All host semantic/protection/COW/projection decisions, MM-lock crossings,
+host worker parks and EL0 entries are **zero** in every row. Retirement visits
+are **2**; capacity settlement scans **768/1280** physical frame slots,
+proportional to granted extents. After user mapping retirement, references are
+exactly **3** explicit boot-control references and **0** user references/pins.
+Physical pins all balance on portal destruction.
+
+The transfer budget derives from three passes, four table levels and the
+existing bounded table-grant/reclaim widths (8 each), not unrelated VMAs:
+`3 * 4 * (8 + 8 + 4) * pages`. Measured visits are exactly `58 * pages`.
+VMA queries are bounded by three passes times tree height, with four boundary
+visits per level; the unrelated-node increase doubles visits, not 32x.
+Fork necessarily clones its own VMAs: its bound includes the cloned node
+population and tree height. Capacity is extent-bounded; physical policy is
+reused unchanged from `el1-elastic-frame-extents.toml`: 4 KiB Linux pages,
+16 KiB compounds, 1 MiB grants, 16 KiB refill threshold, 1 MiB high watermark,
+synchronous single outstanding grant and at most one wholly free retained
+extent per MM after settlement. No second policy table was introduced.
+
+`extent_generation_and_pin_custody` additionally fills 512 pages, refuses a
+forged grant token, refuses returning an extent containing a referenced or
+pinned retired page, refuses fork with an outstanding target copy, then rejects
+the stale completion and returns the exact generation. Four compile-fail
+doctests prevent handle access to manager, mutable VMA, protections and raw
+host pointer; `just test` now runs them.
+
+Section 6's reject/rethink conditions:
+
+- Stopped transfer needs EL0/host-worker parking: **PASS**, zero entries/parks;
+  closed execution gate and 256 unchanged parked records.
+- Fork needs a host VMA/reference snapshot: **PASS**, zero host projection
+  inputs/decisions; owner clone visits 260/9779, owner table words 7168/7680.
+- Lease drain needs host page-table pauses: **PASS**, pending drop performs
+  atomic pin release only, and old completion is refused without a pause.
+- Capacity needs semantic VA/predecessor custody: **PASS**, exact extent/token
+  return checks only; forged, cross-MM, busy and repeated returns are refused.
+- MM lock across host I/O: **PASS**, zero actual callback/root-holder crossings.
+- Zero 18-ID forwarding but approximately 161 total exits/fork: **UNMEASURED**.
+  N0 contains no guest or creation workload and makes no exit-count promise;
+  this remains a mandatory N2/N3 workload rejection gate.
+
+This is a bounded anonymous-MM experiment, not an installed second production
+lane. N1 still owns production admission binding, all VMA kinds, cross-core
+failure rollback, multi-vCPU publication and signed stale-TLBI/cache negative
+controls. No guest run or Docker result is claimed. Shared edits are limited
+to the resolved EL1 reservation-lock entry, module registration, dev-only
+production image dependency, doctest recipe and contract/inventory binding.
+
 ### N0 preparation receipt (partial, 2026-10-02)
 
 Initial reduction ran on admission `690383cc8`, not main. The director froze
@@ -523,7 +625,7 @@ core extraction, Linux clone/exec edge cases and host-file coherence are real
 work, not trivial ports. Accept the approach only if the following small
 experiment closes the seam without adding a second model.
 
-**N0 experiment (future implementation, first bounded brief):** two VM-free
+**N0 experiment (implemented above; original bounded brief):** two VM-free
 EL1 MM instances with the same GuestVa, live reservation core and MMU tables,
 plus a fake physical extent backend. Through the proposed sealed handle,
 exercise only UserTransfer, Fork and Capacity: map lazy memory, copyout,
