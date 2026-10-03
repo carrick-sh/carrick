@@ -1,0 +1,22 @@
+
+running 1 test
+test el1_tlb_running_thread_mm_edits_cost_no_maintenance ... tlb-edit-budget munmap origins rounds=4: {(2, 6000006000): 1, (2, 600020a000): 5}
+tlb-edit-budget attribution rounds=4 mprotect=9 munmap=6 mmap=1
+el1-sched tlb-edit-budget rounds=4 owed=16 issued_on_return=16 issued_by_host=2 maintenance_exits=2 exits=72 tlb-edit-budget rounds=4 errors=0 ok=true
+tlb-edit-budget munmap origins rounds=36: {(4, 6000006000): 1, (4, 600020a000): 24}
+tlb-edit-budget attribution rounds=36 mprotect=72 munmap=37 mmap=1
+el1-sched tlb-edit-budget rounds=36 owed=110 issued_on_return=110 issued_by_host=1 maintenance_exits=2 exits=197 tlb-edit-budget rounds=36 errors=0 ok=true
+el1-sched tlb-edit-budget over 32 added rounds: owed +94, issued by host +0, maintenance exits +0
+
+thread 'el1_tlb_running_thread_mm_edits_cost_no_maintenance' (76129514) panicked at crates/carrick-embed/tests/el1_sched.rs:2604:5:
+32 added rounds owed only 94 invalidations to their returns
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    el1_tlb_running_thread_mm_edits_cost_no_maintenance
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.22s
+

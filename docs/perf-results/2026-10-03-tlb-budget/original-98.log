@@ -1,0 +1,9 @@
+
+running 1 test
+test el1_tlb_running_thread_mm_edits_cost_no_maintenance ... el1-sched tlb-edit-budget rounds=4 owed=14 issued_on_return=14 issued_by_host=2 maintenance_exits=2 exits=75 tlb-edit-budget rounds=4 errors=0 ok=true
+el1-sched tlb-edit-budget rounds=36 owed=112 issued_on_return=112 issued_by_host=1 maintenance_exits=2 exits=200 tlb-edit-budget rounds=36 errors=0 ok=true
+el1-sched tlb-edit-budget over 32 added rounds: owed +98, issued by host +0, maintenance exits +0
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 83 filtered out; finished in 0.21s
+

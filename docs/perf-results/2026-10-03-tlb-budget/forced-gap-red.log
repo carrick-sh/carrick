@@ -1,0 +1,18 @@
+
+running 1 test
+test el1_tlb_mm_edit_window_excludes_sibling_allocations ... tlb-edit-budget forced_gap=true sibling_gap_overlaps=true
+tlb-edit-budget rounds=36 errors=1 ok=false remap round=0 Out of memory (os error 12)
+
+
+thread 'el1_tlb_mm_edit_window_excludes_sibling_allocations' (76162476) panicked at crates/carrick-embed/tests/el1_sched.rs:2630:5:
+exit 1 signal None stdout "tlb-edit-budget forced_gap=true sibling_gap_overlaps=true\ntlb-edit-budget rounds=36 errors=1 ok=false remap round=0 Out of memory (os error 12)\n" stderr ""
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    el1_tlb_mm_edit_window_excludes_sibling_allocations
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 84 filtered out; finished in 0.11s
+

@@ -1,0 +1,9 @@
+
+running 1 test
+test el1_tlb_mm_edit_window_excludes_sibling_allocations ... tlb-edit-budget forced_gap=true sibling_gap_overlaps=false
+tlb-edit-budget rounds=36 errors=0 ok=true 
+
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 84 filtered out; finished in 0.21s
+
