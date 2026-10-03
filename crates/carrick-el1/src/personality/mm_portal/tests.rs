@@ -620,3 +620,72 @@ fn extent_generation_and_pin_custody() {
         stats.pin_releases.load(Ordering::Relaxed)
     );
 }
+
+/// The inverse permission rule is already green in the N0 owner core. It is
+/// deliberately not labelled a production red: N1a must bind the same rule
+/// to the checked host provider, with neither peer-MM nor mirror authority.
+#[test]
+fn n1a_two_live_mms_retire_and_protect_read_faults_are_exact() {
+    let (mut p, _) = portal();
+    let a = boot(16).seal(&mut p).unwrap();
+    let b = boot(16).seal(&mut p).unwrap();
+    let span = range(VA, PAGE_BYTES);
+    for (h, value) in [(a, b'A'), (b, b'B')] {
+        p.user_transfer(
+            h,
+            UserTransfer::MapLazy {
+                range: span,
+                protection: ReservationProtection::READ_WRITE,
+            },
+        )
+        .unwrap();
+        write(&mut p, h, VA, &[value]).unwrap();
+    }
+    p.user_transfer(
+        a,
+        UserTransfer::Protect {
+            range: span,
+            protection: ReservationProtection::NONE,
+        },
+    )
+    .unwrap();
+    assert_eq!(read(&mut p, a, VA, &mut [0]).unwrap_err().errno(), 14);
+    let mut peer = [0];
+    read(&mut p, b, VA, &mut peer).unwrap();
+    assert_eq!(peer, [b'B']);
+    p.user_transfer(a, UserTransfer::Unmap { range: span })
+        .unwrap();
+    assert_eq!(read(&mut p, a, VA, &mut [0]).unwrap_err().errno(), 14);
+    read(&mut p, b, VA, &mut peer).unwrap();
+    assert_eq!(peer, [b'B']);
+}
+
+/// Production sealing must preserve already resident user bytes, not turn
+/// an imported live mapping into a new zero-filled lazy reservation.
+#[test]
+fn red_until_n1a_seal_preserves_resident_boot_mapping() {
+    let (mut p, _) = portal();
+    let mut boot = boot(16);
+    let data = p.grant(ExtentKind::Data, None).unwrap();
+    p.backend.write(data.extent, 0, b"live").unwrap();
+    let mut tables = PageTableManager::new(
+        boot.image,
+        boot.image_base,
+        PageTableLayoutConfig::new(0x100000, EXTENT_BYTES as usize, 0, 0),
+    );
+    tables
+        .map_aliased(
+            VA,
+            data.extent.base(),
+            PAGE_BYTES,
+            carrick_mmu_core::aarch64::UserLeafAccess::READ_WRITE,
+            None,
+        )
+        .unwrap();
+    boot.image = tables.into_bytes().unwrap();
+    boot.map_lazy(range(VA, PAGE_BYTES), ReservationProtection::READ_WRITE);
+    let h = boot.seal(&mut p).unwrap();
+    let mut bytes = [0; 4];
+    read(&mut p, h, VA, &mut bytes).unwrap();
+    assert_eq!(bytes, *b"live", "admission discarded resident input bytes");
+}
