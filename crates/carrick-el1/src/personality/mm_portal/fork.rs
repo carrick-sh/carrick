@@ -246,6 +246,8 @@ impl UnpublishedEl1Child {
         if parent.incarnation().raw() != request.operation.incarnation.get()
             || parent.generation() != self.completion.parent_generation
             || !child.authenticate_fork_origin(request)
+            || !parent.fork_write_authorized(Some(request.operation.sequence))
+            || !child.fork_write_authorized(Some(request.operation.sequence))
         {
             return Err(MmError::Stale);
         }
@@ -278,13 +280,30 @@ impl UnpublishedEl1Child {
         {
             return Err(MmError::Stale);
         }
+        let mut child_root = portal.child_root(child, worker)?;
+        if !root.fork_write_authorized(Some(self.completion.request.operation.sequence))
+            || !child_root.fork_write_authorized(Some(self.completion.request.operation.sequence))
+            || !child_root.authenticate_fork_origin(self.completion.request)
+        {
+            return Err(MmError::Stale);
+        }
         rollback(words, &self.scratch.edits)?;
         words.publish_barrier();
         words.invalidate_range(0, 1 << 48);
         root.finish_fork_publication(self.completion.request.operation)?;
-        root.commit_fork_generation()?;
+        self.completion.parent_generation = root.commit_fork_generation()?;
+        if !self.scratch.edits.iter().any(|edit| {
+            edit.before & 3 == 3
+                && self
+                    .completion
+                    .request
+                    .parent_tables
+                    .contains(edit.before & PA)
+        }) {
+            self.completion.parent_tables_used = 0;
+        }
+        self.completion.child_tables_used = 0;
         drop(root);
-        let mut child_root = portal.child_root(child, worker)?;
         child_root.finish_fork_publication(self.completion.request.operation)?;
         child_root.retire()?;
         // The child's words are unreachable. Physical table/grant custody is
@@ -350,7 +369,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
         {
             return Err(MmError::Stale);
         }
-        if !root.fork_settled() {
+        if !root.fork_ready() {
             return Err(MmError::Busy);
         }
         let mut full = false;
@@ -431,7 +450,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
         {
             return Err(MmError::Stale);
         }
-        if !root.fork_settled() {
+        if !root.fork_ready() {
             return Err(MmError::Busy);
         }
         let child = self.child_root(request.child_mm, worker)?;
@@ -517,7 +536,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
         {
             return Err(MmError::Stale);
         }
-        if !root.fork_settled() {
+        if !root.fork_ready() {
             return Err(MmError::Busy);
         }
         let mut child = self.child_root(request.child_mm, worker)?;
@@ -865,6 +884,9 @@ fn copy_entry<W: LiveDescriptorWords + ?Sized>(
     if descriptor & 1 == 0 && el1_private_leaf_state(descriptor) == El1PrivateLeafState::Unowned {
         return Ok((descriptor, descriptor));
     }
+    if el1_private_leaf_state(descriptor) == El1PrivateLeafState::Retired {
+        return Ok((descriptor, 0));
+    }
     let span = 1u64 << SHIFTS[level];
     const CONTROL: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE - 0x2_0000;
     let structural = va < CONTROL + 0x20_0000 && va + span > CONTROL;
@@ -904,6 +926,7 @@ fn copy_entry<W: LiveDescriptorWords + ?Sized>(
                 source_ipa,
                 destination_ipa,
                 len: span,
+                executable: descriptor & (1 << 53) == 0,
             })?;
             return Ok((descriptor, (descriptor & !PA) | destination_ipa));
         }
@@ -1184,7 +1207,9 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         {
             crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, grant.ttbr0);
         }
-        slot.complete_finish(0);
+        if !slot.complete_finish_receipt(child.completion()) {
+            return Err(MmError::Stale);
+        }
         Ok(())
     })();
     frame.x[0] = result.err().map_or(0, |error| u64::from(error.errno()));
