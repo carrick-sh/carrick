@@ -1061,7 +1061,10 @@ pub(super) mod tests {
                         root: SubstrateGpa(ROOT),
                         pool: &pool,
                         residency: &residency,
-                        copy_base: carrick_el1_abi::EL1_COW_COPY_BASE,
+                        copy_window: carrick_el1::cow::CowCopyWindow::target(
+                            &words,
+                            SubstrateGpa(ROOT),
+                        ),
                     },
                     77,
                     VA,
