@@ -204,6 +204,11 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         request: carrick_el1_abi::PortalTransferRequest,
         slot: u32,
     ) -> Result<(), MmError> {
+        if request.operation.carrier != self.carrier
+            || carrick_sched_core::SlotId::from_index(slot as usize).is_none()
+        {
+            return Err(MmError::Stale);
+        }
         let claim = self.roots.claim_prepared(self.nodes, permit, request)?;
         let notification = claim.notification();
         if !claim.release() {
