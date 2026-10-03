@@ -1675,3 +1675,17 @@ payload whose Drop panics can no longer escape before the fatal branch.
 The actual custom-payload subprocess red caught that second panic, observed
 successor wake0 versus1, and returned without SIGABRT. Its same terminal
 regression now includes both ordinary string and panicking-Drop payloads.
+
+Director-requested window checkpoint: inactive HostIo file-read staging is
+preserved as explicit WIP. It adds bounded injectable pread, an owned host-fd
+reference plus cursor reservation, and commit of only copied bytes. The bound
+derives from MM_PORTAL_MAX_BYTES. Its core tests cover zero/short commit,
+shared-description exact-once bytes and f_pos remaining unchanged during copy;
+these are not production dispatcher greens.
+
+Before activation, replace blocking recall with owned recall continuation,
+retain exact live fd-slot/resource authority, exclude every competing legacy
+f_pos writer/lseek, release executor capacity during storage/cursor waits,
+provide symmetric O_APPEND writes, and wire owner PREPARE/COMMIT with one CPU
+loan across ready consumption. Existing offset callers remain open above.
+No guessed seek-back or MemoryProtections fallback is an accepted destination.
