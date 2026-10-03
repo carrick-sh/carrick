@@ -46,7 +46,8 @@ impl PreparedDelivery<'_> {
                 };
             // SAFETY: this capability came from the exact claimed node's
             // retained PREPARE admission, before that claim was released.
-            unsafe { zone.retained_object_notification(key) }.publish(waker, &completion);
+            unsafe { zone.retained_object_notification(key) }
+                .publish(carrick_sched_core::Waker::El1 { slot: waker }, &completion);
         }
     }
 }
