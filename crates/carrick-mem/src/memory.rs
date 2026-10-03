@@ -3896,6 +3896,20 @@ pub fn stage1_carrier_maintenance_page_tables() -> Vec<u8> {
         bytes[off..off + 8].copy_from_slice(&desc.to_le_bytes());
     }
 
+    // The fourth page is the L1 table for the retained carrier table pool.
+    // Pool primaries and extension arenas are physical custody, never EL0
+    // mappings. A maintenance-root service can therefore address the exact
+    // authenticated target root without borrowing its user translation.
+    let pool_base = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+    let pool_size = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_SIZE;
+    let pool_l0 = ((pool_base >> 39) & 511) as usize * 8;
+    bytes[pool_l0..pool_l0 + 8].copy_from_slice(&table_descriptor(root_pa + 0x3000).to_le_bytes());
+    const POOL_FLAGS: u64 = KERNEL_BLOCK_FLAGS | NON_GLOBAL | (1 << 53);
+    for pa in (pool_base..pool_base + pool_size).step_by(1 << 30) {
+        let off = 0x3000 + ((pa >> 30) & 511) as usize * 8;
+        bytes[off..off + 8].copy_from_slice(&(pa | POOL_FLAGS).to_le_bytes());
+    }
+
     bytes
 }
 
@@ -7574,6 +7588,41 @@ mod stage1_tests {
         assert_eq!(opcode(LINUX_EL1_ASID_MAINT_BASE, 2), AARCH64_DSB_SY_OPCODE);
         assert_eq!(opcode(LINUX_EL1_ASID_MAINT_BASE, 3), AARCH64_ISB_OPCODE);
         assert_eq!(opcode(LINUX_EL1_ASID_MAINT_BASE, 4), AARCH64_HVC1_OPCODE);
+    }
+
+    #[test]
+    fn carrier_maintenance_root_reaches_table_pool_without_el0_access() {
+        let bytes = stage1_carrier_maintenance_page_tables();
+        let base = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+        let size = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_SIZE;
+        for offset in (0..size).step_by(2 * 1024 * 1024) {
+            let va = base + offset;
+            let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+                carrick_mmu_core::aarch64::walk_descriptors(
+                    &bytes,
+                    LINUX_CARRIER_MAINT_ROOT_BASE,
+                    va,
+                ),
+            );
+            assert_ne!(
+                leaf & 3,
+                0,
+                "target table pool must be reachable at {va:#x}"
+            );
+            assert_eq!(leaf & (1 << 6), 0, "table pool must deny EL0 access");
+            assert_eq!(leaf & (3 << 53), 3 << 53, "table pool is never executable");
+            assert_ne!(leaf & (1 << 11), 0, "table pool must be non-global");
+        }
+        for va in [base - 4096, base + size] {
+            let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+                carrick_mmu_core::aarch64::walk_descriptors(
+                    &bytes,
+                    LINUX_CARRIER_MAINT_ROOT_BASE,
+                    va,
+                ),
+            );
+            assert_eq!(leaf & 3, 0, "mapping must stay inside the table pool");
+        }
     }
 
     #[test]
