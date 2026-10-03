@@ -1327,3 +1327,65 @@ acceptance, public bulk Capacity (including the frozen 64 GiB/16 TiB witnesses),
 GuestMemory venue 3 and remaining non-fork ownership transitions remain OPEN.
 This is a review-ready fork implementation checkpoint, not whole-N1 acceptance
 or a claim of adversarial security hardening.
+
+#### Venue-3 continuation boundary inspection — 2026-10-03
+
+Inspected clean `e19e1377c` before changing production code. This is a scope
+decision receipt, not implementation, red-first evidence or acceptance.
+The director confirmed that scheduler-owned transfer capacity and suspendable
+GuestMemory/dispatcher outcomes are prerequisites within venue 3. Suspension
+must retain its completed offset, release execution capacity, and never lower
+to EFAULT or acquire mutable engine ownership through an unchecked alias.
+
+The remaining decision concerns the enclosing syscall's completion authority:
+
+- `carrick-guest-mem/src/lib.rs:473` and `:522` expose synchronous `&self`
+  checked reads. `MemoryError` at `:1182` carries no owned continuation.
+- `carrick-aarch64/src/user_transfer.rs:202` advances an owned transfer using
+  a mutable engine and borrowed-TTBR0 admission. Its `Suspended` result retains
+  the transfer buffer and offset, but not the enclosing syscall's Rust stack.
+  `engine.rs:8035` likewise needs mutable driving-vCPU ownership.
+- `carrick-kernel/src/dispatch/outcome.rs:1183` converts every memory error
+  to EFAULT. Merely adding a memory error variant does not preserve suspension.
+- `carrick-kernel/src/dispatch/fs/rw.rs:1377` consumes socket bytes before
+  the guest copy at `:1380`. The vector case at `:1643` consumes a segment
+  before `:1646`, with remaining iovecs and total held on the handler stack.
+  Re-dispatch after transfer completion would consume another payload;
+  completing only the transfer would lose remaining iovecs and syscall return
+  authority. These are concrete stream-corruption boundaries, not permission
+  failures, and retaining only the UserTransfer byte offset is insufficient.
+
+The director rejected general consuming-handler continuation migration as too
+wide for venue 3. The chosen approach is two-phase UserTransfer: bounded
+destination PREPARE resolves lazy/COW backing and takes pins before source
+effects. Preparation may suspend and restart cleanly before consuming bytes;
+copy into a prepared span must not suspend. Huge vectors prepare bounded
+chunks and preserve Linux short-count semantics. Concurrent unmap may produce
+a genuine EFAULT and the appropriate partial count. This supersedes the
+initial recommendation to migrate enclosing handler continuations.
+
+**Outstanding owner-admission decision:** physical pins alone do not establish
+that non-suspending copy guarantee. In
+`carrick-el1/src/personality/mm_portal/production.rs:470`, `try_begin_edit`
+refusal returns `Ok(None)` even when mapping and physical custody are unchanged.
+`serve_transfer` at `:630` lowers this to completion errno 11. It would occur
+after source consumption in a selection/pin-only PREPARE implementation.
+Retaining the current editor across source I/O contradicts the transport's
+no-MM-lock-across-host-I/O rule; lowering editor contention to EFAULT contradicts
+the director's suspension ruling.
+
+Recommendation posted as a blocker: introduce a bounded EL1-issued prepared
+copy permit retaining semantic admission separately from the descriptor editor,
+with conflicting edits deferred until commit/cancel. Alternatively the director
+must explicitly allow a post-consumption completion continuation for editor
+contention. This is an owner lifetime protocol decision, not a proposed retry,
+timeout, host fallback or permission-mirror repair. Do not delete the mirror
+before the prepared-copy lifetime protocol and scheduler read service are bound.
+
+The requested production reds remain unimplemented and unrun. `mmapv8align`
+must bind to the EL1-map/mirror-unmapped checked-host-read witness;
+`mmapprivatefiletrack` must bind to the private-file host-read/write witness
+with two live same-VA MMs. Neither assignment is a passing receipt. Inverse
+EL1 unmap/PROT_NONE EFAULT 14, raw-escape closure, internal-window confinement,
+mirror storage deletion and all requested verification remain open. No signed,
+guest or Docker execution occurred during this inspection.
