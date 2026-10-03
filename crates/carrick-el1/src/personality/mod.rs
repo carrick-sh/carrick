@@ -4,4 +4,5 @@ pub mod file;
 pub mod inotify;
 pub mod ipc;
 pub mod lifecycle;
+pub mod mm_portal;
 pub mod sched;

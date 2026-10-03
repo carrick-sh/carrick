@@ -22,3 +22,6 @@ path = "src/entry.rs"
 
 [lib]
 path = "src/lib.rs"
+
+[dev-dependencies]
+carrick-mem = { path = "../carrick-mem" }

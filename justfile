@@ -417,6 +417,7 @@ test *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
     python3 -c 'import fcntl, os; [fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK) for fd in (0, 1, 2)]' 2>/dev/null || true
+    cargo test -p carrick-el1 --doc mm_portal
     if [ "{{os()}}" = "macos" ]; then
         # Runtime tests exercise process-wide signal dispositions, custom-x18
         # transitions, and fork from the test harness. Running those cases on
