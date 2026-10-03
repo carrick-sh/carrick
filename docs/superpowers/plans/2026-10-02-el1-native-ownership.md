@@ -1607,3 +1607,14 @@ The production owner matrix now checks that COMMIT admits another editor
 while its exact prepared range still overlaps; the previous matrix assertion
 incorrectly required the old editor-held one-shot behavior. Host checked-memory
 consumers and the full cutover remain pending.
+
+Current-CPU review corrections (prerequisite only):
+- `nested_shared_service_entry_refuses_without_panicking_or_effects`: actual
+  red was RefCell panic at shared Fork entry; now nested entry refuses before
+  CPU/transport effects and preserves the outer register image.
+- `serial_host_busy_transfer_admission_keeps_carrier_unbound`: actual red
+  changed initially unbound slots to carrier17 while refusing a busy CPU. One
+  checked loan now precedes binding and all register/slot inspection.
+- `serial_host_transfer_restore_failure_is_terminal`: injected restoration
+  failure previously returned normally; the child now terminates with SIGABRT
+  rather than exposing a reusable, partially restored executor.
