@@ -8,8 +8,11 @@ use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+#[path = "reservations/prepared.rs"]
+mod prepared;
 #[path = "reservations/storage.rs"]
 mod storage;
+pub use prepared::ClaimedPreparedCopy;
 pub use storage::ResolvedReservationNodes;
 
 const ROOTS: usize = carrick_sched_core::spaces::ADDRESS_SPACES;
@@ -17,7 +20,7 @@ const NODES: usize = 1024;
 /// Bootstrap metadata only. Exhaustion is a capacity request, never Linux
 /// ENOMEM. Existing reservations can still be observed and retired.
 pub const RESERVATIONS_OFFSET: usize = EL1_RESERVATIONS_OFFSET as usize;
-const VERSION: u64 = 7;
+const VERSION: u64 = 8;
 /// Nodes each root keeps for its host venue: enough for the net growth of
 /// any one host syscall's mirror (at most two straddler splits per edit
 /// boundary pair, demotion and placeholder included).
@@ -33,6 +36,7 @@ const DEFERRED_SLOTS: usize = 64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
     Busy,
+    PreparedConflict,
     Stale,
     Invalid,
     Collision,
@@ -162,6 +166,8 @@ struct State {
     generation: u64,
     sequence: u64,
     fork_origin_node: u32,
+    /// Elastic permit queue node; its payload owns the active list head.
+    prepared_head: u32,
     tree: u32,
     /// Head of this root's host-venue node reserve (linked through
     /// `Node::next_free`, private to this root while reserved).
@@ -392,9 +398,25 @@ impl Spares {
 }
 #[repr(C)]
 struct Node {
-    next_free: AtomicU32,
-    data: UnsafeCell<NodeData>,
+    // The original AtomicU32 had four bytes of alignment padding here.
+    // AtomicU64 preserves the stride and carries exact generation+phase CAS.
+    next_free: AtomicU64,
+    data: UnsafeCell<NodePayload>,
 }
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PreparedHeader {
+    next: u32,
+    tail: u32,
+    words: [u64; 13],
+}
+#[derive(Clone, Copy)]
+union NodePayload {
+    mapping: NodeData,
+    prepared: PreparedHeader,
+    words: [u64; 14],
+}
+const _: () = assert!(core::mem::size_of::<NodePayload>() == core::mem::size_of::<NodeData>());
 // A live node belongs to exactly one locked root. Free nodes are handed over
 // using the generation-qualified free list's release/acquire operations.
 unsafe impl Sync for Node {}
@@ -402,6 +424,7 @@ unsafe impl Sync for Node {}
 #[repr(C)]
 pub struct SharedReservations {
     layout_hash: AtomicU64,
+    prepared_sequence: AtomicU64,
     roots: [Root; ROOTS],
     /// Lock-free mirror of each root's `State::admitted`, one bit per root:
     /// set at admission, cleared at publish and retirement. Lets the guest
@@ -422,6 +445,9 @@ const LAYOUT_HASH: u64 = {
         core::mem::size_of::<Root>() as u64,
         core::mem::size_of::<State>() as u64,
         core::mem::size_of::<Node>() as u64,
+        core::mem::size_of::<NodePayload>() as u64,
+        core::mem::offset_of!(State, prepared_head) as u64,
+        core::mem::offset_of!(SharedReservations, prepared_sequence) as u64,
         core::mem::size_of::<Pending>() as u64,
         core::mem::offset_of!(SharedReservations, roots) as u64,
         core::mem::offset_of!(SharedReservations, admitted) as u64,
@@ -512,6 +538,7 @@ impl SharedReservations {
                     generation: root.epoch.load(Ordering::Relaxed) + 1,
                     sequence: 0,
                     fork_origin_node: 0,
+                    prepared_head: 0,
                     tree: 0,
                     host_reserve_head: 0,
                     layout,
@@ -677,7 +704,7 @@ impl SharedReservations {
             return Err(Refusal::Busy);
         }
         if index != 0 {
-            let next = self.node(index, banks).next_free.load(Ordering::Relaxed);
+            let next = self.node(index, banks).next_free.load(Ordering::Relaxed) as u32;
             let generation = (head >> 32)
                 .checked_add(1)
                 .filter(|v| *v <= u32::MAX as u64)
@@ -705,7 +732,7 @@ impl SharedReservations {
         // return, not polling for a guest/host event while holding a worker.
         let mut head = self.free.load(Ordering::Acquire);
         loop {
-            node.next_free.store(head as u32, Ordering::Relaxed);
+            node.next_free.store(head as u32 as u64, Ordering::Relaxed);
             let generation = ((head >> 32) + 1).min(u32::MAX as u64);
             let next = (generation << 32) | index as u64;
             match self
@@ -1072,7 +1099,11 @@ impl Reservations<'_> {
         &mut self,
         request: carrick_el1_abi::PortalForkRequest,
     ) -> Result<(), Refusal> {
-        if self.state().fork_pending || self.pending().is_some() || self.deferred().next().is_some()
+        self.reap_prepared();
+        if self.has_prepared_copy()
+            || self.state().fork_pending
+            || self.pending().is_some()
+            || self.deferred().next().is_some()
         {
             return Err(Refusal::Busy);
         }
@@ -1180,8 +1211,9 @@ impl Reservations<'_> {
         self.state_mut().generation = next;
         Ok(self.generation())
     }
-    pub fn fork_ready(&self) -> bool {
-        self.pending().is_none() && !self.state().fork_pending
+    pub fn fork_ready(&mut self) -> bool {
+        self.reap_prepared();
+        self.pending().is_none() && !self.state().fork_pending && !self.has_prepared_copy()
     }
     pub fn fork_settled(&self) -> bool {
         self.pending().is_none() && !self.state().fork_pending && self.deferred().next().is_none()
@@ -1202,12 +1234,12 @@ impl Reservations<'_> {
             return NodeData::default();
         }
         // SAFETY: indices are private to the admitted tree and root guard.
-        unsafe { *self.table.node(id, self.banks).data.get() }
+        unsafe { (*self.table.node(id, self.banks).data.get()).mapping }
     }
     fn write(&mut self, id: u32, node: NodeData) {
         self.work += 1;
         unsafe {
-            *self.table.node(id, self.banks).data.get() = node;
+            *self.table.node(id, self.banks).data.get() = NodePayload { mapping: node };
         }
     }
     fn node_at(&mut self, address: u64) -> Option<NodeData> {
@@ -1640,6 +1672,11 @@ impl Reservations<'_> {
         if self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Busy);
         }
+        if self.prepared_overlaps(range)
+            || source.is_some_and(|range| self.prepared_overlaps(range))
+        {
+            return Err(Refusal::PreparedConflict);
+        }
         if !self.in_layout(range) {
             return Err(Refusal::ForeignMapping);
         }
@@ -1792,7 +1829,7 @@ impl Reservations<'_> {
             self.table
                 .node(id, self.banks)
                 .next_free
-                .store(head, Ordering::Relaxed);
+                .store(u64::from(head), Ordering::Relaxed);
             self.state_mut().host_reserve_head = id;
             self.state_mut().host_reserved += 1;
         } else {
@@ -1815,7 +1852,7 @@ impl Reservations<'_> {
             .node(head, self.banks)
             .next_free
             .load(Ordering::Relaxed);
-        self.state_mut().host_reserve_head = next;
+        self.state_mut().host_reserve_head = next as u32;
         self.state_mut().host_reserved -= 1;
         Ok(head)
     }
@@ -1879,7 +1916,7 @@ impl Reservations<'_> {
                 .node(head, self.banks)
                 .next_free
                 .load(Ordering::Relaxed);
-            self.state_mut().host_reserve_head = next;
+            self.state_mut().host_reserve_head = next as u32;
             self.state_mut().host_reserved -= 1;
             self.table.release(head, self.banks);
         }
@@ -2735,6 +2772,9 @@ impl Reservations<'_> {
         flags: ReservationNodeFlags,
         backing: Option<HostBackingIdentity>,
     ) -> Result<(), Refusal> {
+        if self.prepared_overlaps(range) {
+            return Err(Refusal::PreparedConflict);
+        }
         let generation = self.host_edit_admitted()?;
         self.insert_backed_node(
             range,
@@ -2748,6 +2788,9 @@ impl Reservations<'_> {
     /// Host commit of a retirement it served itself: removes every node in
     /// `range`, whatever its kind, keeping straddlers' outside pieces.
     pub fn retire_opaque(&mut self, range: ReservationRange) -> Result<(), Refusal> {
+        if self.prepared_overlaps(range) {
+            return Err(Refusal::PreparedConflict);
+        }
         let generation = self.host_edit_admitted()?;
         let needed = self.splits_needed(range);
         let mut spares = Spares(self.host_spares(needed)?);
@@ -2999,10 +3042,15 @@ impl Reservations<'_> {
     /// Owed returns must be reconciled first: the MM's frames are only
     /// settled once every EL1-retired extent has its inventory receipt.
     pub fn retire(mut self) -> Result<(), Refusal> {
-        if self.pending().is_some() || self.state().fork_pending || self.deferred().next().is_some()
+        self.reap_prepared();
+        if self.has_prepared_copy()
+            || self.pending().is_some()
+            || self.state().fork_pending
+            || self.deferred().next().is_some()
         {
             return Err(Refusal::Busy);
         }
+        self.reap_prepared();
         for slot in self.deferred_slots() {
             slot.mm.store(0, Ordering::Release);
         }
@@ -3014,6 +3062,11 @@ impl Reservations<'_> {
         self.clear_fork_origin();
         self.state_mut().tree = 0;
         self.drain_host_reserve();
+        let prepared_queue = self.state().prepared_head;
+        self.state_mut().prepared_head = 0;
+        if prepared_queue != 0 {
+            self.free_node(prepared_queue);
+        }
         self.root
             .epoch
             .store(self.state().generation, Ordering::Relaxed);
@@ -3071,6 +3124,23 @@ mod tests {
         .unwrap();
         guard.complete(receipt).unwrap()
     }
+    #[test]
+    fn prepared_copy_owner_layout_receipt_preserves_metadata_node_stride() {
+        assert_eq!(core::mem::size_of::<Node>(), 120);
+        assert_eq!(core::mem::offset_of!(Node, data), 8);
+        std::println!(
+            "owner layout: node={} root={} state={} reservations={} zone={} portal_slot={} owner_hash={:#x} scheduler_hash={:#x}",
+            core::mem::size_of::<Node>(),
+            core::mem::size_of::<Root>(),
+            core::mem::size_of::<State>(),
+            core::mem::size_of::<SharedReservations>(),
+            core::mem::size_of::<carrick_sched_core::ZoneTables>(),
+            core::mem::size_of::<carrick_el1_abi::PortalTransferSlot>(),
+            LAYOUT_HASH,
+            carrick_sched_core::object_wait::OBJECT_WAIT_LAYOUT_HASH
+        );
+    }
+
     #[test]
     fn reservation_observer_walk_is_linear_and_generation_exact_for_two_mms() {
         let table = table();
