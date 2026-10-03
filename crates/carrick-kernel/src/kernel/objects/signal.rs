@@ -1140,11 +1140,15 @@ impl SignalAuthority {
     /// action carries the exact stop-invalidation epoch in which it left
     /// pending state.
     pub fn take_lowest_in(&self, wanted: SigSet) -> Option<SignalDequeue> {
+        let recipients = self.foreign_task_recipients();
         let generation_guard = self.task.lock_signal_generation();
         let mut thread = self.thread.signal_state.lock();
         let mut task = self.task_pending.queue.lock();
         let thread_signal = thread.pending().intersect(wanted).lowest_signum();
-        let task_signal = task.present().intersect(wanted).lowest_signum();
+        let task_signal = recipients
+            .available(&task, self.thread.key().tid)
+            .intersect(wanted)
+            .lowest_signum();
         let owner = match (thread_signal, task_signal) {
             (None, None) => return None,
             (Some(_), None) => SignalPendingOwner::Thread,
@@ -1185,6 +1189,21 @@ impl SignalAuthority {
         !thread
             .pending()
             .union(task.present())
+            .intersect(wanted)
+            .is_empty()
+    }
+
+    /// Whether this exact thread has a deliverable pending signal. Shared
+    /// signals designated for another live, unblocked thread do not make this
+    /// thread's syscall boundary or blocking-wait admission interruptible.
+    pub fn has_deliverable_in(&self, wanted: SigSet) -> bool {
+        let recipients = self.foreign_task_recipients();
+        let _generation_guard = self.task.lock_signal_generation();
+        let thread = self.thread.signal_state.lock();
+        let task = self.task_pending.queue.lock();
+        !thread
+            .pending()
+            .union(recipients.available(&task, self.thread.key().tid))
             .intersect(wanted)
             .is_empty()
     }

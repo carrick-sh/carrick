@@ -1043,13 +1043,8 @@ impl<'a> SignalView<'a> {
         // an internal re-dispatch edge rather than guest-visible EINTR.
         let non_interrupting =
             effective_block_mask.union(self.wait_ignored_disposition_mask(context));
-        let pending = Self::required_signal_thread(context, tid)
-            .signal_state()
-            .pending()
-            .union(context.shared().pending_signals().present());
-        !pending
-            .intersect(non_interrupting.complement().union(always_deliverable))
-            .is_empty()
+        Self::signal_authority_for(context, tid)
+            .has_deliverable_in(non_interrupting.complement().union(always_deliverable))
     }
 
     /// The set of signals whose CURRENT disposition would be
@@ -3841,6 +3836,22 @@ mod tests {
             DispatchOutcome::Returned { value: 0 }
         );
 
+        assert!(
+            root.signal_authority()
+                .take_lowest_in(SigSet::EMPTY.complement())
+                .is_none(),
+            "the leader's ordinary delivery boundary took a signal addressed to thread {sibling_tid:?}"
+        );
+        assert!(
+            !dispatcher
+                .signal_view()
+                .has_deliverable_dispatch_pending_for_wait(
+                    &root,
+                    root.thread().registry_id(),
+                    carrick_abi::WaitSigMask::NONE,
+                ),
+            "the leader's wait admission saw a signal addressed to thread {sibling_tid:?}"
+        );
         assert!(
             root.signal_authority()
                 .reserve_deliverable_for_wait(carrick_abi::WaitSigMask::NONE)

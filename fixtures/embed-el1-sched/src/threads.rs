@@ -278,6 +278,7 @@ pub fn spawn_slope(n: usize, rounds: usize) -> i32 {
 static HANDLED1: AtomicU32 = AtomicU32::new(0);
 static HANDLER1_TID: AtomicI32 = AtomicI32::new(0);
 static HANDLED2: AtomicU32 = AtomicU32::new(0);
+static HANDLER2_TID: AtomicI32 = AtomicI32::new(0);
 static CHILD_TID: AtomicI32 = AtomicI32::new(0);
 static CHILD_STARTED: AtomicU32 = AtomicU32::new(0);
 static CHILD_RELEASE: AtomicU32 = AtomicU32::new(0);
@@ -290,6 +291,7 @@ extern "C" fn on_usr1(_: i32) {
 }
 
 extern "C" fn on_usr2(_: i32) {
+    HANDLER2_TID.store(gettid(), Ordering::SeqCst);
     HANDLED2.fetch_add(1, Ordering::SeqCst);
 }
 
@@ -390,6 +392,7 @@ pub fn tgkill_after_clone(rounds: usize) -> i32 {
             HANDLED1.store(0, Ordering::SeqCst);
             HANDLER1_TID.store(0, Ordering::SeqCst);
             HANDLED2.store(0, Ordering::SeqCst);
+            HANDLER2_TID.store(0, Ordering::SeqCst);
             CHILD_TID.store(0, Ordering::SeqCst);
             CHILD_STARTED.store(0, Ordering::SeqCst);
             CHILD_RELEASE.store(0, Ordering::SeqCst);
@@ -461,6 +464,12 @@ pub fn tgkill_after_clone(rounds: usize) -> i32 {
             }
             if !wait_word_ge(&HANDLED2, 1, WAIT) {
                 failures.push(format!("round {round}: peer kill(tid) not delivered"));
+            }
+            if HANDLER2_TID.load(Ordering::SeqCst) != tid {
+                failures.push(format!(
+                    "round {round}: peer kill handler ran on {} not {tid}",
+                    HANDLER2_TID.load(Ordering::SeqCst)
+                ));
             }
             std::thread::sleep(Duration::from_millis(5));
             if HANDLED1.load(Ordering::SeqCst) != 1 || HANDLED2.load(Ordering::SeqCst) != 1 {
