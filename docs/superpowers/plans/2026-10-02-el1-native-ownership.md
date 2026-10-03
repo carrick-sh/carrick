@@ -1249,3 +1249,12 @@ GuestMemory venue 3, prior production-admission reds/WorkObservation, signed
 hardware coherence/TLBI and end-to-end N1/N2 acceptance remain OPEN. This
 receipt is production-owner UserTransfer groundwork, not whole-N1 closure,
 other-host runtime acceptance or adversarial security hardening.
+
+#### N1c fork checkpoint — placement capacity boundary
+
+The director identified frozen `coredumpbit`/`mmapcluster` witnesses whose
+64 GiB and 16 TiB `MAP_NORESERVE` reservations exceed the current production
+reservation arena. `Reservations::first_fit` refuses placement and the syscall
+lowers it to `ENOMEM`. This fork checkpoint inherits the owner's layout; it
+does not lift that placement bound. Those capacity witnesses remain OPEN for
+N1's bulk Capacity/reservation-model work. No guest run is claimed here.
