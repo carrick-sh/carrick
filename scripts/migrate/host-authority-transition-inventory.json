@@ -14710,6 +14710,33 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
+      "resource": "carrier-owned authenticated control connection handler thread used by `spawn_handler`"
+    },
+    "expansion": null,
+    "operation": "std::thread::Builder::new",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/kernel/control/connection.rs:65 in `spawn_handler`, `std::thread::Builder::new` acts only on the carrier-owned authenticated per-connection control handler; no guest identity selects its host target.",
+    "review_id": "HA-000712",
+    "source": {
+      "byte_end": 1757,
+      "byte_start": 1732,
+      "column": 23,
+      "column_end": 48,
+      "column_start": 23,
+      "file": "crates/carrick-kernel/src/kernel/control/connection.rs",
+      "line": 65,
+      "line_end": 65,
+      "line_start": 65
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
       "resource": "carrier-owned authenticated control server thread used by `start_at_inner` at line 270"
     },
     "expansion": null,
