@@ -1092,6 +1092,7 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             roots: crate::memory::reservations::shared_guest(),
             spaces: &zone.spaces,
             nodes: None,
+            zone: Some(zone),
         };
         let index = zone
             .spaces
@@ -1177,6 +1178,7 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             roots: crate::memory::reservations::shared_guest(),
             spaces: &zone.spaces,
             nodes: None,
+            zone: Some(zone),
         };
         let settlement = if commit {
             child.commit(&portal, frame.slot as u32).map(|_| ())

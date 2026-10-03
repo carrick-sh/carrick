@@ -1421,3 +1421,91 @@ unchanged; any scheduler storage-layout change enters the ABI layout hash.
 This out-of-fence support implements the required EL1-owned park/wake boundary,
 not a host-worker wait or a polling substitute. Implementation and all venue-3
 acceptance gates remain pending.
+
+#### Venue-3 owner permit receipt — 2026-10-03
+
+The owner implementation now separates semantic copy admission from the
+descriptor editor. Detached per-page receipts retain exact request identity,
+physical-custody authentication and notification admission while the wire slot
+prepares another page. COMMIT/CANCEL claim generation and phase atomically,
+without a root guard, descriptor words or current target grant. Elastic
+reservation nodes hold permits; settled-only intrusive queues and direct
+unlinking make preparing and settling an aggregate linear in its page count.
+No socket-derived aggregate bound or host consuming handler is bound yet.
+
+The director extended scope to a general scheduler completion primitive:
+"owned WakeEffects collected under queue lock and delivered by holder after
+unlock (including handback), no polled bitmap, no spin; scope extended to
+sched-core and effect-delivery callers." Completion-enabled admission retains
+exact queue incarnation until publication. Queue guards own the mandatory
+effect callback, including internal cancellation/unlink. Held execution slots
+transfer saved continuations through the carrier's existing host handback
+authority. Host exit reconciliation drains these handbacks. Publication uses
+one exchange and one link store; an interrupted producer retains custody and
+the consumer returns immediately. MM queues and later metadata queues can use
+the same primitive; IPC remains in its original namespace.
+
+Actual red evidence, before implementation:
+`RUSTC_WRAPPER= cargo test -p carrick-el1 prepared_copy_ -- --nocapture`
+exited 101, with 0 passed and 2 failed:
+`prepared_copy_overlapping_munmap_waits_before_any_mutation` and
+`prepared_copy_releases_editor_for_unrelated_edit`. The old editor fence
+prevented unrelated edits and did not reject an overlapping owner proposal
+before mutation.
+
+Actual green owner bindings in `mm_portal/tests.rs`:
+
+- `prepared_copy_overlapping_munmap_waits_before_any_mutation` and
+  `prepared_copy_releases_editor_for_unrelated_edit` close those two reds.
+- `prepared_copy_commit_and_cancel_never_acquire_held_root_or_editor`
+  covers held root/editor, actual short-copy length, unrelated MM generation
+  changes and stale receipt refusal.
+- `prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall`
+  covers munmap/mprotect/remap, both commit and cancel, and a queue held across
+  settlement. Saved arguments/PC/token resume and the owner edit actually
+  applies, without a forwarded host retry.
+- `prepared_copy_elastic_aggregate_prepare_and_settlement_have_linear_work`
+  checks 16/64/256/320 pages, exactly N preparation visits and N settlement
+  visits, and no settled-history rescan.
+- `prepared_copy_metadata_capacity_suspends_before_source_and_recovers_after_cancel`
+  exhausts elastic metadata before source effects, cancels prior receipts and
+  demonstrates recovered preparation capacity.
+- `prepared_copy_hardware_settlement_seam_needs_no_live_grant_or_descriptor_words`
+  closes the target gate, holds the root and settles through the same helper
+  used by hardware COMMIT/CANCEL with no descriptor-word input.
+
+Scheduler witnesses are
+`completion_held_queue_publication_advances_epoch_and_holder_delivers`,
+`completion_admission_blocks_rebind_and_rejects_stale_incarnation`,
+`completion_held_slot_transfers_exact_saved_operation_to_host_boundary`,
+`completion_internal_cancel_unlink_delivers_pending_wake_after_unlock`,
+`completion_publication_unlock_races_always_deliver` (64 races), and
+`paused_producer_link_retains_custody_and_consumer_never_waits`. ABI witness
+`detached_page_receipts_reuse_wire_slot_and_preserve_exact_settlement` covers
+aggregate receipts independent of the single-flight wire slot.
+
+Validation receipts: `cargo test -p carrick-el1` 239/239;
+`cargo test -p carrick-el1-abi` 119/119 plus 2 compile-fail doctests;
+`cargo test -p carrick-sched-core` 96/96. All used `RUSTC_WRAPPER=` and exited
+0. Targeted kernel/runtime `cargo check` and targeted EL1/ABI/scheduler/
+kernel/runtime `cargo clippy --lib -- -D warnings` also exited 0.
+
+The owner layout witness prints Node=120, Root=280, State=256,
+SharedReservations=420008, ZoneTables=5416128 and PortalSlot=192 bytes.
+Owner layout version is 8, hash `0x9388e3e56ddcda4b`; object-wait protocol is
+2, layout hash `0xa23b8b6353e28c37`. Appended transfer fields fit prior slot
+padding; `MM_TRANSFER_LAYOUT_HASH` includes their offsets/states even though
+slot stride is unchanged. Scheduler queue fields and carrier handback state
+are appended; the expanded object-wait array was the last original
+ZoneTables field, so earlier scheduler field offsets remain unchanged.
+The global EL1 ABI hash incorporates both layout receipts.
+
+Task 2 remains responsible for current-executor host service binding and
+owner-authenticated target table access on the maintenance root. PREPARE/
+select/one-shot still check target TTBR and use the primary-table alias
+(`production.rs:876`, `:883`, `:888`); the maintenance mapping needs the
+stage-1 pool window. Removing TTBR equality alone would authenticate the
+wrong primary table. Host consuming paths, socket-derived aggregate bounds,
+mirror deletion, inverse EFAULT/raw-escape proofs and signed acceptance
+remain open. No guest, signed or Docker execution was performed for this
+owner receipt. This receipt does not close N1 or venue-3 acceptance.
