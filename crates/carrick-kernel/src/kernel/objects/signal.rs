@@ -394,6 +394,15 @@ impl TaskPendingQueue {
             .map(|signal| (signal, self.recipient(signal, leader)))
             .collect()
     }
+
+    /// Pending signals whose sender explicitly named a secondary thread.
+    fn named_recipients(&self) -> Vec<(LinuxSignal, LinuxTid)> {
+        self.named_recipients
+            .iter()
+            .filter(|(signal, _)| self.queue.present().contains(signal.raw()))
+            .map(|(&signal, &recipient)| (signal, recipient))
+            .collect()
+    }
 }
 
 /// Recipients of the task queue observed by one waiting thread
@@ -413,6 +422,23 @@ impl TaskRecipientSnapshot {
     fn available(&self, queue: &TaskPendingQueue, me: LinuxTid) -> SigSet {
         let mut available = queue.present().difference(self.claimed);
         for (signal, recipient) in queue.recipients(self.leader) {
+            let sampled = self
+                .recipients
+                .iter()
+                .any(|&(seen, seen_recipient)| seen == signal && seen_recipient == recipient);
+            if recipient != me && !sampled {
+                available = available.without(signal.raw());
+            }
+        }
+        available
+    }
+
+    /// Admission view for ordinary blocking syscalls: unnamed process signals
+    /// remain eligible on any thread, while an explicitly named signal stays
+    /// with its live, unblocked recipient.
+    fn available_named(&self, queue: &TaskPendingQueue, me: LinuxTid) -> SigSet {
+        let mut available = queue.present().difference(self.claimed);
+        for (signal, recipient) in queue.named_recipients() {
             let sampled = self
                 .recipients
                 .iter()
@@ -1140,15 +1166,11 @@ impl SignalAuthority {
     /// action carries the exact stop-invalidation epoch in which it left
     /// pending state.
     pub fn take_lowest_in(&self, wanted: SigSet) -> Option<SignalDequeue> {
-        let recipients = self.foreign_task_recipients();
         let generation_guard = self.task.lock_signal_generation();
         let mut thread = self.thread.signal_state.lock();
         let mut task = self.task_pending.queue.lock();
         let thread_signal = thread.pending().intersect(wanted).lowest_signum();
-        let task_signal = recipients
-            .available(&task, self.thread.key().tid)
-            .intersect(wanted)
-            .lowest_signum();
+        let task_signal = task.present().intersect(wanted).lowest_signum();
         let owner = match (thread_signal, task_signal) {
             (None, None) => return None,
             (Some(_), None) => SignalPendingOwner::Thread,
@@ -1197,13 +1219,13 @@ impl SignalAuthority {
     /// signals designated for another live, unblocked thread do not make this
     /// thread's syscall boundary or blocking-wait admission interruptible.
     pub fn has_deliverable_in(&self, wanted: SigSet) -> bool {
-        let recipients = self.foreign_task_recipients();
+        let recipients = self.foreign_named_task_recipients();
         let _generation_guard = self.task.lock_signal_generation();
         let thread = self.thread.signal_state.lock();
         let task = self.task_pending.queue.lock();
         !thread
             .pending()
-            .union(recipients.available(&task, self.thread.key().tid))
+            .union(recipients.available_named(&task, self.thread.key().tid))
             .intersect(wanted)
             .is_empty()
     }
@@ -1231,6 +1253,31 @@ impl SignalAuthority {
             });
             // A live recipient that does not block the signal receives it. A
             // gone recipient, or one that blocks it, leaves it to any thread.
+            if blocked.is_some_and(|blocked| !blocked.contains(signal.raw())) {
+                snapshot.claimed = snapshot.claimed.with(signal.raw());
+            }
+        }
+        snapshot
+    }
+
+    fn foreign_named_task_recipients(&self) -> TaskRecipientSnapshot {
+        let leader = LinuxTid::for_task_leader(self.task.key().id);
+        let me = self.thread.key().tid;
+        let mut snapshot = TaskRecipientSnapshot {
+            leader,
+            recipients: self.task_pending.queue.lock().named_recipients(),
+            claimed: SigSet::EMPTY,
+        };
+        let mut masks: BTreeMap<LinuxTid, Option<SigSet>> = BTreeMap::new();
+        for &(signal, recipient) in &snapshot.recipients {
+            if recipient == me {
+                continue;
+            }
+            let blocked = *masks.entry(recipient).or_insert_with(|| {
+                self.task
+                    .thread(recipient)
+                    .map(|thread| thread.blocked_mask())
+            });
             if blocked.is_some_and(|blocked| !blocked.contains(signal.raw())) {
                 snapshot.claimed = snapshot.claimed.with(signal.raw());
             }

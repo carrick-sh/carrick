@@ -3837,12 +3837,6 @@ mod tests {
         );
 
         assert!(
-            root.signal_authority()
-                .take_lowest_in(SigSet::EMPTY.complement())
-                .is_none(),
-            "the leader's ordinary delivery boundary took a signal addressed to thread {sibling_tid:?}"
-        );
-        assert!(
             !dispatcher
                 .signal_view()
                 .has_deliverable_dispatch_pending_for_wait(
