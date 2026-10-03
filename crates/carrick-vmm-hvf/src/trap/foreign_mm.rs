@@ -1093,6 +1093,22 @@ impl MmAccessState {
         self.retire_mm_root_stage2_in_using(
             custody,
             expected_root_slot,
+            true,
+            &mut unmap_global_frame_stage2_record,
+        )
+    }
+
+    /// Retire an exec predecessor's physical root while preserving its
+    /// software image/source for the successor authority handoff.
+    pub(crate) fn retire_exec_mm_root_stage2_in(
+        &self,
+        custody: &CarrierVmCustody,
+        expected_root_slot: (u64, u64),
+    ) -> Result<RetiredMmRootStage2, TrapError> {
+        self.retire_mm_root_stage2_in_using(
+            custody,
+            expected_root_slot,
+            false,
             &mut unmap_global_frame_stage2_record,
         )
     }
@@ -1101,13 +1117,14 @@ impl MmAccessState {
         &self,
         custody: &CarrierVmCustody,
         expected_root_slot: (u64, u64),
+        terminal: bool,
         unmap: &mut dyn FnMut(u64, usize) -> Result<(), CarrierStage2BackendError>,
     ) -> Result<RetiredMmRootStage2, TrapError> {
         // Keep the authority identity and its descriptor-access guard alive
         // through backend retirement and pool release. A cached owner Arc keeps
         // storage resident, but does not stop a pooled slot being reissued.
         let page_tables = self.page_tables.read();
-        page_tables.retire_with_exclusion(|manager| {
+        let retire = |manager: Option<&carrick_mmu_core::aarch64::PageTableManager>| {
             // Descriptor publication records the root high-water mark while
             // holding this authority, then takes mm_root_stage2. Match that
             // order so retirement cannot wait for the publisher while holding
@@ -1153,7 +1170,8 @@ impl MmAccessState {
                 unmap,
                 &mut release_retired_stage2_ipa,
             )?;
-            if let Some(snapshot) = custody.stage2_record_snapshot(authority.record_identity.record_id)
+            if let Some(snapshot) =
+                custody.stage2_record_snapshot(authority.record_identity.record_id)
             {
                 return Err(TrapError::Hypervisor(format!(
                     "stage-1 root structural record remained nonterminal: {snapshot:?}"
@@ -1191,7 +1209,12 @@ impl MmAccessState {
                 physical_extent: key,
                 owner,
             })
-        })
+        };
+        if terminal {
+            page_tables.retire_with_exclusion(retire)
+        } else {
+            page_tables.with_retirement_exclusion(retire)
+        }
     }
 
     pub(crate) fn retain_physical_backing_in(
