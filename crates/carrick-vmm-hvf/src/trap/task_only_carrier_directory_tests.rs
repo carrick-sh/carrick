@@ -532,6 +532,88 @@ fn prepared_task() -> HvpatchPreparedTaskAuthority {
     }
 }
 
+#[test]
+fn retired_process_slot_reuse_does_not_alias_retained_thread_authority() {
+    let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let directory = Arc::new(HvpatchCarrierTaskStateDirectory::default());
+    let rollbacks = Arc::new(AtomicUsize::new(0));
+    let slot = Some((0x1100_0000, 0x20_0000));
+    let mut old = directory
+        .publish(
+            identity(1),
+            test_state(&rollbacks),
+            HvpatchPreparedTaskAuthority {
+                mm_root_slot: slot,
+                ..prepared_task()
+            },
+        )
+        .unwrap();
+    old.registration
+        .as_mut()
+        .unwrap()
+        .retire_dormant_authority();
+    // Logical retirement may return the root slot while a captured thread
+    // still retains its predecessor backend. Arc lifetime is not MM identity.
+    let mut successor_identity = identity(2);
+    successor_identity.task_serial += 1;
+    successor_identity.linux_pid += 1;
+    let successor = directory.publish(
+        successor_identity,
+        test_state(&rollbacks),
+        HvpatchPreparedTaskAuthority {
+            mm_root_slot: slot,
+            inventory: HvpatchTaskInventoryAuthority::ProcessPrepared {
+                ledger: Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+                staged: Vec::new(),
+                commit: None,
+                challenge: None,
+            },
+            ..prepared_task()
+        },
+    );
+    let successor = successor
+        .unwrap_or_else(|error| panic!("retained predecessor rejected successor: {error}"));
+    let successor_mm = Arc::clone(
+        successor
+            .registration
+            .as_ref()
+            .unwrap()
+            .task_mm
+            .as_ref()
+            .unwrap(),
+    );
+    assert!(!Arc::ptr_eq(
+        old.registration.as_ref().unwrap().task_mm.as_ref().unwrap(),
+        &successor_mm,
+    ));
+    let mut sibling_identity = successor_identity;
+    sibling_identity.thread_serial += 1;
+    sibling_identity.linux_tid += 1;
+    let sibling = directory
+        .publish(
+            sibling_identity,
+            test_state(&rollbacks),
+            HvpatchPreparedTaskAuthority {
+                mm_root_slot: slot,
+                ..prepared_task()
+            },
+        )
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        sibling
+            .registration
+            .as_ref()
+            .unwrap()
+            .task_mm
+            .as_ref()
+            .unwrap(),
+        &successor_mm,
+    ));
+    // Delayed predecessor cleanup must not erase the successor's interned MM.
+    drop(old);
+    assert_eq!(successor_mm.inventory.lock().phase_name(), "prepared");
+}
+
 fn owner_key(
     directory: &HvpatchCarrierTaskStateDirectory,
     generation: u64,
