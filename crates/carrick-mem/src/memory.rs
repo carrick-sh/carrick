@@ -381,9 +381,11 @@ const _: () = assert!(
 
 /// Carrick's carrier-owned stage-1 root table for scoped EL1 ASID maintenance.
 /// Sits immediately following the syscall mailbox arena in the first 2 MiB kernel hole.
-pub const LINUX_CARRIER_MAINT_ROOT_BASE: u64 =
-    LINUX_SYSCALL_MAILBOX_BASE + LINUX_SYSCALL_MAILBOX_ARENA_SIZE;
-pub const LINUX_CARRIER_MAINT_ROOT_SIZE: u64 = 0x4000;
+pub const LINUX_CARRIER_MAINT_ROOT_BASE: u64 = carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE;
+pub const LINUX_CARRIER_MAINT_ROOT_SIZE: u64 = carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_SIZE;
+const _: () = assert!(
+    LINUX_CARRIER_MAINT_ROOT_BASE == LINUX_SYSCALL_MAILBOX_BASE + LINUX_SYSCALL_MAILBOX_ARENA_SIZE
+);
 const _: () = assert!(LINUX_CARRIER_MAINT_ROOT_BASE.is_multiple_of(0x4000));
 const _: () = assert!(
     (LINUX_CARRIER_MAINT_ROOT_BASE - LINUX_KERNEL_REGION_BASE) + LINUX_CARRIER_MAINT_ROOT_SIZE
@@ -791,6 +793,40 @@ pub const LINUX_ALIAS_IPA_SIZE: u64 = 0x10_0000_0000; // 64 GiB of alias space
 pub const LINUX_EL1_KERNEL_BASE: u64 = carrick_el1_abi::EL1_REGION_BASE;
 pub const LINUX_EL1_KERNEL_SIZE: u64 = carrick_el1_abi::EL1_REGION_SIZE;
 pub const LINUX_EL1_IMAGE_SIZE: u64 = carrick_el1_abi::EL1_IMAGE_SIZE;
+/// Carrier-only transient aliases; one pair for each exact executor slot.
+pub const LINUX_EL1_SERVICE_COPY: carrick_guest_mem::GuestVaRange =
+    carrick_guest_mem::GuestVaRange::from_len(
+        carrick_guest_mem::GuestVa(carrick_el1_abi::EL1_SERVICE_COPY_BASE),
+        carrick_el1_abi::EL1_SERVICE_COPY_SIZE as usize,
+    );
+/// Retained L3 table plus slot claims, inside the shared EL1 region.
+pub const LINUX_EL1_SERVICE_COPY_TABLE: ServiceCopyTableExtent = ServiceCopyTableExtent {
+    base: Gpa(carrick_el1_abi::EL1_SERVICE_COPY_TABLE_BASE),
+    len: core::mem::size_of::<carrick_el1_abi::ServiceCopyTable>(),
+};
+/// Physical custody geometry, distinct from the transient virtual alias span.
+pub struct ServiceCopyTableExtent {
+    base: Gpa,
+    len: usize,
+}
+impl ServiceCopyTableExtent {
+    pub const fn base(&self) -> Gpa {
+        self.base
+    }
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+const _: () = assert!(
+    LINUX_EL1_KERNEL_BASE + LINUX_EL1_IMAGE_SIZE <= LINUX_EL1_SERVICE_COPY_TABLE.base().raw()
+);
+const _: () = assert!(
+    LINUX_EL1_SERVICE_COPY_TABLE.base().raw() + LINUX_EL1_SERVICE_COPY_TABLE.len() as u64
+        <= carrick_el1_abi::EL1_MM_PORTAL_BASE
+);
 
 const fn ranges_do_not_overlap(a_base: u64, a_size: u64, b_base: u64, b_size: u64) -> bool {
     a_base + a_size <= b_base || b_base + b_size <= a_base
@@ -2101,6 +2137,10 @@ impl AddressSpace {
 
     /// Install the in-guest EL1 kernel image region.
     pub fn with_el1_region(self) -> Result<Self, AddressSpaceError> {
+        assert!(
+            carrick_el1_image::IMAGE.len() as u64 <= LINUX_EL1_IMAGE_SIZE,
+            "EL1 image overlaps reserved counter/service-table storage"
+        );
         // A stale image once served nothing, silently: refuse one built
         // against a different layout of the shared records.
         carrick_el1_abi::check_image_abi(carrick_el1_image::IMAGE)
@@ -3909,6 +3949,13 @@ pub fn stage1_carrier_maintenance_page_tables() -> Vec<u8> {
         let off = 0x3000 + ((pa >> 30) & 511) as usize * 8;
         bytes[off..off + 8].copy_from_slice(&(pa | POOL_FLAGS).to_le_bytes());
     }
+
+    // Each scheduler slot owns two leaves of a retained L3 page in the EL1
+    // region. Leaves start invalid and are initialized only by their claimant.
+    let copy_l2 = 0x2000 + ((LINUX_EL1_SERVICE_COPY.start().raw() >> 21) & 511) as usize * 8;
+    bytes[copy_l2..copy_l2 + 8].copy_from_slice(
+        &table_descriptor(LINUX_EL1_SERVICE_COPY_TABLE.base().raw()).to_le_bytes(),
+    );
 
     bytes
 }
