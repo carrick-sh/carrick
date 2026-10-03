@@ -1618,3 +1618,29 @@ Current-CPU review corrections (prerequisite only):
 - `serial_host_transfer_restore_failure_is_terminal`: injected restoration
   failure previously returned normally; the child now terminates with SIGABRT
   rather than exposing a reusable, partially restored executor.
+
+
+Venue-3 owned file-description cursor prerequisite (inactive core):
+- One cursor lives in DescriptionCommon, shared by dup/fork/SCM_RIGHTS.
+  A short bookkeeping lock elects owned tickets; no borrowed description
+  guard or pool worker waits for another guest operation.
+- Release transfers custody to one successor, then delivers its notification
+  after unlock. Queued cancellation removes its entry immediately; granted
+  cancellation transfers once. Per-cursor iterative effect draining covers
+  reentrant callbacks and final-Arc cancellation without stack growth.
+- `cursor_release_wakes_one_successor_at_any_waiter_population` failed with
+  two notifications for one completion at population2 in the initial
+  broadcast implementation; the bound is one successor at 2/32/256 waiters.
+- `cursor_callback_cancellation_does_not_recurse_through_successors` failed
+  with callback depth256 versus1 before iterative draining.
+- Release-before-enrollment, cross-thread ownership, canceled queued/granted
+  custody and concurrent release during notification have focused witnesses.
+
+This core does not activate dispatcher consumers. Existing read/write/readv/
+writev/lseek/sendfile/splice offset callers still use the old description
+locking paths until the owned recall/continuation unit replaces them. HostIo
+staging, shared-file short-count commit, storage-wait executor release,
+O_APPEND symmetry and admitted EL1 delegation removal remain OPEN. The old
+ObservedCopy dispatcher source-consumption witness saw f_pos8192 before
+copy, even though seek-back returned4096; its separate staged-core green
+will not count as production dispatcher closure.
