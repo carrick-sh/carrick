@@ -490,6 +490,28 @@ fn delegated_mprotect_is_visible_to_proc_maps_from_the_root() {
 }
 
 #[test]
+fn admitted_private_file_retains_owner_backing_before_fork() {
+    let mut dispatcher = SyscallDispatcher::new();
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; 2 * PAGE as usize]);
+    let mut memory = arena_memory();
+    let file = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        0,
+        2 * PAGE,
+        LINUX_PROT_READ | LINUX_PROT_WRITE,
+        LINUX_MAP_PRIVATE,
+        FILE_FD,
+    )) as u64;
+    let root = Root::admit(&dispatcher);
+    let mapping = root.lock().mapping(file).unwrap();
+    assert!(
+        mapping.host_backing.is_some(),
+        "admitted private file has no owner backing identity; fork still needs the host private_file_maps projection"
+    );
+}
+
+#[test]
 fn delegated_rlimit_as_counts_every_mapping_exactly_once() {
     let mut dispatcher = SyscallDispatcher::new();
     install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; 2 * PAGE as usize]);
