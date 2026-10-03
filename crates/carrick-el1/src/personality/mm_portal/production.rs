@@ -317,6 +317,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
                                 range: plan.range,
                                 protection: plan.protection,
                                 fault_page: plan.fault_page,
+                                host_backing: None,
                             },
                         ));
                     }
@@ -345,11 +346,16 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
                 LeafAccess::Execute => 4,
             };
             let mut root = self.root(continuation.handle.mm(), slot)?;
-            let plan = root.fault_plan(
+            let plan = root.transfer_fault_plan(
                 va,
                 carrick_el1_abi::EL1_FRAME_GRANT_TARGET_SIZE,
                 ReservationProtection::from_bits(bits).ok_or(MmError::Invalid)?,
             )?;
+            let host_backing = root.mapping(plan.range.start()).and_then(|mapping| {
+                mapping
+                    .host_backing
+                    .and_then(|source| source.advance(plan.range.start() - mapping.range.start()))
+            });
             drop(root);
             if !request_lazy_frames(mailbox, mm, va, bits) {
                 return Ok(TransferStep::Suspended);
@@ -365,6 +371,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
                 range: plan.range,
                 protection: plan.protection,
                 fault_page: plan.fault_page,
+                host_backing,
             }));
         };
         Ok(TransferStep::Selected(SelectedChunk {
@@ -743,6 +750,13 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
                 frame.x[12] = window.protection.bits();
                 frame.x[13] = window.fault_page;
                 frame.x[14] = if cow { 2 } else { 1 };
+                frame.x[16] = window
+                    .host_backing
+                    .map_or(0, |source| source.handle().get());
+                frame.x[17] = window
+                    .host_backing
+                    .map_or(0, |source| source.generation().get());
+                frame.x[18] = window.host_backing.map_or(0, |source| source.offset());
                 Err(MmError::Busy)
             }
             TransferStep::Suspended => Err(MmError::Busy),
@@ -798,7 +812,7 @@ pub fn serve_grant<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
                 fault_page: window.fault_page,
             };
             if root.incarnation().raw() != window.operation.incarnation.get()
-                || !root.authenticate_fault(plan)
+                || !root.authenticate_transfer_fault(plan, window.host_backing)
             {
                 return Err(MmError::Stale);
             }

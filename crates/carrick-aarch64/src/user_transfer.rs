@@ -245,6 +245,18 @@ impl OwnedUserTransfer {
                         )
                         .ok_or_else(|| error("invalid supply permission"))?,
                         fault_page: selected_frame.x[13],
+                        host_backing: if selected_frame.x[16] == 0 {
+                            if selected_frame.x[17] != 0 || selected_frame.x[18] != 0 {
+                                return Err(error("invalid backing receipt"));
+                            }
+                            None
+                        } else {
+                            Some(carrick_el1_abi::HostBackingIdentity::new(
+                                nz(selected_frame.x[16])?,
+                                nz(selected_frame.x[17])?,
+                                selected_frame.x[18],
+                            ))
+                        },
                     };
                     if selected_frame.x[14] == 2 {
                         return Ok(if custody.refill_cow(self.target, window)? {
