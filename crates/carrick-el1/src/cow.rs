@@ -38,12 +38,51 @@ pub enum GuestCowOutcome {
 
 /// Where one MM's guest COW runs: its live table words and authenticated
 /// root, the shared grant pool, and the MM's copy-window base.
+#[derive(Clone, Copy)]
+pub struct CowCopyWindow<'a> {
+    words: &'a dyn LiveDescriptorWords,
+    root: SubstrateGpa,
+    slot: Option<&'a carrick_el1_abi::ServiceCopyLease<'a>>,
+}
+
+impl<'a> CowCopyWindow<'a> {
+    /// The faulting target's fixed, preprovisioned alias pair. The caller
+    /// holds that MM's editor and executes under its translation root.
+    pub fn target(words: &'a dyn LiveDescriptorWords, root: SubstrateGpa) -> Self {
+        Self {
+            words,
+            root,
+            slot: None,
+        }
+    }
+
+    /// The service's current translation root and exclusive scheduler slot
+    /// jointly authorize its pair. Borrowing the lease prevents reuse until
+    /// the entire owner operation has restored the aliases.
+    pub fn maintenance(
+        words: &'a dyn LiveDescriptorWords,
+        live_ttbr: u64,
+        slot: &'a carrick_el1_abi::ServiceCopyLease<'a>,
+    ) -> Option<Self> {
+        (live_ttbr == carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE).then_some(Self {
+            words,
+            root: SubstrateGpa(carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE),
+            slot: Some(slot),
+        })
+    }
+
+    fn base(&self) -> u64 {
+        self.slot
+            .map_or(carrick_el1_abi::EL1_COW_COPY_BASE, |slot| slot.base())
+    }
+}
+
 pub struct GuestCowVenue<'a, W: ?Sized> {
     pub words: &'a W,
     pub root: SubstrateGpa,
     pub pool: &'a CowGrantPool,
     pub residency: &'a FrameGrantResidencyTable,
-    pub copy_base: u64,
+    pub copy_window: CowCopyWindow<'a>,
     pub publish_executable: Option<&'a dyn Fn(carrick_el1_abi::CowGrant, u64, u64) -> bool>,
 }
 
@@ -74,7 +113,7 @@ where
         root,
         pool,
         residency,
-        copy_base,
+        copy_window,
         publish_executable,
     } = *venue;
     let run = match classify_guest_cow_write(words, root, far, publish_executable.is_some()) {
@@ -133,9 +172,9 @@ where
     }
     for offset in (0..run.len).step_by(PAGE as usize) {
         let copied = with_cow_copy_aliases(
-            words,
-            root,
-            copy_base,
+            copy_window.words,
+            copy_window.root,
+            copy_window.base(),
             SubstrateGpa(run.old_ipa.raw() + offset),
             SubstrateGpa(new_ipa + offset),
             &mut copy_page,
@@ -403,13 +442,245 @@ mod tests {
                 root: SubstrateGpa(ROOT),
                 pool,
                 residency: &residency_table(),
-                copy_base: EL1_COW_COPY_BASE,
+                copy_window: crate::cow::CowCopyWindow::target(&arena.words(), SubstrateGpa(ROOT)),
             },
             MM,
             far,
             |source, destination| memory.copy_through(arena, source, destination),
             || invalidations.set(invalidations.get() + 1),
         )
+    }
+
+    #[test]
+    fn maintenance_copy_failed_alias_install_restores_before_slot_reuse() {
+        use carrick_el1_abi::{
+            EL1_CARRIER_MAINT_ROOT_BASE as SERVICE_ROOT, EL1_SERVICE_COPY_TABLE_BASE,
+            ServiceCopyTable, SlotId,
+        };
+        use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorRefusal, TableWindow};
+        struct FailDestination<'a> {
+            words: &'a dyn LiveDescriptorWords,
+            destination: u64,
+        }
+        impl LiveDescriptorWords for FailDestination<'_> {
+            fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+                self.words.load(pa)
+            }
+            fn compare_exchange(
+                &self,
+                pa: u64,
+                old: u64,
+                new: u64,
+            ) -> Result<bool, DescriptorRefusal> {
+                if pa == self.destination && new & 1 != 0 {
+                    Ok(false)
+                } else {
+                    self.words.compare_exchange(pa, old, new)
+                }
+            }
+            fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+                self.words.store_unlinked(pa, value)
+            }
+            fn publish_barrier(&self) {
+                self.words.publish_barrier();
+            }
+            fn invalidate_range(&self, va: u64, len: u64) {
+                self.words.invalidate_range(va, len);
+            }
+        }
+        let image = carrick_mem::memory::stage1_carrier_maintenance_page_tables();
+        let root: Vec<AtomicU64> = image
+            .chunks_exact(8)
+            .map(|bytes| AtomicU64::new(u64::from_le_bytes(bytes.try_into().unwrap())))
+            .collect();
+        let table = ServiceCopyTable::new();
+        let slot = SlotId::new(19);
+        let lease = table.try_claim(slot).unwrap();
+        let words = unsafe {
+            PrimaryTableWords::new(
+                root.as_ptr().cast_mut(),
+                SERVICE_ROOT,
+                root.len() * 8,
+                &MAINTENANCE,
+            )
+            .unwrap()
+            .with_window(TableWindow {
+                words: (&table as *const ServiceCopyTable).cast_mut().cast(),
+                physical_base: EL1_SERVICE_COPY_TABLE_BASE,
+                byte_len: 4096,
+            })
+            .unwrap()
+        };
+        let failing = FailDestination {
+            words: &words,
+            destination: EL1_SERVICE_COPY_TABLE_BASE + (u64::from(slot.raw()) * 2 + 1) * 8,
+        };
+        let (target, _) = forked(false);
+        let pool = CowGrantPool::new();
+        pool.publish(MM, GRANT, backing()).unwrap();
+        let outcome = resolve_guest_cow(
+            &GuestCowVenue {
+                words: &target.words(),
+                root: SubstrateGpa(ROOT),
+                pool: &pool,
+                residency: &residency_table(),
+                copy_window: CowCopyWindow::maintenance(&failing, SERVICE_ROOT, &lease).unwrap(),
+                publish_executable: None,
+            },
+            MM,
+            VA,
+            |_, _| panic!("failed destination publication must not copy"),
+            || {},
+        );
+        assert_eq!(outcome, GuestCowOutcome::Declined(CowDecline::Refused));
+        assert_eq!(target.leaf(VA), armed(OLD, true));
+        drop(lease);
+        drop(table.try_claim(slot).unwrap());
+        assert!(
+            pool.claim(MM).is_some(),
+            "failed copy returns its physical grant"
+        );
+    }
+
+    #[test]
+    fn maintenance_copy_two_live_same_va_mms_use_disjoint_slots_and_restore() {
+        use carrick_el1_abi::{
+            EL1_CARRIER_MAINT_ROOT_BASE as SERVICE_ROOT, EL1_SERVICE_COPY_TABLE_BASE,
+            ServiceCopyTable, SlotId,
+        };
+        use carrick_mmu_core::aarch64::descriptor_txn::TableWindow;
+        let service_image = carrick_mem::memory::stage1_carrier_maintenance_page_tables();
+        let service_root: Vec<AtomicU64> = service_image
+            .chunks_exact(8)
+            .map(|bytes| AtomicU64::new(u64::from_le_bytes(bytes.try_into().unwrap())))
+            .collect();
+        let table = ServiceCopyTable::new();
+        let rendezvous = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for index in 0..2_u8 {
+                let table = &table;
+                let service_root = &service_root;
+                let rendezvous = &rendezvous;
+                scope.spawn(move || {
+                    let (target, memory) = forked(false);
+                    let mm = MM + u64::from(index);
+                    let source_ipa = OLD + u64::from(index) * 0x10000;
+                    let replacement_ipa = GRANT + u64::from(index) * 0x10000;
+                    for page in 0..4 {
+                        target
+                            .set_leaf(VA + page * PAGE, armed(source_ipa + page * PAGE, page != 3));
+                        memory
+                            .0
+                            .borrow_mut()
+                            .insert(source_ipa + page * PAGE, vec![index + 11; 4096]);
+                    }
+                    let pool = CowGrantPool::new();
+                    pool.publish(mm, replacement_ipa, backing()).unwrap();
+                    let slot = SlotId::new(index);
+                    let lease = table.try_claim(slot).unwrap();
+                    let service_words = unsafe {
+                        PrimaryTableWords::new(
+                            service_root.as_ptr().cast_mut(),
+                            SERVICE_ROOT,
+                            service_root.len() * 8,
+                            &MAINTENANCE,
+                        )
+                        .unwrap()
+                        .with_window(TableWindow {
+                            words: (table as *const ServiceCopyTable).cast_mut().cast(),
+                            physical_base: EL1_SERVICE_COPY_TABLE_BASE,
+                            byte_len: 4096,
+                        })
+                        .unwrap()
+                    };
+                    assert!(
+                        CowCopyWindow::maintenance(&service_words, SERVICE_ROOT + 4096, &lease)
+                            .is_none()
+                    );
+                    let aliases =
+                        CowCopyWindow::maintenance(&service_words, SERVICE_ROOT, &lease).unwrap();
+                    let outcome = resolve_guest_cow(
+                        &GuestCowVenue {
+                            words: &target.words(),
+                            root: SubstrateGpa(ROOT),
+                            pool: &pool,
+                            residency: &residency_table(),
+                            copy_window: aliases,
+                            publish_executable: None,
+                        },
+                        mm,
+                        VA,
+                        |source, destination| {
+                            rendezvous.wait(); // Both MMs have live aliases simultaneously.
+                            assert!(table.try_claim(slot).is_none());
+                            let leaf = |va| {
+                                service_words
+                                    .load(EL1_SERVICE_COPY_TABLE_BASE + indices(va)[3] as u64 * 8)
+                                    .unwrap()
+                            };
+                            let from = leaf(source);
+                            let to = leaf(destination);
+                            assert_eq!(from & (3 << 6), 2 << 6);
+                            assert_eq!(to & (3 << 6), 0);
+                            assert_eq!(from & XN, XN);
+                            assert_eq!(to & XN, XN);
+                            assert!((source_ipa..source_ipa + 4 * PAGE).contains(&(from & PA)));
+                            assert!(
+                                (replacement_ipa..replacement_ipa + 4 * PAGE).contains(&(to & PA))
+                            );
+                            let copied = memory.page(from & PA);
+                            memory.0.borrow_mut().insert(to & PA, copied);
+                            rendezvous.wait();
+                        },
+                        || {},
+                    );
+                    assert!(
+                        matches!(outcome, GuestCowOutcome::Resolved(_)),
+                        "{outcome:?}"
+                    );
+                    assert_eq!(memory.page(replacement_ipa), vec![index + 11; 4096]);
+                    assert_eq!(target.leaf(VA) & PA, replacement_ipa);
+                    drop(lease); // Asserts both leaves have been restored before reuse.
+                    drop(table.try_claim(slot).unwrap());
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn maintenance_copy_uses_service_root_without_target_aliases() {
+        let (target, memory) = forked(false);
+        let service = Arena::new(true);
+        let before = service.image();
+        let pool = CowGrantPool::new();
+        pool.publish(MM, GRANT, backing()).unwrap();
+        let outcome = resolve_guest_cow(
+            &GuestCowVenue {
+                publish_executable: None,
+                words: &target.words(),
+                root: SubstrateGpa(ROOT),
+                pool: &pool,
+                residency: &residency_table(),
+                copy_window: crate::cow::CowCopyWindow::target(
+                    &service.words(),
+                    SubstrateGpa(ROOT),
+                ),
+            },
+            MM,
+            VA,
+            |source, destination| memory.copy_through(&service, source, destination),
+            || {},
+        );
+        assert!(
+            matches!(outcome, GuestCowOutcome::Resolved(_)),
+            "maintenance-root COW must resolve without target-root copy aliases: {outcome:?}"
+        );
+        assert_eq!(memory.page(GRANT), memory.page(OLD));
+        assert_eq!(
+            service.image(),
+            before,
+            "all service aliases must be restored"
+        );
     }
 
     #[test]
@@ -438,7 +709,7 @@ mod tests {
                 root: SubstrateGpa(ROOT),
                 pool: &pool,
                 residency: &residency,
-                copy_base: EL1_COW_COPY_BASE,
+                copy_window: crate::cow::CowCopyWindow::target(&arena.words(), SubstrateGpa(ROOT)),
             },
             MM,
             VA,
@@ -478,13 +749,14 @@ mod tests {
         residency.publish(identity).unwrap();
         let page = residency.lookup(MM, VA).unwrap();
         let lease = residency.pin_transfer(page).unwrap();
+        let words = arena.words();
         let venue = GuestCowVenue {
             publish_executable: None,
             words: &arena.words(),
             root: SubstrateGpa(ROOT),
             pool: &pool,
             residency: &residency,
-            copy_base: EL1_COW_COPY_BASE,
+            copy_window: crate::cow::CowCopyWindow::target(&words, SubstrateGpa(ROOT)),
         };
         assert_eq!(
             resolve_guest_cow(
@@ -699,7 +971,10 @@ mod tests {
                     root: SubstrateGpa(ttbr0 & PA),
                     pool: self.pool,
                     residency: &residency_table(),
-                    copy_base: EL1_COW_COPY_BASE,
+                    copy_window: crate::cow::CowCopyWindow::target(
+                        &self.arena.words(),
+                        SubstrateGpa(ttbr0 & PA),
+                    ),
                 },
                 mm_key,
                 far,
