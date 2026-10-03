@@ -989,6 +989,7 @@ dependencies = [
  "carrick-hal",
  "carrick-host",
  "carrick-mem",
+ "carrick-mmu-core",
  "carrick-signal-linux",
  "carrick-thread",
  "carrick-timer-core",
