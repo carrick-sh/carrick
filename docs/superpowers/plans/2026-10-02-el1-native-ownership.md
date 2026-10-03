@@ -1158,3 +1158,48 @@ launcher-negative and exact-root/nested-path checks remain, and the carrier
 checker is separately verified on the actual repository. No product checker is
 skipped or relaxed. The focused three-test boundary run passes; full-tree escape,
 carrier-only, runtime abort and runtime global-state checks all exit zero.
+
+#### Final whole-branch review fix receipt — fresh import undo ownership
+
+The whole-branch review found that idempotent `begin_undo` allowed two pending
+imports, or an import and an existing loader, to share a manager-wide journal.
+Dropping one could roll back the other's descriptors. Both required ownership
+witnesses reproduced this: `transfer_import_refuses_competing_pending_journal`
+failed with `second pending import joined the first journal`, and
+`transfer_import_refuses_existing_loader_journal` failed with
+`import joined an existing loader journal`.
+
+`PageTableManager::begin_fresh_undo` in
+`crates/carrick-mmu-core/src/aarch64.rs:4253` now checks and acquires a fresh
+journal atomically under the existing exclusive mutable manager borrow;
+already-open journals are left untouched. The existing Stage1Editor forwards
+that operation while its authority lock is held (`stage1_authority.rs:1365`).
+`ImportDescriptorUndo` in `trap/sparse_materialization.rs:2699` is a non-clone
+RAII owner of that fresh journal, the exact retained Stage1Authority and its
+resolver. Preparation acquires it before source snapshot or physical effects.
+Descriptor sync, commit and rollback all use those same retained owners.
+PendingImport rolls back its descriptors before releasing physical publication;
+pre-publication failures release the empty fresh journal through RAII. No new
+semantic owner, mutex or post-admission editor was introduced.
+
+The physical witnesses in `trap/foreign_mm/tests.rs:13382` and `:13387` now
+pass. Under one admission owner, a second pending import refuses before physical
+allocation identity counters change; the first translation, `away` bytes, pin
+count one and full inventory remain intact. The fixture then covers both first
+refusal restoring its original descriptor and first successful admission/commit.
+A preexisting loader journal likewise retains its edits, open state, unchanged
+physical inventory and ability to roll back after import refusal.
+
+The minor contract finding is also closed: `el1-mm-exclusive-owner.toml` names
+`carrick-vmm-hvf::trap::user_transfer::tests::native_owner_matrix_moves_bytes_with_balanced_physical_pins`.
+Its evidence now states that the matrix itself uses physical HVF custody and
+balanced pins. Cargo exact-name listing found one test; exact execution passed.
+
+Scoped receipts: HVF `transfer_` nine passed; exact matrix one passed; scoped
+HVF/AArch64/MMU all-target Clippy passed; `check-contracts` checked 92 contracts,
+15 claims and 164 surfaces. The HVF fatal inventory moves the existing rollback
+failure classification into ImportDescriptorUndo and retires only the old
+missing-resolver abort: resolver absence now refuses before journal acquisition,
+and successful preparation retains the resolver through cleanup. Parent owns
+clean position reconciliation, final gates and the one scoped fix review.
+No guest/Docker run or deferred Fork/Capacity/venue3 acceptance is claimed.
