@@ -4247,6 +4247,17 @@ impl PageTableManager {
         Ok(outcome)
     }
 
+    /// Acquire a fresh journal without joining another caller's transaction.
+    /// `false` leaves the already-open journal and all its edits untouched.
+    /// The exclusive mutable manager borrow makes check and acquisition atomic.
+    pub fn begin_fresh_undo(&mut self) -> Result<bool, PageTableError> {
+        if self.undo.is_some() {
+            return Ok(false);
+        }
+        self.begin_undo()?;
+        Ok(true)
+    }
+
     /// Open an undo journal covering every descriptor edit from here until
     /// [`Self::commit_undo`] or [`Self::rollback_undo`].
     pub fn begin_undo(&mut self) -> Result<(), PageTableError> {

@@ -13379,6 +13379,20 @@ fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
 /// reservation admission, descriptor setup and transfer copy are production.
 #[test]
 fn transfer_external_copy_only_and_stale_source_precede_root_admission() {
+    exercise_retained_import(0);
+}
+
+#[test]
+fn transfer_import_refuses_existing_loader_journal() {
+    exercise_retained_import(1);
+}
+
+#[test]
+fn transfer_import_refuses_competing_pending_journal() {
+    exercise_retained_import(2);
+}
+
+fn exercise_retained_import(journal_case: u8) {
     use carrick_aarch64::user_transfer::TransferCustody;
     use carrick_el1::personality::mm_portal::test_support::{Region, VA, admit, nodes};
     use carrick_el1_abi::{
@@ -13460,6 +13474,153 @@ fn transfer_external_copy_only_and_stale_source_precede_root_admission() {
         carrick_hal::ForeignAsid::from_kernel_allocation(installed.snapshot.asid),
         installed.snapshot.stage1_root,
     );
+    let tables = installed.state.page_tables_authority();
+    let resolver = installed.state.live_resolver.read().clone().unwrap();
+    if journal_case == 1 {
+        let loader_va = VA + 0x8000;
+        let original = tables.with_manager(|manager| manager.translate(loader_va));
+        tables
+            .edit(
+                || panic!("loader tables missing"),
+                |editor| {
+                    editor.begin_undo().unwrap();
+                    editor
+                        .map_private_aliased(
+                            loader_va,
+                            source_ipa,
+                            4096,
+                            carrick_mmu_core::aarch64::UserLeafAccess {
+                                writable: true,
+                                executable: false,
+                            },
+                        )
+                        .unwrap();
+                    unsafe { editor.sync_to_host(&resolver) }.unwrap();
+                    Ok::<_, TrapError>(())
+                },
+            )
+            .unwrap();
+        let physical_serial = authority.serial.load(std::sync::atomic::Ordering::SeqCst);
+        let result = target.prepare_import(
+            binding,
+            carrick_hal::PreAdmissionPermit::new(&guard).unwrap(),
+            source
+                .retain_import_source(Gpa(source_ipa), 4096, receipt)
+                .unwrap(),
+            ReservationRange::new(VA, VA + 4096).unwrap(),
+            ReservationProtection::READ_WRITE,
+        );
+        assert!(result.is_err(), "import joined an existing loader journal");
+        assert_eq!(
+            authority.serial.load(std::sync::atomic::Ordering::SeqCst),
+            physical_serial,
+            "refusal must precede physical allocation/publication"
+        );
+        assert_eq!(
+            tables.with_manager(|manager| manager.translate(loader_va)),
+            Some(Some(source_ipa))
+        );
+        assert_eq!(
+            tables.with_manager(|manager| manager.undo_is_open()),
+            Some(true)
+        );
+        assert_eq!(
+            installed.state.frame_inventory.ledger.lock().extents.len(),
+            before
+        );
+        assert_eq!(
+            source_custody
+                .stage2_record_snapshot(identity.record_id)
+                .unwrap()
+                .pin_count,
+            0
+        );
+        unsafe { tables.rollback_undo(&resolver) }.unwrap();
+        assert_eq!(
+            tables.with_manager(|manager| manager.translate(loader_va)),
+            original
+        );
+        return;
+    }
+    let refuse_competing = |first_ipa: u64| {
+        if journal_case != 2 {
+            return;
+        }
+        let first_owner = transport
+            .custody
+            .global_frame_host_owners
+            .lock()
+            .range(..=(first_ipa, u64::MAX))
+            .next_back()
+            .unwrap()
+            .1
+            .owner()
+            .clone();
+        let first_identity = first_owner.record_identity;
+        let first_receipt = PortalRetainedData {
+            record: nonzero(first_identity.record_id.0),
+            vm_generation: nonzero(first_identity.vm_generation.0),
+            owner: first_identity
+                .logical_owner
+                .map(|owner| (nonzero(owner.id), nonzero(owner.generation))),
+        };
+        let before_inventory = installed
+            .state
+            .frame_inventory
+            .ledger
+            .lock()
+            .extents
+            .clone();
+        let physical_serial = authority.serial.load(std::sync::atomic::Ordering::SeqCst);
+        let result = target.prepare_import(
+            binding,
+            carrick_hal::PreAdmissionPermit::new(&guard).unwrap(),
+            target
+                .retain_import_source(Gpa(first_ipa), 4096, first_receipt)
+                .unwrap(),
+            ReservationRange::new(VA + 0x4000, VA + 0x5000).unwrap(),
+            ReservationProtection::READ_WRITE,
+        );
+        assert!(
+            result.is_err(),
+            "second pending import joined the first journal"
+        );
+        assert_eq!(
+            authority.serial.load(std::sync::atomic::Ordering::SeqCst),
+            physical_serial,
+            "refusal must precede physical allocation/publication"
+        );
+        assert_eq!(
+            tables.with_manager(|manager| manager.translate(VA)),
+            Some(Some(first_ipa))
+        );
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(first_owner.ptr(), 4) },
+            b"away"
+        );
+        assert_eq!(
+            transport
+                .custody
+                .stage2_record_snapshot(first_identity.record_id)
+                .unwrap()
+                .pin_count,
+            1
+        );
+        assert_eq!(
+            installed
+                .state
+                .frame_inventory
+                .ledger
+                .lock()
+                .extents
+                .clone(),
+            before_inventory
+        );
+        assert_eq!(
+            tables.with_manager(|manager| manager.undo_is_open()),
+            Some(true)
+        );
+    };
     // A refused admission drops the exact staged destination before any root
     // publication. A later source/target generation must remain usable.
     let original_translation = installed
@@ -13493,7 +13654,12 @@ fn transfer_external_copy_only_and_stale_source_precede_root_admission() {
         tables.with_manager(|manager| manager.translate(VA)),
         Some(Some(refused_ready.physical_ipa))
     );
+    refuse_competing(refused_ready.physical_ipa);
     drop(refused);
+    assert_eq!(
+        tables.with_manager(|manager| manager.undo_is_open()),
+        Some(false)
+    );
     assert_eq!(
         tables.with_manager(|manager| manager.translate(VA)),
         original_translation,
@@ -13553,6 +13719,7 @@ fn transfer_external_copy_only_and_stale_source_precede_root_admission() {
         )
         .unwrap();
     let ready = pending.ready();
+    refuse_competing(ready.physical_ipa);
     assert!(zone.spaces.find(guard.mm.get()).is_none());
     let owner = transport
         .custody
@@ -13590,6 +13757,10 @@ fn transfer_external_copy_only_and_stale_source_precede_root_admission() {
         .commit(unsafe { carrick_hal::PreAdmissionReceipt::after_admission(&guard) })
         .unwrap();
     assert_eq!(committed, ready);
+    assert_eq!(
+        tables.with_manager(|manager| manager.undo_is_open()),
+        Some(false)
+    );
     assert_eq!(
         transport
             .custody

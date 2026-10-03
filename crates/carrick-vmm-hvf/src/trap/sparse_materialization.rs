@@ -2700,10 +2700,66 @@ impl RetainedImportSource {
     }
 }
 
+/// Owns only a freshly acquired loader journal on the retained stage-1
+/// authority. All import acquisition uses the same atomic fresh claim; this
+/// non-clone owner is installed before source copying or physical publication.
+struct ImportDescriptorUndo {
+    tables: carrick_aarch64::Stage1Authority,
+    resolver: std::sync::Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>,
+    active: bool,
+}
+impl ImportDescriptorUndo {
+    fn begin(state: &MmAccessState) -> Result<Self, TrapError> {
+        let failure =
+            || TrapError::Hypervisor("import requires an unclaimed loader journal".into());
+        let tables = state.page_tables_authority();
+        let resolver = state.live_resolver.read().clone().ok_or_else(failure)?;
+        tables.edit(
+            || Err(failure()),
+            |editor| {
+                if !editor.begin_fresh_undo().map_err(|error| {
+                    TrapError::Hypervisor(format!("import fresh undo: {error:?}"))
+                })? {
+                    return Err(failure());
+                }
+                Ok(())
+            },
+        )?;
+        Ok(Self {
+            tables,
+            resolver,
+            active: true,
+        })
+    }
+    fn commit(&mut self) {
+        self.tables.commit_undo();
+        self.active = false;
+    }
+    fn rollback(&mut self) {
+        if !self.active {
+            return;
+        }
+        // SAFETY: this owner retains the exact resolver and fresh journal;
+        // its caller still holds pre-admission mutation/publication authority.
+        unsafe { self.tables.rollback_undo(&self.resolver) }.unwrap_or_else(|error| {
+            carrick_fatal!(
+                "hvpatch::user_transfer",
+                "import descriptor rollback failed before physical release: {error:?}"
+            )
+        });
+        self.active = false;
+    }
+}
+impl Drop for ImportDescriptorUndo {
+    fn drop(&mut self) {
+        self.rollback();
+    }
+}
+
 /// Physical publication remains rollback-owned until the same kernel owner
 /// confirms normal root admission. The permit keeps publication exclusion alive.
 pub struct PendingImport<'a> {
-    descriptor_undo: bool,
+    descriptor_undo: ImportDescriptorUndo,
     permit: carrick_hal::PreAdmissionPermit<'a>,
     pending: PendingTransferGrant,
 }
@@ -2735,12 +2791,7 @@ impl PendingImport<'_> {
                 "pending import lost physical publication"
             )
         });
-        self.pending
-            .context
-            .state
-            .page_tables_authority()
-            .commit_undo();
-        self.descriptor_undo = false;
+        self.descriptor_undo.commit();
         Ok(publication.ready)
     }
 }
@@ -2752,25 +2803,7 @@ impl Drop for PendingImport<'_> {
                 "unsettled import is visible to an admitted root"
             );
         }
-        if self.descriptor_undo {
-            let state = &self.pending.context.state;
-            let resolver = state.live_resolver.read().clone().unwrap_or_else(|| {
-                carrick_fatal!(
-                    "hvpatch::user_transfer",
-                    "import rollback lost retained table resolver"
-                )
-            });
-            // SAFETY: the retained exact target resolver owns every touched
-            // table; kernel publication/mutation admission still excludes use.
-            unsafe { state.page_tables_authority().rollback_undo(&resolver) }.unwrap_or_else(
-                |error| {
-                    carrick_fatal!(
-                        "hvpatch::user_transfer",
-                        "import descriptor rollback failed before physical release: {error:?}"
-                    )
-                },
-            );
-        }
+        self.descriptor_undo.rollback();
     }
 }
 
@@ -2823,6 +2856,7 @@ impl PublicationContext<'static> {
         {
             return Err(invalid());
         }
+        let descriptor_undo = ImportDescriptorUndo::begin(&self.state)?;
         let bytes = source.snapshot();
         let binding = self.state.cow_runtime.read().clone().ok_or_else(invalid)?;
         let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
@@ -2912,21 +2946,16 @@ impl PublicationContext<'static> {
                 })?;
         }
         drop(pending.registry.take());
-        let mut import = PendingImport {
+        let import = PendingImport {
             permit,
             pending,
-            descriptor_undo: false,
+            descriptor_undo,
         };
-        let state = import.pending.context.state.clone();
-        let resolver = state.live_resolver.read().clone().ok_or_else(invalid)?;
+        let resolver = &import.descriptor_undo.resolver;
         let ready = import.ready();
-        state.page_tables_authority().edit(
+        import.descriptor_undo.tables.edit(
             || Err(invalid()),
             |editor| {
-                editor
-                    .begin_undo()
-                    .map_err(|error| TrapError::Hypervisor(format!("import undo: {error:?}")))?;
-                import.descriptor_undo = true;
                 editor
                     .map_private_aliased(
                         range.start(),
@@ -2941,7 +2970,7 @@ impl PublicationContext<'static> {
                         TrapError::Hypervisor(format!("import descriptors: {error:?}"))
                     })?;
                 // SAFETY: retained resolver names the exact unpublished target.
-                unsafe { editor.sync_to_host(&resolver) }.map_err(|error| {
+                unsafe { editor.sync_to_host(resolver) }.map_err(|error| {
                     TrapError::Hypervisor(format!("import descriptor publication: {error:?}"))
                 })
             },
