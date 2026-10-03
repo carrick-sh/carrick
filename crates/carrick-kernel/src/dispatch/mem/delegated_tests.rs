@@ -2933,7 +2933,7 @@ fn delegated_fork_then_protect_restore_leaves_one_row_in_both_mms() {
         child_root.guest_mprotect(
             shared + PAGE,
             PAGE,
-            ReservationProtection::from_bits(u64::from(prot.bits())).unwrap(),
+            ReservationProtection::from_bits(prot.bits()).unwrap(),
         );
     }
     assert_eq!(
