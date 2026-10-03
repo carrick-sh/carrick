@@ -454,8 +454,8 @@ pub fn tgkill_after_clone(rounds: usize) -> i32 {
             if !write_count(role.wr, tid as u64) {
                 failures.push(format!("round {round}: peer write"));
             } else {
-                match poll_read_count(role.rd, 10_000) {
-                    Some(1) => {}
+                match read_report(role.rd, 10_000) {
+                    Ok(1) => {}
                     other => failures.push(format!("round {round}: peer kill result {other:?}")),
                 }
             }
@@ -1043,6 +1043,7 @@ enum ForkStormFailure {
     Reap(ReapOutcome),
 }
 
+#[derive(Debug)]
 enum ReportFailure {
     PollTimeout,
     PollError { errno: i32 },
