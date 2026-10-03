@@ -7,7 +7,10 @@
  * ABI: scalar argument order is declared in carrick-observability/probes.rs.
  * FrameId is an inventory identity, not a host-owner generation. This first
  * capture does not yet authenticate the hardware translation at the EL0 read.
- * PERTURBATION: scalar printf per lifecycle/COW/stage2/invalidation event;
+ * PERTURBATION: scalar printf per lifecycle/COW, frame-pool, stage2,
+ * MM-publication/slot and invalidation event. Executor claims are intentionally
+ * excluded: they add tens of thousands of lines to this suite and can change
+ * its lifecycle schedule without contributing an MM/ASID/frame ownership join.
  * write buffers <=512 bytes are inspected during their authenticated host copy.
  * Not performance evidence. No stacks, polling or retries. Bound: 180 seconds.
  * Publication/slot/TLBI and write-copy providers require live qualification.
@@ -22,7 +25,6 @@ dtrace:::BEGIN { started = timestamp; events = 0; errors = 0; publication = 0; s
 carrick*:::hvpatch-guest-lifecycle-identity,
 carrick*:::hvpatch-guest-lifecycle,
 carrick*:::hvpatch-guest-address-space,
-carrick*:::hvpatch-executor-claim,
 carrick*:::hvpatch-frame-cow-identity,
 carrick*:::hvpatch-frame-cow,
 carrick*:::hvpatch-global-frame-stage2,
