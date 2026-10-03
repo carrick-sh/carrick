@@ -1198,7 +1198,11 @@ impl HostTransfer<'_> {
             // Consume exactly the request observed here. A later request
             // changes Transferring or stays visible on the host-owned record;
             // it cannot be erased by a separate read followed by clear.
-            if rec.host_wanted.take(self.record.incarnation) == Some(Handback::GroupStop)
+            // A service record carries scheduler custody through the host
+            // handoff. Keep its interruption alongside that custody until
+            // the executor consumes the record, instead of replacing it.
+            if rec.handback() != Some(Handback::Service)
+                && rec.host_wanted.take(self.record.incarnation) == Some(Handback::GroupStop)
                 && rec.has_object_operation()
             {
                 rec.handback
@@ -3652,9 +3656,15 @@ impl ZoneTables {
                     // A thread woken or preempted keeps what it resumes with
                     // (its wake's result, or its registers); the claimant's
                     // action (a signal, a control request) follows its resume.
+                    // Service is custody of an exact held scheduler row,
+                    // not a return reason. GroupStop already published its
+                    // incarnation-tagged request; compose it with custody.
                     if rec.has_object_operation()
                         || kind == Handback::Cancelled
-                        || !matches!(rec.handback(), Some(Handback::Woken | Handback::Resumed))
+                        || !matches!(
+                            rec.handback(),
+                            Some(Handback::Woken | Handback::Resumed | Handback::Service)
+                        )
                     {
                         rec.handback.store(kind as u32, Ordering::Release);
                     }
