@@ -287,6 +287,22 @@ pub(super) fn publish_frame_grant(
     retirement: Option<&InventoryLeaseRetirement>,
     _registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
 ) -> Result<PublishedFrameGrant, TrapError> {
+    publish_frame_grant_backing(
+        context,
+        request,
+        retirement,
+        SparseExtentBacking::Anon,
+        _registry,
+    )
+}
+
+fn publish_frame_grant_backing(
+    context: &PublicationContext<'_>,
+    request: carrick_hal::El1FrameGrantRequest,
+    retirement: Option<&InventoryLeaseRetirement>,
+    backing: SparseExtentBacking<'_>,
+    _registry: &crate::fork_quiesce::FrameRegistryGuard<'_>,
+) -> Result<PublishedFrameGrant, TrapError> {
     let end = request
         .semantic_base
         .checked_add(request.len)
@@ -319,7 +335,7 @@ pub(super) fn publish_frame_grant(
         std::sync::Arc::clone(&context.custody),
         request.semantic_base,
         end,
-        SparseExtentBacking::Anon,
+        backing,
     )?;
     if page_granular_arm {
         carrick_fatal!(
@@ -2277,6 +2293,8 @@ mod arena_pin_tests {
 /// before a descriptor can name it. Drop settles only those identities.
 pub(super) struct PendingTransferGrant {
     context: PublicationContext<'static>,
+    // Failed preparation rolls back under the guard already held by its owner.
+    registry: Option<crate::fork_quiesce::FrameRegistryGuard<'static>>,
     publication: Option<PublishedFrameGrant>,
     pin: Option<CarrierStage2Pin>,
     record: Option<CarrierStage2RecordIdentity>,
@@ -2347,6 +2365,7 @@ impl PublicationContext<'static> {
         )?;
         let mut pending = PendingTransferGrant {
             context: self,
+            registry: Some(registry),
             publication: Some(publication),
             pin: None,
             record: None,
@@ -2434,7 +2453,7 @@ impl PublicationContext<'static> {
         ) {
             return Ok(None);
         }
-        drop(registry);
+        drop(pending.registry.take());
         Ok(Some(Box::new(pending)))
     }
 }
@@ -2526,11 +2545,13 @@ impl Drop for PendingTransferGrant {
                     "pending target lost physical authority"
                 )
             });
-        let _registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
-            carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
-            binding.identity.linux_pid,
-            binding.identity.linux_tid,
-        );
+        let _registry = self.registry.take().unwrap_or_else(|| {
+            crate::fork_quiesce::FrameRegistryGuard::acquire(
+                carrick_observability::probes::HvpatchTopologyOperation::AliasUnmap,
+                binding.identity.linux_pid,
+                binding.identity.linux_tid,
+            )
+        });
         let (key, expected) = publication.inventory_entry;
         let mut inventory = self.context.state.frame_inventory.ledger.lock();
         let actual = inventory.extents.get(&key).copied();
@@ -2616,5 +2637,315 @@ impl Drop for PendingTransferGrant {
                 .remove_exact_values_in_batch(&[publication.alias]);
         }
         let _ = &self.pin;
+    }
+}
+
+/// A nontransferable source retains its own physical owner. Copying its bytes
+/// into a new owner never imports its frame or source-directory authority.
+pub struct RetainedImportSource {
+    pin: GlobalFrameOwnerPin,
+    _custody: std::sync::Arc<CarrierVmCustody>,
+    offset: usize,
+    len: usize,
+}
+impl RetainedImportSource {
+    pub(crate) fn from_pin(
+        pin: GlobalFrameOwnerPin,
+        expected: CarrierStage2RecordIdentity,
+        offset: usize,
+        len: usize,
+    ) -> Result<Self, TrapError> {
+        let invalid = || TrapError::Hypervisor("stale or invalid retained import source".into());
+        if pin.owner.record_identity != expected
+            || len == 0
+            || len > 16 * 1024
+            || offset
+                .checked_add(len)
+                .is_none_or(|end| end > pin.owner.len())
+        {
+            return Err(invalid());
+        }
+        let custody = pin.owner.custody.upgrade().ok_or_else(invalid)?;
+        let record = custody
+            .stage2_record_snapshot(expected.record_id)
+            .ok_or_else(invalid)?;
+        // Existing retained pins remain readable after retirement is requested.
+        // New acquisition is still governed by CarrierVmCustody::pin_stage2_record.
+        if record.vm_generation != expected.vm_generation
+            || record.logical_owner != expected.logical_owner
+            || !record.mapped
+            || record.terminalized_by_vm_destroy
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            pin,
+            _custody: custody,
+            offset,
+            len,
+        })
+    }
+    fn snapshot(&self) -> Vec<u8> {
+        let mut bytes = vec![0; self.len];
+        // SAFETY: exact source pin and retained mapping own the checked range,
+        // including after its original directory or portal is destroyed.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                self.pin.owner.ptr().add(self.offset),
+                bytes.as_mut_ptr(),
+                self.len,
+            );
+        }
+        bytes
+    }
+}
+
+/// Physical publication remains rollback-owned until the same kernel owner
+/// confirms normal root admission. The permit keeps publication exclusion alive.
+pub struct PendingImport<'a> {
+    descriptor_undo: bool,
+    permit: carrick_hal::PreAdmissionPermit<'a>,
+    pending: PendingTransferGrant,
+}
+impl PendingImport<'_> {
+    pub fn ready(&self) -> carrick_hal::El1FrameGrantReady {
+        self.pending
+            .publication
+            .as_ref()
+            .unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "pending import lost physical publication"
+                )
+            })
+            .ready
+    }
+    pub fn commit(
+        mut self,
+        receipt: carrick_hal::PreAdmissionReceipt<'_>,
+    ) -> Result<carrick_hal::El1FrameGrantReady, TrapError> {
+        if !self.permit.authenticates(&receipt) || self.permit.unpublished() {
+            return Err(TrapError::Hypervisor(
+                "import admission receipt mismatch".into(),
+            ));
+        }
+        let publication = self.pending.publication.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::user_transfer",
+                "pending import lost physical publication"
+            )
+        });
+        self.pending
+            .context
+            .state
+            .page_tables_authority()
+            .commit_undo();
+        self.descriptor_undo = false;
+        Ok(publication.ready)
+    }
+}
+impl Drop for PendingImport<'_> {
+    fn drop(&mut self) {
+        if self.pending.publication.is_some() && !self.permit.unpublished() {
+            carrick_fatal!(
+                "hvpatch::user_transfer",
+                "unsettled import is visible to an admitted root"
+            );
+        }
+        if self.descriptor_undo {
+            let state = &self.pending.context.state;
+            let resolver = state.live_resolver.read().clone().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "import rollback lost retained table resolver"
+                )
+            });
+            // SAFETY: the retained exact target resolver owns every touched
+            // table; kernel publication/mutation admission still excludes use.
+            unsafe { state.page_tables_authority().rollback_undo(&resolver) }.unwrap_or_else(
+                |error| {
+                    carrick_fatal!(
+                        "hvpatch::user_transfer",
+                        "import descriptor rollback failed before physical release: {error:?}"
+                    )
+                },
+            );
+        }
+    }
+}
+
+impl PublicationContext<'static> {
+    /// Physical setup has the existing kernel publication owner; it cannot
+    /// borrow a current fault identity or touch a post-admission root.
+    pub(crate) fn for_import(
+        state: std::sync::Arc<MmAccessState>,
+        custody: std::sync::Arc<CarrierVmCustody>,
+        permit: &carrick_hal::PreAdmissionPermit<'_>,
+    ) -> Result<Self, TrapError> {
+        let invalid =
+            || TrapError::Hypervisor("import requires exact unpublished host setup".into());
+        let binding = state.cow_runtime.read().clone().ok_or_else(invalid)?;
+        if !permit.unpublished()
+            || permit.mm().get() != binding.identity.mm
+            || state.page_tables_authority().live_descriptor_owner()
+                != carrick_mmu_core::aarch64::LiveDescriptorOwner::Host
+            || !binding.persistent_vm_lifecycle
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            mm_key: permit.mm(),
+            state,
+            custody,
+            authority: binding.authority,
+            mm_root_slot: binding.mm_root_slot,
+            container_root: binding.container_root,
+            _exclusion: None,
+            _invocation: None,
+            foreign: None,
+        })
+    }
+    pub(crate) fn prepare_import<'a>(
+        self,
+        permit: carrick_hal::PreAdmissionPermit<'a>,
+        source: RetainedImportSource,
+        range: carrick_el1_abi::ReservationRange,
+        protection: carrick_el1_abi::ReservationProtection,
+    ) -> Result<PendingImport<'a>, TrapError> {
+        let invalid = || TrapError::Hypervisor("invalid pre-admission import".into());
+        if !permit.unpublished()
+            || permit.mm() != self.mm_key
+            || range.len() != source.len as u64
+            || range.len() > 16 * 1024
+            || protection.bits() == 0
+            || self.state.page_tables_authority().live_descriptor_owner()
+                != carrick_mmu_core::aarch64::LiveDescriptorOwner::Host
+        {
+            return Err(invalid());
+        }
+        let bytes = source.snapshot();
+        let binding = self.state.cow_runtime.read().clone().ok_or_else(invalid)?;
+        let registry = crate::fork_quiesce::FrameRegistryGuard::acquire(
+            carrick_observability::probes::HvpatchTopologyOperation::SiblingMaterialize,
+            binding.identity.linux_pid,
+            binding.identity.linux_tid,
+        );
+        if !alias_registry()
+            .lock()
+            .overlapping_process_aliases(
+                range.start(),
+                range.len() as usize,
+                self.mm_root_slot,
+                self.container_root,
+            )
+            .is_empty()
+        {
+            return Err(invalid());
+        }
+        let publication = publish_frame_grant_backing(
+            &self,
+            carrick_hal::El1FrameGrantRequest {
+                mm_key: self.mm_key.get(),
+                fault_va: range.start(),
+                access: 1,
+                semantic_base: range.start(),
+                len: range.len(),
+                permissions: protection.bits(),
+            },
+            None,
+            SparseExtentBacking::SeededAnon { bytes: &bytes },
+            &registry,
+        )?;
+        // From the first successful publication, every fallible step has an
+        // exact rollback owner, including the already-held registry guard.
+        let mut pending = PendingTransferGrant {
+            context: self,
+            registry: Some(registry),
+            publication: Some(publication),
+            pin: None,
+            record: None,
+            txn: None,
+            descriptor_settled: false,
+        };
+        let publication = pending.publication.as_ref().unwrap_or_else(|| {
+            carrick_fatal!(
+                "hvpatch::user_transfer",
+                "new import lost physical publication"
+            )
+        });
+        let owner = pending
+            .context
+            .custody
+            .global_frame_host_owners
+            .lock()
+            .get(&publication.inventory_entry.0)
+            .and_then(GlobalFrameOwnerEntry::live_owner)
+            .cloned()
+            .ok_or_else(invalid)?;
+        pending.record = Some(owner.record_identity);
+        pending.pin = Some(
+            pending
+                .context
+                .custody
+                .pin_stage2_record(owner.record_identity)
+                .map_err(|_| invalid())?,
+        );
+        if !global_frame::register_shared_alias_if_vacant(
+            publication.alias,
+            pending.context.mm_root_slot,
+            pending.context.container_root,
+        ) {
+            return Err(invalid());
+        }
+        if protection.bits() & 4 != 0 {
+            pending
+                .context
+                .custody
+                .publish_user_executable(
+                    publication.alias.physical_ipa,
+                    publication.alias.physical_size as u64,
+                    |_, _| None,
+                    |_, _| None,
+                )
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("import executable publication: {error:?}"))
+                })?;
+        }
+        drop(pending.registry.take());
+        let mut import = PendingImport {
+            permit,
+            pending,
+            descriptor_undo: false,
+        };
+        let state = import.pending.context.state.clone();
+        let resolver = state.live_resolver.read().clone().ok_or_else(invalid)?;
+        let ready = import.ready();
+        state.page_tables_authority().edit(
+            || Err(invalid()),
+            |editor| {
+                editor
+                    .begin_undo()
+                    .map_err(|error| TrapError::Hypervisor(format!("import undo: {error:?}")))?;
+                import.descriptor_undo = true;
+                editor
+                    .map_private_aliased(
+                        range.start(),
+                        ready.physical_ipa,
+                        range.len(),
+                        carrick_mmu_core::aarch64::UserLeafAccess {
+                            writable: protection.bits() & 2 != 0,
+                            executable: protection.bits() & 4 != 0,
+                        },
+                    )
+                    .map_err(|error| {
+                        TrapError::Hypervisor(format!("import descriptors: {error:?}"))
+                    })?;
+                // SAFETY: retained resolver names the exact unpublished target.
+                unsafe { editor.sync_to_host(&resolver) }.map_err(|error| {
+                    TrapError::Hypervisor(format!("import descriptor publication: {error:?}"))
+                })
+            },
+        )?;
+        Ok(import)
     }
 }

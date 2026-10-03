@@ -468,41 +468,14 @@ impl MmExecutorParticipation {
         self.authority.mm_id
     }
 
-    /// Publish this MM's address space, whose translation roots are
-    /// `ttbr0`/`ttbr1`, for guest EL1 to install on a vCPU itself (EL1
-    /// increment 2): its gate follows this MM's fence. Only
-    /// [`super::SyscallDispatcher::publish_bound_address_space`] calls it,
-    /// so a publication always decides its root's admission.
-    pub(in crate::dispatch) fn publish_address_space(
+    /// Capture immutable owner references before mutation borrows participation.
+    pub(in crate::dispatch) fn address_space_publication_owner(
         &self,
-        ttbr0: u64,
-        ttbr1: u64,
-    ) -> Option<crate::kernel::AddressSpacePublication> {
-        self.authority.seal_reservation_provider();
-        let (brk_current, mmap_next) = {
-            let state = self.authority.mem.lock();
-            (state.program_break(), state.arena_high_water())
-        };
-        // The publishing process's limits seed its root; `setrlimit` on the
-        // process pushes later changes.
-        let task = self.admission.thread().and_then(|thread| thread.task());
-        let rlimits = task
-            .as_ref()
-            .map_or_else(crate::kernel::RlimitSet::carrick_defaults, |task| {
-                task.rlimits()
-            });
-        crate::kernel::publish_address_space_with_layout(
-            self.mm_id(),
-            self.pt_quiesce(),
-            ttbr0,
-            ttbr1,
-            brk_current,
-            mmap_next,
-            crate::kernel::mm_occupancy::ReservationRootPublication {
-                limits: crate::kernel::ReservationLimits::of_task(&rlimits, task.as_ref()),
-                provider: self.authority.reservation_provider_for_publication(),
-            },
-        )
+    ) -> AddressSpacePublicationOwner {
+        AddressSpacePublicationOwner {
+            authority: Arc::clone(&self.authority),
+            task: self.admission.thread().and_then(|thread| thread.task()),
+        }
     }
 
     pub(crate) fn mutation_coordinator(&self) -> Arc<mm_mutation::MmMutationCoordinator> {
@@ -1553,5 +1526,43 @@ mod reservation_provider_tests {
             Err(Refusal::MetadataRequired)
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 5);
+    }
+}
+
+/// Mutable layout and limits are sampled only after the caller holds mutation
+/// admission; cloning the references before acquisition cannot stale anchors.
+pub(in crate::dispatch) struct AddressSpacePublicationOwner {
+    authority: Arc<DispatchMmAuthority>,
+    task: Option<crate::kernel::TaskRef>,
+}
+impl AddressSpacePublicationOwner {
+    pub(in crate::dispatch) fn publish(
+        &self,
+        owner: &crate::kernel::mm_occupancy::PreAdmissionGuard,
+        ttbr0: u64,
+        ttbr1: u64,
+    ) -> Option<crate::kernel::AddressSpacePublication> {
+        self.authority.seal_reservation_provider();
+        let (brk_current, mmap_next) = {
+            let state = self.authority.mem.lock();
+            (state.program_break(), state.arena_high_water())
+        };
+        let rlimits = self
+            .task
+            .as_ref()
+            .map_or_else(crate::kernel::RlimitSet::carrick_defaults, |task| {
+                task.rlimits()
+            });
+        owner.publish(
+            self.authority.pt_quiesce(),
+            ttbr0,
+            ttbr1,
+            brk_current,
+            mmap_next,
+            crate::kernel::mm_occupancy::ReservationRootPublication {
+                limits: crate::kernel::ReservationLimits::of_task(&rlimits, self.task.as_ref()),
+                provider: self.authority.reservation_provider_for_publication(),
+            },
+        )
     }
 }
