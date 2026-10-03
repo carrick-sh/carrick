@@ -26,9 +26,14 @@ pub(crate) fn deliver_completion(
     #[cfg(target_os = "none")]
     {
         let mut cpu = crate::substrate::sched::hw::HardwareCpu;
+        let own = match waker {
+            carrick_sched_core::Waker::El1 { slot } => Some(slot),
+            carrick_sched_core::Waker::Host => None,
+        };
+        assert!(own.is_some() || (!effects.queued_own && !effects.misplaced));
         for slot in effects
             .sgi_slots()
-            .chain((effects.queued_own && waker != venue).then_some(waker))
+            .chain(own.filter(|slot| effects.queued_own && *slot != venue))
         {
             let target = zone.slot(slot).sgi_target();
             if target != 0 {
@@ -36,11 +41,12 @@ pub(crate) fn deliver_completion(
             }
         }
         if effects.misplaced
-            && let Some(task) = carrick_el1_abi::current_task_guest(usize::from(waker.raw()))
+            && let Some(slot) = own
+            && let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw()))
         {
             task.mark_pending_host_work();
         }
-        if (deferred || (effects.queued_own && waker == venue))
+        if (deferred || (effects.queued_own && own == Some(venue)))
             && let Some(task) = carrick_el1_abi::current_task_guest(usize::from(venue.raw()))
         {
             task.mark_pending_host_work();
