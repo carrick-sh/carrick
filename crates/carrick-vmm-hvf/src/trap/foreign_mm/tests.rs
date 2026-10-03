@@ -12935,6 +12935,7 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
             range: carrick_el1_abi::ReservationRange::new(start, start + 4096).unwrap(),
             protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
             fault_page: start,
+            host_backing: None,
         };
         let context = sparse_materialization::PublicationContext::for_transfer(
             installed.state.clone(),
@@ -13218,6 +13219,7 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         range: carrick_el1_abi::ReservationRange::new(TEST_VA, TEST_VA + 4096).unwrap(),
         protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
         fault_page: TEST_VA,
+        host_backing: None,
     };
     let context = sparse_materialization::PublicationContext::for_transfer(
         installed.state.clone(),
@@ -13335,6 +13337,7 @@ fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
         range: carrick_el1_abi::ReservationRange::new(start, start + 4096).unwrap(),
         protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
         fault_page: start,
+        host_backing: None,
     };
     let context = sparse_materialization::PublicationContext::for_transfer(
         installed.state.clone(),

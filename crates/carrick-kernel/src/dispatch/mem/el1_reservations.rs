@@ -85,6 +85,7 @@ type ImportRow = (
     ReservationRange,
     ReservationProtection,
     ReservationNodeFlags,
+    Option<carrick_el1_abi::HostBackingIdentity>,
 );
 
 /// Every host row as a root node, and the rows the root will own (which then
@@ -92,28 +93,64 @@ type ImportRow = (
 struct AdmissionRows {
     rows: Vec<ImportRow>,
     owned: Vec<(u64, u64)>,
+    backing_leases: Vec<super::host_backing::HostBackingLease>,
 }
 
 fn admission_rows(mem: &MemState) -> Result<AdmissionRows, Refusal> {
     let mut owned = Vec::new();
-    let rows = mem
-        .semantic_vmas
-        .iter()
-        .map(|vma| {
-            let range = ReservationRange::new(vma.start, vma.end).ok_or(Refusal::Invalid)?;
-            let bits =
-                u64::from(vma.read) | (u64::from(vma.write) << 1) | (u64::from(vma.execute) << 2);
-            let prot = ReservationProtection::from_bits(bits).ok_or(Refusal::Invalid)?;
-            let flags = if root_owned_row(vma, mem) {
-                owned.push((vma.start, vma.end));
-                ReservationNodeFlags::ANONYMOUS_PRIVATE.union(carried_flags(vma))
-            } else {
-                opaque_flags(vma, mem)
-            };
-            Ok((range, prot, flags))
-        })
-        .collect::<Result<_, Refusal>>()?;
-    Ok(AdmissionRows { rows, owned })
+    let mut backing_leases = Vec::new();
+    let mut rows = Vec::new();
+    for vma in mem.semantic_vmas.iter() {
+        let bits =
+            u64::from(vma.read) | (u64::from(vma.write) << 1) | (u64::from(vma.execute) << 2);
+        let prot = ReservationProtection::from_bits(bits).ok_or(Refusal::Invalid)?;
+        let flags = if root_owned_row(vma, mem) {
+            owned.push((vma.start, vma.end));
+            ReservationNodeFlags::ANONYMOUS_PRIVATE.union(carried_flags(vma))
+        } else {
+            opaque_flags(vma, mem)
+        };
+        // Pre-admission only: preserve source boundaries even when the host's
+        // VMA coalescer joined several retained file fragments into one row.
+        let mut boundaries = vec![vma.start, vma.end];
+        for source in &mem.private_file_maps {
+            if source.start < vma.end && source.end > vma.start {
+                boundaries.push(source.start.max(vma.start));
+                boundaries.push(source.end.min(vma.end));
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        for span in boundaries.windows(2) {
+            let start = span[0];
+            let end = span[1];
+            let range = ReservationRange::new(start, end).ok_or(Refusal::Invalid)?;
+            let backing = mem
+                .private_file_maps
+                .iter()
+                .find(|source| source.start <= start && source.end >= end)
+                .map(|source| {
+                    let lease = mem
+                        .host_backing_custody
+                        .retain_source(source.backing.clone())
+                        .ok_or(Refusal::MetadataRequired)?;
+                    let offset = source
+                        .offset
+                        .checked_add(start - source.start)
+                        .ok_or(Refusal::Invalid)?;
+                    let identity = lease.identity(offset);
+                    backing_leases.push(lease);
+                    Ok(identity)
+                })
+                .transpose()?;
+            rows.push((range, prot, flags, backing));
+        }
+    }
+    Ok(AdmissionRows {
+        rows,
+        owned,
+        backing_leases,
+    })
 }
 
 /// An admission of an MM that is already delegated: idempotent for its own
@@ -152,7 +189,11 @@ fn admit_bind(
         .checked_add(layout.mmap_size)
         .and_then(|end| ReservationRange::new(layout.mmap_base, end))
         .ok_or(Refusal::Invalid)?;
-    let AdmissionRows { rows, owned } = admission_rows(mem)?;
+    let AdmissionRows {
+        rows,
+        owned,
+        backing_leases,
+    } = admission_rows(mem)?;
     // Taken before the root guard (the projection must not read the root).
     // Every owned row becomes a root node, so it is never charged here.
     let host = HostCharges::at_admission(mem);
@@ -167,8 +208,11 @@ fn admit_bind(
             import.external_address_bytes = 0;
             import.external_data_bytes = 0;
             model.configure_import(import)?;
-            for (range, prot, flags) in rows {
-                model.import_with(range, prot, flags)?;
+            for (range, prot, flags, backing) in rows {
+                match backing {
+                    Some(backing) => model.import_with_backing(range, prot, flags, backing)?,
+                    None => model.import_with(range, prot, flags)?,
+                }
             }
             // Sealed with the exact charges of everything it does not hold:
             // the guest venue decides against them from its first proposal.
@@ -183,6 +227,7 @@ fn admit_bind(
         result
     })?;
     mem.seal_delegated(root, &owned);
+    mem.host_backing_leases.extend(backing_leases);
     Ok(El1Admission::Delegated)
 }
 

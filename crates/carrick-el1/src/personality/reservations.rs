@@ -320,7 +320,16 @@ impl NodeData {
     /// Whether an adjacent node is the same Linux mapping (a VMA boundary
     /// the tree keeps only to separate incarnations).
     fn same_mapping(&self, other: &NodeData) -> bool {
-        self.prot == other.prot && self.flags == other.flags
+        self.prot == other.prot
+            && self.flags == other.flags
+            && match (self.host_backing, other.host_backing) {
+                (None, None) => true,
+                (Some(a), Some(b)) if self.start <= other.start => {
+                    a.advance(other.start - self.start) == Some(b)
+                }
+                (Some(a), Some(b)) => b.advance(self.start - other.start) == Some(a),
+                _ => false,
+            }
     }
 }
 
@@ -908,6 +917,25 @@ impl Reservations<'_> {
         max_len: u64,
         access: ReservationProtection,
     ) -> Result<ReservationFaultPlan, Refusal> {
+        self.fault_plan_for_source(address, max_len, access, false)
+    }
+    /// Transfer materialization may consume an explicitly retained byte
+    /// source. Ordinary anonymous fault planning keeps its existing boundary.
+    pub fn transfer_fault_plan(
+        &mut self,
+        address: u64,
+        max_len: u64,
+        access: ReservationProtection,
+    ) -> Result<ReservationFaultPlan, Refusal> {
+        self.fault_plan_for_source(address, max_len, access, true)
+    }
+    fn fault_plan_for_source(
+        &mut self,
+        address: u64,
+        max_len: u64,
+        access: ReservationProtection,
+        allow_backing: bool,
+    ) -> Result<ReservationFaultPlan, Refusal> {
         if !self.is_admitted() {
             return Err(Refusal::Stale);
         }
@@ -919,7 +947,7 @@ impl Reservations<'_> {
             return Err(Refusal::Busy);
         }
         let mapping = self.mapping(page).ok_or(Refusal::Hole)?;
-        if !mapping.anonymous {
+        if !mapping.anonymous && !(allow_backing && mapping.host_backing.is_some()) {
             return Err(Refusal::ForeignMapping);
         }
         if !mapping.protection.permits(access) {
@@ -941,14 +969,28 @@ impl Reservations<'_> {
         })
     }
     pub fn authenticate_fault(&mut self, plan: ReservationFaultPlan) -> bool {
+        self.authenticate_transfer_fault(plan, None)
+    }
+    pub fn authenticate_transfer_fault(
+        &mut self,
+        plan: ReservationFaultPlan,
+        backing: Option<HostBackingIdentity>,
+    ) -> bool {
         plan.mm == self.mm
             && plan.generation == self.generation()
             && self.pending().is_none_or(|p| {
                 p.range.end() <= plan.range.start() || p.range.start() >= plan.range.end()
             })
             && self.mapping(plan.fault_page).is_some_and(|m| {
-                m.anonymous
-                    && m.protection == plan.protection
+                (if let Some(backing) = backing {
+                    plan.range
+                        .start()
+                        .checked_sub(m.range.start())
+                        .and_then(|offset| m.host_backing.and_then(|source| source.advance(offset)))
+                        == Some(backing)
+                } else {
+                    m.anonymous && m.host_backing.is_none()
+                }) && m.protection == plan.protection
                     && m.range.start() <= plan.range.start()
                     && m.range.end() >= plan.range.end()
             })
@@ -1054,6 +1096,7 @@ impl Reservations<'_> {
             n.prot = successor.prot;
             n.flags = successor.flags;
             n.incarnation = successor.incarnation;
+            n.host_backing = successor.host_backing;
             (n.right, freed) = self.erase(n.right, successor.start);
         }
         self.write(root, n);
@@ -1720,6 +1763,9 @@ impl Reservations<'_> {
         let mut high = low;
         high.start = address;
         high.end = n.end;
+        high.host_backing = n
+            .host_backing
+            .and_then(|backing| backing.advance(address - n.start));
         self.write(freed, low);
         let tree = self.insert(self.state().tree, freed);
         self.state_mut().tree = tree;
@@ -2073,12 +2119,38 @@ impl Reservations<'_> {
         }
         self.insert_node(range, prot, flags)
     }
+    /// Import a retained byte source before admission. Fork and node splits
+    /// preserve this identity; it is never reconstructed from a host VMA.
+    pub fn import_with_backing(
+        &mut self,
+        range: ReservationRange,
+        prot: ReservationProtection,
+        flags: ReservationNodeFlags,
+        backing: carrick_el1_abi::HostBackingIdentity,
+    ) -> Result<(), Refusal> {
+        if self.state().admitted {
+            return Err(Refusal::Stale);
+        }
+        self.insert_backed_node(range, prot, flags, Some(backing))
+    }
     fn insert_node(
         &mut self,
         range: ReservationRange,
         prot: ReservationProtection,
         flags: ReservationNodeFlags,
     ) -> Result<(), Refusal> {
+        self.insert_backed_node(range, prot, flags, None)
+    }
+    fn insert_backed_node(
+        &mut self,
+        range: ReservationRange,
+        prot: ReservationProtection,
+        flags: ReservationNodeFlags,
+        host_backing: Option<carrick_el1_abi::HostBackingIdentity>,
+    ) -> Result<(), Refusal> {
+        if host_backing.is_some_and(|backing| backing.advance(range.len()).is_none()) {
+            return Err(Refusal::Invalid);
+        }
         if self.pending().is_some() {
             return Err(Refusal::Busy);
         }
@@ -2094,6 +2166,7 @@ impl Reservations<'_> {
             end: range.end(),
             prot: pack_prot(prot),
             flags: pack_flags(flags),
+            host_backing,
             ..NodeData::default()
         };
         node.incarnation = self.incarnation_for(&node);
@@ -2122,11 +2195,21 @@ impl Reservations<'_> {
         prot: ReservationProtection,
         flags: ReservationNodeFlags,
     ) -> Result<(), Refusal> {
+        self.insert_opaque_backed(range, prot, flags, None)
+    }
+    pub fn insert_opaque_backed(
+        &mut self,
+        range: ReservationRange,
+        prot: ReservationProtection,
+        flags: ReservationNodeFlags,
+        backing: Option<HostBackingIdentity>,
+    ) -> Result<(), Refusal> {
         let generation = self.host_edit_admitted()?;
-        self.insert_node(
+        self.insert_backed_node(
             range,
             prot,
             flags.difference(ReservationNodeFlags::ANONYMOUS),
+            backing,
         )?;
         self.state_mut().generation = generation;
         Ok(())
@@ -2303,6 +2386,7 @@ impl Reservations<'_> {
             self.state_mut().tree = tree;
             self.free_node(freed);
             n.start = left.start;
+            n.host_backing = left.host_backing;
         }
         if let Some(right) = self.next(n.end)
             && right.start == n.end
@@ -3751,6 +3835,59 @@ mod tests {
         let Decision::Work(request) = d else { panic!() };
         assert_eq!(request.operation, ReservationOperation::Move);
         g.refuse(request).unwrap();
+    }
+
+    #[test]
+    fn owner_fork_keeps_file_identity_and_split_offsets() {
+        use carrick_el1_abi::HostBackingIdentity;
+        use core::num::NonZeroU64;
+        let table = table();
+        let a = ReservationMm::new(40).unwrap();
+        let b = ReservationMm::new(41).unwrap();
+        table.publish(0, a, layout()).unwrap();
+        table.publish(1, b, layout()).unwrap();
+        let source = HostBackingIdentity::new(
+            NonZeroU64::new(17).unwrap(),
+            NonZeroU64::new(3).unwrap(),
+            0x8000,
+        );
+        let mut parent = table.lock(0, a).unwrap();
+        parent
+            .import_with_backing(
+                range(0x100000, 0x104000),
+                ReservationProtection::READ_WRITE,
+                ReservationNodeFlags::PRIVATE,
+                source,
+            )
+            .unwrap();
+        parent.finish_import().unwrap();
+        parent
+            .set_flags(
+                range(0x101000, 0x103000),
+                ReservationNodeFlags::DONTFORK,
+                ReservationNodeFlags::EMPTY,
+            )
+            .unwrap();
+        assert_eq!(
+            parent.mapping(0x101000).unwrap().host_backing,
+            source.advance(0x1000)
+        );
+        assert_eq!(
+            parent.mapping(0x103000).unwrap().host_backing,
+            source.advance(0x3000)
+        );
+        let mut child = table.lock(1, b).unwrap();
+        parent.clone_into(&mut child).unwrap();
+        assert_eq!(child.mapping(0x100000).unwrap().host_backing, Some(source));
+        assert!(child.mapping(0x101000).is_none());
+        assert_eq!(
+            child.mapping(0x103000).unwrap().host_backing,
+            source.advance(0x3000)
+        );
+        assert_eq!(
+            parent.mapping(0x101000).unwrap().host_backing,
+            source.advance(0x1000)
+        );
     }
 
     #[test]
