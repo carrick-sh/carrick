@@ -816,3 +816,76 @@ mirror deletion, hardware TLBI/cache binding, then host+signed acceptance and
 the frozen-baseline generic/case probe delta. These checkpoints do not establish
 production ownership, signed runtime behavior or review-ready status. No
 known-red entry is removed and no Docker or signed run is claimed here.
+
+#### N1 owner adapter
+
+Director decision: the production EL1 memory owner remains the sole owner.
+Delete N0's private MM IDs, `PageTableManager`s, frame/reference ledger and
+dangling bank mapping. `El1MmHandle`, closed `TransferIntent` (including
+`CarrickInternalRead`) and exact-generation completion remain the public
+surface; they identify production authority rather than a portal vector slot.
+No GuestMemory venue-3 cutover is included in this adapter slice.
+
+The production functions and structures to reuse are:
+
+- Exact MM/root resolution: `AddressSpaces::find` and `grant`
+  (`crates/carrick-sched-core/src/spaces.rs:462`), as used by
+  `PreparedView::lock` (`crates/carrick-runtime/src/vcpu_loop/reservations.rs:135`,
+  exact-MM lookup at line 145). `CarrierReservations` borrows the table from
+  its retained `CarrierMetadataAccess` region (`reservations.rs:63`), never
+  from a portal-owned allocation. `AddressSpaces::try_begin_edit`
+  (`spaces.rs:495`) supplies the exact-MM descriptor editor.
+- UserTransfer permission and mapping policy: the admitted reservation root
+  through `delegated_anonymous_root`
+  (`crates/carrick-el1/src/memory.rs:855`); policy operations reuse
+  `decide_anonymous_syscall` (`memory.rs:184`) and
+  `serve_delegated_anonymous` (`memory.rs:662`). These functions preserve
+  existing proposals, descriptor completion and deferred-return authority;
+  their current forwarding outcomes are not transfer completion.
+- UserTransfer prepared-page materialization:
+  `HardwarePreparedResolver::commit_prepared`
+  (`crates/carrick-el1/src/fault.rs:156`), using the authenticated TTBR0
+  and `FrameGrantResidencyTable::lookup`/`record_commit`
+  (`crates/carrick-el1-abi/src/lib.rs:1646`, `lib.rs:1678`).
+  `HardwareCowResolver::resolve_cow` (`fault.rs:186`) uses
+  `PrimaryTableWords` at the live TTBR0 (`fault.rs:194`), the shared
+  `cow_grant_pool_guest` (`fault.rs:206`) and `resolve_guest_cow`
+  (`crates/carrick-el1/src/cow.rs:57`). Reuse this classifier/pool rather
+  than the N0 portal's independent COW frame ledger.
+- Carrier reservation-bank lifetime:
+  `ResolvedReservationNodes::refresh`
+  (`crates/carrick-el1/src/personality/reservations/storage.rs:77`)
+  receives the retained carrier region for bootstrap banks and exact extent
+  pins for dynamic banks. `SharedReservations::provision_metadata`
+  (`storage.rs:159`) publishes banks outside MM locks. EL1's identity bank
+  view (`storage.rs:139`) and the host's resolved view name the same storage.
+- Fork **open for the next turn**: production admission's `admit_fork`
+  (`crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs:190`)
+  seeds the child's published root through `DelegatedRoot::seed_from`
+  (`el1_reservations/provider.rs:185`). The adapter must bind production
+  descriptor/COW publication and child occupancy, not call N0's snapshot fork.
+- Capacity **open for the next turn**: existing frame grant requests in
+  `dispatch_fault_with_prepared` (`fault.rs:822`, request at line 945),
+  shared COW grants, and `CarrierReservations::provision_metadata`
+  (`crates/carrick-runtime/src/vcpu_loop/reservations.rs:76`) are the
+  existing supply paths. They do not yet constitute a stopped-target
+  UserTransfer continuation or a general user-frame pin capability.
+
+Adapter prerequisite requiring director disposition: N0's delayed completion
+and partial-compound reuse witnesses retain physical data pins independently
+of the MM editor. Production `FrameGrantResidencyTable::retire`
+(`crates/carrick-el1-abi/src/lib.rs:1766`) revokes a record without a transfer
+pin count. `HostApertureState::pin_extent`
+(`crates/carrick-vmm-hvf/src/metadata_grant.rs:326`) resolves only the dynamic
+metadata aperture, not general user frames. Reusing either as a general data
+pin would invent custody. The stopped-target lazy path also needs an owned
+transfer continuation: current frame supply ends in `Action::Forward`
+(`fault.rs:952`), not a suspended portal operation. Decide whether the
+production data-pin and transfer suspension protocol is a prerequisite in
+this turn despite deferring the public Capacity operation. Do not retain the
+N0 ledger, hold an MM editor across suspension, run target EL0, or report an
+unbacked lazy page as EFAULT to make these witnesses pass.
+
+This adapter entry is design and source inspection only. UserTransfer has not
+been rebound, the private model has not been deleted, and no tests, signed
+acceptance or review-ready implementation receipt are claimed by this entry.
