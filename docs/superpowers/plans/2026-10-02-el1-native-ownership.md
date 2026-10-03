@@ -1644,3 +1644,11 @@ O_APPEND symmetry and admitted EL1 delegation removal remain OPEN. The old
 ObservedCopy dispatcher source-consumption witness saw f_pos8192 before
 copy, even though seek-back returned4096; its separate staged-core green
 will not count as production dispatcher closure.
+
+Cursor review round1 correction: callback delivery and final effect destruction
+now have an enforced fatal unwind boundary. Runtime catches cannot resume a
+description with an abandoned draining flag. The actual child regression
+`serial_host_cursor_callback_panic_is_terminal` caught a callback panic then
+observed successor wake0 versus1 before the fix (no SIGABRT); after the fix
+it requires SIGABRT6. All seven cursor core tests pass. Consumer activation
+and the remaining release/recall prerequisites stay open.
