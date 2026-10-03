@@ -720,10 +720,18 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let _ = serve_transfer(&portal, service, &words, frame.slot as u32, || {
         // The host resumes this exact stack after copy OR cancellation. The
         // editor cannot be abandoned by resetting the service-call registers.
-        unsafe {
-            core::arch::asm!("hvc #1", clobber_abi("C"));
-        }
+        yield_host_effect();
     });
+}
+
+/// Suspend the current portal service stack for an authenticated host effect.
+/// The host must resume this exact stack after servicing or cancelling the
+/// effect; the portal keeps its operation and editor custody across the yield.
+#[cfg(target_os = "none")]
+pub(super) fn yield_host_effect() {
+    unsafe {
+        core::arch::asm!("hvc #1", clobber_abi("C"));
+    }
 }
 
 /// Selection entry for a borrowed target root. Input x1..x7 is carrier, MM,

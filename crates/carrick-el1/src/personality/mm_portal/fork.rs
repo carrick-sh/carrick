@@ -1127,9 +1127,7 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let scratch = portal.census_fork(request, &words, frame.slot as u32)?;
         let plan = portal.prepare_fork(request, scratch, &words, frame.slot as u32)?;
         for (index, custody) in plan.custody().iter().copied().enumerate() {
-            if !service.retain(index as u64, custody, || unsafe {
-                core::arch::asm!("hvc #1", clobber_abi("C"));
-            }) {
+            if !service.retain(index as u64, custody, super::production::yield_host_effect) {
                 return Err(MmError::Busy);
             }
         }
