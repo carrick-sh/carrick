@@ -3872,6 +3872,14 @@
       "fingerprint": "9e8626c33b7c47d779db3d34727f9d84c827089895d32d058e9285a8e449b3e6",
       "classification": "config_debug",
       "rationale": "Immutable process-wide operator policy, read once using the exact-zero lifecycle hatches. It stores only service-enable booleans; lifecycle pages, identities, gates, pending signals and control slots remain owned by each task arena. Equal-key live-kernel contracts verify that this policy cache does not merge process state."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/metadata_grant.rs",
+      "symbol": "delayed_owner::GATE",
+      "fingerprint": "67371d74ddd40139d7e53c78fcc20692f54007dd3b9269ca9952b8fcb87dfa3e",
+      "classification": "test_only",
+      "rationale": "Feature-only macOS/AArch64 metadata-grant-test-support rendezvous between signed fixture monitor and host service boundaries. The guest harness serializes fixture ownership; Probe drop releases and removes the gate. It changes only service timing, retains exact CarrierMetadataAccess/custody generation, re-authenticates at service time, and invokes the identical production completion function. It is absent from non-test product builds and owns no Linux guest identity or allocator authority."
     }
   ]
 }
