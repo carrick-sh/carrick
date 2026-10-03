@@ -996,34 +996,78 @@ impl MemState {
         }
         // Root-owned anonymous nodes are not host rows: the mirror replaces
         // only the opaque part of the range.
+        let root = delegated.root.clone();
         let covered: Vec<_> = Self::root_anonymous_pieces(&delegated.root, start, end)
             .iter()
             .map(|piece| (piece.range.start(), piece.range.end()))
             .collect();
         let segments = uncovered_segments(start, end, &covered);
         let mut rows = Vec::new();
+        let mut backing_leases = Vec::new();
         for &(segment_start, segment_end) in &segments {
             for vma in self.semantic_vmas.overlapping(segment_start, segment_end) {
-                rows.push((
-                    vma.start.max(segment_start),
-                    vma.end.min(segment_end),
-                    protection(vma.read, vma.write, vma.execute),
-                    opaque_flags(vma, self),
-                ));
+                let start = vma.start.max(segment_start);
+                let end = vma.end.min(segment_end);
+                let mut boundaries = vec![start, end];
+                for source in &self.private_file_maps {
+                    if source.start < end && source.end > start {
+                        boundaries.push(source.start.max(start));
+                        boundaries.push(source.end.min(end));
+                    }
+                }
+                boundaries.sort_unstable();
+                boundaries.dedup();
+                for span in boundaries.windows(2) {
+                    let backing = self
+                        .private_file_maps
+                        .iter()
+                        .find(|source| source.start <= span[0] && source.end >= span[1])
+                        .map(|source| {
+                            let lease = self
+                                .host_backing_custody
+                                .retain_source(source.backing.clone())
+                                .unwrap_or_else(|| {
+                                    broken_root(
+                                        "retained file source capacity",
+                                        Refusal::MetadataRequired,
+                                    )
+                                });
+                            let offset = source
+                                .offset
+                                .checked_add(span[0] - source.start)
+                                .unwrap_or_else(|| {
+                                    broken_root("retained file source offset", Refusal::Invalid)
+                                });
+                            let identity = lease.identity(offset);
+                            backing_leases.push(lease);
+                            identity
+                        });
+                    rows.push((
+                        span[0],
+                        span[1],
+                        protection(vma.read, vma.write, vma.execute),
+                        opaque_flags(vma, self),
+                        backing,
+                    ));
+                }
             }
         }
-        delegated
-            .root
-            .with_root(|model| {
-                for &(segment_start, segment_end) in &segments {
-                    model.retire_opaque(reservation_range(segment_start, segment_end)?)?;
-                }
-                for (row_start, row_end, prot, flags) in rows {
-                    model.insert_opaque(reservation_range(row_start, row_end)?, prot, flags)?;
-                }
-                Ok(())
-            })
-            .unwrap_or_else(|refusal| broken_root("a host row mirror", refusal));
+        root.with_root(|model| {
+            for &(segment_start, segment_end) in &segments {
+                model.retire_opaque(reservation_range(segment_start, segment_end)?)?;
+            }
+            for (row_start, row_end, prot, flags, backing) in rows {
+                model.insert_opaque_backed(
+                    reservation_range(row_start, row_end)?,
+                    prot,
+                    flags,
+                    backing,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap_or_else(|refusal| broken_root("a host row mirror", refusal));
+        self.host_backing_leases.extend(backing_leases);
     }
 
     /// Demote the root-owned anonymous nodes overlapping `[start, end)` into
