@@ -2752,6 +2752,17 @@
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::user_transfer",
       "rationale": "Executable copy completed but existing I2 publication failed; returning completion could expose incoherent executable bytes."
+    },
+    {
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::stage2_lifecycle",
+      "rationale": "Retiring unpublished owner-selected stage-2 capacity failed; logical arena reuse would leave physical translations reachable.",
+      "sink": "fatal",
+      "domain": "hvpatch::stage2_lifecycle",
+      "file": "crates/carrick-vmm-hvf/src/trap/owner_fork.rs",
+      "function": "<OwnerPhysicalForkBuilder as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "e59134c8fba8ed2c686adc06733d97054647349c97dd4cd46ceb9555f338657f"
     }
   ]
 }
