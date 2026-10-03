@@ -64,6 +64,33 @@ const COMPLETED: u64 = 4;
 const READING: u64 = 5;
 const COPY_REQUESTED: u64 = 6;
 const COPY_DONE: u64 = 7;
+const PREPARED: u64 = 8;
+const SUSPENDED: u64 = 9;
+
+/// PREPARE refused before any consuming effect. Aggregate callers cancel all
+/// earlier page permits before requesting metadata capacity or reselecting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortalPrepareSuspension {
+    SelectionChanged,
+    ReservationMetadata,
+}
+
+/// Owner-issued semantic admission. The operation generation and slot
+/// incarnation authenticate settlement independently of MM policy edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortalPreparedPermit {
+    pub index: u32,
+    pub generation: NonZeroU64,
+    pub operation: PortalOperation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortalTransferPhase {
+    Transfer,
+    Prepare,
+    Commit,
+    Cancel,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortalTransferIntent {
@@ -179,7 +206,8 @@ impl PortalTransferRequest {
             fork_sequence: None,
         })
     }
-    fn words(self) -> [u64; 17] {
+    #[doc(hidden)]
+    pub fn words(self) -> [u64; 17] {
         [
             MM_PORTAL_PROTOCOL,
             self.operation.carrier.get(),
@@ -200,7 +228,8 @@ impl PortalTransferRequest {
             self.fork_sequence.map_or(0, NonZeroU64::get),
         ]
     }
-    fn decode(w: [u64; 17]) -> Option<Self> {
+    #[doc(hidden)]
+    pub fn decode(w: [u64; 17]) -> Option<Self> {
         if w[0] != MM_PORTAL_PROTOCOL || w[15] > 1 {
             return None;
         }
@@ -251,7 +280,31 @@ pub struct PortalTransferSlot {
     request: [AtomicU64; 17],
     completed: AtomicU64,
     errno: AtomicU64,
+    phase: AtomicU64,
+    permit: [AtomicU64; 2],
+    copy_len: AtomicU64,
 }
+/// Appended prepared-transfer vocabulary and field offsets participate even
+/// when new words fit in the previous cache-line padding.
+pub const MM_TRANSFER_LAYOUT_HASH: u64 = {
+    let words = [
+        1u64,
+        PREPARED,
+        SUSPENDED,
+        core::mem::size_of::<PortalTransferSlot>() as u64,
+        core::mem::offset_of!(PortalTransferSlot, phase) as u64,
+        core::mem::offset_of!(PortalTransferSlot, permit) as u64,
+        core::mem::offset_of!(PortalTransferSlot, copy_len) as u64,
+    ];
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut i = 0;
+    while i < words.len() {
+        hash = (hash ^ words[i]).wrapping_mul(0x100000001b3);
+        i += 1;
+    }
+    hash
+};
+
 impl Default for PortalTransferSlot {
     fn default() -> Self {
         Self::new()
@@ -264,11 +317,55 @@ impl PortalTransferSlot {
             request: [const { AtomicU64::new(0) }; 17],
             completed: AtomicU64::new(0),
             errno: AtomicU64::new(0),
+            phase: AtomicU64::new(0),
+            permit: [const { AtomicU64::new(0) }; 2],
+            copy_len: AtomicU64::new(0),
         }
     }
     /// The producer must retain the exact physical storage pin independently
     /// until take_completion settles. Busy slots never demote to host access.
     pub fn submit(&self, request: PortalTransferRequest) -> Option<PortalTransferTicket<'_>> {
+        self.submit_phase(
+            request,
+            PortalTransferPhase::Transfer,
+            None,
+            request.range.len(),
+        )
+    }
+    pub fn submit_prepare(
+        &self,
+        request: PortalTransferRequest,
+    ) -> Option<PortalTransferTicket<'_>> {
+        self.submit_phase(request, PortalTransferPhase::Prepare, None, 0)
+    }
+    pub fn submit_commit(
+        &self,
+        request: PortalTransferRequest,
+        permit: PortalPreparedPermit,
+        copy_len: u64,
+    ) -> Option<PortalTransferTicket<'_>> {
+        if permit.operation != request.operation || copy_len > request.range.len() {
+            return None;
+        }
+        self.submit_phase(request, PortalTransferPhase::Commit, Some(permit), copy_len)
+    }
+    pub fn submit_cancel(
+        &self,
+        request: PortalTransferRequest,
+        permit: PortalPreparedPermit,
+    ) -> Option<PortalTransferTicket<'_>> {
+        if permit.operation != request.operation {
+            return None;
+        }
+        self.submit_phase(request, PortalTransferPhase::Cancel, Some(permit), 0)
+    }
+    fn submit_phase(
+        &self,
+        request: PortalTransferRequest,
+        phase: PortalTransferPhase,
+        permit: Option<PortalPreparedPermit>,
+        copy_len: u64,
+    ) -> Option<PortalTransferTicket<'_>> {
         self.state
             .compare_exchange(IDLE, WRITING, Ordering::Acquire, Ordering::Relaxed)
             .ok()?;
@@ -277,6 +374,18 @@ impl PortalTransferSlot {
         }
         self.completed.store(0, Ordering::Relaxed);
         self.errno.store(0, Ordering::Relaxed);
+        self.phase.store(
+            match phase {
+                PortalTransferPhase::Transfer => 0,
+                PortalTransferPhase::Prepare => 1,
+                PortalTransferPhase::Commit => 2,
+                PortalTransferPhase::Cancel => 3,
+            },
+            Ordering::Relaxed,
+        );
+        self.permit[0].store(permit.map_or(0, |p| u64::from(p.index)), Ordering::Relaxed);
+        self.permit[1].store(permit.map_or(0, |p| p.generation.get()), Ordering::Relaxed);
+        self.copy_len.store(copy_len, Ordering::Relaxed);
         self.state.store(REQUESTED, Ordering::Release);
         Some(PortalTransferTicket {
             slot: self,
@@ -299,9 +408,28 @@ impl PortalTransferSlot {
             .compare_exchange(REQUESTED, SERVICING, Ordering::Acquire, Ordering::Relaxed)
             .ok()?;
         let request = self.load_request()?;
+        let phase = match self.phase.load(Ordering::Relaxed) {
+            0 => PortalTransferPhase::Transfer,
+            1 => PortalTransferPhase::Prepare,
+            2 => PortalTransferPhase::Commit,
+            3 => PortalTransferPhase::Cancel,
+            _ => return None,
+        };
+        let permit = match phase {
+            PortalTransferPhase::Commit | PortalTransferPhase::Cancel => {
+                Some(PortalPreparedPermit {
+                    index: u32::try_from(self.permit[0].load(Ordering::Relaxed)).ok()?,
+                    generation: NonZeroU64::new(self.permit[1].load(Ordering::Relaxed))?,
+                    operation: request.operation,
+                })
+            }
+            _ => None,
+        };
         Some(PortalTransferService {
             slot: self,
             request,
+            phase,
+            permit,
         })
     }
 }
@@ -326,9 +454,31 @@ pub struct PortalTransferTicket<'a> {
     settled: bool,
 }
 impl PortalTransferTicket<'_> {
-    /// Service one bounded physical copy while EL1 retains its real editor
+    /// Detach the owner permit, freeing only wire storage. Physical custody
+    /// must remain live until a later exact COMMIT or CANCEL settles it.
+    pub fn take_prepared(&mut self) -> Option<PortalPreparedPermit> {
+        if self.settled
+            || self.slot.state.load(Ordering::Acquire) != PREPARED
+            || self.slot.load_request()? != self.request
+        {
+            return None;
+        }
+        let permit = PortalPreparedPermit {
+            index: u32::try_from(self.slot.permit[0].load(Ordering::Relaxed)).ok()?,
+            generation: NonZeroU64::new(self.slot.permit[1].load(Ordering::Relaxed))?,
+            operation: self.request.operation,
+        };
+        self.slot
+            .state
+            .compare_exchange(PREPARED, READING, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        self.settled = true;
+        self.slot.state.store(IDLE, Ordering::Release);
+        Some(permit)
+    }
+    /// Service one bounded physical copy while EL1 retains its semantic permit
     /// on the suspended stack. The callback must neither block nor re-enter
-    /// EL1. A refusal is resumed to release that exact guard before settlement.
+    /// EL1. A refusal resumes the exact service for permit settlement.
     pub fn copy_requested(
         &mut self,
         copy: impl for<'copy> FnOnce(PortalCopyRequest<'copy>) -> bool,
@@ -339,8 +489,16 @@ impl PortalTransferTicket<'_> {
         {
             return false;
         }
+        let mut request = self.request;
+        let Some(range) = PortalByteRange::new(
+            request.range.address(),
+            self.slot.copy_len.load(Ordering::Relaxed),
+        ) else {
+            return false;
+        };
+        request.range = range;
         let success = copy(PortalCopyRequest {
-            request: self.request,
+            request,
             _scope: core::marker::PhantomData,
         });
         self.slot
@@ -368,6 +526,28 @@ impl PortalTransferTicket<'_> {
         self.slot.state.store(IDLE, Ordering::Release);
         true
     }
+    /// Consume a pre-effect refusal and release this wire slot. Detached
+    /// permits prepared on earlier pages remain the caller's responsibility.
+    pub fn take_prepare_suspension(&mut self) -> Option<PortalPrepareSuspension> {
+        if self.settled
+            || self.slot.state.load(Ordering::Acquire) != SUSPENDED
+            || self.slot.load_request()? != self.request
+        {
+            return None;
+        }
+        let reason = match self.slot.errno.load(Ordering::Relaxed) {
+            1 => PortalPrepareSuspension::SelectionChanged,
+            2 => PortalPrepareSuspension::ReservationMetadata,
+            _ => return None,
+        };
+        self.slot
+            .state
+            .compare_exchange(SUSPENDED, READING, Ordering::Acquire, Ordering::Relaxed)
+            .ok()?;
+        self.settled = true;
+        self.slot.state.store(IDLE, Ordering::Release);
+        Some(reason)
+    }
     pub fn take_completion(&mut self) -> Option<PortalTransferCompletion> {
         if self.settled
             || self.slot.state.load(Ordering::Acquire) != COMPLETED
@@ -379,7 +559,7 @@ impl PortalTransferTicket<'_> {
         let errno = self.slot.errno.load(Ordering::Relaxed);
         if completed > self.request.range.len()
             || errno > 4095
-            || (errno == 0 && completed != self.request.range.len())
+            || (errno == 0 && completed != self.slot.copy_len.load(Ordering::Relaxed))
         {
             return None;
         }
@@ -402,8 +582,46 @@ impl PortalTransferTicket<'_> {
 pub struct PortalTransferService<'a> {
     slot: &'a PortalTransferSlot,
     request: PortalTransferRequest,
+    phase: PortalTransferPhase,
+    permit: Option<PortalPreparedPermit>,
 }
 impl PortalTransferService<'_> {
+    pub const fn phase(&self) -> PortalTransferPhase {
+        self.phase
+    }
+    pub const fn permit(&self) -> Option<PortalPreparedPermit> {
+        self.permit
+    }
+    pub fn copy_len(&self) -> u64 {
+        self.slot.copy_len.load(Ordering::Relaxed)
+    }
+    pub fn suspend_prepare(self, reason: PortalPrepareSuspension) -> bool {
+        if !matches!(
+            self.phase,
+            PortalTransferPhase::Prepare | PortalTransferPhase::Transfer
+        ) {
+            return false;
+        }
+        self.slot.errno.store(
+            match reason {
+                PortalPrepareSuspension::SelectionChanged => 1,
+                PortalPrepareSuspension::ReservationMetadata => 2,
+            },
+            Ordering::Relaxed,
+        );
+        self.slot.state.store(SUSPENDED, Ordering::Release);
+        true
+    }
+    pub fn complete_prepared(self, permit: PortalPreparedPermit) -> bool {
+        if self.phase != PortalTransferPhase::Prepare || permit.operation != self.request.operation
+        {
+            return false;
+        }
+        self.slot.permit[0].store(u64::from(permit.index), Ordering::Relaxed);
+        self.slot.permit[1].store(permit.generation.get(), Ordering::Relaxed);
+        self.slot.state.store(PREPARED, Ordering::Release);
+        true
+    }
     pub const fn request(&self) -> PortalTransferRequest {
         self.request
     }
@@ -421,7 +639,7 @@ impl PortalTransferService<'_> {
     pub fn complete(self, completed: u64, errno: u32) -> bool {
         if completed > self.request.range.len()
             || errno > 4095
-            || (errno == 0 && completed != self.request.range.len())
+            || (errno == 0 && completed != self.copy_len())
         {
             return false;
         }
@@ -501,7 +719,7 @@ const _: () = assert!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn request(sequence: u64) -> PortalTransferRequest {
+    pub(super) fn request(sequence: u64) -> PortalTransferRequest {
         PortalTransferRequest::new(
             PortalOperation {
                 carrier: NonZeroU64::new(1).unwrap(),
@@ -576,5 +794,46 @@ mod tests {
         assert!(slot.submit(request(2)).is_none());
         assert!(slot.claim().unwrap().complete(4, 0));
         assert!(slot.submit(request(2)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod prepared_tests {
+    use super::*;
+    #[test]
+    fn detached_page_receipts_reuse_wire_slot_and_preserve_exact_settlement() {
+        let slot = PortalTransferSlot::new();
+        let request = super::tests::request(1);
+        let first = PortalPreparedPermit {
+            index: 11,
+            generation: NonZeroU64::new(21).unwrap(),
+            operation: request.operation,
+        };
+        let second = PortalPreparedPermit {
+            index: 12,
+            generation: NonZeroU64::new(22).unwrap(),
+            operation: request.operation,
+        };
+        for permit in [first, second] {
+            let mut ticket = slot.submit_prepare(request).unwrap();
+            let service = slot.claim().unwrap();
+            assert_eq!(service.phase(), PortalTransferPhase::Prepare);
+            assert!(service.complete_prepared(permit));
+            assert_eq!(ticket.take_prepared(), Some(permit));
+        }
+        let mut cancel = slot.submit_cancel(request, second).unwrap();
+        let service = slot.claim().unwrap();
+        assert_eq!(service.permit(), Some(second));
+        assert!(service.complete(0, 0));
+        assert_eq!(cancel.take_completion().unwrap().completed, 0);
+        let mut commit = slot.submit_commit(request, first, 2).unwrap();
+        let service = slot.claim().unwrap();
+        assert!(
+            service.copy_with(|| assert!(
+                commit.copy_requested(|copy| copy.request().range.len() == 2)
+            ))
+        );
+        assert!(service.complete(2, 0));
+        assert_eq!(commit.take_completion().unwrap().completed, 2);
     }
 }

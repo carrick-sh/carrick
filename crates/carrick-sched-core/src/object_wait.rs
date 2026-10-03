@@ -16,7 +16,33 @@ use super::*;
 
 /// Admission capacity, independent of the number of execution slots. Queue
 /// storage is provisioned once with the zone; transfers allocate no entries.
-pub const OBJECT_WAIT_QUEUES: usize = ZONE_RECORDS + 1;
+/// IPC retains the original queue domain. Carrier metadata uses the next
+/// queue; MM permit waits use the following disjoint domain. Round the total
+/// for the queue census bitmap.
+pub const ADDRESS_SPACE_WAIT_BASE: usize = ZONE_RECORDS;
+pub const OBJECT_WAIT_QUEUES: usize =
+    (ADDRESS_SPACE_WAIT_BASE + 1 + spaces::ADDRESS_SPACES).div_ceil(64) * 64;
+
+pub const OBJECT_WAIT_PROTOCOL: u64 = 2;
+pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
+    let words = [
+        OBJECT_WAIT_PROTOCOL,
+        OBJECT_WAIT_QUEUES as u64,
+        core::mem::size_of::<ObjectQueue>() as u64,
+        core::mem::offset_of!(ObjectQueue, generation) as u64,
+        core::mem::offset_of!(ObjectQueue, epoch) as u64,
+        core::mem::offset_of!(ObjectQueue, completion_mode) as u64,
+        core::mem::offset_of!(ObjectQueue, publishers) as u64,
+        core::mem::size_of::<crate::completion_queue::CompletionQueue>() as u64,
+    ];
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut i = 0;
+    while i < words.len() {
+        hash = (hash ^ words[i]).wrapping_mul(0x100000001b3);
+        i += 1;
+    }
+    hash
+};
 
 /// Direct queue index plus the exact object incarnation. Different readiness
 /// classes of one object have different indices, assigned by its authority.
@@ -29,7 +55,7 @@ pub struct ObjectWaitKey {
 
 impl ObjectWaitKey {
     pub const fn new(index: u32, generation: u64) -> Option<Self> {
-        if index == 0 || index as usize >= ZONE_RECORDS || generation == 0 {
+        if index == 0 || index as usize >= OBJECT_WAIT_QUEUES || generation == 0 {
             None
         } else {
             Some(Self { index, generation })
@@ -53,6 +79,16 @@ impl ObjectWaitKey {
             Self::metadata_request(generation)
         } else {
             Self::new(index, generation)
+        }
+    }
+
+    /// Exact admitted MM incarnation, independent of its mutable policy
+    /// generation. No IPC readiness lane can name this index domain.
+    pub const fn address_space(index: usize, incarnation: u64) -> Option<Self> {
+        if index >= spaces::ADDRESS_SPACES {
+            None
+        } else {
+            Self::new((ADDRESS_SPACE_WAIT_BASE + 1 + index) as u32, incarnation)
         }
     }
 
@@ -153,6 +189,150 @@ pub struct HostObjectWakeReport {
     pub handed: u32,
 }
 
+/// Linear effect custody passed from a queue holder after unlocking. The
+/// delivery venue owns SGIs and any required host handback.
+#[must_use = "queue completion effects must be delivered after unlock"]
+pub struct OwnedObjectWakeEffects<'a> {
+    zone: &'a ZoneTables,
+    key: ObjectWaitKey,
+    waker: SlotId,
+    effects: WakeEffects,
+    handed: u32,
+}
+impl OwnedObjectWakeEffects<'_> {
+    pub(crate) fn missing_venue(self) {
+        assert_eq!(
+            self.zone.object_waits[self.key.index as usize]
+                .completion_mode
+                .load(Ordering::Acquire),
+            0,
+            "completion-enabled queue requires an effect delivery venue"
+        );
+    }
+
+    pub fn into_parts(mut self) -> (SlotId, WakeEffects) {
+        assert_eq!(self.handed, 0, "owned handbacks require delivery");
+        (self.waker, core::mem::take(&mut self.effects))
+    }
+    /// Host venue consumes exact detached claims after queue unlock.
+    pub fn deliver_handbacks(
+        mut self,
+        handed: &mut impl FnMut(RecordRef),
+    ) -> (SlotId, WakeEffects) {
+        let zone = self.zone;
+        while let Some(id) = RecordId::from_raw(self.handed) {
+            let rec = zone.record(id);
+            self.handed = rec.object.next.load(Ordering::Relaxed);
+            let transfer = zone.completion_transfer(id);
+            if let Some(record) = transfer.publish() {
+                handed(record);
+            }
+        }
+        (self.waker, core::mem::take(&mut self.effects))
+    }
+    /// Guest venue moves detached claims to the existing carrier handback
+    /// boundary. The caller must force that boundary after publication.
+    pub fn defer_handbacks(mut self) -> (SlotId, WakeEffects, bool) {
+        let zone = self.zone;
+        let deferred = self.handed != 0;
+        if deferred {
+            let mut tail = self.handed;
+            loop {
+                let next = zone
+                    .record(RecordId(tail))
+                    .object
+                    .next
+                    .load(Ordering::Relaxed);
+                if next == 0 {
+                    break;
+                }
+                tail = next;
+            }
+            zone.completion_handbacks
+                .push(self.handed, tail, |previous, next| {
+                    zone.record(RecordId(previous))
+                        .object
+                        .next
+                        .store(next, Ordering::Release)
+                });
+            self.handed = 0;
+        }
+        (self.waker, core::mem::take(&mut self.effects), deferred)
+    }
+}
+impl Drop for OwnedObjectWakeEffects<'_> {
+    fn drop(&mut self) {
+        assert!(
+            self.handed == 0 && self.effects == WakeEffects::default(),
+            "owned queue completion effects were not delivered"
+        );
+    }
+}
+
+/// Linear notification custody; no source may be consumed before admission.
+#[must_use = "notification admission must be published, detached, or cancelled"]
+pub struct ObjectNotificationTicket<'a> {
+    zone: &'a ZoneTables,
+    key: ObjectWaitKey,
+    retained: bool,
+}
+impl ObjectNotificationTicket<'_> {
+    pub fn key(&self) -> ObjectWaitKey {
+        self.key
+    }
+    /// Move custody into an authority's exact-generation durable record.
+    pub fn detach(mut self) -> ObjectWaitKey {
+        self.retained = false;
+        self.key
+    }
+    /// Never waits or retries. A current holder or this publisher owns delivery.
+    pub fn publish(mut self, waker: SlotId, completion: &dyn Fn(OwnedObjectWakeEffects)) {
+        let key = self.key;
+        self.retained = false;
+        let queue = &self.zone.object_waits[key.index as usize];
+        assert_eq!(
+            queue.generation.load(Ordering::Acquire),
+            key.generation,
+            "admitted notification incarnation"
+        );
+        let previous_epoch = queue.epoch.fetch_add(1, Ordering::SeqCst);
+        assert!(previous_epoch != u64::MAX, "notification epoch exhaustion");
+        queue
+            .notification_waker
+            .store(u32::from(waker.raw()), Ordering::Release);
+        let state = queue.lock.fetch_or(NOTIFY_PENDING, Ordering::SeqCst);
+        if state == 0
+            && queue
+                .lock
+                .compare_exchange(
+                    NOTIFY_PENDING,
+                    OWNED_LOCK | NOTIFY_PENDING,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+        {
+            drop(ObjectWaitGuard {
+                zone: self.zone,
+                key,
+                completion: Some(completion),
+            });
+        }
+        queue.publishers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+impl Drop for ObjectNotificationTicket<'_> {
+    fn drop(&mut self) {
+        if self.retained {
+            self.zone.object_waits[self.key.index as usize]
+                .publishers
+                .fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+const OWNED_LOCK: u32 = 2;
+const NOTIFY_PENDING: u32 = 4;
+
 #[repr(C)]
 pub(super) struct ObjectQueue {
     lock: AtomicU32,
@@ -160,6 +340,10 @@ pub(super) struct ObjectQueue {
     tail: AtomicU32,
     generation: AtomicU64,
     epoch: AtomicU64,
+    /// Appended mode: completion-enabled queues require a delivery hook.
+    completion_mode: AtomicU32,
+    notification_waker: AtomicU32,
+    publishers: AtomicU64,
 }
 
 #[repr(C)]
@@ -181,15 +365,75 @@ pub(super) struct ObjectRecord {
 pub struct ObjectWaitGuard<'a> {
     zone: &'a ZoneTables,
     key: ObjectWaitKey,
+    completion: Option<&'a dyn Fn(OwnedObjectWakeEffects)>,
 }
 
 impl Drop for ObjectWaitGuard<'_> {
     fn drop(&mut self) {
-        self.queue().lock.store(0, Ordering::Release);
+        let queue = self.queue();
+        let Some(completion) = self.completion else {
+            queue.lock.store(0, Ordering::Release);
+            return;
+        };
+        // Atomic unlock either wins before publication (the publisher takes
+        // the unlocked pending queue), or observes the publisher's bit and
+        // owns its notification. No retry, spin, bitmap scan, or parked worker.
+        if queue
+            .lock
+            .compare_exchange(OWNED_LOCK, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return;
+        }
+        let waker = SlotId::new(queue.notification_waker.load(Ordering::Acquire) as u8);
+        let mut effects = WakeEffects::default();
+        let handed = self.drain_completion(waker, &mut effects);
+        // Publishers coalesce while this holder drains. No new enrollment can
+        // occur under this lock; every publication still advances the epoch.
+        queue.lock.store(0, Ordering::SeqCst);
+        completion(OwnedObjectWakeEffects {
+            zone: self.zone,
+            key: self.key,
+            waker,
+            effects,
+            handed,
+        });
     }
 }
 
 impl ObjectWaitGuard<'_> {
+    fn drain_completion(&self, waker: SlotId, effects: &mut WakeEffects) -> u32 {
+        let mut handed = 0;
+        let mut cursor = self.queue().head.load(Ordering::Relaxed);
+        while let Some(record) = RecordId::from_raw(cursor) {
+            let rec = self.zone.record(record);
+            cursor = rec.object.next.load(Ordering::Relaxed);
+            let from @ Claim::Parked { seq } = rec.claim() else {
+                continue;
+            };
+            if self.zone.claim_for_el1_with_wait(
+                (record, seq, 0),
+                waker,
+                effects,
+                || self.unlink(record),
+                true,
+            ) {
+                continue;
+            }
+            if let Some(transfer) = self
+                .zone
+                .begin_host_transfer(self.zone.record_ref(record), from)
+            {
+                self.unlink(record);
+                self.zone.mark_woken(rec, 0);
+                rec.object.next.store(handed, Ordering::Relaxed);
+                handed = record.raw();
+                // The intrusive receipt exclusively owns this transfer.
+                let _ = transfer;
+            }
+        }
+        handed
+    }
     fn queue(&self) -> &ObjectQueue {
         &self.zone.object_waits[self.key.index as usize]
     }
@@ -215,9 +459,12 @@ impl ObjectWaitGuard<'_> {
         handed: &mut impl FnMut(RecordRef),
         placed: &mut impl FnMut(HostPlacement),
     ) -> Result<HostObjectWakeReport, ObjectWaitError> {
-        let epoch = self.queue().epoch.load(Ordering::Relaxed);
-        let next_epoch = epoch.checked_add(1).ok_or(ObjectWaitError::Exhausted)?;
-        self.queue().epoch.store(next_epoch, Ordering::Relaxed);
+        self.queue()
+            .epoch
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+                epoch.checked_add(1)
+            })
+            .map_err(|_| ObjectWaitError::Exhausted)?;
         let mut report = HostObjectWakeReport::default();
         let mut cursor = self.queue().head.load(Ordering::Relaxed);
         while let Some(record) = RecordId::from_raw(cursor) {
@@ -283,6 +530,9 @@ impl ObjectWaitGuard<'_> {
         operation: OperationToken,
         deadline: u64,
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
+        if deadline != 0 && self.completion.is_some() {
+            return Err((ObjectWaitError::Occupied, operation));
+        }
         if snapshot.key != self.key {
             return Err((ObjectWaitError::Stale, operation));
         }
@@ -360,9 +610,12 @@ impl ObjectWaitGuard<'_> {
         waker: SlotId,
         effects: &mut WakeEffects,
     ) -> Result<ObjectWakeReport, ObjectWaitError> {
-        let epoch = self.queue().epoch.load(Ordering::Relaxed);
-        let next_epoch = epoch.checked_add(1).ok_or(ObjectWaitError::Exhausted)?;
-        self.queue().epoch.store(next_epoch, Ordering::Relaxed);
+        self.queue()
+            .epoch
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |epoch| {
+                epoch.checked_add(1)
+            })
+            .map_err(|_| ObjectWaitError::Exhausted)?;
         let mut report = ObjectWakeReport::default();
         let mut cursor = self.queue().head.load(Ordering::Relaxed);
         while let Some(record) = RecordId::from_raw(cursor) {
@@ -455,6 +708,60 @@ impl ZoneRecord {
 }
 
 impl ZoneTables {
+    fn completion_transfer(&self, id: RecordId) -> HostTransfer<'_> {
+        let claim = self.record(id).claim();
+        assert!(
+            matches!(claim, Claim::Transferring { .. }),
+            "completion chain exact transfer custody"
+        );
+        let seq = claim.seq();
+        HostTransfer {
+            zone: self,
+            record: self.record_ref(id),
+            seq,
+        }
+    }
+    /// Called at a notified host boundary, never as a periodic poll.
+    pub fn take_completion_handbacks(
+        &self,
+        wait: &impl LockWait,
+        handed: &mut impl FnMut(RecordRef),
+    ) {
+        // Host boundary only. Producers never acquire this consumer lock.
+        let mut attempt = 0;
+        while self
+            .completion_consumer
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            assert!(
+                wait.wait(attempt),
+                "completion consumer must retain delivery custody"
+            );
+            attempt = attempt.saturating_add(1);
+        }
+        while let Some(id) = unsafe {
+            self.completion_handbacks.pop(
+                |id| {
+                    self.record(RecordId(id))
+                        .object
+                        .next
+                        .load(Ordering::Acquire)
+                },
+                |id, next| {
+                    self.record(RecordId(id))
+                        .object
+                        .next
+                        .store(next, Ordering::Release)
+                },
+            )
+        } {
+            if let Some(record) = self.completion_transfer(RecordId(id)).publish() {
+                handed(record);
+            }
+        }
+        self.completion_consumer.store(0, Ordering::Release);
+    }
     fn lock_object_index(
         &self,
         key: ObjectWaitKey,
@@ -468,7 +775,11 @@ impl ZoneTables {
                 .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                return Some(ObjectWaitGuard { zone: self, key });
+                return Some(ObjectWaitGuard {
+                    zone: self,
+                    key,
+                    completion: None,
+                });
             }
             if !wait.wait(attempt) {
                 return None;
@@ -485,6 +796,13 @@ impl ZoneTables {
         key: ObjectWaitKey,
         wait: &impl LockWait,
     ) -> Result<(), ObjectWaitError> {
+        if self.object_waits[key.index as usize]
+            .completion_mode
+            .load(Ordering::Acquire)
+            != 0
+        {
+            return Err(ObjectWaitError::Occupied);
+        }
         let guard = self
             .lock_object_index(key, wait)
             .ok_or(ObjectWaitError::Busy)?;
@@ -500,6 +818,125 @@ impl ZoneTables {
         Ok(())
     }
 
+    /// Generic admission. Rebinding cannot pass an admitted publisher or a
+    /// holder responsible for its deferred effects.
+    pub fn bind_object_wait_with_completion(
+        &self,
+        key: ObjectWaitKey,
+        wait: &impl LockWait,
+        completion: &dyn Fn(OwnedObjectWakeEffects),
+    ) -> Result<(), ObjectWaitError> {
+        let guard = self.lock_completion_index(key, wait, completion)?;
+        let queue = guard.queue();
+        if queue.generation.load(Ordering::Acquire) >= key.generation {
+            return Err(ObjectWaitError::Stale);
+        }
+        if queue.head.load(Ordering::Relaxed) != NIL
+            || queue.publishers.load(Ordering::Acquire) != 0
+        {
+            return Err(ObjectWaitError::Occupied);
+        }
+        queue.completion_mode.store(1, Ordering::Release);
+        queue.generation.store(key.generation, Ordering::Release);
+        queue.epoch.store(1, Ordering::SeqCst);
+        Ok(())
+    }
+    fn lock_completion_index<'a>(
+        &'a self,
+        key: ObjectWaitKey,
+        wait: &impl LockWait,
+        completion: &'a dyn Fn(OwnedObjectWakeEffects),
+    ) -> Result<ObjectWaitGuard<'a>, ObjectWaitError> {
+        let queue = &self.object_waits[key.index as usize];
+        let mut attempt = 0;
+        loop {
+            let state = queue.lock.load(Ordering::SeqCst);
+            if (state == 0 || state == NOTIFY_PENDING)
+                && queue
+                    .lock
+                    .compare_exchange(
+                        state,
+                        OWNED_LOCK | state,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    )
+                    .is_ok()
+            {
+                // A pending notification always names the current incarnation.
+                let actual = queue.generation.load(Ordering::Acquire);
+                let guard = ObjectWaitGuard {
+                    zone: self,
+                    key: ObjectWaitKey {
+                        index: key.index,
+                        generation: actual,
+                    },
+                    completion: Some(completion),
+                };
+                return Ok(guard);
+            }
+            if !wait.wait(attempt) {
+                return Err(ObjectWaitError::Busy);
+            }
+            attempt = attempt.saturating_add(1);
+        }
+    }
+    pub fn completion_enabled(&self, key: ObjectWaitKey) -> bool {
+        self.object_waits[key.index as usize]
+            .completion_mode
+            .load(Ordering::Acquire)
+            != 0
+    }
+    pub fn object_wait_with_completion<'a>(
+        &'a self,
+        key: ObjectWaitKey,
+        wait: &impl LockWait,
+        completion: &'a dyn Fn(OwnedObjectWakeEffects),
+    ) -> Result<ObjectWaitGuard<'a>, ObjectWaitError> {
+        let guard = self.lock_completion_index(key, wait, completion)?;
+        if guard.queue().completion_mode.load(Ordering::Acquire) == 0
+            || guard.key.generation != key.generation
+        {
+            return Err(ObjectWaitError::Stale);
+        }
+        Ok(guard)
+    }
+    /// Reserve before a consuming operation becomes ready. The ticket pins
+    /// this exact queue incarnation until cancellation or publication.
+    pub fn admit_object_notification<'a>(
+        &'a self,
+        key: ObjectWaitKey,
+        wait: &impl LockWait,
+        completion: &dyn Fn(OwnedObjectWakeEffects),
+    ) -> Result<ObjectNotificationTicket<'a>, ObjectWaitError> {
+        if !self.completion_handbacks.initialize() {
+            return Err(ObjectWaitError::Busy);
+        }
+        let guard = self.object_wait_with_completion(key, wait, completion)?;
+        guard
+            .queue()
+            .publishers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_add(1))
+            .map_err(|_| ObjectWaitError::Exhausted)?;
+        Ok(ObjectNotificationTicket {
+            zone: self,
+            key,
+            retained: true,
+        })
+    }
+    /// Reconstitute custody moved into an owner-owned, exact-generation record.
+    ///
+    /// # Safety
+    /// The caller exclusively owns one detached admission for this key.
+    pub unsafe fn retained_object_notification(
+        &self,
+        key: ObjectWaitKey,
+    ) -> ObjectNotificationTicket<'_> {
+        ObjectNotificationTicket {
+            zone: self,
+            key,
+            retained: true,
+        }
+    }
     /// Lock-free census of queue `index` (never takes its lock).
     pub fn object_queue_census(&self, index: u32) -> Option<ObjectQueueCensus> {
         let queue = self.object_waits.get(index as usize)?;
@@ -528,9 +965,15 @@ impl ZoneTables {
         key: ObjectWaitKey,
         wait: &impl LockWait,
     ) -> Result<ObjectWaitGuard<'_>, ObjectWaitError> {
+        if self.completion_enabled(key) {
+            return Err(ObjectWaitError::Occupied);
+        }
         let guard = self
             .lock_object_index(key, wait)
             .ok_or(ObjectWaitError::Busy)?;
+        if guard.queue().completion_mode.load(Ordering::Acquire) != 0 {
+            return Err(ObjectWaitError::Occupied);
+        }
         if guard.queue().generation.load(Ordering::Relaxed) != key.generation {
             return Err(ObjectWaitError::Stale);
         }
@@ -591,7 +1034,14 @@ impl ZoneTables {
             ) else {
                 return;
             };
-            let Ok(guard) = self.object_wait(key, wait) else {
+            let completion =
+                |effects: OwnedObjectWakeEffects<'_>| wait.complete_object_wake(self, effects);
+            let result = if self.completion_enabled(key) {
+                self.object_wait_with_completion(key, wait, &completion)
+            } else {
+                self.object_wait(key, wait)
+            };
+            let Ok(guard) = result else {
                 continue;
             };
             if rec.object.queue.load(Ordering::Acquire) == index {
@@ -758,6 +1208,266 @@ mod host_tests {
             .notify_object_host(&mut |r| handed.push(r.id), &mut |_| {})
             .unwrap();
         (report, handed)
+    }
+
+    #[test]
+    fn completion_held_queue_publication_advances_epoch_and_holder_delivers() {
+        use std::cell::Cell;
+        let zone = fixture(true);
+        let key = ObjectWaitKey::new(3, 11).unwrap();
+        let delivered = Cell::new(0);
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            assert!(!zone.object_queue_census(key.index()).unwrap().locked);
+            let (_, effects) =
+                owned.deliver_handbacks(&mut |_| panic!("available slot should queue"));
+            assert!(effects.queued_own);
+            delivered.set(delivered.get() + 1);
+        };
+        zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &completion)
+            .unwrap();
+        assert!(matches!(
+            zone.object_wait(key, &BoundedSpin(0)),
+            Err(ObjectWaitError::Occupied)
+        ));
+        let ticket = zone
+            .admit_object_notification(key, &BoundedSpin(0), &completion)
+            .unwrap();
+        let record = allocate(&zone, 401);
+        let guard = zone
+            .object_wait_with_completion(key, &BoundedSpin(0), &completion)
+            .unwrap();
+        let snapshot = guard.snapshot();
+        guard
+            .park(snapshot, record, OperationToken::new(401, 11).unwrap())
+            .unwrap();
+        ticket.publish(SLOT, &completion);
+        assert_eq!(
+            delivered.get(),
+            0,
+            "publication must return while queue remains held"
+        );
+        assert!(zone.object_queue_census(key.index()).unwrap().epoch > snapshot.epoch);
+        let other = allocate(&zone, 402);
+        assert!(matches!(
+            guard.park(snapshot, other, OperationToken::new(402, 11).unwrap()),
+            Err((ObjectWaitError::Changed, _))
+        ));
+        drop(guard);
+        assert_eq!(delivered.get(), 1);
+        assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
+        assert!(matches!(zone.record(record).claim(), Claim::Queued { .. }));
+        zone.free_record(other);
+    }
+
+    #[test]
+    fn completion_admission_blocks_rebind_and_rejects_stale_incarnation() {
+        let zone = fixture(false);
+        let old = ObjectWaitKey::new(3, 11).unwrap();
+        let new = ObjectWaitKey::new(3, 12).unwrap();
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.into_parts();
+        };
+        zone.bind_object_wait_with_completion(old, &BoundedSpin(0), &completion)
+            .unwrap();
+        let ticket = zone
+            .admit_object_notification(old, &BoundedSpin(0), &completion)
+            .unwrap();
+        assert_eq!(
+            zone.bind_object_wait_with_completion(new, &BoundedSpin(0), &completion),
+            Err(ObjectWaitError::Occupied)
+        );
+        let guard = zone
+            .object_wait_with_completion(old, &BoundedSpin(0), &completion)
+            .unwrap();
+        ticket.publish(SLOT, &completion);
+        assert_eq!(
+            zone.bind_object_wait_with_completion(new, &BoundedSpin(0), &completion),
+            Err(ObjectWaitError::Busy)
+        );
+        drop(guard);
+        zone.bind_object_wait_with_completion(new, &BoundedSpin(0), &completion)
+            .unwrap();
+        assert!(matches!(
+            zone.admit_object_notification(old, &BoundedSpin(0), &completion),
+            Err(ObjectWaitError::Stale)
+        ));
+        assert_eq!(
+            zone.object_queue_census(new.index()).unwrap().generation,
+            12
+        );
+    }
+
+    #[test]
+    fn completion_held_slot_transfers_exact_saved_operation_to_host_boundary() {
+        for held in [false, true] {
+            let zone = fixture(true);
+            let key = ObjectWaitKey::new(3, 11).unwrap();
+            let completion = |owned: OwnedObjectWakeEffects<'_>| {
+                let (_, _, deferred) = owned.defer_handbacks();
+                assert!(deferred);
+            };
+            zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &completion)
+                .unwrap();
+            let ticket = zone
+                .admit_object_notification(key, &BoundedSpin(0), &completion)
+                .unwrap();
+            let record = allocate(&zone, 403);
+            // SAFETY: unpublished fixture record is exclusively owned here.
+            unsafe {
+                let context = zone.record(record).ctx_mut();
+                context.pc = 0x1000;
+                context.x[8] = 215;
+                context.x[0] = 0x4000;
+            }
+            {
+                let guard = zone
+                    .object_wait_with_completion(key, &BoundedSpin(0), &completion)
+                    .unwrap();
+                guard
+                    .park(
+                        guard.snapshot(),
+                        record,
+                        OperationToken::new(403, 11).unwrap(),
+                    )
+                    .unwrap();
+            }
+            let slot = if held {
+                Some(zone.slot_lock(SLOT, &BoundedSpin(0)).unwrap())
+            } else {
+                zone.leave_guest(SLOT, &SpinForever);
+                zone.drive(SLOT, 999); // Original waker executor was detached/replaced.
+                None
+            };
+            ticket.publish(SLOT, &completion);
+            assert!(matches!(
+                zone.record(record).claim(),
+                Claim::Transferring { .. }
+            ));
+            assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
+            drop(slot);
+            let mut delivered = Vec::new();
+            zone.take_completion_handbacks(&SpinForever, &mut |r| delivered.push(r));
+            assert_eq!(delivered, [zone.record_ref(record)]);
+            assert!(matches!(zone.record(record).claim(), Claim::Host { .. }));
+            assert_eq!(zone.record(record).handback(), Some(Handback::Resumed));
+            // SAFETY: boundary now owns this exact Host record and operation.
+            let rec = zone.record(record);
+            assert_eq!(unsafe { rec.ctx_mut() }.pc, 0x1000);
+            assert_eq!(unsafe { rec.take_object_operation() }.unwrap().index(), 403);
+        }
+    }
+
+    #[test]
+    fn completion_internal_cancel_unlink_delivers_pending_wake_after_unlock() {
+        use std::cell::Cell;
+        let zone = fixture(true);
+        let key = ObjectWaitKey::new(3, 11).unwrap();
+        let delivered = Cell::new(false);
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            assert!(!zone.object_queue_census(key.index()).unwrap().locked);
+            let _ = owned.deliver_handbacks(&mut |_| {});
+            delivered.set(true);
+        };
+        struct Venue<'a>(&'a dyn Fn(OwnedObjectWakeEffects));
+        impl LockWait for Venue<'_> {
+            fn wait(&self, _: u32) -> bool {
+                false
+            }
+            fn complete_object_wake(&self, _: &ZoneTables, effects: OwnedObjectWakeEffects) {
+                (self.0)(effects);
+            }
+        }
+        zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &completion)
+            .unwrap();
+        let ticket = zone
+            .admit_object_notification(key, &BoundedSpin(0), &completion)
+            .unwrap();
+        let cancelled = allocate(&zone, 404);
+        let other = allocate(&zone, 405);
+        let guard = zone
+            .object_wait_with_completion(key, &BoundedSpin(0), &completion)
+            .unwrap();
+        guard
+            .park(
+                guard.snapshot(),
+                cancelled,
+                OperationToken::new(404, 11).unwrap(),
+            )
+            .unwrap();
+        guard
+            .park(
+                guard.snapshot(),
+                other,
+                OperationToken::new(405, 11).unwrap(),
+            )
+            .unwrap();
+        let transfer = zone
+            .begin_host_transfer(zone.record_ref(cancelled), zone.record(cancelled).claim())
+            .unwrap();
+        assert_eq!(
+            zone.claim_for_host(
+                zone.record_ref(cancelled),
+                None,
+                Handback::Cancelled,
+                &Venue(&completion)
+            ),
+            HostClaim::Deferred
+        );
+        ticket.publish(SLOT, &completion);
+        // Leave the already pending queue unlocked for internal cleanup; the
+        // exact host transfer, not a queue observer, must supply delivery.
+        core::mem::forget(guard);
+        zone.object_waits[key.index as usize]
+            .lock
+            .store(NOTIFY_PENDING, Ordering::Release);
+        let ready = transfer.finish(&Venue(&completion)).unwrap();
+        assert_eq!(ready, zone.record_ref(cancelled));
+        assert_eq!(zone.record(cancelled).handback(), Some(Handback::Cancelled));
+        assert!(delivered.get());
+        assert!(matches!(zone.record(other).claim(), Claim::Queued { .. }));
+        assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
+    }
+
+    #[test]
+    fn completion_publication_unlock_races_always_deliver() {
+        use std::sync::atomic::AtomicUsize;
+        let zone = fixture(true);
+        let key = ObjectWaitKey::new(3, 11).unwrap();
+        let deliveries = AtomicUsize::new(0);
+        let completion = |owned: OwnedObjectWakeEffects<'_>| {
+            let _ = owned.deliver_handbacks(&mut |_| {});
+            deliveries.fetch_add(1, Ordering::SeqCst);
+        };
+        zone.bind_object_wait_with_completion(key, &SpinForever, &completion)
+            .unwrap();
+        for tid in 500..564 {
+            let ticket = zone
+                .admit_object_notification(key, &SpinForever, &completion)
+                .unwrap();
+            let record = allocate(&zone, tid);
+            let guard = zone
+                .object_wait_with_completion(key, &SpinForever, &completion)
+                .unwrap();
+            guard
+                .park(
+                    guard.snapshot(),
+                    record,
+                    OperationToken::new(tid, 11).unwrap(),
+                )
+                .unwrap();
+            let barrier = Barrier::new(2);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    ticket.publish(SLOT, &completion);
+                });
+                barrier.wait();
+                drop(guard);
+            });
+            assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
+            assert!(matches!(zone.record(record).claim(), Claim::Queued { .. }));
+        }
+        assert_eq!(deliveries.load(Ordering::SeqCst), 64);
     }
 
     #[test]
