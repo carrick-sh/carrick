@@ -184,6 +184,10 @@ pub(crate) fn drive(
     syscall: &Syscall,
     args: [u64; 6],
     shared: &Arc<Shared>,
+    mut continuation_gate: Option<(
+        &crate::operand::ScriptCheckpoint,
+        &crate::operand::ScriptCheckpoint,
+    )>,
 ) -> Result<InternalCompletion, ExampleError> {
     let deadline = Instant::now() + WAIT_BOUND;
     loop {
@@ -382,6 +386,15 @@ pub(crate) fn drive(
                     .map_err(|e| {
                         ExampleError::Unsupported(format!("continuation capture failed: {e}"))
                     })?;
+
+                    if let Some((admitted, resume)) = continuation_gate.take() {
+                        admitted.signal();
+                        if !resume.wait() {
+                            return Err(ExampleError::WaitTimedOut(
+                                "continuation construction gate",
+                            ));
+                        }
+                    }
 
                     let mut continuation =
                         BlockedContinuation::from_dispatch_outcome(blocking_outcome, capture)
