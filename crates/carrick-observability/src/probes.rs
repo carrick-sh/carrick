@@ -5261,6 +5261,11 @@ mod real {
         /// detail is the PortalWaitCause or refused errno for classes 3/6,
         /// zero otherwise. Never reports guest bytes.
         fn hvpatch__el1__host__read__progress(_: u64, _: u64, _: u64, _: u32, _: u64) {}
+        /// Owner host-copyout preparation. Args: first VA, total bytes,
+        /// phase (0 begin, 1 supply, 2 supply result, 3 prepared, 4 owner
+        /// wait, 5 physical wait, 6 fault, 7 limit), detail (supply kind or
+        /// result, wait cause, fault class). No guest bytes or pointer grant.
+        fn hvpatch__el1__host__write__prepare(_: u64, _: u64, _: u32, _: u64) {}
         /// Physical retention refusal for an EL1 owner read: selected IPA and
         /// reason (1 no indexed stage-2 record, 3 missing, 4 unmapped,
         /// 5 retiring). Diagnostic only; it grants no custody.
@@ -6683,6 +6688,11 @@ mod real {
         carrick_usdt::hvpatch__el1__host__read__progress!(|| (
             address, length, offset, class, detail
         ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_el1_host_write_prepare(address: u64, length: u64, phase: u32, detail: u64) {
+        carrick_usdt::hvpatch__el1__host__write__prepare!(|| (address, length, phase, detail));
     }
 
     #[inline(never)]
@@ -9092,6 +9102,7 @@ mod stub {
     stub!(hvpatch_el1_owner_selection(phase: u32));
     stub!(hvpatch_el1_owner_bind_result(errno: u64));
     stub!(hvpatch_el1_host_read_progress(address: u64, length: u64, offset: u64, class: u32, detail: u64));
+    stub!(hvpatch_el1_host_write_prepare(address: u64, length: u64, phase: u32, detail: u64));
     stub!(hvpatch_el1_host_read_retention(ipa: u64, reason: u32));
     #[allow(dead_code, unused_variables)]
     #[inline(always)]
