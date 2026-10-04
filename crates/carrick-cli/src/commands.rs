@@ -920,6 +920,25 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             trace_gid,
             trace_groups,
         } => {
+            if let (Some(raw), Some(summary)) = (&trace_out, &summary_jsonl)
+                && raw == summary
+            {
+                bail!("--trace-out and --summary-jsonl must name different files");
+            }
+            if profile == Some(crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuLowRate)
+                && trace_out.is_none()
+            {
+                bail!(
+                    "hvpatch-carrier-cpu-low-rate requires --trace-out so its complete raw stack population is retained"
+                );
+            }
+            if profile == Some(crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuAttribution)
+                && trace_out.is_none()
+            {
+                bail!(
+                    "hvpatch-carrier-cpu-attribution requires --trace-out so its complete raw stack population is retained"
+                );
+            }
             #[cfg(any(target_os = "macos", target_os = "freebsd"))]
             {
                 // Apply env vars carried across the sudo re-exec as CLI args.
@@ -992,26 +1011,6 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 if command.is_empty() {
                     bail!(
                         "trace needs a carrick subcommand to forward (e.g. `carrick trace run alpine:latest /bin/busybox echo hi`)"
-                    );
-                }
-                if let (Some(raw), Some(summary)) = (&trace_out, &summary_jsonl)
-                    && raw == summary
-                {
-                    bail!("--trace-out and --summary-jsonl must name different files");
-                }
-                if profile == Some(crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuLowRate)
-                    && trace_out.is_none()
-                {
-                    bail!(
-                        "hvpatch-carrier-cpu-low-rate requires --trace-out so its complete raw stack population is retained"
-                    );
-                }
-                if profile
-                    == Some(crate::trace_profile::TraceProfileKind::HvpatchCarrierCpuAttribution)
-                    && trace_out.is_none()
-                {
-                    bail!(
-                        "hvpatch-carrier-cpu-attribution requires --trace-out so its complete raw stack population is retained"
                     );
                 }
                 if profile
