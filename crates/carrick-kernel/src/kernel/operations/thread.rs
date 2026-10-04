@@ -292,6 +292,16 @@ impl PreparedThreadClone {
             self.publish_reserved(&mut state, PublicationLane::HostClone)?
         };
         let published = publication.finish();
+        #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
+        if let Some(context) = published.context() {
+            crate::schedule_point!(
+                kernel.schedule_hooks(),
+                super::super::schedule::Event::thread(
+                    context,
+                    super::super::schedule::Point::ThreadPublished
+                )
+            );
+        }
         if let Some(context) = published.context() {
             let state = kernel.registry().settled().read();
             kernel
@@ -308,7 +318,22 @@ impl PreparedThreadClone {
     pub fn record_birth(self) -> ThreadKey {
         let key = self.thread.key();
         let kernel = Arc::clone(&self.reservation.kernel);
+        #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
+        let event = super::super::schedule::Event {
+            point: super::super::schedule::Point::BirthRecorded,
+            actor: Some(super::super::schedule::Subject {
+                task: self.reservation.task.key(),
+                thread: self.reservation.caller.key(),
+                generation: self.reservation.caller.execution_state().generation(),
+            }),
+            authority: super::super::schedule::Authority::Thread(super::super::schedule::Subject {
+                task: self.reservation.task.key(),
+                thread: key,
+                generation: None,
+            }),
+        };
         kernel.registry().thread_ledger().record_birth(self);
+        crate::schedule_point!(kernel.schedule_hooks(), event);
         key
     }
 
@@ -864,6 +889,13 @@ impl Kernel {
         plan: ClonePlan,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<ThreadCloneReservation, KernelOperationError> {
+        crate::schedule_point!(
+            self.schedule_hooks(),
+            super::super::schedule::Event::thread(
+                parent,
+                super::super::schedule::Point::BeforeThreadReservation
+            )
+        );
         self.sweep_retired_threads();
         if !Arc::ptr_eq(self, &parent.kernel) {
             return Err(KernelOperationError::ForeignContext);

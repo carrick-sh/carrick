@@ -705,10 +705,12 @@ version = "0.1.0"
 dependencies = [
  "carrick-abi",
  "carrick-conformance-contract",
+ "carrick-el1-abi",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-kernel",
  "carrick-observability",
+ "carrick-sched-core",
  "carrick-vfs",
  "libc",
  "parking_lot",
