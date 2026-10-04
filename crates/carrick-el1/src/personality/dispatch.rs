@@ -358,7 +358,10 @@ where
             && memory::delegated_anonymous_root(
                 nr as u64,
                 task,
-                &zone.tables.spaces,
+                crate::substrate::sched::object_wait::space_access(
+                    zone.tables,
+                    SlotId::new(slot as u8),
+                ),
                 memory::reservations::shared_guest(),
             )
             .is_some()
@@ -382,7 +385,10 @@ where
             frame,
             counters,
             task,
-            &zone.tables.spaces,
+            crate::substrate::sched::object_wait::space_access(
+                zone.tables,
+                SlotId::new(slot as u8),
+            ),
             memory::reservations::shared_guest(),
             &mut memory::HardwareAnonymousEditor,
         ) {
@@ -425,7 +431,15 @@ where
     {
         let orig_x0 = frame.x[0];
         let mut editor = memory::HardwareAnonymousPermissionEditor;
-        match memory::try_serve_mprotect(frame, current_tasks, &zone.tables.spaces, &mut editor) {
+        match memory::try_serve_mprotect(
+            frame,
+            current_tasks,
+            crate::substrate::sched::object_wait::space_access(
+                zone.tables,
+                SlotId::new(slot as u8),
+            ),
+            &mut editor,
+        ) {
             memory::MprotectDisposition::Forward => {}
             // The edit is in the guest tables and in the space's VMA journal
             // (or refused): the host applies the journal before it next reads
@@ -455,7 +469,15 @@ where
     {
         let orig_x0 = frame.x[0];
         let mut editor = memory::HardwareAnonymousRetirementEditor;
-        match memory::try_serve_munmap(frame, current_tasks, &zone.tables.spaces, &mut editor) {
+        match memory::try_serve_munmap(
+            frame,
+            current_tasks,
+            crate::substrate::sched::object_wait::space_access(
+                zone.tables,
+                SlotId::new(slot as u8),
+            ),
+            &mut editor,
+        ) {
             memory::MunmapDisposition::Forward => {}
             memory::MunmapDisposition::Return(result) => {
                 frame.x[0] = result as u64;

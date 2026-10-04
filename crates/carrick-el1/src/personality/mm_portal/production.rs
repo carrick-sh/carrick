@@ -237,16 +237,57 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         delivery.publish();
         Ok(())
     }
+    pub(super) fn space_access(
+        &self,
+        slot: u32,
+    ) -> Result<carrick_sched_core::spaces::notification::SpaceAccess<'_>, MmError> {
+        if let Some(zone) = self.zone {
+            let slot =
+                carrick_sched_core::SlotId::from_index(slot as usize).ok_or(MmError::Invalid)?;
+            return Ok(crate::substrate::sched::object_wait::space_access(
+                zone, slot,
+            ));
+        }
+        #[cfg(any(test, feature = "host-test"))]
+        {
+            return Ok(
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(self.spaces),
+            );
+        }
+        #[cfg(not(any(test, feature = "host-test")))]
+        Err(MmError::Stale)
+    }
+    pub(super) fn root_any(
+        &self,
+        mm: ReservationMm,
+        slot: u32,
+    ) -> Result<Reservations<'_>, MmError> {
+        let index = self.spaces.find(mm.raw()).ok_or(MmError::Stale)?.index();
+        if let Some(venue) = self.space_access(slot)?.venue() {
+            let roots = crate::memory::reservations::RootReleaseVenue::new(self.roots, venue)?;
+            return match self.nodes {
+                Some(nodes) => Ok(roots.lock_el1_resolved(index, mm, nodes, slot)?),
+                None => Ok(roots.lock_el1(index, mm, slot)?),
+            };
+        }
+        #[cfg(any(test, feature = "host-test"))]
+        {
+            return match self.nodes {
+                Some(nodes) => Ok(self.roots.lock_el1_resolved(index, mm, nodes, slot)?),
+                None => Ok(self.roots.lock_el1(index, mm, slot)?),
+            };
+        }
+        #[cfg(not(any(test, feature = "host-test")))]
+        Err(MmError::Stale)
+    }
     pub(super) fn root(&self, mm: ReservationMm, slot: u32) -> Result<Reservations<'_>, MmError> {
         let index = self.spaces.find(mm.raw()).ok_or(MmError::Stale)?.index();
         if !self.roots.admitted(index, mm) {
             return Err(MmError::Stale);
         }
-        match self.nodes {
-            Some(nodes) => Ok(self.roots.lock_el1_resolved(index, mm, nodes, slot)?),
-            None => Ok(self.roots.lock_el1(index, mm, slot)?),
-        }
+        self.root_any(mm, slot)
     }
+
     pub fn admitted_handle(&self, mm: ReservationMm, slot: u32) -> Result<El1MmHandle, MmError> {
         let root = self.root(mm, slot)?;
         // SAFETY: this exact root is production-admitted and retained above.
@@ -361,7 +402,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         let mm = continuation.handle.mm().raw();
         let index = self.spaces.find(mm).ok_or(MmError::Stale)?;
         let owner = NonZeroU64::new(u64::from(slot) + 1).ok_or(MmError::Invalid)?;
-        let Some(_editor) = self.spaces.try_begin_edit(index, mm, owner) else {
+        let Some(_editor) = self.space_access(slot)?.try_begin_edit(index, mm, owner) else {
             return Ok(TransferStep::Suspended);
         };
         let Some(grant) = self.spaces.grant(index, mm) else {
@@ -554,10 +595,11 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         }
         let mm = selected.handle.mm().raw();
         let index = self.spaces.find(mm).ok_or(MmError::Stale)?;
-        let Some(editor) =
-            self.spaces
-                .try_begin_edit(index, mm, NonZeroU64::new(u64::from(slot) + 1).unwrap())
-        else {
+        let Some(editor) = self.space_access(slot)?.try_begin_edit(
+            index,
+            mm,
+            NonZeroU64::new(u64::from(slot) + 1).unwrap(),
+        ) else {
             return Ok(None);
         };
         let Some(grant) = self.spaces.grant(index, mm) else {
@@ -713,31 +755,9 @@ pub fn prepare_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized
         return Ok(None);
     };
     let mut root = portal.root(handle.mm(), slot)?;
-    let notification = if let Some(zone) = portal.zone {
-        let key = root.prepared_wait_key().ok_or(MmError::Stale)?;
-        let waker =
-            carrick_sched_core::SlotId::from_index(slot as usize).ok_or(MmError::Invalid)?;
-        let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
-            crate::substrate::sched::object_wait::deliver_completion(zone, waker, effects)
-        };
-        if zone
-            .object_wait_with_completion(key, &carrick_sched_core::BoundedSpin(256), &completion)
-            .is_err()
-        {
-            zone.bind_object_wait_with_completion(
-                key,
-                &carrick_sched_core::BoundedSpin(256),
-                &completion,
-            )
-            .map_err(|_| MmError::Busy)?;
-        }
-        Some(
-            zone.admit_object_notification(key, &carrick_sched_core::BoundedSpin(256), &completion)
-                .map_err(|_| MmError::Busy)?,
-        )
-    } else {
-        None
-    };
+    let notification = root.notification_ticket(
+        carrick_sched_core::spaces::notification::SpaceWaitCause::PreparedOverlap,
+    );
     // On allocation refusal the ticket cancels its admission before returning.
     let key = notification.as_ref().map(|ticket| ticket.key());
     let permit = root.prepare_copy(request, key)?;
@@ -1103,9 +1123,11 @@ pub fn serve_grant<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
     let mm = window.operation.mm;
     let claimed = slot.descriptor().claim_for_mm(mm.raw())?;
     let editor = portal.spaces.find(mm.raw()).and_then(|index| {
-        portal
-            .spaces
-            .try_begin_edit(index, mm.raw(), NonZeroU64::new(u64::from(worker) + 1)?)
+        portal.space_access(worker).ok()?.try_begin_edit(
+            index,
+            mm.raw(),
+            NonZeroU64::new(u64::from(worker) + 1)?,
+        )
     });
     let outcome = (|| {
         if editor.is_none() {
