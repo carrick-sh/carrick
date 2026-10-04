@@ -266,12 +266,12 @@ impl UnpublishedEl1Child {
         let owner = NonZeroU64::new(u64::from(worker) + 1).ok_or(MmError::Invalid)?;
         let parent_index = portal.spaces.find(parent.raw()).ok_or(MmError::Stale)?;
         let _parent_editor = portal
-            .spaces
+            .space_access(worker)?
             .try_begin_edit(parent_index, parent.raw(), owner)
             .ok_or(MmError::Busy)?;
         let child_index = portal.spaces.find(child.raw()).ok_or(MmError::Stale)?;
         let _child_editor = portal
-            .spaces
+            .space_access(worker)?
             .try_begin_closed_child_edit(child_index, child.raw(), owner)
             .ok_or(MmError::Busy)?;
         let mut root = portal.root(parent, worker)?;
@@ -329,12 +329,9 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
         mm: carrick_el1_abi::ReservationMm,
         worker: u32,
     ) -> Result<Reservations<'_>, MmError> {
-        let index = self.spaces.find(mm.raw()).ok_or(MmError::Stale)?.index();
-        match self.nodes {
-            Some(nodes) => Ok(self.roots.lock_el1_resolved(index, mm, nodes, worker)?),
-            None => Ok(self.roots.lock_el1(index, mm, worker)?),
-        }
+        self.root_any(mm, worker)
     }
+
     /// First census the reachable graph with fixed recursion and a bounded
     /// temporary owner reservation observation. Allocate undo/table storage
     /// only after releasing editors and metadata, proportional to actual work.
@@ -355,7 +352,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
             .find(request.operation.mm.raw())
             .ok_or(MmError::Stale)?;
         let editor = self
-            .spaces
+            .space_access(worker)?
             .try_begin_edit(index, request.operation.mm.raw(), owner)
             .ok_or(MmError::Busy)?;
         let grant = self
@@ -425,7 +422,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
             .find(request.operation.mm.raw())
             .ok_or(MmError::Stale)?;
         let editor = self
-            .spaces
+            .space_access(worker)?
             .try_begin_edit(index, request.operation.mm.raw(), owner)
             .ok_or(MmError::Busy)?;
         let grant = self
@@ -437,7 +434,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
             .find(request.child_mm.raw())
             .ok_or(MmError::Stale)?;
         let child_editor = self
-            .spaces
+            .space_access(worker)?
             .try_begin_closed_child_edit(child_index, request.child_mm.raw(), owner)
             .ok_or(MmError::Busy)?;
         if child_editor.grant().ttbr0 & PA != request.child_tables.base {
@@ -515,7 +512,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
             .find(request.operation.mm.raw())
             .ok_or(MmError::Stale)?;
         let editor = self
-            .spaces
+            .space_access(worker)?
             .try_begin_edit(index, request.operation.mm.raw(), owner)
             .ok_or(MmError::Busy)?;
         let child_index = self
@@ -523,7 +520,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
             .find(request.child_mm.raw())
             .ok_or(MmError::Stale)?;
         let child_editor = self
-            .spaces
+            .space_access(worker)?
             .try_begin_closed_child_edit(child_index, request.child_mm.raw(), owner)
             .ok_or(MmError::Busy)?;
         if child_editor.grant().ttbr0 & PA != request.child_tables.base {
