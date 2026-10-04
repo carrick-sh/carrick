@@ -109,9 +109,12 @@ If either lock is held, it skips without deleting anything. It retains both
 guards through removal. Before any census or deletion it also holds exclusive
 locks on Cargo's native `target/{debug,release}/.cargo-lock` files. Ordinary
 Cargo builds participate in these locks even when bypassing the host lease.
-These lock files are never pruned, and the stock Perl parent retains their
-descriptors through the complete pruning command. Root-visible lsof checks
-exclude only that parent, which owns lock files rather than artifacts.
+These lock files are never pruned. Their descriptors are explicitly inherited
+by the deletion shell and utilities, so killing the Perl parent cannot release
+exclusion while a deletion child remains alive. The local and remote host
+lease descriptors also follow deletion children. Root-visible lsof exempts
+only the two exact exclusively held Cargo lock paths; every artifact stays
+visible even when opened by a guardian process.
 All accounting utilities are checked before scanning; failed or invalid byte
 accounting stops before unlinking the candidate. It uses the same root-visible
 lsof checks as worktree cleanup. Run from another checkout when pruning a target containing the
