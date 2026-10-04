@@ -43,7 +43,12 @@ fn ledger_reserves_before_api_and_counts_booting_and_deduplicates() {
 #[test]
 fn existing_unknown_clone_blocks_admission_even_without_ledger_entry() {
     let mut ledger = Ledger::default();
-    assert!(ledger.reserve(job(1), &[vm(309, "unknown")], 10).is_err());
+    let unknown = PoolMember {
+        id: 309,
+        pool: POOL.into(),
+        template: false,
+    };
+    assert!(ledger.reserve(job(1), &[unknown], 10).is_err());
 }
 
 #[test]
@@ -89,13 +94,24 @@ fn exact_labels_reject_extra_missing_and_duplicate_labels() {
 }
 
 #[test]
-fn cpu_admission_rejects_eighty_five_percent_and_missing_headroom() {
-    assert!(admit_resources(0.724, 16, 11 << 30));
+fn cpu_admission_enforces_director_eighty_percent_ceiling_and_headroom() {
+    assert!(admit_resources(0.675, 16, 11 << 30));
+    assert!(!admit_resources(0.676, 16, 11 << 30));
     assert!(!admit_resources(0.725, 16, 11 << 30));
     assert!(!admit_resources(0.75, 16, 11 << 30));
     assert!(!admit_resources(f64::NAN, 16, 11 << 30));
     assert!(!admit_resources(0.1, 0, 11 << 30));
     assert!(!admit_resources(0.1, 16, 9 << 30));
+}
+
+#[test]
+fn cached_template_flag_cannot_exempt_a_clone_id_from_the_budget() {
+    let member = PoolMember {
+        id: 308,
+        pool: POOL.into(),
+        template: true,
+    };
+    assert!(Ledger::default().reserve(job(1), &[member], 10).is_err());
 }
 
 #[test]
