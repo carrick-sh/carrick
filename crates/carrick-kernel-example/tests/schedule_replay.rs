@@ -1,8 +1,8 @@
 //! Recorded ordering witness for fork/close/exit_group and strict replay.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 use carrick_kernel_example::{
-    ExampleError, Schedule, ScheduleReceipt, ScriptedBackend, Step, alloc_word, await_parked, slot,
-    sys,
+    ExampleError, Point, Schedule, ScheduleReceipt, ScriptedBackend, Step, alloc_word,
+    await_parked, slot, sys,
 };
 
 fn futex_scenario() -> Vec<Step> {
@@ -22,21 +22,17 @@ fn futex_scenario() -> Vec<Step> {
 fn futex_acknowledged_scenario() -> Vec<Step> {
     vec![
         alloc_word(0, 1),
-        Step::Sys(
-            sys::pipe2(0)
-                .ret(0)
-                .save_out_i32(0, 0, 1)
-                .save_out_i32(0, 1, 2),
-        ),
+        alloc_word(1, 1),
         Step::Sys(sys::clone_thread(0)),
         Step::ChildMarker(vec![
             await_parked(1, "wait_root"),
             Step::Sys(sys::futex_wake_labeled("wake_root", slot(0), 1).ret(1)),
-            Step::Sys(sys::write(slot(2), b"w").ret(1)),
+            await_parked(1, "wait_ack"),
+            Step::Sys(sys::futex_wake_labeled("wake_ack", slot(1), 1).ret(1)),
             Step::Sys(sys::exit_thread(0)),
         ]),
         Step::Sys(sys::futex_wait_labeled("wait_root", slot(0), 1).ret(0)),
-        Step::Sys(sys::read(slot(1), 1).ret(1)),
+        Step::Sys(sys::futex_wait_labeled("wait_ack", slot(1), 1).ret(0)),
         Step::Sys(sys::exit_group(0)),
     ]
 }
@@ -79,9 +75,25 @@ fn futex_wake_exit_receipt_replays() {
         "/tests/fixtures/futex-wake-exit-seed637.json"
     );
     let retained: ScheduleReceipt = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    let (_, current) = run_futex(&Schedule::explore(0));
-    let schedule = Schedule::replay(retained.clone())
-        .allow_source_pair(&retained.source_hash, &current.source_hash);
+    assert_eq!(retained.backend, "kernel-example/portable");
+    let enrolled = retained
+        .decisions
+        .iter()
+        .position(|decision| decision.point == Point::WaitEnrolled)
+        .expect("futex wait enrollment must be recorded");
+    let published = retained
+        .decisions
+        .iter()
+        .position(|decision| decision.point == Point::FutexWakePublished)
+        .expect("in-zone wake admission must be recorded");
+    let resumed = retained
+        .decisions
+        .iter()
+        .position(|decision| decision.point == Point::WaitResumed)
+        .expect("futex continuation resume must be recorded");
+    assert!(enrolled < published && published < resumed);
+    assert_eq!(retained.decisions[published].runnable.len(), 2);
+    let schedule = Schedule::replay(retained.clone());
     let (result, replayed) = run_futex(&schedule);
     assert_eq!(retained.decisions, replayed.decisions);
     let report = result.expect("historical futex pair completes");
@@ -92,6 +104,32 @@ fn futex_wake_exit_receipt_replays() {
             .iter()
             .any(|completion| completion.label == "wake_root"),
         "historical receipt must show the waker being retired before return"
+    );
+}
+
+#[test]
+fn scheduled_external_readiness_fails_closed() {
+    let schedule = Schedule::explore(0);
+    let result = ScriptedBackend::new()
+        .with_schedule(schedule.clone())
+        .run_root(vec![
+            Step::Sys(
+                sys::pipe2(0)
+                    .ret(0)
+                    .save_out_i32(0, 0, 0)
+                    .save_out_i32(0, 1, 1),
+            ),
+            Step::Sys(sys::read(slot(0), 1).ret(1)),
+        ]);
+    assert!(
+        matches!(result, Err(ExampleError::Schedule(ref reason)) if reason.contains("external readiness")),
+        "{result:?}"
+    );
+    assert!(
+        schedule
+            .receipt("external wait rejected", None)
+            .unwrap_err()
+            .contains("external readiness")
     );
 }
 

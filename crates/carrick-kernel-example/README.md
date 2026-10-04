@@ -121,8 +121,9 @@ explicit `allow_source_pair`.
 also runs the replay controls. The default schedule test asserts fd-pin
 semantics and work on its fresh seeded run, then replays that run exactly.
 The Linux x86_64 retained `tests/fixtures/fdpin-seed5.json` witnesses the
-pre-fix `fork(2)`/`close(2)`/`exit_group(2)` ordering. Retained fixtures are
-historical evidence and are replayed only when `VMFREE_REPLAY` names one.
+pre-fix `fork(2)`/`close(2)`/`exit_group(2)` ordering. Those version-2,
+host-labelled receipts remain historical evidence; the portable version-3
+replayer rejects them. `VMFREE_REPLAY` accepts portable receipts only.
 On a pre-fix scratch checkout, use the ignored
 `record_fd_pin_schedule_on_historical_revision` test with `VMFREE_TRACE` to
 record a receipt while the default conformance test fails. After applying the
@@ -134,17 +135,21 @@ remain unscheduled.
 
 `tests/fixtures/fdpin-seed5-main-prefx.json` records the same scenario with
 the newer task serials from main after reversing only the fd-pin correction.
-It replays on the fixed main with an explicit source pair; ordinary replay
-still refuses to remap exact task identities across revisions.
+The historical source pair describes that comparison; ordinary replay refuses
+to remap exact task identities across revisions.
 
-Receipts name the host OS and architecture. Another host records and replays
-its own decisions; cross-host result and work snapshots are not conflated.
+Portable receipts name `kernel-example/portable` and replay the same actor
+decisions on Linux and macOS. The retained futex wake/exit receipt records the
+in-zone futex wake publication as a scheduler decision before the waiter
+resumes. Its successful wake can retire the waker before its script completion
+is recorded; the acknowledged scenario uses a second futex wait and wake to
+give the waker time to record the first completion.
 
-Scheduled scenarios release their permit while a continuation waits and admit
-its actor again after an event. A successful in-zone futex wake publishes the
-resumed actor before the waker's next decision. Host descriptor readiness and
-timer delivery can still depend on reactor timing, so retain a receipt only
-after strict replay confirms its ordering. Host checkpoint steps remain
-unsupported. Internal lock contention and weak-memory orders are later
-milestones. A
-fixed wall watchdog reports a stranded harness actor.
+Scheduled scenarios admit only untimed private futex continuations. Enrollment
+releases the actor's permit; a successful in-zone wake makes its waiter
+runnable inside the waker's scheduler decision. The waiter polls the published
+event once after receiving its permit. Host descriptor readiness, timers and
+other external waits fail with `external readiness` before enrollment, rather
+than depending on reactor timing. Host checkpoint steps remain unsupported.
+Internal lock contention and weak-memory orders are later milestones. A fixed
+wall watchdog reports a stranded harness actor.
