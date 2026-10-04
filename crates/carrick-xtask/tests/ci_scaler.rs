@@ -152,3 +152,81 @@ fn completed_job_remains_deduplicated_after_cleanup_and_restart() {
     assert!(ledger.reserve(job(1), &[], 20).is_err());
     assert!(ledger.reserve(job(2), &[], 20).is_ok());
 }
+
+#[test]
+fn recovery_distinguishes_failed_absent_clone_from_ambiguous_submission() {
+    let mut row = Ledger::default().reserve(job(1), &[], 0).unwrap();
+    assert_eq!(
+        recovery_decision(&row, false, TaskState::Absent, 900),
+        Recovery::FinishAbsent
+    );
+    row.state = State::Cloning;
+    assert_eq!(
+        recovery_decision(&row, false, TaskState::Absent, 900),
+        Recovery::Quarantine
+    );
+    assert_eq!(
+        recovery_decision(&row, false, TaskState::Failed, 1),
+        Recovery::FinishAbsent
+    );
+    assert_eq!(
+        recovery_decision(&row, false, TaskState::Running, 900),
+        Recovery::Wait
+    );
+    assert_eq!(
+        recovery_decision(&row, true, TaskState::Failed, 1),
+        Recovery::Inspect
+    );
+    row.state = State::Reaping;
+    assert_eq!(
+        recovery_decision(&row, false, TaskState::Succeeded, 1),
+        Recovery::FinishAbsent
+    );
+}
+
+#[test]
+fn job_start_authorization_rejects_wrong_repository_event_ref_and_sha() {
+    let mut context = JobContext {
+        repository: "carrick-sh/carrick".into(),
+        event: "workflow_dispatch".into(),
+        workflow_ref:
+            "carrick-sh/carrick/.github/workflows/willow-pilot.yml@refs/heads/work/willow-pilot"
+                .into(),
+        sha: "a".repeat(40),
+    };
+    assert!(authorize_job(&context, &"a".repeat(40)).is_ok());
+    assert!(authorize_job(&context, &"b".repeat(40)).is_err());
+    context.event = "pull_request".into();
+    assert!(authorize_job(&context, &"a".repeat(40)).is_err());
+    context.event = "workflow_dispatch".into();
+    context.repository = "fork/carrick".into();
+    assert!(authorize_job(&context, &"a".repeat(40)).is_err());
+    context.repository = "carrick-sh/carrick".into();
+    context.workflow_ref = "carrick-sh/carrick/.github/workflows/other.yml@refs/heads/main".into();
+    assert!(authorize_job(&context, &"a".repeat(40)).is_err());
+}
+
+#[test]
+fn job_admission_and_quiesce_share_one_durable_exclusion_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("admission.lock"), "").unwrap();
+    assert_eq!(quiesce_guest(dir.path()).unwrap(), Assignment::Unassigned);
+    assert!(mark_job_started(dir.path()).is_err());
+    std::fs::remove_file(dir.path().join("draining")).unwrap();
+    mark_job_started(dir.path()).unwrap();
+    assert_eq!(quiesce_guest(dir.path()).unwrap(), Assignment::Busy);
+    assert!(!dir.path().join("draining").exists());
+}
+
+#[test]
+fn durable_ledger_round_trip_rejects_corruption_without_resetting_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ledger.json");
+    let mut ledger = Ledger::default();
+    ledger.reserve(job(1), &[], 10).unwrap();
+    ledger.save(&path).unwrap();
+    let mut restored = Ledger::load(&path).unwrap();
+    assert!(restored.reserve(job(2), &[], 11).is_err());
+    std::fs::write(&path, "{broken").unwrap();
+    assert!(Ledger::load(&path).is_err());
+}
