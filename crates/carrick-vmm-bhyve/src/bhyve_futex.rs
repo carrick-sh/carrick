@@ -8,13 +8,13 @@
 
 use std::sync::Arc;
 
-use carrick_thread::platform_futex::FutexTableFutex;
+use carrick_thread::platform_futex::{FutexTableFutex, SharedFutexTable};
 use carrick_thread::thread::FutexTable;
 
 /// The bhyve `PlatformFutex`. Construct with [`make_bhyve_futex`].
 pub type BhyveFutex = FutexTableFutex;
 
 /// Wrap the process-private `FutexTable`.
-pub fn make_bhyve_futex(table: Arc<FutexTable>) -> BhyveFutex {
-    FutexTableFutex::new(table)
+pub fn make_bhyve_futex(table: Arc<FutexTable>, shared: SharedFutexTable) -> BhyveFutex {
+    FutexTableFutex::new(table, shared)
 }

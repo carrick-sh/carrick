@@ -497,7 +497,11 @@ fn install_test_fd_authority(
         .expect("test slot authority")
 }
 
-fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
+fn outcome_for(
+    family: ContinuationFamily,
+    tid: ThreadId,
+    context: &KernelContext,
+) -> DispatchOutcome {
     match family {
         ContinuationFamily::FutexWait => DispatchOutcome::FutexWait {
             wait: FutexTable::new().prepare_wait(0x1000),
@@ -516,7 +520,10 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
                 },
                 waiter_key: 31,
             },
-            generation: carrick_thread::platform_futex::carrier_shared_futex_table()
+            generation: context
+                .kernel()
+                .shared_futex()
+                .table()
                 .prepare_wait(synthetic_shared_queue_key(0x3000, 31)),
             value: 7,
             timeout: Some(Duration::from_secs(4)),
@@ -529,7 +536,10 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
                 },
                 waiter_key: 41,
             },
-            generation: carrick_thread::platform_futex::carrier_shared_futex_table()
+            generation: context
+                .kernel()
+                .shared_futex()
+                .table()
                 .prepare_wait(synthetic_shared_queue_key(0x4000, 41)),
             value: 8,
             timeout: Some(Duration::from_secs(5)),
@@ -541,7 +551,10 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
                 waiter_key: 51,
             },
             waiter_key: 51,
-            generation: carrick_thread::platform_futex::carrier_shared_futex_table()
+            generation: context
+                .kernel()
+                .shared_futex()
+                .table()
                 .prepare_wait(synthetic_shared_queue_key(0x5000, 51)),
             value: 10,
             sysv: None,
@@ -682,7 +695,7 @@ fn exhaustive_real_dispatch_shapes_become_owned_send_static_continuations() {
     let now = Instant::now();
     for family in DISPATCH_FAMILIES {
         let continuation = BlockedContinuation::from_dispatch_outcome(
-            outcome_for(family, context.thread().registry_id()),
+            outcome_for(family, context.thread().registry_id(), &context),
             capture(&context, generation),
         )
         .expect("blocking outcome must convert");
@@ -1786,7 +1799,7 @@ fn timeout_signal_exec_exit_and_drop_cleanup_are_literal_for_every_family() {
         let probe = Arc::new(AtomicUsize::new(0));
         let make = || {
             let mut continuation = BlockedContinuation::from_dispatch_outcome(
-                outcome_for(family, context.thread().registry_id()),
+                outcome_for(family, context.thread().registry_id(), &context),
                 capture(&context, generation),
             )
             .expect("continuation");
@@ -1925,7 +1938,7 @@ fn select_and_sleep_guest_writes_revalidate_exact_mm_before_any_access() {
         ),
     ] {
         let continuation = BlockedContinuation::from_dispatch_outcome(
-            outcome_for(family, context.thread().registry_id()),
+            outcome_for(family, context.thread().registry_id(), &context),
             capture(&context, generation),
         )
         .unwrap();
@@ -2442,7 +2455,10 @@ fn shared_reactor_rechecks_private_futex_and_shared_word_producer_state() {
         DispatchOutcome::WaitOnSharedWord {
             location,
             waiter_key: location.waiter_key(),
-            generation: carrick_thread::platform_futex::carrier_shared_futex_table()
+            generation: context
+                .kernel()
+                .shared_futex()
+                .table()
                 .prepare_wait(shared_queue_key(location)),
             value: 7,
             sysv: None,
@@ -2455,7 +2471,10 @@ fn shared_reactor_rechecks_private_futex_and_shared_word_producer_state() {
         .enroll(&mut registration)
         .expect("enroll shared word");
     word.store(8, Ordering::Release);
-    carrick_thread::platform_futex::carrier_shared_futex_table()
+    context
+        .kernel()
+        .shared_futex()
+        .table()
         .wake(shared_queue_key(location), 1);
     assert_eq!(
         await_event(&service, registration.wake_token()).expect("shared word durable recheck"),
@@ -2466,7 +2485,22 @@ fn shared_reactor_rechecks_private_futex_and_shared_word_producer_state() {
 #[test]
 fn two_live_shared_word_owners_do_not_consume_each_others_wake() {
     let (kernel_a, context_a) = bootstrap(15_234);
-    let (kernel_b, context_b) = bootstrap(15_235);
+    let context_b = kernel_a
+        .prepare_container_root(
+            ThreadId::synthetic_for_tests(15235),
+            None,
+            "second futex task".to_owned(),
+            Arc::new(crate::kernel::Container::new(
+                crate::kernel::LaunchContext::unmanaged(crate::kernel::RunId::new(
+                    "second futex task",
+                )),
+            )),
+            None,
+        )
+        .expect("prepare second task")
+        .commit()
+        .expect("second task");
+    let kernel_b = Arc::clone(&kernel_a);
     let generation_a = publish(&context_a, 0x556);
     let generation_b = publish(&context_b, 0x557);
     let service_a = CarrierWaitService::new(Arc::new(Scheduler::new(kernel_a)));
@@ -2499,7 +2533,7 @@ fn two_live_shared_word_owners_do_not_consume_each_others_wake() {
     };
     assert_ne!(location_a.key(), location_b.key());
     assert_ne!(shared_queue_key(location_a), shared_queue_key(location_b));
-    let table = carrick_thread::platform_futex::carrier_shared_futex_table();
+    let table = context_a.kernel().shared_futex().table();
 
     // Enroll B first. A one-waiter wake on A must never retire B's wait,
     // even though the old hash would have put both owners on one queue.
@@ -2559,14 +2593,29 @@ fn two_live_shared_word_owners_do_not_consume_each_others_wake() {
 #[test]
 fn two_live_owners_of_one_shared_word_receive_one_wake_each() {
     let (kernel_a, context_a) = bootstrap(15_236);
-    let (kernel_b, context_b) = bootstrap(15_237);
+    let context_b = kernel_a
+        .prepare_container_root(
+            ThreadId::synthetic_for_tests(15235),
+            None,
+            "second futex task".to_owned(),
+            Arc::new(crate::kernel::Container::new(
+                crate::kernel::LaunchContext::unmanaged(crate::kernel::RunId::new(
+                    "second futex task",
+                )),
+            )),
+            None,
+        )
+        .expect("prepare second task")
+        .commit()
+        .expect("second task");
+    let kernel_b = Arc::clone(&kernel_a);
     let generation_a = publish(&context_a, 0x558);
     let generation_b = publish(&context_b, 0x559);
     let service_a = CarrierWaitService::new(Arc::new(Scheduler::new(kernel_a)));
     let service_b = CarrierWaitService::new(Arc::new(Scheduler::new(kernel_b)));
     let word = std::sync::atomic::AtomicU32::new(7);
     let location = direct_shared_word_location(&word);
-    let table = carrick_thread::platform_futex::carrier_shared_futex_table();
+    let table = context_a.kernel().shared_futex().table();
 
     let a = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::WaitOnSharedWord {
@@ -2644,8 +2693,8 @@ fn two_kernels_with_the_same_file_word_do_not_share_wakes() {
         offset: 64,
         waiter_key: 0x55a,
     };
-    let table_a = carrick_thread::platform_futex::carrier_shared_futex_table();
-    let table_b = carrick_thread::platform_futex::carrier_shared_futex_table();
+    let table_a = context_a.kernel().shared_futex().table();
+    let table_b = context_b.kernel().shared_futex().table();
     let make_wait = |context: &KernelContext, generation, table: &FutexTable| {
         BlockedContinuation::from_dispatch_outcome(
             DispatchOutcome::SharedFutexWait {
@@ -4960,7 +5009,10 @@ fn shared_word_lifetime_and_safety_through_cancellation_retirement() {
         waiter_key: word_raw as usize,
     };
 
-    let futex_wait = carrick_thread::platform_futex::carrier_shared_futex_table()
+    let futex_wait = context
+        .kernel()
+        .shared_futex()
+        .table()
         .prepare_wait(shared_queue_key(location));
     let mut continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::WaitOnSharedWord {
@@ -7080,7 +7132,7 @@ fn group_stop_preserves_published_terminal_results() {
                 },
             }
         } else {
-            outcome_for(family, ThreadId::synthetic_for_tests(153_802))
+            outcome_for(family, ThreadId::synthetic_for_tests(153_802), &context)
         };
         let continuation = BlockedContinuation::from_dispatch_outcome(
             outcome,

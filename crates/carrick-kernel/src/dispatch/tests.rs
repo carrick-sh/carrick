@@ -4057,6 +4057,7 @@ mod overlay_dispatch_tests {
         let clock = crate::kernel::container::ClockDomain::default();
         let outcome = dispatch_threaded_futex(
             &clock,
+            &carrick_thread::platform_futex::SharedFutexTable::new(),
             request,
             &mut memory,
             &reporter,
@@ -4094,6 +4095,7 @@ mod overlay_dispatch_tests {
         let clock = crate::kernel::container::ClockDomain::default();
         let outcome = dispatch_threaded_futex(
             &clock,
+            &carrick_thread::platform_futex::SharedFutexTable::new(),
             request,
             &mut memory,
             &reporter,
@@ -4162,6 +4164,7 @@ mod overlay_dispatch_tests {
         let clock = crate::kernel::container::ClockDomain::default();
         let outcome = dispatch_threaded_futex(
             &clock,
+            &carrick_thread::platform_futex::SharedFutexTable::new(),
             request,
             &mut memory,
             &reporter,
@@ -4219,6 +4222,7 @@ mod overlay_dispatch_tests {
         let clock = crate::kernel::container::ClockDomain::default();
         let outcome = dispatch_threaded_futex(
             &clock,
+            &carrick_thread::platform_futex::SharedFutexTable::new(),
             request,
             &mut memory,
             &reporter,

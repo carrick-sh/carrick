@@ -1254,10 +1254,9 @@ impl CarrierWaitService {
         }
         let futex_source = match &probe {
             ReadinessProbe::Futex { table, wait, .. } => Some((table.0.clone(), wait.clone())),
-            ReadinessProbe::SharedWord { generation, .. } => Some((
-                Arc::clone(carrick_thread::platform_futex::carrier_shared_futex_table()),
-                generation.clone(),
-            )),
+            ReadinessProbe::SharedWord {
+                table, generation, ..
+            } => Some((Arc::clone(table.table()), generation.clone())),
             _ => None,
         };
         if let Some((table, wait)) = futex_source {

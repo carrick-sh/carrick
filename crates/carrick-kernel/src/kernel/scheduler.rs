@@ -7160,7 +7160,6 @@ mod tests {
     #[test]
     fn generic_wake_racing_shared_futex_settlement_cannot_fabricate_wake() {
         use carrick_guest_mem::{HostVa, SharedFutexLocation};
-        use carrick_thread::platform_futex::carrier_shared_futex_table;
 
         let (kernel, waiter) = bootstrap(12_123);
         publish(&waiter, 31);
@@ -7187,7 +7186,7 @@ mod tests {
                     },
                     waiter_key,
                 ),
-                generation: carrier_shared_futex_table().prepare_wait(
+                generation: kernel.shared_futex().table().prepare_wait(
                     carrick_thread::platform_futex::carrier_shared_futex_key(
                         SharedFutexLocation::Direct {
                             word: HostVa(waiter_key),
@@ -7241,7 +7240,7 @@ mod tests {
         assert_eq!(scheduler.queued_len(), 0);
 
         assert_eq!(
-            carrier_shared_futex_table().wake(
+            kernel.shared_futex().table().wake(
                 carrick_thread::platform_futex::carrier_shared_futex_key(
                     SharedFutexLocation::Direct {
                         word: HostVa(waiter_key),

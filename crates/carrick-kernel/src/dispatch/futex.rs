@@ -119,6 +119,7 @@ pub(crate) fn dispatch_futex_pi(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_threaded_futex(
     clock: &crate::kernel::container::ClockDomain,
+    shared: &carrick_thread::platform_futex::SharedFutexTable,
     request: SyscallRequest,
     memory: &mut impl CurrentMmMemory,
     reporter: &CompatReporter,
@@ -408,10 +409,9 @@ pub(crate) fn dispatch_threaded_futex(
                 // generation snapshot is needed here.
                 return DispatchOutcome::SharedFutexWait {
                     target: SharedFutexTarget::new(location, location.waiter_key()),
-                    generation: carrick_thread::platform_futex::carrier_shared_futex_table()
-                        .prepare_wait(carrick_thread::platform_futex::carrier_shared_futex_key(
-                            location,
-                        )),
+                    generation: shared.table().prepare_wait(
+                        carrick_thread::platform_futex::carrier_shared_futex_key(location),
+                    ),
                     value,
                     timeout,
                 };
@@ -638,6 +638,7 @@ struct FutexWaitvEntry {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn dispatch_futex_waitv_args(
     clock: &crate::kernel::container::ClockDomain,
+    shared: &carrick_thread::platform_futex::SharedFutexTable,
     memory: &mut impl CurrentMmMemory,
     futex: Option<&crate::thread::FutexTable>,
     zone: Option<(&'static carrick_el1_abi::ZoneTables, u64)>,
@@ -753,10 +754,9 @@ pub(crate) fn dispatch_futex_waitv_args(
         {
             return DispatchOutcome::SharedFutexWaitv {
                 target: SharedFutexTarget::new(location, location.waiter_key()),
-                generation: carrick_thread::platform_futex::carrier_shared_futex_table()
-                    .prepare_wait(carrick_thread::platform_futex::carrier_shared_futex_key(
-                        location,
-                    )),
+                generation: shared.table().prepare_wait(
+                    carrick_thread::platform_futex::carrier_shared_futex_key(location),
+                ),
                 value: entry.value,
                 timeout,
                 index: index as i64,

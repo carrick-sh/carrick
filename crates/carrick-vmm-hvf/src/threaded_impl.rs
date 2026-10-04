@@ -15,13 +15,13 @@
 
 use std::sync::Arc;
 
-use carrick_thread::platform_futex::FutexTableFutex;
+use carrick_thread::platform_futex::{FutexTableFutex, SharedFutexTable};
 use carrick_thread::thread::FutexTable;
 
 /// HVF's `PlatformFutex`. Construct with [`hvf_futex`].
 pub type HvfFutex = FutexTableFutex;
 
 /// Wrap the process-private `FutexTable`.
-pub fn hvf_futex(table: Arc<FutexTable>) -> HvfFutex {
-    FutexTableFutex::new(table)
+pub fn hvf_futex(table: Arc<FutexTable>, shared: SharedFutexTable) -> HvfFutex {
+    FutexTableFutex::new(table, shared)
 }

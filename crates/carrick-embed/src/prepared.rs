@@ -94,6 +94,7 @@ impl PreparedContainer {
                     self.generation,
                     Arc::clone(&self.retired),
                     Arc::clone(&self.current_generation),
+                    self.carrier.runtime.shared_futex().clone(),
                 ));
             }
         }

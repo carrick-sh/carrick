@@ -302,6 +302,7 @@ impl TaskRevision {
 
 pub struct RootBootstrap {
     task_id: TaskId,
+    shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     registry_id: ThreadId,
     mm_backend: Option<Arc<dyn MmBackend>>,
     diagnostic_name: String,
@@ -380,6 +381,7 @@ impl RootBootstrap {
         // Product bootstraps override this with `with_container`.
         Ok(Self {
             task_id: TaskId::for_root_bootstrap(observed_pid)?,
+            shared_futex: carrick_thread::platform_futex::SharedFutexTable::new(),
             registry_id,
             mm_backend,
             diagnostic_name,
@@ -392,6 +394,16 @@ impl RootBootstrap {
     /// built from the CLI's `LaunchContext` and installed on the dispatcher).
     pub fn with_container(mut self, container: Arc<Container>) -> Self {
         self.container = container;
+        self
+    }
+
+    /// Admit the carrier's pre-created authority, also used by host shared
+    /// buffer leases minted before the root starts executing.
+    pub fn with_shared_futex(
+        mut self,
+        shared: carrick_thread::platform_futex::SharedFutexTable,
+    ) -> Self {
+        self.shared_futex = shared;
         self
     }
 
@@ -475,6 +487,7 @@ pub struct Kernel {
     ids: IdRegistry,
     object_ids: ObjectIdRegistry,
     frame_inventory: FrameInventoryAuthority,
+    shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     fd_ceiling: Arc<super::FdCeilingAuthority>,
     hvpatch_child_token_issuer: Arc<carrick_hal::HvpatchChildTokenIssuer>,
     #[allow(dead_code)] // consumed by the HVPatch carrier-directory publication slice
@@ -1300,6 +1313,12 @@ impl Kernel {
     pub fn host_signal(&self) -> &Arc<dyn HostSignalBridge> {
         &self.host_signal
     }
+
+    /// Shared and auxiliary wait queues for exactly this kernel. Forked tasks
+    /// retain this authority even when their private futex tables change.
+    pub fn shared_futex(&self) -> &carrick_thread::platform_futex::SharedFutexTable {
+        &self.shared_futex
+    }
     pub fn bootstrap_root(
         bootstrap: RootBootstrap,
     ) -> Result<(Arc<Self>, KernelContext), KernelError> {
@@ -1443,6 +1462,7 @@ impl Kernel {
             ids,
             object_ids,
             frame_inventory: FrameInventoryAuthority::new(),
+            shared_futex: bootstrap.shared_futex,
             fd_ceiling,
             ipc: Mutex::new(None),
             hvpatch_child_token_issuer,
