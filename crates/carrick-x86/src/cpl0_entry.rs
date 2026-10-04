@@ -87,6 +87,30 @@ const _: () = assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
 mod tests {
     use super::*;
     #[test]
+    fn native_entry_keeps_full_width_opaque_head() {
+        for head in [0, 0x0000_1234_0000_a000, 0x8000_5678_0000_a000, u64::MAX] {
+            let frame = NativeFrame {
+                rax: 273,
+                rdi: head,
+                rsi: 24,
+                ..Default::default()
+            };
+            assert_eq!(frame.decode().args[0], head, "opaque head {head:#018x}");
+        }
+    }
+
+    #[test]
+    fn native_entry_keeps_full_width_robust_list_length() {
+        let frame = NativeFrame {
+            rax: 273,
+            rdi: 0,
+            rsi: 0x1_0000_0018,
+            ..Default::default()
+        };
+        assert_eq!(frame.decode().args[1], 0x1_0000_0018);
+    }
+
+    #[test]
     fn native_entry_keeps_arguments_number_and_captured_stack() {
         let frame = NativeFrame {
             rax: 273,

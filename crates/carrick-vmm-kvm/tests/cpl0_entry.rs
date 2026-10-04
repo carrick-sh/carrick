@@ -37,6 +37,93 @@ fn program(calls: &[(u64, u64)]) -> Vec<u8> {
     bytes
 }
 
+// Observe each task in turn while both lifecycle slots remain live. Registration
+// must store even NULL, unmapped and noncanonical heads without accessing them.
+fn assert_opaque_registrations(calls: [&[(u64, u64)]; 2]) {
+    assert_eq!(calls[0].len(), calls[1].len());
+    let a = program(calls[0]);
+    let b = program(calls[1]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&a, &b]).expect("real KVM + CPL0 image");
+    let mut heads = [(0, 0); 2];
+    let mut entries = [0; 2];
+    let mut publications = [0; 2];
+    for round in 0..calls[0].len() {
+        for task in 0..2 {
+            let (head, len) = calls[task][round];
+            let observation = carrier.observe(task).expect("bounded native entry/return");
+            if len == 24 {
+                heads[task] = (head, 24);
+                publications[task] += 1;
+            }
+            entries[task] += 1;
+            assert_eq!(
+                observation.result,
+                if len == 24 { 0_i64 } else { -22_i64 },
+                "full result: task {task}, round {round}, len {len:#x}"
+            );
+            assert_eq!(
+                observation.heads, heads,
+                "opaque heads and unchanged sibling: task {task}, round {round}"
+            );
+            assert_eq!(observation.entries, entries);
+            assert_eq!(observation.completions, entries);
+            assert_eq!(observation.publications, publications);
+            assert_eq!(observation.served, entries[0] + entries[1]);
+            assert_eq!(observation.forwarded, 0, "zero semantic forwards per call");
+            assert_eq!(
+                observation.semantic_host_exits, 0,
+                "no host serving scaffold"
+            );
+            let stack = 0x3_1fe8 + task as u64 * 0x1_0000;
+            assert_eq!(observation.captured_stack, stack);
+            assert_eq!(observation.returned_stack, stack);
+            assert_eq!(observation.preserved_rbx, head);
+        }
+    }
+}
+
+#[test]
+fn two_live_tasks_register_full_width_heads_without_dereferencing() {
+    // Deliberately share low 32 bits across tasks: truncation destroys their
+    // distinct opaque identities. Neither high address is mapped by this image.
+    let a = [
+        (0x0000_1234_0000_a000, 24),
+        (0x8000_1234_0000_a000, 24),
+        (0, 24),
+        (u64::MAX, 24),
+        (0x0000_1234_0000_dead, 23),
+    ];
+    let b = [
+        (0x0000_5678_0000_a000, 24),
+        (0x8000_5678_0000_a000, 24),
+        (u64::MAX, 24),
+        (0, 24),
+        (0x8000_5678_0000_beef, 25),
+    ];
+    assert_opaque_registrations([&a, &b]);
+}
+
+#[test]
+fn two_live_tasks_reject_length_with_high_bits_preserving_both_heads() {
+    // Low heads in the first round isolate RSI truncation from RDI truncation:
+    // the negative control reaches a completed call with the wrong result.
+    let a = [
+        (0, 24),
+        (0x8000_1234_0000_dead, 0x1_0000_0018),
+        (0x0000_1234_0000_a000, 24),
+        (u64::MAX, 0x1_0000_0018),
+        (0, 24),
+    ];
+    let b = [
+        (0xb000, 24),
+        (0x0000_5678_0000_beef, 0x1_0000_0018),
+        (0x8000_5678_0000_a000, 24),
+        (0, 0x1_0000_0018),
+        (0x0000_5678_0000_a000, 24),
+    ];
+    assert_opaque_registrations([&a, &b]);
+}
+
 #[test]
 fn two_live_tasks_serve_robust_lists_without_host_forwards() {
     let a = program(&[(0xa000, 24), (0xa040, 24), (0xdead, 23), (0xdead, 0)]);
