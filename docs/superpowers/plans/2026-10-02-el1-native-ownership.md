@@ -2139,3 +2139,14 @@ this window. The final physical-retention classification correction passed
 (`/tmp/venue3-retain-classification-{red,green}.log`). Permanent custody errors
 now propagate separately from absent/retired records. The final complete
 verification sequence remains open; no host acceptance receipt is claimed.
+
+Post-checkpoint raw-entry correction: the engine's
+`commit_prepared_host_write` could issue legacy grants/first-touch edits before
+the backend owner fence. It now holds an explicit legacy authority borrow
+before any preparation; `host_read` likewise refuses owner roots before its
+legacy permission helper. Actual engine-entry witness
+`admitted_owner_refuses_legacy_raw_write_preparation` was RED0/1, then GREEN1/1
+(`/tmp/venue3-raw-preparation-{red,green}.log`). Independent scoped review
+approved. This closes entry after admission; initial-admission exclusion of
+already-returned legacy pointers remains part of the open root transaction.
+`just test` passed on the preceding checkpoint (final HVF723 passed/3 ignored).
