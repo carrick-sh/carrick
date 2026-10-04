@@ -36,15 +36,23 @@ impl Drop for CheckoutGuard {
 // file uses a file query, whereas +D includes recursive directory mappings.
 const IDLE_CENSUS: &str = r#"
 idle() {
-    if [ -d "$1" ]; then set -- -F p +D "$1"; else set -- -F p "$1"; fi
-    # The Perl parent owns only the target lock descriptors, never artifacts.
-    if [ -n "${CARRICK_PRUNE_LOCK_PID:-}" ]; then set -- "$@" -a -p "^$CARRICK_PRUNE_LOCK_PID"; fi
+    if [ -d "$1" ]; then set -- -F pn +D "$1"; else set -- -F pn "$1"; fi
     if [ "$uid" = 0 ]; then
         if "$lsof_bin" "$@" > "$state/use.out" 2> "$state/use.err"; then code=0; else code=$?; fi
     else
         if sudo -n -u root "$lsof_bin" "$@" > "$state/use.out" 2> "$state/use.err"; then code=0; else code=$?; fi
     fi
-    [ "$code" = 1 ] && [ ! -s "$state/use.out" ] && [ ! -s "$state/use.err" ]
+    [ ! -s "$state/use.err" ] || return 1
+    if [ ! -s "$state/use.out" ]; then [ "$code" = 1 ]; return; fi
+    case "$code" in 0|1) ;; *) return 1;; esac
+    # Inherited guardians appear in the target census. Exempt only the two
+    # exact native lock paths held exclusively; keep every artifact visible.
+    awk -v debug="${CARRICK_PRUNE_TARGET:-}/debug/.cargo-lock" -v release="${CARRICK_PRUNE_TARGET:-}/release/.cargo-lock" '
+        /^p[0-9]+$/ { if (pid && !names) bad=1; pid=1; names=0; next }
+        /^n/ { if (!pid || (substr($0,2)!=debug && substr($0,2)!=release)) bad=1; names++; seen=1; next }
+        { bad=1 }
+        END { exit (bad || !seen || !names) ? 1 : 0 }
+    ' "$state/use.out"
 }
 "#;
 
@@ -78,8 +86,9 @@ done
 
 // Cargo holds the profile's .cargo-lock while using artifacts. An exclusive
 // lock excludes both older exclusive Cargo locks and newer shared Cargo locks.
-// Keep the handles in this parent through the complete census/removal command.
-const CARGO_TARGET_LOCKS: &str = r#"use Fcntl qw(:flock :DEFAULT);
+// Inherit the handles through exec so parent death cannot release exclusion
+// while the deletion shell or one of its utilities remains alive.
+const CARGO_TARGET_LOCKS: &str = r#"use Fcntl qw(:flock :DEFAULT F_GETFD F_SETFD FD_CLOEXEC);
 use File::Path qw(make_path);
 my $target = shift @ARGV;
 my @locks;
@@ -93,21 +102,33 @@ for my $profile ('debug', 'release') {
         print "keep target (Cargo lock is held) | $target\n";
         exit 0;
     }
+    my $flags = fcntl($lock, F_GETFD, 0);
+    die "Cargo lock descriptor flags: $!\n" unless defined $flags;
+    fcntl($lock, F_SETFD, $flags & ~FD_CLOEXEC) or die "Cargo lock inheritance: $!\n";
     push @locks, $lock;
 }
-$ENV{CARRICK_PRUNE_LOCK_PID} = $$;
+$ENV{CARRICK_PRUNE_TARGET} = $target;
 system(@ARGV);
 die "target prune spawn: $!\n" if $? == -1;
 exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
 "#;
 
 fn pruning_body(targets: &[PathBuf], days: u64, apply: bool) -> Result<String, GcError> {
+    pruning_body_with_census(targets, days, apply, IDLE_CENSUS)
+}
+
+fn pruning_body_with_census(
+    targets: &[PathBuf],
+    days: u64,
+    apply: bool,
+    idle_census: &str,
+) -> Result<String, GcError> {
     let older_than = days
         .checked_sub(1)
         .filter(|_| days <= i32::MAX as u64)
         .ok_or_else(|| GcError::Census("artifact age must be 1..=2147483647 days".into()))?;
     let candidate = format!(
-        "set -u\napply=$1; age=$2; state=$3; lsof_bin=$4; uid=$5; shift 5\n{IDLE_CENSUS}\n{}",
+        "set -u\napply=$1; age=$2; state=$3; lsof_bin=$4; uid=$5; shift 5\n{idle_census}\n{}",
         CANDIDATES.replace("AGE_QUERY", AGE_QUERY)
     );
     let paths = targets
@@ -123,7 +144,7 @@ fn pruning_body(targets: &[PathBuf], days: u64, apply: bool) -> Result<String, G
     let target_body = shell_quote(&format!(
         r#"set -u
 target=$1; apply=$2; age=$3; state=$4; lsof_bin=$5; uid=$6
-{IDLE_CENSUS}
+{idle_census}
 if [ ! -x "$lsof_bin" ] || ! idle "$target"; then
     printf 'keep target (in use or unknown visibility) | %s\n' "$target"
     exit 0
@@ -173,8 +194,8 @@ printf 'target pruning: %s %s allocated bytes (age >= {days} days)\n' "$action" 
 }
 
 /// Stock Perl supplies BSD flock on macOS, which ships no flock executable.
-/// Keep its descriptor in the parent across system(), never unlink a live lease.
-const REMOTE_LEASE: &str = r#"use Fcntl qw(:flock);
+/// Inherit its descriptor into deletion children; never unlink a live lease.
+const REMOTE_LEASE: &str = r#"use Fcntl qw(:flock F_GETFD F_SETFD FD_CLOEXEC);
 my $path = shift @ARGV;
 open(my $lock, '>>', $path) or die "host lease open: $!\n";
 chmod 0666, $path;
@@ -182,6 +203,9 @@ unless (flock($lock, LOCK_EX | LOCK_NB)) {
     print "target pruning skipped: host lease is held\n";
     exit 0;
 }
+my $flags = fcntl($lock, F_GETFD, 0);
+die "host lease descriptor flags: $!\n" unless defined $flags;
+fcntl($lock, F_SETFD, $flags & ~FD_CLOEXEC) or die "host lease inheritance: $!\n";
 system(@ARGV);
 die "target pruning spawn: $!\n" if $? == -1;
 exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
@@ -223,7 +247,7 @@ pub(crate) fn run(
     let lease_path = std::env::var_os("CARRICK_HOST_LEASE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_PATH));
-    let Some(_lease) = HostLease::try_exclusive(&lease_path)? else {
+    let Some(lease) = HostLease::try_exclusive(&lease_path)? else {
         writeln!(writer, "target pruning skipped: host lease is held")?;
         return Ok(());
     };
@@ -243,8 +267,20 @@ pub(crate) fn run(
             .collect()
     };
     let body = pruning_body(&targets, args.days, args.apply)?;
-    let output = crate::command::run_checked("/bin/sh", ["-c", &body], None)?;
-    writer.write_all(output.stdout.as_bytes())?;
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args(["-c", &body]);
+    lease.configure_command(&mut command)?;
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(crate::command::CommandError::NonZeroExit {
+            program: "/bin/sh".into(),
+            status: output.status,
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+        .into());
+    }
+    writer.write_all(&output.stdout)?;
     Ok(())
 }
 
@@ -296,6 +332,105 @@ mod tests {
         (target, file)
     }
 
+    fn parent_death_keeps_child_lock(remote: bool) {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::process::Stdio;
+        let temp = tempfile::tempdir().unwrap();
+        let (target, artifact) = old_artifact(temp.path());
+        let socket = temp.path().join("child.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(listener.accept()).unwrap());
+        let handshake = temp.path().join("child.pl");
+        fs::write(&handshake, r#"use IO::Socket::UNIX; my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $ARGV[0]) or die $!; print $s "ready\n"; $s->flush; my $reply = <$s>; die "lost controller" unless defined $reply;"#).unwrap();
+        // The shell survives its Perl lock parent and stays at the barrier
+        // immediately before deletion. Its inherited stdout bounds its exit.
+        let shell = format!(
+            "/usr/bin/perl {} {} && rm -f {}",
+            shell_quote(handshake.to_str().unwrap()),
+            shell_quote(socket.to_str().unwrap()),
+            shell_quote(artifact.to_str().unwrap())
+        );
+        let lock_path = if remote {
+            temp.path().join("host.lock")
+        } else {
+            target.join("debug/.cargo-lock")
+        };
+        let mut parent = Command::new("/usr/bin/perl")
+            .args([
+                "-e",
+                if remote {
+                    REMOTE_LEASE
+                } else {
+                    CARGO_TARGET_LOCKS
+                },
+            ])
+            .arg(if remote { &lock_path } else { &target })
+            .args(["/bin/sh", "-c", &shell])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut peer, _) = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("deletion child must reach barrier")
+            .unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut ready = [0; 6];
+        peer.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready\n");
+        let lock = fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        assert!(matches!(
+            lock.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        // Kill only the guardian, never the deletion child or process group.
+        assert_eq!(unsafe { libc::kill(parent.id() as i32, libc::SIGTERM) }, 0);
+        parent.wait().unwrap();
+        let acquisition = lock.try_lock();
+        let blocked = matches!(acquisition, Err(std::fs::TryLockError::WouldBlock));
+        if acquisition.is_ok() {
+            lock.unlock().unwrap();
+        }
+        assert!(artifact.exists());
+        peer.write_all(b"delete\n").unwrap();
+        drop(peer);
+        // Reading to EOF waits for every inheriting shell/utility to exit,
+        // even though wait() has already reaped the killed parent.
+        let mut stdout = Vec::new();
+        parent
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
+        assert!(!artifact.exists(), "surviving child must complete deletion");
+        assert!(
+            lock.try_lock().is_ok(),
+            "lock must release after child exit"
+        );
+        assert!(
+            blocked,
+            "{} lock released after parent death while deletion child lived",
+            if remote { "host" } else { "Cargo" }
+        );
+    }
+
+    #[test]
+    fn cargo_lock_survives_parent_death_until_deletion_child_exits() {
+        parent_death_keeps_child_lock(false);
+    }
+
+    #[test]
+    fn remote_host_lock_survives_parent_death_until_deletion_child_exits() {
+        parent_death_keeps_child_lock(true);
+    }
+
     #[test]
     fn native_cargo_lock_preserves_old_artifacts_despite_idle_census() {
         let temp = tempfile::tempdir().unwrap();
@@ -303,9 +438,8 @@ mod tests {
         let bin = utility_fixture(temp.path(), "");
         let lock = fs::File::create(target.join("debug/.cargo-lock")).unwrap();
         lock.lock().unwrap();
-        let body = pruning_body(&[target], 2, true)
-            .unwrap()
-            .replace(IDLE_CENSUS, "\nidle() { return 0; }\n");
+        let body =
+            pruning_body_with_census(&[target], 2, true, "\nidle() { return 0; }\n").unwrap();
         let output = Command::new("/bin/sh")
             .args(["-c", &body])
             .env("PATH", bin)
@@ -342,9 +476,7 @@ mod tests {
             handshake = handshake.display(),
             socket = socket.display()
         );
-        let body = pruning_body(std::slice::from_ref(&target), 2, true)
-            .unwrap()
-            .replace(IDLE_CENSUS, &idle);
+        let body = pruning_body_with_census(std::slice::from_ref(&target), 2, true, &idle).unwrap();
         let child = Command::new("/bin/sh")
             .args(["-c", &body])
             .env("PATH", bin)
@@ -423,9 +555,8 @@ mod tests {
         let mut ready = [0; 6];
         peer.read_exact(&mut ready).unwrap();
         assert_eq!(&ready, b"ready\n");
-        let body = pruning_body(&[target], 2, true)
-            .unwrap()
-            .replace(IDLE_CENSUS, "\nidle() { return 0; }\n");
+        let body =
+            pruning_body_with_census(&[target], 2, true, "\nidle() { return 0; }\n").unwrap();
         let output = Command::new("/bin/sh")
             .args(["-c", &body])
             .env("PATH", bin)
@@ -454,9 +585,8 @@ mod tests {
         let bin = utility_fixture(temp.path(), "awk");
         // Pin the external OS census to idle; exercise real find/du/deletion
         // and shell accounting with the reviewed missing-utility PATH.
-        let body = pruning_body(&[target], 2, true)
-            .unwrap()
-            .replace(IDLE_CENSUS, "\nidle() { return 0; }\n");
+        let body =
+            pruning_body_with_census(&[target], 2, true, "\nidle() { return 0; }\n").unwrap();
         let output = Command::new("/bin/sh")
             .args(["-c", &body])
             .env("PATH", bin)
@@ -479,9 +609,8 @@ mod tests {
         let bin = utility_fixture(temp.path(), "awk");
         fs::write(bin.join("awk"), "#!/bin/sh\nexit 75\n").unwrap();
         fs::set_permissions(bin.join("awk"), fs::Permissions::from_mode(0o755)).unwrap();
-        let body = pruning_body(&[target], 2, true)
-            .unwrap()
-            .replace(IDLE_CENSUS, "\nidle() { return 0; }\n");
+        let body =
+            pruning_body_with_census(&[target], 2, true, "\nidle() { return 0; }\n").unwrap();
         let output = Command::new("/bin/sh")
             .args(["-c", &body])
             .env("PATH", bin)
