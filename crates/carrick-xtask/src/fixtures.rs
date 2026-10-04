@@ -11,6 +11,8 @@ use thiserror::Error;
 
 use crate::{command, probe_inventory, provision};
 
+pub mod archive;
+
 const SCHEMA: &str = "carrick.fixtures.v1";
 pub const INSTALLED_MANIFEST: &str = "target/fixtures/installed.json";
 const INPUTS: &[&str] = &[
@@ -50,6 +52,11 @@ pub struct FixturesArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum FixturesAction {
+    /// Build and publish a mode-preserving bundle artifact for Actions.
+    Publish {
+        #[arg(long)]
+        sha: String,
+    },
     /// Build in a fresh exact-SHA snapshot on Linux (native ARM or cross).
     Build {
         #[arg(long)]
@@ -59,8 +66,14 @@ pub enum FixturesAction {
     },
     /// Validate the entire bundle before installing any executable.
     Restore {
-        #[arg(long)]
-        manifest: PathBuf,
+        #[arg(long, required_unless_present = "bundle", conflicts_with = "bundle")]
+        manifest: Option<PathBuf>,
+        #[arg(
+            long,
+            required_unless_present = "manifest",
+            conflicts_with = "manifest"
+        )]
+        bundle: Option<PathBuf>,
         #[arg(long, help = "Expected commit (default: checkout HEAD)")]
         sha: Option<String>,
     },
@@ -424,8 +437,7 @@ fn manifest_bytes(manifest: &Manifest) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec_pretty(manifest)?)
 }
 
-pub fn verify_bundle(root: &Path, path: &Path, sha: Option<&str>) -> Result<Manifest> {
-    let expected = expected_head(root, sha)?;
+fn read_bundle_manifest(path: &Path, expected: Option<&CommitSha>) -> Result<Manifest> {
     let bytes = fs::read(path)?;
     let parent = path
         .parent()
@@ -437,14 +449,65 @@ pub fn verify_bundle(root: &Path, path: &Path, sha: Option<&str>) -> Result<Mani
     if manifest_bytes(&manifest)? != bytes {
         return Err(fail("noncanonical fixture manifest"));
     }
-    validate_manifest(root, &manifest, &expected)?;
+    if manifest.schema != SCHEMA || expected.is_some_and(|sha| sha != &manifest.source_head) {
+        return Err(fail("unknown fixture schema or wrong SHA"));
+    }
+    Ok(manifest)
+}
+
+fn check_bundle_objects(path: &Path, manifest: &Manifest) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| fail("manifest has no bundle directory"))?;
     for executable in &manifest.executables {
         validate_executable(
             &safe_path(parent, &format!("objects/{}", executable.sha256.0))?,
             executable,
         )?;
     }
+    Ok(())
+}
+
+fn inspect_bundle(path: &Path, expected: Option<&CommitSha>) -> Result<Manifest> {
+    let manifest = read_bundle_manifest(path, expected)?;
+    check_bundle_objects(path, &manifest)?;
     Ok(manifest)
+}
+
+pub fn verify_bundle(root: &Path, path: &Path, sha: Option<&str>) -> Result<Manifest> {
+    let expected = expected_head(root, sha)?;
+    let manifest = read_bundle_manifest(path, Some(&expected))?;
+    validate_manifest(root, &manifest, &expected)?;
+    check_bundle_objects(path, &manifest)?;
+    Ok(manifest)
+}
+
+/// Select only an unambiguous exact-commit bundle, never mutable probe caches.
+pub fn resolve_bundle(root: &Path, sha: &str, explicit: Option<&Path>) -> Result<PathBuf> {
+    let expected = CommitSha::try_from(sha.to_owned())?;
+    let path = if let Some(path) = explicit {
+        path.to_path_buf()
+    } else {
+        let directory = root.join("target/fixtures/bundles").join(&expected.0);
+        let mut manifests = Vec::new();
+        if directory.is_dir() {
+            for entry in fs::read_dir(directory)? {
+                let path = entry?.path().join("manifest.json");
+                if path.is_file() {
+                    manifests.push(path);
+                }
+            }
+        }
+        if manifests.len() != 1 {
+            return Err(fail(format!(
+                "expected one exact-SHA fixture bundle, found {}; publish it on Linux or supply --fixture-manifest",
+                manifests.len()
+            )));
+        }
+        manifests.remove(0)
+    };
+    inspect_bundle(&path, Some(&expected))?;
+    Ok(path)
 }
 
 pub fn verify_installed(root: &Path) -> Result<Manifest> {
@@ -701,12 +764,29 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
 
 pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Result<()> {
     match action {
+        FixturesAction::Publish { sha } => {
+            let manifest = build(root, &sha, None)?;
+            let artifact = archive::pack(&manifest, &root.join("target/fixtures/published"))?;
+            writeln!(
+                writer,
+                "fixtures: published artifact {}",
+                artifact.display()
+            )?;
+        }
         FixturesAction::Build { sha, output } => {
             let path = build(root, &sha, output.as_deref())?;
             writeln!(writer, "fixtures: bundle manifest {}", path.display())?;
         }
-        FixturesAction::Restore { manifest, sha } => {
-            let work = restore(root, &manifest, sha.as_deref())?;
+        FixturesAction::Restore {
+            manifest,
+            bundle,
+            sha,
+        } => {
+            let work = match (manifest, bundle) {
+                (Some(manifest), None) => restore(root, &manifest, sha.as_deref())?,
+                (None, Some(bundle)) => archive::restore(root, &bundle, sha.as_deref())?,
+                _ => return Err(fail("supply exactly one of --manifest or --bundle")),
+            };
             writeln!(
                 writer,
                 "fixtures: restored and verified {} executables; durability_flushes={}",

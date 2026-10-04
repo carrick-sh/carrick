@@ -431,3 +431,425 @@ fn identities_reject_abbreviations_and_non_hex_values() {
     assert!(CommitSha::try_from("HEAD".to_owned()).is_err());
     assert!(ContentHash::try_from("g".repeat(64)).is_err());
 }
+
+// Real Git cleanup, just recipes, archive transport and xtask verification.
+// Only guest/HVF acceptance is replaced with the fixture preflight it needs.
+struct Preparation {
+    scratch: tempfile::TempDir,
+    archive: PathBuf,
+    checkout: PathBuf,
+    lock: PathBuf,
+    bin: PathBuf,
+}
+
+impl Preparation {
+    fn new(f: &Fixture) -> Self {
+        let scratch = tempfile::tempdir().unwrap();
+        let archive = scratch.path().join("fixtures.tar.gz");
+        let bundle = f.path.parent().unwrap();
+        assert!(
+            Command::new("tar")
+                .args(["-czf"])
+                .arg(&archive)
+                .arg("-C")
+                .arg(bundle.parent().unwrap())
+                .arg(bundle.file_name().unwrap())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let checkout = scratch.path().join("checkout");
+        let lock = scratch.path().join("checkout.lock");
+        fs::create_dir(&lock).unwrap();
+        let bin = scratch.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        write(
+            &bin,
+            "cargo",
+            br#"#!/bin/sh
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+[ "$#" -gt 0 ] || exit 91
+shift
+exec "$FIXTURE_TEST_XTASK" "$@"
+"#,
+        );
+        write(&bin, "just", br#"#!/bin/sh
+if [ "$1" = accept ]; then
+    "$FIXTURE_TEST_XTASK" fixtures verify || exit $?
+    [ "$CARRICK_HOST_LEASE_MODE" = gate ] || exit 92
+    [ -d "$FIXTURE_TEST_CHECKOUT_LOCK" ] || exit 93
+    touch "$FIXTURE_TEST_ACCEPTED"
+    receipt_dir="target/el1-gate/$(git rev-parse --short HEAD)"
+    mkdir -p "$receipt_dir"
+    printf '{"head":"%s","phase":"signed","overall":"PASS"}\n' "$(git rev-parse HEAD)" > "$receipt_dir/receipt.json"
+    printf '%s\n' '==================== ACCEPT GATE SUMMARY ====================' 'fixture preparation preflight passed (HVF acceptance replaced in this test)' '============================================================='
+else
+    exec "$FIXTURE_TEST_JUST" --justfile "$FIXTURE_TEST_JUSTFILE" --working-directory "$PWD" "$@"
+fi
+"#);
+        for name in ["cargo", "just"] {
+            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Self {
+            scratch,
+            archive,
+            checkout,
+            lock,
+            bin,
+        }
+    }
+
+    fn command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        let just = Command::new("sh")
+            .args(["-c", "command -v just"])
+            .output()
+            .unwrap();
+        assert!(just.status.success());
+        command
+            .env(
+                "PATH",
+                format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("FIXTURE_TEST_XTASK", env!("CARGO_BIN_EXE_carrick-xtask"))
+            .env(
+                "FIXTURE_TEST_JUST",
+                String::from_utf8(just.stdout).unwrap().trim(),
+            )
+            .env(
+                "FIXTURE_TEST_JUSTFILE",
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../justfile"),
+            )
+            .env("FIXTURE_TEST_CHECKOUT_LOCK", &self.lock)
+            .env(
+                "FIXTURE_TEST_ACCEPTED",
+                self.scratch.path().join("accepted"),
+            )
+            .env(
+                "CARRICK_HOST_LEASE_PATH",
+                self.scratch.path().join("host.lock"),
+            )
+            .env_remove("CARRICK_HOST_LEASE_FD")
+            .env_remove("CARRICK_HOST_LEASE_MODE");
+        command
+    }
+
+    fn setup(&self, f: &Fixture) {
+        let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
+        let script = carrick_xtask::remote_accept::build_worktree_setup_cmd(
+            f.repo.path().to_str().unwrap(),
+            self.checkout.to_str().unwrap(),
+            &sha,
+        );
+        let out = self.command("sh").args(["-c", &script]).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn remote_job(&self) -> (String, String) {
+        let log = self.scratch.path().join("accept.log");
+        let exit = self.scratch.path().join("exit");
+        let script = carrick_xtask::remote_accept::build_accept_job_script(
+            self.checkout.to_str().unwrap(),
+            carrick_xtask::accept::AcceptPhase::Signed,
+            log.to_str().unwrap(),
+            exit.to_str().unwrap(),
+            self.lock.to_str().unwrap(),
+            Some(self.archive.to_str().unwrap()),
+        )
+        .unwrap();
+        let out = self.command("sh").args(["-c", &script]).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (
+            fs::read_to_string(exit).unwrap().trim().to_owned(),
+            fs::read_to_string(log).unwrap(),
+        )
+    }
+}
+
+#[test]
+fn remote_preparation_restores_empty_checkout_before_signed_preflight() {
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    let (exit, log) = p.remote_job();
+    assert_eq!(exit, "0", "empty checkout preparation failed:\n{log}");
+    carrick_xtask::accept::verify_signed_fixtures(&p.checkout).unwrap();
+}
+
+#[test]
+fn remote_preparation_restores_raw_fixtures_after_same_sha_cleanup() {
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    fixtures::restore(&p.checkout, &f.path, None).unwrap();
+    p.setup(&f);
+    // Reuse must reinstall missing ignored outputs even when HEAD is unchanged.
+    fs::remove_dir_all(p.checkout.join("fixtures/linux-aarch64-hello/target")).unwrap();
+    let (exit, log) = p.remote_job();
+    assert_eq!(exit, "0", "same-SHA checkout preparation failed:\n{log}");
+    carrick_xtask::accept::verify_signed_fixtures(&p.checkout).unwrap();
+}
+
+#[test]
+fn remote_preparation_rejects_stale_sha_before_acceptance() {
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    write(
+        f.repo.path(),
+        "README.md",
+        b"a new commit with the same fixture sources\n",
+    );
+    git(f.repo.path(), &["add", "README.md"]);
+    git(f.repo.path(), &["commit", "-qm", "next commit"]);
+    p.setup(&f);
+    let (exit, _) = p.remote_job();
+    assert_ne!(exit, "0");
+    assert!(!p.scratch.path().join("accepted").exists());
+    assert!(carrick_xtask::accept::verify_signed_fixtures(&p.checkout).is_err());
+}
+
+#[test]
+fn actions_restore_entrypoint_preserves_modes_and_passes_fixture_preflight() {
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    let out = p
+        .command("just")
+        .current_dir(&p.checkout)
+        .arg("fixtures-restore")
+        .arg(&p.archive)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "Actions restore failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    carrick_xtask::accept::verify_signed_fixtures(&p.checkout).unwrap();
+}
+
+#[test]
+fn fixture_preparation_lease_preserves_shell_argument_boundaries() {
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    let out = p
+        .command("just")
+        .current_dir(&p.checkout)
+        .args([
+            "lease",
+            "gate",
+            "sh",
+            "-c",
+            "printf '%s' \"$1\"",
+            "fixture-test",
+            "two words",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.stdout, b"two words");
+}
+
+#[test]
+fn remote_accept_cli_transfers_the_bundle_and_prepares_a_fresh_checkout() {
+    let f = Fixture::new();
+    let mut p = Preparation::new(&f);
+    let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
+    let source = f.path.parent().unwrap();
+    let stored = f
+        .repo
+        .path()
+        .join("target/fixtures/bundles")
+        .join(&sha)
+        .join(source.file_name().unwrap());
+    fs::create_dir_all(stored.join("objects")).unwrap();
+    fs::copy(&f.path, stored.join("manifest.json")).unwrap();
+    for entry in fs::read_dir(source.join("objects")).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), stored.join("objects").join(entry.file_name())).unwrap();
+    }
+    let remote = p.scratch.path().join("remote");
+    fs::create_dir(&remote).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["clone", "--bare", "--quiet"])
+            .arg(f.repo.path())
+            .arg(remote.join("carrick.git"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    p.checkout = remote.join("gate-worktree");
+    fs::remove_dir(&p.lock).unwrap();
+    p.lock = remote.join("gate-worktree.lock");
+    // Only the SSH network boundary is replaced. Real Git and rsync servers
+    // execute in scratch; detached acceptance is joined to avoid test polling.
+    write(
+        &p.bin,
+        "ssh",
+        br#"#!/bin/sh
+[ "$1" != -G ] || exit 0
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o|-p|-l) shift 2 ;;
+        -o*) shift ;;
+        *) break ;;
+    esac
+done
+shift
+script="$*"
+case "$script" in
+    'df -Pk '*)
+        printf '%s\n' 'Filesystem 1024-blocks Used Available Capacity Mounted on' 'fixture-volume 104857600 0 104857600 0% /fixture-test'
+        exit 0 ;;
+    *nohup*) script="$script
+wait" ;;
+esac
+exec sh -c "$script"
+"#,
+    );
+    fs::set_permissions(p.bin.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let out = p
+        .command(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .arg("--root")
+        .arg(f.repo.path())
+        .args([
+            "remote-accept",
+            "--phase",
+            "signed",
+            "--ref",
+            &sha,
+            "--host",
+            "fixture-test-local",
+        ])
+        .arg("--remote-root")
+        .arg(&remote)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "normal remote preparation failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    carrick_xtask::accept::verify_signed_fixtures(&p.checkout).unwrap();
+    assert!(
+        !p.lock.exists(),
+        "checkout admission was not released after completion"
+    );
+}
+
+#[test]
+fn fixture_artifact_is_immutable_and_retains_executable_modes() {
+    let f = Fixture::new();
+    let output = tempfile::tempdir().unwrap();
+    let artifact = fixtures::archive::pack(&f.path, output.path()).unwrap();
+    let original = fs::read(&artifact).unwrap();
+    assert_eq!(
+        fixtures::archive::pack(&f.path, output.path()).unwrap(),
+        artifact
+    );
+    assert_eq!(fs::read(&artifact).unwrap(), original);
+    fixtures::archive::restore(f.repo.path(), &artifact, None).unwrap();
+    carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).unwrap();
+    fs::write(&artifact, b"tampered artifact").unwrap();
+    assert!(fixtures::archive::pack(&f.path, output.path()).is_err());
+}
+
+#[test]
+fn archived_missing_tampered_or_linked_objects_fail_before_publication() {
+    for case in ["missing", "tampered", "symlink", "mode"] {
+        let f = Fixture::new();
+        match case {
+            "missing" => fs::remove_file(f.object()).unwrap(),
+            "tampered" => fs::write(f.object(), b"tampered").unwrap(),
+            "symlink" => {
+                let object = f.object();
+                fs::remove_file(&object).unwrap();
+                std::os::unix::fs::symlink("/etc/passwd", object).unwrap();
+            }
+            "mode" => fs::set_permissions(f.object(), fs::Permissions::from_mode(0o644)).unwrap(),
+            _ => unreachable!(),
+        }
+        let p = Preparation::new(&f);
+        p.setup(&f);
+        let error = fixtures::archive::restore(&p.checkout, &p.archive, None).unwrap_err();
+        assert!(
+            !p.checkout.join(fixtures::INSTALLED_MANIFEST).exists(),
+            "{case}: {error}"
+        );
+        assert!(
+            !p.checkout.join(&f.manifest.executables[0].path).exists(),
+            "{case}: {error}"
+        );
+    }
+}
+
+#[test]
+fn remote_bundle_selection_rejects_missing_ambiguous_and_wrong_sha_inputs() {
+    let f = Fixture::new();
+    let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
+    assert!(fixtures::resolve_bundle(f.repo.path(), &sha, None).is_err());
+    assert!(fixtures::resolve_bundle(f.repo.path(), &"a".repeat(40), Some(&f.path)).is_err());
+    assert_eq!(
+        fixtures::resolve_bundle(f.repo.path(), &sha, Some(&f.path)).unwrap(),
+        f.path
+    );
+    for name in ["one", "two"] {
+        let path = f
+            .repo
+            .path()
+            .join("target/fixtures/bundles")
+            .join(&sha)
+            .join(name);
+        fs::create_dir_all(&path).unwrap();
+        fs::copy(&f.path, path.join("manifest.json")).unwrap();
+    }
+    assert!(
+        fixtures::resolve_bundle(f.repo.path(), &sha, None)
+            .unwrap_err()
+            .to_string()
+            .contains("found 2")
+    );
+}
+
+#[test]
+fn signed_preparation_requires_a_bundle_and_checkout_admission() {
+    for phase in [
+        carrick_xtask::accept::AcceptPhase::Signed,
+        carrick_xtask::accept::AcceptPhase::All,
+    ] {
+        assert!(
+            carrick_xtask::remote_accept::build_accept_job_script(
+                "/checkout",
+                phase,
+                "/log",
+                "/exit",
+                "/lock",
+                None,
+            )
+            .is_err()
+        );
+    }
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    fs::remove_dir(&p.lock).unwrap();
+    let (exit, _) = p.remote_job();
+    assert_ne!(exit, "0");
+    assert!(!p.checkout.join(fixtures::INSTALLED_MANIFEST).exists());
+    assert!(!p.scratch.path().join("accepted").exists());
+}

@@ -1,6 +1,5 @@
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -46,6 +45,12 @@ pub struct RemoteAcceptArgs {
 
     #[arg(long, help = "Attach to an existing run-id and resume polling")]
     pub attach: Option<String>,
+
+    #[arg(
+        long,
+        help = "Exact-SHA fixture manifest (default: unique local target/fixtures/bundles/<sha> bundle)"
+    )]
+    pub fixture_manifest: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -78,6 +83,10 @@ pub enum RemoteAcceptError {
         "remote rsync path '{0}' contains characters unsupported by portable rsync argument handling"
     )]
     InvalidRsyncPath(String),
+    #[error("signed fixture preparation: {0}")]
+    Fixtures(#[from] crate::fixtures::FixturesError),
+    #[error("signed/all remote acceptance requires an exact-SHA fixture bundle")]
+    MissingFixtureBundle,
 }
 
 pub fn shell_quote(s: &str) -> String {
@@ -223,41 +232,14 @@ pub fn extract_summary(log: &str) -> Option<String> {
     Some(log[start_idx..full_end].to_string())
 }
 
-pub fn resolve_probe_dir(root: &Path, target_triple: &str) -> PathBuf {
-    let local = root
-        .join("conformance-probes/target")
-        .join(target_triple)
-        .join("release");
-    if use_local_probes(&local) {
-        return local;
-    }
-    if let Ok(out) = command::run_checked("git", ["rev-parse", "--git-common-dir"], Some(root)) {
-        let common = PathBuf::from(out.stdout.trim());
-        let common = if common.is_relative() {
-            root.join(common)
-        } else {
-            common
-        };
-        if let Some(parent) = common.parent() {
-            let candidate = parent
-                .join("conformance-probes/target")
-                .join(target_triple)
-                .join("release");
-            if use_local_probes(&candidate) {
-                return candidate;
-            }
-        }
-    }
-    local
-}
-
 pub fn build_accept_job_script(
     worktree_dir: &str,
     phase: AcceptPhase,
     log_file: &str,
     exit_file: &str,
     lock_dir: &str,
-) -> String {
+    fixture_bundle: Option<&str>,
+) -> Result<String, RemoteAcceptError> {
     let env_file = Path::new(worktree_dir)
         .parent()
         .unwrap_or(Path::new("."))
@@ -268,9 +250,21 @@ pub fn build_accept_job_script(
     let q_exit = shell_quote(exit_file);
     let q_exit_tmp = shell_quote(&format!("{exit_file}.tmp"));
     let q_lock = shell_quote(lock_dir);
-    format!(
-        "[ -f {q_env} ] && . {q_env}; cd {q_worktree} && just accept --phase {phase} > {q_log} 2>&1; echo $? > {q_exit_tmp} && mv {q_exit_tmp} {q_exit}; rm -rf {q_lock}"
-    )
+    let command = if phase == AcceptPhase::Host {
+        format!("just accept --phase {phase}")
+    } else {
+        let bundle = fixture_bundle.ok_or(RemoteAcceptError::MissingFixtureBundle)?;
+        // One gate lease spans restoration, accept and scoped guest cleanup.
+        // The checkout lock is already held and remains held until job exit.
+        let preparation = format!(
+            "test -d {q_lock} && just fixtures-restore {} && just accept --phase {phase}",
+            shell_quote(bundle)
+        );
+        format!("just lease gate sh -c {}", shell_quote(&preparation))
+    };
+    Ok(format!(
+        "[ -f {q_env} ] && . {q_env}; cd {q_worktree} && {command} > {q_log} 2>&1; echo $? > {q_exit_tmp} && mv {q_exit_tmp} {q_exit}; rm -rf {q_lock}"
+    ))
 }
 
 pub fn build_detached_start_cmd(
@@ -280,13 +274,21 @@ pub fn build_detached_start_cmd(
     log_file: &str,
     exit_file: &str,
     lock_dir: &str,
-) -> String {
-    let script = build_accept_job_script(worktree_dir, phase, log_file, exit_file, lock_dir);
-    format!(
+    fixture_bundle: Option<&str>,
+) -> Result<String, RemoteAcceptError> {
+    let script = build_accept_job_script(
+        worktree_dir,
+        phase,
+        log_file,
+        exit_file,
+        lock_dir,
+        fixture_bundle,
+    )?;
+    Ok(format!(
         "mkdir -p {} && nohup sh -c {} >/dev/null 2>&1 </dev/null &",
         shell_quote(run_dir),
         shell_quote(&script)
-    )
+    ))
 }
 
 pub fn build_worktree_setup_cmd(bare_repo: &str, worktree_dir: &str, full_sha: &str) -> String {
@@ -534,63 +536,31 @@ fn rsync_args(source: &str, destination: &str) -> [String; 6] {
     ]
 }
 
-fn use_local_probes(local_dir: &Path) -> bool {
-    fs::read_dir(local_dir).is_ok_and(|entries| {
-        entries.flatten().any(|entry| {
-            entry.path().is_file()
-                && entry.path().extension().is_none()
-                && entry
-                    .metadata()
-                    .is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
-        })
-    })
-}
-
-pub fn build_remote_probe_fallback_cmd(remote_root: &str, worktree: &str, target: &str) -> String {
-    let dest = shell_quote(&format!(
-        "{worktree}/conformance-probes/target/{target}/release"
-    ));
-    let source = shell_quote(&format!(
-        "{remote_root}/carrick/conformance-probes/target/{target}/release"
-    ));
-    format!(
-        "if [ -d {source} ]; then mkdir -p {dest} && rsync -a {source}/ {dest}/ && echo 'Using remote prebuilt probes for {target} (executable freshness still requires signed validation)'; else echo 'No remote prebuilt probes for {target}; host gate can run, signed probe gate must fail if required executables are missing'; fi"
-    )
-}
-
-fn copy_probe_executables(
+fn copy_fixture_bundle(
     local_root: &Path,
     host: &str,
-    remote_worktree: &str,
-    remote_root: &str,
-) -> Result<(), RemoteAcceptError> {
-    let targets = ["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"];
-    for target in targets {
-        let local_dir = resolve_probe_dir(local_root, target);
-        if !use_local_probes(&local_dir) {
-            eprintln!(
-                "Warning: local probe dir '{}' has no built probes; using remote prebuilt probes for {target}",
-                local_dir.display()
-            );
-            let fallback = build_remote_probe_fallback_cmd(remote_root, remote_worktree, target);
-            println!("{}", run_ssh_command(host, &fallback)?.trim());
-            continue;
-        }
-
-        let remote_dest = format!("{remote_worktree}/conformance-probes/target/{target}/release");
-        let mkdir_cmd = format!("mkdir -p {}", shell_quote(&remote_dest));
-        run_ssh_command(host, &mkdir_cmd)?;
-
-        let local_src = format!("{}/", local_dir.display());
-        let remote_target = rsync_remote_spec(host, &format!("{remote_dest}/"))?;
-        command::run_checked("rsync", rsync_args(&local_src, &remote_target), None).map_err(
-            |e| RemoteAcceptError::Ssh {
-                host: host.to_string(),
-                details: format!("failed to rsync probes for {target}: {e}"),
-            },
-        )?;
-    }
-    Ok(())
+    run_dir: &str,
+    sha: &str,
+    manifest: Option<&Path>,
+) -> Result<String, RemoteAcceptError> {
+    let manifest = crate::fixtures::resolve_bundle(local_root, sha, manifest)?;
+    let artifact =
+        crate::fixtures::archive::pack(&manifest, &local_root.join("target/fixtures/published"))?;
+    crate::fixtures::archive::verify(&artifact, sha)?;
+    let destination = format!("{run_dir}/fixtures");
+    run_ssh_command(host, &format!("mkdir -p {}", shell_quote(&destination)))?;
+    let filename = artifact
+        .file_name()
+        .ok_or(RemoteAcceptError::MissingFixtureBundle)?
+        .to_string_lossy();
+    let remote_artifact = format!("{destination}/{filename}");
+    let remote_spec = rsync_remote_spec(host, &remote_artifact)?;
+    command::run_checked(
+        "rsync",
+        rsync_args(&artifact.to_string_lossy(), &remote_spec),
+        None,
+    )?;
+    Ok(remote_artifact)
 }
 
 pub(crate) fn check_remote_disk_space(
@@ -744,14 +714,23 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
             WorktreePolicy::Recreate,
         )?;
 
-        // Copy probe executables
-        println!("Syncing probe executables to remote worktree...");
-        copy_probe_executables(&local_root, &host, &worktree_dir, &remote_root)?;
+        let run_dir = format!("{remote_root}/gate-runs/{run_id}");
+        let bundle = if args.phase == AcceptPhase::Host {
+            None
+        } else {
+            println!("Transferring exact-SHA fixture bundle...");
+            Some(copy_fixture_bundle(
+                &local_root,
+                &host,
+                &run_dir,
+                &full_sha,
+                args.fixture_manifest.as_deref(),
+            )?)
+        };
 
         // Step 4: Start detached accept gate on remote
         println!("run-id: {run_id}");
 
-        let run_dir = format!("{remote_root}/gate-runs/{run_id}");
         let log_file = format!("{run_dir}/accept.log");
         let exit_file = format!("{run_dir}/exit");
         let start_cmd = build_detached_start_cmd(
@@ -761,7 +740,8 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
             &log_file,
             &exit_file,
             &lock_dir,
-        );
+            bundle.as_deref(),
+        )?;
 
         println!("Starting detached accept gate on {host}...");
         run_ssh_command(&host, &start_cmd)?;
@@ -981,41 +961,6 @@ mod tests {
     }
 
     #[test]
-    fn linux_missing_probes_use_remote_prebuilt() {
-        let root = tempfile::tempdir().unwrap();
-        let probes = resolve_probe_dir(root.path(), "aarch64-unknown-linux-musl");
-        assert_eq!(
-            probes,
-            root.path()
-                .join("conformance-probes/target/aarch64-unknown-linux-musl/release")
-        );
-        assert!(!use_local_probes(&probes));
-        fs::create_dir_all(&probes).unwrap();
-        assert!(
-            !use_local_probes(&probes),
-            "empty release directories are not built probes"
-        );
-        let executable = probes.join("probe-example");
-        fs::write(&executable, b"ELF").unwrap();
-        assert!(
-            !use_local_probes(&probes),
-            "non-executable files are not probes"
-        );
-        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(use_local_probes(&probes));
-        let fallback = build_remote_probe_fallback_cmd(
-            "/remote root",
-            "/remote root/gate-worktree",
-            "aarch64-unknown-linux-musl",
-        );
-        assert!(fallback.contains(
-            "'/remote root/carrick/conformance-probes/target/aarch64-unknown-linux-musl/release'"
-        ));
-        assert!(fallback.contains("'/remote root/gate-worktree/conformance-probes/target/aarch64-unknown-linux-musl/release'"));
-        assert!(fallback.contains("Using remote prebuilt probes"));
-    }
-
-    #[test]
     fn test_shell_quoting() {
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("simple"), "'simple'");
@@ -1052,12 +997,21 @@ mod tests {
             log_file,
             exit_file,
             lock_dir,
-        );
+            None,
+        )
+        .unwrap();
 
         assert!(start_cmd.starts_with("mkdir -p '/Volumes/carrick/gate runs/123' && nohup sh -c "));
         assert!(start_cmd.ends_with(" >/dev/null 2>&1 </dev/null &"));
-        let script =
-            build_accept_job_script(worktree, AcceptPhase::Host, log_file, exit_file, lock_dir);
+        let script = build_accept_job_script(
+            worktree,
+            AcceptPhase::Host,
+            log_file,
+            exit_file,
+            lock_dir,
+            None,
+        )
+        .unwrap();
         assert!(start_cmd.contains(&shell_quote(&script)));
         let start_cmd = script;
         assert!(start_cmd.contains("cd '/Volumes/carrick/work tree with spaces'"));

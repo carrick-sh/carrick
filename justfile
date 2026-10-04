@@ -88,8 +88,13 @@ xtask *ARGS:
     cargo run --locked -p carrick-xtask -- {{ARGS}}
 
 # Run under the host flock lease (carrick shared, gate/docker exclusive).
+[positional-arguments]
 lease MODE +CMD:
-    cargo run --locked -p carrick-xtask -- host-lease --mode {{MODE}} -- {{CMD}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    lease_mode="$1"
+    shift
+    exec cargo run --locked -p carrick-xtask -- host-lease --mode "$lease_mode" -- "$@"
 
 # Run the host and/or signed landing gate under an exclusive host lease (no Docker).
 accept *ARGS:
@@ -98,6 +103,14 @@ accept *ARGS:
 # Run `just accept` (no Docker) on the remote gate Mac and fetch the receipt.
 remote-accept *ARGS:
     cargo run --locked -p carrick-xtask -- remote-accept {{ARGS}}
+
+# Linux publisher: exact-SHA build plus immutable, mode-preserving .tar.gz artifact.
+fixtures-publish SHA:
+    cargo run --locked -p carrick-xtask -- fixtures publish --sha {{quote(SHA)}}
+
+# Restore the transferred artifact after checkout cleanup; signed jobs hold gate admission.
+fixtures-restore BUNDLE:
+    cargo run --locked -p carrick-xtask -- fixtures restore --bundle {{quote(BUNDLE)}}
 
 # Return a reviewed-position-only patch from the same locked cloudmac worktree.
 # Apply and commit locally; this command never applies the patch for you.
