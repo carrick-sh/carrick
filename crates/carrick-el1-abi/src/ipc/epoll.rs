@@ -8,7 +8,7 @@
 //! member is an IPC object (eventfd, pipe end) lives here, in an
 //! [`IpcEpollItem`]; every other item (sockets, files, nested epolls, ...)
 //! lives in the host's interest map, and this record only counts them
-//! ([`EpollState::host_items`]). An item's home is chosen by member type at
+//! ([`IpcRegion::epoll_host_items`]). An item's home is chosen by member type at
 //! `EPOLL_CTL_ADD` and never changes. EL1 serves a wait only while
 //! `host_items == 0`; the host serves a mixed set by harvesting this
 //! record first and its own items second.
