@@ -80,6 +80,11 @@ impl Fixture {
         );
         write(root, "conformance-probes/src/bin/probeinit.rs", b"helper\n");
         write(root, "conformance-probes/src/bin/hello.rs", b"probe\n");
+        write(
+            root,
+            "crates/carrick-el1-abi/src/lib.rs",
+            b"local fixture dependency\n",
+        );
         write(root, "conformance-probes/probe-inventory.json", br#"{"probeinit":{"class":"helper","runner":"generic","excluded":false},"hello":{"class":"conformance","runner":"generic","excluded":false}}"#);
         git(root, &["add", "."]);
         git(root, &["commit", "-qm", "fixture inputs"]);
@@ -252,6 +257,23 @@ fn source_tamper_and_untracked_input_are_rejected() {
         b"untracked source",
     );
     f.rejected("dirty fixture source");
+}
+
+#[test]
+fn local_workspace_dependency_sources_are_verified() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    write(
+        f.repo.path(),
+        "crates/carrick-el1-abi/src/lib.rs",
+        b"changed dependency",
+    );
+    assert!(
+        fixtures::verify_installed(f.repo.path())
+            .unwrap_err()
+            .to_string()
+            .contains("dirty fixture source")
+    );
 }
 #[test]
 fn missing_source_hash_and_missing_executable_row_are_rejected() {
