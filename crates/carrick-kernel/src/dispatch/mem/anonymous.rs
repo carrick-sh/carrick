@@ -1491,17 +1491,6 @@ fn edit_range(address: u64, length: u64, page_size: u64) -> Option<ReservationRa
 }
 
 impl MemView<'_> {
-    /// Read the admitted owner's exact mapping for fault attribution.
-    pub(in crate::dispatch) fn owner_mapping_at(
-        &self,
-        address: u64,
-    ) -> Option<carrick_el1::memory::reservations::Mapping> {
-        let root = self.mem().lock().delegated_root()?.clone();
-        root.with_root(|model| Ok(model.mapping(address)))
-            .ok()
-            .flatten()
-    }
-
     /// One root step with the host's current limits and the charges of
     /// everything the root does not hold pushed first.
     fn with_charged_root<R>(
