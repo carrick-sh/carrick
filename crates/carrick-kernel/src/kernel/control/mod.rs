@@ -1,4 +1,11 @@
 //! Authenticated host-operator control for one managed HVPatch carrier.
+//!
+//! Each direction carries one bounded, length-prefixed JSON frame. The length
+//! is authoritative: a complete payload does not wait for peer EOF. JSON
+//! trailing data inside that payload is rejected; bytes beyond the frame are
+//! never dispatched as another request on this connection. Writers half-close
+//! after their frame, but that is teardown, not an acknowledgement the reader
+//! must wait for before processing a complete request or response.
 
 pub mod archive;
 mod endpoint;
@@ -197,7 +204,9 @@ pub struct CarrierControlServer {
     /// Set by `quiesce_admission`: the owner record is `TearingDown` and
     /// belongs to the managed guard until the terminal receipt is durable.
     retain_owner_on_drop: bool,
+    #[cfg(test)]
     tracker: Arc<parking_lot::Mutex<connection::ConnectionTracker>>,
+    cancellation: Arc<connection::ControlCancellation>,
 }
 
 /// Run-lifetime guard for one managed carrier. Terminal state is persisted
@@ -267,9 +276,14 @@ impl CarrierControlServer {
         archive: Arc<dyn CarrierArchiveControl>,
         archive_slot: Option<Arc<ArchiveAdmissionSlot>>,
     ) -> Result<Self, ControlError> {
+        let cancellation = Arc::new(connection::ControlCancellation::new()?);
         let nonce = ControlNonce::fresh()?;
         endpoint.claim(nonce)?;
         let listener = UnixListener::bind(endpoint.socket_path())?;
+        if let Err(error) = listener.set_nonblocking(true) {
+            endpoint.rollback_unpublished_socket();
+            return Err(error.into());
+        }
         if let Err(error) = endpoint.publish_bound_owner(nonce) {
             endpoint.rollback_unpublished_socket();
             return Err(error.into());
@@ -279,8 +293,11 @@ impl CarrierControlServer {
         let thread_endpoint = endpoint.clone();
         let thread_exec = Arc::clone(&exec);
         let thread_archive = Arc::clone(&archive);
-        let tracker = Arc::new(parking_lot::Mutex::new(connection::ConnectionTracker::new()));
+        let tracker = Arc::new(parking_lot::Mutex::new(connection::ConnectionTracker::new(
+            Arc::clone(&cancellation),
+        )));
         let thread_tracker = Arc::clone(&tracker);
+        let thread_cancellation = Arc::clone(&cancellation);
         let join = match std::thread::Builder::new()
             .name("carrick-carrier-control".to_owned())
             .spawn(move || {
@@ -298,6 +315,7 @@ impl CarrierControlServer {
                     },
                     thread_endpoint,
                     thread_tracker,
+                    thread_cancellation,
                 );
             }) {
             Ok(join) => join,
@@ -315,7 +333,9 @@ impl CarrierControlServer {
             shutdown,
             join: Some(join),
             retain_owner_on_drop: false,
+            #[cfg(test)]
             tracker,
+            cancellation,
         })
     }
 
@@ -373,8 +393,7 @@ impl CarrierControlServer {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.tracker.lock().cancel_and_join();
-        let _ = UnixStream::connect(self.endpoint.socket_path());
+        self.cancellation.cancel();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -511,6 +530,22 @@ pub fn send_at(
     state: &crate::container::CarrierControlState,
     operation: ControlOperation,
 ) -> Result<ControlOutcome, ControlError> {
+    let wait = ResponseWait::Deadline(operation_response_deadline(&operation));
+    send_at_with_wait(endpoint, state, operation, wait)
+}
+
+enum ResponseWait {
+    Deadline(Duration),
+    #[cfg(test)]
+    Completion,
+}
+
+fn send_at_with_wait(
+    endpoint: &ControlEndpoint,
+    state: &crate::container::CarrierControlState,
+    operation: ControlOperation,
+    wait: ResponseWait,
+) -> Result<ControlOutcome, ControlError> {
     if state.schema != CARRIER_CONTROL_STATE_SCHEMA {
         return Err(ControlError::Protocol(format!(
             "unknown carrier control state schema {}",
@@ -538,9 +573,14 @@ pub fn send_at(
             "carrier control owner changed during connect".to_owned(),
         ));
     }
-    let response_deadline = operation_response_deadline(&operation);
-    stream.set_read_timeout(Some(response_deadline))?;
-    stream.set_write_timeout(Some(DEADLINE))?;
+    match wait {
+        ResponseWait::Deadline(deadline) => {
+            stream.set_read_timeout(Some(deadline))?;
+            stream.set_write_timeout(Some(DEADLINE))?;
+        }
+        #[cfg(test)]
+        ResponseWait::Completion => {}
+    }
     let request = ControlRequest {
         schema: REQUEST_SCHEMA.to_owned(),
         request_id: ControlNonce::fresh()?,
@@ -553,9 +593,12 @@ pub fn send_at(
         &serde_json::to_vec(&request).map_err(protocol)?,
     )?;
     let request_id = request.request_id;
-    let response: ControlResponse =
-        serde_json::from_slice(&read_frame_with_deadline(&mut stream, response_deadline)?)
-            .map_err(protocol)?;
+    let bytes = match wait {
+        ResponseWait::Deadline(deadline) => read_frame_with_deadline(&mut stream, deadline)?,
+        #[cfg(test)]
+        ResponseWait::Completion => read_frame(&mut stream)?,
+    };
+    let response: ControlResponse = serde_json::from_slice(&bytes).map_err(protocol)?;
     if response.schema != RESPONSE_SCHEMA || response.request_id != request_id {
         return Err(ControlError::Protocol(
             "response authority does not match requested incarnation".to_owned(),
@@ -583,8 +626,8 @@ fn operation_response_deadline(operation: &ControlOperation) -> Duration {
     }
 }
 
-pub(super) fn handle(
-    stream: &mut UnixStream,
+fn handle(
+    stream: &mut connection::ControlConnection,
     kernel: &Arc<super::Kernel>,
     init: super::TaskKey,
     nonce: ControlNonce,
@@ -593,7 +636,6 @@ pub(super) fn handle(
 ) -> Result<(), ControlError> {
     authenticate(stream)?;
     // Per-connection request wait
-    stream.set_write_timeout(Some(DEADLINE))?;
     let request: ControlRequest = serde_json::from_slice(&read_frame(stream)?).map_err(protocol)?;
     let request_id = request.request_id;
     let exact = ControlTaskKey::from(init);
@@ -712,7 +754,7 @@ fn exec_status_outcome(status: ExecStatus) -> ControlOutcome {
 }
 
 fn write_response(
-    stream: &mut UnixStream,
+    stream: &mut connection::ControlConnection,
     request_id: ControlNonce,
     nonce: ControlNonce,
     init: ControlTaskKey,
@@ -728,7 +770,7 @@ fn write_response(
     write_frame(stream, &serde_json::to_vec(&response).map_err(protocol)?)
 }
 
-fn authenticate(stream: &UnixStream) -> Result<(), ControlError> {
+fn authenticate(stream: &impl AsRawFd) -> Result<(), ControlError> {
     let peer = carrick_portable::peer_credentials(stream.as_raw_fd())?;
     let uid = unsafe { libc::geteuid() };
     if peer.uid != uid {
@@ -740,7 +782,17 @@ fn authenticate(stream: &UnixStream) -> Result<(), ControlError> {
     Ok(())
 }
 
-fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), ControlError> {
+trait FrameStream: Write {
+    fn finish_frame(&self) -> std::io::Result<()>;
+}
+
+impl FrameStream for UnixStream {
+    fn finish_frame(&self) -> std::io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
+    }
+}
+
+fn write_frame(stream: &mut impl FrameStream, bytes: &[u8]) -> Result<(), ControlError> {
     if bytes.len() > MAX_CONTROL_FRAME {
         return Err(ControlError::Protocol("frame too large".to_owned()));
     }
@@ -748,11 +800,18 @@ fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), ControlError
     stream.write_all(&len.to_be_bytes())?;
     stream.write_all(bytes)?;
     stream.flush()?;
-    stream.shutdown(std::net::Shutdown::Write)?;
+    if let Err(error) = stream.finish_frame() {
+        // The authoritative frame is already written. A peer that consumed
+        // it may close before this optional teardown half-close; Darwin then
+        // reports ENOTCONN. That is not a failed or truncated frame write.
+        if error.kind() != std::io::ErrorKind::NotConnected {
+            return Err(error.into());
+        }
+    }
     Ok(())
 }
 
-fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, ControlError> {
+fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, ControlError> {
     let mut prefix = [0_u8; 4];
     stream.read_exact(&mut prefix)?;
     let len = u32::from_be_bytes(prefix) as usize;
@@ -761,10 +820,6 @@ fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, ControlError> {
     }
     let mut bytes = vec![0_u8; len];
     stream.read_exact(&mut bytes)?;
-    let mut trailing = [0_u8; 1];
-    if stream.read(&mut trailing)? != 0 {
-        return Err(ControlError::Protocol("trailing bytes".to_owned()));
-    }
     Ok(bytes)
 }
 
@@ -792,6 +847,31 @@ mod tests {
 
     use super::*;
 
+    const CONTROL_COMPLETION_FAILURE_BOUND: Duration = Duration::from_secs(30);
+
+    // These tests assert protocol semantics and resource ownership. Observe
+    // response/EOF through the production protocol path without turning its
+    // operator-facing wall-clock deadline into a test scheduling budget.
+    fn send_at(
+        endpoint: &ControlEndpoint,
+        state: &crate::container::CarrierControlState,
+        operation: ControlOperation,
+    ) -> Result<ControlOutcome, ControlError> {
+        let endpoint = endpoint.clone();
+        let state = state.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let response =
+                send_at_with_wait(&endpoint, &state, operation, ResponseWait::Completion);
+            let _ = tx.send(response);
+        });
+        let response = rx
+            .recv_timeout(CONTROL_COMPLETION_FAILURE_BOUND)
+            .expect("control server did not complete the response or close the connection");
+        client.join().expect("control completion client panicked");
+        response
+    }
+
     fn kernel_with_init() -> (Arc<super::super::Kernel>, super::super::KernelContext) {
         let bootstrap = super::super::RootBootstrap::for_reference_model(
             carrick_abi::LINUX_BOOTSTRAP_PID as i32,
@@ -800,6 +880,111 @@ mod tests {
         )
         .expect("bootstrap");
         super::super::Kernel::bootstrap_root(bootstrap).expect("kernel")
+    }
+
+    #[test]
+    fn complete_frame_does_not_wait_for_peer_half_close() {
+        let (mut sender, mut receiver) = UnixStream::pair().expect("socket pair");
+        sender.write_all(&4_u32.to_be_bytes()).expect("prefix");
+        sender.write_all(b"ping").expect("payload");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = tx.send(read_frame(&mut receiver));
+        });
+        let payload = rx
+            .recv_timeout(CONTROL_COMPLETION_FAILURE_BOUND)
+            .expect("complete frame waited for peer half-close")
+            .expect("complete frame");
+        assert_eq!(payload, b"ping");
+        // Keep the writer open until the frame is known to have completed.
+        drop(sender);
+        reader.join().expect("frame reader");
+    }
+
+    #[test]
+    fn frame_write_completes_when_peer_closes_after_reading_payload() {
+        struct CloseBeforeFinish {
+            stream: UnixStream,
+            peer_closed: std::sync::mpsc::Receiver<()>,
+        }
+        impl Write for CloseBeforeFinish {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.stream.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.stream.flush()
+            }
+        }
+        impl FrameStream for CloseBeforeFinish {
+            fn finish_frame(&self) -> std::io::Result<()> {
+                self.peer_closed
+                    .recv_timeout(CONTROL_COMPLETION_FAILURE_BOUND)
+                    .expect("peer did not consume and close the frame");
+                self.stream.shutdown(std::net::Shutdown::Write)
+            }
+        }
+        let (stream, mut peer) = UnixStream::pair().expect("socket pair");
+        let (tx, peer_closed) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            assert_eq!(read_frame(&mut peer).expect("frame"), b"ping");
+            drop(peer);
+            tx.send(()).expect("peer close receipt");
+        });
+        let mut sender = CloseBeforeFinish {
+            stream,
+            peer_closed,
+        };
+        write_frame(&mut sender, b"ping").expect("complete frame survives peer close");
+        reader.join().expect("reader");
+    }
+
+    #[test]
+    fn half_closed_request_before_handler_start_delivers_response_and_joins() {
+        let (kernel, init) = kernel_with_init();
+        let nonce = ControlNonce::fresh().expect("nonce");
+        let cancellation = Arc::new(connection::ControlCancellation::new().expect("cancellation"));
+        let mut tracker = connection::ConnectionTracker::new(cancellation);
+        let (mut client, server) = UnixStream::pair().expect("socket pair");
+        let request = ControlRequest {
+            schema: REQUEST_SCHEMA.to_owned(),
+            request_id: ControlNonce::fresh().expect("request id"),
+            owner_nonce: nonce,
+            expected_init: init.task().key().into(),
+            operation: ControlOperation::Status,
+        };
+        // Match the captured state: the full frame and peer half-close are
+        // already present before the handler reaches any read/trailing check.
+        write_frame(&mut client, &serde_json::to_vec(&request).expect("request"))
+            .expect("half-close complete request");
+        tracker.spawn_handler(
+            server,
+            kernel,
+            init.task().key(),
+            nonce,
+            Arc::new(ExecAdmissionSlot::default()),
+            Arc::new(ArchiveAdmissionSlot::default()),
+        );
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = tx.send(read_frame(&mut client));
+        });
+        let bytes = rx
+            .recv_timeout(CONTROL_COMPLETION_FAILURE_BOUND)
+            .expect("half-closed request did not receive a response")
+            .expect("response frame");
+        let response: ControlResponse = serde_json::from_slice(&bytes).expect("response");
+        assert_eq!(response.outcome, ControlOutcome::Alive);
+        assert_eq!(response.request_id, request.request_id);
+        assert_eq!(response.owner_nonce, nonce);
+        assert!(
+            tracker
+                .slot_observer()
+                .wait_for_count(0, CONTROL_COMPLETION_FAILURE_BOUND)
+        );
+        tracker.cancel_and_join();
+        assert_eq!(tracker.live_handlers_count(), 0);
+        assert_eq!(tracker.retained_handlers_count(), 0);
+        reader.join().expect("response reader");
     }
 
     #[test]
@@ -1702,8 +1887,17 @@ mod tests {
         .expect("server");
         let state = server.state();
 
-        let _stalled = UnixStream::connect(endpoint.socket_path()).expect("connect stalled");
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut stalled = UnixStream::connect(endpoint.socket_path()).expect("connect stalled");
+        // The peer remains open with an incomplete payload, so completing
+        // this handler requires cancellation, even if it starts after it.
+        stalled.write_all(&64_u32.to_be_bytes()).expect("prefix");
+        stalled.write_all(b"x").expect("partial payload");
+        assert!(server.wait_for_live_handlers_count(1, CONTROL_COMPLETION_FAILURE_BOUND));
+        assert!(
+            server
+                .cancellation
+                .wait_for_handlers(1, CONTROL_COMPLETION_FAILURE_BOUND)
+        );
 
         let (tx, rx) = std::sync::mpsc::channel();
         let test_endpoint = endpoint.clone();
@@ -1732,17 +1926,30 @@ mod tests {
         )
         .expect("server");
 
-        let _stalled = UnixStream::connect(endpoint.socket_path()).expect("connect stalled");
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut stalled = UnixStream::connect(endpoint.socket_path()).expect("connect stalled");
+        stalled.write_all(&64_u32.to_be_bytes()).expect("prefix");
+        stalled.write_all(b"x").expect("partial payload");
+        assert!(server.wait_for_live_handlers_count(1, CONTROL_COMPLETION_FAILURE_BOUND));
+        assert!(
+            server
+                .cancellation
+                .wait_for_handlers(1, CONTROL_COMPLETION_FAILURE_BOUND)
+        );
 
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let shutdown = std::thread::spawn(move || {
             server.shutdown();
+            assert_eq!(
+                server.live_handlers_count(),
+                0,
+                "shutdown joins the slot owner"
+            );
             let _ = tx.send(());
         });
 
         rx.recv_timeout(std::time::Duration::from_secs(5))
             .expect("server shutdown timed out with stalled client connected");
+        shutdown.join().expect("shutdown thread");
     }
 
     #[test]
@@ -1762,6 +1969,7 @@ mod tests {
                 send_at(&endpoint, &state, ControlOperation::Status).expect("status"),
                 ControlOutcome::Alive,
             );
+            assert!(server.wait_for_live_handlers_count(0, CONTROL_COMPLETION_FAILURE_BOUND));
         }
 
         assert!(
