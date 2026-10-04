@@ -6,7 +6,6 @@ use carrick_aarch64::descriptor_drain::{EngineDrainVenue, apply_guest_descriptor
 use carrick_guest_mem::GuestMemory;
 use carrick_hal::{GuestVmBackend, SyscallTrap, ThreadedEngine};
 use carrick_mem::{elf::SegmentPerms, memory::AddressSpace};
-use carrick_mmu_core::aarch64::LiveDescriptorOwner;
 use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorOp, PageSpan, TerminalEdit};
 use carrick_vmm_hvf::trap::new_hvf_trap_engine;
 use std::num::NonZeroU64;
@@ -133,7 +132,10 @@ fn serial_host_el1_descriptor_service_executes_and_settles() {
             as *const carrick_el1_abi::ZoneTables)
     };
     let mm = NonZeroU64::new(77).unwrap();
-    assert!(engine.select_live_descriptor_owner(LiveDescriptorOwner::Guest));
+    assert_eq!(
+        engine.page_tables().select_guest_descriptor_owner(),
+        Ok(carrick_aarch64::stage1_authority::GuestLaneSelection::Selected)
+    );
     let txn = engine
         .page_tables()
         .prepare_guest_descriptor_txn(
