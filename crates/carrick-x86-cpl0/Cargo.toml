@@ -1,0 +1,18 @@
+[package]
+name = "carrick-x86-cpl0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
+
+[[bin]]
+name = "carrick-x86-cpl0"
+path = "src/entry.rs"
+test = false
+bench = false
+
+[lints]
+workspace = true

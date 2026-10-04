@@ -796,14 +796,15 @@ fn sigaltstack_serves_off_the_alternate_stack() {
 }
 
 #[test]
-fn set_robust_list_stores_the_head_or_forwards() {
+fn set_robust_list_stores_the_head_or_returns_einval() {
     let mut w = World::new(LifecycleHatches::ON);
     let (action, frame) = w.syscall(SYS_SET_ROBUST_LIST, &[0x9000, 24]);
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0], 0);
     assert_eq!(w.venue.leader_slot().robust_list(), (0x9000, 24));
-    let (action, _) = w.syscall(SYS_SET_ROBUST_LIST, &[0xa000, 23]);
-    assert_eq!(action, Action::Forward);
+    let (action, frame) = w.syscall(SYS_SET_ROBUST_LIST, &[0xa000, 23]);
+    assert_eq!(action, Action::Served);
+    assert_eq!(frame.x[0] as i64, -22);
     assert_eq!(w.venue.leader_slot().robust_list(), (0x9000, 24));
     let mut w = World::new(LifecycleHatches {
         threads: true,

@@ -18,6 +18,7 @@
 pub mod arch_context;
 pub mod bringup;
 pub mod bringup_fns;
+pub mod cpl0_entry;
 pub mod engine;
 pub mod fault;
 pub mod vdso;
