@@ -43,7 +43,7 @@ fn fail(message: impl Into<String>) -> TrapError {
 pub(crate) struct Watchdog {
     cancel: mpsc::Sender<()>,
     worker: Option<std::thread::JoinHandle<()>>,
-    expired: Arc<AtomicBool>,
+    pub(crate) expired: Arc<AtomicBool>,
 }
 impl Watchdog {
     pub(crate) fn start() -> Self {
@@ -97,9 +97,9 @@ pub struct Observation {
 /// The vCPUs drop before the VM, and its registered backing drops last.
 /// No run handle or host pointer escapes this fixture owner.
 pub struct Cpl0Carrier {
-    cpus: [KvmVcpu; 2],
-    _vm: KvmVm,
-    ram: GuestRam,
+    pub(crate) cpus: [KvmVcpu; 2],
+    pub(crate) _vm: KvmVm,
+    pub(crate) ram: GuestRam,
     metadata_base: NonNull<u8>,
     host_forwards: u64,
     kicks: u64,
@@ -108,6 +108,14 @@ pub struct Cpl0Carrier {
 
 impl Cpl0Carrier {
     pub fn boot(image: &Path, programs: [&[u8]; 2]) -> Result<Self, TrapError> {
+        Self::boot_inner(image, programs, false)
+    }
+
+    pub(crate) fn boot_inner(
+        image: &Path,
+        programs: [&[u8]; 2],
+        interrupts: bool,
+    ) -> Result<Self, TrapError> {
         let bytes = std::fs::read(image).map_err(|e| fail(format!("CPL0 image: {e}")))?;
         let plan = carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62)
             .map_err(|e| fail(format!("CPL0 ELF: {e}")))?;
@@ -115,8 +123,12 @@ impl Cpl0Carrier {
             return Err(fail("CPL0 entry outside its supervisor image"));
         }
         let mut ram = GuestRam::new();
-        ram.add_window(0, RAM_SIZE, WindowKind::Private)
-            .map_err(|e| fail(e.to_string()))?;
+        ram.add_window(
+            0,
+            if interrupts { 2 * RAM_SIZE } else { RAM_SIZE },
+            WindowKind::Private,
+        )
+        .map_err(|e| fail(e.to_string()))?;
         let mut maps = Vec::new();
         for segment in &plan.segments {
             let end = segment
@@ -193,6 +205,10 @@ impl Cpl0Carrier {
                 exec: false,
             });
         }
+        if interrupts {
+            maps.extend(crate::carrier_interrupts::supervisor_maps());
+            maps.push(crate::carrier_interrupts::data_map(0));
+        }
         let tables = pml4_tables(
             &maps,
             LAYOUT.pml4_base,
@@ -201,6 +217,18 @@ impl Cpl0Carrier {
         .map_err(|e| fail(format!("CPL0 tables: {e:?}")))?;
         ram.write_gpa(LAYOUT.pml4_base, &tables)
             .map_err(|e| fail(e.to_string()))?;
+        if interrupts {
+            let last = maps.last_mut().ok_or_else(|| fail("progress data map"))?;
+            *last = crate::carrier_interrupts::data_map(1);
+            let second = pml4_tables(
+                &maps,
+                crate::carrier_interrupts::SECOND_ROOT,
+                carrick_x86::X86_PML4_CAPACITY as usize,
+            )
+            .map_err(|e| fail(format!("second progress root: {e:?}")))?;
+            ram.write_gpa(crate::carrier_interrupts::SECOND_ROOT, &second)
+                .map_err(|e| fail(e.to_string()))?;
+        }
         let boot = <carrick_hal::x8664_arch::X8664GuestArch as carrick_hal::guest_arch::GuestArch>::bootstrap_sysregs();
         let gdt: Vec<u8> = boot
             .gdt
@@ -287,10 +315,18 @@ impl Cpl0Carrier {
                     publications: AtomicU64::new(0),
                     completions: AtomicU64::new(0),
                     captured_stack: AtomicU64::new(0),
+                    scheduler_witness: AtomicU64::new(if interrupts && index == 0 {
+                        carrick_x86::cpl0_scheduler::PROGRESS_STATE
+                    } else {
+                        0
+                    }),
                 });
             }
         }
         let mut vm = KvmVm::create_empty().map_err(|e| fail(e.to_string()))?;
+        if interrupts {
+            crate::carrier_interrupts::create_irqchip(&vm)?;
+        }
         for (gpa, ptr, len) in ram.windows_for_kvm() {
             vm.map_memory(
                 gpa,
@@ -363,13 +399,13 @@ impl Cpl0Carrier {
         // SAFETY: all callers select initialized, aligned retained records.
         unsafe { &*self.metadata_base.as_ptr().add(offset as usize).cast::<T>() }
     }
-    fn binding(&self, index: usize) -> &CpuBinding {
+    pub(crate) fn binding(&self, index: usize) -> &CpuBinding {
         self.metadata(BINDING_OFFSET + index as u64 * STRIDE)
     }
     fn task(&self, index: usize) -> &CurrentTask {
         self.metadata(TASK_OFFSET + index as u64 * STRIDE)
     }
-    fn slot(&self, index: usize) -> &ThreadControlSlot {
+    pub(crate) fn slot(&self, index: usize) -> &ThreadControlSlot {
         self.metadata(CONTROL_OFFSET + index as u64 * STRIDE)
     }
     pub fn inject_boundary_kicks(&mut self, index: usize) -> Result<(), TrapError> {

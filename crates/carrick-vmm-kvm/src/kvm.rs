@@ -486,7 +486,7 @@ pub struct KvmVm {
     /// `set_user_memory_region` / `get_preferred_target` all take `&self`, so a
     /// shared `&VmFd` suffices for both vCPU creation and (fork-child) memory
     /// registration. See Task 5 unknown #1.
-    vm: Arc<VmFd>,
+    pub(crate) vm: Arc<VmFd>,
     /// The next `KVM_CREATE_VCPU` vcpu_id to hand out, shared across every
     /// `KvmVm` handle that targets the SAME VM (the main engine + all
     /// `clone(CLONE_THREAD)` siblings). `KVM_CREATE_VCPU` REQUIRES a unique

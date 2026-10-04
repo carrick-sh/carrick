@@ -27,6 +27,17 @@ static ALLOCATOR: NoAllocation = NoAllocation;
 mod adapter;
 
 #[cfg(target_os = "none")]
+#[allow(dead_code)] // Includes hardware hooks reserved for the M4 owner handoff.
+#[path = "../../carrick-x86/src/interrupts.rs"]
+mod interrupts;
+#[cfg(target_os = "none")]
+mod progress;
+#[cfg(target_os = "none")]
+#[allow(dead_code)] // Included native adapter also exposes the host bootstrap API.
+#[path = "../../carrick-x86/src/cpl0_scheduler.rs"]
+mod scheduler;
+
+#[cfg(target_os = "none")]
 core::arch::global_asm!(
     ".section .text.entry, \"ax\"",
     ".global carrick_x86_syscall",
@@ -109,6 +120,11 @@ mod kernel {
         let task = unsafe { &*(binding.task_address as *const CurrentTask) };
         let counters = unsafe { &*(binding.counters_address as *const Counters) };
         binding.entries.fetch_add(1, Ordering::Relaxed);
+        let scheduler_witness =
+            binding.scheduler_witness.load(Ordering::Acquire) == super::scheduler::PROGRESS_STATE;
+        if scheduler_witness {
+            super::progress::entry_boundary();
+        }
         if binding.entry_kick.swap(0, Ordering::AcqRel) != 0 {
             doorbell(ENTRY_KICK_PORT, frame);
         }
@@ -132,6 +148,9 @@ mod kernel {
             }
         }
         binding.completions.fetch_add(1, Ordering::Relaxed);
+        if scheduler_witness {
+            super::progress::return_boundary();
+        }
         if binding.return_kick.swap(0, Ordering::AcqRel) != 0 {
             doorbell(RETURN_KICK_PORT, frame);
         }
