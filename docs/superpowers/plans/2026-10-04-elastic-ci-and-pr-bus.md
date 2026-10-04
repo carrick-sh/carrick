@@ -1,42 +1,151 @@
-# Elastic CI and a PR bus
+# Runner-first CI and a reactive PR bus
 
-Status: **proposal, 2026-10-04**. This document authorizes no deployment. Pool
-creation, templates, credentials, runner registration, VM resizing, purchases and
-GitHub settings need separate owner approval. All implementation paths below are
-proposed; this change creates only this document.
+Status: **plan of record; direction approved by the owner on 2026-10-04**.
+This is a docs-only revision, not a deployment or acceptance claim. Infrastructure
+activation remains subject to the decisions below. Reported operational evidence
+is dated 2026-10-04; capabilities without a live qualification are **UNVERIFIED**.
 
-## Decisions and compatibility
+## Workflow and why it changes
 
-| Boundary | Design |
+1. Agents build and run focused tests locally, push early, and open PRs. They
+   stop running full gates (`just accept`, `remote-accept`) themselves.
+2. Runners execute gates as required PR checks. The GitHub merge queue tests the
+   merged result: **a merge group IS the batch gate**, replacing the director's
+   manual batch assembly. PR evidence never substitutes for merged-result checks.
+3. Agents react to results. PR-bus phase 2 sends a failed check and its failure
+   log to the PR's primary driver as an agy follow-up; the driver fixes and pushes.
+4. The director reviews diffs, runs independent read-only reviews, and handles
+   escalation and enqueueing. Independent reviews caught real defects in every
+   batch-5 PR on 2026-10-04; green checks do not replace review.
+
+The owner's 2026-10-04 operational evidence explains the change:
+
+- Six or more workers each queued 20–35 minutes behind one exclusive VM host
+  lease; gates ran one at a time.
+- `remote-accept` refused immediately when cloudmac's gate-worktree lock was
+  held, forcing the director to hand-sequence access.
+- Stale or superseded runs held locks; a waiting gate acquired the lease after
+  priority had been reassigned.
+- A worker's cancellation SIGTERMed another checkout's gate because its process
+  filter was not bound to its checkout.
+- cloudmac's data volume was a USB drive delivering about 2 MB/s under load.
+  Worktrees and caches were moved to an internal SSD volume with a 100 GiB quota
+  and a guard agent. This fixes the reported storage placement problem; it does
+  not establish runner throughput or eliminate lease serialization.
+
+## Gate placement
+
+| Gate | Runner and boundary |
 | --- | --- |
-| Landing | PRs and GitHub merge queue; the director reviews, enqueues and owns landing. A helper result never authorizes a merge. |
-| Companion | Read the [merge-queue migration at `0410065d`](https://github.com/carrick-sh/carrick/blob/0410065d0597a86548fc3860f77f4121f8b91942/docs/superpowers/plans/2026-10-04-merge-queue-migration.md). Retain checks `host-linux-arm64`, `host-linux-x86-kvm`, `macos-host`, `signed`, `merge-queue`, exact event-SHA receipts and failure-on-skip aggregate behavior. |
-| Superseded hardware proposal | The companion proposes two Macs and persistent runners. Owner decisions here exclude the director's Mac from runners and propose supervised JIT registration on **cloudmac only**, pending approval. Reconcile that plan before activation. |
-| Trust | Collaborators drive work; agents share the owner's GitHub account. The repository is **public**, confirmed with `gh repo view`; collaborators-only work does not prevent outside PRs/comments. Authenticate every privileged request and retain the companion's workflow review/admission boundary. |
-| Ownership | Exactly one DRIVER per PR, recorded by the director in a durable assignment ledger; HELPERS have scoped tasks and their own branches. Shared GitHub identity cannot enforce separation between those roles. |
-| Capacity | Willow/PVE 9.2: supplied measurements are 16 threads, about 75% busy; 62 GB RAM, about 12 GB free; VM 210 uses 40 GB/12 vCPU, VM 106 uses 8 GB. Free storage: local-lvm 815 GB, external ZFS 440 GB. |
-| Evidence limit | `ssh root@willow` failed DNS; read-only SSH to `100.122.248.80` timed out. These measurements were supplied by the owner, not independently recaptured. No Proxmox mutation occurred. |
-| Protected machines | Never touch VMs 105/106 or any VM outside the dedicated CI pool. VMs 200–203/211, including BSD references 201/211, are reference evidence only. VM 210 resizing/migration is an explicit owner operation, outside the scaler. |
-| Oracle | Director owns Docker oracle execution. x86 Docker proves the x86 lane only; the canonical ARM oracle needs native ARM Linux. Never overlap Carrick and Docker phases on a physical host. |
+| fmt, clippy, doc, test, cross-check, BSD builds | GitHub-hosted Ubuntu and **`macos-15` pinned**: the `hv_gic` APIs require SDK 15. Hosted macOS cannot run Hypervisor.framework guests. Hosted BSD builds/cross-checks do not prove bhyve/NVMM runtime behavior. |
+| `linux-portable`, x86 KVM/CPL0 | Ephemeral willow Proxmox clones first, plus AWS Spot **`c8i.4xlarge` (16 vCPU/32 GiB)**, about **$0.30/h in us-west-2** in the owner's 2026-10-04 snapshot. C8i virtual instances support nested virtualization since February 2026, also reported by `describe-instance-types`; live Carrick qualification on the chosen AMI is **UNVERIFIED**. |
+| aarch64 Linux with KVM | The owner's biggest capacity gap. Proposed AWS Spot **`c7g.metal` (64 vCPU/128 GiB)** at about **$0.82/h**, or **`c6g.metal`** at about **$0.72/h** in the same dated snapshot. Graviton exposes KVM only on bare metal; hosted ARM semantics tests do not fill this gap. Availability and live ARM KVM/Carrick results are **UNVERIFIED**. |
+| Signed HVF | **cloudmac self-hosted runner — OWNER APPROVED 2026-10-04.** JIT ephemeral registration; only `merge_group` and owner-triggered `workflow_dispatch`, never untrusted `pull_request` events. Workers stop using cloudmac directly for gates. |
+| Docker oracle | Dedicated director-controlled job/host, never sharing a host with Carrick runs. Native ARM Linux for the canonical ARM oracle; x86 results prove only x86. No Docker on cloudmac or VM 210. |
+| EC2 Mac fallback only | On-demand Dedicated Host, **24 h minimum**, no Spot. Obtain a current quote and approval before use; minute-scale elasticity does not apply. |
 
-The shared owner account also cannot supply an independent GitHub approving
-review of its own PR. The companion's review rules require a distinct authorized
-reviewer identity, or a deliberately revised owner-approved review policy before
-activation; labels and comments do not solve that constraint.
+Prices above are owner-supplied historical observations, **UNVERIFIED in this
+revision**, not launch quotes or guarantees of Spot capacity. Recheck region/AZ,
+price history and instance capabilities before provisioning. AWS documents
+[C8i nesting from 2026-02-16](https://aws.amazon.com/about-aws/whats-new/2026/02/amazon-ec2-nested-virtualization-on-virtual/),
+[current nested-virtualization support](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html)
+and [EC2 Mac restrictions](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-mac-instances.html).
+
+## Prerequisites, in order
+
+1. Land [PR #3, ci-green](https://github.com/carrick-sh/carrick/pull/3), so main's
+   hosted CI is green.
+2. Fix all four merge-queue blockers below. Each would break merge-group runs;
+   changing runner capacity alone cannot fix them. Numbers are the director's
+   blocker identifiers, not assumed GitHub PR numbers.
+
+   | Blocker | Required change and proof |
+   | --- | --- |
+   | (9) Rustdoc exemption receipt binds the exact PR base SHA | Bind the exemption to covered inputs: reviewed file hashes plus toolchain. An unrelated merge must preserve validity; a covered-input change must invalidate it. This does not relax exact-SHA gate/artifact receipts. |
+   | (12) Source-hash-pinned schedule replay receipts | Futex wake/exit and setid receipts currently fail after any unrelated kernel source edit. Scope validation to the replay's actual covered inputs and prove unrelated edits preserve validity while relevant changes invalidate it; do not simply disable freshness checks. |
+   | (11) Failed `remote-recapture` leaks `gate-worktree.lock` | Release on failure/cancellation and prove the next checkout can acquire it; preserve checkout-before-host-lease ordering. |
+   | (13) `remote-accept` refuses a held checkout lock | Queue with an explicit bound, report the holder, and prove timeout/cancellation removes the waiter. Cleanup must be bound to the checkout and run ID, never another checkout's gate. |
+
+3. Land [PR #2, merge-queue workflows](https://github.com/carrick-sh/carrick/pull/2),
+   then enable the main ruleset: PRs, merge queue, required checks. Review identity
+   remains an owner decision. Reconcile the companion migration's persistent/two-Mac
+   proposal with cloudmac-only JIT and separate oracle provisioning before enabling
+   it. Required checks must run for `merge_group`, validate its exact event SHA,
+   and fail on missing evidence or skipped required tests. Keep check names and
+   ruleset requirements aligned (`host-linux-arm64`, `host-linux-x86-kvm`,
+   `macos-host`, `signed`, `merge-queue`); signed checks are required at the merge
+   group stage, not an impossible untrusted-PR prerequisite.
+4. Register runners: willow pilot first, then the AWS Spot fleet. Fleet activation
+   needs a spend cap, a standard Spot vCPU quota increase from the reported **32**
+   to about **128** (on-demand quota currently **16**), and a **NON-ROOT scoped IAM
+   role**. The account CLI currently uses root credentials; rotate or remove them
+   as part of credential remediation, and never give them to the fleet. These
+   account observations are owner-reported and **UNVERIFIED in this revision**.
+5. Enable PR-bus phase 2, then switch every worker brief to **push-and-react**.
+   Update conflicting full-gate requirements in AGENTS.md, skills and hooks in
+   that cutover PR. Do not describe workers as switched while briefs still demand
+   local acceptance. Until required runner coverage is qualified, keep the queue
+   paused where coverage is missing; do not treat missing checks as success.
+
+## AWS Spot fleet
+
+Provision through reviewed **CloudFormation/CDK**, with separate x86 and arm64
+launch templates. Require IMDSv2, encrypted EBS and **no SSH**; use SSM Session
+Manager for authorized diagnosis. Prebake AMIs with KVM, Rust **1.96**, just,
+cargo-deny and semgrep, recording image/toolchain/package hashes. Enable nested
+virtualization explicitly for C8i. Job credentials cannot launch instances,
+register more runners or change IAM; the controller uses the scoped non-root role.
+
+Reuse the willow demand/ledger contract below: approved workflow/event/SHA,
+complete label matching, one JIT registration per job, durable instance ownership,
+external cleanup and exported logs. Terminate idle instances and remove stale
+registrations. A Spot interruption invalidates that attempt: preserve its logs
+and **rerun the gate from scratch** on a fresh runner, because receipts bind one
+artifact. Infrastructure retries must not hide a conformance failure.
+
+The requested **AWS Budgets hard cap** needs automatic deny-launch/stop actions
+plus controller admission limits, bounded job lifetime and idle termination.
+Reserve worst-case job cost before launch, including storage/transfer and cleanup
+headroom. [AWS Budgets actions](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-controls.html)
+provide a backstop, but [billing notifications can lag](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html):
+Budgets alone cannot guarantee an instantaneous dollar ceiling. Enforce the
+owner-approved operating cap in the controller and report residual billing risk.
+
+Before a lane becomes required, record architecture, AMI, kernel/page size,
+non-root `/dev/kvm` open, KVM API 12, VM/vCPU execution and actual Carrick tests
+with zero skips. For x86 include CPL0; for ARM include live ARM trap/exec tests
+and `just kvm-smoke`. Device presence and `describe-instance-types` are capability
+signals, not runtime acceptance. Graviton metal Spot is the proposed ARM path;
+ARM boards, Asahi and cloudmac nested Linux experiments are no longer prerequisites.
 
 ## Willow runner pool
 
-Use a small Rust controller under `carrick-xtask`, running as an unprivileged
-service on willow, with a durable job/VM ledger outside runner disks. It invokes
+[Pilot PR #18](https://github.com/carrick-sh/carrick/pull/18) reports template
+**300**, a scoped token, a **single-clone** limit and an **80% projected CPU**
+admission ceiling. Template qualification and clone lifecycle operations are
+reported proven; the first job is pending a quiet window. A successful Actions
+job plus teardown remains **UNVERIFIED**. The wider scaler below is a proposal,
+not a claim that the pilot has delivered the fleet.
+
+Owner-supplied capacity snapshot: 16 threads, about 75% busy; 62 GB RAM, about
+12 GB free; VM 210 uses 40 GB/12 vCPU and VM 106 uses 8 GB. Free storage was
+local-lvm 815 GB and external ZFS 440 GB. These measurements are **UNVERIFIED in
+this revision** and need recapture before expansion. Never mutate VMs 105/106 or
+objects outside the CI pool; 200–203/211 are reference evidence only. Resizing
+VM 210 is an owner operation outside the scaler.
+
+Extend the existing pilot with a small Rust controller under `carrick-xtask`,
+running as an unprivileged service on willow, with a durable job/VM ledger
+outside runner disks. It invokes
 `gh api` with argument arrays, owns no worker conversations, and scales to zero.
 Build or helper code never executes on the hypervisor itself.
 
 | Component | Concrete proposal and acceptance proof |
 | --- | --- |
-| Namespace | Pool `carrick-ci`; reserve VMIDs **300–349**, templates 300–307 (four variants, two generations), clones 308–349. Verify that the range is unused before reservation. Mutation/deletion requires pool membership **and** range **and** ledger identity/tag. Never adopt a VM just because its name matches. |
-| Golden image | Future repo script `scripts/ci/build-template-debian.sh`: checksum-pinned Debian 13 image, package snapshot, Rust from `rust-toolchain.toml`, Cargo.lock, just, cargo-deny, Semgrep, jq, clang/cross toolchains, sccache and checksum-pinned official runner. Manifest records inputs, script commit, image hash and qualification results. Repeatable inputs, not an unsupported claim of bit-identical disks. |
-| Variants | Base Linux/build image; KVM capability from the same base; Docker-enabled x86 oracle variant for director-approved jobs. No Docker in VM 210 workers. Templates contain no owner login, SSH private key, GitHub credential or registered runner. Regenerate machine IDs/SSH host keys at first boot. |
-| Storage | Linked clones on supported local-lvm thin storage; dedicate a CI allocation capped at **300 GiB**, retain at most two image generations. 64-GiB clone disks; 96 GiB for heavy/oracle jobs. Keep at least 150 GiB actual thin-pool free space; stop admission on low data **or metadata** headroom. External ZFS is optional image/log storage after approval, not an implicit grant over its existing volumes. |
+| Namespace | Pool `carrick-ci`; reserve VMIDs **300–349**, templates 300–307 (four variants, two generations), clones 308–349. Preserve pilot reservations and verify remaining IDs are unused before expansion. Mutation/deletion requires pool membership **and** range **and** ledger identity/tag. Never adopt a VM just because its name matches. |
+| Golden image | Extend the pilot template builder toward checksum-pinned Debian 13 image, package snapshot, Rust from `rust-toolchain.toml`, Cargo.lock, just, cargo-deny, Semgrep, jq, clang/cross toolchains, sccache and checksum-pinned official runner. Manifest records inputs, script commit, image hash and qualification results. Repeatable inputs, not an unsupported claim of bit-identical disks. |
+| Variants | Base Linux/build image; KVM capability from the same base. Oracle images belong on a separate director-controlled host, not this Carrick pool. No Docker in VM 210 workers. Templates contain no owner login, SSH private key, GitHub credential or registered runner. Regenerate machine IDs/SSH host keys at first boot. |
+| Storage | Linked clones on supported local-lvm thin storage; dedicate a CI allocation capped at **300 GiB**, retain at most two image generations. 64-GiB clone disks; 96 GiB for heavy jobs. Keep at least 150 GiB actual thin-pool free space; stop admission on low data **or metadata** headroom. External ZFS is optional image/log storage after approval, not an implicit grant over its existing volumes. |
 | Nested x86 | Willow is Ryzen: qualify host `kvm_amd nested=1`, expose `cpu: host`/SVM to clones, open `/dev/kvm` as the job user, require KVM API version 12 and live vCPU execution. Configuration changes need approval; existence of the device or a compile pass is insufficient. |
 | PVE credential | Privilege-separated, expiring `ci-scaler@pve!elastic` token; VM rights scoped to `/pool/carrick-ci`, template clone rights only on dedicated templates. No root/global VM, `Sys.Modify`, permission management, migration or backup privileges. |
 | ACL qualification | Pool-scoped VM privileges alone may not authorize cloning: allocation needs dedicated-storage `Datastore.AllocateSpace`/audit and an approved bridge's `SDN.Use`. Owner preconfigures those narrow resource ACLs; never broaden to shared storage administration to fix a 403. Use API-viewer permission checks on **installed 9.2**, then prove clone/start/stop/delete in-pool succeeds and outside-pool access is denied. If namespace isolation cannot be expressed, stop and redesign the allocation broker. |
@@ -81,26 +190,25 @@ is distinct from retrying a failing conformance test; preserve each failure.
 
 ### Size and throughput
 
-All figures below are **planning estimates**, not measured build performance.
+All figures below are **UNVERIFIED planning estimates**, not measured build performance.
 Treat the supplied GB measurements conservatively as approximate GiB and
 recapture actual bytes before deployment. Reserve **6 GiB for willow/controller**
 and **4 CPU-thread equivalents for host/Windows demand**; do not resize VM 106.
 
-| Operating mode | VM 210 and pool budget | Eligible runner mix | Estimated service rate |
-| --- | --- | --- | --- |
-| Today: pilot only | Leave 210 at 40 GiB/12 vCPU; pool max 1 clone, **2 vCPU/4 GiB**. About 8 GiB of supplied free memory remains after allocation. | One lightweight lint/cross-check job, Cargo jobs=2. No heavy build or credible performance comparison under 75% host load. | Assuming 15–30 min work + 2 min boot/cleanup: **1.9–3.5 jobs/h** when admitted. |
-| Recommended after draining sessions | Owner reduces 210 to **24 GiB/6 vCPU**, CPU limit **4**. Pool max **8 CPU equivalents/20 GiB**, at most **3 clones**. Memory budget: 24 + 8 (106) + 6 reserve + 20 pool = **58 GiB**, leaving about 4 GiB extra. | Two normal **4-vCPU/8-GiB** Linux/KVM runners; or one **8-vCPU/20-GiB** heavy runner, Cargo jobs=6; not both. | Two normal jobs at 20–35 min + 2 min overhead: **3.2–5.5 jobs/h**. One heavy job at 35–60 min + 2 min: **1.0–1.6 jobs/h**. |
-| BSD job in recommended mode | One **2-vCPU/2-GiB** Linux proxy plus one **4-vCPU/8-GiB** BSD target; both count toward clone cap. | One BSD pair plus one **2-vCPU/4-GiB** lightweight job fits at **8 vCPU/14 GiB**, 3 clones. Heavy mode excludes BSD pairs. | BSD pair at 25–45 min + 3 min overhead: **1.25–2.1 jobs/h**, plus independent lightweight work. |
-| Retire 210 later | Owner drains/saves sessions, replaces them with persistent development storage and dedicated-pool work VMs; 210 remains excluded from deletion. Pool could rise to **12 CPU/36 GiB**, after recapture. | Three **4-vCPU/10-GiB** normal jobs, or one **8-vCPU/20-GiB** heavy plus one normal. | Three normal jobs: **4.9–8.2 jobs/h** under the same assumed durations; worker sessions consume this same budget. |
+| Stage | Proposed capacity |
+| --- | --- |
+| Pilot | Leave VM 210 unchanged; one **2-vCPU/4-GiB/64-GiB** clone, Cargo jobs=2, lightweight work only. |
+| After owner drains/resizes VM 210 | Candidate: 210 at **24 GiB/6 vCPU**, CPU limit **4**. Pool max **8 CPU equivalents/20 GiB**, at most **3 clones**. Two **4-vCPU/8-GiB** runners or one **8-vCPU/20-GiB** heavy runner, never both. |
+| Future BSD runtime pair | **2-vCPU/2-GiB** Linux proxy plus **4-vCPU/8-GiB** BSD target, both charged to the pool; heavy mode excludes pairs. |
 
 At the supplied 75% CPU utilization, reserving two additional busy threads would
 project 87.5%, above the admission limit: the pilot initially waits for a quieter
-window (at most 72.5% existing utilization). The present host has disk space, not
+window (at most 67.5% existing utilization). The present host has disk space, not
 immediately available heavy-build capacity.
 
 Reserve both CPUs and memory atomically; `cpulimit`/Cargo jobs constrain real
 parallelism, fixed RAM avoids balloon-induced gate failures. Admit only if measured
-memory retains the reserve and projected CPU use stays below 85%; pause admission
+memory retains the reserve and projected CPU use stays below 80%; pause admission
 after sustained pressure, without throttling or cancelling a live correctness
 gate. Shrinking vCPU counts alone does not remove the current worker load: drain
 sessions first and reduce admitted worker/build work. Developer OOM or loss of
@@ -113,98 +221,87 @@ landing rate:** cloudmac remains the serial bottleneck. Nested lane performance
 evidence requires exclusive quiet-host admission, including other willow guests;
 if owner workloads cannot be quieted, collect semantic evidence only.
 
-## FreeBSD/bhyve and NetBSD/NVMM
+## Signed HVF on cloudmac
 
-GitHub's [official supported runner OSes](https://docs.github.com/en/actions/reference/runners/self-hosted-runners)
-exclude BSDs. Recommend an official ephemeral **Linux proxy runner** that drives
-one disposable BSD target over SSH. The proxy reports the GitHub check and uploads
-target evidence; Carrick compilation/tests execute on BSD, never on the proxy.
+**OWNER APPROVED 2026-10-04**, confirmed through the director during this
+revision: cloudmac is the signed HVF runner, using JIT ephemeral registration
+only for `merge_group` jobs and owner-triggered `workflow_dispatch`, never
+untrusted `pull_request` events; workers stop using cloudmac directly for gates.
+The supervisor design admits one runner at a time and excludes all
+`pull_request` jobs. Deployment and live qualification remain **UNVERIFIED**.
+The repository is already restricted to collaborators only per the owner. Still authenticate event, actor, reviewed workflow and SHA before
+admission; labels alone are not a trust boundary. The director's Mac is excluded.
 
-| Approach | Security and maintenance | Choice |
-| --- | --- | --- |
-| Linux proxy + BSD clone | Extra small VM and SSH transport, but official job lifecycle/actions/artifact handling. Supervisor provisions one-use SSH access, pins generated host keys, disables agent forwarding, passes no GitHub/PVE credentials to BSD, and destroys both VMs. Proxy cannot allocate arbitrary targets. Preserve remote exit codes and fail on disconnect/missing logs/skips. | **Use for both BSD lanes.** Send a source archive for the exact SHA and hashes; no blanket shared-tree rsync. Cancellation asks the supervisor to reap only that job's target. |
-| [Community `github-act-runner`](https://github.com/ChristopherHX/github-act-runner) in BSD | Go/act implementation advertises FreeBSD support; NetBSD, JIT/one-job behavior, action compatibility and cancellation need qualification on pinned versions. Places runner credentials and a second protocol implementation in each BSD image; upstream compatibility and incident response become our responsibility. | Research alternative, not initial acceptance infrastructure. Require checkout, shell, artifacts, cancellation and credential-erasure proofs before considering it. |
+Use a dedicated non-admin job account, credential-free checkout and no personal
+keychain/SSH/agy credentials or general sudo. Supervisor credentials remain
+inaccessible to jobs. One-job registration limits reuse; account/workspace reset
+is not machine reimaging. Suspected compromise blocks admission.
 
-| Template/build script proposed | Qualification before scheduling | Size |
-| --- | --- | --- |
-| `scripts/ci/build-template-freebsd.sh`: checksum-pinned **FreeBSD 15** image/package repository, Rust pin, LLVM/libclang, just/git, non-root CI user, scripted `vmm` loading and guest device permissions. | `cpu: host` exposes SVM; load `vmm`, open `/dev/vmm`, build `--no-default-features --features platform-freebsd`; execute real bhyve guest tests and cleanup. Use [HAL](../../hal.md) and [bhyve memory contract](../../bhyve-shared-memory.md), not an old native-backend pass. | 4 vCPU/8 GiB/64 GiB + proxy 2 vCPU/2 GiB. |
-| `scripts/ci/build-template-netbsd.sh`: checksum-pinned **NetBSD 11** release or explicitly pinned prerelease if no approved release exists, pkgsrc/package snapshot, Rust/LLVM pin, SSH bootstrap and NVMM module/device permissions. | SVM visible; open `/dev/nvmm`, query its capability/version, execute live NVMM vCPU tests with `platform-netbsd`; record precise kernel/CPU/nesting manifest. VM 201/211 references stay stopped/untouched. [Older native-lane evidence](../../netbsd-native-lane-evidence.md) proves neither NetBSD 11 nor NVMM. | Same; one pair initially. |
+All users share the durable physical-host lease. Preserve checkout lock → host
+lease → build/tests ordering; never unlink a live lock or upgrade shared to
+exclusive. Workers no longer request direct gates. Schedule authorized debugging
+separately, never overlapping signed acceptance. Cancel only recorded job-owned
+processes using checkout identity and `CARRICK_RUN_ID`; use
+`scripts/sudo/kill.sh <run-id>`, never a broad process filter. Failed cleanup
+blocks the next job. Never shut down, reboot or sleep cloudmac.
 
-Both scripts use the Debian script's manifest/secret-erasure contract and produce
-templates in the dedicated pool. Nested SVM availability does not prove bhyve or
-NVMM works: an unsupported lane remains visibly blocked and cannot supply a green
-required check. Add BSD required checks only after live qualification and a
-reviewed merge-queue aggregate update; until then existing cross-checks retain
-their narrower meaning.
+Build with signed scripts and Apple ld64. Record SHA, artifact SHA-256, CDHash,
+LC_UUID, entitlement and `__dof_carrick`; preserve the tested binary between
+rungs. Upload logs and receipts on failure as well as success. Reap only the
+job's workspace, runner registration and processes after exporting evidence.
 
-## Native ARM Linux and ARM BSD capacity
+Replace any companion workflow's host-Docker fixture preparation before
+activation: the dedicated native ARM oracle/build host publishes immutable,
+source/executable-hash-validated fixtures for the exact SHA; cloudmac verifies
+and restores them. No Docker or nested Linux workaround on cloudmac. Move portable
+work to hosted/Linux runners while retaining Darwin host, signing, HVF, USDT and
+artifact identity coverage. KVM success cannot qualify HVF behavior.
 
-Willow cannot hardware-accelerate ARM guests. Emulation/cross-compilation does
-not fill the native ARM oracle or KVM gap. Rank purchases after trying the free
-hosted tier and an authorized local capability experiment.
+Qualification is **UNVERIFIED**: require one full merge group, correct artifact
+identity, no skipped required tests, cancellation scoped to its checkout, and
+supervisor restart recovery without rebooting the host. Measure queue/gate/cleanup
+p50/p95 before setting capacity expectations; JIT registration does not make one
+physical HVF host parallel.
 
-| Rank/use | Capacity, cost and limitations | First proof |
-| --- | --- | --- |
-| **1. GitHub-hosted `ubuntu-24.04-arm`** | Native ARM host tests and director-approved Docker oracle jobs; standard hosted jobs are free for this public repository, subject to service limits. Keep these jobs hosted instead of moving ARM work to willow. Disk headroom and image pulls need measurement. [GitHub runner specifications](https://docs.github.com/en/actions/reference/runners/github-hosted-runners). | Record `uname -m`, image digest and `docker info` architecture; run native `linux/arm64`, never QEMU/Rosetta. Separately try opening `/dev/kvm`, KVM API 12, VM/vCPU creation and execution. Hosted ARM KVM is **unproven**; absence means blocked KVM capability, not a passing runtime gate. |
-| **2. Dedicated permanent ARM Linux box** | Recommend procurement budget **$350–500 all-in** for an RK3588 **32-GB** board, NVMe, PSU and cooling: one 4-core/12-GiB build and one 2-core/6-GiB service VM, or one exclusive oracle/KVM phase. Budget is an allowance, not a vendor quote. [Radxa's 32-GB RK3588 option](https://docs.radxa.com/en/rock5/rock5itx/getting-started/introduction). | Verify firmware exposes EL2, supported kernel/KVM/GIC, a 4-KiB page configuration and thermal stability. Boot ARM FreeBSD/NetBSD under QEMU/KVM with recorded image/UEFI hashes. Prefer this recurring resource over using cloudmac's small RAM pool. |
-| **2b. Used M1/M2 mini with Asahi** | Alternative procurement allowance **$250–500**, subject to a real quote; choose at least 16 GB, preferably a 24-GB M2. Dedicated purchased machine only. Faster build candidate, less RAM than the 32-GB board, distribution/kernel maintenance and 16-KiB-page compatibility costs. [Asahi page-size compatibility notes](https://asahilinux.org/docs/sw/broken-software/). | Native Linux KVM does not require Apple's M3 VZ nesting feature. Prove actual KVM and ARM BSD boot on this kernel; a supported desktop install is insufficient. Never reinstall either existing Mac. |
-| **3. On-demand Graviton `c7g.metal`, preferably Spot after qualification** | [AWS specifies 64 cores/128 GiB](https://docs.aws.amazon.com/ec2/latest/instancetypes/co.html). Budget example, **not a live quote**: $1/host-hour Spot allowance, $2.32/host-hour on-demand assumption; one exclusive 1-h job costs $1 or $2.32 plus boot/EBS/egress. Four independent 8-core/16-GiB builds amortize to $0.25 or $0.58/job-hour at full occupancy. Quiet oracle/performance jobs use the whole host. | Owner selects region/AZ, verifies metal Spot availability and [current Spot history](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot-instances-history.html)/on-demand quote. Test `/dev/kvm`, live Carrick and ARM BSD guests on the actual image. Cap one instance, 2 h/job, $10/day initially; termination exports evidence and marks interrupted acceptance incomplete. Non-metal Graviton is not assumed to expose EL2. |
-| **Experiment only: M4 + VZ Linux nesting** | Director Mac: **32 GB**, manual experiments only, never a runner. cloudmac: **16 GB**, signed gate first. Both macOS **27**, per director; cloudmac M4/16 GB independently confirmed read-only. Linux VMs can be native ARM Docker/KVM hosts if qualified, but consume the same physical CPU/RAM as signed work. | First use director-operated Tart Linux VM, **4 vCPU/8 GiB/64 GiB**, with `tart run --nested`; reserve at least 12 GiB for the 32-GB host. On cloudmac, only an approved idle-window test, **2 vCPU/4 GiB**, Cargo jobs=2, then shut down before any signed work. Never run a signed gate and Linux VM together. |
+## BSD runtime extension
 
-Concrete M4 experiment: pin Tart/image versions, query
-`VZGenericPlatformConfiguration.isNestedVirtualizationSupported`, start an
-ARM Ubuntu VM with nesting enabled, verify `aarch64`, then **open** `/dev/kvm`
-and issue `KVM_GET_API_VERSION` (`ioctl 0xae00`, expect 12). Run
-`cargo test -p carrick-vmm-kvm --lib -- --nocapture`, require the ARM live
-`trap_engine::execve_tests` to execute with **zero SKIP lines**, and run
-`just kvm-smoke` (builds fixture/backend and checks guest stdout/exit). Archive
-host/guest kernel, page size, vCPU capability and full results; an ioctl alone
-does not prove a usable vCPU. ARM BSD guests are a subsequent **8–12-GiB** Linux
-VM experiment using QEMU/KVM and disposable image overlays, suitable for the
-32-GB director experiment or a dedicated ARM box, not cloudmac during gate work.
+Keep BSD builds in hosted CI. Future bhyve/NVMM runtime coverage can use official
+one-job Linux proxy runners driving disposable FreeBSD/NetBSD clones; BSD runtime
+qualification is **UNVERIFIED**. Send an exact-SHA source archive with hashes,
+preserve target exit codes, pin one-use SSH host keys, disable forwarding, and
+export target logs. Give the BSD target no GitHub/PVE credentials. Cancellation
+reaps only the ledger-owned proxy/target pair.
 
-Tart/VZ documentation currently describes [M3/M4, macOS 15+ nesting for **Linux guests**](https://tart.run/faq/#nested-virtualization-support).
-That supports testing Linux KVM, not an assertion that a macOS VM can itself run
-Carrick HVF. macOS 27 behavior still needs a live capability test. ARM BSD boot
-and host tests do not imply ARM bhyve/NVMM Carrick backends: the repo's current
-BSD VMM lanes are x86, as documented in HAL.
+Proposed checksum-pinned FreeBSD 15 and NetBSD 11 (or explicitly pinned prerelease)
+templates must prove exposed SVM, non-root device access and live bhyve/NVMM vCPU
+execution, not merely compilation. Follow [HAL](../../hal.md) and the
+[bhyve memory contract](../../bhyve-shared-memory.md). Existing reference VMs stay
+untouched. Unsupported nesting remains visibly blocked; add required runtime
+checks only after qualification and an aggregate-policy review.
 
-Docker inside a Linux VM on cloudmac runs no Docker daemon on macOS, but still
-uses cloudmac's resources and must honor its physical-host lease. It **does not
-automatically satisfy** the owner's no-host-Docker intent: approve or reject that
-interpretation explicitly. Default recommendation is hosted/dedicated ARM
-Linux oracle execution, with cloudmac reserved for signing.
+## PR bus: failures return to the driver
 
-## The macOS signed tier
+**Phase 1 exists:** the dispatch-disabled listener is in the agy-director plugin
+at **`75be370`**, per the owner. This revision does not claim active dispatch or
+revalidate that plugin. **Phase 2 is proposed and UNVERIFIED:** consume failed
+check/job results and attach the failure log to a follow-up for the PR's assigned
+primary driver through existing agy-director. Do not create a second scheduler.
 
-| Item | Proposal |
+| Phase-2 contract | Required behavior |
 | --- | --- |
-| Admission | After explicit approval, a trusted cloudmac supervisor starts **one JIT runner per job**, never two. Labels include `self-hosted,macOS,ARM64,carrick-signed,macos-host`; `macos-host` then `signed` are separate one-job registrations for the same merge-group SHA. No persistent runner service is necessary; the supervisor persists. |
-| Trust boundary | Only reviewed merge groups and authorized main dispatches. Dedicated non-admin job account, no personal keychain/SSH/agy credentials, credential-free checkout, no general sudo. Root-owned supervisor/config and controller tokens are inaccessible to jobs. JIT limits reuse, but account/workspace reset is **not machine reimaging**; suspected compromise quarantines the host. |
-| Ordering | One cloudmac-wide queue covers Actions, helpers, remote-accept and any approved Linux VM. Lock order remains remote checkout lock → physical-host lease → build/tests; Actions uses its own checkout. All accounts use the same durable absolute `CARRICK_HOST_LEASE_PATH`; never unlink it or upgrade shared to exclusive. Accept holds exclusive `gate`; diagnostics use the existing signed/shared rules. |
-| Artifact | `just build`/signed scripts, Apple ld64, entitlement and `__dof_carrick`; record full SHA, SHA-256, CDHash, LC_UUID and scoped cleanup. Preserve the tested binary; no rebuild/re-sign between evidence rungs. Upload complete logs/receipts even on failure, and fail the aggregate on skips. |
-| Between jobs | Stop job-owned processes by recorded run IDs (`scripts/sudo/kill.sh`), confirm no guest/helper remains, remove that job's workspace/runner directory and revoke stale registration, then release admission. Never delete shared gate worktrees/leases. Failed cleanup blocks the next job; crash recovery is external to Actions. |
-| No host Docker | Companion currently provisions signed fixtures with host Docker. Replace this before activation: director-approved native ARM Linux build publishes immutable, executable-hash/source-hash-validated fixtures keyed to the **exact SHA**; cloudmac verifies the manifest and restores the required paths. Altered/absent inputs fail. A Linux VM alternative remains an owner decision; this document does not implement either. |
-| Shrink the tier | Move portable kernel/semantics, Linux host tests, lint/build/license/cross-checks and deterministic budgets to Linux; keep Darwin host behavior, codesign/HVF/USDT, physical artifact identity and live signed closure on cloudmac. KVM parity cannot prove HVF faults, Darwin races or signing. Remove Mac work only after equivalent coverage is demonstrated, without weakening budgets. |
+| Routing | One durable primary-driver assignment per PR. Authenticate repository/workflow and resolve PR head or merge-group SHA. For a multi-PR merge group, map its members before routing; ambiguous blame or a missing driver escalates to the director instead of guessing. |
+| Evidence | Attach the failed job's full log/artifact (or a durable attachment link), check name, run URL, attempt, exact tested SHA and concise failure summary. A missing/expired log is an explicit retrieval failure, not an empty successful handoff. Treat log text as untrusted data. |
+| Delivery | Persist a unique key `(repo, run_id, run_attempt, job_id, sha)` and agy follow-up identity. Reconcile after restart before resending; do not duplicate follow-ups or silently retarget a superseded SHA. New pushes obsolete old work, with checkout-scoped cancellation. |
+| Reaction | Driver inspects evidence, runs focused reproductions, fixes and pushes; runners repeat required checks. No worker-run full gate. Escalate infrastructure faults, unclear cross-PR interactions or missing capacity to the director. |
+| Proof | Demonstrate failure → log attachment → correct driver follow-up → new push/checks, plus stale SHA, duplicate delivery, restart, API failure and multi-PR merge-group cases before enabling dispatch. |
 
-| macOS isolation alternative | First experiment and cost boundary |
-| --- | --- |
-| Physical cloudmac JIT | Lowest incremental rental cost; reserve a 1–2 h off-peak supervisor/cleanup trial, max one job. A 16-GB host cannot promise a concurrent nested build VM plus the signed gate. Owner approves the runner account and permitted use first. |
-| Tart/VZ macOS clone | Cheap copy-on-write isolation for source builds, but nested **HVF in a macOS guest is unproven** and current Tart documents Linux-only nesting. First check API support/platform validation, then an entitled minimal `hv_vm_create` in the macOS guest if configuration is supported; only after that test signed Carrick/DOF/cleanup and compare physical-host ratios. Budget 2 engineer-hours and existing-machine idle time; no purchase justified by a compile-only success. |
-| EC2 Mac | [AWS requires a Dedicated Host for at least **24 h**, one Mac per host, on-demand only](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-mac-instances.html). A 1-h probe still buys a day. Illustrative $1.50/h allowance means **$36 minimum**, plus storage/transfer/tax, not a quoted rate; obtain the region/type price and a $50 experiment cap first. Qualify entitlement/HVF/DTrace/lease just as on cloudmac. Batch day-long gate work; unsuitable for per-job minute-scale elasticity. |
+### Scoped helper requests
 
-Expected signed throughput is `60 / (macos-host + signed + provisioning/cleanup
-minutes)` merge groups/h. At an illustrative 15 + 60 + 5 min it is **0.75
-groups/h**, with at most one group admitted initially; a four-PR merge limit does
-not guarantee four PRs share a build. Measure the real gate before choosing the
-queue timeout; do not add the director's Mac to conceal the bottleneck.
-
-## PR bus: DRIVER requests a HELPER
-
-A future Rust listener polls `gh api` comments on open PRs every 30 s (pagination,
-durable cursor plus overlap/reconciliation). One host listener owns each host's
-dispatch ledger. It translates validated data into an allowlisted task template
-for the **existing agy-director**, rather than creating another agent scheduler.
+Retain the PR-bus helper protocol for host-specific diagnosis. The listener polls
+`gh api` comments every 30 s with pagination, a durable cursor and overlap/full
+reconciliation. One listener per host owns the ledger. Paths and task templates
+come from trusted host configuration, never PR input. Helpers diagnose or make
+scoped changes; they do not become a parallel manual acceptance service.
 
 Exactly one fenced JSON object after the literal `/carrick-helper v1` is a
 request; surrounding prose is never interpreted as commands. Example values:
@@ -233,60 +330,42 @@ request; surrounding prose is never interpreted as commands. Example values:
 | Job kinds | Allowlisted `portable`, `kvm-debug`, `bhyve-debug`, `nvmm-debug`, `signed-debug`, `arm-kvm-debug`; oracle execution remains a director operation. Host capabilities and availability choose whether a request can run. Signed helpers retain codesign/trace/LLDB rules; VM 210 helpers retain **no Docker**. |
 | Claim | Host-local transactional unique key `(repo, PR, comment_id, request_id, sha)` plus process lock; publish claim before dispatch, persist agy worker name. One listener per host; restart reconciles agy state before redispatch. Editing a claimed comment cannot change its task; replace with a new request. New PR SHA marks old evidence stale; do not silently move running helpers to it. |
 | Worktree | Host prepares an isolated checkout of the requested SHA with branch **`work/<pr>-<host>-<kind>`**, e.g. `work/123-cloudmac-signed-debug`. One active generation per branch; reuse only after review/cleanup, never force-push. Helper pushes only this branch, never the DRIVER branch or main. |
-| Result | Listener consumes agy's validated work contract and posts a PR comment: request id/host, base SHA, helper branch/commit, done/partial/blocked, commands and exit codes, full log/artifact URLs, receipt paths, signed identity when applicable, limits/blockers and cleanup proof. Missing command execution cannot claim `tests_passing: true`; comments cannot forge required Actions checks. |
+| Result | Listener consumes agy's validated work contract and posts a PR comment: request id/host, base SHA, helper branch/commit, done/partial/blocked, commands and exit codes, full log/artifact URLs, receipt paths, signed diagnostic identity when applicable, limits/blockers and cleanup proof. Missing command execution cannot claim `tests_passing: true`; comments cannot forge required Actions checks. |
 | Reintegrate | DRIVER reads/reviews helper diff, cherry-picks accepted work and republishes its own branch. Evidence is pinned to the helper tree; changed driver/merge-group trees get fresh checks. Director independently reviews before enqueueing; GitHub performs the queued landing. |
 | Labels | Aggregate advisory labels `agent:driver-active`, `agent:helper-requested`, `agent:helper-running`, `agent:blocked`, `agent:driver-review`, `agent:director-review`; `host:cloudmac`, `host:willow-kvm`, `host:freebsd`, `host:netbsd`, `host:arm-linux`. Recompute from all requests so one completed helper cannot hide another blocked one. Labels are not acceptance or authorization. |
 | Caps | Initially **1 helper/PR**, **2 VM helpers**, **1 cloudmac helper**; **3 global** maximum, additionally bounded by existing agy capacity and physical budgets. cloudmac helper and CI never overlap; signed queue gets priority with scheduled helper windows. Per PR: at most 2 new requests/day and 120 helper-minutes/day; operator-configured provider/token spend ceiling. Exhausted quota leaves a visible queued/blocked reason; helpers cannot recursively dispatch. |
 
-Integration sketch (future listener constructs argv; these are not deployment
-commands executed by this change):
+## Open owner decisions
+
+| Decision | Proposed choice / activation boundary |
+| --- | --- |
+| AWS spend, quotas and IAM | Set the operating spend cap and budget actions; request about 128 standard Spot vCPUs from the reported 32 (16 on-demand today); establish a non-root scoped role and rotate/remove existing root CLI credentials. No fleet launch under root. |
+| Review identity | Agents share the owner's GitHub identity, which cannot provide an independent approving review of its own PR. Choose a distinct authorized reviewer identity or an explicit revised review policy before enabling the ruleset. Read-only agent reviews remain required director evidence. |
+| VM 210 sizing | Keep pilot sizing until the owner decides whether to drain/resize 210 to 24 GiB/6 vCPU/CPU limit 4. Expanded pool/storage/network ACLs require approval and recaptured host capacity. |
+| aarch64 KVM capacity | Choose **Graviton metal Spot**, concretely `c7g.metal` or `c6g.metal`, region/AZ and budget. Confirm capacity and live KVM before requiring the lane. Hosted ARM and willow cannot substitute for this proof. |
+
+## Rollout evidence and rollback
+
+No phase weakens checks to manufacture green. Follow the ordered prerequisites;
+then require pilot job/teardown, fleet interruption/idle cleanup, a complete
+merge-group gate and phase-2 delivery proofs. Exercise controller restart,
+stale registration, API outage and checkout-scoped cancellation. Preserve logs,
+receipts, image manifests and failed-attempt identity outside disposable runners.
+
+If admission, isolation or cleanup fails, freeze new jobs, preserve evidence and
+reap only ledger-owned resources. Pause affected merge-queue admission; keep
+hosted checks running. Disable bus dispatch independently while retaining its
+ledger and listener. Escalate to the director rather than returning workers to
+hand-sequenced full gates. Never touch protected VMs or power-cycle cloudmac.
+
+## Verification of this revision
+
+Requested docs-only verification:
 
 ```sh
-python3 ~/.claude/local-marketplaces/agy-director/agy-director/scripts/agy_worker.py \
-  --host cloudmac --run pr-123 capacity
-python3 ~/.claude/local-marketplaces/agy-director/agy-director/scripts/agy_worker.py \
-  --host cloudmac --run pr-123 dispatch --name pr123-signed-debug \
-  --dir /host-approved/worktrees/pr123-cloudmac-signed-debug \
-  --prompt-file /listener-owned/validated-request.txt \
-  --backend auto --class hard --timeout 60m
-python3 ~/.claude/local-marketplaces/agy-director/agy-director/scripts/agy_worker.py \
-  --run pr-123 inbox --all-hosts --follow
+test -s docs/superpowers/plans/2026-10-04-elastic-ci-and-pr-bus.md && just fmt-check
 ```
 
-The plugin path above is the director's configured installation. This VM has
-`/home/carrick/agy-director/scripts/agy_worker.py`; read-only inspection confirmed
-`--host`, `capacity`, `dispatch`, prompt shipping and merged inbox support. Paths
-are host-registry configuration, not PR input. A listener generates prompts from
-a fixed policy plus clearly delimited task data; prompt-injection resistance is
-also enforced through host permissions, branch/scope fencing and credentials.
-Never assume a prompt alone isolates an agent with an owner account.
-
-## Phases, decisions and rollback
-
-Every phase is a separate reviewed implementation PR and approval to change the
-named infrastructure. No phase may weaken existing required checks to look green.
-
-| Phase | Deliverable / owner decision | Proof before enabling | Risk and rollback |
-| --- | --- | --- | --- |
-| **0. Agree boundaries** | Reconcile companion Mac/Docker/reviewer conflicts; confirm merge-queue eligibility, cloudmac approval, token ownership, budgets and range/pool/storage/network ACLs. Record willow telemetry; retain bootstrap remote-accept until cutover. | Reviewed plan, named independent reviewer/policy, source/host trust decision and exact existing check inventory. | Incorrect permission/identity assumptions: keep existing hosted checks and manual director gates; register nothing. |
-| **1. Hosted ARM + bus dry run** | Keep ARM host tier hosted; owner authorizes hosted native ARM oracle workflow. Implement parser/dedup/quota listener with **dispatch disabled**, then approve one helper host. No ARM KVM claim yet. | Unauthorized/malformed/stale/edited/duplicate requests rejected; API outage, restart, quota, result/label reconciliation demonstrated. Native oracle architecture/digests/logs preserved. | Prompt injection or duplicate spend: disable listeners, drain named agy workers, preserve ledger/evidence; resume explicit director dispatch. Remove oracle scheduling, preserve canonical cache. |
-| **2. One willow pilot** | Approve pool, dedicated Debian template script, narrow token and 2-vCPU/4-GiB pilot; boot/JIT/reap controller. Limit to trusted lightweight jobs. | In/out-of-pool ACL denial, unique allocation, cancellation, stale registration, lost completion/controller crash, storage exhaustion and zero leaked job VMs. | Leak/ACL/resource error: freeze scaling, revoke token, drain/reap only ledger-owned pool clones; restore hosted Linux routing. Never touch legacy VMs. |
-| **3. Capacity + BSD** | Owner drains/resizes 210 to 24 GiB/6 vCPU/CPU limit 4; approve FreeBSD 15/NetBSD 11 template scripts and proxy pairs. Activate normal/heavy budget only after recapture. | 20-job queue/resource measurements; nested KVM/bhyve/NVMM live proofs, exact exit propagation and pair cleanup; BSD aggregate policy reviewed separately. | Session OOM, nested failure, disk pressure: freeze/drain pool, restore owner-recorded 210 configuration after shutdown; keep failed BSD lane blocked and existing cross-checks, not a fake runtime pass. |
-| **4. cloudmac JIT** | Explicit owner approval; implement supervisor, host lease/account cleanup and exact-SHA ARM fixture transfer replacing host Docker. Reconcile migration workflow before activation. | One complete merge group through fresh host/signed registrations, exact artifact identity, no skips, cancellation/cleanup and supervisor reboot tested. | Cleanup/isolation or provisioning failure: stop admission, quarantine/reset account if necessary, retain evidence; pause queue and use director-controlled exact-SHA remote acceptance. Never fall back to director-Mac runner registration. |
-| **5. ARM KVM/BSD** | Approve a manual M4 Linux-nesting experiment; prefer permanent 32-GB ARM box if hosted KVM fails. Decide used Asahi alternative, cloudmac Linux-VM/Docker interpretation or capped Graviton experiment. | Device open + VM/vCPU execution + Carrick live tests without skips; native ARM oracle and ARM BSD boot/host tests separately evidenced; actual price quote before purchase/launch. | Unsupported EL2/pages, throttling, Spot loss or signed contention: remove capability label, export failure, destroy only owned overlays/instances; retain hosted ARM semantics/oracle and physical cloudmac signing. |
-
-Open approvals: pool/range and exact PVE ACLs; VM 210 worker-session tradeoff;
-cloudmac runner account and cleanup authority; signed fixture supply without host
-Docker; collaborator/shared-account review policy; hosted oracle authorization;
-ARM hardware/cloud spend; whether cloudmac Linux-VM Docker is allowed. Polling,
-proxy BSD runners and the initial sizing are recommendations, not installed facts.
-
-## Verification of this document
-
-Markdown lint/render and link/structure checks validate the document. The director
-waived acceptance gates for this docs-only change. Earlier CI/portable attempts
-were stopped and cloudmac host acceptance was lock-blocked; the PR records these
-limits without claiming acceptance receipts.
-Those checks cannot qualify the proposed scaler, BSD nesting, ARM KVM, runner
-isolation or merge queue. Signed/HVF and Docker oracle execution are not performed
-on this Linux worker. No runner, infrastructure or GitHub setting is changed here.
+This check does not qualify any runner, AWS capacity, hypervisor, PR-bus dispatch
+or merge-queue behavior. No infrastructure, workflow or ruleset changes are made
+by this revision, and no acceptance receipts or runtime results are claimed.
