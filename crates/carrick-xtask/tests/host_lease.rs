@@ -327,6 +327,125 @@ fn nested_admission_requires_the_supervisor_scope_writer() {
 }
 
 #[test]
+fn cancellation_preserves_another_checkout_with_identical_command() {
+    struct Fixture {
+        runner: std::process::Child,
+        control: Option<std::process::ChildStdin>,
+        pids: Vec<libc::pid_t>,
+    }
+    impl Fixture {
+        fn reap_known(&self) {
+            #[cfg(target_os = "linux")]
+            for &pid in self.pids.iter().skip(1) {
+                // SAFETY: reap exact fixture/supervisor PIDs if adopted here.
+                if pid > 0 {
+                    unsafe {
+                        libc::waitpid(pid, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            drop(self.control.take());
+            let _ = self.runner.kill();
+            let _ = self.runner.wait();
+            if let Some(&fork) = self.pids.first() {
+                // SAFETY: exact fixture PID recorded at its fork readiness.
+                unsafe {
+                    libc::kill(fork, libc::SIGKILL);
+                }
+            }
+            self.reap_known();
+        }
+    }
+    let lock = tempfile::NamedTempFile::new().unwrap();
+    let spawn = |checkout: &std::path::Path, ready: &std::path::Path| {
+        let mut runner = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["host-lease", "--mode", "carrick", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", FORK_FIXTURE])
+            .current_dir(checkout)
+            .env_remove("CARRICK_HOST_LEASE_SOCKET")
+            .env_remove("CARRICK_HOST_LEASE_FD")
+            .env("CARRICK_HOST_LEASE_PATH", lock.path())
+            .env("CARRICK_LEASE_READY", ready)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let control = runner.stdin.take();
+        let mut fixture = Fixture {
+            runner,
+            control,
+            pids: Vec::new(),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let data = std::fs::read_to_string(ready).unwrap();
+            let fields: Vec<_> = data.split_whitespace().collect();
+            if fields.len() == 5 {
+                assert_eq!(fields[1], "0", "fixture inherited flock");
+                fixture.pids = [fields[0], fields[2], fields[3], fields[4]]
+                    .iter()
+                    .map(|p| p.parse().unwrap())
+                    .collect();
+                return fixture;
+            }
+            assert!(fixture.runner.try_wait().unwrap().is_none());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "checkout fixture not ready"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    };
+    let checkout_a = tempfile::tempdir().unwrap();
+    let checkout_b = tempfile::tempdir().unwrap();
+    let ready_a = tempfile::NamedTempFile::new().unwrap();
+    let ready_b = tempfile::NamedTempFile::new().unwrap();
+    // Identical executable, arguments and lease inode; only cwd/scope differ.
+    let mut victim = spawn(checkout_a.path(), ready_a.path());
+    let mut other = spawn(checkout_b.path(), ready_b.path());
+    victim.runner.kill().unwrap();
+    victim.runner.wait().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        // SAFETY: liveness probes for exact PIDs recorded by both fixtures.
+        unsafe {
+            assert_eq!(
+                libc::kill(other.pids[0], 0),
+                0,
+                "cancellation selected another checkout's fork"
+            );
+            assert_eq!(
+                libc::kill(other.pids[1], 0),
+                0,
+                "cancellation selected another checkout's test process"
+            );
+            if libc::kill(victim.pids[0], 0) < 0 && libc::kill(victim.pids[1], 0) < 0 {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "cancelled checkout's workload survived"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    victim.reap_known();
+    victim.pids.clear(); // Exit observations also prevent signalling reused IDs.
+    assert!(
+        other.runner.try_wait().unwrap().is_none(),
+        "other checkout's runner was cancelled"
+    );
+    drop(other.control.take());
+    assert!(other.runner.wait().unwrap().success());
+    other.reap_known();
+    other.pids.clear();
+}
+
+#[test]
 fn cli_load_check_runs_portable_ps_before_command() {
     let temp = tempfile::NamedTempFile::new().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
