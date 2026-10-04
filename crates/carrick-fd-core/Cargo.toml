@@ -9,3 +9,10 @@ workspace = true
 
 [dependencies]
 carrick-sched-core = { path = "../carrick-sched-core" }
+
+[features]
+# Substitutions exist only in this crate's unit-test target, never the ABI.
+loom = []
+
+[dev-dependencies]
+loom = "=0.7.2"
