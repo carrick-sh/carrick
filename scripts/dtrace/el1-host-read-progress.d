@@ -35,6 +35,15 @@
  *     then returned route 3 (refused) in state 3 (host working). Earlier
  *     executable pages took the same route and resolved (route 2). This
  *     excludes missing source and missing owner selection for that page.
+ *     Engine subroutes: 5 preparation declined, 6 submitted, 7 descriptor
+ *     receipt refused, 8 selection withdrawn without receipt, 9 source EOF,
+ *     10 descriptor receipt applied. Route 7's detail is the stable
+ *     DescriptorRefusal wire code; other engine subroutes use detail zero.
+ *     Live-qualified on signed guest_smoke-504ebb617cfe4759,
+ *     n1f-refusal-trace-20261004: route 7 carries detail 17
+ *     (JournalCapacity) on 0x6000042000 after 64 prior one-page file grants
+ *     in the same 2 MiB residency-index window. The owner source remains
+ *     live; the index's 64-slot collision bound rejects the 65th page.
  *     Companion fault, frame-grant, mapping-leaf, syscall-service and mmap
  *     lowering probes use their carrick-observability signatures. The
  *     mapping-leaf phases are 0 prepare, 1 submit, 3 applied, 4 settled,
