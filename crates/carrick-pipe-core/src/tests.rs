@@ -664,3 +664,22 @@ fn el1_ipc_unbacked_pipe_needs_storage_only_to_write() {
     record.unread = 1;
     assert!(Pipe::attach(&mut record, &mut [], &mut []).is_err());
 }
+// Main exposes readiness bits only. A write/drain edge between observation
+// and enrollment returns to the same bits; it must leave a revision witness.
+#[test]
+fn b_prep_readiness_revision_detects_pre_enrollment_edge_at_1_8_64() {
+    for population in [1, 8, 64] {
+        for _ in 0..population {
+            let mut bytes = [0; PIPE_BUF];
+            let mut slots = [Page::default(); 1];
+            let mut p = Pipe::with_capacity(&mut bytes, &mut slots, PIPE_BUF, PIPE_BUF).unwrap();
+            let before = p.readiness(End::Reader);
+            assert_eq!(p.try_write(b"edge").result, Ok(4));
+            assert_eq!(p.try_read(&mut [0; 4]).result, Ok(4));
+            // Deterministic enrollment point: the old notification had no
+            // enrolled target. Probe AFTER enrolling, never park blindly.
+            let after_enroll = p.readiness(End::Reader);
+            assert_ne!(after_enroll, before, "the pre-enrollment edge was lost");
+        }
+    }
+}

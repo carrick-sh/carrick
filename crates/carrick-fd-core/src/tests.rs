@@ -4,6 +4,118 @@ use super::*;
 use std::sync::{Mutex, OnceLock};
 use std::{boxed::Box, vec::Vec};
 
+// Baseline adapter: main has only single-slot installation. Replace this
+// composition with the owner transaction after capturing its behavioral red.
+fn b_prep_install_pair<const T: usize>(
+    c: &View<T>,
+    table: TableId,
+    pins: [&OfdPin; 2],
+) -> Result<[Fd; 2], Error> {
+    let first = {
+        let (_guard, t) = c.lock(table)?;
+        Fd(t.allocate(0)? as i32)
+    };
+    c.install_pin(table, first, pins[0], true)?;
+    let second = {
+        let (_guard, t) = c.lock(table)?;
+        Fd(t.allocate(0)? as i32)
+    };
+    c.install_pin(table, second, pins[1], true)?;
+    Ok([first, second])
+}
+
+#[test]
+fn b_prep_pair_refusal_leaves_no_half_pair_at_1_8_64() {
+    for population in [1, 8, 64] {
+        let c = authority::<1, 66>();
+        let table = c
+            .create_table(population, &mut storage(population))
+            .unwrap();
+        for fd in 0..population - 1 {
+            c.open(table, Fd(0), description(fd as u64), false).unwrap();
+        }
+        let reader = c.create_pinned(description(100)).unwrap();
+        let writer = c.create_pinned(description(101)).unwrap();
+        assert_eq!(
+            b_prep_install_pair(&c, table, [&reader, &writer]),
+            Err(Error::TooManyFiles)
+        );
+        assert_eq!(
+            c.get(table, Fd((population - 1) as i32)),
+            Err(Error::BadFd),
+            "population {population}: a failed pair published its reader"
+        );
+        assert_eq!(c.holds(&reader), Ok((0, 1)));
+        assert_eq!(c.holds(&writer), Ok((0, 1)));
+        assert!(c.unpin(reader).unwrap().is_some());
+        assert!(c.unpin(writer).unwrap().is_some());
+        c.destroy_table(table, |_| {}).unwrap();
+    }
+}
+
+#[test]
+fn b_prep_pair_second_retain_refusal_preserves_slots_and_holds() {
+    let c = authority::<1, 2>();
+    let table = c.create_table(2, &mut storage(2)).unwrap();
+    let reader = c.create_pinned(description(1)).unwrap();
+    let writer = c.create_pinned(description(2)).unwrap();
+    let ofd = c.ofd(writer.key().index).unwrap();
+    ofd.holds.store((FREE_INDEX << 32) | PIN, Ordering::Relaxed);
+    assert_eq!(
+        b_prep_install_pair(&c, table, [&reader, &writer]),
+        Err(Error::NoMemory)
+    );
+    assert_eq!(c.get(table, Fd(0)), Err(Error::BadFd));
+    assert_eq!(c.holds(&reader), Ok((0, 1)));
+    ofd.holds.store(PIN, Ordering::Relaxed);
+    c.unpin(reader).unwrap();
+    c.unpin(writer).unwrap();
+    c.destroy_table(table, |_| {}).unwrap();
+}
+
+#[test]
+fn b_prep_clone_files_fork_exec_and_reuse_at_1_8_64() {
+    for population in [1, 8, 64] {
+        let c = authority::<3, 65>();
+        let parent = c
+            .create_table(population, &mut storage(population))
+            .unwrap();
+        for fd in 0..population {
+            c.open(parent, Fd(0), description(fd as u64), false)
+                .unwrap();
+        }
+        let peer = parent; // CLONE_FILES owns exactly the same slot table.
+        c.setfd(peer, Fd(0), true).unwrap();
+        let child = c.fork(parent, &mut storage(population)).unwrap();
+        let (operation, original) = c.pin(child, Fd(0)).unwrap();
+        let raw = operation.into_raw();
+        c.exec(child, |_| {
+            panic!("parent and operation retain the description")
+        })
+        .unwrap();
+        assert_eq!(c.get(child, Fd(0)), Err(Error::BadFd));
+        assert_eq!(c.getfd(parent, Fd(0)), Ok(true));
+        assert_eq!(c.close(peer, Fd(0)), Ok(None));
+        assert_eq!(c.get(parent, Fd(0)), Err(Error::BadFd));
+        assert_eq!(c.open(child, Fd(0), description(999), false), Ok(Fd(0)));
+        let operation = OfdPin::from_raw(raw);
+        assert_eq!(c.pinned(&operation), Ok(original));
+        assert_eq!(c.unpin(operation), Ok(Some(original)));
+        // Even after the old OFD index is recycled, its generation is dead.
+        let replacement = c.create_pinned(description(1000)).unwrap();
+        let stale = OfdPin::from_raw(raw);
+        assert_eq!(c.pinned(&stale), Err(Error::StalePin));
+        assert_eq!(
+            c.install_pin(child, Fd(0), &stale, false),
+            Err(Error::StalePin)
+        );
+        assert_eq!(c.get(child, Fd(0)).unwrap().backing, BackingToken(999));
+        c.unpin(replacement).unwrap();
+        c.destroy_table(child, |_| {}).unwrap();
+        c.destroy_table(parent, |_| {}).unwrap();
+    }
+}
+
 // Only test fixtures allocate; the substrate receives resolved slices.
 // One process-wide arena of leaked extents: token = index + 1.
 type Backing = (&'static [DescriptorSlot], &'static [AtomicU64]);
