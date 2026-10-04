@@ -172,6 +172,50 @@
       "domain": "dispatch::mm_binding"
     },
     {
+      "file": "crates/carrick-kernel/src/dispatch/host_io.rs",
+      "function": "OwnedHostFileCursor::advance",
+      "ordinal_in_function": 1,
+      "fingerprint": "66ffde13bfd16e5f88964c8118dd60b0a4395845177cd39b4f02262fba85be05",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::file_cursor",
+      "rationale": "The copied count exceeded the offset range already checked before staging, violating the owned cursor prefix invariant.",
+      "sink": "fatal",
+      "domain": "dispatch::file_cursor"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/host_io.rs",
+      "function": "OwnedHostFileCursor::advance",
+      "ordinal_in_function": 2,
+      "fingerprint": "521af0d7a5d09926f4cb1a148310c14482cefc93b6f886706e8620d755ff0f13",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::file_cursor",
+      "rationale": "Exact offset commit failed on a retained regular-file descriptor after bytes were delivered; replay would corrupt shared file position.",
+      "sink": "fatal",
+      "domain": "dispatch::file_cursor"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/host_io.rs",
+      "function": "OwnedHostFileCursor::stage_read",
+      "ordinal_in_function": 1,
+      "fingerprint": "423c1ed0be9327c12fe43a4cd53346d834e0a4bb2b175655b706325e51daaa8a",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::file_cursor",
+      "rationale": "A HostIo implementation returned more bytes than the checked bounded stage requested; accepting them would exceed prepared transfer custody.",
+      "sink": "fatal",
+      "domain": "dispatch::file_cursor"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/host_io.rs",
+      "function": "StagedFileRead::commit",
+      "ordinal_in_function": 1,
+      "fingerprint": "2242443e2e874ef05bcbfdd0a8b6652fdb4bbf5f4996c6ea809e8e7f16ec9d12",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::file_cursor",
+      "rationale": "The caller claims a delivered prefix larger than the staged bytes, so the owned cursor cannot safely advance.",
+      "sink": "fatal",
+      "domain": "dispatch::file_cursor"
+    },
+    {
       "file": "crates/carrick-kernel/src/dispatch/io_buffers.rs",
       "function": "random_device_bytes",
       "ordinal_in_function": 1,
@@ -370,6 +414,28 @@
       "domain": "dispatch::brk"
     },
     {
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
+      "function": "SyscallDispatcher::publish_bound_address_space",
+      "ordinal_in_function": 1,
+      "fingerprint": "6705a80f304626b9bb2b68a1d32204d67dfbff13885ff00036683b647a9fd52d",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::el1_reservations",
+      "rationale": "Only an MM's own loading executor may publish its address space and admit its reservation root; a participation of another MM reaching this dispatcher means the runtime bound the wrong executor to the MM, and publishing would admit one MM's root under another's authority.",
+      "sink": "fatal",
+      "domain": "dispatch::el1_reservations"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs",
+      "function": "<RootHostWait as carrick_el1::memory::reservations::RootWait>::wait",
+      "ordinal_in_function": 1,
+      "fingerprint": "0881b22e0d038671818abceaa4cb09d6c160dbe7266a60bf9f389a7c40ba8ef8",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::el1_reservations",
+      "rationale": "A reservation root still names a guest EL1 slot whose run sequence stayed even and unchanged across a whole failed attempt: that vCPU executed nothing while holding the root, so EL1 left a critical section holding it and nothing can ever release it. Waiting would park a host thread holding the MM's MemState forever; the contradiction is proven, so the carrier fails loud.",
+      "sink": "fatal",
+      "domain": "dispatch::el1_reservations"
+    },
+    {
       "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
       "function": "MemView<'a>::commit_mmap_growdown",
       "ordinal_in_function": 1,
@@ -379,6 +445,17 @@
       "rationale": "Caller lacks host alias dispatch exclusion in commit_mmap_growdown; cannot mutate growdown range without synchronization.",
       "sink": "fatal",
       "domain": "dispatch::mmap_growdown"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
+      "function": "MemView<'a>::commit_published_frame_grant",
+      "ordinal_in_function": 1,
+      "fingerprint": "0455600fbfc5b5800e8f18f81243f2a79a61ffb2a3a3eb295ac718896d259176",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::resident_frame_grant",
+      "rationale": "A retired grant settlement is licensed by the originating exact-MM host-alias exclusion. Committing its return-accounting span through another dispatcher would attach backing to the wrong MM and permit reuse before its owed return. This is contradictory kernel authority, not a guest errno; stop before mutating the stock list.",
+      "sink": "fatal",
+      "domain": "dispatch::resident_frame_grant"
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
@@ -1021,6 +1098,61 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "delegate_transaction",
+      "ordinal_in_function": 1,
+      "fingerprint": "cbdc1c1c7f9b03ea6baa4b8ac7076f8a2c2249bd6ead24011b5d67ca357d1f79",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "The monotonically allocated inode generation wrapped to zero before admitted publication.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "delegated_file_authority",
+      "ordinal_in_function": 1,
+      "fingerprint": "898469539d2f8add5983508df709d4f0ba309f1d5776c8e9177e7f120a01f749",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "A delegated inode has no bound carrier zone, so its release could not address exact waiters.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "delegated_file_authority",
+      "ordinal_in_function": 2,
+      "fingerprint": "75946499f57a9c2f309fb39d28c5a069c7617cd54ba02b544bbaff0119984d64",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "The delegated inode handle is outside the fixed notification index domain.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "delegated_file_authority",
+      "ordinal_in_function": 3,
+      "fingerprint": "8b2e81421661b28505a9ccdaa4f96f4e74261743a6b8a03c98ca2bf23e37ec0c",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "The delegated inode storage belongs to a different carrier zone than the selected release venue.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "execute_recall",
+      "ordinal_in_function": 1,
+      "fingerprint": "2dc2d4ad49b1cf4693e4a31b2cf319e382ee40a47846ac535352ad3e7dad8a24",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Owned recall reached a null EL1 region although its live inode binding requires carrier storage.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "function": "lock_delegated_file",
       "ordinal_in_function": 1,
       "fingerprint": "f3e409b4b3c4a81563e12254a3747f49e49bd4db6f1d08e1e46a752fb3f99cea",
@@ -1032,23 +1164,34 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "function": "recall_binding",
-      "ordinal_in_function": 1,
-      "fingerprint": "2dc2d4ad49b1cf4693e4a31b2cf319e382ee40a47846ac535352ad3e7dad8a24",
+      "function": "lock_delegated_file",
+      "ordinal_in_function": 2,
+      "fingerprint": "61fa68e7d81b65d99266140eb0a2016174cdb5362a3912344507efd73d3d20e0",
       "verdict": "carrier_fault",
       "failure_domain": "el1_delegation",
-      "rationale": "Inode recall with no EL1 region mapped; the in-zone bytes are unreachable, so continuing would lose them.",
+      "rationale": "The host acquired an inode lock but could not attach its authenticated notification custody, so release would lack exact wake authority.",
       "sink": "fatal",
       "domain": "el1_delegation"
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "function": "recall_locked",
+      "function": "recall",
       "ordinal_in_function": 1,
-      "fingerprint": "e62358e6a2864ad4f910af3fabaaaa6e76373a20e90d8aeb6315774c5e613b9a",
+      "fingerprint": "5fef690a2d1a4fc6b3a22c0531c383d3952bc749214a650b4cfba75cbc1047dd",
       "verdict": "carrier_fault",
       "failure_domain": "el1_delegation",
-      "rationale": "Delegated description has no inode registration at recall; every delegation registers at description construction, so the owner model is violated and the write-back target is unknown.",
+      "rationale": "A delegated description lost its inode registration before recall.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "recall",
+      "ordinal_in_function": 2,
+      "fingerprint": "08cc9940e2d649db017252168236507d49e369ceb240d8a47e457910f29ef066",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Terminal owned recall left a live member handle; a second detach would race the completed owner transition.",
       "sink": "fatal",
       "domain": "el1_delegation"
     },
@@ -1064,13 +1207,112 @@
       "domain": "el1_delegation"
     },
     {
-      "file": "crates/carrick-kernel/src/el1_delegation.rs",
-      "function": "write_back_target",
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "function": "RecallJob::new",
       "ordinal_in_function": 1,
-      "fingerprint": "b0d6132a22ab3d265bb34c201866728d3a4f6b89fde9e1b79f01afd10e139f2b",
+      "fingerprint": "ba3e1c6aab0484bec50fa1e0162c69e39a8983f98a50b129f18f4b315b1234ed",
       "verdict": "carrier_fault",
       "failure_domain": "el1_delegation",
-      "rationale": "An in-zone inode has dirty pages but no writable member ever joined; only a writable description can dirty pages, so the membership bookkeeping is corrupt and the bytes have no write-back target.",
+      "rationale": "An admitted live inode had a zero generation, so the owned recall job cannot authenticate its target.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "function": "RecallJob::step",
+      "ordinal_in_function": 1,
+      "fingerprint": "128f2978c1bd5449110a4198e2cb9e7914b916e204862c7bd5dbfe1732bdbff6",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "An owned recall lost its exact generation subscription while the inode owner still retained the job.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "function": "RecallJob::step",
+      "ordinal_in_function": 2,
+      "fingerprint": "fe31559e5fb2cb159f819405941b122dbd715109abe1857b1afc5cf348b58aff",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "An owned recall lost its exact inode host lock generation during completion.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "function": "RecallJob::step",
+      "ordinal_in_function": 3,
+      "fingerprint": "c2738fc8f4551e74860fafc5196a3703437170482233a824b94edac23d1f91ea",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Member cleanup found no owner for the inode whose recall job still holds its binding.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "function": "RecallJob::step",
+      "ordinal_in_function": 4,
+      "fingerprint": "d2e6a3bbccad04fa09939722bf516560bdf0e1b3a9e9a49d48c41493f6b939af",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Full recall lost the inode owner before terminal publication and resource retirement.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "function": "driver",
+      "ordinal_in_function": 1,
+      "fingerprint": "cd3c3fe6d26d39bbf2444e57ea905942bb9245d0a77c5e23bdec0bdc65939b48",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "The fixed carrier recall storage workers could not start; no worker remains to settle already-owned inode recall jobs.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "function": "handoff",
+      "ordinal_in_function": 1,
+      "fingerprint": "16c992bedda60641d190ccacb9ed2a572f5563c13a239d6f2fddb1347833897f",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "A delegated last functional reference has no inode identity, so recall cannot name the owned target.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "function": "handoff",
+      "ordinal_in_function": 2,
+      "fingerprint": "fb8c0795c42aa67c0fff5f2ab48f702aa154f708f7430d6625e6887e1c94e76e",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "The delegated description has no inode owner at its final-reference handoff.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "function": "handoff",
+      "ordinal_in_function": 3,
+      "fingerprint": "4173c9813ef39925624aff7015bd42d5d22c570faeb813e2d35c55ff1fc9ad34",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Cursor or final-reference handoff crossed an excluded initial delegation publication.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation/writeback.rs",
+      "function": "InodeWriteback::apply",
+      "ordinal_in_function": 1,
+      "fingerprint": "6c19eb32e609a979eb63aae2f53a33558d6716fad81f73f7dd9756827882fe45",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "Dirty in-zone bytes have no writable member at owned writeback, so silently completing recall would lose guest file data.",
       "sink": "fatal",
       "domain": "el1_delegation"
     },
@@ -1361,6 +1603,50 @@
       "domain": "kernel::mm_occupancy"
     },
     {
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "function": "<PreAdmissionGuard as carrick_hal::PreAdmissionOwner>::mm",
+      "ordinal_in_function": 1,
+      "fingerprint": "59943e23c01c03d13bbe1926076eb8fc20ef6cbedf955b71a865425cfe1f7495",
+      "sink": "fatal",
+      "domain": "kernel::mm_occupancy",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::mm_occupancy",
+      "rationale": "Kernel publication lock guard holds a zero MM identity, violating exact unpublished-target authority."
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "function": "SpaceTables::free",
+      "ordinal_in_function": 1,
+      "fingerprint": "18366775b48e20a4b89e3bdeb956c225ec7311b5b35a27c6df006662f583bc48",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::mm_occupancy",
+      "rationale": "Live MM retirement has no exact key, so its notification source cannot be retired safely.",
+      "sink": "fatal",
+      "domain": "kernel::mm_occupancy"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "function": "SpaceTables::free",
+      "ordinal_in_function": 2,
+      "fingerprint": "18366775b48e20a4b89e3bdeb956c225ec7311b5b35a27c6df006662f583bc48",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::mm_occupancy",
+      "rationale": "The retiring MM key has no authenticated zone entry membership.",
+      "sink": "fatal",
+      "domain": "kernel::mm_occupancy"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/mm_occupancy.rs",
+      "function": "SpaceTables::free",
+      "ordinal_in_function": 3,
+      "fingerprint": "18366775b48e20a4b89e3bdeb956c225ec7311b5b35a27c6df006662f583bc48",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::mm_occupancy",
+      "rationale": "An admitted MM reached retirement without the release venue needed for terminal publication.",
+      "sink": "fatal",
+      "domain": "kernel::mm_occupancy"
+    },
+    {
       "file": "crates/carrick-kernel/src/kernel/objects.rs",
       "function": "<FileTableFunctionalLease as Drop>::drop",
       "ordinal_in_function": 1,
@@ -1448,6 +1734,61 @@
       "rationale": "FileSlot generation atomic counter overflow or zero; wrapping slot generations would cause ABA aliasing across file slot lifecycle.",
       "sink": "fatal",
       "domain": "kernel::file_slot_generation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects/file_cursor.rs",
+      "function": "<CursorWaiter as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "ee40537c62bffeebb0bbb556f164e6c1d0f2a6d5ba2a6268fd9cb2732435e42b",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::file_cursor",
+      "rationale": "A cursor waiter reached destruction in a state outside waiting, granted, or consumed.",
+      "sink": "fatal",
+      "domain": "kernel::file_cursor"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects/file_cursor.rs",
+      "function": "FileCursor::release",
+      "ordinal_in_function": 1,
+      "fingerprint": "960475d721c6e5f187583bfe30ebbf7de5c5a2e7bbcdac1b74eadabb398b58dd",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::file_cursor",
+      "rationale": "Cursor release presented a different ticket than its exact elected owner.",
+      "sink": "fatal",
+      "domain": "kernel::file_cursor"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects/file_cursor.rs",
+      "function": "FileCursor::release",
+      "ordinal_in_function": 2,
+      "fingerprint": "053042e6968cab5858520eb6fb5b8c05c0afbbd4ac2401528828b1e204a2d6a8",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::file_cursor",
+      "rationale": "Cursor wake delivery panicked while drain ownership was held; recovery would strand successor tickets.",
+      "sink": "fatal",
+      "domain": "kernel::file_cursor"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects/file_cursor.rs",
+      "function": "FileDescription::try_reserve_cursor",
+      "ordinal_in_function": 1,
+      "fingerprint": "977d67c2c8688741be771c129a375e1dd24ea84cf794aef109db047433dcb489",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::file_cursor",
+      "rationale": "The cursor generation became zero before a new ticket could be issued.",
+      "sink": "fatal",
+      "domain": "kernel::file_cursor"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/objects/file_cursor.rs",
+      "function": "FileDescription::try_reserve_cursor",
+      "ordinal_in_function": 2,
+      "fingerprint": "c8c349a1677d5363496547b79fb85238315c7cfb1fd163fdb466b783f5b7fef8",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::file_cursor",
+      "rationale": "The cursor ticket counter exhausted its generation range; reuse would violate exact successor ownership.",
+      "sink": "fatal",
+      "domain": "kernel::file_cursor"
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/process.rs",
