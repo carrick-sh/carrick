@@ -364,10 +364,8 @@ impl UserTransferCustody {
         if len == 0 || len > 4096 || selected.ipa.checked_add(len as u64).is_none() {
             return Err(error());
         }
-        let Some(identity) = self.custody.stage2_record_covering(selected.ipa, len) else {
-            carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 1);
-            return Ok(None);
-        };
+        // A known physical extent overrun is permanent refusal, even if its
+        // owner is concurrently retiring. Check it before selecting a wait.
         let global = {
             let owners = self.custody.global_frame_host_owners.lock();
             if let Some((&(base, length), entry)) =
@@ -378,10 +376,7 @@ impl UserTransferCustody {
                     if selected.ipa + len as u64 > end {
                         return Err(error());
                     }
-                    entry
-                        .live_owner()
-                        .filter(|owner| owner.record_identity == identity)
-                        .cloned()
+                    entry.live_owner().cloned()
                 } else {
                     None
                 }
@@ -389,6 +384,25 @@ impl UserTransferCustody {
                 None
             }
         };
+        // Select the record containing the first byte so a range crossing its
+        // end cannot be mistaken for absent backing (and endlessly reselected).
+        let Some(identity) = self.custody.stage2_record_covering(selected.ipa, 1) else {
+            carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 1);
+            return Ok(None);
+        };
+        let extent = self
+            .custody
+            .stage2_record_snapshot(identity.record_id)
+            .ok_or_else(error)?;
+        if selected
+            .ipa
+            .checked_sub(extent.ipa)
+            .and_then(|offset| offset.checked_add(len as u64))
+            .is_none_or(|end| end > extent.len as u64)
+        {
+            return Err(error());
+        }
+        let global = global.filter(|owner| owner.record_identity == identity);
         let mapping = if let Some(owner) = global {
             Some(Arc::clone(&owner.mapping))
         } else {
