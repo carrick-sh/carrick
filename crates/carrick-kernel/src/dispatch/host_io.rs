@@ -85,6 +85,110 @@ impl HostIo for SystemHostIo {
     }
 }
 
+/// Owned admission before host cursor capture. Numeric fd close cannot retire
+/// the description while an operation waits for a cursor or inode recall.
+#[derive(Debug)]
+pub struct FileCursorAdmission(CursorAdmissionStage);
+
+#[derive(Debug)]
+enum CursorAdmissionStage {
+    Cursor {
+        wait: crate::kernel::objects::FileCursorWait,
+        lease: crate::kernel::objects::FileDescriptionFdLease,
+    },
+    Recall(crate::el1_delegation::OwnedRecallRequest),
+}
+
+#[derive(Debug)]
+pub enum FileCursorAdmissionStep {
+    Ready(crate::el1_delegation::OwnedRecallReady),
+    Wait(FileCursorAdmission),
+    Fault(LinuxErrno),
+}
+
+impl FileCursorAdmission {
+    pub fn begin(
+        description: &std::sync::Arc<crate::kernel::FileDescription>,
+    ) -> FileCursorAdmissionStep {
+        let Some(lease) = description.retain_fd_lease() else {
+            return FileCursorAdmissionStep::Fault(carrick_abi::LINUX_EBADF);
+        };
+        match description.try_reserve_cursor() {
+            Ok(cursor) => {
+                let request = crate::el1_delegation::begin_owned_recall(cursor);
+                // The request retains its own functional lease before this
+                // admission lease is dropped: no zero-reference gap.
+                drop(lease);
+                match request {
+                    Ok(request) => Self(CursorAdmissionStage::Recall(request)).advance(),
+                    Err(errno) => FileCursorAdmissionStep::Fault(errno),
+                }
+            }
+            Err(wait) => {
+                FileCursorAdmissionStep::Wait(Self(CursorAdmissionStage::Cursor { wait, lease }))
+            }
+        }
+    }
+
+    /// One owned stage transition; a contended source is never polled here.
+    pub fn advance(self) -> FileCursorAdmissionStep {
+        match self.0 {
+            CursorAdmissionStage::Cursor { wait, lease } => {
+                let Some(cursor) = wait.take_reservation() else {
+                    return FileCursorAdmissionStep::Wait(Self(CursorAdmissionStage::Cursor {
+                        wait,
+                        lease,
+                    }));
+                };
+                let request = crate::el1_delegation::begin_owned_recall(cursor);
+                drop(lease);
+                match request {
+                    Ok(request) => match request.try_ready() {
+                        Ok(ready) => FileCursorAdmissionStep::Ready(ready),
+                        Err(request) => FileCursorAdmissionStep::Wait(Self(
+                            CursorAdmissionStage::Recall(request),
+                        )),
+                    },
+                    Err(errno) => FileCursorAdmissionStep::Fault(errno),
+                }
+            }
+            CursorAdmissionStage::Recall(request) => match request.try_ready() {
+                Ok(ready) => FileCursorAdmissionStep::Ready(ready),
+                Err(request) => {
+                    FileCursorAdmissionStep::Wait(Self(CursorAdmissionStage::Recall(request)))
+                }
+            },
+        }
+    }
+
+    /// Enroll first, then probe the durable grant/completion. The caller keeps
+    /// the returned subscription in CarrierWaitService until exact handback.
+    pub fn subscribe(
+        &self,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> (Option<crate::kernel::WaitCallbackEnrollment>, bool) {
+        match &self.0 {
+            CursorAdmissionStage::Cursor { wait, .. } => {
+                let (subscription, ready) = wait.subscribe(wake);
+                (Some(subscription), ready)
+            }
+            CursorAdmissionStage::Recall(request) => {
+                let subscription = request
+                    .wait_queue()
+                    .map(|queue| queue.enroll_callback(move |_| wake()));
+                (subscription, request.is_complete())
+            }
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        match &self.0 {
+            CursorAdmissionStage::Cursor { wait, .. } => wait.changed(),
+            CursorAdmissionStage::Recall(request) => request.is_complete(),
+        }
+    }
+}
+
 /// Inactive staging prerequisite: production dispatch does not call this yet.
 /// Owned recall/capacity lowering, exact resource-lifetime admission and all
 /// competing current-offset callers must be integrated before activation.
@@ -238,6 +342,55 @@ mod cursor_tests {
         let request = crate::el1_delegation::begin_owned_recall(cursor).unwrap();
         OwnedHostFileCursor::capture_recalled(request.try_ready().unwrap()).unwrap()
     }
+    #[test]
+    fn queued_cursor_admission_survives_numeric_close_and_release_before_enrollment() {
+        let (description, _fd) = description(b"retained");
+        let owner = description.try_reserve_cursor().unwrap();
+        let FileCursorAdmissionStep::Wait(wait) = FileCursorAdmission::begin(&description) else {
+            panic!("cursor must wait for existing owner");
+        };
+        description.release_fd_ref();
+        assert_eq!(description.common().fd_refs(), 1);
+        drop(owner);
+        let (_subscription, ready) = wait.subscribe(|| {});
+        assert!(ready, "release before enrollment must remain observable");
+        let FileCursorAdmissionStep::Ready(ready) = wait.advance() else {
+            panic!("exact retained description must survive numeric close");
+        };
+        let cursor = OwnedHostFileCursor::capture_recalled(ready).unwrap();
+        assert_eq!(description.common().fd_refs(), 1);
+        let staged = cursor
+            .stage_read(&SystemHostIo, HostReadLimit::new(8).unwrap())
+            .unwrap();
+        assert_eq!(staged.bytes(), b"retained");
+        drop(staged);
+        assert_eq!(description.common().fd_refs(), 0);
+    }
+
+    #[test]
+    fn canceled_queued_cursor_admission_releases_lease_and_passes_exact_successor() {
+        let (description, _fd) = description(b"retained");
+        let owner = description.try_reserve_cursor().unwrap();
+        let FileCursorAdmissionStep::Wait(canceled) = FileCursorAdmission::begin(&description)
+        else {
+            panic!("first waiter");
+        };
+        let FileCursorAdmissionStep::Wait(successor) = FileCursorAdmission::begin(&description)
+        else {
+            panic!("second waiter");
+        };
+        description.release_fd_ref();
+        assert_eq!(description.common().fd_refs(), 2);
+        drop(canceled);
+        assert_eq!(description.common().fd_refs(), 1);
+        drop(owner);
+        let FileCursorAdmissionStep::Ready(ready) = successor.advance() else {
+            panic!("cancellation must pass the exact next ticket");
+        };
+        drop(ready);
+        assert_eq!(description.common().fd_refs(), 0);
+    }
+
     #[test]
     fn legacy_dispatch_file_fault_count_matches_shared_offset() {
         for available in [0, 4096] {
