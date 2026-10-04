@@ -163,5 +163,10 @@ fn live_registry_loads_all_claims() {
             .require(id)
             .expect("native contract must be registered");
     }
-    assert_eq!(registry.claims().len(), 15);
+    assert_eq!(registry.claims().len(), 16);
+    assert!(
+        registry
+            .claims()
+            .any(|claim| { claim.id.as_str() == "kernel.futex.contention.kernel-ownership" })
+    );
 }
