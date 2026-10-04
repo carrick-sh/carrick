@@ -731,8 +731,9 @@ or performance budget relaxation. Unaccepted workloads remain explicitly open.
 - [ ] Accept here: `just fmt-check`; proposed
   `just accept --phase kvm --receipt target/kvm-carrier-accept.json`;
   proposed `just kvm-carrier-smoke`; `just conformance-probes` with executing
-  KVM routing. Existing `just kvm-smoke` targets hello-aarch64 (justfile:871)
-  and is not an x86 carrier gate; do not count it as one.
+  KVM routing. Existing
+  `cargo test -p carrick-vmm-kvm --test cpl0_entry` proves executing x86
+  entry bindings; it does not prove the full OCI carrier admission.
   Native-x86 Docker authority/timing is a **separate serial director phase**,
   unavailable in this no-Docker task. A failed ratio is unfinished correctness.
 

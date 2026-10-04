@@ -26,17 +26,13 @@ guest-issued sends, and this fixture is its regression lock.
 
 ## Build / run
 
-This needs glibc (`sigaction`/`printf`) and therefore the REAL dispatcher
-(`carrick-kvm`), not the freestanding thin shim. It is built + run inside the
-nested-KVM Lima guest by `scripts/kvm-smoke-lima.sh` (case 26), where an aarch64
-Linux gcc + glibc exist:
+This glibc fixture belonged to the retired 1:1 aarch64 dispatcher driver.
+It has no current acceptance binding. On native aarch64 Linux, its oracle
+prints `sender-pid-ok` and exits 0:
 
 ```sh
 gcc -static -O2 -o sender-pid sender-pid.c
-carrick-kvm run-elf ./sender-pid   # stdout contains "sender-pid-ok", exit 0
+./sender-pid
 ```
 
-`build.sh` performs that gcc build with whatever `gcc` (or `$CC`) is on PATH. On
-macOS there is no glibc aarch64 gcc, so the binary is built+run in-guest rather
-than committed (the same reason the C-based signal cases in the smoke script are
-gcc-compiled in-guest).
+`build.sh` performs the gcc build using `gcc` (or `$CC`).

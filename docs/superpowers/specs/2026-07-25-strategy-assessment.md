@@ -41,9 +41,11 @@ run of the **native** backend against the project's own 23-case pre-merge smoke 
 demonstrated to pass the project's own fast gate. The native bless checklist is **2 of 14**
 items checked, and its "Current next action" reads *"Stop correctness laddering on the
 measured Go compiler/import performance blocker"* **[V]**. Nothing automated observes a
-guest anywhere: `just ci` runs no guest, and both CI jobs that would (`hvf-conformance`,
-`kvm-smoke`) are dormant behind unset repo variables **[V]** — so CI executes **zero** guest
-instructions on any lane.
+guest in this audit: `just ci` ran no guest, and the two guest CI jobs
+(`hvf-conformance` and the former AArch64 smoke lane) were dormant behind
+unset repo variables **[V]**. The AArch64 recipe is now retired; current
+x86 entry smoke uses `cargo test -p carrick-vmm-kvm --test cpl0_entry` on
+a Linux x86_64 host with real KVM and a built CPL0 image.
 
 Breadth is thinner than the crate list implies. The native capability table
 (`page_profile.rs:124-138`) admits exactly **three** (host OS, host ISA) pairs — macOS/aarch64,

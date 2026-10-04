@@ -51,7 +51,7 @@ just fmt-check
 All three exit zero. Builds still emit numerous warnings; a warnings-as-errors
 gate is not claimed. The final CLI build log is `build-final.log`.
 
-`just kvm-smoke` currently targets the AArch64 fixture, so the x86 path used
+The retired smoke recipe targeted the AArch64 fixture, so this x86 audit used
 `crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs` and standalone KVM `run-elf`.
 The raw M0/M1 ELF was materialized from the existing `m01_blob()` in
 `guest_setup_x86.rs`, using the same ELF wrapper as the live test. It has no
@@ -184,3 +184,6 @@ Disabling the page-profile check or reviving a retired process-per-task backend
 would not implement it. Acceptance needs two-live-process and exhausted-pool
 contracts plus real OCI execution. No carrier/recycle stress, ARM64/HVF runtime
 gate, Docker oracle, full `just ci`, or overhead ratio is claimed here.
+
+Current x86 entry smoke uses `cargo test -p carrick-vmm-kvm --test cpl0_entry`
+on a Linux x86_64 host with real `/dev/kvm` and a built CPL0 image.
