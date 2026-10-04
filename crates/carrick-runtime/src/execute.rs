@@ -155,6 +155,7 @@ pub(crate) fn cached_lower_enabled(
 /// complying with Apple's macOS Software License Agreement when running amd64
 /// containers through Rosetta 2. Setting it (to any value) accepts that risk
 /// and suppresses the per-run reminder.
+#[cfg(target_os = "macos")]
 pub const ROSETTA_ACCEPT_ENV: &str = "CARRICK_ACCEPT_ROSETTA_TERMS";
 
 /// Print a one-time (per process) reminder that amd64 support drives Apple's
@@ -163,6 +164,7 @@ pub const ROSETTA_ACCEPT_ENV: &str = "CARRICK_ACCEPT_ROSETTA_TERMS";
 /// operator accepts the terms via [`ROSETTA_ACCEPT_ENV`] (or the legacy
 /// `CARRICK_NO_ROSETTA_NOTICE`). Goes to stderr so it never corrupts a streaming
 /// guest's stdout.
+#[cfg(target_os = "macos")]
 pub(crate) fn rosetta_license_notice() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static SHOWN: AtomicBool = AtomicBool::new(false);
