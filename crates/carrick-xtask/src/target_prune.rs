@@ -75,6 +75,13 @@ idle() {
 const AGE_QUERY: &str =
     r#"find "$entry" \( ! -mtime "$age" -o -type l -o \( -type f -links +1 \) \) -print"#;
 
+const TARGET_IDENTITY_CHECK: &str = r#"use Fcntl qw(:mode);
+my ($target, $device, $inode) = @ARGV;
+my @current = lstat($target);
+die "target identity changed before pruning\n"
+    unless @current && S_ISDIR($current[2]) && $current[0] == $device && $current[1] == $inode;
+"#;
+
 const CANDIDATES: &str = r#"
 for entry do
     if ! AGE_QUERY > "$state/age"; then exit 1; fi
@@ -87,6 +94,7 @@ for entry do
         # Recheck the descendant age proof after the census.
         if ! AGE_QUERY > "$state/age"; then exit 1; fi
         [ ! -s "$state/age" ] || continue
+        TARGET_IDENTITY_CHECK || exit 1
         printf '%s\n' "$allocated" >> "$state/bytes" || exit 1
         rm -rf -- "$entry" || exit 1
         action=pruned
@@ -102,9 +110,18 @@ done
 // lock excludes both older exclusive Cargo locks and newer shared Cargo locks.
 // Inherit the handles through exec so parent death cannot release exclusion
 // while the deletion shell or one of its utilities remains alive.
-const CARGO_TARGET_LOCKS: &str = r#"use Fcntl qw(:flock :DEFAULT F_GETFD F_SETFD FD_CLOEXEC);
+const CARGO_TARGET_LOCKS: &str = r#"use Fcntl qw(:flock :DEFAULT :mode F_GETFD F_SETFD FD_CLOEXEC);
 use File::Path qw(make_path);
-my $target = shift @ARGV;
+use Cwd qw(abs_path);
+my $input = shift @ARGV;
+my $target = abs_path($input) // die "target canonicalization: $!\n";
+sysopen(my $root, $target, O_RDONLY | O_NOFOLLOW) or die "target identity open: $!\n";
+my @identity = stat($root);
+my @source = stat($input);
+die "target identity changed during canonicalization\n"
+    unless @identity && @source && S_ISDIR($identity[2])
+        && $identity[0] == $source[0] && $identity[1] == $source[1];
+close($root) or die "target identity close: $!\n";
 my @locks;
 for my $profile ('debug', 'release') {
     my $directory = "$target/$profile";
@@ -121,7 +138,12 @@ for my $profile ('debug', 'release') {
     fcntl($lock, F_SETFD, $flags & ~FD_CLOEXEC) or die "Cargo lock inheritance: $!\n";
     push @locks, $lock;
 }
+my @current = lstat($target);
+die "target identity changed during lock acquisition\n"
+    unless @current && S_ISDIR($current[2]) && $current[0] == $identity[0] && $current[1] == $identity[1];
 $ENV{CARRICK_PRUNE_TARGET} = $target;
+$ENV{CARRICK_PRUNE_DEVICE} = $identity[0];
+$ENV{CARRICK_PRUNE_INODE} = $identity[1];
 system(@ARGV);
 die "target prune spawn: $!\n" if $? == -1;
 exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
@@ -138,13 +160,19 @@ fn pruning_body_with_census(
     idle_census: &str,
 ) -> Result<String, GcError> {
     let idle_census = idle_census.replace("LOCK_FIELD_PARSER", LOCK_FIELD_PARSER);
+    let identity_check = format!(
+        "/usr/bin/perl -e {} \"$CARRICK_PRUNE_TARGET\" \"$CARRICK_PRUNE_DEVICE\" \"$CARRICK_PRUNE_INODE\"",
+        shell_quote(TARGET_IDENTITY_CHECK)
+    );
     let older_than = days
         .checked_sub(1)
         .filter(|_| days <= i32::MAX as u64)
         .ok_or_else(|| GcError::Census("artifact age must be 1..=2147483647 days".into()))?;
     let candidate = format!(
         "set -u\napply=$1; age=$2; state=$3; lsof_bin=$4; uid=$5; shift 5\n{idle_census}\n{}",
-        CANDIDATES.replace("AGE_QUERY", AGE_QUERY)
+        CANDIDATES
+            .replace("AGE_QUERY", AGE_QUERY)
+            .replace("TARGET_IDENTITY_CHECK", &identity_check)
     );
     let paths = targets
         .iter()
@@ -158,7 +186,8 @@ fn pruning_body_with_census(
     let candidate = shell_quote(&candidate);
     let target_body = shell_quote(&format!(
         r#"set -u
-target=$1; apply=$2; age=$3; state=$4; lsof_bin=$5; uid=$6
+target=$CARRICK_PRUNE_TARGET; apply=$2; age=$3; state=$4; lsof_bin=$5; uid=$6
+{identity_check} || exit 1
 {idle_census}
 if [ ! -x "$lsof_bin" ] || ! idle "$target"; then
     printf 'keep target (in use or unknown visibility) | %s\n' "$target"
@@ -349,8 +378,8 @@ mod tests {
 
     fn real_lock_census(target: &Path) -> String {
         let shell = format!(
-            "lsof_bin=$(command -v lsof) || exit 1; sudo -n -u root \"$lsof_bin\" -F pfn +D {}",
-            shell_quote(target.to_str().unwrap())
+            "lsof_bin=$(command -v lsof) || exit 1; if [ \"$(id -u)\" = 0 ]; then \"$lsof_bin\" -F pfn +D {target}; else sudo -n -u root \"$lsof_bin\" -F pfn +D {target}; fi",
+            target = shell_quote(target.to_str().unwrap())
         );
         let output = Command::new("/usr/bin/perl")
             .args(["-e", CARGO_TARGET_LOCKS])
@@ -404,6 +433,43 @@ mod tests {
     #[test]
     fn real_lsof_descriptor_protocol_prunes_idle_target() {
         assert_real_idle_target_pruned(false);
+    }
+
+    #[test]
+    fn real_lsof_canonical_names_prune_symlinked_ancestor_target() {
+        assert_real_idle_target_pruned(true);
+    }
+
+    #[test]
+    fn authenticated_canonical_target_rejects_replacement_and_symlink() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (target, artifact) = old_artifact(&root);
+        let identity = fs::metadata(&target).unwrap();
+        let check = || {
+            Command::new("/usr/bin/perl")
+                .args(["-e", TARGET_IDENTITY_CHECK])
+                .arg(&target)
+                .args([identity.dev().to_string(), identity.ino().to_string()])
+                .output()
+                .unwrap()
+        };
+        assert!(check().status.success());
+        let retired = root.join("original-target");
+        fs::rename(&target, &retired).unwrap();
+        fs::create_dir(&target).unwrap();
+        assert!(
+            !check().status.success(),
+            "replacement must fail identity authentication"
+        );
+        fs::remove_dir(&target).unwrap();
+        symlink(&retired, &target).unwrap();
+        assert!(
+            !check().status.success(),
+            "symlink must fail even when pointing to the original inode"
+        );
+        assert!(artifact.exists());
     }
 
     #[test]
