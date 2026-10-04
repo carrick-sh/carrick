@@ -11,8 +11,9 @@
 #[path = "../../../carrick-kernel/tests/integration/common/syscall_support.rs"]
 mod support;
 
+use carrick_kernel::dispatch::FdWaitCompletion;
 #[cfg(target_os = "macos")]
-use carrick_kernel::dispatch::{FdWaitCompletion, ThreadCtx, WaitFds};
+use carrick_kernel::dispatch::{ThreadCtx, WaitFds};
 #[cfg(target_os = "macos")]
 use carrick_kernel::kernel::Scheduler;
 #[cfg(target_os = "macos")]
