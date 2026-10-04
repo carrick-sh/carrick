@@ -24,7 +24,7 @@ jobs:
   # HVPatch runtime or Linux behavioral conformance.
   check:
     name: hosted macOS · source + host-only tests
-    runs-on: macos-14 # Apple Silicon
+    runs-on: macos-15 # Apple Silicon; SDK provides the macOS 15 hv_gic_* APIs
     steps:
       - uses: actions/checkout@v4
         with:
@@ -71,7 +71,7 @@ jobs:
 
       # These two sit between `check-matrix` and `check`, the same place they
       # occupy in the justfile's `ci` recipe. The layering gate walks the
-      # dependency closures with `cargo metadata | jq` — the hosted macos-14
+      # dependency closures with `cargo metadata | jq` — the hosted macos-15
       # image ships jq (1.8.2 on image 20260831), so no install step is
       # needed; if a future image drops it the gate fails loudly on the
       # missing binary rather than passing vacuously. The portable check
