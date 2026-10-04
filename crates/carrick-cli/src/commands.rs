@@ -112,6 +112,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
     // Kept alongside the opened store: the trace hops rebuild argv and must
     // re-emit the ROOT-level flag verbatim, which needs the path, not the
     // opened `ImageStore`.
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let store_path = store.clone();
     let store = store
         .map(ImageStore::new)
@@ -1502,7 +1503,10 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 let _ = (
                     flowindent,
                     script,
+                    require_script_exit,
                     profile,
+                    core_artifact,
+                    profile_bound_seconds,
                     summary_jsonl,
                     preflight_quiet_host,
                     trace_out,
@@ -2574,6 +2578,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn legacy_custom_trace_allows_missing_exit_but_rejects_loss_or_interruption() {
         assert!(!custom_trace_report_is_rejected(
@@ -2596,6 +2601,7 @@ mod tests {
         ));
     }
 
+    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn strict_custom_trace_requires_a_zero_exit_receipt() {
         assert!(custom_trace_report_is_rejected(

@@ -1,7 +1,9 @@
 //! Strict reader for the HVPatch guest-identity host-safety DTrace protocol.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "macos")]
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -17,6 +19,7 @@ pub(crate) struct HvpatchIdentityHostSafetySummary {
 }
 
 impl HvpatchIdentityHostSafetySummary {
+    #[cfg(target_os = "macos")]
     pub(crate) fn from_path(path: &Path, status: ProfileCaptureStatus) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("read HVPatch identity safety stream {}", path.display()))?;
@@ -114,6 +117,7 @@ impl HvpatchIdentityHostSafetySummary {
         })
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn render_human(self) -> String {
         format!(
             "HVPatch identity host safety: guest_kills={}, guest_sigstops={}, guest_sigconts={}, low_guest_id_host_kills={}",

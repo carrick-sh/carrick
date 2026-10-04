@@ -133,15 +133,19 @@ mod debug_exec_stamps;
 mod fs_setup;
 mod hvpatch_carrier_cpu_attribution_profile;
 mod hvpatch_carrier_cpu_low_rate_profile;
+#[cfg(any(test, target_os = "macos"))]
 mod hvpatch_core_profile;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod hvpatch_inotify_population_profile;
 // Strict text reader for the bundled one-VM HVPatch K1 lifecycle profile.
+#[cfg(any(test, target_os = "macos"))]
 mod hvpatch_exec_runtime_profile;
 // Strict reader for the exit-class / forwarded-syscall attribution profile.
 #[cfg_attr(not(any(target_os = "macos", target_os = "freebsd")), allow(dead_code))]
 mod hvpatch_exit_attribution_profile;
+#[cfg(any(test, target_os = "macos"))]
 mod hvpatch_identity_host_safety_profile;
+#[cfg(any(test, target_os = "macos"))]
 mod hvpatch_k1_profile;
 mod lifecycle;
 #[cfg_attr(not(any(target_os = "macos", target_os = "freebsd")), allow(dead_code))]

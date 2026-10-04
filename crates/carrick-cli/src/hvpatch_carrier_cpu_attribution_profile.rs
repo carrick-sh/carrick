@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use crate::trace_profile::ProfileCaptureStatus;
 
 const PREFIX: &str = "HVPCARRIERATTR";
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) const PROGRAM_SHA256_PLACEHOLDER: &str =
     "/* CARRICK_HVPCARRIERCPUATTR_PROGRAM_SHA256 */";
 
@@ -34,6 +35,7 @@ pub(crate) const BOUND_PLACEHOLDER: &str = "/* CARRICK_HVPCARRIERCPUATTR_BOUND *
 /// Render the bundled template's immutable digest into the raw-stream header.
 pub(crate) const MAX_INSTRUMENTATION_SHARE: f64 = 0.05;
 
+#[cfg(any(test, target_os = "macos"))]
 pub(crate) fn render_profile_script(template: &str) -> Result<String> {
     let slots = template.match_indices(PROGRAM_SHA256_PLACEHOLDER).count();
     if slots != 1 {

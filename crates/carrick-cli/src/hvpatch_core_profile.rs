@@ -6,7 +6,9 @@
 //! extents to bound memory and avoid whole-file hashing over large sparse holes.
 
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+#[cfg(target_os = "macos")]
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -124,6 +126,7 @@ pub(crate) struct HvpatchCoreSummary {
 }
 
 impl HvpatchCoreSummary {
+    #[cfg(target_os = "macos")]
     pub(crate) fn from_path(
         path: &Path,
         artifact_path: &Path,
@@ -384,6 +387,7 @@ impl HvpatchCoreSummary {
         })
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn render_human(self) -> String {
         format!(
             "HVPatch core: generation={}, pid={}, tid={}, threads={}, bytes={}",

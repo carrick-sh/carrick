@@ -478,7 +478,7 @@ mod tests {
     /// instead of failing with "does not declare a capture bound".
     #[test]
     fn hvpatch_carrier_cpu_attribution_declares_a_capture_bound() {
-        let template = carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_CARRIER_CPU_ATTRIBUTION_D;
+        let template = include_str!("../../../scripts/dtrace/hvpatch-carrier-cpu-attribution.d");
         assert_eq!(
             TraceProfileKind::HvpatchCarrierCpuAttribution.capture_bound_placeholder(),
             Some(crate::hvpatch_carrier_cpu_attribution_profile::BOUND_PLACEHOLDER)
