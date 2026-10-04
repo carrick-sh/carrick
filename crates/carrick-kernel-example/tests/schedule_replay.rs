@@ -19,6 +19,28 @@ fn futex_scenario() -> Vec<Step> {
     ]
 }
 
+fn futex_acknowledged_scenario() -> Vec<Step> {
+    vec![
+        alloc_word(0, 1),
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 1)
+                .save_out_i32(0, 1, 2),
+        ),
+        Step::Sys(sys::clone_thread(0)),
+        Step::ChildMarker(vec![
+            await_parked(1, "wait_root"),
+            Step::Sys(sys::futex_wake_labeled("wake_root", slot(0), 1).ret(1)),
+            Step::Sys(sys::write(slot(2), b"w").ret(1)),
+            Step::Sys(sys::exit_thread(0)),
+        ]),
+        Step::Sys(sys::futex_wait_labeled("wait_root", slot(0), 1).ret(0)),
+        Step::Sys(sys::read(slot(1), 1).ret(1)),
+        Step::Sys(sys::exit_group(0)),
+    ]
+}
+
 fn run_futex(
     schedule: &Schedule,
 ) -> (
@@ -57,11 +79,32 @@ fn futex_wake_exit_receipt_replays() {
         "/tests/fixtures/futex-wake-exit-seed637.json"
     );
     let retained: ScheduleReceipt = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-    let (result, replayed) = run_futex(&Schedule::replay(retained.clone()));
+    let (_, current) = run_futex(&Schedule::explore(0));
+    let schedule = Schedule::replay(retained.clone())
+        .allow_source_pair(&retained.source_hash, &current.source_hash);
+    let (result, replayed) = run_futex(&schedule);
     assert_eq!(retained.decisions, replayed.decisions);
-    let report = result.expect("futex pair completes");
+    let report = result.expect("historical futex pair completes");
     assert_eq!(report.ret("wait_root"), 0);
-    assert_eq!(report.ret("wake_root"), 1);
+    assert!(
+        !report
+            .completions()
+            .iter()
+            .any(|completion| completion.label == "wake_root"),
+        "historical receipt must show the waker being retired before return"
+    );
+}
+
+#[test]
+fn futex_wake_acknowledgment_survives_explored_schedules() {
+    for seed in 0..200 {
+        let report = ScriptedBackend::new()
+            .with_schedule(Schedule::explore(seed))
+            .run_root(futex_acknowledged_scenario())
+            .unwrap_or_else(|error| panic!("seed {seed}: {error:?}"));
+        assert_eq!(report.ret("wait_root"), 0, "seed {seed}");
+        assert_eq!(report.ret("wake_root"), 1, "seed {seed}");
+    }
 }
 
 #[test]
