@@ -180,7 +180,7 @@ class HostAuthorityRenameTests(unittest.TestCase):
                             }
                         ],
                         "executed_profiles": ["macos-cli-default"],
-                "capture_receipt": {"rows": []},
+                        "capture_receipt": {"rows": []},
                     }
                 ),
                 encoding="utf-8",
@@ -202,6 +202,84 @@ class HostAuthorityRenameTests(unittest.TestCase):
         rows = json.loads(inv_path.read_text())
         self.assertEqual(rows[0]["source"]["file"], NEW_FILE)
         self.assertIn(f"{NEW_FILE}:10", rows[0]["rationale"])
+
+
+class HostAuthorityProfileTests(unittest.TestCase):
+    """Keep host-specific drift checks in the tests run by lint-domains."""
+
+    def setUp(self) -> None:
+        checker = SCRIPT.with_name("check-host-authority-transitions.py")
+        spec = importlib.util.spec_from_file_location("host_authority_profiles", checker)
+        self.checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.checker)
+        self.inventory = self.checker.load_inventory(self.checker.INVENTORY_PATH)
+        self.matrix = self.checker.load_matrix(self.checker.MATRIX_PATH)
+
+    def project(self, profiles: list[str]) -> list[dict]:
+        rows = []
+        for reviewed in self.inventory:
+            projected = sorted(set(reviewed["profiles"]) & set(profiles))
+            if projected:
+                rows.append({
+                    field: projected if field == "profiles" else reviewed[field]
+                    for field in self.checker.ACTUAL_FIELDS
+                })
+        return rows
+
+    def test_linux_projection_rejects_added_removed_and_changed_sites(self) -> None:
+        profiles = self.checker.select_profiles(self.matrix, None, current_host="linux")
+        self.assertEqual(profiles, ["linux-cli", "linux-runtime"])
+        actual = self.project(profiles)
+        self.assertTrue(actual, "Linux must have reviewed rows")
+        self.checker.validate(actual, self.inventory, profiles, self.matrix.required_profiles)
+
+        # A fake new Linux-only call must fail even when the macOS receipt's
+        # projection is unchanged. The live compiler breaker also exercises
+        # this with a real added std::process::id call in an isolated checkout.
+        new_site = {
+            **actual[0],
+            "catalog_id": "HA-CATALOG-PROCESS-ID",
+            "operation": "std::process::id",
+            "source": {**actual[0]["source"], "file": "crates/fake/src/linux.rs"},
+            "expansion": None,
+            "profiles": profiles,
+        }
+        changed = [{**actual[0], "profiles": ["linux-cli"]}, *actual[1:]]
+        for label, drift in (
+            ("new", [*actual, new_site]),
+            ("removed", actual[1:]),
+            ("changed", changed),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(self.checker.InventoryError, "inventory drift"):
+                    self.checker.validate(
+                        drift, self.inventory, profiles, self.matrix.required_profiles
+                    )
+
+    def test_macos_receipt_checks_shared_projection_and_all_reviews(self) -> None:
+        catalog = self.checker.load_catalog_manifest(self.checker.CATALOG_MANIFEST_PATH)
+        receipt = self.checker.load_capture_receipt(
+            self.checker.MACOS_CAPTURE_PATH, self.matrix, catalog
+        )
+        self.checker.validate_inventory_against_receipt(self.inventory, receipt)
+        linux_only = next(
+            row for row in self.inventory
+            if not set(row["profiles"]) & set(receipt["executed_profiles"])
+        )
+        malformed = [
+            {**row, "classification": "unreviewed"} if row is linux_only else row
+            for row in self.inventory
+        ]
+        with self.assertRaises(self.checker.InventoryError):
+            self.checker.validate_inventory_against_receipt(malformed, receipt)
+        profiles = list(receipt["executed_profiles"])
+        self.checker.validate(
+            self.project(profiles), self.inventory, profiles, self.matrix.required_profiles
+        )
+
+    def test_foreign_profile_selection_fails_explicitly(self) -> None:
+        with self.assertRaisesRegex(self.checker.InventoryError, "unavailable on current host"):
+            self.checker.select_profiles(self.matrix, "macos-*", current_host="linux")
 
 
 if __name__ == "__main__":
