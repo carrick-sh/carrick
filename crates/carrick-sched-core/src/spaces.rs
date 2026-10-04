@@ -435,15 +435,24 @@ impl AddressSpaces {
     /// and never receive this bit.
     pub fn mark_initial_bindable(&self, index: SpaceIndex) -> bool {
         let entry = self.entry(index);
-        entry
-            .gate
-            .compare_exchange(
-                GATE_CLOSED,
-                GATE_CLOSED | GATE_INITIAL_BIND,
+        let mut observed = entry.gate.load(Ordering::SeqCst);
+        loop {
+            if observed & GATE_CLOSED == 0 || observed & GATE_INITIAL_BIND != 0 {
+                return false;
+            }
+            // A publication may own a counted page-table pause while the
+            // initial closed root is marked. Preserve those low bits; only
+            // the first open, after the pause lowers, revokes BIND forever.
+            match entry.gate.compare_exchange(
+                observed,
+                observed | GATE_INITIAL_BIND,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
-            )
-            .is_ok()
+            ) {
+                Ok(_) => return true,
+                Err(actual) => observed = actual,
+            }
+        }
     }
 
     /// Host: no EL1 install of the entry from now on. The caller then scans
@@ -848,6 +857,23 @@ mod tests {
             spaces.closed_root_identity(first, 71).is_none(),
             "a later close cannot resurrect the initial BIND"
         );
+    }
+
+    #[test]
+    fn initial_bind_mark_preserves_the_publication_pause() {
+        let spaces = AddressSpaces::new();
+        let index = spaces.publish_closed(73, 0x60_000, 0x60_000).unwrap();
+        // Production binds the MM's fence while the publication mutation
+        // owns a page-table pause. The gate is CLOSED plus that counted pause.
+        spaces.raise(index);
+        assert!(spaces.mark_initial_bindable(index));
+        assert!(spaces.grant(index, 73).is_none());
+        assert!(spaces.closed_root_identity(index, 73).is_none());
+        spaces.lower(index);
+        assert_eq!(spaces.closed_root_identity(index, 73), Some(0x60_000));
+        spaces.open(index);
+        assert_eq!(spaces.grant(index, 73).unwrap().ttbr0, 0x60_000);
+        assert!(spaces.closed_root_identity(index, 73).is_none());
     }
     use core::num::NonZeroU64;
     use std::sync::{Arc, mpsc};
