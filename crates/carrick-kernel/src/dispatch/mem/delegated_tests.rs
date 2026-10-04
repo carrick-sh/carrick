@@ -1341,12 +1341,22 @@ fn delegated_host_mprotect_keeps_untouched_root_pages_observable() {
     twin.anonymous(base, 2 * PAGE, RW);
     twin.touch(base);
     twin.both(|_, memory| memory.protect_log.borrow_mut().clear());
-    // A host-served mprotect of root-owned memory: the untouched page's leaf
-    // must go back to invalid so its first touch is still observed.
+    // The owner-aware backend preserves untouched hidden leaves. The legacy
+    // backend publishes then re-arms them; both must preserve first touch.
     twin.host_mprotect(base, 2 * PAGE, LINUX_PROT_READ);
-    twin.same("leaf edits of the host mprotect", |_, memory| {
-        memory.protect_log.borrow().clone()
-    });
+    assert_eq!(
+        *twin.delegated_memory.owner_protect_log.borrow(),
+        vec![(base, (2 * PAGE) as usize, LINUX_PROT_READ)]
+    );
+    assert!(twin.delegated_memory.protect_log.borrow().is_empty());
+    assert!(twin.host_memory.owner_protect_log.borrow().is_empty());
+    assert_eq!(
+        *twin.host_memory.protect_log.borrow(),
+        vec![
+            (base, (2 * PAGE) as usize, LINUX_PROT_READ),
+            (base + PAGE, PAGE as usize, 0),
+        ]
+    );
     twin.same("first touch after the mprotect", |d, _| {
         fault_answers(d, &[base, base + PAGE])
     });
