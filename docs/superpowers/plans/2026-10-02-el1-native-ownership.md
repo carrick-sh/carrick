@@ -2166,3 +2166,10 @@ The lint gate first found an unchecked integer cast in the legacy HostIo test's
 expected return. The expectation now uses `returned_len`; its unchanged
 behavior test passes. Latest full EL1 run257 and ABI125+2doc pass. Complete
 milestone acceptance remains open regardless of these prerequisite receipts.
+
+The nine global-state additions were then independently reviewed and recorded:
+three carrier-infrastructure controls (the bounded recall driver, its once-only
+startup, and aperture-drain lifetime exclusion), plus six test-only hooks or
+subprocess selectors. Existing entries and metadata are unchanged; the global
+state checker passes. Runtime-abort and host-authority inventory/capture
+closure remain open, so `lint-domains` and milestone acceptance are not green.
