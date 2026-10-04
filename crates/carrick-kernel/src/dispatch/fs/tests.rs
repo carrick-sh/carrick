@@ -8082,6 +8082,7 @@ fn trusted_dirfd_lane_serves_nofollow_directory_probe_enotdir() {
 
 #[test]
 fn memfd_proc_self_fd_reopen_access_mode_and_seals() {
+    // The dispatcher consumes canonical numbers, independent of the host ISA.
     let mut dispatcher = SyscallDispatcher::new();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x1000]);
     let reporter = CompatReporter::default();
@@ -8095,12 +8096,7 @@ fn memfd_proc_self_fd_reopen_access_mode_and_seals() {
         .unwrap()
     };
 
-    #[cfg(target_arch = "aarch64")]
-    const SYS_MEMFD_CREATE: u64 = 279;
-    #[cfg(target_arch = "x86_64")]
-    const SYS_MEMFD_CREATE: u64 = 319;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const SYS_MEMFD_CREATE: u64 = 279;
+    const SYS_MEMFD_CREATE: u64 = carrick_abi::syscall::nr::MEMFD_CREATE.raw();
 
     memory.write_bytes(0x4000, b"test_memfd\0").unwrap();
     let outcome = run(
@@ -8207,6 +8203,7 @@ fn memfd_proc_self_fd_reopen_access_mode_and_seals() {
 
 #[test]
 fn memfd_proc_self_fd_reopen_trunc_shares_inode() {
+    // The dispatcher consumes canonical numbers, independent of the host ISA.
     let mut dispatcher = SyscallDispatcher::new();
     let mut memory = LinearMemory::new(0x4000, vec![0xab; 0x10000]);
     let reporter = CompatReporter::default();
@@ -8220,47 +8217,17 @@ fn memfd_proc_self_fd_reopen_trunc_shares_inode() {
         .unwrap()
     };
 
-    #[cfg(target_arch = "aarch64")]
-    const SYS_MEMFD_CREATE: u64 = 279;
-    #[cfg(target_arch = "x86_64")]
-    const SYS_MEMFD_CREATE: u64 = 319;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const SYS_MEMFD_CREATE: u64 = 279;
+    const SYS_MEMFD_CREATE: u64 = carrick_abi::syscall::nr::MEMFD_CREATE.raw();
 
-    #[cfg(target_arch = "aarch64")]
-    const SYS_OPENAT: u64 = 56;
-    #[cfg(target_arch = "x86_64")]
-    const SYS_OPENAT: u64 = 257;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const SYS_OPENAT: u64 = 56;
+    const SYS_OPENAT: u64 = carrick_abi::syscall::nr::OPENAT.raw();
 
-    #[cfg(target_arch = "aarch64")]
-    const SYS_WRITE: u64 = 64;
-    #[cfg(target_arch = "x86_64")]
-    const SYS_WRITE: u64 = 1;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const SYS_WRITE: u64 = 64;
+    const SYS_WRITE: u64 = carrick_abi::syscall::nr::WRITE.raw();
 
-    #[cfg(target_arch = "aarch64")]
-    const SYS_READ: u64 = 63;
-    #[cfg(target_arch = "x86_64")]
-    const SYS_READ: u64 = 0;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const SYS_READ: u64 = 63;
+    const SYS_READ: u64 = carrick_abi::syscall::nr::READ.raw();
 
-    #[cfg(target_arch = "aarch64")]
-    const SYS_LSEEK: u64 = 62;
-    #[cfg(target_arch = "x86_64")]
-    const SYS_LSEEK: u64 = 8;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const SYS_LSEEK: u64 = 62;
+    const SYS_LSEEK: u64 = carrick_abi::syscall::nr::LSEEK.raw();
 
-    #[cfg(target_arch = "aarch64")]
-    const SYS_FSTAT: u64 = 80;
-    #[cfg(target_arch = "x86_64")]
-    const SYS_FSTAT: u64 = 5;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const SYS_FSTAT: u64 = 80;
+    const SYS_FSTAT: u64 = carrick_abi::syscall::nr::FSTAT.raw();
 
     memory.write_bytes(0x4000, b"test_trunc\0").unwrap();
     let outcome = run(
@@ -8358,6 +8325,7 @@ fn memfd_proc_self_fd_reopen_trunc_shares_inode() {
 
 #[test]
 fn pwrite64_to_memfd_returns_without_deadlock() {
+    // The dispatcher consumes canonical numbers, independent of the host ISA.
     let mut dispatcher = SyscallDispatcher::new();
     let mut memory = LinearMemory::new(0x4000, vec![0; 0x10000]);
     let reporter = CompatReporter::default();
@@ -8371,12 +8339,7 @@ fn pwrite64_to_memfd_returns_without_deadlock() {
         .unwrap()
     };
 
-    #[cfg(target_arch = "aarch64")]
-    const SYS_MEMFD_CREATE: u64 = 279;
-    #[cfg(target_arch = "x86_64")]
-    const SYS_MEMFD_CREATE: u64 = 319;
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    const SYS_MEMFD_CREATE: u64 = 279;
+    const SYS_MEMFD_CREATE: u64 = carrick_abi::syscall::nr::MEMFD_CREATE.raw();
     const SYS_PWRITE64: u64 = 68;
 
     memory.write_bytes(0x4000, b"pwrite_memfd\0").unwrap();
