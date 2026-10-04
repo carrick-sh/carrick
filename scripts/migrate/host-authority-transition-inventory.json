@@ -16274,18 +16274,18 @@
       "linux-cli",
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-embed/src/testing/invariants.rs:156 in `fork_admitted`, `std::thread::Builder::new` acts only on owned audit deadline workers keyed by exact TaskKey and cancellation channels; it does not delegate Linux namespace or process authority to the host.",
+    "rationale": "At crates/carrick-embed/src/testing/invariants.rs:160 in `fork_admitted`, `std::thread::Builder::new` acts only on owned audit deadline workers keyed by exact TaskKey and cancellation channels; it does not delegate Linux namespace or process authority to the host.",
     "review_id": "HA-000707",
     "source": {
-      "byte_end": 5635,
-      "byte_start": 5610,
-      "column": 9,
-      "column_end": 34,
-      "column_start": 9,
+      "byte_end": 5811,
+      "byte_start": 5786,
+      "column": 25,
+      "column_end": 50,
+      "column_start": 25,
       "file": "crates/carrick-embed/src/testing/invariants.rs",
-      "line": 156,
-      "line_end": 156,
-      "line_start": 156
+      "line": 160,
+      "line_end": 160,
+      "line_start": 160
     }
   },
   {
@@ -16301,18 +16301,18 @@
       "linux-cli",
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-embed/src/testing/invariants.rs:252 in `arm_task`, `std::thread::Builder::new` acts only on owned audit deadline workers keyed by exact TaskKey and cancellation channels; it does not delegate Linux namespace or process authority to the host.",
+    "rationale": "At crates/carrick-embed/src/testing/invariants.rs:262 in `arm_task`, `std::thread::Builder::new` acts only on owned audit deadline workers keyed by exact TaskKey and cancellation channels; it does not delegate Linux namespace or process authority to the host.",
     "review_id": "HA-000708",
     "source": {
-      "byte_end": 8637,
-      "byte_start": 8612,
-      "column": 9,
-      "column_end": 34,
-      "column_start": 9,
+      "byte_end": 9059,
+      "byte_start": 9034,
+      "column": 25,
+      "column_end": 50,
+      "column_start": 25,
       "file": "crates/carrick-embed/src/testing/invariants.rs",
-      "line": 252,
-      "line_end": 252,
-      "line_start": 252
+      "line": 262,
+      "line_end": 262,
+      "line_start": 262
     }
   },
   {
