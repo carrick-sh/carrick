@@ -185,7 +185,13 @@ mod tests {
         );
         assert_eq!(
             ObjectWaitKey::reservation_pool(generation).index() as usize,
-            super::super::ADDRESS_SPACE_WAIT_BASE
+            super::super::RESERVATION_POOL_WAIT_INDEX
+        );
+        assert_ne!(
+            ObjectWaitKey::reservation_pool(generation).index(),
+            ObjectWaitKey::metadata_request(generation.get())
+                .unwrap()
+                .index()
         );
         assert!(ObjectWaitKey::new(first.index(), generation.get()).is_none());
         assert_eq!(
