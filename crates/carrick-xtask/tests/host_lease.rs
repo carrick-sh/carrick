@@ -79,7 +79,13 @@ fn fork_without_exec_fixture() {
         // cleanup handshake on both red and green, so this fixture reaps its fork.
         std::io::stdin().read_exact(&mut [0]).ok();
         libc::close(control[1]);
-        assert_eq!(libc::waitpid(pid, std::ptr::null_mut(), 0), pid);
+        let mut status = 0;
+        assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+        assert!(
+            libc::WIFEXITED(status),
+            "fork did not exit normally: {status}"
+        );
+        assert_eq!(libc::WEXITSTATUS(status), 0, "fork exit status");
     }
 }
 
@@ -545,3 +551,37 @@ fn fake_ps_refuses_load_and_override_records_parent_command() {
         "accept must refuse before starting host work"
     );
 }
+
+#[test]
+fn fork_fixture_rejects_abnormal_fork_exit() {
+    let lock = tempfile::NamedTempFile::new().unwrap();
+    let ready = tempfile::NamedTempFile::new().unwrap();
+    let mut fixture = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", FORK_FIXTURE])
+        .env("CARRICK_HOST_LEASE_PATH", lock.path())
+        .env("CARRICK_LEASE_READY", ready.path())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let pid = loop {
+        let data = std::fs::read_to_string(ready.path()).unwrap();
+        if let Some(pid) = data.split_whitespace().next() {
+            break pid.parse::<libc::pid_t>().unwrap();
+        }
+        if std::time::Instant::now() >= deadline {
+            fixture.kill().unwrap();
+            fixture.wait().unwrap();
+            panic!("fork fixture readiness timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    // SAFETY: the fixture retains and reaps this exact child until stdin EOF.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    drop(fixture.stdin.take());
+    assert!(
+        !fixture.wait().unwrap().success(),
+        "fixture accepted a SIGKILLed fork as normal completion"
+    );
+}
+
