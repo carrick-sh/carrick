@@ -1,7 +1,9 @@
 //! Strict reader for the six-stage HVPatch exec runtime DTrace protocol.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "macos")]
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -15,6 +17,7 @@ pub(crate) struct HvpatchExecRuntimeSummary {
 }
 
 impl HvpatchExecRuntimeSummary {
+    #[cfg(target_os = "macos")]
     pub(crate) fn from_path(path: &Path, status: ProfileCaptureStatus) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("read HVPatch exec runtime stream {}", path.display()))?;
@@ -160,6 +163,7 @@ impl HvpatchExecRuntimeSummary {
         })
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn render_human(self) -> String {
         format!(
             "HVPatch exec runtime stages: completed_execs={}, events={}, events_per_exec=6",

@@ -6,7 +6,9 @@
 //! report.
 
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+#[cfg(target_os = "macos")]
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -213,6 +215,7 @@ pub(crate) struct HvpatchK1LifecycleSummary {
 }
 
 impl HvpatchK1LifecycleSummary {
+    #[cfg(target_os = "macos")]
     pub(crate) fn from_path(path: &Path, status: ProfileCaptureStatus) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("read HVPatch K1 lifecycle stream {}", path.display()))?;
@@ -407,6 +410,7 @@ impl HvpatchK1LifecycleSummary {
         validate_capture(&births, &execs, &terminals, &vm, end)
     }
 
+    #[cfg(target_os = "macos")]
     pub(crate) fn render_human(self) -> String {
         format!(
             "HVPatch K1 lifecycle: roots={}, forks={}, execs={}, exits={}, unique_births={}, final_live={}, VM creates={}, VM destroys={}, complete=true",
