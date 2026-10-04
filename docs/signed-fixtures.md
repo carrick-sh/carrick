@@ -77,6 +77,12 @@ just xtask fixtures verify
 just xtask fixtures verify --manifest /scratch/bundle/<manifest-sha256>/manifest.json
 ```
 
+Restore acquires exclusive host gate admission inside the Rust operation,
+before validation or publication, and holds it through final verification.
+An inherited gate lease is reused; an inherited shared lease is rejected
+without attempting an upgrade. Standalone manifest and archive restores
+therefore cannot replace fixtures used by a live signed gate.
+
 Restore verifies the address, commit, full source and executable inventories,
 all hashes, executable permissions, AArch64 ELF architecture, static musl
 shape, GNU loader, and compiler pin before writing any destination. Paths

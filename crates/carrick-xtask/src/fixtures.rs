@@ -98,6 +98,8 @@ pub enum FixturesError {
     Command(#[from] command::CommandError),
     #[error(transparent)]
     Inventory(#[from] probe_inventory::InventoryError),
+    #[error("fixture restore gate admission: {0}")]
+    HostLease(#[from] crate::host_lease::HostLeaseError),
 }
 
 type Result<T> = std::result::Result<T, FixturesError>;
@@ -562,6 +564,7 @@ fn publish_file(path: &Path, bytes: &[u8], kind: PublicationKind) -> Result<usiz
 }
 
 pub fn restore(root: &Path, path: &Path, sha: Option<&str>) -> Result<RestoreWork> {
+    let _gate = crate::host_lease::HostLease::acquire(crate::host_lease::HostLeaseMode::Gate)?;
     let manifest = verify_bundle(root, path, sha)?;
     let parent = path
         .parent()
