@@ -60,7 +60,7 @@ fn write_marker() -> Step {
     )
 }
 
-fn fork_creator() -> Vec<Step> {
+fn fork_creator(admitted: ScriptCheckpoint) -> Vec<Step> {
     let closed = ScriptCheckpoint::default();
     vec![
         write_word(12, 22),
@@ -79,6 +79,7 @@ fn fork_creator() -> Vec<Step> {
             await_parked(slot(3), "child_wait"),
             Step::Sys(sys::exit_group(7)),
         ]),
+        Step::SignalCheckpoint(admitted),
         Step::Sys(sys::close(slot(1)).ret(0)),
         // fd 4 is reused, but the child's fd 4 still names the old pipe OFD.
         pipe(4, 5),
@@ -96,7 +97,7 @@ fn fork_creator() -> Vec<Step> {
     ]
 }
 
-fn thread_creator() -> Vec<Step> {
+fn thread_creator(admitted: ScriptCheckpoint) -> Vec<Step> {
     vec![
         pipe(0, 1),
         Step::Sys(sys::getpid().save(3)),
@@ -111,6 +112,7 @@ fn thread_creator() -> Vec<Step> {
             await_parked(slot(3), "thread_join"),
             Step::Sys(sys::exit_thread(0)),
         ]),
+        Step::SignalCheckpoint(admitted),
         named(
             sys::futex_wait_labeled("thread_join", slot(6), 100).ret(0),
             "thread_join",
@@ -141,23 +143,30 @@ fn composed(n: usize, threads: bool) -> RunReport {
     let go = ScriptCheckpoint::default();
     let mut script = vec![alloc_word(12, 11)];
     let mut ready = Vec::new();
+    let mut admissions = Vec::new();
     for _ in 0..n {
         let checkpoint = ScriptCheckpoint::default();
+        let admitted = ScriptCheckpoint::default();
         let mut creator = vec![
             Step::SignalCheckpoint(checkpoint.clone()),
             Step::AwaitCheckpoint(go.clone()),
         ];
         creator.extend(if threads {
-            thread_creator()
+            thread_creator(admitted.clone())
         } else {
-            fork_creator()
+            fork_creator(admitted.clone())
         });
         script.push(Step::Sys(sys::fork()));
         script.push(Step::ChildMarker(creator));
         ready.push(checkpoint);
+        admissions.push(admitted);
     }
     script.extend(ready.into_iter().map(Step::AwaitCheckpoint));
     script.push(Step::SignalCheckpoint(go));
+    // Each inner fork/clone publishes one admission. Waiting for all N here
+    // makes the unchanged checkpoint bound apply to one creator's progress,
+    // not the cumulative time until any creator happens to exit.
+    script.extend(admissions.into_iter().map(Step::AwaitCheckpoint));
     // Root stays alive until every creator is reaped.
     for _ in 0..n {
         script.push(named(sys::wait4(-1, 0), "creator_wait"));

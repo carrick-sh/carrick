@@ -40,7 +40,9 @@ join also used one deadline for the whole vector of children despite its
 per-child contract; each child now receives its own unchanged bound.
 
 Audit boundary: `drive` bounds a single syscall episode and `await_parked`
-bounds one enrollment. `ScriptCheckpoint::wait` in the N2 population fixtures
-(`n2_task_lifecycle.rs` and `n2_creation.rs`) can still cover up to 32 clone
-admissions in one phase; they need a separate progress-aware checkpoint
-contract before a loaded host verdict for those fixtures is authoritative.
+bounds one enrollment. The related N2 population fixtures now also publish
+one checkpoint per child admission or parked sibling
+(`n2_task_lifecycle.rs`) and per creator's inner fork/clone admission
+(`n2_creation.rs`). A generic `wait4` can still cover peer work beyond the
+admission itself; this change makes the known batch population visible before
+the reaping phase, but does not claim arbitrary host-load immunity.
