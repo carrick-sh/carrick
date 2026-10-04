@@ -6,7 +6,7 @@ use crate::memory::reservations::{Reservations, ResolvedReservationNodes, Shared
 use carrick_el1_abi::{
     FrameGrantResidencyTable, PinnedMetadataExtent, ReservationMm, ReservationProtection,
 };
-use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
+use carrick_mmu_core::aarch64::descriptor_txn::{LiveDescriptorWords, PageSpan};
 use carrick_mmu_core::aarch64::{GuestPreparedCommit, LeafAccess, terminal_descriptor_permits_el0};
 use carrick_sched_core::{AddressSpaces, SpaceEditor};
 use core::num::NonZeroU64;
@@ -587,7 +587,12 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         if leaf.is_none() {
             if let Some(page) = residency.lookup(mm, va)
                 && matches!(
-                    prepared.commit_prepared(grant.ttbr0, va & !4095, page.expected_ipa, access),
+                    prepared.commit_prepared(
+                        grant.ttbr0,
+                        PageSpan::containing(va).va,
+                        page.expected_ipa,
+                        access,
+                    ),
                     Ok(GuestPreparedCommit::Committed | GuestPreparedCommit::AlreadyResident)
                 )
             {
