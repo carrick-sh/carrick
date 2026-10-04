@@ -33,6 +33,18 @@
  *     PREPARE for 20603 bytes at 0x6000004064 and got phase 7 before any
  *     copyout grant. The portal permit bound is 4096 bytes; this is the
  *     oversized caller request, not a host read failure or source EOF.
+ *     syscall::recvfrom entry/return is live-listed on this Mac with entry
+ *     arg0=int host fd, arg2=size_t capacity, arg3=int flags; return arg0
+ *     and arg1 are int result words. This arm reports host socket progress
+ *     alongside the owner prepare sequence for forwarded recvfrom.
+ *     hvpatch-el1-owner-grant-supply(va,len,phase,detail) distinguishes
+ *     missing transport (1), invalid ASID (2), missing foreign binding (3),
+ *     overlapping retained alias (4, detail=count), publication entry (5).
+ *     Live-qualified on signed el1_host_copyout-873518cad531afb9,
+ *     n1f-grantrefusal-trace-20261004: the recvfrom destination
+ *     0x6000008005 requested a 32 KiB grant rooted at 0x6000004000;
+ *     phase 4 reported one overlapping alias after the prior read and pread
+ *     mappings had been unmapped. The refusal preceded host recvfrom.
  *     hvpatch-el1-fault-root-mapping(far,start,end,source_handle,source_offset)
  *     observes the admitted root at final fault delivery only. A zero range
  *     means no root mapping; a zero source handle means no retained file
@@ -85,6 +97,30 @@ carrick*:::hvpatch-el1-host-write-prepare
     printf("EL1HOSTREAD1|ns=%d|copyout-prepare|pid=%d|va=0x%x|len=%d|phase=%d|detail=%d\n",
         timestamp, pid, arg0, arg1, arg2, arg3);
     @copyout[arg2, arg3] = count();
+}
+
+carrick*:::hvpatch-el1-owner-grant-supply
+/pid == $target || progenyof($target)/
+{
+    printf("EL1HOSTREAD1|ns=%d|grant-supply|va=0x%x|len=%d|phase=%d|detail=%d\n",
+        timestamp, arg0, arg1, arg2, arg3);
+    @grant_supply[arg2, arg3] = count();
+}
+
+syscall::recvfrom:entry
+/pid == $target || progenyof($target)/
+{
+    self->recv_capacity = arg2;
+    printf("EL1HOSTREAD1|ns=%d|host-recv-entry|pid=%d|fd=%d|capacity=%d|flags=%d\n",
+        timestamp, pid, arg0, arg2, arg3);
+}
+
+syscall::recvfrom:return
+/pid == $target || progenyof($target)/
+{
+    printf("EL1HOSTREAD1|ns=%d|host-recv-return|pid=%d|capacity=%d|r0=%d|r1=%d\n",
+        timestamp, pid, self->recv_capacity, arg0, arg1);
+    self->recv_capacity = 0;
 }
 
 carrick*:::hvpatch-el1-host-read-retention
@@ -196,4 +232,5 @@ END
     printa("EL1HOSTREAD1|class=%d|detail=%d|count=%@d\n", @classes);
     printa("EL1HOSTREAD1|retention=%d|count=%@d\n", @retention);
     printa("EL1HOSTREAD1|copyout-phase=%d|detail=%d|count=%@d\n", @copyout);
+    printa("EL1HOSTREAD1|grant-supply-phase=%d|detail=%d|count=%@d\n", @grant_supply);
 }
