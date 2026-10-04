@@ -28,6 +28,53 @@ how-to-run-and-interpret companion.
 
 ---
 
+## Worker acceptance receipts
+
+Linux workers commit their changes, then run these foreground gates before
+reporting review-ready (no Docker):
+
+```sh
+just accept --profile linux-portable
+just remote-accept --ref "$(git rev-parse HEAD)" --phase host
+```
+
+`linux-portable` uses the existing accept step/receipt driver and runs only the
+host phase, including when the phase defaults to `all`. Explicit `--phase signed`
+is rejected before any steps run. It runs `just test-kernel`, native Cargo tests
+for the neutral cores/ABI/EL1, kernel example, x86/AArch64 engines, Linux host
+primitives, contract registry and xtask, plus a separate KVM test step; the
+`carrick-guest-arch` crate is absent (guest architecture types live in `carrick-hal`).
+It also runs clippy for the CLI's `platform-linux,syscall-shim` closure and worker
+harnesses with `-D warnings`, fmt-check, and the shared `lint-domains-source` checks. A separate authority compiler
+step executes Linux profiles; live macOS/FreeBSD/NetBSD profiles require those
+hosts and are explicitly recorded in the receipt's skipped steps. Source checks
+and validation of the committed macOS compiler capture still run. This is host
+evidence, not guest execution or complete authority-matrix evidence.
+
+Linux host-policy test exceptions are named with reasons in
+[`scripts/linux-host-test-allowlist.json`](../scripts/linux-host-test-allowlist.json).
+The receipt annotates matching failures and separately names unallowlisted ones;
+no failing command is silently turned green. Backend ABI failures require fixes,
+not additions to this allowlist. All steps run even after an earlier step fails.
+
+`remote-accept` pushes the committed ref to the gate Mac (default
+`rentamac@cloudmac`, `/Volumes/carrick/dev`), runs the regular macOS acceptance
+profile, prints its summary, and fetches the receipt/logs into
+`target/remote-gate/<run-id>/`. Local receipts are in
+`target/el1-gate/<short-head>/receipt.json`. Include both verdicts and receipt paths
+in the hand-off, classifying failures honestly. Tracked changes make the local
+receipt red; results belong to the recorded commit.
+
+For changes touching macOS or ARM, also run
+`just remote-accept --ref <commit> --phase signed` before review-ready, coordinating
+signed execution with the director. Do not overlap signed runs on the gate box.
+Missing or empty local ARM64 probe directories use the gate Mac's prebuilt probes
+from `<remote-root>/carrick/conformance-probes/target/`, explicitly announced in
+the output. Existing gate-worktree probes are retained if no source exists; absent
+required probes must fail the signed gate. A prebuilt executable's presence does
+not prove source freshness; signed gates retain their artifact/probe validation
+requirements.
+
 ## Kernel semantics suite
 
 `just test-kernel` is the VM-free inner loop for a kernel conformance defect.

@@ -82,7 +82,8 @@ with **`HV_DENIED` (`0xfae94007`)**.
 | `just kvm-smoke` / `just kvm-smoke-lima` | KVM smoke (`/dev/kvm`, lima from macOS). |
 | `just install-hooks` | Install git hooks (once per clone). |
 | `just accept [ARGS]` | Run host and/or signed landing gate (no Docker). |
-| `just remote-accept [ARGS]` | Run `just accept` (no Docker) on the remote gate Mac and fetch the receipt. |
+| `just accept --profile linux-portable` | Linux host gate + receipt; signed phase rejected. |
+| `just remote-accept --ref COMMIT --phase host` | Worker gate on cloudmac + fetched receipt; also run signed for macOS/ARM changes. |
 | `just lease MODE +CMD` | Run command under host flock lease (carrick shared, gate/docker exclusive). |
 
 **Toolchain:** pin, edition, members, `deny`ed lints: [`rust-toolchain.toml`](rust-toolchain.toml) and
@@ -417,7 +418,7 @@ verification, acceptance.
 - **Never `git merge --ff-only` inside a worktree** (merges its own branch).
   Rebase there, fast-forward from main, reconcile inventories on the CLEAN
   merged tree, `just lint-domains`.
-- **Workers run `just accept`** (receipt path in the final report) before reporting done.
+- **Linux workers run `just accept --profile linux-portable`, then `just remote-accept --ref <their commit> --phase host`** before reporting review-ready; macOS/ARM changes also require `--phase signed` coordinated with the director. Include both verdicts and receipt paths. macOS workers run `just accept`.
 
 ## Commits, hooks & CI
 

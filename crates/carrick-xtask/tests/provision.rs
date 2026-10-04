@@ -406,6 +406,22 @@ fn empty_targets_are_provisioned() {
 
     let mut out = Vec::new();
     let res = provision::run_with_runner(Some(root), ProvisionAction::All, &runner, &mut out);
+    if !matches!(std::env::consts::ARCH, "aarch64" | "arm64") {
+        assert!(
+            matches!(res, Err(provision::ProvisionError::Prerequisite(ref message))
+            if message == "--closure-arm64 requires an arm64 host")
+        );
+        assert!(!root.join("target/test-results/provisioning.json").exists());
+        assert!(
+            runner
+                .recorded_commands
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(program, _)| !program.starts_with("scripts/build-") && program != "docker")
+        );
+        return;
+    }
     assert!(res.is_ok(), "provision::run_with_runner failed: {:?}", res);
 
     let receipt_path = root.join("target/test-results/provisioning.json");
