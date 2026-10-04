@@ -27,6 +27,7 @@ fn fork_without_exec_fixture() {
         .collect();
     let mut control = [0; 2];
     let mut ready = [0; 2];
+    let detached = std::env::var_os("CARRICK_LEASE_DETACHED").is_some();
     // SAFETY: valid pipe arrays; after fork the child uses only libc and _exit.
     unsafe {
         assert_eq!(libc::pipe(control.as_mut_ptr()), 0);
@@ -46,7 +47,15 @@ fn fork_without_exec_fixture() {
                     count += 1;
                 }
             }
+            if detached && libc::setsid() < 0 {
+                libc::_exit(2);
+            }
             libc::write(ready[1], (&count as *const u32).cast(), 4);
+            if detached {
+                loop {
+                    libc::pause();
+                }
+            }
             let mut byte = 0u8;
             libc::read(control[0], (&mut byte as *mut u8).cast(), 1);
             libc::_exit(0);
@@ -58,7 +67,12 @@ fn fork_without_exec_fixture() {
         libc::close(ready[0]);
         std::fs::write(
             std::env::var_os("CARRICK_LEASE_READY").unwrap(),
-            format!("{pid} {count} {}", std::process::id()),
+            format!(
+                "{pid} {count} {} {} {}",
+                std::process::id(),
+                libc::getppid(),
+                std::env::var("CARRICK_LEASE_SUPERVISOR").unwrap_or_else(|_| "0".into())
+            ),
         )
         .unwrap();
         // Parent keeps stdin open after killing the lease runner. EOF is the
@@ -70,8 +84,29 @@ fn fork_without_exec_fixture() {
 }
 
 #[test]
-fn forked_test_child_cannot_keep_lease_after_holder_is_killed() {
+fn runner_death_cancels_workload_before_releasing_exclusion() {
+    runner_death_preserves_exclusion(false, false);
+}
+
+#[test]
+fn runner_death_cancels_nested_workload_before_releasing_exclusion() {
+    runner_death_preserves_exclusion(true, false);
+}
+
+#[test]
+fn runner_death_cancels_detached_nested_workload_before_releasing_exclusion() {
+    runner_death_preserves_exclusion(true, true);
+}
+
+#[cfg(test)]
+fn runner_death_preserves_exclusion(nested: bool, detached: bool) {
     use std::os::fd::AsRawFd;
+    // Linux subreaper configuration is process-wide; serialize that fixture
+    // state only, while each admitted workload still runs its fork concurrently.
+    #[cfg(target_os = "linux")]
+    static SUBREAPER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(target_os = "linux")]
+    let _serial = SUBREAPER.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(target_os = "linux")]
     struct Subreaper(libc::c_int);
     #[cfg(target_os = "linux")]
@@ -98,9 +133,17 @@ fn forked_test_child_cannot_keep_lease_after_holder_is_killed() {
         child: std::process::Child,
         control: Option<std::process::ChildStdin>,
         helper: Option<libc::pid_t>,
+        fork: Option<libc::pid_t>,
+        parents: Vec<libc::pid_t>,
     }
     impl Drop for Cleanup {
         fn drop(&mut self) {
+            if let Some(pid) = self.fork {
+                // SAFETY: this fixture owns the fork PID and its parent's wait.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
             drop(self.control.take());
             drop(self.child.stdin.take());
             let _ = self.child.kill();
@@ -112,13 +155,34 @@ fn forked_test_child_cannot_keep_lease_after_holder_is_killed() {
                     libc::waitpid(pid, std::ptr::null_mut(), 0);
                 }
             }
+            #[cfg(target_os = "linux")]
+            for &pid in &self.parents {
+                // SAFETY: wait only fixture/adopted supervisor PIDs, never -1.
+                if pid > 0 {
+                    unsafe {
+                        libc::waitpid(pid, std::ptr::null_mut(), 0);
+                    }
+                }
+            }
         }
     }
     let lock = tempfile::NamedTempFile::new().unwrap();
     let ready = tempfile::NamedTempFile::new().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+    command.args(["host-lease", "--mode", "gate", "--"]);
+    if nested {
+        command.arg(env!("CARGO_BIN_EXE_carrick-xtask")).args([
+            "host-lease",
+            "--mode",
+            "carrick",
+            "--",
+        ]);
+    }
+    if detached {
+        command.env("CARRICK_LEASE_DETACHED", "1");
+    }
     let mut holder = Cleanup {
-        child: Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
-            .args(["host-lease", "--mode", "gate", "--"])
+        child: command
             .arg(std::env::current_exe().unwrap())
             .args(["--ignored", "--exact", FORK_FIXTURE])
             .env_remove("CARRICK_HOST_LEASE_FD")
@@ -130,13 +194,16 @@ fn forked_test_child_cannot_keep_lease_after_holder_is_killed() {
             .unwrap(),
         control: None,
         helper: None,
+        fork: None,
+        parents: Vec::new(),
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let (pid, count) = loop {
         let data = std::fs::read_to_string(ready.path()).unwrap();
         let fields: Vec<_> = data.split_whitespace().collect();
-        if fields.len() == 3 {
+        if fields.len() == 5 {
             holder.helper = Some(fields[2].parse().unwrap());
+            holder.parents = fields[3..].iter().map(|p| p.parse().unwrap()).collect();
             break (
                 fields[0].parse::<libc::pid_t>().unwrap(),
                 fields[1].parse::<u32>().unwrap(),
@@ -152,8 +219,16 @@ fn forked_test_child_cannot_keep_lease_after_holder_is_killed() {
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
+    holder.fork = Some(pid);
     // SAFETY: independent flock and existence checks do not modify the child.
     unsafe {
+        if detached {
+            assert_eq!(
+                libc::getsid(pid),
+                pid,
+                "fixture must leave the runner's session"
+            );
+        }
         assert_eq!(
             libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
             -1
@@ -163,17 +238,25 @@ fn forked_test_child_cannot_keep_lease_after_holder_is_killed() {
         // until the live-child and lock-release assertions have finished.
         holder.control = holder.child.stdin.take();
         holder.child.wait().unwrap();
-        assert_eq!(
-            libc::kill(pid, 0),
-            0,
-            "fork child must remain alive for the assertion"
-        );
-        let release = libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
-        assert_eq!(
-            (count, release),
-            (0, 0),
-            "live test fork inherited descriptors or retained lease after holder died"
-        );
+        assert_eq!(count, 0, "test fork inherited the raw lease descriptor");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let release = libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
+            let alive = libc::kill(pid, 0) == 0;
+            assert!(
+                release != 0 || !alive,
+                "exclusion released while admitted {}workload PID {pid} survives runner death",
+                if nested { "nested " } else { "" }
+            );
+            if release == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "workload not cancelled and reaped"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         drop(holder.control.take());
     }
 }
@@ -221,6 +304,26 @@ fn nested_cli_reuses_exclusive_gate_without_deadlock_or_downgrade() {
     // Other parallel tests can be between fork and exec; the named production
     // acquisition bound waits for that release instead of declaring a leak.
     HostLease::acquire_path(temp.path(), HostLeaseMode::Carrick).unwrap();
+}
+
+#[test]
+fn nested_admission_requires_the_supervisor_scope_writer() {
+    let lock = tempfile::NamedTempFile::new().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .args(["host-lease", "--mode", "gate", "--", "/bin/sh", "-c"])
+        .arg("unset CARRICK_HOST_LEASE_SCOPE_FD; exec \"$1\" host-lease --mode carrick -- /bin/echo SHOULD_NOT_RUN")
+        .arg("scope-fixture")
+        .arg(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .env_remove("CARRICK_HOST_LEASE_SOCKET")
+        .env_remove("CARRICK_HOST_LEASE_FD")
+        .env("CARRICK_HOST_LEASE_PATH", lock.path())
+        .output().unwrap();
+    assert!(
+        !output.status.success(),
+        "nested admission succeeded without a live scope writer"
+    );
+    assert!(output.stdout.is_empty(), "unscoped nested command ran");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid inherited host lease"));
 }
 
 #[test]
