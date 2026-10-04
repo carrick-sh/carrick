@@ -2862,6 +2862,8 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         length: usize,
         checked: bool,
     ) -> Result<(), MemoryError> {
+        let authority = self.protections.clone();
+        let _legacy = authority.legacy().ok_or(MemoryError::Unsupported)?;
         if length == 0 {
             return Ok(());
         }
@@ -3715,6 +3717,8 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn host_read(&self, address: u64, len: usize) -> Option<carrick_guest_mem::HostRead> {
+        let authority = self.protections.clone();
+        let _legacy = authority.legacy()?;
         if !self.el1_private_range_permits(
             address,
             len,
@@ -8574,6 +8578,24 @@ mod transfer_service_tests {
             0,
             0,
         )
+    }
+    #[test]
+    fn admitted_owner_refuses_legacy_raw_write_preparation() {
+        let mut engine = engine_fixture();
+        // This fixture does not execute the owner. It tests that a named owner
+        // cannot enter legacy descriptor/grant preparation in the first place.
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                core::num::NonZeroU64::new(17).unwrap(),
+                carrick_el1_abi::ReservationMm::new(88).unwrap(),
+                core::num::NonZeroU64::new(3).unwrap(),
+            )
+        };
+        engine.protections = UserMemoryAuthority::from_owner(handle);
+        assert!(matches!(
+            engine.prepare_host_write(0x4000, 1),
+            Err(MemoryError::Unsupported)
+        ));
     }
     struct Custody;
     impl crate::user_transfer::TransferCustody for Custody {
