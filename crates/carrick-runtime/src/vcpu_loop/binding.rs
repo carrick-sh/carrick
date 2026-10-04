@@ -248,6 +248,13 @@ pub(super) enum HvpatchProductionPhase {
     ResumeOwnerZone {
         frame: carrick_hal::RawSyscall,
     },
+    /// A retained physical writer owns this dependency. Its subscription
+    /// remains live while the job, not a pool worker, is blocked.
+    ResumeOwnerPhysical {
+        frame: carrick_hal::RawSyscall,
+        wait: carrick_guest_mem::OwnedMemoryWait,
+        _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
+    },
     ExecSiblingDrain {
         context: carrick_kernel::kernel::KernelContext,
         owner: Box<exec::PreparedExecveDrain>,
@@ -376,6 +383,7 @@ impl HvpatchProductionPhase {
             Self::Complete => 12,
             Self::BootstrapThreadChild => 13,
             Self::ResumeZone | Self::ResumeOwnerZone { .. } => 14,
+            Self::ResumeOwnerPhysical { .. } => 18,
         }
     }
 }
@@ -2672,7 +2680,14 @@ where
         frame: carrick_hal::RawSyscall,
         outcome: DispatchOutcome,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
-        if let DispatchOutcome::OwnerMemorySupply { request } = outcome {
+        if let DispatchOutcome::OwnerMemorySupply { request, committed } = outcome {
+            self.state.owner_read_progress = self
+                .state
+                .owner_read_progress
+                .checked_add(committed)
+                .ok_or_else(|| {
+                    RuntimeError::Configuration("owner read progress overflow".to_owned())
+                })?;
             let (grant_va, grant_len) = match request {
                 carrick_guest_mem::MemorySupplyRequest::Grant(window)
                 | carrick_guest_mem::MemorySupplyRequest::Cow(window) => {
@@ -2757,8 +2772,53 @@ where
             )?;
             return self.service_outcome(engine, control, frame, outcome);
         }
-        if let DispatchOutcome::OwnerMemoryWait { wait } = outcome {
+        if let DispatchOutcome::OwnerMemoryWait { wait, committed } = outcome {
+            self.state.owner_read_progress = self
+                .state
+                .owner_read_progress
+                .checked_add(committed)
+                .ok_or_else(|| {
+                    RuntimeError::Configuration("owner read progress overflow".to_owned())
+                })?;
             return self.owner_memory_park(engine, control, frame, wait);
+        }
+        if let DispatchOutcome::OwnerPhysicalWait { wait, committed } = outcome {
+            self.state.owner_read_progress = self
+                .state
+                .owner_read_progress
+                .checked_add(committed)
+                .ok_or_else(|| {
+                    RuntimeError::Configuration("owner read progress overflow".to_owned())
+                })?;
+            let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                RuntimeError::Configuration("physical owner wait lost context".to_owned())
+            })?;
+            let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+                RuntimeError::Configuration("physical owner wait lost scheduler".to_owned())
+            })?;
+            let scheduler = runtime.continuation_services(context.kernel()).0;
+            let wake = registration_wake_callback(scheduler, context.thread().key(), false);
+            let (subscription, ready) = wait.0.enroll(wake);
+            if ready || wait.0.is_ready() {
+                drop(subscription);
+                let outcome = self.state.redispatch_threaded_syscall(
+                    &self.kernel,
+                    engine,
+                    control.submission.host_wait_context(),
+                )?;
+                return self.service_outcome(engine, control, frame, outcome);
+            }
+            self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
+                frame,
+                wait,
+                _subscription: subscription,
+            };
+            return Ok(self.suspend(
+                HvpatchLoopSuspension::BlockedContinuation,
+                executor::ExecutorExit::Blocked(
+                    carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                ),
+            ));
         }
         if carrick_kernel::kernel::continuation::is_blocking_dispatch_outcome(&outcome) {
             let _ = self.state.stash_parked_registers(engine);
@@ -2798,8 +2858,24 @@ where
             }
             other => other,
         };
+        let outcome = if self.state.owner_read_progress > 0
+            && matches!(outcome, DispatchOutcome::Errno { .. })
+        {
+            // A later page fault does not undo bytes already copied from a
+            // regular file. The prefix is the one syscall's real result.
+            DispatchOutcome::Returned { value: 0 }
+        } else {
+            outcome
+        };
         Ok(match outcome {
             DispatchOutcome::Returned { value } => {
+                let prefix = std::mem::take(&mut self.state.owner_read_progress);
+                let value = i64::try_from(prefix)
+                    .ok()
+                    .and_then(|prefix| value.checked_add(prefix))
+                    .ok_or_else(|| {
+                        RuntimeError::Configuration("owner read return overflow".to_owned())
+                    })?;
                 self.state
                     .complete_returned(engine, &self.kernel.reporter, value)?;
                 self.state.trace_syscall_return(self.traps, Some(value));
@@ -3787,6 +3863,32 @@ where
                 HvpatchProductionPhase::ResumeZone => return self.resume_zone(engine, control),
                 HvpatchProductionPhase::ResumeOwnerZone { frame } => {
                     return self.resume_owner_zone(engine, control, frame);
+                }
+                HvpatchProductionPhase::ResumeOwnerPhysical {
+                    frame,
+                    wait,
+                    _subscription,
+                } => {
+                    if !wait.0.is_ready() {
+                        self.phase = HvpatchProductionPhase::ResumeOwnerPhysical {
+                            frame,
+                            wait,
+                            _subscription,
+                        };
+                        return Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::Blocked(
+                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                            ),
+                        ));
+                    }
+                    drop(_subscription);
+                    let outcome = self.state.redispatch_threaded_syscall(
+                        &self.kernel,
+                        engine,
+                        control.submission.host_wait_context(),
+                    )?;
+                    return self.service_outcome(engine, control, frame, outcome);
                 }
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 HvpatchProductionPhase::BootstrapProcessChild(bootstrap) => {

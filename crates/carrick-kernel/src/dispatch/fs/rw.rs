@@ -1044,37 +1044,74 @@ impl<'a> FsView<'a> {
             {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             }
+            // These sources can be reread at an exact offset. Prepare and
+            // commit each bounded owner destination before advancing the
+            // shared description: the generic path below stages the whole
+            // read and cannot preserve a partial owner copyout.
+            let destination = [LinuxIovec {
+                iov_base: address,
+                iov_len: count,
+            }];
+            if let OpenDescription::File {
+                contents, offset, ..
+            } = &mut *open
+            {
+                if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+                    let (copied, refusal) = read_from_repeatable_owner_at(
+                        memory,
+                        address,
+                        length,
+                        *offset,
+                        |at, bytes| contents.read_at(at as u64, bytes),
+                    )?;
+                    *offset += copied;
+                    return Ok(match refusal {
+                        Some(error) => crate::el1_delegation::owner_prepare_refusal_after(
+                            error,
+                            copied as u64,
+                        ),
+                        None => DispatchOutcome::returned_len_or_errno(copied),
+                    });
+                }
+                let copied = read_from_file_contents_at(memory, contents, *offset, &destination)?;
+                *offset += copied;
+                return Ok(DispatchOutcome::returned_len_or_errno(copied));
+            }
+            if let OpenDescription::InMemoryFile {
+                contents, offset, ..
+            } = &mut *open
+            {
+                let data = contents.read();
+                if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+                    let (copied, refusal) = read_from_repeatable_owner_at(
+                        memory,
+                        address,
+                        length,
+                        *offset,
+                        |at, bytes| {
+                            let source = data.read_range(at, bytes.len());
+                            bytes[..source.len()].copy_from_slice(&source);
+                            Ok(source.len())
+                        },
+                    )?;
+                    *offset += copied;
+                    return Ok(match refusal {
+                        Some(error) => crate::el1_delegation::owner_prepare_refusal_after(
+                            error,
+                            copied as u64,
+                        ),
+                        None => DispatchOutcome::returned_len_or_errno(copied),
+                    });
+                }
+                let copied = read_from_sparse_buffer_at(memory, &data, *offset, &destination)?;
+                *offset += copied;
+                return Ok(DispatchOutcome::returned_len_or_errno(copied));
+            }
             let (read_len, bytes) = match &mut *open {
                 OpenDescription::Closed { .. } => {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 }
-                OpenDescription::File {
-                    contents, offset, ..
-                } => {
-                    let mut buf = vec![0u8; length];
-                    match contents.read_at(*offset as u64, &mut buf) {
-                        Ok(read_len) => {
-                            *offset += read_len;
-                            buf.truncate(read_len);
-                            (read_len, buf)
-                        }
-                        Err(errno) => {
-                            drop(open);
-                            return Ok(DispatchOutcome::errno(errno));
-                        }
-                    }
-                }
-                OpenDescription::InMemoryFile {
-                    contents,
-                    offset,
-                    ..
-                } => {
-                    let data = contents.read();
-                    let bytes = data.read_range(*offset, length);
-                    let read_len = bytes.len();
-                    *offset += read_len;
-                    (read_len, bytes)
-                }
+                OpenDescription::File { .. } | OpenDescription::InMemoryFile { .. } => unreachable!(),
                 OpenDescription::SyntheticFile {
                     path,
                     contents,
@@ -1892,6 +1929,39 @@ impl<'a> FsView<'a> {
                 )?;
                 drop(open);
                 return Ok(outcome);
+            }
+            if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+                let result = match &*open {
+                    OpenDescription::File { contents, .. } => Some(
+                        read_from_repeatable_owner_at(memory, buffer, length, offset, |at, bytes| {
+                            contents.read_at(at as u64, bytes)
+                        })?,
+                    ),
+                    OpenDescription::InMemoryFile { contents, .. } => {
+                        let data = contents.read();
+                        Some(read_from_repeatable_owner_at(
+                            memory,
+                            buffer,
+                            length,
+                            offset,
+                            |at, bytes| {
+                                let source = data.read_range(at, bytes.len());
+                                bytes[..source.len()].copy_from_slice(&source);
+                                Ok(source.len())
+                            },
+                        )?)
+                    }
+                    _ => None,
+                };
+                if let Some((copied, refusal)) = result {
+                    return Ok(match refusal {
+                        Some(error) => crate::el1_delegation::owner_prepare_refusal_after(
+                            error,
+                            copied as u64,
+                        ),
+                        None => DispatchOutcome::returned_len_or_errno(copied),
+                    });
+                }
             }
             let bytes = match &*open {
                 OpenDescription::Closed { .. } => {
