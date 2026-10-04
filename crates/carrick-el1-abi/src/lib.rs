@@ -1712,8 +1712,10 @@ impl Drop for FrameGrantTransferPin<'_> {
     }
 }
 
-/// Fixed shared open-addressed index. Lookup is bounded to 64 probes even
-/// when many MMs coexist; a full probe chain only declines the guest fast path.
+/// Fixed shared open-addressed index. Single-page grants hash by page; bulk
+/// grants hash by their 2 MiB window so every page inside a bulk grant finds
+/// the same chain. Both lookups remain bounded to 64 probes even when many
+/// MMs coexist; a full probe chain only declines the guest fast path.
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub struct FrameGrantResidencyTable {
@@ -1729,15 +1731,20 @@ impl FrameGrantResidencyTable {
         }
     }
 
-    fn first_slot(mm_key: u64, va: u64) -> usize {
+    fn first_slot(mm_key: u64, va: u64, single_page: bool) -> usize {
         let window = va / EL1_FRAME_GRANT_TARGET_SIZE;
+        let key = if single_page {
+            va / GRANT_PAGE_SIZE
+        } else {
+            window
+        };
         let mixed =
-            mm_key.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ window.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            mm_key.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ key.wrapping_mul(0xbf58_476d_1ce4_e5b9);
         (mixed as usize) & (FRAME_GRANT_RESIDENCY_SLOTS - 1)
     }
 
-    fn probe(mm_key: u64, va: u64, offset: usize) -> usize {
-        (Self::first_slot(mm_key, va) + offset) & (FRAME_GRANT_RESIDENCY_SLOTS - 1)
+    fn probe(mm_key: u64, va: u64, single_page: bool, offset: usize) -> usize {
+        (Self::first_slot(mm_key, va, single_page) + offset) & (FRAME_GRANT_RESIDENCY_SLOTS - 1)
     }
 
     /// Host: publish an authenticated grant while the exact-MM mutation guard
@@ -1746,9 +1753,25 @@ impl FrameGrantResidencyTable {
         if !identity.valid() {
             return None;
         }
+        // The two hash classes share one table. Check both before admitting
+        // the new range so a page grant cannot overlap a bulk grant (or the
+        // reverse) merely because their first slots differ. Exact-MM editors
+        // serialize publications for this MM.
+        for page in (identity.semantic_base..identity.semantic_base + identity.len)
+            .step_by(GRANT_PAGE_SIZE as usize)
+        {
+            if self.lookup(identity.mm_key, page).is_some() {
+                return None;
+            }
+        }
         let mut available = None;
         for probe in 0..GRANT_PROBES {
-            let slot = Self::probe(identity.mm_key, identity.semantic_base, probe);
+            let slot = Self::probe(
+                identity.mm_key,
+                identity.semantic_base,
+                identity.len == GRANT_PAGE_SIZE,
+                probe,
+            );
             let record = &self.slots[slot];
             let state = record.state.load(Ordering::Acquire);
             if state & GRANT_STATE_MASK == GRANT_LIVE {
@@ -1785,30 +1808,32 @@ impl FrameGrantResidencyTable {
     /// Guest: find the exact live grant covering a prepared leaf.
     pub fn lookup(&self, mm_key: u64, va: u64) -> Option<FrameGrantResidencyPage> {
         let page = va & !(GRANT_PAGE_SIZE - 1);
-        for probe in 0..GRANT_PROBES {
-            let slot = Self::probe(mm_key, page, probe);
-            let record = &self.slots[slot];
-            let epoch = record.state.load(Ordering::Acquire);
-            match epoch & GRANT_STATE_MASK {
-                GRANT_EMPTY => return None,
-                GRANT_LIVE => {
-                    let identity = record.identity();
-                    if identity.mm_key == mm_key
-                        && page >= identity.semantic_base
-                        && page - identity.semantic_base < identity.len
-                        && record.state.load(Ordering::Acquire) == epoch
-                    {
-                        let bit = ((page - identity.semantic_base) / GRANT_PAGE_SIZE) as usize;
-                        return Some(FrameGrantResidencyPage {
-                            slot,
-                            identity,
-                            expected_ipa: identity.physical_ipa + bit as u64 * GRANT_PAGE_SIZE,
-                            epoch,
-                            bit,
-                        });
+        for single_page in [true, false] {
+            for probe in 0..GRANT_PROBES {
+                let slot = Self::probe(mm_key, page, single_page, probe);
+                let record = &self.slots[slot];
+                let epoch = record.state.load(Ordering::Acquire);
+                match epoch & GRANT_STATE_MASK {
+                    GRANT_EMPTY => break,
+                    GRANT_LIVE => {
+                        let identity = record.identity();
+                        if identity.mm_key == mm_key
+                            && page >= identity.semantic_base
+                            && page - identity.semantic_base < identity.len
+                            && record.state.load(Ordering::Acquire) == epoch
+                        {
+                            let bit = ((page - identity.semantic_base) / GRANT_PAGE_SIZE) as usize;
+                            return Some(FrameGrantResidencyPage {
+                                slot,
+                                identity,
+                                expected_ipa: identity.physical_ipa + bit as u64 * GRANT_PAGE_SIZE,
+                                epoch,
+                                bit,
+                            });
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         None
@@ -4848,6 +4873,66 @@ mod tests {
         assert!(table.retire(fresh_slot, second));
         table.publish(second).unwrap();
         assert!(!table.record_commit(stale_page));
+    }
+
+    #[test]
+    fn one_page_file_grants_do_not_fill_one_bulk_window_probe_chain() {
+        let table = FrameGrantResidencyTable::new();
+        let base = 0x4000_0000;
+        for index in 0..EL1_FRAME_GRANT_TARGET_SIZE / GRANT_PAGE_SIZE {
+            let identity = FrameGrantResidencyIdentity {
+                mm_key: 41,
+                semantic_base: base + index * 4096,
+                physical_ipa: 0x9000_0000 + index * 4096,
+                len: 4096,
+                mapping_id: index + 1,
+                frame_id: index + 1,
+                owner_generation: 23,
+                inventory_revision: 29,
+            };
+            assert!(
+                table.publish(identity).is_some(),
+                "file page {index} rejected inside one 2 MiB window"
+            );
+            assert_eq!(
+                table.lookup(41, identity.semantic_base).unwrap().identity,
+                identity
+            );
+        }
+    }
+
+    #[test]
+    fn page_and_bulk_grants_reject_overlaps_across_hash_classes() {
+        let table = FrameGrantResidencyTable::new();
+        let bulk = FrameGrantResidencyIdentity {
+            mm_key: 41,
+            semantic_base: 0x4000_0000,
+            physical_ipa: 0x9000_0000,
+            len: 4 * 4096,
+            mapping_id: 17,
+            frame_id: 19,
+            owner_generation: 23,
+            inventory_revision: 29,
+        };
+        let page = FrameGrantResidencyIdentity {
+            semantic_base: bulk.semantic_base + 2 * 4096,
+            physical_ipa: bulk.physical_ipa + 2 * 4096,
+            len: 4096,
+            ..bulk
+        };
+        let bulk_slot = table.publish(bulk).unwrap();
+        assert_eq!(
+            table
+                .lookup(bulk.mm_key, page.semantic_base)
+                .unwrap()
+                .identity,
+            bulk
+        );
+        assert!(table.publish(page).is_none());
+        assert!(table.retire(bulk_slot, bulk));
+        let page_slot = table.publish(page).unwrap();
+        assert!(table.publish(bulk).is_none());
+        assert!(table.retire(page_slot, page));
     }
 
     #[test]
