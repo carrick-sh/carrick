@@ -2627,6 +2627,77 @@ fn two_live_owners_of_one_shared_word_receive_one_wake_each() {
 }
 
 #[test]
+fn two_kernels_with_the_same_file_word_do_not_share_wakes() {
+    let (kernel_a, context_a) = bootstrap(15_238);
+    let (kernel_b, context_b) = bootstrap(15_239);
+    let generation_a = publish(&context_a, 0x55a);
+    let generation_b = publish(&context_b, 0x55b);
+    let service_a = CarrierWaitService::new(Arc::new(Scheduler::new(kernel_a)));
+    let service_b = CarrierWaitService::new(Arc::new(Scheduler::new(kernel_b)));
+    let word = std::sync::atomic::AtomicU32::new(7);
+    let location = SharedFutexLocation::File {
+        word: HostVa(std::ptr::from_ref(&word) as usize),
+        identity: carrick_hal::SharedFutexFileIdentity {
+            device: 42,
+            inode: 73,
+        },
+        offset: 64,
+        waiter_key: 0x55a,
+    };
+    let table_a = carrick_thread::platform_futex::carrier_shared_futex_table();
+    let table_b = carrick_thread::platform_futex::carrier_shared_futex_table();
+    let make_wait = |context: &KernelContext, generation, table: &FutexTable| {
+        BlockedContinuation::from_dispatch_outcome(
+            DispatchOutcome::SharedFutexWait {
+                target: SharedFutexTarget::new(location, location.waiter_key()),
+                generation: table.prepare_wait(shared_queue_key(location)),
+                value: 7,
+                timeout: Some(Duration::from_secs(5)),
+            },
+            capture(context, generation),
+        )
+        .expect("shared file wait")
+    };
+    // B enrolls first: an accidentally shared table deterministically gives
+    // A's first counted wake to B, even with identical live host backing.
+    let b = make_wait(&context_b, generation_b, table_b);
+    let mut registration_b = service_b.prepare_registration(&b);
+    service_b.enroll(&mut registration_b).expect("enroll B");
+    let a = make_wait(&context_a, generation_a, table_a);
+    let mut registration_a = service_a.prepare_registration(&a);
+    service_a.enroll(&mut registration_a).expect("enroll A");
+    assert_eq!(table_a.wake(shared_queue_key(location), 1), 1);
+    let mut event_b = Box::pin(service_b.event(registration_b.wake_token()));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        event_b.as_mut().poll(&mut cx).is_pending(),
+        "kernel A woke kernel B's waiter on the same file word"
+    );
+    assert_eq!(
+        await_event_timeout(
+            &service_a,
+            registration_a.wake_token(),
+            Duration::from_millis(250)
+        ),
+        Some(Ok(ContinuationEvent::Ready))
+    );
+    assert_eq!(
+        table_a.wake(shared_queue_key(location), 1),
+        0,
+        "A must contain no cross-instance waiter entries"
+    );
+    assert_eq!(table_b.wake(shared_queue_key(location), 1), 1);
+    assert_eq!(
+        await_event_timeout(
+            &service_b,
+            registration_b.wake_token(),
+            Duration::from_millis(250)
+        ),
+        Some(Ok(ContinuationEvent::Ready))
+    );
+}
+
+#[test]
 fn shared_reactor_drives_write_record_signal_and_vfork_sources() {
     let (kernel, context) = bootstrap(15_233);
     let generation = publish(&context, 0x554);
