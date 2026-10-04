@@ -109,7 +109,7 @@ pub struct RetainedUserData {
     custody: Arc<CarrierVmCustody>,
     _mapping: Option<Arc<GlobalFrameSharedMapping>>,
     _metadata: Option<crate::metadata_grant::CarrierMetadataAccess>,
-    _write: Option<code_content::ContentWrite<OwnedCodeContent>>,
+    _write: Option<Arc<code_content::PendingContentWrite<OwnedCodeContent>>>,
     carrier: NonZeroU64,
     identity: PortalRetainedData,
     selected: PortalSelectedData,
@@ -117,7 +117,17 @@ pub struct RetainedUserData {
     pointer: *mut u8,
     len: usize,
 }
+enum TransferBytes<'a> {
+    Read(&'a mut [u8]),
+    Write(&'a [u8]),
+}
 impl TransferPin for RetainedUserData {
+    fn pending(&self) -> Option<carrick_guest_mem::OwnedMemoryWait> {
+        self._write
+            .as_ref()
+            .filter(|write| !write.is_ready())
+            .map(|write| carrick_guest_mem::OwnedMemoryWait(write.clone()))
+    }
     fn identity(&self) -> PortalRetainedData {
         self.identity
     }
@@ -126,25 +136,56 @@ impl TransferPin for RetainedUserData {
         authorization: carrick_el1_abi::PortalCopyRequest<'_>,
         bytes: &mut [u8],
     ) -> bool {
+        if self.intent == PortalTransferIntent::UserWrite {
+            self.copy_out(authorization, bytes)
+        } else {
+            self.copy_bytes(authorization, TransferBytes::Read(bytes))
+        }
+    }
+    fn copy_out(
+        &mut self,
+        authorization: carrick_el1_abi::PortalCopyRequest<'_>,
+        bytes: &[u8],
+    ) -> bool {
+        if self.intent != PortalTransferIntent::UserWrite {
+            return false;
+        }
+        self.copy_bytes(authorization, TransferBytes::Write(bytes))
+    }
+}
+impl RetainedUserData {
+    fn copy_bytes(
+        &mut self,
+        authorization: carrick_el1_abi::PortalCopyRequest<'_>,
+        bytes: TransferBytes<'_>,
+    ) -> bool {
+        if self._write.as_ref().is_some_and(|write| !write.is_ready()) {
+            return false;
+        }
+        let len = match &bytes {
+            TransferBytes::Read(bytes) => bytes.len(),
+            TransferBytes::Write(bytes) => bytes.len(),
+        };
         let request = authorization.request();
         if request.operation.carrier != self.carrier
             || request.retained != self.identity
             || request.selected != self.selected
             || request.intent != self.intent
             || request.range.len() > self.len as u64
-            || request.range.len() != bytes.len() as u64
+            || request.range.len() != len as u64
         {
             return false;
         }
-        // SAFETY: the exact stage-2 pin and retained backing keep this checked
-        // bounded physical interval alive. The caller invokes this only from
-        // owner-authorized copy effect. The exact prepared permit remains live
-        // through COMMIT; a short copy may consume only its authenticated prefix.
+        // SAFETY: exact authorization, retained backing and pin cover this
+        // bounded interval. The typed buffer chooses the copy direction.
         unsafe {
-            if self.intent == PortalTransferIntent::UserWrite {
-                core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.pointer, bytes.len());
-            } else {
-                core::ptr::copy_nonoverlapping(self.pointer, bytes.as_mut_ptr(), bytes.len());
+            match bytes {
+                TransferBytes::Read(bytes) => {
+                    core::ptr::copy_nonoverlapping(self.pointer, bytes.as_mut_ptr(), len)
+                }
+                TransferBytes::Write(bytes) => {
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), self.pointer, len)
+                }
             }
         }
         if self.intent == PortalTransferIntent::UserWrite {
@@ -157,16 +198,11 @@ impl TransferPin for RetainedUserData {
                 )
             });
             let offset = self.pointer as usize - mapping.host_base() as usize;
-            mapping.code_content.mark_icache_dirty(offset, bytes.len());
+            mapping.code_content.mark_icache_dirty(offset, len);
         }
         if self.intent == PortalTransferIntent::UserWrite && self.selected.executable {
             self.custody
-                .publish_user_executable(
-                    self.selected.ipa,
-                    bytes.len() as u64,
-                    |_, _| None,
-                    |_, _| None,
-                )
+                .publish_user_executable(self.selected.ipa, len as u64, |_, _| None, |_, _| None)
                 .unwrap_or_else(|error| {
                     carrick_fatal!(
                         "hvpatch::user_transfer",
@@ -255,7 +291,7 @@ impl TransferCustody for UserTransferCustody {
         len: usize,
         intent: PortalTransferIntent,
     ) -> Result<Option<Self::Pin>, TrapError> {
-        Ok(self.retain_exact(selected, len, intent).ok())
+        self.retain_exact(selected, len, intent)
     }
 }
 impl UserTransferCustody {
@@ -304,31 +340,45 @@ impl UserTransferCustody {
         selected: PortalSelectedData,
         len: usize,
         intent: PortalTransferIntent,
-    ) -> Result<RetainedUserData, TrapError> {
-        let error = || TrapError::Hypervisor("UserTransfer physical selection is stale".to_owned());
+    ) -> Result<Option<RetainedUserData>, TrapError> {
+        let error =
+            || TrapError::Hypervisor("UserTransfer physical custody invariant refused".to_owned());
         if len == 0 || len > 4096 || selected.ipa.checked_add(len as u64).is_none() {
             return Err(error());
         }
         let global = {
             let owners = self.custody.global_frame_host_owners.lock();
-            owners
-                .range(..=(selected.ipa, u64::MAX))
-                .next_back()
-                .filter(|((base, length), _)| {
-                    selected.ipa + len as u64 <= base.saturating_add(*length)
-                })
-                .and_then(|(_, entry)| entry.live_owner().cloned())
+            if let Some((&(base, length), entry)) =
+                owners.range(..=(selected.ipa, u64::MAX)).next_back()
+            {
+                let end = base.saturating_add(length);
+                if selected.ipa < end {
+                    if selected.ipa + len as u64 > end {
+                        return Err(error());
+                    }
+                    entry.live_owner().cloned()
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         };
         let (identity, mapping) = if let Some(owner) = global {
             (owner.record_identity, Some(Arc::clone(&owner.mapping)))
         } else {
             let identity = {
                 let records = self.custody.carrier_stage2_records.lock();
-                let (&(base, length), identity) = records
-                    .range(..=(selected.ipa, u64::MAX))
-                    .next_back()
-                    .ok_or_else(error)?;
-                if selected.ipa + len as u64 > base.saturating_add(length) {
+                let Some((&(base, length), identity)) =
+                    records.range(..=(selected.ipa, u64::MAX)).next_back()
+                else {
+                    return Ok(None);
+                };
+                let end = base.saturating_add(length);
+                if selected.ipa >= end {
+                    return Ok(None);
+                }
+                if selected.ipa + len as u64 > end {
                     return Err(error());
                 }
                 *identity
@@ -340,6 +390,19 @@ impl UserTransferCustody {
                 .get(&identity.record_id)
                 .map(|entry| Arc::clone(&entry.mapping));
             (identity, mapping)
+        };
+        let pin = match self.custody.pin_stage2_record(identity) {
+            Ok(pin) => pin,
+            Err(
+                CarrierStage2PinError::NotFound
+                | CarrierStage2PinError::NotMapped
+                | CarrierStage2PinError::RetirementRequested,
+            ) => return Ok(None),
+            Err(reason) => {
+                return Err(TrapError::Hypervisor(format!(
+                    "UserTransfer physical pin refused: {reason:?}"
+                )));
+            }
         };
         // A bare stage-2 alias does not own its source allocation. Require
         // the retained physical backing before exposing even a read pin.
@@ -355,10 +418,6 @@ impl UserTransferCustody {
         if mapping.is_none() && metadata.is_none() {
             return Err(error());
         }
-        let pin = self
-            .custody
-            .pin_stage2_record(identity)
-            .map_err(|_| error())?;
         let record = self
             .custody
             .stage2_record_snapshot(identity.record_id)
@@ -398,20 +457,20 @@ impl UserTransferCustody {
                 None => None,
             },
         };
-        // Revocation can wait for native-code users. It therefore precedes
-        // EL1 revalidation/editor acquisition, never the bounded copy callback.
+        // Revocation returns owned readiness without waiting for native-code
+        // users. Its writer exclusion survives suspension through pending().
         let write = if intent == PortalTransferIntent::UserWrite {
-            Some(
+            Some(Arc::new(
                 mapping
                     .as_ref()
                     .ok_or_else(error)?
-                    .begin_content_write(offset, len)
+                    .prepare_content_write(offset, len)
                     .map_err(|_| error())?,
-            )
+            ))
         } else {
             None
         };
-        Ok(RetainedUserData {
+        Ok(Some(RetainedUserData {
             _pin: pin,
             custody: self.custody.clone(),
             _mapping: mapping,
@@ -423,7 +482,7 @@ impl UserTransferCustody {
             intent,
             pointer,
             len,
-        })
+        }))
     }
 }
 
@@ -471,6 +530,39 @@ pub(super) mod tests {
             offset: 0,
         }
     }
+    #[test]
+    fn user_write_retention_releases_executor_while_code_reader_is_active() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let owner = backing(&custody, 0x4800_0000);
+        let mut observation = owner.mapping.code_content.observe(0, 4).unwrap();
+        observation.begin_execution().unwrap();
+        let physical = UserTransferCustody::new(custody.clone());
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let pin = physical
+                .retain(selection(0x4800_0000), 4, PortalTransferIntent::UserWrite)
+                .unwrap()
+                .unwrap();
+            sent.send(()).unwrap();
+            drop(pin);
+        });
+        let returned = received
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        observation.finish_execution();
+        if !returned {
+            received
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+        }
+        worker.join().unwrap();
+        assert!(
+            returned,
+            "physical retention parked its executor behind a live code reader"
+        );
+    }
+
     #[test]
     fn native_owner_matrix_moves_bytes_with_balanced_physical_pins() {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
@@ -537,6 +629,89 @@ pub(super) mod tests {
                 owners: Vec::new(),
             })
         });
+    }
+
+    #[test]
+    fn invalid_physical_request_is_not_an_owner_recheck_wait() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let _owner = backing(&custody, 0xa085_3100_0000);
+        let physical = UserTransferCustody::new(custody);
+        assert!(
+            physical
+                .retain(
+                    selection(0xa085_3100_0000),
+                    0,
+                    PortalTransferIntent::UserRead
+                )
+                .is_err(),
+            "permanent physical refusal was erased into immediate owner reselect"
+        );
+        assert!(
+            physical
+                .retain(
+                    selection(0xa085_3100_0000 + 16382),
+                    4,
+                    PortalTransferIntent::UserRead
+                )
+                .is_err(),
+            "known backing range overflow must not become a recheck wait"
+        );
+        assert!(
+            physical
+                .retain(
+                    selection(0xa085_3100_0000 + 32768),
+                    4,
+                    PortalTransferIntent::UserRead
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn drained_copy_stays_ready_during_rejected_stale_execution_entry() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let ipa = 0xa085_3000_0000;
+        let owner = backing(&custody, ipa);
+        let mut stale = owner.mapping.code_content.observe(0, 4).unwrap();
+        let physical = UserTransferCustody::new(custody);
+        let selected = selection(ipa);
+        let mut pin = physical
+            .retain(selected, 4, PortalTransferIntent::UserWrite)
+            .unwrap()
+            .unwrap();
+        assert!(pin.pending().is_none());
+        let request = carrick_el1_abi::PortalTransferRequest::new(
+            PortalOperation {
+                carrier: physical.carrier(),
+                mm: ReservationMm::new(77).unwrap(),
+                incarnation: NonZeroU64::new(1).unwrap(),
+                sequence: NonZeroU64::new(1).unwrap(),
+            },
+            PortalByteRange::new(0x4000_0000, 4).unwrap(),
+            PortalTransferIntent::UserWrite,
+            selected,
+            pin.identity(),
+        )
+        .unwrap();
+        let slot = PortalTransferSlot::new();
+        let mut ticket = slot.submit(request).unwrap();
+        let service = slot.claim().unwrap();
+        let mut copied = false;
+        let rejected = stale.begin_execution_with_hook(|| {
+            copied = service.copy_with(|| {
+                assert!(
+                    ticket.copy_requested(|authorization| pin.copy_out(authorization, b"data")),
+                    "drained destination became unready after source consumption"
+                )
+            });
+        });
+        assert_eq!(rejected, Err(code_content::ContentError::Changed));
+        assert!(copied);
+        assert!(service.complete(4, 0));
+        assert_eq!(ticket.take_completion().unwrap().completed, 4);
     }
 
     #[test]

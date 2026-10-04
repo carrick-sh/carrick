@@ -551,6 +551,7 @@ version = "0.1.0"
 name = "carrick-guest-mem"
 version = "0.1.0"
 dependencies = [
+ "carrick-el1-abi",
  "carrick-fatal",
  "libc",
  "parking_lot",

@@ -2390,11 +2390,35 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     // This adapter must be transparent. In particular, inheriting a modelless
     // default here silently bypasses the wrapped backend's physical repoint and
     // provenance publication while `run_syscall_loop` uses this split shape.
-    fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
+    fn protections(&self) -> Option<carrick_guest_mem::LegacyProtectionRead<'_>> {
         self.mem.protections()
     }
     fn has_complete_mapping_metadata(&self) -> bool {
         self.mem.has_complete_mapping_metadata()
+    }
+    fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+        self.mem.user_memory_venue()
+    }
+    fn prepare_write(
+        &mut self,
+        ranges: &[carrick_guest_mem::GuestWriteRange],
+    ) -> Result<
+        Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
+        carrick_guest_mem::MemoryPrepareError,
+    > {
+        self.mem.prepare_write(ranges)
+    }
+    fn resume_read(
+        &self,
+        continuation: carrick_guest_mem::OwnedReadContinuation,
+    ) -> Result<Vec<u8>, MemoryError> {
+        self.mem.resume_read(continuation)
+    }
+    fn read_carrick_internal(
+        &self,
+        range: carrick_el1_abi::CarrickInternalReadRange,
+    ) -> Result<Vec<u8>, MemoryError> {
+        self.mem.read_carrick_internal(range)
     }
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         self.mem.read_bytes(address, length)

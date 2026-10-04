@@ -439,7 +439,6 @@ use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
     OwedStage1Maintenance, Stage1Maintenance,
 };
-use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{Gpa, MemoryError, SharedFutexLocation};
 use carrick_hal::{
     GuestEntryRegs, GuestVmBackend, HostAliasBacking, ProcessForkRequest, Reg, SysReg, TrapError,
@@ -1134,7 +1133,7 @@ impl TaskOnlyRuntimeProjectionSlot {
         })?;
         backend.runtime_task_state(
             projection.page_tables.clone(),
-            Arc::clone(&projection.protections),
+            projection.protections.clone(),
         )
     }
 
@@ -1402,7 +1401,7 @@ pub struct HvpatchPreparedTaskOnlyEngineState {
     carrier: HvpatchPreparedCarrierTaskState,
     snapshot: Aarch64VcpuSnapshot,
     page_tables: carrick_aarch64::Stage1Authority,
-    protections: Arc<MemoryProtections>,
+    protections: carrick_guest_mem::UserMemoryAuthority,
     process_asid: Option<u16>,
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -2449,8 +2448,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             .map_err(|e| TrapError::Hypervisor(e.to_string()))
     }
 
-    fn protections(&self) -> Option<&MemoryProtections> {
-        Some(self.state.protections_ref())
+    fn protections(&self) -> Option<carrick_guest_mem::LegacyProtectionRead<'_>> {
+        self.state.protections_ref()
     }
 
     fn fork_cow_ranges(&mut self) -> Vec<carrick_aarch64::vmm::ForkCowRange> {
@@ -2777,7 +2776,24 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         self.state.page_tables_snapshot()
     }
 
-    fn exec_protections(&self) -> Option<Arc<MemoryProtections>> {
+    fn install_user_memory_authority(
+        &mut self,
+        authority: carrick_guest_mem::UserMemoryAuthority,
+    ) -> Result<(), TrapError> {
+        if self.state.protections.same_authority(&authority) {
+            return Ok(());
+        }
+        let handle = authority.owner().ok_or_else(|| {
+            TrapError::Hypervisor("cannot replace a live root with a legacy mirror".into())
+        })?;
+        self.state.protections.admit_owner(handle).map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "backend user-memory admission refused before execution: {error:?}"
+            ))
+        })
+    }
+
+    fn exec_protections(&self) -> Option<carrick_guest_mem::UserMemoryAuthority> {
         Some(self.state.task_protections_authority())
     }
 
@@ -3107,9 +3123,9 @@ mod task_only_materializer_tests {
         }
         carrick_aarch64::Aarch64TaskRuntimeProjection {
             page_tables: carrick_aarch64::Stage1Authority::new_with_manager(Some(manager)),
-            protections: std::sync::Arc::new(
+            protections: carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
                 carrick_guest_mem::protections::MemoryProtections::default(),
-            ),
+            )),
             process_asid: Some(asid),
         }
     }
@@ -3120,7 +3136,7 @@ mod task_only_materializer_tests {
         let root = 0x9a_0000_0000;
         let projection = runtime_projection(root, 2);
         let expected_page_tables = projection.page_tables.clone();
-        let expected_protections = std::sync::Arc::clone(&projection.protections);
+        let expected_protections = projection.protections.clone();
         let slot = super::TaskOnlyRuntimeProjectionSlot::new(projection);
         let retained = slot.take().expect("take exact runtime binding");
         assert!(retained.shares_exact_mm_authority(&expected_page_tables, &expected_protections));
@@ -3141,7 +3157,7 @@ mod task_only_materializer_tests {
         assert!(slot.take().is_err(), "a loaded projection is non-cloneable");
 
         let replacement = runtime_projection(replacement_root, 2);
-        let replacement_protections = std::sync::Arc::clone(&replacement.protections);
+        let replacement_protections = replacement.protections.clone();
         slot.put(replacement).expect("publish exec replacement");
         assert!(
             slot.put(old).is_err(),
@@ -3151,10 +3167,11 @@ mod task_only_materializer_tests {
         let reloaded = slot.take().expect("reload replacement projection");
         assert_eq!(reloaded.process_asid, Some(2));
         assert_eq!(reloaded.page_tables.root_base(), Some(replacement_root));
-        assert!(std::sync::Arc::ptr_eq(
-            &reloaded.protections,
-            &replacement_protections
-        ));
+        assert!(
+            reloaded
+                .protections
+                .same_authority(&replacement_protections)
+        );
     }
 
     #[test]
