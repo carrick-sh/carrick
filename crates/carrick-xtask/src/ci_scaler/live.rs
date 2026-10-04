@@ -12,6 +12,40 @@ struct Token {
     #[serde(rename = "value")]
     secret: String,
 }
+enum PveCall {
+    Get,
+    Post(Value),
+    Put(Value),
+    Delete,
+}
+impl PveCall {
+    fn method(&self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post(_) => "POST",
+            Self::Put(_) => "PUT",
+            Self::Delete => "DELETE",
+        }
+    }
+    fn body(&self) -> Option<Value> {
+        match self {
+            Self::Post(body) | Self::Put(body) => Some(body.clone()),
+            Self::Get | Self::Delete => None,
+        }
+    }
+}
+fn request_config(token: &Token, call: &PveCall) -> Result<String, ScalerError> {
+    let header = format!("Authorization: PVEAPIToken={}={}", token.id, token.secret);
+    let mut config = format!("header = {}\n", serde_json::to_string(&header)?);
+    if let Some(data) = call.body() {
+        config.push_str("header = \"Content-Type: application/json\"\n");
+        config.push_str(&format!(
+            "data = {}\n",
+            serde_json::to_string(&data.to_string())?
+        ));
+    }
+    Ok(config)
+}
 struct Pve {
     token: Token,
     deadline: std::cell::Cell<Option<Instant>>,
@@ -42,20 +76,9 @@ impl Pve {
             deadline: std::cell::Cell::new(None),
         })
     }
-    fn request(&self, method: &str, path: &str, data: Option<Value>) -> Result<Value, ScalerError> {
+    fn request(&self, call: PveCall, path: &str) -> Result<Value, ScalerError> {
         let limit = remaining(self.deadline.get(), Duration::from_secs(45))?;
-        let header = format!(
-            "Authorization: PVEAPIToken={}={}",
-            self.token.id, self.token.secret
-        );
-        let mut config = format!("header = {}\n", serde_json::to_string(&header)?);
-        if let Some(data) = data {
-            config.push_str("header = \"Content-Type: application/json\"\n");
-            config.push_str(&format!(
-                "data = {}\n",
-                serde_json::to_string(&data.to_string())?
-            ));
-        }
+        let config = request_config(&self.token, &call)?;
         let bytes = execute(
             Command::new("curl").args([
                 "--fail",
@@ -68,7 +91,7 @@ impl Pve {
                 "--config",
                 "-",
                 "--request",
-                method,
+                call.method(),
                 &format!("https://willow.atxconsulting.com:8006/api2/json{path}"),
             ]),
             config.as_bytes(),
@@ -81,7 +104,7 @@ impl Pve {
             .ok_or(ScalerError::External("PVE response lacks data"))
     }
     fn inventory(&self) -> Result<Vec<Vm>, ScalerError> {
-        let pool = self.request("GET", "/pools/carrick-ci", None)?;
+        let pool = self.request(PveCall::Get, "/pools/carrick-ci")?;
         if pool["poolid"] != POOL {
             return Err(ScalerError::Guard("PVE returned another pool"));
         }
@@ -118,7 +141,7 @@ impl Pve {
             .into_iter()
             .find(|v| v.id == row.vm.get())
             .ok_or(ScalerError::Guard("ledger VM is absent"))?;
-        let config = self.request("GET", &format!("{}/config", base(row.vm)), None)?;
+        let config = self.request(PveCall::Get, &format!("{}/config", base(row.vm)))?;
         authenticate_config(row, vm, &config)
     }
     fn task_done(&self, task: &str) -> Result<bool, ScalerError> {
@@ -132,7 +155,7 @@ impl Pve {
         if !task.starts_with("UPID:willow:") || task.contains('/') {
             return Err(ScalerError::Guard("task belongs to another node"));
         }
-        let result = self.request("GET", &format!("/nodes/willow/tasks/{task}/status"), None)?;
+        let result = self.request(PveCall::Get, &format!("/nodes/willow/tasks/{task}/status"))?;
         if result["status"] == "stopped" {
             if result["exitstatus"] != "OK" {
                 return Ok(TaskState::Failed);
@@ -158,9 +181,8 @@ impl Pve {
     fn agent(&self, row: &Record, command: &[&str]) -> Result<String, ScalerError> {
         self.guard(row)?;
         let response = self.request(
-            "POST",
+            PveCall::Post(json!({"command":command})),
             &format!("{}/agent/exec", base(row.vm)),
-            Some(json!({"command":command})),
         )?;
         let pid = response["pid"]
             .as_u64()
@@ -168,9 +190,8 @@ impl Pve {
         let deadline = Instant::now() + Duration::from_secs(25);
         while Instant::now() < deadline {
             let status = self.request(
-                "GET",
+                PveCall::Get,
                 &format!("{}/agent/exec-status?pid={pid}", base(row.vm)),
-                None,
             )?;
             if status["exited"].as_bool() == Some(true) || status["exited"].as_u64() == Some(1) {
                 if status["exitcode"].as_u64() != Some(0) {
@@ -185,9 +206,8 @@ impl Pve {
     fn guest_ip(&self, row: &Record) -> Result<Ipv4Addr, ScalerError> {
         self.guard(row)?;
         let data = self.request(
-            "GET",
+            PveCall::Get,
             &format!("{}/agent/network-get-interfaces", base(row.vm)),
-            None,
         )?;
         let interfaces = data["result"]
             .as_array()
@@ -641,12 +661,11 @@ fn provision(
     row.state = State::Cloning;
     update(ledger, row, path)?; // Write-ahead, even if POST's outcome is ambiguous.
     row.task = Some(task_id(pve.request(
-        "POST",
-        "/nodes/willow/qemu/300/clone",
-        Some(json!({
+        PveCall::Post(json!({
             "newid":row.vm.get(), "pool":POOL, "name":row.name, "full":false,
             "description":format!("Carrick pilot ledger identity {}", row.name)
         })),
+        "/nodes/willow/qemu/300/clone",
     )?)?);
     update(ledger, row, path)?;
     pve.wait_task(
@@ -656,13 +675,12 @@ fn provision(
     )?;
     pve.guard(row)?;
     pve.request(
-        "PUT",
-        &format!("{}/config", base(row.vm)),
-        Some(json!({
+        PveCall::Put(json!({
             "ciuser":"runner", "sshkeys":std::fs::read_to_string(key.with_extension("key.pub"))?,
             "ipconfig0":"ip=dhcp", "tags":"carrick-ci;willow-pilot",
             "cores":2,"memory":4096,"balloon":0,"cpulimit":2,"cpu":"host"
         })),
+        &format!("{}/config", base(row.vm)),
     )?;
     if !resource_admission()? {
         return Err(ScalerError::Guard("host admission denied before boot"));
@@ -673,9 +691,8 @@ fn provision(
     let shared_deadline = ApiDeadline(&pve.deadline);
     row.state = State::Booting;
     row.task = Some(task_id(pve.request(
-        "POST",
+        PveCall::Post(json!({})),
         &format!("{}/status/start", base(row.vm)),
-        Some(json!({})),
     )?)?);
     update(ledger, row, path)?;
     pve.wait_task(
@@ -795,12 +812,11 @@ fn cleanup(
         std::fs::write(dir.join(format!("{}.runner.log", row.name)), log)?;
     }
     pve.guard(row)?;
-    let status = pve.request("GET", &format!("{}/status/current", base(row.vm)), None)?;
+    let status = pve.request(PveCall::Get, &format!("{}/status/current", base(row.vm)))?;
     if status["status"] != "stopped" {
         row.task = Some(task_id(pve.request(
-            "POST",
+            PveCall::Post(json!({})),
             &format!("{}/status/stop", base(row.vm)),
-            Some(json!({})),
         )?)?);
         update(ledger, row, path)?;
         pve.wait_task(
@@ -810,11 +826,7 @@ fn cleanup(
         )?;
     }
     pve.guard(row)?;
-    row.task = Some(task_id(pve.request(
-        "DELETE",
-        &base(row.vm),
-        Some(json!({"purge":true})),
-    )?)?);
+    row.task = Some(task_id(pve.request(PveCall::Delete, &base(row.vm))?)?);
     update(ledger, row, path)?;
     pve.wait_task(
         row.task
@@ -940,14 +952,14 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
     if template.pool != POOL {
         return Err(ScalerError::Guard("template pool mismatch"));
     }
-    let config = pve.request("GET", "/nodes/willow/qemu/300/config", None)?;
+    let config = pve.request(PveCall::Get, "/nodes/willow/qemu/300/config")?;
     if !qualified_template(&config) {
         return Err(ScalerError::Guard(
             "template does not match approved size/storage/bridge",
         ));
     }
     // Read-only privilege proof. Never probe a denied destructive operation.
-    let protected = pve.request("GET", "/access/permissions?path=/vms/105", None)?;
+    let protected = pve.request(PveCall::Get, "/access/permissions?path=/vms/105")?;
     if protected.as_object().is_none_or(|map| {
         map.values()
             .any(|v| v.as_object().is_none_or(|m| !m.is_empty()))
@@ -1009,6 +1021,30 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn pve_read_and_delete_have_no_body_or_global_purge() {
+        let token = Token {
+            id: "fixture".into(),
+            secret: "not-a-credential".into(),
+        };
+        for call in [PveCall::Get, PveCall::Delete] {
+            let config = request_config(&token, &call).unwrap();
+            assert!(
+                !config.contains("data ="),
+                "PVE rejects GET/DELETE bodies with HTTP 501"
+            );
+            assert!(!config.contains("Content-Type"));
+            assert!(!config.contains("purge"));
+        }
+        for call in [
+            PveCall::Post(json!({"cores":2})),
+            PveCall::Put(json!({"cores":2})),
+        ] {
+            let config = request_config(&token, &call).unwrap();
+            assert!(config.contains("Content-Type: application/json"));
+            assert!(config.contains("data ="));
+        }
+    }
     #[test]
     fn ownership_uses_live_config_identity_and_retains_pool_and_template_fences() {
         let row = row();
