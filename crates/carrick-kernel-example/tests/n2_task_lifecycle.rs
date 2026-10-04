@@ -132,7 +132,7 @@ fn wait_scenario(n: usize, autoreap: bool) -> RunReport {
                     sys::rt_sigaction(LINUX_SIGCHLD, &action[..], 0, 8).ret(0),
                 ));
             }
-            for i in 0..n {
+            for (i, checkpoint) in progress.iter().enumerate() {
                 parent.push(birth(10 + i));
                 parent.push(Step::ChildMarker(vec![
                     Step::AwaitCheckpoint(release.clone()),
@@ -141,7 +141,7 @@ fn wait_scenario(n: usize, autoreap: bool) -> RunReport {
                     await_parked(slot(4), "d_wait"),
                     exit(7),
                 ]));
-                parent.push(Step::SignalCheckpoint(progress[i].clone()));
+                parent.push(Step::SignalCheckpoint(checkpoint.clone()));
             }
             parent.push(Step::AwaitCheckpoint(population_go));
             // wait4(2) refers to wait(2): WNOHANG is zero for a live child,
@@ -249,9 +249,9 @@ fn group_scenario(n: usize) -> RunReport {
             // exit_group(2): terminate every thread of this group, including
             // parked siblings. The other live parent is an independent group.
             // https://man7.org/linux/man-pages/man2/exit_group.2.html
-            for i in 0..n {
+            for (i, checkpoint) in progress.iter().enumerate() {
                 parent.push(await_parked(slot(10 + i), "sibling_read"));
-                parent.push(Step::SignalCheckpoint(progress[i].clone()));
+                parent.push(Step::SignalCheckpoint(checkpoint.clone()));
             }
             parent.push(Step::AwaitCheckpoint(population_go));
             parent.push(exit(37));
