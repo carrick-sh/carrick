@@ -22,6 +22,229 @@ struct ReadWindow {
     pin: GlobalFrameOwnerPin,
 }
 
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod owner_tests {
+    use super::*;
+    use carrick_el1::personality::mm_portal::{MmPortal, test_support as owner};
+    use carrick_el1_abi::{AddressSpaces, SlotId, ZONE_SLOTS};
+    use std::num::{NonZeroU16, NonZeroU64};
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct Live(CarrierForeignMmSnapshot);
+    impl ForeignMmLiveAuthority for Live {
+        fn snapshot(&self, _: Instant) -> Result<Box<dyn ForeignMmSnapshot>, Error> {
+            Ok(Box::new(self.0.clone()))
+        }
+    }
+
+    /// Physical fixture only: admission/permissions remain the existing EL1
+    /// reservation and descriptor owners. No replacement observer policy.
+    fn install(
+        custody: &Arc<CarrierVmCustody>,
+        handle: carrick_el1_abi::El1MmHandle,
+        tables: &owner::Tables,
+        ipa: u64,
+        fill: u8,
+    ) -> (Arc<MmAccessState>, CarrierForeignMmSnapshot) {
+        let ordinal = handle.mm().raw();
+        let mut inventory = HvpatchFrameInventory::default();
+        let mut mappings = Vec::new();
+        for (base, len, data) in [
+            (tables.base, tables.words.len() * 8, true),
+            (ipa, 0x4000, false),
+        ] {
+            let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                len,
+                crate::host_mapping::HostMappingKind::PerMmKernelState,
+            )
+            .unwrap();
+            let generation = next_global_frame_owner_generation();
+            let host_addr = mapping.as_ptr() as usize;
+            // SAFETY: this fixture owns the entire new allocation. Descriptor
+            // words originate in the existing production-owner test fixture.
+            unsafe {
+                if data {
+                    std::ptr::copy_nonoverlapping(
+                        tables.words.as_ptr().cast::<u8>(),
+                        mapping.as_ptr(),
+                        len,
+                    );
+                } else {
+                    mapping.as_ptr().write_bytes(fill, len);
+                }
+            }
+            let physical = GlobalFrameHostOwner::new(
+                GlobalFrameStage2Lease::fixed(base, len as u64),
+                mapping,
+                3,
+                generation,
+                base,
+                len as u64,
+            );
+            custody.global_frame_host_owners.lock().insert(
+                (base, len as u64),
+                GlobalFrameOwnerEntry::Live(Arc::new(physical)),
+            );
+            let id = NonZeroU64::new(ordinal * 10 + u64::from(data)).unwrap();
+            let mapping = carrick_hal::MappingId::from_kernel_allocation(id);
+            mappings.push(mapping);
+            inventory.extents.insert(
+                (base, len as u64),
+                InventoryExtent {
+                    frame: carrick_hal::FrameId::from_kernel_allocation(id),
+                    mapping,
+                    backing: InventoryBackingIdentity::Private(id.get()),
+                    stage2_base: base,
+                    stage2_length: len as u64,
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr,
+                        generation,
+                    },
+                },
+            );
+        }
+        let binding = CarrierForeignMmBinding {
+            asid: carrick_hal::ForeignAsid::from_kernel_allocation(
+                NonZeroU16::new(u16::try_from(ordinal).unwrap()).unwrap(),
+            ),
+            stage1_root: carrick_guest_mem::Gpa(tables.base),
+        };
+        let snapshot = CarrierForeignMmSnapshot {
+            mm: carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(ordinal).unwrap()),
+            binding,
+            backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(1),
+            vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
+            frame_inventory_revision:
+                carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
+            mapping_ids: mappings,
+            executable_ranges: Vec::new(),
+            readable_ranges: vec![
+                carrick_hal::ForeignReadableRange::from_kernel_projection(
+                    GuestVa(owner::VA),
+                    GuestVa(owner::VA + 4096),
+                )
+                .unwrap(),
+            ],
+        };
+        // An admitted handle carries no host page-table manager or mirror.
+        let state = MmAccessState::new_unbound(
+            carrick_aarch64::Stage1Authority::new_with_manager(None),
+            carrick_guest_mem::UserMemoryAuthority::from_owner(handle),
+            Arc::new(parking_lot::Mutex::new(inventory)),
+            Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
+        );
+        state.install_identity(snapshot.mm, binding);
+        (state, snapshot)
+    }
+
+    #[test]
+    fn n1_stopped_observer_and_native_lease_use_exact_owner() {
+        let _guard = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
+        let region = owner::Region::new();
+        let spaces: &AddressSpaces = &region.zone().spaces;
+        let a = owner::admit_notified(&region, 77, owner::ROOT, 1, 0);
+        let b = owner::admit_notified(&region, 78, owner::ROOT + 0x100000, 1, 0);
+        let nodes = owner::nodes(&region);
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let portal = MmPortal::new(custody.transfer_carrier, region.table(), spaces, &nodes)
+            .with_zone(region.zone())
+            .unwrap();
+        // Occupy every production EL1 service slot. This is not a substitute
+        // for the reserved runtime's default executor-pool exhaustion binding.
+        for index in 0..ZONE_SLOTS {
+            let slot = SlotId::from_index(index).unwrap();
+            region.zone().publish_slot(slot, a.raw(), None, 0);
+            region.zone().drive(slot, u64::try_from(index).unwrap() + 1);
+        }
+        let mut identity = carrick_el1_abi::ThreadIdentity {
+            tid: 1000,
+            serial: 1,
+            mm: a.raw(),
+            generation: 1,
+            ..Default::default()
+        };
+        let stopped = region.zone().alloc_record(identity).unwrap();
+        region
+            .zone()
+            .publish_park(stopped, region.zone().next_seq(stopped));
+        identity.tid += 1;
+        identity.mm = b.raw();
+        let live = region.zone().alloc_host_runnable(identity).unwrap();
+        let mut failures = Vec::new();
+        for (mm, root, ipa, expected) in [
+            (a, owner::ROOT, owner::IPA, b'A'),
+            (b, owner::ROOT + 0x100000, owner::IPA + 0x100000, b'B'),
+        ] {
+            let tables = owner::Tables::new(root, ipa, 1);
+            let handle = portal.admitted_handle(mm, 0).unwrap();
+            let selected = owner::selected(owner::select(
+                &portal,
+                &portal
+                    .begin(
+                        handle,
+                        carrick_el1::personality::mm_portal::GuestVa::new(owner::VA),
+                        4,
+                        carrick_el1_abi::PortalTransferIntent::UserRead,
+                        0,
+                    )
+                    .unwrap(),
+                &tables,
+            ));
+            assert_eq!(selected.ipa, ipa, "production owner selected another MM");
+            let (state, snapshot) = install(&custody, handle, &tables, ipa, expected);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let backing = state
+                .retain_physical_backing_in(&custody, &snapshot, deadline)
+                .unwrap();
+            let lease = CarrierForeignMmReadLease {
+                custody: custody.clone(),
+                state,
+                inner: parking_lot::Mutex::new(CarrierLeaseState {
+                    retained: snapshot.clone(),
+                    backing,
+                }),
+            };
+            let mut bytes = [0; 4];
+            match prepare(
+                &lease,
+                &Live(snapshot.clone()),
+                &snapshot,
+                GuestVa(owner::VA),
+                4,
+                deadline,
+            ) {
+                Ok(window) => {
+                    window
+                        .copy_into(
+                            &Live(snapshot.clone()),
+                            &snapshot,
+                            GuestVa(owner::VA),
+                            &mut bytes,
+                            deadline,
+                        )
+                        .unwrap();
+                    assert_eq!(bytes, [expected; 4]);
+                }
+                Err(error) => {
+                    failures.push(format!("mm={} checked owner read: {error:?}", mm.raw()))
+                }
+            }
+        }
+        assert!(matches!(
+            region.zone().record(stopped).claim(),
+            carrick_el1_abi::Claim::Parked { .. }
+        ));
+        assert!(region.zone().record(live).needs_host());
+        assert!(
+            failures.is_empty(),
+            "missing production observer owner binding: {failures:?}"
+        );
+    }
+}
+
 impl std::fmt::Debug for ReadWindow {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadWindow")
