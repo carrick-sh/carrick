@@ -138,6 +138,16 @@ pub struct PageSpan {
 impl PageSpan {
     pub const EMPTY: Self = Self { va: 0, len: 0 };
 
+    /// Descriptor granule containing a byte address. Use this when a caller
+    /// has authorized a byte range but the table operation requires a page.
+    #[must_use]
+    pub const fn containing(va: u64) -> Self {
+        Self {
+            va: va - va % PT_PAGE,
+            len: PT_PAGE,
+        }
+    }
+
     #[must_use]
     pub const fn new(va: u64, len: u64) -> Self {
         Self { va, len }

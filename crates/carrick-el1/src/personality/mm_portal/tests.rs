@@ -237,93 +237,94 @@ fn prepared_bulk_leaf_and_live_residency_select_existing_owner_page() {
         }
     }
 
-    let region = Region::new();
-    let spaces = AddressSpaces::new();
-    let mm = admit(&region, &spaces, 77, ROOT, 8, 0);
-    let view = nodes(&region);
-    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
-    let tables = Tables::new(ROOT, IPA, 0);
-    let maintenance = CallerInvalidatesAsid;
-    let words = tables.live(&maintenance);
-    let first = VA;
-    let later = VA + 4 * 4096;
-    let length = 8 * 4096;
-    let mut journal = InlineJournal::new();
-    let nz = |value| NonZeroU64::new(value).unwrap();
-    let outcome = execute_descriptor_op(
-        &words,
-        SubstrateGpa(ROOT),
-        DescriptorOp::Prepare {
-            publication: GuestLeafPublication {
-                va: first,
-                ipa: IPA,
-                len: length,
-                writable: true,
-                executable: false,
-            },
-            resident: PageSpan::new(first, 4096),
-            backing: BackingIdentity {
-                frame_id: nz(6),
-                mapping_id: nz(7),
-                owner_generation: nz(8),
-                inventory_revision: nz(9),
-            },
-        },
-        &TableGrants::NONE,
-        &mut journal,
-    );
-    assert!(
-        matches!(outcome, DescriptorOutcome::Applied(_)),
-        "{outcome:?}"
-    );
-    let residency = residency();
-    residency
-        .publish(FrameGrantResidencyIdentity {
-            mm_key: mm.raw(),
-            semantic_base: first,
-            physical_ipa: IPA,
-            len: length,
-            mapping_id: 7,
-            frame_id: 6,
-            owner_generation: 8,
-            inventory_revision: 9,
-        })
-        .unwrap();
-    let page = residency.lookup(mm.raw(), later).unwrap();
-    assert_eq!(page.expected_ipa, IPA + 4 * 4096);
-    let transfer = portal
-        .begin(
-            portal.admitted_handle(mm, 0).unwrap(),
-            GuestVa::new(later + 5),
-            4091,
-            TransferIntent::UserWrite,
-            0,
-        )
-        .unwrap();
-    let mut prepared = Prepared {
-        tables: &tables,
-        result: core::cell::Cell::new(None),
-    };
-    let selected = portal
-        .select(
-            &transfer,
+    for (length, page_offset) in [(4 * 4096, 2 * 4096), (8 * 4096, 4 * 4096)] {
+        let region = Region::new();
+        let spaces = AddressSpaces::new();
+        let mm = admit(&region, &spaces, 77, ROOT, 8, 0);
+        let view = nodes(&region);
+        let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+        let tables = Tables::new(ROOT, IPA, 0);
+        let maintenance = CallerInvalidatesAsid;
+        let words = tables.live(&maintenance);
+        let first = VA;
+        let later = VA + page_offset;
+        let mut journal = InlineJournal::new();
+        let nz = |value| NonZeroU64::new(value).unwrap();
+        let outcome = execute_descriptor_op(
             &words,
-            &mut prepared,
-            &mut NoopCowResolver,
-            &residency,
-            0,
-        )
-        .unwrap();
-    assert_eq!(
-        prepared.result.get(),
-        Some(Ok(GuestPreparedCommit::Committed)),
-        "prepared leaf refused the exact live residency"
-    );
-    let TransferStep::Selected(selected) = selected else {
-        panic!("live prepared grant requested a second physical owner: {selected:?}")
-    };
-    assert_eq!(selected.ipa, IPA + 4 * 4096 + 5);
-    assert!(residency.is_guest_committed(mm.raw(), later));
+            SubstrateGpa(ROOT),
+            DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va: first,
+                    ipa: IPA,
+                    len: length,
+                    writable: true,
+                    executable: false,
+                },
+                resident: PageSpan::new(first, 4096),
+                backing: BackingIdentity {
+                    frame_id: nz(6),
+                    mapping_id: nz(7),
+                    owner_generation: nz(8),
+                    inventory_revision: nz(9),
+                },
+            },
+            &TableGrants::NONE,
+            &mut journal,
+        );
+        assert!(
+            matches!(outcome, DescriptorOutcome::Applied(_)),
+            "{outcome:?}"
+        );
+        let residency = residency();
+        residency
+            .publish(FrameGrantResidencyIdentity {
+                mm_key: mm.raw(),
+                semantic_base: first,
+                physical_ipa: IPA,
+                len: length,
+                mapping_id: 7,
+                frame_id: 6,
+                owner_generation: 8,
+                inventory_revision: 9,
+            })
+            .unwrap();
+        let page = residency.lookup(mm.raw(), later).unwrap();
+        assert_eq!(page.expected_ipa, IPA + page_offset);
+        let transfer = portal
+            .begin(
+                portal.admitted_handle(mm, 0).unwrap(),
+                GuestVa::new(later + 5),
+                4091,
+                TransferIntent::UserWrite,
+                0,
+            )
+            .unwrap();
+        let mut prepared = Prepared {
+            tables: &tables,
+            result: core::cell::Cell::new(None),
+        };
+        let selected = portal
+            .select(
+                &transfer,
+                &words,
+                &mut prepared,
+                &mut NoopCowResolver,
+                &residency,
+                0,
+            )
+            .unwrap();
+        assert_eq!(
+            prepared.result.get(),
+            Some(Ok(GuestPreparedCommit::Committed)),
+            "prepared leaf refused the exact live residency"
+        );
+        let TransferStep::Selected(selected) = selected else {
+            panic!("live prepared grant requested a second physical owner: {selected:?}")
+        };
+        assert_eq!(selected.ipa, IPA + page_offset + 5);
+        assert!(residency.is_guest_committed(mm.raw(), later));
+    }
 }
 
 #[test]
