@@ -484,6 +484,20 @@ pub fn resolve_short_sha_for_receipt(
     sha12[..9.min(sha12.len())].to_string()
 }
 
+fn rsync_command() -> Command {
+    let mut command = Command::new("rsync");
+    // Match the old macOS rsync shell-argument contract even with Linux rsync
+    // 3.2.4+, which otherwise escapes our shell quotes a second time. Older
+    // clients ignore these env vars; both sides receive the same quoted paths.
+    command.env("RSYNC_OLD_ARGS", "1");
+    command.env("RSYNC_PROTECT_ARGS", "0");
+    command
+}
+
+fn remote_rsync_path(host: &str, path: &str) -> String {
+    format!("{host}:{}", shell_quote(path))
+}
+
 fn use_local_probes(local_dir: &Path) -> bool {
     fs::read_dir(local_dir).is_ok_and(|entries| {
         entries.flatten().any(|entry| {
@@ -532,8 +546,8 @@ fn copy_probe_executables(
         run_ssh_command(host, &mkdir_cmd)?;
 
         let local_src = format!("{}/", local_dir.display());
-        let remote_target = format!("{host}:\"{remote_dest}/\"");
-        let rsync_output = Command::new("rsync")
+        let remote_target = remote_rsync_path(host, &format!("{remote_dest}/"));
+        let rsync_output = rsync_command()
             .args([
                 "-avz",
                 "-e",
@@ -554,6 +568,37 @@ fn copy_probe_executables(
                 details: format!("failed to rsync probes for {target}: {stderr}"),
             });
         }
+    }
+    Ok(())
+}
+
+fn fetch_remote_path(
+    host: &str,
+    source: &str,
+    destination: &Path,
+) -> Result<(), RemoteAcceptError> {
+    let output = rsync_command()
+        .args([
+            "-avz",
+            "-e",
+            "ssh -o BatchMode=yes -o ConnectTimeout=10",
+            &remote_rsync_path(host, source),
+            &destination.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|source| RemoteAcceptError::Io {
+            path: destination.to_path_buf(),
+            source,
+        })?;
+    if !output.status.success() {
+        return Err(RemoteAcceptError::Ssh {
+            host: host.to_string(),
+            details: format!(
+                "rsync fetch of {source} failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ),
+        });
     }
     Ok(())
 }
@@ -751,30 +796,18 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
     // Copy only target/el1-gate/<short_sha>/ for THIS sha
     let short_sha = resolve_short_sha_for_receipt(&host, &worktree_dir, &sha12, Some(&local_root));
     let remote_receipt_src = format!("{worktree_dir}/target/el1-gate/{short_sha}/");
-    let local_receipt_dest = format!("{}/", local_dest.display());
-    let _ = Command::new("rsync")
-        .args([
-            "-avz",
-            "-e",
-            "ssh -o BatchMode=yes -o ConnectTimeout=10",
-            &format!("{host}:\"{remote_receipt_src}\""),
-            &local_receipt_dest,
-        ])
-        .output();
-
+    let mut exit_code = exit_code;
+    if let Err(error) = fetch_remote_path(&host, &remote_receipt_src, &local_dest) {
+        eprintln!("Warning: failed to fetch remote receipt: {error}");
+        exit_code = 1;
+    }
     let remote_log_src = format!("{remote_run_dir_path}/accept.log");
     let local_log_dest = local_dest.join("accept.log");
-    let _ = Command::new("rsync")
-        .args([
-            "-avz",
-            "-e",
-            "ssh -o BatchMode=yes -o ConnectTimeout=10",
-            &format!("{host}:\"{remote_log_src}\""),
-            &local_log_dest.to_string_lossy(),
-        ])
-        .output();
+    if let Err(error) = fetch_remote_path(&host, &remote_log_src, &local_log_dest) {
+        eprintln!("Warning: failed to fetch remote log: {error}");
+        exit_code = 1;
+    }
 
-    let mut exit_code = exit_code;
     if let Ok(log_content) = fs::read_to_string(&local_log_dest) {
         if let Some(summary) = extract_summary(&log_content) {
             println!("\n{summary}");
@@ -800,7 +833,12 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
     }
 
     let local_receipt = local_receipt_path(&local_root, &run_id);
-    println!("Local receipt path: {}", local_receipt.display());
+    if local_receipt.is_file() {
+        println!("Local receipt path: {}", local_receipt.display());
+    } else {
+        eprintln!("Warning: receipt missing at {}", local_receipt.display());
+        exit_code = 1;
+    }
 
     let prune_cmd = build_prune_runs_cmd(&gate_runs_dir, MAX_RECENT_GATE_RUNS);
     if let Err(e) = run_ssh_command(&host, &prune_cmd) {
@@ -813,6 +851,25 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_rsync_paths_use_one_shell_quoting_layer() {
+        let path = "/remote root/worker's $receipt.log";
+        assert_eq!(
+            remote_rsync_path("gate", path),
+            "gate:'/remote root/worker'\\''s $receipt.log'"
+        );
+        let command = rsync_command();
+        let env: Vec<_> = command.get_envs().collect();
+        assert!(env.contains(&(
+            std::ffi::OsStr::new("RSYNC_OLD_ARGS"),
+            Some(std::ffi::OsStr::new("1"))
+        )));
+        assert!(env.contains(&(
+            std::ffi::OsStr::new("RSYNC_PROTECT_ARGS"),
+            Some(std::ffi::OsStr::new("0"))
+        )));
+    }
 
     #[test]
     fn linux_missing_probes_use_remote_prebuilt() {
