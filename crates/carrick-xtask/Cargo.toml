@@ -27,3 +27,6 @@ flate2.workspace = true
 tar.workspace = true
 
 carrick-conformance = { path = "../carrick-conformance" }
+
+[dev-dependencies]
+yaml-rust2 = { version = "0.13", default-features = false }
