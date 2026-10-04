@@ -612,6 +612,36 @@ fn admitted_private_file_mmap_keeps_partial_last_page_in_owner_root() {
 }
 
 #[test]
+fn guest_fixed_anonymous_replacement_retires_stale_file_bus_range() {
+    let mut dispatcher = SyscallDispatcher::new();
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; PAGE as usize]);
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    let file = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        0,
+        3 * PAGE,
+        LINUX_PROT_READ | LINUX_PROT_WRITE,
+        LINUX_MAP_PRIVATE,
+        FILE_FD,
+    )) as u64;
+    let replaced = file + PAGE;
+    assert!(dispatcher.mmap_fault_is_sigbus(replaced));
+    root.guest_mmap(
+        Placement::Fixed(replaced),
+        PAGE,
+        ReservationProtection::READ_WRITE,
+    )
+    .unwrap();
+    assert!(root.lock().mapping(replaced).unwrap().anonymous);
+    assert!(
+        !dispatcher.mmap_fault_is_sigbus(replaced),
+        "owner replacement must supersede the host's stale EOF record"
+    );
+}
+
+#[test]
 fn fixed_file_overlap_replaces_old_owner_source_offset() {
     let mut dispatcher = SyscallDispatcher::new();
     let bytes: Vec<u8> = (0..4 * PAGE as usize)
