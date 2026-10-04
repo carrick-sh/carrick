@@ -33,7 +33,9 @@ use carrick_kernel::thread::{FutexTable, ThreadId, ThreadRegistry};
 use parking_lot::{Condvar, Mutex};
 
 use crate::memory::TaskMemory;
-use crate::operand::{Expect, Layout, Operand, Save, Step, Syscall};
+use crate::operand::{
+    Expect, Layout, Operand, Save, ScriptCheckpoint, ScriptPausePoint, Step, Syscall,
+};
 use crate::process::{AddressSpace, AddressSpaceError, AsidAllocator, ExampleProcess};
 use crate::report::{Completion, Output, RunReport};
 
@@ -111,6 +113,14 @@ pub struct ScriptedBackend {
     fs_backend: Option<Box<dyn carrick_vfs::fs_backend::FsBackend>>,
     rootfs_layer: Option<carrick_vfs::rootfs::RootFs>,
     root_exit_checkpoint: Option<crate::operand::ScriptCheckpoint>,
+    pauses: Vec<ScriptPause>,
+}
+
+struct ScriptPause {
+    label: &'static str,
+    point: ScriptPausePoint,
+    reached: ScriptCheckpoint,
+    resume: ScriptCheckpoint,
 }
 
 impl Default for ScriptedBackend {
@@ -131,6 +141,7 @@ impl ScriptedBackend {
             fs_backend: None,
             rootfs_layer: None,
             root_exit_checkpoint: None,
+            pauses: Vec::new(),
         }
     }
 
@@ -154,6 +165,25 @@ impl ScriptedBackend {
         checkpoint: crate::operand::ScriptCheckpoint,
     ) -> Self {
         self.root_exit_checkpoint = Some(checkpoint);
+        self
+    }
+
+    /// Pause the first matching operation at a kernel boundary. The peer waits
+    /// on `reached`, performs its operation, then signals `resume`. Missing peer
+    /// progress fails under the existing wait bound, without sleeps or retries.
+    pub fn with_pause(
+        mut self,
+        label: &'static str,
+        point: ScriptPausePoint,
+        reached: ScriptCheckpoint,
+        resume: ScriptCheckpoint,
+    ) -> Self {
+        self.pauses.push(ScriptPause {
+            label,
+            point,
+            reached,
+            resume,
+        });
         self
     }
 
@@ -194,6 +224,7 @@ impl ScriptedBackend {
             wait_service,
             process_exit_codes: Mutex::new(std::collections::HashMap::new()),
             work_scope: work_scope.clone(),
+            pauses: Mutex::new(self.pauses),
         });
         let process = Arc::new(process);
         let mut dispatcher = SyscallDispatcher::with_bridges(self.bridges);
@@ -255,6 +286,12 @@ impl ScriptedBackend {
         }
         let script_exit_code = root_exit?;
         joined?;
+        if let Some(pause) = shared.pauses.lock().first() {
+            return Err(ExampleError::Script(format!(
+                "unused checkpoint for {} at {:?}",
+                pause.label, pause.point
+            )));
+        }
         if let Some((pid, tid, error)) = ledger.task_failures.into_iter().next() {
             return Err(ExampleError::Task {
                 pid,
@@ -324,9 +361,31 @@ pub(crate) struct Shared {
     pub(crate) wait_service: CarrierWaitService,
     pub(crate) process_exit_codes: Mutex<std::collections::HashMap<i32, i32>>,
     pub(crate) work_scope: carrick_observability::work_meter::WorkScope,
+    pauses: Mutex<Vec<ScriptPause>>,
 }
 
 impl Shared {
+    pub(crate) fn pause(
+        &self,
+        label: &'static str,
+        point: ScriptPausePoint,
+    ) -> Result<(), ExampleError> {
+        let pause = {
+            let mut pauses = self.pauses.lock();
+            pauses
+                .iter()
+                .position(|pause| pause.label == label && pause.point == point)
+                .map(|index| pauses.remove(index))
+        };
+        if let Some(pause) = pause {
+            pause.reached.signal();
+            if !pause.resume.wait() {
+                return Err(ExampleError::WaitTimedOut(label));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn register_active_token(&self, task_key: TaskKey, token: ContinuationWakeToken) {
         self.active_wait_tokens.lock().push((task_key, token));
     }
@@ -561,8 +620,13 @@ impl Task {
                                     "fork must be followed by child_marker".to_owned(),
                                 ));
                             };
-                            let child_pid =
-                                self.on_fork(flags, exit_signal, child_script, shared)?;
+                            let child_pid = self.on_fork(
+                                syscall.label,
+                                flags,
+                                exit_signal,
+                                child_script,
+                                shared,
+                            )?;
                             self.last_child = Some(child_pid);
                             self.finish_syscall(syscall, Ok(child_pid as i64), outs, shared)?;
                         }
@@ -576,6 +640,7 @@ impl Task {
                                 ));
                             };
                             let child_tid = self.on_clone_thread(
+                                syscall.label,
                                 flags,
                                 clear_child_tid_addr,
                                 child_script,
@@ -614,6 +679,7 @@ impl Task {
                                 }),
                             };
                             self.on_exit(code, shared)?;
+                            shared.pause(syscall.label, ScriptPausePoint::AfterProcessExit)?;
                             expectation_check?;
                             return Ok(code);
                         }
@@ -1099,6 +1165,7 @@ impl Task {
     /// two are instrumentation, the last were refused before this point.
     fn on_fork(
         &mut self,
+        label: &'static str,
         flags: u64,
         exit_signal: u32,
         child_script: &[Step],
@@ -1119,6 +1186,7 @@ impl Task {
         let child_tid = ThreadId::from_guest_supplied_tid(child_pid);
         let space = AddressSpace::allocate(&shared.asids)?;
         let prepared = reservation.prepare_with_mm_backend(space.mm_backend(), child_tid)?;
+        shared.pause(label, ScriptPausePoint::AfterForkPreparation)?;
 
         let parent_mm_id = parent.shared().mm().id();
         let child_mm_id = prepared.child_mm_id();
@@ -1180,12 +1248,12 @@ impl Task {
     /// address space, dispatcher, and futex table.
     fn on_clone_thread(
         &mut self,
+        label: &'static str,
         flags: u64,
         clear_child_tid_addr: u64,
         child_script: &[Step],
         shared: &Arc<Shared>,
     ) -> Result<Result<i32, LinuxErrno>, ExampleError> {
-        let _dispatcher = self.dispatcher.lock();
         let parent = &self.context;
         let plan = ClonePlan::from_flags(LinuxCloneFlags::from_bits_retain(flags))?;
         // clone(2) EAGAIN when the real uid is at its RLIMIT_NPROC soft
@@ -1199,8 +1267,15 @@ impl Task {
         };
         let child_tid = reservation.visible_tid();
         let thread_id = ThreadId::from_guest_supplied_tid(child_tid);
+        shared.pause(label, ScriptPausePoint::AfterCloneReservation)?;
 
         let prepared = reservation.prepare(thread_id)?;
+        shared.pause(label, ScriptPausePoint::AfterClonePreparation)?;
+        // Preparation owns its exact resources and can overlap a sibling's
+        // fork. Serialize publication with this backend's terminal paths.
+        let _dispatcher = self.dispatcher.lock();
+        let prepared = prepared.reserve_publication_eventually()?;
+        shared.pause(label, ScriptPausePoint::AfterClonePublicationReservation)?;
         let published = prepared.commit()?;
         let child_context = published.into_context()?;
 

@@ -405,6 +405,7 @@ pub(crate) fn drive(
                     continuation.bind_product_futex(&task.futex_table);
 
                     let mut registration = shared.wait_service.prepare_registration(&continuation);
+                    shared.pause(syscall.label, crate::ScriptPausePoint::BeforeWaitEnrollment)?;
                     shared.wait_service.enroll(&mut registration).map_err(|e| {
                         ExampleError::Unsupported(format!("wait service enroll failed: {e}"))
                     })?;
