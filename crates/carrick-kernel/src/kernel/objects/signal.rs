@@ -736,6 +736,21 @@ impl ThreadSignalState {
         self.blocked = blocked;
     }
 
+    /// Apply the existing handler-state transition as one leaf operation.
+    /// The caller supplies its sanitized mask; no memory or register authority
+    /// is acquired here.
+    pub(crate) fn enter_handler(&mut self, handler_mask: SigSet, on_altstack: bool) -> SigSet {
+        let saved = self
+            .take_armed_restore_mask()
+            .unwrap_or_else(|| self.blocked());
+        self.set_blocked(handler_mask);
+        self.push_handler_frame(HandlerFrameState {
+            on_altstack,
+            restore_mask: None,
+        });
+        saved
+    }
+
     pub const fn pending(&self) -> SigSet {
         self.pending.present()
     }

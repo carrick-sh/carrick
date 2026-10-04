@@ -71,6 +71,47 @@ pub struct SigframeRestore {
     pub magic: u64,
 }
 
+/// Encoded Linux frame staging. This owns bytes, not permission to write the
+/// stack: the owner must authorize and complete the transfer before activation.
+pub struct SignalFrameImage {
+    frame: carrick_abi::CarrickSigframe,
+    address: carrick_guest_mem::GuestVa,
+    params: InjectParams,
+}
+
+impl SignalFrameImage {
+    pub fn address(&self) -> carrick_guest_mem::GuestVa {
+        self.address
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        self.frame.as_bytes()
+    }
+
+    pub fn saved_pc(&self) -> carrick_guest_mem::GuestVa {
+        carrick_guest_mem::GuestVa(self.frame.saved_pc)
+    }
+}
+
+/// Decoded and validated Linux resume state. Construction performs no register,
+/// mask, or handler-stack mutation and grants no authority to select an MM.
+pub struct ValidatedSigreturn {
+    mcontext: carrick_abi::LinuxSignalContext,
+    sigmask: u64,
+    magic: u64,
+    frame_sp: carrick_guest_mem::GuestVa,
+}
+
+impl ValidatedSigreturn {
+    pub fn sigmask(&self) -> carrick_abi::SigSet {
+        carrick_abi::SigSet::from_raw(self.sigmask)
+    }
+
+    pub fn saved_pc(&self) -> carrick_guest_mem::GuestVa {
+        carrick_guest_mem::GuestVa(self.mcontext.pc)
+    }
+}
+
 fn signal_frame_memory_error_code(error: &MemoryError) -> i32 {
     match error {
         MemoryError::OutOfBounds { .. } => 1,
@@ -85,15 +126,12 @@ fn signal_frame_memory_error_code(error: &MemoryError) -> i32 {
     }
 }
 
-/// Build a `CarrickSigframe` for `p.signum`, write it to the guest's user
-/// stack, and redirect the vCPU to the handler. Preserves the pre-signal
-/// register state in the frame so [`restore_sigframe`] recovers it on
-/// `rt_sigreturn`. Returns the new SP and the frame's saved PC for the caller's
-/// telemetry. See `SyscallTrap::inject_signal` for the full per-field contract.
-pub fn build_sigframe<E: RegAccess + CurrentMmMemory>(
-    engine: &mut E,
+/// Encode the interrupted state without accessing guest memory or changing
+/// registers. Frame delivery and owner transfer use this one codec.
+pub fn encode_sigframe<E: RegAccess>(
+    engine: &E,
     p: InjectParams,
-) -> Result<SigframeInject, TrapError> {
+) -> Result<SignalFrameImage, TrapError> {
     let mut frame = carrick_abi::CarrickSigframe::empty();
     frame.signum = p.signum as u32;
     for i in 0..31 {
@@ -236,6 +274,25 @@ pub fn build_sigframe<E: RegAccess + CurrentMmMemory>(
     // (LTP sigaltstack01 deliberately exercises that).
     let frame_bytes = frame.as_bytes();
     let new_sp = signal_frame_stack_pointer(frame.saved_sp, p.altstack, frame_bytes.len())?;
+    Ok(SignalFrameImage {
+        frame,
+        address: carrick_guest_mem::GuestVa(new_sp),
+        params: p,
+    })
+}
+
+/// Write the encoded frame and activate the handler only after successful
+/// transfer. The existing backend transport remains here until N1's explicit
+/// SignalFrame binding replaces it; it is not an owner completion receipt.
+pub fn build_sigframe<E: RegAccess + CurrentMmMemory>(
+    engine: &mut E,
+    p: InjectParams,
+) -> Result<SigframeInject, TrapError> {
+    let image = encode_sigframe(engine, p)?;
+    let new_sp = image.address().raw();
+    let frame_bytes = image.bytes();
+    let p = &image.params;
+    let frame = &image.frame;
     // A prepared lazy leaf is not yet a valid stage-1 translation. The
     // backend authenticates Linux write intent and commits first touch before
     // the ordinary whole-range host-buffer check below.
@@ -414,7 +471,43 @@ pub fn restore_sigframe<E: RegAccess + CurrentMmMemory>(
         // guest-reachable, so deliver a guest SIGSEGV (force_sigsegv), not a
         // fatal runtime abort. Mirrors build_sigframe's write arm.
         .map_err(|_| TrapError::SignalDeliveryFault)?;
-    let frame = carrick_abi::CarrickSigframe::read_from_bytes(&bytes)
+    let validated = decode_sigreturn(carrick_guest_mem::GuestVa(sp), &bytes)?;
+    let ValidatedSigreturn {
+        mcontext,
+        sigmask: restored_sigmask,
+        magic,
+        frame_sp,
+    } = validated;
+    let saved_x = mcontext.regs;
+    for (i, value) in saved_x.iter().enumerate() {
+        engine.set_reg(Reg::X(i as u32), *value)?;
+    }
+    // Restore V0–V31 + FPSR/FPCR from the fpsimd_context the matching
+    // build_sigframe stored (a handler may have mutated it). Skip silently if
+    // the record's magic is absent (older/foreign frame) — never restore
+    // garbage over the vector registers.
+    restore_fpsimd(engine, &mcontext, fpsimd_enabled)?;
+    let saved_pc = mcontext.pc;
+    let saved_sp = mcontext.sp;
+    let saved_spsr = mcontext.pstate;
+    engine.set_reg(Reg::ElrEl1, saved_pc)?;
+    engine.set_reg(Reg::Sp, saved_sp)?;
+    engine.set_reg(Reg::SpsrEl1, saved_spsr)?;
+    Ok(SigframeRestore {
+        sigmask: restored_sigmask,
+        saved_pc,
+        frame_sp: frame_sp.raw(),
+        magic,
+    })
+}
+
+/// Decode exactly one frame supplied by a completed read. This codec neither
+/// chooses its source nor mutates guest state on a malformed ucontext.
+pub fn decode_sigreturn(
+    frame_sp: carrick_guest_mem::GuestVa,
+    bytes: &[u8],
+) -> Result<ValidatedSigreturn, TrapError> {
+    let frame = carrick_abi::CarrickSigframe::read_from_bytes(bytes)
         .map_err(|_| TrapError::Hypervisor("sigframe decode failed".to_string()))?;
     let magic = frame.magic;
 
@@ -437,25 +530,10 @@ pub fn restore_sigframe<E: RegAccess + CurrentMmMemory>(
         // a runtime abort.
         return Err(TrapError::SignalDeliveryFault);
     }
-    let saved_x = mcontext.regs;
-    for (i, value) in saved_x.iter().enumerate() {
-        engine.set_reg(Reg::X(i as u32), *value)?;
-    }
-    // Restore V0–V31 + FPSR/FPCR from the fpsimd_context the matching
-    // build_sigframe stored (a handler may have mutated it). Skip silently if
-    // the record's magic is absent (older/foreign frame) — never restore
-    // garbage over the vector registers.
-    restore_fpsimd(engine, &mcontext, fpsimd_enabled)?;
-    let saved_pc = mcontext.pc;
-    let saved_sp = mcontext.sp;
-    let saved_spsr = mcontext.pstate;
-    engine.set_reg(Reg::ElrEl1, saved_pc)?;
-    engine.set_reg(Reg::Sp, saved_sp)?;
-    engine.set_reg(Reg::SpsrEl1, saved_spsr)?;
-    Ok(SigframeRestore {
+    Ok(ValidatedSigreturn {
+        mcontext,
         sigmask: restored_sigmask,
-        saved_pc,
-        frame_sp: sp,
+        frame_sp,
         magic,
     })
 }
@@ -641,6 +719,40 @@ mod tests {
             fault_esr: 0,
             fpsimd_enabled: false,
             sigreturn_trampoline_base: 0x7100,
+        }
+    }
+
+    #[test]
+    fn signal_frame_codec_stages_without_memory_or_register_effects() {
+        for restart in [false, true] {
+            let engine = FrameEngine::new();
+            let before = engine.registers.clone();
+            let image = encode_sigframe(&engine, params(restart)).unwrap();
+            assert_eq!(engine.registers, before);
+            assert_eq!(engine.unmanaged_transfers, 0);
+            let decoded = decode_sigreturn(image.address(), image.bytes()).unwrap();
+            assert_eq!(decoded.sigmask(), carrick_abi::SigSet::from_raw(0x123));
+            assert_eq!(
+                decoded.saved_pc(),
+                carrick_guest_mem::GuestVa(if restart { 0x4000 } else { 0x4004 })
+            );
+
+            // A Linux-shaped frame rebuilt without Carrick's private trailer
+            // remains valid (Rosetta); the ucontext is authoritative.
+            let mut foreign = carrick_abi::CarrickSigframe::read_from_bytes(image.bytes()).unwrap();
+            foreign.magic = 0;
+            assert_eq!(
+                decode_sigreturn(image.address(), foreign.as_bytes())
+                    .unwrap()
+                    .saved_pc(),
+                decoded.saved_pc(),
+            );
+            foreign.ucontext.uc_mcontext.pstate = 5;
+            assert!(matches!(
+                decode_sigreturn(image.address(), foreign.as_bytes()),
+                Err(TrapError::SignalDeliveryFault)
+            ));
+            assert_eq!(engine.registers, before);
         }
     }
 

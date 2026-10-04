@@ -650,9 +650,6 @@ impl<'a> SignalView<'a> {
         let thread = Self::required_signal_thread(context, tid);
         let sa_flags = carrick_abi::LinuxSaFlags::from_bits_truncate(action.sa_flags);
         let saved = thread.update_signal_state(|state| {
-            let saved = state
-                .take_armed_restore_mask()
-                .unwrap_or_else(|| state.blocked());
             let delivered = if sa_flags.contains(carrick_abi::LinuxSaFlags::NODEFER) {
                 SigSet::EMPTY
             } else {
@@ -664,14 +661,9 @@ impl<'a> SignalView<'a> {
                     .union(delivered)
                     .union(SigSet::from_raw(action.sa_mask[0])),
             );
-            state.set_blocked(handler_mask);
             let on_altstack =
                 sa_flags.contains(carrick_abi::LinuxSaFlags::ONSTACK) && state.altstack().is_some();
-            state.push_handler_frame(crate::kernel::HandlerFrameState {
-                on_altstack,
-                restore_mask: None,
-            });
-            saved
+            state.enter_handler(handler_mask, on_altstack)
         });
         // Change the shared disposition only after releasing the thread leaf.
         if sa_flags.contains(carrick_abi::LinuxSaFlags::RESETHAND) {
