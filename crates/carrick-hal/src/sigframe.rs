@@ -768,6 +768,7 @@ mod tests {
             let restored = restore_sigframe(&mut engine, false).unwrap();
             assert_eq!(restored.sigmask, 0x123);
             assert_eq!(restored.saved_pc, if restart { 0x4000 } else { 0x4004 });
+            assert_eq!(engine.registers.elr, if restart { 0x4000 } else { 0x4004 });
             assert_eq!(
                 engine.registers.x[0],
                 if restart { 0xabba } else { (-4i64) as u64 }
