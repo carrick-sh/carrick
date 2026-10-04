@@ -261,3 +261,27 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         }
     }
 }
+
+/// Bind release authority at the actual zone-bearing guest entrypoint.
+pub fn space_access(
+    zone: &carrick_sched_core::ZoneTables,
+    slot: carrick_sched_core::SlotId,
+) -> carrick_sched_core::spaces::notification::SpaceAccess<'_> {
+    fn deliver(
+        zone: &carrick_sched_core::ZoneTables,
+        waker: carrick_sched_core::Waker,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+    ) {
+        assert!(matches!(waker, carrick_sched_core::Waker::El1 { .. }));
+        if let carrick_sched_core::Waker::El1 { slot } = waker {
+            deliver_completion(zone, slot, effects);
+        }
+    }
+    carrick_sched_core::spaces::notification::SpaceAccess::notified(
+        carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+            zone,
+            waker: carrick_sched_core::Waker::El1 { slot },
+            deliver,
+        },
+    )
+}
