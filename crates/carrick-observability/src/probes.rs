@@ -5254,6 +5254,13 @@ mod real {
         /// First-load BIND's EL1 errno before the host may decline owner
         /// selection. Zero is success; nonzero is the owner service's refusal.
         fn hvpatch__el1__owner__bind__result(_: u64) {}
+        /// One bounded host read through the admitted EL1 owner. Args: guest
+        /// VA, requested length, completed prefix, progress class and detail:
+        /// 0 complete, 1 advanced, 2 physical wait, 3 owner wait, 4 supply,
+        /// 5 retired, 6 refused, 7 omitted suspension, 8 service failure.
+        /// detail is the PortalWaitCause or refused errno for classes 3/6,
+        /// zero otherwise. Never reports guest bytes.
+        fn hvpatch__el1__host__read__progress(_: u64, _: u64, _: u64, _: u32, _: u64) {}
         /// A host-venue step on a delegated MM's reservation root was
         /// refused and fails its syscall. Arg: the `Refusal` ordinal (0 Busy,
         /// 1 Stale, 2 Invalid, 3 Collision, 4 Hole, 5 ForeignMapping,
@@ -6650,6 +6657,19 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_el1_owner_bind_result(errno: u64) {
         carrick_usdt::hvpatch__el1__owner__bind__result!(|| errno);
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_el1_host_read_progress(
+        address: u64,
+        length: u64,
+        offset: u64,
+        class: u32,
+        detail: u64,
+    ) {
+        carrick_usdt::hvpatch__el1__host__read__progress!(|| (
+            address, length, offset, class, detail
+        ));
     }
 
     /// See the `hvpatch__el1__root__host__refusal` provider doc.
@@ -9036,6 +9056,7 @@ mod stub {
     stub!(hvpatch_el1_root_prepublish(mm: u64, phase: u32));
     stub!(hvpatch_el1_owner_selection(phase: u32));
     stub!(hvpatch_el1_owner_bind_result(errno: u64));
+    stub!(hvpatch_el1_host_read_progress(address: u64, length: u64, offset: u64, class: u32, detail: u64));
     stub!(hvpatch_el1_root_host_refusal(refusal: u32));
     stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));
     stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));
