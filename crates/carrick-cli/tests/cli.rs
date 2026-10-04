@@ -12,6 +12,15 @@ fn command() -> Command {
     Command::cargo_bin("carrick").expect("carrick test binary")
 }
 
+// Each child selects this host layout using its own CARRICK_HOME and TMPDIR.
+fn scratch_root(home: &std::path::Path) -> std::path::PathBuf {
+    home.join(if cfg!(target_os = "macos") {
+        "scratch"
+    } else {
+        "carrick"
+    })
+}
+
 #[test]
 fn exec_backend_help_lists_only_portable_values() {
     command()
@@ -201,6 +210,7 @@ fn network_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args([
             "network",
             "create",
@@ -233,6 +243,7 @@ fn network_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["network", "create", other_network_name])
         .assert()
         .success();
@@ -240,6 +251,7 @@ fn network_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["network", "inspect", network_name, other_network_name])
         .assert()
         .success()
@@ -266,6 +278,7 @@ fn network_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["network", "ls"])
         .assert()
         .success()
@@ -274,6 +287,7 @@ fn network_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args([
             "network",
             "create",
@@ -287,6 +301,7 @@ fn network_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["network", "inspect", "carrick_cli_network_from_config"])
         .assert()
         .success()
@@ -297,6 +312,7 @@ fn network_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args([
             "network",
             "rm",
@@ -323,11 +339,14 @@ fn network_cli_connects_and_disconnects_container_resources() {
     }
     let home = tempfile::tempdir().unwrap();
     let id = "b".repeat(64);
-    let cdir = home.path().join("containers").join(&id);
+    let cdir = scratch_root(home.path()).join("containers").join(&id);
     std::fs::create_dir_all(&cdir).unwrap();
+    // Network inspection exposes endpoints only for a live Running container.
+    // The test process keeps this synthetic container live across CLI children.
     let state = serde_json::json!({
         "id": id, "name": "carrick_cli_attach", "image": "img", "command": [],
-        "status": "created", "supervisor_pid": 0, "init_pid": 0,
+        "status": "running", "supervisor_pid": std::process::id(),
+        "init_pid": std::process::id(),
         "created_secs": 0, "exit_code": serde_json::Value::Null, "auto_remove": false,
     });
     std::fs::write(cdir.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
@@ -335,6 +354,7 @@ fn network_cli_connects_and_disconnects_container_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["network", "create", "carrick_cli_attach_net"])
         .assert()
         .success();
@@ -342,6 +362,7 @@ fn network_cli_connects_and_disconnects_container_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args([
             "network",
             "connect",
@@ -366,6 +387,7 @@ fn network_cli_connects_and_disconnects_container_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["network", "inspect", "carrick_cli_attach_net"])
         .assert()
         .success()
@@ -374,12 +396,27 @@ fn network_cli_connects_and_disconnects_container_resources() {
         .stdout(contains("172.31.44.11"))
         .stdout(contains("fd00:carrick::11"))
         .stdout(contains("169.254.44.11"))
-        .stdout(contains("\"GwPriority\":42"))
         .stdout(contains("\"DriverOpts\":{\"mode\":\"bridge\"}"));
+
+    // GwPriority belongs to the container's EndpointSettings in the Engine API.
+    let inspected = Command::cargo_bin("carrick")
+        .unwrap()
+        .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
+        .args(["inspect", "carrick_cli_attach"])
+        .assert()
+        .success();
+    let containers: serde_json::Value =
+        serde_json::from_slice(&inspected.get_output().stdout).unwrap();
+    assert_eq!(
+        containers[0]["NetworkSettings"]["Networks"]["carrick_cli_attach_net"]["GwPriority"],
+        42
+    );
 
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["network", "rm", "carrick_cli_attach_net"])
         .assert()
         .failure()
@@ -388,6 +425,7 @@ fn network_cli_connects_and_disconnects_container_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args([
             "network",
             "disconnect",
@@ -401,6 +439,7 @@ fn network_cli_connects_and_disconnects_container_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["network", "inspect", "carrick_cli_attach_net"])
         .assert()
         .success()
@@ -471,6 +510,7 @@ fn volume_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args([
             "volume",
             "create",
@@ -488,6 +528,7 @@ fn volume_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["volume", "create", volume_name])
         .assert()
         .success()
@@ -495,6 +536,7 @@ fn volume_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["volume", "create", other_volume_name])
         .assert()
         .success()
@@ -503,6 +545,7 @@ fn volume_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["volume", "inspect", volume_name, other_volume_name])
         .assert()
         .success()
@@ -514,10 +557,9 @@ fn volume_cli_manages_docker_style_resources() {
         .stdout(contains("\"Mountpoint\""));
 
     let id = "c".repeat(64);
-    let cdir = home.path().join("containers").join(&id);
+    let cdir = scratch_root(home.path()).join("containers").join(&id);
     std::fs::create_dir_all(&cdir).unwrap();
-    let mountpoint = home
-        .path()
+    let mountpoint = scratch_root(home.path())
         .join("docker-api/volumes")
         .join(volume_name)
         .join("_data");
@@ -538,6 +580,7 @@ fn volume_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["volume", "rm", volume_name])
         .assert()
         .failure()
@@ -546,6 +589,7 @@ fn volume_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["volume", "rm", "-f", volume_name])
         .assert()
         .failure()
@@ -554,6 +598,7 @@ fn volume_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["volume", "rm", "-f", "carrick_cli_missing_volume"])
         .assert()
         .success()
@@ -564,6 +609,7 @@ fn volume_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["volume", "ls"])
         .assert()
         .success()
@@ -572,6 +618,7 @@ fn volume_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args([
             "volume",
             "ls",
@@ -588,6 +635,7 @@ fn volume_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["volume", "ls", "--format", "{{.Name}}"])
         .assert()
         .success()
@@ -597,6 +645,7 @@ fn volume_cli_manages_docker_style_resources() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["volume", "rm", volume_name, other_volume_name])
         .assert()
         .success()
@@ -663,6 +712,7 @@ fn resource_cli_prune_honors_filters() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args([
             "network",
             "create",
@@ -675,12 +725,14 @@ fn resource_cli_prune_honors_filters() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["network", "create", "carrick_cli_prune_other"])
         .assert()
         .success();
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args([
             "network",
             "prune",
@@ -696,6 +748,7 @@ fn resource_cli_prune_honors_filters() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args([
             "volume",
             "create",
@@ -708,12 +761,14 @@ fn resource_cli_prune_honors_filters() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["volume", "create", "carrick_cli_prune_other_volume"])
         .assert()
         .success();
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args([
             "volume",
             "prune",
@@ -728,12 +783,14 @@ fn resource_cli_prune_honors_filters() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["volume", "inspect", "carrick_cli_prune_volume"])
         .assert()
         .success();
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args([
             "volume",
             "prune",
@@ -758,9 +815,9 @@ fn logs_replays_captured_output_for_a_container() {
         return;
     }
     let home = tempfile::tempdir().unwrap();
-    // registry_root == <CARRICK_HOME>/scratch/containers/<id>/
+    // Match the registry selected by the isolated child on this host.
     let id = "a".repeat(64);
-    let cdir = home.path().join("scratch/containers").join(&id);
+    let cdir = scratch_root(home.path()).join("containers").join(&id);
     std::fs::create_dir_all(&cdir).unwrap();
     let state = serde_json::json!({
         "id": id, "name": serde_json::Value::Null, "image": "img", "command": [],
@@ -774,6 +831,7 @@ fn logs_replays_captured_output_for_a_container() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["logs", &id])
         .assert()
         .success()
@@ -784,6 +842,7 @@ fn logs_replays_captured_output_for_a_container() {
     Command::cargo_bin("carrick")
         .unwrap()
         .env("CARRICK_HOME", home.path())
+        .env("TMPDIR", home.path())
         .args(["logs", "--tail", "1", &id])
         .assert()
         .success()
