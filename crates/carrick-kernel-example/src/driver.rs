@@ -271,6 +271,7 @@ pub(crate) fn drive(
             )?;
             (outcome, request)
         };
+        crate::schedule_point!(shared, task, crate::schedule::Point::DispatchUnlocked);
 
         loop {
             match outcome {
@@ -396,6 +397,7 @@ pub(crate) fn drive(
                         }
                     }
 
+                    crate::schedule_point!(shared, task, crate::schedule::Point::ContinuationBuild);
                     let mut continuation =
                         BlockedContinuation::from_dispatch_outcome(blocking_outcome, capture)
                             .map_err(|e| {
@@ -444,6 +446,13 @@ pub(crate) fn drive(
                     // Drive wait service event on host thread. Note: `shared.wake_active_tokens_for_task`
                     // calling `publish_ready` for a retired task is transport notification only:
                     // it prompts this host thread loop to wake and observe exact liveness/retirement.
+                    if shared.schedule.is_some() {
+                        shared.unregister_active_token(token);
+                        let _ = continuation.cancel(CancellationCause::ServiceShutdown);
+                        return Err(ExampleError::Schedule(
+                            "external readiness is not admitted in scheduled scenarios".into(),
+                        ));
+                    }
                     let event_result = block_on_timeout_with_scope(
                         shared.wait_service.event(token),
                         remaining,

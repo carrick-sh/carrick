@@ -68,6 +68,7 @@ support is not a kernel conformance defect.
 | `src/operand.rs`, `src/sys.rs` | Generic vocabulary and syscall constructors. |
 | `src/memory.rs` | Bounded guest-memory allocation and output access. |
 | `src/report.rs` | Per-task completions, outputs, and dispatch accounting. |
+| `src/schedule.rs` | Opt-in graph-local seeded decisions and strict replay at unlocked harness seams. |
 | `src/scripted.rs` | Script execution, process construction, fork, and retirement through public kernel operations. |
 | `src/driver.rs` | Outcome handling and kernel continuation enrollment; bounded parking on `CarrierWaitService`. |
 | `src/process.rs` | `CarrierProcess`, `MmBackend`, and `Stage1MmProjection` implementations with exact kernel identity and address-space bindings. |
@@ -104,3 +105,38 @@ This experimental crate uses public items of `carrick-kernel`, `carrick-hal`,
 keeps its `test-support` dependencies out of the product selection. The root
 manifest's `default-members` selects only `carrick-cli`, preventing accidental
 feature unification into the shipped binary.
+
+## Deterministic scenario schedules
+
+`ScriptedBackend::new().with_schedule(Schedule::explore(seed))` admits one
+actor at a time at the typed `schedule_point!` seams. The run owns its
+coordinator; child identities are registered before their host threads start.
+`Schedule::receipt(result, work_snapshot)` records the exact actor generation,
+point, visit number, runnable set and decision, plus source/fixture hashes.
+`Schedule::replay(receipt)` rejects drift and an unconsumed suffix. Source
+comparison across the known-bad and fixed fd-pin revisions requires an
+explicit `allow_source_pair`.
+
+`just test-vmfree-schedule` checks the product closure and runs replay controls.
+The Linux x86_64 retained `tests/fixtures/fdpin-seed5.json` witnesses the
+pre-fix `fork(2)`/`close(2)`/`exit_group(2)` ordering. Replay it explicitly
+with `VMFREE_REPLAY` and `VMFREE_REQUIRE_FIXED=1` on that revision to expose
+the fd-pin error. After applying the separately owned fd-pin correction in a
+scratch checkout, declare the exact source pair with
+`VMFREE_ALLOW_FIXED_SOURCE` to prove the same ordering passes. The pre-fix
+code borrows a raw host fd; host fd-number reuse can change its outcome on
+macOS even with identical guest decisions. Ordinary kernel semantics tests
+remain unscheduled.
+
+`tests/fixtures/fdpin-seed5-main-prefx.json` records the same scenario with
+the newer task serials from main after reversing only the fd-pin correction.
+It replays on the fixed main with an explicit source pair; ordinary replay
+still refuses to remap exact task identities across revisions.
+
+Receipts name the host OS and architecture. Another host records and replays
+its own decisions; cross-host result and work snapshots are not conflated.
+
+Scheduled scenarios currently refuse external readiness and host checkpoint
+steps. They schedule runnable segments; real reactor events, logical timers,
+internal lock contention and weak-memory orders are later milestones. A
+fixed wall watchdog reports a stranded harness actor.
