@@ -348,6 +348,10 @@ impl SyscallDispatcher {
         binding.capture(crate::kernel::LinuxTid::for_task_leader(binding.task_id()))
     }
 
+    pub fn shared_futex(&self) -> carrick_thread::platform_futex::SharedFutexTable {
+        self.kernel_binding.read().kernel().shared_futex().clone()
+    }
+
     pub fn register_one_task_thread(
         &self,
         parent: &crate::kernel::KernelContext,

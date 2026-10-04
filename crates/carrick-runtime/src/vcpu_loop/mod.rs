@@ -643,7 +643,6 @@ impl KernelState {
 
     pub(crate) fn register_hvpatch_runtime_endpoint(
         self: &Arc<Self>,
-        futex: Arc<FutexTable>,
         kicker: Arc<dyn VcpuRegistry>,
         platform_futex: Arc<dyn PlatformFutex>,
     ) {
@@ -665,7 +664,6 @@ impl KernelState {
         // reaches a PARKED guest only because of it.
         signal_context.task().set_waker(Arc::new(HvpatchTaskWaker {
             task: Arc::downgrade(signal_context.task()),
-            futex,
             kicker,
             platform_futex,
             signal_pump: Arc::clone(&self.signal_pump),

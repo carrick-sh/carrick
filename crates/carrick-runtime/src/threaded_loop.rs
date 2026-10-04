@@ -38,11 +38,12 @@ use carrick_kernel::run_result::{RunResult, RuntimeError};
 /// `HostBackend` host; HVF's kqueue-pump wake is a different mechanism, so HVF
 /// keeps its own loop (`runtime.rs`) — it is migrated last / deferrable.
 pub trait HostBackend: Send + Sync + 'static {
-    /// Wrap a process-private `FutexTable` as this host's `PlatformFutex`
-    /// (its shared-page futex shim — Linux `SYS_futex` / FreeBSD `_umtx_op`).
+    /// Wrap the process-private table and the owning kernel's shared authority
+    /// as this host's `PlatformFutex`.
     fn make_futex(
         &self,
         table: std::sync::Arc<crate::thread::FutexTable>,
+        shared: carrick_thread::platform_futex::SharedFutexTable,
     ) -> std::sync::Arc<dyn carrick_hal::PlatformFutex>;
 
     /// This host's start-only signal-pump control (kick-handler + xsig-ring
@@ -309,26 +310,10 @@ where
     // The CONCRETE process-private futex table, threaded UNCHANGED through the
     // dispatch + complete_futex_wait path (the generation-snapshot lost-wake
     // protocol stays byte-identical). The host's object-safe `PlatformFutex`
-    // wraps the SAME table for the SHARED-futex / notify-signal-pending ops;
-    // the factory rebuilds that pairing over a fresh table on the fork child
-    // side.
+    // wraps this private table together with the kernel's shared authority;
+    // fork replaces only the private side of that pairing.
     let futex = Arc::new(FutexTable::new());
-    // Publish one weak, exact-generation endpoint under the container's typed
-    // identity. The RAII token outlives every helper and removes only this
-    // generation when the loop returns.
-    let _runtime_endpoint = crate::thread::register_container_runtime_endpoint(
-        dispatcher.container().id(),
-        &registry,
-        &futex,
-    );
-    let platform_futex: Arc<dyn carrick_hal::PlatformFutex> = host.make_futex(Arc::clone(&futex));
     let host_for_factory = std::sync::Arc::new(host);
-    let factory_host = Arc::clone(&host_for_factory);
-    let platform_futex_factory: PlatformFutexFactory = Arc::new(
-        move |table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
-            factory_host.make_futex(table)
-        },
-    );
     let signal_pump: Arc<dyn carrick_hal::SignalPumpControl> =
         Arc::from(host_for_factory.make_signal_pump());
     // The live-vCPU registry. Constructing the kicker installs the kick-signal
@@ -336,10 +321,6 @@ where
     // vCPU out of its run ioctl. Built before the kernel so the signal-arrival
     // wake can reach a target vCPU via it.
     let kicker: Arc<dyn carrick_hal::VcpuRegistry> = host_for_factory.make_kicker();
-    // The signal ARRIVAL/wake mechanism. Default kick+futex hosts kick every live
-    // vCPU + nudge the futex; HVF supplies its kqueue-pump wake.
-    let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
-        host_for_factory.make_signal_arrival(&kicker, &platform_futex);
     let setup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::hvpatch::initialize_root_process(&mut engine, &mut dispatcher, carrier)
     }));
@@ -409,6 +390,31 @@ where
                 .kernel_runtime()
                 .map(|runtime| Arc::clone(runtime.directory()))
         });
+    // Root initialization may rebind the dispatcher to an existing carrier
+    // kernel. Capture its authority only after that publication, never from
+    // the provisional one-task bootstrap kernel. Fork factories retain it.
+    let shared_futex = dispatcher.shared_futex();
+    // Publish one weak, exact-generation endpoint under the container's typed
+    // identity. The RAII token outlives every helper and removes only this
+    // generation when the loop returns.
+    let _runtime_endpoint = crate::thread::register_container_runtime_endpoint(
+        dispatcher.container().id(),
+        &registry,
+        &futex,
+        &shared_futex,
+    );
+    let platform_futex: Arc<dyn carrick_hal::PlatformFutex> =
+        host_for_factory.make_futex(Arc::clone(&futex), shared_futex.clone());
+    let factory_host = Arc::clone(&host_for_factory);
+    let platform_futex_factory: PlatformFutexFactory = Arc::new(
+        move |table: Arc<FutexTable>| -> Arc<dyn carrick_hal::PlatformFutex> {
+            factory_host.make_futex(table, shared_futex.clone())
+        },
+    );
+    // The signal ARRIVAL/wake mechanism. Default kick+futex hosts kick every live
+    // vCPU + nudge the futex; HVF supplies its kqueue-pump wake.
+    let signal_arrival: Arc<dyn carrick_hal::SignalArrival> =
+        host_for_factory.make_signal_arrival(&kicker, &platform_futex);
     let kernel = Arc::new(KernelState::new(
         dispatcher,
         signal_pump,
@@ -416,11 +422,7 @@ where
         hvpatch_process,
         shared_hvpatch_runtime,
     ));
-    kernel.register_hvpatch_runtime_endpoint(
-        Arc::clone(&futex),
-        Arc::clone(&kicker),
-        Arc::clone(&platform_futex),
-    );
+    kernel.register_hvpatch_runtime_endpoint(Arc::clone(&kicker), Arc::clone(&platform_futex));
     let mut control_exec = None;
     // Mutating carrier control is mandatory for a managed detached container.
     // Publish Running only after the socket is bound and the exact root task has

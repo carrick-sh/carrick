@@ -281,6 +281,11 @@ and host backing. The VM-free continuation witness
 requires A's wake to reach only A, then requires zero additional waiter entries
 in A while B remains enrolled. This is an exact zero cross-instance budget
 under `kernel.futex.contention`, independent of timing or host process identity.
+`two_shared_authorities_have_no_cross_instance_entries` exercises cloned
+descendant authorities with fresh private tables at 1, 8, 32 and 128 file
+words. Each table holds only its own live keys and returns to zero after
+retirement. Embed host-buffer leases carry the carrier's same typed authority,
+including leases minted before the first kernel root boots.
 
 The signed binding reuses Carrick's futex probes to prove guest execution. A
 separate uninstrumented release run compares the pinned futex distribution with

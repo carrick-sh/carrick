@@ -2387,14 +2387,6 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-thread/src/platform_futex.rs",
-      "symbol": "carrier_shared_futex_table::TABLE",
-      "fingerprint": "37b1584fafd1a4678b218d1509460a70b31bb36914a9cf8b947c03ab62fe5246",
-      "classification": "carrier_infra",
-      "rationale": "Carrier-scoped synchronized infrastructure; it is either immutable, keyed by exact container identity, or coordinates the one host carrier without storing current-container identity."
-    },
-    {
-      "kind": "static",
       "file": "crates/carrick-thread/src/thread.rs",
       "symbol": "FUTEX_HALT_POLL_NS",
       "fingerprint": "4999d3235076fb9bf7d67eddbcb7fa835a18419891bcdc032cc9bdc66ea17974",

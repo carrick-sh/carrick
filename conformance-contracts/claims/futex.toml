@@ -10,6 +10,17 @@ capability = { class = "vm-free-existing", capability = "carrick-kernel-example:
 coverage = { status = "violation-demonstrated", layer = "vm-free", known_bad_revision = "2026-09-18-futex-leak" }
 
 [[claims]]
+id = "kernel.futex.contention.kernel-ownership"
+contract = "kernel.futex.contention"
+description = "Two live kernels on identical file words have zero cross-instance waiter entries or wakes"
+linux_authority = ["man 2 futex"]
+fixture_requirements = ["kernel:two-kernels-same-file-word"]
+related_contracts = ["kernel.futex.requeue"]
+related_ecosystem_rows = ["carrick-embed:shared-buffer"]
+capability = { class = "vm-free-existing", capability = "carrick-kernel::two_kernels_with_the_same_file_word_do_not_share_wakes" }
+coverage = { status = "violation-demonstrated", layer = "vm-free", known_bad_revision = "6a33e26b2" }
+
+[[claims]]
 id = "kernel.futex.requeue.batch-move"
 contract = "kernel.futex.requeue"
 description = "Futex CMP_REQUEUE moves waiters between futex words in single batch"

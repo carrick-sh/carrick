@@ -381,6 +381,7 @@ pub enum ReadinessProbe {
     },
     SharedWord {
         location: SharedFutexLocation,
+        table: carrick_thread::platform_futex::SharedFutexTable,
         generation: FutexWait,
         value: u32,
         deadline: Option<Instant>,
@@ -724,6 +725,7 @@ impl ReadinessProbe {
                 ..
             } => Self::SharedWord {
                 location: *location,
+                table: state.authority.shared_futex.clone(),
                 generation: generation.clone(),
                 value: *value,
                 deadline: state.deadline,
@@ -925,6 +927,7 @@ impl ReadinessProbe {
                 generation,
                 value,
                 deadline,
+                ..
             } => {
                 if let Some(event) = deadline_event(*deadline) {
                     return Some(event);

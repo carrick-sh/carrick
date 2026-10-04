@@ -804,9 +804,11 @@ mod tests {
             ),
             VcpuRegistrationEnrollment::Registered
         ));
-        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
-            crate::threaded_impl::hvf_futex(std::sync::Arc::new(crate::thread::FutexTable::new())),
-        );
+        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> =
+            std::sync::Arc::new(crate::threaded_impl::hvf_futex(
+                std::sync::Arc::new(crate::thread::FutexTable::new()),
+                carrick_thread::platform_futex::SharedFutexTable::new(),
+            ));
         (registry, kicks, futex)
     }
 
@@ -965,9 +967,11 @@ mod tests {
             ),
             VcpuRegistrationEnrollment::Registered
         ));
-        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
-            crate::threaded_impl::hvf_futex(std::sync::Arc::new(crate::thread::FutexTable::new())),
-        );
+        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> =
+            std::sync::Arc::new(crate::threaded_impl::hvf_futex(
+                std::sync::Arc::new(crate::thread::FutexTable::new()),
+                carrick_thread::platform_futex::SharedFutexTable::new(),
+            ));
 
         let pump = spawn_signal_wake_pump(registry, futex);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1009,9 +1013,11 @@ mod tests {
         crate::host_signal::install_default_handlers();
         let registry: std::sync::Arc<dyn carrick_hal::VcpuRegistry> =
             std::sync::Arc::new(VcpuKicker::new());
-        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
-            crate::threaded_impl::hvf_futex(std::sync::Arc::new(crate::thread::FutexTable::new())),
-        );
+        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> =
+            std::sync::Arc::new(crate::threaded_impl::hvf_futex(
+                std::sync::Arc::new(crate::thread::FutexTable::new()),
+                carrick_thread::platform_futex::SharedFutexTable::new(),
+            ));
         let pump = spawn_signal_pump(registry, futex);
         pump.stop();
     }
@@ -1029,9 +1035,11 @@ mod tests {
         crate::host_signal::install_default_handlers();
         let registry: std::sync::Arc<dyn carrick_hal::VcpuRegistry> =
             std::sync::Arc::new(VcpuKicker::new());
-        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> = std::sync::Arc::new(
-            crate::threaded_impl::hvf_futex(std::sync::Arc::new(crate::thread::FutexTable::new())),
-        );
+        let futex: std::sync::Arc<dyn carrick_hal::PlatformFutex> =
+            std::sync::Arc::new(crate::threaded_impl::hvf_futex(
+                std::sync::Arc::new(crate::thread::FutexTable::new()),
+                carrick_thread::platform_futex::SharedFutexTable::new(),
+            ));
         let pump = spawn_signal_pump(registry, futex);
         // Let the pump finish setting up and park in kevent().
         std::thread::sleep(std::time::Duration::from_millis(150));

@@ -13,7 +13,6 @@ use parking_lot::{Condvar, Mutex};
 
 use carrick_fatal::carrick_fatal;
 use carrick_hal::{SignalArrival, VcpuRegistry};
-use carrick_thread::thread::FutexTable;
 
 use crate::vcpu_loop::continuation;
 use crate::vcpu_loop::executor;
@@ -124,12 +123,11 @@ pub(crate) struct HvpatchTaskWaker {
     /// Weak exact task authority. The task owns this waker, so retaining an
     /// `Arc<Task>` here would form a cycle and keep exited processes alive.
     pub(crate) task: Weak<carrick_kernel::kernel::Task>,
-    /// Unparks a `FUTEX_WAIT`, and the futex-backed waits layered on it.
-    pub(crate) futex: Arc<FutexTable>,
     /// Forces the vCPU out of `hv_vcpu_run` so a RUNNING guest reaches a
     /// boundary where it polls. Process-scoped, which is correct here: the
     /// waker is registered per Linux process with that process's own kicker.
     pub(crate) kicker: Arc<dyn VcpuRegistry>,
+    /// Notifies both private waits and this kernel's shared futex waits.
     pub(crate) platform_futex: Arc<dyn carrick_hal::PlatformFutex>,
     pub(crate) signal_pump: Arc<dyn carrick_hal::SignalPumpControl>,
     /// Writes the wake pipes every parked `ThreadWaiter` kqueue watches.
@@ -160,8 +158,7 @@ impl carrick_kernel::kernel::TaskWaker for HvpatchTaskWaker {
             // A task racing physical retirement no longer has an exact thread
             // to target. Preserve the safe compatibility nudge for that brief
             // interval; ordinary live-task wakes never take this path.
-            self.futex.notify_signal_pending();
-            carrick_thread::platform_futex::carrier_shared_futex_table().notify_signal_pending();
+            self.platform_futex.notify_signal_pending();
             self.signal_arrival.wake_all_waiters();
             self.kicker.kick_all();
             return;
@@ -1161,11 +1158,12 @@ impl HvpatchRuntimeDirectory {
 }
 
 pub(crate) fn shared_futex_wake(
+    shared: &carrick_thread::platform_futex::SharedFutexTable,
     location: carrick_guest_mem::SharedFutexLocation,
     count: u32,
 ) -> i64 {
     let host_addr = location.wait_addr().raw();
-    let carrier_woken = carrick_thread::platform_futex::carrier_shared_futex_table().wake(
+    let carrier_woken = shared.table().wake(
         carrick_thread::platform_futex::carrier_shared_futex_key(location),
         count,
     );
@@ -1284,7 +1282,6 @@ mod tests {
         let arrival = Arc::new(RecordingSignalArrival::default());
         let waker = HvpatchTaskWaker {
             task: Arc::downgrade(&task),
-            futex: Arc::new(FutexTable::new()),
             kicker: Arc::new(carrick_hal::GenericVcpuRegistry::default()),
             platform_futex: Arc::new(crate::vcpu_loop::tests::NoopPlatformFutex),
             signal_pump: Arc::new(EndpointTestSignalPump),
