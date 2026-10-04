@@ -2219,6 +2219,7 @@ fn host_mkdirat_existing_root_returns_eexist() {
 }
 
 mod serial_host {
+    #[cfg(target_os = "macos")]
     use super::*;
 
     /// Cached-lower form of the walk fixture: the immutable image tree is a
@@ -11209,6 +11210,7 @@ mod readonly_destination_offsets {
         assert_eq!(host_offset(raw), FILE_OFFSET + 4096);
     }
 
+    #[cfg(target_os = "macos")]
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ParsedDirent {
         ino: u64,
@@ -11218,6 +11220,7 @@ mod readonly_destination_offsets {
         name: String,
     }
 
+    #[cfg(target_os = "macos")]
     fn parse_dirents(buf: &[u8]) -> Vec<ParsedDirent> {
         let mut out = Vec::new();
         let mut offset = 0;
@@ -11248,6 +11251,7 @@ mod readonly_destination_offsets {
     }
 
     mod serial_host {
+        #[cfg(target_os = "macos")]
         use super::*;
 
         #[cfg(target_os = "macos")]

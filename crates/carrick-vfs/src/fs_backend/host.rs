@@ -185,6 +185,7 @@ macro_rules! host_fstat {
     }};
 }
 
+#[cfg(target_os = "macos")]
 macro_rules! host_open {
     ($($arg:expr),* $(,)?) => {{
         #[cfg(any(test, feature = "test-support"))]
@@ -480,13 +481,6 @@ impl DirCacheEntry {
 #[allow(dead_code)]
 pub(crate) struct StatCacheEntry {
     real: RealStat,
-}
-
-#[cfg(not(target_os = "macos"))]
-impl StatCacheEntry {
-    fn is_valid(&self, _current_dir_gen: u64) -> bool {
-        true
-    }
 }
 
 pub(crate) struct WatchResCacheEntry {
@@ -2733,6 +2727,7 @@ impl HostFsBackend {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn may_have_upper_symlinks(&self) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         if self.symlink_seen.load(Relaxed) {
@@ -3801,6 +3796,7 @@ fn fget_u32_xattr(fd: std::os::fd::RawFd, name: &[u8]) -> Option<u32> {
     (n == 4).then(|| u32::from_le_bytes(v))
 }
 
+#[cfg(target_os = "macos")]
 fn lget_u32_xattr(path: *const libc::c_char, name: &[u8]) -> Option<u32> {
     #[cfg(any(test, feature = "test-support"))]
     HOST_XATTR_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -3980,6 +3976,7 @@ pub fn fd_carrick_meta(
 /// Read carrick's guest metadata (mode / owner uid+gid / AF_UNIX-socket marker)
 /// for a path in ONE `llistxattr` plus a targeted `lgetxattr` for only the
 /// attributes actually present — without opening a file descriptor.
+#[cfg(target_os = "macos")]
 pub(crate) fn path_carrick_meta(
     path: *const libc::c_char,
 ) -> (Option<u32>, Option<NsUid>, Option<NsGid>, bool) {
@@ -5926,12 +5923,12 @@ impl FsBackend for HostFsBackend {
         true
     }
 
-    fn create_raw_fd(&self, path: &str, mode: u32, trunc: bool) -> HostFdOpen<(i32, bool)> {
+    fn create_raw_fd(&self, path: &str, _mode: u32, trunc: bool) -> HostFdOpen<(i32, bool)> {
         #[cfg(target_os = "macos")]
         if let Some(normalized) = normalize(path)
             && let Some(rel) = Self::rel_path(&normalized)
         {
-            match self.fast_create_for_guest(rel, mode, trunc) {
+            match self.fast_create_for_guest(rel, _mode, trunc) {
                 HostFdOpen::Served(created) => return HostFdOpen::Served(created),
                 HostFdOpen::Refused(refused) => return HostFdOpen::Refused(refused),
                 HostFdOpen::Unavailable => {}

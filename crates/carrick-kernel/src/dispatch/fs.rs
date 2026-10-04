@@ -1420,6 +1420,7 @@ impl<'a> FsView<'a> {
     /// [`Self::host_pipe_read_end_for_pipe_id`]; the userspace `tee` uses it to
     /// restore the source pipe after peeking its buffered bytes on hosts that
     /// lack `tee(2)`.
+    #[cfg(not(target_os = "linux"))]
     pub(super) fn host_pipe_write_end_for_pipe_id(&self, pipe_id: u64) -> Option<HostFd> {
         if pipe_id == 0 {
             return None;

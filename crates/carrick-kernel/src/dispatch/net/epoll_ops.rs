@@ -27,10 +27,14 @@ use crate::dispatch::{
 mod write_rearm;
 pub(in crate::dispatch) use write_rearm::{IoRearm, WriteRearm};
 
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 const EPOLL_REBIND_REASON_IO_REARM: u32 = 1;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 const EPOLL_REBIND_REASON_CLOSE_DETACH: u32 = 2;
 
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 const EPOLL_REBIND_REASON_WAIT_SAMPLE: u32 = 3;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 const EPOLL_REBIND_REASON_CTL_DEL: u32 = 4;
 
 /// A new epoll description: its kqueue (host-half readiness and the user
@@ -237,6 +241,7 @@ fn listener_level_ready(
     }
 }
 
+#[cfg(any(test, target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
 fn epoll_wait_sample_needs_host_rebind(
     before: u32,
     raw: u32,
@@ -912,7 +917,9 @@ impl<'a> NetView<'a> {
                         return;
                     };
                     if let OpenDescription::Epoll {
-                        interest, kqueue, ..
+                        interest,
+                        kqueue: _kqueue,
+                        ..
                     } = &mut *open
                     {
                         #[cfg(any(
@@ -1043,7 +1050,7 @@ impl<'a> NetView<'a> {
                             host_rearms.dedup();
                             for host_fd in host_rearms {
                                 self.rebind_epoll_host_registration(
-                                    kqueue,
+                                    _kqueue,
                                     interest,
                                     HostFd(host_fd),
                                     EPOLL_REBIND_REASON_IO_REARM,
