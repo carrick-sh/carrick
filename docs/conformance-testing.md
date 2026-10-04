@@ -49,7 +49,10 @@ harnesses with `-D warnings`, fmt-check, and the shared `lint-domains-source` ch
 step executes Linux profiles; live macOS/FreeBSD/NetBSD profiles require those
 hosts and are explicitly recorded in the receipt's skipped steps. Source checks
 and validation of the committed macOS compiler capture still run. This is host
-evidence, not guest execution or complete authority-matrix evidence.
+evidence, not guest execution or complete authority-matrix evidence. Snapshot
+extraction validates every Git archive member before writing; Python versions
+with extraction filters also apply the data filter, while Python 3.11 uses the
+same manifest validation before extraction.
 
 Linux host-policy test exceptions are named with reasons in
 [`scripts/linux-host-test-allowlist.json`](../scripts/linux-host-test-allowlist.json).

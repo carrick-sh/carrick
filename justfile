@@ -178,6 +178,7 @@ lint-domains-source:
     # base, and a discover run would turn that pre-existing red into a
     # blocked gate for every unrelated change.
     python3 -m unittest scripts/migrate/tests/test_reconcile_rename.py scripts/tests/test_rehome_line_pinned_inventories.py
+    python3 -m unittest scripts.tests.test_host_authority_transitions.SnapshotExtractionTest
     python3 -m unittest scripts/tests/test_conformance_contract_policy.py
     cargo run -p carrick-conformance-contract --bin check-contracts -- --root .
     cargo metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
