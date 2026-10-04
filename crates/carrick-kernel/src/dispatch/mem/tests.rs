@@ -80,6 +80,7 @@ pub struct CountingMmapMemory {
     unmap_calls: Cell<usize>,
     fail_unmap_at: Cell<Option<u64>>,
     pub(crate) protect_log: RefCell<Vec<(u64, usize, u64)>>,
+    pub(crate) owner_protect_log: RefCell<Vec<(u64, usize, u64)>>,
     /// Every backend retirement (`unmap_range`), in order.
     pub(crate) unmap_log: RefCell<Vec<(u64, usize)>>,
 }
@@ -139,6 +140,7 @@ impl CountingMmapMemory {
             unmap_calls: Cell::new(0),
             fail_unmap_at: Cell::new(None),
             protect_log: RefCell::new(Vec::new()),
+            owner_protect_log: RefCell::new(Vec::new()),
             unmap_log: RefCell::new(Vec::new()),
         }
     }
@@ -226,6 +228,18 @@ impl GuestMemory for CountingMmapMemory {
 
     fn supports_concurrent_exec_protection(&self) -> bool {
         self.concurrent_exec_protection
+    }
+
+    fn protect_owner_reserved_range(
+        &mut self,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
+        self.owner_protect_log
+            .borrow_mut()
+            .push((address, len, prot));
+        Ok(())
     }
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
