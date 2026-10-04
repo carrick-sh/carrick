@@ -22,6 +22,17 @@
  *     record-ID authority, absent from the old carrier-MM-only IPA index.
  *     The exact PortalWaitCause was Reservations, but no real reservation
  *     was held: this missing lookup could never wake itself.
+ *     hvpatch-el1-host-write-prepare(va, len, phase, detail) observes the
+ *     pre-consume host-copyout permit: phase 0 begin (detail requested bound),
+ *     1 supply (1 grant, 2 COW, 3 metadata), 2 supply result (1 settled,
+ *     0 declined, 2 service error), 3 prepared, 4 owner wait (detail is
+ *     PortalWaitCause), 5 physical wait, 6 fault (1 bounds, 2 host map,
+ *     3 retired, 4 unsupported, 5 metadata allocation, 6 other), 7 limit.
+ *     Live-qualified on signed el1_host_copyout-873518cad531afb9,
+ *     n1f-copyout-attach2-20261004: the original in-memory file read asked
+ *     PREPARE for 20603 bytes at 0x6000004064 and got phase 7 before any
+ *     copyout grant. The portal permit bound is 4096 bytes; this is the
+ *     oversized caller request, not a host read failure or source EOF.
  *     hvpatch-el1-fault-root-mapping(far,start,end,source_handle,source_offset)
  *     observes the admitted root at final fault delivery only. A zero range
  *     means no root mapping; a zero source handle means no retained file
@@ -66,6 +77,14 @@ carrick*:::hvpatch-el1-host-read-progress
     if (arg3 == 3) {
         ustack(16);
     }
+}
+
+carrick*:::hvpatch-el1-host-write-prepare
+/pid == $target || progenyof($target)/
+{
+    printf("EL1HOSTREAD1|ns=%d|copyout-prepare|pid=%d|va=0x%x|len=%d|phase=%d|detail=%d\n",
+        timestamp, pid, arg0, arg1, arg2, arg3);
+    @copyout[arg2, arg3] = count();
 }
 
 carrick*:::hvpatch-el1-host-read-retention
@@ -176,4 +195,5 @@ END
 {
     printa("EL1HOSTREAD1|class=%d|detail=%d|count=%@d\n", @classes);
     printa("EL1HOSTREAD1|retention=%d|count=%@d\n", @retention);
+    printa("EL1HOSTREAD1|copyout-phase=%d|detail=%d|count=%@d\n", @copyout);
 }
