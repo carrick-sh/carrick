@@ -3343,11 +3343,7 @@ impl crate::kernel::FileDescription {
         loop {
             let handle = self.delegation_handle();
             if handle != 0 {
-                let mut guard = d.write();
-                let handle = self.delegation_handle();
-                if handle != 0 {
-                    let _ = crate::el1_delegation::recall_locked(self, &mut guard, handle);
-                }
+                let _ = crate::el1_delegation::recall(self);
             }
             let guard = d.read();
             // The one entry at open may land between the check above and
@@ -3365,24 +3361,29 @@ impl crate::kernel::FileDescription {
     #[track_caller]
     pub(crate) fn write_for_io(&self) -> Option<FileDescriptionWriteGuard<'_>> {
         let d = self.open_description()?;
-        let mut guard = d.write();
-        let handle = self.delegation_handle();
-        if handle != 0 {
-            let _ = crate::el1_delegation::recall_locked(self, &mut guard, handle);
+        loop {
+            let _ = crate::el1_delegation::recall(self);
+            let guard = d.write();
+            // The one initial publication may have won before this guard.
+            // Drop the guard before recall; publication is one-shot.
+            if self.delegation_handle() != 0 {
+                drop(guard);
+                continue;
+            }
+            return Some(FileDescriptionWriteGuard {
+                guard,
+                description: self,
+            });
         }
-        Some(FileDescriptionWriteGuard {
-            guard,
-            description: self,
-        })
     }
 
     #[cfg(test)]
     pub(crate) fn try_write_for_test(&self) -> Option<FileDescriptionWriteGuard<'_>> {
         let d = self.open_description()?;
-        let mut guard = d.try_write()?;
-        let handle = self.delegation_handle();
-        if handle != 0 {
-            let _ = crate::el1_delegation::recall_locked(self, &mut guard, handle);
+        let _ = crate::el1_delegation::recall(self);
+        let guard = d.try_write()?;
+        if self.delegation_handle() != 0 {
+            return None;
         }
         Some(FileDescriptionWriteGuard {
             guard,
