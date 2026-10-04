@@ -1455,6 +1455,7 @@
         "kernel.futex.requeue"
       ],
       "claims": [
+        "kernel.futex.contention.kernel-ownership",
         "kernel.futex.contention.wake-cardinality",
         "kernel.futex.requeue.batch-move"
       ]
