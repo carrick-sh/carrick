@@ -375,7 +375,9 @@ impl HvfVmState {
             let Ok(len) = usize::try_from(span.len) else {
                 continue;
             };
-            self.protections.set_no_write(span.start, len, true);
+            if let Some(protections) = self.protections.legacy() {
+                protections.set_no_write(span.start, len, true);
+            }
         }
     }
 
@@ -513,7 +515,9 @@ impl HvfVmState {
                 shared_process_mm: false,
                 mm_access: MmAccessState::new(
                     carrick_aarch64::Stage1Authority::new(),
-                    std::sync::Arc::new(MemoryProtections::default()),
+                    carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+                        MemoryProtections::default(),
+                    )),
                     std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
                     std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
                     std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),

@@ -1469,7 +1469,9 @@ impl HvfVmState {
         };
         // Exec replaces the exact MM authority as one unit. Old protections,
         // stage-1 state, and COW metadata cannot survive independently.
-        let protections = std::sync::Arc::new(MemoryProtections::default());
+        let protections = carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+            MemoryProtections::default(),
+        ));
         let cow_armed = std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
         let cow_deferred_publications = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
         self.mm_access = MmAccessState::new(

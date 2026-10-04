@@ -156,7 +156,7 @@ fn closed_target_gate_suspends_owned_position() {
 }
 
 #[test]
-fn stopped_lazy_transfer_reuses_fault_grant_mailbox() {
+fn owner_lazy_selection_keeps_supply_owned_when_fault_mailbox_is_occupied() {
     let region = Region::new();
     let spaces = AddressSpaces::new();
     let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
@@ -174,6 +174,42 @@ fn stopped_lazy_transfer_reuses_fault_grant_mailbox() {
         )
         .unwrap();
     let mailbox = FrameGrantMailbox::new();
+    assert!(crate::fault::request_lazy_frames(&mailbox, 99, VA, 1));
+    let result = portal
+        .select(
+            &transfer,
+            &tables.live(&CallerInvalidatesAsid),
+            &mut NoopPreparedResolver,
+            &mut NoopCowResolver,
+            &residency(),
+            0,
+        )
+        .unwrap();
+    assert!(
+        matches!(result, TransferStep::Supply(window) if window.operation.mm == mm),
+        "owner selection must retain its supply receipt independently of fault transport occupancy"
+    );
+    assert_eq!(mailbox.claim_request().unwrap().mm_key, 99);
+}
+
+#[test]
+fn stopped_lazy_transfer_reuses_fault_grant_mailbox() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 1);
+    tables.words[1536].store(0, Ordering::Release);
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserRead,
+            0,
+        )
+        .unwrap();
     let maintenance = CallerInvalidatesAsid;
     assert!(matches!(
         portal
@@ -183,7 +219,6 @@ fn stopped_lazy_transfer_reuses_fault_grant_mailbox() {
                 &mut NoopPreparedResolver,
                 &mut NoopCowResolver,
                 &residency(),
-                &mailbox,
                 0
             )
             .unwrap(),
@@ -263,7 +298,6 @@ fn internal_reads_cannot_name_arbitrary_user_windows() {
                 &mut NoopPreparedResolver,
                 &mut NoopCowResolver,
                 &residency(),
-                &carrick_el1_abi::FrameGrantMailbox::new(),
                 0
             ),
             Err(MmError::Fault)
@@ -318,7 +352,6 @@ fn kernel_only_leaf_does_not_trigger_anonymous_supply() {
             &mut NoopPreparedResolver,
             &mut NoopCowResolver,
             &residency(),
-            &FrameGrantMailbox::new(),
             0
         ),
         Err(MmError::Fault)
@@ -562,7 +595,6 @@ fn stopped_target_untouched_transfer_prepares_only_exact_owner_window() {
     let maintenance = CallerInvalidatesAsid;
     let words = tables.live(&maintenance);
     let residency = residency();
-    let mailbox = FrameGrantMailbox::new();
     let transfer = portal
         .begin(
             portal.admitted_handle(mm, 0).unwrap(),
@@ -579,7 +611,6 @@ fn stopped_target_untouched_transfer_prepares_only_exact_owner_window() {
             &mut NoopPreparedResolver,
             &mut NoopCowResolver,
             &residency,
-            &mailbox,
             0,
         )
         .unwrap()
@@ -631,7 +662,6 @@ fn stopped_target_untouched_transfer_prepares_only_exact_owner_window() {
                 &mut NoopPreparedResolver,
                 &mut NoopCowResolver,
                 &residency,
-                &mailbox,
                 0,
             )
             .unwrap(),
@@ -737,7 +767,6 @@ fn partial_retired_compound_replacement_preserves_live_neighbor() {
         }
     }
     let residency = residency();
-    let mailbox = FrameGrantMailbox::new();
     let transfer = portal
         .begin(
             portal.admitted_handle(mm, 0).unwrap(),
@@ -754,7 +783,6 @@ fn partial_retired_compound_replacement_preserves_live_neighbor() {
             &mut NoopPreparedResolver,
             &mut NoopCowResolver,
             &residency,
-            &mailbox,
             0,
         )
         .unwrap()
@@ -806,7 +834,6 @@ fn partial_retired_compound_replacement_preserves_live_neighbor() {
                 &mut NoopPreparedResolver,
                 &mut NoopCowResolver,
                 &residency,
-                &mailbox,
                 0,
             )
             .unwrap(),
@@ -860,18 +887,15 @@ fn kernel_only_write_denial_is_a_fault_without_supply() {
             0,
         )
         .unwrap();
-    let mailbox = FrameGrantMailbox::new();
     let result = portal.select(
         &transfer,
         &tables.live(&CallerInvalidatesAsid),
         &mut NoopPreparedResolver,
         &mut NoopCowResolver,
         &residency(),
-        &mailbox,
         0,
     );
     assert!(matches!(result, Err(MmError::Fault)), "{result:?}");
-    assert!(mailbox.claim_request().is_none());
 }
 
 #[test]
@@ -1032,7 +1056,6 @@ fn cow_without_publication_capability_refuses_exec_and_instruction_reads_work() 
             0,
         )
         .unwrap();
-    let mailbox = FrameGrantMailbox::new();
     assert_eq!(
         portal.select(
             &write,
@@ -1040,13 +1063,11 @@ fn cow_without_publication_capability_refuses_exec_and_instruction_reads_work() 
             &mut NoopPreparedResolver,
             &mut NoopCowResolver,
             &residency(),
-            &mailbox,
             0
         ),
         Err(MmError::UnsupportedExecutableCow)
     );
     assert_eq!(MmError::UnsupportedExecutableCow.errno(), 95);
-    assert!(mailbox.claim_request().is_none());
     let instruction = portal
         .begin(
             portal.admitted_handle(mm, 0).unwrap(),
@@ -1066,14 +1087,11 @@ fn cow_without_publication_capability_refuses_exec_and_instruction_reads_work() 
                 &mut NoopPreparedResolver,
                 &mut NoopCowResolver,
                 &residency(),
-                &mailbox,
                 0
             )
             .unwrap(),
-        TransferStep::Supply(_)
+        TransferStep::Supply(window) if window.protection.permits(ReservationProtection::from_bits(4).unwrap())
     ));
-    let request = mailbox.claim_request().unwrap();
-    assert_eq!(request.access, 4);
 }
 
 #[test]
@@ -1138,7 +1156,6 @@ fn imported_private_empty_cow_pool_returns_owned_exact_target_supply() {
         .unwrap();
     let pool = carrick_el1_abi::CowGrantPool::new();
     let resident = residency();
-    let mailbox = FrameGrantMailbox::new();
     let TransferStep::CowSupply(window) = portal
         .select(
             &transfer,
@@ -1146,7 +1163,6 @@ fn imported_private_empty_cow_pool_returns_owned_exact_target_supply() {
             &mut NoopPreparedResolver,
             &mut EmptyCow(&tables, &pool, &resident),
             &resident,
-            &mailbox,
             0,
         )
         .unwrap()
@@ -1156,10 +1172,6 @@ fn imported_private_empty_cow_pool_returns_owned_exact_target_supply() {
     assert_eq!(window.operation.mm, mm);
     assert_eq!(window.range.len(), 4096);
     assert_eq!(transfer.offset(), 0);
-    assert!(
-        mailbox.claim_request().is_none(),
-        "private file COW never asks anonymous zero supply"
-    );
     assert!(
         spaces
             .try_begin_edit(
@@ -1204,14 +1216,12 @@ fn reservation_policy_readonly_none_and_retire_refuse_exact_mm() {
                         0,
                     )
                     .unwrap();
-                let mailbox = FrameGrantMailbox::new();
                 let result = portal.select(
                     &transfer,
                     &tables.live(&CallerInvalidatesAsid),
                     &mut NoopPreparedResolver,
                     &mut NoopCowResolver,
                     &residency(),
-                    &mailbox,
                     0,
                 );
                 let allowed = mm == b
@@ -1222,7 +1232,6 @@ fn reservation_policy_readonly_none_and_retire_refuse_exact_mm() {
                 } else {
                     assert_eq!(result.unwrap_err().errno(), 14);
                 }
-                assert!(mailbox.claim_request().is_none());
             }
         }
     }
@@ -1597,7 +1606,6 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
             0,
         )
         .unwrap();
-    let mailbox = FrameGrantMailbox::new();
     let residency = residency();
     let TransferStep::Supply(window) = portal
         .select(
@@ -1606,7 +1614,6 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
             &mut NoopPreparedResolver,
             &mut NoopCowResolver,
             &residency,
-            &mailbox,
             0,
         )
         .unwrap()
@@ -1654,7 +1661,6 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
                 &mut NoopPreparedResolver,
                 &mut NoopCowResolver,
                 &residency,
-                &mailbox,
                 0,
             )
             .unwrap(),
@@ -1680,7 +1686,6 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
                 &mut NoopPreparedResolver,
                 &mut NoopCowResolver,
                 &residency,
-                &mailbox,
                 0,
             )
             .unwrap(),
@@ -2555,7 +2560,7 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
                 &zone.spaces,
                 &view,
             )
-            .with_zone(&zone)
+            .with_zone(zone)
             .unwrap();
             let tables = Tables::new(ROOT, IPA, 2);
             let maintenance = CallerInvalidatesAsid;
@@ -2602,7 +2607,7 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
             let original = frame.x;
             let key = portal.prepared_wait_key(transfer.handle).unwrap();
             let mut sched = Sched {
-                zone: &zone,
+                zone,
                 slot,
                 task: &task,
                 cpu: &mut cpu,
@@ -2837,7 +2842,7 @@ fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
         &zone.spaces,
         &view,
     )
-    .with_zone(&zone)
+    .with_zone(zone)
     .unwrap();
     let plain = MmPortal::new(
         NonZeroU64::new(1).unwrap(),
@@ -2883,7 +2888,7 @@ fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
     frame.elr = 0x1004;
     let original = frame.x;
     let mut sched = Sched {
-        zone: &zone,
+        zone,
         slot,
         task: &task,
         cpu: &mut cpu,
@@ -3375,4 +3380,40 @@ fn owner_wait_queue_admission_busy_retains_owned_handback_until_unlock() {
     );
     assert_eq!(actual, [expected]);
     assert_eq!(operation.unwrap().index(), 701);
+}
+
+#[test]
+fn selected_data_retains_exact_pre_selection_reservation_observation() {
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(
+        NonZeroU64::new(1).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(zone)
+    .unwrap();
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let transfer = portal
+        .begin(handle, GuestVa::new(VA), 4, TransferIntent::UserRead, 0)
+        .unwrap();
+    let entry = zone
+        .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+        .unwrap();
+    let source = entry.notifications(handle.incarnation()).unwrap();
+    let revision = source.observe(SpaceWaitCause::Reservations).revision();
+    let tables = Tables::new(ROOT, IPA, 1);
+    let chosen = selected(select(&portal, &transfer, &tables));
+    let wait = chosen.retry.unwrap();
+    assert_eq!(wait.handle(), handle);
+    assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Reservations);
+    assert_eq!(wait.revision(), revision);
+    assert_ne!(
+        source.observe(SpaceWaitCause::Reservations).revision(),
+        revision
+    );
 }

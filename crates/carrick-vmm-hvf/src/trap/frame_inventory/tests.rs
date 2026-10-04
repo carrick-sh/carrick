@@ -1201,7 +1201,9 @@ fn exec_successor_root_publication_installs_exact_structural_authority() {
 
     let access = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
-        std::sync::Arc::new(MemoryProtections::default()),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+            MemoryProtections::default(),
+        )),
         std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
         std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
         std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -5962,7 +5964,7 @@ fn foreign_mm_binding_stage1_tables_preserves_the_exact_shared_mm_access_arc() {
 
     let distinct_state = MmAccessState::new_unbound(
         page_tables.clone(),
-        std::sync::Arc::clone(&owner.protections),
+        owner.protections.clone(),
         owner.frame_inventory.shared_ledger(),
         std::sync::Arc::clone(&owner.cow_armed),
         std::sync::Arc::clone(&owner.cow_deferred_publications),

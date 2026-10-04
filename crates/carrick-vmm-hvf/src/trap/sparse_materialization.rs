@@ -1095,6 +1095,9 @@ pub(super) fn publish_replacing(
     flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     retire_previous: &mut dyn FnMut(),
 ) -> Result<PublishedSparseExtent, TrapError> {
+    let _legacy = context.state.protections.legacy().ok_or_else(|| {
+        TrapError::Hypervisor("admitted owner MM cannot enter host sparse publication".into())
+    })?;
     let guest_lane = context
         .state
         .page_tables_authority()
@@ -1182,7 +1185,10 @@ pub(super) fn publish_replacing(
                     executable: context
                         .state
                         .protections
-                        .range_executable(start, semantic_len),
+                        .legacy()
+                        .is_some_and(|protections| {
+                            protections.range_executable(start, semantic_len)
+                        }),
                 },
             )
         } else {
@@ -1374,7 +1380,7 @@ pub(super) fn publish_replacing(
                     }
                     if context.foreign.is_some() {
                         editor.set_rw(start, semantic_len,
-                            context.state.protections.range_executable(start, semantic_len))
+                            context.state.protections.legacy().is_some_and(|protections| protections.range_executable(start, semantic_len)))
                     } else {
                         editor.set_prot_none(start, semantic_len)
                     }.map_err(|error| match error {
@@ -1909,7 +1915,9 @@ mod arena_pin_tests {
         .unwrap();
         let state = MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
-            std::sync::Arc::new(MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+                MemoryProtections::default(),
+            )),
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -2232,7 +2240,9 @@ mod arena_pin_tests {
         .unwrap();
         let state = MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
-            std::sync::Arc::new(MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+                MemoryProtections::default(),
+            )),
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -2268,7 +2278,9 @@ mod arena_pin_tests {
         let pointer = owner.ptr();
         let state = MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
-            std::sync::Arc::new(MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+                MemoryProtections::default(),
+            )),
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
