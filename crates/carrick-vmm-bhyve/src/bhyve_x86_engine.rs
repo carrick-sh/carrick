@@ -46,7 +46,7 @@
 #![cfg(target_arch = "x86_64")]
 
 use std::ffi::c_int;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex};
 
