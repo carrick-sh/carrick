@@ -1,5 +1,5 @@
 //! Process-owned ITIMER_REAL transitions, clean-room from setitimer(2):
-//! https://man7.org/linux/man-pages/man2/setitimer.2.html.
+//! <https://man7.org/linux/man-pages/man2/setitimer.2.html>.
 //!
 //! Clock values/spans are nanoseconds in the same injected monotonic elapsed
 //! real-time domain. The caller converts timeval and supplies the clock; this
