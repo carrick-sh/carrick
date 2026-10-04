@@ -1592,6 +1592,7 @@ impl AddressSpacePublicationOwner {
         owner: &crate::kernel::mm_occupancy::PreAdmissionGuard,
         ttbr0: u64,
         ttbr1: u64,
+        closed: bool,
     ) -> Option<crate::kernel::AddressSpacePublication> {
         self.authority.seal_reservation_provider();
         let (brk_current, mmap_next) = {
@@ -1604,16 +1605,28 @@ impl AddressSpacePublicationOwner {
             .map_or_else(crate::kernel::RlimitSet::carrick_defaults, |task| {
                 task.rlimits()
             });
-        owner.publish(
-            self.authority.pt_quiesce(),
-            ttbr0,
-            ttbr1,
-            brk_current,
-            mmap_next,
-            crate::kernel::mm_occupancy::ReservationRootPublication {
-                limits: crate::kernel::ReservationLimits::of_task(&rlimits, self.task.as_ref()),
-                provider: self.authority.reservation_provider_for_publication(),
-            },
-        )
+        let root = crate::kernel::mm_occupancy::ReservationRootPublication {
+            limits: crate::kernel::ReservationLimits::of_task(&rlimits, self.task.as_ref()),
+            provider: self.authority.reservation_provider_for_publication(),
+        };
+        if closed {
+            owner.publish_closed(
+                self.authority.pt_quiesce(),
+                ttbr0,
+                ttbr1,
+                brk_current,
+                mmap_next,
+                root,
+            )
+        } else {
+            owner.publish(
+                self.authority.pt_quiesce(),
+                ttbr0,
+                ttbr1,
+                brk_current,
+                mmap_next,
+                root,
+            )
+        }
     }
 }

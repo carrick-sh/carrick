@@ -46,6 +46,9 @@ pub const ADDRESS_SPACES: usize = 1024;
 /// Gate bit: EL1 may not install the address space (being published, or
 /// its ASID is retiring). The low bits count the raised page-table pauses.
 pub const GATE_CLOSED: u64 = 1 << 63;
+/// The initial publication may BIND while closed; clearing on first open is
+/// permanent, including after a later close for retirement.
+pub const GATE_INITIAL_BIND: u64 = 1 << 62;
 
 /// A freed entry (skipped by lookups, reused by publications).
 const FREED: u64 = u64::MAX;
@@ -424,7 +427,23 @@ impl AddressSpaces {
         );
         self.entry(index)
             .gate
-            .fetch_and(!GATE_CLOSED, Ordering::SeqCst);
+            .fetch_and(!(GATE_CLOSED | GATE_INITIAL_BIND), Ordering::SeqCst);
+    }
+
+    /// Mark one never-opened initial publication as eligible for the exact
+    /// host BIND service. Fork children use a different closed constructor
+    /// and never receive this bit.
+    pub fn mark_initial_bindable(&self, index: SpaceIndex) -> bool {
+        let entry = self.entry(index);
+        entry
+            .gate
+            .compare_exchange(
+                GATE_CLOSED,
+                GATE_CLOSED | GATE_INITIAL_BIND,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
     }
 
     /// Host: no EL1 install of the entry from now on. The caller then scans
@@ -572,6 +591,19 @@ impl AddressSpaces {
             ttbr1,
             cow_owed: (published != covered).then_some(published),
         })
+    }
+
+    /// The exact identity of a root that is still CLOSED. Only its
+    /// publication owner may mint a typed closed-bind capability from this;
+    /// neither installation nor an editor follows from the observation.
+    /// Guest transfers continue to use [`Self::grant`] and its open gate.
+    pub fn closed_root_identity(&self, index: SpaceIndex, key: u64) -> Option<u64> {
+        let entry = self.entry(index);
+        if entry.gate.load(Ordering::SeqCst) != (GATE_CLOSED | GATE_INITIAL_BIND) {
+            return None;
+        }
+        let ttbr0 = entry.ttbr0.load(Ordering::Acquire);
+        (ttbr0 != 0 && entry.key.load(Ordering::SeqCst) == key).then_some(ttbr0)
     }
 
     /// EL1: a broadcast invalidation of the space's ASID covered the
@@ -792,6 +824,31 @@ impl AddressSpaces {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initial_closed_bind_is_exact_and_expires_at_first_open() {
+        let spaces = AddressSpaces::new();
+        let first = spaces.publish_closed(71, 0x40_000, 0x40_000).unwrap();
+        let second = spaces.publish_closed(72, 0x50_000, 0x50_000).unwrap();
+        assert!(spaces.grant(first, 71).is_none());
+        assert!(spaces.closed_root_identity(first, 71).is_none());
+        assert!(spaces.mark_initial_bindable(first));
+        assert_eq!(spaces.closed_root_identity(first, 71), Some(0x40_000));
+        assert!(spaces.closed_root_identity(first, 72).is_none());
+        assert!(spaces.closed_root_identity(second, 72).is_none());
+        assert!(
+            spaces.grant(first, 71).is_none(),
+            "closed BIND cannot install"
+        );
+        spaces.open(first);
+        assert!(spaces.closed_root_identity(first, 71).is_none());
+        assert_eq!(spaces.grant(first, 71).unwrap().ttbr0, 0x40_000);
+        spaces.close(first);
+        assert!(
+            spaces.closed_root_identity(first, 71).is_none(),
+            "a later close cannot resurrect the initial BIND"
+        );
+    }
     use core::num::NonZeroU64;
     use std::sync::{Arc, mpsc};
     use std::vec::Vec;

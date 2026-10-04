@@ -897,6 +897,15 @@ impl MmAccessState {
         binding: CarrierForeignMmBinding,
     ) {
         *self.identity.write() = Some((mm, binding));
+        // The initial runner may have recorded backing before the kernel
+        // publishes its exact MM identity. Revisit only the same pending
+        // admission once both are present.
+        if let Some(resolver) = self.live_resolver.read().clone() {
+            let authority = self.page_tables.read().clone();
+            // SAFETY: this resolver was authenticated at installation.
+            let promoted = unsafe { self.bind_backing(&authority, resolver) };
+            self.record_guest_lane_promotion(promoted);
+        }
     }
 
     pub(crate) fn page_tables_authority(&self) -> carrick_aarch64::Stage1Authority {
@@ -942,15 +951,47 @@ impl MmAccessState {
         if let Some(publisher) = self.arena_publisher.read().clone() {
             authority.set_arena_publisher(publisher);
         }
-        match self.backing_binding {
-            LiveBackingBinding::Immediate => unsafe { authority.bind_live_backing(resolver) },
-            // The placeholder authority a state is born with holds no manager:
-            // recording the backing there would be copied to the engine's
-            // authority by `adopt_unshared_predecessor`, which makes its
-            // manager live. Only an authority with a manager records it.
-            LiveBackingBinding::Deferred if authority.is_none() => false,
-            LiveBackingBinding::Deferred => unsafe { authority.record_live_backing(resolver) },
+        // A pending descriptor selection has no authority to publish until
+        // this state names the exact MM and live root the owner admitted.
+        let pending = self.protections.pending_owner();
+        let exact = pending.is_some_and(|handle| {
+            self.identity.read().as_ref().is_some_and(|(mm, binding)| {
+                mm.raw_for_probe() == handle.mm().raw()
+                    && authority.root_base() == Some(binding.stage1_root.0)
+            })
+        });
+        if let Some(handle) = pending.filter(|_| exact) {
+            let promoted = self.protections.promote_pending_with(handle, || {
+                match self.backing_binding {
+                    // SAFETY: forwarded authenticated resolver contract.
+                    LiveBackingBinding::Immediate => unsafe {
+                        authority.bind_live_backing(std::sync::Arc::clone(&resolver))
+                    },
+                    LiveBackingBinding::Deferred if authority.is_none() => false,
+                    // SAFETY: forwarded authenticated resolver contract.
+                    LiveBackingBinding::Deferred => unsafe {
+                        authority.record_live_backing(std::sync::Arc::clone(&resolver))
+                    },
+                }
+            });
+            if let Ok(promoted) = promoted {
+                return promoted;
+            }
         }
+        match self.backing_binding {
+            // SAFETY: forwarded authenticated resolver contract.
+            LiveBackingBinding::Immediate => unsafe {
+                authority.bind_live_backing_without_promotion(resolver);
+            },
+            // A placeholder manager must not become live through a copied
+            // predecessor; the real authority is bound later.
+            LiveBackingBinding::Deferred if authority.is_none() => {}
+            // SAFETY: forwarded authenticated resolver contract.
+            LiveBackingBinding::Deferred => unsafe {
+                authority.record_live_backing_without_promotion(resolver);
+            },
+        }
+        false
     }
 
     pub(crate) fn bind_page_tables_authority(&self, page_tables: carrick_aarch64::Stage1Authority) {

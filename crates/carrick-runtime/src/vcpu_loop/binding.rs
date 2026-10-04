@@ -3578,9 +3578,10 @@ where
                             "admitted MM vanished before publication"
                         );
                     };
+                    let mut owner_admission_error = None;
                     binding.publish_address_space(|lease_ttbr0| {
                         let (ttbr0, ttbr1) = engine.el1_switchable_roots()?;
-                        (ttbr0 == lease_ttbr0)
+                        let closed = (ttbr0 == lease_ttbr0)
                             .then(|| {
                                 self.kernel.dispatcher.publish_bound_address_space(
                                     participation,
@@ -3589,8 +3590,21 @@ where
                                     ttbr1,
                                 )
                             })
-                            .flatten()
+                            .flatten()?;
+                        match super::signal::open_first_address_space(engine, closed) {
+                            Ok(publication) => Some(publication),
+                            Err(error) => {
+                                owner_admission_error = Some(error);
+                                None
+                            }
+                        }
                     });
+                    if let Some(error) = owner_admission_error {
+                        return Err(RuntimeError::Configuration(format!(
+                            "published MM owner admission: {error}"
+                        ))
+                        .into());
+                    }
                 }
             }
 

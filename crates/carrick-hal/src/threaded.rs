@@ -3171,13 +3171,33 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
     ) {
     }
 
+    /// Shared root authority cloned before the first EL1 publication. The
+    /// caller holds its write admission guard through publication and the
+    /// exact owner selection on this same engine.
+    fn user_memory_admission_authority(&self) -> Option<carrick_guest_mem::UserMemoryAuthority> {
+        None
+    }
+
+    fn owner_transfer_carrier(&self) -> Option<std::num::NonZeroU64> {
+        None
+    }
+
+    fn select_live_descriptor_owner_under_guard(
+        &mut self,
+        owner: carrick_mmu_core::aarch64::LiveDescriptorOwner,
+        _guard: &mut carrick_guest_mem::UserMemoryAdmissionGuard<'_>,
+        _closed: Option<carrick_el1_abi::PortalClosedRootBind>,
+    ) -> Result<bool, TrapError> {
+        self.select_live_descriptor_owner(owner)
+    }
+
     /// Select the venue that owns this engine's live stage-1 descriptor
-    /// stores. `false`: this backend has no guest-owned lane.
+    /// stores. `false`: this backend has no admitted guest-owned lane.
     fn select_live_descriptor_owner(
         &mut self,
         _owner: carrick_mmu_core::aarch64::LiveDescriptorOwner,
-    ) -> bool {
-        false
+    ) -> Result<bool, TrapError> {
+        Ok(false)
     }
 
     /// This vCPU's full TTBR0 (root and ASID).

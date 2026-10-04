@@ -514,7 +514,7 @@ impl SyscallDispatcher {
         memory: &mut M,
         ttbr0: u64,
         ttbr1: u64,
-    ) -> Option<crate::kernel::AddressSpacePublication> {
+    ) -> Option<crate::kernel::UnpublishedInitialAddressSpace> {
         if !participation.authorizes(&self.mm_authority()) {
             carrick_fatal::carrick_fatal!(
                 "dispatch::el1_reservations",
@@ -523,9 +523,13 @@ impl SyscallDispatcher {
             );
         }
         self.with_address_space_admission(participation, |admission| {
-            admission.publish(memory, ttbr0, ttbr1, false).map(|_| ())
+            admission
+                .publish(memory, ttbr0, ttbr1, false, true)
+                .map(|_| ())
         })
-        .map(|(publication, ())| publication)
+        .map(|(publication, ())| {
+            crate::kernel::UnpublishedInitialAddressSpace::from_closed(publication)
+        })
     }
 }
 
@@ -610,7 +614,7 @@ impl BoundAddressSpaceAdmission<'_> {
         ttbr0: u64,
         ttbr1: u64,
     ) -> Option<carrick_hal::PreAdmissionReceipt<'_>> {
-        self.publish(memory, ttbr0, ttbr1, true)?
+        self.publish(memory, ttbr0, ttbr1, true, false)?
     }
     fn publish<M: CurrentMmMemory + ?Sized>(
         &self,
@@ -618,8 +622,13 @@ impl BoundAddressSpaceAdmission<'_> {
         ttbr0: u64,
         ttbr1: u64,
         require_delegated: bool,
+        closed: bool,
     ) -> Option<Option<carrick_hal::PreAdmissionReceipt<'_>>> {
-        *self.prepared.borrow_mut() = Some(self.owner.publish(&self.publication, ttbr0, ttbr1)?);
+        *self.prepared.borrow_mut() =
+            Some(
+                self.owner
+                    .publish(&self.publication, ttbr0, ttbr1, closed)?,
+            );
         #[cfg(test)]
         if let Some(hook) = self.after_publication.borrow_mut().take() {
             hook();
@@ -1083,7 +1092,7 @@ mod tests {
         let mut memory = crate::dispatch::LinearMemory::new(0x10000, vec![0; 4096]);
         assert!(
             admission
-                .publish(&mut memory, 0x1000, 0x1000, false)
+                .publish(&mut memory, 0x1000, 0x1000, false, false)
                 .is_some()
         );
         let index = spaces.find(mm.raw()).unwrap();
