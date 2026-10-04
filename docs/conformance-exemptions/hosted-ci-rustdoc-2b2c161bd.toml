@@ -1,6 +1,6 @@
 schema = "carrick.conformance-exemption.v1"
-base = "8b6cf9031bca940f0bc48468a5fcbd96963a78bf"
-head = "adba18a6cca54a50576c78a1e49dc589328df9b6"
+base = "6a33e26b2a042da1858a2804e42b66adda487d24"
+head = "2b2c161bd82981fc8ef18ab4307feb55f39fd98e"
 paths = ["crates/carrick-mmu-core/src/aarch64.rs"]
 contracts = [
   "kernel.fork.stage1-image",
