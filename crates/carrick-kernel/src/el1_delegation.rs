@@ -972,11 +972,13 @@ pub enum NotEligible {
     Observed,
     /// The description already had its one entry attempt, at open.
     EntryUsed,
+    /// An owned host operation already has this description's cursor.
+    CursorOwned,
 }
 
 impl NotEligible {
     /// Every reason, in discriminant order.
-    pub const ALL: [NotEligible; 21] = [
+    pub const ALL: [NotEligible; 22] = [
         NotEligible::Disabled,
         NotEligible::NoRegion,
         NotEligible::NotRegularFile,
@@ -998,6 +1000,7 @@ impl NotEligible {
         NotEligible::SeccompFiltered,
         NotEligible::Observed,
         NotEligible::EntryUsed,
+        NotEligible::CursorOwned,
     ];
 }
 
@@ -1175,8 +1178,22 @@ pub(crate) fn enter_zone_at_open(
         return Err(NotEligible::NotRegularFile);
     };
     let result = if open_file.description.common().take_zone_entry() {
-        let mut open = d.write();
-        delegate_transaction(open_file, &mut open, file_table, fd, fs, rlimits, policy)
+        // Entry shares the owned host cursor's admission. Taking the one-shot
+        // token alone cannot authorize publication over a host operation that
+        // has already recalled this description and retained its offset.
+        match open_file.description.try_reserve_cursor() {
+            Ok(_cursor) => {
+                let mut open = d.write();
+                delegate_transaction(open_file, &mut open, file_table, fd, fs, rlimits, policy)
+                // `open` is released before `_cursor` can notify a successor.
+            }
+            Err(wait) => {
+                // Delegation is optional and one-shot. Cancel even if this
+                // ticket was concurrently granted; never wait or retry entry.
+                drop(wait);
+                Err(NotEligible::CursorOwned)
+            }
+        }
     } else {
         Err(NotEligible::EntryUsed)
     };
@@ -2308,6 +2325,49 @@ mod tests {
             assert!(!no_active_delegations());
             recall(&first.description).unwrap();
             assert_eq!(host_bytes(&tmp), b"onetwo");
+        }
+
+        #[test]
+        fn initial_entry_cannot_publish_over_an_owned_host_cursor() {
+            let _region = Region::new();
+            let tmp = temp_with(b"cursor");
+            let open = open_host(&tmp);
+            let cursor = open.description.try_reserve_cursor().unwrap();
+            let entered = delegate_default(&open, 3);
+            // Keep the failing baseline's real delegation cleanup intact so
+            // the semantic assertion, not last-reference teardown, is the red.
+            if entered.is_ok() {
+                recall(&open.description).unwrap();
+            }
+            assert!(
+                entered.is_err(),
+                "initial delegation published while host cursor authority was owned"
+            );
+            assert_eq!(open.description.delegation_handle(), 0);
+            assert!(no_active_delegations());
+            drop(cursor);
+            assert_eq!(delegate_default(&open, 3), Err(NotEligible::EntryUsed));
+            assert!(open.description.try_reserve_cursor().is_ok());
+        }
+
+        #[test]
+        fn initial_entry_owns_cursor_until_publication_finishes() {
+            let _region = Region::new();
+            let tmp = temp_with(b"cursor");
+            let open = open_host(&tmp);
+            let description = open.description.clone();
+            let excluded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = excluded.clone();
+            *PAUSE_HOOK.lock() = Some(Box::new(move || {
+                observed.store(description.try_reserve_cursor().is_err(), Ordering::Release);
+            }));
+            delegate_default(&open, 3).unwrap();
+            recall(&open.description).unwrap();
+            assert!(
+                excluded.load(Ordering::Acquire),
+                "host cursor entered while initial delegation was publishing"
+            );
+            assert!(open.description.try_reserve_cursor().is_ok());
         }
 
         #[test]

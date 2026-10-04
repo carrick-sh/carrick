@@ -1706,3 +1706,35 @@ delivery after unlock (review minor addressed).
 This is only publication plumbing. Authenticated live-MM source attachment,
 real editor/root/gate/pending releases and cause-specific lost-wake closure
 remain open, along with owned recall, consumer activation and mirror removal.
+
+
+#### Venue-3 pending initial delegation and cursor admission — 2026-10-03
+
+The initial open-time delegation now uses the same description-owned cursor
+reservation as the staged host operation. The one-shot entry token is consumed
+before the bounded admission attempt; contention cancels its exact waiter and
+permanently refuses entry. Successful admission lasts through delegation or
+rollback, and the description guard drops before cursor successor delivery.
+The inode registration remains retained by the cursor's description ownership.
+This change reaches `carrick-kernel/src/el1_delegation.rs` outside the original
+kernel-dispatch fence because the pending opener itself must exclude publication
+over an owned host cursor; a dispatcher-only check cannot close that race.
+
+Red-first, with the old production entry unchanged and cleanup before assertion:
+`RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-kernel initial_entry_ --lib -- --nocapture`
+exited101, zero passed and two failed. The actual failures were
+`initial delegation published while host cursor authority was owned` and
+`host cursor entered while initial delegation was publishing`, in
+`initial_entry_cannot_publish_over_an_owned_host_cursor` and
+`initial_entry_owns_cursor_until_publication_finishes` respectively.
+The final two witness drivers are unchanged for the successor verification.
+Successor verification: `RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-kernel el1_delegation::tests --lib -- --nocapture`
+exited zero, all19 delegation tests passed, including both unchanged witnesses.
+The serial-host classifier passed, and independent review found no issue.
+
+This unit does not activate production offset consumers. Guard-free owned
+recall, guest-lock completion delivery, exact fd-slot custody, every competing
+current-offset caller, UserTransfer PREPARE and admitted mirror removal remain
+open. It reproduces neither `mmapv8align` nor `mmapprivatefiletrack`; their
+required production witnesses remain those listed in the venue-3 boundary
+inspection above.
