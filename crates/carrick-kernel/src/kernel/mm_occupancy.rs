@@ -657,7 +657,9 @@ impl SpaceTables {
                 .unwrap_or_else(|| {
                     carrick_fatal!("kernel::mm_occupancy", "missing retiring entry membership")
                 })
-                .retire_entry();
+                .retire_entry(self.release_venue().unwrap_or_else(|| {
+                    carrick_fatal!("kernel::mm_occupancy", "retirement requires release venue")
+                }));
         } else {
             self.spaces.free(index);
         }
