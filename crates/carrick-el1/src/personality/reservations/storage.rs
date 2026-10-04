@@ -51,7 +51,7 @@ pub(super) trait NodeBanks {
 /// locks; an unchanged generation does zero resolution/allocation work. A view
 /// for one carrier/table cannot be attached to another table.
 pub struct ResolvedReservationNodes<P: PinnedMetadataExtent> {
-    table: *const SharedReservations,
+    pub(super) table: *const SharedReservations,
     count: u32,
     bases: [*mut Node; BANKS],
     pins: [Option<P>; BANKS],
@@ -260,6 +260,7 @@ impl SharedReservations {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "host-test"))]
     pub fn lock_resolved<'a, P: PinnedMetadataExtent>(
         &'a self,
         index: usize,
@@ -270,11 +271,20 @@ impl SharedReservations {
         if !core::ptr::eq(nodes.table, self) {
             return Err(Refusal::Stale);
         }
-        self.lock_using(index, mm, Some(nodes), false, wait, RootHolder::Host.word())
+        self.lock_using(
+            index,
+            mm,
+            Some(nodes),
+            false,
+            wait,
+            RootHolder::Host.word(),
+            RootAuthority::SourceFree(self.source_free()),
+        )
     }
 
     /// EL1's single-attempt owner venue over authenticated elastic banks.
     /// Resolution and capacity provision must precede this acquisition.
+    #[cfg(any(test, feature = "host-test"))]
     pub fn lock_el1_resolved<'a, P: PinnedMetadataExtent>(
         &'a self,
         index: usize,
@@ -292,6 +302,7 @@ impl SharedReservations {
             false,
             &NoRootWait,
             RootHolder::El1Slot(slot).word(),
+            RootAuthority::SourceFree(self.source_free()),
         )
     }
 
@@ -301,7 +312,15 @@ impl SharedReservations {
         index: usize,
         mm: ReservationMm,
     ) -> Result<Reservations<'_>, Refusal> {
-        self.lock_using(index, mm, None, true, &NoRootWait, RootHolder::Host.word())
+        self.lock_using(
+            index,
+            mm,
+            None,
+            true,
+            &NoRootWait,
+            RootHolder::Host.word(),
+            RootAuthority::SourceFree(self.source_free()),
+        )
     }
 
     pub(super) fn node<'a>(&'a self, id: u32, banks: Option<&'a dyn NodeBanks>) -> &'a Node {

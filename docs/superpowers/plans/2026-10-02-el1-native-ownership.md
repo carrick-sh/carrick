@@ -1738,3 +1738,63 @@ current-offset caller, UserTransfer PREPARE and admitted mirror removal remain
 open. It reproduces neither `mmapv8align` nor `mmapprivatefiletrack`; their
 required production witnesses remain those listed in the venue-3 boundary
 inspection above.
+
+#### Venue-3 actual MM release sources — 2026-10-03
+
+Root admission attaches durable exact-MM notification custody before admitted
+publication. Production host and EL1 callers carry authenticated root/zone
+venues; source-free constructors are explicitly model-only. Six distinct
+causes use the existing completion engine: prepared overlap, editor, root
+availability, pending edit, gate and metadata. Queue epoch is the revision.
+The32-byte attachment uses SpaceEntry's original padding at offset344; the
+384-byte stride and earlier zone fields stay fixed. Additional cause storage
+is exactly5*ADDRESS_SPACES queues, appended after old completion fields.
+Protocol4 and reservation version9 include these semantics in shared hashes.
+
+Actual root/editor/gate release publishes revisions before atomic unlock and
+delivers owned effects after unlock. Nested gate lower preserves fetch_sub.
+Editor admission rollback uses the same release authority. Root admission
+retains its exact source before CAS and preserves a successor's required
+venue bit on stale refusal. Fork notification refusal is inside existing
+copy-list cleanup. Source retirement excludes new borrowers; the unique last
+borrower completes entry cleanup without parking a worker. Old derived
+notification tickets exclude queue reincarnation. Generic queue enrollment
+rechecks the revision/predicate after linking, before park, and removes an
+unparked registration if the host predicate unwinds.
+
+The necessary host support reaches kernel/mm_occupancy.rs and runtime's
+PreparedView: both own actual zone membership and therefore are the proper
+release/admission authorities. Guest fault/memory helpers now carry SpaceAccess
+from their zone-bearing entrypoints. No container arithmetic or invented host
+slot supplies authority. Root helpers without a venue refuse admitted roots
+before attempting a lock or invoking the host wait policy.
+
+Behavioral reds cover missing actual editor/root release notifications,
+nested gate release, and a delayed old-MM root admission demoting a reused
+root's required bit. The delayed-root witness is unchanged between the
+restored old lock_using sequence (0 versus9223372036854775808, exit101) and
+its corrected green. The earlier root-release fixture changed from manual
+source attachment to production finish_import admission; its common failing
+boundary was old Drop omitting the producer edge, not an identical setup.
+
+Validation: RUSTC_WRAPPER= cargo test -p carrick-sched-core -p carrick-el1
+-p carrick-el1-abi --lib:113 scheduler,248 EL1,122 ABI tests pass. Production
+kernel/runtime lib check and combined sched-core/EL1/kernel/runtime lib clippy
+with -D warnings pass. Specific tests cover each cause before/during
+registration, unrelated causes, held-queue actual release, failed editor
+admission, source binding/retirement, old-ticket rebind, wrong region,
+nested gates, and abandoned receipt unlock-before-delivery.
+
+This is the real release-hook prerequisite, not host checked-memory cutover.
+Typed portal suspension receipts, actual host cause enrollment, shared metadata
+pool and exact provisioning completion, owned recall, source consumers and
+admitted permission-mirror deletion remain open. The required production
+mmapv8align/mmapprivatefiletrack mappings and remote signed/Docker acceptance
+remain unchanged and unclaimed. Replaced legacy host root callsites are
+PreparedView::lock's lock_resolved and mm_occupancy's child-authentication/final
+retirement lock calls; their replacements authenticate RootReleaseVenue. No
+MemoryProtections authority has been retired by this unit.
+The existing VM-free HVF test
+`native_owner_matrix_moves_bytes_with_balanced_physical_pins` also passes after
+its fixture switched to actual same-region notified owner admission. It keeps
+all original byte, physical-pin and structural-budget assertions.
