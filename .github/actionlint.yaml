@@ -1,0 +1,9 @@
+# Routing labels used by the repository's physical gate workflows.
+# This config informs the local validator; it does not register runners.
+self-hosted-runner:
+  labels:
+    - carrick-hvf
+    - carrick-kvm
+    - kvm
+    - carrick-signed
+    - macos-host

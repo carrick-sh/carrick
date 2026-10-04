@@ -1,22 +1,30 @@
-name: Hosted CI
+name: CI and merge queue
 
 on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+    branches: [main]
   workflow_dispatch:
-  # Nightly catches moving @stable toolchain and hosted runner-image drift.
+  # Nightly catches hosted runner-image drift with the pinned toolchain.
   schedule:
     - cron: "0 7 * * *"
 
-# Cancel superseded runs on the same ref to save runner minutes.
+# Only PRs cancel superseded runs; never cancel a live signed gate.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARRICK_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
 
 jobs:
   # Source, ABI, kernel-graph, and host-semantic validation on public hosted
@@ -26,9 +34,10 @@ jobs:
     name: hosted macOS · source + host-only tests
     runs-on: macos-14 # Apple Silicon
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Conformance contract coverage (PR changed surfaces)
         if: github.event_name == 'pull_request'
@@ -39,15 +48,16 @@ jobs:
         run: cargo run -p carrick-conformance-contract --bin check-contracts -- --root .
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: 1.96.0
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
 
       # The gate commands live in the justfile (single source of truth). CI
       - name: Install just and cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just, cargo-deny
 
@@ -73,13 +83,9 @@ jobs:
       # occupy in the justfile's `ci` recipe. The layering gate walks the
       # dependency closures with `cargo metadata | jq` — the hosted macos-14
       # image ships jq (1.8.2 on image 20260831), so no install step is
-      # needed; if a future image drops it the gate fails loudly on the
-      # missing binary rather than passing vacuously. The portable check
-      # cross-compiles carrick-kernel for aarch64-unknown-linux-gnu, a target
-      # rust-toolchain.toml already declares on the pinned 1.96.0 toolchain,
-      # so rustup installs it with the toolchain and this needs no `targets:`
-      # of its own (adding one to dtolnay/rust-toolchain@stable would land it
-      # on the sibling `stable` toolchain the toolchain file then overrides).
+      # needed; a missing binary fails loudly. The portable check compiles
+      # carrick-kernel for aarch64-unknown-linux-gnu, already declared on the
+      # pinned toolchain in rust-toolchain.toml and installed above.
       - name: Layering gate (crate closures + product feature closure)
         run: just check-layering
 
@@ -126,10 +132,8 @@ jobs:
           just test-integration
 
 
-  # Hosted runners intentionally stop at source, host-semantic, and target
-  # closure evidence. Real guest execution lives in kernel-runtime.yml on
-  # trusted, capability-labeled hardware; a skipped or unsupported nested-virt
-  # attempt is never represented as a kernel pass here.
+  # Hosted x86 KVM is an explicit runtime gate below; ARM host checks remain
+  # VM-free. Signed HVF acceptance uses only trusted events and physical Macs.
 
   # L1 — cross-compile our OWNED crates for aarch64-linux + assert the
   # platform-linux dependency closure links NO macOS hypervisor (carrick-vmm-hvf /
@@ -137,25 +141,90 @@ jobs:
   # fix. Cheap on a hosted Linux runner; the full CLI is NOT cross-compiled
   # here (ring/oci-client need a C cross toolchain) — that real Linux build
   # happens natively in the local nested-KVM VM (see `just build-linux`).
-  # Real KVM execution is a separate trusted-hardware job; it is not inferred
-  # from this cross-check.
+  # The same hosted x86 job separately requires hardware KVM and runs suites;
+  # cross-compilation alone never counts as runtime evidence.
   cross-check-linux:
-    name: aarch64-linux cross-check · no-hvf closure
-    runs-on: ubuntu-latest
+    name: host-linux-x86-kvm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain (+ aarch64-linux target)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: 1.96.0
           targets: aarch64-unknown-linux-gnu
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
 
       - name: Install just
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just
+
+      - name: Prepare complete step logs
+        run: mkdir -p target/merge-queue
+
+      - name: Require usable hardware KVM (fail closed)
+        run: |
+          set -euo pipefail
+          {
+            if [[ "$(uname -m)" != x86_64 || ! -c /dev/kvm ]]; then
+              echo "::error::x86 KVM gate requires an x86_64 host and /dev/kvm; refusing a skipped suite."
+              exit 1
+            fi
+            sudo apt-get update
+            sudo apt-get install -y acl musl-tools
+            sudo setfacl -m "u:$(id -un):rw" /dev/kvm
+            if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
+              echo "::error::/dev/kvm is not readable and writable by the runner."
+              exit 1
+            fi
+            python3 - <<'PYKVM'
+          import fcntl, os
+          fd = os.open('/dev/kvm', os.O_RDWR | os.O_CLOEXEC)
+          try:
+              version = fcntl.ioctl(fd, 0xAE00, 0)  # KVM_GET_API_VERSION
+              if version != 12:
+                  raise SystemExit(f'KVM API version {version}, expected 12')
+              print(f'/dev/kvm opened successfully; API version {version}')
+          finally:
+              os.close(fd)
+          PYKVM
+          } 2>&1 | tee target/merge-queue/kvm-preflight.log
+
+      - name: Build required x86 CPL0 image and musl fixture (no missing-image skip)
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-none x86_64-unknown-linux-musl
+          cargo build --locked --release -p carrick-x86-cpl0 --target x86_64-unknown-none \
+            2>&1 | tee target/merge-queue/kvm-cpl0-image.log
+          test -f target/x86_64-unknown-none/release/carrick-x86-cpl0
+          cargo build --release \
+            --manifest-path crates/carrick-vmm-bhyve/fixtures/hello-x86_64/Cargo.toml \
+            --target x86_64-unknown-linux-musl \
+            --target-dir crates/carrick-vmm-bhyve/fixtures/hello-x86_64/target \
+            2>&1 | tee target/merge-queue/kvm-fixture.log
+          test -x crates/carrick-vmm-bhyve/fixtures/hello-x86_64/target/x86_64-unknown-linux-musl/release/carrick-hello-x86_64
+
+      - name: x86 engine and real KVM suites
+        run: |
+          set -euo pipefail
+          cargo test --locked -p carrick-x86 --lib \
+            2>&1 | tee target/merge-queue/x86-engine.log
+          cargo test --locked -p carrick-vmm-kvm --no-fail-fast \
+            --test carrier_cpu --test cpl0_entry --test live_vcpu_x86 --test sentinel_decode \
+            -- --nocapture 2>&1 | tee target/merge-queue/kvm-suites.log
+          if grep -q 'SKIP:' target/merge-queue/kvm-suites.log; then
+            echo "::error::KVM suite reported a skip; this is not runtime acceptance."
+            exit 1
+          fi
 
       - name: Cross-check carrick-hal + carrick-vmm-kvm + carrick-host-linux for aarch64-linux
         run: just check-linux
@@ -167,45 +236,70 @@ jobs:
       - name: Native unit tests for carrick-host-linux
         run: cargo test -p carrick-host-linux
 
-  # Native Linux run of the kernel-semantics suites (crates/carrick-kernel-example):
-  # scripted two-process Linux semantics against the public kernel API with no
-  # VMM, no codesign, no Docker. The kernel is portable by construction
-  # (`just check-kernel-portable` above proves the source; this proves the
-  # SEMANTICS on a Linux host), and an aarch64 runner matches the kernel's guest
-  # ABI and the portable-check target. It is the fast, independent signal beside
-  # the macOS job: ~5 s of tests after the build. Measured 2026-09-17 in the lima
-  # aarch64 VM before wiring: 94 passed, 0 failed.
-  #
-  # NOT yet run here: the kernel lib lane (`cargo test -p carrick-kernel --lib
-  # --features test-support -- --skip serial_host`). On Linux it passes 1957/1964;
-  # the seven failures are host-specific expectations, each a named follow-up
-  # (fix the Linux host path or gate the Darwin expectation), never a skip list:
-  #   dispatch::fs::tests::lseek_data_and_hole_across_backends
-  #   dispatch::mem::backing::tests::readonly_host_fd_cannot_carry_a_writable_shared_file_mapping
-  #   dispatch::net::support::tests::host_to_linux_sockaddr_unix_does_not_leak_private_hash_path_without_metadata
-  #   dispatch::net::support::tests::host_to_linux_sockaddr_unix_falls_back_to_xattr_across_processes
-  #   dispatch::overlay_dispatch_tests::epoll_et_delivers_listener_edge_without_read_byte_growth
-  #   dispatch::overlay_dispatch_tests::large_nonblocking_host_pipe_write_uses_small_ready_window
-  #   dispatch::overlay_dispatch_tests::large_nonblocking_host_socket_write_uses_small_ready_window
-  # When those are green, replace `test-kernel-semantics` below with `test-kernel`.
-  kernel-linux-native:
-    name: aarch64-linux native · kernel semantics suites (no VMM)
-    runs-on: ubuntu-24.04-arm
-    steps:
-      - uses: actions/checkout@v4
+      - name: Scoped cleanup
+        if: always()
+        run: scripts/sudo/kill.sh "$CARRICK_RUN_ID"
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install just
-        uses: taiki-e/install-action@v2
+      - name: Upload complete x86 logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          tool: just
+          name: host-linux-x86-kvm-${{ github.sha }}-${{ github.run_attempt }}
+          path: target/merge-queue/
+          if-no-files-found: error
+          retention-days: 30
 
-      - name: Kernel semantics suites, natively on Linux
-        run: just test-kernel-semantics
+  # Native ARM64 source/host evidence; accept reuses fmt-check and test-kernel.
+  # Its clippy-linux and source lints supplement the explicit just recipes.
+  kernel-linux-native:
+    name: host-linux-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: 1.96.0
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just,cargo-deny
+      - name: Install Semgrep and prepare complete step logs
+        run: |
+          mkdir -p target/merge-queue
+          python3 -m venv "$RUNNER_TEMP/semgrep"
+          "$RUNNER_TEMP/semgrep/bin/pip" install semgrep
+          echo "$RUNNER_TEMP/semgrep/bin" >> "$GITHUB_PATH"
+      - name: Portable acceptance (fmt-check, test-kernel and portable host suites)
+        run: |
+          set -euo pipefail
+          just accept --profile linux-portable 2>&1 | tee target/merge-queue/accept-console.log
+          receipt="target/el1-gate/$(git rev-parse --short HEAD)/receipt.json"
+          jq -e --arg head "$(git rev-parse HEAD)" \
+            '.head == $head and .clean_tree and .overall == "PASS" and .profile == "linux-portable"' \
+            "$receipt" | tee target/merge-queue/receipt-check.log
+      - name: Full host recipes (platform-aware; no guest or Docker)
+        run: |
+          set -euo pipefail
+          just clippy 2>&1 | tee target/merge-queue/clippy.log
+          just test 2>&1 | tee target/merge-queue/test.log
+          just lint-domains 2>&1 | tee target/merge-queue/lint-domains.log
+          just doc 2>&1 | tee target/merge-queue/doc.log
+      - name: Upload accept receipt and complete logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: host-linux-arm64-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/el1-gate/
+            target/merge-queue/
+          if-no-files-found: error
+          retention-days: 30
 
   # Cross-compile the FULL carrick-cli + carrick-runtime closure for
   # x86_64-unknown-freebsd — INCLUDING the C deps (ring via oci-client), handled
@@ -222,17 +316,20 @@ jobs:
       FBSD_MAJOR: "14"
       FBSD_SYSROOT: ${{ github.workspace }}/.freebsd-sysroot
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain (+ freebsd target)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: 1.96.0
           targets: x86_64-unknown-freebsd
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
 
       - name: Install just
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just
 
@@ -241,7 +338,7 @@ jobs:
 
       - name: Cache FreeBSD sysroot
         id: fbsd-sysroot
-        uses: actions/cache@v4
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.FBSD_SYSROOT }}
           key: freebsd-sysroot-${{ env.FBSD_VERSION }}
@@ -275,17 +372,20 @@ jobs:
     name: x86_64-netbsd cross-check · nvmm backend
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain (+ netbsd target)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
+          toolchain: 1.96.0
           targets: x86_64-unknown-netbsd
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
 
       - name: Install just
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just
 
@@ -299,15 +399,202 @@ jobs:
     name: cargo-deny · licenses
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: 1.96.0
 
       - name: Install just + cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just,cargo-deny
 
       - name: cargo-deny (licenses · bans · sources)
         run: just deny
+
+  trusted-event:
+    name: authorize-trusted-event
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      authorized: ${{ steps.authorize.outputs.authorized }}
+    steps:
+      # No checkout: authorization never executes PR-supplied code.
+      - id: authorize
+        name: Restrict manual Mac gates to maintainers on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API_URL: ${{ github.api_url }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            merge_group) echo 'authorized=true' >> "$GITHUB_OUTPUT" ;;
+            workflow_dispatch)
+              if [[ "$REF" != refs/heads/main ]]; then
+                echo "::error::Manual self-hosted gates only accept the main ref."
+                exit 1
+              fi
+              for actor in "$ACTOR" "$TRIGGERING_ACTOR"; do
+                role=$(curl --fail --silent --show-error \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H 'Accept: application/vnd.github+json' \
+                  -H 'X-GitHub-Api-Version: 2022-11-28' \
+                  "$API_URL/repos/$REPOSITORY/collaborators/$actor/permission" | jq -r '.role_name')
+                if [[ "$role" != maintain && "$role" != admin ]]; then
+                  echo "::error::Manual gate actor $actor must have the maintain or admin role."
+                  exit 1
+                fi
+              done
+              echo 'authorized=true' >> "$GITHUB_OUTPUT"
+              ;;
+            *) echo 'authorized=false' >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  macos-host:
+    # Never pull_request: public fork code must not be dispatched to a Mac.
+    # The hosted authorization job also restricts manual runs and reruns.
+    if: >-
+      ${{ (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') &&
+          needs.trusted-event.outputs.authorized == 'true' }}
+    needs: [trusted-event, kernel-linux-native, cross-check-linux]
+    name: macos-host
+    runs-on: [self-hosted, macOS, ARM64, carrick-signed, macos-host]
+    environment: carrick-trusted
+    timeout-minutes: 240
+    concurrency:
+      group: carrick-macos-gate-${{ github.repository }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARRICK_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}-host
+      GATE_PHASE: host
+      CHECK_NAME: macos-host
+    # Literal job names ensure the PR emits skipped checks with the same names.
+    # Share steps with signed through a YAML anchor, rather than a guarded matrix.
+    steps: &macos-accept-steps
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      # Tools are provisioned by the director in the user LaunchAgent's PATH;
+      # no privileged installer or public-PR cache is used on these machines.
+      - name: Verify Apple Silicon and gate tools
+        run: |
+          mkdir -p target/merge-queue
+          {
+            test "$(uname -s)" = Darwin
+            test "$(uname -m)" = arm64
+            for tool in just cargo rustup semgrep cargo-deny jq codesign otool; do
+              command -v "$tool"
+            done
+            ulimit -Hn
+          } 2>&1 | tee target/merge-queue/preflight.log
+      - name: Provision fresh signed fixtures and probes (exclusive Docker lease)
+        if: env.GATE_PHASE == 'signed'
+        run: |
+          set -euo pipefail
+          # Builds native ARM64 Linux fixtures; no oracle execution. Docker and
+          # guest phases are serial, under the SAME machine-wide lease path.
+          just lease docker just land-provision all \
+            2>&1 | tee target/merge-queue/provision.log
+      - name: Accept exact checkout (owns exclusive gate lease)
+        run: |
+          set -euo pipefail
+          ulimit -n 65536
+          # Do not wrap accept in a shared carrick lease: no lock upgrades.
+          just accept --phase "$GATE_PHASE" 2>&1 | tee target/merge-queue/accept-console.log
+          receipt="target/el1-gate/$(git rev-parse --short HEAD)/receipt.json"
+          jq -e --arg head "$(git rev-parse HEAD)" --arg phase "$GATE_PHASE" \
+            '.head == $head and .clean_tree and .overall == "PASS" and .phase == $phase' \
+            "$receipt" | tee target/merge-queue/receipt-check.log
+      - name: Scoped cleanup, including accept's per-step run IDs
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p target/merge-queue
+          {
+            printf '%s\n' "$CARRICK_RUN_ID"
+            # accept currently assigns accept-<timestamp>-<step> IDs itself.
+            # Its complete console survives cancellation before receipt write.
+            if [[ -f target/merge-queue/accept-console.log ]]; then
+              sed -n 's/.*(run_id: \(accept-[A-Za-z0-9_-]*\)).*/\1/p' target/merge-queue/accept-console.log
+            fi
+          } | sort -u > target/merge-queue/cleanup-ids.txt
+          cleanup_status=0
+          while IFS= read -r run_id; do
+            for id in "$run_id" "$run_id-cli"; do
+              scripts/sudo/kill.sh "$id" || cleanup_status=1
+            done
+          done < target/merge-queue/cleanup-ids.txt \
+            > target/merge-queue/cleanup.log 2>&1
+          cat target/merge-queue/cleanup.log
+          exit "$cleanup_status"
+      - name: Upload receipt and all gate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ env.CHECK_NAME }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/el1-gate/
+            target/merge-queue/
+            target/test-results/
+          if-no-files-found: error
+          retention-days: 30
+
+  signed:
+    name: signed
+    # Never pull_request: even a fork PR with hosted checks passing gets no
+    # self-hosted execution. Manual dispatch also needs hosted authorization.
+    if: >-
+      ${{ (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') &&
+          needs.trusted-event.outputs.authorized == 'true' }}
+    needs: [trusted-event, kernel-linux-native, cross-check-linux, macos-host]
+    runs-on: [self-hosted, macOS, ARM64, carrick-signed]
+    environment: carrick-trusted
+    timeout-minutes: 240
+    concurrency:
+      group: carrick-macos-gate-${{ github.repository }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARRICK_RUN_ID: gha-${{ github.run_id }}-${{ github.run_attempt }}-signed
+      GATE_PHASE: signed
+      CHECK_NAME: signed
+    steps: *macos-accept-steps
+
+  merge-queue:
+    name: merge-queue
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [check, cross-check-linux, kernel-linux-native, cross-check-freebsd, cross-check-netbsd, deny, trusted-event, macos-host, signed]
+    steps:
+      # GitHub treats skipped jobs as successful required checks. This check
+      # makes a skipped/cancelled/failed Mac tier a failure on merge_group.
+      - name: Require every applicable tier
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          EVENT: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq -e 'del(."macos-host", .signed) | all(.[]; .result == "success")' <<< "$RESULTS"
+          case "$EVENT" in
+            merge_group|workflow_dispatch)
+              jq -e '."trusted-event".outputs.authorized == "true" and ."macos-host".result == "success" and .signed.result == "success"' <<< "$RESULTS"
+              ;;
+            *) jq -e '."macos-host".result == "skipped" and .signed.result == "skipped"' <<< "$RESULTS" ;;
+          esac
