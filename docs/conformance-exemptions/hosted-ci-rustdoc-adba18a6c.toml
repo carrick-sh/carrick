@@ -1,0 +1,13 @@
+schema = "carrick.conformance-exemption.v1"
+base = "8b6cf9031bca940f0bc48468a5fcbd96963a78bf"
+head = "adba18a6cca54a50576c78a1e49dc589328df9b6"
+paths = ["crates/carrick-mmu-core/src/aarch64.rs"]
+contracts = [
+  "kernel.fork.stage1-image",
+  "kernel.el1.gic",
+  "kernel.mm.metadata-refusal",
+  "kernel.el1.stage1-publication",
+  "kernel.exec.stage1-image",
+  "kernel.mm.image-page-permissions",
+]
+rationale = "The exact MMU diff changes only Rust documentation comments: register bit ranges become inline code, and three safety references to a now test-only helper are replaced with that helper's existing alignment, arena identity, exclusive mutation and architectural invalidation obligations. No executable token, descriptor publication, guest result or work budget changes. Rustdoc with -D warnings passes; every changed line was checked to be a documentation comment."
