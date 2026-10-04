@@ -885,6 +885,24 @@ fn reconcile_one(
     Ok(false)
 }
 
+fn qualified_template(config: &Value) -> bool {
+    // PVE 9 returns memory's decimal MiB quantity as a JSON string.
+    let memory_mib = config["memory"].as_u64().or_else(|| {
+        config["memory"]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok())
+    });
+    config["cpu"] == "host"
+        && config["cores"] == 2
+        && memory_mib == Some(4096)
+        && config["scsi0"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("local-lvm:") && s.contains("size=64G"))
+        && config["net0"]
+            .as_str()
+            .is_some_and(|s| s.contains("bridge=vmbr0"))
+}
+
 pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<(), ScalerError> {
     if sha.len() != 40 || !sha.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Err(ScalerError::Guard("approved SHA must be full commit hash"));
@@ -914,16 +932,7 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
         return Err(ScalerError::Guard("template pool mismatch"));
     }
     let config = pve.request("GET", "/nodes/willow/qemu/300/config", None)?;
-    if config["cpu"] != "host"
-        || config["cores"] != 2
-        || config["memory"] != 4096
-        || !config["scsi0"]
-            .as_str()
-            .is_some_and(|s| s.starts_with("local-lvm:") && s.contains("size=64G"))
-        || !config["net0"]
-            .as_str()
-            .is_some_and(|s| s.contains("bridge=vmbr0"))
-    {
+    if !qualified_template(&config) {
         return Err(ScalerError::Guard(
             "template does not match approved size/storage/bridge",
         ));
@@ -991,6 +1000,21 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn template_guard_accepts_pve_string_memory_and_rejects_wrong_sizes() {
+        let mut config = json!({
+            "cpu":"host", "cores":2, "memory":"4096",
+            "scsi0":"local-lvm:base-300-disk-0,size=64G",
+            "net0":"virtio=BC:24:11:54:4F:C9,bridge=vmbr0"
+        });
+        assert!(qualified_template(&config));
+        config["memory"] = json!(4096);
+        assert!(qualified_template(&config));
+        for memory in [json!(8192), json!("8192"), json!("4096MiB"), json!(null)] {
+            config["memory"] = memory;
+            assert!(!qualified_template(&config));
+        }
+    }
     #[test]
     fn shared_readiness_deadline_bounds_a_nested_external_command() {
         let deadline = Instant::now() + Duration::from_millis(100);
