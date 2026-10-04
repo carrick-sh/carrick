@@ -192,6 +192,140 @@ fn owner_lazy_selection_keeps_supply_owned_when_fault_mailbox_is_occupied() {
     assert_eq!(mailbox.claim_request().unwrap().mm_key, 99);
 }
 
+/// A bulk first-touch grant can leave a prepared leaf several pages past its
+/// first resident page. A later host copyout must consume that exact backing
+/// through the owner instead of requesting overlapping physical inventory.
+#[test]
+fn prepared_bulk_leaf_and_live_residency_select_existing_owner_page() {
+    use crate::fault::PreparedPageResolver;
+    use carrick_el1_abi::FrameGrantResidencyIdentity;
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants,
+        execute_descriptor_op,
+    };
+    use carrick_mmu_core::aarch64::{
+        GuestLeafPublication, GuestPreparedCommit, GuestPreparedCommitError, LeafAccess,
+        SubstrateGpa, commit_existing_el1_prepared_page,
+    };
+
+    struct Prepared<'a> {
+        tables: &'a Tables,
+        result: core::cell::Cell<Option<Result<GuestPreparedCommit, GuestPreparedCommitError>>>,
+    }
+    impl PreparedPageResolver for Prepared<'_> {
+        fn commit_prepared(
+            &mut self,
+            ttbr0: u64,
+            va: u64,
+            expected_ipa: u64,
+            access: LeafAccess,
+        ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+            // SAFETY: Tables owns an aligned, live primary image for this MM.
+            let result = unsafe {
+                commit_existing_el1_prepared_page(
+                    self.tables.words.as_ptr().cast_mut(),
+                    ttbr0,
+                    self.tables.words.len() * 8,
+                    None,
+                    va,
+                    expected_ipa,
+                    access,
+                )
+            };
+            self.result.set(Some(result));
+            result
+        }
+    }
+
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 8, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 0);
+    let maintenance = CallerInvalidatesAsid;
+    let words = tables.live(&maintenance);
+    let first = VA;
+    let later = VA + 4 * 4096;
+    let length = 8 * 4096;
+    let mut journal = InlineJournal::new();
+    let nz = |value| NonZeroU64::new(value).unwrap();
+    let outcome = execute_descriptor_op(
+        &words,
+        SubstrateGpa(ROOT),
+        DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: first,
+                ipa: IPA,
+                len: length,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(first, 4096),
+            backing: BackingIdentity {
+                frame_id: nz(6),
+                mapping_id: nz(7),
+                owner_generation: nz(8),
+                inventory_revision: nz(9),
+            },
+        },
+        &TableGrants::NONE,
+        &mut journal,
+    );
+    assert!(
+        matches!(outcome, DescriptorOutcome::Applied(_)),
+        "{outcome:?}"
+    );
+    let residency = residency();
+    residency
+        .publish(FrameGrantResidencyIdentity {
+            mm_key: mm.raw(),
+            semantic_base: first,
+            physical_ipa: IPA,
+            len: length,
+            mapping_id: 7,
+            frame_id: 6,
+            owner_generation: 8,
+            inventory_revision: 9,
+        })
+        .unwrap();
+    let page = residency.lookup(mm.raw(), later).unwrap();
+    assert_eq!(page.expected_ipa, IPA + 4 * 4096);
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(later + 5),
+            4091,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let mut prepared = Prepared {
+        tables: &tables,
+        result: core::cell::Cell::new(None),
+    };
+    let selected = portal
+        .select(
+            &transfer,
+            &words,
+            &mut prepared,
+            &mut NoopCowResolver,
+            &residency,
+            0,
+        )
+        .unwrap();
+    assert_eq!(
+        prepared.result.get(),
+        Some(Ok(GuestPreparedCommit::Committed)),
+        "prepared leaf refused the exact live residency"
+    );
+    let TransferStep::Selected(selected) = selected else {
+        panic!("live prepared grant requested a second physical owner: {selected:?}")
+    };
+    assert_eq!(selected.ipa, IPA + 4 * 4096 + 5);
+    assert!(residency.is_guest_committed(mm.raw(), later));
+}
+
 #[test]
 fn owner_grant_rejects_recycled_range_after_host_reconciliation() {
     use crate::memory::reservations::{Decision, Placement, ReservationFaultPlan};
