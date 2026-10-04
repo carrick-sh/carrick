@@ -472,6 +472,25 @@ pub fn from_sole_executor<'authority>(
 /// Exact-MM task/custody admission for an admitted owner. This capability
 /// owns no host page-table pause or EL1 editor exclusion and cannot be
 /// converted to a host descriptor editor. The owner supplies memory policy.
+///
+/// An admitted identity cannot construct a host image builder:
+///
+/// ```compile_fail,E0277
+/// use carrick_el1_abi::El1MmHandle;
+/// use carrick_mmu_core::aarch64::PageTableManager;
+/// fn host_builder(handle: El1MmHandle) -> PageTableManager {
+///     handle.into()
+/// }
+/// ```
+///
+/// Lifecycle admission cannot be converted to host edit authority:
+///
+/// ```compile_fail,E0308
+/// use carrick_kernel::dispatch::mm_mutation::{MmMutationGuard, OwnerMmTopologyGuard};
+/// fn host_editor(owner: OwnerMmTopologyGuard<'_>) -> MmMutationGuard<'_> {
+///     owner
+/// }
+/// ```
 pub struct OwnerMmTopologyGuard<'authority> {
     inner: MmMutationGuard<'authority>,
 }
