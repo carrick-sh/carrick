@@ -416,10 +416,20 @@ test -s docs/superpowers/plans/2026-10-04-n2-readiness.md && just fmt-check
 The requested nonempty-document/format check passed. A read-only manifest
 check validated 38 leaf paths, no pairwise or driver overlap, existing paths
 on M/N, and no overlap with the frozen N1/helper diffs. `git diff --check`
-also passed. The rulebook pre-push `just ci` passed formatting, Clippy and
-domain/authority checks, then exited 101 because `cargo-deny` is not installed.
-Log: `/tmp/n2-audit-ci.log`; later CI stages were not reached. This is an
-environment blocker, not a green full-CI receipt.
+also passed. The initial rulebook `just ci` stopped at missing `cargo-deny`
+(`/tmp/n2-audit-ci.log`). After the director installed it, the complete recipe
+was attempted again on documentation commit `fab4a0b96`:
+`CARRICK_RUN_ID=n2-audit-ci-final just ci`, log
+`/tmp/n2-audit-ci-final.log`. Formatting, Clippy, domain/authority, dependency,
+matrix, layering, portable-kernel and workspace build checks passed. Rustdoc
+then exited 101 on inherited `carrick-mmu-core/src/aarch64.rs:299,826,889,949,1831`
+unresolved `[5:0]`, `publish_existing_invalid_private_pages` and `AP[1]`
+links, and `carrick-el1-abi/src/ipc/epoll.rs:11`'s private
+`EpollState::host_items` link. Both files are unchanged from M; the inspected
+[PR #3](https://github.com/carrick-sh/carrick/pull/3) contains their fixes.
+Host-test and integration-test stages after rustdoc were not reached. This
+records a blocked full CI attempt, not a green acceptance receipt; fixing
+those source files is outside this planning-only task.
 
 Product acceptance commands in this plan are future obligations. This audit
 must not be reported as N1, N2 or N3 acceptance.
