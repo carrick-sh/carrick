@@ -2865,9 +2865,10 @@ mod tests {
             let private = unix_socket_host_dir().join(format!("carrick-noxattr-{pid}.sock"));
             std::fs::create_dir_all(unix_socket_host_dir()).expect("create private unix dir");
             std::fs::write(&private, b"").expect("create private host node");
-            let mut bytes = vec![0u8, libc::AF_UNIX as u8];
+            let mut bytes = vec![0u8; 2];
             bytes.extend_from_slice(private.as_os_str().as_bytes());
             bytes.push(0);
+            set_host_sockaddr_header(&mut bytes, libc::AF_UNIX);
             let out = host_to_linux_sockaddr(&bytes, 0, false);
             let _ = std::fs::remove_file(&private);
             assert_eq!(
@@ -2881,10 +2882,11 @@ mod tests {
 
         // The host supports extended attributes: the cross-process fallback must
         // reverse-translate the host node back to the guest sun_path.
-        // macOS-form AF_UNIX sockaddr (sa_len, sa_family=AF_UNIX, then path).
-        let mut bytes = vec![0u8, libc::AF_UNIX as u8];
+        // Native host header: BSD's (len, family) or Linux's u16 family.
+        let mut bytes = vec![0u8; 2];
         bytes.extend_from_slice(node.as_os_str().as_bytes());
         bytes.push(0);
+        set_host_sockaddr_header(&mut bytes, libc::AF_UNIX);
 
         let out = host_to_linux_sockaddr(&bytes, 0, false);
         let _ = std::fs::remove_file(&node);
@@ -2908,9 +2910,10 @@ mod tests {
         let node = dir.join(format!("carrick-unmapped-{}.sock", std::process::id()));
         std::fs::write(&node, b"").expect("create temp host node");
 
-        let mut bytes = vec![0u8, libc::AF_UNIX as u8];
+        let mut bytes = vec![0u8; 2];
         bytes.extend_from_slice(node.as_os_str().as_bytes());
         bytes.push(0);
+        set_host_sockaddr_header(&mut bytes, libc::AF_UNIX);
 
         let out = host_to_linux_sockaddr(&bytes, 0, false);
         let _ = std::fs::remove_file(&node);

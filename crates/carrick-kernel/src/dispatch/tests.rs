@@ -523,13 +523,20 @@ mod overlay_dispatch_tests {
             libc::close(fds[1]);
         }
 
-        let DispatchOutcome::Returned { value } = outcome else {
-            panic!("large nonblocking write should make partial progress, got {outcome:?}");
-        };
-        assert!(
-            value > 0 && (value as usize) < bytes.len(),
-            "expected a positive partial write, got {value}"
-        );
+        // Linux cannot reuse a pipe buffer slot until the entire buffer is
+        // drained. Darwin exposes the single-byte window to a partial write.
+        #[cfg(target_os = "linux")]
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EAGAIN));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let DispatchOutcome::Returned { value } = outcome else {
+                panic!("large nonblocking write should make partial progress, got {outcome:?}");
+            };
+            assert!(
+                value > 0 && (value as usize) < bytes.len(),
+                "expected a positive partial write, got {value}"
+            );
+        }
     }
 
     #[test]
@@ -581,13 +588,20 @@ mod overlay_dispatch_tests {
             libc::close(fds[1]);
         }
 
-        let DispatchOutcome::Returned { value } = outcome else {
-            panic!("large nonblocking socket write should make partial progress, got {outcome:?}");
-        };
-        assert!(
-            value > 0 && (value as usize) < bytes.len(),
-            "expected a positive partial socket write, got {value}"
-        );
+        // A one-byte recv does not release the filled Linux socket's queued
+        // buffer allocation. Darwin admits a partial write into that window.
+        #[cfg(target_os = "linux")]
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EAGAIN));
+        #[cfg(not(target_os = "linux"))]
+        {
+            let DispatchOutcome::Returned { value } = outcome else {
+                panic!("large nonblocking socket write should make partial progress, got {outcome:?}");
+            };
+            assert!(
+                value > 0 && (value as usize) < bytes.len(),
+                "expected a positive partial socket write, got {value}"
+            );
+        }
     }
 
     #[test]
