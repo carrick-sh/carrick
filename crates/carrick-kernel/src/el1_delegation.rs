@@ -1699,6 +1699,153 @@ impl<M: carrick_guest_mem::CurrentMmMemory> carrick_el1::file::UserCopy for Host
     }
 }
 
+/// One already-admitted owner read span. The zone file copies from its cache
+/// under the inode lock; commit lands those same bytes after the lock drops
+/// without another potentially suspending memory lookup.
+struct HostPreparedRead {
+    destination: u64,
+    capacity: usize,
+    pending: Option<Vec<u8>>,
+}
+
+impl carrick_el1::file::UserCopy for HostPreparedRead {
+    fn copy_out(&mut self, destination: u64, source: &[u8]) -> bool {
+        if destination != self.destination || source.len() > self.capacity || self.pending.is_some()
+        {
+            return false;
+        }
+        self.pending = Some(source.to_vec());
+        true
+    }
+
+    fn copy_in(&mut self, _destination: &mut [u8], _source: u64) -> bool {
+        false
+    }
+}
+
+pub(crate) fn owner_prepare_refusal(
+    error: carrick_guest_mem::MemoryPrepareError,
+) -> crate::dispatch::DispatchOutcome {
+    use carrick_guest_mem::MemoryPrepareError;
+    match error {
+        MemoryPrepareError::OwnerWait(wait) => {
+            crate::dispatch::DispatchOutcome::OwnerMemoryWait { wait }
+        }
+        MemoryPrepareError::Physical(wait) => {
+            crate::dispatch::DispatchOutcome::OwnerPhysicalWait { wait }
+        }
+        MemoryPrepareError::Supply(request) => {
+            crate::dispatch::DispatchOutcome::OwnerMemorySupply { request }
+        }
+        MemoryPrepareError::Fault(_) => {
+            crate::dispatch::DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
+        }
+        MemoryPrepareError::Limit(limit) => carrick_fatal!(
+            "el1_delegation",
+            "bounded owner copyout exceeded permit: {limit:?}"
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
+    description: &FileDescription,
+    nr: usize,
+    args: [u64; 3],
+    memory: &mut M,
+    region_ptr: usize,
+    record: &DelegatedOpenFile,
+    file: &DelegatedFile,
+    handle: u32,
+    open_handle: u32,
+) -> Option<crate::dispatch::DispatchOutcome> {
+    // SAFETY: the inotify table lives in this retained EL1 region.
+    let inotify_table = unsafe {
+        std::slice::from_raw_parts(
+            (region_ptr + EL1_INOTIFY_TABLE_OFFSET as usize) as *const DelegatedInotify,
+            MAX_DELEGATED_INOTIFY,
+        )
+    };
+    let zone_file = carrick_el1::file::ZoneFile {
+        inode: file,
+        open: record,
+    };
+    let mut delivered = 0u64;
+    while delivered < args[1] {
+        let Some(destination) = args[0].checked_add(delivered) else {
+            return Some(crate::dispatch::DispatchOutcome::errno(
+                carrick_abi::LINUX_EFAULT,
+            ));
+        };
+        let chunk =
+            (args[1] - delivered).min((4096 - (destination as usize & 4095)) as u64) as usize;
+        let Some(range) =
+            carrick_guest_mem::GuestWriteRange::new(carrick_guest_mem::GuestVa(destination), chunk)
+        else {
+            return Some(crate::dispatch::DispatchOutcome::errno(
+                carrick_abi::LINUX_EFAULT,
+            ));
+        };
+        let permit = match memory.prepare_write(&[range]) {
+            Ok(permit) => permit,
+            Err(error) => return Some(owner_prepare_refusal(error)),
+        };
+        let file_guard = lock_delegated_file(file, handle);
+        if !record.is_bound_to(file)
+            || record.inode_handle.load(Ordering::Acquire) != handle
+            || description.delegation_handle() != open_handle
+        {
+            drop(file_guard);
+            return None;
+        }
+        let mut user = HostPreparedRead {
+            destination,
+            capacity: chunk,
+            pending: None,
+        };
+        let mut bounded_args = args;
+        bounded_args[0] = destination;
+        bounded_args[1] = chunk as u64;
+        if nr == 67 {
+            let Some(offset) = args[2].checked_add(delivered) else {
+                return Some(crate::dispatch::DispatchOutcome::errno(
+                    carrick_abi::LINUX_EINVAL,
+                ));
+            };
+            bounded_args[2] = offset;
+        }
+        // SAFETY: the inode is locked and live; the cache pointer is its slot.
+        let result = unsafe {
+            carrick_el1::serve_locked_file_op(
+                &zone_file,
+                inotify_table,
+                nr,
+                bounded_args,
+                delegated_cache(region_ptr, handle),
+                &mut user,
+                &HostInstanceLock,
+            )
+        };
+        drop(file_guard);
+        let value = result.ok()?;
+        if let Some(errno) = carrick_abi::LinuxErrno::from_guest_retval(value) {
+            return Some(crate::dispatch::DispatchOutcome::errno(errno));
+        }
+        if let Some(bytes) = user.pending {
+            permit.commit(&[&bytes]);
+        }
+        crate::el1_inotify::deliver_owed_wakes();
+        delivered += value as u64;
+        if value < chunk as i64 {
+            break;
+        }
+    }
+    HOST_SERVED.fetch_add(1, Ordering::Relaxed);
+    Some(crate::dispatch::DispatchOutcome::Returned {
+        value: delivered as i64,
+    })
+}
+
 /// The host waits for a marking inotify instance (lock order: file, then
 /// instance); it has nowhere else to send the operation.
 struct HostInstanceLock;
@@ -1747,6 +1894,22 @@ pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
         return None;
     }
     let file = delegated_file_object(region_ptr, handle);
+    if matches!(nr, 63 | 67)
+        && args[1] != 0
+        && memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
+    {
+        return serve_prepared_owner_read(
+            description,
+            nr,
+            args,
+            memory,
+            region_ptr,
+            record,
+            file,
+            handle,
+            open_handle,
+        );
+    }
     let file_guard = lock_delegated_file(file, handle);
     if !record.is_bound_to(file)
         || record.inode_handle.load(Ordering::Acquire) != handle
@@ -1763,13 +1926,13 @@ pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
             MAX_DELEGATED_INOTIFY,
         )
     };
-    let mut user = HostUserCopy {
-        memory,
-        pending: Vec::new(),
-    };
     let zone_file = carrick_el1::file::ZoneFile {
         inode: file,
         open: record,
+    };
+    let mut user = HostUserCopy {
+        memory,
+        pending: Vec::new(),
     };
     // SAFETY: the inode is locked and live; the cache pointer is its slot.
     let result = unsafe {
