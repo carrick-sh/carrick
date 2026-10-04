@@ -574,7 +574,10 @@ is changed. This is a VM-free policy binding for
 `kernel.el1.signal-delivery-owner`, not acceptance of landing C.
 
 - `policy` extracts the kernel object's first-standard/FIFO-real-time pending
-  algorithm using the existing core payload queue and set. It adds typed Linux
+  algorithm using an explicit `StandardSignalSlot` for first-instance retention,
+  a FIFO `VecDeque` for real-time instances, and the existing core set. The
+  production `PendingQueue::publish` retains its original newest-replacement
+  behavior; policy does not use that queue's coalescing flag. It adds typed Linux
   signal/action/mask policy, handler entry, fork/exec reducers, child decisions
   and exact-key inboxes. `ActionInheritance::Shared` returns the existing
   sighand key for CLONE_SIGHAND; `Copied` returns independent actions. The
@@ -624,11 +627,21 @@ preparation the one-shot metadata assertion also caught an over-broad reset
 before it was aligned with the existing kernel test. Architecture restorer
 fixtures were added before their API (capability compile red).
 
+Follow-up: the director's landing gate found that the first-instance change
+to the existing `PendingQueue` affected production `child_watch`, whose
+`child_exit_siginfo_queues_and_coalesces` test requires the newest payload.
+The original `payload_policy_is_caller_selected` assertion is restored, and
+first-instance tests now target `StandardSignalSlot`. Before the correction,
+the restored core assertion failed (2 instead of 3), and the unchanged child
+watch test failed (child 601 instead of child 602). This supersedes the initial
+claim that changing the shared queue was an isolated preparatory correction;
+history is retained and production semantics are restored in a new commit.
+
 Findings for the integrating owner (source inspection, no kernel changes):
 
 | Current representation/behavior | Core policy / handoff decision | Linux authority |
 | --- | --- | --- |
-| Core `PendingQueue::publish(coalesce=true)` replaced the old payload, unlike kernel `PendingQueue::enqueue_standard`. Its existing child-watch caller uses this for standard signals. | Coalescing now keeps the first pending instance, including no payload; FIFO remains FIFO. The existing generic queue test was corrected red-first. | [signal(7), standard queueing](https://man7.org/linux/man-pages/man7/signal.7.html) |
+| Current production SIGCHLD siginfo coalescing in `carrick-signal-linux/src/child_watch.rs` uses `PendingQueue::publish(coalesce=true)` per `(pid, signal)` and keeps the newest payload. Kernel `PendingQueue::enqueue_standard` keeps the first. | Preserve current production behavior in this preparatory slice. Landing C must decide the SIGCHLD discrepancy with a director-run native arm64 Docker oracle line, then migrate `child_watch` to the policy core's explicit first-instance `StandardSignalSlot`. | [signal(7), standard queueing retains the first pending instance](https://man7.org/linux/man-pages/man7/signal.7.html) |
 | `TaskPendingQueue::recipient` defaults to the leader and keeps a named recipient per signal; other kernel wait logic can retarget. | Pure process-target selection uses the first live, unblocked exact key in caller order. Revalidate and publish under admission; leave pending when all eligible threads block it. This is a selection-interface difference, not proof the full kernel path violates Linux. | [signal(7), process-directed delivery](https://man7.org/linux/man-pages/man7/signal.7.html) |
 | Kernel default delivery folds SIGCONT into Ignore and all fatal defaults into Terminate. | Core returns Continue and distinguishes core-dump defaults. Generation-time SIGCONT resume/stop cancellation must occur even with a caught/ignored disposition; this slice does not implement job-control graph mutation or dump production. | [signal(7), default actions](https://man7.org/linux/man-pages/man7/signal.7.html) |
 | `Sighand::autoreaps_children` and child-exit notification are separate helpers; the latter has no stop/continue event parameter. | `child_decision` returns independent auto-reap and notification data, including SA_NOCLDWAIT's caught notification and SA_NOCLDSTOP's stop/continue suppression. This must not remove waitable stop/continue events. | [sigaction(2)](https://man7.org/linux/man-pages/man2/sigaction.2.html), [wait(2)](https://man7.org/linux/man-pages/man2/wait.2.html) |
@@ -649,6 +662,13 @@ Portable verification: `cargo test -p carrick-signal-core` (12 unit tests,
 18 policy contracts), `cargo clippy -p carrick-signal-core --all-targets -- -D
 warnings`, and `just fmt-check`. Clippy exits zero but reports the existing
 Linux-invalid `libc::proc_listallpids` catalog entry in root `clippy.toml`.
+Follow-up verification expands the portable gate to
+`cargo test -p carrick-signal-core -p carrick-signal-linux`,
+`cargo clippy -p carrick-signal-core -p carrick-signal-linux --all-targets --no-deps -- -D warnings`,
+and `just fmt-check`, covering the production child-watch consumer without
+editing it. All three exit zero: 12 core unit tests, 18 policy contracts and
+47 signal-linux unit tests pass. The existing Clippy catalog warning remains.
+The native arm64 Docker oracle line remains director-owned.
 No signed/HVF, Docker, `just accept`, kernel or EL1 binding gate was run on this
 Linux box, as instructed. Frame/protection/sigreturn, altstack, job-control,
 permission/sender validation, RLIMIT_SIGPENDING admission, shared publication,

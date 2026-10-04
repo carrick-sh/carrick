@@ -150,8 +150,10 @@ impl DispositionSet {
     }
 }
 
-/// Pending payload queue. Coalescing retains the first instance, including an
-/// explicitly absent payload; otherwise instances are delivered FIFO.
+/// Existing caller-selected payload queue. `publish(value, true)` replaces
+/// every queued payload with the newest; `false` appends for FIFO delivery.
+/// Production child-watch callers rely on replacement. Linux first-instance
+/// standard-signal policy uses [`StandardSignalSlot`] instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingQueue<T>(VecDeque<T>);
 
@@ -163,8 +165,8 @@ impl<T> Default for PendingQueue<T> {
 
 impl<T> PendingQueue<T> {
     pub fn publish(&mut self, value: T, coalesce: bool) {
-        if coalesce && !self.0.is_empty() {
-            return;
+        if coalesce {
+            self.0.clear();
         }
         self.0.push_back(value);
     }
@@ -173,6 +175,38 @@ impl<T> PendingQueue<T> {
     }
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+}
+
+/// One pending Linux standard-signal instance, retaining the first payload.
+/// Unlike [`PendingQueue`]'s replacement mode, later publications never
+/// overwrite the pending instance. `StandardSignalSlot<Option<T>>` preserves
+/// an explicitly absent first siginfo separately from an empty slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandardSignalSlot<T>(Option<T>);
+
+impl<T> Default for StandardSignalSlot<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<T> StandardSignalSlot<T> {
+    /// True if a new instance was retained; false if one is already pending.
+    pub fn publish_first(&mut self, value: T) -> bool {
+        if self.0.is_some() {
+            return false;
+        }
+        self.0 = Some(value);
+        true
+    }
+
+    pub fn take(&mut self) -> Option<T> {
+        self.0.take()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_none()
     }
 }
 
@@ -237,20 +271,22 @@ mod tests {
         queue.publish(2, false);
         assert_eq!(queue.take(), Some(1));
         queue.publish(3, true);
-        assert_eq!(queue.take(), Some(2));
+        assert_eq!(queue.take(), Some(3));
         assert!(queue.is_empty());
     }
 
     #[test]
     fn standard_coalescing_retains_first_payload_including_absence() {
-        let mut queue = PendingQueue::default();
-        queue.publish(Some(1), true);
-        queue.publish(Some(2), true);
-        assert_eq!(queue.take(), Some(Some(1)));
-        assert!(queue.is_empty());
-        queue.publish(None, true);
-        queue.publish(Some(3), true);
-        assert_eq!(queue.take(), Some(None));
-        assert!(queue.is_empty());
+        let mut slot = StandardSignalSlot::default();
+        assert!(slot.is_empty());
+        assert!(slot.publish_first(Some(1)));
+        assert!(!slot.publish_first(Some(2)));
+        assert_eq!(slot.take(), Some(Some(1)));
+        assert!(slot.is_empty());
+        assert!(slot.publish_first(None));
+        assert!(!slot.publish_first(Some(3)));
+        assert!(!slot.is_empty());
+        assert_eq!(slot.take(), Some(None));
+        assert!(slot.is_empty());
     }
 }
