@@ -77,6 +77,9 @@ pub struct CpuBinding {
     pub publications: AtomicU64,
     pub completions: AtomicU64,
     pub captured_stack: AtomicU64,
+    /// Private hardware witness binding; zero in normal M2 entry. This is
+    /// retained CPL0 control transport, not common task/scheduler authority.
+    pub scheduler_witness: AtomicU64,
 }
 const _: () = assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
 

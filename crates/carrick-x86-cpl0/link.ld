@@ -6,5 +6,6 @@ SECTIONS {
     .rodata : ALIGN(4096) { *(.rodata .rodata.*) }
     .data : ALIGN(4096) { *(.data .data.*) *(.got .got.*) }
     .bss : ALIGN(4096) { *(.bss .bss.*) *(COMMON) }
+    .progress_header 0x1f0000 : { KEEP(*(.progress_header)) }
     /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }

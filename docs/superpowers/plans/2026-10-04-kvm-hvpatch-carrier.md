@@ -573,6 +573,79 @@ N1/N2 slices. No new scheduler/pipe/futex implementation or shared runtime.
 - [ ] Accept: `cargo test -p carrick-el1 -p carrick-sched-core -p carrick-fd-core -p carrick-pipe-core --lib`;
   `CARRICK_RUN_ID=kvm-m4 cargo test -p carrick-vmm-kvm --test cpl0_progress`.
 
+#### M4 preparation handoff (2026-10-04, x86 only)
+
+The N1-independent hardware binding uses existing `ZoneTables`, `RecordRef`,
+`SlotId`, claims, FIFO queues, `requeue_preempted`, `switch_in`, `wake` and
+`install_space` without modifying sched-core, EL1 ABI/personality or runtime.
+Native state is a `ContextBinding { record: RecordRef, context: NativeContext }`
+sidecar, authenticated against the shared record incarnation and OnCpu claim.
+It never overlays x86 registers onto the ARM `ThreadCtx` fields. This sidecar
+is fixture custody, **not** an accepted production MM/task owner.
+
+Owner hook handoff after N1/N2 land (no edits to those owners in preparation):
+
+```rust
+// Refine the existing common ThreadCpu surface, retaining its one policy body.
+trait ThreadCpu {
+    type Frame;
+    type SavedContext;
+    type AddressContext;
+    fn save(&mut self, frame: &Self::Frame, context: &mut Self::SavedContext);
+    fn load(&mut self, frame: &mut Self::Frame, context: &Self::SavedContext);
+    fn install_context(&mut self, context: &Self::AddressContext)
+        -> Result<(), ContextRefusal>;
+}
+// A backend-owned context loan is issued under the SAME RecordRef/claim.
+// ARM lends its existing ThreadCtx; x86 lends NativeContext, including XSAVE.
+trait NativeContextStore {
+    type SavedContext;
+    fn lend_on_cpu(&mut self, record: RecordRef, slot: SlotId)
+        -> Result<&mut Self::SavedContext, ContextRefusal>;
+}
+```
+
+`ContextRefusal` must distinguish stale record/context generation, closed MM
+admission and unsupported CPU state. Owner-issued root/generation receipts
+must qualify `AddressContext<RootGpa>` before its no-PCID CR3 installation;
+matching a fixture `SpaceGrant.ttbr0` alone does not establish N1 authority.
+The existing guest-arch `InterruptBackend` signatures remain the target:
+`arm_timer(Option<Deadline>)`, `send_wake(CpuTarget, WakeToken)` and
+`end_interrupt(InterruptAck<HardwareInterrupt>)`. Bind counter/frequency and
+qualified LAPIC tick conversion there; the fixture's `TimerTicks(100_000)` is
+only a hardware preemption quantum, not a Linux deadline or timer policy.
+Publish a token under shared wait ownership before sending its APIC kick;
+`hardware::send_wake(ApicId) -> Result<(), IpiBusy>` refuses a busy ICR without
+polling. The eventual common caller must retain undelivered wake ownership.
+
+Preparation witness: one running KVM vCPU, two shared records and private
+CR3s mapping VA `0x50000` to different pages. Sixteen timer interrupts alternate
+syscall-free compute; FS/GS, GPRs, XMM15/YMM15 and progress survive. Entry and
+return masked-boundary MSI injections around a real shared-kernel
+`set_robust_list` call each cause exactly one shared wake, publication and
+completion. Both task control slots are inspected.
+Only two boundary controls and final observation exit to the host; any other
+exit fails. Timer/kick semantic host forwards and interrupt host exits are zero.
+The unused M2 second vCPU remains stopped; it cannot supply guest progress.
+
+Mutation evidence under `target/kvm-m4prep/`: disabled admission fails the
+VM-free ownership assertion; a mismatched record/MM sidecar also fails
+admission (before the MM identity check); disarmed LAPIC timer reaches the
+5 s watchdog;
+omitted CR3 install fails live CR3 (6291456 vs 25165824); omitted XSAVE restore
+fails XMM/YMM tags (0 vs 49); omitted TLS restore after first return fails FS
+isolation (0 vs 62721); suppressed shared wake fails FIFO alternation (0 vs 1); omitted R14
+restore fails its distinct GPR tag (0 vs 43969).
+All mutations are restored before final verification. Preparation verification
+passes: the freestanding release build, x86/KVM crate tests (including the M2
+entry tests), both live `cpl0_progress` cases, `just test-kernel`, and focused
+host/image clippy. The executing image SHA-256 is
+`8e424ad5c90d1464bc74d7a325270233e6319bd341b1fb108d9306a4eb0e81fb`.
+Linux-portable acceptance is run on the committed tree; its receipt remains
+under `target/el1-gate/<head>/receipt.json`. These hardware tests do not close M4 IPC exhaustion, signal/timer policy, runtime leases, N1 production
+MM ownership, ARM signed gates or Docker timing. Remote host receipt is
+**director-queued** for this preparation.
+
 ### M5 — persistent KVM carrier binds the shared runtime
 
 **Fence:** KVM `carrier.rs`/`executor.rs`, x86 carrier CPU implementation,
