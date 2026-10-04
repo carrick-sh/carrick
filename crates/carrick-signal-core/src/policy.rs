@@ -1,6 +1,6 @@
 //! Pure Linux signal policy extracted from kernel/objects/signal.rs.
 //!
-//! Semantic authority: https://man7.org/linux/man-pages/man7/signal.7.html,
+//! Semantic authority: <https://man7.org/linux/man-pages/man7/signal.7.html>,
 //! sigaction(2), sigprocmask(2), sigsuspend(2), wait(2), clone(2), fork(2)
 //! and execve(2). Numbering is Linux asm-generic, as used by AArch64.
 //! `carrick-abi` is the repository's wire-ABI source of truth; its current std

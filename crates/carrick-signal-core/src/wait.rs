@@ -1,5 +1,5 @@
 //! Interrupted-wait policy from signal(7), "Interruption of system calls":
-//! https://man7.org/linux/man-pages/man7/signal.7.html.
+//! <https://man7.org/linux/man-pages/man7/signal.7.html>.
 //! No wait registration, transport, syscall-number table or scheduler here.
 
 use core::num::NonZeroUsize;
