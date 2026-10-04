@@ -16,7 +16,7 @@ fn command() -> Command {
 fn exec_backend_help_lists_only_portable_values() {
     command()
         .env_remove("CARRICK_EXEC_BACKEND")
-        .args(["run-elf", "--help"])
+        .args(["run", "--help"])
         .assert()
         .success()
         .stdout(contains("possible values: hvpatch"));
@@ -26,7 +26,7 @@ fn exec_backend_help_lists_only_portable_values() {
 fn removed_auto_exec_backend_has_migration_guidance() {
     command()
         .env_remove("CARRICK_EXEC_BACKEND")
-        .args(["run-elf", "--exec-backend", "vmm", "/does/not/matter"])
+        .args(["run", "--exec-backend", "vmm", "/does/not/matter"])
         .assert()
         .code(2)
         .stderr(contains("only 'hvpatch' is supported"));
@@ -36,7 +36,7 @@ fn removed_auto_exec_backend_has_migration_guidance() {
 fn exec_backend_hvf_environment_value_has_migration_guidance() {
     command()
         .env("CARRICK_EXEC_BACKEND", "hvf")
-        .args(["run-elf", "/does/not/matter"])
+        .args(["run", "/does/not/matter"])
         .assert()
         .code(2)
         .stderr(contains("only 'hvpatch' is supported"));
@@ -46,7 +46,7 @@ fn exec_backend_hvf_environment_value_has_migration_guidance() {
 fn native_code_mode_flag_is_not_public_policy() {
     let output = command()
         .args([
-            "run-elf",
+            "run",
             "--exec-backend",
             "hvpatch",
             "--native-code-mode",
