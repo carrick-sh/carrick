@@ -587,7 +587,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         if leaf.is_none() {
             if let Some(page) = residency.lookup(mm, va)
                 && matches!(
-                    prepared.commit_prepared(grant.ttbr0, va, page.expected_ipa, access),
+                    prepared.commit_prepared(grant.ttbr0, va & !4095, page.expected_ipa, access),
                     Ok(GuestPreparedCommit::Committed | GuestPreparedCommit::AlreadyResident)
                 )
             {
