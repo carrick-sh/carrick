@@ -133,7 +133,7 @@ pub fn dispatch_entry(frame: &mut TrapFrame, counters: &Counters) -> Action {
     if frame.esr == 0 {
         return dispatch_irq(frame, counters);
     }
-    if ((frame.esr >> 26) & 0x3F) == 0x24 {
+    if matches!((frame.esr >> 26) & 0x3f, 0x20 | 0x24) {
         return dispatch_fault(frame, counters);
     }
     dispatch_syscall(frame, counters)
@@ -1905,6 +1905,18 @@ mod tests {
         // Arbitrary x8 is not treated as a syscall
         assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 0);
         assert_eq!(counters.served[172].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn instruction_abort_reaches_the_owner_fault_dispatch() {
+        let counters = Counters::default();
+        let mut frame = TrapFrame {
+            esr: (0x20 << 26) | 0x07,
+            far: 0x6000_1000,
+            ..TrapFrame::default()
+        };
+        assert_eq!(dispatch_entry(&mut frame, &counters), Action::Forward);
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
     }
 
     #[test]
