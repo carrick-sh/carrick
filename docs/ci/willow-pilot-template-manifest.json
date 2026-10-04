@@ -1,0 +1,31 @@
+{
+  "vmid": 300,
+  "pool": "carrick-ci",
+  "cpu": "host",
+  "vcpus": 2,
+  "memory_mib": 4096,
+  "disk_gib": 64,
+  "storage": "local-lvm",
+  "bridge": "vmbr0",
+  "script_commit": "09cb8d774c81e27bce05ce30e9f42805fb542d2e",
+  "script_sha256": "c4cd13ad15d6b82c2dbb075f63accbc8352f37dd1933ed4cd30c74a5fa84d342",
+  "image_url": "https://cloud.debian.org/images/cloud/trixie/20261001-2618/debian-13-generic-amd64-20261001-2618.qcow2",
+  "image_sha512": "6f0f93335bdef4ccf523c4317cc663ea52ca23b862667785f3d6d186ab4674a937385ccff0c55996b4b2e4c19e440cdf211e2a75ffa2f6548037ab43950c841d",
+  "runner_version": "2.337.0",
+  "runner_sha256": "70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613",
+  "sccache_sha256": "45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89",
+  "rustup_sha256": "dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71",
+  "toolchain_sha256": "a7a08ad2f330606358dcf19871aa16a409a1dafd23bd4791c236f3bd25d53130",
+  "cargo_lock_sha256": "23c65e286ab6df2b415f3fb1dbb1bfad59d344e8aeb26537557c4261519f495d",
+  "xtask_sha256": "f5bbbdc69f96212f6499f9b609eac644a51d9d8fa4225e6bf2ee2a8cbb10669f",
+  "bootstrap_sha256": "d28e8dcf9e1feb2efb2a6e9d82e713dfe6bdbdbe533d4b65f447d0c327db9c48",
+  "packages_sha256": "e80864e48c257ae32dd0a83e6cfefd633600c98d1f85123a8136bd2585562cd4",
+  "qualification": {
+    "kernel": "6.12.111+deb13-amd64",
+    "rust": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+    "kvm_api": 12,
+    "user": "runner",
+    "svm": true,
+    "runner_registered": false
+  }
+}

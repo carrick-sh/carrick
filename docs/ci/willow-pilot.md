@@ -7,6 +7,9 @@ configuration. The foreground controller runs **on Willow** through SSH from
 the Mac: the PVE secret remains in `/root/carrick-ci-token.json` and on-host
 memory/pipes. Jobs receive only one-use JIT material.
 
+The [pilot receipt](willow-pilot-evidence.md) records current qualification,
+cleanup and the incomplete live job proof.
+
 ## Build and supervise
 
 Build `carrick-xtask` for x86 Linux away from the hypervisor. On the Mac, the
