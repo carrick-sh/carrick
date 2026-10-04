@@ -821,4 +821,94 @@ mod tests {
         owner_scheduler.close();
         peer_scheduler.close();
     }
+
+    #[test]
+    fn abi_first_entry_after_exec_close_cannot_acquire_a_runtime_owner() {
+        let (_, scheduler, kernel, owner, _, _) =
+            test_carrier_graph_with_dispatcher!(72_497, SyscallDispatcher::new());
+        let (_, peer_scheduler, peer_kernel, peer, _, _) =
+            test_carrier_graph_with_dispatcher!(72_498, SyscallDispatcher::new());
+        let owner_state = state(&kernel, &owner, 1_001);
+        let peer_state = state(&peer_kernel, &peer, 1_001);
+        let factory = ProcessThreadAdoptionFactory::capture(&kernel, &owner_state).unwrap();
+        let peer_factory =
+            ProcessThreadAdoptionFactory::capture(&peer_kernel, &peer_state).unwrap();
+        // The runtime cell already exists when EL1 publishes Born. Its first
+        // host entry is delayed until exec has sealed and stopped the census.
+        let reservation = factory.reserve(owner.thread().key()).unwrap();
+        let admission = kernel
+            .close_clone_admission_for_exec(owner_state.this_tid)
+            .unwrap();
+        owner_state.registry.remove_all_except(owner_state.this_tid);
+        let adopted = adopt_thread_runtime::<CrashCaptureTestEngine>(reservation, &owner, None);
+        assert!(
+            adopted.is_err(),
+            "first entry after exec's stop must release its capacity, not create a late runtime owner"
+        );
+        let peer_reservation = peer_factory.reserve(peer.thread().key()).unwrap();
+        assert!(
+            adopt_thread_runtime::<CrashCaptureTestEngine>(peer_reservation, &peer, None).is_ok(),
+            "the live peer's admission must remain open"
+        );
+        drop(admission);
+        scheduler.close();
+        peer_scheduler.close();
+    }
+
+    #[test]
+    fn abi_first_entry_before_terminal_close_remains_in_the_admission_drain() {
+        let (_, scheduler, kernel, owner, _, _) =
+            test_carrier_graph_with_dispatcher!(72_499, SyscallDispatcher::new());
+        let owner_state = state(&kernel, &owner, 1_001);
+        let factory = ProcessThreadAdoptionFactory::capture(&kernel, &owner_state).unwrap();
+        let reservation = factory.reserve(owner.thread().key()).unwrap();
+        let adopted =
+            adopt_thread_runtime::<CrashCaptureTestEngine>(reservation, &owner, None).unwrap();
+        // Pause after runtime custody is consumed but before registration,
+        // member enrollment and activation. Exit cannot snapshot members yet.
+        assert_eq!(
+            kernel
+                .clone_admission
+                .try_claim_process_exit(owner_state.this_tid)
+                .unwrap()
+                .claim,
+            super::super::ProcessExitClaim::Pending,
+            "terminal stop must wait for the first entry to publish or cancel its member"
+        );
+        drop(adopted);
+        assert_eq!(
+            kernel
+                .clone_admission
+                .try_claim_process_exit(owner_state.this_tid)
+                .unwrap()
+                .claim,
+            super::super::ProcessExitClaim::Owner
+        );
+        scheduler.close();
+    }
+
+    #[test]
+    fn abi_first_entry_of_an_existing_birth_can_finish_while_fork_admission_is_closed() {
+        let (_, scheduler, kernel, owner, _, _) =
+            test_carrier_graph_with_dispatcher!(72_500, SyscallDispatcher::new());
+        let owner_state = state(&kernel, &owner, 1_001);
+        let factory = ProcessThreadAdoptionFactory::capture(&kernel, &owner_state).unwrap();
+        let reservation = factory.reserve(owner.thread().key()).unwrap();
+        let fork_permit = kernel
+            .clone_admission
+            .enroll_process_fork(owner_state.this_tid)
+            .admitted()
+            .unwrap();
+        let fork_close = fork_permit
+            .try_close_for_fork(owner_state.this_tid)
+            .unwrap()
+            .closed()
+            .unwrap();
+        let adopted = adopt_thread_runtime::<CrashCaptureTestEngine>(reservation, &owner, None)
+            .expect("a fork must not retire its existing born sibling");
+        drop(adopted);
+        drop(fork_close);
+        drop(fork_permit);
+        scheduler.close();
+    }
 }
