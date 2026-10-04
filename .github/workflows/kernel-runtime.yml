@@ -120,12 +120,12 @@ jobs:
 
   # A real KVM device is the contract. An incidental or software-emulated
   # hosted environment is not accepted as this smoke lane.
-  kvm-smoke:
-    name: KVM · real /dev/kvm smoke
+  kvm-cpl0-entry:
+    name: KVM · x86 CPL0 entry smoke
     if: >-
       ${{ vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
           (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
-    runs-on: [self-hosted, linux, kvm, carrick-kvm]
+    runs-on: [self-hosted, linux, x64, kvm, carrick-kvm]
     timeout-minutes: 60
     concurrency:
       group: carrick-kvm-${{ github.repository }}
@@ -136,6 +136,7 @@ jobs:
       - name: Verify KVM host
         run: |
           test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
           test -c /dev/kvm
           test -r /dev/kvm
           test -w /dev/kvm
@@ -145,10 +146,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install just
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just
+      - name: Build x86 CPL0 image
+        run: |
+          rustup target add x86_64-unknown-none
+          cargo build --locked --release -p carrick-x86-cpl0 --target x86_64-unknown-none
 
-      - name: KVM smoke fixture
-        run: just kvm-smoke
+      - name: x86 CPL0 entry smoke
+        run: cargo test --locked -p carrick-vmm-kvm --test cpl0_entry

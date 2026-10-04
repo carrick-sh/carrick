@@ -248,7 +248,7 @@ and no minute budget to design around). **S** = self-hosted.
 | Job | Runner | Why it cannot move |
 |---|---|---|
 | `hvf-conformance` | `[self-hosted, macos, arm64]` **S** | **[V/E]** HVF needs `com.apple.security.hypervisor`, and GitHub documents *"Nested-virtualization is not supported due to the limitation of Apple's Virtualization Framework"* on hosted macOS. Hosted arm64 macOS is M1; Apple's nested virt needs M3+. This is also the only macOS box with Docker, so it owns the live arm64 oracle, `just conformance-probes` (which drives `bollard` directly and self-skips without a daemon), and the **raw** amplification tier (`carrick trace` auto-sudos and needs `/dev/dtrace`). **Fix before enabling:** `ci.yml:288` runs `cargo test --workspace`, which violates `justfile`'s deliberate split (carrick-runtime tests fork from the harness and deadlock in parallel; the recipe runs them alone under `RUST_TEST_THREADS=1`). Point it at `just test` + `just test-integration`, plus an explicit `--ignored` step for the guest-booting tests. |
-| `kvm-smoke` / `kvm-local` | `[self-hosted, linux, kvm]` **S** | `just kvm-smoke`'s fixture is **aarch64**, so it needs an aarch64 KVM host and does **not** move. The amd64 `--lane kvm-local` **might** move to hosted `ubuntu-latest` pending open question (5). |
+| `kvm-cpl0-entry` / `kvm-local` | `[self-hosted, linux, x64, kvm]` **S** | The current CPL0 entry binding requires real `/dev/kvm` on Linux x86_64 and a built freestanding CPL0 image. The former AArch64 smoke recipe is retired. Full OCI carrier admission remains separate. |
 | bhyve / NVMM / BSD lanes | fleet **S** | **[V]** No GitHub-hosted FreeBSD or NetBSD runner exists. A cross-platform-action VM is x86-emulated and unusable as a guest lane. Permanently self-hosted. |
 
 ### 3.3 How the Docker oracle fits without making the gate non-deterministic
@@ -626,7 +626,7 @@ each failure shape:**
    vocabulary is `MATCH-covered` / `DIFF-covered` / `unexercised` / `unproven
    (lane absent)`. Only the first two are evidence.
 2. **`--require-lane <name>`** — a missing lane is a non-zero exit. This is what
-   stops the current shape where `hvf-conformance` and `kvm-smoke` both report
+   stops the historical shape where `hvf-conformance` and the former AArch64 lane both reported
    `skipped` and the run still concludes green.
 3. **`if: always()` on `fleet-aggregate`** — a lane that *failed* must still
    contribute its rows, or the matrix silently narrows to the green lanes.

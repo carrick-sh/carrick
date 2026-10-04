@@ -79,7 +79,7 @@ with **`HV_DENIED` (`0xfae94007`)**.
 | `just test-embed [ARGS]` 🔏 | Signed `carrick-embed` guest tests (see Rule 0). Opt-in (HVF + `ubuntu:24.04`), **not** in `just ci`. |
 | `just matrix` | Re-render [`docs/support-matrix.md`](docs/support-matrix.md). |
 | `just check-matrix` | Drift gate: matrix == fresh render of `baseline.jsonl` (deterministic, no run). |
-| `just kvm-smoke` / `just kvm-smoke-lima` | KVM smoke (`/dev/kvm`, lima from macOS). |
+| `cargo test -p carrick-vmm-kvm --test cpl0_entry` | x86 CPL0 entry smoke (Linux x86_64, real `/dev/kvm`, built `carrick-x86-cpl0` image). |
 | `just install-hooks` | Install git hooks (once per clone). |
 | `just accept [ARGS]` | Run host and/or signed landing gate (no Docker). |
 | `just accept --profile linux-portable` | Linux host gate + receipt; signed phase rejected. |

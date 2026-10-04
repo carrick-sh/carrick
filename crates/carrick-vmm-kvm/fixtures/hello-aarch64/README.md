@@ -1,9 +1,9 @@
 # hello-aarch64 — freestanding KVM-MVP test fixture
 
 A hand-written, libc-free aarch64 Linux ELF that issues exactly
-`write(1, "ok\n", 3)` then `exit_group(0)`. It is the L2 success criterion
-for the carrick-vmm-kvm aarch64 MVP: `just kvm-smoke` runs it under
-`carrick-vmm-kvm` and diffs the output against `oracle.expected`.
+`write(1, "ok\n", 3)` then `exit_group(0)`. It records the former aarch64
+MVP smoke fixture. The 1:1 runtime smoke runner is retired; this fixture
+has no current acceptance binding.
 
 ## Build (Mac-native, no extra toolchain)
 
@@ -25,4 +25,4 @@ the M3-nested HVF Linux VM:
 ```
 
 `oracle.expected` holds that stdout (`ok\n`); the exit code is asserted
-separately by `just kvm-smoke`.
+separately when running the fixture.

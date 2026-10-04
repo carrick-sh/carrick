@@ -11,7 +11,13 @@ The audit also surfaced **one live correctness bug, not just a coverage hole**: 
 Ranked by durability × silent-regression-likelihood × blast-radius. The first four are structural and each collapses several individual findings.
 
 ### R1 — Stand up one CI lane that actually runs a guest *(fixes #no-guest-runs-in-ci; unblocks ~all runtime findings)*
-Add a scheduled (nightly) job on a **self-hosted Linux runner with `/dev/kvm`** (the willow/Proxmox nested-virt fleet already exists) running `just kvm-smoke` — it does `run-elf` of a freestanding aarch64 ELF on real KVM with **zero Docker dependency**, so it gates the shared `carrick-x86` + `carrick-aarch64` engine bring-up. Separately, register the Apple-Silicon runner and set `CARRICK_SELF_HOSTED=true` to un-dorm the existing `hvf-conformance` job (`ci.yml:198`), which self-skips safely if Docker is absent. Do **not** assume GitHub-hosted Ubuntu provides `/dev/kvm` — nested virt is not guaranteed. **Protects:** every lane gains its first automated guest-execution smoke; today a broken syscall translation, a reclaim deadlock, or an x86 engine fault is invisible until a human runs a manual gate.
+The original proposal was a self-hosted Linux lane with real `/dev/kvm`
+running the former AArch64 smoke fixture. That 1:1 smoke recipe is retired.
+The current x86 entry binding is
+`cargo test -p carrick-vmm-kvm --test cpl0_entry`, after building
+`carrick-x86-cpl0` for `x86_64-unknown-none`. It requires a Linux x86_64 KVM
+host and proves CPL0 entry contracts. Full guest workload conformance and
+Apple-Silicon HVF acceptance remain separate gates.
 
 ### R2 — Fix the seccomp ISA hardcode (live guest-fatal bug) *(fixes #seccomp-arch-hardcoded)*
 `dispatch/mod.rs:2170-2174` builds `seccomp_data` with `arch = AUDIT_ARCH_AARCH64` and `nr = request.number` (the *canonical* number). Source `arch` from `GuestReportedArch` (add `AUDIT_ARCH_X86_64 = 0xC000003E` to `seccomp.rs`) and feed the **raw pre-normalization** guest syscall number (carry it on `SyscallRequest`). Add a `seccompdefaultprofile.rs` probe (install an arch-gated filter; assert allow succeeds and deny returns the filter errno) gated on hvf **and** the x86 lanes, plus a `seccomp.rs` unit test asserting an x86_64-arch filter KILLs against an aarch64 `SeccompData` and allows against an x86 one. **Protects:** kvm/bhyve/nvmm + Rosetta. **Prevents:** the standard Docker/systemd/browser-sandbox seccomp profile silently killing the guest on its first syscall — currently undetected because the x86 lane is report-only and CI runs no guest.
@@ -135,7 +141,7 @@ Severities are the verdict-corrected values. Duplicates across themes are merged
 
 **Phase 0 — the one live bug + the root multiplier (do immediately):**
 1. **R2 seccomp ISA fix** — it is guest-fatal on every x86 lane today, not a coverage gap. Ship the fix + probe + unit test.
-2. **R1 CI guest lane** — nightly `just kvm-smoke` on the self-hosted KVM box + un-dorm `hvf-conformance`. Everything below becomes meaningfully enforceable once a guest runs.
+2. **R1 CI guest lane** — use the x86 CPL0 entry binding on a self-hosted KVM box and the separate HVF runtime lane. The former AArch64 smoke recipe is retired.
 
 **Phase 1 — cheap CI-visibility wins (hours, existing runners, no guest needed):**
 3. **R3**: `cargo test -p carrick-host-linux`, NetBSD cross-check, `--all-targets` on BSD checks.

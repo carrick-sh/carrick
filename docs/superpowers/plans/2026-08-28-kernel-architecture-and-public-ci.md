@@ -111,7 +111,7 @@ Do not change the existing commands or `RLIMIT_NOFILE` setup in this job.
 
 - [ ] **Step 3: Remove all self-hosted jobs from `ci.yml`**
 
-Delete the complete `kvm-smoke` job and its preceding R1 comment. Delete the
+Delete the retired AArch64 smoke job and its preceding R1 comment. Delete the
 complete `hvf-conformance` job and its preceding comment. Replace the old
 hosted-runner note above `cross-check-linux` with:
 
@@ -130,12 +130,12 @@ Leave `cross-check-linux`, `cross-check-freebsd`, `cross-check-netbsd`, and
 Run only these read-only checks:
 
 ```bash
-rg -n "self-hosted|kvm-smoke|hvf-conformance|guest vCPU" .github/workflows/ci.yml
+rg -n "self-hosted|hvf-conformance|guest vCPU" .github/workflows/ci.yml
 sed -n '1,340p' .github/workflows/ci.yml
 git diff --check -- .github/workflows/ci.yml
 ```
 
-Expected: no `self-hosted`, `kvm-smoke`, or `hvf-conformance`; the one guest-vCPU
+Expected: no `self-hosted` or `hvf-conformance`; the one guest-vCPU
 mention states that hosted CI does not launch one; `git diff --check` is silent.
 
 - [ ] **Step 5: Commit the hosted-only workflow**
@@ -312,12 +312,12 @@ the public probe gate, while this job's claim is the frozen 2,127-suite gate.
 Append:
 
 ```yaml
-  kvm-smoke:
-    name: KVM · real /dev/kvm smoke
+  kvm-cpl0-entry:
+    name: KVM · x86 CPL0 entry smoke
     if: >-
       ${{ vars.CARRICK_SELF_HOSTED_KVM == 'true' &&
           (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
-    runs-on: [self-hosted, linux, kvm, carrick-kvm]
+    runs-on: [self-hosted, linux, x64, kvm, carrick-kvm]
     timeout-minutes: 60
     concurrency:
       group: carrick-kvm-${{ github.repository }}
@@ -328,6 +328,7 @@ Append:
       - name: Verify KVM host
         run: |
           test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
           test -c /dev/kvm
           test -r /dev/kvm
           test -w /dev/kvm
@@ -337,13 +338,13 @@ Append:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install just
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just
+      - name: Build x86 CPL0 image
+        run: |
+          rustup target add x86_64-unknown-none
+          cargo build --locked --release -p carrick-x86-cpl0 --target x86_64-unknown-none
 
-      - name: KVM smoke fixture
-        run: just kvm-smoke
+      - name: x86 CPL0 entry smoke
+        run: cargo test --locked -p carrick-vmm-kvm --test cpl0_entry
 ```
 
 - [ ] **Step 5: Perform a static security and proof-boundary review**

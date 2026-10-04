@@ -879,35 +879,6 @@ build-linux:
 lima-up:
     ./scripts/lima-up.sh
 
-# TURNKEY L2 (run on the macOS host): build carrick-vmm-kvm natively inside the
-# lima nested-KVM guest and run hello-aarch64 against real /dev/kvm. This is the
-# MVP success gate on Apple Silicon. Run `just lima-up` once first.
-kvm-smoke-lima:
-    ./scripts/kvm-smoke-lima.sh
-
-# LOCAL (L2): run the freestanding hello-aarch64 under carrick-vmm-kvm on real
-# /dev/kvm and diff stdout + exit code against the oracle. This is the MVP
-# success gate when you ALREADY have /dev/kvm (e.g. inside the nested-KVM VM, or
-# a native Linux/aarch64 host). On a macOS host use `just kvm-smoke-lima` instead.
-kvm-smoke: build-linux build-fixture
-    #!/usr/bin/env bash
-    set -euo pipefail
-    fix=crates/carrick-vmm-kvm/fixtures/hello-aarch64
-    bin=target/release/carrick-vmm-kvm
-    got="$("$bin" run-elf "$fix/hello-aarch64")"
-    code=$?
-    if [[ "$got" != "$(cat "$fix/oracle.expected")" ]]; then
-        echo "FAIL: output mismatch" >&2
-        echo "  expected: $(cat "$fix/oracle.expected" | xxd)" >&2
-        echo "  got:      $(printf '%s' "$got" | xxd)" >&2
-        exit 1
-    fi
-    if [[ "$code" -ne 0 ]]; then
-        echo "FAIL: exit code $code (expected 0)" >&2
-        exit 1
-    fi
-    echo "OK: hello-aarch64 printed 'ok' and exited 0 under KVM."
-
 # LOCAL, NON-GATING stretch: run a musl-static binary under carrick-vmm-kvm and
 # RECORD the first syscall it dies on (scopes the full-Linux-backend spec).
 # Never a pass/fail — logs the failing __NR_* and always exits 0.

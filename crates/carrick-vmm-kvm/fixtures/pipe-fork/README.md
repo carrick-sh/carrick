@@ -32,9 +32,6 @@ links it into a static executable.
 
 ## Running
 
-The fixture is run by `scripts/kvm-smoke-lima.sh` against the carrick-vmm-kvm thin
-shim inside the nested-KVM Lima VM (`just kvm-smoke-lima`). Expected stdout is
-`pipe-ok\n` (see `oracle.expected`); expected exit code is 0.
-
-A static aarch64 Linux ELF cannot exec directly on macOS, so the smoke test is
-gated behind the Lima L2 lane.
+This is a historical fixture for the retired 1:1 aarch64 smoke lane.
+Expected stdout is `pipe-ok\n` (see `oracle.expected`); expected exit code
+is 0. It has no current acceptance binding.

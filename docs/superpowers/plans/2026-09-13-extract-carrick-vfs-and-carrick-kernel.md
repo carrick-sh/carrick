@@ -1215,7 +1215,7 @@ no runtime/vmm crate in its closure; just ci."
 - [ ] **Step 1:** Record binary identity exactly as in Task 1.5 Step 1.
 - [ ] **Step 2:** `just conformance full`, then `just conformance-probes` from the repo root, serially with the Docker phase; attribute any DIFF before touching code.
 - [ ] **Step 3:** `just test-embed` → green.
-- [ ] **Step 4:** If the lima/KVM box is reachable: `just kvm-smoke-lima` → unchanged. (The KVM lane is the in-tree alternate backend; it now consumes `carrick-kernel` through the same hal traits an external backend would.)
+- [ ] **Step 4:** On a Linux x86_64 KVM host with a built CPL0 image: `cargo test -p carrick-vmm-kvm --test cpl0_entry` → unchanged. This proves the executing CPL0 entry bindings, not full OCI runtime conformance.
 - [ ] **Step 5:** Build-time receipt, single variable, quiet host: `touch crates/carrick-kernel/src/dispatch/fs.rs && time cargo build -p carrick-cli --release` twice, versus the same touch of `crates/carrick-runtime/src/dispatch/fs.rs` on the pre-plan commit twice. Write both to `docs/perf-results/2026-09-xx-crate-extraction-build-time.md` as "suggests".
 - [ ] **Step 6:** Append the Phase 2 receipt to `docs/conformance-campaigns/2026-09-13-crate-extraction.md`; commit `docs(conformance): phase 2 receipt for the carrick-kernel extraction`.
 

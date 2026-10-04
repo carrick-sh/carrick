@@ -391,8 +391,8 @@ pub enum StdioMode {
 /// `carrick_kernel::container_policy`) — never by editing individual syscall
 /// handlers to fabricate policy-shaped errnos (recorded maintainer ruling,
 /// 2026-07-10). `ContainerDefault` is the serde default so a persisted
-/// container spec is docker-shaped; bare-ELF drivers (`run-elf`,
-/// `carrick-kvm run-elf`) explicitly choose `Unconfined`.
+/// container spec is docker-shaped; bare-ELF developer fixtures explicitly
+/// choose `Unconfined`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeccompPolicy {

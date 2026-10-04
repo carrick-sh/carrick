@@ -154,11 +154,13 @@ rewrite baselines automatically.
 
 #### Linux KVM lane
 
-The runner labels are `[self-hosted, linux, kvm, carrick-kvm]`. The job is
+The runner labels are `[self-hosted, linux, x64, kvm, carrick-kvm]`. The job is
 nightly/manual, gated by its existing repository variable, and fails before
-building unless usable `/dev/kvm` is present. It runs the repository's
-`just kvm-smoke` recipe. Its claim is limited to the KVM smoke fixture and must
-not be presented as macOS/HVF conformance.
+building unless usable `/dev/kvm` is present on Linux x86_64. It builds
+`carrick-x86-cpl0` for `x86_64-unknown-none`, then runs
+`cargo test -p carrick-vmm-kvm --test cpl0_entry`. Its claim is limited to
+executing CPL0 entry bindings and must not be presented as full OCI or
+macOS/HVF conformance.
 
 FreeBSD/bhyve and NetBSD/NVMM retain hosted cross-checks. Real execution for
 those backends remains target-host work until corresponding trusted runners and
