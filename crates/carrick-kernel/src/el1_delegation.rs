@@ -576,7 +576,7 @@ fn recall_binding(identity: InodeIdentity, binding: GuestBinding) {
 
     let live = binding.live_members();
     let file = delegated_file_object(region_ptr, handle);
-    lock_delegated_file(file, handle);
+    let mut file_guard = lock_delegated_file(file, handle);
     file.state
         .store(DELEGATED_STATE_RECALLING, Ordering::Release);
     // In-guest watches on this file become host watches on its path: the
@@ -612,7 +612,8 @@ fn recall_binding(identity: InodeIdentity, binding: GuestBinding) {
         }
     }
     file.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
-    file.unlock();
+    file_guard.retire_notifications();
+    drop(file_guard);
     free_handle(handle);
     drop(live);
     drop(binding);
@@ -680,7 +681,7 @@ fn sync_owner(identity: InodeIdentity) -> Option<(Result<(), carrick_abi::LinuxE
         return None;
     }
     let file = delegated_file_object(region_ptr, handle);
-    lock_delegated_file(file, handle);
+    let file_guard = lock_delegated_file(file, handle);
     let outcome = if file.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST {
         let rootfs = snapshot.rootfs.upgrade();
         let result = write_back_target(file, handle, identity, &snapshot, rootfs.as_deref());
@@ -688,7 +689,7 @@ fn sync_owner(identity: InodeIdentity) -> Option<(Result<(), carrick_abi::LinuxE
     } else {
         None
     };
-    file.unlock();
+    drop(file_guard);
     if let Some((Err(err), _)) = &outcome {
         for member in &snapshot.members {
             member.common().record_writeback_error(*err);
@@ -810,11 +811,11 @@ pub(crate) fn recall_files_marked_by(inotify_handle: u32) {
                         OwnerState::Guest(binding) => {
                             let file = delegated_file_object(region_ptr, binding.inode);
                             let mut marked = false;
-                            lock_delegated_file(file, binding.inode);
+                            let file_guard = lock_delegated_file(file, binding.inode);
                             file.for_each_mark(|mark| {
                                 marked |= mark.inotify_handle == inotify_handle
                             });
-                            file.unlock();
+                            drop(file_guard);
                             marked.then_some(*identity)
                         }
                         _ => None,
@@ -850,9 +851,9 @@ pub(crate) fn remove_inotify_marks_from_all_files(
         if Some(handle) == held_file_handle {
             file.remove_marks_for_inotify(inotify_handle);
         } else {
-            lock_delegated_file(file, handle);
+            let file_guard = lock_delegated_file(file, handle);
             file.remove_marks_for_inotify(inotify_handle);
-            file.unlock();
+            drop(file_guard);
         }
     }
 }
@@ -872,9 +873,9 @@ pub(crate) fn attach_zone_watch(
         return false;
     }
     let file = delegated_file_object(region_ptr, file_handle);
-    lock_delegated_file(file, file_handle);
+    let file_guard = lock_delegated_file(file, file_handle);
     if file.state.load(Ordering::Acquire) != DELEGATED_STATE_GUEST {
-        file.unlock();
+        drop(file_guard);
         return false;
     }
     let marked = file.add_mark(DelegatedMark {
@@ -890,7 +891,7 @@ pub(crate) fn attach_zone_watch(
     if marked && !attached {
         let _ = file.remove_mark(inotify_handle, wd);
     }
-    file.unlock();
+    drop(file_guard);
     attached
 }
 
@@ -902,9 +903,9 @@ pub(crate) fn remove_mark(file_handle: u32, inotify_handle: u32, wd: i32) {
         return;
     }
     let file = delegated_file_object(region_ptr, file_handle);
-    lock_delegated_file(file, file_handle);
+    let file_guard = lock_delegated_file(file, file_handle);
     let _ = file.remove_mark(inotify_handle, wd);
-    file.unlock();
+    drop(file_guard);
 }
 
 fn delegated_file_object(region_ptr: usize, handle: u32) -> &'static DelegatedFile {
@@ -1090,7 +1091,8 @@ pub(crate) static YIELD_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// spin briefly, then yield between bursts. The long bound is evidence of a
 /// bug, never a scheduling budget.
 #[track_caller]
-fn lock_delegated_file(file: &DelegatedFile, handle: u32) {
+fn lock_delegated_file(file: &DelegatedFile, handle: u32) -> DelegatedFileGuard<'_> {
+    let authority = delegated_file_authority(file, handle);
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(30);
     while !file.host_lock_bounded(64) {
@@ -1116,6 +1118,50 @@ fn lock_delegated_file(file: &DelegatedFile, handle: u32) {
         std::thread::yield_now();
     }
     note_host_holder(handle);
+    // SAFETY: the successful host lock acquisition owns this authenticated
+    // inode. The returned guard becomes its sole unlock authority.
+    unsafe { authority.from_locked() }.unwrap_or_else(|_| {
+        carrick_fatal!(
+            "el1_delegation",
+            "lost delegated inode notification custody"
+        )
+    })
+}
+
+fn delegated_file_authority(file: &DelegatedFile, handle: u32) -> DelegatedFileAuthority<'_> {
+    use carrick_sched_core::object_wait::{DelegatedFileWaitIndex, DelegatedReleaseVenue};
+    let zone = zone_tables()
+        .unwrap_or_else(|| carrick_fatal!("el1_delegation", "delegated inode has no carrier zone"));
+    let index = handle
+        .checked_sub(1)
+        .and_then(|index| DelegatedFileWaitIndex::from_index(index as usize))
+        .unwrap_or_else(|| carrick_fatal!("el1_delegation", "invalid delegated inode handle"));
+    fn deliver(
+        zone: &carrick_sched_core::ZoneTables,
+        _: carrick_sched_core::Waker,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+    ) {
+        carrick_sched_core::LockWait::complete_object_wake(
+            &crate::el1_zone::HostLockWait,
+            zone,
+            effects,
+        );
+    }
+    DelegatedFileAuthority::new(
+        file,
+        index,
+        DelegatedReleaseVenue {
+            zone,
+            waker: carrick_sched_core::Waker::Host,
+            deliver,
+        },
+    )
+    .unwrap_or_else(|_| {
+        carrick_fatal!(
+            "el1_delegation",
+            "delegated inode belongs to another carrier"
+        )
+    })
 }
 
 /// The call site and host thread of the last host acquisition of each inode
@@ -1434,7 +1480,15 @@ fn delegate_transaction(
     let record = open_file_object(region_ptr, open_handle);
     let inode_generation = NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed);
     let open_generation = NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed);
-    lock_delegated_file(file, handle);
+    let mut file_guard = lock_delegated_file(file, handle);
+    let incarnation = std::num::NonZeroU64::new(inode_generation).unwrap_or_else(|| {
+        carrick_fatal!("el1_delegation", "delegated inode generation exhausted")
+    });
+    if file_guard.admit_notifications(incarnation).is_err() {
+        drop(file_guard);
+        drop(owners);
+        return rollback((Some(handle), Some(open_handle)), NotEligible::TableFull);
+    }
     file.generation.store(inode_generation, Ordering::Relaxed);
     file.size.store(size, Ordering::Relaxed);
     file.dirty_mask.store(0, Ordering::Relaxed);
@@ -1450,7 +1504,7 @@ fn delegate_transaction(
         flags,
     );
     file.state.store(DELEGATED_STATE_GUEST, Ordering::Release);
-    file.unlock();
+    drop(file_guard);
     let published = fd_map_publish(
         region_ptr,
         file_table.raw(),
@@ -1460,9 +1514,10 @@ fn delegate_transaction(
         open_generation,
     );
     if !published {
-        lock_delegated_file(file, handle);
+        let mut file_guard = lock_delegated_file(file, handle);
         file.state.store(DELEGATED_STATE_DEAD, Ordering::Release);
-        file.unlock();
+        file_guard.retire_notifications();
+        drop(file_guard);
         drop(owners);
         return rollback((Some(handle), Some(open_handle)), NotEligible::TableFull);
     }
@@ -1535,10 +1590,10 @@ fn join_transaction(
     let file = delegated_file_object(region_ptr, handle);
     let record = open_file_object(region_ptr, open_handle);
     let generation = NEXT_INCARNATION.fetch_add(1, Ordering::Relaxed);
-    lock_delegated_file(file, handle);
+    let file_guard = lock_delegated_file(file, handle);
     let inode_generation = file.generation.load(Ordering::Acquire);
     init_open_file(record, handle, inode_generation, generation, offset, flags);
-    file.unlock();
+    drop(file_guard);
     if !fd_map_publish(
         region_ptr,
         file_table.raw(),
@@ -1547,9 +1602,9 @@ fn join_transaction(
         open_handle,
         generation,
     ) {
-        lock_delegated_file(file, handle);
+        let file_guard = lock_delegated_file(file, handle);
         retire_open_file(region_ptr, open_handle);
-        file.unlock();
+        drop(file_guard);
         return Err(NotEligible::TableFull);
     }
     description.set_delegation_handle(open_handle);
@@ -1664,12 +1719,12 @@ pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
         return None;
     }
     let file = delegated_file_object(region_ptr, handle);
-    lock_delegated_file(file, handle);
+    let file_guard = lock_delegated_file(file, handle);
     if !record.is_bound_to(file)
         || record.inode_handle.load(Ordering::Acquire) != handle
         || description.delegation_handle() != open_handle
     {
-        file.unlock();
+        drop(file_guard);
         return None;
     }
     // SAFETY: the inotify table lives in the EL1 region with
@@ -1700,7 +1755,7 @@ pub(crate) fn serve_on_host<M: carrick_guest_mem::CurrentMmMemory>(
             &HostInstanceLock,
         )
     };
-    file.unlock();
+    drop(file_guard);
     let landed = user.finish();
     // The host is already at its boundary: deliver what a write owed now.
     crate::el1_inotify::deliver_owed_wakes();
@@ -1841,9 +1896,9 @@ pub(crate) fn release_description(description: &FileDescription) {
         {
             fd_map_clear_handle(region_ptr, handle);
             let file = delegated_file_object(region_ptr, inode);
-            lock_delegated_file(file, inode);
+            let file_guard = lock_delegated_file(file, inode);
             retire_open_file(region_ptr, handle);
-            file.unlock();
+            drop(file_guard);
             description.set_delegation_handle(0);
             return;
         }
@@ -2328,6 +2383,33 @@ mod tests {
         }
 
         #[test]
+        fn actual_inode_release_advances_its_exact_notification() {
+            use carrick_sched_core::object_wait::{DelegatedFileWaitIndex, ObjectWaitKey};
+            let _region = Region::new();
+            let tmp = temp_with(b"release");
+            let open = open_host(&tmp);
+            let handle = delegate_default(&open, 3).unwrap();
+            let file = delegated_file_object(get_el1_region_host_ptr(), handle);
+            let index = DelegatedFileWaitIndex::from_index((handle - 1) as usize).unwrap();
+            let generation =
+                std::num::NonZeroU64::new(file.generation.load(Ordering::Acquire)).unwrap();
+            let key = ObjectWaitKey::delegated_file(index, generation);
+            let zone = zone_tables().unwrap();
+            let before = zone.object_queue_census(key.index()).unwrap().epoch;
+            let guard = lock_delegated_file(file, handle);
+            assert!(!file.host_lock_bounded(1), "competing recall must suspend");
+            drop(guard);
+            let after = zone.object_queue_census(key.index()).unwrap().epoch;
+            let unlocked = !file.is_locked();
+            recall(&open.description).unwrap();
+            assert!(unlocked, "release must unlock the actual inode");
+            assert_ne!(
+                before, after,
+                "actual inode unlock lost its completion edge"
+            );
+        }
+
+        #[test]
         fn initial_entry_cannot_publish_over_an_owned_host_cursor() {
             let _region = Region::new();
             let tmp = temp_with(b"cursor");
@@ -2606,17 +2688,18 @@ mod tests {
 
         #[test]
         fn contended_host_lock_yields_until_the_holder_releases() {
-            let file = Arc::new(DelegatedFile::default());
+            let _region = Region::new();
+            let file = delegated_file_object(get_el1_region_host_ptr(), 1);
             assert!(file.try_lock());
             let before = YIELD_COUNT.load(Ordering::Relaxed);
-            let holder = Arc::clone(&file);
+            let holder = file;
             let releaser = std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 holder.unlock();
             });
-            lock_delegated_file(&file, 1);
+            let file_guard = lock_delegated_file(file, 1);
             releaser.join().unwrap();
-            file.unlock();
+            drop(file_guard);
             assert!(
                 YIELD_COUNT.load(Ordering::Relaxed) > before,
                 "never yielded"
