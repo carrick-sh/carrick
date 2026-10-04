@@ -632,3 +632,250 @@ impl CowGrantSettlement for CarrierGuestCowSettlement {
         }
     }
 }
+
+#[cfg(test)]
+pub(super) mod n1_physical_tests {
+    use super::*;
+    use std::num::NonZeroU64;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Failure {
+        Stage2,
+        BackendInventory,
+        KernelInventory,
+        Receipt,
+        Cancel,
+    }
+
+    /// Only the kernel publication boundary is doubled: the stage-2 and
+    /// backend inventory transactions below are the production implementation.
+    struct PhysicalAuthority {
+        failure: Failure,
+        generation: u64,
+        live: AtomicUsize,
+        rollbacks: AtomicUsize,
+    }
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    fn nz(value: u64) -> NonZeroU64 {
+        NonZeroU64::new(value).unwrap()
+    }
+    fn provenance() -> carrick_hal::FrameInventoryProvenance {
+        carrick_hal::FrameInventoryProvenance::from_kernel_entropy([73; 32])
+    }
+
+    impl carrick_hal::FrameCowAuthority for PhysicalAuthority {
+        fn quiesce(&self) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Error> {
+            Ok(Box::new(()))
+        }
+        fn reserve(
+            &self,
+            _: usize,
+            _: usize,
+            _: usize,
+        ) -> Result<carrick_hal::FrameInventoryReservation, Error> {
+            unreachable!("the fixture supplies its exact candidates")
+        }
+        fn apply(&self, _: carrick_hal::FrameInventoryCommit<()>) -> Result<(), Error> {
+            unreachable!("a physical grant requires its receipt")
+        }
+        fn mapping_is_live(
+            &self,
+            _: carrick_hal::MappingId,
+            _: carrick_hal::FrameId,
+            _: carrick_guest_mem::Gpa,
+            _: carrick_hal::FrameLength,
+        ) -> Result<bool, Error> {
+            Ok(self.live.load(Ordering::Relaxed) != 0)
+        }
+        fn frame_mapping_count(&self, _: carrick_hal::FrameId) -> Result<Option<usize>, Error> {
+            unreachable!("physical publication cannot make a COW reference decision")
+        }
+        fn apply_frame_grant(
+            &self,
+            commit: carrick_hal::FrameInventoryCommit<()>,
+            mapping: carrick_hal::MappingId,
+            frame: carrick_hal::FrameId,
+            _: carrick_guest_mem::Gpa,
+            _: carrick_hal::FrameLength,
+        ) -> Result<
+            (
+                carrick_hal::FrameInventoryApplyReceipt,
+                carrick_hal::ForeignOwnerGeneration,
+            ),
+            Error,
+        > {
+            if self.failure == Failure::KernelInventory {
+                return Err(std::io::Error::other("injected kernel publication refusal").into());
+            }
+            assert_eq!(self.live.swap(1, Ordering::Relaxed), 0);
+            Ok((
+                carrick_hal::FrameInventoryApplyReceipt::from_kernel_authority(
+                    provenance(),
+                    commit.batch().transaction(),
+                    nz(7),
+                    1,
+                    vec![(mapping, frame)],
+                ),
+                carrick_hal::ForeignOwnerGeneration::from_backend_counter(nz(
+                    self.generation + u64::from(self.failure == Failure::Receipt)
+                )),
+            ))
+        }
+        fn rollback_frame_grant(
+            &self,
+            receipt: &carrick_hal::FrameInventoryApplyReceipt,
+        ) -> Result<(), Error> {
+            assert_eq!(receipt.mm(), nz(7));
+            assert_eq!(self.live.swap(0, Ordering::Relaxed), 1);
+            self.rollbacks.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    pub(in crate::trap) fn publication_rollback_matrix(
+        _guard: &parking_lot::MutexGuard<'static, ()>,
+    ) -> Vec<String> {
+        let mut violations = Vec::new();
+        let mut retired_generation = None;
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        for failure in [
+            Failure::Stage2,
+            Failure::BackendInventory,
+            Failure::KernelInventory,
+            Failure::Receipt,
+            Failure::Cancel,
+        ] {
+            let stub = ScopedStage2MapTestStub::enable();
+            stub.set_fail_next_map(failure == Failure::Stage2);
+            // Exercise the real backend map and registration primitives; the
+            // ordinary guest-COW allocator deliberately bypasses hv_vm_map
+            // in unit tests and cannot qualify map-failure rollback.
+            let allocated = (|| {
+                let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
+                    CowArmedRanges::COMPOUND_SIZE as usize,
+                    crate::host_mapping::HostMappingKind::FrameCow,
+                )
+                .unwrap();
+                let mut lease = GlobalFrameStage2Lease::reserve(
+                    CowArmedRanges::COMPOUND_SIZE,
+                    CowArmedRanges::COMPOUND_SIZE,
+                )?;
+                let (ipa, len) = lease.key();
+                let pointer = mapping.as_ptr();
+                let rc = unsafe { inventory_hv_vm_map(pointer.cast(), ipa, len as usize, 7) };
+                if rc != 0 {
+                    return Err(TrapError::Hypervisor(format!(
+                        "injected stage-2 map refusal: {rc}"
+                    )));
+                }
+                lease.mark_mapped();
+                let generation = register_global_frame_host_owner_in(&custody, lease, mapping, 7)?;
+                Ok((pointer, ipa, generation))
+            })();
+            if failure == Failure::Stage2 {
+                assert!(allocated.is_err());
+                assert!(custody.global_frame_host_owners.lock().is_empty());
+                continue;
+            }
+            let (pointer, ipa, generation) = allocated.unwrap();
+            let authority = Arc::new(PhysicalAuthority {
+                failure,
+                generation,
+                live: AtomicUsize::new(0),
+                rollbacks: AtomicUsize::new(0),
+            });
+            let inventory = Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
+            let reservation = carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                provenance(),
+                carrick_hal::FrameInventoryBatch::prepare(
+                    carrick_hal::KernelTransactionId::from_kernel_allocation(nz(1)),
+                    carrick_hal::FrameEventCapacity::for_event_count(2).unwrap(),
+                )
+                .unwrap(),
+                vec![carrick_hal::FrameId::from_kernel_allocation(nz(1))],
+                vec![carrick_hal::MappingId::from_kernel_allocation(nz(1))],
+            );
+            let mut owner = GlobalFrameOwnerRollback::new(custody.clone());
+            owner.record((ipa, CowArmedRanges::COMPOUND_SIZE));
+            stub.set_fail_stage_mapping(failure == Failure::BackendInventory);
+            let prepared = super::super::cow_engine::GuestPreparedBacking::prepare_owned(
+                custody.clone(),
+                authority.clone(),
+                inventory.clone(),
+                reservation,
+                nz(7),
+                InventoryMappingStage {
+                    gpa: ipa,
+                    length: CowArmedRanges::COMPOUND_SIZE,
+                    permissions: carrick_hal::MemPerms {
+                        read: true,
+                        write: true,
+                        exec: true,
+                    },
+                    backing: HvfVmState::private_backing_identity(),
+                    inherited_frame: None,
+                    stage2_lease: Some((ipa, CowArmedRanges::COMPOUND_SIZE)),
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: pointer as usize,
+                        generation,
+                    },
+                },
+                owner,
+            );
+            assert_eq!(prepared.is_ok(), failure == Failure::Cancel, "{failure:?}");
+            if let Ok(grant) = &prepared {
+                let pool = CowGrantPool::new();
+                let backing = grant.backing().unwrap();
+                assert!(pool.publish(7, ipa, backing).is_some());
+                if pool.publish(7, ipa, backing).is_some() {
+                    violations.push("CowGrantPool accepts a duplicate physical grant".into());
+                }
+                let stale = carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                    owner_generation: retired_generation.unwrap(),
+                    ..backing
+                };
+                assert_ne!(stale.owner_generation, backing.owner_generation);
+                if pool.publish(7, ipa, stale).is_some() {
+                    violations.push(
+                        "CowGrantPool accepts a grant with a retired physical generation".into(),
+                    );
+                }
+            }
+            // Dropping an unpublished grant is its one inverse, including
+            // cancellation after every physical publication has succeeded.
+            drop(prepared);
+            let ledger = inventory.lock();
+            assert!(ledger.extents.is_empty(), "{failure:?}");
+            let frames = ledger.frames.lock();
+            assert!(frames.references.is_empty(), "{failure:?}");
+            assert!(frames.extent_references.is_empty(), "{failure:?}");
+            assert!(frames.stage2_references.is_empty(), "{failure:?}");
+            assert_eq!(authority.live.load(Ordering::Relaxed), 0, "{failure:?}");
+            assert_eq!(
+                authority.rollbacks.load(Ordering::Relaxed),
+                usize::from(matches!(failure, Failure::Receipt | Failure::Cancel)),
+                "{failure:?}"
+            );
+            assert!(
+                custody.global_frame_host_owners.lock().is_empty(),
+                "{failure:?}"
+            );
+            assert!(
+                !ScopedStage2MapTestStub::is_mapped(ipa, CowArmedRanges::COMPOUND_SIZE as usize),
+                "{failure:?}"
+            );
+            retired_generation = Some(nz(generation));
+        }
+        violations
+    }
+
+    #[test]
+    fn n1_physical_grant_rolls_back_every_publication() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _unclosed_pool_admission = publication_rollback_matrix(&_guard);
+    }
+}

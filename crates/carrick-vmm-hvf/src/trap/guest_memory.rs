@@ -1195,6 +1195,11 @@ impl HvfTaskState {
             address: copy_address,
             length: bytes.len(),
         };
+        // The owner route consumes an authenticated physical transfer, never
+        // this helper's host-selected mapping. Keep the legacy borrow through
+        // the copy so admission cannot retire that venue between selection
+        // and the last byte.
+        let _legacy = self.protections.legacy().ok_or_else(error)?;
         let write = self
             .with_mapping_for_range_in(custody, lookup_address, bytes.len(), |source| {
                 source.begin_access(
@@ -1228,6 +1233,12 @@ impl HvfTaskState {
         copy_address: u64,
         dst: &mut [u8],
     ) -> Option<Result<MappingView, MemoryError>> {
+        let Some(_legacy) = self.protections.legacy() else {
+            return Some(Err(MemoryError::OutOfBounds {
+                address: copy_address,
+                length: dst.len(),
+            }));
+        };
         let read =
             self.with_mapping_for_range_in(custody, lookup_address, dst.len(), |source| {
                 source.begin_access(
@@ -1252,3 +1263,375 @@ impl HvfTaskState {
 
 #[cfg(test)]
 mod scrub_tests;
+
+#[cfg(test)]
+mod n1_policy_tests {
+    use super::*;
+    use carrick_el1::memory::reservations::Layout;
+    use carrick_el1::personality::mm_portal::{MmPortal, test_support};
+    use carrick_el1_abi::{
+        AddressSpaces, ReservationMm, ReservationNodeFlags as Flags, ReservationProtection,
+        ReservationRange,
+    };
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+
+    const VA: u64 = test_support::VA;
+    const COMPOUND: u64 = 16384;
+
+    fn exact_compound_returns_and_reuse() {
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let pool = Arc::new(crate::frame_pool::PreMappedFramePool::new_test_fixture(1));
+        let compound = pool.allocate_compound().unwrap();
+        let ipa = compound.ipa();
+        let generation = register_pooled_global_frame_host_owner_in(
+            &custody,
+            compound,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .unwrap();
+        let host = custody.global_frame_host_owners.lock()[&(ipa, COMPOUND)]
+            .owner()
+            .ptr();
+        let pin = pin_exact_live_global_frame_owner_in(
+            &custody,
+            ipa,
+            COMPOUND,
+            host as usize,
+            generation,
+        )
+        .unwrap();
+        let retire = |base, len, generation| {
+            retire_global_frame_host_owner_if_generation_in_using(
+                &custody,
+                base,
+                len,
+                generation,
+                &mut |_, _| panic!("pooled backing must stay stage-2 mapped"),
+            )
+        };
+        // Returning one Linux page cannot release its 16 KiB physical owner.
+        assert!(matches!(
+            retire(ipa + 4096, 4096, generation),
+            GlobalFrameRetirementOutcome::NotFound { .. }
+        ));
+        assert!(pool.allocate_compound().is_none());
+        assert!(matches!(
+            retire(ipa, COMPOUND, generation),
+            GlobalFrameRetirementOutcome::DeferredActivePins { .. }
+        ));
+        assert!(pool.allocate_compound().is_none());
+        drop(pin);
+        assert!(retire(ipa, COMPOUND, generation).is_retired());
+        assert!(matches!(
+            retire(ipa, COMPOUND, generation),
+            GlobalFrameRetirementOutcome::NotFound { .. }
+        ));
+        let successor = pool.allocate_compound().unwrap();
+        assert_eq!(successor.ipa(), ipa);
+        let next_generation = register_pooled_global_frame_host_owner_in(
+            &custody,
+            successor,
+            u64::from(applevisor::memory::MemPerms::ReadWrite),
+        )
+        .unwrap();
+        assert_ne!(next_generation, generation);
+        assert!(matches!(
+            retire(ipa, COMPOUND, generation),
+            GlobalFrameRetirementOutcome::MismatchedGeneration { .. }
+        ));
+        assert!(pool.allocate_compound().is_none());
+        assert!(retire(ipa, COMPOUND, next_generation).is_retired());
+    }
+
+    /// Import the actual owner tree, rather than a host VMA mirror. Both MMs
+    /// have the same VA and different physical backing and root identities.
+    fn admit_policy(
+        region: &test_support::Region,
+        spaces: &AddressSpaces,
+        mm: u64,
+        root: u64,
+        flags: Flags,
+        protection: ReservationProtection,
+    ) -> ReservationMm {
+        let index = spaces.publish_closed(mm, root, root).unwrap();
+        let mm = ReservationMm::new(mm).unwrap();
+        region
+            .table()
+            .publish(
+                index.index(),
+                mm,
+                Layout {
+                    heap: ReservationRange::new(4096, VA).unwrap(),
+                    arena: ReservationRange::new(VA, VA + 0x1000_0000).unwrap(),
+                    brk: 4096,
+                    address_limit: u64::MAX,
+                    data_limit: u64::MAX,
+                    external_address_bytes: 0,
+                    external_data_bytes: 0,
+                },
+            )
+            .unwrap();
+        let nodes = test_support::nodes(region);
+        let mut owner = region
+            .table()
+            .lock_el1_resolved(index.index(), mm, &nodes, 0)
+            .unwrap();
+        owner
+            .import_with(
+                ReservationRange::new(VA, VA + COMPOUND).unwrap(),
+                protection,
+                flags,
+            )
+            .unwrap();
+        owner.finish_import().unwrap();
+        drop(owner);
+        spaces.open(index);
+        mm
+    }
+
+    fn policy_and_backing_violations(check_host_policy: bool) -> Vec<String> {
+        exact_compound_returns_and_reuse();
+        let policies = [
+            ("private-anon", Flags::ANONYMOUS_PRIVATE),
+            ("shared-anon", Flags::SHARED_ANONYMOUS),
+            ("private-file", Flags::PRIVATE.union(Flags::FILE)),
+            ("shared-file", Flags::FILE),
+            ("growdown", Flags::ANONYMOUS_PRIVATE.union(Flags::GROWSDOWN)),
+            ("dontfork", Flags::ANONYMOUS_PRIVATE.union(Flags::DONTFORK)),
+            (
+                "wipeonfork",
+                Flags::ANONYMOUS_PRIVATE.union(Flags::WIPEONFORK),
+            ),
+        ];
+        let mut violations = Vec::new();
+        for (name, flags) in policies {
+            for protection in [
+                ReservationProtection::READ_WRITE,
+                ReservationProtection::from_bits(1).unwrap(),
+                ReservationProtection::NONE,
+            ] {
+                let mut region = test_support::Region::new();
+                region.add_bank();
+                let spaces = AddressSpaces::new();
+                let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+                let mut peers = Vec::new();
+                for (ordinal, fill) in [(77, 0x31), (78, 0x72)] {
+                    let mm = admit_policy(
+                        &region,
+                        &spaces,
+                        ordinal,
+                        test_support::ROOT + (ordinal - 77) * 0x100_000,
+                        flags,
+                        protection,
+                    );
+                    let nodes = test_support::nodes(&region);
+                    let portal =
+                        MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &nodes);
+                    let ipa = test_support::IPA + (ordinal - 77) * COMPOUND;
+                    let backing = super::super::user_transfer::tests::backing(&custody, ipa);
+                    // SAFETY: this newly allocated fixture owner covers 16 KiB.
+                    unsafe { backing.ptr().write_bytes(fill, COMPOUND as usize) };
+                    let mut task = HvfTaskState::neutral();
+                    let mut row =
+                        crate::trap::thread_sibling_tests::mapped_region(VA, VA + COMPOUND, ipa);
+                    row.host_addr = backing.ptr();
+                    row.owner_generation = backing.generation();
+                    task.mappings.insert(row);
+                    task.protections
+                        .select_owner(portal.admitted_handle(mm, 0).unwrap(), || {
+                            Ok::<_, ()>(carrick_guest_mem::OwnerMemorySelection::Immediate)
+                        })
+                        .unwrap();
+                    peers.push((mm, ordinal, fill, backing, task));
+                }
+                // Keep both admitted projections and both physical owners
+                // alive during every access attempt at their identical VA.
+                let nodes = test_support::nodes(&region);
+                for (mm, ordinal, fill, backing, task) in &peers {
+                    // Even a correct physical generation is not permission to
+                    // accept the host's semantic predecessor at this VA.
+                    let mut observed = [0xcc; 4];
+                    if matches!(
+                        task.copy_guest_mapping_out(&custody, VA, VA, &mut observed),
+                        Some(Ok(_))
+                    ) {
+                        violations.push(format!(
+                            "{name}/prot={}/mm={ordinal}: host semantic read accepted ({observed:x?})",
+                            protection.bits()
+                        ));
+                    }
+                    assert_eq!(
+                        observed,
+                        [0xcc; 4],
+                        "{name}/prot={}/mm={ordinal}: refused read changed its output",
+                        protection.bits()
+                    );
+                    if task
+                        .copy_guest_mapping_in(&custody, VA, VA, &[0xa5; 4])
+                        .is_ok()
+                    {
+                        violations.push(format!(
+                            "{name}/prot={}/mm={ordinal}: host semantic write accepted",
+                            protection.bits()
+                        ));
+                    }
+                    // The physical adapter must not consume either MM's bytes
+                    // when it has no owner-issued transfer authorization.
+                    if unsafe { std::slice::from_raw_parts(backing.ptr(), 4) } != [*fill; 4] {
+                        violations.push(format!("{name}/mm={ordinal}: predecessor bytes changed"));
+                    }
+                    if !check_host_policy {
+                        continue;
+                    }
+                    let index = spaces.find(mm.raw()).unwrap().index();
+                    let mut host = region
+                        .table()
+                        .lock_resolved(
+                            index,
+                            *mm,
+                            &nodes,
+                            &carrick_el1::memory::reservations::NoRootWait,
+                        )
+                        .unwrap();
+                    let range = ReservationRange::new(VA, VA + COMPOUND).unwrap();
+                    if host.set_flags(range, Flags::DONTFORK, Flags::EMPTY).is_ok() {
+                        violations.push(format!(
+                            "{name}/mm={ordinal}: admitted host can change DONTFORK policy"
+                        ));
+                    }
+                }
+            }
+        }
+        violations
+    }
+
+    #[test]
+    fn n1_legacy_host_write_prevents_owner_admission_until_settlement() {
+        use carrick_guest_mem::{GuestVa, HostVa, HostWriteRange, OwnerMemorySelection};
+        use std::cell::Cell;
+
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let mut region = test_support::Region::new();
+        region.add_bank();
+        let spaces = AddressSpaces::new();
+        let mm = admit_policy(
+            &region,
+            &spaces,
+            77,
+            test_support::ROOT,
+            Flags::ANONYMOUS_PRIVATE,
+            ReservationProtection::READ_WRITE,
+        );
+        let peer_protection = ReservationProtection::from_bits(1).unwrap();
+        let peer = admit_policy(
+            &region,
+            &spaces,
+            78,
+            test_support::ROOT + 0x100_000,
+            Flags::ANONYMOUS_PRIVATE,
+            peer_protection,
+        );
+        let nodes = test_support::nodes(&region);
+        let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &nodes);
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let backing = super::super::user_transfer::tests::backing(&custody, test_support::IPA);
+        let peer_backing =
+            super::super::user_transfer::tests::backing(&custody, test_support::IPA + COMPOUND);
+        // SAFETY: these distinct fixture owners each cover one 16 KiB compound.
+        unsafe {
+            backing.ptr().write_bytes(0x31, COMPOUND as usize);
+            peer_backing.ptr().write_bytes(0x72, COMPOUND as usize);
+        }
+        let mut task = HvfTaskState::neutral();
+        let mut row =
+            crate::trap::thread_sibling_tests::mapped_region(VA, VA + COMPOUND, test_support::IPA);
+        row.host_addr = backing.ptr();
+        row.owner_generation = backing.generation();
+        task.mappings.insert(row);
+        let range = HostWriteRange {
+            guest: GuestVa(VA),
+            host: HostVa(backing.ptr() as usize),
+            len: 4,
+        };
+        let mut writes = super::super::host_writes::HostWrites::default();
+        writes.begin(&task, &custody, &[range]).unwrap();
+        let selected_before_finish = Cell::new(false);
+        let admission = task.protections.select_owner(handle, || {
+            selected_before_finish.set(true);
+            Ok::<_, ()>(OwnerMemorySelection::Immediate)
+        });
+        let published_before_finish = task.protections.owner();
+        let selector_ran_before_finish = selected_before_finish.get();
+
+        // Complete the already admitted host call through its retained pointer.
+        // A physical pin makes this write safe from reuse, but cannot authorize
+        // crossing semantic admission. Check settlement before reporting red.
+        unsafe { backing.ptr().copy_from_nonoverlapping(b"done".as_ptr(), 4) };
+        writes.finish();
+        let mut expected = vec![0x31; COMPOUND as usize];
+        expected[..4].copy_from_slice(b"done");
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(backing.ptr(), COMPOUND as usize) },
+            expected
+        );
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(peer_backing.ptr(), COMPOUND as usize) },
+            vec![0x72; COMPOUND as usize]
+        );
+        for (target, protection) in [
+            (mm, ReservationProtection::READ_WRITE),
+            (peer, peer_protection),
+        ] {
+            let index = spaces.find(target.raw()).unwrap().index();
+            let mut owner = region
+                .table()
+                .lock_el1_resolved(index, target, &nodes, 0)
+                .unwrap();
+            assert_eq!(owner.mapping(VA).unwrap().protection, protection);
+        }
+        assert!(
+            !matches!(admission, Ok(OwnerMemorySelection::Immediate))
+                && !selector_ran_before_finish
+                && published_before_finish.is_none(),
+            "legacy HostWrites crossed owner admission before finish; \
+             physical pinning did not preserve semantic admission"
+        );
+        // Either refusal or an asynchronous drain is valid. If settlement
+        // already promoted the exact pending owner, no second selector runs.
+        if task.protections.owner().is_none() {
+            let selected_after_finish = Cell::new(false);
+            task.protections
+                .select_owner(handle, || {
+                    selected_after_finish.set(true);
+                    Ok::<_, ()>(OwnerMemorySelection::Immediate)
+                })
+                .unwrap();
+            assert!(selected_after_finish.get());
+        }
+        assert_eq!(task.protections.owner(), Some(handle));
+        assert!(writes.begin(&task, &custody, &[range]).is_err());
+    }
+
+    #[test]
+    fn n1_admitted_mapping_helpers_require_owner_transfer() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let violations = policy_and_backing_violations(false);
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+    }
+
+    #[test]
+    fn n1_policy_and_backing_have_no_host_semantic_authority() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let mut violations = policy_and_backing_violations(true);
+        violations.extend(
+            super::super::guest_cow::n1_physical_tests::publication_rollback_matrix(&_guard),
+        );
+        assert!(
+            violations.is_empty(),
+            "N1 host semantic authority:\n{}",
+            violations.join("\n")
+        );
+    }
+}
