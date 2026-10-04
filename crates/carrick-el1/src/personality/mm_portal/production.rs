@@ -435,10 +435,12 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             return Err(pending.map_or(MmError::Busy, MmError::Wait));
         }
         if continuation.intent == TransferIntent::CarrickInternalRead {
-            // Production image header page: immutable after image admission,
-            // kernel-only and never a generic privileged user-copy bypass.
-            let base = carrick_el1_abi::EL1_REGION_BASE + carrick_el1_abi::EL1_IMAGE_OFFSET;
-            if va < base || va.checked_add(len).is_none_or(|end| end > base + 4096) {
+            // Only named Carrick control windows bypass user-VMA permission
+            // selection. Live translation and exact owner validation still apply.
+            if !carrick_el1_abi::CarrickInternalReadRange::authorizes(
+                continuation.address.raw(),
+                continuation.len,
+            ) {
                 return Err(MmError::Fault);
             }
         } else {
