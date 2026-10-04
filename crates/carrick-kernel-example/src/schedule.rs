@@ -645,7 +645,15 @@ impl Schedule {
             || !state.admission_waiters.is_empty()
             || !state.dependencies.is_empty()
         {
-            return Err("schedule actors did not drain".into());
+            return Err(format!(
+                "schedule actors did not drain: current={:?}, runnable={:?}, futex_parked={:?}, admission_parked={:?}, dependencies={:?}, last_decision={:?}",
+                state.current,
+                state.actors,
+                state.parked,
+                state.admission_waiters,
+                state.dependencies,
+                state.decisions.last(),
+            ));
         }
         if let Some(replay) = &state.replay
             && replay.decisions.len() != state.decisions.len()
