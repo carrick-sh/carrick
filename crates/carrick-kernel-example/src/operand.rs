@@ -146,6 +146,18 @@ impl Layout {
 #[derive(Clone, Debug, Default)]
 pub struct ScriptCheckpoint(std::sync::Arc<(parking_lot::Mutex<bool>, parking_lot::Condvar)>);
 
+/// Kernel-operation boundaries at which the scripted backend can yield to a
+/// peer. These checkpoints arrange a schedule; they carry no guest authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScriptPausePoint {
+    BeforeWaitEnrollment,
+    AfterCloneReservation,
+    AfterClonePreparation,
+    AfterClonePublicationReservation,
+    AfterForkPreparation,
+    AfterProcessExit,
+}
+
 impl PartialEq for ScriptCheckpoint {
     fn eq(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.0, &other.0)

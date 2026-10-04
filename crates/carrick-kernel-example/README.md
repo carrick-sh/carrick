@@ -33,6 +33,15 @@ variant.
 - A fork syscall is followed by `Step::ChildMarker` with the child's script.
   `await_parked(tid, label)` establishes that another task enrolled its wait
   before the next action. Do not sleep to arrange execution order.
+- `ScriptCheckpoint` releases a peer at a script position. For an ordering
+  inside a syscall, `ScriptedBackend::with_pause(label, ScriptPausePoint,
+  reached, resume)` pauses the first matching operation before wait enrollment,
+  after clone reservation/preparation/publication reservation, after fork
+  preparation, or after process exit publication. The peer waits on `reached`,
+  performs its action, and signals `resume`. Both waits use `WAIT_BOUND`;
+  an unused checkpoint fails the run.
+  Clone preparation owns its captured resources and can overlap a sibling fork;
+  the dispatcher mutex serializes clone publication and terminal handling.
 
 Use `alloc_word`/`write_word` or `alloc_buffer`/`write_buffer` for persistent
 memory referenced through slots, including futex words shared by sibling threads.
