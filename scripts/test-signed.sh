@@ -218,15 +218,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Build carrick-embed's immutable static guest fixtures (local musl
-# cross-compiles, no Docker) before any signed HVF test process is started.
-if [ "$pkg" = "carrick-embed" ]; then
-    scripts/build-linux-fixtures.sh
-    scripts/build-embed-interceptor-probe.sh
-    scripts/build-embed-zone-readers.sh
-    scripts/build-embed-icache-reuse.sh
-    scripts/build-embed-el1-sched.sh
-fi
+# Guest fixtures come from the exact-SHA Linux bundle. Rebuilding here would
+# replace the proven executable identity and require toolchains on cloudmac.
+# Also verify on direct test-embed/conformance-next invocations, before signing
+# or executing any test. The inherited lease covers this verification too.
+case "$pkg" in
+    carrick-embed|carrick-conformance-next)
+        cargo run --locked -p carrick-xtask -- fixtures verify
+        ;;
+esac
 
 # 1. Build (never run) the package's test executables and collect their
 #    paths. Only the package's OWN test-profile artifacts carry

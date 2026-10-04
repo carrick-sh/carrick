@@ -81,6 +81,12 @@ are published atomically, and the installed receipt at
 has no acceptance authority; there is no promise of a multi-directory atomic
 filesystem transaction. Verify always reads every installed executable again.
 
+Signed acceptance in both profiles records a fixture verification step and
+fails before signing or guest execution if it cannot verify the installed
+receipt and every fixture. `test-signed.sh` verifies again for embed and
+conformance-next invocations; it consumes the restored bytes without building
+guest fixtures. Restore a new exact-SHA bundle after every checkout change.
+
 ## Contract and evidence
 
 This is host-only acceptance/provisioning code outside guest execution. The
