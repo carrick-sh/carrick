@@ -1415,6 +1415,7 @@ mod n1_policy_tests {
                 region.add_bank();
                 let spaces = AddressSpaces::new();
                 let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+                let mut peers = Vec::new();
                 for (ordinal, fill) in [(77, 0x31), (78, 0x72)] {
                     let mm = admit_policy(
                         &region,
@@ -1442,6 +1443,12 @@ mod n1_policy_tests {
                             Ok::<_, ()>(carrick_guest_mem::OwnerMemorySelection::Immediate)
                         })
                         .unwrap();
+                    peers.push((mm, ordinal, fill, backing, task));
+                }
+                // Keep both admitted projections and both physical owners
+                // alive during every access attempt at their identical VA.
+                let nodes = test_support::nodes(&region);
+                for (mm, ordinal, fill, backing, task) in &peers {
                     // Even a correct physical generation is not permission to
                     // accept the host's semantic predecessor at this VA.
                     let mut observed = [0xcc; 4];
@@ -1465,7 +1472,7 @@ mod n1_policy_tests {
                     }
                     // The physical adapter must not consume either MM's bytes
                     // when it has no owner-issued transfer authorization.
-                    if unsafe { std::slice::from_raw_parts(backing.ptr(), 4) } != [fill; 4] {
+                    if unsafe { std::slice::from_raw_parts(backing.ptr(), 4) } != [*fill; 4] {
                         violations.push(format!("{name}/mm={ordinal}: predecessor bytes changed"));
                     }
                     if !check_host_policy {
@@ -1476,7 +1483,7 @@ mod n1_policy_tests {
                         .table()
                         .lock_resolved(
                             index,
-                            mm,
+                            *mm,
                             &nodes,
                             &carrick_el1::memory::reservations::NoRootWait,
                         )
