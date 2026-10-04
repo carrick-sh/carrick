@@ -25,6 +25,7 @@ struct ReadWindow {
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 mod owner_tests {
     use super::*;
+    use carrick_aarch64::user_transfer::{TransferCustody, TransferPin};
     use carrick_el1::personality::mm_portal::{MmPortal, test_support as owner};
     use carrick_el1_abi::{AddressSpaces, SlotId, ZONE_SLOTS};
     use std::num::{NonZeroU16, NonZeroU64};
@@ -144,6 +145,130 @@ mod owner_tests {
         );
         state.install_identity(snapshot.mm, binding);
         Ok((state, snapshot))
+    }
+
+    fn check_fixture_custody(
+        custody: &Arc<CarrierVmCustody>,
+        tables: &owner::Tables,
+        ipa: u64,
+    ) -> Result<(), String> {
+        let transfer = crate::trap::UserTransferCustody::new(custody.clone());
+        for (base, len) in [(tables.base, tables.words.len() * 8), (ipa, 0x4000)] {
+            let physical = custody
+                .global_frame_host_owners
+                .lock()
+                .get(&(base, len as u64))
+                .and_then(|entry| entry.live_owner().cloned())
+                .ok_or("fixture physical owner is missing")?;
+            if !physical
+                .custody
+                .upgrade()
+                .is_some_and(|registered| Arc::ptr_eq(&registered, custody))
+            {
+                return Err("fixture physical owner belongs to another carrier custody".into());
+            }
+            let record = custody
+                .stage2_record_covering(base, len)
+                .ok_or("fixture carrier has no covering stage-2 record")?;
+            if record != physical.record_identity {
+                return Err("fixture stage-2 record differs from physical owner".into());
+            }
+            let retained = transfer
+                .retain(
+                    carrick_el1_abi::PortalSelectedData {
+                        ipa: base,
+                        executable: false,
+                        root_generation: NonZeroU64::MIN,
+                        offset: 0,
+                    },
+                    4,
+                    carrick_el1_abi::PortalTransferIntent::CarrickInternalRead,
+                )
+                .map_err(|error| format!("fixture UserTransfer physical retention: {error:?}"))?
+                .ok_or("fixture UserTransfer cannot retain physical backing")?;
+            if retained.identity().record.get() != record.record_id.0
+                || retained.identity().vm_generation.get() != record.vm_generation.0
+                || transfer.carrier() != custody.transfer_carrier
+            {
+                return Err("fixture UserTransfer retained another carrier record".into());
+            }
+        }
+        Ok(())
+    }
+
+    struct ResidentFixture {
+        _region: owner::Region,
+        tables: owner::Tables,
+        custody: Arc<CarrierVmCustody>,
+        lease: CarrierForeignMmReadLease,
+        snapshot: CarrierForeignMmSnapshot,
+    }
+
+    fn resident_fixture() -> Result<ResidentFixture, String> {
+        let region = owner::Region::new();
+        let mm = owner::admit_notified(&region, 77, owner::ROOT, 1, 0);
+        let nodes = owner::nodes(&region);
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let portal = MmPortal::new(
+            custody.transfer_carrier,
+            region.table(),
+            &region.zone().spaces,
+            &nodes,
+        )
+        .with_zone(region.zone())
+        .map_err(|error| format!("fixture portal zone: {error:?}"))?;
+        let handle = portal
+            .admitted_handle(mm, 0)
+            .map_err(|error| format!("fixture admitted handle: {error:?}"))?;
+        let tables = owner::Tables::new(owner::ROOT, owner::IPA, 1);
+        let (state, snapshot) = install(&custody, handle, &tables, owner::IPA, b'A')?;
+        let backing = state
+            .retain_physical_backing_in(
+                &custody,
+                &snapshot,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .map_err(|error| format!("fixture read lease backing: {error:?}"))?;
+        let lease = CarrierForeignMmReadLease {
+            custody: custody.clone(),
+            state,
+            inner: parking_lot::Mutex::new(CarrierLeaseState {
+                retained: snapshot.clone(),
+                backing,
+            }),
+        };
+        Ok(ResidentFixture {
+            _region: region,
+            tables,
+            custody,
+            lease,
+            snapshot,
+        })
+    }
+
+    #[test]
+    fn n1_review_owner_window_refusal_cannot_select_legacy_fallback() {
+        let _guard = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
+        let fixture = resident_fixture().unwrap();
+        for len in [4, 4097] {
+            let refusal = prepare(
+                &fixture.lease,
+                &Live(fixture.snapshot.clone()),
+                &fixture.snapshot,
+                GuestVa(owner::VA),
+                len,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
+            assert_eq!(refusal, Error::Translation(GuestVa(owner::VA)));
+        }
+    }
+
+    #[test]
+    fn n1_review_observer_fixture_uses_exact_carrier_custody() {
+        let _guard = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
+        let fixture = resident_fixture().unwrap();
+        check_fixture_custody(&fixture.custody, &fixture.tables, owner::IPA).unwrap();
     }
 
     #[test]
