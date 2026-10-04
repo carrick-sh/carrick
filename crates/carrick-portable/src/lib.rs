@@ -2010,3 +2010,39 @@ mod pure_transform_tests {
         super::set_errno(original);
     }
 }
+
+/// A positive host process identity supplied by a native supervisor.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+pub struct HostProcessId(libc::pid_t);
+
+#[cfg(target_os = "linux")]
+impl HostProcessId {
+    /// Cross the native PID boundary explicitly; groups and sentinel IDs are
+    /// never valid process-exit watch targets.
+    pub fn from_native(pid: libc::pid_t) -> std::io::Result<Self> {
+        if pid <= 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "process watch requires a positive host PID",
+            ));
+        }
+        Ok(Self(pid))
+    }
+}
+
+/// Pin one Linux host process incarnation for pollable exit observation.
+///
+/// libc does not expose pidfd_open. Keep the flags-zero native syscall in this
+/// reviewed portability boundary, returning ownership rather than a bare fd.
+#[cfg(target_os = "linux")]
+pub fn process_exit_fd(process: HostProcessId) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: positive host PID, flags zero; kernel returns a fresh descriptor.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process.0, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful pidfd_open transfers unique descriptor ownership.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as libc::c_int) })
+}
