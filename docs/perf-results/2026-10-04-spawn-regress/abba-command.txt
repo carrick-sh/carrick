@@ -1,0 +1,18 @@
+Outer command:
+CARRICK_RUN_ID=spawn-regress-abba just lease gate /bin/bash target/spawn-regress-evidence/abba.sh
+
+Runner script (the frozen driver path was selected while the loop was already running; its bytes matched target/debug/carrick-xtask):
+#!/bin/bash
+set -euo pipefail
+cd /Volumes/CaseSensitive/carrick/.worktrees/wt-spawn-regress
+for round in $(seq -w 1 20); do
+    for slot in 1 2 3 4; do
+        case "$slot" in
+            1|4) arm=base; artifact=/Volumes/CaseSensitive/carrick/.worktrees/impact-base/target/release/carrick ;;
+            2|3) arm=candidate; artifact=/Volumes/CaseSensitive/carrick/.worktrees/impact-pb/target/release/carrick ;;
+        esac
+        phase="r${round}-s${slot}-${arm}"
+        CARRICK_RUN_ID="spawn-regress-${phase}" "$PWD/target/spawn-regress-evidence/carrick-xtask" impact carrick --artifact "$artifact" --workload spawn-loop --samples 1 --out "docs/perf-results/2026-10-04-spawn-regress/abba/${phase}.json" > "target/spawn-regress-evidence/${phase}.log" 2>&1
+        printf '%s complete\n' "$phase"
+    done
+done
