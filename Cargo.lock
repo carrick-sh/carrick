@@ -995,6 +995,7 @@ dependencies = [
  "carrick-host",
  "carrick-mem",
  "carrick-mmu-core",
+ "carrick-sched-core",
  "carrick-signal-linux",
  "carrick-thread",
  "carrick-timer-core",
@@ -1034,6 +1035,7 @@ dependencies = [
  "carrick-hal",
  "carrick-host",
  "carrick-mem",
+ "carrick-sched-core",
  "libc",
  "zerocopy",
 ]
@@ -1045,6 +1047,7 @@ dependencies = [
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-guest-arch",
+ "carrick-sched-core",
 ]
 
 [[package]]
