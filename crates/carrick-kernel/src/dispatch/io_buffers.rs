@@ -3,7 +3,7 @@
 use carrick_abi::{LINUX_EFAULT, LINUX_EINVAL};
 pub(crate) use carrick_abi::{LINUX_IOV_MAX, LinuxIovec, LinuxOpenHow};
 use carrick_fatal::carrick_fatal;
-use carrick_guest_mem::CurrentMmMemory;
+use carrick_guest_mem::{CurrentMmMemory, GuestVa, GuestWriteRange, MemoryPrepareError};
 
 use crate::dispatch::DispatchError;
 use crate::dispatch::fd_table::FileContents;
@@ -125,17 +125,12 @@ pub(crate) fn read_from_contents_at(
         if read_len == 0 {
             break;
         }
-        if memory
-            .write_bytes(iov_base, &remaining[..read_len])
-            .is_err()
-        {
-            return Ok(total);
-        }
-        offset += read_len;
+        let copied = copy_read_bytes(memory, iov_base, &remaining[..read_len]);
+        offset += copied;
         total = total
-            .checked_add(read_len)
+            .checked_add(copied)
             .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-        if read_len < iov_len {
+        if copied < read_len || read_len < iov_len {
             break;
         }
     }
@@ -164,18 +159,83 @@ pub(crate) fn read_from_sparse_buffer_at(
             break;
         }
         let bytes = buffer.read_range(offset, read_len);
-        if memory.write_bytes(iov_base, &bytes).is_err() {
-            return Ok(total);
-        }
-        offset += read_len;
+        let copied = copy_read_bytes(memory, iov_base, &bytes);
+        offset += copied;
         total = total
-            .checked_add(read_len)
+            .checked_add(copied)
             .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-        if read_len < iov_len {
+        if copied < read_len || read_len < iov_len {
             break;
         }
     }
     Ok(total)
+}
+
+/// Copy a repeatable source through one owner permit at a time. A failure
+/// after a committed prefix reports exactly that prefix to the caller, which
+/// advances its file offset by the same count.
+fn copy_read_bytes(memory: &mut impl CurrentMmMemory, address: u64, bytes: &[u8]) -> usize {
+    if memory.user_memory_venue() != carrick_guest_mem::UserMemoryVenue::Owner {
+        return if memory.write_bytes(address, bytes).is_ok() {
+            bytes.len()
+        } else {
+            0
+        };
+    }
+    let mut copied = 0usize;
+    while copied < bytes.len() {
+        let Some(at) = address.checked_add(copied as u64) else {
+            break;
+        };
+        let step = (4096 - (at as usize & 4095)).min(bytes.len() - copied);
+        if memory
+            .write_bytes(at, &bytes[copied..copied + step])
+            .is_err()
+        {
+            break;
+        }
+        copied += step;
+    }
+    copied
+}
+
+/// A repeatable source permits an exact restart after an owner refusal. Read
+/// each bounded chunk before preparing its destination, then commit only the
+/// bytes actually read. The caller owns the file offset and advances it by
+/// `copied` even when the next chunk needs an owner supply or wait.
+pub(in crate::dispatch) fn read_from_repeatable_owner_at(
+    memory: &mut impl CurrentMmMemory,
+    address: u64,
+    length: usize,
+    offset: usize,
+    mut read_at: impl FnMut(usize, &mut [u8]) -> Result<usize, LinuxErrno>,
+) -> Result<(usize, Option<MemoryPrepareError>), DispatchError> {
+    let mut scratch = [0u8; 4096];
+    let mut copied = 0usize;
+    while copied < length {
+        let at = address
+            .checked_add(copied as u64)
+            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+        let source_offset = offset
+            .checked_add(copied)
+            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+        let step = (4096 - (at as usize & 4095)).min(length - copied);
+        let read_len = match read_at(source_offset, &mut scratch[..step]) {
+            Ok(0) => break,
+            Ok(read_len) => read_len,
+            Err(_errno) if copied > 0 => break,
+            Err(errno) => return Err(DispatchError::Errno(errno)),
+        };
+        let range = GuestWriteRange::new(GuestVa(at), read_len)
+            .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+        let prepared = match memory.prepare_write(&[range]) {
+            Ok(prepared) => prepared,
+            Err(error) => return Ok((copied, Some(error))),
+        };
+        prepared.commit(&[&scratch[..read_len]]);
+        copied += read_len;
+    }
+    Ok((copied, None))
 }
 
 pub(crate) fn read_from_synthetic_device_iovecs(
@@ -235,7 +295,18 @@ pub(in crate::dispatch) fn read_from_file_contents_at(
     if max_iov_len == 0 {
         return Ok(0);
     }
-    let mut scratch = vec![0u8; max_iov_len];
+    // An EL1 owner issues at most one page of write permission per stream
+    // step. Preparing the whole iovec makes untouched destinations fail the
+    // bounded portal contract before any file byte can be delivered.
+    let owner = memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner;
+    let mut scratch = vec![
+        0u8;
+        if owner {
+            max_iov_len.min(4096)
+        } else {
+            max_iov_len
+        }
+    ];
     let mut total = 0usize;
     for iovec in iovecs {
         let iov_base = iovec.iov_base;
@@ -244,28 +315,173 @@ pub(in crate::dispatch) fn read_from_file_contents_at(
         if iov_len == 0 {
             continue;
         }
-        let buf = &mut scratch[..iov_len];
-        match contents.read_at(offset as u64, buf) {
-            Ok(0) => break,
-            Ok(read_len) => {
-                if memory.write_bytes(iov_base, &buf[..read_len]).is_err() {
-                    return Ok(total);
+        let mut iov_done = 0usize;
+        while iov_done < iov_len {
+            let address = iov_base
+                .checked_add(iov_done as u64)
+                .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+            let step = if owner {
+                (4096 - (address as usize & 4095)).min(iov_len - iov_done)
+            } else {
+                iov_len - iov_done
+            };
+            let buf = &mut scratch[..step];
+            match contents.read_at(offset as u64, buf) {
+                Ok(0) => break,
+                Ok(read_len) => {
+                    if memory.write_bytes(address, &buf[..read_len]).is_err() {
+                        return Ok(total);
+                    }
+                    offset += read_len;
+                    iov_done += read_len;
+                    total = total
+                        .checked_add(read_len)
+                        .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
+                    if read_len < step {
+                        break;
+                    }
                 }
-                offset += read_len;
-                total = total
-                    .checked_add(read_len)
-                    .ok_or(DispatchError::LengthTooLarge(u64::MAX))?;
-                if read_len < iov_len {
-                    break;
+                Err(errno) => {
+                    if total > 0 {
+                        return Ok(total);
+                    }
+                    return Err(DispatchError::Errno(errno));
                 }
             }
-            Err(errno) => {
-                if total > 0 {
-                    return Ok(total);
-                }
-                return Err(DispatchError::Errno(errno));
-            }
+        }
+        if iov_done < iov_len {
+            break;
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod owner_repeatable_read_tests {
+    use super::*;
+    use carrick_guest_mem::{GuestMemory, MemoryError, PreparedGuestWrite, UserMemoryVenue};
+    use std::cell::RefCell;
+    use std::sync::{Arc, Mutex};
+
+    const BASE: u64 = 0x1000_0000;
+
+    struct OwnerMemory {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        prepared_lengths: Vec<usize>,
+        prepare_count: usize,
+        refuse_at: Option<usize>,
+    }
+
+    struct Permit {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        offset: usize,
+        len: usize,
+    }
+
+    impl PreparedGuestWrite for Permit {
+        fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+            assert_eq!(outputs.len(), 1);
+            assert!(outputs[0].len() <= self.len);
+            self.bytes.lock().unwrap()[self.offset..self.offset + outputs[0].len()]
+                .copy_from_slice(outputs[0]);
+        }
+    }
+
+    impl GuestMemory for OwnerMemory {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            assert_eq!(ranges.len(), 1);
+            let range = ranges[0];
+            self.prepare_count += 1;
+            self.prepared_lengths.push(range.len());
+            if self.refuse_at == Some(self.prepare_count) {
+                return Err(MemoryPrepareError::Fault(MemoryError::OutOfBounds {
+                    address: range.address().raw(),
+                    length: range.len(),
+                }));
+            }
+            Ok(Box::new(Permit {
+                bytes: Arc::clone(&self.bytes),
+                offset: (range.address().raw() - BASE) as usize,
+                len: range.len(),
+            }))
+        }
+
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            let offset = (address - BASE) as usize;
+            Ok(self.bytes.lock().unwrap()[offset..offset + length].to_vec())
+        }
+
+        fn write_bytes_raw(&mut self, _address: u64, _bytes: &[u8]) -> Result<(), MemoryError> {
+            panic!("owner copyout bypassed its prepared permit")
+        }
+    }
+
+    impl CurrentMmMemory for OwnerMemory {}
+
+    #[test]
+    fn regular_file_read_keeps_full_count_and_exact_offset_after_later_chunk_refusal() {
+        let payload: Vec<u8> = (0..9000).map(|index| (index % 251) as u8).collect();
+        let mut memory = OwnerMemory {
+            bytes: Arc::new(Mutex::new(vec![0; 16 * 1024])),
+            prepared_lengths: Vec::new(),
+            prepare_count: 0,
+            refuse_at: Some(2),
+        };
+        let address = BASE + 100;
+        let source_offset = 50;
+        let observed_offsets = RefCell::new(Vec::new());
+        let mut read_at = |at: usize, bytes: &mut [u8]| {
+            observed_offsets.borrow_mut().push(at);
+            let source = payload.get(at - source_offset..).unwrap_or_default();
+            let count =
+                source
+                    .len()
+                    .min(bytes.len())
+                    .min(if observed_offsets.borrow().len() == 1 {
+                        1000
+                    } else {
+                        4096
+                    });
+            bytes[..count].copy_from_slice(&source[..count]);
+            Ok(count)
+        };
+        let (prefix, refusal) = read_from_repeatable_owner_at(
+            &mut memory,
+            address,
+            payload.len(),
+            source_offset,
+            &mut read_at,
+        )
+        .unwrap();
+        assert_eq!(prefix, 1000);
+        assert!(matches!(refusal, Some(MemoryPrepareError::Fault(_))));
+        assert_eq!(*observed_offsets.borrow(), [50, 1050]);
+        assert_eq!(&memory.bytes.lock().unwrap()[100..1100], &payload[..1000]);
+
+        memory.refuse_at = None;
+        let (remaining, refusal) = read_from_repeatable_owner_at(
+            &mut memory,
+            address + prefix as u64,
+            payload.len() - prefix,
+            source_offset + prefix,
+            &mut read_at,
+        )
+        .unwrap();
+        assert_eq!(remaining + prefix, payload.len());
+        assert!(refusal.is_none());
+        assert_eq!(observed_offsets.borrow()[2], 1050);
+        assert!(memory.prepared_lengths.iter().all(|&len| len <= 4096));
+        assert!(memory.prepared_lengths.contains(&4096));
+        assert_eq!(
+            &memory.bytes.lock().unwrap()[100..100 + payload.len()],
+            payload.as_slice()
+        );
+    }
 }
