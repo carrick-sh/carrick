@@ -2878,6 +2878,8 @@ def _run_checked_mode(
     if pending:
         print(
             "host-authority census subset passed; result is partial; "
+            f"executed profiles: {', '.join(executed)}; "
+            f"reviewed rows: {len(rows)}; "
             f"pending profiles: {', '.join(pending)}"
         )
     else:
