@@ -789,7 +789,7 @@ fn serial_host_el1_ipc_every_slot_boundary_delivers_owed_host_wakes() {
     };
     const SLOT: usize = 3;
     // A private, zeroed EL1 region (the host maps a fresh one per carrier).
-    let region_bytes = vec![0u8; carrick_el1_abi::EL1_REGION_SIZE as usize];
+    let region_bytes = carrick_test_support::TestEl1Region::zeroed();
     carrick_el1_abi::record_el1_region_host_ptr(region_bytes.as_ptr() as usize);
     let task = |slot: usize| {
         let at = region_bytes.as_ptr() as usize
@@ -941,7 +941,7 @@ fn mixed_venue_readv_wakes_on_el1_write(write_before_enroll: bool) {
     use std::time::{Duration, Instant};
     use zerocopy::IntoBytes;
     const SLOT: usize = 2;
-    let region_bytes = vec![0u8; carrick_el1_abi::EL1_REGION_SIZE as usize];
+    let region_bytes = carrick_test_support::TestEl1Region::zeroed();
     carrick_el1_abi::record_el1_region_host_ptr(region_bytes.as_ptr() as usize);
     let task = |slot: usize| {
         let at = region_bytes.as_ptr() as usize

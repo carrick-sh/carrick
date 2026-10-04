@@ -12,5 +12,6 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+carrick-el1-abi = { path = "../carrick-el1-abi" }
 flate2.workspace = true
 tar.workspace = true

@@ -471,13 +471,13 @@ mod tests {
         /// exactly as the host maps a fresh one.
         struct Region {
             _lock: parking_lot::MutexGuard<'static, ()>,
-            _buffer: Vec<u8>,
+            _buffer: Box<carrick_test_support::TestEl1Region>,
         }
 
         impl Region {
             fn new() -> Self {
                 let lock = TEST_LOCK.lock();
-                let buffer = vec![0u8; carrick_el1_abi::EL1_REGION_SIZE as usize];
+                let buffer = carrick_test_support::TestEl1Region::zeroed();
                 carrick_el1_abi::record_el1_region_host_ptr(buffer.as_ptr() as usize);
                 crate::el1_zone::enable(true);
                 Self {

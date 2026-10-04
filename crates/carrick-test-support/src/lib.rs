@@ -4,10 +4,13 @@
 //! layers — each layer a gzipped tar. The end-to-end tests (`carrick-cli`'s
 //! `cli.rs`, `carrick-runtime`'s integration suites) need to synthesise those
 //! layers in-memory rather than ship binary fixtures on disk: a one-file
-//! `etc/motd`, a directory tree, a symlink graph. This crate is just the tar+gzip
+//! `etc/motd`, a directory tree, a symlink graph. This crate provides the tar+gzip
 //! builders that do that — [`gzip_tar`] (files at mode 0644), [`gzip_tar_with_modes`]
 //! (explicit per-file modes, for the chmod/exec-bit cases), and
 //! [`gzip_tar_with_links`] (files plus symlinks, for the path-resolution tests).
+//!
+//! [`TestEl1Region`] provides aligned backing for VM-free tests that address
+//! cache-line-aligned ABI records in a synthetic EL1 region.
 //!
 //! It is a separate crate, rather than a `#[cfg(test)]` module, for one reason:
 //! the same fixture builders are consumed from MULTIPLE crates' test targets
@@ -23,6 +26,9 @@
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use std::io::Write;
+
+mod el1_region;
+pub use el1_region::TestEl1Region;
 
 pub fn gzip_tar<const N: usize>(files: [(&str, &[u8]); N]) -> Vec<u8> {
     gzip_tar_with_modes(files.map(|(path, contents)| (path, contents, 0o644)))
