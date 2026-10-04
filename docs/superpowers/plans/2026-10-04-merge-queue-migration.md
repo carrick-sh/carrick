@@ -33,8 +33,10 @@ and rerun actor for repository `maintain` or `admin` roles. An API error denies
 execution. The permission endpoint needs only repository metadata read, implicit
 in the read-only GitHub installation token. No PAT is supplied to the jobs.
 
-The Mac jobs use `[self-hosted, macOS, ARM64, carrick-signed]`; the host job
-also requires `macos-host`. The signed job follows the host job. Cross-run Mac
+The Mac jobs require `[self-hosted, macOS, ARM64, carrick-signed, cloudmac]`;
+the host job also requires `macos-host`. The owner approved cloudmac as the
+only runner candidate. The director's local Mac must not be registered. The
+signed job follows the host job. Cross-run Mac
 concurrency never cancels an active job. Before signed execution,
 `just lease docker just land-provision all` builds fresh native ARM Linux fixtures
 and probes under an exclusive lease. Provisioning uses Docker to build artifacts,
@@ -51,7 +53,7 @@ extracts those exact IDs from the complete console log and calls
 Actions ID. It records failures and counts; it never uses `pkill`. This also
 covers cancellation before accept publishes a receipt. A machine crash can
 prevent any `always()` step: the director must inspect/reap recorded IDs before
-returning that host to service.
+returning cloudmac to service.
 
 Artifacts named `<check>-<event-sha>-<attempt>` retain the entire
 `target/el1-gate/` tree (including `<short-sha>/receipt.json` and every step log),
@@ -109,7 +111,7 @@ Queue settings:
 - Maximum merge batch: **4 PRs**. Minimum: **4**, with a **5 minute** wait for that
   population, after which smaller batches may merge. These are merge limits,
   not a promise that four PRs share one CI build.
-- Build concurrency: **1 merge group**, initially, because the two Macs and the
+- Build concurrency: **1 merge group**, initially, because the single cloudmac runner and its
   host lease are the scarce resource. The Mac jobs also share a concurrency group. Do not
   increase concurrency or shorten evidence to hide a capacity problem.
 - Status-check timeout: **360 minutes**. Hosted prerequisites, two Mac phases
@@ -164,13 +166,14 @@ Before any runner is online, the director, after owner approval, must:
 4. Install CODEOWNERS with the owner's approved identity and enforce the review
    rules above. Audit *all* repository workflows and write-capable collaborators.
    Do not give workers enqueue rights beyond the reviewed operating procedure.
-5. Isolate the runner accounts and obtain explicit owner acceptance of residual
+5. Isolate the cloudmac runner account and obtain explicit owner acceptance of residual
    risk. With repo-scoped runners there is no enforced selected-workflow
    allowlist. If the owner needs that guarantee, use a separately approved
    architecture such as organization runner groups restricted to trusted
    workflows, or externally gated isolated machines; do not activate this plan
-   on the director's everyday account and call it secure.
-6. Keep the old `carrick-hvf`/`carrick-kvm` labels off these new registrations.
+   on an everyday account and call it secure. The director's Mac is excluded
+   from runner registration under the owner's current decision.
+6. Keep the old `carrick-hvf`/`carrick-kvm` labels off the new cloudmac registration.
    Disable old scheduled hardware execution on a shared gate host before
    cutover (the director manages existing variables/registrations), or move it
    to separate hosts. `kernel-runtime.yml` predates this full gate lease flow;
@@ -181,21 +184,22 @@ Before any runner is online, the director, after owner approval, must:
    merge-group receipt/artifact identity. Enable ordinary queue landings only
    after that end-to-end exercise; this Linux validation cannot prove it.
 
-## Runner installation: cloudmac and the director's Mac
+## Runner installation: cloudmac only; director Mac stays local
 
 These are instructions for the director, not actions taken by this change.
-Use one dedicated non-admin macOS account and **one runner process per physical
-Mac**, repo-scoped to the owner's actual GitHub `OWNER/REPO`. Keep source review,
+On cloudmac use one dedicated non-admin macOS account and **one runner
+process total**, repo-scoped to the owner's actual GitHub `OWNER/REPO`. Keep
+source review,
 SSH identities, signing certificates, personal keychains and unrelated work out
 of that account. Ad-hoc Carrick signing needs no private signing key. Preserve
-only narrowly approved sudo diagnostics; no general passwordless sudo. Both
-machines need real Apple Silicon HVF capability, Apple ld64/Xcode tools, a
+only narrowly approved sudo diagnostics; no general passwordless sudo. Cloudmac
+needs real Apple Silicon HVF capability, Apple ld64/Xcode tools, a
 sufficient hard file limit for `ulimit -n 65536`, native ARM Docker for provisioning,
 Rust 1.96.0 with `rust-toolchain.toml` targets/components, just, cargo-deny,
 Semgrep, jq, Python and existing signing/debug tools. Never use lld for Mach-O.
 
 Use **non-ephemeral registration initially**: there is no authorized automation
-here to reimage/re-register physical Macs after each job, and losing registration
+here to reimage/re-register cloudmac after each job, and losing registration
 after a host job would strand its signed partner. Persistent registration is a
 maintenance choice, not a security claim. Ephemeral registration alone does not
 clean a host. A future ephemeral lane needs automated replacement of the entire
@@ -203,7 +207,7 @@ machine/account plus external log retention before it can replace this service.
 Rebuild fixtures/probes each signed job, retain no public-PR caches, and reset the
 account/machine after suspected compromise.
 
-For each machine, download the current **macOS ARM64** runner tarball and verify
+For cloudmac, download the current **macOS ARM64** runner tarball and verify
 the SHA-256 displayed by the repository's Settings → Actions → Runners → New
 self-hosted runner page. Extract to a dedicated account-owned directory, e.g.
 `~/actions-runner-carrick`. Use a short-lived **repository registration token**
@@ -213,9 +217,8 @@ logged in as that account, use the page's token interactively:
 ```sh
 cd ~/actions-runner-carrick
 # Built-in default labels are self-hosted, macOS, ARM64; retain them.
-# Substitute cloudmac-carrick or director-mac-carrick as appropriate.
 ./config.sh --url https://github.com/OWNER/REPO \
-  --name cloudmac-carrick --labels carrick-signed,macos-host --work _work
+  --name cloudmac-carrick --labels carrick-signed,macos-host,cloudmac --work _work
 ./svc.sh install
 ./svc.sh start
 ./svc.sh status
@@ -231,14 +234,27 @@ include the approved tool locations (`~/.cargo/bin`, Homebrew, Semgrep), then
 restart and confirm its environment with a maintainer dispatch. User services
 are not a promise of pre-login availability.
 
-Both accounts and all local gate/Docker processes must use the same absolute
-`CARRICK_HOST_LEASE_PATH` **on each physical host** and have permissions to that
+The cloudmac runner account and all gate/Docker processes on that host must use
+the same absolute
+`CARRICK_HOST_LEASE_PATH` **on cloudmac** and have permissions to that
 same lock file. Do not give each checkout/account a private lease path. Export
 it in the user service environment and the director's local shells. Never unlink
 a live lease file. Accept inherits an exclusive descriptor into signed scripts;
-there is no shared-to-exclusive upgrade. Keep one runner per host even if labels
+there is no shared-to-exclusive upgrade. Keep one cloudmac runner even though
+its labels
 match both jobs. Do not share the remote-accept worktree: Actions
 uses its own checkout, while the lease coordinates physical host access.
+
+The director's Mac remains a local development and manual acceptance machine:
+install no Actions runner or LaunchAgent there, and assign it no runner labels.
+Local `just accept`, `remote-accept` and `remote-recapture` remain available.
+Cloudmac runs both Mac tiers serially on its one runner, with signed following
+host; its outage or environment approval backlog blocks queued landings.
+Throughput is bounded by the sum of the host and signed gate durations for each
+merge-group build. A maximum merge batch of four does not guarantee one build
+for four PRs, so do not advertise four-way runner parallelism or add a director
+Mac fallback. Keep build concurrency one and measure real queue latency before
+the owner considers further capacity.
 
 ## Worker/director flow and retained tools
 
@@ -274,10 +290,10 @@ Proposed concise AGENTS.md amendment (apply at cutover, not before):
 
 ## Rollback
 
-Freeze enqueueing and remove affected PRs from the queue. Stop both user services
+Freeze enqueueing and remove affected PRs from the queue. Stop the cloudmac user service
 with `./svc.sh stop` before editing trusted workflow guards. Collect complete
-Actions artifacts and acceptance run IDs, reap only those IDs, inspect the Macs,
-and reset compromised runner accounts/machines before restart. Do not delete a
+Actions artifacts and acceptance run IDs, reap only those IDs, inspect cloudmac,
+and reset its runner account/machine before restart. Do not delete a
 live host lease or kill unrelated Carrick processes.
 
 The director restores the recorded pre-cutover ruleset/settings and legacy

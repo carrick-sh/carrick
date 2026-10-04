@@ -460,6 +460,7 @@ jobs:
             *) echo 'authorized=false' >> "$GITHUB_OUTPUT" ;;
           esac
 
+  # Owner-approved runner candidate: cloudmac only; no director Mac fallback.
   macos-host:
     # Never pull_request: public fork code must not be dispatched to a Mac.
     # The hosted authorization job also restricts manual runs and reruns.
@@ -468,7 +469,7 @@ jobs:
           needs.trusted-event.outputs.authorized == 'true' }}
     needs: [trusted-event, kernel-linux-native, cross-check-linux]
     name: macos-host
-    runs-on: [self-hosted, macOS, ARM64, carrick-signed, macos-host]
+    runs-on: [self-hosted, macOS, ARM64, carrick-signed, macos-host, cloudmac]
     environment: carrick-trusted
     timeout-minutes: 240
     concurrency:
@@ -560,7 +561,7 @@ jobs:
       ${{ (github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch') &&
           needs.trusted-event.outputs.authorized == 'true' }}
     needs: [trusted-event, kernel-linux-native, cross-check-linux, macos-host]
-    runs-on: [self-hosted, macOS, ARM64, carrick-signed]
+    runs-on: [self-hosted, macOS, ARM64, carrick-signed, cloudmac]
     environment: carrick-trusted
     timeout-minutes: 240
     concurrency:
