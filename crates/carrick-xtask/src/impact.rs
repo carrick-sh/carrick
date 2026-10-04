@@ -71,6 +71,39 @@ pub struct Sample {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
     pub cleanup_ok: bool,
+    #[serde(default)]
+    pub host_load: Option<SampleHostLoad>,
+}
+/// Host observation immediately before launch, outside the timed/CPU window.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SampleHostLoad {
+    pub load_average_1m: f64,
+    pub rustc_processes: usize,
+}
+fn rustc_processes(commands: &str) -> usize {
+    commands
+        .lines()
+        .filter(|command| {
+            Path::new(command.trim())
+                .file_name()
+                .is_some_and(|name| name == "rustc")
+        })
+        .count()
+}
+fn sample_host_load() -> Result<SampleHostLoad> {
+    let mut load = 0.0;
+    // SAFETY: getloadavg writes one double to the supplied live pointer.
+    if unsafe { libc::getloadavg(&mut load, 1) } != 1 || !load.is_finite() || load < 0.0 {
+        return Err("host load average unavailable".into());
+    }
+    let processes = Command::new("ps").args(["-axo", "comm="]).output()?;
+    if !processes.status.success() {
+        return Err("host compiler census failed".into());
+    }
+    Ok(SampleHostLoad {
+        load_average_1m: load,
+        rustc_processes: rustc_processes(std::str::from_utf8(&processes.stdout)?),
+    })
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkloadReceipt {
@@ -167,6 +200,7 @@ struct Output {
     wall: f64,
     cpu: Option<f64>,
     timed_out: bool,
+    host_load: Option<SampleHostLoad>,
 }
 trait Runner {
     fn execute(
@@ -206,6 +240,7 @@ impl Runner for SystemRunner {
             command.env("CARRICK_RUN_ID", id);
         }
         command.envs(env.iter().cloned());
+        let host_load = run_id.map(|_| sample_host_load()).transpose()?;
         let cpu_before = child_cpu()?;
         let start = Instant::now();
         let mut child = command.spawn()?;
@@ -239,6 +274,7 @@ impl Runner for SystemRunner {
             wall,
             cpu,
             timed_out,
+            host_load,
         })
     }
 }
@@ -711,6 +747,7 @@ fn measure(
                         exit_code: output.code,
                         timed_out: output.timed_out,
                         cleanup_ok: cleanup.is_ok(),
+                        host_load: output.host_load,
                     };
                 let ok = valid_sample(&sample);
                 receipt
@@ -952,6 +989,13 @@ pub fn run(root: Option<&Path>, action: Action) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compiler_census_counts_process_names_not_command_arguments() {
+        assert_eq!(
+            rustc_processes("/toolchain/bin/rustc\nrustc\n/agent/rustc-helper\ncodex exec rustc\n"),
+            2
+        );
+    }
     use super::*;
     use std::collections::VecDeque;
     struct Fake {
@@ -993,6 +1037,7 @@ mod tests {
             exit_code: Some(0),
             timed_out: false,
             cleanup_ok: true,
+            host_load: None,
         };
         let mut warmup = sample.clone();
         warmup.warmup = true;
