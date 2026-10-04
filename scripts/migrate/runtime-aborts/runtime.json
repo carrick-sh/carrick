@@ -1175,6 +1175,17 @@
     },
     {
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "function": "owner_prepare_refusal_after",
+      "ordinal_in_function": 1,
+      "fingerprint": "a4ad8d530de80e55eace70db7bf07843deb30ff746680e36e7efe7690ff47957",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1_delegation",
+      "rationale": "A bounded owner copyout exceeded its prepared permit despite the caller splitting transfers at the page boundary; this is a carrier chunking invariant failure, not a guest errno.",
+      "sink": "fatal",
+      "domain": "el1_delegation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "function": "recall",
       "ordinal_in_function": 1,
       "fingerprint": "5fef690a2d1a4fc6b3a22c0531c383d3952bc749214a650b4cfba75cbc1047dd",
