@@ -724,7 +724,58 @@ fn threads_of_another_process_are_not_woken() {
 /// the host could take the queued thread): a servable one is served.
 #[test]
 fn queued_threads_do_not_send_other_syscalls_to_the_host() {
-    let zone = zone();
+    // A served delegated file and its scheduler must share the actual carrier
+    // region: an unrelated stack inode is not notification authority.
+    struct Region {
+        ptr: core::ptr::NonNull<u8>,
+        layout: std::alloc::Layout,
+    }
+    impl Drop for Region {
+        fn drop(&mut self) {
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+        }
+    }
+    let layout =
+        std::alloc::Layout::from_size_align(carrick_el1_abi::EL1_REGION_SIZE as usize, 4096)
+            .unwrap();
+    let region = Region {
+        ptr: core::ptr::NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap(),
+        layout,
+    };
+    let zone = unsafe {
+        &*region
+            .ptr
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+            .cast::<ZoneTables>()
+    };
+    let objects = unsafe {
+        core::slice::from_raw_parts(
+            region
+                .ptr
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_OBJECT_TABLE_OFFSET as usize)
+                .cast::<DelegatedFile>(),
+            1,
+        )
+    };
+    let authority = carrick_el1_abi::DelegatedFileAuthority::new(
+        &objects[0],
+        carrick_sched_core::object_wait::DelegatedFileWaitIndex::from_index(0).unwrap(),
+        carrick_sched_core::object_wait::DelegatedReleaseVenue {
+            zone,
+            waker: carrick_sched_core::Waker::Host,
+            deliver: |_, _, effects| {
+                let _ = effects.deliver_handbacks(&mut |_| {});
+            },
+        },
+    )
+    .unwrap();
+    let mut admission = authority.try_host().unwrap().unwrap();
+    admission
+        .admit_notifications(core::num::NonZeroU64::new(42).unwrap())
+        .unwrap();
+    drop(admission);
     let word = AtomicU32::new(0);
     let uaddr = word.as_ptr() as u64;
     let tasks = [
@@ -739,7 +790,6 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
     // fd 3 of the task's file table is a delegated file EL1 serves lseek on.
     let fd_map = [FdMapSlot::new()];
     fd_map[0].set(5, 3, 1, 42);
-    let objects = [DelegatedFile::new()];
     let opens = [DelegatedOpenFile::new()];
     opens[0]
         .state
@@ -764,12 +814,12 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
             &counters,
             &tasks,
             &fd_map,
-            &objects,
+            objects,
             &opens,
             &inotify,
             &names,
             Some(crate::Zone {
-                tables: &zone,
+                tables: zone,
                 cpu,
                 user: &HardwareUserWord,
             }),
@@ -790,6 +840,12 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
     tasks[3].mark_pending_host_work();
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
     assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Forward);
+    let mut retirement = authority.try_host().unwrap().unwrap();
+    objects[0]
+        .state
+        .store(carrick_el1_abi::DELEGATED_STATE_DEAD, Ordering::Release);
+    retirement.retire_notifications();
+    drop(retirement);
 }
 
 // ---------------------------------------------------------------------------
