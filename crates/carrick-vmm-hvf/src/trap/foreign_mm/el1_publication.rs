@@ -235,3 +235,88 @@ impl carrick_aarch64::vmm::Stage1Services for ForeignStage1Services<'_> {
         }
     }
 }
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+    use carrick_guest_mem::{UserMemoryAdmissionError, UserMemoryAuthority};
+    use std::sync::Arc;
+
+    struct NoCall;
+    impl carrick_guest_mem::CallerEl1Call for NoCall {
+        fn slot(&self) -> Option<usize> {
+            Some(0)
+        }
+        fn drain_foreign(
+            &mut self,
+            _: u64,
+            _: u64,
+            _: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+        ) -> Result<u64, String> {
+            panic!("drop-order witness must not execute a guest service")
+        }
+    }
+
+    struct AdmissionDrop {
+        authority: UserMemoryAuthority,
+        handle: carrick_el1_abi::El1MmHandle,
+        result: Arc<parking_lot::Mutex<Option<Result<(), UserMemoryAdmissionError>>>>,
+    }
+    impl carrick_guest_mem::BorrowedTtbr0Admission for AdmissionDrop {
+        fn arm(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    impl Drop for AdmissionDrop {
+        fn drop(&mut self) {
+            *self.result.lock() = Some(self.authority.admit_owner(self.handle));
+        }
+    }
+
+    #[test]
+    fn n1_foreign_publisher_drop_keeps_legacy_exclusion_through_admission_cleanup() {
+        let _guard = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
+        use carrick_el1::personality::mm_portal::{MmPortal, test_support as owner};
+        let region = owner::Region::new();
+        let mm = owner::admit_notified(&region, 77, owner::ROOT, 1, 0);
+        let nodes = owner::nodes(&region);
+        let portal = MmPortal::new(
+            std::num::NonZeroU64::MIN,
+            region.table(),
+            &region.zone().spaces,
+            &nodes,
+        )
+        .with_zone(region.zone())
+        .unwrap();
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let authority = UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default()));
+        let result = Arc::new(parking_lot::Mutex::new(None));
+        let mut caller = NoCall;
+        // This exercises the real publisher's field destruction. No service
+        // or replacement MM model participates in the cleanup interleaving.
+        let publisher = ForeignEl1Publisher {
+            caller: &mut caller,
+            admission: Box::new(AdmissionDrop {
+                authority: authority.clone(),
+                handle,
+                result: result.clone(),
+            }),
+            tables: carrick_aarch64::Stage1Authority::new_with_manager(None),
+            slots: None,
+            mm_key: std::num::NonZeroU64::new(mm.raw()).unwrap(),
+            root: owner::ROOT,
+            ttbr0: owner::ROOT,
+            _legacy: authority.legacy().unwrap(),
+        };
+        drop(publisher);
+        assert_eq!(
+            *result.lock(),
+            Some(Err(UserMemoryAdmissionError::LegacyReadActive))
+        );
+        assert_eq!(
+            authority.admit_owner(handle),
+            Ok(()),
+            "cleanup leaked exclusion"
+        );
+    }
+}
