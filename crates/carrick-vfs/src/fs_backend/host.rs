@@ -1102,7 +1102,7 @@ fn discover_orphans_after_root_lock(
     let Ok(_root_guard) = root_lock.write() else {
         return Vec::new();
     };
-    discover_orphans(scratch_root, None)
+    discover_orphans(scratch_root, Some(STARTUP_DISCOVERY_LIMIT))
 }
 
 impl std::fmt::Debug for HostFsBackend {
@@ -7187,8 +7187,18 @@ pub(crate) fn acquire_lockfile(
     Ok(lock)
 }
 
+/// Root entries startup orphan discovery may inspect before deferring the
+/// rest to the background pass.
+pub(crate) const STARTUP_DISCOVERY_LIMIT: usize = 64;
+
+#[cfg(test)]
+std::thread_local! {
+    /// Root entries inspected by `discover_orphans`, for structural budgets.
+    pub(crate) static ORPHAN_DISCOVERY_ENTRIES: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
 pub(crate) fn sweep_orphans(scratch_root: &Path) -> ScratchCleanupReceipts {
-    const STARTUP_DISCOVERY_LIMIT: usize = 64;
     let retired_scratch = discover_orphans(scratch_root, Some(STARTUP_DISCOVERY_LIMIT));
     cleanup_oldest_trash_checkpoint(scratch_root);
     let mut receipts = ScratchCleanupReceipts::default();
@@ -7211,6 +7221,8 @@ fn discover_orphans(scratch_root: &Path, limit: Option<usize>) -> Vec<PathBuf> {
     };
     let mut retired_scratch = Vec::new();
     for entry in entries.take(limit.unwrap_or(usize::MAX)).flatten() {
+        #[cfg(test)]
+        ORPHAN_DISCOVERY_ENTRIES.with(|n| n.set(n.get() + 1));
         let path = entry.path();
         if !path.is_dir() {
             continue;
