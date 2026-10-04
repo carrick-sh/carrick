@@ -243,6 +243,11 @@ pub(super) enum HvpatchProductionPhase {
     /// Parked in the in-guest zone (EL1 plan 1b); loaded from its zone record
     /// once the host owns it again ([`super::zone`]).
     ResumeZone,
+    /// A host user-copy was enrolled on its EL1 owner cause. The saved
+    /// syscall still owns completion; a wake re-enters its exact dispatch.
+    ResumeOwnerZone {
+        frame: carrick_hal::RawSyscall,
+    },
     ExecSiblingDrain {
         context: carrick_kernel::kernel::KernelContext,
         owner: Box<exec::PreparedExecveDrain>,
@@ -370,7 +375,7 @@ impl HvpatchProductionPhase {
             Self::TerminalRetireRetry { .. } => 11,
             Self::Complete => 12,
             Self::BootstrapThreadChild => 13,
-            Self::ResumeZone => 14,
+            Self::ResumeZone | Self::ResumeOwnerZone { .. } => 14,
         }
     }
 }
@@ -2752,6 +2757,9 @@ where
             )?;
             return self.service_outcome(engine, control, frame, outcome);
         }
+        if let DispatchOutcome::OwnerMemoryWait { wait } = outcome {
+            return self.owner_memory_park(engine, control, frame, wait);
+        }
         if carrick_kernel::kernel::continuation::is_blocking_dispatch_outcome(&outcome) {
             let _ = self.state.stash_parked_registers(engine);
             let request = self
@@ -3777,6 +3785,9 @@ where
             let phase = std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident);
             match phase {
                 HvpatchProductionPhase::ResumeZone => return self.resume_zone(engine, control),
+                HvpatchProductionPhase::ResumeOwnerZone { frame } => {
+                    return self.resume_owner_zone(engine, control, frame);
+                }
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 HvpatchProductionPhase::BootstrapProcessChild(bootstrap) => {
                     bootstrap_hvpatch_process_child(
