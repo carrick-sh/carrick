@@ -8,7 +8,7 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorOutcome, DescriptorReceipt, DescriptorTxnSlot,
 };
 use carrick_mmu_core::aarch64::{GuestPreparedCommit, GuestPreparedCommitError, LeafAccess};
-use carrick_sched_core::AddressSpaces;
+use carrick_sched_core::spaces::notification::SpaceAccess;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -141,7 +141,7 @@ pub struct PreparedFaultPath<'a, P: PreparedPageResolver> {
 /// `access`. A busy root answers `Some(false)`: the host decides.
 fn root_admits_commit(
     roots: Option<&crate::memory::reservations::SharedReservations>,
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     slot: u32,
     mm_key: u64,
     page: u64,
@@ -153,7 +153,7 @@ fn root_admits_commit(
     if !roots.admitted(index, mm) {
         return None;
     }
-    let Ok(mut model) = roots.lock_el1(index, mm, slot) else {
+    let Ok(mut model) = roots.lock_in(spaces, index, mm, slot) else {
         return Some(false);
     };
     let bits = match access {
@@ -547,7 +547,7 @@ impl DescriptorTxnApplier for HardwareDescriptorTxnApplier {
 pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
     frame: &TrapFrame,
     current_tasks: &[CurrentTask],
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     path: &mut DescriptorTxnPath<'_, X>,
 ) -> Option<Action> {
     let mm_key = current_tasks
@@ -580,7 +580,7 @@ pub fn dispatch_fault_with_descriptor_txns<P, C, X>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     mut txns: Option<DescriptorTxnPath<'_, X>>,
     mailboxes: GrantMailboxes<'_>,
     prepared: Option<PreparedFaultPath<'_, P>>,
@@ -625,7 +625,7 @@ pub trait CowCopyWindow {
 pub fn copy_granted_cow_page<W, C>(
     words: &W,
     grant: carrick_mmu_core::aarch64::descriptor_txn::CowCopyGrant,
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     owner: NonZeroU64,
     window: &mut C,
 ) -> Result<
@@ -686,7 +686,7 @@ pub enum DrainOutcome {
 /// settled or resumed EL0 on the report would run against stale
 /// translations.
 pub fn drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     mm_key: u64,
     ttbr0: u64,
@@ -710,7 +710,7 @@ pub fn drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
 /// One attempt of [`drain_mm_descriptor_txns`]. `None`: another EL1 editor
 /// holds the MM while some of its submissions are still in flight; retry.
 fn try_drain_mm_descriptor_txns<X: DescriptorTxnApplier>(
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     mm_key: u64,
     ttbr0: u64,
@@ -762,7 +762,7 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
     frame: &TrapFrame,
     action: Action,
     current_tasks: &[CurrentTask],
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     applier: &mut X,
 ) -> Action {
@@ -800,7 +800,7 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
 /// Answers in `frame.x[0]`: applied count, plus the blocked bit.
 pub fn serve_host_drain<X: DescriptorTxnApplier>(
     frame: &mut TrapFrame,
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     slots: &carrick_el1_abi::DescriptorTxnSlots,
     applier: &mut X,
 ) {
@@ -830,7 +830,10 @@ pub fn drain_before_el0_hw(frame: &TrapFrame, action: Action) -> Action {
         frame,
         action,
         current_tasks,
-        &zone.spaces,
+        crate::substrate::sched::object_wait::space_access(
+            zone,
+            carrick_sched_core::SlotId::new(frame.slot as u8),
+        ),
         carrick_el1_abi::descriptor_txn_slots_guest(),
         &mut HardwareDescriptorTxnApplier,
     )
@@ -842,7 +845,10 @@ pub fn serve_host_drain_hw(frame: &mut TrapFrame) {
     let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
     serve_host_drain(
         frame,
-        &zone.spaces,
+        crate::substrate::sched::object_wait::space_access(
+            zone,
+            carrick_sched_core::SlotId::new(frame.slot as u8),
+        ),
         carrick_el1_abi::descriptor_txn_slots_guest(),
         &mut HardwareDescriptorTxnApplier,
     );
@@ -872,7 +878,10 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
             frame,
             counters,
             current_tasks,
-            &zone.spaces,
+            crate::substrate::sched::object_wait::space_access(
+                zone,
+                carrick_sched_core::SlotId::new(frame.slot as u8),
+            ),
             Some(DescriptorTxnPath {
                 slots: carrick_el1_abi::descriptor_txn_slots_guest(),
                 applier: &mut HardwareDescriptorTxnApplier,
@@ -923,7 +932,7 @@ pub fn dispatch_fault_with_regions<C: CowResolver>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     mailboxes: GrantMailboxes<'_>,
     cow_resolver: &mut C,
 ) -> Action {
@@ -994,7 +1003,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
     frame: &mut TrapFrame,
     counters: &Counters,
     current_tasks: &[CurrentTask],
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     mailboxes: GrantMailboxes<'_>,
     mut prepared: Option<PreparedFaultPath<'_, P>>,
     cow_resolver: &mut C,
@@ -1138,7 +1147,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
 /// The host sees only this exact owner window and retained handle byte service.
 pub struct FileFaultVenue<'a> {
     pub roots: &'a crate::memory::reservations::SharedReservations,
-    pub spaces: &'a AddressSpaces,
+    pub spaces: SpaceAccess<'a>,
     pub slots: &'a carrick_el1_abi::MmPortalSlots,
     pub worker: u32,
     pub mailbox: &'a FrameGrantMailbox,
@@ -1152,7 +1161,10 @@ impl FileFaultVenue<'_> {
             if !self.roots.admitted(index.index(), mm) {
                 return None;
             }
-            let mut root = self.roots.lock_el1(index.index(), mm, self.worker).ok()?;
+            let mut root = self
+                .roots
+                .lock_in(self.spaces, index.index(), mm, self.worker)
+                .ok()?;
             root.mapping(va)?.host_backing?;
             owner_source.set(true);
             let protection = carrick_el1_abi::ReservationProtection::from_bits(access)?;
@@ -1268,7 +1280,7 @@ mod tests {
                 &mut frame,
                 &Counters::default(),
                 &tasks,
-                &spaces,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
                 Some(PreparedFaultPath {
                     residency: &table,
@@ -1394,7 +1406,7 @@ mod tests {
                 &mut frame,
                 &Counters::default(),
                 &tasks,
-                &spaces,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
                 Some(PreparedFaultPath {
                     residency: &residency,
@@ -1442,7 +1454,9 @@ mod tests {
                 &mut frame,
                 &Counters::default(),
                 &[task],
-                &published_space(mm, 0x8800_0000),
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(
+                    &published_space(mm, 0x8800_0000)
+                ),
                 GrantMailboxes::own(&FrameGrantMailbox::new()),
                 Some(PreparedFaultPath {
                     residency: &table,
@@ -1513,7 +1527,7 @@ mod tests {
                         frame,
                         &counters,
                         &tasks,
-                        &spaces,
+                        carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                         GrantMailboxes {
                             own,
                             peers: Some(&boxes)
@@ -1576,7 +1590,7 @@ mod tests {
                     &mut second,
                     &counters,
                     &tasks,
-                    &spaces,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                     GrantMailboxes {
                         own: origin,
                         peers: Some(&boxes)
@@ -1606,7 +1620,7 @@ mod tests {
                 &mut frame,
                 &Counters::default(),
                 &tasks,
-                &spaces,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
                 &mut NoopCowResolver,
             ),
@@ -1667,7 +1681,7 @@ mod tests {
                 &mut frame,
                 &counters,
                 &tasks,
-                &spaces,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
                 &mut cow_resolver,
             ),
@@ -1680,7 +1694,7 @@ mod tests {
                 &mut frame,
                 &counters,
                 &tasks,
-                &spaces,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
                 &mut cow_resolver,
             ),
@@ -1717,7 +1731,7 @@ mod tests {
                     &mut first,
                     &counters,
                     &tasks,
-                    &spaces,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                     GrantMailboxes {
                         own: origin,
                         peers: Some(&boxes),
@@ -1754,7 +1768,7 @@ mod tests {
                     &mut retry,
                     &counters,
                     &tasks,
-                    &spaces,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                     GrantMailboxes {
                         own,
                         peers: Some(&boxes),
@@ -1779,7 +1793,7 @@ mod tests {
                     &mut next,
                     &counters,
                     &tasks,
-                    &spaces,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                     GrantMailboxes {
                         own: origin,
                         peers: Some(&boxes),
@@ -1817,7 +1831,7 @@ mod tests {
                 &mut frame,
                 &counters,
                 &tasks,
-                &spaces,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
                 &mut cow_resolver,
             ),
@@ -1847,7 +1861,7 @@ mod tests {
                 &mut frame,
                 &counters,
                 &tasks,
-                &spaces,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
                 &mut cow_resolver,
             ),
@@ -1878,7 +1892,7 @@ mod tests {
                 &mut frame,
                 &counters,
                 &tasks,
-                &spaces,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
                 &mut cow_resolver,
             ),
@@ -1911,7 +1925,7 @@ mod tests {
                 &mut frame,
                 &counters,
                 &tasks,
-                &spaces,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
                 &mut cow_resolver,
             ),
@@ -2094,7 +2108,7 @@ mod tests {
                 &mut frame,
                 counters,
                 &[task],
-                spaces,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(spaces),
                 Some(DescriptorTxnPath { slots, applier }),
                 GrantMailboxes::own(&FrameGrantMailbox::new()),
                 None::<PreparedFaultPath<'_, NoopPreparedResolver>>,
@@ -2257,7 +2271,7 @@ mod tests {
                     &frame(SVC),
                     Action::Served,
                     &[task(77)],
-                    &spaces,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                     &slots,
                     &mut applier
                 ),
@@ -2281,7 +2295,7 @@ mod tests {
                     &frame(0),
                     Action::Forward,
                     &[task(77)],
-                    &spaces,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                     &slots,
                     &mut applier
                 ),
@@ -2298,7 +2312,7 @@ mod tests {
                     &frame(0),
                     Action::Served,
                     &[task(77)],
-                    &spaces,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                     &slots,
                     &mut applier
                 ),
@@ -2315,7 +2329,7 @@ mod tests {
                     &frame(SVC),
                     Action::Idle,
                     &[task(77)],
-                    &spaces,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                     &slots,
                     &mut applier
                 ),
@@ -2344,7 +2358,7 @@ mod tests {
                     &frame(SVC),
                     Action::Served,
                     &tasks,
-                    &closed,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&closed),
                     &slots,
                     &mut applier
                 ),
@@ -2371,7 +2385,7 @@ mod tests {
                     &frame(SVC),
                     Action::Served,
                     &tasks,
-                    &closed,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&closed),
                     &slots,
                     &mut applier
                 ),
@@ -2383,7 +2397,7 @@ mod tests {
                     &frame(0),
                     Action::Served,
                     &tasks,
-                    &closed,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&closed),
                     &slots,
                     &mut applier
                 ),
@@ -2395,7 +2409,7 @@ mod tests {
                     &frame(fault),
                     Action::Served,
                     &tasks,
-                    &closed,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&closed),
                     &slots,
                     &mut applier
                 ),
@@ -2428,7 +2442,7 @@ mod tests {
                     &frame(SVC),
                     Action::Served,
                     &[task(77)],
-                    &spaces,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                     &slots,
                     &mut applier
                 ),
@@ -2458,11 +2472,21 @@ mod tests {
             };
             call.x[carrick_el1_abi::DESCRIPTOR_DRAIN_MM] = 78;
             call.x[carrick_el1_abi::DESCRIPTOR_DRAIN_TTBR0] = ROOT | ASID;
-            serve_host_drain(&mut call, &closed, &slots, &mut applier);
+            serve_host_drain(
+                &mut call,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&closed),
+                &slots,
+                &mut applier,
+            );
             assert_eq!(call.x[0], 0, "another MM's call applies nothing");
             assert!(writable(&arena));
             call.x[carrick_el1_abi::DESCRIPTOR_DRAIN_MM] = 77;
-            serve_host_drain(&mut call, &closed, &slots, &mut applier);
+            serve_host_drain(
+                &mut call,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&closed),
+                &slots,
+                &mut applier,
+            );
             assert_eq!(call.x[0], 1);
             assert!(!writable(&arena));
             let receipt = slots.take_receipt(5, txn.id).unwrap();
@@ -2484,7 +2508,7 @@ mod tests {
                 &frame(SVC),
                 Action::Served,
                 &[task(77)],
-                &spaces,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 &slots,
                 &mut applier,
             );
@@ -2512,7 +2536,7 @@ mod tests {
             let mut applier = ArenaApplier::new(&_arena);
             let mut step = || {
                 try_drain_mm_descriptor_txns(
-                    &spaces,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                     &slots,
                     77,
                     ROOT | ASID,
@@ -2537,7 +2561,7 @@ mod tests {
             drop(other);
             assert_eq!(
                 drain_mm_descriptor_txns(
-                    &spaces,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                     &slots,
                     77,
                     ROOT | ASID,
@@ -2590,7 +2614,7 @@ mod tests {
             let mut applier = ArenaApplier::new(&arena);
             assert_eq!(
                 drain_mm_descriptor_txns(
-                    &spaces,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                     &slots,
                     mm,
                     ROOT | ASID,
@@ -2678,12 +2702,25 @@ mod tests {
             let closed = AddressSpaces::new();
             closed.publish_closed(77, ROOT | ASID, ROOT | ASID).unwrap();
             assert!(matches!(
-                copy_granted_cow_page(&words, grant, &closed, nz(1), &mut frames),
+                copy_granted_cow_page(
+                    &words,
+                    grant,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&closed),
+                    nz(1),
+                    &mut frames
+                ),
                 Err(CowCopyError::Refused(DescriptorRefusal::Contended))
             ));
             assert!(frames.destination.iter().all(|&b| b == 0));
             let spaces = published_space(77, ROOT | ASID);
-            let copy = copy_granted_cow_page(&words, grant, &spaces, nz(1), &mut frames).unwrap();
+            let copy = copy_granted_cow_page(
+                &words,
+                grant,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                nz(1),
+                &mut frames,
+            )
+            .unwrap();
             assert_eq!(frames.destination, frames.source);
             assert_eq!(copy.grant(), grant);
         }
