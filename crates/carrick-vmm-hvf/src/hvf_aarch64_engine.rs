@@ -2893,7 +2893,7 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         &self,
         target: carrick_aarch64::user_transfer::TransferTarget,
         window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<Option<Box<dyn carrick_aarch64::user_transfer::TransferGrant>>, TrapError> {
+    ) -> Result<carrick_aarch64::user_transfer::TransferPreparation, TrapError> {
         carrick_aarch64::user_transfer::TransferCustody::prepare(
             &self.user_transfer_custody(),
             target,
