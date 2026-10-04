@@ -27,7 +27,7 @@ bitflags::bitflags! {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, IntoBytes, Immutable)]
 struct IdtGate64 {
     offset_low: u16,
     selector: u16,
@@ -39,6 +39,15 @@ struct IdtGate64 {
 }
 
 const _: () = assert!(std::mem::size_of::<IdtGate64>() == 16);
+
+/// Serialize the existing descriptor type for an additional CPL0 IRQ vector.
+/// The same typed constructor/layout serves both exception and IRQ gates.
+pub(crate) fn interrupt_gate_bytes(entry: u64) -> [u8; 16] {
+    let gate = IdtGate64::interrupt(entry);
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(gate.as_bytes());
+    bytes
+}
 
 impl IdtGate64 {
     fn interrupt(offset: u64) -> Self {

@@ -640,7 +640,7 @@ All mutations are restored before final verification. Preparation verification
 passes: the freestanding release build, x86/KVM crate tests (including the M2
 entry tests), both live `cpl0_progress` cases, `just test-kernel`, and focused
 host/image clippy. The executing image SHA-256 is
-`8e424ad5c90d1464bc74d7a325270233e6319bd341b1fb108d9306a4eb0e81fb`.
+`d1d8a8c94be8ac9bf73d1964d1561f0e1fde91131d2b3aa9cabf6b59130fbcf4`.
 Linux-portable acceptance is run on the committed tree; its receipt remains
 under `target/el1-gate/<head>/receipt.json`. These hardware tests do not close M4 IPC exhaustion, signal/timer policy, runtime leases, N1 production
 MM ownership, ARM signed gates or Docker timing. Remote host receipt is
