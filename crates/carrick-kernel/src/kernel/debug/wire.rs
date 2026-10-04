@@ -1,13 +1,11 @@
 //! Length-prefixed framing for the kernel debug socket.
 //!
-//! Exactly one frame travels in each direction, and the sender half-closes
-//! afterwards. That makes "trailing bytes" a detectable protocol violation
-//! rather than an ambiguity: after the declared payload the reader must see
-//! EOF, so a peer that appends anything is refused by name.
+//! The declared length is authoritative. Writers half-close for teardown;
+//! readers never wait for EOF after a complete frame. Both protocols share
+//! framing and the server's cancellation-aware socket transport.
 //!
-//! Both sides run under a deadline. A wedged guest must never wedge the
-//! debugger, so every socket read/write carries a timeout derived from the
-//! remaining budget and expiry is reported as a named timeout.
+//! Only clients impose a transport deadline, to bound a dead peer. Snapshot
+//! collection retains its own authority budgets and named refusals.
 
 use std::io::{ErrorKind, Read, Write};
 use std::time::{Duration, Instant};
@@ -17,7 +15,7 @@ pub const MAX_REQUEST_BYTES: usize = 4 * 1024;
 /// Canonical JSON responses are capped so one wedged reader cannot be made to
 /// allocate without bound.
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
-/// Both sides use the same two-second budget.
+/// The production client uses a two-second request budget.
 pub const DEADLINE: Duration = Duration::from_secs(2);
 /// How long the server lets the coherent snapshot wait for its authorities.
 /// Strictly inside [`DEADLINE`]: a snapshot allowed the whole budget made a
@@ -28,10 +26,6 @@ pub const STRICT_SNAPSHOT_BUDGET: Duration = Duration::from_millis(900);
 /// spend on try-locks. [`STRICT_SNAPSHOT_BUDGET`] + this leaves the rest of
 /// [`DEADLINE`] to encode and write the reply.
 pub const DEGRADED_BUDGET: Duration = Duration::from_millis(400);
-
-/// Frame length prefix, sized from the type actually encoded rather than
-/// written down, so the reader and writer cannot drift apart.
-const LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
@@ -44,8 +38,6 @@ pub enum WireError {
     FrameTooLarge { declared: usize, cap: usize },
     #[error("kernel debug frame ended after {read} of {declared} bytes")]
     Truncated { declared: usize, read: usize },
-    #[error("kernel debug frame carried {0} trailing byte(s) after the declared payload")]
-    TrailingBytes(usize),
     #[error("kernel debug payload is not valid JSON: {0}")]
     Json(String),
     #[error("kernel debug transport failed: {0}")]
@@ -77,10 +69,7 @@ fn remaining(
 }
 
 fn classify(error: std::io::Error, side: &'static str, started: Instant) -> WireError {
-    if matches!(
-        error.kind(),
-        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-    ) {
+    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) {
         return WireError::TimedOut {
             side,
             elapsed: started.elapsed(),
@@ -89,123 +78,105 @@ fn classify(error: std::io::Error, side: &'static str, started: Instant) -> Wire
     WireError::Io(error)
 }
 
-/// Write one length-prefixed frame and half-close the write side.
-pub fn write_frame<S>(
+use super::super::socket_rpc::{self, FrameError, FrameStream};
+
+impl From<FrameError> for WireError {
+    fn from(error: FrameError) -> Self {
+        match error {
+            FrameError::TooLarge { declared, cap } => Self::FrameTooLarge { declared, cap },
+            FrameError::Truncated { declared, read } => Self::Truncated { declared, read },
+            FrameError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
+// A client deadline decorates I/O, not the framing protocol. The server uses
+// the same framer directly with a cancellation-aware Connection, without this
+// decorator or a wall-clock transport deadline.
+struct DeadlineIo<'a, S> {
+    stream: &'a mut S,
+    deadline: Instant,
+    started: Instant,
+    side: &'static str,
+}
+
+impl<S> DeadlineIo<'_, S> {
+    fn check(&self) -> std::io::Result<()> {
+        remaining(self.deadline, self.side, self.started)
+            .map(|_| ())
+            .map_err(|error| std::io::Error::new(ErrorKind::TimedOut, error))
+    }
+
+    fn classify(&self, error: FrameError) -> WireError {
+        match error {
+            FrameError::Io(error) => classify(error, self.side, self.started),
+            error => error.into(),
+        }
+    }
+}
+
+impl<S: Read> Read for DeadlineIo<'_, S> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.stream.read(bytes)
+    }
+}
+
+impl<S: Write> Write for DeadlineIo<'_, S> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.check()?;
+        self.stream.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl<S: Write + SocketDeadline> FrameStream for DeadlineIo<'_, S> {
+    fn finish_frame(&mut self) -> std::io::Result<()> {
+        self.stream.shutdown_write().map_err(|error| match error {
+            WireError::Io(error) => error,
+            error => std::io::Error::other(error),
+        })
+    }
+}
+
+/// Write one authoritative frame under the client's existing request budget.
+pub fn write_frame<S: Write + SocketDeadline>(
     stream: &mut S,
     payload: &[u8],
     cap: usize,
     deadline: Instant,
     side: &'static str,
-) -> Result<(), WireError>
-where
-    S: Write + SocketDeadline,
-{
-    if payload.len() > cap {
-        return Err(WireError::FrameTooLarge {
-            declared: payload.len(),
-            cap,
-        });
-    }
+) -> Result<(), WireError> {
     let started = Instant::now();
-    // The cap check above already bounds this, but the conversion carries the
-    // proof rather than asserting it: a frame length that cannot be encoded is
-    // a refusal, never a panic in a diagnostic path.
-    let length = u32::try_from(payload.len()).map_err(|_| WireError::FrameTooLarge {
-        declared: payload.len(),
-        cap,
-    })?;
-    let mut framed = Vec::with_capacity(LENGTH_PREFIX_BYTES + payload.len());
-    framed.extend_from_slice(&length.to_be_bytes());
-    framed.extend_from_slice(payload);
-
-    // Set the socket timeout ONCE. Re-setting it per iteration is what broke
-    // the first live server: on Darwin, `setsockopt` on an `AF_UNIX` socket
-    // whose peer has closed AND whose write half is shut down returns
-    // `EINVAL`, which turned every successfully completed exchange into a
-    // transport failure on the final read. The absolute `deadline` check below
-    // is the real bound; the socket timeout only stops one blocking call.
     stream.set_write_deadline(Some(remaining(deadline, side, started)?))?;
-    let mut written = 0;
-    while written < framed.len() {
-        remaining(deadline, side, started)?;
-        match stream.write(&framed[written..]) {
-            Ok(0) => {
-                return Err(WireError::Truncated {
-                    declared: framed.len(),
-                    read: written,
-                });
-            }
-            Ok(count) => written += count,
-            Err(error) => return Err(classify(error, side, started)),
-        }
-    }
-    stream
-        .flush()
-        .map_err(|error| classify(error, side, started))?;
-    stream.shutdown_write()?;
-    Ok(())
+    let mut bounded = DeadlineIo {
+        stream,
+        deadline,
+        started,
+        side,
+    };
+    socket_rpc::write_frame(&mut bounded, payload, cap).map_err(|error| bounded.classify(error))
 }
 
-/// Read exactly one length-prefixed frame, then require EOF.
-pub fn read_frame<S>(
+/// Read one authoritative frame under the client's existing request budget.
+pub fn read_frame<S: Read + SocketDeadline>(
     stream: &mut S,
     cap: usize,
     deadline: Instant,
     side: &'static str,
-) -> Result<Vec<u8>, WireError>
-where
-    S: Read + SocketDeadline,
-{
+) -> Result<Vec<u8>, WireError> {
     let started = Instant::now();
-    // One `setsockopt` for the whole exchange — see `write_frame`.
     stream.set_read_deadline(Some(remaining(deadline, side, started)?))?;
-    let mut prefix = [0_u8; LENGTH_PREFIX_BYTES];
-    read_exact(stream, &mut prefix, deadline, side, started)?;
-    let declared = u32::from_be_bytes(prefix) as usize;
-    if declared > cap {
-        return Err(WireError::FrameTooLarge { declared, cap });
-    }
-
-    let mut payload = vec![0_u8; declared];
-    read_exact(stream, &mut payload, deadline, side, started)?;
-
-    // The peer must be done. Any further byte means the frame was not the
-    // whole message, which we refuse rather than silently ignore.
-    remaining(deadline, side, started)?;
-    let mut trailing = [0_u8; 1];
-    match stream.read(&mut trailing) {
-        Ok(0) => Ok(payload),
-        Ok(count) => Err(WireError::TrailingBytes(count)),
-        Err(error) => Err(classify(error, side, started)),
-    }
-}
-
-fn read_exact<S>(
-    stream: &mut S,
-    buffer: &mut [u8],
-    deadline: Instant,
-    side: &'static str,
-    started: Instant,
-) -> Result<(), WireError>
-where
-    S: Read,
-{
-    let declared = buffer.len();
-    let mut filled = 0;
-    while filled < declared {
-        remaining(deadline, side, started)?;
-        match stream.read(&mut buffer[filled..]) {
-            Ok(0) => {
-                return Err(WireError::Truncated {
-                    declared,
-                    read: filled,
-                });
-            }
-            Ok(count) => filled += count,
-            Err(error) => return Err(classify(error, side, started)),
-        }
-    }
-    Ok(())
+    let mut bounded = DeadlineIo {
+        stream,
+        deadline,
+        started,
+        side,
+    };
+    socket_rpc::read_frame(&mut bounded, cap).map_err(|error| bounded.classify(error))
 }
 
 /// Deadline control over a stream. Implemented for `UnixStream`; the in-memory
@@ -275,6 +246,34 @@ pub fn decode_exact<T: serde::de::DeserializeOwned>(payload: &[u8]) -> Result<T,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep the peer's write side open after a complete frame. No EOF can
+    // arrive: completion must be determined by the declared length alone.
+    fn complete_frame_without_eof(side: &'static str) {
+        let (mut peer, mut reader) = std::os::unix::net::UnixStream::pair().expect("pair");
+        peer.write_all(&framed(b"complete")).expect("write frame");
+        let result = read_frame(
+            &mut reader,
+            MAX_REQUEST_BYTES,
+            Instant::now() + DEADLINE,
+            side,
+        );
+        assert_eq!(
+            result.expect("complete frame must not wait for EOF"),
+            b"complete"
+        );
+        drop(peer);
+    }
+
+    #[test]
+    fn server_read_completes_before_the_peer_half_closes() {
+        complete_frame_without_eof("server-read");
+    }
+
+    #[test]
+    fn client_read_completes_before_the_peer_half_closes() {
+        complete_frame_without_eof("client-read");
+    }
 
     /// In-memory duplex that records what was written and replays a scripted
     /// read stream, so framing rules are testable without a real socket.
@@ -346,7 +345,7 @@ mod tests {
         assert_eq!(stream.outgoing, framed(b"payload"));
         assert!(
             stream.shutdown,
-            "writer must half-close so the peer can detect end of frame"
+            "writer half-close is optional teardown after frame completion"
         );
 
         let mut reader = Duplex::reading(framed(b"payload"));
@@ -361,20 +360,21 @@ mod tests {
     }
 
     #[test]
-    fn trailing_bytes_after_the_declared_payload_are_refused() {
+    fn bytes_beyond_the_authoritative_frame_are_not_read_or_dispatched() {
         let mut bytes = framed(b"payload");
-        bytes.push(b'!');
+        bytes.extend_from_slice(&framed(b"another request"));
         let mut reader = Duplex::reading(bytes);
-        let error = read_frame(
+        let payload = read_frame(
             &mut reader,
             MAX_REQUEST_BYTES,
             Instant::now() + DEADLINE,
             "test",
         )
-        .expect_err("trailing bytes must be refused");
-        assert!(
-            matches!(error, WireError::TrailingBytes(1)),
-            "expected trailing-byte rejection, got {error:?}"
+        .expect("complete first frame");
+        assert_eq!(payload, b"payload");
+        assert_eq!(
+            reader.incoming.position() as usize,
+            framed(b"payload").len()
         );
     }
 

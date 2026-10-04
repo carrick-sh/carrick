@@ -12,7 +12,9 @@ mod endpoint;
 pub mod exec;
 mod teardown;
 
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(test)]
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
@@ -206,7 +208,7 @@ pub struct CarrierControlServer {
     retain_owner_on_drop: bool,
     #[cfg(test)]
     tracker: Arc<parking_lot::Mutex<connection::ConnectionTracker>>,
-    cancellation: Arc<connection::ControlCancellation>,
+    cancellation: Arc<connection::Cancellation>,
 }
 
 /// Run-lifetime guard for one managed carrier. Terminal state is persisted
@@ -276,7 +278,7 @@ impl CarrierControlServer {
         archive: Arc<dyn CarrierArchiveControl>,
         archive_slot: Option<Arc<ArchiveAdmissionSlot>>,
     ) -> Result<Self, ControlError> {
-        let cancellation = Arc::new(connection::ControlCancellation::new()?);
+        let cancellation = Arc::new(connection::Cancellation::new()?);
         let nonce = ControlNonce::fresh()?;
         endpoint.claim(nonce)?;
         let listener = UnixListener::bind(endpoint.socket_path())?;
@@ -627,7 +629,7 @@ fn operation_response_deadline(operation: &ControlOperation) -> Duration {
 }
 
 fn handle(
-    stream: &mut connection::ControlConnection,
+    stream: &mut connection::Connection,
     kernel: &Arc<super::Kernel>,
     init: super::TaskKey,
     nonce: ControlNonce,
@@ -754,7 +756,7 @@ fn exec_status_outcome(status: ExecStatus) -> ControlOutcome {
 }
 
 fn write_response(
-    stream: &mut connection::ControlConnection,
+    stream: &mut connection::Connection,
     request_id: ControlNonce,
     nonce: ControlNonce,
     init: ControlTaskKey,
@@ -782,45 +784,21 @@ fn authenticate(stream: &impl AsRawFd) -> Result<(), ControlError> {
     Ok(())
 }
 
-trait FrameStream: Write {
-    fn finish_frame(&self) -> std::io::Result<()>;
-}
+use super::socket_rpc::{self, FrameStream};
 
-impl FrameStream for UnixStream {
-    fn finish_frame(&self) -> std::io::Result<()> {
-        self.shutdown(std::net::Shutdown::Write)
+fn frame_error(error: socket_rpc::FrameError) -> ControlError {
+    match error {
+        socket_rpc::FrameError::Io(error) => ControlError::Io(error),
+        error => protocol(error),
     }
 }
 
 fn write_frame(stream: &mut impl FrameStream, bytes: &[u8]) -> Result<(), ControlError> {
-    if bytes.len() > MAX_CONTROL_FRAME {
-        return Err(ControlError::Protocol("frame too large".to_owned()));
-    }
-    let len = u32::try_from(bytes.len()).map_err(|_| protocol("frame too large"))?;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(bytes)?;
-    stream.flush()?;
-    if let Err(error) = stream.finish_frame() {
-        // The authoritative frame is already written. A peer that consumed
-        // it may close before this optional teardown half-close; Darwin then
-        // reports ENOTCONN. That is not a failed or truncated frame write.
-        if error.kind() != std::io::ErrorKind::NotConnected {
-            return Err(error.into());
-        }
-    }
-    Ok(())
+    socket_rpc::write_frame(stream, bytes, MAX_CONTROL_FRAME).map_err(frame_error)
 }
 
 fn read_frame(stream: &mut impl Read) -> Result<Vec<u8>, ControlError> {
-    let mut prefix = [0_u8; 4];
-    stream.read_exact(&mut prefix)?;
-    let len = u32::from_be_bytes(prefix) as usize;
-    if len > MAX_CONTROL_FRAME {
-        return Err(ControlError::Protocol("frame too large".to_owned()));
-    }
-    let mut bytes = vec![0_u8; len];
-    stream.read_exact(&mut bytes)?;
-    Ok(bytes)
+    socket_rpc::read_frame(stream, MAX_CONTROL_FRAME).map_err(frame_error)
 }
 
 fn read_frame_with_deadline(
@@ -916,7 +894,7 @@ mod tests {
             }
         }
         impl FrameStream for CloseBeforeFinish {
-            fn finish_frame(&self) -> std::io::Result<()> {
+            fn finish_frame(&mut self) -> std::io::Result<()> {
                 self.peer_closed
                     .recv_timeout(CONTROL_COMPLETION_FAILURE_BOUND)
                     .expect("peer did not consume and close the frame");
@@ -942,7 +920,7 @@ mod tests {
     fn half_closed_request_before_handler_start_delivers_response_and_joins() {
         let (kernel, init) = kernel_with_init();
         let nonce = ControlNonce::fresh().expect("nonce");
-        let cancellation = Arc::new(connection::ControlCancellation::new().expect("cancellation"));
+        let cancellation = Arc::new(connection::Cancellation::new().expect("cancellation"));
         let mut tracker = connection::ConnectionTracker::new(cancellation);
         let (mut client, server) = UnixStream::pair().expect("socket pair");
         let request = ControlRequest {
@@ -1973,10 +1951,10 @@ mod tests {
         }
 
         assert!(
-            server.retained_handlers_count() <= connection::CONTROL_MAX_CONNECTIONS,
-            "retained handlers count {} exceeded CONTROL_MAX_CONNECTIONS {}",
+            server.retained_handlers_count() <= socket_rpc::MAX_CONNECTIONS,
+            "retained handlers count {} exceeded MAX_CONNECTIONS {}",
             server.retained_handlers_count(),
-            connection::CONTROL_MAX_CONNECTIONS
+            socket_rpc::MAX_CONNECTIONS
         );
         server.shutdown();
     }
@@ -1984,6 +1962,7 @@ mod tests {
     #[test]
     fn connection_limit_drops_excess_and_recovers_after_client_drops() {
         const SLOT_CHANGE_FAILURE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+        const EOF_FAILURE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
         let (_temp, endpoint) = endpoint::test_endpoint("control-conn-limit");
         let (kernel, init) = kernel_with_init();
         let mut server = CarrierControlServer::start_at(
@@ -1996,49 +1975,48 @@ mod tests {
 
         // Hold 16 stalled connections.
         let mut stalled = Vec::new();
-        for _ in 0..connection::CONTROL_MAX_CONNECTIONS {
+        for _ in 0..socket_rpc::MAX_CONNECTIONS {
             let client = UnixStream::connect(endpoint.socket_path()).expect("connect stalled");
             stalled.push(client);
         }
 
         // Observe admission, rather than sleeping for the accept thread.
-        assert!(server.wait_for_live_handlers_count(
-            connection::CONTROL_MAX_CONNECTIONS,
-            SLOT_CHANGE_FAILURE_BOUND,
-        ));
-        assert_eq!(
-            server.live_handlers_count(),
-            connection::CONTROL_MAX_CONNECTIONS
+        assert!(
+            server.wait_for_live_handlers_count(
+                socket_rpc::MAX_CONNECTIONS,
+                SLOT_CHANGE_FAILURE_BOUND,
+            )
         );
+        assert_eq!(server.live_handlers_count(), socket_rpc::MAX_CONNECTIONS);
 
         // A 17th connection must read EOF promptly (bounded wait that fails the test).
         let mut client17 = UnixStream::connect(endpoint.socket_path()).expect("connect 17th");
-        client17
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .expect("set read timeout");
+        // Observe EOF directly. Darwin can reject a timeout setter with
+        // EINVAL after the server has already closed this excess connection.
         let mut buf = [0u8; 1];
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let reader = std::thread::spawn(move || {
             use std::io::Read;
             let res = client17.read(&mut buf);
             let _ = tx.send(res);
         });
         let n = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(EOF_FAILURE_BOUND)
             .expect("17th connection timed out waiting for EOF")
             .expect("read from 17th connection");
         assert_eq!(n, 0, "17th connection must read EOF promptly");
+        reader.join().expect("excess connection reader");
 
         // After dropping one stalled client, a new Status succeeds.
         drop(stalled.pop());
         assert!(server.wait_for_live_handlers_count(
-            connection::CONTROL_MAX_CONNECTIONS - 1,
+            socket_rpc::MAX_CONNECTIONS - 1,
             SLOT_CHANGE_FAILURE_BOUND,
         ));
         // A completed handler releases admission without another accept/reap.
         assert_eq!(
             server.live_handlers_count(),
-            connection::CONTROL_MAX_CONNECTIONS - 1
+            socket_rpc::MAX_CONNECTIONS - 1
         );
 
         let outcome =

@@ -59,22 +59,19 @@ pub fn abort(run_id: &str) -> Result<AbortAck, ClientError> {
 }
 
 pub fn abort_at(endpoint: &DebugEndpoint, run_id: &str) -> Result<AbortAck, ClientError> {
-    let deadline = Instant::now() + DEADLINE;
-    let mut stream = connect(endpoint)?;
-    let encoded = wire::encode_canonical(&KernelDebugRequest::abort(run_id))?;
-    timeout_aware(wire::write_frame(
-        &mut stream,
-        &encoded,
-        MAX_REQUEST_BYTES,
-        deadline,
-        "client-write",
-    ))?;
-    let payload = timeout_aware(wire::read_frame(
-        &mut stream,
-        MAX_RESPONSE_BYTES,
-        deadline,
-        "client-read",
-    ))?;
+    abort_at_with_wait(
+        endpoint,
+        run_id,
+        ResponseWait::Deadline(Instant::now() + DEADLINE),
+    )
+}
+
+pub(super) fn abort_at_with_wait(
+    endpoint: &DebugEndpoint,
+    run_id: &str,
+    wait: ResponseWait,
+) -> Result<AbortAck, ClientError> {
+    let payload = exchange_at(endpoint, &KernelDebugRequest::abort(run_id), wait)?;
     if let Ok(refusal) = wire::decode_exact::<ServerRefusal>(&payload)
         && refusal.schema == KERNEL_DEBUG_RESPONSE_SCHEMA
     {
@@ -120,26 +117,21 @@ pub fn fetch_at(
     endpoint: &DebugEndpoint,
     tables: Option<Vec<KernelDebugTable>>,
 ) -> Result<KernelDebugSnapshot, ClientError> {
-    let deadline = Instant::now() + DEADLINE;
-    let mut stream = connect(endpoint)?;
+    fetch_at_with_wait(
+        endpoint,
+        tables,
+        ResponseWait::Deadline(Instant::now() + DEADLINE),
+    )
+}
 
+pub(super) fn fetch_at_with_wait(
+    endpoint: &DebugEndpoint,
+    tables: Option<Vec<KernelDebugTable>>,
+    wait: ResponseWait,
+) -> Result<KernelDebugSnapshot, ClientError> {
     let request = KernelDebugRequest::for_tables(tables);
     let requested = request.selected();
-    let encoded = wire::encode_canonical(&request)?;
-    timeout_aware(wire::write_frame(
-        &mut stream,
-        &encoded,
-        MAX_REQUEST_BYTES,
-        deadline,
-        "client-write",
-    ))?;
-
-    let payload = timeout_aware(wire::read_frame(
-        &mut stream,
-        MAX_RESPONSE_BYTES,
-        deadline,
-        "client-read",
-    ))?;
+    let payload = exchange_at(endpoint, &request, wait)?;
 
     // An error response shares the schema tag but has no tables, so try the
     // refusal shape first and report the runtime's own reason.
@@ -157,6 +149,48 @@ pub fn fetch_at(
     let snapshot: KernelDebugSnapshot = wire::decode_exact(&payload)?;
     snapshot.validate(&requested)?;
     Ok(snapshot)
+}
+
+pub(super) enum ResponseWait {
+    Deadline(Instant),
+    #[cfg(test)]
+    Completion,
+}
+
+// Production and completion-observing semantic tests use one protocol path.
+// The deadline is an operator's dead-peer guard, not a test scheduling budget.
+fn exchange_at(
+    endpoint: &DebugEndpoint,
+    request: &KernelDebugRequest,
+    wait: ResponseWait,
+) -> Result<Vec<u8>, ClientError> {
+    let mut stream = connect(endpoint)?;
+    let encoded = wire::encode_canonical(request)?;
+    match wait {
+        ResponseWait::Deadline(deadline) => {
+            timeout_aware(wire::write_frame(
+                &mut stream,
+                &encoded,
+                MAX_REQUEST_BYTES,
+                deadline,
+                "client-write",
+            ))?;
+            timeout_aware(wire::read_frame(
+                &mut stream,
+                MAX_RESPONSE_BYTES,
+                deadline,
+                "client-read",
+            ))
+        }
+        #[cfg(test)]
+        ResponseWait::Completion => {
+            super::super::socket_rpc::write_frame(&mut stream, &encoded, MAX_REQUEST_BYTES)
+                .map_err(WireError::from)?;
+            super::super::socket_rpc::read_frame(&mut stream, MAX_RESPONSE_BYTES)
+                .map_err(WireError::from)
+                .map_err(ClientError::from)
+        }
+    }
 }
 
 fn timeout_aware<T>(result: Result<T, WireError>) -> Result<T, ClientError> {
