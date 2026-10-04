@@ -1533,7 +1533,7 @@ fn exec_predecessor_cleanup_rechecks_a_republished_stage2_reference() {
         sharing: GuestMappingSharing::Private,
         ownership_scope,
         inventory_backing: InventoryBackingIdentity::Private(lease_key.0),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 0,
     };
@@ -1734,7 +1734,7 @@ fn exec_cleanup_after_owner_release_keeps_same_scope_reused_successor() {
         sharing: GuestMappingSharing::Private,
         ownership_scope: scope,
         inventory_backing: InventoryBackingIdentity::Private(0x2340),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: old_generation,
     };
@@ -2072,7 +2072,7 @@ fn exec_authority_fingerprint_fixture() -> ExecAuthorityFingerprint {
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
         }],
         allocator: ExecAllocatorFingerprint {
@@ -2517,7 +2517,7 @@ fn child_local_mapping_authenticates_through_its_own_raii_lease() {
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 0,
     };
@@ -2576,7 +2576,7 @@ fn a_stale_alias_row_never_retires_the_recycled_lease_successor() {
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken(2)),
         inventory_backing: InventoryBackingIdentity::Private(5190),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation,
     };
@@ -3260,7 +3260,7 @@ fn process_retirement_reads_mapping_rows_once_not_once_per_inventory_extent() {
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: generation,
         });
@@ -3472,7 +3472,7 @@ fn process_retirement_rejects_a_recycled_owner_generation() {
         sharing: GuestMappingSharing::GlobalShared,
         ownership_scope: AliasOwnershipScope::Global,
         inventory_backing: InventoryBackingIdentity::SharedAnon(owner_generation),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation,
     };
@@ -3787,7 +3787,7 @@ fn retained_private_reuse_requires_and_preserves_exact_owner_generation() {
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
         inventory_backing: InventoryBackingIdentity::Private(401),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: generation.saturating_sub(1),
     };
@@ -3848,7 +3848,7 @@ fn partial_unmap_preserves_stale_generation_on_both_local_fragments() {
         is_dynamic_alias: true,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 77,
     }];
@@ -4056,7 +4056,7 @@ fn fork_independent_kernel_state_publication_registers_global_frame_owner_and_re
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation,
     });
@@ -4182,7 +4182,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 0,
     });
@@ -4251,7 +4251,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 42,
     });
@@ -4320,7 +4320,7 @@ fn unowned_global_frame_mapping_authenticates_and_retires_against_registered_own
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation,
     });
@@ -4991,7 +4991,7 @@ fn unowned_retirement_rejects_an_unmapped_local_lease() {
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 0,
     });
@@ -5561,7 +5561,7 @@ fn cow_lane_reuse_requires_an_unpublished_exact_owner_lane() {
         sharing: GuestMappingSharing::Private,
         ownership_scope: scope,
         inventory_backing: extent.backing,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: extent.stage2_owner.generation,
     };
@@ -5750,7 +5750,7 @@ fn distant_live_alias_retains_the_shared_physical_cow_inventory() {
             size: 0x4000,
         },
         inventory_backing: InventoryBackingIdentity::Private(0x71),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 9,
     };
@@ -5805,7 +5805,7 @@ fn cow_then_fork_distant_alias_keeps_inventory_for_live_owner() {
             size: 0x4000,
         },
         inventory_backing: InventoryBackingIdentity::Private(0x72),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 19,
     };
@@ -6270,7 +6270,7 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
         is_dynamic_alias: true,
         sharing,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 0,
         structural_owner: None,
@@ -6384,7 +6384,10 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
 
     let mut coarse = guest.clone();
     coarse.owner_generation = 77;
-    coarse.shared_key_base = 0x9900_0000;
+    coarse.shared_key_base = Some(carrick_guest_mem::SharedFutexFileIdentity {
+        device: 0,
+        inode: 0x9900_0000,
+    });
     coarse.shared_key_offset = 0x3000;
     let leaf = 0x1000;
     let mixed = [
@@ -6629,7 +6632,7 @@ fn fork_inherits_private_and_shared_frames_before_any_write() {
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
         inherited_frame,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: coarse.owner_generation,
     };
@@ -6747,7 +6750,7 @@ fn fork_inventory_inheritance_rejects_a_stale_owner_generation() {
         is_dynamic_alias: true,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: current_generation,
         structural_owner: None,
@@ -7203,7 +7206,7 @@ fn fork_translation_accepts_winning_overlay_independent_of_descriptor_order() {
         is_dynamic_alias: true,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         inherited_frame: None,
         stage2_lease: None,

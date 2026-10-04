@@ -79,7 +79,7 @@ fn shared_mm_task_projection_preserves_structural_owner() {
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: false,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: epoch.raw(),
         structural_owner: Some(std::sync::Arc::clone(&owner)),
@@ -125,7 +125,7 @@ fn thread_mapping_descriptor_preserves_shared_mapping_metadata() {
         is_dynamic_alias: true,
         sharing: GuestMappingSharing::GlobalShared,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 17,
         structural_owner: None,
@@ -158,7 +158,7 @@ fn global_frame_futex_resolves_raw_backing_ipa_not_semantic_va() {
         host_addr: 0x1000usize as *mut u8,
         guest_writable: true,
         sharing: GuestMappingSharing::GlobalShared,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
     };
     let location = view
@@ -207,7 +207,7 @@ pub(crate) fn mapped_region(start: u64, end: u64, ipa: u64) -> HvfMappedRegion {
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 0,
     }

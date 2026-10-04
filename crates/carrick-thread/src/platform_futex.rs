@@ -19,10 +19,15 @@
 //! guest processes as separate host processes and therefore still need a real
 //! cross-process kernel primitive.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use carrick_hal::{FutexOutcome, PlatformFutex, SharedFutexLocation, ThreadId};
+use carrick_fatal::carrick_fatal;
+use carrick_hal::{FutexOutcome, PlatformFutex, SharedFutexKey, SharedFutexLocation, ThreadId};
+use parking_lot::Mutex;
 
 use crate::thread::{FutexTable, FutexWaitOutcome};
 
@@ -50,6 +55,52 @@ impl FutexTableFutex {
 pub fn carrier_shared_futex_table() -> &'static Arc<FutexTable> {
     static TABLE: std::sync::OnceLock<Arc<FutexTable>> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| Arc::new(FutexTable::new()))
+}
+
+const CARRIER_KEY_SHARDS: usize = 64;
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum CarrierKey {
+    Shared(SharedFutexKey),
+    Auxiliary(u64),
+}
+
+struct CarrierKeys {
+    shards: [Mutex<HashMap<CarrierKey, u64>>; CARRIER_KEY_SHARDS],
+    next: AtomicU64,
+}
+
+/// Intern an exact key into the carrier's existing queue index. The map
+/// compares full file identities and offsets; hashing chooses only a lock.
+/// IDs are never recycled while the carrier lives, so stale queued waits
+/// cannot join a new owner after an address or inode is reused.
+fn carrier_futex_key(key: CarrierKey) -> u64 {
+    static KEYS: OnceLock<CarrierKeys> = OnceLock::new();
+    let keys = KEYS.get_or_init(|| CarrierKeys {
+        shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+        next: AtomicU64::new(1),
+    });
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    let shard = (hasher.finish() as usize) % CARRIER_KEY_SHARDS;
+    let mut map = keys.shards[shard].lock();
+    *map.entry(key).or_insert_with(|| {
+        let id = keys.next.fetch_add(1, Ordering::Relaxed);
+        if id == u64::MAX {
+            carrick_fatal!("thread::shared_futex", "carrier futex key ID overflow");
+        }
+        id
+    })
+}
+
+pub fn carrier_shared_futex_key(location: SharedFutexLocation) -> u64 {
+    carrier_futex_key(CarrierKey::Shared(location.key()))
+}
+
+/// The SysV wait channels share the same table but occupy a disjoint key
+/// namespace, so a file or direct futex cannot consume their wake.
+pub fn carrier_aux_futex_key(key: u64) -> u64 {
+    carrier_futex_key(CarrierKey::Auxiliary(key))
 }
 
 impl PlatformFutex for FutexTableFutex {
@@ -88,9 +139,9 @@ impl PlatformFutex for FutexTableFutex {
     ///
     /// Under the HVPatch kernel every Linux process is a THREAD of one carrier
     /// sharing one address space, so a "cross-process" guest futex is an
-    /// ordinary intra-process rendezvous. `waiter_key` is already the
-    /// carrier-stable identity of the futex word, so all guest processes
-    /// naming the same word hash to the same bucket of one carrier-wide table.
+    /// ordinary intra-process rendezvous. The exact location identity is
+    /// interned before it reaches the carrier-wide table; a file-key hash
+    /// collision cannot make different words share a queue.
     ///
     /// This replaces a Darwin `os_sync_wait_on_address` path whose own header
     /// justified itself with "carrick forks each guest process as a real macOS
@@ -111,7 +162,7 @@ impl PlatformFutex for FutexTableFutex {
         wait_enrolled: &dyn Fn(),
     ) -> i64 {
         let table = carrier_shared_futex_table();
-        let waiter_key = location.waiter_key();
+        let waiter_key = carrier_shared_futex_key(location);
         // SAFETY: the futex word is a live, 4-byte-aligned host word for as
         // long as the guest mapping naming it is alive; the wait does not
         // outlive the syscall that named it.
@@ -121,7 +172,7 @@ impl PlatformFutex for FutexTableFutex {
         // so enrollment order carries no lost-wake risk here.
         wait_enrolled();
         match unsafe {
-            table.wait_while_word_equals(waiter_key as u64, word, value, timeout, tid, interrupted)
+            table.wait_while_word_equals(waiter_key, word, value, timeout, tid, interrupted)
         } {
             FutexWaitOutcome::Woken => 0,
             FutexWaitOutcome::TimedOut => carrick_abi::LINUX_ETIMEDOUT.guest_retval(),
@@ -129,12 +180,12 @@ impl PlatformFutex for FutexTableFutex {
         }
     }
 
-    fn shared_wake(&self, _location: SharedFutexLocation, waiter_key: usize, n: u32) -> i64 {
+    fn shared_wake(&self, location: SharedFutexLocation, _waiter_key: usize, n: u32) -> i64 {
         // The return is Linux's contract: exactly the number of parked waiters
         // released. `FutexTable::wake` reports `unparked_threads`, and shared
         // waiters park word-validated (never generation-validated), so a wake
         // that unparks nobody genuinely woke nobody.
-        i64::from(carrier_shared_futex_table().wake(waiter_key as u64, n))
+        i64::from(carrier_shared_futex_table().wake(carrier_shared_futex_key(location), n))
     }
 
     /// `FUTEX_CMP_REQUEUE` on a shared futex: a real queue relink
@@ -144,14 +195,19 @@ impl PlatformFutex for FutexTableFutex {
     /// woken waiter a token telling it whether to re-park on the destination.
     fn shared_requeue(
         &self,
-        _from: SharedFutexLocation,
-        from_key: usize,
-        _to: SharedFutexLocation,
-        to_key: usize,
+        from: SharedFutexLocation,
+        _from_key: usize,
+        to: SharedFutexLocation,
+        _to_key: usize,
         wake: u32,
         requeue: u32,
     ) -> (u32, u32) {
-        carrier_shared_futex_table().requeue(from_key as u64, to_key as u64, wake, requeue)
+        carrier_shared_futex_table().requeue(
+            carrier_shared_futex_key(from),
+            carrier_shared_futex_key(to),
+            wake,
+            requeue,
+        )
     }
 
     fn requeue(&self, from: u64, to: u64, wake: u32, requeue: u32) -> (u32, u32) {
@@ -361,7 +417,7 @@ impl<S: NativeSharedFutex> PlatformFutex for FutexTableNativeFutex<S> {
 mod tests {
     use super::*;
     use crate::thread::FutexGenerationEnrollment;
-    use carrick_hal::HostVa;
+    use carrick_hal::{HostVa, SharedFutexFileIdentity};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A shared guest futex rendezvous is now entirely in-process: one waiter
@@ -388,7 +444,7 @@ mod tests {
         // is not a lost wake — it advances the bucket generation, so the waiter
         // returns without parking — but then the wake reports 0 and this test
         // would be asserting the wrong thing.
-        while carrier_shared_futex_table().waiter_count(addr as u64) == 0 {
+        while carrier_shared_futex_table().waiter_count(carrier_shared_futex_key(location)) == 0 {
             std::thread::yield_now();
         }
         // The wake is keyed on `waiter_key`, which is what makes two guest
@@ -402,6 +458,72 @@ mod tests {
     }
 
     #[test]
+    fn file_words_with_colliding_hints_have_distinct_carrier_queues() {
+        let first_identity = SharedFutexFileIdentity {
+            device: 0x1234,
+            inode: 0,
+        };
+        let second_identity = SharedFutexFileIdentity {
+            device: 0x1234 ^ 1_u64.rotate_left(32),
+            inode: 1,
+        };
+        let offset = 0x40;
+        let first_hint = carrick_host::futex_key::shared_futex_waiter_key(first_identity, offset);
+        let second_hint = carrick_host::futex_key::shared_futex_waiter_key(second_identity, offset);
+        assert_eq!(
+            first_hint, second_hint,
+            "force a real legacy hash collision"
+        );
+        let first_word = std::sync::atomic::AtomicU32::new(7);
+        let second_word = std::sync::atomic::AtomicU32::new(42);
+        let first = SharedFutexLocation::File {
+            word: HostVa(std::ptr::from_ref(&first_word) as usize),
+            identity: first_identity,
+            offset,
+            waiter_key: first_hint,
+        };
+        let second = SharedFutexLocation::File {
+            word: HostVa(std::ptr::from_ref(&second_word) as usize),
+            identity: second_identity,
+            offset,
+            waiter_key: second_hint,
+        };
+        let table = carrier_shared_futex_table();
+        let first_key = carrier_shared_futex_key(first);
+        let second_key = carrier_shared_futex_key(second);
+        assert_ne!(first_key, second_key);
+        let first_wait = table.prepare_wait(first_key);
+        let second_wait = table.prepare_wait(second_key);
+        let first_hits = Arc::new(AtomicUsize::new(0));
+        let second_hits = Arc::new(AtomicUsize::new(0));
+        let first_count = Arc::clone(&first_hits);
+        let second_count = Arc::clone(&second_hits);
+        let _first_subscription = match table.subscribe_generation(
+            first_wait,
+            Arc::new(move |_| {
+                first_count.fetch_add(1, Ordering::SeqCst);
+            }),
+        ) {
+            FutexGenerationEnrollment::Subscribed(subscription) => subscription,
+            FutexGenerationEnrollment::Ready(_) => panic!("first waiter must be queued"),
+        };
+        let _second_subscription = match table.subscribe_generation(
+            second_wait,
+            Arc::new(move |_| {
+                second_count.fetch_add(1, Ordering::SeqCst);
+            }),
+        ) {
+            FutexGenerationEnrollment::Subscribed(subscription) => subscription,
+            FutexGenerationEnrollment::Ready(_) => panic!("second waiter must be queued"),
+        };
+        assert_eq!(table.wake(first_key, 1), 1);
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(table.wake(second_key, 1), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn shared_wake_publishes_exact_carrier_generation_callback() {
         let word = Box::leak(Box::new(std::sync::atomic::AtomicU32::new(7)));
         let addr = std::ptr::from_ref(word) as usize;
@@ -411,7 +533,7 @@ mod tests {
             waiter_key: key,
         };
         let table = carrier_shared_futex_table();
-        let generation = table.prepare_wait(key as u64);
+        let generation = table.prepare_wait(carrier_shared_futex_key(location));
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
         let _subscription = match table.subscribe_generation(

@@ -1539,8 +1539,9 @@ impl SysvWaitState {
                 waiter_key,
             },
             waiter_key,
-            generation: carrick_thread::platform_futex::carrier_shared_futex_table()
-                .prepare_wait(waiter_key as u64),
+            generation: carrick_thread::platform_futex::carrier_shared_futex_table().prepare_wait(
+                carrick_thread::platform_futex::carrier_aux_futex_key(waiter_key as u64),
+            ),
             value: self.word.load(),
             sysv: Some(self),
         }
@@ -1589,7 +1590,10 @@ fn wake_msg_queue_waiters(path: &Path, id: MsgQueueId) {
     if let Ok(word) = MsgQueueWaitWord::open(path) {
         word.wake_all();
     }
-    carrick_thread::platform_futex::carrier_shared_futex_table().wake(id.raw() as u64, u32::MAX);
+    carrick_thread::platform_futex::carrier_shared_futex_table().wake(
+        carrick_thread::platform_futex::carrier_aux_futex_key(id.raw() as u64),
+        u32::MAX,
+    );
 }
 
 fn read_shm_nattch(segment: &ShmSegment) -> u64 {
@@ -3330,8 +3334,10 @@ fn sysv_msgctl<M: CurrentMmMemory>(
             }
             let _ = std::fs::remove_file(path);
             let _ = std::fs::remove_file(msg_queue_wait_path(path));
-            carrick_thread::platform_futex::carrier_shared_futex_table()
-                .wake(msqid.raw() as u64, u32::MAX);
+            carrick_thread::platform_futex::carrier_shared_futex_table().wake(
+                carrick_thread::platform_futex::carrier_aux_futex_key(msqid.raw() as u64),
+                u32::MAX,
+            );
             Ok(DispatchOutcome::Returned { value: 0 })
         }
         LINUX_IPC_STAT => {

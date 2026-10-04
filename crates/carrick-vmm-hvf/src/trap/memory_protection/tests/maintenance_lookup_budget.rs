@@ -119,7 +119,7 @@ fn alias(
         sharing: GuestMappingSharing::Private,
         ownership_scope: scope,
         inventory_backing: InventoryBackingIdentity::Private(1),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 0,
     }

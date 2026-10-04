@@ -728,7 +728,7 @@ fn replacement(base: u64, generation: u64) -> super::PendingEl1GrantReplacement 
                 ContainerRootToken::ROOT,
             ),
             inventory_backing: HvfVmState::private_backing_identity(),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: generation,
         },
@@ -918,7 +918,7 @@ fn el1_frame_grant_rollback_matches_only_the_grants_own_alias() {
             ContainerRootToken::ROOT,
         ),
         inventory_backing: HvfVmState::private_backing_identity(),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 17,
     };

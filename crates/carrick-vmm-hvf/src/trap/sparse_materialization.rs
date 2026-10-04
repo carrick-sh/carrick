@@ -428,7 +428,7 @@ pub(super) fn publish_frame_grant(
             context.container_root,
         ),
         inventory_backing,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation,
     };
@@ -448,7 +448,7 @@ pub(super) fn publish_frame_grant(
         is_dynamic_alias: true,
         sharing,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation,
     };
@@ -748,7 +748,7 @@ impl MmAccessState {
                 is_dynamic_alias: false,
                 sharing: GuestMappingSharing::Private,
                 guest_writable: true,
-                shared_key_base: 0,
+                shared_key_base: None,
                 shared_key_offset: 0,
             };
 
@@ -1505,7 +1505,7 @@ pub(super) fn publish_replacing(
             context.container_root,
         ),
         inventory_backing,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation,
     });
@@ -1525,7 +1525,7 @@ pub(super) fn publish_replacing(
         is_dynamic_alias: true,
         sharing,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation,
     };

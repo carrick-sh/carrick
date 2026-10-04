@@ -120,7 +120,7 @@ fn retained_interior_pages_republish_lifetime_edges() {
             size: root.1,
         },
         inventory_backing: InventoryBackingIdentity::Private(46),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 0,
     };
@@ -269,7 +269,7 @@ impl HvfVmState {
                             let is_alias = is_reusable_global_frame_extent(mapping.ipa, 1);
                             let eligible_without_cow = mapping.sharing
                                 == GuestMappingSharing::Private
-                                && mapping.shared_key_base == 0
+                                && mapping.shared_key_base.is_none()
                                 && !is_alias
                                 && retained_fragment.is_none()
                                 && zero_anonymous_remap_enabled();
@@ -301,7 +301,7 @@ impl HvfVmState {
                             let target = unsafe { mapping.host_addr.add(offset) };
                             let eligible_without_cow = mapping.sharing
                                 == GuestMappingSharing::Private
-                                && mapping.shared_key_base == 0
+                                && mapping.shared_key_base.is_none()
                                 && retained_fragment.is_none()
                                 && zero_anonymous_remap_enabled();
                             let eligible = scrub_remap_eligible(eligible_without_cow, || {

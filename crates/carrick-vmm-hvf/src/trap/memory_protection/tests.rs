@@ -25,7 +25,7 @@ mod alias_remap_limiter_tests {
             sharing: GuestMappingSharing::Private,
             ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
             inventory_backing: InventoryBackingIdentity::Private(1),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -75,7 +75,7 @@ mod alias_remap_limiter_tests {
             sharing: GuestMappingSharing::Private,
             ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
             inventory_backing: InventoryBackingIdentity::Private(2),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -523,7 +523,7 @@ mod alias_registry_tests {
                 size: parent_root_slot.1,
             },
             inventory_backing: InventoryBackingIdentity::SharedAnon(41),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -574,7 +574,7 @@ mod alias_registry_tests {
             sharing: GuestMappingSharing::Private,
             ownership_scope: scope(owner),
             inventory_backing: InventoryBackingIdentity::Private(owner),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -683,7 +683,7 @@ mod alias_registry_tests {
                     size: parent_root_slot.1,
                 },
                 inventory_backing: InventoryBackingIdentity::SharedAnon(42),
-                shared_key_base: 0,
+                shared_key_base: None,
                 shared_key_offset: 0,
                 owner_generation: 0,
             },
@@ -782,7 +782,10 @@ mod alias_registry_tests {
                 offset: 0x8000,
                 length: 0xc000,
             },
-            shared_key_base: 7,
+            shared_key_base: Some(carrick_guest_mem::SharedFutexFileIdentity {
+                device: 0,
+                inode: 7,
+            }),
             shared_key_offset: 0x8000,
             owner_generation: 0,
         };
@@ -912,7 +915,7 @@ mod alias_registry_tests {
             sharing: GuestMappingSharing::Private,
             ownership_scope: scope,
             inventory_backing: InventoryBackingIdentity::Private(46),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -978,7 +981,7 @@ mod alias_registry_tests {
             sharing: GuestMappingSharing::ForkSharedAnonymous,
             ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
             inventory_backing: InventoryBackingIdentity::SharedAnon(44),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -1046,7 +1049,7 @@ mod alias_registry_tests {
             sharing: GuestMappingSharing::ForkSharedAnonymous,
             ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
             inventory_backing: InventoryBackingIdentity::SharedAnon(45),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -1124,7 +1127,7 @@ mod alias_registry_tests {
             is_dynamic_alias: true,
             sharing: GuestMappingSharing::ForkSharedAnonymous,
             guest_writable: true,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -1147,7 +1150,7 @@ mod alias_registry_tests {
             sharing: desc.sharing,
             ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
             inventory_backing: InventoryBackingIdentity::SharedAnon(46),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -1213,7 +1216,7 @@ mod alias_registry_tests {
             is_dynamic_alias,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation,
         };
@@ -1233,7 +1236,7 @@ mod alias_registry_tests {
                 size: root_slot.1,
             },
             inventory_backing: InventoryBackingIdentity::SharedAnon(43),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 7,
         };
@@ -1313,7 +1316,7 @@ mod alias_registry_tests {
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             guest_writable: false,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: generation,
         };
@@ -1333,7 +1336,7 @@ mod alias_registry_tests {
                 size: root_slot.1,
             },
             inventory_backing: InventoryBackingIdentity::Private(71),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: generation,
         };
@@ -1386,7 +1389,7 @@ mod alias_registry_tests {
             sharing: GuestMappingSharing::Private,
             ownership_scope,
             inventory_backing: InventoryBackingIdentity::Private(ipa),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -1440,7 +1443,7 @@ mod alias_registry_tests {
             is_dynamic_alias: true,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -1460,7 +1463,7 @@ mod alias_registry_tests {
                 size: root_slot.1,
             },
             inventory_backing: InventoryBackingIdentity::Private(44),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -1512,7 +1515,7 @@ mod alias_registry_tests {
             sharing: GuestMappingSharing::Private,
             ownership_scope: AliasOwnershipScope::ContainerRoot(container_1),
             inventory_backing: InventoryBackingIdentity::Private(1),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -1530,7 +1533,7 @@ mod alias_registry_tests {
             sharing: GuestMappingSharing::Private,
             ownership_scope: AliasOwnershipScope::ContainerRoot(container_2),
             inventory_backing: InventoryBackingIdentity::Private(2),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -1625,7 +1628,7 @@ mod alias_registry_tests {
                 size: child_root_slot.1,
             },
             inventory_backing: InventoryBackingIdentity::Private(1),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         };
@@ -1676,7 +1679,7 @@ mod alias_registry_tests {
             is_dynamic_alias: true,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 0,
         });
@@ -1744,7 +1747,7 @@ mod alias_registry_tests {
             is_dynamic_alias: true,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: generation,
         };
@@ -1979,7 +1982,7 @@ mod alias_registry_tests {
             sharing: GuestMappingSharing::Private,
             ownership_scope: scope,
             inventory_backing: InventoryBackingIdentity::Private(1),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 1,
         }
@@ -2945,7 +2948,7 @@ fn retained_fragment_query_wide_hit_avoids_unrelated_narrow_rows() {
         sharing: GuestMappingSharing::Private,
         ownership_scope: AliasOwnershipScope::ContainerRoot(ContainerRootToken::ROOT),
         inventory_backing: InventoryBackingIdentity::Private(1),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 0,
     };

@@ -576,6 +576,7 @@ name = "carrick-host"
 version = "0.1.0"
 dependencies = [
  "carrick-fatal",
+ "carrick-guest-mem",
  "carrick-kernel-arena",
  "libc",
  "mach2",
@@ -889,6 +890,7 @@ dependencies = [
  "carrick-abi",
  "carrick-fatal",
  "carrick-hal",
+ "carrick-host",
  "carrick-observability",
  "libc",
  "parking_lot",

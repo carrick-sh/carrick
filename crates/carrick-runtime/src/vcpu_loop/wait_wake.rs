@@ -1160,10 +1160,16 @@ impl HvpatchRuntimeDirectory {
     }
 }
 
-pub(crate) fn shared_futex_wake(host_addr: usize, waiter_key: usize, count: u32) -> i64 {
-    let carrier_woken =
-        carrick_thread::platform_futex::carrier_shared_futex_table().wake(waiter_key as u64, count);
-    let ulock_woken = crate::ulock::wake_counted(host_addr, waiter_key, count);
+pub(crate) fn shared_futex_wake(
+    location: carrick_guest_mem::SharedFutexLocation,
+    count: u32,
+) -> i64 {
+    let host_addr = location.wait_addr().raw();
+    let carrier_woken = carrick_thread::platform_futex::carrier_shared_futex_table().wake(
+        carrick_thread::platform_futex::carrier_shared_futex_key(location),
+        count,
+    );
+    let ulock_woken = crate::ulock::wake_counted(host_addr, location.waiter_key(), count);
     crate::probes::ulock_wake(host_addr as u64, 0, ulock_woken);
     i64::from(carrier_woken).max(ulock_woken.max(0))
 }

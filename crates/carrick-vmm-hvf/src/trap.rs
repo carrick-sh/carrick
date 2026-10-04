@@ -2047,7 +2047,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: mm_slot,
         }),
@@ -2406,7 +2406,7 @@ pub(crate) struct HvfMappedRegion {
     /// a PROT_READ MAP_SHARED file alias) or corrupting a carrick-owned
     /// `write:false` region. (audit M1; probe `rosharedbus`)
     pub(crate) guest_writable: bool,
-    pub(crate) shared_key_base: u64,
+    pub(crate) shared_key_base: Option<carrick_guest_mem::SharedFutexFileIdentity>,
     pub(crate) shared_key_offset: u64,
 }
 
@@ -2446,7 +2446,7 @@ pub(crate) struct MappingView {
     host_addr: *mut u8,
     guest_writable: bool,
     sharing: GuestMappingSharing,
-    shared_key_base: u64,
+    shared_key_base: Option<carrick_guest_mem::SharedFutexFileIdentity>,
     shared_key_offset: u64,
 }
 
@@ -2539,7 +2539,7 @@ struct ProcessMappingDesc {
     pub(crate) sharing: GuestMappingSharing,
     pub(crate) guest_writable: bool,
     pub(crate) inherited_frame: Option<carrick_hal::FrameId>,
-    pub(crate) shared_key_base: u64,
+    pub(crate) shared_key_base: Option<carrick_guest_mem::SharedFutexFileIdentity>,
     pub(crate) shared_key_offset: u64,
     pub(crate) owner_generation: u64,
 }
@@ -3550,7 +3550,7 @@ struct HvpatchTaskMappingState {
     structural_owner: Option<std::sync::Arc<StructuralBackingOwner>>,
     is_dynamic_alias: bool,
     sharing: GuestMappingSharing,
-    shared_key_base: u64,
+    shared_key_base: Option<carrick_guest_mem::SharedFutexFileIdentity>,
     shared_key_offset: u64,
     owner_generation: u64,
     global_frame_owner_role: GlobalFrameOwnerRole,

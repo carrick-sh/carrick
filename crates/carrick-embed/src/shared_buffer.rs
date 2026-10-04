@@ -355,9 +355,23 @@ impl SharedBufferLease {
             return Err(SharedBufferError::Misaligned(offset));
         }
         let word = HostVa(unsafe { self.inner.ptr.as_ptr().add(offset) } as usize);
-        let base = carrick_host::futex_key::shared_file_key_base(self.inner.file.as_raw_fd());
-        let waiter_key = carrick_host::futex_key::shared_futex_waiter_key(base, offset as u64);
-        Ok(SharedFutexLocation::Direct { word, waiter_key })
+        let location = if let Some(identity) =
+            carrick_host::futex_key::shared_file_key_base(self.inner.file.as_raw_fd())
+        {
+            let offset = offset as u64;
+            SharedFutexLocation::File {
+                word,
+                identity,
+                offset,
+                waiter_key: carrick_host::futex_key::shared_futex_waiter_key(identity, offset),
+            }
+        } else {
+            SharedFutexLocation::Direct {
+                word,
+                waiter_key: word.raw(),
+            }
+        };
+        Ok(location)
     }
 
     /// Wait on the futex word at `offset` while its value equals `expected`.
@@ -374,7 +388,7 @@ impl SharedBufferLease {
 
         let outcome = unsafe {
             table.wait_while_word_equals(
-                location.waiter_key() as u64,
+                carrick_thread::platform_futex::carrier_shared_futex_key(location),
                 word_ptr,
                 expected,
                 timeout,
@@ -395,7 +409,10 @@ impl SharedBufferLease {
     pub fn futex_wake(&self, offset: usize, count: u32) -> Result<u32, SharedBufferError> {
         let location = self.shared_futex_location(offset)?;
         let table = carrick_thread::platform_futex::carrier_shared_futex_table();
-        let woken = table.wake(location.waiter_key() as u64, count);
+        let woken = table.wake(
+            carrick_thread::platform_futex::carrier_shared_futex_key(location),
+            count,
+        );
         Ok(woken)
     }
 }

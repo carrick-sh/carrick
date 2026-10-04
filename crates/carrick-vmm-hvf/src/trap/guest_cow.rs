@@ -540,7 +540,7 @@ pub(crate) fn settle_one(
             runtime.container_root,
         ),
         inventory_backing: grant_extent.backing,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation,
     });

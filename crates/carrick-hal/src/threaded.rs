@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use carrick_guest_mem::CurrentMmMemory;
-pub use carrick_guest_mem::{HostVa, SharedFutexLocation};
+pub use carrick_guest_mem::{HostVa, SharedFutexFileIdentity, SharedFutexKey, SharedFutexLocation};
 
 use crate::error::{OsError, Reg, SysReg};
 use crate::trap::{SyscallTrap, TrapError};
