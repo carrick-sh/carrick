@@ -986,6 +986,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-aarch64",
  "carrick-abi",
+ "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-mem",
  "carrick-hal",
@@ -1026,12 +1027,21 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
  "carrick-abi",
+ "carrick-guest-arch",
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
  "carrick-mem",
  "libc",
  "zerocopy",
+]
+
+[[package]]
+name = "carrick-x86-cpl0"
+version = "0.1.0"
+dependencies = [
+ "carrick-el1-abi",
+ "carrick-guest-arch",
 ]
 
 [[package]]
