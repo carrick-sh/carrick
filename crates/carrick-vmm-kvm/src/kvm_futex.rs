@@ -65,7 +65,7 @@ mod tests {
             0,
             carrick_hal::ThreadId::synthetic_for_tests(1),
             Some(Duration::from_millis(50)),
-            &never_interrupted(),
+            &|| false,
         );
         assert_eq!(
             outcome,
