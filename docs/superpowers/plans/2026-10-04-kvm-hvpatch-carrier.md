@@ -103,10 +103,12 @@ are ARM-specific packaging; x86 needs a thin image artifact/ABI receipt.
 | Common kernel at CPL0 first | Requires entry/return, user-copy/fault, root/context, interrupt/timer and wake hooks. Reuses the 184-tested EL1 personality plus sched/fd/IPC cores, N1 production owner and N2 task transactions. | Target. First real shared served path is M2; grow hardware slices without a duplicate Linux personality. |
 
 **Package choice:** retain `carrick-el1` as the common kernel library during
-N1/N2; its existing ARM image and a new `carrick-cpl0` image are thin entries,
+N1/N2; its existing ARM image and a new `carrick-x86-cpl0` image are thin entries,
 not separate kernels. Put the no_std interface in new `carrick-guest-arch`.
 Avoid a broad package rename while N1 changes its imports. Host-facing typed
-KVM CPU custody stays in carrick-hal/x86/KVM. Names are proposed; the single
+KVM CPU custody stays in carrick-hal/x86/KVM. **Post-N2:** rename `carrick-el1`
+to a neutral common-kernel package in one reviewed move; update both image
+dependencies and delete the old package spelling. The single
 semantic owner and adapter separation are mandatory.
 
 **KernelArch seam:** refine existing ThreadCpu/UserWord/MemoryValidator/editor
@@ -243,8 +245,14 @@ sched-core lib/object_wait/spaces; EL1 ABI layout/descriptor/mm_portal records;
 runtime memory/reservations/quiesce/binding/lifecycle/signal/zone/backend.
 N1 also reserves kernel objects for its cursor. Refresh the actual landed
 diff, not just this snapshot. Leaf disjointness is preparation permission,
-not proof the owner is accepted. M2 router wiring waits for its ABI/router
-hand-off; M3 binds the accepted production owner, never a provisional copy.
+not proof the owner is accepted. M2 first serving does **not** wait for N1
+cursor/MM acceptance. It needs only
+the narrow common-entry/export and ISA-selection hand-off below; request those
+lines separately from N1, without taking its MM router/ABI ownership. M3 binds
+the accepted production owner, never a provisional copy. `sched/hw.rs`,
+`file.rs`, `alloc.rs`, `lock.rs` and `sched.rs` are absent from the refreshed
+`git diff --name-only ad3e127a9 origin/work/n1` (snapshot unchanged at 8d5df2d2e).
+If that changes, defer the touched leaf to M2; no parallel edits.
 
 **M5 first needs a shared runtime file:**
 `carrick-runtime/src/vcpu_loop/executor/backend.rs:432`, followed within that
@@ -306,28 +314,55 @@ above, minimal exports. No runtime, N1 owner/router/ABI or lifecycle edits. New 
 
 ### M2 — CPL0 entry serves the common kernel's first syscall
 
-**Fence:** new thin `carrick-cpl0` image/linker/entry, x86 `cpl0_entry.rs`,
-KVM `cpl0_boot.rs`, `tests/cpl0_entry.rs`; common entry/router adapter and EL1 manifest/export registration only
-**after N1 router/ABI hand-off**. No shared runtime. Remove the displaced
-ARM register-specific router body as it is normalized; no second switch.
+Candidates were source-read on `00cd94614`, not inferred from syscall names:
 
-- [ ] Use existing ELF/long-mode bring-up to load the common kernel image,
-  supervisor stacks/TSS/IST, IDT, LSTAR/STAR/FMASK and per-CPU saved user SP.
-  Validate canonical RIP/RSP/RFLAGS; use IRETQ where SYSRET is unsafe.
-- [ ] First served call: **lseek on an admitted guest-owned OFD**, using
-  existing `personality/file.rs:34` and the landed N1 cursor. This exercises
-  mutable state/errno without inventing getpid (currently forwarded; N2
-  moves identity once). Guest native nr 8 normalizes to canonical lseek.
-- [ ] Red: current bring-up exits for every call. Native common tests and
-  two live guest contexts seek distinct offsets; invalid whence returns
-  numeric EINVAL, with no state change. Count **zero semantic host forwards**
-  over repeated calls; inject kick at entry/return, exactly one completion.
-  The benchmark's constant-return stub does not satisfy this witness.
+| Call | Current common route / dependencies | First-call choice |
+| --- | --- | --- |
+| set_robust_list (x86 273 → canonical 99) | `personality/dispatch.rs:456` → `lifecycle.rs:162`, `:320`; admitted LifecycleVenue, issued CurrentTask and ThreadControlSlot, open setup gate, length 24. Writes slot metadata, never dereferences head; no UserCopy, scheduler switch, N1 cursor or MM owner. | **Choose:** real mutable kernel-owned state, already served on this base, zero pending-branch policy dependencies. |
+| rt_sigprocmask with both pointers NULL | Same dispatch branch; `lifecycle.rs:207`. Issued slot/open gate and sigset size 8; reads owned mask, returns 0 without copy. Non-NULL forms require user-copy hooks. | Available now, but NULL-only success observes less state than robust-list publication. |
+| Private FUTEX_WAKE | `dispatch.rs:481` → `personality/sched.rs:37`; admitted zone/MM identity, wait queues and CPU wake hooks. | Already served, but needs scheduler/interrupt work beyond first entry. |
+| clock_gettime / sched_yield | No served arm in `dispatch.rs:518` on this base; fall through at :652. Existing timer counter methods do not implement these syscalls. | Do not invent an already-served path. |
+| gettid | No lifecycle arm on this base. Phase B adds EL1 serving from exact owned thread identity. | Use once Phase B lands; introduces one pending branch dependency today. |
+| lseek | `dispatch.rs:608`, `:831` → `personality/file.rs:34`; admitted OFD/cursor. | Later M2/M3 follow-up after N1 cursor hand-off, never a prerequisite for the first CPL0 call. |
+
+**Fence:** thin `carrick-x86-cpl0` image/linker/entry, x86 `cpl0_entry.rs`,
+KVM `cpl0_boot.rs`, `tests/cpl0_entry.rs`; new normalized common entry and
+frame-independent robust-list helper in the **existing** kernel. No runtime,
+N1 MM policy or ABI layout edits. Phase B/N1 full acceptance is not a first-call
+prerequisite.
+
+**Narrow hand-off still required:** EL1 Cargo.toml/lib.rs exports and
+ISA-selective module/image wiring are N1-touched. Coordinate only new interface
+dependency/entry export and selection of x86-safe common modules; the first
+image cannot compile ARM-only hardware bodies unchanged. Extract
+`lifecycle.rs:320` to a typed argument/slot helper and have the existing ARM
+call invoke that same body. Coordinate this leaf with Phase B. Normalize the
+existing robust-list route at `dispatch.rs:456` only if needed for the common
+entry, leaving all memory/reservation routes untouched. The new x86 entry must
+call the shared helper through the common entry, not build a fake ARM TrapFrame
+or copy the syscall algorithm. Existing common ThreadControlSlot/page records
+need no layout change for this call; broader native-context ABI wiring stays
+with its owner. N1's cursor and production MM changes are outside this hand-off.
+
+- [ ] Use ELF/long-mode bring-up to load the common image, supervisor stacks/
+  TSS/IST, IDT, LSTAR/STAR/FMASK and saved user SP. Validate canonical RIP/RSP/
+  RFLAGS; use IRETQ where SYSRET is unsafe.
+- [ ] Red: current bring-up exits for every call. Two issued live task contexts
+  repeatedly set distinct robust-list heads (length 24); verify only their own
+  control slot changes via the common kernel's own slot accessor (or shared
+  get_robust_list), return 0, and **zero semantic host forwards**. No head
+  dereference or user copy occurs. Admit the shared invalid-length error
+  route in this landing: len != 24 returns EINVAL (22) without changing either
+  head, also with zero semantic host forwards. A return code alone is not a
+  witness; inspect both stored heads after success and error.
+  Inject kicks at entry/return; exactly one slot publication/completion.
 - [ ] Contracts: task-load-entry, captured-stack, kick boundary
-  (`kernel.vcpu.kick-el0-boundary`) and OFD cursor contract from N1 hand-off.
-  Delete lseek host scaffold in this landing; final test-result transport
-  is a declared control crossing, outside the served-call window.
-- [ ] Accept: `cargo build --release -p carrick-cpl0 --target x86_64-unknown-none`;
+  (`kernel.vcpu.kick-el0-boundary`) and existing lifecycle control-slot ownership.
+  Remove the successful robust-list host scaffold in this landing; final test
+  result/state inspection is declared control transport outside serving.
+- [ ] After N1's cursor hand-off, add shared lseek offset/errno/isolation
+  witnesses through the same entry; no first-call dependency on that work.
+- [ ] Accept: `cargo build --release -p carrick-x86-cpl0 --target x86_64-unknown-none`;
   `cargo test -p carrick-el1 --lib`;
   `CARRICK_RUN_ID=kvm-m2 cargo test -p carrick-vmm-kvm --test cpl0_entry`.
 
