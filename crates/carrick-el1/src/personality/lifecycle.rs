@@ -13,24 +13,31 @@
 //!   cleared and woken, the record freed and the entry marked
 //!   `ExitedInZone` for the host to fold.
 //! * `rt_sigprocmask`, `sigaltstack`, `set_robust_list` on the thread's
-//!   [`ThreadControlSlot`].
+//!   [`ThreadControlSlot`](carrick_el1_abi::ThreadControlSlot);
+//!   `set_robust_list` through the ISA-neutral body in
+//!   [`super::thread_setup`], which the x86_64 CPL0 entry shares.
 //!
 //! Every case EL1 cannot answer exactly as the host lane would (an error
 //! return, a user copy that faults here, a closed gate, a traced or seccomp
 //! process, a full pool) is forwarded with no effect left behind, so the host
-//! lane gives the one answer. Nothing here returns an errno.
+//! lane gives the one answer. The one errno returned here is
+//! `set_robust_list`'s `EINVAL` for a wrong length, which the shared body
+//! decides before touching the slot.
 use super::sched::{ETIMEDOUT_RESULT, Sched, Served, ThreadCpu, UserWord};
+use super::thread_setup::{self, RobustListHead, RobustListLen, RobustListSlot, setup_open};
+pub use super::thread_setup::{
+    GuestLifecycleVenue, LifecycleThread, LifecycleVenue, SYS_SET_ROBUST_LIST, guest_venue,
+};
 use crate::file::UserCopy;
 use carrick_el1_abi::{
-    Action, AltStack, BlockedMask, BornRecord, Claim, Counters, CurrentTask, El1TaskId, EntryRef,
-    EntryState, GateState, LifecycleDecline, ThreadControlSlot, ThreadCtx, ThreadIdentity,
-    ThreadLifecyclePage, TransitionError, TrapFrame,
+    Action, AltStack, BlockedMask, BornRecord, Claim, Counters, CurrentTask, El1TaskId, EntryState,
+    GateState, LifecycleDecline, ThreadCtx, ThreadIdentity, TransitionError, TrapFrame,
 };
 use core::sync::atomic::Ordering;
 
-/// Linux aarch64 syscall numbers served here.
+/// Linux aarch64 syscall numbers served here (`SYS_SET_ROBUST_LIST` is the
+/// shared canonical number from [`thread_setup`]).
 pub const SYS_EXIT: usize = 93;
-pub const SYS_SET_ROBUST_LIST: usize = 99;
 pub const SYS_SIGALTSTACK: usize = 132;
 pub const SYS_RT_SIGPROCMASK: usize = 135;
 pub const SYS_GETTID: usize = 178;
@@ -97,26 +104,6 @@ fn stack_t_bytes(words: [u64; 3]) -> [u8; STACK_T_SIZE] {
     bytes
 }
 
-/// `sizeof(struct robust_list_head)` on 64-bit Linux.
-const ROBUST_LIST_HEAD_SIZE: u64 = 24;
-
-/// Where EL1 finds the lifecycle state of the thread running on a vCPU. The
-/// host (runtime stage L4) publishes it; placement is per process.
-pub trait LifecycleVenue {
-    /// The lifecycle page of `task`'s process and `task`'s own control
-    /// slot, or `None` when EL1 serves no lifecycle call for it.
-    fn thread<'a>(&'a self, task: &'a CurrentTask) -> Option<LifecycleThread<'a>>;
-    /// The control slot a thread born into `entry` of `page` will own.
-    fn born_slot(&self, page: &ThreadLifecyclePage, entry: EntryRef) -> Option<&ThreadControlSlot>;
-}
-
-/// One running thread's lifecycle state.
-#[derive(Clone, Copy)]
-pub struct LifecycleThread<'a> {
-    pub page: &'a ThreadLifecyclePage,
-    pub slot: &'a ThreadControlSlot,
-}
-
 /// Whether `nr` is a call this module may serve.
 pub const fn is_lifecycle_syscall(nr: usize) -> bool {
     matches!(
@@ -176,8 +163,17 @@ pub fn serve<C: ThreadCpu, U: UserWord>(
             Some(served(frame, 0, false))
         }
         SYS_SET_ROBUST_LIST => {
-            serve_set_robust_list(frame, thread)?;
-            Some(served(frame, 0, false))
+            // The shared body owns both answers (0 and EINVAL); only a
+            // declined call (closed gate, hatch off) forwards.
+            let [head, len] = [frame.x[0], frame.x[1]];
+            let result = thread_setup::set_robust_list(
+                thread.page,
+                RobustListSlot::new(thread.slot, None),
+                RobustListHead::new(head),
+                RobustListLen::new(len),
+            )
+            .linux_result()?;
+            Some(served(frame, result as u64, false))
         }
         SYS_CLONE => {
             let visible = serve_clone(sched.as_mut()?, frame, thread, venue, user, counters)?;
@@ -213,12 +209,6 @@ fn user_sp<C: ThreadCpu, U: UserWord>(sched: &mut Sched<'_, C, U>, frame: &TrapF
 
 fn ranges_overlap(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
     a < b.saturating_add(b_len) && b < a.saturating_add(a_len)
-}
-
-/// Whether EL1 may serve the per-thread setup calls: the hatch is on and
-/// the gate is not terminally closed (a tracer or seccomp must see them).
-fn setup_open(page: &ThreadLifecyclePage) -> bool {
-    page.serves_sigmask() && page.gate() != GateState::Closed
 }
 
 /// `rt_sigprocmask(how, set, oldset, sigsetsize)`. `Some(work)`: served
@@ -332,19 +322,6 @@ fn serve_sigaltstack(
     if let Some(stack) = replacement {
         thread.slot.write_altstack(stack);
     }
-    Some(())
-}
-
-/// `set_robust_list(head, len)`: the head goes to the thread's slot, where
-/// exit finds it.
-fn serve_set_robust_list(frame: &TrapFrame, thread: LifecycleThread<'_>) -> Option<()> {
-    let [head, len] = [frame.x[0], frame.x[1]];
-    if !setup_open(thread.page) || len != ROBUST_LIST_HEAD_SIZE {
-        return None;
-    }
-    thread
-        .slot
-        .set_robust_list(head, ROBUST_LIST_HEAD_SIZE as u32);
     Some(())
 }
 
@@ -661,40 +638,3 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
 #[cfg(test)]
 #[path = "lifecycle/tests.rs"]
 mod tests;
-
-/// Production venue: addresses are EL1-only retained metadata, carried with
-/// exact scheduler identity across parks and switches.
-pub struct GuestLifecycleVenue;
-
-#[cfg(target_os = "none")]
-impl LifecycleVenue for GuestLifecycleVenue {
-    fn thread<'a>(&'a self, task: &'a CurrentTask) -> Option<LifecycleThread<'a>> {
-        let (page, slot) = task.lifecycle_refs()?;
-        Some(LifecycleThread { page, slot })
-    }
-    fn born_slot(&self, page: &ThreadLifecyclePage, entry: EntryRef) -> Option<&ThreadControlSlot> {
-        let address = page.control_address(entry)?;
-        let end = address.checked_add(core::mem::size_of::<ThreadControlSlot>() as u64)?;
-        if address < carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
-            || end
-                > carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
-                    + carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE
-            || !address.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)
-        {
-            return None;
-        }
-        // SAFETY: the host stocks this address only after reserving executable custody;
-        // carrier metadata retains its exact backing across every zone reference.
-        Some(unsafe { &*(address as *const ThreadControlSlot) })
-    }
-}
-
-#[cfg(target_os = "none")]
-pub fn guest_venue() -> Option<&'static dyn LifecycleVenue> {
-    static VENUE: GuestLifecycleVenue = GuestLifecycleVenue;
-    Some(&VENUE)
-}
-#[cfg(not(target_os = "none"))]
-pub fn guest_venue() -> Option<&'static dyn LifecycleVenue> {
-    None
-}

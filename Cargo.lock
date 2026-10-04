@@ -444,6 +444,7 @@ name = "carrick-el1"
 version = "0.1.0"
 dependencies = [
  "carrick-el1-abi",
+ "carrick-guest-arch",
  "carrick-inotify-core",
  "carrick-mem",
  "carrick-mmu-core",
@@ -1040,6 +1041,7 @@ dependencies = [
 name = "carrick-x86-cpl0"
 version = "0.1.0"
 dependencies = [
+ "carrick-el1",
  "carrick-el1-abi",
  "carrick-guest-arch",
 ]

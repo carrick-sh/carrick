@@ -14,7 +14,7 @@ pub const OBSERVE_NATIVE: u64 = u64::MAX;
 
 /// Stack order is enforced by the CPL0 assembly and these compile assertions.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct NativeFrame {
     pub r15: u64,
     pub r14: u64,
@@ -76,5 +76,79 @@ pub struct CpuBinding {
     pub entries: AtomicU64,
     pub publications: AtomicU64,
     pub completions: AtomicU64,
+    pub captured_stack: AtomicU64,
 }
 const _: () = assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn native_entry_keeps_arguments_number_and_captured_stack() {
+        let frame = NativeFrame {
+            rax: 273,
+            rdi: 1,
+            rsi: 24,
+            rdx: 3,
+            r10: 4,
+            r8: 5,
+            r9: 6,
+            rsp: 0x31fe8,
+            ..Default::default()
+        };
+        let call = frame.decode();
+        assert_eq!(call.isa, GuestIsa::X86_64);
+        assert_eq!(call.native.raw(), 273);
+        assert_eq!(call.canonical.raw(), 99);
+        assert_eq!(call.args, [1, 24, 3, 4, 5, 6]);
+        assert_eq!(call.stack.raw(), frame.rsp);
+        assert_eq!(
+            NativeFrame { rax: 99, ..frame }.decode().canonical.raw(),
+            u64::MAX
+        );
+    }
+    #[test]
+    fn iret_return_rejects_noncanonical_targets_and_privileged_flags() {
+        let valid = NativeFrame {
+            rcx: 0x10000,
+            rsp: 0x31fe8,
+            r11: 0x202,
+            ..Default::default()
+        };
+        assert!(valid.valid_user_return());
+        for target in [0, 1 << 47, u64::MAX] {
+            assert!(
+                !NativeFrame {
+                    rcx: target,
+                    ..valid
+                }
+                .valid_user_return()
+            );
+            assert!(
+                !NativeFrame {
+                    rsp: target,
+                    ..valid
+                }
+                .valid_user_return()
+            );
+        }
+        for mask in [3 << 12, 1 << 14, 1 << 17, 1 << 19, 1 << 20] {
+            assert!(
+                !NativeFrame {
+                    r11: valid.r11 | mask,
+                    ..valid
+                }
+                .valid_user_return()
+            );
+        }
+        assert!(!NativeFrame { r11: 0, ..valid }.valid_user_return());
+        // These require IRETQ; there is no unsafe SYSRET alternate path.
+        assert!(
+            NativeFrame {
+                r11: valid.r11 | (1 << 8) | (1 << 16),
+                ..valid
+            }
+            .valid_user_return()
+        );
+    }
+}
