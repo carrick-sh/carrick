@@ -1449,6 +1449,27 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     );
 }
 
+#[cfg(any(test, target_os = "none"))]
+fn bind_service_root(
+    spaces: &carrick_sched_core::AddressSpaces,
+    mm: ReservationMm,
+    closed: bool,
+    expected_root: u64,
+) -> Result<u64, MmError> {
+    let index = spaces.find(mm.raw()).ok_or(MmError::Stale)?;
+    if closed {
+        let root = spaces
+            .closed_root_identity(index, mm.raw())
+            .ok_or(MmError::Stale)?;
+        if root != expected_root {
+            return Err(MmError::Stale);
+        }
+        Ok(root)
+    } else {
+        Ok(spaces.grant(index, mm.raw()).ok_or(MmError::Busy)?.ttbr0)
+    }
+}
+
 #[cfg(target_os = "none")]
 pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let Some(executor_slot) = carrick_el1_abi::service_slot_from_stack(
@@ -1470,13 +1491,20 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let mm = ReservationMm::new(frame.x[2]).ok_or(MmError::Stale)?;
         let zone =
             unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
-        let index = zone.spaces.find(mm.raw()).ok_or(MmError::Stale)?;
-        let grant = zone.spaces.grant(index, mm.raw()).ok_or(MmError::Busy)?;
+        // The normal BIND still requires an open grant. The first-load BIND
+        // carries a publication-issued closed-root token and must recheck
+        // that this exact entry has never opened. No transfer service uses
+        // the closed identity observation.
+        let root = match frame.x[6] {
+            0 => bind_service_root(&zone.spaces, mm, false, 0)?,
+            1 => bind_service_root(&zone.spaces, mm, true, frame.x[7])?,
+            _ => return Err(MmError::Stale),
+        };
         let live: u64;
         unsafe {
             core::arch::asm!("mrs {}, ttbr0_el1",out(reg)live,options(nomem,nostack));
         }
-        if carrick_el1_abi::service_target_table_window(live, grant.ttbr0).is_none() {
+        if carrick_el1_abi::service_target_table_window(live, root).is_none() {
             return Err(MmError::Stale);
         }
         let portal = MmPortal::<GuestMetadataPin> {
@@ -1498,4 +1526,36 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         Ok(())
     })();
     frame.x[0] = result.err().map_or(0, |error| u64::from(error.errno()));
+}
+
+#[cfg(test)]
+mod closed_bind_tests {
+    use super::*;
+
+    #[test]
+    fn closed_bind_cannot_escape_its_initial_mm_or_gate() {
+        let spaces = carrick_sched_core::AddressSpaces::new();
+        let first = ReservationMm::new(81).unwrap();
+        let second = ReservationMm::new(82).unwrap();
+        let first_index = spaces
+            .publish_closed(first.raw(), 0x81_000, 0x81_000)
+            .unwrap();
+        spaces
+            .publish_closed(second.raw(), 0x82_000, 0x82_000)
+            .unwrap();
+        assert!(bind_service_root(&spaces, first, false, 0).is_err());
+        assert!(bind_service_root(&spaces, first, true, 0x81_000).is_err());
+        assert!(spaces.mark_initial_bindable(first_index));
+        assert_eq!(
+            bind_service_root(&spaces, first, true, 0x81_000),
+            Ok(0x81_000)
+        );
+        assert!(bind_service_root(&spaces, first, true, 0x82_000).is_err());
+        assert!(bind_service_root(&spaces, second, true, 0x81_000).is_err());
+        spaces.open(first_index);
+        assert!(bind_service_root(&spaces, first, true, 0x81_000).is_err());
+        assert_eq!(bind_service_root(&spaces, first, false, 0), Ok(0x81_000));
+        spaces.close(first_index);
+        assert!(bind_service_root(&spaces, first, true, 0x81_000).is_err());
+    }
 }
