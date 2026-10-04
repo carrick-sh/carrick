@@ -14,14 +14,19 @@ use crate::common::*;
 fn futex_wait_parks_and_a_wake_from_the_sibling_thread_resumes_it() {
     let script = vec![
         alloc_word(0, 1),
+        pipe_to_slots(1, 2),
         Step::Sys(sys::clone_thread(0)),
         Step::ChildMarker(vec![
             // Deterministic handshake: wait until root task is parked in futex_wait.
             await_parked(1, "wait_root"),
             Step::Sys(sys::futex_wake_labeled("wake_root", slot(0), 1).ret(1)),
+            // FUTEX_WAKE returns a wake count, but promises no ordering between
+            // the waker's return and the resumed waiter (man 2 FUTEX_WAKE).
+            Step::Sys(sys::write(slot(2), b"w").ret(1)),
             Step::Sys(sys::exit_thread(0)),
         ]),
         Step::Sys(sys::futex_wait_labeled("wait_root", slot(0), 1).ret(0)),
+        Step::Sys(sys::read(slot(1), 1).ret(1)),
         Step::Sys(sys::exit_group(0)),
     ];
 

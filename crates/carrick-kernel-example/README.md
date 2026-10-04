@@ -140,7 +140,11 @@ still refuses to remap exact task identities across revisions.
 Receipts name the host OS and architecture. Another host records and replays
 its own decisions; cross-host result and work snapshots are not conflated.
 
-Scheduled scenarios currently refuse external readiness and host checkpoint
-steps. They schedule runnable segments; real reactor events, logical timers,
-internal lock contention and weak-memory orders are later milestones. A
+Scheduled scenarios release their permit while a continuation waits and admit
+its actor again after an event. A successful in-zone futex wake publishes the
+resumed actor before the waker's next decision. Host descriptor readiness and
+timer delivery can still depend on reactor timing, so retain a receipt only
+after strict replay confirms its ordering. Host checkpoint steps remain
+unsupported. Internal lock contention and weak-memory orders are later
+milestones. A
 fixed wall watchdog reports a stranded harness actor.
