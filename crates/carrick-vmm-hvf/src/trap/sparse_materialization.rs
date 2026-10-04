@@ -2424,7 +2424,8 @@ impl PublicationContext<'static> {
     pub(super) fn prepare_transfer(
         self,
         window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<Option<Box<dyn carrick_aarch64::user_transfer::TransferGrant>>, TrapError> {
+    ) -> Result<carrick_aarch64::user_transfer::TransferPreparation, TrapError> {
+        use carrick_aarch64::user_transfer::TransferPreparation;
         use carrick_mmu_core::aarch64::descriptor_txn::{BackingIdentity, DescriptorOp, PageSpan};
         let failure = |message: String| TrapError::Hypervisor(format!("target grant: {message}"));
         let binding = self
@@ -2464,13 +2465,65 @@ impl PublicationContext<'static> {
             self.container_root,
         );
         if !overlapping.is_empty() {
+            let resident = carrick_el1_abi::frame_grant_residency_host()
+                .and_then(|table| table.lookup(window.operation.mm.raw(), window.fault_page));
+            carrick_observability::probes::hvpatch_el1_owner_grant_supply(
+                window.fault_page,
+                resident.map_or(0, |page| page.identity.len),
+                10,
+                resident.map_or(0, |page| page.identity.owner_generation),
+            );
+            if let Some(page) = resident {
+                carrick_observability::probes::hvpatch_el1_owner_grant_supply(
+                    page.identity.semantic_base,
+                    page.expected_ipa,
+                    11,
+                    page.identity.physical_ipa,
+                );
+            }
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                 window.range.start(),
                 window.range.len(),
                 4,
                 overlapping.len() as u64,
             );
-            return Ok(None);
+            for (_, alias) in &overlapping {
+                carrick_observability::probes::hvpatch_el1_owner_grant_supply(
+                    alias.start,
+                    alias.size as u64,
+                    8,
+                    alias.owner_generation,
+                );
+                carrick_observability::probes::hvpatch_el1_owner_grant_supply(
+                    alias.ipa,
+                    alias.physical_size as u64,
+                    9,
+                    match alias.ownership_scope {
+                        AliasOwnershipScope::MmRootSlot { .. } => 1,
+                        AliasOwnershipScope::ContainerRoot(_) => 2,
+                        AliasOwnershipScope::Global => 3,
+                    },
+                );
+            }
+            // An EL0 first touch can complete after PREPARE chose this page.
+            // A committed residency and the matching physical alias authorize
+            // only a fresh owner selection, never reuse of this stale window.
+            let peer_resident = resident.is_some_and(|page| {
+                carrick_el1_abi::frame_grant_residency_host().is_some_and(|table| {
+                    table.is_guest_committed(window.operation.mm.raw(), window.fault_page)
+                }) && overlapping.iter().any(|(_, alias)| {
+                    window.fault_page >= alias.start
+                        && window.fault_page < alias.start.saturating_add(alias.size as u64)
+                        && alias.ipa.checked_add(window.fault_page - alias.start)
+                            == Some(page.expected_ipa)
+                        && alias.owner_generation == page.identity.owner_generation
+                })
+            });
+            return Ok(if peer_resident {
+                TransferPreparation::PeerResident
+            } else {
+                TransferPreparation::Declined
+            });
         }
         carrick_observability::probes::hvpatch_el1_owner_grant_supply(
             window.range.start(),
@@ -2583,10 +2636,10 @@ impl PublicationContext<'static> {
             pending.context.mm_root_slot,
             pending.context.container_root,
         ) {
-            return Ok(None);
+            return Ok(TransferPreparation::Declined);
         }
         drop(pending.registry.take());
-        Ok(Some(Box::new(pending)))
+        Ok(TransferPreparation::Grant(Box::new(pending)))
     }
 }
 impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
@@ -2619,6 +2672,17 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
             );
         }
         let applied = matches!(receipt.outcome, DescriptorOutcome::Applied(_));
+        // A peer can advance the reservation generation after PREPARE but
+        // before this grant takes EL1's editor. The refused transaction has
+        // consumed no bytes or published a descriptor; once its physical
+        // custody is returned, the original syscall can select its owner
+        // window afresh. Other refusals do not grant that retry authority.
+        let stale_root = matches!(
+            receipt.outcome,
+            DescriptorOutcome::Refused(
+                carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot
+            )
+        );
         let result = self
             .context
             .state
@@ -2643,7 +2707,13 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
             }
         }
         self.descriptor_settled = true;
-        Ok(applied)
+        if !applied && !stale_root {
+            return Err(TrapError::Hypervisor(format!(
+                "owner grant descriptor refused: {:?}",
+                receipt.outcome
+            )));
+        }
+        Ok(applied || stale_root)
     }
 }
 impl Drop for PendingTransferGrant {

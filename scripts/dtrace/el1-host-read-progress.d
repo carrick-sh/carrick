@@ -39,7 +39,28 @@
  *     alongside the owner prepare sequence for forwarded recvfrom.
  *     hvpatch-el1-owner-grant-supply(va,len,phase,detail) distinguishes
  *     missing transport (1), invalid ASID (2), missing foreign binding (3),
- *     overlapping retained alias (4, detail=count), publication entry (5).
+ *     overlapping retained alias (4, detail=count), publication entry (5),
+ *     host deferred-return reconciliation (6, detail=number acknowledged),
+ *     and exact grant result (7, detail=1 settled, 0 declined). On an
+ *     overlap, phase 8 reports each alias VA/size/physical owner generation;
+ *     phase 9 reports its IPA/physical size/scope (1 exact MM root, 2
+ *     container root, 3 global). These diagnostics identify the retained
+ *     row; they do not authorize its retirement.
+ *     Phase 10 reports the fault page with live residency length and physical
+ *     owner generation (both zero if lookup misses) when an alias overlaps.
+ *     Phase 11 reports the residency semantic base, expected IPA for the
+ *     requested page, and its physical base.
+ *     Mapping-leaf probes sample the fault page, its neighbour, and the
+ *     page 16 KiB above it to distinguish prepared stock from physical
+ *     alias coverage without a descriptor.
+ *     Live-qualified on signed el1_host_copyout-873518cad531afb9,
+ *     n1g-ipa-attach-20261004: recvfrom page 0x6000008000 still had a
+ *     prepared leaf for IPA 0x9b40104000 and live residency generation 8
+ *     with that same expected IPA. The later grant was caused by the portal
+ *     passing byte address 0x6000008005 to an aligned-page commit, which
+ *     refused BadAddress in the VM-free reproduction. This traced artifact
+ *     predates the aligned-page fix; its copyout failure is not a post-fix
+ *     verdict.
  *     Live-qualified on signed el1_host_copyout-873518cad531afb9,
  *     n1f-grantrefusal-trace-20261004: the recvfrom destination
  *     0x6000008005 requested a 32 KiB grant rooted at 0x6000004000;
