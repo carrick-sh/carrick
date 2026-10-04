@@ -703,7 +703,7 @@ fn prlimit64_writes_packed_rlimit() {
 }
 
 #[test]
-fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
+fn getrusage_bootstrap_reports_usage_for_self_and_validates_who() {
     const LINUX_RUSAGE_SELF: u64 = 0;
     const LINUX_RUSAGE_CHILDREN: u64 = (-1_i64) as u64;
     const LINUX_EINVAL: LinuxErrno = LinuxErrno::new(22);
@@ -713,11 +713,18 @@ fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
     let reporter = CompatReporter::default();
     let mut dispatcher = SyscallDispatcher::new();
 
-    // RUSAGE_SELF with valid pointer -> zeroed rusage, returns 0.
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let cpu_before = (
+        context.task().self_cpu_us(),
+        context.task().self_system_cpu_us(),
+    );
+    let host_before = carrick_kernel::host_proc::self_resource_usage().unwrap_or_default();
+    // CPU belongs to this task; RSS and major faults still come from the host
+    // address space. Bound each value by its authority around the syscall.
     assert_eq!(
         dispatcher
             .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
+                &context,
                 SyscallRequest::new(
                     165,
                     SyscallArgs::from([LINUX_RUSAGE_SELF, 0x4000, 0, 0, 0, 0])
@@ -729,26 +736,48 @@ fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
         DispatchOutcome::Returned { value: 0 }
     );
     let rusage = read_rusage(&memory, 0x4000);
-    #[cfg(not(target_os = "macos"))]
-    assert_eq!(rusage, LinuxRusage::zeroed());
-    #[cfg(target_os = "macos")]
-    {
-        assert!(rusage.ru_utime.tv_sec >= 0);
-        assert!(rusage.ru_utime.tv_usec >= 0);
-        assert!(rusage.ru_stime.tv_sec >= 0);
-        assert!(rusage.ru_stime.tv_usec >= 0);
-        assert!(rusage.ru_maxrss >= 0);
-    }
+    let cpu_after = (
+        context.task().self_cpu_us(),
+        context.task().self_system_cpu_us(),
+    );
+    let host_after = carrick_kernel::host_proc::self_resource_usage().unwrap_or_default();
+    let timeval_us = |time: LinuxTimeval| {
+        let seconds = time.tv_sec;
+        let microseconds = time.tv_usec;
+        assert!(seconds >= 0);
+        assert!((0..1_000_000).contains(&microseconds));
+        u64::try_from(seconds).unwrap() * 1_000_000 + u64::try_from(microseconds).unwrap()
+    };
+    assert!((cpu_before.0..=cpu_after.0).contains(&timeval_us(rusage.ru_utime)));
+    assert!((cpu_before.1..=cpu_after.1).contains(&timeval_us(rusage.ru_stime)));
+    assert!(
+        (host_before.maxrss_bytes / 1024..=host_after.maxrss_bytes / 1024)
+            .contains(&u64::try_from(rusage.ru_maxrss).unwrap())
+    );
+    assert!(
+        (host_before.majflt..=host_after.majflt)
+            .contains(&u64::try_from(rusage.ru_majflt).unwrap())
+    );
+    let mut reported = LinuxRusage::zeroed();
+    reported.ru_utime = rusage.ru_utime;
+    reported.ru_stime = rusage.ru_stime;
+    reported.ru_maxrss = rusage.ru_maxrss;
+    reported.ru_majflt = rusage.ru_majflt;
+    assert_eq!(
+        rusage, reported,
+        "unreported ABI fields overwrite the poisoned buffer"
+    );
 
-    // RUSAGE_CHILDREN with valid pointer -> same.
-    // Pre-poison the buffer so we can prove the handler zeroed it.
+    // This fresh task has no guest children, so their CPU and faults are zero.
+    // Pre-poison the buffer to check complete ABI publication independently.
+    let host_before = carrick_kernel::host_proc::self_resource_usage().unwrap_or_default();
     memory
         .write_bytes(0x4000, &vec![0xaa; core::mem::size_of::<LinuxRusage>()])
         .unwrap();
     assert_eq!(
         dispatcher
             .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
+                &context,
                 SyscallRequest::new(
                     165,
                     SyscallArgs::from([LINUX_RUSAGE_CHILDREN, 0x4000, 0, 0, 0, 0]),
@@ -760,20 +789,20 @@ fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
         DispatchOutcome::Returned { value: 0 }
     );
     let rusage_children = read_rusage(&memory, 0x4000);
-    #[cfg(not(target_os = "macos"))]
-    assert_eq!(rusage_children, LinuxRusage::zeroed());
-    #[cfg(target_os = "macos")]
-    {
-        assert_eq!(rusage_children.ru_utime, LinuxTimeval::new(0, 0));
-        assert_eq!(rusage_children.ru_stime, LinuxTimeval::new(0, 0));
-        assert!(rusage_children.ru_maxrss >= 0);
-    }
+    let host_after = carrick_kernel::host_proc::self_resource_usage().unwrap_or_default();
+    assert!(
+        (host_before.maxrss_bytes / 1024..=host_after.maxrss_bytes / 1024)
+            .contains(&u64::try_from(rusage_children.ru_maxrss).unwrap())
+    );
+    let mut reported_children = LinuxRusage::zeroed();
+    reported_children.ru_maxrss = rusage_children.ru_maxrss;
+    assert_eq!(rusage_children, reported_children);
 
     // who = 99 -> EINVAL.
     assert_eq!(
         dispatcher
             .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
+                &context,
                 SyscallRequest::new(165, SyscallArgs::from([99, 0x4000, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
@@ -788,7 +817,7 @@ fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
     assert_eq!(
         dispatcher
             .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
+                &context,
                 SyscallRequest::new(
                     165,
                     SyscallArgs::from([LINUX_RUSAGE_SELF, 0xdead_0000, 0, 0, 0, 0]),
@@ -806,7 +835,7 @@ fn getrusage_bootstrap_zeros_rusage_for_self_and_validates_who() {
     assert_eq!(
         dispatcher
             .dispatch(
-                &dispatcher.capture_one_task_context().unwrap(),
+                &context,
                 SyscallRequest::new(165, SyscallArgs::from([LINUX_RUSAGE_SELF, 0, 0, 0, 0, 0])),
                 &mut memory,
                 &reporter,
