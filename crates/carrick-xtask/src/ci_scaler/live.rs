@@ -623,8 +623,13 @@ fn resource_admission() -> Result<bool, ScalerError> {
         .ok_or(ScalerError::Guard("memory available"))?
         * 1024;
     let busy = utilization.max(load);
+    let limiting_source = if utilization >= load {
+        "/proc/stat:5s-delta"
+    } else {
+        "/proc/loadavg:1m-per-cpu"
+    };
     println!(
-        "admission busy={busy:.3} projected={:.3} memory_available={available}",
+        "admission utilization={utilization:.3} utilization_source=/proc/stat:5s-delta load_per_cpu={load:.3} load_source=/proc/loadavg:1m-per-cpu online_cpus={threads} limiting_source={limiting_source} busy={busy:.3} projected={:.3} reserved_vcpus=2 memory_available={available}",
         busy + 2.0 / threads as f64
     );
     enforce_cpu_ceiling(busy, u32::try_from(threads).unwrap_or(0))?;
