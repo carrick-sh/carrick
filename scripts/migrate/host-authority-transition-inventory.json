@@ -200,18 +200,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:517 in `send_at`, `libc::geteuid` acts only on the same-UID carrier-control peer authentication boundary used by `send_at` at line 453; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:530 in `send_at`, `libc::geteuid` acts only on the same-UID carrier-control peer authentication boundary used by `send_at` at line 453; no guest identity selects its host target.",
     "review_id": "HA-000010",
     "source": {
-      "byte_end": 17263,
-      "byte_start": 17250,
+      "byte_end": 17741,
+      "byte_start": 17728,
       "column": 24,
       "column_end": 37,
       "column_start": 24,
       "file": "crates/carrick-kernel/src/kernel/control/mod.rs",
-      "line": 517,
-      "line_end": 517,
-      "line_start": 517
+      "line": 530,
+      "line_end": 530,
+      "line_start": 530
     }
   },
   {
@@ -227,18 +227,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:720 in `authenticate`, `libc::geteuid` acts only on the same-UID carrier-control peer authentication boundary used by `authenticate` at line 656; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:733 in `authenticate`, `libc::geteuid` acts only on the same-UID carrier-control peer authentication boundary used by `authenticate` at line 656; no guest identity selects its host target.",
     "review_id": "HA-000011",
     "source": {
-      "byte_end": 25147,
-      "byte_start": 25134,
+      "byte_end": 25625,
+      "byte_start": 25612,
       "column": 24,
       "column_end": 37,
       "column_start": 24,
       "file": "crates/carrick-kernel/src/kernel/control/mod.rs",
-      "line": 720,
-      "line_end": 720,
-      "line_start": 720
+      "line": 733,
+      "line_end": 733,
+      "line_start": 733
     }
   },
   {
@@ -12312,18 +12312,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:403 in `start`, `std::process::id` acts only on the nonce-bound current carrier-control owner identity used by `start` at line 364; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/control/mod.rs:416 in `start`, `std::process::id` acts only on the nonce-bound current carrier-control owner identity used by `start` at line 364; no guest identity selects its host target.",
     "review_id": "HA-000527",
     "source": {
-      "byte_end": 12870,
-      "byte_start": 12854,
+      "byte_end": 13348,
+      "byte_start": 13332,
       "column": 27,
       "column_end": 43,
       "column_start": 27,
       "file": "crates/carrick-kernel/src/kernel/control/mod.rs",
-      "line": 403,
-      "line_end": 403,
-      "line_start": 403
+      "line": 416,
+      "line_end": 416,
+      "line_start": 416
     }
   },
   {
@@ -14718,18 +14718,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/control/connection.rs:92 in `spawn_handler`, `std::thread::Builder::new` acts only on the per-connection carrier control handler; bounded by CONTROL_MAX_CONNECTIONS; joined on shutdown; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/control/connection.rs:133 in `spawn_handler`, `std::thread::Builder::new` acts only on the per-connection carrier control handler; bounded by CONTROL_MAX_CONNECTIONS; joined on shutdown; no guest identity selects its host target.",
     "review_id": "HA-000712",
     "source": {
-      "byte_end": 2550,
-      "byte_start": 2525,
+      "byte_end": 3603,
+      "byte_start": 3578,
       "column": 23,
       "column_end": 48,
       "column_start": 23,
       "file": "crates/carrick-kernel/src/kernel/control/connection.rs",
-      "line": 92,
-      "line_end": 92,
-      "line_start": 92
+      "line": 133,
+      "line_end": 133,
+      "line_start": 133
     }
   },
   {
