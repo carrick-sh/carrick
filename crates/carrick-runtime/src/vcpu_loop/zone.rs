@@ -580,6 +580,197 @@ where
         self.settle_into_zone(control, state, record, seq, timeout, request)
     }
 
+    /// Enroll an exact EL1 owner release before surrendering the executor.
+    /// The portal checks the producer revision after linking the record, so a
+    /// release racing enrollment returns `Changed` and redispatches here.
+    pub(super) fn owner_memory_park(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+        wait: carrick_el1_abi::PortalOwnerWait,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
+        let Some((zone, mm)) = zone_for(self.state.zone_mm) else {
+            return Err(RuntimeError::Configuration(
+                "owner memory wait has no exact carrier zone".to_owned(),
+            )
+            .into());
+        };
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            return Err(RuntimeError::Configuration(
+                "owner memory wait has no carrier portal".to_owned(),
+            )
+            .into());
+        }
+        // SAFETY: the live engine retains this carrier's complete ABI region;
+        // authenticate_wait independently checks its relation to `zone`.
+        let slots = unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        };
+        let state = engine.snapshot_guest_state_for_publication()?;
+        let ctx = zone_ctx_from_state(&state, ZoneExit::Syscall { completed: true })?;
+        let request = self
+            .state
+            .syscall_completion
+            .guest("owner wait lost its prepared completion token")?
+            .syscall()
+            .request;
+        let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+            RuntimeError::Configuration("owner wait lost its Kernel context".to_owned())
+        })?;
+        let identity = ThreadIdentity {
+            tid: carrick_el1_abi::El1TaskId::from_linux_tid(self.state.linux_tid.raw()).raw(),
+            serial: context.thread().key().serial.raw(),
+            mm,
+            file_table: context.resources().files().id().raw(),
+            generation: control
+                .current_submission_key()
+                .map(|(_, generation)| generation.raw())
+                .unwrap_or(0),
+            affinity: context.thread().affinity().words()[0],
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        let enrollment = slots.authenticate_wait(zone, wait).map_err(|error| {
+            RuntimeError::Configuration(format!("owner wait receipt rejected: {error:?}"))
+        })?;
+        let record = zone.alloc_record(identity).map_err(|error| {
+            RuntimeError::Configuration(format!("owner wait record unavailable: {error:?}"))
+        })?;
+        // SAFETY: this freshly allocated record has not been published.
+        unsafe { *zone.record(record).ctx_mut() = ctx };
+        let seq = zone.next_seq(record);
+        let token = OperationToken::metadata_request(context.thread().key().serial.raw())
+            .ok_or_else(|| RuntimeError::Configuration("owner wait serial is zero".to_owned()))?;
+        let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+            carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects)
+        };
+        match enrollment.park_host(record, token, &complete) {
+            Ok(()) => {
+                zone.counters
+                    .host_parks
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let exit = self.settle_into_zone(
+                    control,
+                    state,
+                    zone.record_ref(record),
+                    seq,
+                    None,
+                    request,
+                )?;
+                self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame };
+                Ok(exit)
+            }
+            Err((ObjectWaitError::Changed | ObjectWaitError::Stale, _token)) => {
+                zone.free_record(record);
+                let outcome = self.state.redispatch_threaded_syscall(
+                    &self.kernel,
+                    engine,
+                    control.submission.host_wait_context(),
+                )?;
+                self.service_outcome(engine, control, frame, outcome)
+            }
+            Err((error, _token)) => {
+                zone.free_record(record);
+                Err(RuntimeError::Configuration(format!(
+                    "owner wait enrollment refused: {error:?}"
+                ))
+                .into())
+            }
+        }
+    }
+
+    /// Consume the host-owned handback and retry the still-owned syscall.
+    /// No guest return value is fabricated from a notification.
+    pub(super) fn resume_owner_zone(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        frame: carrick_hal::RawSyscall,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let context = self
+            .kernel
+            .dispatcher
+            .capture_kernel_context(self.state.linux_tid)
+            .map_err(|error| {
+                RuntimeError::Configuration(format!("owner wait resume lost context: {error}"))
+            })?;
+        let lease = control.execution_lease_mut().map_err(RuntimeError::Trap)?;
+        let continuation = lease.blocked_continuation().ok_or_else(|| {
+            RuntimeError::Configuration("owner wait resume lost continuation".to_owned())
+        })?;
+        let record = continuation
+            .zone_wait()
+            .map(|wait| wait.record)
+            .ok_or_else(|| {
+                RuntimeError::Configuration("owner wait resume found a non-zone wait".to_owned())
+            })?;
+        let event = continuation
+            .ready_event()
+            .map_err(|error| RuntimeError::Configuration(format!("owner wait event: {error:?}")))?;
+        let fresh = context
+            .task_binding()
+            .capture(self.state.linux_tid)
+            .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+        let mut result =
+            carrick_kernel::kernel::continuation::resume_continuation(lease, event, &fresh)
+                .map_err(|error| {
+                    RuntimeError::Configuration(format!("owner wait resume: {error:?}"))
+                })?;
+        let reserved = result.take_reserved_signal();
+        let zone = carrick_kernel::el1_zone::zone().ok_or_else(|| {
+            RuntimeError::Configuration("owner wait resume without zone".to_owned())
+        })?;
+        let rec = zone.live(record).ok_or_else(|| {
+            RuntimeError::Configuration(format!("owner wait record {record:?} is gone"))
+        })?;
+        if !rec.has_object_operation() {
+            return Err(RuntimeError::Configuration(
+                "owner wait wake lost its host operation".to_owned(),
+            )
+            .into());
+        }
+        // SAFETY: the host owns this handed-back record and has consumed its
+        // exact completion event. The token is the metadata-form receipt
+        // installed by owner_memory_park, not an IPC operation.
+        let token = unsafe { rec.take_object_operation() };
+        if token
+            .and_then(|token| token.metadata_generation())
+            .is_none()
+        {
+            return Err(RuntimeError::Configuration(
+                "owner wait wake returned another operation".to_owned(),
+            )
+            .into());
+        }
+        zone.free_record(record.id);
+        self.state.service_kernel_context = Some(context.retain_exact());
+        let pc = engine.current_pc()?;
+        if let Some(outcome) = service_signals_threaded(
+            &self.kernel,
+            &context,
+            engine,
+            self.state.this_tid,
+            self.state.fatal_image_generation,
+            None,
+            Some(pc),
+            None,
+            reserved,
+            self.traps,
+        )? {
+            return Ok(self.enter_terminal_with_outcome(engine, outcome));
+        }
+        let outcome = self.state.redispatch_threaded_syscall(
+            &self.kernel,
+            engine,
+            control.submission.host_wait_context(),
+        )?;
+        self.service_outcome(engine, control, frame, outcome)
+    }
+
     /// A zone-parked thread was loaded from its record: apply how its wait
     /// ended, free the record, and deliver any signal at this EL0 boundary.
     pub(super) fn resume_zone(
