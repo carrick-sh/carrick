@@ -1,5 +1,7 @@
 //! Lease ownership and workload lifetime share one supervisor process.
 //! The caller is a proxy: its death requests cancellation, never unlocks flock.
+//! Catchable termination cancels work before release. SIGKILL of this sole
+//! flock owner releases exclusion immediately; it is not crash containment.
 
 use crate::host_lease::{HostLease, HostLeaseError, HostLeaseMode, extract_exit_code};
 use std::ffi::OsString;
@@ -112,7 +114,7 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
         #[cfg(target_os = "macos")]
         scope,
         #[cfg(target_os = "macos")]
-        cancelled: Vec::new(),
+        cancelled: std::collections::BTreeMap::new(),
     };
     let supervision = events
         .watch_worker(workload.child.id() as libc::pid_t)
@@ -120,38 +122,74 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
 
     // On owner death AND normal command exit, terminate remaining run-scoped
     // descendants. Retain exclusion across this whole operation and EOF.
-    workload
-        .cancel()
-        .unwrap_or_else(|e| fail_closed("cancel workload", e));
-    let status = workload
-        .child
-        .wait()
-        .unwrap_or_else(|e| fail_closed("reap worker", e));
+    complete_cleanup("cancel workload", || workload.cancel());
+    let status = complete_cleanup("reap worker", || workload.child.wait());
     workload.reaped = true;
     #[cfg(target_os = "linux")]
-    reap_descendants().unwrap_or_else(|e| fail_closed("reap descendants", e));
+    complete_cleanup("reap descendants", reap_descendants);
     let mut bytes = [0; 256];
     loop {
         match lifetime.read(&mut bytes) {
             Ok(0) => break,
             Ok(_) => continue,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => fail_closed("workload lifetime EOF", error),
+            Err(_) => {
+                complete_cleanup("workload lifetime EOF", || lifetime.read(&mut bytes));
+            }
         }
     }
     #[cfg(not(target_os = "linux"))]
-    workload
-        .wait_for_reaping()
-        .unwrap_or_else(|e| fail_closed("descendant reaping", e));
+    complete_cleanup("descendant reaping", || workload.wait_for_reaping());
     supervision.map_err(HostLeaseError::ChildWait)?;
     drop(lease);
     Ok(extract_exit_code(&status))
 }
 
-fn fail_closed(operation: &str, error: io::Error) -> ! {
-    eprintln!("host-lease: {operation} failed: {error}; retaining exclusion");
+fn complete_cleanup<T>(operation: &str, mut attempt: impl FnMut() -> io::Result<T>) -> T {
+    let mut reported = None;
     loop {
-        std::thread::park();
+        match attempt() {
+            Ok(result) => return result,
+            Err(error) => {
+                let message = error.to_string();
+                if reported.as_ref() != Some(&message) {
+                    eprintln!(
+                        "host-lease: {operation} failed: {error}; retaining exclusion and continuing cleanup"
+                    );
+                    reported = Some(message);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    #[test]
+    fn permission_error_keeps_observing_workload_exit() {
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut attempts = 0;
+            super::complete_cleanup("permission fixture", || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                } else {
+                    // Privileged work finishes naturally after cancellation was
+                    // refused. The next observation must permit cleanup/release.
+                    Ok(())
+                }
+            });
+            send.send(attempts).unwrap();
+        });
+        assert_eq!(
+            receive
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .ok(),
+            Some(2),
+            "permission error prevented the next exit observation"
+        );
     }
 }
 
@@ -179,7 +217,7 @@ struct Workload {
     #[cfg(target_os = "macos")]
     scope: macos_scope::PipeWriter,
     #[cfg(target_os = "macos")]
-    cancelled: Vec<libc::pid_t>,
+    cancelled: std::collections::BTreeMap<ProcessIncarnation, macos_scope::ProcessWatch>,
 }
 
 impl Workload {
@@ -187,7 +225,7 @@ impl Workload {
         let group = self.child.id() as libc::pid_t;
         #[cfg(target_os = "macos")]
         {
-            self.cancelled = self.scope.cancel(group)?;
+            self.scope.cancel(group, &mut self.cancelled)?;
         }
         // SAFETY: child created its own session/group before exec. The zombie
         // leader remains unreaped here, pinning its identity during cancellation.
@@ -195,7 +233,13 @@ impl Workload {
         if unsafe { libc::kill(-group, libc::SIGKILL) } < 0
             && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
         {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EPERM) {
+                return Err(error);
+            }
+            eprintln!(
+                "host-lease: privileged workload refused cancellation; retaining exclusion until exit"
+            );
         }
         Ok(())
     }
@@ -203,12 +247,9 @@ impl Workload {
     #[cfg(not(target_os = "linux"))]
     fn wait_for_reaping(&self) -> io::Result<()> {
         #[cfg(target_os = "macos")]
-        for &pid in &self.cancelled {
+        for process in self.cancelled.values() {
             loop {
-                // SAFETY: scoped members were stopped and killed before wait.
-                if unsafe { libc::kill(pid, 0) } < 0
-                    && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-                {
+                if process.reaped()? {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
@@ -236,6 +277,87 @@ impl Workload {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ProcessIncarnation {
+    pid: libc::pid_t,
+    start_seconds: u64,
+    start_microseconds: u64,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl ProcessIncarnation {
+    fn signal(
+        self,
+        signal: libc::c_int,
+        observe: impl FnOnce(libc::pid_t) -> io::Result<Option<Self>>,
+        send: impl FnOnce(libc::pid_t, libc::c_int) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.present(observe(self.pid)?) {
+            send(self.pid, signal)?;
+        }
+        Ok(())
+    }
+
+    fn present(self, observed: Option<Self>) -> bool {
+        observed == Some(self)
+    }
+}
+
+#[cfg(test)]
+mod incarnation_tests {
+    use super::ProcessIncarnation;
+
+    #[test]
+    fn exit_reap_and_reuse_before_each_signal_does_not_target_replacement() {
+        let selected = ProcessIncarnation {
+            pid: 24,
+            start_seconds: 1,
+            start_microseconds: 10,
+        };
+        let replacement = ProcessIncarnation {
+            start_seconds: 2,
+            ..selected
+        };
+        for signal in [libc::SIGSTOP, libc::SIGKILL] {
+            for observed in [None, Some(replacement)] {
+                let mut signalled = false;
+                selected
+                    .signal(
+                        signal,
+                        |_| Ok(observed),
+                        |_, _| {
+                            signalled = true;
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                assert!(
+                    !signalled,
+                    "signal {signal} targeted an exited/reused process incarnation"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reaping_does_not_wait_on_a_replacement_incarnation() {
+        let selected = ProcessIncarnation {
+            pid: 24,
+            start_seconds: 1,
+            start_microseconds: 10,
+        };
+        let replacement = ProcessIncarnation {
+            start_seconds: 2,
+            ..selected
+        };
+        assert!(
+            !selected.present(Some(replacement)),
+            "reaping waited on a reused PID"
+        );
+    }
+}
+
 impl Drop for Workload {
     fn drop(&mut self) {
         if !self.reaped {
@@ -257,11 +379,30 @@ fn reap_descendants() -> io::Result<()> {
             let pid: libc::pid_t = pid
                 .parse()
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            // Exit/reaping authority is independent of signal permission. A
+            // privileged adopted child that exited must not be stuck at EPERM.
+            let reaped = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if reaped == pid {
+                continue;
+            }
+            if reaped < 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ECHILD) {
+                    continue;
+                }
+                return Err(error);
+            }
             // SAFETY: exact unreaped adopted child, cannot be a reused PID.
             if unsafe { libc::kill(pid, libc::SIGKILL) } < 0
                 && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
             {
-                return Err(io::Error::last_os_error());
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::EPERM) {
+                    return Err(error);
+                }
+                eprintln!(
+                    "host-lease: privileged descendant {pid} refused cancellation; awaiting its exit with exclusion held"
+                );
             }
         }
         // SAFETY: this process runs no unrelated work; all children are scoped.
@@ -284,6 +425,7 @@ mod macos_scope;
 struct ExitEvents {
     owner: OwnedFd,
     worker: Option<OwnedFd>,
+    cancellation: CancellationSignals,
 }
 
 #[cfg(target_os = "linux")]
@@ -295,6 +437,7 @@ impl ExitEvents {
         Ok(Self {
             owner: Self::pidfd(owner)?,
             worker: None,
+            cancellation: CancellationSignals::new()?,
         })
     }
     fn watch_worker(&mut self, worker: libc::pid_t) -> io::Result<()> {
@@ -316,6 +459,11 @@ impl ExitEvents {
             events: libc::POLLIN,
             revents: 0,
         }];
+        events.push(libc::pollfd {
+            fd: self.cancellation.reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        });
         if let Some(worker) = &self.worker {
             events.push(libc::pollfd {
                 fd: worker.as_raw_fd(),
@@ -327,7 +475,7 @@ impl ExitEvents {
             // SAFETY: initialized array of live process descriptors.
             let result = unsafe { libc::poll(events.as_mut_ptr(), events.len() as _, timeout) };
             if result >= 0 {
-                return Ok(events[0].revents != 0);
+                return Ok(events[0].revents != 0 || events[1].revents != 0);
             }
             let error = io::Error::last_os_error();
             if error.kind() != io::ErrorKind::Interrupted {
@@ -340,6 +488,7 @@ impl ExitEvents {
 #[cfg(not(target_os = "linux"))]
 struct ExitEvents {
     queue: OwnedFd,
+    _cancellation: CancellationSignals,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -350,13 +499,24 @@ impl ExitEvents {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
+        let cancellation = CancellationSignals::new()?;
         let result = Self {
             queue: unsafe { OwnedFd::from_raw_fd(fd) },
+            _cancellation: cancellation,
         };
         if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
             return Err(io::Error::last_os_error());
         }
         result.watch(owner)?;
+        // Register the self-pipe, so signal arrival before kevent waits cannot
+        // be lost. The handler only writes; cleanup runs in ordinary code.
+        let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
+        event.ident = result._cancellation.reader.as_raw_fd() as _;
+        event.filter = libc::EVFILT_READ;
+        event.flags = libc::EV_ADD | libc::EV_ENABLE;
+        if unsafe { libc::kevent(fd, &event, 1, std::ptr::null_mut(), 0, std::ptr::null()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(result)
     }
     fn watch(&self, pid: libc::pid_t) -> io::Result<()> {
@@ -418,6 +578,38 @@ impl ExitEvents {
             if error.kind() != io::ErrorKind::Interrupted {
                 return Err(error);
             }
+        }
+    }
+}
+
+struct CancellationSignals {
+    reader: std::os::unix::net::UnixStream,
+    registrations: Vec<signal_hook::SigId>,
+}
+
+impl CancellationSignals {
+    fn new() -> io::Result<Self> {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+        let mut result = Self {
+            reader,
+            registrations: Vec::new(),
+        };
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            result
+                .registrations
+                .push(signal_hook::low_level::pipe::register(
+                    signal,
+                    writer.try_clone()?,
+                )?);
+        }
+        Ok(result)
+    }
+}
+
+impl Drop for CancellationSignals {
+    fn drop(&mut self) {
+        for &registration in &self.registrations {
+            signal_hook::low_level::unregister(registration);
         }
     }
 }

@@ -146,7 +146,12 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   lock descriptor through command-tree cancellation and reaping. Commands and
   tests inherit a scope pipe, never the flock; nested runners
   never downgrade or reacquire it. Never upgrade a shared lease into a
-  gate/Docker lease.
+  gate/Docker lease. Runner death and supervisor TERM/INT/HUP cancel supervised
+  work before release. SIGKILL of the sole supervisor releases flock immediately;
+  Darwin descendants that detach and close every scope fd escape. Darwin checks
+  process start time before each signal, with a residual query-to-kill reuse
+  window. These limits and the containment follow-up are explicit in
+  [`docs/host-lease-containment-follow-up.md`](docs/host-lease-containment-follow-up.md).
 - **Stamp `CARRICK_RUN_ID`; reap with [`scripts/sudo/kill.sh`](scripts/sudo/kill.sh) `<run-id>`**,
   never `pkill -f carrick` (kills other lanes/worktrees). `timeout` wrappers can't be lldb-attached and a
   wedged CLI ignores SIGTERM.
