@@ -12,6 +12,32 @@ pub(crate) struct PreparedCorePublication {
     pub(crate) fatal_tid: i32,
 }
 
+/// Serialization offset, never a guest address or a memory-read capability.
+struct CoreFileOffset(u64);
+
+/// Consume already captured bytes. Snapshot source selection belongs to the
+/// owner; sparse serialization only accounts for nonzero bytes and file space.
+fn append_core_bytes(
+    extents: &mut Vec<carrick_kernel::core_dump::CoreExtent>,
+    remaining_budget: &mut u64,
+    offset: CoreFileOffset,
+    bytes: &[u8],
+) {
+    for run in carrick_kernel::dispatch::mem::core_data_runs(bytes) {
+        let emitted = run
+            .len()
+            .min(usize::try_from(*remaining_budget).unwrap_or(usize::MAX));
+        if emitted == 0 {
+            break;
+        }
+        *remaining_budget -= emitted as u64;
+        extents.push(carrick_kernel::core_dump::CoreExtent {
+            offset: offset.0 + run.start as u64,
+            bytes: bytes[run.start..run.start + emitted].to_vec(),
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CrashLeaseDrainBudget {
     pub(crate) timeout: Duration,
@@ -704,19 +730,12 @@ where
                         })?;
                         // Bulk preparation is not guest residency. Zero-filled
                         // pages can be holes without omitting host-written data.
-                        for run in carrick_kernel::dispatch::mem::core_data_runs(&bytes) {
-                            let emitted = run
-                                .len()
-                                .min(usize::try_from(remaining_budget).unwrap_or(usize::MAX));
-                            if emitted == 0 {
-                                break;
-                            }
-                            remaining_budget -= emitted as u64;
-                            extents.push(carrick_kernel::core_dump::CoreExtent {
-                                offset: seg_offset + address - map.start + run.start as u64,
-                                bytes: bytes[run.start..run.start + emitted].to_vec(),
-                            });
-                        }
+                        append_core_bytes(
+                            &mut extents,
+                            &mut remaining_budget,
+                            CoreFileOffset(seg_offset + address - map.start),
+                            &bytes,
+                        );
                         consumed += to_read;
                     }
                 }
@@ -773,6 +792,106 @@ mod tests {
     use carrick_kernel::dispatch::SyscallDispatcher;
     use parking_lot::Mutex;
     use std::time::Duration;
+
+    mod serial_host {
+        use super::*;
+
+        /// N1 row 26: an owner Snapshot must reject an unauthenticated MM,
+        /// rather than silently publishing an incomplete thread census.
+        #[test]
+        fn n1_snapshot_includes_parked_el1_registers() {
+            // Keep the existing sparse serialization/work witness in this
+            // contract: a 64 GiB VMA reads only its three resident pages.
+            capture_core_sparse_large_vma_reads_only_materialized_subranges_and_preserves_filesz();
+
+            struct Region(Vec<u8>);
+            impl Drop for Region {
+                fn drop(&mut self) {
+                    carrick_kernel::el1_zone::enable(false);
+                    carrick_el1_abi::record_el1_region_host_ptr(0);
+                }
+            }
+            let region = Region(vec![0; carrick_el1_abi::EL1_REGION_SIZE as usize]);
+            carrick_el1_abi::record_el1_region_host_ptr(region.0.as_ptr() as usize);
+            carrick_kernel::el1_zone::enable(true);
+            let (process, root) = crate::hvpatch::process_context_for_tests(70_280);
+            let plan = carrick_kernel::kernel::ClonePlan::from_flags(
+                carrick_abi::LinuxCloneFlags::THREAD
+                    | carrick_abi::LinuxCloneFlags::SIGHAND
+                    | carrick_abi::LinuxCloneFlags::VM,
+            )
+            .unwrap();
+            let sibling = process
+                .kernel_graph()
+                .reserve_thread_clone(&root, plan, None)
+                .unwrap()
+                .prepare(ThreadId::synthetic_for_tests(70_281))
+                .unwrap()
+                .commit()
+                .unwrap()
+                .start_thread()
+                .unwrap()
+                .into_context();
+            let key = sibling.thread().key();
+            let mm = root.shared().mm().id().raw();
+            let zone = carrick_el1_abi::zone_tables().unwrap();
+            let record = zone
+                .alloc_record(carrick_el1_abi::ThreadIdentity {
+                    tid: u64::try_from(key.tid.raw()).unwrap(),
+                    serial: key.serial.raw(),
+                    mm,
+                    file_table: 0,
+                    generation: 0,
+                    affinity: 0,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
+            let mut ctx = carrick_el1_abi::ThreadCtx::ZERO;
+            ctx.x[0] = 0x5a5a;
+            ctx.pc = 0x4000;
+            ctx.pstate = 0x6000_0000;
+            // SAFETY: this new record has not been published to any executor.
+            unsafe { *zone.record(record).ctx_mut() = ctx };
+            let guard = zone
+                .lock(
+                    carrick_el1_abi::ZoneTables::bucket_of(mm, 0x1000),
+                    &carrick_kernel::el1_zone::HostLockWait,
+                )
+                .unwrap();
+            let seq = zone.next_seq(record);
+            zone.enqueue(&guard, record, seq, mm, 0x1000, u32::MAX, 0)
+                .unwrap();
+            zone.publish_park(record, seq);
+            drop(guard);
+            let authority = carrick_kernel::kernel::CrashCaptureAuthority::default();
+            let generation = authority.issue().unwrap();
+            root.thread()
+                .publish_crash_registers(generation, carrick_hal::Aarch64CoreRegisters::default());
+            let quorum =
+                carrick_kernel::kernel::CrashQuorum::open(Arc::clone(root.task()), generation, mm);
+            let carrick_kernel::kernel::CrashQuorumPoll::Complete(files) = quorum.poll() else {
+                panic!("the exact parked EL1 thread must answer without a host vote");
+            };
+            assert_eq!(files.len(), 2);
+            let parked = files.iter().find(|file| file.tid == key.tid).unwrap();
+            assert_eq!(parked.registers.gprs[0], 0x5a5a);
+            assert_eq!(parked.registers.resume_pc, 0x4000);
+
+            let unauthenticated = carrick_kernel::kernel::CrashQuorum::open(
+                Arc::clone(root.task()),
+                generation,
+                mm.checked_add(1).unwrap(),
+            );
+            assert!(
+                !matches!(
+                    unauthenticated.poll(),
+                    carrick_kernel::kernel::CrashQuorumPoll::Complete(_)
+                ),
+                "Snapshot must refuse a mismatched MM instead of publishing only the host vote"
+            );
+        }
+    }
 
     fn register_crash_test_vcpu(
         registry: &dyn VcpuRegistry,
