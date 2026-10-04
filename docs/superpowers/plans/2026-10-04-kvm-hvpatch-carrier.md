@@ -603,12 +603,18 @@ trait NativeContextStore {
     fn lend_on_cpu(&mut self, record: RecordRef, slot: SlotId)
         -> Result<&mut Self::SavedContext, ContextRefusal>;
 }
+// Export the existing sched.rs publish_identity body; do not copy it to x86.
+pub fn publish_identity(task: &CurrentTask, id: ThreadIdentity);
 ```
 
 `ContextRefusal` must distinguish stale record/context generation, closed MM
 admission and unsupported CPU state. Owner-issued root/generation receipts
 must qualify `AddressContext<RootGpa>` before its no-PCID CR3 installation;
 matching a fixture `SpaceGrant.ttbr0` alone does not establish N1 authority.
+The common scheduler keeps its existing `publish_identity` call after each
+admitted native-context load, including lifecycle/control-slot and serial
+restoration. The preparation witness's second task is compute-only; it does
+not claim common syscall identity publication after switching to that task.
 The existing guest-arch `InterruptBackend` signatures remain the target:
 `arm_timer(Option<Deadline>)`, `send_wake(CpuTarget, WakeToken)` and
 `end_interrupt(InterruptAck<HardwareInterrupt>)`. Bind counter/frequency and
