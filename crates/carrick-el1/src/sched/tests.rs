@@ -785,8 +785,8 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
         CurrentTask::new(),
         task_for(101),
     ];
-    host_publish(&zone, SLOT, MM, None, 0);
-    let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
+    host_publish(zone, SLOT, MM, None, 0);
+    let b = host_park(zone, 202, uaddr, thread_ctx(0xB, uaddr));
     let counters = Counters::default();
     // fd 3 of the task's file table is a delegated file EL1 serves lseek on.
     let fd_map = [FdMapSlot::new()];
