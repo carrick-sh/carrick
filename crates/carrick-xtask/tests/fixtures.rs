@@ -318,6 +318,35 @@ fn installed_manifest_and_missing_installed_file_fail_closed() {
     write(f.repo.path(), fixtures::INSTALLED_MANIFEST, b"{}");
     assert!(fixtures::verify_installed(f.repo.path()).is_err());
 }
+
+#[test]
+fn signed_preflight_rejects_existing_directories_without_manifest() {
+    let f = Fixture::new();
+    for target in ["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"] {
+        fs::create_dir_all(
+            f.repo
+                .path()
+                .join("conformance-probes/target")
+                .join(target)
+                .join("release"),
+        )
+        .unwrap();
+    }
+    assert!(carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).is_err());
+}
+
+#[test]
+fn signed_preflight_rehashes_restored_executables() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).unwrap();
+    write(
+        f.repo.path(),
+        &f.manifest.executables[0].path,
+        b"stale executable",
+    );
+    assert!(carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).is_err());
+}
 #[test]
 fn identities_reject_abbreviations_and_non_hex_values() {
     assert!(CommitSha::try_from("HEAD".to_owned()).is_err());

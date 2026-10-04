@@ -772,6 +772,15 @@ fn run_command_redirect(
     Ok((extract_exit_code(&status).into(), duration_s))
 }
 
+pub fn verify_signed_fixtures(root: &Path) -> Result<(), AcceptError> {
+    crate::fixtures::verify_installed(root).map_err(|error| {
+        AcceptError::Failed(format!(
+            "signed fixture provenance: {error}; restore an exact-HEAD bundle with xtask fixtures restore --manifest <path>"
+        ))
+    })?;
+    Ok(())
+}
+
 pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptError> {
     args.phase = profile_phase(args.profile, args.phase)?;
     // remote-accept holds its checkout lock first. Hold the host lease across
@@ -893,8 +902,10 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
         }
     }
 
-    // 2. Signed Phase
-    if matches!(args.phase, AcceptPhase::Signed | AcceptPhase::All) {
+    // Fail before signing or guest execution, while preserving a FAIL receipt.
+    let signed_requested = matches!(args.phase, AcceptPhase::Signed | AcceptPhase::All);
+    let mut fixtures_valid = false;
+    if signed_requested {
         if std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64" {
             return Err(AcceptError::UnsupportedPlatform(format!(
                 "{}-{} (signed phase requires macOS aarch64)",
@@ -902,7 +913,43 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 std::env::consts::ARCH
             )));
         }
+        let start = Instant::now();
+        let result = verify_signed_fixtures(&root);
+        fixtures_valid = result.is_ok();
+        let error = result.err().map(|error| error.to_string());
+        let log_path = run_dir.join("signed-00-fixtures.log");
+        let message = if let Some(error) = &error {
+            failures.push(error.clone());
+            error.clone()
+        } else {
+            let receipt_hash =
+                crate::provision::compute_sha256(&root.join(crate::fixtures::INSTALLED_MANIFEST))
+                    .map_err(|source| AcceptError::Io {
+                    path: root.join(crate::fixtures::INSTALLED_MANIFEST),
+                    source,
+                })?;
+            format!(
+                "all signed-tier fixture hashes verified for {head}; installed receipt sha256={receipt_hash}"
+            )
+        };
+        fs::write(&log_path, &message).map_err(|source| AcceptError::Io {
+            path: log_path.clone(),
+            source,
+        })?;
+        println!("  fixtures: {message}");
+        step_results.push(StepResult {
+            name: "fixtures".into(),
+            command: "xtask fixtures verify".into(),
+            exit_code: Some(if fixtures_valid { 0 } else { 1 }),
+            log_path,
+            duration_s: start.elapsed().as_secs_f64(),
+            passed: fixtures_valid,
+            error,
+        });
+    }
 
+    // 2. Signed Phase
+    if signed_requested && fixtures_valid {
         println!("--- Signed phase starting (profile: {}) ---", args.profile);
 
         // Signed Step 1: just build + artifact inspection
@@ -1013,22 +1060,6 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                 passed,
                 error,
             });
-        }
-
-        // Signed Step 2: probe binaries check for musl and gnu (in full profile)
-        if args.profile == AcceptProfile::Full {
-            for target in ["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"] {
-                let release_dir = root
-                    .join("conformance-probes/target")
-                    .join(target)
-                    .join("release");
-                if !release_dir.is_dir() {
-                    let msg = format!(
-                        "probe binaries missing for {target}: run scripts/build-probes.sh (Docker)"
-                    );
-                    failures.push(msg.clone());
-                }
-            }
         }
 
         // Signed Step 3: el1-embed (carrick-embed el1_) vs allowlist
