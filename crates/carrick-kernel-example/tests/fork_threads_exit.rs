@@ -32,22 +32,52 @@ use carrick_kernel_example::{ScriptedBackend, Step, await_parked, last_child, sl
 /// Budget: exactly one read admission, no redispatch or retry after retirement.
 #[test]
 fn fork_parent_exit_between_pipe_wait_admission_and_continuation_build() {
+    admitted_pipe_wait_after_parent_exit(sys::read(slot(0), 1).ret(1), false);
+}
+
+#[test]
+fn fork_parent_exit_between_pipe_write_admission_and_continuation_build() {
+    admitted_pipe_wait_after_parent_exit(sys::write(slot(1), b"x").ret(1), true);
+}
+
+#[test]
+fn fork_parent_exit_between_pipe_readv_admission_and_continuation_build() {
+    use carrick_kernel_example::{Layout, Operand, RelocWidth, Syscall};
+    let iov = Layout::new(16)
+        .with_reloc(0, RelocWidth::U64, Operand::Out(1))
+        .with_u64(8, 1);
+    let readv = Syscall::new(
+        "readv",
+        carrick_abi::syscall::nr::READV,
+        [slot(0), iov.into(), 1.into(), 0.into(), 0.into(), 0.into()],
+    )
+    .ret(1);
+    admitted_pipe_wait_after_parent_exit(readv, false);
+}
+
+fn admitted_pipe_wait_after_parent_exit(wait: carrick_kernel_example::Syscall, fill: bool) {
     let admitted = ScriptCheckpoint::default();
     let resume = ScriptCheckpoint::default();
     let child_live = ScriptCheckpoint::default();
     let child_exit = ScriptCheckpoint::default();
     let retired = ScriptCheckpoint::default();
-    let script = vec![
-        Step::Sys(
-            sys::pipe2(0)
-                .ret(0)
-                .save_out_i32(0, 0, 0)
-                .save_out_i32(0, 1, 1),
-        ),
+    let label = wait.label;
+    let mut script = vec![Step::Sys(
+        sys::pipe2(0)
+            .ret(0)
+            .save_out_i32(0, 0, 0)
+            .save_out_i32(0, 1, 1),
+    )];
+    if fill {
+        script.push(Step::Sys(
+            sys::write(slot(1), &vec![0x33; 65536]).ret(65536),
+        ));
+    }
+    script.extend([
         Step::Sys(sys::clone_thread(0)),
         Step::ChildMarker(vec![
             Step::SysBeforeContinuation {
-                syscall: sys::read(slot(0), 1).ret(1),
+                syscall: wait,
                 admitted: admitted.clone(),
                 resume: resume.clone(),
             },
@@ -66,7 +96,7 @@ fn fork_parent_exit_between_pipe_wait_admission_and_continuation_build() {
         Step::Sys(sys::wait4(last_child(), 0)),
         // Retire the last fd-table owners while the sibling holds its outcome.
         Step::Sys(sys::exit_group(0)),
-    ];
+    ]);
     let handle = std::thread::spawn({
         let retired = retired.clone();
         move || {
@@ -86,10 +116,13 @@ fn fork_parent_exit_between_pipe_wait_admission_and_continuation_build() {
     let report = result.expect("retired sibling must cancel, never return Unsupported");
     assert_eq!(report.exit_code(), 0);
     assert_eq!(report.tasks_started(), 3);
-    assert_eq!(report.dispatches_for_tid(2, "read"), 1);
+    assert_eq!(report.dispatches_for_tid(2, label), 1);
     assert!(
-        report.completions().iter().all(|row| row.label != "read"),
-        "exit_group tears down the read instead of returning a guest result"
+        report
+            .completions()
+            .iter()
+            .all(|row| row.tid != 2 || row.label != label),
+        "exit_group tears down the admitted I/O instead of returning a guest result"
     );
 }
 
