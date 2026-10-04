@@ -543,6 +543,117 @@ both-root shared retirement. Full verification and receipts are recorded below
 when completed; remote host receipt is **director-queued**, and macOS signed,
 Docker and accepted N1/M5 integration remain director-owned.
 
+#### M3 stacked checkpoint and N1 grant-service handoff (2026-10-04)
+
+`work/x86-m3` is stacked on `work/n1`, with batch-4 M2 prerequisites and
+M3 descriptor/backing preparation cherry-picked preserving their authors.
+This checkpoint proposes the following **N1 seam changes for n1f integration**:
+
+- `carrick-el1/src/personality/mm_portal/production.rs`: parameterize the
+  existing `MmPortal` by `OwnerMmu` (ARM default); the same selection,
+  revalidation, prepared permit, completion and cancellation bodies serve
+  both descriptor backends. ARM translation/COW classification moves once
+  to `carrick-mmu-core/src/owner_mmu.rs`; x86 supplies hardware interpretation.
+- `carrick-el1/src/personality/mm_portal/fork.rs`: parameterize the existing
+  census, prepare, publish, commit/abort and unpublished capsule by
+  `OwnerForkMmu`. Reservation inheritance, physical custody selection,
+  closed-child admission, exact certificate, rollback and generation policy
+  remain in that one implementation. ARM keeps its private control window;
+  x86 preserves supervisor entry tables without inventing another MM graph.
+- `carrick-el1/src/personality/mm_portal/mod.rs` and `tests.rs`: register the
+  x86 native witness and share existing test-only fork fixtures.
+- `carrick-el1/src/lib.rs`: export the no_std owner hardware interface to
+  both thin images. The production x86 portal remains excluded pending the
+  grant-service handoff below. `alloc.rs` and `sched/object_wait.rs` are
+  unchanged: changing only their exports cannot unblock the ARM-only grant
+  service imports. No first-load/copyout/recvfrom grant code is changed.
+
+`CarrierMemory::retain_output(FrameGpa, usize) -> Result<RetainedX86Data<'_>,
+MemoryError>` implements the existing N1 `TransferPin` protocol. Its borrow
+keeps the exact memslot registration alive through permit settlement; copy
+requires the owner-issued `PortalCopyRequest`, exact physical output, slot
+incarnation, VM generation and frame-owner generation. Physical retention
+never grants reservation or VA authority. No new transfer cursor/permit policy
+or VM-wide shared-zero source is introduced.
+
+**Director boundary:** stop CPL0 production owner serving at n1f's active
+fault/reservation grant services. These are the precise remaining interfaces:
+
+```rust
+// production.rs: reusable policy after architecture imports are enabled.
+// Method on MmPortal<'a, P: PinnedMetadataExtent, B: OwnerMmu>.
+pub fn select<W: LiveDescriptorWords + ?Sized, R: PreparedPageResolver, C: CowResolver>(
+    &self, continuation: &TransferContinuation, words: &W,
+    prepared: &mut R, cow: &mut C, residency: &FrameGrantResidencyTable,
+    slot: u32,
+) -> Result<TransferStep, MmError>;
+pub fn prepare_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized, B: OwnerMmu>(
+    portal: &MmPortal<'_, P, B>, request: PortalTransferRequest,
+    words: &W, slot: u32,
+) -> Result<Option<PortalPreparedPermit>, MmError>;
+pub fn serve_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized, B: OwnerMmu>(
+    portal: &MmPortal<'_, P, B>, service: PortalTransferService<'_>,
+    words: &W, slot: u32, host_copy: impl FnOnce(),
+) -> Result<(), MmError>;
+
+// Existing grant service: NOT shared as-is; currently ARM wire/editor/receipt.
+pub fn serve_grant<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
+    portal: &MmPortal<'_, P, Aarch64Mmu>, slot: &PortalGrantSlot,
+    words: &W, residency: &FrameGrantResidencyTable, worker: u32,
+    invalidate: impl FnOnce(),
+) -> Option<aarch64::descriptor_txn::DescriptorReceipt>;
+
+// Existing fault resolver interfaces; x86 needs backend implementations,
+// preserving the one reservation/supply policy, not copying these services.
+fn PreparedPageResolver::commit_prepared(
+    &mut self, root_register: u64, va: u64, expected_ipa: u64,
+    access: LeafAccess,
+) -> Result<GuestPreparedCommit, GuestPreparedCommitError>;
+fn CowResolver::resolve_cow_outcome(
+    &mut self, root_register: u64, mm_key: u64, fault_va: u64,
+) -> CowResolution;
+fn CowResolver::executable_publication(&self) -> bool;
+fn CowResolver::take_cow_completion(&mut self) -> Option<CowGrantCompletion>;
+```
+
+`serve_grant` authenticates the exact reservation fault window, publishes its
+residency identity, applies `DescriptorOp::Prepare` and settles the submission.
+Those policy steps must stay common. Its `PortalGrantSlot` embeds an ARM
+`DescriptorTxnSlot`; retired-leaf recognition, Prepare encoding, unlinked table
+grants, transaction outcome and receipt are ARM-shaped. It needs a coordinated
+backend/wire seam, using x86's existing rollback-capable Map/Publish operations
+as **one** publication, not two independently accepted edits. Its signature
+cannot simply accept `X86Mmu` today. Preserve exact physical inventory readiness
+and receipt settlement, and N1's retained-byte/extent/compound budgets.
+
+`select_transfer_hw`, `serve_transfer_hw`, `serve_grant_hw` and
+`bind_transfer_hw` each currently take `&mut carrick_el1_abi::TrapFrame` and
+use ARM stack/TTBR/HVC hooks. `serve_fork_hw` and `finish_fork_hw` have the same
+ARM-shaped signature. Their thin entry/maintenance transport cannot be reused
+as-is by CPL0; call the existing common policy with normalized x86 entry and
+root/permit/receipt identity. No fake ARM frame or host semantic fallback.
+The x86 freestanding library also needs the existing allocator and scheduler
+notification exports (`space_access`, `deliver_completion`) behind real x86
+hardware hooks. Those exports depend on the grant services and are not enabled
+by substituting `host-test` or source-free admissions in a production image.
+
+Evidence at this checkpoint: native transfer and fork witnesses use the actual
+N1 production reservations/address spaces at 16/64/256 pages; transfer checks
+exactly eight descriptor loads per touched page with 512 unrelated mappings.
+Both were red with ARM hardware interpretation before the shared seam. Two
+real KVM roots are then read through N1's owner-issued copy protocol and retain
+distinct bytes. Omitting the physical output check is a discriminating red
+for a valid pin belonging to the other MM. The existing KVM first-touch, COW,
+NX/protection, rollback, generation reuse and drain fixtures remain hardware
+proofs; they do not execute the production owner in CPL0.
+
+**Still open:** CPL0 production owner execution, owner Grant/Fork physical
+inventory callbacks (the preparation fixtures remain callbacks), Exec/Capacity
+composition, stopped-MM transfers with every production executor lease
+occupied, root-arena retirement, ARM signed gates and same-image Docker timing.
+This checkpoint does not check off M3 or any whole-N1 acceptance rung. No
+Docker is run; receipts and draft PR are reported after foreground gates.
+
 ### M4 — shared scheduler, timer/wake and IPC on CPL0
 
 **Fence:** new x86 `cpl0_scheduler.rs`/`interrupts.rs`, KVM
