@@ -33,3 +33,14 @@ batch. The corrected script sends one byte after each child iteration; the
 parent drains them only after its own batch. The actors' namespace operations
 remain concurrent, and the existing five-second bound now diagnoses lack of
 progress for one iteration rather than cumulative batch time.
+
+The host-backed namespace publication matrix used the same completion shape,
+so it receives the same per-iteration protocol. The backend's final child
+join also used one deadline for the whole vector of children despite its
+per-child contract; each child now receives its own unchanged bound.
+
+Audit boundary: `drive` bounds a single syscall episode and `await_parked`
+bounds one enrollment. `ScriptCheckpoint::wait` in the N2 population fixtures
+(`n2_task_lifecycle.rs` and `n2_creation.rs`) can still cover up to 32 clone
+admissions in one phase; they need a separate progress-aware checkpoint
+contract before a loaded host verdict for those fixtures is authoritative.
