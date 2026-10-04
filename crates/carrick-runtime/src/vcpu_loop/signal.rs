@@ -433,15 +433,19 @@ pub(super) fn resolve_owner_file_fault(
     let completed = engine
         .service_owner_file_fault(mm_key, generation)?
         .ok_or_else(|| TrapError::Hypervisor("owner file fault selection was displaced".into()))?;
-    publish_frame_grant_refusal(
-        mailbox,
-        request,
-        if completed == carrick_hal::OwnerFileFaultOutcome::Resolved {
-            carrick_el1_abi::FRAME_GRANT_ERR_STALE
-        } else {
-            carrick_el1_abi::FRAME_GRANT_ERR_DENIED
-        },
-    );
+    if completed == carrick_hal::OwnerFileFaultOutcome::Resolved {
+        if !mailbox.complete_resolved_owner_fault(request) {
+            carrick_fatal::carrick_fatal!(
+                "hvpatch::owner_file_fault",
+                "resolved owner file grant lost exact mailbox claim: mm={} generation={} fault=0x{:x}",
+                request.mm_key,
+                request.request_generation,
+                request.fault_va,
+            );
+        }
+    } else {
+        publish_frame_grant_refusal(mailbox, request, carrick_el1_abi::FRAME_GRANT_ERR_DENIED);
+    }
     Ok(Some(completed))
 }
 
