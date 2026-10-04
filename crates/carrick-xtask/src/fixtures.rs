@@ -14,6 +14,13 @@ use crate::{command, probe_inventory, provision};
 const SCHEMA: &str = "carrick.fixtures.v1";
 pub const INSTALLED_MANIFEST: &str = "target/fixtures/installed.json";
 const INPUTS: &[&str] = &[
+    // The EL1 scheduler fixture depends on workspace path crates. Hash the
+    // tracked workspace conservatively, including root dependency/patch and
+    // lint declarations, so adding a transitive local crate cannot escape
+    // provenance without needing Cargo or a registry on the restore host.
+    "Cargo.toml",
+    "Cargo.lock",
+    "crates",
     "conformance-probes",
     "fixtures/linux-aarch64-hello",
     "fixtures/embed-interceptor-probe",
@@ -27,9 +34,6 @@ const INPUTS: &[&str] = &[
     "scripts/build-embed-el1-sched.sh",
     "rust-toolchain.toml",
     ".cargo/config.toml",
-    "crates/carrick-xtask/src/fixtures.rs",
-    "crates/carrick-xtask/src/provision.rs",
-    "crates/carrick-xtask/src/probe_inventory.rs",
 ];
 const EMBED: &[(&str, &str)] = &[
     ("embed-interceptor-probe", "interceptor-probe"),

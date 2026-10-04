@@ -46,6 +46,10 @@ Build requires the full current HEAD SHA and clean fixture source inputs. It
 builds in a fresh `git archive` snapshot: an old executable or Cargo target
 cache cannot stand in for a fresh output. Cargo locks, Cargo configuration,
 fixture sources, probe inventory, build scripts, and compiler pin are hashed.
+The source inventory conservatively includes all tracked workspace crates and
+root Cargo manifests/lockfile: the EL1 scheduler fixture has local path
+dependencies, whose source changes must also invalidate verification. Restore
+does not need Cargo metadata resolution or registry access for this check.
 The manifest also records `rustc -vV`, Cargo, GNU linker identity, target triple
 per executable, and SHA-256 of every executable. Builds check that the
 checkout and snapshot still agree before publishing.
