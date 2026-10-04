@@ -1,0 +1,654 @@
+{
+  "schema_version": 1,
+  "generator_version": 2,
+  "seed": 637,
+  "source_hash": "63f2e720e23c8e4029ed5cb3a0268fb631dd7a6369b648ae415413f522813bd7",
+  "fixture_hash": "5dc969a4d055328d71984baf24ad74987fbc6445f98bb3021e129cf83dae7b06",
+  "backend": "kernel-example/linux/x86_64",
+  "scale": 1,
+  "decisions": [
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "step",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "step",
+      "visit": 1,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "dispatch-unlocked",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "step",
+      "visit": 2,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      },
+      "point": "step",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "dispatch-unlocked",
+      "visit": 1,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "continuation-build",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      },
+      "point": "await-parked",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "wait-enrolled",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      },
+      "point": "step",
+      "visit": 1,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      },
+      "point": "dispatch-unlocked",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "wait-resumed",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "step",
+      "visit": 3,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "dispatch-unlocked",
+      "visit": 2,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "fd-drained",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "terminal-unlocked",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "terminal-published",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "finish",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      },
+      "point": "finish",
+      "visit": 0,
+      "runnable": [],
+      "next": null
+    }
+  ],
+  "result": "wake-completed=false",
+  "work_snapshot": {
+    "values": {
+      "kernel_dispatches": 4,
+      "kernel_redispatches": 0,
+      "continuation_enrollments": 1,
+      "continuation_parks": 1,
+      "wake_publications": 1,
+      "continuation_resumes": 1,
+      "guest_memory_read_bytes": 0,
+      "guest_memory_write_bytes": 0,
+      "guest_memory_copy_bytes": 0,
+      "guest_memory_zero_bytes": 0,
+      "backing_materialized_bytes": 0,
+      "vfs_backend_operations": 0,
+      "directory_entries_visited": 0,
+      "host_backend_calls": 0,
+      "namespace_path_visits": 0,
+      "host_namespace_mutation_opens": 0,
+      "host_write_position_queries": 0,
+      "page_table_edits": 0,
+      "page_table_invalidations": 0,
+      "page_table_image_allocations": 0,
+      "host_mapping_allocations": 0,
+      "fork_projection_rows_visited": 0,
+      "inotify_queue_visits": 0,
+      "backing_allocations": 0,
+      "task_admissions": 0,
+      "vcpu_admissions": 0,
+      "vcpu_releases": 0,
+      "vcpu_migrations": 0,
+      "futex_queue_visits": 2,
+      "futex_waiters_woken": 1,
+      "hvf_syscall_exits": 0,
+      "portal_requests": 0,
+      "portal_completions": 0,
+      "portal_fallbacks": 0,
+      "portal_stale_rejects": 0,
+      "host_heap_allocations": 0,
+      "native_activation_leaf_checks": 0,
+      "native_data_activations": 0,
+      "native_code_words": 0,
+      "native_code_invalidation_pages": 0,
+      "mm_snapshot_collections": 0,
+      "foreign_owner_pins": 0,
+      "alias_rows_visited": 0,
+      "task_mapping_rows_visited": 0,
+      "frame_extents_visited": 0,
+      "allocator_bins_checked": 0,
+      "allocator_blocks_inspected": 0,
+      "allocator_splits_performed": 0,
+      "allocator_merges_performed": 0,
+      "allocator_capacity_bytes": 0,
+      "child_exit_notification_thread_visits": 0,
+      "child_exit_notification_wake_attempts": 0,
+      "child_exit_notification_wake_deliveries": 0
+    },
+    "dropped_events": 0,
+    "unknown_metrics": []
+  }
+}

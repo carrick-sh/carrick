@@ -663,7 +663,19 @@ impl Task {
                             )));
                         }
                     };
-                    shared.await_parked(resolved_id, label, WAIT_BOUND)?;
+                    if let Some(schedule) = &shared.schedule {
+                        while !shared
+                            .parked_notifications
+                            .lock()
+                            .contains(&(resolved_id, *label))
+                        {
+                            schedule
+                                .point(self.schedule_actor(), crate::schedule::Point::AwaitParked)
+                                .map_err(ExampleError::Schedule)?;
+                        }
+                    } else {
+                        shared.await_parked(resolved_id, label, WAIT_BOUND)?;
+                    }
                 }
                 Step::Sys(syscall) | Step::SysBeforeContinuation { syscall, .. } => {
                     let (args, outs) = self.resolve(syscall)?;

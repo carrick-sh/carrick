@@ -229,6 +229,8 @@ pub(crate) fn drive(
         task.context = fresh;
         let tid = task.context.thread().registry_id();
 
+        #[cfg(debug_assertions)]
+        let parked_before_wake = shared.schedule.as_ref().map_or(0, |s| s.parked_count());
         let (mut outcome, request) = {
             let disp = task.dispatcher.lock();
             if !task.is_live() {
@@ -271,6 +273,17 @@ pub(crate) fn drive(
             )?;
             (outcome, request)
         };
+        #[cfg(debug_assertions)]
+        if let Some(schedule) = &shared.schedule
+            && syscall.nr == carrick_abi::syscall::nr::FUTEX
+            && args[1] & carrick_abi::LINUX_FUTEX_CMD_MASK == carrick_abi::LINUX_FUTEX_WAKE
+            && matches!(outcome, DispatchOutcome::Returned { value } if value > 0)
+            && parked_before_wake > 0
+        {
+            schedule
+                .await_wake_publication(task.schedule_actor(), parked_before_wake)
+                .map_err(ExampleError::Schedule)?;
+        }
         crate::schedule_point!(shared, task, crate::schedule::Point::DispatchUnlocked);
 
         loop {
@@ -453,22 +466,28 @@ pub(crate) fn drive(
                         return Err(ExampleError::WaitTimedOut(syscall.label));
                     }
 
+                    #[cfg(debug_assertions)]
+                    if let Some(schedule) = &shared.schedule {
+                        schedule
+                            .park(task.schedule_actor())
+                            .map_err(ExampleError::Schedule)?;
+                    }
+
                     // Drive wait service event on host thread. Note: `shared.wake_active_tokens_for_task`
                     // calling `publish_ready` for a retired task is transport notification only:
                     // it prompts this host thread loop to wake and observe exact liveness/retirement.
-                    if shared.schedule.is_some() {
-                        shared.unregister_active_token(token);
-                        let _ = continuation.cancel(CancellationCause::ServiceShutdown);
-                        return Err(ExampleError::Schedule(
-                            "external readiness is not admitted in scheduled scenarios".into(),
-                        ));
-                    }
                     let event_result = block_on_timeout_with_scope(
                         shared.wait_service.event(token),
                         remaining,
                         Some(&shared.work_scope),
                     );
                     shared.unregister_active_token(token);
+                    #[cfg(debug_assertions)]
+                    if let Some(schedule) = &shared.schedule {
+                        schedule
+                            .unpark(task.schedule_actor())
+                            .map_err(ExampleError::Schedule)?;
+                    }
                     let Some(event_result) = event_result else {
                         let _ = continuation.cancel(CancellationCause::ServiceShutdown);
                         return Err(ExampleError::WaitTimedOut(syscall.label));
