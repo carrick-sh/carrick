@@ -22,7 +22,6 @@ const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 /// A lent caller vCPU bound to one authenticated target MM.
 pub(crate) struct ForeignEl1Publisher<'a> {
-    _legacy: carrick_guest_mem::LegacyProtectionRead<'a>,
     caller: &'a mut dyn carrick_guest_mem::CallerEl1Call,
     /// The target ASID generation's admission for the borrowed-TTBR0
     /// windows: it lives until this publisher drops, so the target cannot
@@ -33,6 +32,9 @@ pub(crate) struct ForeignEl1Publisher<'a> {
     mm_key: std::num::NonZeroU64,
     root: u64,
     ttbr0: u64,
+    // Struct fields drop in declaration order. Keep admission cleanup and
+    // retained table authority inside the legacy borrow's lifetime.
+    _legacy: carrick_guest_mem::LegacyProtectionRead<'a>,
 }
 
 impl<'a> ForeignEl1Publisher<'a> {
@@ -158,10 +160,10 @@ impl carrick_aarch64::descriptor_drain::GuestDrainVenue for ForeignEl1Publisher<
 /// the exact-target invalidator, or EL1 publication through the lent vCPU.
 pub(crate) enum ForeignStage1Services<'a> {
     Host {
-        _legacy: carrick_guest_mem::LegacyProtectionRead<'a>,
         invalidator: &'a mut dyn carrick_hal::ForeignMmInvalidator,
         binding: carrick_hal::ForeignMmBinding,
         deadline: std::time::Instant,
+        _legacy: carrick_guest_mem::LegacyProtectionRead<'a>,
     },
     Guest(ForeignEl1Publisher<'a>),
 }
