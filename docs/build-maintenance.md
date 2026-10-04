@@ -122,7 +122,10 @@ by the deletion shell and utilities, so killing the Perl parent cannot release
 exclusion while a deletion child remains alive. The local and remote host
 lease descriptors also follow deletion children. Root-visible lsof exempts
 only the two exact exclusively held Cargo lock paths; every artifact stays
-visible even when opened by a guardian process.
+visible even when opened by a guardian process. The census explicitly requests
+process, descriptor and name fields (`lsof -F pfn`), validating complete file
+records at descriptor and process boundaries. Unrelated files, cwd/mappings,
+unknown fields and incomplete or duplicate records keep the target.
 All accounting utilities are checked before scanning; failed or invalid byte
 accounting stops before unlinking the candidate. It uses the same root-visible
 lsof checks as worktree cleanup. Run from another checkout when pruning a target containing the

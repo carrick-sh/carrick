@@ -32,11 +32,28 @@ impl Drop for CheckoutGuard {
     }
 }
 
-// lsof exit 1 with no output/warnings is the only evidence of idle. A regular
-// file uses a file query, whereas +D includes recursive directory mappings.
+// An empty census or complete records for exclusively held native locks prove
+// idle. A file query and +D both retain warnings as unknown visibility.
+const LOCK_FIELD_PARSER: &str = r#"
+    /^p[1-9][0-9]*$/ {
+        if (pid && (!file || !name)) bad=1;
+        pid=substr($0,2); file=0; name=0; next
+    }
+    /^f[0-9]+$/ {
+        if (!pid || (file && !name) || descriptors[pid SUBSEP $0]++) bad=1;
+        file=1; name=0; next
+    }
+    /^n/ {
+        if (!pid || !file || name || (substr($0,2)!=debug && substr($0,2)!=release)) bad=1;
+        name=1; seen=1; next
+    }
+    { bad=1 }
+    END { exit (bad || !seen || !file || !name) ? 1 : 0 }
+"#;
+
 const IDLE_CENSUS: &str = r#"
 idle() {
-    if [ -d "$1" ]; then set -- -F pn +D "$1"; else set -- -F pn "$1"; fi
+    if [ -d "$1" ]; then set -- -F pfn +D "$1"; else set -- -F pfn "$1"; fi
     if [ "$uid" = 0 ]; then
         if "$lsof_bin" "$@" > "$state/use.out" 2> "$state/use.err"; then code=0; else code=$?; fi
     else
@@ -48,10 +65,7 @@ idle() {
     # Inherited guardians appear in the target census. Exempt only the two
     # exact native lock paths held exclusively; keep every artifact visible.
     awk -v debug="${CARRICK_PRUNE_TARGET:-}/debug/.cargo-lock" -v release="${CARRICK_PRUNE_TARGET:-}/release/.cargo-lock" '
-        /^p[0-9]+$/ { if (pid && !names) bad=1; pid=1; names=0; next }
-        /^n/ { if (!pid || (substr($0,2)!=debug && substr($0,2)!=release)) bad=1; names++; seen=1; next }
-        { bad=1 }
-        END { exit (bad || !seen || !names) ? 1 : 0 }
+        LOCK_FIELD_PARSER
     ' "$state/use.out"
 }
 "#;
@@ -123,6 +137,7 @@ fn pruning_body_with_census(
     apply: bool,
     idle_census: &str,
 ) -> Result<String, GcError> {
+    let idle_census = idle_census.replace("LOCK_FIELD_PARSER", LOCK_FIELD_PARSER);
     let older_than = days
         .checked_sub(1)
         .filter(|_| days <= i32::MAX as u64)
@@ -330,6 +345,138 @@ mod tests {
             )
             .unwrap();
         (target, file)
+    }
+
+    fn real_lock_census(target: &Path) -> String {
+        let shell = format!(
+            "lsof_bin=$(command -v lsof) || exit 1; sudo -n -u root \"$lsof_bin\" -F pfn +D {}",
+            shell_quote(target.to_str().unwrap())
+        );
+        let output = Command::new("/usr/bin/perl")
+            .args(["-e", CARGO_TARGET_LOCKS])
+            .arg(target)
+            .args(["/bin/sh", "-c", &shell])
+            .output()
+            .unwrap();
+        assert!(
+            matches!(output.status.code(), Some(0 | 1)),
+            "real lsof failed: {output:?}"
+        );
+        assert!(output.stderr.is_empty(), "real lsof warnings: {output:?}");
+        let census = String::from_utf8(output.stdout).unwrap();
+        for field in ['p', 'f', 'n'] {
+            assert!(
+                census.lines().any(|line| line.starts_with(field)),
+                "missing {field} in real census: {census}"
+            );
+        }
+        census
+    }
+
+    fn assert_real_idle_target_pruned(alias: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let checkout = root.join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let (target, artifact) = old_artifact(&checkout);
+        let census = real_lock_census(&target);
+        let input = if alias {
+            let link = root.join("worktree-alias");
+            symlink(&checkout, &link).unwrap();
+            link.join("target")
+        } else {
+            target
+        };
+        let body = pruning_body(&[input], 2, true).unwrap();
+        let output = Command::new("/bin/sh")
+            .args(["-c", &body])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && !artifact.exists(),
+            "real lsof must permit idle pruning (alias={alias}): artifact_exists={}, stdout={}, stderr={}, actual lock census:\n{census}",
+            artifact.exists(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn real_lsof_descriptor_protocol_prunes_idle_target() {
+        assert_real_idle_target_pruned(false);
+    }
+
+    #[test]
+    fn real_lsof_unrelated_open_artifact_keeps_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (target, artifact) = old_artifact(&root);
+        let _open_artifact = fs::File::open(&artifact).unwrap();
+        let census = real_lock_census(&target);
+        assert!(census.contains(artifact.to_str().unwrap()), "{census}");
+        let body = pruning_body(&[target], 2, true).unwrap();
+        let output = Command::new("/bin/sh")
+            .args(["-c", &body])
+            .output()
+            .unwrap();
+        assert!(output.status.success() && artifact.exists(), "{output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("in use or unknown visibility"));
+    }
+
+    #[test]
+    fn real_lsof_records_reject_malformed_descriptor_boundaries() {
+        use std::process::Stdio;
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (target, _) = old_artifact(&root);
+        let census = real_lock_census(&target);
+        let debug = format!("debug={}/debug/.cargo-lock", target.display());
+        let release = format!("release={}/release/.cargo-lock", target.display());
+        let parse = |records: &str| {
+            let mut child = Command::new("awk")
+                .args(["-v", &debug, "-v", &release, LOCK_FIELD_PARSER])
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(records.as_bytes())
+                .unwrap();
+            child.wait().unwrap().success()
+        };
+        assert!(parse(&census));
+        let lines: Vec<_> = census.lines().collect();
+        let without_descriptors = lines
+            .iter()
+            .filter(|line| !line.starts_with('f'))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let without_names = lines
+            .iter()
+            .filter(|line| !line.starts_with('n'))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        for malformed in [
+            without_descriptors,
+            without_names,
+            format!("{census}f99\n"),
+            format!("{census}p0\nf9\nn{}/debug/.cargo-lock\n", target.display()),
+            format!("{census}n{}/debug/.cargo-lock\n", target.display()),
+            format!("{census}fcwd\nn{}\n", target.display()),
+            format!("{census}xunexpected\n"),
+            format!("{census}{}\n", lines[1]),
+        ] {
+            assert!(
+                !parse(&malformed),
+                "accepted malformed real census: {malformed}"
+            );
+        }
     }
 
     fn parent_death_keeps_child_lock(remote: bool) {
