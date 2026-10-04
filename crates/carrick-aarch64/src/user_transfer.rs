@@ -12,6 +12,67 @@ use carrick_hal::TrapError;
 use core::num::NonZeroU64;
 pub use staging::prepare_write;
 
+/// Fulfil one exact owner-issued physical request before retrying the same
+/// transfer. The request carries the MM incarnation and grant generation;
+/// the guest validates both again while applying the descriptor transaction.
+pub fn supply<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
+    engine: &Aarch64EngineCore<V>,
+    custody: &C,
+    slots: &MmPortalSlots,
+    target: TransferTarget,
+    request: carrick_guest_mem::MemorySupplyRequest,
+) -> Result<bool, TrapError> {
+    use carrick_guest_mem::MemorySupplyRequest;
+    let window = match request {
+        MemorySupplyRequest::Grant(window) => window,
+        MemorySupplyRequest::Cow(window) => return custody.refill_cow(target, window),
+        MemorySupplyRequest::Metadata { .. } => return Ok(false),
+    };
+    if window.operation.carrier != target.handle.carrier()
+        || window.operation.mm != target.handle.mm()
+        || window.operation.incarnation != target.handle.incarnation()
+    {
+        return Err(TrapError::Hypervisor(
+            "owner grant request differs from selected root".into(),
+        ));
+    }
+    let Some(mut grant) = custody.prepare(target, window)? else {
+        return Ok(false);
+    };
+    let mut service = engine.transfer_service_loan()?;
+    let slot = slots
+        .grant(service.slot()?)
+        .ok_or_else(|| TrapError::Hypervisor("owner grant slot absent".into()))?;
+    if !slot.submit(window, grant.transaction()) {
+        return Err(TrapError::Hypervisor(
+            "owner grant slot occupied by another request".into(),
+        ));
+    }
+    let result = run_selected_service(
+        &mut service,
+        TrapFrame {
+            esr: carrick_el1_abi::MM_PORTAL_GRANT_ESR,
+            ..TrapFrame::default()
+        },
+        target,
+        None,
+        &mut || false,
+    );
+    if let Some(receipt) = slot.take_receipt(window, grant.transaction()) {
+        let settled = grant.settle(&receipt)?;
+        result?;
+        Ok(settled)
+    } else if slot.withdraw(window, grant.transaction()) {
+        result?;
+        Ok(false)
+    } else {
+        carrick_fatal::carrick_fatal!(
+            "aarch64::user_transfer",
+            "unsettled owner grant retains physical custody"
+        );
+    }
+}
+
 /// Host physical custody, with no permission or VA-translation authority.
 pub trait TransferPin {
     fn pending(&self) -> Option<carrick_guest_mem::OwnedMemoryWait> {
