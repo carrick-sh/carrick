@@ -497,7 +497,7 @@ impl carrick_aarch64::fork::PhysicalForkBuilder<ProcessSpec> for OwnerPhysicalFo
             mappings,
             inventory_mappings,
             ProcessSpecPlanContext {
-                protections: Arc::new(MemoryProtections::default()),
+                protections: carrick_guest_mem::UserMemoryAuthority::from_owner(completion.child),
                 mailbox_slots: self.mailbox_slots.clone(),
                 syscall_transport: self.syscall_transport,
                 persistent_vm_lifecycle: self.persistent,

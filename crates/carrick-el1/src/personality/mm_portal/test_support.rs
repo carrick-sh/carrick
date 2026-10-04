@@ -3,8 +3,8 @@ use super::*;
 use crate::fault::{NoopCowResolver, NoopPreparedResolver};
 use crate::memory::reservations::{Layout, ResolvedReservationNodes, SharedReservations};
 use carrick_el1_abi::{
-    FrameGrantMailbox, FrameGrantResidencyTable, MetadataExtent, MetadataExtentResolver,
-    MetadataResolutionError, PinnedMetadataExtent, ReservationProtection, ReservationRange,
+    FrameGrantResidencyTable, MetadataExtent, MetadataExtentResolver, MetadataResolutionError,
+    PinnedMetadataExtent, ReservationProtection, ReservationRange,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::{CallerInvalidatesAsid, PrimaryTableWords};
 use carrick_sched_core::AddressSpaces;
@@ -330,7 +330,6 @@ pub fn select(
             &mut NoopPreparedResolver,
             &mut NoopCowResolver,
             &residency(),
-            &FrameGrantMailbox::new(),
             0,
         )
         .unwrap()
@@ -452,7 +451,6 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
                                 &mut NoopPreparedResolver,
                                 &mut NoopCowResolver,
                                 &residency(),
-                                &FrameGrantMailbox::new(),
                                 0,
                             )
                             .unwrap(),
@@ -702,7 +700,6 @@ fn copy_one(
         &mut NoopPreparedResolver,
         &mut NoopCowResolver,
         &residency(),
-        &FrameGrantMailbox::new(),
         0,
     )?);
     let identity = physical.retain(

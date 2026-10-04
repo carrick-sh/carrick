@@ -167,6 +167,15 @@ impl CloneTidOutputTransaction {
             Err(carrick_guest_mem::MemoryError::HostMap(_)) => {
                 carrick_observability::probes::HvpatchCloneTidWriteResult::HostMap
             }
+            Err(
+                carrick_guest_mem::MemoryError::ReadSuspended(_)
+                | carrick_guest_mem::MemoryError::Physical(_)
+                | carrick_guest_mem::MemoryError::OwnerWait(_)
+                | carrick_guest_mem::MemoryError::Supply(_),
+            ) => carrick_observability::probes::HvpatchCloneTidWriteResult::Suspended,
+            Err(carrick_guest_mem::MemoryError::OwnerRetired(_)) => {
+                carrick_observability::probes::HvpatchCloneTidWriteResult::OwnerRetired
+            }
         };
         crate::probes::mn_clone_tid_output(backend_tid.raw(), output, address, result_kind);
         result.is_ok()
