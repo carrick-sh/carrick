@@ -1849,3 +1849,29 @@ and the real host unlocks; dispatch-only changes cannot supply those producers.
 Blocking legacy recall, owner-held cancellation-independent cleanup, host MM
 continuation enrollment, consumer activation and admitted mirror deletion remain
 open. No final verification or acceptance receipt is claimed by this unit.
+
+#### Recall storage owns bytes, not borrowed guards — 2026-10-03
+
+Recall now captures at most the fixed delegated cache capacity as owned dirty
+pages while holding its authenticated inode guard. It withdraws every fd-map
+member, marks the inode terminal and retires source admission before releasing
+that guard. The owner remains Recalling and retains the binding, allocation and
+live members until writeback finishes. Host state is published before final
+member custody is dropped. The existing sync-only path uses the same byte
+snapshot/apply implementation while preserving its exclusion and guest owner.
+
+Description read/write access now calls recall before taking the description
+guard, rechecking the one-shot initial-publication race afterward. The old
+recall_locked entry point is deleted. This removes held description and inode
+guards from recall storage; it does not yet turn recall election or contention
+into an owned host continuation.
+
+`recall_releases_inode_and_description_before_storage` samples the actual locks
+at actual writeback entry and then performs the real host write. Pre-change
+behavior failed cleanly with both locks held (observed1, expected7); unchanged
+successor passed. /tmp/venue3-recall-guards-{red,green}.log retains receipts.
+`RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-kernel
+el1_delegation::tests --lib -- --nocapture` passed21 tests; source review approved.
+The scheduler's queued-thread/lseek fixture now uses a same-region admitted
+inode; all its previous assertions remain. Combined scheduler/EL1/ABI lib tests
+passed117/251/123. No frozen probe or final acceptance closure is claimed.
