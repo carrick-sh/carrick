@@ -43,6 +43,10 @@ type ChildWatchTable = HashMap<i32, (i32, i32)>;
 
 static CHILD_WATCHES: Mutex<Option<ChildWatchTable>> = Mutex::new(None);
 
+/// Tests touching either child-watch store share one lock across modules.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// Raw host-observed child-exit payload, captured by backend glue from
 /// `waitid(WNOWAIT|WNOHANG)` and consumed by runtime delivery to build the
 /// guest's Linux `siginfo_t`.
@@ -238,8 +242,7 @@ mod tests {
     /// Serialise the tests: `CHILD_WATCHES` is a process-global static, so
     /// distinct test cases must not race each other's inserts/removes.
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        static TEST_LOCK: Mutex<()> = Mutex::new(());
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        super::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     #[test]

@@ -433,6 +433,45 @@ mod tests {
         TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The supervisor reset test and the owner-module tests all mutate these
+    /// process globals. A different module's clear must stay excluded while
+    /// the supervisor test holds its test guard.
+    #[test]
+    fn supervisor_test_guard_covers_shared_state_owners() {
+        let _lock = lock_test();
+        child_watch::clear();
+        host_disposition::clear_all();
+        child_watch::register(0x6161, 0x5757, 17);
+        host_disposition::mark_installed(10);
+
+        let (watch_open, mask_open) = std::thread::spawn(|| {
+            let watch_open = match child_watch::TEST_LOCK.try_lock() {
+                Ok(_owner_guard) => {
+                    child_watch::clear();
+                    true
+                }
+                Err(_) => false,
+            };
+            let mask_open = match host_disposition::MASK_TEST_LOCK.try_lock() {
+                Ok(_owner_guard) => {
+                    host_disposition::clear_all();
+                    true
+                }
+                Err(_) => false,
+            };
+            (watch_open, mask_open)
+        })
+        .join()
+        .expect("owner-lock witness thread panicked");
+
+        let watch_survived = child_watch::is_tracked(0x6161);
+        let mask_survived = host_disposition::is_installed(10);
+        child_watch::clear();
+        host_disposition::clear_all();
+        assert_eq!((watch_open, mask_open), (false, false));
+        assert!(watch_survived && mask_survived);
+    }
+
     #[test]
     fn pending_bit_basics() {
         let _lock = lock_test();
