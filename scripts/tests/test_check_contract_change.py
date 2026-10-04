@@ -135,6 +135,20 @@ class CheckContractChangeTest(unittest.TestCase):
         self.assertEqual(res.returncode, 1)
         self.assertIn("unclassified", res.stderr)
 
+    def test_new_fixture_publisher_paths_are_host_tooling(self):
+        for relative in (
+            "crates/carrick-xtask/src/fixtures.rs",
+            "crates/carrick-xtask/src/fixtures/archive.rs",
+        ):
+            path = self.repo / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("// host fixture publication and verification\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "add host fixture publisher"], cwd=self.repo, check=True)
+
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
     def test_6_broad_exemption_glob_exits_1(self):
         self.guest_file.write_text("// modified futex\n", encoding="utf-8")
         head_sha = "2" * 40
