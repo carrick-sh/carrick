@@ -811,6 +811,14 @@
     },
     {
       "kind": "env_var_os",
+      "file": "crates/carrick-kernel/src/kernel/objects/file_cursor.rs",
+      "symbol": "tests::serial_host::serial_host_cursor_callback_panic_is_terminal::CHILD",
+      "fingerprint": "4d5b2991ce7e588a230b426714dab1a617060b9bd445dc3f7951c005ead41744",
+      "classification": "test_only",
+      "rationale": "Environment selector used only by the serial host fatal-callback subprocess fixture to distinguish the child invocation and panic payload mode; absent from product builds and never selects guest state."
+    },
+    {
+      "kind": "env_var_os",
       "file": "crates/carrick-kernel/src/kernel/operations/signal.rs",
       "symbol": "post_signal_to_authorized_target_inner::CARRICK_SIG_DEBUG",
       "fingerprint": "c3ebac26552821dc161b816d5870e2a482bba18de94aa6b15d568d126be9d8fe",
@@ -1107,6 +1115,14 @@
     },
     {
       "kind": "env_var_os",
+      "file": "crates/carrick-vmm-hvf/src/trap/code_content.rs",
+      "symbol": "tests::serial_host::serial_host_content_callback_panic_is_terminal_after_all_releases::CHILD",
+      "fingerprint": "4d5b2991ce7e588a230b426714dab1a617060b9bd445dc3f7951c005ead41744",
+      "classification": "test_only",
+      "rationale": "Environment selector used only by the serial host fatal-callback subprocess fixture to distinguish the child invocation and panic payload mode; absent from product builds and never selects guest state."
+    },
+    {
+      "kind": "env_var_os",
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "symbol": "zero_anonymous_remap_enabled::CARRICK_DSR_ZERO_REMAP",
       "fingerprint": "71305498cda28a62a37368e8985d314746d4eb66e989ed11a3142a11e5e54b18",
@@ -1312,6 +1328,14 @@
       "fingerprint": "d3bce58c23c5a39148597c742d4efc3d23c0c671f159649ee582aae719dda689",
       "classification": "config_debug",
       "rationale": "Cached value of the CARRICK_EL1_RESERVATIONS hatch in crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs; read once, immutable for the carrier's life."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/dispatch/mem/host_backing.rs",
+      "symbol": "NEXT_HANDLE",
+      "fingerprint": "4d7c01b5a4835d666559663dfe07700fc2b94799b3621bf1885c214955dce7aa",
+      "classification": "monotonic_allocator",
+      "rationale": "Process-lifetime unique opaque physical byte-source handles prevent crossfeeding simultaneous custodians with equal local source generations. This counter allocates custody identity only; it stores no Linux MM, VMA, protection, offset or fork policy. The two_live_custodians_reject_each_others_source_tokens contract verifies independent custody, and retired handles are never reused."
     },
     {
       "kind": "static",
@@ -1676,10 +1700,66 @@
     {
       "kind": "static",
       "file": "crates/carrick-kernel/src/el1_delegation.rs",
+      "symbol": "tests::WRITEBACK_HOOK",
+      "fingerprint": "9c97b32129216966bc8cfbaad88deb2f7b5caf9321a4002ec5dd0e5fe498238b",
+      "classification": "test_only",
+      "rationale": "Test-module callback samples real inode and description exclusion at the storage boundary in serial recall fixtures; absent from product builds."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation.rs",
       "symbol": "tests::serial_host::TEST_LOCK",
       "fingerprint": "b45f2e0792f4c7c840555bdf52882bf567b1f7f35998d77b3e2084e080d8479d",
       "classification": "test_only",
       "rationale": "Test-only mutex serializing EL1 delegation unit tests that share the process-global region pointer."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "symbol": "APERTURE_DRAIN",
+      "fingerprint": "badd55d1b20a3ac5529e40a6ea3b945cc62c2a9a57cf9b99be4d975e58d58db4",
+      "classification": "carrier_infra",
+      "rationale": "Serializes the indexed owner-recall completion drain against retirement of this carrier's EL1 aperture. It protects pointer lifetime only, holds no storage or guest-resource wait, and does not select a guest process identity."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "symbol": "DRAIN_HOOK",
+      "fingerprint": "391aedf8263e74bb0b79db364632c989430f73f5186e8260dcec5ad376e4b7ae",
+      "classification": "test_only",
+      "rationale": "cfg(test) one-shot callback injecting aperture-drain teardown interleavings in serial host fixtures; absent from product builds."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "symbol": "DRIVER",
+      "fingerprint": "d937a24765a893aea26e50565b1960ee1846266eabd023289583f469ff877798",
+      "classification": "carrier_infra",
+      "rationale": "One carrier-owned recall storage driver with a fixed pair of workers. Ready entries retain exact RecallJob custody; inode OwnerState owns cleanup and the fixed inode-index routes are Weak references. This infrastructure carries no current-task identity or guest executor lease."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "symbol": "RUN_FINISHED_HOOK",
+      "fingerprint": "22fb2979c1113a67f443bf6124659cdb0f7da6d8ebe0885fa6d4095d41184fb1",
+      "classification": "test_only",
+      "rationale": "cfg(test) exact-generation callback observing completion of a recall driver step in serial host fixtures; absent from product builds."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "symbol": "START",
+      "fingerprint": "7b25081609cd2f7aa222869f3b6a1c70683b5c1f510f72ad56cc677b0407d547",
+      "classification": "carrier_infra",
+      "rationale": "Once-only initialization of exactly STORAGE_WORKERS=2 recall storage threads for the process carrier. Guest tasks cannot change the population or select a host identity; cancellation retains cleanup in the exact inode owner job."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "symbol": "TERMINAL_ENQUEUES",
+      "fingerprint": "513b1e320ed78d4c66472466d2ad51b5597d0ddd328a40e87e434def53ae88cf",
+      "classification": "test_only",
+      "rationale": "cfg(test) counter detecting forbidden readiness requeue after recall terminal completion; absent from product builds."
     },
     {
       "kind": "static",
@@ -2736,6 +2816,14 @@
       "fingerprint": "a0ccdeda340da2b279747bf16082da76bc8e007411347293f55726be1efa45db",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static CARRIER_VM_LIVE in crates/carrick-vmm-hvf/src/trap.rs maintaining host process lifecycle or VM resources."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-vmm-hvf/src/trap/carrier_custody.rs",
+      "symbol": "new::NEXT_CARRIER",
+      "fingerprint": "639242e1ca8f5e68e417c1200b7e23e4a125b090984d41970dc187ad878afe37",
+      "classification": "monotonic_allocator",
+      "rationale": "Process-lifetime unique physical carrier identities prevent crossfeeding two live custody owners with equal local VM generations; this allocates custody identity, not Linux task or container state."
     },
     {
       "kind": "static",
