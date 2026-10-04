@@ -2,7 +2,7 @@
 //! The hooks are absent from release builds of the example backend, and this
 //! crate is absent from Carrick's product dependency closure.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -21,7 +21,7 @@ const GENERATOR_VERSION: u32 = 2;
 const WATCHDOG: Duration = Duration::from_secs(5);
 
 /// A source boundary at which an actor may relinquish its test permit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Point {
     Step,
@@ -94,6 +94,7 @@ struct State {
     parked: BTreeSet<Actor>,
     current: Option<Actor>,
     decisions: Vec<Decision>,
+    visits: BTreeMap<(Actor, Point), usize>,
     replay: Option<ScheduleReceipt>,
     source_hash: String,
     fixture_hash: String,
@@ -113,6 +114,7 @@ impl Schedule {
                 parked: BTreeSet::new(),
                 current: None,
                 decisions: Vec::new(),
+                visits: BTreeMap::new(),
                 replay: None,
                 source_hash: String::new(),
                 fixture_hash: String::new(),
@@ -220,11 +222,9 @@ impl Schedule {
                 Some(runnable[(state.random >> 14) as usize % runnable.len()])
             }
         };
-        let visit = state
-            .decisions
-            .iter()
-            .filter(|d| d.actor == actor && d.point == point)
-            .count();
+        let visits = state.visits.entry((actor, point)).or_default();
+        let visit = *visits;
+        *visits += 1;
         let next = if let Some(replay) = &state.replay {
             let expected = replay
                 .decisions
