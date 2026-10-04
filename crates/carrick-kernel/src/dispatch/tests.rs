@@ -2111,13 +2111,13 @@ mod overlay_dispatch_tests {
         assert_eq!(data, listener as u64);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn epoll_et_host_then_inzone_arrival_tracks_separate_latches() {
         check_mixed_listener_arrivals(false);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn epoll_et_inzone_then_host_arrival_tracks_separate_latches() {
         check_mixed_listener_arrivals(true);
@@ -2125,7 +2125,7 @@ mod overlay_dispatch_tests {
 
     /// Each order starts with a fresh listener, so the second source cannot
     /// inherit a baseline from an earlier arrival of the same source.
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn check_mixed_listener_arrivals(inzone_first: bool) {
         use carrick_abi::{LINUX_SO_ERROR, LINUX_SOL_SOCKET};
 
