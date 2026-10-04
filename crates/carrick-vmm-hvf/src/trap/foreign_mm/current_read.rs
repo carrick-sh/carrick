@@ -166,7 +166,12 @@ pub(super) fn prepare(
     if !authority.snapshot(deadline)?.has_same_contents(snapshot) {
         return Err(Error::LeaseStale);
     }
-    if lease.state.protections.range_no_access(start.raw(), len) {
+    if lease
+        .state
+        .protections
+        .legacy()
+        .is_none_or(|protections| protections.range_no_access(start.raw(), len))
+    {
         return Err(Error::Translation(start));
     }
     let page_tables = lease
@@ -336,7 +341,12 @@ impl ForeignMmReadWindow for ReadWindow {
         ) {
             return Err(Error::OwnerStale);
         }
-        if self.state.protections.range_no_access(va.raw(), dst.len()) {
+        if self
+            .state
+            .protections
+            .legacy()
+            .is_none_or(|protections| protections.range_no_access(va.raw(), dst.len()))
+        {
             return Err(Error::Translation(va));
         }
         let physical = self

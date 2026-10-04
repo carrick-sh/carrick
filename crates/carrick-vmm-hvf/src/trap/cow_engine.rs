@@ -2254,7 +2254,11 @@ impl HvfTaskState {
         {
             return Ok(None);
         }
-        if !self.protections.range_unmapped(page_va, 1) {
+        if !self
+            .protections
+            .legacy()
+            .is_some_and(|protections| protections.range_unmapped(page_va, 1))
+        {
             return Err(TrapError::Hypervisor(format!(
                 "HVPatch live VA 0x{page_va:x} names retired stage-2 IPA 0x{retained_ipa:x}"
             )));
@@ -2325,7 +2329,10 @@ impl HvfTaskState {
             let needs_materialization = retained.is_some_and(|ipa| {
                 self.physical_cow_source(probe, ipa).is_none()
                     || self.retained_output_lacks_exclusive_claim(ipa)
-            }) && self.protections.range_unmapped(probe, 1);
+            }) && self
+                .protections
+                .legacy()
+                .is_some_and(|protections| protections.range_unmapped(probe, 1));
             if !needs_materialization {
                 span_end = probe;
                 break;
@@ -3175,7 +3182,7 @@ impl HvfTaskState {
                     HvfVmState::refresh_stage1_exclusivity(manager.manager);
                     let mut page_va = span_start;
                     while page_va < span_end {
-                        if source_guest_writable && !self.protections.range_write_denied(page_va, 1)
+                        if source_guest_writable && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1))
                         {
                             manager
                                 .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
@@ -3221,7 +3228,7 @@ impl HvfTaskState {
                         }
                         let leaf = live[3];
                         let expected_ap = if source_guest_writable
-                            && !self.protections.range_write_denied(page_va, 1)
+                            && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1))
                         {
                             AP_USER_RW
                         } else {
@@ -3341,7 +3348,10 @@ impl HvfTaskState {
         let span = candidate.map(|candidate| self.live_cow_span(candidate, fault_va));
         let Some(span) = span else {
             let mapping = self.mapping_for_range_in(custody, fault_va, 1);
-            let write_denied = self.protections.range_write_denied(fault_va, 1);
+            let write_denied = self
+                .protections
+                .legacy()
+                .is_none_or(|protections| protections.range_write_denied(fault_va, 1));
             let private_writable_mapping = mapping.is_some_and(|mapping| {
                 mapping.guest_writable && mapping.sharing == GuestMappingSharing::Private
             });
@@ -3417,7 +3427,9 @@ impl HvfTaskState {
             })?
             .guest_writable;
         if frame_cow_write_is_denied(
-            self.protections.range_write_denied(fault_va, 1),
+            self.protections
+                .legacy()
+                .is_none_or(|protections| protections.range_write_denied(fault_va, 1)),
             source_guest_writable,
             intent,
         ) {
@@ -3987,9 +3999,9 @@ impl HvfTaskState {
                     let mut writable_pages = 0_u8;
                     for index in 0..(span.len as u64 / PAGE_SIZE) {
                         if source_guest_writable
-                            && !self
-                                .protections
-                                .range_write_denied(span.va + index * PAGE_SIZE, 1)
+                            && !self.protections.legacy().is_none_or(|protections| {
+                                protections.range_write_denied(span.va + index * PAGE_SIZE, 1)
+                            })
                         {
                             writable_pages |= 1 << index;
                         }
@@ -4190,7 +4202,7 @@ impl HvfTaskState {
                             let span_end = span.va.saturating_add(span.len as u64);
                             let mut page_va = span.va & !(PAGE_SIZE - 1);
                             while page_va < span_end {
-                                if source_guest_writable && !self.protections.range_write_denied(page_va, 1) {
+                                if source_guest_writable && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1)) {
                                     manager
                                         .set_writable_preserving_attributes(page_va, PAGE_SIZE as usize)
                                         .map_err(|error| {
@@ -4241,7 +4253,7 @@ impl HvfTaskState {
                             let expected_ap = if span.kernel_only {
                                 0
                             } else if source_guest_writable
-                                && !self.protections.range_write_denied(page_va, 1)
+                                && !self.protections.legacy().is_none_or(|protections| protections.range_write_denied(page_va, 1))
                             {
                                 AP_USER_RW
                             } else {
@@ -4893,6 +4905,10 @@ impl HvfVmState {
         intent: carrick_aarch64::vmm::FrameCowWriteIntent,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
+        let authority = self.protections.clone();
+        let _legacy = authority.legacy().ok_or_else(|| {
+            TrapError::Hypervisor("admitted owner MM cannot enter host COW selection".into())
+        })?;
         if len == 0 {
             return Ok(());
         }
@@ -4935,7 +4951,10 @@ impl HvfVmState {
                             // routing it there turned every brk SHRINK over
                             // such a page into a refusal (ltp-brk02). A live
                             // VA's scrub resolves through its live backing.
-                            let unmapped = self.protections.range_unmapped(current, 1);
+                            let unmapped = self
+                                .protections
+                                .legacy()
+                                .is_some_and(|protections| protections.range_unmapped(current, 1));
                             let no_source =
                                 unmapped && self.physical_cow_source(current, ipa).is_none();
                             let shared = unmapped
@@ -5891,7 +5910,9 @@ impl HvfVmState {
     /// True if `[address, address+length)` overlaps any PROT_NONE range. Used
     /// to fault syscall-path accesses to a guest PROT_NONE buffer (EFAULT).
     pub(crate) fn range_no_access(&self, address: u64, length: usize) -> bool {
-        self.protections.range_no_access(address, length)
+        self.protections
+            .legacy()
+            .is_none_or(|protections| protections.range_no_access(address, length))
     }
 
     /// Write the vDSO vvar data page: the counter frequency and the
@@ -5979,7 +6000,9 @@ impl HvfVmState {
     /// Clearing performs interval subtraction so an mprotect/mmap that re-enables
     /// part of a PROT_NONE region leaves only the still-protected remainder.
     pub(crate) fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
-        self.protections.set_no_access(address, len, no_access);
+        if let Some(protections) = self.protections.legacy() {
+            protections.set_no_access(address, len, no_access);
+        }
     }
 
     /// Mirror a partial `munmap`'s registry split onto this engine's LOCAL
@@ -7541,7 +7564,10 @@ impl HvfTaskState {
         {
             return Some(project(MappingSource::Region(mapping)));
         }
-        if !self.protections.range_no_access(address, length)
+        if !self
+            .protections
+            .legacy()
+            .is_none_or(|protections| protections.range_no_access(address, length))
             && let Some(alias) = current_registry_projection()
         {
             return Some(project(MappingSource::Alias(&alias)));

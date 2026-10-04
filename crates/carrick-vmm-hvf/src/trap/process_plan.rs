@@ -1456,7 +1456,10 @@ impl HvfTaskState {
                 // belongs in the child's physical/frame inventory and COW-arm
                 // registry so a later mprotect/remap cannot expose the parent's
                 // frame, but there is no live PTE to authenticate at fork.
-                if self.protections.range_no_access(mapping.start, 1)
+                if self
+                    .protections
+                    .legacy()
+                    .is_none_or(|protections| protections.range_no_access(mapping.start, 1))
                     || mapping.is_dynamic_alias
                     || !fork_mapping_requires_base_translation(
                         mapping.start,
@@ -1782,8 +1785,15 @@ impl HvfTaskState {
         );
 
         let stage_started = std::time::Instant::now();
-        let protections = std::sync::Arc::new(MemoryProtections::from_snapshot(
-            self.protections.snapshot_all(),
+        let protections = carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+            MemoryProtections::from_snapshot(
+                self.protections
+                    .legacy()
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor("owner MM reached legacy copied-fork path".into())
+                    })?
+                    .snapshot_all(),
+            ),
         ));
         emit_stage(
             HvpatchForkProcessSpecStagePhase::BackendProtections,

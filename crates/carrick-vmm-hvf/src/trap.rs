@@ -422,7 +422,7 @@ pub use sysreg::{host_clock_uptime_ns, host_counter, host_counter_frequency};
 
 // Process-wide PROT_NONE bookkeeping is a neutral-core abstraction shared with
 // every other backend (KVM included) — see carrick_mem::protections. Both hold
-// it as `Arc<MemoryProtections>` and clone it into each sibling vCPU thread.
+// it as `carrick_guest_mem::UserMemoryAuthority` and clone it into each sibling vCPU thread.
 use carrick_mem::protections::MemoryProtections;
 
 // SyscallTrap/TrapError moved down into the carrick-hal leaf crate
@@ -1749,12 +1749,12 @@ impl HvfTaskState {
         &self,
         mm_access: &std::sync::Arc<MmAccessState>,
         page_tables: &carrick_aarch64::Stage1Authority,
-        protections: &std::sync::Arc<MemoryProtections>,
+        protections: &carrick_guest_mem::UserMemoryAuthority,
     ) -> bool {
         std::sync::Arc::ptr_eq(&self.mm_access, mm_access)
             && carrick_aarch64::Aarch64TaskRuntimeProjection {
                 page_tables: page_tables.clone(),
-                protections: std::sync::Arc::clone(protections),
+                protections: protections.clone(),
                 process_asid: None,
             }
             .shares_exact_mm_authority(&self.page_tables_authority(), &self.protections)
@@ -1870,7 +1870,9 @@ impl HvfTaskState {
 
     fn neutral() -> Self {
         let page_tables = carrick_aarch64::Stage1Authority::new();
-        let protections = std::sync::Arc::new(MemoryProtections::default());
+        let protections = carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+            MemoryProtections::default(),
+        ));
         let frame_inventory =
             std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
         let cow_armed = std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
@@ -1917,7 +1919,11 @@ impl HvfTaskState {
     }
 
     fn audit_neutral(&self) -> Result<(), TrapError> {
-        let protections = self.protections.snapshot_all();
+        let protections = self
+            .protections
+            .legacy()
+            .ok_or_else(|| TrapError::Hypervisor("owner MM cannot be neutral task state".into()))?
+            .snapshot_all();
         let inventory = self.frame_inventory.ledger.lock();
         let frames = inventory.frames.lock();
         let neutral = self.mappings.is_empty()
@@ -2013,7 +2019,7 @@ impl HvfTaskState {
             let frames = self.frame_inventory.lock().frames.clone();
             self.mm_access = MmAccessState::new_unbound(
                 self.page_tables_authority(),
-                std::sync::Arc::clone(&self.protections),
+                self.protections.clone(),
                 std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::with_frames(
                     frames,
                 ))),
@@ -2107,7 +2113,9 @@ pub(crate) fn hvpatch_task_state_test_fixture(
     let cow_authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority> =
         std::sync::Arc::new(task_only_carrier_directory_tests::TestCowAuthority);
     let page_tables = carrick_aarch64::Stage1Authority::new();
-    let protections = std::sync::Arc::new(MemoryProtections::default());
+    let protections = carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+        MemoryProtections::default(),
+    ));
     let frame_inventory =
         std::sync::Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default()));
     let cow_armed = std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default()));
@@ -3056,7 +3064,7 @@ fn process_mapping_needs_stage2_install(inherited_frame: Option<carrick_hal::Fra
 pub struct ProcessSpecPlan {
     mappings: Vec<ProcessMappingDesc>,
     inventory_mappings: Vec<ProcessInventoryDesc>,
-    protections: std::sync::Arc<MemoryProtections>,
+    protections: carrick_guest_mem::UserMemoryAuthority,
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     syscall_transport: HvfSyscallTransport,
     persistent_vm_lifecycle: bool,
@@ -3069,7 +3077,7 @@ pub struct ProcessSpecPlan {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct ProcessSpecPlanContext {
-    pub(crate) protections: std::sync::Arc<MemoryProtections>,
+    pub(crate) protections: carrick_guest_mem::UserMemoryAuthority,
     pub(crate) mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     pub(crate) syscall_transport: HvfSyscallTransport,
     pub(crate) persistent_vm_lifecycle: bool,
@@ -3134,7 +3142,7 @@ pub struct ProcessSpec {
     vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     mappings: Vec<ProcessMappingDesc>,
     inventory_mappings: Vec<ProcessInventoryDesc>,
-    protections: std::sync::Arc<MemoryProtections>,
+    protections: carrick_guest_mem::UserMemoryAuthority,
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
     syscall_transport: HvfSyscallTransport,
     persistent_vm_lifecycle: bool,
@@ -3209,7 +3217,7 @@ impl ProcessSpec {
         let mut plan = ProcessSpecPlan {
             mappings: std::mem::take(&mut self.mappings),
             inventory_mappings: std::mem::take(&mut self.inventory_mappings),
-            protections: std::sync::Arc::clone(&self.protections),
+            protections: self.protections.clone(),
             mailbox_slots: std::sync::Arc::clone(&self.mailbox_slots),
             syscall_transport: self.syscall_transport,
             persistent_vm_lifecycle: self.persistent_vm_lifecycle,
@@ -3303,7 +3311,7 @@ impl HvpatchTaskOnlyBackendState {
     pub(crate) fn runtime_task_state(
         &self,
         page_tables: carrick_aarch64::Stage1Authority,
-        protections: std::sync::Arc<MemoryProtections>,
+        protections: carrick_guest_mem::UserMemoryAuthority,
     ) -> Result<HvfTaskState, TrapError> {
         self.registration
             .as_ref()
@@ -5689,7 +5697,7 @@ impl HvpatchTaskRegistration {
     fn runtime_task_state(
         &self,
         page_tables: carrick_aarch64::Stage1Authority,
-        protections: std::sync::Arc<MemoryProtections>,
+        protections: carrick_guest_mem::UserMemoryAuthority,
     ) -> Result<HvfTaskState, TrapError> {
         let task_mm = self
             .task_mm
@@ -5734,7 +5742,7 @@ impl HvpatchTaskRegistration {
             std::sync::Arc::clone(slot.get_or_insert_with(|| {
                 let access = MmAccessState::new(
                     page_tables.clone(),
-                    std::sync::Arc::clone(&protections),
+                    protections.clone(),
                     std::sync::Arc::clone(&ledger),
                     std::sync::Arc::clone(&cow_armed),
                     std::sync::Arc::clone(&cow_deferred_publications),
@@ -6694,8 +6702,8 @@ pub(crate) use guest_memory::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
     /// The process-wide PROT_NONE bookkeeping (the engine's EFAULT gate).
-    pub(crate) fn protections_ref(&self) -> &MemoryProtections {
-        &self.protections
+    pub(crate) fn protections_ref(&self) -> Option<carrick_guest_mem::LegacyProtectionRead<'_>> {
+        self.protections.legacy()
     }
 
     /// A `Send`/`Sync` kick handle for THIS thread's live vCPU. The engine's
