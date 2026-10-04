@@ -32,6 +32,9 @@
 //! lock; EL1 reads them, records COW coverage, and claims the exact entry's
 //! single page-table editor word before mutating live descriptors.
 
+pub mod notification;
+use notification::{NotificationSource, SpaceNotificationLease, SpaceReleaseVenue, SpaceWaitCause};
+
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -98,7 +101,17 @@ pub struct SpaceEntry {
     /// Edits the host has applied. `head - tail` are pending.
     journal_tail: AtomicU64,
     journal: [JournalSlot; VMA_JOURNAL_ENTRIES],
+    notifications: NotificationSource,
 }
+
+// The notification custody uses existing tail padding. Preserve every prior
+// entry field offset and the original 384-byte stride (no zone table moves).
+const _: () = assert!(core::mem::size_of::<SpaceEntry>() == 384);
+const _: () = assert!(core::mem::offset_of!(SpaceEntry, journal) == 88);
+const _: () = assert!(core::mem::offset_of!(SpaceEntry, notifications) == 344);
+pub const SPACE_NOTIFICATION_LAYOUT_HASH: u64 = 0x534e_4f54_4946_0001
+    ^ (core::mem::offset_of!(SpaceEntry, notifications) as u64)
+    ^ ((core::mem::size_of::<NotificationSource>() as u64) << 32);
 
 /// The table, in the shared EL1 region inside the zone.
 #[repr(C, align(64))]
@@ -144,6 +157,10 @@ pub struct SpaceGrant {
 pub struct SpaceEditor<'a> {
     entry: &'a SpaceEntry,
     owner: NonZeroU64,
+    release: Option<(SpaceReleaseVenue<'a>, SpaceNotificationLease<'a>)>,
+    venue: Option<SpaceReleaseVenue<'a>>,
+    index: SpaceIndex,
+    key: u64,
 }
 
 /// Exclusive initialization of a published, closed fork child. This guard
@@ -229,15 +246,46 @@ impl<'a> SpaceEditor<'a> {
     }
 }
 
-impl Drop for SpaceEditor<'_> {
-    fn drop(&mut self) {
+impl SpaceEditor<'_> {
+    fn release_editor(&self) {
         let released = self.entry.active_editor.compare_exchange(
             self.owner.get(),
             0,
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
-        debug_assert_eq!(released, Ok(self.owner.get()));
+        assert_eq!(released, Ok(self.owner.get()));
+    }
+}
+impl Drop for SpaceEditor<'_> {
+    fn drop(&mut self) {
+        let needs_late_release = self.release.is_none() && self.entry.notifications.attached();
+        let late_release = needs_late_release
+            .then(|| {
+                self.venue.and_then(|venue| {
+                    venue
+                        .zone
+                        .editor_notification(self.index, self.key)
+                        .map(|lease| (venue, lease))
+                })
+            })
+            .flatten();
+        assert!(
+            !needs_late_release || late_release.is_some(),
+            "held admitted editor requires exact source release"
+        );
+        if let Some((venue, lease)) = self.release.as_ref().or(late_release.as_ref()) {
+            let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_>| {
+                (venue.deliver)(venue.zone, venue.waker, effects)
+            };
+            let receipt = lease
+                .reserve(SpaceWaitCause::Editor)
+                .advance_revision(venue.waker, &completion);
+            self.release_editor();
+            receipt.publish();
+        } else {
+            self.release_editor();
+        }
     }
 }
 
@@ -264,6 +312,7 @@ impl AddressSpaces {
                     brk_current: AtomicU64::new(0),
                     journal_head: AtomicU64::new(0),
                     journal_tail: AtomicU64::new(0),
+                    notifications: NotificationSource::new(),
                     journal: [const {
                         JournalSlot {
                             start: AtomicU64::new(0),
@@ -337,9 +386,10 @@ impl AddressSpaces {
             let index = (start + probe) % ADDRESS_SPACES;
             let entry = &self.entries[index];
             let current = entry.key.load(Ordering::SeqCst);
-            if current != 0 && current != FREED {
+            if (current != 0 && current != FREED) || !entry.notifications.reusable() {
                 continue;
             }
+            entry.notifications.prepare_entry();
             entry.gate.store(GATE_CLOSED, Ordering::SeqCst);
             entry.ttbr0.store(ttbr0, Ordering::Relaxed);
             entry.ttbr1.store(ttbr1, Ordering::Relaxed);
@@ -360,6 +410,10 @@ impl AddressSpaces {
     /// Host: let EL1 install the entry (pauses raised meanwhile stay
     /// counted).
     pub fn open(&self, index: SpaceIndex) {
+        assert!(
+            !self.entry(index).notifications.attached(),
+            "admitted gate requires a release venue"
+        );
         self.entry(index)
             .gate
             .fetch_and(!GATE_CLOSED, Ordering::SeqCst);
@@ -426,6 +480,10 @@ impl AddressSpaces {
 
     /// Host: the pause [`Self::raise`] counted ended.
     pub fn lower(&self, index: SpaceIndex) {
+        assert!(
+            !self.entry(index).notifications.attached(),
+            "admitted gate requires a release venue"
+        );
         self.entry(index).gate.fetch_sub(1, Ordering::SeqCst);
     }
 
@@ -443,11 +501,20 @@ impl AddressSpaces {
     pub fn free(&self, index: SpaceIndex) {
         let entry = self.entry(index);
         debug_assert_eq!(entry.active_editor.load(Ordering::SeqCst), 0);
-        entry.key.store(FREED, Ordering::SeqCst);
+        assert!(
+            entry.notifications.empty(),
+            "retire MM notification source before entry"
+        );
+        entry.notifications.claim_entry_retirement();
+        entry.notifications.finish_entry_retirement(self, index);
+    }
+    fn clear_retired_entry(&self, index: SpaceIndex) {
+        let entry = self.entry(index);
         entry.ttbr0.store(0, Ordering::Relaxed);
         entry.ttbr1.store(0, Ordering::Relaxed);
         entry.mmap_next.store(0, Ordering::Relaxed);
         entry.brk_current.store(0, Ordering::Relaxed);
+        entry.key.store(FREED, Ordering::SeqCst);
     }
 
     pub fn mmap_next(&self, index: SpaceIndex) -> u64 {
@@ -516,22 +583,47 @@ impl AddressSpaces {
         key: u64,
         owner: NonZeroU64,
     ) -> Option<SpaceEditor<'_>> {
+        self.try_begin_edit_with_venue(index, key, owner, None)
+    }
+    pub fn try_begin_edit_with_venue<'a>(
+        &'a self,
+        index: SpaceIndex,
+        key: u64,
+        owner: NonZeroU64,
+        venue: Option<SpaceReleaseVenue<'a>>,
+    ) -> Option<SpaceEditor<'a>> {
         let entry = self.entry(index);
+        assert!(
+            !entry.notifications.attached() || venue.is_some(),
+            "admitted editor requires release venue"
+        );
+        if venue.is_some_and(|v| !core::ptr::eq(&v.zone.spaces, self)) {
+            return None;
+        }
+        // Take live source custody before publishing an editor other probes
+        // can observe. A closing admitted source refuses before the CAS.
+        let release = if entry.notifications.attached() {
+            let venue = venue?;
+            Some((venue, venue.zone.editor_notification(index, key)?))
+        } else {
+            None
+        };
         entry
             .active_editor
             .compare_exchange(0, owner.get(), Ordering::SeqCst, Ordering::SeqCst)
             .ok()?;
+        let editor = SpaceEditor {
+            entry,
+            owner,
+            release,
+            venue,
+            index,
+            key,
+        };
         if entry.gate.load(Ordering::SeqCst) != 0 || entry.key.load(Ordering::SeqCst) != key {
-            let released = entry.active_editor.compare_exchange(
-                owner.get(),
-                0,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
-            debug_assert_eq!(released, Ok(owner.get()));
-            return None;
+            return None; // The same RAII release publishes the rollback edge.
         }
-        Some(SpaceEditor { entry, owner })
+        Some(editor)
     }
 
     /// Claim a never-runnable child while its publication gate remains closed.
@@ -542,12 +634,41 @@ impl AddressSpaces {
         key: u64,
         owner: NonZeroU64,
     ) -> Option<ClosedChildEditor<'_>> {
+        self.try_begin_closed_child_edit_with_venue(index, key, owner, None)
+    }
+    pub fn try_begin_closed_child_edit_with_venue<'a>(
+        &'a self,
+        index: SpaceIndex,
+        key: u64,
+        owner: NonZeroU64,
+        venue: Option<SpaceReleaseVenue<'a>>,
+    ) -> Option<ClosedChildEditor<'a>> {
         let entry = self.entry(index);
+        assert!(
+            !entry.notifications.attached() || venue.is_some(),
+            "admitted closed child requires release venue"
+        );
+        if venue.is_some_and(|v| !core::ptr::eq(&v.zone.spaces, self)) {
+            return None;
+        }
+        let release = if entry.notifications.attached() {
+            let venue = venue?;
+            Some((venue, venue.zone.editor_notification(index, key)?))
+        } else {
+            None
+        };
         entry
             .active_editor
             .compare_exchange(0, owner.get(), Ordering::SeqCst, Ordering::SeqCst)
             .ok()?;
-        let editor = SpaceEditor { entry, owner };
+        let editor = SpaceEditor {
+            entry,
+            owner,
+            release,
+            venue,
+            index,
+            key,
+        };
         if key == 0
             || entry.key.load(Ordering::SeqCst) != key
             || entry.gate.load(Ordering::SeqCst) != GATE_CLOSED
@@ -927,5 +1048,57 @@ mod tests {
         spaces.close(index);
         assert!(spaces.try_begin_edit(index, 13, owner).is_none());
         assert_eq!(spaces.active_editor(index), None);
+    }
+    #[test]
+    fn editor_release_publishes_the_waiters_exact_completion() {
+        use crate::object_wait::ObjectWaitKey;
+        use crate::{BoundedSpin, ZoneTables};
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables>());
+            assert!(!ptr.is_null());
+            std::boxed::Box::from_raw(ptr.cast::<ZoneTables>())
+        };
+        let index = zone.spaces.publish_closed(13, 0x30000, 0x30000).unwrap();
+        zone.spaces.open(index);
+        let key =
+            ObjectWaitKey::address_space_cause(index.index(), 1, SpaceWaitCause::Editor).unwrap();
+        let identity = notification::SpaceNotificationIdentity {
+            mm: NonZeroU64::new(13).unwrap(),
+            incarnation: NonZeroU64::new(1).unwrap(),
+        };
+        fn deliver(
+            _: &ZoneTables,
+            _: crate::Waker,
+            owned: crate::object_wait::OwnedObjectWakeEffects<'_>,
+        ) {
+            let _ = owned.deliver_handbacks(&mut |_| {});
+        }
+        let venue = SpaceReleaseVenue {
+            zone: &zone,
+            waker: crate::Waker::Host,
+            deliver,
+        };
+        let completion = |owned: crate::object_wait::OwnedObjectWakeEffects<'_>| {
+            let _ = owned.deliver_handbacks(&mut |_| {});
+        };
+        zone.admit_space_notifications(index, identity, &BoundedSpin(0), &completion)
+            .unwrap();
+        let editor = zone
+            .spaces
+            .try_begin_edit_with_venue(index, 13, NonZeroU64::new(1).unwrap(), Some(venue))
+            .unwrap();
+        let before = zone.object_queue_census(key.index()).unwrap().epoch;
+        assert!(
+            zone.spaces
+                .try_begin_edit_with_venue(index, 13, NonZeroU64::new(2).unwrap(), Some(venue))
+                .is_none()
+        );
+        drop(editor);
+        assert!(
+            zone.object_queue_census(key.index()).unwrap().epoch > before,
+            "actual editor release must publish the failed probe's producer edge"
+        );
+        zone.spaces.close(index);
+        zone.close_space_notifications(index, identity).unwrap();
     }
 }
