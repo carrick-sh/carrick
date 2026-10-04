@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::ffi::{CString, OsString};
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::Arc;
@@ -16,6 +17,7 @@ pub const DEFAULT_LOCK_PATH: &str = "/tmp/carrick-host-lease.lock";
 /// A contended machine may be running a full acceptance gate. Failure, never skip.
 pub const HOST_LEASE_WAIT_LIMIT: Duration = Duration::from_secs(60 * 60);
 const INHERITED_SOCKET: &str = "CARRICK_HOST_LEASE_SOCKET";
+pub(crate) const SCOPE_FD: &str = "CARRICK_HOST_LEASE_SCOPE_FD";
 const VALIDATION_LIMIT: Duration = Duration::from_secs(5);
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,9 +71,10 @@ pub enum HostLeaseError {
 }
 
 pub struct HostLease {
-    // Only the outer tooling runner owns the flock. Nested runners carry a
-    // validation endpoint, never an open description of the lock inode.
+    // Production workloads run below lease_supervisor, which alone owns this
+    // holder and retains it through cancellation, descendant exit and reaping.
     _holder: Option<LeaseHolder>,
+    _scope: Option<OwnedFd>,
     socket: PathBuf,
     path: PathBuf,
     mode: HostLeaseMode,
@@ -82,6 +85,38 @@ struct LeaseIdentity {
     dev: u64,
     ino: u64,
     mode: HostLeaseMode,
+    scope: Option<ScopeIdentity>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ScopeIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+impl ScopeIdentity {
+    pub(crate) fn writer(fd: &OwnedFd) -> io::Result<Self> {
+        // SAFETY: the caller owns this scope descriptor; verify its direction.
+        let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if stat.st_mode & libc::S_IFMT != libc::S_IFIFO || flags & libc::O_ACCMODE != libc::O_WRONLY
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "lease scope is not a pipe writer",
+            ));
+        }
+        Ok(Self {
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino as u64,
+        })
+    }
 }
 
 struct LeaseHolder {
@@ -104,6 +139,15 @@ impl Drop for LeaseHolder {
 }
 
 impl HostLease {
+    /// Claim an idle host directly, without waiting or inherited admission.
+    pub fn try_exclusive(path: &Path) -> Result<Option<Self>, HostLeaseError> {
+        match Self::acquire_path_with_limit(path, HostLeaseMode::Gate, Duration::ZERO) {
+            Ok(lease) => Ok(Some(lease)),
+            Err(HostLeaseError::Timeout { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn acquire(mode: HostLeaseMode) -> Result<Self, HostLeaseError> {
         let path = std::env::var_os("CARRICK_HOST_LEASE_PATH")
             .map(PathBuf::from)
@@ -127,6 +171,30 @@ impl HostLease {
         path: &Path,
         mode: HostLeaseMode,
         limit: Duration,
+    ) -> Result<Self, HostLeaseError> {
+        Self::acquire_path_with_wait(path, mode, limit, None, |duration| {
+            std::thread::sleep(duration);
+            Ok(false)
+        })
+    }
+
+    pub(crate) fn acquire_supervised(
+        mode: HostLeaseMode,
+        scope: ScopeIdentity,
+        wait: impl FnMut(Duration) -> io::Result<bool>,
+    ) -> Result<Self, HostLeaseError> {
+        let path = std::env::var_os("CARRICK_HOST_LEASE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_PATH));
+        Self::acquire_path_with_wait(&path, mode, HOST_LEASE_WAIT_LIMIT, Some(scope), wait)
+    }
+
+    fn acquire_path_with_wait(
+        path: &Path,
+        mode: HostLeaseMode,
+        limit: Duration,
+        scope: Option<ScopeIdentity>,
+        mut wait: impl FnMut(Duration) -> io::Result<bool>,
     ) -> Result<Self, HostLeaseError> {
         let path_str = path.to_str().ok_or_else(|| HostLeaseError::Io {
             path: path.to_path_buf(),
@@ -200,21 +268,41 @@ impl HostLease {
                     limit,
                 });
             }
-            std::thread::sleep(
-                Duration::from_millis(100).min(limit.saturating_sub(start.elapsed())),
-            );
+            let interrupted =
+                wait(Duration::from_millis(100).min(limit.saturating_sub(start.elapsed())));
+            if !matches!(interrupted, Ok(false)) {
+                // SAFETY: uniquely owned lock attempt, no work admitted yet.
+                unsafe {
+                    libc::close(fd);
+                }
+                return Err(HostLeaseError::Io {
+                    path: path.to_path_buf(),
+                    source: match interrupted {
+                        Err(error) => error,
+                        _ => io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "lease runner died before admission",
+                        ),
+                    },
+                });
+            }
         }
         eprintln!("host-lease: acquired {mode} at {}", path.display());
 
         // SAFETY: fd is uniquely owned after successful acquisition.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Self::serve(path, mode, fd).map_err(|source| HostLeaseError::Io {
+        Self::serve(path, mode, fd, scope).map_err(|source| HostLeaseError::Io {
             path: path.to_path_buf(),
             source,
         })
     }
 
-    fn serve(path: &Path, mode: HostLeaseMode, fd: OwnedFd) -> io::Result<Self> {
+    fn serve(
+        path: &Path,
+        mode: HostLeaseMode,
+        fd: OwnedFd,
+        scope: Option<ScopeIdentity>,
+    ) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
         // Keep AF_UNIX names short even when the checkout/TMPDIR is long.
         // TempDir creates a private 0700 directory; its random path is the
@@ -230,6 +318,7 @@ impl HostLease {
             dev: metadata.dev(),
             ino: metadata.ino(),
             mode,
+            scope,
         })?;
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stopping);
@@ -258,21 +347,34 @@ impl HostLease {
                 stopping,
                 server: Some(server),
             }),
+            _scope: None,
             socket,
             path: path.to_path_buf(),
             mode,
         })
     }
 
-    /// Commands inherit only the validation capability. Their exec closes the
-    /// outer runner's CLOEXEC fd, including when Cargo never calls acquire.
-    /// The caller must retain this handle through execution and scoped cleanup.
+    /// Nested commands stay inside the supervisor's workload lifetime. The
+    /// scope pipe (never a lock description) also covers fork without exec.
     pub fn configure_command(&self, command: &mut Command) -> io::Result<()> {
         command
             .env_remove("CARRICK_HOST_LEASE_FD")
             .env_remove("CARRICK_HOST_LEASE_MODE")
             .env(INHERITED_SOCKET, &self.socket)
             .env("CARRICK_HOST_LEASE_PATH", &self.path);
+        if let Some(scope) = &self._scope {
+            let scope = scope.try_clone()?;
+            command.env(SCOPE_FD, scope.as_raw_fd().to_string());
+            // SAFETY: explicit scope-pipe handoff, only async-signal-safe fcntl.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(scope.as_raw_fd(), libc::F_SETFD, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         Ok(())
     }
 
@@ -303,8 +405,35 @@ impl HostLease {
                 "holder does not lease the configured lock file".into(),
             ));
         }
+        let scope = if let Some(expected_scope) = identity.scope {
+            let duplicate_scope = || -> io::Result<OwnedFd> {
+                let fd: libc::c_int = std::env::var(SCOPE_FD)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+                    .parse()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+                // SAFETY: duplicate only an inherited descriptor; the owned
+                // duplicate pins the identity while authenticating its scope.
+                let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+                if duplicate < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // SAFETY: newly returned, uniquely owned duplicate scope writer.
+                let duplicate = unsafe { OwnedFd::from_raw_fd(duplicate) };
+                if ScopeIdentity::writer(&duplicate)? != expected_scope {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "descriptor is not this lease's scope",
+                    ));
+                }
+                Ok(duplicate)
+            };
+            Some(duplicate_scope().map_err(|e| HostLeaseError::Inherited(e.to_string()))?)
+        } else {
+            None
+        };
         Ok(Self {
             _holder: None,
+            _scope: scope,
             socket: socket.to_path_buf(),
             path: path.to_path_buf(),
             mode: identity.mode,
@@ -328,9 +457,17 @@ pub fn run_command(
     if cmd_args.is_empty() {
         return Err(HostLeaseError::EmptyCommand);
     }
+    if std::env::var_os("CARRICK_HOST_LEASE_FD").is_some() {
+        return Err(HostLeaseError::Inherited(
+            "obsolete fd handoff; restart the outer lease runner".into(),
+        ));
+    }
 
     if check_load {
         crate::host_load::check()?;
+    }
+    if std::env::var_os(INHERITED_SOCKET).is_none() {
+        return crate::lease_supervisor::launch(mode, check_load, cmd_args);
     }
     let lease = HostLease::acquire(mode)?;
     if check_load {

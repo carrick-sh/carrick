@@ -4,6 +4,7 @@ pub mod command;
 pub mod host_lease;
 pub mod host_load;
 pub mod impact;
+pub mod lease_supervisor;
 pub mod ledger_merge;
 pub mod probe_coverage;
 pub mod probe_inventory;

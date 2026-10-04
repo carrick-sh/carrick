@@ -63,6 +63,9 @@ pub enum Commands {
     )]
     HostLease(HostLeaseArgs),
 
+    #[command(hide = true)]
+    LeaseSupervisor(crate::lease_supervisor::SupervisorArgs),
+
     #[command(about = "Run the host and/or signed landing gate and output a JSON receipt")]
     Accept(crate::accept::AcceptArgs),
 
@@ -241,7 +244,36 @@ where
     T: Into<OsString> + Clone,
     W: Write,
 {
-    let cli = Cli::try_parse_from(args)?;
+    let argv: Vec<OsString> = args.into_iter().map(Into::into).collect();
+    let cli = Cli::try_parse_from(&argv)?;
+    if std::env::var_os("CARRICK_HOST_LEASE_SOCKET").is_none() {
+        let mode = match &cli.command {
+            Commands::Accept(_) => Some(crate::host_lease::HostLeaseMode::Gate),
+            Commands::Impact(args) => match &args.action {
+                crate::impact::Action::Carrick { .. } => {
+                    Some(crate::host_lease::HostLeaseMode::Carrick)
+                }
+                crate::impact::Action::Docker { .. } => {
+                    Some(crate::host_lease::HostLeaseMode::Docker)
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(mode) = mode {
+            let mut command = vec![
+                std::env::current_exe()
+                    .map_err(|source| CliError::Io {
+                        path: PathBuf::from("current executable"),
+                        source,
+                    })?
+                    .into_os_string(),
+            ];
+            command.extend(argv.into_iter().skip(1));
+            let code = crate::host_lease::run_command(mode, true, &command)?;
+            std::process::exit(code);
+        }
+    }
     match cli.command {
         Commands::Impact(args) => crate::impact::run(cli.root.as_deref(), args.action)
             .map_err(|e| CliError::Impact(e.to_string())),
@@ -356,6 +388,10 @@ where
             let exit_code =
                 crate::host_lease::run_command(args.mode, args.check_load, &args.command)?;
             std::process::exit(exit_code);
+        }
+        Commands::LeaseSupervisor(args) => {
+            let code = crate::lease_supervisor::run(args)?;
+            std::process::exit(code);
         }
         Commands::Accept(args) => {
             crate::accept::run(cli.root.as_deref(), args)?;

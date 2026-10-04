@@ -47,7 +47,7 @@ cd "$(dirname "$0")/.."
 . scripts/lib/post-link-sign.sh
 . scripts/lib/test-signed-args.sh
 
-# Bootstrap once into the Rust lease runner, which owns the lock through
+# Bootstrap once into the Rust lease supervisor, which owns the lock through
 # build, signing, tests and EXIT cleanup. Descendants get only its validation
 # socket; nested runners never own, reacquire or downgrade the gate flock.
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -57,7 +57,7 @@ fi
 if [ -z "${CARRICK_HOST_LEASE_SOCKET:-}" ]; then
     exec cargo run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- ./scripts/test-signed.sh "$@"
 fi
-# Validate the outer runner's lease and check host load before any work. The runner
+# Validate the supervised lease and check host load before any work. The runner
 # logs detected PIDs and parent commands even with CARRICK_ALLOW_LOAD=1.
 cargo run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- true
 
