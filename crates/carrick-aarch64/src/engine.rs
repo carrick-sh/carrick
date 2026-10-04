@@ -29,6 +29,7 @@ use carrick_guest_mem::{
     CurrentMmMemory, Gpa, GuestMemory, GuestVa, MappingSharing, MemoryError, RepointPrivateError,
     SharedFutexLocation,
 };
+use carrick_guest_mem::{LegacyProtectionRead, UserMemoryAuthority};
 use carrick_hal::guest_arch::GuestArch as _;
 use carrick_hal::threaded::{Aarch64TaskCpuStateV1, GuestCpuState};
 use carrick_hal::{
@@ -443,7 +444,7 @@ pub struct Aarch64EngineCore<V: Aarch64Vmm> {
 
     /// Process-wide PROT_NONE ranges; the EFAULT gate on every syscall-buffer
     /// access. SHARED by `CLONE_THREAD` siblings (`Arc` clone), COW'd on fork.
-    protections: Arc<MemoryProtections>,
+    protections: UserMemoryAuthority,
 
     /// The immediately following protection edit initializes a new VMA. Its
     /// cold reservation must discard retired predecessor leaf authority.
@@ -485,7 +486,7 @@ pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
     asid_generation: u64,
     pending_guest_run_receipt_ns: u64,
     page_tables: Stage1Authority,
-    protections: Arc<MemoryProtections>,
+    protections: UserMemoryAuthority,
     pending_process_fork: Option<ParentForkCowRollback>,
     pending_owner_fork: Option<OwnerForkTransaction<V::ProcessBuilder>>,
     owed_stage1_maintenance: crate::vmm::OwedStage1Maintenance,
@@ -498,7 +499,7 @@ pub struct Aarch64TaskEngineState<V: Aarch64Vmm> {
 /// construction-time clones.
 pub struct Aarch64TaskRuntimeProjection {
     pub page_tables: Stage1Authority,
-    pub protections: Arc<MemoryProtections>,
+    pub protections: UserMemoryAuthority,
     pub process_asid: Option<u16>,
 }
 
@@ -509,10 +510,10 @@ impl Aarch64TaskRuntimeProjection {
     pub fn shares_exact_mm_authority(
         &self,
         page_tables: &Stage1Authority,
-        protections: &Arc<MemoryProtections>,
+        protections: &UserMemoryAuthority,
     ) -> bool {
         self.page_tables.shares_exact_authority(page_tables)
-            && Arc::ptr_eq(&self.protections, protections)
+            && self.protections.same_authority(protections)
     }
 }
 unsafe impl<V: Aarch64Vmm> Send for Aarch64TaskEngineState<V> {}
@@ -676,6 +677,9 @@ pub(crate) struct TransferServiceLoan<'a, V: Aarch64Vmm> {
     cpu: std::cell::RefMut<'a, V::Vcpu>,
 }
 impl<V: Aarch64Vmm> TransferServiceLoan<'_, V> {
+    pub(crate) fn target_ttbr0(&self) -> Result<u64, TrapError> {
+        self.cpu.get_sys_reg(SysReg::Ttbr0)
+    }
     pub(crate) fn slot(&self) -> Result<usize, TrapError> {
         self.cpu
             .mailbox_slot()
@@ -753,7 +757,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         mut vm: V,
         vcpu: V::Vcpu,
         page_tables: Stage1Authority,
-        protections: Arc<MemoryProtections>,
+        protections: UserMemoryAuthority,
         process_asid: Option<u16>,
         mm_generation: u64,
         asid_generation: u64,
@@ -1330,10 +1334,12 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         // table (sharedanonfutexfork / futexforkrequeue: all waiters
         // ETIMEDOUT while the parent's wake found zero). One mm, one
         // authority.
-        let protections = vm
-            .exec_protections()
-            .unwrap_or_else(|| Arc::new(MemoryProtections::default()));
-        seed_heap_unmapped(&protections);
+        let protections = vm.exec_protections().unwrap_or_else(|| {
+            UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default()))
+        });
+        if let Some(legacy) = protections.legacy() {
+            seed_heap_unmapped(&legacy);
+        }
         Self {
             vm,
             vcpu: std::cell::RefCell::new(vcpu),
@@ -1442,7 +1448,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 
     /// The shared PROT_NONE EFAULT gate (cloned across `CLONE_THREAD` siblings,
     /// COW'd on fork).
-    pub fn protections(&self) -> &Arc<MemoryProtections> {
+    pub fn protections(&self) -> &UserMemoryAuthority {
         &self.protections
     }
 
@@ -1456,7 +1462,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         mut vm: V,
         vcpu: V::Vcpu,
         page_tables: Stage1Authority,
-        protections: Arc<MemoryProtections>,
+        protections: UserMemoryAuthority,
     ) -> Self {
         vm.bind_stage1_page_tables(page_tables.clone());
         Self {
@@ -3176,7 +3182,168 @@ impl<V: Aarch64Vmm> carrick_guest_mem::CallerEl1Call for Aarch64EngineCore<V> {
     }
 }
 
+impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
+    /// Owner routing is selected by root admission, never by a failed copy.
+    fn read_owner_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        self.read_owner_bytes_with_intent(
+            address,
+            length,
+            carrick_el1_abi::PortalTransferIntent::UserRead,
+        )
+    }
+    fn read_owner_bytes_with_intent(
+        &self,
+        address: u64,
+        length: usize,
+        intent: carrick_el1_abi::PortalTransferIntent,
+    ) -> Result<Vec<u8>, MemoryError> {
+        let handle = self.protections.owner().ok_or(MemoryError::Unsupported)?;
+        if handle.mm().raw() != self.mm_generation {
+            return Err(MemoryError::HostMap(
+                "owner memory incarnation mismatch".into(),
+            ));
+        }
+        let ttbr0 = self
+            .transfer_service_loan()
+            .and_then(|loan| loan.target_ttbr0())
+            .map_err(|error| MemoryError::HostMap(error.to_string()))?;
+        let target = crate::user_transfer::TransferTarget::from_handle(handle, ttbr0);
+        let transfer = crate::user_transfer::OwnedUserTransfer::new(
+            target,
+            crate::user_transfer::UserTransfer::CopyIn {
+                address,
+                len: length,
+                intent,
+            },
+        )
+        .ok_or(MemoryError::OutOfBounds { address, length })?;
+        self.continue_owner_read(transfer)
+    }
+    fn continue_owner_read(
+        &self,
+        mut transfer: crate::user_transfer::OwnedUserTransfer,
+    ) -> Result<Vec<u8>, MemoryError> {
+        if self.protections.owner() != Some(transfer.target_handle()) {
+            return Err(MemoryError::HostMap(
+                "read continuation belongs to another root".into(),
+            ));
+        }
+        let address = transfer.address();
+        let length = transfer.len();
+        let custody = self
+            .vm
+            .owner_transfer_custody()
+            .ok_or(MemoryError::Unsupported)?;
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            return Err(MemoryError::Unsupported);
+        }
+        // SAFETY: the live engine retains the exact complete carrier ABI region.
+        let slots = unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        };
+        loop {
+            use crate::user_transfer::TransferProgress;
+            match transfer
+                .advance(self, custody.as_ref(), slots)
+                .map_err(|error| MemoryError::HostMap(error.to_string()))?
+            {
+                TransferProgress::Complete => return Ok(transfer.into_bytes()),
+                TransferProgress::Physical(wait) => {
+                    return Err(MemoryError::ReadSuspended(Box::new(
+                        carrick_guest_mem::MemoryReadSuspension {
+                            wait: carrick_guest_mem::MemoryReadWait::Physical(wait),
+                            continuation: carrick_guest_mem::OwnedReadContinuation::new(transfer),
+                        },
+                    )));
+                }
+                TransferProgress::Advanced => {}
+                TransferProgress::OwnerWait(wait) => {
+                    return Err(MemoryError::ReadSuspended(Box::new(
+                        carrick_guest_mem::MemoryReadSuspension {
+                            wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
+                            continuation: carrick_guest_mem::OwnedReadContinuation::new(transfer),
+                        },
+                    )));
+                }
+                TransferProgress::Supply(supply) => {
+                    return Err(MemoryError::ReadSuspended(Box::new(
+                        carrick_guest_mem::MemoryReadSuspension {
+                            wait: carrick_guest_mem::MemoryReadWait::Supply(supply),
+                            continuation: carrick_guest_mem::OwnedReadContinuation::new(transfer),
+                        },
+                    )));
+                }
+                TransferProgress::Retired(handle) => return Err(MemoryError::OwnerRetired(handle)),
+                TransferProgress::Refused(errno) if errno.get() != 14 => {
+                    return Err(MemoryError::HostMap(format!(
+                        "owner copyin refused: {errno:?}"
+                    )));
+                }
+                TransferProgress::Refused(_) => {
+                    return Err(MemoryError::OutOfBounds { address, length });
+                }
+                TransferProgress::Suspended => {
+                    return Err(MemoryError::HostMap(
+                        "owner read omitted suspension receipt".into(),
+                    ));
+                }
+            }
+        }
+    }
+    fn write_owner_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        let range = carrick_guest_mem::GuestWriteRange::new(GuestVa(address), bytes.len()).ok_or(
+            MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            },
+        )?;
+        let prepared = self.prepare_write(&[range]).map_err(|error| match error {
+            carrick_guest_mem::MemoryPrepareError::Limit(limit) => MemoryError::HostMap(format!(
+                "write requires bounded prepare before consumption: {limit:?}"
+            )),
+            carrick_guest_mem::MemoryPrepareError::Fault(error) => error,
+            carrick_guest_mem::MemoryPrepareError::Physical(wait) => MemoryError::Physical(wait),
+            carrick_guest_mem::MemoryPrepareError::OwnerWait(wait) => MemoryError::OwnerWait(wait),
+            carrick_guest_mem::MemoryPrepareError::Supply(supply) => {
+                MemoryError::Supply(Box::new(supply))
+            }
+        })?;
+        prepared.commit(&[bytes]);
+        Ok(())
+    }
+}
+
 impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
+    fn read_carrick_internal(
+        &self,
+        range: carrick_el1_abi::CarrickInternalReadRange,
+    ) -> Result<Vec<u8>, MemoryError> {
+        if self.protections.owner().is_some() {
+            self.read_owner_bytes_with_intent(
+                range.address(),
+                range.len() as usize,
+                carrick_el1_abi::PortalTransferIntent::CarrickInternalRead,
+            )
+        } else {
+            self.read_bytes_raw(range.address(), range.len() as usize)
+        }
+    }
+    fn resume_read(
+        &self,
+        continuation: carrick_guest_mem::OwnedReadContinuation,
+    ) -> Result<Vec<u8>, MemoryError> {
+        let transfer = continuation
+            .take::<crate::user_transfer::OwnedUserTransfer>()
+            .ok_or_else(|| {
+                MemoryError::HostMap(
+                    "read continuation already consumed or belongs to another backend".into(),
+                )
+            })?;
+        self.continue_owner_read(transfer)
+    }
+
     fn caller_el1_call(&mut self) -> Option<&mut dyn carrick_guest_mem::CallerEl1Call> {
         self.vcpu.get_mut().mailbox_slot()?;
         Some(self)
@@ -3199,14 +3366,78 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         self.supports_lazy_anonymous_mmap()
     }
 
-    /// The PROT_NONE set the shared default `read_bytes`/`write_bytes` gate on
-    /// (keyed on the guest VA). The backend owns it (KVM in `GuestRam`, shared
-    /// across siblings); `*_raw` does the IPA-translated backing lookup only.
-    fn protections(&self) -> Option<&MemoryProtections> {
+    /// Borrow the backend's legacy mirror. Admitted roots have no mirror and
+    /// authorize checked and raw copies through the same EL1 transfer venue.
+    fn protections(&self) -> Option<LegacyProtectionRead<'_>> {
         self.vm.protections()
     }
 
+    fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+        if self.protections.owner().is_some() {
+            carrick_guest_mem::UserMemoryVenue::Owner
+        } else {
+            carrick_guest_mem::UserMemoryVenue::Legacy
+        }
+    }
+
+    fn prepare_write(
+        &mut self,
+        ranges: &[carrick_guest_mem::GuestWriteRange],
+    ) -> Result<
+        Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
+        carrick_guest_mem::MemoryPrepareError,
+    > {
+        let Some(handle) = self.protections.owner() else {
+            return Err(carrick_guest_mem::MemoryPrepareError::Fault(
+                MemoryError::Unsupported,
+            ));
+        };
+        if handle.mm().raw() != self.mm_generation {
+            carrick_fatal::carrick_fatal!(
+                "aarch64::prepared_copy",
+                "current task differs from admitted memory authority"
+            );
+        }
+        let custody = self.vm.owner_transfer_custody().unwrap_or_else(|| {
+            carrick_fatal::carrick_fatal!(
+                "aarch64::prepared_copy",
+                "admitted task lacks physical custody"
+            )
+        });
+        let ttbr0 = self
+            .transfer_service_loan()
+            .and_then(|loan| loan.target_ttbr0())
+            .map_err(|error| {
+                carrick_guest_mem::MemoryPrepareError::Fault(MemoryError::HostMap(
+                    error.to_string(),
+                ))
+            })?;
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            carrick_fatal::carrick_fatal!(
+                "aarch64::prepared_copy",
+                "admitted carrier region absent"
+            );
+        }
+        // SAFETY: the live engine retains this carrier's complete ABI region;
+        // selection independently authenticates its address and carrier binding.
+        let slots = unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        };
+        crate::user_transfer::prepare_write(
+            self,
+            custody.as_ref(),
+            slots,
+            crate::user_transfer::TransferTarget::from_handle(handle, ttbr0),
+            ranges,
+        )
+    }
+
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+        if self.protections.owner().is_some() {
+            return self.read_owner_bytes(address, length);
+        }
         if !self.el1_private_range_permits(
             address,
             length,
@@ -3264,6 +3495,11 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn read_into_raw(&self, address: u64, dst: &mut [u8]) -> Result<(), MemoryError> {
+        if self.protections.owner().is_some() {
+            let bytes = self.read_owner_bytes(address, dst.len())?;
+            dst.copy_from_slice(&bytes);
+            return Ok(());
+        }
         // No-alloc fixed-size read (`read_u32`/`read_u64`/struct headers), still
         // page-segmented for fragmented overlays.
         let length = dst.len();
@@ -3346,6 +3582,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        if self.protections.owner().is_some() {
+            return self.write_owner_bytes(address, bytes);
+        }
         // PROT_NONE gated on the guest VA in the default `write_bytes`; backing
         // lookup on the translated IPA (see `read_bytes_raw`). For a
         // `repoint_private` overlay the syscall write lands in the PRIVATE overlay
@@ -3394,6 +3633,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        if self.protections.owner().is_some() {
+            return self.write_owner_bytes(address, bytes);
+        }
         // carrick-INTERNAL frame the guest must receive even into a guest-read-only
         // mapping (vdso vvar, sigframe, bootstrap): bypass the per-mapping WRITE
         // permission (the host page is writable). PROT_NONE is NOT re-gated (the
@@ -3576,6 +3818,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// PROT_NONE check — used to clear a reused/`munmap`'d region whose stale bytes
     /// must never resurface after a later `mprotect` makes it readable.
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
+        if self.protections.owner().is_some() {
+            return self.write_owner_bytes(address, &vec![0; len]);
+        }
         self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::BackingMaintenance)?;
         self.vm.zero_backing(address, len)
     }
@@ -4278,7 +4523,9 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         if let Some(protections) = self.vm.exec_protections() {
             self.protections = protections;
         }
-        seed_heap_unmapped(&self.protections);
+        if let Some(legacy) = self.protections.legacy() {
+            seed_heap_unmapped(&legacy);
+        }
         if let Some(asid) = self.process_asid {
             <Self as ThreadedEngine>::configure_process_asid(self, asid)?;
         }
@@ -4610,7 +4857,7 @@ pub struct Aarch64SiblingSpec<V: Aarch64Vmm> {
     /// The parent's PROT_NONE bookkeeping, SHARED (Arc clone). On KVM the
     /// load-bearing share is inside the backend `GuestRam` (via
     /// `from_shared_windows`); this is the engine-side mirror.
-    protections: Arc<MemoryProtections>,
+    protections: UserMemoryAuthority,
     process_asid: Option<u16>,
 }
 
@@ -4618,7 +4865,7 @@ pub struct Aarch64ProcessSpec<V: Aarch64Vmm> {
     builder: V::ProcessBuilder,
     snapshot: Aarch64VcpuSnapshot,
     page_tables: Stage1Authority,
-    protections: Arc<MemoryProtections>,
+    protections: UserMemoryAuthority,
     process_asid: u16,
 }
 
@@ -4626,7 +4873,7 @@ pub struct Aarch64SiblingTaskOnlyParts<V: Aarch64Vmm> {
     pub builder: V::SiblingBuilder,
     pub snapshot: Aarch64VcpuSnapshot,
     pub page_tables: Stage1Authority,
-    pub protections: Arc<MemoryProtections>,
+    pub protections: UserMemoryAuthority,
     pub process_asid: Option<u16>,
 }
 
@@ -4634,7 +4881,7 @@ pub struct Aarch64ProcessTaskOnlyParts<V: Aarch64Vmm> {
     pub builder: V::ProcessBuilder,
     pub snapshot: Aarch64VcpuSnapshot,
     pub page_tables: Stage1Authority,
-    pub protections: Arc<MemoryProtections>,
+    pub protections: UserMemoryAuthority,
     pub process_asid: u16,
 }
 
@@ -5705,26 +5952,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             })?;
         }
         let stage_started = std::time::Instant::now();
-        let protections = Arc::new(MemoryProtections::from_snapshot(
-            self.protections.snapshot_all(),
+        let legacy = self.protections.legacy().ok_or_else(|| {
+            TrapError::Hypervisor("owner root cannot take a legacy fork projection".into())
+        })?;
+        let protections = UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::from_snapshot(legacy.snapshot_all()),
         ));
-        if fork_debug_va().is_some() {
-            let wrapper = self.protections.snapshot_all();
-            let backend = self.vm.protections().map(|p| p.snapshot_all());
-            eprintln!(
-                "[FUTEXDBG] fork spec: wrapper protections Arc={:p} shared={:?}; backend \
-                 protections shared={:?}; same instance={}",
-                Arc::as_ptr(&self.protections),
-                wrapper.mutable_shared_backing,
-                backend.as_ref().map(|s| &s.mutable_shared_backing),
-                self.vm.protections().is_some_and(|p| {
-                    std::ptr::eq(
-                        p as *const MemoryProtections,
-                        Arc::as_ptr(&self.protections),
-                    )
-                }),
-            );
-        }
+        drop(legacy);
         emit_stage(
             HvpatchForkProcessSpecStagePhase::WrapperProtections,
             stage_started,
@@ -6050,7 +6284,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             page_tables: self.page_tables.clone(),
             // Share the SAME PROT_NONE bookkeeping (engine-side mirror; the backing
             // share lives in the backend `GuestRam`).
-            protections: Arc::clone(&self.protections),
+            protections: self.protections.clone(),
             process_asid: self.process_asid,
         })
     }
@@ -7138,7 +7372,7 @@ mod tests {
         let sibling_protections = Arc::clone(&protections);
         assert!(
             Arc::ptr_eq(&protections, &sibling_protections),
-            "CLONE_VM sibling must share the same Arc<MemoryProtections>"
+            "CLONE_VM sibling must share the same UserMemoryAuthority"
         );
 
         // 5. Exec replacement resets heap on fresh mm.
@@ -7899,6 +8133,9 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 crate::user_transfer::TransferProgress::Advanced => {}
                 crate::user_transfer::TransferProgress::Suspended
                 | crate::user_transfer::TransferProgress::OwnerWait(_)
+                | crate::user_transfer::TransferProgress::Retired(_)
+                | crate::user_transfer::TransferProgress::Physical(_)
+                | crate::user_transfer::TransferProgress::Supply(_)
                 | crate::user_transfer::TransferProgress::Refused(_) => {
                     return Err(TrapError::Hypervisor(
                         "owner parent transfer refused".into(),
@@ -8070,7 +8307,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 builder,
                 snapshot,
                 page_tables: authority,
-                protections: Arc::new(MemoryProtections::default()),
+                protections: UserMemoryAuthority::from_owner(pending.completion().child),
                 process_asid,
             })
         })();
@@ -8265,7 +8502,7 @@ mod transfer_service_tests {
         fn read_gpa(&self, gpa: u64, len: usize) -> Result<Vec<u8>, TrapError> {
             panic!("unused backend method")
         }
-        fn protections(&self) -> Option<&MemoryProtections> {
+        fn protections(&self) -> Option<LegacyProtectionRead<'_>> {
             panic!("unused backend method")
         }
         fn translated_read(&self, va: u64, ipa: u64, len: usize) -> Result<Vec<u8>, MemoryError> {
@@ -8332,7 +8569,7 @@ mod transfer_service_tests {
                 fail_restore: false,
             },
             Stage1Authority::new(),
-            Arc::new(MemoryProtections::default()),
+            UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
             None,
             0,
             0,

@@ -2914,7 +2914,7 @@ impl HvfVmState {
         &self,
         mm_access: &std::sync::Arc<MmAccessState>,
         page_tables: &carrick_aarch64::Stage1Authority,
-        protections: &std::sync::Arc<MemoryProtections>,
+        protections: &carrick_guest_mem::UserMemoryAuthority,
     ) -> bool {
         self.task
             .runtime_authorities_match(mm_access, page_tables, protections)
@@ -2924,8 +2924,8 @@ impl HvfVmState {
         self.task.mm_access_authority()
     }
 
-    pub(crate) fn task_protections_authority(&self) -> std::sync::Arc<MemoryProtections> {
-        std::sync::Arc::clone(&self.protections)
+    pub(crate) fn task_protections_authority(&self) -> carrick_guest_mem::UserMemoryAuthority {
+        self.protections.clone()
     }
 
     /// Tell `manager` whether THIS thread's edit is exclusive, before an
