@@ -526,7 +526,15 @@ impl Drop for Reservations<'_> {
             // SAFETY: this guard exclusively owns this exact authenticated root
             // lock; protected state is no longer used after the release.
             unsafe {
-                lease.release_resource(venue.release, &self.root.locked, self.unlocked, causes);
+                if self.retiring_notifications {
+                    lease.release_retiring_resource(
+                        venue.release,
+                        &self.root.locked,
+                        self.unlocked,
+                    );
+                } else {
+                    lease.release_resource(venue.release, &self.root.locked, self.unlocked, causes);
+                }
             }
         } else {
             self.root
@@ -3159,9 +3167,18 @@ impl Reservations<'_> {
                 .zone
                 .space_entry(identity.mm)
                 .ok_or(Refusal::Stale)?;
-            entry
-                .close_notifications(identity.incarnation)
-                .map_err(|_| Refusal::Busy)?;
+            if venue.release.zone.spaces.gate(entry.index())
+                & carrick_sched_core::spaces::GATE_CLOSED
+                == 0
+                || venue
+                    .release
+                    .zone
+                    .spaces
+                    .active_editor(entry.index())
+                    .is_some()
+            {
+                return Err(Refusal::Busy);
+            }
             self.retiring_notifications = true;
             self.unlocked = ResourceUnlocked::Plain;
         }

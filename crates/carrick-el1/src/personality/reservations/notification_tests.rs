@@ -203,7 +203,7 @@ fn delayed_old_root_admission_cannot_demote_reused_notification_word() {
             let zone = self.venue.release.zone;
             zone.space_entry(core::num::NonZeroU64::new(self.mm.raw()).unwrap())
                 .unwrap()
-                .retire_entry();
+                .retire_entry(self.venue.release);
             let next_mm = self.mm.raw() + carrick_sched_core::spaces::ADDRESS_SPACES as u64;
             let next = zone.spaces.publish_closed(next_mm, ROOT, ROOT).unwrap();
             if next == self.index {
@@ -213,7 +213,7 @@ fn delayed_old_root_admission_cannot_demote_reused_notification_word() {
                 // The counted old admission correctly retained the old entry.
                 zone.space_entry(core::num::NonZeroU64::new(next_mm).unwrap())
                     .unwrap()
-                    .retire_entry();
+                    .retire_entry(self.venue.release);
             }
             true
         }
