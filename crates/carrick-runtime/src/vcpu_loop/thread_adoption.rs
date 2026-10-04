@@ -205,6 +205,31 @@ pub(super) struct AdoptedThreadRuntime<E: ThreadedEngine> {
     pub(super) state: ThreadRuntimeState<E>,
     pub(super) injected_lease: Arc<InjectedExecutionLeaseSlot>,
     pub(super) submission: carrick_kernel::kernel::scheduler::ProcessBirthSubmission,
+    birth_admission: Option<super::CloneAdmissionPermit>,
+}
+
+#[derive(Debug)]
+pub(super) enum ThreadRuntimeAdoptionError {
+    /// Exec/exit already owns the born thread's kernel-row retirement.
+    TerminalOwner,
+    Trap(TrapError),
+}
+
+impl From<TrapError> for ThreadRuntimeAdoptionError {
+    fn from(error: TrapError) -> Self {
+        Self::Trap(error)
+    }
+}
+
+impl From<ThreadRuntimeAdoptionError> for RuntimeError {
+    fn from(error: ThreadRuntimeAdoptionError) -> Self {
+        match error {
+            ThreadRuntimeAdoptionError::TerminalOwner => Self::Configuration(
+                "host clone unexpectedly lost its existing adoption admission".into(),
+            ),
+            ThreadRuntimeAdoptionError::Trap(error) => Self::Trap(error),
+        }
+    }
 }
 
 impl<E: ThreadedEngine + 'static> ProcessThreadAdoptionFactory<E>
@@ -443,7 +468,7 @@ pub(super) fn adopt_thread_runtime<E: ThreadedEngine + 'static>(
     reservation: ThreadBirthAdoptionReservation,
     context: &KernelContext,
     frame: Option<&carrick_el1_abi::ThreadCtx>,
-) -> Result<AdoptedThreadRuntime<E>, TrapError>
+) -> Result<AdoptedThreadRuntime<E>, ThreadRuntimeAdoptionError>
 where
     E::SiblingSpec: 'static,
 {
@@ -451,13 +476,35 @@ where
     {
         return Err(TrapError::Hypervisor(
             "thread adoption capacity belongs to another exact task/thread".into(),
-        ));
+        )
+        .into());
     }
     let mut reserved = reservation
         .consume::<ReservedThreadRuntime<E>>()
         .map_err(|_| {
             TrapError::Hypervisor("thread adoption capacity has another execution lane".into())
         })?;
+    let birth_admission = match reserved.origin {
+        ThreadAdoptionOrigin::HostClone(_) => None,
+        ThreadAdoptionOrigin::AbiBorn => {
+            match reserved
+                .kernel
+                .clone_admission
+                .enroll_born_thread_adoption()
+            {
+                super::CloneEnrollment::Admitted(permit) => Some(permit),
+                super::CloneEnrollment::Refused => {
+                    return Err(ThreadRuntimeAdoptionError::TerminalOwner);
+                }
+                super::CloneEnrollment::Deferred { .. } => {
+                    return Err(TrapError::Hypervisor(
+                        "born thread adoption unexpectedly deferred behind fork admission".into(),
+                    )
+                    .into());
+                }
+            }
+        }
+    };
     let process =
         reserved.kernel.hvpatch_process.as_ref().ok_or_else(|| {
             TrapError::Hypervisor("thread adoption lost its owner process".into())
@@ -467,7 +514,8 @@ where
     {
         return Err(TrapError::Hypervisor(
             "thread adoption rejected foreign kernel authority".into(),
-        ));
+        )
+        .into());
     }
     let mut state = reserved.state.pop().ok_or_else(|| {
         TrapError::Hypervisor("thread adoption runtime cell was already consumed".into())
@@ -480,7 +528,8 @@ where
         _ => {
             return Err(TrapError::Hypervisor(
                 "birth adoption requires its reserved CPU and first-entry frame".into(),
-            ));
+            )
+            .into());
         }
     };
     state.syscall_completion = match reserved.origin {
@@ -501,6 +550,7 @@ where
         state,
         injected_lease: reserved.injected_lease,
         submission: reserved.submission,
+        birth_admission,
     })
 }
 
@@ -512,7 +562,15 @@ fn activate_born_thread<E: ThreadedEngine + 'static>(
 where
     E::SiblingSpec: 'static,
 {
-    let mut adopted = adopt_thread_runtime::<E>(reservation, context, Some(frame))?;
+    let mut adopted = match adopt_thread_runtime::<E>(reservation, context, Some(frame)) {
+        Ok(adopted) => adopted,
+        // The caller frees this exact stopped zone record. The kernel's
+        // terminal owner retires its row; no runtime registry/job may appear
+        // after that owner's member census has closed.
+        Err(ThreadRuntimeAdoptionError::TerminalOwner) => return Ok(()),
+        Err(ThreadRuntimeAdoptionError::Trap(error)) => return Err(error),
+    };
+    let birth_admission = adopted.birth_admission.take();
     let cpu = adopted
         .cpu
         .take()
@@ -576,11 +634,14 @@ where
         .take_opened_start_gate(generation)
         .ok_or_else(|| TrapError::Hypervisor("born adoption lost start proof".into()))?;
     logical.install_start_gate(gate)?;
-    dormant.activate(
+    let result = dormant.activate(
         &scheduler,
         context.thread().clone(),
         logical.activation_proof()?,
-    )
+    );
+    // Registration, member enrollment and submission are all inside admission.
+    drop(birth_admission);
+    result
 }
 
 #[cfg(test)]
@@ -845,6 +906,10 @@ mod tests {
             adopted.is_err(),
             "first entry after exec's stop must release its capacity, not create a late runtime owner"
         );
+        assert!(matches!(
+            adopted,
+            Err(ThreadRuntimeAdoptionError::TerminalOwner)
+        ));
         let peer_reservation = peer_factory.reserve(peer.thread().key()).unwrap();
         assert!(
             adopt_thread_runtime::<CrashCaptureTestEngine>(peer_reservation, &peer, None).is_ok(),

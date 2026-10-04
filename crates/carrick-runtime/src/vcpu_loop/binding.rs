@@ -2300,7 +2300,7 @@ where
                     None,
                     false,
                 );
-                return Err(RuntimeError::Trap(error));
+                return Err(error.into());
             }
         };
         let mut logical = match prepare_hvpatch_logical_job(HvpatchLogicalJobInput {
