@@ -5770,6 +5770,276 @@ mod ipc_set_tests {
     mod serial_host {
         use super::*;
 
+        // The supervisor is a separate exec, so its worker can be killed and
+        // reaped even when SIGKILL bypasses every destructor in the test parent.
+        // Only this test-control socket is handed off; never a host-lease fd.
+        struct WatchdogChild {
+            supervisor: std::process::Child,
+            control: std::os::unix::net::UnixStream,
+        }
+
+        impl WatchdogChild {
+            fn spawn(mut command: std::process::Command) -> std::io::Result<Self> {
+                use std::io::Read;
+                use std::os::fd::AsRawFd;
+                use std::os::unix::process::CommandExt;
+                let (control, monitor) = std::os::unix::net::UnixStream::pair()?;
+                command
+                    .env(
+                        "CARRICK_SYSVIPC_WATCHDOG_FD",
+                        monitor.as_raw_fd().to_string(),
+                    )
+                    .env(
+                        "CARRICK_SYSVIPC_WATCHDOG_PARENT",
+                        std::process::id().to_string(),
+                    );
+                // SAFETY: only async-signal-safe fcntl on this owned control fd.
+                unsafe {
+                    command.pre_exec(move || {
+                        let fd = monitor.as_raw_fd();
+                        let flags = libc::fcntl(fd, libc::F_GETFD);
+                        if flags < 0
+                            || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                let supervisor = command.spawn()?;
+                drop(command);
+                let mut guard = Self {
+                    supervisor,
+                    control,
+                };
+                guard
+                    .control
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+                let mut ready = [0; 1];
+                guard.control.read_exact(&mut ready)?;
+                guard.control.set_read_timeout(None)?;
+                Ok(guard)
+            }
+
+            fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+                self.supervisor.try_wait()
+            }
+
+            fn kill(&mut self) -> std::io::Result<()> {
+                self.control.shutdown(std::net::Shutdown::Write)
+            }
+
+            fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+                self.supervisor.wait()
+            }
+        }
+
+        impl Drop for WatchdogChild {
+            fn drop(&mut self) {
+                let _ = self.kill();
+                let _ = self.wait();
+            }
+        }
+
+        fn supervise_watchdog_child() {
+            use std::io::Write;
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            let Some(fd) = std::env::var_os("CARRICK_SYSVIPC_WATCHDOG_FD") else {
+                return;
+            };
+            let fd: libc::c_int = fd.to_str().unwrap().parse().unwrap();
+            // SAFETY: the explicit exec handoff grants ownership of this socket.
+            let mut control = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+            // End the handoff before spawning the worker.
+            // SAFETY: fd is a live owned descriptor; flags are process-local.
+            unsafe {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                assert!(
+                    flags >= 0 && libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == 0
+                );
+            }
+            let parent: libc::pid_t = std::env::var("CARRICK_SYSVIPC_WATCHDOG_PARENT")
+                .unwrap()
+                .parse()
+                .unwrap();
+            // Watch the exact live parent before creating any worker. If the
+            // parent has already died, there is no worker to orphan.
+            // SAFETY: getppid has no preconditions.
+            if unsafe { libc::getppid() } != parent {
+                std::process::exit(1);
+            }
+
+            #[cfg(target_os = "linux")]
+            fn pidfd(pid: libc::pid_t) -> std::io::Result<OwnedFd> {
+                // SAFETY: pidfd_open pins one process incarnation, flags zero.
+                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // SAFETY: newly returned descriptor, uniquely owned.
+                Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
+            }
+
+            #[cfg(not(target_os = "linux"))]
+            fn watch(kq: &OwnedFd, pid: libc::pid_t) -> std::io::Result<()> {
+                // SAFETY: zeroed kevent, then initialized for EVFILT_PROC.
+                let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
+                event.ident = pid as _;
+                event.filter = libc::EVFILT_PROC;
+                event.flags = libc::EV_ADD | libc::EV_ENABLE;
+                event.fflags = libc::NOTE_EXIT;
+                // SAFETY: valid owned queue and one initialized change.
+                if unsafe {
+                    libc::kevent(
+                        kq.as_raw_fd(),
+                        &event,
+                        1,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null(),
+                    )
+                } < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            }
+
+            #[cfg(target_os = "linux")]
+            let parent_exit = match pidfd(parent) {
+                Ok(fd) => fd,
+                Err(_) => std::process::exit(1),
+            };
+            #[cfg(not(target_os = "linux"))]
+            let queue = {
+                // SAFETY: kqueue creates a new descriptor.
+                let fd = unsafe { libc::kqueue() };
+                assert!(fd >= 0);
+                // SAFETY: newly returned, uniquely owned queue.
+                let queue = unsafe { OwnedFd::from_raw_fd(fd) };
+                if watch(&queue, parent).is_err() {
+                    std::process::exit(1);
+                }
+                // SAFETY: queue is owned and must not reach the worker exec.
+                assert_eq!(
+                    unsafe { libc::fcntl(queue.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) },
+                    0
+                );
+                queue
+            };
+            struct Worker(std::process::Child);
+            impl Drop for Worker {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let mut worker = Worker(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(std::env::args_os().skip(1))
+                    .env_remove("CARRICK_SYSVIPC_WATCHDOG_FD")
+                    .env_remove("CARRICK_SYSVIPC_WATCHDOG_PARENT")
+                    .spawn()
+                    .expect("spawn supervised worker"),
+            );
+            let worker_pid = worker.0.id() as libc::pid_t;
+            #[cfg(target_os = "linux")]
+            let worker_exit = pidfd(worker_pid).expect("worker pidfd");
+            #[cfg(not(target_os = "linux"))]
+            {
+                if let Err(err) = watch(&queue, worker_pid) {
+                    if err.raw_os_error() != Some(libc::ESRCH) {
+                        panic!("worker watch: {err}");
+                    }
+                    let status = worker.0.wait().unwrap();
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+                // SAFETY: initialized read event for the live control socket.
+                let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
+                event.ident = control.as_raw_fd() as _;
+                event.filter = libc::EVFILT_READ;
+                event.flags = libc::EV_ADD | libc::EV_ENABLE;
+                assert_eq!(
+                    unsafe {
+                        libc::kevent(
+                            queue.as_raw_fd(),
+                            &event,
+                            1,
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null(),
+                        )
+                    },
+                    0
+                );
+            }
+            // Parent-death watch and worker-reaping authority exist before ready.
+            control.write_all(&[1]).expect("supervisor ready");
+            loop {
+                #[cfg(target_os = "linux")]
+                let worker_done = {
+                    let mut events = [
+                        libc::pollfd {
+                            fd: parent_exit.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: control.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                        libc::pollfd {
+                            fd: worker_exit.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        },
+                    ];
+                    // SAFETY: three live descriptors, blocking event wait.
+                    let result = unsafe { libc::poll(events.as_mut_ptr(), 3, -1) };
+                    if result < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    assert!(result > 0);
+                    events[2].revents != 0
+                };
+                #[cfg(not(target_os = "linux"))]
+                let worker_done = {
+                    // SAFETY: queue is owned, output storage initialized by kevent.
+                    let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
+                    let result = unsafe {
+                        libc::kevent(
+                            queue.as_raw_fd(),
+                            std::ptr::null(),
+                            0,
+                            &mut event,
+                            1,
+                            std::ptr::null(),
+                        )
+                    };
+                    if result < 0
+                        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+                    {
+                        continue;
+                    }
+                    assert!(result > 0);
+                    event.filter == libc::EVFILT_PROC && event.ident == worker_pid as usize
+                };
+                if !worker_done {
+                    let _ = worker.0.kill();
+                }
+                let status = worker.0.wait().expect("reap supervised worker");
+                use std::os::unix::process::ExitStatusExt;
+                std::process::exit(
+                    status
+                        .code()
+                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+                );
+            }
+        }
+
         #[test]
         fn message_queue_hot_path_does_not_rewrite_identity_file() {
             let dispatcher = SyscallDispatcher::new();
@@ -6043,18 +6313,21 @@ mod ipc_set_tests {
 
         #[test]
         fn proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock() {
+            supervise_watchdog_child();
             if std::env::var_os("CARRICK_SYSVIPC_TEST_CHILD").is_some() {
                 run_proc_sysvipc_concurrency_worker();
                 return;
             }
 
-            let mut child = std::process::Command::new(std::env::current_exe().expect("test exe path"))
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("test exe path"));
+            command
                 .env("CARRICK_SYSVIPC_TEST_CHILD", "1")
                 .arg("--exact")
                 .arg("dispatch::sysv::ipc_set_tests::serial_host::proc_sysvipc_rendering_races_attachment_cleanup_and_paired_mutation_without_deadlock")
-                .arg("--nocapture")
-                .spawn()
-                .expect("spawn concurrency test child process");
+                .arg("--nocapture");
+            let mut child =
+                WatchdogChild::spawn(command).expect("spawn concurrency test child process");
 
             let start = std::time::Instant::now();
             let timeout = std::time::Duration::from_secs(10);
@@ -6084,19 +6357,34 @@ mod ipc_set_tests {
 
         #[test]
         fn watchdog_kills_and_reaps_on_deadlock_timeout() {
+            supervise_watchdog_child();
             if std::env::var_os("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK").is_some() {
+                if let Some(path) = std::env::var_os("CARRICK_SYSVIPC_WATCHDOG_READY") {
+                    std::fs::write(
+                        path,
+                        format!("{} {}", std::process::id(), unsafe { libc::getppid() }),
+                    )
+                    .expect("publish child ready");
+                }
                 loop {
                     std::thread::park();
                 }
             }
 
-            let mut child = std::process::Command::new(std::env::current_exe().expect("test exe path"))
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("test exe path"));
+            command
                 .env("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK", "1")
                 .arg("--exact")
                 .arg("dispatch::sysv::ipc_set_tests::serial_host::watchdog_kills_and_reaps_on_deadlock_timeout")
-                .arg("--nocapture")
-                .spawn()
-                .expect("spawn deadlocked child process");
+                .arg("--nocapture");
+            let mut child = WatchdogChild::spawn(command).expect("spawn deadlocked child process");
+
+            if std::env::var_os("CARRICK_SYSVIPC_WATCHDOG_PARENT_HOLD").is_some() {
+                loop {
+                    std::thread::park();
+                }
+            }
 
             let start = std::time::Instant::now();
             let timeout = std::time::Duration::from_millis(200);
@@ -6119,6 +6407,110 @@ mod ipc_set_tests {
                 !status.success(),
                 "killed deadlocked child should report non-zero / terminated status"
             );
+        }
+
+        #[test]
+        fn watchdog_child_is_reaped_when_test_parent_is_killed() {
+            #[cfg(target_os = "linux")]
+            struct Subreaper(libc::c_int);
+            #[cfg(target_os = "linux")]
+            impl Drop for Subreaper {
+                fn drop(&mut self) {
+                    // SAFETY: restore the serial fixture's prior process setting.
+                    unsafe {
+                        libc::prctl(libc::PR_SET_CHILD_SUBREAPER, self.0);
+                    }
+                }
+            }
+            #[cfg(target_os = "linux")]
+            let _subreaper = {
+                let mut previous = 0;
+                // SAFETY: valid output; only our exact adopted PIDs are reaped.
+                unsafe {
+                    assert_eq!(libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut previous), 0);
+                    assert_eq!(libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1), 0);
+                }
+                Subreaper(previous)
+            };
+            struct Cleanup {
+                parent: std::process::Child,
+                worker: Option<libc::pid_t>,
+                supervisor: Option<libc::pid_t>,
+            }
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    let _ = self.parent.kill();
+                    let _ = self.parent.wait();
+                    if let Some(pid) = self.worker {
+                        // SAFETY: exact run-scoped worker; cleanup on red/panic.
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                        }
+                        #[cfg(target_os = "linux")]
+                        // SAFETY: only the red fixture's adopted worker PID.
+                        unsafe {
+                            libc::waitpid(pid, std::ptr::null_mut(), 0);
+                        }
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Some(pid) = self.supervisor {
+                        // SAFETY: exact adopted supervisor, after its worker died.
+                        unsafe {
+                            libc::waitpid(pid, std::ptr::null_mut(), 0);
+                        }
+                    }
+                }
+            }
+            let ready = tempfile::NamedTempFile::new().expect("ready file");
+            let mut cleanup = Cleanup {
+                parent: std::process::Command::new(std::env::current_exe().expect("test exe"))
+                    .args(["--exact", "dispatch::sysv::ipc_set_tests::serial_host::watchdog_kills_and_reaps_on_deadlock_timeout", "--nocapture"])
+                    .env("CARRICK_SYSVIPC_WATCHDOG_PARENT_HOLD", "1")
+                    .env("CARRICK_SYSVIPC_WATCHDOG_READY", ready.path())
+                    .spawn().expect("parent test process"),
+                worker: None,
+                supervisor: None,
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let pid = loop {
+                let data = std::fs::read_to_string(ready.path()).unwrap();
+                if let Some((worker, supervisor)) = data.split_once(' ') {
+                    let supervisor: libc::pid_t = supervisor.parse().unwrap();
+                    if supervisor != cleanup.parent.id() as libc::pid_t {
+                        cleanup.supervisor = Some(supervisor);
+                    }
+                    break worker.parse::<libc::pid_t>().unwrap();
+                }
+                assert!(
+                    cleanup.parent.try_wait().unwrap().is_none(),
+                    "parent exited before ready"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "child readiness timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            cleanup.worker = Some(pid);
+            cleanup.parent.kill().unwrap();
+            cleanup.parent.wait().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                // SAFETY: signal zero checks whether the exact worker has been reaped.
+                if unsafe { libc::kill(pid, 0) } < 0 {
+                    assert_eq!(
+                        std::io::Error::last_os_error().raw_os_error(),
+                        Some(libc::ESRCH)
+                    );
+                    cleanup.worker = None;
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "deadlock child survived parent death or was not reaped: {pid}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
         }
 
         fn run_remapped_shmat_same_shmid_worker() {
@@ -6193,18 +6585,21 @@ mod ipc_set_tests {
 
         #[test]
         fn remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting() {
+            supervise_watchdog_child();
             if std::env::var_os("CARRICK_SAME_SHMID_TEST_CHILD").is_some() {
                 run_remapped_shmat_same_shmid_worker();
                 return;
             }
 
-            let mut child = std::process::Command::new(std::env::current_exe().expect("test exe path"))
+            let mut command =
+                std::process::Command::new(std::env::current_exe().expect("test exe path"));
+            command
                 .env("CARRICK_SAME_SHMID_TEST_CHILD", "1")
                 .arg("--exact")
                 .arg("dispatch::sysv::ipc_set_tests::serial_host::remapped_shmat_same_shmid_does_not_deadlock_and_preserves_accounting")
-                .arg("--nocapture")
-                .spawn()
-                .expect("spawn same-shmid test child process");
+                .arg("--nocapture");
+            let mut child =
+                WatchdogChild::spawn(command).expect("spawn same-shmid test child process");
 
             let start = std::time::Instant::now();
             let timeout = std::time::Duration::from_secs(5);
