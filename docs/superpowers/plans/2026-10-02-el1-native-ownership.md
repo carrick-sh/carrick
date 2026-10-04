@@ -2058,3 +2058,16 @@ not reproduce `mmapv8align` or `mmapprivatefiletrack`; their host-consumer
 witnesses, the inverse EFAULT14 checks, prepared receive/edit interleavings,
 all consumer activation, control-window writes, and final acceptance remain
 open. The broader prepared-copy/GuestMemory integration is unaccepted WIP.
+
+##### Venue-3 shared completion callback prerequisite — 2026-10-03
+
+Extract the existing callback enrollment/snapshot registry from kernel
+WaitQueue into `carrick-thread::completion`; WaitQueue delegates to it while
+retaining waiters, subscription policy and depth accounting. HVF cannot
+reuse the kernel-owned queue without a dependency cycle. This narrow thread
+and kernel/wait_set scope exception supplies one callback implementation,
+not a second wait engine. Independent scoped spec/quality review approved.
+Registry reentry/cancellation test1/1 and existing WaitQueue tests5/5 passed:
+`/tmp/venue3-completion-extraction-green.log`,
+`/tmp/venue3-waitqueue-extraction-green.log`. This extraction alone makes no
+claim about the new ContentPage panic boundary or physical-wait activation.
