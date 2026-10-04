@@ -921,7 +921,24 @@ impl<'a> MemView<'a> {
     }
 
     pub(crate) fn mmap_fault_is_sigbus(&self, addr: u64) -> bool {
-        bus_fault_contains(&self.mem().lock().bus_fault_ranges, addr)
+        let (host_bus, owner) = {
+            let authority = self.mem();
+            let mem = authority.lock();
+            (
+                bus_fault_contains(&mem.bus_fault_ranges, addr),
+                mem.delegated_root().cloned(),
+            )
+        };
+        if !host_bus {
+            return false;
+        }
+        // An EL1 MAP_FIXED or munmap can replace a host-recorded EOF page
+        // without passing through the host's bus-range bookkeeping. The live
+        // owner mapping wins: anonymous bytes and holes are not file EOF.
+        owner.is_none_or(|root| {
+            root.with_root(|model| Ok(model.mapping(addr).is_some_and(|m| !m.anonymous)))
+                .unwrap_or(true)
+        })
     }
 
     /// Read-only classifier used at the trap boundary before it chooses the
