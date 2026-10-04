@@ -1569,8 +1569,10 @@ mod tests {
     }
 
     impl carrick_guest_mem::GuestMemory for ProtectionOnlyMemory {
-        fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
-            Some(&self.protections)
+        fn protections(&self) -> Option<carrick_guest_mem::LegacyProtectionRead<'_>> {
+            Some(carrick_guest_mem::LegacyProtectionRead::borrowed(
+                &self.protections,
+            ))
         }
 
         fn read_bytes_raw(

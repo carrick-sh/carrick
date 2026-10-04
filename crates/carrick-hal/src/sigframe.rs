@@ -77,6 +77,11 @@ fn signal_frame_memory_error_code(error: &MemoryError) -> i32 {
         MemoryError::Unsupported => 2,
         MemoryError::HostMap(_) => 3,
         MemoryError::MetadataAllocation => 4,
+        MemoryError::OwnerWait(_) => 5,
+        MemoryError::Supply(_) => 6,
+        MemoryError::Physical(_) => 7,
+        MemoryError::ReadSuspended(_) => 8,
+        MemoryError::OwnerRetired(_) => 9,
     }
 }
 

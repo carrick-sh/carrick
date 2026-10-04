@@ -867,7 +867,7 @@ fn install_mm_sparse(
     let state = MmAccessState::for_foreign_read_test(
         binding,
         carrick_aarch64::Stage1Authority::new_with_manager(Some(tables)),
-        Arc::new(MemoryProtections::default()),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
         Arc::new(parking_lot::Mutex::new(inventory)),
         &snapshot,
     );
@@ -3818,7 +3818,7 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
     };
     let replacement_state = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
-        Arc::new(MemoryProtections::default()),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
         Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
         Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
         Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -4359,7 +4359,7 @@ fn copied_fork_child_activation_publishes_exact_foreign_mm_binding() {
     });
     let prepared_mm_access = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
-        Arc::new(MemoryProtections::default()),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
         task_mm
             .inventory
             .lock()
@@ -4418,7 +4418,9 @@ fn copied_fork_child_activation_publishes_exact_foreign_mm_binding() {
     let runtime = registration
         .runtime_task_state(
             runtime_page_tables.clone(),
-            Arc::new(MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
         )
         .expect("materialize executable copied child runtime state");
     let preserved_prepared_mm = Arc::ptr_eq(&runtime.mm_access, &prepared_mm_access);
@@ -4542,7 +4544,7 @@ fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() 
     });
     let prepared_mm_access = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
-        Arc::new(MemoryProtections::default()),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
         task_mm
             .inventory
             .lock()
@@ -4628,7 +4630,12 @@ fn production_manager_bound_through_runtime_task_state_grows_extension_arenas() 
     );
 
     let runtime = registration
-        .runtime_task_state(runtime_page_tables, Arc::new(MemoryProtections::default()))
+        .runtime_task_state(
+            runtime_page_tables,
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
+        )
         .expect("materialize executable copied child runtime state");
 
     let pt_auth = runtime.page_tables_authority();
@@ -4695,7 +4702,7 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
     });
     let prepared_mm_access = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
-        Arc::new(MemoryProtections::default()),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
         task_mm
             .inventory
             .lock()
@@ -4776,7 +4783,12 @@ fn production_resolver_under_manager_lock_does_not_deadlock_on_multi_arena_sync(
         .unwrap();
 
     let mut runtime = registration
-        .runtime_task_state(runtime_page_tables, Arc::new(MemoryProtections::default()))
+        .runtime_task_state(
+            runtime_page_tables,
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
+        )
         .expect("materialize executable copied child runtime state");
 
     let mut primary_host = vec![0u8; carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize];
@@ -4885,7 +4897,7 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     });
     let prepared_mm_access = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
-        Arc::new(MemoryProtections::default()),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
         task_mm
             .inventory
             .lock()
@@ -4986,7 +4998,9 @@ fn child_fork_replicates_multi_arena_stage1_page_tables() {
     let mut parent_runtime = registration
         .runtime_task_state(
             parent_authority.clone(),
-            Arc::new(MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
         )
         .expect("materialize parent runtime state");
 
@@ -5603,7 +5617,9 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         shared_process_mm: false,
         mm_access: MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
-            Arc::new(MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
             parent_inventory,
             Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -5875,7 +5891,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         carrick_aarch64::Stage1Authority::new_with_manager(Some(child_page_tables));
     let child_state = MmAccessState::new_unbound(
         child_page_tables_authority.clone(),
-        Arc::new(MemoryProtections::default()),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
         Arc::clone(&child_inventory),
         child_cow_armed,
         child_deferred_publications,
@@ -6485,7 +6501,9 @@ fn initial_fixed_mapping_composes_through_first_fork_preparation() {
                 carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
             ),
         }],
-        protections: Arc::new(MemoryProtections::default()),
+        protections: carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::default(),
+        )),
         mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
         syscall_transport: HvfSyscallTransport::Mailbox,
         persistent_vm_lifecycle: true,
@@ -6649,7 +6667,9 @@ fn private_overlay_publication_preserves_structural_owner_across_fork() {
                 carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
             ),
         }],
-        protections: Arc::new(MemoryProtections::default()),
+        protections: carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::default(),
+        )),
         mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
         syscall_transport: HvfSyscallTransport::Mailbox,
         persistent_vm_lifecycle: true,
@@ -6833,7 +6853,9 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
                 carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
             ),
         }],
-        protections: Arc::new(MemoryProtections::default()),
+        protections: carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::default(),
+        )),
         mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
         syscall_transport: HvfSyscallTransport::Mailbox,
         persistent_vm_lifecycle: true,
@@ -6991,7 +7013,9 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
                 carrick_observability::probes::HvpatchForkFrameKind::PrivateCow,
             ),
         }],
-        protections: Arc::new(MemoryProtections::default()),
+        protections: carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::default(),
+        )),
         mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
         syscall_transport: HvfSyscallTransport::Mailbox,
         persistent_vm_lifecycle: true,
@@ -7067,7 +7091,7 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
     };
     let state = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
-        Arc::new(MemoryProtections::default()),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
         ledger,
         Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
         Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -7146,7 +7170,9 @@ fn owned_foreign_mm_registration_teardown_is_exact_and_stale_safe() {
     let make_state = || {
         MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
-            Arc::new(MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
             Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -7586,7 +7612,9 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         shared_process_mm: false,
         mm_access: MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
-            Arc::new(MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
             parent_inventory,
             Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -7987,7 +8015,9 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     let child_task_state = backend_state
         .runtime_task_state(
             carrick_aarch64::Stage1Authority::new_with_manager(Some(child_pt)),
-            Arc::new(MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
         )
         .expect("materialize child runtime task state");
 
@@ -8165,7 +8195,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
     };
     let stale_mm_access = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
-        Arc::new(MemoryProtections::default()),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
         Arc::new(parking_lot::Mutex::new(stale_inventory)),
         Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
         Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -9758,7 +9788,9 @@ fn owned_global_frame_alias_uses_the_fresh_registered_owner_generation() {
             },
             fork_frame_receipt_kind: None,
         }],
-        protections: Arc::new(MemoryProtections::default()),
+        protections: carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::default(),
+        )),
         mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
         syscall_transport: HvfSyscallTransport::Mailbox,
         persistent_vm_lifecycle: true,
@@ -9993,7 +10025,9 @@ fn abort_prepared_child_preserves_borrowed_parent_global_frame_owner() {
                 ),
             },
         ],
-        protections: Arc::new(MemoryProtections::default()),
+        protections: carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::default(),
+        )),
         mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
         syscall_transport: HvfSyscallTransport::Mailbox,
         persistent_vm_lifecycle: true,
@@ -10122,7 +10156,9 @@ fn partial_structural_map_plan(root_ipa: u64) -> (ProcessSpecPlan, Arc<CarrierVm
             structural_mapping(crate::memory::LINUX_PAGE_TABLES_BASE + 0x20_0000, later_ipa),
         ],
         inventory_mappings: Vec::new(),
-        protections: Arc::new(MemoryProtections::default()),
+        protections: carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::default(),
+        )),
         mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
         syscall_transport: HvfSyscallTransport::Mailbox,
         persistent_vm_lifecycle: true,
@@ -10395,7 +10431,9 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
             owner_generation: 0,
         }],
         inventory_mappings: Vec::new(),
-        protections: Arc::new(MemoryProtections::default()),
+        protections: carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::default(),
+        )),
         mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
         syscall_transport: HvfSyscallTransport::Mailbox,
         persistent_vm_lifecycle: true,
@@ -10574,7 +10612,9 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
                 fork_frame_receipt_kind: None,
             },
         ],
-        protections: Arc::new(MemoryProtections::default()),
+        protections: carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::default(),
+        )),
         mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
         syscall_transport: HvfSyscallTransport::Mailbox,
         persistent_vm_lifecycle: true,
@@ -10732,7 +10772,9 @@ fn serial_host_foreign_mm_failure_injection_at_composition_boundaries() {
             },
             fork_frame_receipt_kind: None,
         }],
-        protections: Arc::new(MemoryProtections::default()),
+        protections: carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::default(),
+        )),
         mailbox_slots: Arc::new(MailboxSlotAllocator::new()),
         syscall_transport: HvfSyscallTransport::Mailbox,
         persistent_vm_lifecycle: true,
@@ -11747,6 +11789,8 @@ fn retained_reuse_fixture(
     installed
         .state
         .protections
+        .legacy()
+        .expect("legacy retained-reuse fixture")
         .set_unmapped(TEST_VA, OWNER_LEN, true);
     let mut authority = TestForeignCowAuthority::new(&installed);
     authority.allow_quiesce = true;
@@ -12732,7 +12776,9 @@ mod guest_cow {
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
         let state = MmAccessState::new(
             carrick_aarch64::Stage1Authority::new(),
-            Arc::new(MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
             Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -12807,7 +12853,9 @@ mod guest_cow {
         let state_with = |binding| {
             MmAccessState::new(
                 carrick_aarch64::Stage1Authority::new(),
-                Arc::new(MemoryProtections::default()),
+                carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                    MemoryProtections::default(),
+                )),
                 Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
                 Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
                 Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -13895,7 +13943,6 @@ fn exercise_retained_import(journal_case: u8) {
                 &mut carrick_el1::fault::NoopPreparedResolver,
                 &mut carrick_el1::fault::NoopCowResolver,
                 &carrick_el1::personality::mm_portal::test_support::residency(),
-                &carrick_el1_abi::FrameGrantMailbox::new(),
                 0,
             )
             .unwrap(),

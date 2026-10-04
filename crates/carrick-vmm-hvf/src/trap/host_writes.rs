@@ -285,7 +285,12 @@ impl HvfTaskState {
         len: usize,
     ) -> Option<HostRead> {
         let address = strip_pointer_tag(address);
-        if len == 0 || self.protections.range_no_access(address, len) {
+        if len == 0
+            || self
+                .protections
+                .legacy()
+                .is_none_or(|protections| protections.range_no_access(address, len))
+        {
             return None;
         }
         let access = admit_contiguous(self, custody, HostAccess::Read, address, len, None).ok()?;
@@ -401,7 +406,11 @@ impl HostWrites {
     ) -> Result<(), MemoryError> {
         for range in ranges {
             let address = strip_pointer_tag(range.guest.raw());
-            if task.protections.range_write_denied(address, range.len) {
+            if task
+                .protections
+                .legacy()
+                .is_none_or(|protections| protections.range_write_denied(address, range.len))
+            {
                 return Err(MemoryError::OutOfBounds {
                     address,
                     length: range.len,
