@@ -16268,7 +16268,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/continuation/wait_service.rs",
-      "line": 1372,
+      "line": 1404,
       "categories": [
         "epoll"
       ],
@@ -16277,7 +16277,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "line": 1279,
+      "line": 1285,
       "categories": [
         "mapping"
       ],
@@ -16286,7 +16286,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/core.rs",
-      "line": 2073,
+      "line": 2081,
       "categories": [
         "mapping"
       ],
@@ -16583,7 +16583,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/exec.rs",
-      "line": 432,
+      "line": 440,
       "categories": [
         "lifecycle"
       ],
