@@ -119,6 +119,150 @@ impl<'a> HostPipeReadTarget<'a> {
     }
 }
 
+fn host_read_into(
+    buf: &mut [u8],
+    target: &HostPipeReadTarget<'_>,
+) -> Result<isize, super::outcome::DispatchError> {
+    let read_fn = |buf: &mut [u8]| -> isize {
+        #[cfg(test)]
+        crate::dispatch::budget_meter::record_host_read();
+        if let Some(flow) = target.socket_flow {
+            let mut ledger = flow.lock_ledger();
+            let n = unsafe {
+                match target.offset {
+                    Some(off) => libc::pread(
+                        target.host_fd,
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                        off as libc::off_t,
+                    ),
+                    None => libc::read(target.host_fd, buf.as_mut_ptr() as *mut _, buf.len()),
+                }
+            };
+            if n > 0 {
+                if target.is_stream {
+                    ledger.consume_stream(n as usize);
+                } else {
+                    ledger.consume_dgram();
+                }
+            }
+            n
+        } else {
+            unsafe {
+                match target.offset {
+                    Some(off) => libc::pread(
+                        target.host_fd,
+                        buf.as_mut_ptr() as *mut _,
+                        buf.len(),
+                        off as libc::off_t,
+                    ),
+                    None => libc::read(target.host_fd, buf.as_mut_ptr() as *mut _, buf.len()),
+                }
+            }
+        }
+    };
+    let mut n = 0isize;
+    if let Some(hw) = target.host_wait {
+        hw.run_with_host_wait(&mut || n = read_fn(buf))?;
+    } else {
+        n = read_fn(buf);
+    }
+    crate::probes::host_pipe_io(target.host_fd, 0, n as i64);
+    Ok(n)
+}
+
+fn read_host_pipe_into_owner(
+    memory: &mut impl CurrentMmMemory,
+    guest_addr: u64,
+    buf: &mut [u8],
+    target: HostPipeReadTarget<'_>,
+) -> Result<DispatchOutcome, super::outcome::DispatchError> {
+    let mut delivered = 0usize;
+    while delivered < buf.len() {
+        let Some(address) = guest_addr.checked_add(delivered as u64) else {
+            return Ok(DispatchOutcome::returned_len_or_errno(delivered));
+        };
+        let page_left = (4096 - (address as usize & 4095)).min(buf.len() - delivered);
+        let Some(range) =
+            carrick_guest_mem::GuestWriteRange::new(carrick_guest_mem::GuestVa(address), page_left)
+        else {
+            return Ok(if delivered > 0 {
+                DispatchOutcome::returned_len_or_errno(delivered)
+            } else {
+                DispatchOutcome::errno(LINUX_EFAULT)
+            });
+        };
+        let prepared = match memory.prepare_write(&[range]) {
+            Ok(prepared) => prepared,
+            Err(error) if delivered > 0 => {
+                // The previous prepared chunks were committed and exactly
+                // their bytes were consumed. Linux returns that real prefix.
+                let _ = error;
+                return Ok(DispatchOutcome::returned_len_or_errno(delivered));
+            }
+            Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(wait)) => {
+                return Ok(DispatchOutcome::OwnerMemoryWait { wait });
+            }
+            Err(carrick_guest_mem::MemoryPrepareError::Physical(wait)) => {
+                return Ok(DispatchOutcome::OwnerPhysicalWait { wait });
+            }
+            Err(carrick_guest_mem::MemoryPrepareError::Supply(request)) => {
+                return Ok(match request {
+                    carrick_guest_mem::MemorySupplyRequest::Metadata { observed, .. } => {
+                        DispatchOutcome::OwnerMemoryWait { wait: observed }
+                    }
+                    _ => DispatchOutcome::OwnerMemorySupply { request },
+                });
+            }
+            Err(carrick_guest_mem::MemoryPrepareError::Fault(_)) => {
+                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+            }
+            Err(carrick_guest_mem::MemoryPrepareError::Limit(limit)) => {
+                return Err(super::outcome::DispatchError::MemoryPreparation(format!(
+                    "one owner read chunk exceeds prepared range: {limit:?}"
+                )));
+            }
+        };
+        // A positioned read must advance the explicit offset by the prefix;
+        // ordinary read advances the shared host description itself.
+        let chunk_target = if let Some(base) = target.offset {
+            let Some(offset) = base.checked_add(delivered as i64) else {
+                return Err(super::outcome::DispatchError::MemoryPreparation(
+                    "positioned host read offset overflow".into(),
+                ));
+            };
+            target.clone().with_offset(offset).with_host_wait(None)
+        } else {
+            target.clone().with_host_wait(None)
+        };
+        // No permit survives a readiness wait. Commit is infallible once the
+        // nonblocking host read has consumed this bounded chunk.
+        let n = host_read_into(&mut buf[delivered..delivered + page_left], &chunk_target)?;
+        if let Err(errno) = n.host_syscall_errno() {
+            return Ok(if delivered > 0 {
+                DispatchOutcome::returned_len_or_errno(delivered)
+            } else if errno == LINUX_EAGAIN || errno == LINUX_EINTR {
+                would_block_outcome(
+                    target.host_fd,
+                    libc::POLLIN,
+                    target.nonblocking,
+                    target.host_fd_owner,
+                    target.authority.into_wait_authority(),
+                )
+            } else {
+                DispatchOutcome::errno(errno)
+            });
+        }
+        let count = n as usize;
+        prepared.commit(&[&buf[delivered..delivered + count]]);
+        delivered += count;
+        if count < page_left || (target.socket_flow.is_some() && !target.is_stream) {
+            break;
+        }
+    }
+    Ok(DispatchOutcome::returned_len_or_errno(delivered))
+}
+
 /// read(2) on a host-backed fd (pipe/socket/file). Host-backed descriptions are
 /// adopted non-blocking at creation time, so EAGAIN means a blocking-mode guest
 /// fd hands off to the runtime's lockless kqueue wait via WaitOnFds while a
@@ -130,6 +274,9 @@ pub(crate) fn read_host_pipe_into(
     buf: &mut [u8],
     target: HostPipeReadTarget<'_>,
 ) -> Result<DispatchOutcome, super::outcome::DispatchError> {
+    if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+        return read_host_pipe_into_owner(memory, guest_addr, buf, target);
+    }
     let HostPipeReadTarget {
         host_fd,
         host_fd_owner,
@@ -370,6 +517,14 @@ pub(crate) fn read_host_pipe(
     // Clamp to Linux's MAX_RW_COUNT before staging a host buffer; a huge guest
     // count would otherwise be a one-syscall OOM-abort of the runtime.
     let length = length.min(MAX_RW_COUNT);
+    if memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner {
+        if length <= SMALL_HOST_READ_BUF {
+            let mut buf = [0u8; SMALL_HOST_READ_BUF];
+            return read_host_pipe_into_owner(memory, guest_addr, &mut buf[..length], target);
+        }
+        let mut buf = vec![0u8; length];
+        return read_host_pipe_into_owner(memory, guest_addr, &mut buf, target);
+    }
     if let Some(host_ptr) = memory.host_ptr_for_write(guest_addr, length) {
         let range = [carrick_guest_mem::HostWriteRange {
             guest: carrick_guest_mem::GuestVa(guest_addr),
@@ -1005,10 +1160,214 @@ mod host_pipe_read_pin_tests {
     use super::*;
     use crate::dispatch::budget_meter;
     use crate::dispatch::outcome::LinearMemory;
-    use carrick_guest_mem::GuestMemory;
+    use carrick_guest_mem::{
+        GuestMemory, GuestWriteRange, MemoryError, MemoryPrepareError, PreparedGuestWrite,
+        UserMemoryVenue,
+    };
+    use std::sync::{Arc, Mutex};
 
     const MEM_BASE: u64 = 0x1000_0000;
     const MEM_LEN: usize = 0x10_0000; // 1 MiB
+
+    struct OwnerMemory {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        prepared_lengths: Arc<Mutex<Vec<usize>>>,
+        fail_prepare: bool,
+        wait_prepare: Option<carrick_el1_abi::PortalOwnerWait>,
+    }
+
+    struct OwnerPermit {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        offset: usize,
+        capacity: usize,
+    }
+
+    impl PreparedGuestWrite for OwnerPermit {
+        fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+            assert_eq!(outputs.len(), 1);
+            assert!(outputs[0].len() <= self.capacity);
+            self.bytes.lock().unwrap()[self.offset..self.offset + outputs[0].len()]
+                .copy_from_slice(outputs[0]);
+        }
+    }
+
+    impl GuestMemory for OwnerMemory {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+
+        fn prepare_write(
+            &mut self,
+            ranges: &[GuestWriteRange],
+        ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+            assert_eq!(ranges.len(), 1);
+            let range = ranges[0];
+            self.prepared_lengths.lock().unwrap().push(range.len());
+            if let Some(wait) = self.wait_prepare.take() {
+                return Err(MemoryPrepareError::OwnerWait(wait));
+            }
+            if self.fail_prepare {
+                return Err(MemoryPrepareError::Fault(MemoryError::OutOfBounds {
+                    address: range.address().raw(),
+                    length: range.len(),
+                }));
+            }
+            let offset = (range.address().raw() - MEM_BASE) as usize;
+            Ok(Box::new(OwnerPermit {
+                bytes: Arc::clone(&self.bytes),
+                offset,
+                capacity: range.len(),
+            }))
+        }
+
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            let offset = (address - MEM_BASE) as usize;
+            Ok(self.bytes.lock().unwrap()[offset..offset + length].to_vec())
+        }
+
+        fn write_bytes_raw(&mut self, _address: u64, _bytes: &[u8]) -> Result<(), MemoryError> {
+            panic!("owner read bypassed its prepared copyout permit")
+        }
+    }
+    impl CurrentMmMemory for OwnerMemory {}
+
+    #[test]
+    fn owner_pipe_read_prepares_each_chunk_and_preserves_second_read() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let payload: Vec<u8> = (0..6000).map(|n| (n % 251) as u8).collect();
+        assert_eq!(
+            unsafe { libc::write(fds[1], payload.as_ptr().cast(), payload.len()) },
+            6000
+        );
+        let lengths = Arc::new(Mutex::new(Vec::new()));
+        let mut memory = OwnerMemory {
+            bytes: Arc::new(Mutex::new(vec![0; MEM_LEN])),
+            prepared_lengths: Arc::clone(&lengths),
+            fail_prepare: false,
+            wait_prepare: None,
+        };
+        let target = || {
+            HostPipeReadTarget::new(
+                fds[0],
+                None,
+                true,
+                crate::dispatch::wait_authority::WaitFdAuthority::Empty,
+            )
+        };
+        assert_eq!(
+            read_host_pipe(&mut memory, MEM_BASE + 123, 5000, target()).unwrap(),
+            DispatchOutcome::Returned { value: 5000 },
+        );
+        assert_eq!(
+            read_host_pipe(&mut memory, MEM_BASE + 5123, 1000, target()).unwrap(),
+            DispatchOutcome::Returned { value: 1000 },
+        );
+        assert_eq!(memory.read_bytes(MEM_BASE + 123, 6000).unwrap(), payload);
+        assert!(lengths.lock().unwrap().iter().all(|&len| len <= 4096));
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn owner_prepare_fault_does_not_consume_pipe_bytes() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let payload = b"retained pipe payload";
+        assert_eq!(
+            unsafe { libc::write(fds[1], payload.as_ptr().cast(), payload.len()) },
+            payload.len() as isize
+        );
+        let mut memory = OwnerMemory {
+            bytes: Arc::new(Mutex::new(vec![0; MEM_LEN])),
+            prepared_lengths: Arc::new(Mutex::new(Vec::new())),
+            fail_prepare: true,
+            wait_prepare: None,
+        };
+        let outcome = read_host_pipe(
+            &mut memory,
+            MEM_BASE,
+            payload.len(),
+            HostPipeReadTarget::new(
+                fds[0],
+                None,
+                true,
+                crate::dispatch::wait_authority::WaitFdAuthority::Empty,
+            ),
+        )
+        .unwrap();
+        assert_eq!(outcome, DispatchOutcome::errno(LINUX_EFAULT));
+        let mut remaining = [0u8; 21];
+        assert_eq!(
+            unsafe { libc::read(fds[0], remaining.as_mut_ptr().cast(), remaining.len()) },
+            payload.len() as isize
+        );
+        assert_eq!(&remaining, payload);
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
+
+    #[test]
+    fn owner_wait_suspends_pipe_read_before_consuming_bytes() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use std::num::NonZeroU64;
+
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let payload = b"waited owner payload";
+        assert_eq!(
+            unsafe { libc::write(fds[1], payload.as_ptr().cast(), payload.len()) },
+            payload.len() as isize
+        );
+        // SAFETY: this mock's revision models the exact admitted source
+        // observed before its deliberately failed reservation probe.
+        let wait = unsafe {
+            PortalOwnerWait::from_owner(
+                El1MmHandle::from_admitted_owner(
+                    NonZeroU64::new(1).unwrap(),
+                    ReservationMm::new(2).unwrap(),
+                    NonZeroU64::new(3).unwrap(),
+                ),
+                PortalWaitCause::Reservations,
+                7,
+            )
+        };
+        let mut memory = OwnerMemory {
+            bytes: Arc::new(Mutex::new(vec![0; MEM_LEN])),
+            prepared_lengths: Arc::new(Mutex::new(Vec::new())),
+            fail_prepare: false,
+            wait_prepare: Some(wait),
+        };
+        let outcome = read_host_pipe(
+            &mut memory,
+            MEM_BASE,
+            payload.len(),
+            HostPipeReadTarget::new(
+                fds[0],
+                None,
+                true,
+                crate::dispatch::wait_authority::WaitFdAuthority::Empty,
+            ),
+        )
+        .unwrap();
+        assert!(
+            matches!(outcome, DispatchOutcome::OwnerMemoryWait { wait: actual } if actual == wait)
+        );
+        let mut remaining = [0u8; 20];
+        assert_eq!(
+            unsafe { libc::read(fds[0], remaining.as_mut_ptr().cast(), remaining.len()) },
+            payload.len() as isize
+        );
+        assert_eq!(&remaining, payload);
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+    }
 
     /// Verify that `read_host_pipe` takes the zero-copy raw-pointer path
     /// (not the staging-buffer path) when `host_ptr_for_write` succeeds,
