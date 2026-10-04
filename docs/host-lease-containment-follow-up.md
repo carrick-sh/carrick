@@ -25,8 +25,14 @@ Permission to signal is independent of permission to reap an adopted child.
   `detached_closed_scope_descendant_is_cancelled` deliberately fails on Darwin
   when explicitly invoked with `--ignored`; it runs normally and passes on
   Linux. The fixture closes every duplicate, not just the advertised writer.
-- **Darwin PID reuse:** every signal rechecks `(pid, start seconds, start
-  microseconds)` from `PROC_PIDTBSDINFO`. Exit watches register on the selected
+- **Darwin PID reuse:** every signal rechecks the kernel unique process ID and,
+  when readable, `(pid, start seconds, start microseconds)` from
+  `PROC_PIDTBSDINFO`. Root-owned helpers deny that full query; UID-independent
+  unique-ID and short-BSD status queries preserve observation across UID changes.
+  The native layout and permission rules are qualified against
+  [Apple's process-info API](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info_private.h)
+  and [implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/proc_info.c).
+  Exit watches register on the selected
   process and are authenticated again after registration. Reaping compares the
   same incarnation; it never waits on a replacement using `kill(pid, 0)`.
   Deterministic model tests cover exit, reap and reuse before each signal check.

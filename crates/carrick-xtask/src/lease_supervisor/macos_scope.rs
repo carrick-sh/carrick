@@ -118,7 +118,7 @@ impl PipeWriter {
                 let Some(info) = process_info(pid)? else {
                     continue;
                 };
-                let identity = incarnation(pid, &info);
+                let identity = info.identity;
                 // SAFETY: native session query. Pipe identity covers setsid
                 // while at least one scope descriptor remains open.
                 if pid > 0
@@ -249,10 +249,7 @@ impl ProcessWatch {
         let Some(info) = process_info(self.identity.pid)? else {
             return Ok(true);
         };
-        Ok(!self
-            .identity
-            .present(Some(incarnation(self.identity.pid, &info)))
-            || info.pbi_status == libc::SZOMB)
+        Ok(!self.identity.present(Some(info.identity)) || info.status == libc::SZOMB)
     }
 
     pub(super) fn reaped(&self) -> io::Result<bool> {
@@ -261,22 +258,65 @@ impl ProcessWatch {
     }
 }
 
-fn incarnation(pid: libc::pid_t, info: &libc::proc_bsdinfo) -> ProcessIncarnation {
-    ProcessIncarnation {
-        pid,
-        start_seconds: info.pbi_start_tvsec,
-        start_microseconds: info.pbi_start_tvusec,
-    }
+struct NativeProcessInfo {
+    identity: ProcessIncarnation,
+    status: u32,
 }
 
 fn observe(pid: libc::pid_t) -> io::Result<Option<ProcessIncarnation>> {
-    Ok(process_info(pid)?.map(|info| incarnation(pid, &info)))
+    Ok(process_info(pid)?.map(|info| info.identity))
 }
 
-fn process_info(pid: libc::pid_t) -> io::Result<Option<libc::proc_bsdinfo>> {
+// Native proc_info_private.h API layout (56 bytes), absent from libc. Unlike
+// full BSD info, unique identity and SHORTBSDINFO do not require matching UID.
+#[repr(C)]
+struct UniqueInfo {
+    _executable_uuid: [u8; 16],
+    unique_id: u64,
+    _parent_unique_id: u64,
+    _pid_version: i32,
+    _original_parent_version: i32,
+    _reserved: [u64; 2],
+}
+const _: () = assert!(size_of::<UniqueInfo>() == 56);
+
+// Native sys/proc_info.h public short-BSD layout, added to newer libc versions
+// than this workspace pins. Keep its ABI qualification beside the unique ID.
+#[repr(C)]
+struct ShortInfo {
+    _pid: u32,
+    _parent: u32,
+    _group: u32,
+    status: u32,
+    _name: [libc::c_char; 16],
+    _flags: u32,
+    _uids_and_gids: [u32; 6],
+    _reserved: u32,
+}
+const _: () = assert!(size_of::<ShortInfo>() == 64);
+
+fn unique_info(pid: libc::pid_t) -> io::Result<Option<UniqueInfo>> {
+    let mut info = std::mem::MaybeUninit::<UniqueInfo>::zeroed();
+    let size = size_of::<UniqueInfo>() as libc::c_int;
+    // SAFETY: matching native PROC_PIDUNIQIDENTIFIERINFO (17) ABI output.
+    let got = unsafe { libc::proc_pidinfo(pid, 17, 0, info.as_mut_ptr().cast(), size) };
+    if got == size {
+        return Ok(Some(unsafe { info.assume_init() }));
+    }
+    let error = io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+        return Ok(None);
+    }
+    Err(error)
+}
+
+fn process_info(pid: libc::pid_t) -> io::Result<Option<NativeProcessInfo>> {
     if pid <= 0 {
         return Ok(None);
     }
+    let Some(unique) = unique_info(pid)? else {
+        return Ok(None);
+    };
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: correctly sized native process-info output.
@@ -289,15 +329,54 @@ fn process_info(pid: libc::pid_t) -> io::Result<Option<libc::proc_bsdinfo>> {
             size,
         )
     };
-    if got != size {
+    let (start, status) = if got == size {
+        // SAFETY: full matching native output initialized by libproc.
+        let info = unsafe { info.assume_init() };
+        (
+            Some((info.pbi_start_tvsec, info.pbi_start_tvusec)),
+            info.pbi_status,
+        )
+    } else {
         let error = io::Error::last_os_error();
         if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
             return Ok(None);
         }
-        return Err(error);
+        if error.raw_os_error() != Some(libc::EPERM) {
+            return Err(error);
+        }
+        let mut info = std::mem::MaybeUninit::<ShortInfo>::zeroed();
+        let size = size_of::<ShortInfo>() as libc::c_int;
+        // SAFETY: UID-independent native status query for privileged helpers.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                13, // PROC_PIDT_SHORTBSDINFO
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if got != size {
+            let error = io::Error::last_os_error();
+            if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        (None, unsafe { info.assume_init() }.status)
+    };
+    // Metadata must belong to the same kernel incarnation across the queries.
+    if unique_info(pid)?.is_none_or(|current| current.unique_id != unique.unique_id) {
+        return Ok(None);
     }
-    // SAFETY: libproc initialized the entire structure.
-    Ok(Some(unsafe { info.assume_init() }))
+    Ok(Some(NativeProcessInfo {
+        identity: ProcessIncarnation {
+            pid,
+            unique_id: unique.unique_id,
+            start,
+        },
+        status,
+    }))
 }
 
 fn all_pids() -> io::Result<Vec<libc::pid_t>> {
@@ -321,5 +400,19 @@ fn all_pids() -> io::Result<Vec<libc::pid_t>> {
         }
         pids.truncate(got as usize / size_of::<libc::pid_t>());
         return Ok(pids);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn privileged_identity_is_observable_without_signal_permission() {
+        // Read-only qualification against root-owned launchd. No signal is
+        // sent; its incarnation must remain observable to cleanup after EPERM.
+        assert!(
+            super::observe(1)
+                .expect("privileged exit observation denied")
+                .is_some()
+        );
     }
 }
