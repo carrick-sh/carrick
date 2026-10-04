@@ -34,10 +34,24 @@
  *     slot refused, 3 root publication refused, 4 owner publication returned,
  *     5 duplicate MM slot, 6 address-space slot refused, 7 reservation-root
  *     installation refused, 8 fence binding refused, 9 closed root published.
+ *     `hvpatch-el1-owner-selection(u32 phase)` follows the root publication:
+ *     0 entered, 1 precondition refused, 2 no memory admission authority,
+ *     3 no transfer carrier, 4 no closed BIND token, 5 selecting under guard,
+ *     6 selection returned, 7 admitted handle, 8 immediate owner missing.
+ *     `hvpatch-el1-owner-bind-result(u64 errno)` is the exact first-load
+ *     EL1 BIND result.
+ *     Embedded callers need this owner-selection probe as their positive
+ *     control: `syscall-return` is emitted by the optional compat observer
+ *     and does not fire in their normal execution path.
+ *     `vcpu-fault(u64 esr, u64 elr, u64 far, u64 x30, u64 sp, i32 tid)`
+ *     reports a fatal EL0 fault; `hvpatch-syscall-service-begin` counts guest
+ *     syscall entries by native number when tracing a first-load failure.
  *
  * (c) Perturbation: admission probes fire a bounded number of times per
  *     published address space; the positive control counts every guest
- *     syscall return, so use this script only to diagnose admission.
+ *     syscall return. The fault probe fires only on a fatal guest fault;
+ *     syscall entry aggregation fires on every guest syscall. Use this script
+ *     only to diagnose admission or its immediate failure.
  *
  * Usage: target/release/carrick trace --script scripts/dtrace/el1-root-admission.d -- run ...
  */
@@ -68,6 +82,37 @@ carrick*:::hvpatch-el1-root-prepublish
     @prepublish[(uint32_t)arg1] = count();
 }
 
+carrick*:::hvpatch-el1-owner-selection
+/pid == $target || progenyof($target)/
+{
+    printf("EL1ROOTADMISSION1|owner-selection|phase=%u|pid=%d\n",
+        (uint32_t)arg0, pid);
+    @owner_selection[(uint32_t)arg0] = count();
+}
+
+carrick*:::hvpatch-el1-owner-bind-result
+/pid == $target || progenyof($target)/
+{
+    printf("EL1ROOTADMISSION1|owner-bind-result|errno=%llu|pid=%d\n",
+        (uint64_t)arg0, pid);
+    @owner_bind_result[(uint64_t)arg0] = count();
+}
+
+carrick*:::vcpu-fault
+/pid == $target || progenyof($target)/
+{
+    printf("EL1ROOTADMISSION1|vcpu-fault|esr=%llx|elr=%llx|far=%llx|x30=%llx|sp=%llx|tid=%d|pid=%d\n",
+        (uint64_t)arg0, (uint64_t)arg1, (uint64_t)arg2,
+        (uint64_t)arg3, (uint64_t)arg4, (int)arg5, pid);
+    @faults = count();
+}
+
+carrick*:::hvpatch-syscall-service-begin
+/pid == $target || progenyof($target)/
+{
+    @syscall_entries[(uint64_t)arg3] = count();
+}
+
 carrick*:::syscall-return
 /pid == $target || progenyof($target)/
 {
@@ -85,5 +130,9 @@ dtrace:::END
     printa("EL1ROOTADMISSION1|summary|origin=%u|outcome=%u|count=%@d\n", @admissions);
     printa("EL1ROOTADMISSION1|candidate-summary|phase=%u|count=%@d\n", @candidates);
     printa("EL1ROOTADMISSION1|prepublish-summary|phase=%u|count=%@d\n", @prepublish);
+    printa("EL1ROOTADMISSION1|owner-selection-summary|phase=%u|count=%@d\n", @owner_selection);
+    printa("EL1ROOTADMISSION1|owner-bind-result-summary|errno=%llu|count=%@d\n", @owner_bind_result);
+    printa("EL1ROOTADMISSION1|vcpu-fault-count=%@d\n", @faults);
+    printa("EL1ROOTADMISSION1|syscall-entry|nr=%llu|count=%@d\n", @syscall_entries);
     printa("EL1ROOTADMISSION1|positive-control|syscall-returns=%@d\n", @syscall_returns);
 }
