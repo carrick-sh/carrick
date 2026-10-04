@@ -1078,6 +1078,14 @@ impl Kernel {
             .control_lease()
             .lifecycle()
             .reopen_after_exec_binding();
+        // Binding a singleton process is not demand for sibling threads.
+        // Its first actual host clone publishes the second live thread and
+        // replenishes executable capacity before returning to the caller.
+        // Fork/exec-only workloads therefore never reserve unused runtime
+        // cells, while subsequent EL1 births keep the existing pool path.
+        if context.thread().control_lease().lifecycle().live() == 1 {
+            return;
+        }
         self.registry()
             .thread_ledger()
             .replenish(self, &state, context);
