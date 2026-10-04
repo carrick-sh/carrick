@@ -600,23 +600,28 @@ pub(super) fn open_first_address_space<E: ThreadedEngine>(
     closed: carrick_kernel::kernel::UnpublishedInitialAddressSpace,
 ) -> Result<carrick_kernel::kernel::AddressSpacePublication, carrick_hal::TrapError> {
     use carrick_mmu_core::aarch64::LiveDescriptorOwner;
+    carrick_observability::probes::hvpatch_el1_owner_selection(0);
     if engine.live_descriptor_owner() != LiveDescriptorOwner::Guest {
         if let Err(reason) =
             GuestDescriptorLanePrecondition::current().admission(DescriptorLaneHatch::current())
         {
+            carrick_observability::probes::hvpatch_el1_owner_selection(1);
             engine.record_guest_descriptor_lane_refusal(reason);
             return Ok(closed.open_legacy());
         }
     }
     let Some(authority) = engine.user_memory_admission_authority() else {
+        carrick_observability::probes::hvpatch_el1_owner_selection(2);
         return Ok(closed.open_legacy());
     };
     let carrier = engine.owner_transfer_carrier().ok_or_else(|| {
+        carrick_observability::probes::hvpatch_el1_owner_selection(3);
         carrick_hal::TrapError::Hypervisor(
             "admitted user-memory backend lost its transfer carrier".into(),
         )
     })?;
     let token = closed.bind_token(carrier).ok_or_else(|| {
+        carrick_observability::probes::hvpatch_el1_owner_selection(4);
         carrick_hal::TrapError::Hypervisor(
             "first-load root is not an exact closed BIND publication".into(),
         )
@@ -626,18 +631,23 @@ pub(super) fn open_first_address_space<E: ThreadedEngine>(
             "first-load user-memory admission guard refused: {reason:?}"
         ))
     })?;
-    engine.select_live_descriptor_owner_under_guard(
+    carrick_observability::probes::hvpatch_el1_owner_selection(5);
+    let selected = engine.select_live_descriptor_owner_under_guard(
         LiveDescriptorOwner::Guest,
         &mut guard,
         Some(token),
     )?;
-    if guard.selection_handle().is_some() {
-        closed.open_admitted(&guard).map_err(|_| {
-            carrick_hal::TrapError::Hypervisor("first-load owner guard selected another MM".into())
-        })
-    } else {
-        Ok(closed.open_legacy())
+    carrick_observability::probes::hvpatch_el1_owner_selection(6);
+    if !selected || guard.selection_handle().is_none() {
+        carrick_observability::probes::hvpatch_el1_owner_selection(8);
+        return Err(carrick_hal::TrapError::Hypervisor(
+            "first-load owner failed to select immediate live backing".into(),
+        ));
     }
+    carrick_observability::probes::hvpatch_el1_owner_selection(7);
+    closed.open_admitted(&guard).map_err(|_| {
+        carrick_hal::TrapError::Hypervisor("first-load owner guard selected another MM".into())
+    })
 }
 
 /// Whether EL1 completed fork-COW copies of `mm` the host has not settled
