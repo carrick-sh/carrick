@@ -28,6 +28,8 @@ pub struct DelegatedReleaseVenue<'zone> {
     pub zone: &'zone ZoneTables,
     pub waker: Waker,
     pub deliver: for<'z> fn(&'z ZoneTables, Waker, OwnedObjectWakeEffects<'z>),
+    /// A source-licensed owner-only wake, delivered strictly after inode unlock.
+    pub owner_ready: fn(&ZoneTables, Waker),
 }
 impl<'zone> DelegatedReleaseVenue<'zone> {
     /// Derive release custody from the live base pin protected by an inode lock.
@@ -92,11 +94,16 @@ impl<'zone> DelegatedLockRelease<'_, 'zone> {
 struct Unlock<'a>(&'a AtomicU32);
 impl Drop for Unlock<'_> {
     fn drop(&mut self) {
-        self.0.store(0, Ordering::Release);
+        self.0.store(0, Ordering::SeqCst);
     }
 }
-impl Drop for DelegatedLockRelease<'_, '_> {
-    fn drop(&mut self) {
+impl DelegatedLockRelease<'_, '_> {
+    /// Release exclusion and publish an owner callback while the source's
+    /// counted publication still prevents incarnation rebinding.
+    pub fn release_with(mut self, after_unlock: impl FnOnce()) {
+        self.release(after_unlock);
+    }
+    fn release(&mut self, after_unlock: impl FnOnce()) {
         let Some(ticket) = self.ticket.take() else {
             return;
         };
@@ -106,7 +113,38 @@ impl Drop for DelegatedLockRelease<'_, '_> {
         };
         let publication = ticket.advance_revision(self.venue.waker, &completion);
         drop(unlock);
+        after_unlock();
         publication.publish();
+    }
+}
+impl Drop for DelegatedLockRelease<'_, '_> {
+    fn drop(&mut self) {
+        self.release(|| {});
+    }
+}
+
+impl ZoneTables {
+    /// Publish an indexed owner wake. Only typed delegated indices enter this
+    /// distinct domain; the inode's exact generation remains the authority.
+    pub fn mark_delegated_host_pending(&self, index: DelegatedFileWaitIndex) {
+        self.delegated_host_pending[index.index() / 64]
+            .fetch_or(1 << (index.index() % 64), Ordering::Release);
+    }
+    pub fn take_delegated_host_pending(&self) -> impl Iterator<Item = DelegatedFileWaitIndex> + '_ {
+        self.delegated_host_pending
+            .iter()
+            .enumerate()
+            .flat_map(|(word, bits)| {
+                let mut pending = bits.swap(0, Ordering::AcqRel);
+                core::iter::from_fn(move || {
+                    if pending == 0 {
+                        return None;
+                    }
+                    let bit = pending.trailing_zeros() as usize;
+                    pending &= pending - 1;
+                    DelegatedFileWaitIndex::from_index(word * 64 + bit)
+                })
+            })
     }
 }
 
@@ -156,6 +194,22 @@ mod tests {
         );
     }
     #[test]
+    fn owner_index_is_bounded_and_drains_only_published_slots() {
+        let zone = zone();
+        assert_eq!(core::mem::size_of_val(&zone.delegated_host_pending), 16);
+        let first = DelegatedFileWaitIndex::from_index(0).unwrap();
+        let last = DelegatedFileWaitIndex::from_index(DELEGATED_FILE_WAIT_QUEUES - 1).unwrap();
+        zone.mark_delegated_host_pending(last);
+        zone.mark_delegated_host_pending(first);
+        zone.mark_delegated_host_pending(last);
+        assert_eq!(
+            zone.take_delegated_host_pending()
+                .collect::<std::vec::Vec<_>>(),
+            [first, last]
+        );
+        assert!(zone.take_delegated_host_pending().next().is_none());
+    }
+    #[test]
     fn held_inode_release_notifies_after_unlock_and_retained_source_retirement() {
         let zone = zone();
         let index = DelegatedFileWaitIndex::from_index(5).unwrap();
@@ -177,6 +231,7 @@ mod tests {
             zone: &zone,
             waker: Waker::Host,
             deliver,
+            owner_ready: |_, _| {},
         };
         let release = unsafe { venue.retain_locked(index, generation, &lock) }.unwrap();
         let derived = release.source().reserve();
@@ -200,7 +255,21 @@ mod tests {
             .park(queue.snapshot(), record, OperationToken::new(7, 9).unwrap())
             .unwrap();
         drop(source); // retiring base pin under the exact still-held inode lock
-        drop(release);
+        release.release_with(|| {
+            assert_eq!(lock.load(Ordering::SeqCst), 0);
+            let replacement = ObjectWaitKey::delegated_file(index, NonZeroU64::new(10).unwrap());
+            assert!(
+                zone.object_queue(key.index() as usize)
+                    .publishers
+                    .load(Ordering::Acquire)
+                    > 0,
+                "owner callback retains the source publication independently of the held queue"
+            );
+            assert!(matches!(
+                zone.bind_object_wait_with_completion(replacement, &BoundedSpin(0), &completion),
+                Err(ObjectWaitError::Busy | ObjectWaitError::Occupied),
+            ));
+        });
         assert_eq!(lock.load(Ordering::Acquire), 0);
         assert_eq!(delivered.get(), 0);
         drop(queue);
@@ -242,6 +311,7 @@ mod tests {
                     zone: &zone,
                     waker: Waker::Host,
                     deliver,
+                    owner_ready: |_, _| {},
                 }
                 .retain_locked(index, generation, &lock)
             }
