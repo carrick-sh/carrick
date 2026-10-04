@@ -251,6 +251,14 @@ fn writable_dirs(path: &Path) -> Result<(), GcError> {
     Ok(())
 }
 
+fn removal_paths_are_direct(registered: &Path, given: &Path) -> bool {
+    [registered, given].into_iter().all(|path| {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+            && std::fs::canonicalize(path).is_ok_and(|canonical| canonical == path)
+    }) && registered == given
+}
+
 pub fn run(root: &Path, args: WorktreeGcArgs, writer: &mut impl Write) -> Result<(), GcError> {
     run_with_census(root, args, writer, process_use_with_locks)
 }
@@ -263,6 +271,11 @@ fn run_with_census(
 ) -> Result<(), GcError> {
     if args.prune_targets {
         return crate::target_prune::run(root, args, writer);
+    }
+    if std::fs::symlink_metadata(root)?.file_type().is_symlink() {
+        return Err(GcError::Census(
+            "GC checkout path is a symlink; removal refused".into(),
+        ));
     }
     let common = PathBuf::from(
         git(
@@ -300,6 +313,14 @@ fn run_with_census(
                 continue;
             }
         };
+        if !removal_paths_are_direct(&tree.path, &path) {
+            writeln!(
+                writer,
+                "keep (symlink/noncanonical registered root) | {}",
+                tree.path.display()
+            )?;
+            continue;
+        }
         // Git lists the primary checkout first, including when its git-dir is
         // external or reached through a symlink. Preserve the original path's
         // gate classification as well as its canonical identity.
@@ -356,9 +377,25 @@ fn run_with_census(
                 writeln!(writer, "keep (changed during census) | {}", path.display())?;
                 continue;
             }
+            if !removal_paths_are_direct(&tree.path, &path) {
+                writeln!(
+                    writer,
+                    "keep (root changed during census) | {}",
+                    tree.path.display()
+                )?;
+                continue;
+            }
             writable_dirs(&path)?;
             if census_use(&path, Some(&cargo_locks)) != UseState::Idle {
                 writeln!(writer, "keep (in use before removal) | {}", path.display())?;
+                continue;
+            }
+            if !removal_paths_are_direct(&tree.path, &path) {
+                writeln!(
+                    writer,
+                    "keep (root changed before removal) | {}",
+                    tree.path.display()
+                )?;
                 continue;
             }
             authority.retire()?;
@@ -371,9 +408,8 @@ fn run_with_census(
                 ],
                 Some(root),
             );
-            if removal.is_err() {
-                authority.restore()?;
-            }
+            // Git can delete contents/admin metadata before returning an error.
+            // Keep the tombstone on every attempted removal, including failure.
             removal?;
             writeln!(writer, "removed | {}", path.display())?;
         }
@@ -497,6 +533,103 @@ mod tests {
             worker.exists(),
             "unmanaged checkout must be preserved: {}",
             String::from_utf8_lossy(&output)
+        );
+    }
+
+    #[test]
+    fn registered_symlink_checkout_is_preserved_with_its_admin_and_admission() {
+        use crate::worktree_admission::Admission;
+        use std::os::unix::fs::symlink;
+        let repo = tempfile::tempdir().unwrap();
+        let repo_path = std::fs::canonicalize(repo.path()).unwrap();
+        let root = repo_path.join("main");
+        let worker = repo_path.join("worker");
+        let destination = repo_path.join("ssd-worker");
+        std::fs::create_dir(&root).unwrap();
+        fixture_git(&root, &["init", "-b", "main"]);
+        fixture_git(&root, &["config", "user.email", "test@example.invalid"]);
+        fixture_git(&root, &["config", "user.name", "Test"]);
+        std::fs::write(root.join("witness"), "tracked content must survive").unwrap();
+        fixture_git(&root, &["add", "witness"]);
+        fixture_git(&root, &["commit", "-m", "base"]);
+        fixture_git(
+            &root,
+            &["worktree", "add", "-b", "landed", worker.to_str().unwrap()],
+        );
+        drop(Admission::acquire(&worker).unwrap());
+        let before = fixture_git(&root, &["worktree", "list", "--porcelain"]);
+        // Git still registers the old path. Reproduce dev-volume -> SSD alias
+        // without enrolling a different root or introducing dirty contents.
+        std::fs::rename(&worker, &destination).unwrap();
+        symlink(&destination, &worker).unwrap();
+        let mut output = Vec::new();
+        let result = run_with_census(
+            &root,
+            WorktreeGcArgs {
+                apply: true,
+                prune_targets: false,
+                days: 2,
+                target_dir: None,
+            },
+            &mut output,
+            |_, _| UseState::Idle,
+        );
+        assert!(
+            destination.join("witness").exists(),
+            "symlink destination deleted: result={result:?}, census={}",
+            String::from_utf8_lossy(&output)
+        );
+        assert_eq!(
+            fixture_git(&root, &["worktree", "list", "--porcelain"]),
+            before,
+            "Git administrative entry must survive"
+        );
+        assert!(
+            Admission::acquire(&destination).is_ok(),
+            "refused removal must leave live admission intact"
+        );
+    }
+
+    #[test]
+    fn symlink_checkout_argument_cannot_remove_real_registered_worktree() {
+        use crate::worktree_admission::Admission;
+        use std::os::unix::fs::symlink;
+        let repo = tempfile::tempdir().unwrap();
+        let repo_path = std::fs::canonicalize(repo.path()).unwrap();
+        let root = repo_path.join("main");
+        let worker = repo_path.join("ssd-worker");
+        let alias = repo_path.join("dev-worker");
+        std::fs::create_dir(&root).unwrap();
+        fixture_git(&root, &["init", "-b", "main"]);
+        fixture_git(&root, &["config", "user.email", "test@example.invalid"]);
+        fixture_git(&root, &["config", "user.name", "Test"]);
+        fixture_git(&root, &["commit", "--allow-empty", "-m", "base"]);
+        fixture_git(
+            &root,
+            &["worktree", "add", "-b", "landed", worker.to_str().unwrap()],
+        );
+        drop(Admission::acquire(&worker).unwrap());
+        symlink(&worker, &alias).unwrap();
+        let before = fixture_git(&root, &["worktree", "list", "--porcelain"]);
+        let result = run_with_census(
+            &alias,
+            WorktreeGcArgs {
+                apply: true,
+                prune_targets: false,
+                days: 2,
+                target_dir: None,
+            },
+            &mut Vec::new(),
+            |_, _| UseState::Idle,
+        );
+        assert!(
+            result.is_err() && worker.join(".git").exists(),
+            "symlink given path must fail closed: {result:?}; checkout_exists={}",
+            worker.exists()
+        );
+        assert_eq!(
+            fixture_git(&root, &["worktree", "list", "--porcelain"]),
+            before
         );
     }
 
