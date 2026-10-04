@@ -2504,7 +2504,7 @@
       "file": "crates/carrick-vmm-hvf/src/trap/carrier_custody.rs",
       "function": "CarrierVmCustody::new",
       "ordinal_in_function": 2,
-      "fingerprint": "6913669d540351c0c08a0901ac1a9b3bbb1a5cde07f809a246c559f3f2c1a64e",
+      "fingerprint": "7c8abea6a3cbf851949973cb5fc757aa3683053f5de21c77a319d92725a68090",
       "sink": "fatal",
       "domain": "hvf::transfer",
       "verdict": "carrier_fault",
