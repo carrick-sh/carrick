@@ -62,9 +62,12 @@ fn run_futex(
         .as_ref()
         .ok()
         .map(|report| report.work_snapshot().clone());
-    let receipt = schedule
-        .receipt(summary, work)
-        .expect("complete futex schedule");
+    let receipt = schedule.receipt(summary, work);
+    assert!(
+        receipt.is_ok(),
+        "complete futex schedule: {receipt:?}; run result: {result:?}"
+    );
+    let receipt = receipt.expect("checked complete futex schedule");
     (result, receipt)
 }
 
