@@ -3401,64 +3401,61 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             0,
             carrick_el1_abi::MM_PORTAL_MAX_BYTES,
         );
-        loop {
-            match crate::user_transfer::prepare_write(self, custody.as_ref(), slots, target, ranges)
-            {
-                Err(MemoryPrepareError::Supply(request)) => {
-                    let kind = match request {
-                        carrick_guest_mem::MemorySupplyRequest::Grant(_) => 1,
-                        carrick_guest_mem::MemorySupplyRequest::Cow(_) => 2,
-                        carrick_guest_mem::MemorySupplyRequest::Metadata { .. } => 3,
-                    };
-                    carrick_observability::probes::hvpatch_el1_host_write_prepare(
-                        address, length, 1, kind,
-                    );
-                    // Physical supply is a separate host boundary. The runtime
-                    // first reconciles this MM's EL1-deferred returns under its
-                    // exact mutation permit, then serves this owner receipt.
-                    return Err(MemoryPrepareError::Supply(request));
-                }
-                Ok(prepared) => {
-                    carrick_observability::probes::hvpatch_el1_host_write_prepare(
-                        address, length, 3, 0,
-                    );
-                    return Ok(prepared);
-                }
-                Err(MemoryPrepareError::OwnerWait(wait)) => {
-                    carrick_observability::probes::hvpatch_el1_host_write_prepare(
-                        address,
-                        length,
-                        4,
-                        wait.cause().encode(),
-                    );
-                    return Err(MemoryPrepareError::OwnerWait(wait));
-                }
-                Err(MemoryPrepareError::Physical(wait)) => {
-                    carrick_observability::probes::hvpatch_el1_host_write_prepare(
-                        address, length, 5, 0,
-                    );
-                    return Err(MemoryPrepareError::Physical(wait));
-                }
-                Err(MemoryPrepareError::Fault(error)) => {
-                    let kind = match &error {
-                        MemoryError::OutOfBounds { .. } => 1,
-                        MemoryError::HostMap(_) => 2,
-                        MemoryError::OwnerRetired(_) => 3,
-                        MemoryError::Unsupported => 4,
-                        MemoryError::MetadataAllocation => 5,
-                        _ => 6,
-                    };
-                    carrick_observability::probes::hvpatch_el1_host_write_prepare(
-                        address, length, 6, kind,
-                    );
-                    return Err(MemoryPrepareError::Fault(error));
-                }
-                Err(MemoryPrepareError::Limit(limit)) => {
-                    carrick_observability::probes::hvpatch_el1_host_write_prepare(
-                        address, length, 7, 0,
-                    );
-                    return Err(MemoryPrepareError::Limit(limit));
-                }
+        match crate::user_transfer::prepare_write(self, custody.as_ref(), slots, target, ranges) {
+            Err(MemoryPrepareError::Supply(request)) => {
+                let kind = match request {
+                    carrick_guest_mem::MemorySupplyRequest::Grant(_) => 1,
+                    carrick_guest_mem::MemorySupplyRequest::Cow(_) => 2,
+                    carrick_guest_mem::MemorySupplyRequest::Metadata { .. } => 3,
+                };
+                carrick_observability::probes::hvpatch_el1_host_write_prepare(
+                    address, length, 1, kind,
+                );
+                // Physical supply is a separate host boundary. The runtime
+                // first reconciles this MM's EL1-deferred returns under its
+                // exact mutation permit, then serves this owner receipt.
+                Err(MemoryPrepareError::Supply(request))
+            }
+            Ok(prepared) => {
+                carrick_observability::probes::hvpatch_el1_host_write_prepare(
+                    address, length, 3, 0,
+                );
+                Ok(prepared)
+            }
+            Err(MemoryPrepareError::OwnerWait(wait)) => {
+                carrick_observability::probes::hvpatch_el1_host_write_prepare(
+                    address,
+                    length,
+                    4,
+                    wait.cause().encode(),
+                );
+                Err(MemoryPrepareError::OwnerWait(wait))
+            }
+            Err(MemoryPrepareError::Physical(wait)) => {
+                carrick_observability::probes::hvpatch_el1_host_write_prepare(
+                    address, length, 5, 0,
+                );
+                Err(MemoryPrepareError::Physical(wait))
+            }
+            Err(MemoryPrepareError::Fault(error)) => {
+                let kind = match &error {
+                    MemoryError::OutOfBounds { .. } => 1,
+                    MemoryError::HostMap(_) => 2,
+                    MemoryError::OwnerRetired(_) => 3,
+                    MemoryError::Unsupported => 4,
+                    MemoryError::MetadataAllocation => 5,
+                    _ => 6,
+                };
+                carrick_observability::probes::hvpatch_el1_host_write_prepare(
+                    address, length, 6, kind,
+                );
+                Err(MemoryPrepareError::Fault(error))
+            }
+            Err(MemoryPrepareError::Limit(limit)) => {
+                carrick_observability::probes::hvpatch_el1_host_write_prepare(
+                    address, length, 7, 0,
+                );
+                Err(MemoryPrepareError::Limit(limit))
             }
         }
     }
