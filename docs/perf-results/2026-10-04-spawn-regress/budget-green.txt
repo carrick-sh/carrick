@@ -1,0 +1,15 @@
+Revision: 74f9f63aa
+Command: cargo test -p carrick-kernel-example --test spawn_birth_capacity -- --nocapture
+Exit: 0
+
+   Compiling carrick-kernel v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-spawn-regress/crates/carrick-kernel)
+   Compiling carrick-kernel-example v0.1.0 (/Volumes/CaseSensitive/carrick/.worktrees/wt-spawn-regress/crates/carrick-kernel-example)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 41.13s
+     Running tests/spawn_birth_capacity.rs (target/debug/deps/spawn_birth_capacity-aa202b69edbde20d)
+
+running 2 tests
+test first_host_thread_clone_primes_executable_sibling_capacity ... ok
+test process_only_startup_reserves_no_sibling_runtime_capacity ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+

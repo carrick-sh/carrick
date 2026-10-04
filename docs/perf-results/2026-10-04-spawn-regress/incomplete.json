@@ -1,0 +1,226 @@
+{
+  "schema": 1,
+  "receipts": [
+    {
+      "original_file": "abba-pilot/r01-s1-base.json",
+      "original_sha256": "c69b08861bea1e640dbb63c52224e9a22169e4f3a4dadf1b9e339357e22438b4",
+      "excluded_from_paired_analysis_because": "Pilot stopped before a complete ABBA round; another gate intervened.",
+      "receipt": {
+        "schema": 1,
+        "phase": "carrick",
+        "head": "878fa1fd800381d5c058cbea215cfdf7795b3ce6",
+        "run_id": "spawn-regress-r01-s1-base-17064-1791140743619319000",
+        "measured_runs": 1,
+        "warmup_policy": "one excluded warm-up per workload; fixed measured run count",
+        "artifact": {
+          "path": "/Volumes/CaseSensitive/carrick/.worktrees/impact-base/target/release/carrick",
+          "sha256": "00eacdb4e063903ba99e7b1ca9198650693dacbba39f2fdc3a32aea337ea079b",
+          "cdhash": "c9c247453fecdfefd6d65135b79a707845a63bc5",
+          "lc_uuid": "9D81A7FB-114F-3F68-84FF-4A78689ABDEC",
+          "entitlement": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"https://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\n",
+          "dof_present": true
+        },
+        "errors": [],
+        "workloads": {
+          "spawn-loop": {
+            "image": "ubuntu:24.04",
+            "image_digest": "sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+            "command": [
+              "/bin/sh",
+              "-c",
+              "set -eu; n=1000; start=$(date +%s%N); i=0; while [ \"$i\" -lt \"$n\" ]; do /bin/true; i=$((i+1)); done; end=$(date +%s%N); printf \"impact_window_ns=%s\\n\" \"$((end-start))\""
+            ],
+            "declaration_sha256": "274ba3647fcd504cda075ee32ffa88cc406304c4397ab459bca168b20f4c67dc",
+            "window": {
+              "operations": 1000,
+              "prefix": "impact_window_ns="
+            },
+            "samples": [
+              {
+                "run_id": "spawn-regress-r01-s1-base-17064-1791140743619319000-spawn-loop-0",
+                "argv": [
+                  "/Volumes/CaseSensitive/carrick/.worktrees/impact-base/target/release/carrick",
+                  "run",
+                  "--name",
+                  "spawn-regress-r01-s1-base-17064-1791140743619319000-spawn-loop-0",
+                  "--max-traps",
+                  "18446744073709551615",
+                  "--fs",
+                  "host",
+                  "ubuntu@sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+                  "/bin/sh",
+                  "-c",
+                  "set -eu; n=1000; start=$(date +%s%N); i=0; while [ \"$i\" -lt \"$n\" ]; do /bin/true; i=$((i+1)); done; end=$(date +%s%N); printf \"impact_window_ns=%s\\n\" \"$((end-start))\""
+                ],
+                "warmup": true,
+                "wall_s": 1.83558175,
+                "child_cpu_s": 2.288871,
+                "per_op_s": 0.001746814667,
+                "guest_window_s": 1.746814667,
+                "exit_code": 0,
+                "timed_out": false,
+                "cleanup_ok": true,
+                "host_load": {
+                  "load_average_1m": 17.13232421875,
+                  "rustc_processes": 2
+                }
+              },
+              {
+                "run_id": "spawn-regress-r01-s1-base-17064-1791140743619319000-spawn-loop-1",
+                "argv": [
+                  "/Volumes/CaseSensitive/carrick/.worktrees/impact-base/target/release/carrick",
+                  "run",
+                  "--name",
+                  "spawn-regress-r01-s1-base-17064-1791140743619319000-spawn-loop-1",
+                  "--max-traps",
+                  "18446744073709551615",
+                  "--fs",
+                  "host",
+                  "ubuntu@sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+                  "/bin/sh",
+                  "-c",
+                  "set -eu; n=1000; start=$(date +%s%N); i=0; while [ \"$i\" -lt \"$n\" ]; do /bin/true; i=$((i+1)); done; end=$(date +%s%N); printf \"impact_window_ns=%s\\n\" \"$((end-start))\""
+                ],
+                "warmup": false,
+                "wall_s": 1.691647125,
+                "child_cpu_s": 2.0838359999999994,
+                "per_op_s": 0.001605600833,
+                "guest_window_s": 1.605600833,
+                "exit_code": 0,
+                "timed_out": false,
+                "cleanup_ok": true,
+                "host_load": {
+                  "load_average_1m": 17.13232421875,
+                  "rustc_processes": 2
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "original_file": "abba/r13-s1-base.json",
+      "original_sha256": "9228e67287a336674afd33d6a5290937da26592066a716eddcf5818a9c794eb8",
+      "excluded_from_paired_analysis_because": "Extra complete base invocation after the stop-controller missed round 12.",
+      "receipt": {
+        "schema": 1,
+        "phase": "carrick",
+        "head": "5342e0b50e9256f9cbe0192b56c74b2746bb21eb",
+        "run_id": "spawn-regress-r13-s1-base-51629-1791143635503009000",
+        "measured_runs": 1,
+        "warmup_policy": "one excluded warm-up per workload; fixed measured run count",
+        "artifact": {
+          "path": "/Volumes/CaseSensitive/carrick/.worktrees/impact-base/target/release/carrick",
+          "sha256": "00eacdb4e063903ba99e7b1ca9198650693dacbba39f2fdc3a32aea337ea079b",
+          "cdhash": "c9c247453fecdfefd6d65135b79a707845a63bc5",
+          "lc_uuid": "9D81A7FB-114F-3F68-84FF-4A78689ABDEC",
+          "entitlement": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"https://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\n",
+          "dof_present": true
+        },
+        "errors": [],
+        "workloads": {
+          "spawn-loop": {
+            "image": "ubuntu:24.04",
+            "image_digest": "sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+            "command": [
+              "/bin/sh",
+              "-c",
+              "set -eu; n=1000; start=$(date +%s%N); i=0; while [ \"$i\" -lt \"$n\" ]; do /bin/true; i=$((i+1)); done; end=$(date +%s%N); printf \"impact_window_ns=%s\\n\" \"$((end-start))\""
+            ],
+            "declaration_sha256": "274ba3647fcd504cda075ee32ffa88cc406304c4397ab459bca168b20f4c67dc",
+            "window": {
+              "operations": 1000,
+              "prefix": "impact_window_ns="
+            },
+            "samples": [
+              {
+                "run_id": "spawn-regress-r13-s1-base-51629-1791143635503009000-spawn-loop-0",
+                "argv": [
+                  "/Volumes/CaseSensitive/carrick/.worktrees/impact-base/target/release/carrick",
+                  "run",
+                  "--name",
+                  "spawn-regress-r13-s1-base-51629-1791143635503009000-spawn-loop-0",
+                  "--max-traps",
+                  "18446744073709551615",
+                  "--fs",
+                  "host",
+                  "ubuntu@sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+                  "/bin/sh",
+                  "-c",
+                  "set -eu; n=1000; start=$(date +%s%N); i=0; while [ \"$i\" -lt \"$n\" ]; do /bin/true; i=$((i+1)); done; end=$(date +%s%N); printf \"impact_window_ns=%s\\n\" \"$((end-start))\""
+                ],
+                "warmup": true,
+                "wall_s": 1.4605688749999999,
+                "child_cpu_s": 1.7664870000000001,
+                "per_op_s": 0.001400859083,
+                "guest_window_s": 1.400859083,
+                "exit_code": 0,
+                "timed_out": false,
+                "cleanup_ok": true,
+                "host_load": {
+                  "load_average_1m": 7.32080078125,
+                  "rustc_processes": 1
+                }
+              },
+              {
+                "run_id": "spawn-regress-r13-s1-base-51629-1791143635503009000-spawn-loop-1",
+                "argv": [
+                  "/Volumes/CaseSensitive/carrick/.worktrees/impact-base/target/release/carrick",
+                  "run",
+                  "--name",
+                  "spawn-regress-r13-s1-base-51629-1791143635503009000-spawn-loop-1",
+                  "--max-traps",
+                  "18446744073709551615",
+                  "--fs",
+                  "host",
+                  "ubuntu@sha256:08571ca13e00ca07a2a84eab83a959b4242e22cceb16486a11bef1428c9e93a7",
+                  "/bin/sh",
+                  "-c",
+                  "set -eu; n=1000; start=$(date +%s%N); i=0; while [ \"$i\" -lt \"$n\" ]; do /bin/true; i=$((i+1)); done; end=$(date +%s%N); printf \"impact_window_ns=%s\\n\" \"$((end-start))\""
+                ],
+                "warmup": false,
+                "wall_s": 2.806508333,
+                "child_cpu_s": 3.411206000000001,
+                "per_op_s": 0.002740777667,
+                "guest_window_s": 2.740777667,
+                "exit_code": 0,
+                "timed_out": false,
+                "cleanup_ok": true,
+                "host_load": {
+                  "load_average_1m": 7.32080078125,
+                  "rustc_processes": 1
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "original_file": "abba/r13-s2-candidate.json",
+      "original_sha256": "24770289dbd0e74388db68f4983fdb1bb8f1b90610d34ba5f5e174fe2ea9cc83",
+      "excluded_from_paired_analysis_because": "Registry HTTP 429 before guest launch; no samples. Anonymous pull token redacted.",
+      "receipt": {
+        "schema": 1,
+        "phase": "carrick",
+        "head": "5342e0b50e9256f9cbe0192b56c74b2746bb21eb",
+        "run_id": "spawn-regress-r13-s2-candidate-52025-1791143645282016000",
+        "measured_runs": 1,
+        "warmup_policy": "one excluded warm-up per workload; fixed measured run count",
+        "artifact": {
+          "path": "/Volumes/CaseSensitive/carrick/.worktrees/impact-pb/target/release/carrick",
+          "sha256": "61c6126f25baed039db04a8afd20f2e59498e59224beafe7013b1d05a4d6c9a4",
+          "cdhash": "9fe8df0059bf729f61f3944904d2c75908d85d9f",
+          "lc_uuid": "134BBF6E-843C-3B9D-A5BD-9C161000C0E2",
+          "entitlement": "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"https://www.apple.com/DTDs/PropertyList-1.0.dtd\"><plist version=\"1.0\"><dict><key>com.apple.security.hypervisor</key><true/></dict></plist>\n",
+          "dof_present": true
+        },
+        "errors": [
+          "curl -fsS -H Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json -H Authorization: Bearer [REDACTED] https://registry-1.docker.io/v2/library/ubuntu/manifests/24.04: curl: (56) The requested URL returned error: 429\n"
+        ],
+        "workloads": {}
+      }
+    }
+  ]
+}
