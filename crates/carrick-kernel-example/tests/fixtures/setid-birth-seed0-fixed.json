@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "generator_version": 2,
+  "seed": 0,
+  "source_hash": "72c4a02fa72bd37fb61ede7c1003875ec9ae95f9d44c849d44f204b21cfdd151",
+  "fixture_hash": "71212647df15af61d5ff05e6184012ea7a3edcb6b1a38e24cc141210c1d53c90",
+  "backend": "kernel-example/linux/x86_64",
+  "scale": 1,
+  "decisions": [
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 0
+      },
+      "point": {
+        "kernel": "before-credential-admission"
+      },
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 0
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 0
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 0
+      },
+      "authority": {
+        "Thread": {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": null
+        }
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 0
+      },
+      "point": {
+        "kernel": "credential-published"
+      },
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 0
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 0
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 0
+      },
+      "authority": {
+        "Thread": {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": null
+        }
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 0
+      },
+      "point": "finish",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 0
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 0
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 0
+      },
+      "point": {
+        "kernel": "birth-recorded"
+      },
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 0
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 0
+      },
+      "authority": {
+        "Thread": {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 4,
+          "thread_serial": 13,
+          "execution_generation": null
+        }
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 0
+      },
+      "point": {
+        "kernel": "admission-released"
+      },
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 0
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 0
+      },
+      "authority": {
+        "Thread": {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": null
+        }
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 0
+      },
+      "point": "finish",
+      "visit": 0,
+      "runnable": [],
+      "next": null
+    }
+  ],
+  "result": "setresuid outcomes: [Returned { value: 0 }]",
+  "work_snapshot": null
+}

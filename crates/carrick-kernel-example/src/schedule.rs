@@ -35,6 +35,8 @@ pub enum Point {
     TerminalUnlocked,
     TerminalPublished,
     Finish,
+    Kernel(carrick_kernel::kernel::schedule::Point),
+    AwaitEvent,
 }
 
 /// Exact kernel identity, including both incarnation serials and CPU generation.
@@ -67,6 +69,8 @@ pub struct Decision {
     pub visit: usize,
     pub runnable: Vec<Actor>,
     pub next: Option<Actor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority: Option<carrick_kernel::kernel::schedule::AuthorityStamp>,
 }
 
 /// Portable receipt for strict replay and retained regression fixtures.
@@ -93,12 +97,16 @@ struct State {
     max_transitions: usize,
     actors: BTreeSet<Actor>,
     parked: BTreeMap<Actor, u64>,
+    admission_waiters: BTreeSet<Actor>,
+    observed: BTreeSet<(Actor, Point)>,
+    dependencies: BTreeMap<Actor, (Actor, Point)>,
     current: Option<Actor>,
     decisions: Vec<Decision>,
     visits: BTreeMap<(Actor, Point), usize>,
     replay: Option<ScheduleReceipt>,
     source_hash: String,
     fixture_hash: String,
+    scale: usize,
     started: bool,
     failure: Option<String>,
     allowed_source_pair: Option<(String, String)>,
@@ -113,12 +121,16 @@ impl Schedule {
                 max_transitions: 10_000,
                 actors: BTreeSet::new(),
                 parked: BTreeMap::new(),
+                admission_waiters: BTreeSet::new(),
+                observed: BTreeSet::new(),
+                dependencies: BTreeMap::new(),
                 current: None,
                 decisions: Vec::new(),
                 visits: BTreeMap::new(),
                 replay: None,
                 source_hash: String::new(),
                 fixture_hash: String::new(),
+                scale: 1,
                 started: false,
                 failure: None,
                 allowed_source_pair: None,
@@ -138,6 +150,153 @@ impl Schedule {
         self
     }
 
+    /// Drive public kernel operations on pre-registered, exact actors. No
+    /// dispatcher mutex hides admission races, and no transaction is copied.
+    #[cfg(debug_assertions)]
+    pub fn run_operations(
+        &self,
+        kernel: &Arc<carrick_kernel::kernel::Kernel>,
+        fixture: &str,
+        scale: usize,
+        contexts: &[carrick_kernel::kernel::KernelContext],
+        operation: impl Fn(usize, &OperationActor<'_>) + Sync,
+    ) -> Result<ScheduleReceipt, String> {
+        use carrick_kernel::kernel::schedule::{Authority, Point as KPoint};
+        let actors: Vec<_> = contexts
+            .iter()
+            .map(|context| Actor {
+                task_id: context.task().key().id.raw(),
+                task_serial: context.task().key().serial.raw(),
+                thread_id: context.thread().key().tid.raw(),
+                thread_serial: context.thread().key().serial.raw(),
+                // Zero records the absence of an execution binding; it never
+                // fabricates an initial or successor execution generation.
+                execution_generation: context
+                    .thread()
+                    .execution_state()
+                    .generation()
+                    .map_or(0, |g| g.raw()),
+            })
+            .collect();
+        let root = *actors.first().ok_or("operation fixture has no actors")?;
+        if scale == 0 {
+            return Err("operation fixture has zero scale".into());
+        }
+        self.start_hash(hex_digest(fixture.as_bytes()), root, scale)?;
+        for actor in &actors[1..] {
+            self.register(*actor)?;
+        }
+        let schedule = self.clone();
+        let identities = actors.clone();
+        kernel.schedule_hooks().set(Some(Arc::new(move |event| {
+            let subject = event.actor.or(match event.authority {
+                Authority::Thread(subject) => Some(subject),
+                _ => None,
+            });
+            let Some(actor) = subject
+                .and_then(|subject| {
+                    identities.iter().find(|actor| {
+                        actor.task_id == subject.task.id.raw()
+                            && actor.task_serial == subject.task.serial.raw()
+                            && actor.thread_id == subject.thread.tid.raw()
+                            && actor.thread_serial == subject.thread.serial.raw()
+                            && subject.generation.map_or(0, |generation| generation.raw())
+                                == actor.execution_generation
+                    })
+                })
+                .copied()
+            else {
+                return;
+            };
+            let outcome = match event.point {
+                KPoint::CredentialWaiting => schedule.park_admission(actor),
+                KPoint::CredentialResumed => schedule
+                    .enter(actor)
+                    .and_then(|()| schedule.point(actor, Point::WaitResumed)),
+                KPoint::AdmissionReleased
+                    if matches!(event.authority, Authority::Thread(target) if Some(target) != event.actor) =>
+                {
+                    let Authority::Thread(target) = event.authority else { unreachable!() };
+                    let waiter = identities.iter().find(|candidate| {
+                        candidate.task_id == target.task.id.raw()
+                            && candidate.task_serial == target.task.serial.raw()
+                            && candidate.thread_id == target.thread.tid.raw()
+                            && candidate.thread_serial == target.thread.serial.raw()
+                            && candidate.execution_generation == target.generation.map_or(0, |g| g.raw())
+                    });
+                    match waiter {
+                        Some(waiter) => schedule.publish_admission_wake(actor, *waiter, event.authority.stamp()),
+                        None => Err("admission release names an unregistered waiter".into()),
+                    }
+                },
+                point => schedule.point_with_authority(
+                    actor,
+                    Point::Kernel(point),
+                    Some(event.authority.stamp()),
+                ),
+            };
+            if let Err(error) = outcome {
+                schedule.abort(error);
+            }
+        })));
+        std::thread::scope(|scope| {
+            for (index, context) in contexts.iter().enumerate() {
+                let operation = &operation;
+                let actors = &actors;
+                scope.spawn(move || {
+                    let actor = actors[index];
+                    if let Err(error) = self.enter(actor) {
+                        self.abort(error);
+                        return;
+                    }
+                    let handle = OperationActor {
+                        schedule: self,
+                        kernel,
+                        subject: carrick_kernel::kernel::schedule::Subject::from_context(context),
+                        actor,
+                    };
+                    operation(index, &handle);
+                    if let Err(error) = self.finish(actor) {
+                        self.abort(error);
+                    }
+                });
+            }
+        });
+        kernel.schedule_hooks().set(None);
+        self.receipt("operations drained", None)
+    }
+
+    #[cfg(debug_assertions)]
+    fn await_point(&self, actor: Actor, dependency: (Actor, Point)) -> Result<(), String> {
+        let (lock, wake) = &*self.0;
+        let mut state = lock.lock();
+        if state.observed.contains(&dependency) {
+            return Ok(());
+        }
+        if state.current != Some(actor) || !state.actors.remove(&actor) {
+            return Err("dependency waiter lacks permit".into());
+        }
+        state.dependencies.insert(actor, dependency);
+        if let Err(error) = Self::choose(&mut state, actor, Point::AwaitEvent) {
+            state.failure = Some(error);
+        }
+        wake.notify_all();
+        while !state.actors.contains(&actor) && state.failure.is_none() {
+            if wake.wait_for(&mut state, WATCHDOG).timed_out() {
+                state.failure = Some(format!(
+                    "stranded schedule dependencies: {:?}",
+                    state.dependencies
+                ));
+                wake.notify_all();
+            }
+        }
+        if let Some(error) = state.failure.clone() {
+            return Err(error);
+        }
+        drop(state);
+        self.enter(actor)
+    }
+
     /// Explicitly allow exactly one known-bad -> fixed source comparison.
     pub fn allow_source_pair(self, bad: &str, fixed: &str) -> Self {
         self.0.0.lock().allowed_source_pair = Some((bad.into(), fixed.into()));
@@ -145,23 +304,28 @@ impl Schedule {
     }
 
     pub(crate) fn start(&self, script: &[Step], root: Actor) -> Result<(), String> {
-        let (lock, _) = &*self.0;
-        let mut state = lock.lock();
-        if state.started {
-            return Err("schedule already started".into());
-        }
         if script.iter().any(has_uncontrolled_step) {
             return Err(
                 "scheduled scenario contains an uncontrolled host checkpoint or wait".into(),
             );
         }
+        self.start_hash(hex_digest(format!("{script:?}").as_bytes()), root, 1)
+    }
+
+    fn start_hash(&self, fixture_hash: String, root: Actor, scale: usize) -> Result<(), String> {
+        let (lock, _) = &*self.0;
+        let mut state = lock.lock();
+        if state.started {
+            return Err("schedule already started".into());
+        }
         state.source_hash = source_hash()?;
-        state.fixture_hash = hex_digest(format!("{script:?}").as_bytes());
+        state.fixture_hash = fixture_hash;
+        state.scale = scale;
         if let Some(replay) = &state.replay {
             if replay.schema_version != SCHEMA_VERSION
                 || replay.generator_version != GENERATOR_VERSION
                 || replay.backend != backend_id()
-                || replay.scale != 1
+                || replay.scale != state.scale
                 || replay.fixture_hash != state.fixture_hash
             {
                 return Err("replay schema, backend, scale or fixture mismatch".into());
@@ -181,7 +345,12 @@ impl Schedule {
 
     pub(crate) fn register(&self, actor: Actor) -> Result<(), String> {
         let mut state = self.0.0.lock();
-        if !state.started || state.parked.contains_key(&actor) || !state.actors.insert(actor) {
+        if !state.started
+            || state.parked.contains_key(&actor)
+            || state.admission_waiters.contains(&actor)
+            || state.dependencies.contains_key(&actor)
+            || !state.actors.insert(actor)
+        {
             return Err("duplicate or premature schedule actor".into());
         }
         Ok(())
@@ -190,7 +359,11 @@ impl Schedule {
     pub(crate) fn enter(&self, actor: Actor) -> Result<(), String> {
         let (lock, wake) = &*self.0;
         let mut state = lock.lock();
-        if !state.actors.contains(&actor) && !state.parked.contains_key(&actor) {
+        if !state.actors.contains(&actor)
+            && !state.parked.contains_key(&actor)
+            && !state.admission_waiters.contains(&actor)
+            && !state.dependencies.contains_key(&actor)
+        {
             return Err("unregistered schedule actor".into());
         }
         while state.current != Some(actor) && state.failure.is_none() {
@@ -203,13 +376,34 @@ impl Schedule {
     }
 
     fn choose(state: &mut State, actor: Actor, point: Point) -> Result<(), String> {
+        Self::choose_with_authority(state, actor, point, None)
+    }
+
+    fn choose_with_authority(
+        state: &mut State,
+        actor: Actor,
+        point: Point,
+        authority: Option<carrick_kernel::kernel::schedule::AuthorityStamp>,
+    ) -> Result<(), String> {
         if state.decisions.len() >= state.max_transitions {
             return Err("schedule transition budget exceeded".into());
+        }
+        state.observed.insert((actor, point));
+        let ready: Vec<_> = state
+            .dependencies
+            .iter()
+            .filter(|(_, dependency)| **dependency == (actor, point))
+            .map(|(waiting, _)| *waiting)
+            .collect();
+        for waiting in ready {
+            state.dependencies.remove(&waiting);
+            state.actors.insert(waiting);
         }
         let runnable: Vec<_> = state.actors.iter().copied().collect();
         // Markers within the terminal sequence only observe. In particular,
         // FdDrained runs under the dispatcher mutex and must never park there.
-        let observation = matches!(point, Point::FdDrained | Point::TerminalPublished);
+        let observation = matches!(point, Point::FdDrained | Point::TerminalPublished)
+            || matches!(point, Point::Kernel(p) if p.observation_only());
         let generated = if observation {
             Some(actor)
         } else {
@@ -231,9 +425,13 @@ impl Schedule {
                 .decisions
                 .get(state.decisions.len())
                 .ok_or("replay exhausted before execution ended")?;
-            if expected.actor != actor || expected.point != point || expected.visit != visit {
+            if expected.actor != actor
+                || expected.point != point
+                || expected.visit != visit
+                || expected.authority != authority
+            {
                 return Err(format!(
-                    "replay point, actor or visit drift at {}",
+                    "replay point, actor, visit or authority drift at {}",
                     state.decisions.len()
                 ));
             }
@@ -263,25 +461,85 @@ impl Schedule {
             visit,
             runnable,
             next,
+            authority,
         });
         state.current = next;
         Ok(())
     }
 
     pub(crate) fn point(&self, actor: Actor, point: Point) -> Result<(), String> {
+        self.point_with_authority(actor, point, None)
+    }
+
+    fn point_with_authority(
+        &self,
+        actor: Actor,
+        point: Point,
+        authority: Option<carrick_kernel::kernel::schedule::AuthorityStamp>,
+    ) -> Result<(), String> {
         let (lock, wake) = &*self.0;
         {
             let mut state = lock.lock();
             if state.current != Some(actor) {
                 return Err("schedule actor lacks permit".into());
             }
-            if let Err(error) = Self::choose(&mut state, actor, point) {
+            if let Err(error) = Self::choose_with_authority(&mut state, actor, point, authority) {
                 state.failure = Some(error.clone());
                 wake.notify_all();
                 return Err(error);
             }
             wake.notify_all();
         }
+        self.enter(actor)
+    }
+
+    /// Admission waiting releases the permit but host condvar delivery cannot
+    /// restore eligibility. Only the reservation owner's release event can.
+    #[cfg(debug_assertions)]
+    fn park_admission(&self, actor: Actor) -> Result<(), String> {
+        let (lock, wake) = &*self.0;
+        let mut state = lock.lock();
+        if state.current != Some(actor) || !state.actors.remove(&actor) {
+            return Err("admission waiter lacks permit".into());
+        }
+        state.admission_waiters.insert(actor);
+        if let Err(error) = Self::choose(&mut state, actor, Point::WaitEnrolled) {
+            state.failure = Some(error.clone());
+            wake.notify_all();
+            return Err(error);
+        }
+        wake.notify_all();
+        Ok(())
+    }
+
+    #[cfg(debug_assertions)]
+    fn publish_admission_wake(
+        &self,
+        actor: Actor,
+        waiter: Actor,
+        authority: carrick_kernel::kernel::schedule::AuthorityStamp,
+    ) -> Result<(), String> {
+        let (lock, wake) = &*self.0;
+        let mut state = lock.lock();
+        if state.current != Some(actor) || !state.admission_waiters.remove(&waiter) {
+            let error = "admission release lacks a permit or matching waiter".to_string();
+            state.failure = Some(error.clone());
+            wake.notify_all();
+            return Err(error);
+        }
+        state.actors.insert(waiter);
+        if let Err(error) = Self::choose_with_authority(
+            &mut state,
+            actor,
+            Point::Kernel(carrick_kernel::kernel::schedule::Point::AdmissionReleased),
+            Some(authority),
+        ) {
+            state.failure = Some(error.clone());
+            wake.notify_all();
+            return Err(error);
+        }
+        wake.notify_all();
+        drop(state);
         self.enter(actor)
     }
 
@@ -350,6 +608,8 @@ impl Schedule {
         if state.failure.is_some() {
             state.actors.remove(&actor);
             state.parked.remove(&actor);
+            state.admission_waiters.remove(&actor);
+            state.dependencies.remove(&actor);
             wake.notify_all();
             return Ok(());
         }
@@ -379,7 +639,12 @@ impl Schedule {
         if let Some(error) = &state.failure {
             return Err(error.clone());
         }
-        if !state.started || !state.actors.is_empty() || !state.parked.is_empty() {
+        if !state.started
+            || !state.actors.is_empty()
+            || !state.parked.is_empty()
+            || !state.admission_waiters.is_empty()
+            || !state.dependencies.is_empty()
+        {
             return Err("schedule actors did not drain".into());
         }
         if let Some(replay) = &state.replay
@@ -404,11 +669,64 @@ impl Schedule {
             source_hash: state.source_hash.clone(),
             fixture_hash: state.fixture_hash.clone(),
             backend: backend_id(),
-            scale: 1,
+            scale: state.scale,
             decisions: state.decisions.clone(),
             result,
             work_snapshot,
         })
+    }
+}
+
+/// A public-operation actor can await an admitted event without polling or
+/// holding an OS lock. Points use the same graph hook as product operations.
+#[cfg(debug_assertions)]
+pub struct OperationActor<'a> {
+    schedule: &'a Schedule,
+    kernel: &'a Arc<carrick_kernel::kernel::Kernel>,
+    subject: carrick_kernel::kernel::schedule::Subject,
+    actor: Actor,
+}
+#[cfg(debug_assertions)]
+impl OperationActor<'_> {
+    pub fn identity(&self) -> Actor {
+        self.actor
+    }
+    pub fn point(&self, point: carrick_kernel::kernel::schedule::Point) {
+        carrick_kernel::schedule_point!(
+            self.kernel.schedule_hooks(),
+            carrick_kernel::kernel::schedule::Event {
+                point,
+                actor: Some(self.subject),
+                authority: carrick_kernel::kernel::schedule::Authority::Thread(self.subject),
+            }
+        );
+    }
+    pub fn authority_point(
+        &self,
+        point: carrick_kernel::kernel::schedule::Point,
+        authority: carrick_kernel::kernel::schedule::Authority,
+    ) {
+        carrick_kernel::schedule_point!(
+            self.kernel.schedule_hooks(),
+            carrick_kernel::kernel::schedule::Event {
+                point,
+                authority,
+                actor: Some(self.subject),
+            }
+        );
+    }
+    pub fn after(&self, actor: Actor, point: Point) -> Result<(), String> {
+        self.schedule.await_point(self.actor, (actor, point))
+    }
+    /// Publish a released reservation as a scheduling decision, naming the
+    /// exact admitted waiter. Call only after releasing the real reservation.
+    pub fn release_admission(&self, waiter: &carrick_kernel::kernel::KernelContext) {
+        self.authority_point(
+            carrick_kernel::kernel::schedule::Point::AdmissionReleased,
+            carrick_kernel::kernel::schedule::Authority::Thread(
+                carrick_kernel::kernel::schedule::Subject::from_context(waiter),
+            ),
+        );
     }
 }
 
@@ -438,6 +756,10 @@ fn compute_source_hash() -> Result<String, String> {
     let mut paths = Vec::new();
     collect_rust_sources(&root.join("crates/carrick-kernel/src"), &mut paths)?;
     collect_rust_sources(&root.join("crates/carrick-kernel-example/src"), &mut paths)?;
+    for name in ["carrick-sched-core", "carrick-fd-core", "carrick-pipe-core"] {
+        collect_rust_sources(&root.join("crates").join(name).join("src"), &mut paths)?;
+    }
+    paths.push(root.join("crates/carrick-kernel-example/tests/admission_interleavings.rs"));
     paths.push(root.join("crates/carrick-kernel-example/tests/schedule_replay.rs"));
     paths.sort();
     let mut hash = Sha256::new();
@@ -471,15 +793,4 @@ fn collect_rust_sources(
     Ok(())
 }
 
-/// One source-level hook API. Optimized builds contain no call or point value.
-#[macro_export]
-macro_rules! schedule_point {
-    ($shared:expr, $task:expr, $point:expr) => {
-        #[cfg(debug_assertions)]
-        if let Some(schedule) = &$shared.schedule {
-            schedule
-                .point($task.schedule_actor(), $point)
-                .map_err($crate::scripted::ExampleError::Schedule)?;
-        }
-    };
-}
+pub use carrick_kernel::schedule_point;

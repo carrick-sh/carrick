@@ -1116,6 +1116,10 @@ impl Kernel {
         let context = self
             .context(task.key().id, key.tid)
             .map_err(|error| error.to_string())?;
+        crate::schedule_point!(
+            self.schedule_hooks(),
+            super::schedule::Event::thread(&context, super::schedule::Point::BeforeFirstEntry)
+        );
         if context.thread().key() != key {
             return Err("born first entry changed identity".into());
         }
@@ -1126,6 +1130,10 @@ impl Kernel {
             .thread_adoption_factory()
             .ok_or("born thread lost adoption factory")?;
         factory.adopt_first_host_entry(&context, reservation, frame)?;
+        crate::schedule_point!(
+            self.schedule_hooks(),
+            super::schedule::Event::thread(&context, super::schedule::Point::FirstEntryFinished)
+        );
         Ok(true)
     }
 

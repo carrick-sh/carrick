@@ -30,6 +30,7 @@ pub mod operations;
 pub mod process_lifecycle;
 pub mod registry;
 mod revision_capacity;
+pub mod schedule;
 pub mod scheduler;
 pub mod snapshot;
 mod socket_rpc;
