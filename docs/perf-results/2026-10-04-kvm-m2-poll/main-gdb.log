@@ -1,0 +1,17 @@
+warning: Missing auto-load script at offset 0 in section .debug_gdb_scripts
+of file /home/carrick/dev/wt-m2-kvm/target/debug/carrick-vmm-kvm.
+Use `info auto-load python-scripts [REGEXP]' to list them.
+Breakpoint 1 at 0xab64b: file crates/carrick-x86/src/bringup_fns.rs, line 661.
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+M2 syscall stop
+$1 = carrick_hal::trap::RawSyscall {current_guest_sp: core::option::Option<u64>::None, number: carrick_abi::CanonicalNr (96), args: [2526696, 2529352, 0, 2097216, 2097496, 231], guest_abi: carrick_abi::LinuxGuestAbi::X86_64, native_number: carrick_abi::NativeNr (218)}
+M2 syscall stop
+$2 = carrick_hal::trap::RawSyscall {current_guest_sp: core::option::Option<u64>::None, number: carrick_abi::CanonicalNr (18446744073709551575), args: [1099511561328, 3, 0, 0, 0, 0], guest_abi: carrick_abi::LinuxGuestAbi::X86_64, native_number: carrick_abi::NativeNr (7)}
+carrick-x86 run-elf: unhandled canonical=18446744073709551575 x86_name=<unknown> args=[fffffefc70, 3, 0, 0, 0, 0] → -ENOSYS
+M2 syscall stop
+$3 = carrick_hal::trap::RawSyscall {current_guest_sp: core::option::Option<u64>::None, number: carrick_abi::CanonicalNr (135), args: [0, 2127200, 1099511561104, 8, 0, 0], guest_abi: carrick_abi::LinuxGuestAbi::X86_64, native_number: carrick_abi::NativeNr (14)}
+M2 syscall stop
+$4 = carrick_hal::trap::RawSyscall {current_guest_sp: core::option::Option<u64>::None, number: carrick_abi::CanonicalNr (130), args: [3814653, 6, 1099511561104, 8, 0, 0], guest_abi: carrick_abi::LinuxGuestAbi::X86_64, native_number: carrick_abi::NativeNr (200)}
+carrick-x86: guest called tkill(SIGABRT) → exit(134)
+[Inferior 1 (process 3814653) exited with code 0206]

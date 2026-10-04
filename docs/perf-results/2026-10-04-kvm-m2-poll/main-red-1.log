@@ -1,0 +1,22 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running tests/live_vcpu_x86.rs (target/debug/deps/live_vcpu_x86-4810161888ab5069)
+
+running 1 test
+[M2] running fixture via /tmp/carrick-m2-bisect/target/debug/carrick-vmm-kvm
+[M2] stdout="" stderr="carrick-x86 run-elf: unhandled canonical=18446744073709551575 x86_name=<unknown> args=[fffffefc50, 3, 0, 0, 0, 0] → -ENOSYS\ncarrick-x86: guest called tkill(SIGABRT) → exit(134)\n" status=ExitStatus(unix_wait_status(34304))
+
+thread 'test_m2_musl_static_hello' (3935243) panicked at crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs:280:5:
+assertion `left == right` failed: M2 stdout mismatch: got "" want "hello, x86_64 world\n"
+  left: []
+ right: [104, 101, 108, 108, 111, 44, 32, 120, 56, 54, 95, 54, 52, 32, 119, 111, 114, 108, 100, 10]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test test_m2_musl_static_hello ... FAILED
+
+failures:
+
+failures:
+    test_m2_musl_static_hello
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.13s
+
+error: test failed, to rerun pass `-p carrick-vmm-kvm --test live_vcpu_x86`

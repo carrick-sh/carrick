@@ -1,0 +1,24 @@
+# bad: [b1167c6e19811c5b3a601d979cedca844656454f] test(kvm): add the manual willow ephemeral runner pilot workflow
+# good: [2cbd1e4a7b2b318359ef89344a76352a1982a311] perf(bsd): COW layer-cache seed on FreeBSD via copy_file_range (ZFS block_cloning)
+git bisect start 'b1167c6e1' '2cbd1e4a7'
+# skip: [ab0f14dd68bf8ac699e1b7529db90266302da8bd] docs(runtime): accept clean-room process-vm read milestone
+git bisect skip ab0f14dd68bf8ac699e1b7529db90266302da8bd
+# skip: [695142a7bbccc7115ab827c7cd85b926833bc7a9] docs(runtime): record foreign-write atomicity red
+git bisect skip 695142a7bbccc7115ab827c7cd85b926833bc7a9
+# bad: [f6ae38d20254eee23a8fdadc03dc04a5bddc5965] refactor(kvm): collapse the aarch64 KVM VcpuSnapshot mirror into the neutral type
+git bisect bad f6ae38d20254eee23a8fdadc03dc04a5bddc5965
+# bad: [93c2d0d7f3f15357905c81fe8ed8e35edc19db6c] feat(hal): VcpuScheduler::reset_for_fork — fork-child pool reset (Phase 1 Task 3 groundwork)
+git bisect bad 93c2d0d7f3f15357905c81fe8ed8e35edc19db6c
+# bad: [a139f49f0775c5007ce905e6bf383a9773c4b906] Merge branch 'lane/fs'
+git bisect bad a139f49f0775c5007ce905e6bf383a9773c4b906
+# bad: [f1675973bd3b1e0394ee889c51ec6a4363242ed1] test(runtime_loop): anchor fixture paths to repo root + fix stale name
+git bisect bad f1675973bd3b1e0394ee889c51ec6a4363242ed1
+# bad: [2c2777a9e1212a8a20cc7543ff746d716bc24b6c] test(dispatch): pin full syscall routing with a characterization test
+git bisect bad 2c2777a9e1212a8a20cc7543ff746d716bc24b6c
+# bad: [51deba2961bdd6b38f489046448db19a63856ef5] fix(fs): use a readable dir fd (not O_PATH) for directory owner/mode xattrs
+git bisect bad 51deba2961bdd6b38f489046448db19a63856ef5
+# bad: [8fd191537916577875eae16bc3d9196f2501031f] fix(x86): map x86_64 pause(2) to blocking ppoll, not ENOSYS
+git bisect bad 8fd191537916577875eae16bc3d9196f2501031f
+# bad: [0d3882d8501fe70ec744af3769708930efcb7dd9] fix(x86): handle x86_64 poll(2) with its own ABI, not folded into ppoll
+git bisect bad 0d3882d8501fe70ec744af3769708930efcb7dd9
+# first bad commit: [0d3882d8501fe70ec744af3769708930efcb7dd9] fix(x86): handle x86_64 poll(2) with its own ABI, not folded into ppoll
