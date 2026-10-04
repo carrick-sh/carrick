@@ -8487,6 +8487,7 @@ fn a_backing_with_no_open_description_answers_generic_questions_without_aborting
         )),
     )
     .expect("file description identity");
+    let description = Arc::new(description);
 
     assert_eq!(
         description.common().status_flags(),
