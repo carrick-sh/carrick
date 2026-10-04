@@ -154,6 +154,8 @@ pub struct AcceptReceipt {
     pub probe_diffs: Vec<ProbeDiff>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cleanup_counts: Vec<CleanupCount>,
+    #[serde(default)]
+    pub host_load: crate::host_load::HostLoadReport,
     pub failures: Vec<String>,
 }
 
@@ -563,6 +565,7 @@ pub fn resolve_ltp_suites(root: &Path) -> io::Result<Vec<String>> {
 }
 
 fn run_command_redirect(
+    lease: &HostLease,
     prog: &str,
     args: &[&str],
     env: &[(&str, &str)],
@@ -577,6 +580,7 @@ fn run_command_redirect(
 
     let mut cmd = Command::new(prog);
     cmd.args(args);
+    lease.configure_command(&mut cmd)?;
     cmd.current_dir(cwd);
     cmd.stdin(Stdio::null());
     cmd.stdout(log_file);
@@ -595,6 +599,12 @@ fn run_command_redirect(
 }
 
 pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError> {
+    // remote-accept holds its checkout lock first. Hold the host lease across
+    // host compilation/tests, signing, cleanup, and receipt publication.
+    crate::host_load::check().map_err(|e| AcceptError::Failed(e.to_string()))?;
+    let gate_lease =
+        HostLease::acquire(HostLeaseMode::Gate).map_err(|e| AcceptError::Failed(e.to_string()))?;
+    let host_load = crate::host_load::check().map_err(|e| AcceptError::Failed(e.to_string()))?;
     let repo_info =
         crate::cli::resolve_repo_info(root_arg).map_err(|e| AcceptError::Git(e.to_string()))?;
     let root = repo_info.repository_root;
@@ -640,13 +650,18 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             let display_cmd = format!("{} {}", step.program, step.args.join(" "));
             println!("  running: {display_cmd} (log: {})", log_path.display());
 
-            let (exit_code, duration_s) =
-                run_command_redirect(step.program, step.args, step.env, &root, &log_path).map_err(
-                    |e| AcceptError::Io {
-                        path: log_path.clone(),
-                        source: e,
-                    },
-                )?;
+            let (exit_code, duration_s) = run_command_redirect(
+                &gate_lease,
+                step.program,
+                step.args,
+                step.env,
+                &root,
+                &log_path,
+            )
+            .map_err(|e| AcceptError::Io {
+                path: log_path.clone(),
+                source: e,
+            })?;
 
             let passed = exit_code == Some(0);
             let error = if !passed {
@@ -694,10 +709,8 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             let cmd_str = "just build";
             println!("  running: {cmd_str} (run_id: {run_id})");
 
-            let lease = HostLease::acquire(HostLeaseMode::Carrick)
-                .map_err(|e| AcceptError::Failed(format!("failed to acquire host lease: {e}")))?;
-
             let (exit_code, duration_s) = run_command_redirect(
+                &gate_lease,
                 "just",
                 &["build"],
                 &[("CARRICK_RUN_ID", &run_id)],
@@ -710,7 +723,6 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             })?;
 
             let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-            drop(lease);
 
             let remaining_count = reap
                 .as_ref()
@@ -822,10 +834,8 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             let cmd_str = "./scripts/test-signed.sh carrick-embed el1_ --nocapture";
             println!("  running: {cmd_str} (run_id: {run_id})");
 
-            let lease = HostLease::acquire(HostLeaseMode::Carrick)
-                .map_err(|e| AcceptError::Failed(format!("failed to acquire host lease: {e}")))?;
-
             let (exit_code, duration_s) = run_command_redirect(
+                &gate_lease,
                 "./scripts/test-signed.sh",
                 &["carrick-embed", "el1_", "--nocapture"],
                 &[("CARRICK_RUN_ID", &run_id)],
@@ -838,7 +848,6 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             })?;
 
             let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-            drop(lease);
 
             let remaining_count = reap
                 .as_ref()
@@ -913,10 +922,8 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
                 "./scripts/test-signed.sh carrick-embed a_fresh_executable_page --nocapture";
             println!("  running: {cmd_str} (run_id: {run_id})");
 
-            let lease = HostLease::acquire(HostLeaseMode::Carrick)
-                .map_err(|e| AcceptError::Failed(format!("failed to acquire host lease: {e}")))?;
-
             let (exit_code, duration_s) = run_command_redirect(
+                &gate_lease,
                 "./scripts/test-signed.sh",
                 &["carrick-embed", "a_fresh_executable_page", "--nocapture"],
                 &[("CARRICK_RUN_ID", &run_id)],
@@ -929,7 +936,6 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             })?;
 
             let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-            drop(lease);
 
             let remaining_count = reap
                 .as_ref()
@@ -979,10 +985,8 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             let cmd_str = "./scripts/test-signed.sh carrick-conformance-next generic_probe_shard_ --nocapture";
             println!("  running: {cmd_str} (run_id: {run_id})");
 
-            let lease = HostLease::acquire(HostLeaseMode::Carrick)
-                .map_err(|e| AcceptError::Failed(format!("failed to acquire host lease: {e}")))?;
-
             let (exit_code, duration_s) = run_command_redirect(
+                &gate_lease,
                 "./scripts/test-signed.sh",
                 &[
                     "carrick-conformance-next",
@@ -999,7 +1003,6 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             })?;
 
             let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-            drop(lease);
 
             let remaining_count = reap
                 .as_ref()
@@ -1061,10 +1064,8 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             let cmd_str = "./scripts/test-signed.sh carrick-conformance-next case_ --nocapture";
             println!("  running: {cmd_str} (run_id: {run_id})");
 
-            let lease = HostLease::acquire(HostLeaseMode::Carrick)
-                .map_err(|e| AcceptError::Failed(format!("failed to acquire host lease: {e}")))?;
-
             let (exit_code, duration_s) = run_command_redirect(
+                &gate_lease,
                 "./scripts/test-signed.sh",
                 &["carrick-conformance-next", "case_", "--nocapture"],
                 &[("CARRICK_RUN_ID", &run_id)],
@@ -1077,7 +1078,6 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
             })?;
 
             let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-            drop(lease);
 
             let remaining_count = reap
                 .as_ref()
@@ -1141,11 +1141,8 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
                 let cmd_str = "just --no-deps conformance-probes";
                 println!("  running: {cmd_str} (run_id: {run_id})");
 
-                let lease = HostLease::acquire(HostLeaseMode::Docker).map_err(|e| {
-                    AcceptError::Failed(format!("failed to acquire docker host lease: {e}"))
-                })?;
-
                 let (exit_code, duration_s) = run_command_redirect(
+                    &gate_lease,
                     "just",
                     &["--no-deps", "conformance-probes"],
                     &[("CARRICK_RUN_ID", &run_id)],
@@ -1158,7 +1155,6 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
                 })?;
 
                 let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-                drop(lease);
 
                 let remaining_count = reap
                     .as_ref()
@@ -1226,11 +1222,8 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
                 );
                 println!("  running: {display_cmd} (run_id: {run_id})");
 
-                let lease = HostLease::acquire(HostLeaseMode::Docker).map_err(|e| {
-                    AcceptError::Failed(format!("failed to acquire docker host lease: {e}"))
-                })?;
-
                 let (exit_code, duration_s) = run_command_redirect(
+                    &gate_lease,
                     "cargo",
                     &cmd_args,
                     &[("CARRICK_RUN_ID", &run_id)],
@@ -1243,7 +1236,6 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
                 })?;
 
                 let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-                drop(lease);
 
                 let remaining_count = reap
                     .as_ref()
@@ -1292,11 +1284,8 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
                 );
                 println!("  running: {cmd_str} (run_id: {run_id})");
 
-                let lease = HostLease::acquire(HostLeaseMode::Docker).map_err(|e| {
-                    AcceptError::Failed(format!("failed to acquire docker host lease: {e}"))
-                })?;
-
                 let (exit_code, duration_s) = run_command_redirect(
+                    &gate_lease,
                     &bin_str,
                     &[
                         "run",
@@ -1316,7 +1305,6 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
                 })?;
 
                 let reap = command::run_checked("scripts/sudo/kill.sh", [&run_id], Some(&root));
-                drop(lease);
 
                 let remaining_count = reap
                     .as_ref()
@@ -1398,6 +1386,7 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
         el1: el1_summary,
         probe_diffs,
         cleanup_counts,
+        host_load,
         failures: failures.clone(),
     };
 
@@ -1636,6 +1625,7 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
             el1: None,
             probe_diffs: vec![],
             cleanup_counts: vec![],
+            host_load: crate::host_load::HostLoadReport::default(),
             failures: vec![],
         };
 

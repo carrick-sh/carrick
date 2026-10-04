@@ -47,6 +47,20 @@ cd "$(dirname "$0")/.."
 . scripts/lib/post-link-sign.sh
 . scripts/lib/test-signed-args.sh
 
+# Bootstrap once into the Rust lease runner. The inherited descriptor keeps
+# the lease alive across build, signing, tests and EXIT cleanup. A gate passes
+# its exclusive descriptor down; validation never downgrades it to shared.
+if [ "$(uname -s)" != "Darwin" ]; then
+    echo "test-signed: macOS/HVF only — the entitlement requirement does not exist on this host" >&2
+    exit 1
+fi
+if [ -z "${CARRICK_HOST_LEASE_FD:-}" ]; then
+    exec cargo run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- ./scripts/test-signed.sh "$@"
+fi
+# Validate the inherited lease and check host load before any work. The runner
+# logs detected PIDs and parent commands even with CARRICK_ALLOW_LOAD=1.
+cargo run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- true
+
 pkg="${1:?usage: scripts/test-signed.sh <package> [libtest args...]}"
 shift
 
@@ -69,10 +83,6 @@ has_exact="$TEST_SIGNED_HAS_EXACT"
 ignored_only="$TEST_SIGNED_IGNORED_ONLY"
 include_ignored="$TEST_SIGNED_INCLUDE_IGNORED"
 
-if [ "$(uname -s)" != "Darwin" ]; then
-    echo "test-signed: macOS/HVF only — the entitlement requirement does not exist on this host" >&2
-    exit 1
-fi
 for tool in cargo jq codesign /usr/bin/vtool otool shasum; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "test-signed: missing required tool: $tool" >&2
@@ -97,6 +107,8 @@ if [ -z "$contract_id" ] && [[ "${requested_filter:-}" == *"futex"* ]]; then
 fi
 if [ -n "$contract_id" ]; then
     contract_header_arg=(--arg contract_id "$contract_id")
+    # Literal jq variable, expanded by jq when the header is serialized.
+    # shellcheck disable=SC2016
     contract_header_entry=',contract_id:$contract_id'
 else
     contract_header_arg=()
@@ -141,6 +153,8 @@ cleanup() {
     # catches root-owned `carrick trace` front-ends carrying the same id.
     for id in "$run_id" "$run_id-cli"; do
         cleanup_log="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-cleanup.XXXXXX")"
+        # The caller owns this mktemp log; only process cleanup needs sudo.
+        # shellcheck disable=SC2024
         if sudo -n scripts/sudo/kill.sh "$id" >"$cleanup_log" 2>&1; then
             :
         elif scripts/sudo/kill.sh "$id" >"$cleanup_log" 2>&1; then

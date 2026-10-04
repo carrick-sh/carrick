@@ -4,16 +4,22 @@ use std::ffi::{CString, OsString};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
+use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub const DEFAULT_LOCK_PATH: &str = "/tmp/carrick-host-lease.lock";
+/// A contended machine may be running a full acceptance gate. Failure, never skip.
+pub const HOST_LEASE_WAIT_LIMIT: Duration = Duration::from_secs(60 * 60);
+const INHERITED_FD: &str = "CARRICK_HOST_LEASE_FD";
+const INHERITED_MODE: &str = "CARRICK_HOST_LEASE_MODE";
 
 #[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HostLeaseMode {
     Carrick,
     Docker,
+    Gate,
 }
 
 impl fmt::Display for HostLeaseMode {
@@ -21,6 +27,7 @@ impl fmt::Display for HostLeaseMode {
         match self {
             Self::Carrick => write!(f, "carrick"),
             Self::Docker => write!(f, "docker"),
+            Self::Gate => write!(f, "gate"),
         }
     }
 }
@@ -43,6 +50,18 @@ pub enum HostLeaseError {
     ChildWait(#[source] io::Error),
     #[error("no command specified to run under host-lease")]
     EmptyCommand,
+    #[error(
+        "host-lease: failed waiting for {mode} at '{path}' after {limit:?} (HOST_LEASE_WAIT_LIMIT); no command was run"
+    )]
+    Timeout {
+        path: PathBuf,
+        mode: HostLeaseMode,
+        limit: Duration,
+    },
+    #[error("invalid inherited host lease: {0}")]
+    Inherited(String),
+    #[error("host load check failed: {0}")]
+    Load(#[from] crate::host_load::HostLoadError),
 }
 
 pub struct HostLease {
@@ -53,10 +72,29 @@ pub struct HostLease {
 
 impl HostLease {
     pub fn acquire(mode: HostLeaseMode) -> Result<Self, HostLeaseError> {
-        Self::acquire_path(Path::new(DEFAULT_LOCK_PATH), mode)
+        let path = std::env::var_os("CARRICK_HOST_LEASE_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_PATH));
+        if let Some(fd) = std::env::var_os(INHERITED_FD) {
+            return Self::inherit(
+                &path,
+                mode,
+                &fd.to_string_lossy(),
+                &std::env::var(INHERITED_MODE).unwrap_or_default(),
+            );
+        }
+        Self::acquire_path(&path, mode)
     }
 
     pub fn acquire_path(path: &Path, mode: HostLeaseMode) -> Result<Self, HostLeaseError> {
+        Self::acquire_path_with_limit(path, mode, HOST_LEASE_WAIT_LIMIT)
+    }
+
+    fn acquire_path_with_limit(
+        path: &Path,
+        mode: HostLeaseMode,
+        limit: Duration,
+    ) -> Result<Self, HostLeaseError> {
         let path_str = path.to_str().ok_or_else(|| HostLeaseError::Io {
             path: path.to_path_buf(),
             source: io::Error::new(io::ErrorKind::InvalidInput, "path is not valid UTF-8"),
@@ -66,9 +104,15 @@ impl HostLease {
             source: io::Error::new(io::ErrorKind::InvalidInput, e),
         })?;
 
-        // Open or create the lock file with mode 0666.
+        // Open or create the lock file with mode 0666; inherit only explicitly.
         // SAFETY: c_path is a valid null-terminated C string.
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o666) };
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
+                0o666,
+            )
+        };
         if fd < 0 {
             return Err(HostLeaseError::Io {
                 path: path.to_path_buf(),
@@ -85,56 +129,153 @@ impl HostLease {
 
         let op = match mode {
             HostLeaseMode::Carrick => libc::LOCK_SH,
-            HostLeaseMode::Docker => libc::LOCK_EX,
+            HostLeaseMode::Docker | HostLeaseMode::Gate => libc::LOCK_EX,
         };
 
+        let start = Instant::now();
         let mut waited = false;
         loop {
             // SAFETY: fd is a valid open file descriptor.
-            let ret = unsafe { libc::flock(fd, op | libc::LOCK_NB) };
-            if ret == 0 {
+            if unsafe { libc::flock(fd, op | libc::LOCK_NB) } == 0 {
                 break;
             }
             let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-                waited = true;
-                eprintln!("host-lease: waiting for {mode} ...");
-                break;
-            }
-            // SAFETY: fd is valid and must be closed on error.
-            unsafe { libc::close(fd) };
-            return Err(HostLeaseError::Io {
-                path: path.to_path_buf(),
-                source: err,
-            });
-        }
-
-        if waited {
-            loop {
-                // SAFETY: fd is a valid open file descriptor.
-                let ret = unsafe { libc::flock(fd, op) };
-                if ret == 0 {
-                    break;
-                }
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                // SAFETY: fd is valid and must be closed on error.
+            if !matches!(
+                err.raw_os_error(),
+                Some(libc::EINTR) | Some(libc::EWOULDBLOCK)
+            ) {
+                // SAFETY: close our owned descriptor on error.
                 unsafe { libc::close(fd) };
                 return Err(HostLeaseError::Io {
                     path: path.to_path_buf(),
                     source: err,
                 });
             }
-            eprintln!("host-lease: acquired {mode}");
+            if !waited {
+                eprintln!(
+                    "host-lease: waiting for {mode} at {} (HOST_LEASE_WAIT_LIMIT: {limit:?})",
+                    path.display()
+                );
+                waited = true;
+            }
+            if start.elapsed() >= limit {
+                // SAFETY: close our owned descriptor on timeout.
+                unsafe { libc::close(fd) };
+                return Err(HostLeaseError::Timeout {
+                    path: path.to_path_buf(),
+                    mode,
+                    limit,
+                });
+            }
+            std::thread::sleep(
+                Duration::from_millis(100).min(limit.saturating_sub(start.elapsed())),
+            );
         }
+        eprintln!("host-lease: acquired {mode} at {}", path.display());
 
         Ok(Self {
             fd,
+            path: path.to_path_buf(),
+            mode,
+        })
+    }
+
+    /// Descendants reuse the same open file description: never acquire a
+    /// second shared lock under an exclusive gate, or downgrade the gate lock.
+    pub fn configure_command(&self, command: &mut Command) -> io::Result<()> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::process::CommandExt;
+        // Give the command its own lifetime authority, even if this handle is
+        // dropped before spawn. CLOEXEC prevents leaks to unrelated children.
+        // SAFETY: fcntl duplicates our live owned descriptor.
+        let copy = unsafe { libc::fcntl(self.fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if copy < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: copy is a new owned descriptor.
+        let inherited = unsafe { std::fs::File::from_raw_fd(copy) };
+        command
+            .env(INHERITED_FD, inherited.as_raw_fd().to_string())
+            .env(INHERITED_MODE, self.mode.to_string())
+            .env("CARRICK_HOST_LEASE_PATH", &self.path);
+        // SAFETY: the child uses only async-signal-safe fcntl calls after fork.
+        // Only this command inherits the lease, never unrelated subprocesses.
+        unsafe {
+            command.pre_exec(move || {
+                let fd = inherited.as_raw_fd();
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(())
+    }
+
+    fn inherit(
+        path: &Path,
+        requested: HostLeaseMode,
+        fd: &str,
+        mode: &str,
+    ) -> Result<Self, HostLeaseError> {
+        use std::os::unix::fs::MetadataExt;
+        let mode = match mode {
+            "carrick" => HostLeaseMode::Carrick,
+            "docker" => HostLeaseMode::Docker,
+            "gate" => HostLeaseMode::Gate,
+            _ => return Err(HostLeaseError::Inherited("missing or invalid mode".into())),
+        };
+        if mode != requested && mode != HostLeaseMode::Gate {
+            return Err(HostLeaseError::Inherited(format!(
+                "cannot nest {requested} under {mode}; no lock upgrades"
+            )));
+        }
+        let fd: libc::c_int = fd
+            .parse()
+            .map_err(|_| HostLeaseError::Inherited("invalid descriptor".into()))?;
+        if fd < 3 {
+            return Err(HostLeaseError::Inherited(
+                "descriptor must not be stdin/stdout/stderr".into(),
+            ));
+        }
+        // SAFETY: fcntl validates the descriptor and returns a new owned fd.
+        let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if copy < 0 {
+            return Err(HostLeaseError::Inherited(
+                io::Error::last_os_error().to_string(),
+            ));
+        }
+        // SAFETY: copy is newly owned; File closes it on every error path.
+        let file = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(copy) };
+        let actual = file
+            .metadata()
+            .map_err(|e| HostLeaseError::Inherited(e.to_string()))?;
+        let expected =
+            std::fs::metadata(path).map_err(|e| HostLeaseError::Inherited(e.to_string()))?;
+        if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+            return Err(HostLeaseError::Inherited(
+                "descriptor does not name the configured lock file".into(),
+            ));
+        }
+        // Check that the inode is actually leased, without touching the inherited
+        // description (flock on that description could downgrade its exclusive lock).
+        let probe =
+            std::fs::File::open(path).map_err(|e| HostLeaseError::Inherited(e.to_string()))?;
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        // SAFETY: probe owns a valid fd; LOCK_NB cannot wait.
+        if unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Err(HostLeaseError::Inherited(
+                "descriptor has no active lease".into(),
+            ));
+        }
+        if io::Error::last_os_error().raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(HostLeaseError::Inherited(
+                "cannot verify active lease".into(),
+            ));
+        }
+        Ok(Self {
+            fd: file.into_raw_fd(),
             path: path.to_path_buf(),
             mode,
         })
@@ -152,9 +293,10 @@ impl HostLease {
 impl Drop for HostLease {
     fn drop(&mut self) {
         if self.fd >= 0 {
+            // Closing releases only our reference. LOCK_UN would also unlock
+            // surviving descendants that share the same open description.
             // SAFETY: self.fd is a valid file descriptor owned by HostLease.
             unsafe {
-                libc::flock(self.fd, libc::LOCK_UN);
                 libc::close(self.fd);
             }
             self.fd = -1;
@@ -162,18 +304,34 @@ impl Drop for HostLease {
     }
 }
 
-pub fn run_command(mode: HostLeaseMode, cmd_args: &[OsString]) -> Result<i32, HostLeaseError> {
+pub fn run_command(
+    mode: HostLeaseMode,
+    check_load: bool,
+    cmd_args: &[OsString],
+) -> Result<i32, HostLeaseError> {
     if cmd_args.is_empty() {
         return Err(HostLeaseError::EmptyCommand);
     }
 
+    if check_load {
+        crate::host_load::check()?;
+    }
     let lease = HostLease::acquire(mode)?;
+    if check_load {
+        crate::host_load::check()?;
+    }
 
     let prog = &cmd_args[0];
     let args = &cmd_args[1..];
 
     let mut command = std::process::Command::new(prog);
     command.args(args);
+    lease
+        .configure_command(&mut command)
+        .map_err(|source| HostLeaseError::Io {
+            path: lease.path().to_path_buf(),
+            source,
+        })?;
 
     let mut child = command.spawn().map_err(|e| HostLeaseError::Spawn {
         cmd: prog.to_string_lossy().to_string(),
@@ -212,6 +370,128 @@ pub fn extract_exit_code(status: &ExitStatus) -> i32 {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn gate_and_docker_exclude_all_other_modes() {
+        for holder in [
+            HostLeaseMode::Gate,
+            HostLeaseMode::Docker,
+            HostLeaseMode::Carrick,
+        ] {
+            for contender in [
+                HostLeaseMode::Gate,
+                HostLeaseMode::Docker,
+                HostLeaseMode::Carrick,
+            ] {
+                if holder == HostLeaseMode::Carrick && contender == HostLeaseMode::Carrick {
+                    continue;
+                }
+                let temp = NamedTempFile::new().unwrap();
+                let held = HostLease::acquire_path(temp.path(), holder).unwrap();
+                let blocked =
+                    HostLease::acquire_path_with_limit(temp.path(), contender, Duration::ZERO);
+                assert!(
+                    matches!(blocked, Err(HostLeaseError::Timeout { .. })),
+                    "{holder} must exclude {contender}"
+                );
+                drop(held);
+                HostLease::acquire_path_with_limit(temp.path(), contender, Duration::ZERO).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_gate_remains_exclusive_after_nested_carrick_returns() {
+        let temp = NamedTempFile::new().unwrap();
+        let gate = HostLease::acquire_path(temp.path(), HostLeaseMode::Gate).unwrap();
+        let nested = HostLease::inherit(
+            temp.path(),
+            HostLeaseMode::Carrick,
+            &gate.fd.to_string(),
+            "gate",
+        )
+        .unwrap();
+        assert_eq!(nested.mode(), HostLeaseMode::Gate);
+        drop(nested);
+        assert!(matches!(
+            HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Carrick, Duration::ZERO),
+            Err(HostLeaseError::Timeout { .. })
+        ));
+        // Closing the parent's handle must leave a surviving child's lease held.
+        let child = HostLease::inherit(
+            temp.path(),
+            HostLeaseMode::Carrick,
+            &gate.fd.to_string(),
+            "gate",
+        )
+        .unwrap();
+        drop(gate);
+        assert!(matches!(
+            HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Carrick, Duration::ZERO),
+            Err(HostLeaseError::Timeout { .. })
+        ));
+        drop(child);
+        HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Gate, Duration::ZERO)
+            .unwrap();
+    }
+
+    #[test]
+    fn configured_command_owns_lease_until_command_dropped() {
+        let temp = NamedTempFile::new().unwrap();
+        let gate = HostLease::acquire_path(temp.path(), HostLeaseMode::Gate).unwrap();
+        let mut command = Command::new("true");
+        gate.configure_command(&mut command).unwrap();
+        drop(gate);
+        assert!(matches!(
+            HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Carrick, Duration::ZERO),
+            Err(HostLeaseError::Timeout { .. })
+        ));
+        assert!(command.status().unwrap().success());
+        drop(command);
+        HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Gate, Duration::ZERO)
+            .unwrap();
+    }
+
+    #[test]
+    fn inherited_lease_rejects_upgrade_invalid_fd_and_wrong_path() {
+        let temp = NamedTempFile::new().unwrap();
+        let other = NamedTempFile::new().unwrap();
+        let shared = HostLease::acquire_path(temp.path(), HostLeaseMode::Carrick).unwrap();
+        assert!(
+            HostLease::inherit(
+                temp.path(),
+                HostLeaseMode::Gate,
+                &shared.fd.to_string(),
+                "carrick"
+            )
+            .is_err()
+        );
+        assert!(
+            HostLease::inherit(
+                other.path(),
+                HostLeaseMode::Carrick,
+                &shared.fd.to_string(),
+                "carrick"
+            )
+            .is_err()
+        );
+        assert!(HostLease::inherit(temp.path(), HostLeaseMode::Carrick, "-1", "carrick").is_err());
+        assert!(HostLease::inherit(temp.path(), HostLeaseMode::Carrick, "0", "carrick").is_err());
+        assert!(
+            HostLease::inherit(temp.path(), HostLeaseMode::Carrick, "invalid", "carrick").is_err()
+        );
+        drop(shared);
+        use std::os::fd::AsRawFd;
+        assert!(
+            HostLease::inherit(
+                temp.path(),
+                HostLeaseMode::Carrick,
+                &temp.as_raw_fd().to_string(),
+                "carrick"
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn shared_and_shared_coexist() {

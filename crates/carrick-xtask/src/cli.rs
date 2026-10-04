@@ -59,7 +59,7 @@ pub enum Commands {
 
     #[command(
         name = "host-lease",
-        about = "Run command under machine-global host lease flock (carrick shared, docker exclusive)"
+        about = "Run command under machine-global host lease flock (carrick shared, gate/docker exclusive)"
     )]
     HostLease(HostLeaseArgs),
 
@@ -78,9 +78,12 @@ pub struct HostLeaseArgs {
     #[arg(
         long,
         value_enum,
-        help = "Lock mode: carrick (shared) or docker (exclusive)"
+        help = "Lock mode: carrick (shared), gate or docker (exclusive)"
     )]
     pub mode: crate::host_lease::HostLeaseMode,
+
+    #[arg(long, help = "Refuse yes/stress/stress-ng unless CARRICK_ALLOW_LOAD=1")]
+    pub check_load: bool,
 
     #[arg(
         trailing_var_arg = true,
@@ -344,7 +347,8 @@ where
             Ok(())
         }
         Commands::HostLease(args) => {
-            let exit_code = crate::host_lease::run_command(args.mode, &args.command)?;
+            let exit_code =
+                crate::host_lease::run_command(args.mode, args.check_load, &args.command)?;
             std::process::exit(exit_code);
         }
         Commands::Accept(args) => {
