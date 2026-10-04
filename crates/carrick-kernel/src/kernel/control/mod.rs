@@ -356,6 +356,19 @@ impl CarrierControlServer {
         self.tracker.lock().live_handlers_count()
     }
 
+    #[cfg(test)]
+    fn retained_handlers_count(&self) -> usize {
+        self.tracker.lock().retained_handlers_count()
+    }
+
+    #[cfg(test)]
+    fn wait_for_live_handlers_count(&self, expected: usize, bound: std::time::Duration) -> bool {
+        // Do not hold the tracker lock while waiting: accept owns it when
+        // publishing a newly admitted connection.
+        let slots = self.tracker.lock().slot_observer();
+        slots.wait_for_count(expected, bound)
+    }
+
     fn stop_admission(&mut self) {
         if self.shutdown.swap(true, Ordering::AcqRel) {
             return;
@@ -1752,9 +1765,9 @@ mod tests {
         }
 
         assert!(
-            server.live_handlers_count() <= connection::CONTROL_MAX_CONNECTIONS,
-            "live handlers count {} exceeded CONTROL_MAX_CONNECTIONS {}",
-            server.live_handlers_count(),
+            server.retained_handlers_count() <= connection::CONTROL_MAX_CONNECTIONS,
+            "retained handlers count {} exceeded CONTROL_MAX_CONNECTIONS {}",
+            server.retained_handlers_count(),
             connection::CONTROL_MAX_CONNECTIONS
         );
         server.shutdown();
@@ -1762,6 +1775,7 @@ mod tests {
 
     #[test]
     fn connection_limit_drops_excess_and_recovers_after_client_drops() {
+        const SLOT_CHANGE_FAILURE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
         let (_temp, endpoint) = endpoint::test_endpoint("control-conn-limit");
         let (kernel, init) = kernel_with_init();
         let mut server = CarrierControlServer::start_at(
@@ -1779,13 +1793,11 @@ mod tests {
             stalled.push(client);
         }
 
-        // Wait until all 16 connections have been accepted and spawned.
-        for _ in 0..50 {
-            if server.live_handlers_count() == connection::CONTROL_MAX_CONNECTIONS {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        // Observe admission, rather than sleeping for the accept thread.
+        assert!(server.wait_for_live_handlers_count(
+            connection::CONTROL_MAX_CONNECTIONS,
+            SLOT_CHANGE_FAILURE_BOUND,
+        ));
         assert_eq!(
             server.live_handlers_count(),
             connection::CONTROL_MAX_CONNECTIONS
@@ -1811,8 +1823,15 @@ mod tests {
 
         // After dropping one stalled client, a new Status succeeds.
         drop(stalled.pop());
-        // Wait slightly for the dropped client's thread to exit so it can be reaped.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(server.wait_for_live_handlers_count(
+            connection::CONTROL_MAX_CONNECTIONS - 1,
+            SLOT_CHANGE_FAILURE_BOUND,
+        ));
+        // A completed handler releases admission without another accept/reap.
+        assert_eq!(
+            server.live_handlers_count(),
+            connection::CONTROL_MAX_CONNECTIONS - 1
+        );
 
         let outcome =
             send_at(&endpoint, &state, ControlOperation::Status).expect("status after slot freed");
@@ -1820,5 +1839,10 @@ mod tests {
 
         drop(stalled);
         server.shutdown();
+        assert_eq!(
+            server.live_handlers_count(),
+            0,
+            "shutdown joins all slot owners"
+        );
     }
 }
