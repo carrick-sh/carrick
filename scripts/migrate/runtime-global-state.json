@@ -869,7 +869,7 @@
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/execute.rs",
       "symbol": "rosetta_license_notice::CARRICK_NO_ROSETTA_NOTICE",
-      "fingerprint": "e724c9ed3dee5f6236a4d8c3a2d6487930d175b388429b9beab2826bd918d01a",
+      "fingerprint": "8b0281e55910668859d57191e7ee5379bed58b5e73b3aa370fd4673c7a73d2a3",
       "classification": "config_debug",
       "rationale": "Environment variable CARRICK_NO_ROSETTA_NOTICE read in rosetta_license_notice::CARRICK_NO_ROSETTA_NOTICE (crates/carrick-runtime/src/execute.rs) configuring carrier behavior or debug logging."
     },
@@ -877,7 +877,7 @@
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/execute.rs",
       "symbol": "rosetta_license_notice::ROSETTA_ACCEPT_ENV",
-      "fingerprint": "1c54b6efd2effd257e3e0f41827da03a7a6cf6f304f927d0c994a2592eb3081c",
+      "fingerprint": "2fdeabda5af5b88d31103a1ce002c59239df25fc2207409cb6222a5c29b83ee2",
       "classification": "config_debug",
       "rationale": "Environment variable ROSETTA_ACCEPT_ENV read in rosetta_license_notice::ROSETTA_ACCEPT_ENV (crates/carrick-runtime/src/execute.rs) configuring carrier behavior or debug logging."
     },
@@ -2245,7 +2245,7 @@
       "kind": "static",
       "file": "crates/carrick-runtime/src/execute.rs",
       "symbol": "rosetta_license_notice::SHOWN",
-      "fingerprint": "1bff1d773859304755da3015887258e0b8c104f03d5850a09f60b2bc6f5783ba",
+      "fingerprint": "14cbb1be72365ca21ea8f5275727d92c4680a4964a22eea927cb3ed20c75a168",
       "classification": "carrier_infra",
       "rationale": "Carrier-wide host infrastructure static rosetta_license_notice::SHOWN in crates/carrick-runtime/src/execute.rs maintaining host process lifecycle or VM resources."
     },
