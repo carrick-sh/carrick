@@ -73,7 +73,7 @@ fn first_touch_capacity_forward_is_not_a_linux_syscall_forward() {
                 &mut frame,
                 &counters,
                 &tasks,
-                &spaces,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
                 GrantMailboxes::own(&mailbox),
                 &mut NoopCowResolver,
             ),
