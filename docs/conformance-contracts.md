@@ -273,6 +273,15 @@ subscription, wake or requeue destination reference leaves. The VM-free
 and wakes 10,000 distinct direct and file words in each of two tables, then
 requires zero live shared entries in both.
 
+The shared table belongs to one kernel instance. Linux tasks in that kernel
+must rendezvous on the same file word across fork, while two live kernels
+must never consume each other's wakes even for identical `(dev, ino, offset)`
+and host backing. The VM-free continuation witness
+`two_kernels_with_the_same_file_word_do_not_share_wakes` enrolls B before A,
+requires A's wake to reach only A, then requires zero additional waiter entries
+in A while B remains enrolled. This is an exact zero cross-instance budget
+under `kernel.futex.contention`, independent of timing or host process identity.
+
 The signed binding reuses Carrick's futex probes to prove guest execution. A
 separate uninstrumented release run compares the pinned futex distribution with
 same-image Docker. The existing tests remain until the contract has demonstrated
