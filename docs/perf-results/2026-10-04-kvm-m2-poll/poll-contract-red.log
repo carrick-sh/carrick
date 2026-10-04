@@ -1,0 +1,38 @@
+   Compiling carrick-x86 v0.1.0 (/home/carrick/dev/wt-m2-kvm/crates/carrick-x86)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.74s
+     Running unittests src/lib.rs (target/debug/deps/carrick_x86-9021914d64a80c84)
+
+running 3 tests
+carrick-x86 run-elf: unhandled canonical=18446744073709551575 x86_name=<unknown> args=[0, 3, 0, 0, 0, 0] → -ENOSYS
+carrick-x86 run-elf: unhandled canonical=
+thread 'bringup_fns::poll_tests::normalized_poll_clears_stale_events_and_reports_invalid_descriptors' (3847222) panicked at crates/carrick-x86/src/bringup_fns/poll_tests.rs:121:5:
+assertion `left == right` failed
+  left: [-38]
+ right: [1]
+18446744073709551575note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ x86_name=<unknown> args=[ffffffffffffffff, 0, 0, 0, 0, 0] → -ENOSYS
+
+thread 'bringup_fns::poll_tests::normalized_poll_validates_memory_but_ignores_pointer_for_empty_set' (3847224) panicked at crates/carrick-x86/src/bringup_fns/poll_tests.rs:131:5:
+assertion `left == right` failed
+  left: [-38]
+ right: [0]
+carrick-x86 run-elf: unhandled canonical=18446744073709551575 x86_name=<unknown> args=[0, 1, 0, 0, 0, 0] → -ENOSYS
+
+thread 'bringup_fns::poll_tests::normalized_poll_reports_readiness_and_linear_guest_copy_work' (3847223) panicked at crates/carrick-x86/src/bringup_fns/poll_tests.rs:100:9:
+assertion `left == right` failed
+  left: [-38]
+ right: [1]
+test bringup_fns::poll_tests::normalized_poll_validates_memory_but_ignores_pointer_for_empty_set ... FAILED
+test bringup_fns::poll_tests::normalized_poll_clears_stale_events_and_reports_invalid_descriptors ... FAILED
+test bringup_fns::poll_tests::normalized_poll_reports_readiness_and_linear_guest_copy_work ... FAILED
+
+failures:
+
+failures:
+    bringup_fns::poll_tests::normalized_poll_clears_stale_events_and_reports_invalid_descriptors
+    bringup_fns::poll_tests::normalized_poll_reports_readiness_and_linear_guest_copy_work
+    bringup_fns::poll_tests::normalized_poll_validates_memory_but_ignores_pointer_for_empty_set
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-x86 --lib`

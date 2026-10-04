@@ -1,0 +1,27 @@
+schema_version = 1
+id = "x86.run-elf.poll"
+title = "Standalone x86 startup serves the normalized poll ABI"
+guest_surfaces = ["syscall:poll", "vmm:kvm", "vmm:bhyve", "vmm:nvmm"]
+semantic_authority = [
+  "Linux poll(2): integer millisecond timeout, readiness count, per-entry revents, negative descriptors ignored, invalid descriptors report POLLNVAL, invalid array reports EFAULT",
+  "Committed hello-x86_64/oracle.expected: musl startup reaches main, writes the exact hello line, and exits zero",
+]
+fixture = "carrick-x86::bringup_fns::poll_tests; carrick-vmm-kvm::live_vcpu_x86::test_m2_musl_static_hello"
+scale_points = [1, 8, 32]
+structural_budgets = []
+rationale = """
+The standalone run-elf service loop already exposes host descriptors directly
+for read/write. Its poll bridge must service that same descriptor domain and
+keep the native integer timeout, not reinterpret it as ppoll's pointer.
+The VM-free binding normalizes an actual x86 frame and asserts ready counts
+at 1, 8 and 32 descriptors, exactly 8*n guest bytes read and 2*n guest bytes
+written. Only revents is copied out; fd/events stay unchanged. One host poll
+serves the batch, with no retries or user-space polling loop. No runtime ratio
+is claimed. This does not cover the full kernel's virtual descriptor graph,
+signal delivery, or the standalone loop's pre-existing ppoll approximation.
+"""
+
+[bindings]
+vm_free = "carrick-x86::bringup_fns::poll_tests"
+embed = "not applicable: standalone run-elf loop; live binding is carrick-vmm-kvm::live_vcpu_x86::test_m2_musl_static_hello"
+docker = "committed crates/carrick-vmm-bhyve/fixtures/hello-x86_64/oracle.expected; refresh and cross-host execution remain director-owned"

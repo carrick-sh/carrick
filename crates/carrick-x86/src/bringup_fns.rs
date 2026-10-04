@@ -726,6 +726,13 @@ where
             }
             SYS_SIGALTSTACK => 0,
             SYS_PPOLL => 0,
+            carrick_abi::CARRICK_PRIVATE_X86_POLL => sys_poll(
+                StandaloneHostFds,
+                engine,
+                carrick_guest_mem::GuestVa(args[0]),
+                args[1] as u32,
+                args[2] as i32,
+            ),
             SYS_TKILL => {
                 let sig = args[1];
                 if sig == SIGABRT {
@@ -1157,4 +1164,162 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod poll_tests;
+
+/// Private authority constructed only by the standalone service loop. Product
+/// dispatch cannot construct it or call the host-descriptor bridge.
+struct StandaloneHostFds;
+
+/// Serves only `run_elf_service_loop`'s inherited host descriptors, like its
+/// read/write handlers. This must never back the product's virtual fd or rlimit
+/// path: those authorities belong to the common kernel dispatcher.
+/// Keep poll's integer timeout distinct from ppoll's guest timespec pointer.
+fn sys_poll<E: carrick_guest_mem::GuestMemory>(
+    _authority: StandaloneHostFds,
+    engine: &mut E,
+    fds: carrick_guest_mem::GuestVa,
+    count: u32,
+    timeout_ms: i32,
+) -> i64 {
+    use carrick_abi::{LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOMEM, LinuxPollFd};
+    use zerocopy::FromBytes;
+
+    // This standalone lane has no virtual rlimit table: its descriptor domain
+    // and capacity are the host process's. Validate before allocating/copying.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit is a writable host rlimit, and RLIMIT_NOFILE is valid.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return poll_host_error().guest_retval();
+    }
+    if u64::from(count) > limit.rlim_cur as u64 {
+        return LINUX_EINVAL.guest_retval();
+    }
+    let count = count as usize;
+    let Some(length) = count.checked_mul(size_of::<LinuxPollFd>()) else {
+        return LINUX_EINVAL.guest_retval();
+    };
+    let bytes = if count == 0 {
+        Vec::new()
+    } else {
+        if fds.0.checked_add(length as u64).is_none() {
+            return LINUX_EFAULT.guest_retval();
+        }
+        match engine.read_bytes(fds.0, length) {
+            Ok(bytes) => bytes,
+            Err(_) => return LINUX_EFAULT.guest_retval(),
+        }
+    };
+    if bytes.len() != length {
+        return LINUX_EFAULT.guest_retval();
+    }
+    let mut host_fds = Vec::new();
+    if host_fds.try_reserve_exact(count).is_err() {
+        return LINUX_ENOMEM.guest_retval();
+    }
+    for bytes in bytes.chunks_exact(size_of::<LinuxPollFd>()) {
+        let Ok(fd) = LinuxPollFd::read_from_bytes(bytes) else {
+            return LINUX_EFAULT.guest_retval();
+        };
+        host_fds.push(libc::pollfd {
+            fd: fd.fd,
+            events: poll_events_to_host(carrick_abi::LinuxPollEvents::from_bits_retain(fd.events)),
+            revents: 0,
+        });
+    }
+    // SAFETY: host_fds owns count initialized pollfd values for this one call.
+    // No guest pointer crosses the host boundary; negative timeouts keep their
+    // poll meaning. Do not retry EINTR or replace this with a sampling loop.
+    if unsafe { libc::poll(host_fds.as_mut_ptr(), count as libc::nfds_t, timeout_ms) } < 0 {
+        return poll_host_error().guest_retval();
+    }
+    let mut ready = 0;
+    for (index, (host, original)) in host_fds.iter().zip(bytes.chunks_exact(8)).enumerate() {
+        let requested = carrick_abi::LinuxPollEvents::from_bits_retain(i16::from_le_bytes([
+            original[4],
+            original[5],
+        ]));
+        let revents = poll_events_from_host(host.revents, requested).bits();
+        // Only the result field is writable, not the descriptor or interest.
+        if engine
+            .write_bytes(fds.0 + (index * 8 + 6) as u64, &revents.to_le_bytes())
+            .is_err()
+        {
+            return LINUX_EFAULT.guest_retval();
+        }
+        ready += i64::from(revents != 0);
+    }
+    ready
+}
+
+/// Poll's documented errors have different numbers on BSD and Linux.
+fn poll_host_error() -> carrick_abi::LinuxErrno {
+    use carrick_abi::{
+        LINUX_EAGAIN, LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_EIO, LINUX_ENOMEM,
+    };
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EINTR) => LINUX_EINTR,
+        Some(libc::EINVAL) => LINUX_EINVAL,
+        Some(libc::ENOMEM) => LINUX_ENOMEM,
+        Some(libc::EAGAIN) => LINUX_EAGAIN,
+        Some(libc::EFAULT) => LINUX_EFAULT,
+        _ => LINUX_EIO,
+    }
+}
+
+// POLLWRNORM aliases POLLOUT on BSD, and POLLWRBAND has a different value.
+// Translate the named bits instead of treating Linux masks as native masks.
+const POLL_EVENT_BITS: &[(carrick_abi::LinuxPollEvents, i16)] = &[
+    (carrick_abi::LinuxPollEvents::IN, libc::POLLIN),
+    (carrick_abi::LinuxPollEvents::PRI, libc::POLLPRI),
+    (carrick_abi::LinuxPollEvents::OUT, libc::POLLOUT),
+    (carrick_abi::LinuxPollEvents::ERR, libc::POLLERR),
+    (carrick_abi::LinuxPollEvents::HUP, libc::POLLHUP),
+    (carrick_abi::LinuxPollEvents::NVAL, libc::POLLNVAL),
+    (
+        carrick_abi::LinuxPollEvents::from_bits_retain(carrick_abi::LINUX_POLLRDNORM),
+        libc::POLLRDNORM,
+    ),
+    (
+        carrick_abi::LinuxPollEvents::from_bits_retain(carrick_abi::LINUX_POLLRDBAND),
+        libc::POLLRDBAND,
+    ),
+    (
+        carrick_abi::LinuxPollEvents::from_bits_retain(carrick_abi::LINUX_POLLWRNORM),
+        libc::POLLWRNORM,
+    ),
+    (
+        carrick_abi::LinuxPollEvents::from_bits_retain(carrick_abi::LINUX_POLLWRBAND),
+        libc::POLLWRBAND,
+    ),
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    (carrick_abi::LinuxPollEvents::RDHUP, libc::POLLRDHUP),
+];
+
+fn poll_events_to_host(events: carrick_abi::LinuxPollEvents) -> i16 {
+    POLL_EVENT_BITS.iter().fold(0, |bits, (linux, host)| {
+        bits | if events.contains(*linux) { *host } else { 0 }
+    })
+}
+
+fn poll_events_from_host(
+    events: i16,
+    requested: carrick_abi::LinuxPollEvents,
+) -> carrick_abi::LinuxPollEvents {
+    use carrick_abi::LinuxPollEvents as Events;
+    let observed = POLL_EVENT_BITS
+        .iter()
+        .fold(Events::empty(), |bits, (linux, host)| {
+            bits | if events & host != 0 {
+                *linux
+            } else {
+                Events::empty()
+            }
+        });
+    observed & (requested | Events::ERR | Events::HUP | Events::NVAL)
 }

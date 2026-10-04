@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running tests/live_vcpu_x86.rs (target/debug/deps/live_vcpu_x86-4810161888ab5069)
+
+running 1 test
+[M2] running fixture via /home/carrick/dev/wt-m2-kvm/target/debug/carrick-vmm-kvm
+[M2] stdout="hello, x86_64 world\n" stderr="" status=ExitStatus(unix_wait_status(0))
+test test_m2_musl_static_hello ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.16s
