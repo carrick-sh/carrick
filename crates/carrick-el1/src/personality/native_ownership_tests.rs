@@ -201,7 +201,7 @@ fn syscall(
             &mut frame,
             &Counters::default(),
             &mm.task,
-            spaces,
+            carrick_sched_core::spaces::notification::SpaceAccess::source_free(spaces),
             table,
             editor
         ),

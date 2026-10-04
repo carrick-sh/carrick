@@ -7,7 +7,9 @@ use carrick_el1_abi::{CurrentTask, TrapFrame};
 use carrick_mmu_core::aarch64::{
     GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError,
 };
+#[cfg(test)]
 use carrick_sched_core::AddressSpaces;
+use carrick_sched_core::spaces::notification::SpaceAccess;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
@@ -668,7 +670,7 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
     frame: &mut TrapFrame,
     counters: &carrick_el1_abi::Counters,
     current: &CurrentTask,
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     table: &reservations::SharedReservations,
     editor: &mut E,
 ) -> DelegatedAnonymous {
@@ -684,7 +686,7 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
     };
     use carrick_el1_abi::AnonymousLeave as Leave;
     // Busy: the host venue holds the root; it serves the syscall itself.
-    let Ok(mut model) = table.lock_el1(index.index(), mm, frame.slot as u32) else {
+    let Ok(mut model) = table.lock_in(spaces, index.index(), mm, frame.slot as u32) else {
         return forward(Leave::RootBusy);
     };
     let mut pending = match crate::personality::dispatch::dispatch_anonymous_with_reservations(
@@ -865,7 +867,7 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
 pub fn delegated_anonymous_root(
     nr: u64,
     current: &CurrentTask,
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     table: &reservations::SharedReservations,
 ) -> Option<(
     carrick_el1_abi::ReservationMm,
@@ -887,7 +889,7 @@ pub fn delegated_anonymous_root(
 pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
     frame: &TrapFrame,
     current_tasks: &[CurrentTask],
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     editor: &mut E,
 ) -> MunmapDisposition {
     if frame.x[8] != SYS_MUNMAP {
@@ -946,7 +948,7 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
 pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
     frame: &TrapFrame,
     current_tasks: &[CurrentTask],
-    spaces: &AddressSpaces,
+    spaces: SpaceAccess<'_>,
     editor: &mut E,
 ) -> MprotectDisposition {
     if frame.x[8] != SYS_MPROTECT {
@@ -1061,7 +1063,12 @@ mod tests {
         let (frame, tasks, spaces, ttbr0) = fixture(PROT_READ);
         let mut editor = RecordingEditor::default();
         assert_eq!(
-            try_serve_mprotect(&frame, &tasks, &spaces, &mut editor),
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut editor
+            ),
             MprotectDisposition::Return(0)
         );
         assert_eq!(
@@ -1097,14 +1104,24 @@ mod tests {
         for _ in 0..carrick_sched_core::VMA_JOURNAL_ENTRIES {
             let mut editor = RecordingEditor::default();
             assert_eq!(
-                try_serve_mprotect(&frame, &tasks, &spaces, &mut editor),
+                try_serve_mprotect(
+                    &frame,
+                    &tasks,
+                    carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                    &mut editor
+                ),
                 MprotectDisposition::Return(0)
             );
         }
         // Full: the hardware edit still happens, but the host must cross.
         let mut editor = RecordingEditor::default();
         assert_eq!(
-            try_serve_mprotect(&frame, &tasks, &spaces, &mut editor),
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut editor
+            ),
             MprotectDisposition::ReturnWithWork
         );
         assert_eq!(editor.calls.len(), 1);
@@ -1119,7 +1136,12 @@ mod tests {
         );
         let mut editor = RecordingEditor::default();
         assert_eq!(
-            try_serve_mprotect(&frame, &tasks, &spaces, &mut editor),
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut editor
+            ),
             MprotectDisposition::Return(0)
         );
     }
@@ -1132,7 +1154,12 @@ mod tests {
             ..RecordingEditor::default()
         };
         assert_eq!(
-            try_serve_mprotect(&frame, &tasks, &spaces, &mut refused),
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut refused
+            ),
             MprotectDisposition::Return(-EINVAL)
         );
         let mut widening = RecordingEditor {
@@ -1140,7 +1167,12 @@ mod tests {
             ..RecordingEditor::default()
         };
         assert_eq!(
-            try_serve_mprotect(&frame, &tasks, &spaces, &mut widening),
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut widening
+            ),
             MprotectDisposition::Forward
         );
         assert_eq!(spaces.pending_vma_edits(17), 0);
@@ -1154,7 +1186,12 @@ mod tests {
             ..RecordingEditor::default()
         };
         assert_eq!(
-            try_serve_mprotect(&frame, &tasks, &spaces, &mut ineligible),
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut ineligible
+            ),
             MprotectDisposition::Forward
         );
 
@@ -1163,7 +1200,12 @@ mod tests {
             ..RecordingEditor::default()
         };
         assert_eq!(
-            try_serve_mprotect(&frame, &tasks, &spaces, &mut widening),
+            try_serve_mprotect(
+                &frame,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut widening
+            ),
             MprotectDisposition::Forward
         );
     }
@@ -1193,7 +1235,12 @@ mod tests {
         frame.x[1] = 0x2001;
         let mut editor = RecordingRetirementEditor::default();
         assert_eq!(
-            try_serve_munmap(&frame, &tasks, &spaces, &mut editor),
+            try_serve_munmap(
+                &frame,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut editor
+            ),
             MunmapDisposition::Retired
         );
         assert_eq!(editor.calls, vec![(ttbr0, frame.x[0], 0x3000)]);
@@ -1207,7 +1254,12 @@ mod tests {
         frame.x[0] += 1;
         let mut editor = RecordingRetirementEditor::default();
         assert_eq!(
-            try_serve_munmap(&frame, &tasks, &spaces, &mut editor),
+            try_serve_munmap(
+                &frame,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut editor
+            ),
             MunmapDisposition::Return(-EINVAL)
         );
         assert!(editor.calls.is_empty());
@@ -1215,14 +1267,24 @@ mod tests {
         frame.x[0] -= 1;
         editor.result = Some(GuestRetirementError::NotPrivateAnonymous);
         assert_eq!(
-            try_serve_munmap(&frame, &tasks, &spaces, &mut editor),
+            try_serve_munmap(
+                &frame,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut editor
+            ),
             MunmapDisposition::Forward
         );
 
         frame.x[1] = 0;
         editor.result = None;
         assert_eq!(
-            try_serve_munmap(&frame, &tasks, &spaces, &mut editor),
+            try_serve_munmap(
+                &frame,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                &mut editor
+            ),
             MunmapDisposition::Return(-EINVAL)
         );
     }
@@ -1382,8 +1444,14 @@ mod tests {
             };
             frame.x[8] = nr;
             frame.x[..6].copy_from_slice(&args);
-            let route =
-                serve_delegated_anonymous(&mut frame, counters, &mm.task, spaces, table, editor);
+            let route = serve_delegated_anonymous(
+                &mut frame,
+                counters,
+                &mm.task,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(spaces),
+                table,
+                editor,
+            );
             (route, frame.x[0] as i64)
         }
         const RW: u64 = PROT_READ | PROT_WRITE;

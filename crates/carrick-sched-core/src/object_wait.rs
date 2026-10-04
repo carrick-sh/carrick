@@ -20,14 +20,26 @@ use super::*;
 /// queue; MM permit waits use the following disjoint domain. Round the total
 /// for the queue census bitmap.
 pub const ADDRESS_SPACE_WAIT_BASE: usize = ZONE_RECORDS;
-pub const OBJECT_WAIT_QUEUES: usize =
+pub const ORIGINAL_OBJECT_WAIT_QUEUES: usize =
     (ADDRESS_SPACE_WAIT_BASE + 1 + spaces::ADDRESS_SPACES).div_ceil(64) * 64;
+pub const EXTRA_CAUSE_QUEUES: usize = 5 * spaces::ADDRESS_SPACES;
+pub const OBJECT_WAIT_QUEUES: usize = ORIGINAL_OBJECT_WAIT_QUEUES + EXTRA_CAUSE_QUEUES;
 
-pub const OBJECT_WAIT_PROTOCOL: u64 = 3;
+const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitCause) -> usize {
+    if cause as usize == 0 {
+        ADDRESS_SPACE_WAIT_BASE + 1 + index
+    } else {
+        ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
+    }
+}
+pub const OBJECT_WAIT_PROTOCOL: u64 = 4;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
         OBJECT_WAIT_QUEUES as u64,
+        ORIGINAL_OBJECT_WAIT_QUEUES as u64,
+        core::mem::offset_of!(crate::ZoneTables, space_cause_waits) as u64,
+        crate::spaces::SPACE_NOTIFICATION_LAYOUT_HASH,
         core::mem::size_of::<ObjectQueue>() as u64,
         core::mem::offset_of!(ObjectQueue, generation) as u64,
         core::mem::offset_of!(ObjectQueue, epoch) as u64,
@@ -55,7 +67,7 @@ pub struct ObjectWaitKey {
 
 impl ObjectWaitKey {
     pub const fn new(index: u32, generation: u64) -> Option<Self> {
-        if index == 0 || index as usize >= OBJECT_WAIT_QUEUES || generation == 0 {
+        if index == 0 || index as usize >= ORIGINAL_OBJECT_WAIT_QUEUES || generation == 0 {
             None
         } else {
             Some(Self { index, generation })
@@ -74,14 +86,6 @@ impl ObjectWaitKey {
         }
     }
 
-    fn from_registration(index: u32, generation: u64) -> Option<Self> {
-        if index == ZONE_RECORDS as u32 {
-            Self::metadata_request(generation)
-        } else {
-            Self::new(index, generation)
-        }
-    }
-
     /// Exact admitted MM incarnation, independent of its mutable policy
     /// generation. No IPC readiness lane can name this index domain.
     pub const fn address_space(index: usize, incarnation: u64) -> Option<Self> {
@@ -92,6 +96,44 @@ impl ObjectWaitKey {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn address_space_cause(
+        index: usize,
+        incarnation: u64,
+        cause: spaces::notification::SpaceWaitCause,
+    ) -> Option<Self> {
+        if index >= spaces::ADDRESS_SPACES {
+            None
+        } else {
+            if incarnation == 0 {
+                None
+            } else {
+                Some(Self {
+                    index: cause_queue_index(index, cause) as u32,
+                    generation: incarnation,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn live_space_cause(
+        index: usize,
+        incarnation: u64,
+        cause: spaces::notification::SpaceWaitCause,
+    ) -> Self {
+        assert!(index < spaces::ADDRESS_SPACES && incarnation != 0);
+        Self {
+            index: cause_queue_index(index, cause) as u32,
+            generation: incarnation,
+        }
+    }
+    fn from_retained_registration(index: u32, generation: u64) -> Option<Self> {
+        if index == 0 || index as usize >= OBJECT_WAIT_QUEUES || generation == 0 {
+            None
+        } else {
+            Some(Self { index, generation })
+        }
+    }
     pub const fn index(self) -> u32 {
         self.index
     }
@@ -202,7 +244,8 @@ pub struct OwnedObjectWakeEffects<'a> {
 impl OwnedObjectWakeEffects<'_> {
     pub(crate) fn missing_venue(self) {
         assert_eq!(
-            self.zone.object_waits[self.key.index as usize]
+            self.zone
+                .object_queue(self.key.index as usize)
                 .completion_mode
                 .load(Ordering::Acquire),
             0,
@@ -302,9 +345,21 @@ pub struct BorrowedObjectNotificationSource<'scope, 'zone> {
     key: ObjectWaitKey,
     _source: core::marker::PhantomData<&'scope ()>,
 }
-impl<'zone> BorrowedObjectNotificationSource<'_, 'zone> {
+impl<'scope, 'zone> BorrowedObjectNotificationSource<'scope, 'zone> {
+    pub(crate) fn from_live_admission(
+        zone: &'zone ZoneTables,
+        key: ObjectWaitKey,
+        _admission: &'scope crate::spaces::notification::SpaceNotificationLease<'zone>,
+    ) -> Self {
+        Self {
+            zone,
+            key,
+            _source: core::marker::PhantomData,
+        }
+    }
+
     pub fn reserve(&self) -> ObjectNotificationTicket<'zone> {
-        let queue = &self.zone.object_waits[self.key.index as usize];
+        let queue = self.zone.object_queue(self.key.index as usize);
         // The borrowed source retains a publisher, excluding rebind while
         // deriving. No queue lock, retry loop, or owning source reconstruction.
         assert_eq!(
@@ -345,21 +400,58 @@ impl<'a> ObjectNotificationTicket<'a> {
         self.key
     }
     /// Never waits or retries. A current holder or this publisher owns delivery.
-    pub fn publish(mut self, waker: Waker, completion: &dyn Fn(OwnedObjectWakeEffects)) {
-        let key = self.key;
-        self.retained = false;
-        let queue = &self.zone.object_waits[key.index as usize];
+    pub fn publish(self, waker: Waker, completion: &dyn Fn(OwnedObjectWakeEffects)) {
+        let revision = self.advance_revision(waker, completion);
+        revision.publish();
+    }
+    /// Advance the producer revision while its resource is still excluded.
+    /// The returned receipt must publish after that resource is unlocked.
+    pub(crate) fn advance_revision<'c>(
+        self,
+        waker: Waker,
+        completion: &'c dyn Fn(OwnedObjectWakeEffects),
+    ) -> ObjectNotificationPublication<'a, 'c> {
+        let queue = self.zone.object_queue(self.key.index as usize);
         assert_eq!(
             queue.generation.load(Ordering::Acquire),
-            key.generation,
+            self.key.generation,
             "admitted notification incarnation"
         );
-        let previous_epoch = queue.epoch.fetch_add(1, Ordering::SeqCst);
-        assert!(previous_epoch != u64::MAX, "notification epoch exhaustion");
+        let previous = queue.epoch.fetch_add(1, Ordering::SeqCst);
+        assert!(previous != u64::MAX, "notification epoch exhaustion");
+        ObjectNotificationPublication {
+            ticket: self,
+            waker,
+            completion,
+        }
+    }
+}
+#[must_use = "publish the advanced producer revision after resource unlock"]
+pub(crate) struct ObjectNotificationPublication<'a, 'c> {
+    ticket: ObjectNotificationTicket<'a>,
+    waker: Waker,
+    completion: &'c dyn Fn(OwnedObjectWakeEffects),
+}
+impl ObjectNotificationPublication<'_, '_> {
+    pub fn publish(mut self) {
+        self.publish_inner();
+    }
+    fn publish_inner(&mut self) {
+        if !self.ticket.retained {
+            return;
+        }
+        let waker = self.waker;
+        let completion = self.completion;
+        let key = self.ticket.key;
+        self.ticket.retained = false;
+        let queue = self.ticket.zone.object_queue(key.index as usize);
         queue
             .notification_waker
             .store(encode_notification_waker(waker), Ordering::Release);
         let state = queue.lock.fetch_or(NOTIFY_PENDING, Ordering::SeqCst);
+        // The pending bit/queue holder now owns notification delivery. Release
+        // publisher custody before calling a host callback that may unwind.
+        queue.publishers.fetch_sub(1, Ordering::AcqRel);
         if state == 0
             && queue
                 .lock
@@ -372,18 +464,23 @@ impl<'a> ObjectNotificationTicket<'a> {
                 .is_ok()
         {
             drop(ObjectWaitGuard {
-                zone: self.zone,
+                zone: self.ticket.zone,
                 key,
                 completion: Some(completion),
             });
         }
-        queue.publishers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+impl Drop for ObjectNotificationPublication<'_, '_> {
+    fn drop(&mut self) {
+        self.publish_inner();
     }
 }
 impl Drop for ObjectNotificationTicket<'_> {
     fn drop(&mut self) {
         if self.retained {
-            self.zone.object_waits[self.key.index as usize]
+            self.zone
+                .object_queue(self.key.index as usize)
                 .publishers
                 .fetch_sub(1, Ordering::AcqRel);
         }
@@ -443,6 +540,27 @@ pub struct ObjectWaitGuard<'a> {
     zone: &'a ZoneTables,
     key: ObjectWaitKey,
     completion: Option<&'a dyn Fn(OwnedObjectWakeEffects)>,
+}
+
+// A host predicate may unwind before the record is parked. Keep the newly
+// linked operation private until both rechecks pass, and undo it on any exit.
+struct EnrollmentRollback<'g, 'z> {
+    queue: &'g ObjectWaitGuard<'z>,
+    record: RecordId,
+    armed: bool,
+}
+impl Drop for EnrollmentRollback<'_, '_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.queue.unlink(self.record);
+            self.queue
+                .zone
+                .record(self.record)
+                .object
+                .operation
+                .store(0, Ordering::Release);
+        }
+    }
 }
 
 impl Drop for ObjectWaitGuard<'_> {
@@ -538,7 +656,7 @@ impl ObjectWaitGuard<'_> {
         handed
     }
     fn queue(&self) -> &ObjectQueue {
-        &self.zone.object_waits[self.key.index as usize]
+        self.zone.object_queue(self.key.index as usize)
     }
 
     pub fn snapshot(&self) -> ObjectWaitSnapshot {
@@ -635,6 +753,29 @@ impl ObjectWaitGuard<'_> {
         operation: OperationToken,
         deadline: u64,
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
+        self.park_until_rechecked(snapshot, record, operation, deadline, || true)
+    }
+
+    /// Recheck a nonblocking resource predicate after linking, before parking.
+    /// The producer's revision is also checked after this predicate. A false
+    /// result returns the same operation to its current execution owner.
+    pub fn park_rechecked(
+        &self,
+        snapshot: ObjectWaitSnapshot,
+        record: RecordId,
+        operation: OperationToken,
+        still_blocked: impl FnOnce() -> bool,
+    ) -> Result<(), (ObjectWaitError, OperationToken)> {
+        self.park_until_rechecked(snapshot, record, operation, 0, still_blocked)
+    }
+    fn park_until_rechecked(
+        &self,
+        snapshot: ObjectWaitSnapshot,
+        record: RecordId,
+        operation: OperationToken,
+        deadline: u64,
+        still_blocked: impl FnOnce() -> bool,
+    ) -> Result<(), (ObjectWaitError, OperationToken)> {
         if deadline != 0 && self.completion.is_some() {
             return Err((ObjectWaitError::Occupied, operation));
         }
@@ -675,6 +816,15 @@ impl ObjectWaitGuard<'_> {
             self.queue().head.store(record.raw(), Ordering::Relaxed);
         }
         self.queue().tail.store(record.raw(), Ordering::Relaxed);
+        let mut rollback = EnrollmentRollback {
+            queue: self,
+            record,
+            armed: true,
+        };
+        if !still_blocked() || snapshot.epoch != self.queue().epoch.load(Ordering::SeqCst) {
+            return Err((ObjectWaitError::Changed, operation));
+        }
+        rollback.armed = false;
         rec.object.expired.store(0, Ordering::Relaxed);
         self.zone.set_deadline(record, deadline);
         self.zone.publish_park(record, self.zone.next_seq(record));
@@ -813,6 +963,14 @@ impl ZoneRecord {
 }
 
 impl ZoneTables {
+    fn object_queue(&self, index: usize) -> &ObjectQueue {
+        if index < ORIGINAL_OBJECT_WAIT_QUEUES {
+            &self.object_waits[index]
+        } else {
+            &self.space_cause_waits[index - ORIGINAL_OBJECT_WAIT_QUEUES]
+        }
+    }
+
     fn completion_transfer(&self, id: RecordId) -> HostTransfer<'_> {
         let claim = self.record(id).claim();
         assert!(
@@ -872,7 +1030,7 @@ impl ZoneTables {
         key: ObjectWaitKey,
         wait: &impl LockWait,
     ) -> Option<ObjectWaitGuard<'_>> {
-        let queue = &self.object_waits[key.index as usize];
+        let queue = self.object_queue(key.index as usize);
         let mut attempt = 0;
         loop {
             if queue
@@ -901,7 +1059,8 @@ impl ZoneTables {
         key: ObjectWaitKey,
         wait: &impl LockWait,
     ) -> Result<(), ObjectWaitError> {
-        if self.object_waits[key.index as usize]
+        if self
+            .object_queue(key.index as usize)
             .completion_mode
             .load(Ordering::Acquire)
             != 0
@@ -952,7 +1111,7 @@ impl ZoneTables {
         wait: &impl LockWait,
         completion: &'a dyn Fn(OwnedObjectWakeEffects),
     ) -> Result<ObjectWaitGuard<'a>, ObjectWaitError> {
-        let queue = &self.object_waits[key.index as usize];
+        let queue = self.object_queue(key.index as usize);
         let mut attempt = 0;
         loop {
             let state = queue.lock.load(Ordering::SeqCst);
@@ -986,7 +1145,7 @@ impl ZoneTables {
         }
     }
     pub fn completion_enabled(&self, key: ObjectWaitKey) -> bool {
-        self.object_waits[key.index as usize]
+        self.object_queue(key.index as usize)
             .completion_mode
             .load(Ordering::Acquire)
             != 0
@@ -1042,9 +1201,25 @@ impl ZoneTables {
             retained: true,
         }
     }
+    pub(crate) fn notification_generation(&self, key: ObjectWaitKey) -> u64 {
+        self.object_queue(key.index as usize)
+            .generation
+            .load(Ordering::Acquire)
+    }
+    pub(crate) fn notification_snapshot(&self, key: ObjectWaitKey) -> ObjectWaitSnapshot {
+        let queue = self.object_queue(key.index as usize);
+        assert_eq!(queue.generation.load(Ordering::Acquire), key.generation);
+        ObjectWaitSnapshot {
+            key,
+            epoch: queue.epoch.load(Ordering::SeqCst),
+        }
+    }
     /// Lock-free census of queue `index` (never takes its lock).
     pub fn object_queue_census(&self, index: u32) -> Option<ObjectQueueCensus> {
-        let queue = self.object_waits.get(index as usize)?;
+        if index as usize >= OBJECT_WAIT_QUEUES {
+            return None;
+        }
+        let queue = self.object_queue(index as usize);
         let head = queue.head.load(Ordering::Acquire);
         let mut waiters = 0u32;
         let mut cursor = head;
@@ -1099,9 +1274,10 @@ impl ZoneTables {
     ) -> Result<bool, ()> {
         let rec = self.record(record);
         let index = rec.object.queue.load(Ordering::Acquire);
-        let Some(key) =
-            ObjectWaitKey::from_registration(index, rec.object.generation.load(Ordering::Relaxed))
-        else {
+        let Some(key) = ObjectWaitKey::from_retained_registration(
+            index,
+            rec.object.generation.load(Ordering::Relaxed),
+        ) else {
             return Ok(false);
         };
         let guard = match self.object_wait(key, &BoundedSpin(EL1_SLOT_LOCK_SPINS)) {
@@ -1133,7 +1309,7 @@ impl ZoneTables {
             if index == 0 {
                 return;
             }
-            let Some(key) = ObjectWaitKey::from_registration(
+            let Some(key) = ObjectWaitKey::from_retained_registration(
                 index,
                 rec.object.generation.load(Ordering::Relaxed),
             ) else {
@@ -1522,7 +1698,7 @@ mod host_tests {
         // Leave the already pending queue unlocked for internal cleanup; the
         // exact host transfer, not a queue observer, must supply delivery.
         core::mem::forget(guard);
-        zone.object_waits[key.index as usize]
+        zone.object_queue(key.index as usize)
             .lock
             .store(NOTIFY_PENDING, Ordering::Release);
         let ready = transfer.finish(&Venue(&completion)).unwrap();

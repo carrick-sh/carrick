@@ -813,7 +813,7 @@ fn every_host_exclusion_settles_guest_cow_after_the_editor_leaves() {
         SpaceTables {
             spaces,
             occupancy,
-            zone: false,
+            zone: None,
         },
         mm(42_301),
     )
@@ -829,7 +829,7 @@ fn pre_admission_owner_blocks_publication_and_refuses_without_relocking() {
     let tables = SpaceTables {
         spaces,
         occupancy,
-        zone: false,
+        zone: None,
     };
     let key = mm(42_901);
     let guard = PreAdmissionGuard::acquire_in(tables, key).unwrap();
@@ -903,7 +903,7 @@ fn owner_fork_publication_keeps_child_unswitchable_until_completion() {
     let tables = SpaceTables {
         spaces,
         occupancy,
-        zone: false,
+        zone: None,
     };
     let child = mm(42_990);
     let guard = PreAdmissionGuard::acquire_in(tables, child).unwrap();
