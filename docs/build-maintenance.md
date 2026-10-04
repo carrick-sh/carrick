@@ -117,6 +117,11 @@ If either lock is held, it skips without deleting anything. It retains both
 guards through removal. Before any census or deletion it also holds exclusive
 locks on Cargo's native `target/{debug,release}/.cargo-lock` files. Ordinary
 Cargo builds participate in these locks even when bypassing the host lease.
+Before acquiring those locks, pruning resolves the target once and authenticates
+the directory's device/inode against the supplied path. Lock acquisition,
+census exemptions and deletion all use that canonical root, including when
+a worktree ancestor is a symlink. The bound identity is checked after lock
+acquisition and again before deletion; a changed root stops pruning.
 These lock files are never pruned. Their descriptors are explicitly inherited
 by the deletion shell and utilities, so killing the Perl parent cannot release
 exclusion while a deletion child remains alive. The local and remote host
