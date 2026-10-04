@@ -15,12 +15,20 @@ mod storage;
 pub use prepared::ClaimedPreparedCopy;
 pub use storage::ResolvedReservationNodes;
 
+#[path = "reservations/notification.rs"]
+mod notification;
+use carrick_sched_core::spaces::notification::{
+    ROOT_NOTIFICATION_REQUIRED, ResourceUnlocked, SpaceNotificationLease, SpaceWaitCause,
+};
+use notification::RootAuthority;
+pub use notification::RootReleaseVenue;
+
 const ROOTS: usize = carrick_sched_core::spaces::ADDRESS_SPACES;
 const NODES: usize = 1024;
 /// Bootstrap metadata only. Exhaustion is a capacity request, never Linux
 /// ENOMEM. Existing reservations can still be observed and retired.
 pub const RESERVATIONS_OFFSET: usize = EL1_RESERVATIONS_OFFSET as usize;
-const VERSION: u64 = 8;
+const VERSION: u64 = 9;
 /// Nodes each root keeps for its host venue: enough for the net growth of
 /// any one host syscall's mirror (at most two straddler splits per edit
 /// boundary pair, demotion and placeholder included).
@@ -204,7 +212,7 @@ impl RootHolder {
 
     /// The holder a nonzero lock word names.
     fn of_word(word: u64) -> Self {
-        match word.checked_sub(2) {
+        match (word & !ROOT_NOTIFICATION_REQUIRED).checked_sub(2) {
             Some(slot) => Self::El1Slot(slot as u32),
             None => Self::Host,
         }
@@ -496,10 +504,35 @@ pub struct Reservations<'a> {
     /// pool is empty. EL1's take one attempt and forward on `Busy`.
     host_holder: bool,
     host_proposal: bool,
+    release_venue: Option<RootReleaseVenue<'a>>,
+    notification: Option<SpaceNotificationLease<'a>>,
+    unlocked: ResourceUnlocked,
+    pending_on_entry: bool,
+    retiring_notifications: bool,
 }
 impl Drop for Reservations<'_> {
     fn drop(&mut self) {
-        self.root.locked.store(0, Ordering::Release);
+        if let (Some(venue), Some(lease)) = (self.release_venue, &self.notification) {
+            let pending_completed = self.pending_on_entry
+                && self.state().pending.is_none()
+                && !self.state().fork_pending;
+            let causes = if self.retiring_notifications {
+                &SpaceWaitCause::ALL[..]
+            } else if pending_completed {
+                &[SpaceWaitCause::Reservations, SpaceWaitCause::PendingEdit][..]
+            } else {
+                &[SpaceWaitCause::Reservations][..]
+            };
+            // SAFETY: this guard exclusively owns this exact authenticated root
+            // lock; protected state is no longer used after the release.
+            unsafe {
+                lease.release_resource(venue.release, &self.root.locked, self.unlocked, causes);
+            }
+        } else {
+            self.root
+                .locked
+                .store(self.unlocked.word(), Ordering::Release);
+        }
     }
 }
 
@@ -582,6 +615,7 @@ impl SharedReservations {
     /// answers `Busy` and the syscall or fault goes to the host, which serves
     /// it on its own venue. The lock word names the slot while it is held
     /// ([`Self::el1_slot_holding`]).
+    #[cfg(any(test, feature = "host-test"))]
     pub fn lock_el1(
         &self,
         index: usize,
@@ -595,16 +629,19 @@ impl SharedReservations {
             cfg!(target_os = "none"),
             &NoRootWait,
             RootHolder::El1Slot(slot).word(),
+            RootAuthority::SourceFree(self.source_free()),
         )
     }
 
     /// A host thread's single attempt (final settlement, model fixtures).
+    #[cfg(any(test, feature = "host-test"))]
     pub fn lock(&self, index: usize, mm: ReservationMm) -> Result<Reservations<'_>, Refusal> {
         self.lock_waiting(index, mm, &NoRootWait)
     }
 
     /// A host thread's acquisition, `wait` deciding whether to retry a held
     /// root.
+    #[cfg(any(test, feature = "host-test"))]
     pub fn lock_waiting(
         &self,
         index: usize,
@@ -618,6 +655,7 @@ impl SharedReservations {
             cfg!(target_os = "none"),
             wait,
             RootHolder::Host.word(),
+            RootAuthority::SourceFree(self.source_free()),
         )
     }
 
@@ -628,11 +666,12 @@ impl SharedReservations {
     /// a host waiter wait on a vCPU that is not running).
     pub fn el1_slot_holding(&self, slot: u32) -> Option<usize> {
         let word = RootHolder::El1Slot(slot).word();
-        self.roots
-            .iter()
-            .position(|root| root.locked.load(Ordering::Acquire) == word)
+        self.roots.iter().position(|root| {
+            root.locked.load(Ordering::Acquire) & !ROOT_NOTIFICATION_REQUIRED == word
+        })
     }
 
+    #[allow(clippy::too_many_arguments)] // One admission transaction authenticates both storage and release venues.
     fn lock_using<'a>(
         &'a self,
         index: usize,
@@ -641,7 +680,9 @@ impl SharedReservations {
         identity: bool,
         wait: &dyn RootWait,
         holder: u64,
+        authority: RootAuthority<'a>,
     ) -> Result<Reservations<'a>, Refusal> {
+        let release_venue = authority.release();
         if self.layout_hash.load(Ordering::Acquire) != LAYOUT_HASH {
             return Err(Refusal::Stale);
         }
@@ -650,21 +691,64 @@ impl SharedReservations {
         // never blocks and is resumed to completion) or one host thread (the
         // host serializes its own venues per MM first). EL1 gives up at once;
         // the host waits the holder out.
-        let mut attempt = 0u32;
-        while let Err(held) =
-            root.locked
-                .compare_exchange(0, holder, Ordering::Acquire, Ordering::Acquire)
+        if let Some(venue) = release_venue
+            && (!core::ptr::eq(venue.table, self)
+                || venue
+                    .release
+                    .zone
+                    .spaces
+                    .find(mm.raw())
+                    .is_none_or(|space| space.index() != index))
         {
-            if held != 0 && !wait.wait(attempt, RootHolder::of_word(held)) {
-                return Err(Refusal::Busy);
-            }
-            attempt = attempt.saturating_add(1);
-        }
-        if root.key.load(Ordering::Acquire) != mm.raw() {
-            root.locked.store(0, Ordering::Release);
             return Err(Refusal::Stale);
         }
-        let guard = Reservations {
+        let mut attempt = 0u32;
+        let mut notification = None;
+        let required = loop {
+            if root.key.load(Ordering::Acquire) != mm.raw() {
+                return Err(Refusal::Stale);
+            }
+            let required = root.locked.load(Ordering::Acquire) & ROOT_NOTIFICATION_REQUIRED;
+            if required != 0 && notification.is_none() {
+                let venue = release_venue.ok_or(Refusal::Stale)?;
+                let incarnation = core::num::NonZeroU64::new(
+                    root.epoch
+                        .load(Ordering::Acquire)
+                        .checked_add(1)
+                        .ok_or(Refusal::Stale)?,
+                )
+                .ok_or(Refusal::Stale)?;
+                notification = Some(
+                    venue
+                        .release
+                        .zone
+                        .space_entry(core::num::NonZeroU64::new(mm.raw()).ok_or(Refusal::Stale)?)
+                        .ok_or(Refusal::Stale)?
+                        .notifications(incarnation)
+                        .map_err(|_| Refusal::Stale)?,
+                );
+            }
+            match root.locked.compare_exchange(
+                required,
+                holder | required,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break required,
+                Err(held) => {
+                    if held & ROOT_NOTIFICATION_REQUIRED != 0 && release_venue.is_none() {
+                        return Err(Refusal::Stale);
+                    }
+                    if held & !ROOT_NOTIFICATION_REQUIRED != 0
+                        && !wait.wait(attempt, RootHolder::of_word(held))
+                    {
+                        return Err(Refusal::Busy);
+                    }
+                    attempt = attempt.saturating_add(1);
+                }
+            }
+        };
+        let mut guard = Reservations {
             table: self,
             root,
             mm,
@@ -674,7 +758,20 @@ impl SharedReservations {
             host_venue: false,
             host_holder: holder == RootHolder::Host.word(),
             host_proposal: false,
+            release_venue,
+            notification,
+            unlocked: if required == 0 {
+                ResourceUnlocked::Plain
+            } else {
+                ResourceUnlocked::NotificationRoot
+            },
+            pending_on_entry: false,
+            retiring_notifications: false,
         };
+        if root.key.load(Ordering::Acquire) != mm.raw() {
+            return Err(Refusal::Stale);
+        }
+        guard.pending_on_entry = guard.state().pending.is_some() || guard.state().fork_pending;
         if (banks.is_none() && !identity && self.storage.capacity() > NODES as u32)
             || banks.is_some_and(|banks| banks.count() < self.storage.bank_count())
         {
@@ -2893,6 +2990,7 @@ impl Reservations<'_> {
         if let Err(reason) = self
             .copy_in_order(self.state().tree, &mut list, child)
             .and_then(|()| child.secure_host_nodes(HOST_RESERVE))
+            .and_then(|()| child.admit_notifications())
         {
             let mut id = list.head;
             while id != 0 {
@@ -3007,6 +3105,7 @@ impl Reservations<'_> {
             self.drain_host_reserve();
             return Err(reason);
         }
+        self.admit_notifications()?;
         self.state_mut().admitted = true;
         self.mark_admitted();
         Ok(())
@@ -3051,6 +3150,21 @@ impl Reservations<'_> {
             return Err(Refusal::Busy);
         }
         self.reap_prepared();
+        if let Some(venue) = self.release_venue
+            && self.notification.is_some()
+        {
+            let identity = self.notification_identity()?;
+            let entry = venue
+                .release
+                .zone
+                .space_entry(identity.mm)
+                .ok_or(Refusal::Stale)?;
+            entry
+                .close_notifications(identity.incarnation)
+                .map_err(|_| Refusal::Busy)?;
+            self.retiring_notifications = true;
+            self.unlocked = ResourceUnlocked::Plain;
+        }
         for slot in self.deferred_slots() {
             slot.mm.store(0, Ordering::Release);
         }
@@ -5174,3 +5288,7 @@ mod tests {
         g.secure_host_nodes(HOST_RESERVE).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "reservations/notification_tests.rs"]
+mod notification_tests;

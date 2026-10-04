@@ -39,6 +39,15 @@ impl Region {
             bank: None,
         }
     }
+    pub fn zone(&self) -> &carrick_sched_core::ZoneTables {
+        unsafe {
+            &*self
+                .ptr
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+                .cast()
+        }
+    }
     pub fn table(&self) -> &SharedReservations {
         // SAFETY: zero-initialized production table in its real region offset;
         // the retained region outlives every borrowed view.
@@ -200,6 +209,42 @@ pub fn admit_kind(
     unrelated: usize,
     anonymous: bool,
 ) -> ReservationMm {
+    admit_access(
+        region,
+        carrick_sched_core::spaces::notification::SpaceAccess::source_free(spaces),
+        mm,
+        root,
+        pages,
+        unrelated,
+        anonymous,
+    )
+}
+pub fn admit_notified(
+    region: &Region,
+    mm: u64,
+    root: u64,
+    pages: usize,
+    unrelated: usize,
+) -> ReservationMm {
+    admit_access(
+        region,
+        crate::sched::object_wait::space_access(region.zone(), carrick_sched_core::SlotId::new(0)),
+        mm,
+        root,
+        pages,
+        unrelated,
+        true,
+    )
+}
+fn admit_access(
+    region: &Region,
+    spaces: carrick_sched_core::spaces::notification::SpaceAccess<'_>,
+    mm: u64,
+    root: u64,
+    pages: usize,
+    unrelated: usize,
+    anonymous: bool,
+) -> ReservationMm {
     let index = spaces.publish_closed(mm, root, root).unwrap();
     let mm = ReservationMm::new(mm).unwrap();
     let table = region.table();
@@ -219,9 +264,16 @@ pub fn admit_kind(
         )
         .unwrap();
     let view = nodes(region);
-    let mut owner = table
-        .lock_el1_resolved(index.index(), mm, &view, 0)
-        .unwrap();
+    let mut owner = if let Some(venue) = spaces.venue() {
+        crate::memory::reservations::RootReleaseVenue::new(table, venue)
+            .unwrap()
+            .lock_el1_resolved(index.index(), mm, &view, 0)
+            .unwrap()
+    } else {
+        table
+            .lock_el1_resolved(index.index(), mm, &view, 0)
+            .unwrap()
+    };
     owner
         .import(
             ReservationRange::new(VA, VA + pages as u64 * 4096).unwrap(),
@@ -307,15 +359,12 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
             physical.provision(IPA + 0x100_000, pages * 4096);
             let mut region = Region::new();
             region.add_bank();
-            let raw = unsafe {
-                std::alloc::alloc_zeroed(std::alloc::Layout::new::<carrick_sched_core::ZoneTables>())
-            };
-            assert!(!raw.is_null());
-            let zone = unsafe { Box::from_raw(raw.cast::<carrick_sched_core::ZoneTables>()) };
-            let spaces = &zone.spaces;
-            let a = admit(&region, spaces, 77, ROOT, pages, unrelated);
+            let zone = region.zone();
+            let spaces =
+                crate::sched::object_wait::space_access(zone, carrick_sched_core::SlotId::new(0));
+            let a = admit_notified(&region, 77, ROOT, pages, unrelated);
             // Both live MMs retain the original unrelated mapping population.
-            let b = admit(&region, spaces, 78, ROOT + 0x100_000, pages, unrelated);
+            let b = admit_notified(&region, 78, ROOT + 0x100_000, pages, unrelated);
             let identity = |tid| carrick_sched_core::ThreadIdentity {
                 tid,
                 serial: 1,
@@ -346,7 +395,9 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
                 waiting.push((slot, record, driver));
             }
             let view = nodes(&region);
-            let portal = MmPortal::new(physical.carrier(), region.table(), spaces, &view);
+            let portal = MmPortal::new(physical.carrier(), region.table(), &spaces, &view)
+                .with_zone(zone)
+                .unwrap();
             for (mm, root, ipa, intent) in [
                 (a, ROOT, IPA, TransferIntent::UserWrite),
                 (
@@ -522,7 +573,7 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
 /// retaining that MM's editor. The fixture has no host policy mirror.
 pub fn change_policy(
     region: &Region,
-    spaces: &AddressSpaces,
+    spaces: carrick_sched_core::spaces::notification::SpaceAccess<'_>,
     mm: ReservationMm,
     tables: &Tables,
     protection: Option<ReservationProtection>,
@@ -539,10 +590,18 @@ pub fn change_policy(
         .unwrap();
     let view = nodes(region);
     let request = {
-        let mut root = region
-            .table()
-            .lock_el1_resolved(index.index(), mm, &view, 0)
-            .unwrap();
+        let mut root = match spaces.venue() {
+            Some(venue) => {
+                crate::memory::reservations::RootReleaseVenue::new(region.table(), venue)
+                    .unwrap()
+                    .lock_el1_resolved(index.index(), mm, &view, 0)
+                    .unwrap()
+            }
+            None => region
+                .table()
+                .lock_el1_resolved(index.index(), mm, &view, 0)
+                .unwrap(),
+        };
         let range = ReservationRange::new(VA, VA + 4096).unwrap();
         let decision = match protection {
             Some(protection) => root.mprotect(range, protection).unwrap(),
@@ -598,12 +657,18 @@ pub fn change_policy(
         )
     }
     .unwrap();
-    region
-        .table()
-        .lock_el1_resolved(index.index(), mm, &view, 0)
-        .unwrap()
-        .complete(receipt)
-        .unwrap();
+    (match spaces.venue() {
+        Some(venue) => crate::memory::reservations::RootReleaseVenue::new(region.table(), venue)
+            .unwrap()
+            .lock_el1_resolved(index.index(), mm, &view, 0)
+            .unwrap(),
+        None => region
+            .table()
+            .lock_el1_resolved(index.index(), mm, &view, 0)
+            .unwrap(),
+    })
+    .complete(receipt)
+    .unwrap();
 }
 
 fn copy_one(

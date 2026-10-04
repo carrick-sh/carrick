@@ -1143,7 +1143,13 @@ fn reservation_policy_readonly_none_and_retire_refuse_exact_mm() {
         Some(ReservationProtection::from_bits(0).unwrap()),
         None,
     ] {
-        change_policy(&region, &spaces, a, &a_tables, protection);
+        change_policy(
+            &region,
+            carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+            a,
+            &a_tables,
+            protection,
+        );
         for intent in [TransferIntent::UserRead, TransferIntent::UserWrite] {
             for (mm, tables) in [(a, &a_tables), (b, &b_tables)] {
                 let transfer = portal
@@ -1518,7 +1524,7 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
     assert!(
         (crate::fault::FileFaultVenue {
             roots: region.table(),
-            spaces: &spaces,
+            spaces: carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
             slots: &fault_slots,
             worker: 0,
             mailbox: &fault_mailbox
@@ -2493,17 +2499,12 @@ fn prepared_copy_commit_and_cancel_never_acquire_held_root_or_editor() {
 #[test]
 fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall() {
     use crate::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served, ThreadCpu};
-    use carrick_el1_abi::{Counters, CurrentTask, El1TaskId, SlotId, TrapFrame, ZoneTables};
+    use carrick_el1_abi::{Counters, CurrentTask, El1TaskId, SlotId, TrapFrame};
     for cancel in [false, true] {
         for nr in [215, 226, 216] {
             let region = Region::new();
-            // All-zero is the production empty shared scheduler layout.
-            let zone: Box<ZoneTables> = unsafe {
-                Box::from_raw(
-                    std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables>()).cast(),
-                )
-            };
-            let mm = admit(&region, &zone.spaces, 77, ROOT, 2, 0);
+            let zone = region.zone();
+            let mm = admit_notified(&region, 77, ROOT, 2, 0);
             let view = nodes(&region);
             let portal = MmPortal::new(
                 NonZeroU64::new(1).unwrap(),
@@ -2782,12 +2783,10 @@ fn prepared_copy_rejected_tuple_cannot_overwrite_concurrent_claim() {
 
 fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
     use crate::substrate::sched::{FakeCpu, HardwareUserWord, Sched, Served};
-    use carrick_el1_abi::{Counters, CurrentTask, El1TaskId, SlotId, TrapFrame, ZoneTables};
+    use carrick_el1_abi::{Counters, CurrentTask, El1TaskId, SlotId, TrapFrame};
     let region = Region::new();
-    let zone: Box<ZoneTables> = unsafe {
-        Box::from_raw(std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables>()).cast())
-    };
-    let mm = admit(&region, &zone.spaces, 77, ROOT, 1, 0);
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
     let view = nodes(&region);
     let portal = MmPortal::new(
         NonZeroU64::new(1).unwrap(),
