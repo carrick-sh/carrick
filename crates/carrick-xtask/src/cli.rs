@@ -28,6 +28,9 @@ pub enum Commands {
     #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
     WorktreeGc(crate::worktree_gc::WorktreeGcArgs),
 
+    #[command(about = "Hold checkout admission through a foreground command")]
+    WorktreeRun(crate::worktree_admission::WorktreeRunArgs),
+
     #[command(about = "Per-landing Carrick vs native Docker receipts")]
     Impact(crate::impact::ImpactArgs),
 
@@ -282,6 +285,11 @@ where
     match cli.command {
         Commands::CiScaler(args) => {
             crate::ci_scaler::run(args)?;
+            Ok(())
+        }
+        Commands::WorktreeRun(args) => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::worktree_admission::run(&info.repository_root, args)?;
             Ok(())
         }
         Commands::WorktreeGc(args) => {

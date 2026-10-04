@@ -1,5 +1,6 @@
 //! Conservative, opt-in removal of clean worktrees with proven landed history.
 use crate::command::{self, CommandError};
+use crate::worktree_admission::{CargoLocks, RemovalAuthority, Retirement};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -134,6 +135,51 @@ fn classify_use(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> UseState {
 }
 
 fn process_use(path: &Path) -> UseState {
+    process_use_with_locks(path, None)
+}
+
+fn classify_locked_use(
+    code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+    locks: &CargoLocks,
+) -> UseState {
+    if stdout.is_empty() {
+        return classify_use(code, stdout, stderr);
+    }
+    // Some lsof versions return 1 for a +D census even when selected file
+    // records were emitted. Only complete owned-descriptor records are exempt.
+    if !matches!(code, Some(0 | 1)) || !stderr.is_empty() {
+        return UseState::Unknown;
+    }
+    let Ok(fields) = std::str::from_utf8(stdout) else {
+        return UseState::Unknown;
+    };
+    let mut own_process = false;
+    let mut owned_descriptor = false;
+    for field in fields.lines() {
+        if let Some(pid) = field.strip_prefix('p') {
+            if pid.parse::<u32>().ok() != Some(std::process::id()) {
+                return UseState::Busy;
+            }
+            own_process = true;
+        } else if let Some(descriptor) = field.strip_prefix('f') {
+            if !own_process || !locks.owns_descriptor(descriptor) {
+                return UseState::Busy;
+            }
+            owned_descriptor = true;
+        } else {
+            return UseState::Unknown;
+        }
+    }
+    if owned_descriptor {
+        UseState::Idle
+    } else {
+        UseState::Unknown
+    }
+}
+
+fn process_use_with_locks(path: &Path, locks: Option<&CargoLocks>) -> UseState {
     // An unprivileged empty lsof result can hide another user's processes.
     // Resolve the executable before sudo's secure PATH is substituted (lsof
     // may be installed per-user). Only the read-only census is privileged.
@@ -160,12 +206,15 @@ fn process_use(path: &Path) -> UseState {
     };
     // +D includes cwd, mapped executables and open files anywhere in the tree.
     // Warnings or denied sudo access fail closed; never prompt or retry.
-    census.args(["-F", "p"]);
+    census.args(["-F", if locks.is_some() { "pf" } else { "p" }]);
     if path.is_dir() {
         census.arg("+D");
     }
     match census.arg(path).output() {
-        Ok(out) => classify_use(out.status.code(), &out.stdout, &out.stderr),
+        Ok(out) => match locks {
+            Some(locks) => classify_locked_use(out.status.code(), &out.stdout, &out.stderr, locks),
+            None => classify_use(out.status.code(), &out.stdout, &out.stderr),
+        },
         Err(_) => UseState::Unknown,
     }
 }
@@ -252,10 +301,16 @@ pub fn run(root: &Path, args: WorktreeGcArgs, writer: &mut impl Write) -> Result
         let protected = tree.primary
             || protected(&path, &common, root, tree.locked, &tree.branch)
             || protected(&tree.path, &common, root, tree.locked, &tree.branch);
+        let authority = if protected {
+            None
+        } else {
+            Some(Retirement::claim(&path, &common)?)
+        };
+        let managed = matches!(authority, Some(RemovalAuthority::Acquired(_)));
         let dirty = !git(&path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty();
         let landed = landing(root, main, &tree.head)?;
         let usage = process_use(&path);
-        let eligible = removable(protected, dirty, landed.is_some(), &usage);
+        let eligible = managed && removable(protected, dirty, landed.is_some(), &usage);
         writeln!(
             writer,
             "{} | {} | {} | {} | {:?} | {} | {}",
@@ -266,6 +321,10 @@ pub fn run(root: &Path, args: WorktreeGcArgs, writer: &mut impl Write) -> Result
             usage,
             if protected {
                 "keep (protected)"
+            } else if matches!(authority, Some(RemovalAuthority::Unmanaged)) {
+                "keep (unmanaged)"
+            } else if !managed {
+                "keep (admission busy)"
             } else if eligible {
                 "eligible"
             } else {
@@ -274,20 +333,31 @@ pub fn run(root: &Path, args: WorktreeGcArgs, writer: &mut impl Write) -> Result
             path.display()
         )?;
         if args.apply && eligible {
+            let Some(RemovalAuthority::Acquired(mut authority)) = authority else {
+                continue;
+            };
+            let Some(cargo_locks) = CargoLocks::claim(&path)? else {
+                writeln!(writer, "keep (Cargo lock is held) | {}", path.display())?;
+                continue;
+            };
             // Recheck mutable evidence immediately before removal. Never force:
             // Git independently refuses tracked/untracked changes and locks.
             let head = git(&path, &["rev-parse", "HEAD"])?;
             let clean = git(&path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty();
-            if head.trim() != tree.head || !clean || process_use(&path) != UseState::Idle {
+            if head.trim() != tree.head
+                || !clean
+                || process_use_with_locks(&path, Some(&cargo_locks)) != UseState::Idle
+            {
                 writeln!(writer, "keep (changed during census) | {}", path.display())?;
                 continue;
             }
             writable_dirs(&path)?;
-            if process_use(&path) != UseState::Idle {
+            if process_use_with_locks(&path, Some(&cargo_locks)) != UseState::Idle {
                 writeln!(writer, "keep (in use before removal) | {}", path.display())?;
                 continue;
             }
-            command::run_checked(
+            authority.retire()?;
+            let removal = command::run_checked(
                 "git",
                 [
                     std::ffi::OsStr::new("worktree"),
@@ -295,7 +365,11 @@ pub fn run(root: &Path, args: WorktreeGcArgs, writer: &mut impl Write) -> Result
                     path.as_os_str(),
                 ],
                 Some(root),
-            )?;
+            );
+            if removal.is_err() {
+                authority.restore()?;
+            }
+            removal?;
             writeln!(writer, "removed | {}", path.display())?;
         }
     }
@@ -308,6 +382,116 @@ mod tests {
 
     fn fixture_git(root: &Path, args: &[&str]) -> String {
         git(root, args).unwrap()
+    }
+
+    #[test]
+    fn cargo_lock_census_never_exempts_unrelated_files_of_its_own_process() {
+        // A sibling fork briefly inherits another test's descriptor table.
+        // Create the census files only after exec in an isolated fixture.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "worktree_gc::tests::own_descriptor_census_fixture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated root-visible census fixture invoked by the regression"]
+    fn own_descriptor_census_fixture() {
+        let tree = tempfile::tempdir().unwrap();
+        let profile = tree.path().join("target/debug");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join(".cargo-lock"), "").unwrap();
+        let locks = CargoLocks::claim(tree.path()).unwrap().unwrap();
+        let initial = process_use_with_locks(tree.path(), Some(&locks));
+        // Missing lsof/root visibility is already fail-closed. The protocol
+        // classification tests below also run without OS census privileges.
+        if initial == UseState::Unknown {
+            return;
+        }
+        assert_eq!(initial, UseState::Idle);
+        let artifact = std::fs::File::create(profile.join("unrelated-artifact")).unwrap();
+        let usage = process_use_with_locks(tree.path(), Some(&locks));
+        assert_ne!(
+            usage,
+            UseState::Idle,
+            "own-process artifact must stay visible to the final census"
+        );
+        drop(artifact);
+    }
+
+    #[test]
+    fn locked_census_requires_exact_owned_descriptors_without_warnings() {
+        use std::os::fd::AsRawFd;
+        let tree = tempfile::tempdir().unwrap();
+        let profile = tree.path().join("target/debug");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(profile.join(".cargo-lock"), "").unwrap();
+        let locks = CargoLocks::claim(tree.path()).unwrap().unwrap();
+        let unrelated = std::fs::File::create(tree.path().join("artifact")).unwrap();
+        let fields = format!("p{}\nf{}\n", std::process::id(), unrelated.as_raw_fd());
+        assert_eq!(
+            classify_locked_use(Some(0), fields.as_bytes(), b"", &locks),
+            UseState::Busy
+        );
+        let fields = format!("p{}\nfcwd\n", std::process::id());
+        assert_eq!(
+            classify_locked_use(Some(0), fields.as_bytes(), b"", &locks),
+            UseState::Busy
+        );
+        assert_eq!(
+            classify_locked_use(Some(1), b"", b"denied", &locks),
+            UseState::Unknown
+        );
+        assert_eq!(
+            classify_locked_use(Some(0), b"", b"", &locks),
+            UseState::Unknown
+        );
+        assert_eq!(
+            classify_locked_use(Some(0), b"p42\nf3\n", b"", &locks),
+            UseState::Busy
+        );
+    }
+
+    #[test]
+    fn unmanaged_checkout_is_preserved_on_apply() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().join("main");
+        let worker = repo.path().join("worker");
+        std::fs::create_dir(&root).unwrap();
+        fixture_git(&root, &["init", "-b", "main"]);
+        fixture_git(&root, &["config", "user.email", "test@example.invalid"]);
+        fixture_git(&root, &["config", "user.name", "Test"]);
+        fixture_git(&root, &["commit", "--allow-empty", "-m", "base"]);
+        fixture_git(
+            &root,
+            &["worktree", "add", "-b", "landed", worker.to_str().unwrap()],
+        );
+        let mut output = Vec::new();
+        run(
+            &root,
+            WorktreeGcArgs {
+                apply: true,
+                prune_targets: false,
+                days: 2,
+                target_dir: None,
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert!(
+            worker.exists(),
+            "unmanaged checkout must be preserved: {}",
+            String::from_utf8_lossy(&output)
+        );
     }
 
     #[test]
