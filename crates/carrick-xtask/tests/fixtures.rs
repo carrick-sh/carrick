@@ -9,6 +9,117 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+struct RestoreChild(std::process::Child);
+
+impl RestoreChild {
+    fn finish(&mut self) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "restore child did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for RestoreChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn restore_command(f: &Fixture, lock: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+    command
+        .current_dir(f.repo.path())
+        .args(["fixtures", "restore", "--manifest"])
+        .arg(&f.path)
+        .env("CARRICK_HOST_LEASE_PATH", lock)
+        .env_remove("CARRICK_HOST_LEASE_FD")
+        .env_remove("CARRICK_HOST_LEASE_MODE");
+    command
+}
+
+#[test]
+fn standalone_restore_waits_for_gate_before_publishing() {
+    use carrick_xtask::host_lease::{HostLease, HostLeaseMode};
+    use std::io::BufRead;
+    let f = Fixture::new();
+    let lock = f.store.path().join("host.lock");
+    let gate = HostLease::acquire_path(&lock, HostLeaseMode::Gate).unwrap();
+    let mut child = RestoreChild(
+        restore_command(&f, &lock)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = child.0.stderr.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut waiting = false;
+        let mut log = String::new();
+        for line in std::io::BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            if !waiting && line.contains("host-lease: waiting for gate") {
+                waiting = true;
+                sender.send(true).unwrap();
+            }
+            log.push_str(&line);
+            log.push('\n');
+        }
+        if !waiting {
+            sender.send(false).unwrap();
+        }
+        log
+    });
+    let waiting = receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    assert!(
+        !f.repo.path().join(fixtures::INSTALLED_MANIFEST).exists(),
+        "standalone restore published while another process holds gate admission"
+    );
+    assert!(waiting, "restore never requested exclusive gate admission");
+    for executable in &f.manifest.executables {
+        assert!(!f.repo.path().join(&executable.path).exists());
+    }
+    assert!(child.0.try_wait().unwrap().is_none());
+    drop(gate);
+    let status = child.finish();
+    let log = reader.join().unwrap();
+    assert!(status.success(), "restore failed after admission: {log}");
+    fixtures::verify_installed(f.repo.path()).unwrap();
+}
+
+#[test]
+fn restore_reuses_inherited_gate_and_rejects_shared_upgrade() {
+    use carrick_xtask::host_lease::{HostLease, HostLeaseMode};
+    let f = Fixture::new();
+    let lock = f.store.path().join("host.lock");
+    for mode in [HostLeaseMode::Carrick, HostLeaseMode::Gate] {
+        let lease = HostLease::acquire_path(&lock, mode).unwrap();
+        let mut command = restore_command(&f, &lock);
+        lease.configure_command(&mut command).unwrap();
+        let mut child = RestoreChild(command.spawn().unwrap());
+        let status = child.finish();
+        assert_eq!(status.success(), mode == HostLeaseMode::Gate);
+        assert_eq!(
+            f.repo.path().join(fixtures::INSTALLED_MANIFEST).exists(),
+            mode == HostLeaseMode::Gate
+        );
+    }
+    fixtures::verify_installed(f.repo.path()).unwrap();
+}
+
 fn git(root: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .current_dir(root)
