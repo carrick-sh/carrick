@@ -51,7 +51,8 @@ fn checked(run: RunReport) -> RunReport {
 /// sibling threads share each parent's task graph. Root remains a third live
 /// process until the measured operations and both parent reaps complete.
 fn two_parents(
-    make: impl Fn(ScriptCheckpoint, ScriptCheckpoint) -> Vec<Step>,
+    n: usize,
+    make: impl Fn(Vec<ScriptCheckpoint>, ScriptCheckpoint) -> Vec<Step>,
     status: i32,
 ) -> RunReport {
     let go = ScriptCheckpoint::default();
@@ -61,16 +62,18 @@ fn two_parents(
     let mut populations = Vec::new();
     for index in 0..2 {
         let reached = ScriptCheckpoint::default();
-        let populated = ScriptCheckpoint::default();
+        let progress = (0..n)
+            .map(|_| ScriptCheckpoint::default())
+            .collect::<Vec<_>>();
         let mut parent = vec![
             Step::SignalCheckpoint(reached.clone()),
             Step::AwaitCheckpoint(go.clone()),
         ];
-        parent.extend(make(populated.clone(), population_go.clone()));
+        parent.extend(make(progress.clone(), population_go.clone()));
         script.push(call(sys::fork().save(index), "scaffold_birth"));
         script.push(Step::ChildMarker(parent));
         ready.push(reached);
-        populations.push(populated);
+        populations.extend(progress);
     }
     script.extend(ready.into_iter().map(Step::AwaitCheckpoint));
     script.push(Step::SignalCheckpoint(go));
@@ -114,7 +117,8 @@ fn task_services(run: &RunReport) -> usize {
 
 fn wait_scenario(n: usize, autoreap: bool) -> RunReport {
     let run = two_parents(
-        |populated, population_go| {
+        n,
+        |progress, population_go| {
             let release = ScriptCheckpoint::default();
             let mut parent = vec![Step::Sys(sys::getpid().save(4))];
             if autoreap {
@@ -137,11 +141,9 @@ fn wait_scenario(n: usize, autoreap: bool) -> RunReport {
                     await_parked(slot(4), "d_wait"),
                     exit(7),
                 ]));
+                parent.push(Step::SignalCheckpoint(progress[i].clone()));
             }
-            parent.extend([
-                Step::SignalCheckpoint(populated),
-                Step::AwaitCheckpoint(population_go),
-            ]);
+            parent.push(Step::AwaitCheckpoint(population_go));
             // wait4(2) refers to wait(2): WNOHANG is zero for a live child,
             // positive only for a waitable event, ECHILD after consumption.
             // https://man7.org/linux/man-pages/man2/wait4.2.html
@@ -228,7 +230,8 @@ fn wait_scenario(n: usize, autoreap: bool) -> RunReport {
 
 fn group_scenario(n: usize) -> RunReport {
     let run = two_parents(
-        |populated, population_go| {
+        n,
+        |progress, population_go| {
             let mut parent = vec![Step::Sys(
                 sys::pipe2(0)
                     .ret(0)
@@ -248,11 +251,9 @@ fn group_scenario(n: usize) -> RunReport {
             // https://man7.org/linux/man-pages/man2/exit_group.2.html
             for i in 0..n {
                 parent.push(await_parked(slot(10 + i), "sibling_read"));
+                parent.push(Step::SignalCheckpoint(progress[i].clone()));
             }
-            parent.extend([
-                Step::SignalCheckpoint(populated),
-                Step::AwaitCheckpoint(population_go),
-            ]);
+            parent.push(Step::AwaitCheckpoint(population_go));
             parent.push(exit(37));
             parent
         },
