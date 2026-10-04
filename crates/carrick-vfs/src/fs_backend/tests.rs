@@ -379,11 +379,10 @@ fn repeated_short_runs_reduce_oldest_trash_without_async_worker() {
         if previous == 0 {
             break;
         }
-        let started = std::time::Instant::now();
         let removed = cleanup_oldest_trash_checkpoint(root.path());
-        let checkpoint_wall = started.elapsed();
         let remaining = count_retired_entries(root.path());
 
+        // The removed-count and exact/monotonic progress checks are the work budget.
         assert!((1..=256).contains(&removed), "run {run} removed {removed}");
         assert_eq!(
             previous - remaining,
@@ -393,10 +392,6 @@ fn repeated_short_runs_reduce_oldest_trash_without_async_worker() {
         assert!(
             remaining < previous,
             "every short carrier must make monotonic cleanup progress"
-        );
-        assert!(
-            checkpoint_wall < std::time::Duration::from_millis(250),
-            "bounded checkpoint exceeded startup/exit wall: {checkpoint_wall:?}"
         );
         if run == 0 {
             assert_eq!(
@@ -490,11 +485,13 @@ fn startup_orphan_discovery_is_bounded_on_a_wide_root() {
         std::fs::create_dir(root.path().join(format!("live-{index:04}")))
             .expect("create live directory");
     }
-    let started = std::time::Instant::now();
+    ORPHAN_DISCOVERY_ENTRIES.with(|n| n.set(0));
     let _ = sweep_orphans(root.path());
+    let inspected = ORPHAN_DISCOVERY_ENTRIES.with(|n| n.get());
+    const { assert!(STARTUP_DISCOVERY_LIMIT < 400) };
     assert!(
-        started.elapsed() < std::time::Duration::from_millis(250),
-        "startup must inspect only a bounded root prefix"
+        inspected <= STARTUP_DISCOVERY_LIMIT,
+        "startup must inspect only a bounded root prefix: inspected {inspected}"
     );
 }
 
