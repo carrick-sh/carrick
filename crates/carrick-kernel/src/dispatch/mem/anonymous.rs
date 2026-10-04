@@ -1308,6 +1308,7 @@ impl MemState {
         let mut child = self.clone();
         child.deferred_anonymous = Arc::new(self.deferred_anonymous.fork_private());
         child.first_touch_stock.clear();
+        child.prepared_root_grants.clear();
         if let Some(arena) = child.host_arena_mut() {
             arena.fork_seed = None;
         }

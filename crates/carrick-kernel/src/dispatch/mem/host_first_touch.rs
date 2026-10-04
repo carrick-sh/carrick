@@ -327,7 +327,7 @@ impl SyscallDispatcher {
             return Ok(None);
         }
         let plan_end = plan.start().saturating_add(plan.len());
-        self.adopt_frame_grant_provenance(&plan);
+        let _prepared = self.adopt_frame_grant_provenance(&plan);
         let request = Self::el1_frame_grant_request(&plan, mm_key, cursor, 2);
         let Some(ready) = venue
             .prepare(request)
