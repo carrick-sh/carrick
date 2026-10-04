@@ -72,7 +72,7 @@ pub struct KvmVmm {
     /// engine's live-vCPU shared slot + the shared recycle pool. Bound to a
     /// specific [`KvmVcpu`] via [`Self::bind_reclaim`] at every point the engine
     /// pairs this `KvmVmm` with a vCPU (bring-up, sibling, fork-child, execve), so
-    /// `save_guest_state`/`rebind_to_slot` — which only receive `&mut self.vm` —
+    /// `save_guest_state`/`rebind_to_slot`
     /// can reach and swap the live vCPU underneath the engine's separate `vcpu`
     /// field. `None` only in the transient window before the first bind.
     reclaim: Option<crate::kvm::KvmReclaimHandle>,
@@ -553,50 +553,28 @@ impl X86Vmm for KvmVmm {
         KvmKickHandle::for_current_thread()
     }
 
-    fn save_guest_state(&self) -> Vec<u8> {
-        // Snapshot the blocking thread's full guest CPU state (16 GPRs + RIP/RSP/
-        // RFLAGS + CR0/3/4 + EFER + FS/GS base + the full XSAVE incl AVX YMM) via
-        // the shared X86 snapshot, SERIALIZE it into the returned bytes (round-
-        // tripped to `rebind_to_slot` on the SAME thread), then PARK this thread's
-        // vCPU into the recycle pool so another admitted thread can pop+reuse its
-        // finite vcpu id. Serializing keeps this `&self` (no interior-mutable stash
-        // needed). On any failure return empty — `rebind_to_slot` then errors out
-        // (a reclaim failure is fatal to the thread, never silent corruption).
-        let Some(reclaim) = self.reclaim.as_ref() else {
-            return Vec::new();
-        };
-        // Capture the snapshot through a transient view over the live shared slot
-        // (the vCPU is parked at the ring-0 LSTAR-stub syscall boundary — CPL 0 —
-        // so the native KVM_GET_XSAVE captures clean FP/AVX state).
-        let bytes = match reclaim.with_vcpu(|vcpu| x86_snapshot(vcpu)) {
-            Ok(s) => serialize_x86_snapshot(&s),
-            Err(_) => return Vec::new(),
-        };
-        // Park the vCPU AFTER the snapshot read (which needs the live fd): move the
-        // fd into the recycle pool and leave the shared slot empty for the no-vCPU
-        // host wait.
+    fn save_guest_state(&self, vcpu: &Self::Vcpu) -> Result<X86VcpuSnapshot, TrapError> {
+        let reclaim = self
+            .reclaim
+            .as_ref()
+            .ok_or_else(|| TrapError::Hypervisor("kvm reclaim save: unbound".into()))?;
+        // Capture the complete register/XSAVE state before parking the live fd.
+        // The shared engine owns the typed save/restore payload; errors propagate
+        // instead of being encoded as an empty byte buffer.
+        let snapshot = x86_snapshot(vcpu)?;
         reclaim.park_current();
-        bytes
+        Ok(snapshot)
     }
 
     fn rebind_to_slot(
         &mut self,
+        _vcpu: &mut Self::Vcpu,
         _slot: carrick_hal::SlotId,
-        state: &[u8],
+        layout: BringupLayout,
+        state: &X86VcpuSnapshot,
     ) -> Result<(), TrapError> {
-        // Re-acquire a vCPU for the woken thread and restore its saved state. The
-        // scheduler `slot` is admission bookkeeping; KVM maps it to whatever
-        // pooled/fresh vcpu id `install_recycled` returns (like HVF/bhyve, the
-        // slot value itself is not the KVM vcpu id).
-        let Some(snap) = deserialize_x86_snapshot(state) else {
-            return Err(TrapError::Hypervisor(
-                "kvm reclaim rebind: missing/short snapshot".into(),
-            ));
-        };
-        // Pop a recycled (or fresh) vCPU and INSTALL it into the engine's shared
-        // slot, so the engine's separate `vcpu` field now drives it. `reclaim` is a
-        // `&self.reclaim` borrow; `install_recycled` is `&self`, and the later
-        // `restore_vcpu` is also `&self` — overlapping SHARED borrows, both legal.
+        // Install a pooled/fresh vCPU into the engine's shared slot. The
+        // scheduler slot is admission bookkeeping, not a KVM vCPU id.
         let reclaim = self
             .reclaim
             .as_ref()
@@ -604,11 +582,7 @@ impl X86Vmm for KvmVmm {
         reclaim
             .install_recycled()
             .map_err(|e| TrapError::Hypervisor(e.to_string()))?;
-        // Restore the saved register file onto the freshly-installed vCPU through a
-        // transient view over the now-live shared slot, reusing the production KVM
-        // restore (full sregs/regs/xsave/MSRs + the page-table walks that feed the
-        // resume-state record). `with_vcpu` returns the closure's result.
-        reclaim.with_vcpu(|vcpu| self.restore_vcpu(vcpu, KVM_X86_LAYOUT, &snap))
+        reclaim.with_vcpu(|vcpu| self.restore_vcpu(vcpu, layout, state))
     }
 
     fn build_sibling_builder(&self) -> Result<Self::SiblingBuilder, TrapError> {
@@ -1358,72 +1332,6 @@ fn kvm_max_vcpus() -> usize {
         }
         Err(_) => VCPU_BUDGET_FALLBACK,
     }
-}
-
-/// Wire format of an [`X86VcpuSnapshot`] for the reclaim save→rebind round-trip
-/// (same host thread, so endianness/layout are trivially consistent): the 16
-/// GPRs + RIP/RSP/RFLAGS + CR0/3/4 + EFER + FS/GS base as little-endian u64s,
-/// then a 1-byte XSAVE-present flag, then (if present) the XSAVE_LEN bytes.
-const SNAP_SCALARS: usize = 16 + 3 + 4 + 2; // gprs + rip/rsp/rflags + cr0/3/4/efer + fs/gs
-const SNAP_HEADER_LEN: usize = SNAP_SCALARS * 8 + 1;
-
-fn serialize_x86_snapshot(s: &X86VcpuSnapshot) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(SNAP_HEADER_LEN + carrick_x86::XSAVE_LEN);
-    for g in &s.gprs {
-        buf.extend_from_slice(&g.to_le_bytes());
-    }
-    for v in [
-        s.rip, s.rsp, s.rflags, s.cr0, s.cr3, s.cr4, s.efer, s.fs_base, s.gs_base,
-    ] {
-        buf.extend_from_slice(&v.to_le_bytes());
-    }
-    match &s.xsave {
-        Some(xs) => {
-            buf.push(1);
-            buf.extend_from_slice(xs);
-        }
-        None => buf.push(0),
-    }
-    buf
-}
-
-fn deserialize_x86_snapshot(state: &[u8]) -> Option<X86VcpuSnapshot> {
-    if state.len() < SNAP_HEADER_LEN {
-        return None;
-    }
-    let rd = |i: usize| -> u64 {
-        let off = i * 8;
-        u64::from_le_bytes(state[off..off + 8].try_into().unwrap_or([0u8; 8]))
-    };
-    let mut gprs = [0u64; 16];
-    for (i, g) in gprs.iter_mut().enumerate() {
-        *g = rd(i);
-    }
-    let xsave = if state[SNAP_SCALARS * 8] == 1 {
-        let start = SNAP_HEADER_LEN;
-        let end = start + carrick_x86::XSAVE_LEN;
-        if state.len() < end {
-            return None;
-        }
-        let mut xs = [0u8; carrick_x86::XSAVE_LEN];
-        xs.copy_from_slice(&state[start..end]);
-        Some(xs)
-    } else {
-        None
-    };
-    Some(X86VcpuSnapshot {
-        gprs,
-        rip: rd(16),
-        rsp: rd(17),
-        rflags: rd(18),
-        cr0: rd(19),
-        cr3: rd(20),
-        cr4: rd(21),
-        efer: rd(22),
-        fs_base: rd(23),
-        gs_base: rd(24),
-        xsave,
-    })
 }
 
 /// Serialize a `kvm_fpu` into the 512-byte legacy fxsave layout (Intel SDM

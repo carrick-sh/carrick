@@ -116,7 +116,6 @@ impl std::fmt::Debug for ProductionHvpatchPollError {
     }
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExecCompletionOrigin {
     GuestSyscall,
@@ -1300,6 +1299,7 @@ where
         Ok(None)
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_execve(
         &mut self,

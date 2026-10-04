@@ -1531,6 +1531,7 @@ fn write_profile_summary_jsonl(
         .with_context(|| format!("write summary JSON to {}", jsonl_path.display()))
 }
 
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 fn custom_trace_report_is_rejected(
     report: carrick_runtime::dtrace_consumer::DTraceRunReport,
     require_script_exit: bool,

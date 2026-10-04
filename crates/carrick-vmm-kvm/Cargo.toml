@@ -54,3 +54,4 @@ carrick-host = { path = "../carrick-host" }
 kvm-ioctls = "0.22.1"
 kvm-bindings = "0.12.1"
 vmm-sys-util = "0.14.0"
+zerocopy.workspace = true

@@ -869,9 +869,12 @@ pub(crate) mod binding;
 mod zone;
 
 pub(crate) use binding::{
-    ExecutionLeaseCell, HvpatchBlockInput, HvpatchContinuationInput, HvpatchLogicalJobInput,
-    HvpatchSyscallServiceGuard, launch_persistent_hvpatch_job, prepare_hvpatch_logical_job,
+    ExecutionLeaseCell, HvpatchBlockInput, HvpatchContinuationInput, HvpatchSyscallServiceGuard,
+    launch_persistent_hvpatch_job,
 };
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use binding::{HvpatchLogicalJobInput, prepare_hvpatch_logical_job};
 
 #[cfg(test)]
 pub(in crate::vcpu_loop) use binding::{

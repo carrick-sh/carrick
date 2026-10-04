@@ -345,10 +345,13 @@ impl HvpatchProductionPhase {
     const fn probe_ordinal(&self) -> i32 {
         match self {
             Self::Resident => 0,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             Self::BootstrapProcessChild { .. } => 1,
             Self::ResumeForkQuiesce { .. } => 2,
             Self::ResumeJobControlStop { .. } => 3,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             Self::RetryProcessFork { .. } => 4,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             Self::RetryCloneThread { .. } => 5,
             Self::RetryThreadExit { .. } => 6,
             Self::ResumeBlocked { .. } => 7,
@@ -2849,6 +2852,7 @@ where
                     context,
                 )
             }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             DispatchOutcome::Execve { path, argv, env } => {
                 let context = self
                     .state
@@ -2919,6 +2923,7 @@ where
                     }
                 }
             }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
             DispatchOutcome::Fork {
                 flags,
                 pidfd_out,

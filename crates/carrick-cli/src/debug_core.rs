@@ -227,7 +227,7 @@ fn resolve_program_header_count(bytes: &[u8], declared: u16) -> Result<usize, Co
 }
 
 /// Parse and validate, returning the summary.
-pub(crate) fn validate(path: &Path) -> Result<CoreSummary, Box<dyn std::error::Error>> {
+pub(crate) fn validate(path: &Path) -> anyhow::Result<CoreSummary> {
     let bytes = std::fs::read(path)?;
     let summary = validate_bytes(&bytes, &path.display().to_string())?;
     Ok(summary)
@@ -646,7 +646,7 @@ pub(crate) fn validate_bytes(bytes: &[u8], path: &str) -> Result<CoreSummary, Co
 }
 
 /// `carrick debug core <path>`.
-pub(crate) fn run_debug_core(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run_debug_core(path: &Path) -> anyhow::Result<()> {
     let summary = validate(path)?;
     println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
