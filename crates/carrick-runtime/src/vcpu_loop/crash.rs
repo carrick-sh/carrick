@@ -12,6 +12,32 @@ pub(crate) struct PreparedCorePublication {
     pub(crate) fatal_tid: i32,
 }
 
+/// Serialization offset, never a guest address or a memory-read capability.
+struct CoreFileOffset(u64);
+
+/// Consume already captured bytes. Snapshot source selection belongs to the
+/// owner; sparse serialization only accounts for nonzero bytes and file space.
+fn append_core_bytes(
+    extents: &mut Vec<carrick_kernel::core_dump::CoreExtent>,
+    remaining_budget: &mut u64,
+    offset: CoreFileOffset,
+    bytes: &[u8],
+) {
+    for run in carrick_kernel::dispatch::mem::core_data_runs(bytes) {
+        let emitted = run
+            .len()
+            .min(usize::try_from(*remaining_budget).unwrap_or(usize::MAX));
+        if emitted == 0 {
+            break;
+        }
+        *remaining_budget -= emitted as u64;
+        extents.push(carrick_kernel::core_dump::CoreExtent {
+            offset: offset.0 + run.start as u64,
+            bytes: bytes[run.start..run.start + emitted].to_vec(),
+        });
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CrashLeaseDrainBudget {
     pub(crate) timeout: Duration,
@@ -704,19 +730,12 @@ where
                         })?;
                         // Bulk preparation is not guest residency. Zero-filled
                         // pages can be holes without omitting host-written data.
-                        for run in carrick_kernel::dispatch::mem::core_data_runs(&bytes) {
-                            let emitted = run
-                                .len()
-                                .min(usize::try_from(remaining_budget).unwrap_or(usize::MAX));
-                            if emitted == 0 {
-                                break;
-                            }
-                            remaining_budget -= emitted as u64;
-                            extents.push(carrick_kernel::core_dump::CoreExtent {
-                                offset: seg_offset + address - map.start + run.start as u64,
-                                bytes: bytes[run.start..run.start + emitted].to_vec(),
-                            });
-                        }
+                        append_core_bytes(
+                            &mut extents,
+                            &mut remaining_budget,
+                            CoreFileOffset(seg_offset + address - map.start),
+                            &bytes,
+                        );
                         consumed += to_read;
                     }
                 }
