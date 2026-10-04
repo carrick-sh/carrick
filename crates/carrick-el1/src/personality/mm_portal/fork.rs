@@ -7,15 +7,14 @@ use carrick_el1_abi::{
     PinnedMetadataExtent, PortalForkCompletion, PortalForkCustody, PortalForkRequest,
     ReservationNodeFlags,
 };
+use carrick_guest_arch::{FrameGpa, UserVa};
 use carrick_mmu_core::aarch64::descriptor_txn::{JournalEntry, LiveDescriptorWords};
-use carrick_mmu_core::aarch64::{
-    El1PrivateLeafState, TerminalRule, el1_private_leaf_state, split_terminal_descriptor,
-    terminal_rule_edit,
-};
+use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerForkMmu};
 use core::num::NonZeroU64;
 #[cfg(not(target_os = "none"))]
 use std::vec::Vec;
 
+#[cfg(target_os = "none")]
 const PA: u64 = 0x0000_ffff_ffff_f000;
 const SHIFTS: [u32; 4] = [39, 30, 21, 12];
 
@@ -139,12 +138,13 @@ impl ForkScratch {
     }
 }
 
-pub struct PreparedOwnerFork {
+pub struct PreparedOwnerFork<B: OwnerForkMmu = Aarch64Mmu> {
+    backend: core::marker::PhantomData<B>,
     request: PortalForkRequest,
     parent_root: u64,
     scratch: ForkScratch,
 }
-impl PreparedOwnerFork {
+impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
     pub fn custody(&self) -> &[PortalForkCustody] {
         &self.scratch.custody
     }
@@ -155,12 +155,13 @@ impl PreparedOwnerFork {
 
 /// An unpublished memory result. Task admission chooses commit or rollback;
 /// the child gate is closed throughout, and its exact parent undo remains owned.
-pub struct UnpublishedEl1Child {
+pub struct UnpublishedEl1Child<B: OwnerForkMmu = Aarch64Mmu> {
+    backend: core::marker::PhantomData<B>,
     completion: PortalForkCompletion,
     parent_root: u64,
     scratch: ForkScratch,
 }
-impl UnpublishedEl1Child {
+impl<B: OwnerForkMmu> UnpublishedEl1Child<B> {
     pub fn completion(&self) -> PortalForkCompletion {
         self.completion
     }
@@ -196,10 +197,6 @@ impl UnpublishedEl1Child {
         new_ipa: u64,
         old_ipa: u64,
     ) -> Result<(), MmError> {
-        use carrick_mmu_core::aarch64::{
-            El1PrivateLeafState, LeafAccess, el1_private_leaf_state,
-            terminal_descriptor_permits_el0,
-        };
         let mut table = self.parent_root;
         let mut path = [(0u64, 0u64); 4];
         let mut depth = 0;
@@ -208,26 +205,30 @@ impl UnpublishedEl1Child {
             let live = words.load(pa).map_err(|_| MmError::Core)?;
             path[level] = (pa, live);
             depth = level + 1;
-            if level == 3 || live & 3 != 3 {
+            if level == 3 || !B::is_table(live, level) {
                 break;
             }
-            table = live & PA;
+            table = live & B::ADDRESS_MASK;
         }
         let terminal = path[depth - 1].1;
-        let owned = terminal & PA == new_ipa
+        let owned = terminal & B::ADDRESS_MASK == new_ipa
             && depth == 4
-            && el1_private_leaf_state(terminal) == El1PrivateLeafState::Resident
-            && terminal_descriptor_permits_el0(terminal, LeafAccess::Write);
+            && B::is_owned_resident(terminal)
+            && B::is_writable_user(terminal);
         for (level, (pa, live)) in path[..depth].iter().copied().enumerate() {
             if let Some(entry) = self.scratch.edits.iter_mut().find(|entry| entry.pa == pa) {
                 if live != entry.after {
-                    if level != 3 || !owned || entry.after & PA != old_ipa {
+                    if level != 3 || !owned || entry.after & B::ADDRESS_MASK != old_ipa {
                         return Err(MmError::Stale);
                     }
                     entry.after = live;
                     entry.before = live;
                     entry.bbm_len = 0;
-                } else if owned && level < 3 && entry.after & 3 == 3 && entry.before & 3 != 3 {
+                } else if owned
+                    && level < 3
+                    && B::is_table(entry.after, level)
+                    && !B::is_table(entry.before, level)
+                {
                     entry.before = entry.after;
                     entry.bbm_len = 0;
                 }
@@ -237,7 +238,7 @@ impl UnpublishedEl1Child {
     }
     pub fn commit<P: PinnedMetadataExtent>(
         &mut self,
-        portal: &MmPortal<'_, P>,
+        portal: &MmPortal<'_, P, B>,
         worker: u32,
     ) -> Result<PortalForkCompletion, MmError> {
         let request = self.completion.request;
@@ -257,7 +258,7 @@ impl UnpublishedEl1Child {
     }
     pub fn abort<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
         &mut self,
-        portal: &MmPortal<'_, P>,
+        portal: &MmPortal<'_, P, B>,
         words: &W,
         worker: u32,
     ) -> Result<(), MmError> {
@@ -293,12 +294,12 @@ impl UnpublishedEl1Child {
         root.finish_fork_publication(self.completion.request.operation)?;
         self.completion.parent_generation = root.commit_fork_generation()?;
         if !self.scratch.edits.iter().any(|edit| {
-            edit.before & 3 == 3
+            B::is_table(edit.before, 2)
                 && self
                     .completion
                     .request
                     .parent_tables
-                    .contains(edit.before & PA)
+                    .contains(edit.before & B::ADDRESS_MASK)
         }) {
             self.completion.parent_tables_used = 0;
         }
@@ -313,7 +314,7 @@ impl UnpublishedEl1Child {
     }
 }
 
-impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
+impl<P: PinnedMetadataExtent, B: OwnerForkMmu> MmPortal<'_, P, B> {
     pub fn fork_mapping_count(
         &self,
         mm: carrick_el1_abi::ReservationMm,
@@ -395,7 +396,17 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
                 })
                 .count(),
         };
-        census_table(words, &mappings, grant.ttbr0 & PA, 0, 0, &mut count)?;
+        census_table::<B, W>(
+            words,
+            &mappings,
+            B::root(grant.ttbr0)
+                .map_err(|_| MmError::Core)?
+                .address()
+                .raw(),
+            0,
+            0,
+            &mut count,
+        )?;
         drop(editor);
         ForkScratch::bounded(
             request,
@@ -412,7 +423,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
         mut scratch: ForkScratch,
         words: &W,
         worker: u32,
-    ) -> Result<PreparedOwnerFork, MmError> {
+    ) -> Result<PreparedOwnerFork<B>, MmError> {
         if !request.valid() || request.operation.carrier != self.carrier {
             return Err(MmError::Invalid);
         }
@@ -437,7 +448,12 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
             .space_access(worker)?
             .try_begin_closed_child_edit(child_index, request.child_mm.raw(), owner)
             .ok_or(MmError::Busy)?;
-        if child_editor.grant().ttbr0 & PA != request.child_tables.base {
+        if B::root(child_editor.grant().ttbr0)
+            .map_err(|_| MmError::Core)?
+            .address()
+            .raw()
+            != request.child_tables.base
+        {
             return Err(MmError::Stale);
         }
         let mut root = self.root(request.operation.mm, worker)?;
@@ -480,8 +496,11 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
         if capacity_refused {
             return Err(MmError::NoMemory);
         }
-        let parent_root = grant.ttbr0 & PA;
-        copy_table(words, request, &mut scratch, parent_root, 0, 0, 0)?;
+        let parent_root = B::root(grant.ttbr0)
+            .map_err(|_| MmError::Core)?
+            .address()
+            .raw();
+        copy_table::<B, W>(words, request, &mut scratch, parent_root, 0, 0, 0)?;
         if scratch.reads.iter().any(|(pa, _)| {
             request.child_tables.contains(*pa) || request.parent_tables.contains(*pa)
         }) {
@@ -491,6 +510,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
         drop(child_editor);
         drop(editor);
         Ok(PreparedOwnerFork {
+            backend: core::marker::PhantomData,
             request,
             parent_root,
             scratch,
@@ -501,10 +521,10 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
     /// linking any new table, then clones only the owner's reservation tree.
     pub fn publish_fork<W: LiveDescriptorWords + ?Sized>(
         &self,
-        plan: PreparedOwnerFork,
+        plan: PreparedOwnerFork<B>,
         words: &W,
         worker: u32,
-    ) -> Result<UnpublishedEl1Child, MmError> {
+    ) -> Result<UnpublishedEl1Child<B>, MmError> {
         let request = plan.request;
         let owner = NonZeroU64::new(u64::from(worker) + 1).ok_or(MmError::Invalid)?;
         let index = self
@@ -523,7 +543,12 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
             .space_access(worker)?
             .try_begin_closed_child_edit(child_index, request.child_mm.raw(), owner)
             .ok_or(MmError::Busy)?;
-        if child_editor.grant().ttbr0 & PA != request.child_tables.base {
+        if B::root(child_editor.grant().ttbr0)
+            .map_err(|_| MmError::Core)?
+            .address()
+            .raw()
+            != request.child_tables.base
+        {
             return Err(MmError::Stale);
         }
         let mut root = self.root(request.operation.mm, worker)?;
@@ -628,6 +653,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
         words.publish_barrier();
         words.invalidate_range(0, 1 << 48);
         Ok(UnpublishedEl1Child {
+            backend: core::marker::PhantomData,
             completion: PortalForkCompletion {
                 request,
                 child: child_handle,
@@ -681,7 +707,12 @@ enum Policy {
     Wipe,
     Mixed,
 }
-fn policy(mappings: &[Mapping], base: u64, span: u64, descriptor: u64) -> Result<Policy, MmError> {
+fn policy<B: OwnerForkMmu>(
+    mappings: &[Mapping],
+    base: u64,
+    span: u64,
+    descriptor: u64,
+) -> Result<Policy, MmError> {
     let end = base.checked_add(span).ok_or(MmError::Invalid)?;
     let start_index = mappings.partition_point(|mapping| mapping.range.end() <= base);
     let mut result = None;
@@ -718,7 +749,7 @@ fn policy(mappings: &[Mapping], base: u64, span: u64, descriptor: u64) -> Result
             result
         })
     } else {
-        Ok(if descriptor & (1 << 6) == 0 {
+        Ok(if !B::is_user(descriptor) {
             Policy::Keep
         } else {
             Policy::Omit
@@ -732,7 +763,7 @@ struct ForkCensus {
     live: usize,
     custody: usize,
 }
-fn census_table<W: LiveDescriptorWords + ?Sized>(
+fn census_table<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
     words: &W,
     mappings: &[Mapping],
     table: u64,
@@ -743,7 +774,7 @@ fn census_table<W: LiveDescriptorWords + ?Sized>(
     count.child = count.child.checked_add(512).ok_or(MmError::NoMemory)?;
     count.live = count.live.checked_add(512).ok_or(MmError::NoMemory)?;
     for index in 0..512 {
-        census_entry(
+        census_entry::<B, W>(
             words,
             mappings,
             words.load(table + index * 8).map_err(|_| MmError::Core)?,
@@ -754,7 +785,7 @@ fn census_table<W: LiveDescriptorWords + ?Sized>(
     }
     Ok(())
 }
-fn census_entry<W: LiveDescriptorWords + ?Sized>(
+fn census_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
     words: &W,
     mappings: &[Mapping],
     descriptor: u64,
@@ -765,29 +796,36 @@ fn census_entry<W: LiveDescriptorWords + ?Sized>(
     if descriptor == 0 {
         return Ok(());
     }
-    if level < 3 && descriptor & 3 == 3 {
-        return census_table(words, mappings, descriptor & PA, level + 1, va, count);
+    if B::is_table(descriptor, level) {
+        return census_table::<B, W>(
+            words,
+            mappings,
+            descriptor & B::ADDRESS_MASK,
+            level + 1,
+            va,
+            count,
+        );
     }
     if level == 0 {
         return Err(MmError::Core);
     }
-    if descriptor & 1 == 0 && el1_private_leaf_state(descriptor) == El1PrivateLeafState::Unowned {
+    if B::is_absent_unowned(descriptor) {
         return Ok(());
     }
     let span = 1u64 << SHIFTS[level];
     const CONTROL: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE - 0x2_0000;
-    let structural = va < CONTROL + 0x20_0000 && va + span > CONTROL;
-    let selected = policy(mappings, va, span, descriptor)?;
+    let structural = B::PRIVATE_CONTROL_WINDOW && va < CONTROL + 0x20_0000 && va + span > CONTROL;
+    let selected = policy::<B>(mappings, va, span, descriptor)?;
     if (structural || selected == Policy::Mixed) && level < 3 {
         count.child = count.child.checked_add(512).ok_or(MmError::NoMemory)?;
         if !structural {
             count.parent = count.parent.checked_add(512).ok_or(MmError::NoMemory)?;
         }
         for index in 0..512 {
-            census_entry(
+            census_entry::<B, W>(
                 words,
                 mappings,
-                split_terminal_descriptor(descriptor, level, index)?,
+                B::split(descriptor, level, index).map_err(|_| MmError::Core)?,
                 level + 1,
                 va + ((index as u64) << SHIFTS[level + 1]),
                 count,
@@ -796,21 +834,20 @@ fn census_entry<W: LiveDescriptorWords + ?Sized>(
     } else if structural {
         let alias = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE;
         if !(alias..alias + carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE).contains(&va)
-            && descriptor & PA != 0
+            && descriptor & B::ADDRESS_MASK != 0
         {
             count.custody = count.custody.checked_add(1).ok_or(MmError::NoMemory)?;
         }
-    } else if (selected == Policy::Private
-        || (selected == Policy::Keep && descriptor & (1 << 6) != 0))
-        && el1_private_leaf_state(descriptor) != El1PrivateLeafState::Retired
-        && descriptor & (PA & !(span - 1)) != 0
+    } else if (selected == Policy::Private || (selected == Policy::Keep && B::is_user(descriptor)))
+        && !B::is_retired(descriptor)
+        && descriptor & (B::ADDRESS_MASK & !(span - 1)) != 0
     {
         count.custody = count.custody.checked_add(1).ok_or(MmError::NoMemory)?;
     }
     Ok(())
 }
 
-fn copy_table<W: LiveDescriptorWords + ?Sized>(
+fn copy_table<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
     words: &W,
     request: PortalForkRequest,
     scratch: &mut ForkScratch,
@@ -827,7 +864,7 @@ fn copy_table<W: LiveDescriptorWords + ?Sized>(
         }
         scratch.reads.push((address, descriptor));
         let va = base + ((index as u64) << SHIFTS[level]);
-        let (parent, child) = copy_entry(words, request, scratch, descriptor, level, va)?;
+        let (parent, child) = copy_entry::<B, W>(words, request, scratch, descriptor, level, va)?;
         scratch.child[child_offset + index] = child;
         if parent != descriptor {
             if scratch.edits.len() == scratch.edits.capacity() {
@@ -838,7 +875,7 @@ fn copy_table<W: LiveDescriptorWords + ?Sized>(
                 before: descriptor,
                 after: parent,
                 bbm_va: va,
-                bbm_len: if descriptor & 1 != 0 && parent & 3 == 3 && level < 3 {
+                bbm_len: if B::needs_break_before_make(descriptor, parent, level) {
                     1 << SHIFTS[level]
                 } else {
                     0
@@ -848,7 +885,7 @@ fn copy_table<W: LiveDescriptorWords + ?Sized>(
     }
     Ok(())
 }
-fn copy_entry<W: LiveDescriptorWords + ?Sized>(
+fn copy_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
     words: &W,
     request: PortalForkRequest,
     scratch: &mut ForkScratch,
@@ -859,39 +896,42 @@ fn copy_entry<W: LiveDescriptorWords + ?Sized>(
     if descriptor == 0 {
         return Ok((0, 0));
     }
-    if level < 3 && descriptor & 3 == 3 {
+    if B::is_table(descriptor, level) {
         let child = scratch.allocate_child()?;
-        copy_table(
+        copy_table::<B, W>(
             words,
             request,
             scratch,
-            descriptor & PA,
+            descriptor & B::ADDRESS_MASK,
             level + 1,
             va,
             child,
         )?;
         return Ok((
             descriptor,
-            (request.child_tables.base + child as u64 * 8) | 3,
+            B::table_word(
+                FrameGpa::new(request.child_tables.base + child as u64 * 8),
+                Some(descriptor),
+            ),
         ));
     }
     if level == 0 {
         return Err(MmError::Core);
     }
-    if descriptor & 1 == 0 && el1_private_leaf_state(descriptor) == El1PrivateLeafState::Unowned {
+    if B::is_absent_unowned(descriptor) {
         return Ok((descriptor, descriptor));
     }
-    if el1_private_leaf_state(descriptor) == El1PrivateLeafState::Retired {
+    if B::is_retired(descriptor) {
         return Ok((descriptor, 0));
     }
     let span = 1u64 << SHIFTS[level];
     const CONTROL: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE - 0x2_0000;
-    let structural = va < CONTROL + 0x20_0000 && va + span > CONTROL;
+    let structural = B::PRIVATE_CONTROL_WINDOW && va < CONTROL + 0x20_0000 && va + span > CONTROL;
     if structural && level < 3 {
         let child = scratch.allocate_child()?;
         for index in 0..512 {
-            let original = split_terminal_descriptor(descriptor, level, index)?;
-            let (_, inherited) = copy_entry(
+            let original = B::split(descriptor, level, index).map_err(|_| MmError::Core)?;
+            let (_, inherited) = copy_entry::<B, W>(
                 words,
                 request,
                 scratch,
@@ -903,7 +943,10 @@ fn copy_entry<W: LiveDescriptorWords + ?Sized>(
         }
         return Ok((
             descriptor,
-            (request.child_tables.base + child as u64 * 8) | 3,
+            B::table_word(
+                FrameGpa::new(request.child_tables.base + child as u64 * 8),
+                None,
+            ),
         ));
     }
     if structural {
@@ -914,20 +957,23 @@ fn copy_entry<W: LiveDescriptorWords + ?Sized>(
             if !request.child_tables.contains(output) {
                 return Err(MmError::NoMemory);
             }
-            return Ok((descriptor, (descriptor & !PA) | output));
+            return Ok((descriptor, (descriptor & !B::ADDRESS_MASK) | output));
         }
-        if descriptor & (1 << 7) == 0 {
-            let source_ipa = descriptor & PA;
+        if B::control_needs_copy(descriptor) {
+            let source_ipa = descriptor & B::ADDRESS_MASK;
             let destination_ipa = request.kernel_control_ipa + (va - CONTROL);
             scratch.custody(PortalForkCustody::StructuralCopy {
                 source_ipa,
                 destination_ipa,
                 len: span,
-                executable: descriptor & (1 << 53) == 0,
+                executable: B::is_executable_control(descriptor),
             })?;
-            return Ok((descriptor, (descriptor & !PA) | destination_ipa));
+            return Ok((
+                descriptor,
+                (descriptor & !B::ADDRESS_MASK) | destination_ipa,
+            ));
         }
-        let ipa = descriptor & PA;
+        let ipa = descriptor & B::ADDRESS_MASK;
         if ipa != 0 {
             scratch.custody(PortalForkCustody::Frame {
                 va,
@@ -938,7 +984,7 @@ fn copy_entry<W: LiveDescriptorWords + ?Sized>(
         }
         return Ok((descriptor, descriptor));
     }
-    let policy = policy(&scratch.mappings, va, span, descriptor)?;
+    let policy = policy::<B>(&scratch.mappings, va, span, descriptor)?;
     if policy == Policy::Mixed {
         if level == 3 {
             return Err(MmError::Core);
@@ -947,8 +993,8 @@ fn copy_entry<W: LiveDescriptorWords + ?Sized>(
         let parent = scratch.allocate_parent()?;
         let mut parent_changed = false;
         for index in 0..512 {
-            let original = split_terminal_descriptor(descriptor, level, index)?;
-            let (updated, inherited) = copy_entry(
+            let original = B::split(descriptor, level, index).map_err(|_| MmError::Core)?;
+            let (updated, inherited) = copy_entry::<B, W>(
                 words,
                 request,
                 scratch,
@@ -962,24 +1008,28 @@ fn copy_entry<W: LiveDescriptorWords + ?Sized>(
         }
         return Ok((
             if parent_changed {
-                (request.parent_tables.base + parent as u64 * 8) | 3
+                B::table_word(
+                    FrameGpa::new(request.parent_tables.base + parent as u64 * 8),
+                    None,
+                )
             } else {
                 descriptor
             },
-            (request.child_tables.base + child as u64 * 8) | 3,
+            B::table_word(
+                FrameGpa::new(request.child_tables.base + child as u64 * 8),
+                None,
+            ),
         ));
     }
     match policy {
         Policy::Omit | Policy::Wipe => Ok((descriptor, 0)),
         Policy::Private => {
-            if el1_private_leaf_state(descriptor) == El1PrivateLeafState::Retired {
+            if B::is_retired(descriptor) {
                 return Ok((descriptor, 0));
             }
             let armed =
-                terminal_rule_edit(true, TerminalRule::fork_arm(true), descriptor, level, va)
-                    .map_err(|_| MmError::Core)?
-                    .unwrap_or(descriptor);
-            let output_mask = PA & !(span - 1);
+                B::arm_private(descriptor, level, UserVa::new(va)).map_err(|_| MmError::Core)?;
+            let output_mask = B::ADDRESS_MASK & !(span - 1);
             let ipa = descriptor & output_mask;
             if ipa != 0 {
                 scratch.custody(PortalForkCustody::Frame {
@@ -992,9 +1042,9 @@ fn copy_entry<W: LiveDescriptorWords + ?Sized>(
             Ok((armed, armed))
         }
         Policy::Keep => {
-            let output_mask = PA & !(span - 1);
+            let output_mask = B::ADDRESS_MASK & !(span - 1);
             let ipa = descriptor & output_mask;
-            if ipa != 0 && descriptor & (1 << 6) != 0 {
+            if ipa != 0 && B::is_user(descriptor) {
                 scratch.custody(PortalForkCustody::Frame {
                     va,
                     ipa,

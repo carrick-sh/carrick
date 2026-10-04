@@ -18,6 +18,9 @@ pub mod lock;
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub mod memory;
 pub mod personality;
+// Both freestanding entries can name the same owner hardware interface.
+// The x86 production portal export waits for the N1 grant-service handoff.
+pub use carrick_mmu_core::owner_mmu;
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub mod substrate;
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]

@@ -1237,9 +1237,9 @@ fn reservation_policy_readonly_none_and_retire_refuse_exact_mm() {
     }
 }
 
-struct ForkWords<'a> {
-    arenas: &'a [&'a Tables],
-    loads: core::cell::Cell<usize>,
+pub(super) struct ForkWords<'a> {
+    pub(super) arenas: &'a [&'a Tables],
+    pub(super) loads: core::cell::Cell<usize>,
 }
 impl carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords for ForkWords<'_> {
     fn load(
@@ -1303,7 +1303,7 @@ impl carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords for ForkWord
     fn publish_barrier(&self) {}
     fn invalidate_range(&self, _: u64, _: u64) {}
 }
-fn fork_request(
+pub(super) fn fork_request(
     region: &Region,
     spaces: &AddressSpaces,
     parent: ReservationMm,

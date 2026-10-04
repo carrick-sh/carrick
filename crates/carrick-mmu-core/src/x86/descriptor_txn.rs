@@ -272,6 +272,40 @@ fn validate_entry(entry: u64, level: usize) -> Result<(), DescriptorRefusal> {
     }
     Ok(())
 }
+
+/// Split one coarse terminal without changing PAT or prepared/COW state.
+pub fn split_terminal_descriptor(
+    entry: u64,
+    level: usize,
+    index: usize,
+) -> Result<u64, DescriptorRefusal> {
+    if !matches!(level, 1 | 2) || index >= 512 || entry & HUGE == 0 {
+        return Err(DescriptorRefusal::Malformed);
+    }
+    validate_entry(entry, level)?;
+    let mut flags = (entry & !ADDRESS) & !HUGE;
+    let pat = entry & PAT_LARGE != 0;
+    if level + 1 < 3 {
+        flags |= HUGE;
+        if pat {
+            flags |= PAT_LARGE;
+        }
+    } else if pat {
+        flags |= HUGE;
+    }
+    Ok((leaf_output(entry, level) + index as u64 * level_bytes(level + 1)) | flags)
+}
+
+pub fn arm_cow_terminal(entry: u64) -> Result<u64, DescriptorRefusal> {
+    if entry & (PRESENT | PREPARED) == 0 {
+        return Err(DescriptorRefusal::MissingTable);
+    }
+    Ok(if entry & WRITE != 0 {
+        (entry & !WRITE) | COW | MAY_WRITE
+    } else {
+        entry
+    })
+}
 struct Planner<'a, 't, W: LiveDescriptorWords + ?Sized> {
     words: &'a W,
     txn: &'a DescriptorTxn<'t>,
@@ -319,22 +353,10 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
     }
     fn split(&mut self, entry: u64, level: usize) -> Result<u64, DescriptorRefusal> {
         let child = self.grant()?;
-        let output = leaf_output(entry, level);
-        let mut flags = entry & !ADDRESS;
-        let pat = entry & PAT_LARGE != 0;
-        flags &= !HUGE;
-        if level + 1 < 3 {
-            flags |= HUGE;
-            if pat {
-                flags |= PAT_LARGE;
-            }
-        } else if pat {
-            flags |= HUGE;
-        }
         for index in 0..512 {
             self.set(
                 child + index * 8,
-                (output + index * level_bytes(level + 1)) | flags,
+                split_terminal_descriptor(entry, level, index as usize)?,
             )?;
         }
         Ok(child)
@@ -453,16 +475,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 }
                 entry & !(WRITE | USER | NX | MAY_WRITE) | permissions(p)
             }
-            DescriptorOp::ArmCow(_) => {
-                if entry & (PRESENT | PREPARED) == 0 {
-                    return Err(DescriptorRefusal::MissingTable);
-                }
-                if entry & WRITE != 0 {
-                    (entry & !WRITE) | COW | MAY_WRITE
-                } else {
-                    entry
-                }
-            }
+            DescriptorOp::ArmCow(_) => arm_cow_terminal(entry)?,
             DescriptorOp::CowRepoint { old, new, .. } => {
                 if entry & COW == 0 || entry & MAY_WRITE == 0 {
                     return Err(DescriptorRefusal::NotCowArmed);

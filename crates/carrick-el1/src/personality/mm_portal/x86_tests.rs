@@ -8,6 +8,65 @@ use carrick_sched_core::AddressSpaces;
 use core::sync::atomic::Ordering;
 
 #[test]
+fn x86_owner_fork_arms_private_pages_and_abort_restores_parent() {
+    use super::tests::{ForkWords, fork_request};
+    use carrick_mmu_core::x86::descriptor_txn::{COW, MAY_WRITE};
+    for pages in [16, 64, 256] {
+        let region = Region::new();
+        let spaces = AddressSpaces::new();
+        let parent = admit(&region, &spaces, 77, ROOT, pages, 0);
+        let view = nodes(&region);
+        let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view)
+            .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
+        let tables = Tables::new(ROOT, IPA, pages);
+        for (entry, offset) in [(0, 4096), (513, 8192), (1024, 12288)] {
+            tables.words[entry].store((ROOT + offset) | PRESENT | WRITE | USER, Ordering::Relaxed);
+        }
+        for page in 0..pages {
+            tables.words[1536 + page].store(
+                (IPA + page as u64 * 4096) | PRESENT | WRITE | USER | NX,
+                Ordering::Relaxed,
+            );
+        }
+        let child = Tables::new(ROOT + 0x100000, 0, 0);
+        let supply = Tables::new(ROOT + 0x200000, 0, 0);
+        let request = fork_request(&region, &spaces, parent, 78, &child, &supply);
+        let arenas = [&tables, &child, &supply];
+        let words = ForkWords {
+            arenas: &arenas,
+            loads: core::cell::Cell::new(0),
+        };
+        let plan = portal
+            .prepare_fork(
+                request,
+                portal.census_fork(request, &words, 0).unwrap(),
+                &words,
+                0,
+            )
+            .unwrap();
+        assert_eq!(plan.custody().len(), pages);
+        let mut pending = portal.publish_fork(plan, &words, 0).unwrap();
+        for page in 0..pages {
+            let parent_word = tables.words[1536 + page].load(Ordering::Acquire);
+            assert_eq!(parent_word & (WRITE | COW | MAY_WRITE), COW | MAY_WRITE);
+            assert_eq!(
+                child.words[1536 + page].load(Ordering::Acquire),
+                parent_word
+            );
+        }
+        pending.abort(&portal, &words, 0).unwrap();
+        for page in 0..pages {
+            let parent_word = tables.words[1536 + page].load(Ordering::Acquire);
+            assert_eq!(parent_word & (WRITE | COW | MAY_WRITE), WRITE);
+        }
+        assert!(!region.table().admitted(
+            spaces.find(78).unwrap().index(),
+            ReservationMm::new(78).unwrap()
+        ));
+    }
+}
+
+#[test]
 fn x86_owner_transfer_scales_with_touched_pages_and_preserves_two_mm_identity() {
     for pages in [16, 64, 256] {
         let mut region = Region::new();
