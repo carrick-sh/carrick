@@ -63,9 +63,11 @@
 //!     generation check).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
+use carrick_hal::{SharedFutexKey, SharedFutexLocation};
 use parking_lot::Mutex as ParkingMutex;
 use parking_lot_core::{FilterOp, ParkResult, ParkToken, RequeueOp, UnparkResult, UnparkToken};
 
@@ -1054,6 +1056,16 @@ pub struct FutexTable {
     /// Continuation-model wait queues sharded by futex address.
     queues: Box<[Arc<ParkingMutex<FutexQueue>>; FUTEX_SHARDS]>,
     next_ticket: AtomicU64,
+    /// Exact shared-word identities belong to this queue owner. Two kernel
+    /// instances may use the same file word without sharing a wait queue.
+    shared_keys: Box<[ParkingMutex<HashMap<CarrierKey, u64>>; FUTEX_SHARDS]>,
+    next_shared_key: AtomicU64,
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+enum CarrierKey {
+    Shared(SharedFutexKey),
+    Auxiliary(u64),
 }
 
 impl FutexTable {
@@ -1067,7 +1079,34 @@ impl FutexTable {
                 Arc::new(ParkingMutex::new(FutexQueue::default()))
             })),
             next_ticket: AtomicU64::new(0),
+            shared_keys: Box::new(std::array::from_fn(|_| ParkingMutex::new(HashMap::new()))),
+            next_shared_key: AtomicU64::new(1),
         }
+    }
+
+    fn intern_carrier_key(&self, key: CarrierKey) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let shard = (hasher.finish() as usize) % FUTEX_SHARDS;
+        let mut map = self.shared_keys[shard].lock();
+        *map.entry(key).or_insert_with(|| {
+            let id = self.next_shared_key.fetch_add(1, Ordering::Relaxed);
+            if id == u64::MAX {
+                carrick_fatal::carrick_fatal!(
+                    "thread::shared_futex",
+                    "carrier futex key ID overflow"
+                );
+            }
+            id
+        })
+    }
+
+    pub fn shared_key(&self, location: SharedFutexLocation) -> u64 {
+        self.intern_carrier_key(CarrierKey::Shared(location.key()))
+    }
+
+    pub fn auxiliary_key(&self, key: u64) -> u64 {
+        self.intern_carrier_key(CarrierKey::Auxiliary(key))
     }
 
     /// Attach the wake callback to a queued wait. `Ready` means a wake already

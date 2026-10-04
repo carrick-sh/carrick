@@ -19,15 +19,10 @@
 //! guest processes as separate host processes and therefore still need a real
 //! cross-process kernel primitive.
 
-use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
-use carrick_fatal::carrick_fatal;
-use carrick_hal::{FutexOutcome, PlatformFutex, SharedFutexKey, SharedFutexLocation, ThreadId};
-use parking_lot::Mutex;
+use carrick_hal::{FutexOutcome, PlatformFutex, SharedFutexLocation, ThreadId};
 
 use crate::thread::{FutexTable, FutexWaitOutcome};
 
@@ -57,50 +52,18 @@ pub fn carrier_shared_futex_table() -> &'static Arc<FutexTable> {
     TABLE.get_or_init(|| Arc::new(FutexTable::new()))
 }
 
-const CARRIER_KEY_SHARDS: usize = 64;
-
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
-enum CarrierKey {
-    Shared(SharedFutexKey),
-    Auxiliary(u64),
-}
-
-struct CarrierKeys {
-    shards: [Mutex<HashMap<CarrierKey, u64>>; CARRIER_KEY_SHARDS],
-    next: AtomicU64,
-}
-
 /// Intern an exact key into the carrier's existing queue index. The map
 /// compares full file identities and offsets; hashing chooses only a lock.
 /// IDs are never recycled while the carrier lives, so stale queued waits
 /// cannot join a new owner after an address or inode is reused.
-fn carrier_futex_key(key: CarrierKey) -> u64 {
-    static KEYS: OnceLock<CarrierKeys> = OnceLock::new();
-    let keys = KEYS.get_or_init(|| CarrierKeys {
-        shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
-        next: AtomicU64::new(1),
-    });
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    let shard = (hasher.finish() as usize) % CARRIER_KEY_SHARDS;
-    let mut map = keys.shards[shard].lock();
-    *map.entry(key).or_insert_with(|| {
-        let id = keys.next.fetch_add(1, Ordering::Relaxed);
-        if id == u64::MAX {
-            carrick_fatal!("thread::shared_futex", "carrier futex key ID overflow");
-        }
-        id
-    })
-}
-
 pub fn carrier_shared_futex_key(location: SharedFutexLocation) -> u64 {
-    carrier_futex_key(CarrierKey::Shared(location.key()))
+    carrier_shared_futex_table().shared_key(location)
 }
 
 /// The SysV wait channels share the same table but occupy a disjoint key
 /// namespace, so a file or direct futex cannot consume their wake.
 pub fn carrier_aux_futex_key(key: u64) -> u64 {
-    carrier_futex_key(CarrierKey::Auxiliary(key))
+    carrier_shared_futex_table().auxiliary_key(key)
 }
 
 impl PlatformFutex for FutexTableFutex {
@@ -521,6 +484,33 @@ mod tests {
         assert_eq!(second_hits.load(Ordering::SeqCst), 0);
         assert_eq!(table.wake(second_key, 1), 1);
         assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn two_futex_table_owners_do_not_share_file_word_waits() {
+        let identity = SharedFutexFileIdentity {
+            device: 0x1234,
+            inode: 0x5678,
+        };
+        let word = std::sync::atomic::AtomicU32::new(7);
+        let location = SharedFutexLocation::File {
+            word: HostVa(std::ptr::from_ref(&word) as usize),
+            identity,
+            offset: 0x40,
+            waiter_key: carrick_host::futex_key::shared_futex_waiter_key(identity, 0x40),
+        };
+        let first = FutexTable::new();
+        let second = FutexTable::new();
+        let first_key = first.shared_key(location);
+        let second_key = second.shared_key(location);
+        let first_wait = first.prepare_wait(first_key);
+        let second_wait = second.prepare_wait(second_key);
+
+        assert_eq!(first.wake(first_key, 1), 1);
+        assert!(first.take_woken(&first_wait));
+        assert!(!second.is_woken(&second_wait));
+        assert_eq!(second.wake(second_key, 1), 1);
+        assert!(second.take_woken(&second_wait));
     }
 
     #[test]
