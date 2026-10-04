@@ -1195,6 +1195,11 @@ impl HvfTaskState {
             address: copy_address,
             length: bytes.len(),
         };
+        // The owner route consumes an authenticated physical transfer, never
+        // this helper's host-selected mapping. Keep the legacy borrow through
+        // the copy so admission cannot retire that venue between selection
+        // and the last byte.
+        let _legacy = self.protections.legacy().ok_or_else(error)?;
         let write = self
             .with_mapping_for_range_in(custody, lookup_address, bytes.len(), |source| {
                 source.begin_access(
@@ -1228,6 +1233,12 @@ impl HvfTaskState {
         copy_address: u64,
         dst: &mut [u8],
     ) -> Option<Result<MappingView, MemoryError>> {
+        let Some(_legacy) = self.protections.legacy() else {
+            return Some(Err(MemoryError::OutOfBounds {
+                address: copy_address,
+                length: dst.len(),
+            }));
+        };
         let read =
             self.with_mapping_for_range_in(custody, lookup_address, dst.len(), |source| {
                 source.begin_access(
@@ -1379,9 +1390,7 @@ mod n1_policy_tests {
         mm
     }
 
-    #[test]
-    fn n1_policy_and_backing_have_no_host_semantic_authority() {
-        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    fn policy_and_backing_violations(check_host_policy: bool) -> Vec<String> {
         exact_compound_returns_and_reuse();
         let policies = [
             ("private-anon", Flags::ANONYMOUS_PRIVATE),
@@ -1459,6 +1468,9 @@ mod n1_policy_tests {
                     if unsafe { std::slice::from_raw_parts(backing.ptr(), 4) } != [fill; 4] {
                         violations.push(format!("{name}/mm={ordinal}: predecessor bytes changed"));
                     }
+                    if !check_host_policy {
+                        continue;
+                    }
                     let index = spaces.find(mm.raw()).unwrap().index();
                     let mut host = region
                         .table()
@@ -1478,6 +1490,23 @@ mod n1_policy_tests {
                 }
             }
         }
+        violations
+    }
+
+    #[test]
+    fn n1_admitted_mapping_helpers_require_owner_transfer() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let violations = policy_and_backing_violations(false);
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+    }
+
+    #[test]
+    fn n1_policy_and_backing_have_no_host_semantic_authority() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let mut violations = policy_and_backing_violations(true);
+        violations.extend(
+            super::super::guest_cow::n1_physical_tests::publication_rollback_matrix(&_guard),
+        );
         assert!(
             violations.is_empty(),
             "N1 host semantic authority:\n{}",

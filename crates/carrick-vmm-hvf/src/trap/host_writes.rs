@@ -48,6 +48,9 @@ impl MappingSource<'_> {
             address,
             length: len,
         };
+        // A physical generation authenticates backing, not guest access.
+        // Admitted MMs must arrive through owner-issued UserTransfer pins.
+        let _legacy = task.protections.legacy().ok_or_else(error)?;
         let view = self.view();
         let offset = address.checked_sub(view.start).ok_or_else(error)?;
         let end = address.checked_add(len as u64).ok_or_else(error)?;
