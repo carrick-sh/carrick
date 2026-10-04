@@ -428,6 +428,7 @@ impl Drop for ProcessForkCoordinator {
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
 where
     E::SiblingSpec: 'static,

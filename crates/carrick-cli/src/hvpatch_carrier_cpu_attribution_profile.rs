@@ -48,7 +48,7 @@ pub(crate) fn program_sha256() -> String {
     format!(
         "{:x}",
         Sha256::digest(
-            carrick_runtime::dtrace_consumer::BUNDLED_HVPATCH_CARRIER_CPU_ATTRIBUTION_D.as_bytes(),
+            include_str!("../../../scripts/dtrace/hvpatch-carrier-cpu-attribution.d").as_bytes(),
         )
     )
 }

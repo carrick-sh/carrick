@@ -214,7 +214,6 @@ pub mod vcpu_loop;
 // macOS `runtime.rs` arm; both `runtime` arms re-export them so the original
 // `crate::runtime::…` call-site paths resolve on every platform).
 pub mod debug_state;
-#[cfg(feature = "platform-macos")]
 pub mod execute;
 pub(crate) mod hvpatch;
 pub mod prepare;
