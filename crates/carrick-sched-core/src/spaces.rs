@@ -1125,6 +1125,7 @@ mod tests {
             "actual editor release must publish the failed probe's producer edge"
         );
         zone.spaces.close(index);
-        zone.close_space_notifications(index, identity).unwrap();
+        zone.close_space_notifications(index, identity, venue)
+            .unwrap();
     }
 }
