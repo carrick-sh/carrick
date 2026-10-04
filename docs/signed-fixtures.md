@@ -86,6 +86,12 @@ are published atomically, and the installed receipt at
 `target/fixtures/installed.json` is published last. An interrupted restore
 has no acceptance authority; there is no promise of a multi-directory atomic
 filesystem transaction. Verify always reads every installed executable again.
+Publication performs one durability flush on the final receipt, rather than
+one storage flush per executable. The `host.fixtures.publication` structural
+budget is one flush per restore, independent of executable population; its
+VM-free binding checks both 9 and 71 executable destinations. A receipt alone
+never authorizes files after interruption or power loss: verification rehashes
+every installed path and rejects missing or changed bytes.
 
 Signed acceptance in both profiles records a fixture verification step and
 fails before signing or guest execution if it cannot verify the installed
