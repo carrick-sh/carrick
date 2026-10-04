@@ -117,6 +117,8 @@ pub struct EveryChildRuns {
     within: Duration,
     pending: Arc<Mutex<HashMap<TaskKey, mpsc::Sender<()>>>>,
     aborted: Arc<Mutex<Option<AuditReason>>>,
+    #[cfg(test)]
+    watchdogs: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl EveryChildRuns {
@@ -125,6 +127,8 @@ impl EveryChildRuns {
             within,
             pending: Arc::new(Mutex::new(HashMap::new())),
             aborted: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            watchdogs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -153,7 +157,7 @@ impl KernelAuditor for EveryChildRuns {
         let within = self.within;
         let aborted = Arc::clone(&self.aborted);
         let pending = Arc::clone(&self.pending);
-        std::thread::Builder::new()
+        let _watchdog = std::thread::Builder::new()
             .name(format!("every-child-runs-{}", child.id.raw()))
             .spawn(move || {
                 // ONLY a real timeout is an expiry. A `Disconnected` means
@@ -172,6 +176,8 @@ impl KernelAuditor for EveryChildRuns {
                 }
             })
             .ok();
+        #[cfg(test)]
+        self.watchdogs.lock().extend(_watchdog);
         AuditVerdict::Continue
     }
 
@@ -224,6 +230,8 @@ pub struct ExitBudget {
     within: Duration,
     pending: Arc<Mutex<HashMap<TaskKey, mpsc::Sender<()>>>>,
     aborted: Arc<Mutex<Option<AuditReason>>>,
+    #[cfg(test)]
+    watchdogs: Arc<Mutex<Vec<std::thread::JoinHandle<()>>>>,
 }
 
 impl ExitBudget {
@@ -233,6 +241,8 @@ impl ExitBudget {
             within,
             pending: Arc::new(Mutex::new(HashMap::new())),
             aborted: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            watchdogs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -249,7 +259,7 @@ impl ExitBudget {
         self.pending.lock().insert(task, tx);
         let aborted = Arc::clone(&self.aborted);
         let pending = Arc::clone(&self.pending);
-        std::thread::Builder::new()
+        let _watchdog = std::thread::Builder::new()
             .name(format!("exit-budget-{}", task.id.raw()))
             .spawn(move || {
                 // ONLY a real timeout is an expiry -- see the note in
@@ -269,6 +279,8 @@ impl ExitBudget {
                 }
             })
             .ok();
+        #[cfg(test)]
+        self.watchdogs.lock().extend(_watchdog);
     }
 }
 
@@ -474,7 +486,10 @@ mod tests {
             auditor.fork_admitted(parent, child2, ForkKind::Fork),
             AuditVerdict::Continue
         );
-        std::thread::sleep(Duration::from_millis(100));
+        // Observe completed watchdog work; a sleep cannot guarantee scheduling.
+        for watchdog in std::mem::take(&mut *auditor.watchdogs.lock()) {
+            watchdog.join().unwrap();
+        }
 
         let verdict = auditor.child_first_run(child2, exec, cpu);
         assert_eq!(
@@ -509,7 +524,9 @@ mod tests {
             auditor.fork_admitted(parent, child2, ForkKind::Fork),
             AuditVerdict::Continue
         );
-        std::thread::sleep(Duration::from_millis(100));
+        for watchdog in std::mem::take(&mut *auditor.watchdogs.lock()) {
+            watchdog.join().unwrap();
+        }
 
         let verdict = auditor.exit_settled(child2, wait_status, ExitOwner::Task(parent));
         assert_eq!(
