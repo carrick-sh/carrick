@@ -31,7 +31,8 @@ ordinal!(
     CounterTick,
     CanonicalOrdinal,
     NativeOrdinal,
-    UserFlags
+    UserFlags,
+    FatalCode
 );
 
 macro_rules! generation {
@@ -51,6 +52,7 @@ generation!(
     ExecutionGeneration,
     MmGeneration,
     ContextGeneration,
+    CpuGeneration,
     BackingGeneration,
     OperationSequence,
     CounterFrequency
@@ -187,7 +189,7 @@ impl CpuId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuTarget {
     pub cpu: CpuId,
-    pub generation: ContextGeneration,
+    pub generation: CpuGeneration,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WakeToken {
@@ -225,15 +227,36 @@ pub struct OwnedHostRequest<P> {
     pub kind: HostRequestKind,
     pub payload: P,
 }
-#[derive(Debug, Eq, PartialEq)]
-pub struct RequestToken {
-    pub task: TaskIdentity,
-    pub operation: OperationSequence,
+/// The backend's owned ticket carries completion custody. Copyable identity
+/// fields alone cannot manufacture or duplicate a pending completion.
+#[derive(Debug)]
+pub struct RequestToken<T> {
+    task: TaskIdentity,
+    operation: OperationSequence,
+    ticket: T,
+}
+impl<T> RequestToken<T> {
+    pub const fn new(task: TaskIdentity, operation: OperationSequence, ticket: T) -> Self {
+        Self {
+            task,
+            operation,
+            ticket,
+        }
+    }
+    pub const fn task(&self) -> TaskIdentity {
+        self.task
+    }
+    pub const fn operation(&self) -> OperationSequence {
+        self.operation
+    }
+    pub fn into_ticket(self) -> T {
+        self.ticket
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FatalReport {
     pub task: Option<TaskIdentity>,
-    pub detail: OperationSequence,
+    pub detail: FatalCode,
 }
 
 /// Native frames and owner capabilities are supplied by the respective owner.
@@ -253,6 +276,7 @@ pub trait ArchTypes {
     type HardwareInterrupt;
     type InterruptMask;
     type HostPayload;
+    type HostTicket;
     type HostCompletion;
 }
 
@@ -292,6 +316,7 @@ impl<B: ArchTypes> ArchTypes for Arch<B> {
     type HardwareInterrupt = B::HardwareInterrupt;
     type InterruptMask = B::InterruptMask;
     type HostPayload = B::HostPayload;
+    type HostTicket = B::HostTicket;
     type HostCompletion = B::HostCompletion;
 }
 
@@ -343,8 +368,8 @@ arch_trait!(InterruptArch, InterruptBackend {
     fn current_cpu() -> CpuId;
 });
 arch_trait!(CrossingArch, CrossingBackend {
-    fn submit_host_request(request: OwnedHostRequest<Self::HostPayload>) -> Result<RequestToken, Self::Error>;
-    fn consume_completion(token: RequestToken) -> Result<Self::HostCompletion, Self::Error>;
+    fn submit_host_request(request: OwnedHostRequest<Self::HostPayload>) -> Result<RequestToken<Self::HostTicket>, Self::Error>;
+    fn consume_completion(token: RequestToken<Self::HostTicket>) -> Result<Self::HostCompletion, Self::Error>;
     fn leave_idle() -> Result<(), Self::Error>;
     fn report_fatal(report: FatalReport) -> !;
 });
