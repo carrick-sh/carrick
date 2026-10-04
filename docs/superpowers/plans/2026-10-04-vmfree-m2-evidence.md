@@ -41,7 +41,7 @@ and fail the model. Do not implement a separate pipe protocol for the test.
 
 ## Admission/wake witnesses
 
-Contract `kernel.identity.credential-admission` records the new setid surface;
+Contract `kernel.credentials.birth-admission` owns the setid surface;
 the other witnesses refine the existing `kernel.el1.thread-lifecycle`,
 `kernel.futex.contention` and `kernel.el1.deferred-handback-identity` families.
 These are VM-free semantic/count assertions, with no signed, runtime-ratio or
