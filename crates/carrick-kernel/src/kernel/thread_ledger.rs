@@ -1193,10 +1193,6 @@ mod tests {
         birth_conflict_scope("fork");
     }
     #[test]
-    fn lifecycle_credentials_admission_declines_in_flight_birth_in_only_its_owner() {
-        birth_conflict_scope("credentials");
-    }
-    #[test]
     fn lifecycle_ptrace_admission_declines_in_flight_birth_in_only_its_owner() {
         birth_conflict_scope("ptrace");
     }
@@ -1240,10 +1236,6 @@ mod tests {
         match operation {
             "fork" => assert!(matches!(
                 kernel.reserve_fork(&current, fork_plan(), "conflict".into(), None),
-                Err(KernelOperationError::LifecycleAdmissionBusy(_))
-            )),
-            "credentials" => assert!(matches!(
-                kernel.update_credentials(&current, |_| {}),
                 Err(KernelOperationError::LifecycleAdmissionBusy(_))
             )),
             "ptrace" => assert!(!kernel.claim_ptrace_traceme(&current)),
@@ -1297,13 +1289,6 @@ mod tests {
                 drop(reserved);
                 assert_eq!(page.gate(), carrick_el1_abi::GateState::Open);
             }
-            "credentials" => {
-                kernel.update_credentials(&current, |_| {}).unwrap();
-                assert!(
-                    page.claim_any().is_err(),
-                    "old credential credits must retire"
-                );
-            }
             "ptrace" => {
                 assert!(kernel.claim_ptrace_traceme(&current));
                 assert_eq!(page.gate(), carrick_el1_abi::GateState::Closed);
@@ -1349,6 +1334,158 @@ mod tests {
             _ => unreachable!(),
         }
         assert_eq!(root_page.gate(), carrick_el1_abi::GateState::Open);
+    }
+
+    #[test]
+    fn credential_update_preserves_claimed_sibling_birth_and_uid_accounting() {
+        credential_birth_interleaving(false);
+    }
+
+    #[test]
+    fn credential_update_settles_own_completed_birth_before_cow() {
+        credential_birth_interleaving(true);
+    }
+
+    fn credential_birth_interleaving(own_completed_birth: bool) {
+        let (kernel, root) = bootstrap(9_830);
+        kernel.registry().thread_ledger().set_pool_depth_for_test(4);
+        let peer = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_831),
+                "credential-peer".into(),
+                None,
+            )
+            .unwrap();
+        let peer = unprivileged(&kernel, &peer, 32);
+        let sibling = kernel
+            .clone_thread(
+                &root,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_832),
+                None,
+            )
+            .unwrap();
+        let sibling = unprivileged(&kernel, &sibling, 32);
+        // Prime standing credits from B's uid, then retire the priming thread.
+        let priming = kernel
+            .clone_thread(
+                &sibling,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_833),
+                None,
+            )
+            .unwrap();
+        kernel.exit_thread(&priming, None).unwrap();
+        let page = root.thread().control_lease().lifecycle();
+        let claim = page.claim_any().unwrap();
+        let entry = claim.entry();
+        let identity = page.identity(entry).unwrap();
+        let control = {
+            let state = kernel.registry().settled().read();
+            let record = state.tasks.get(&root.task().key().id).unwrap();
+            let entries = record.thread_pool.entries.lock();
+            let pooled = entries
+                .iter()
+                .find(|candidate| candidate.entry == entry)
+                .unwrap();
+            assert_eq!(pooled.credit, USER);
+            pooled.control.clone()
+        };
+        let mut record_birth = Some(|| {
+            control.reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry);
+            page.thread_born().unwrap();
+            page.record_born(
+                claim,
+                carrick_el1_abi::BornRecord {
+                    caller_task: carrick_el1_abi::El1TaskId::from_linux_tid(
+                        sibling.thread().key().tid.raw(),
+                    )
+                    .raw(),
+                    caller_serial: sibling.thread().key().serial.raw(),
+                    clone_flags: (LinuxCloneFlags::THREAD
+                        | LinuxCloneFlags::SIGHAND
+                        | LinuxCloneFlags::VM
+                        | LinuxCloneFlags::FS
+                        | LinuxCloneFlags::FILES)
+                        .bits(),
+                    clear_child_tid: 0,
+                    blocked: carrick_el1_abi::BlockedMask(0),
+                },
+            )
+            .unwrap();
+        });
+        if own_completed_birth {
+            // A thread cannot execute clone and set*id simultaneously. Its
+            // completed Born must settle with the pre-change credentials.
+            record_birth.take().unwrap()();
+        }
+        // Avoid a context lookup after Born above: update_credentials itself
+        // must settle the completed birth before changing its caller.
+        let current = if own_completed_birth {
+            sibling.retain_exact()
+        } else {
+            kernel
+                .context(root.task().key().id, root.thread().key().tid)
+                .unwrap()
+        };
+        let changed = kernel
+            .update_credentials(&current, |credentials| {
+                credentials.seed_identity(NsUid::new(3000), NsGid::new(3000));
+            })
+            .unwrap();
+        assert_eq!(changed.resources().credentials().ruid(), NsUid::new(3000));
+        if !own_completed_birth {
+            assert_eq!(page.claimed_count(), 1);
+            assert_eq!(page.identity(entry).unwrap(), identity);
+            let state = kernel.registry().settled().read();
+            assert_eq!(
+                state
+                    .tasks
+                    .get(&root.task().key().id)
+                    .unwrap()
+                    .thread_pool
+                    .credits(Some(USER)),
+                1,
+                "only the claimed uid credit survives unused-credit revocation"
+            );
+            drop(state);
+            record_birth.take().unwrap()();
+        }
+        let tid = LinuxTid::from_abi_positive(identity.tid as i32).unwrap();
+        let child = kernel.context(root.task().key().id, tid).unwrap();
+        assert_eq!(
+            child.resources().credentials().ruid(),
+            USER,
+            "clone inherits B's credentials, not A's new credentials"
+        );
+        assert_eq!(child.resources().credentials().rgid(), NsGid::new(1000));
+        assert_eq!(
+            page.state(entry.index()),
+            Some((entry.generation(), EntryState::Published))
+        );
+        assert_eq!(kernel.registry().thread_ledger().in_flight_threads(USER), 0);
+        assert!(peer.exact_thread_is_live());
+        let expected_count = if own_completed_birth { 2 } else { 3 };
+        peer.task()
+            .replace_rlimit(LinuxResource::Nproc, |_| {
+                Ok::<_, Infallible>(LinuxRlimit::new(expected_count as u64, 8192))
+            })
+            .unwrap();
+        let peer = kernel
+            .context(peer.task().key().id, peer.thread().key().tid)
+            .unwrap();
+        assert!(
+            matches!(kernel.reserve_thread_clone(&peer, thread_plan(), None),
+            Err(KernelOperationError::ProcessLimitExceeded { uid: USER, count, .. }) if count == expected_count)
+        );
+        kernel.exit_thread(&child, None).unwrap();
+        let admitted = kernel
+            .reserve_thread_clone(&peer, thread_plan(), None)
+            .unwrap();
+        drop(admitted);
+        assert_eq!(kernel.registry().thread_ledger().in_flight_threads(USER), 0);
     }
 
     #[test]
