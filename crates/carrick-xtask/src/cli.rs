@@ -25,6 +25,8 @@ pub enum Commands {
 
     #[command(about = "Owner-approved, one-job Willow ephemeral runner pilot")]
     CiScaler(crate::ci_scaler::ScalerArgs),
+    #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
+    WorktreeGc(crate::worktree_gc::WorktreeGcArgs),
 
     #[command(about = "Per-landing Carrick vs native Docker receipts")]
     Impact(crate::impact::ImpactArgs),
@@ -123,6 +125,8 @@ pub struct RepoInfo {
 pub enum CliError {
     #[error("ci-scaler: {0}")]
     CiScaler(#[from] crate::ci_scaler::ScalerError),
+    #[error("worktree gc: {0}")]
+    WorktreeGc(#[from] crate::worktree_gc::GcError),
     #[error("impact: {0}")]
     Impact(String),
     #[error("{0}")]
@@ -278,6 +282,11 @@ where
     match cli.command {
         Commands::CiScaler(args) => {
             crate::ci_scaler::run(args)?;
+            Ok(())
+        }
+        Commands::WorktreeGc(args) => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::worktree_gc::run(&info.repository_root, args, writer)?;
             Ok(())
         }
         Commands::Impact(args) => crate::impact::run(cli.root.as_deref(), args.action)
