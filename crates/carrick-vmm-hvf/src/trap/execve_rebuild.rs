@@ -708,6 +708,15 @@ pub(crate) fn switch_exec_stage2_transaction(
             return Err(error);
         }
     }
+    // The last successful map is still before authority publication. Keep
+    // that boundary faultable with the same rollback as every earlier map.
+    if fail_after_maps == Some(new.len()) {
+        rollback(new.len(), &mut unmap, &mut map);
+        return Err(TrapError::Hypervisor(format!(
+            "injected HVPatch exec stage-2 map failure after {} maps",
+            new.len()
+        )));
+    }
     Ok(())
 }
 
