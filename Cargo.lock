@@ -1061,10 +1061,12 @@ version = "0.1.0"
 dependencies = [
  "carrick-conformance",
  "clap",
+ "flate2",
  "libc",
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "tempfile",
  "thiserror",
 ]
