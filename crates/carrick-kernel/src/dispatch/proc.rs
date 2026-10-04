@@ -4752,11 +4752,13 @@ mod kernel_process_dispatch_tests {
     #[derive(Debug)]
     struct ProcessVmReadTransport {
         payload: Vec<u8>,
+        window_refusal: ForeignMmTransportError,
     }
 
     #[derive(Debug)]
     struct ProcessVmReadLease {
         payload: Vec<u8>,
+        window_refusal: ForeignMmTransportError,
     }
 
     thread_local! {
@@ -4791,6 +4793,18 @@ mod kernel_process_dispatch_tests {
     }
 
     impl ForeignMmReadLease for ProcessVmReadLease {
+        fn prepare_read_window(
+            &self,
+            _invocation: &carrick_hal::ForeignMmInvocation,
+            _authority: &dyn carrick_hal::ForeignMmLiveAuthority,
+            _snapshot: &dyn ForeignMmSnapshot,
+            _start: GuestVa,
+            _len: usize,
+            _deadline: Instant,
+        ) -> Result<Box<dyn carrick_hal::ForeignMmReadWindow>, ForeignMmTransportError> {
+            Err(self.window_refusal)
+        }
+
         fn read(
             &self,
             _invocation: &carrick_hal::ForeignMmInvocation,
@@ -4830,6 +4844,7 @@ mod kernel_process_dispatch_tests {
             FOREIGN_LEASE_RETAINS.with(|count| count.set(count.get() + 1));
             Ok(Arc::new(ProcessVmReadLease {
                 payload: self.payload.clone(),
+                window_refusal: self.window_refusal,
             }))
         }
     }
@@ -5049,6 +5064,7 @@ mod kernel_process_dispatch_tests {
         child.shared().mm().install_foreign_mm_endpoint_for_test(
             carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(ProcessVmReadTransport {
                 payload: payload.to_vec(),
+                window_refusal: ForeignMmTransportError::AuthorityUnavailable,
             })),
         );
         child
@@ -5264,6 +5280,53 @@ mod kernel_process_dispatch_tests {
             DispatchOutcome::Returned { value: 4 },
         );
         assert_eq!(memory.read_bytes(LOCAL_BUF, 4).unwrap(), b"PEER");
+    }
+
+    #[test]
+    fn n1_review_current_cache_owner_refusal_never_calls_legacy_read() {
+        let (_lane, _dispatcher, _process, root, _lease) = bound_dispatcher(61_070);
+        for (registry, refusal, expected_reads) in [
+            (
+                61_071,
+                ForeignMmTransportError::Translation(GuestVa(TARGET_VA)),
+                0,
+            ),
+            (61_072, ForeignMmTransportError::AuthorityUnavailable, 1),
+        ] {
+            let current = process_vm_target(&root, registry);
+            current.shared().mm().install_foreign_mm_endpoint_for_test(
+                carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(ProcessVmReadTransport {
+                    payload: b"HOST".to_vec(),
+                    window_refusal: refusal,
+                })),
+            );
+            let execution =
+                crate::kernel::mm_access::test_support::execution_lease(&current, registry as u64);
+            FOREIGN_READ_TRANSACTIONS.with(|count| count.set(0));
+            let mut cache = crate::kernel::mm_access::CurrentReadCache::default();
+            let mut bytes = [0xcc; 4];
+            let result = current.copy_current_into_cached(
+                &execution,
+                GuestVa(TARGET_VA),
+                &mut bytes,
+                &mut cache,
+            );
+            if expected_reads == 0 {
+                assert!(matches!(
+                    result,
+                    Err(crate::kernel::mm_access::MmAccessError::ForeignTransport(error))
+                        if error == refusal
+                ));
+                assert_eq!(bytes, [0xcc; 4]);
+            } else {
+                result.unwrap();
+                assert_eq!(bytes, *b"HOST");
+            }
+            assert_eq!(
+                FOREIGN_READ_TRANSACTIONS.with(|count| count.get()),
+                expected_reads
+            );
+        }
     }
 
     /// Dispatcher preservation witness over the existing test transport.

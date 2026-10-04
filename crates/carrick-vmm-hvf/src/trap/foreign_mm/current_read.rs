@@ -60,7 +60,6 @@ mod owner_tests {
                 crate::host_mapping::HostMappingKind::PerMmKernelState,
             )
             .map_err(|error| format!("physical fixture allocation: {error:?}"))?;
-            let generation = next_global_frame_owner_generation();
             let host_addr = mapping.as_ptr() as usize;
             // SAFETY: this fixture owns the entire new allocation. Descriptor
             // words originate in the existing production-owner test fixture.
@@ -75,18 +74,15 @@ mod owner_tests {
                     mapping.as_ptr().write_bytes(fill, len);
                 }
             }
-            let physical = GlobalFrameHostOwner::new(
-                GlobalFrameStage2Lease::fixed(base, len as u64),
+            let mut stage2 = GlobalFrameStage2Lease::fixed(base, len as u64);
+            stage2.mark_test_mapped_without_backend();
+            let generation = register_global_frame_host_owner_in(
+                custody,
+                stage2,
                 mapping,
-                3,
-                generation,
-                base,
-                len as u64,
-            );
-            custody.global_frame_host_owners.lock().insert(
-                (base, len as u64),
-                GlobalFrameOwnerEntry::Live(Arc::new(physical)),
-            );
+                u64::from(applevisor::memory::MemPerms::ReadWrite),
+            )
+            .map_err(|error| format!("fixture carrier registration: {error:?}"))?;
             let id = NonZeroU64::new(ordinal * 10 + u64::from(data))
                 .ok_or("physical fixture mapping identity is zero")?;
             let mapping = carrick_hal::MappingId::from_kernel_allocation(id);
@@ -304,7 +300,7 @@ mod owner_tests {
         identity.tid += 1;
         identity.mm = b.raw();
         let live = region.zone().alloc_host_runnable(identity).unwrap();
-        let mut failures = Vec::new();
+        let mut observers = Vec::new();
         for (mm, root, ipa, expected) in [
             (a, owner::ROOT, owner::IPA, b'A'),
             (b, owner::ROOT + 0x100000, owner::IPA + 0x100000, b'B'),
@@ -326,6 +322,27 @@ mod owner_tests {
             ));
             assert_eq!(selected.ipa, ipa, "production owner selected another MM");
             let (state, snapshot) = install(&custody, handle, &tables, ipa, expected).unwrap();
+            check_fixture_custody(&custody, &tables, ipa).unwrap();
+            let record = custody.stage2_record_covering(selected.ipa, 4).unwrap();
+            let logical = record.logical_owner.unwrap();
+            let request = selected
+                .request(
+                    carrick_el1_abi::PortalTransferIntent::UserRead,
+                    carrick_el1_abi::PortalRetainedData {
+                        record: NonZeroU64::new(record.record_id.0).unwrap(),
+                        vm_generation: NonZeroU64::new(record.vm_generation.0).unwrap(),
+                        owner: Some((
+                            NonZeroU64::new(logical.id).unwrap(),
+                            NonZeroU64::new(logical.generation).unwrap(),
+                        )),
+                    },
+                )
+                .unwrap();
+            let physical = crate::trap::UserTransferCustody::new(custody.clone())
+                .retain(request.selected, 4, request.intent)
+                .unwrap()
+                .expect("production selection has no exact-carrier physical retention");
+            assert_eq!(physical.identity(), request.retained);
             let deadline = Instant::now() + Duration::from_secs(1);
             let backing = state
                 .retain_physical_backing_in(&custody, &snapshot, deadline)
@@ -338,11 +355,18 @@ mod owner_tests {
                     backing,
                 }),
             };
+            observers.push((mm, expected, lease, snapshot));
+        }
+        let mut failures = Vec::new();
+        // Keep both leases live while alternating the same VA between MMs.
+        for index in [0, 1, 0] {
+            let (mm, expected, lease, snapshot) = &observers[index];
+            let deadline = Instant::now() + Duration::from_secs(1);
             let mut bytes = [0; 4];
             match prepare(
-                &lease,
+                lease,
                 &Live(snapshot.clone()),
-                &snapshot,
+                snapshot,
                 GuestVa(owner::VA),
                 4,
                 deadline,
@@ -351,13 +375,13 @@ mod owner_tests {
                     window
                         .copy_into(
                             &Live(snapshot.clone()),
-                            &snapshot,
+                            snapshot,
                             GuestVa(owner::VA),
                             &mut bytes,
                             deadline,
                         )
                         .unwrap();
-                    assert_eq!(bytes, [expected; 4]);
+                    assert_eq!(bytes, [*expected; 4]);
                 }
                 Err(error) => {
                     failures.push(format!("mm={} checked owner read: {error:?}", mm.raw()))
@@ -502,9 +526,6 @@ pub(super) fn prepare(
         .raw()
         .checked_add(len as u64)
         .ok_or(Error::Translation(start))?;
-    if len == 0 || (start.raw() & !0xfff) != ((end - 1) & !0xfff) {
-        return Err(Error::AuthorityUnavailable);
-    }
     let inner = lease
         .inner
         .try_lock_until(deadline)
@@ -524,7 +545,13 @@ pub(super) fn prepare(
         .state
         .protections
         .legacy()
-        .ok_or(Error::AuthorityUnavailable)?;
+        // AuthorityUnavailable selects the kernel's ordinary-read fallback.
+        // Owner admission must refuse even an unsupported window before that
+        // fallback can select a host translation without an owner permit.
+        .ok_or(Error::Translation(start))?;
+    if len == 0 || (start.raw() & !0xfff) != ((end - 1) & !0xfff) {
+        return Err(Error::AuthorityUnavailable);
+    }
     if legacy.range_no_access(start.raw(), len) {
         return Err(Error::Translation(start));
     }
@@ -699,7 +726,7 @@ impl ForeignMmReadWindow for ReadWindow {
             .state
             .protections
             .legacy()
-            .ok_or(Error::AuthorityUnavailable)?;
+            .ok_or(Error::Translation(va))?;
         if legacy.range_no_access(va.raw(), dst.len()) {
             return Err(Error::Translation(va));
         }
