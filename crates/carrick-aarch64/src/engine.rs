@@ -5354,6 +5354,13 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     "owner BIND differs from the loaded task root".into(),
                 ));
             }
+            if let Some(token) = closed {
+                self.vm.prepare_first_load_owner_backing(
+                    &self.page_tables,
+                    &self.protections,
+                    token,
+                )?;
+            }
             let outcome = guard.select_owner(target.handle(), || {
                 self.page_tables
                     .select_guest_descriptor_owner()

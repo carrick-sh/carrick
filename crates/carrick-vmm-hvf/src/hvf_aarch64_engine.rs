@@ -2527,6 +2527,48 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             .record_guest_lane(outcome);
     }
 
+    fn prepare_first_load_owner_backing(
+        &self,
+        authority: &carrick_aarch64::Stage1Authority,
+        protections: &carrick_guest_mem::UserMemoryAuthority,
+        token: carrick_el1_abi::PortalClosedRootBind,
+    ) -> Result<(), TrapError> {
+        if token.carrier() != self.state.custody().transfer_carrier {
+            return Err(TrapError::Hypervisor(
+                "first-load backing belongs to another carrier".into(),
+            ));
+        }
+        let cow = self.state.task.cow_identity.ok_or_else(|| {
+            TrapError::Hypervisor("first-load backing lacks bound kernel MM identity".into())
+        })?;
+        let asid = token.ttbr0() >> 48;
+        if cow.mm != token.mm().raw() || u64::from(cow.asid) != asid {
+            return Err(TrapError::Hypervisor(
+                "first-load closed root differs from bound kernel MM/ASID".into(),
+            ));
+        }
+        let mm = std::num::NonZeroU64::new(cow.mm)
+            .map(carrick_hal::ForeignMmId::from_kernel_allocation)
+            .ok_or_else(|| TrapError::Hypervisor("first-load MM identity is zero".into()))?;
+        let asid = u16::try_from(asid)
+            .ok()
+            .and_then(std::num::NonZeroU16::new)
+            .map(carrick_hal::ForeignAsid::from_kernel_allocation)
+            .ok_or_else(|| TrapError::Hypervisor("first-load ASID is invalid".into()))?;
+        let backing = self.state.task.mm_access_authority();
+        self.state
+            .carrier_foreign_mm_transport
+            .register_closed_initial_identity(
+                mm,
+                crate::trap::CarrierForeignMmBinding {
+                    asid,
+                    stage1_root: carrick_guest_mem::Gpa(token.ttbr0() & 0x0000_ffff_ffff_f000),
+                },
+                &backing,
+            )?;
+        backing.prepare_first_load_owner_backing(authority, protections, token)
+    }
+
     fn bind_frame_cow(
         &mut self,
         authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
