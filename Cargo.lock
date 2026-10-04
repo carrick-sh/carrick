@@ -741,6 +741,7 @@ dependencies = [
 name = "carrick-mmu-core"
 version = "0.1.0"
 dependencies = [
+ "carrick-guest-arch",
  "carrick-mem",
  "hashbrown 0.15.5",
 ]
