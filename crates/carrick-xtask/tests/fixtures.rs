@@ -57,6 +57,10 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_probe_count(1)
+    }
+
+    fn with_probe_count(count: usize) -> Self {
         let repo = tempfile::tempdir().unwrap();
         let root = repo.path();
         git(root, &["init", "-q"]);
@@ -86,6 +90,25 @@ impl Fixture {
             b"local fixture dependency\n",
         );
         write(root, "conformance-probes/probe-inventory.json", br#"{"probeinit":{"class":"helper","runner":"generic","excluded":false},"hello":{"class":"conformance","runner":"generic","excluded":false}}"#);
+        let mut inventory: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("conformance-probes/probe-inventory.json")).unwrap(),
+        )
+        .unwrap();
+        for index in 1..count {
+            let name = format!("hello{index}");
+            write(
+                root,
+                &format!("conformance-probes/src/bin/{name}.rs"),
+                b"additional probe\n",
+            );
+            inventory[&name] =
+                serde_json::json!({"class":"conformance","runner":"generic","excluded":false});
+        }
+        write(
+            root,
+            "conformance-probes/probe-inventory.json",
+            &serde_json::to_vec(&inventory).unwrap(),
+        );
         std::os::unix::fs::symlink(
             "carrick-el1-abi/src/lib.rs",
             root.join("crates/source-link"),
@@ -226,6 +249,20 @@ fn roundtrip_restores_exact_paths_and_verifies_installed_bytes() {
             .to_string()
             .contains("hash mismatch")
     );
+}
+
+#[test]
+fn restore_durability_flush_budget_does_not_scale_with_executable_count() {
+    for probes in [1, 32] {
+        let f = Fixture::with_probe_count(probes);
+        let work = fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+        assert_eq!(work.executable_publications, f.manifest.executables.len());
+        assert_eq!(
+            work.durability_flushes, 1,
+            "one receipt durability boundary per restore"
+        );
+        fixtures::verify_installed(f.repo.path()).unwrap();
+    }
 }
 #[test]
 fn tampered_object_is_rejected_before_any_install() {

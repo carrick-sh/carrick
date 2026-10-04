@@ -461,25 +461,44 @@ pub fn verify_installed(root: &Path) -> Result<Manifest> {
     Ok(installed.manifest)
 }
 
-fn publish_file(path: &Path, bytes: &[u8], executable: bool) -> Result<()> {
+#[derive(Debug, Default)]
+pub struct RestoreWork {
+    pub executable_publications: usize,
+    pub durability_flushes: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicationKind {
+    Executable,
+    Receipt,
+}
+
+fn publish_file(path: &Path, bytes: &[u8], kind: PublicationKind) -> Result<usize> {
     let parent = path.parent().ok_or_else(|| fail("output has no parent"))?;
     fs::create_dir_all(parent)?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(bytes)?;
     #[cfg(unix)]
-    if executable {
+    if kind == PublicationKind::Executable {
         use std::os::unix::fs::PermissionsExt;
         temp.as_file()
             .set_permissions(fs::Permissions::from_mode(0o755))?;
     }
-    #[cfg(not(unix))]
-    let _ = executable;
-    temp.as_file().sync_all()?;
+    // A receipt alone never authorizes fixture use: acceptance rehashes all
+    // files, including after interruption or power loss. Atomic renames make
+    // complete bytes visible; per-executable full storage flushes add no
+    // validation authority and amplify restore cost on Darwin.
+    let flushes = if kind == PublicationKind::Receipt {
+        temp.as_file().sync_all()?;
+        1
+    } else {
+        0
+    };
     temp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    Ok(flushes)
 }
 
-pub fn restore(root: &Path, path: &Path, sha: Option<&str>) -> Result<()> {
+pub fn restore(root: &Path, path: &Path, sha: Option<&str>) -> Result<RestoreWork> {
     let manifest = verify_bundle(root, path, sha)?;
     let parent = path
         .parent()
@@ -500,24 +519,26 @@ pub fn restore(root: &Path, path: &Path, sha: Option<&str>) -> Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
+    let mut work = RestoreWork::default();
     for (index, executable) in manifest.executables.iter().enumerate() {
-        publish_file(
+        work.durability_flushes += publish_file(
             &safe_path(root, &executable.path)?,
             &fs::read(stage.path().join(index.to_string()))?,
-            true,
+            PublicationKind::Executable,
         )?;
+        work.executable_publications += 1;
     }
     let installed = Installed {
         manifest_sha256: hash_bytes(&manifest_bytes(&manifest)?),
         manifest,
     };
-    publish_file(
+    work.durability_flushes += publish_file(
         &installed_path,
         &serde_json::to_vec_pretty(&installed)?,
-        false,
+        PublicationKind::Receipt,
     )?;
     verify_installed(root)?;
-    Ok(())
+    Ok(work)
 }
 
 fn run_build(command: &mut Command) -> Result<()> {
@@ -685,10 +706,11 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
             writeln!(writer, "fixtures: bundle manifest {}", path.display())?;
         }
         FixturesAction::Restore { manifest, sha } => {
-            restore(root, &manifest, sha.as_deref())?;
+            let work = restore(root, &manifest, sha.as_deref())?;
             writeln!(
                 writer,
-                "fixtures: restored and verified all signed-tier executables"
+                "fixtures: restored and verified {} executables; durability_flushes={}",
+                work.executable_publications, work.durability_flushes
             )?;
         }
         FixturesAction::Verify { manifest, sha } => {
