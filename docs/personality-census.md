@@ -2,17 +2,35 @@
 
 Context: [`docs/personality-boundary.md`](personality-boundary.md) defines the substrate versus personality architecture rule and the mechanical boundary checker (`check-personality-boundary`). This document provides an exact census of all 47 crates across the Carrick workspace to feed the design of a future NT (Windows) personality executing on the same virtualization substrate alongside Linux.
 
+## Corrections (2026-10-04)
+
+Following code-checked review against [`docs/superpowers/specs/2026-10-04-personality-core-split.md`](superpowers/specs/2026-10-04-personality-core-split.md) (PR #19, "Evidence and corrections to the inputs"), the census incorporates the following seven architectural corrections:
+
+1. **Boundary Gate Allowlist Scope:** The mechanical boundary gate allowlist in `crates/carrick-conformance-contract/src/personality_boundary.rs` (the constant `DEFAULT_SUBSTRATE_ALLOWLIST`) contains **seven** crates: sched, mmu, signal, timer, fd, pipe, and el1. Passing this gate demonstrates that code passes the AST syntactic lexical check, but does not prove personality neutrality.
+
+2. **`carrick-signal-core` is LINUX-PERSONALITY:** Reclassified from neutral core to `LINUX-PERSONALITY`. `src/policy.rs` hard-codes Linux signal semantics (`Signal::KILL = 9`, `CHLD = 17`, uncatchable STOP/KILL, sigaction, and exec reset policy). The absence of a Cargo dependency on `carrick-abi` is insufficient for substrate status.
+
+3. **`carrick-timer-core` is MIXED:** Reclassified from neutral core to `MIXED` with 10 personality/adapter items. `src/itimer.rs` defines three fixed REAL/VIRTUAL/PROF slots, process-global `SLOTS`, and BSD timer-ident/arm flags. `src/posix.rs` carries `signum` and `si_value` in `PosixTimerSpec`, and `OVERRUN_MAX` encodes POSIX saturation.
+
+4. **`carrick-fd-core` and `carrick-pipe-core` are MIXED:** Reclassified from neutral core to `MIXED`. `carrick-fd-core` implements dense POSIX `Fd` numbers, `dup2`/`dup3`, `fork`/`exec`, mutable status-flag policy, and `CLOEXEC` handling. `carrick-pipe-core` implements `EventFd`, `EVENTFD_MAX`, and `Step::broken_pipe_signal` requesting SIGPIPE. Both function as Linux client authorities.
+
+5. **`carrick-sched-core` is MIXED:** Reclassified from neutral core to `MIXED` with 8 items. `ThreadIdentity` carries a zero-extended Linux tid and `file_table`, plus lifecycle/control bindings. Its `ThreadCtx` is AArch64 register-shaped rather than ISA-neutral.
+
+6. **`carrick-mmu-core` Stage-1 Translation Granule is 4 KiB:** In `crates/carrick-mmu-core/src/aarch64.rs`, `PT_PAGE` is `0x1000` (4 KiB stage-1 table page). The stage-1 translation tables are already 4 KiB; host 16 KiB backing custody is an independent host-side domain. NT requires reservation policy, not wholesale replacement of stage-1 translation.
+
+7. **ARM64 NT TEB Register is x18:** Windows on ARM64 reserves platform register **x18** for the user Thread Environment Block (TEB) per Microsoft's ARM64 ABI conventions, rather than `tpidr_el0` (which is the Linux TLS register).
+
 ## Required Counts at a Glance
 
 ### Crates per Class
 
 | Classification | Count | Description |
 |---|:---:|---|
-| **SUBSTRATE** | 10 | Personality-neutral virtualization, memory, scheduling, and core data structure mechanisms. |
-| **LINUX-PERSONALITY** | 5 | Dedicated Linux ABI constants, wire structs, signal delivery, and syscall dispatch graph. |
+| **SUBSTRATE** | 5 | Personality-neutral virtualization, memory, and core data structure mechanisms. |
+| **LINUX-PERSONALITY** | 6 | Dedicated Linux ABI constants, wire structs, signal delivery, policy, and syscall dispatch graph. |
 | **HOST/VMM** | 10 | Hypervisor backends (HVF, KVM, bhyve, NVMM), guest ISA scaffolds, and host OS shims. |
 | **TOOLING** | 8 | Conformance harnesses, test runners, contract boundary checkers, and developer workflows. |
-| **MIXED** | 14 | Architecture/runtime components combining neutral substrate mechanisms with Linux-specific ABI/semantics. |
+| **MIXED** | 18 | Architecture/runtime components combining neutral substrate mechanisms with Linux-specific ABI/semantics. |
 | **Total** | **47** | Workspace crate closure under `crates/`. |
 
 ### Linux-Specific Items per Crate (Substrate and Mixed)
@@ -20,32 +38,31 @@ Context: [`docs/personality-boundary.md`](personality-boundary.md) defines the s
 | Crate | Classification | Linux Items | Primary Personality Entanglements |
 |---|---|:---:|---|
 | `carrick-fatal` | SUBSTRATE | 0 | None (clean substrate) |
-| `carrick-fd-core` | SUBSTRATE | 29 | Dense POSIX `Fd` index, `TableId`, `BadFd`, dup/close/fork/exec descriptor operations |
 | `carrick-guest-arch` | SUBSTRATE | 0 | None (clean substrate, sealed hardware trait boundary) |
 | `carrick-guest-mem` | SUBSTRATE | 3 | `Aarch64SyscallFrame`, `X8664SyscallFrame`, `GuestMemory::shared_futex_location` |
 | `carrick-image` | SUBSTRATE | 0 | None (clean substrate, OCI container image format/layer resolution) |
-| `carrick-mmu-core` | SUBSTRATE | 0 | None (clean substrate, AArch64/x86 stage-1 page table algorithms) |
-| `carrick-pipe-core` | SUBSTRATE | 2 | `EVENTFD_MAX` constant, `broken_pipe_signal` SIGPIPE trigger |
-| `carrick-sched-core` | SUBSTRATE | 0 | None (clean substrate, parameterized timer/wait record CAS claims) |
-| `carrick-signal-core` | SUBSTRATE | 31 | Linux signal constants (KILL, CHLD, etc.), `SignalSet`, `SigBlockMask`, `sigaction` policy |
-| `carrick-timer-core` | SUBSTRATE | 0 | None (clean substrate, neutral interval/due-time math, opaque timer IDs) |
+| `carrick-mmu-core` | SUBSTRATE | 0 | None (clean substrate, AArch64/x86 stage-1 page table algorithms; `PT_PAGE = 0x1000`) |
 | `carrick-el1` | MIXED | 36 | EL1 Linux syscall dispatch, Linux errno returns, thread robust list setup |
 | `carrick-el1-abi` | MIXED | 50 | IPC directory epoll readiness, epoll harvest/ctl, OFD growth, clone thread lifecycle |
 | `carrick-el1-image` | MIXED | 0 | None in exports (binary carrier artifact of mixed `carrick-el1`) |
 | `carrick-embed` | MIXED | 20 | Shared buffer futex wait/wake, futex contract runners, Linux VFS metadata |
 | `carrick-engine` | MIXED | 2 | Container request resolution using `carrick-abi` and Linux process specs |
+| `carrick-fd-core` | MIXED | 29 | Dense POSIX `Fd` index, `TableId`, `BadFd`, dup/close/fork/exec descriptor operations |
 | `carrick-hal` | MIXED | 22 | `carrick-abi` wire structs, Linux sigframe injection, itimer signal numbers, `ThreadId` |
 | `carrick-inotify-core` | MIXED | 18 | `LinuxInotifyEventHeader`, `LinuxErrno`, `LINUX_IN_*` masks, `alloc_wd` |
 | `carrick-kernel-arena` | MIXED | 8 | Process table records, PID namespace slot allocation, lock owner PID |
 | `carrick-mem` | MIXED | 109 | `LINUX_*` memory layout constants, Linux ELF PIE bases, VDSO layout, EL0 trampolines |
 | `carrick-observability` | MIXED | 68 | USDT probes tracking host PIDs, epoll interest/ready masks, Linux syscall logging |
+| `carrick-pipe-core` | MIXED | 2 | `EVENTFD_MAX` constant, `broken_pipe_signal` SIGPIPE trigger |
 | `carrick-runtime` | MIXED | 7 | Combined syscall loop with `carrick-abi` dispatcher, Rosetta `/proc` interpreter path, census PIDs |
+| `carrick-sched-core` | MIXED | 8 | `ThreadIdentity` carrying Linux tid and `file_table`, AArch64-shaped `ThreadCtx` |
 | `carrick-spec` | MIXED | 3 | `ProcessSpec` with Linux rlimits, Linux namespace configurations |
 | `carrick-thread` | MIXED | 16 | `FutexTable` private futex wait/wake/requeue, thread registry `ThreadId` |
+| `carrick-timer-core` | MIXED | 10 | Fixed 3 itimer slots (`src/itimer.rs`), `PosixTimerSpec` with `signum`/`si_value`, `OVERRUN_MAX` (`src/posix.rs`) |
 | `carrick-vfs` | MIXED | 48 | `FsBackend` and `Vfs` returning `LinuxErrno`, stat structures, synthetic /proc types |
-| **Subtotal (Substrate)** | **SUBSTRATE (10)** | **65** | **65 items across 4 crates; 6 crates 100% clean** |
-| **Subtotal (Mixed)** | **MIXED (14)** | **407** | **407 items across 13 crates; 1 artifact crate 0 exports** |
-| **Total** | **Audited (24)** | **472** | **Full public item census of substrate and mixed layers** |
+| **Subtotal (Substrate)** | **SUBSTRATE (5)** | **3** | **3 items across 1 crate; 4 crates 100% clean** |
+| **Subtotal (Mixed)** | **MIXED (18)** | **456** | **456 items across 17 crates; 1 artifact crate 0 exports** |
+| **Total** | **Audited (23)** | **459** | **Full public item census of substrate and mixed layers** |
 
 ## Workspace Crate Classification Inventory
 
@@ -54,18 +71,14 @@ Every crate under `crates/` is classified according to the substrate versus pers
 | Crate | Path | Class | Architectural Role |
 |---|---|---|---|
 | `carrick-fatal` | `crates/carrick-fatal` | **SUBSTRATE** | Fatal invariant violation sink and crash recorder (`carrick_fatal!`, `CARRICK_LAST_FATAL`) |
-| `carrick-fd-core` | `crates/carrick-fd-core` | **SUBSTRATE** | Descriptor/OFD authority core (shared-record table allocations, pins, free lists) |
 | `carrick-guest-arch` | `crates/carrick-guest-arch` | **SUBSTRATE** | Sealed hardware boundary, `Arch` traits, ordinals, generational types |
 | `carrick-guest-mem` | `crates/carrick-guest-mem` | **SUBSTRATE** | Guest memory abstraction trait (`GuestMemory`), memory errors, syscall register frames |
 | `carrick-image` | `crates/carrick-image` | **SUBSTRATE** | OCI container image reference parsing, blob store, layer cache, configuration resolution |
-| `carrick-mmu-core` | `crates/carrick-mmu-core` | **SUBSTRATE** | AArch64/x86 stage-1 page table manipulation algorithms, `PageTableManager` |
-| `carrick-pipe-core` | `crates/carrick-pipe-core` | **SUBSTRATE** | Anonymous pipe buffer ring and event counter substrate |
-| `carrick-sched-core` | `crates/carrick-sched-core` | **SUBSTRATE** | In-guest EL1 scheduling core, futex-parked thread zones, wait queues, per-vCPU run queues |
-| `carrick-signal-core` | `crates/carrick-signal-core` | **SUBSTRATE** | Host-free pending signal bitset and slot bookkeeping |
-| `carrick-timer-core` | `crates/carrick-timer-core` | **SUBSTRATE** | Interval and POSIX timer slot bookkeeping, guest-CPU-due timing math |
+| `carrick-mmu-core` | `crates/carrick-mmu-core` | **SUBSTRATE** | AArch64/x86 stage-1 page table manipulation algorithms, `PageTableManager` (4 KiB `PT_PAGE = 0x1000`) |
 | `carrick-abi` | `crates/carrick-abi` | **LINUX-PERSONALITY** | Linux syscall numbers, wire structures, ioctl constants, and layout assertions |
 | `carrick-cli` | `crates/carrick-cli` | **LINUX-PERSONALITY** | Docker-compatible CLI binary executable for running Linux container workloads |
 | `carrick-kernel` | `crates/carrick-kernel` | **LINUX-PERSONALITY** | Complete Linux kernel emulation graph: syscall dispatchers, namespaces, credentials, procfs, sysfs, devpts, sockets, IPC |
+| `carrick-signal-core` | `crates/carrick-signal-core` | **LINUX-PERSONALITY** | Linux signal policy (`policy.rs`): `Signal::KILL = 9`, `CHLD = 17`, uncatchable STOP/KILL, sigaction/exec reset policy |
 | `carrick-signal-linux` | `crates/carrick-signal-linux` | **LINUX-PERSONALITY** | Linux signal numbers, sigaction, siginfo structures, signal delivery frames |
 | `carrick-x86-cpl0` | `crates/carrick-x86-cpl0` | **LINUX-PERSONALITY** | Native entry and boot trampoline into Carrick's in-guest Linux personality on x86_64 |
 | `carrick-aarch64` | `crates/carrick-aarch64` | **HOST/VMM** | Shared AArch64 VMM engine scaffold over `Aarch64Vmm` / `Aarch64Vcpu` |
@@ -91,64 +104,47 @@ Every crate under `crates/` is classified according to the substrate versus pers
 | `carrick-el1-image` | `crates/carrick-el1-image` | **MIXED** | Embedded binary image artifact container for the mixed `carrick-el1` guest kernel |
 | `carrick-embed` | `crates/carrick-embed` | **MIXED** | Library embedding surface (`ContainerBuilder`, `PreparedRun`), exposing futex contracts, shared buffer futexes, and Linux VFS configuration |
 | `carrick-engine` | `crates/carrick-engine` | **MIXED** | Docker-style container run request merge layer, resolving CLI flags and image configs into `RunSpec` |
-| `carrick-hal` | `crates/carrick-hal` | **MIXED** | Hardware abstraction layer traits, currently embedding `carrick-abi` wire structs, Linux sigframe builders, and futex keys |
+| `carrick-fd-core` | `crates/carrick-fd-core` | **MIXED** | Descriptor authority core acting as a Linux client: dense `Fd(i32)`, `TableId`, `dup2`/`dup3`, `fork`/`exec`, mutable status flags, CLOEXEC |
+| `carrick-hal` | `crates/carrick-hal` | **MIXED** | Hardware abstraction layer traits, currently embedding `carrick-abi` wire structs, Linux sigframe injection, and futex keys |
 | `carrick-inotify-core` | `crates/carrick-inotify-core` | **MIXED** | Core inotify ring buffer and watch allocation, embedding `LinuxErrno` and `LINUX_IN_*` constants |
 | `carrick-kernel-arena` | `crates/carrick-kernel-arena` | **MIXED** | Shared memory arena and robust bucket locks, embedding Linux PID namespaces and process table records |
 | `carrick-mem` | `crates/carrick-mem` | **MIXED** | Guest address space construction and page layout, hard-coding `LINUX_*` layout constants and ELF structures |
 | `carrick-observability` | `crates/carrick-observability` | **MIXED** | Compat reporting and USDT/probe instrumentation, embedding Linux syscall tables, epoll probes, and host PIDs |
+| `carrick-pipe-core` | `crates/carrick-pipe-core` | **MIXED** | Anonymous pipe buffer substrate acting as a Linux client: `EventFd`, `EVENTFD_MAX`, `broken_pipe_signal` requesting SIGPIPE |
 | `carrick-runtime` | `crates/carrick-runtime` | **MIXED** | HVPatch VM carrier, vCPU loop, pty supervisor, threading loop, embedding Linux dispatcher calls and Rosetta paths |
+| `carrick-sched-core` | `crates/carrick-sched-core` | **MIXED** | In-guest scheduling core with Linux client fields: `ThreadIdentity` carrying Linux tid and `file_table`, AArch64-shaped `ThreadCtx` |
 | `carrick-spec` | `crates/carrick-spec` | **MIXED** | Shared container specification types (`RunSpec`, `ContainerSpec`), embedding Linux namespace configs and rlimits |
 | `carrick-thread` | `crates/carrick-thread` | **MIXED** | Thread registry and futex park table, implementing Linux private futex operations (`FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_REQUEUE`) and Linux thread IDs |
+| `carrick-timer-core` | `crates/carrick-timer-core` | **MIXED** | Timer mechanism with Linux/POSIX policy: 3 fixed itimer slots (`src/itimer.rs`), `PosixTimerSpec` with `signum`/`si_value`, `OVERRUN_MAX` (`src/posix.rs`) |
 | `carrick-vfs` | `crates/carrick-vfs` | **MIXED** | Filesystem model below the kernel (`Vfs`, `FsBackend`), embedding Linux errno mappings, stat structures, and synthetic /proc entries |
 
 ## Substrate Crates Census
 
-Substrate crates are intended to be strictly personality-neutral. The following census lists all verified clean substrate crates (0 personality items) and details every public type and function where Linux concepts remain.
+Substrate crates are intended to be strictly personality-neutral. The following census lists all verified clean substrate crates (0 personality items) and details public types and functions where Linux concepts remain.
 
 ### `carrick-fatal` (SUBSTRATE)
 
 **Linux Items Count:** 0.
 
-Verified 100% personality-neutral. Contains no `carrick-abi` imports, `LINUX_*`/`SYS_*` constants, errno literals, signals, fd tables, clone flags, pid/tgid, futex ops, epoll, AF_UNIX, or /proc references in its public interface or production implementation.
+Verified 100% personality-neutral. Contains no `carrick-abi` imports, `LINUX_*`/`SYS_*` constants, errno literals, signals, fd tables, clone flags, pid/tgid, futex ops, epoll, AF_UNIX, or /proc references in its public interface or production implementation. (Note: in `carrick-mmu-core`, stage-1 page size is explicitly 4 KiB via `PT_PAGE = 0x1000`).
 
 ### `carrick-guest-arch` (SUBSTRATE)
 
 **Linux Items Count:** 0.
 
-Verified 100% personality-neutral. Contains no `carrick-abi` imports, `LINUX_*`/`SYS_*` constants, errno literals, signals, fd tables, clone flags, pid/tgid, futex ops, epoll, AF_UNIX, or /proc references in its public interface or production implementation.
+Verified 100% personality-neutral. Contains no `carrick-abi` imports, `LINUX_*`/`SYS_*` constants, errno literals, signals, fd tables, clone flags, pid/tgid, futex ops, epoll, AF_UNIX, or /proc references in its public interface or production implementation. (Note: in `carrick-mmu-core`, stage-1 page size is explicitly 4 KiB via `PT_PAGE = 0x1000`).
 
 ### `carrick-image` (SUBSTRATE)
 
 **Linux Items Count:** 0.
 
-Verified 100% personality-neutral. Contains no `carrick-abi` imports, `LINUX_*`/`SYS_*` constants, errno literals, signals, fd tables, clone flags, pid/tgid, futex ops, epoll, AF_UNIX, or /proc references in its public interface or production implementation.
+Verified 100% personality-neutral. Contains no `carrick-abi` imports, `LINUX_*`/`SYS_*` constants, errno literals, signals, fd tables, clone flags, pid/tgid, futex ops, epoll, AF_UNIX, or /proc references in its public interface or production implementation. (Note: in `carrick-mmu-core`, stage-1 page size is explicitly 4 KiB via `PT_PAGE = 0x1000`).
 
 ### `carrick-mmu-core` (SUBSTRATE)
 
 **Linux Items Count:** 0.
 
-Verified 100% personality-neutral. Contains no `carrick-abi` imports, `LINUX_*`/`SYS_*` constants, errno literals, signals, fd tables, clone flags, pid/tgid, futex ops, epoll, AF_UNIX, or /proc references in its public interface or production implementation.
-
-### `carrick-sched-core` (SUBSTRATE)
-
-**Linux Items Count:** 0.
-
-Verified 100% personality-neutral. Contains no `carrick-abi` imports, `LINUX_*`/`SYS_*` constants, errno literals, signals, fd tables, clone flags, pid/tgid, futex ops, epoll, AF_UNIX, or /proc references in its public interface or production implementation.
-
-### `carrick-timer-core` (SUBSTRATE)
-
-**Linux Items Count:** 0.
-
-Verified 100% personality-neutral. Contains no `carrick-abi` imports, `LINUX_*`/`SYS_*` constants, errno literals, signals, fd tables, clone flags, pid/tgid, futex ops, epoll, AF_UNIX, or /proc references in its public interface or production implementation.
-
-### `carrick-pipe-core` (SUBSTRATE)
-
-**Linux Items Count:** 2.
-
-| File:Line | Item Kind | Item Name | Named Linux Concept(s) | Description |
-|---|---|---|---|---|
-| [`crates/carrick-pipe-core/src/lib.rs:20`](crates/carrick-pipe-core/src/lib.rs#L20) | `const` | `EVENTFD_MAX` | fd tables/Fd | fd tables/Fd: ['eventfd'] |
-| [`crates/carrick-pipe-core/src/lib.rs:74`](crates/carrick-pipe-core/src/lib.rs#L74) | `fn` | `broken_pipe_signal` | signals/SigSet | signals/SigSet: ['SIGPIPE', 'BrokenPipe'] |
+Verified 100% personality-neutral. Contains no `carrick-abi` imports, `LINUX_*`/`SYS_*` constants, errno literals, signals, fd tables, clone flags, pid/tgid, futex ops, epoll, AF_UNIX, or /proc references in its public interface or production implementation. (Note: in `carrick-mmu-core`, stage-1 page size is explicitly 4 KiB via `PT_PAGE = 0x1000`).
 
 ### `carrick-guest-mem` (SUBSTRATE)
 
@@ -160,83 +156,9 @@ Verified 100% personality-neutral. Contains no `carrick-abi` imports, `LINUX_*`/
 | [`crates/carrick-guest-mem/src/lib.rs:92`](crates/carrick-guest-mem/src/lib.rs#L92) | `struct` | `Aarch64SyscallFrame` | carrick-abi | carrick-abi: ['Linux AArch64 syscall registers (x8, x0-x5)'] |
 | [`crates/carrick-guest-mem/src/lib.rs:108`](crates/carrick-guest-mem/src/lib.rs#L108) | `struct` | `X8664SyscallFrame` | carrick-abi | carrick-abi: ['Linux x86_64 syscall registers (rax, rdi, rsi, rdx, r10, r8, r9)'] |
 
-### `carrick-fd-core` (SUBSTRATE)
-
-**Linux Items Count:** 29.
-
-| File:Line | Item Kind | Item Name | Named Linux Concept(s) | Description |
-|---|---|---|---|---|
-| [`crates/carrick-fd-core/src/lib.rs:36`](crates/carrick-fd-core/src/lib.rs#L36) | `struct` | `Fd` | fd tables/Fd | fd tables/Fd: ['Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:63`](crates/carrick-fd-core/src/lib.rs#L63) | `enum` | `Error` | fd tables/Fd | fd tables/Fd: ['BadFd'] |
-| [`crates/carrick-fd-core/src/lib.rs:98`](crates/carrick-fd-core/src/lib.rs#L98) | `struct` | `TableId` | fd tables/Fd | fd tables/Fd: ['TableId'] |
-| [`crates/carrick-fd-core/src/lib.rs:753`](crates/carrick-fd-core/src/lib.rs#L753) | `fn` | `install_pair` | fd tables/Fd | fd tables/Fd: ['Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:808`](crates/carrick-fd-core/src/lib.rs#L808) | `fn` | `transaction` | fd tables/Fd | fd tables/Fd: ['TableId'] |
-| [`crates/carrick-fd-core/src/lib.rs:1102`](crates/carrick-fd-core/src/lib.rs#L1102) | `fn` | `create_table` | fd tables/Fd | fd tables/Fd: ['TableId'] |
-| [`crates/carrick-fd-core/src/lib.rs:1124`](crates/carrick-fd-core/src/lib.rs#L1124) | `fn` | `set_limit` | fd tables/Fd | fd tables/Fd: ['TableId'] |
-| [`crates/carrick-fd-core/src/lib.rs:1133`](crates/carrick-fd-core/src/lib.rs#L1133) | `fn` | `open` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1152`](crates/carrick-fd-core/src/lib.rs#L1152) | `fn` | `get` | fd tables/Fd | fd tables/Fd: ['TableId', 'BadFd', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1201`](crates/carrick-fd-core/src/lib.rs#L1201) | `fn` | `refcount` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1206`](crates/carrick-fd-core/src/lib.rs#L1206) | `fn` | `set_offset` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1212`](crates/carrick-fd-core/src/lib.rs#L1212) | `fn` | `getfd` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1216`](crates/carrick-fd-core/src/lib.rs#L1216) | `fn` | `setfd` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1223`](crates/carrick-fd-core/src/lib.rs#L1223) | `fn` | `getfl` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1231`](crates/carrick-fd-core/src/lib.rs#L1231) | `fn` | `setfl` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1254`](crates/carrick-fd-core/src/lib.rs#L1254) | `fn` | `dup` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1259`](crates/carrick-fd-core/src/lib.rs#L1259) | `fn` | `dupfd` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1288`](crates/carrick-fd-core/src/lib.rs#L1288) | `fn` | `dup2` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1297`](crates/carrick-fd-core/src/lib.rs#L1297) | `fn` | `dup3` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1350`](crates/carrick-fd-core/src/lib.rs#L1350) | `fn` | `close` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1358`](crates/carrick-fd-core/src/lib.rs#L1358) | `fn` | `close_range` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1388`](crates/carrick-fd-core/src/lib.rs#L1388) | `fn` | `unshare_close_range` | fd tables/Fd | fd tables/Fd: ['TableId'] |
-| [`crates/carrick-fd-core/src/lib.rs:1407`](crates/carrick-fd-core/src/lib.rs#L1407) | `fn` | `grow_table` | fd tables/Fd | fd tables/Fd: ['TableId'] |
-| [`crates/carrick-fd-core/src/lib.rs:1437`](crates/carrick-fd-core/src/lib.rs#L1437) | `fn` | `fork` | fd tables/Fd | fd tables/Fd: ['TableId'] |
-| [`crates/carrick-fd-core/src/lib.rs:1483`](crates/carrick-fd-core/src/lib.rs#L1483) | `fn` | `exec` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1496`](crates/carrick-fd-core/src/lib.rs#L1496) | `fn` | `destroy_table` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1529`](crates/carrick-fd-core/src/lib.rs#L1529) | `fn` | `pin` | fd tables/Fd | fd tables/Fd: ['TableId', 'BadFd', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1619`](crates/carrick-fd-core/src/lib.rs#L1619) | `fn` | `install_pin` | fd tables/Fd | fd tables/Fd: ['TableId', 'BadFd', 'Fd'] |
-| [`crates/carrick-fd-core/src/lib.rs:1655`](crates/carrick-fd-core/src/lib.rs#L1655) | `fn` | `replace_pin` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
-
-### `carrick-signal-core` (SUBSTRATE)
-
-**Linux Items Count:** 31.
-
-| File:Line | Item Kind | Item Name | Named Linux Concept(s) | Description |
-|---|---|---|---|---|
-| [`crates/carrick-signal-core/src/lib.rs:28`](crates/carrick-signal-core/src/lib.rs#L28) | `struct` | `SignalSet` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/lib.rs:85`](crates/carrick-signal-core/src/lib.rs#L85) | `struct` | `PendingSet` | signals/SigSet | signals/SigSet: ['PendingSet'] |
-| [`crates/carrick-signal-core/src/lib.rs:92`](crates/carrick-signal-core/src/lib.rs#L92) | `fn` | `load` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/lib.rs:96`](crates/carrick-signal-core/src/lib.rs#L96) | `fn` | `publish` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/lib.rs:105`](crates/carrick-signal-core/src/lib.rs#L105) | `fn` | `take` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/lib.rs:123`](crates/carrick-signal-core/src/lib.rs#L123) | `struct` | `DispositionSet` | signals/SigSet | signals/SigSet: ['DispositionSet'] |
-| [`crates/carrick-signal-core/src/lib.rs:186`](crates/carrick-signal-core/src/lib.rs#L186) | `struct` | `StandardSignalSlot` | signals/SigSet | signals/SigSet: ['StandardSignalSlot'] |
-| [`crates/carrick-signal-core/src/policy.rs:21`](crates/carrick-signal-core/src/policy.rs#L21) | `struct` | `Signal` | signals/SigSet | signals/SigSet: [''] |
-| [`crates/carrick-signal-core/src/policy.rs:58`](crates/carrick-signal-core/src/policy.rs#L58) | `struct` | `SigBlockMask` | signals/SigSet | signals/SigSet: ['SigBlockMask', 'SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:61`](crates/carrick-signal-core/src/policy.rs#L61) | `const` | `NONE` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:63`](crates/carrick-signal-core/src/policy.rs#L63) | `const fn` | `blocking_all_of` | signals/SigSet | signals/SigSet: ['', 'SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:67`](crates/carrick-signal-core/src/policy.rs#L67) | `const fn` | `signals` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:75`](crates/carrick-signal-core/src/policy.rs#L75) | `const fn` | `select` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:128`](crates/carrick-signal-core/src/policy.rs#L128) | `struct` | `ActionFlags` | signals/SigSet | signals/SigSet: ['siginfo'] |
-| [`crates/carrick-signal-core/src/policy.rs:138`](crates/carrick-signal-core/src/policy.rs#L138) | `struct` | `Action` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:197`](crates/carrick-signal-core/src/policy.rs#L197) | `fn` | `prepare_delivery` | signals/SigSet | signals/SigSet: ['SigBlockMask', 'siginfo'] |
-| [`crates/carrick-signal-core/src/policy.rs:244`](crates/carrick-signal-core/src/policy.rs#L244) | `struct` | `HandlerDelivery` | signals/SigSet | signals/SigSet: ['SigBlockMask', 'siginfo'] |
-| [`crates/carrick-signal-core/src/policy.rs:273`](crates/carrick-signal-core/src/policy.rs#L273) | `enum` | `MaskChange` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:288`](crates/carrick-signal-core/src/policy.rs#L288) | `struct` | `MaskState` | signals/SigSet | signals/SigSet: ['SigBlockMask'] |
-| [`crates/carrick-signal-core/src/policy.rs:294`](crates/carrick-signal-core/src/policy.rs#L294) | `const fn` | `new` | signals/SigSet | signals/SigSet: ['SigBlockMask'] |
-| [`crates/carrick-signal-core/src/policy.rs:301`](crates/carrick-signal-core/src/policy.rs#L301) | `fn` | `effective` | signals/SigSet | signals/SigSet: ['SigBlockMask'] |
-| [`crates/carrick-signal-core/src/policy.rs:305`](crates/carrick-signal-core/src/policy.rs#L305) | `fn` | `select` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:309`](crates/carrick-signal-core/src/policy.rs#L309) | `fn` | `change` | signals/SigSet | signals/SigSet: ['SigBlockMask'] |
-| [`crates/carrick-signal-core/src/policy.rs:324`](crates/carrick-signal-core/src/policy.rs#L324) | `fn` | `begin_temporary` | signals/SigSet | signals/SigSet: ['SigBlockMask'] |
-| [`crates/carrick-signal-core/src/policy.rs:340`](crates/carrick-signal-core/src/policy.rs#L340) | `fn` | `restore_after_handler` | signals/SigSet | signals/SigSet: ['SigBlockMask'] |
-| [`crates/carrick-signal-core/src/policy.rs:375`](crates/carrick-signal-core/src/policy.rs#L375) | `struct` | `PendingSignals` | signals/SigSet | signals/SigSet: ['StandardSignalSlot', 'SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:394`](crates/carrick-signal-core/src/policy.rs#L394) | `const fn` | `present` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:415`](crates/carrick-signal-core/src/policy.rs#L415) | `fn` | `take_in` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:437`](crates/carrick-signal-core/src/policy.rs#L437) | `fn` | `discard` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:472`](crates/carrick-signal-core/src/policy.rs#L472) | `fn` | `take_pending` | signals/SigSet | signals/SigSet: ['SignalSet'] |
-| [`crates/carrick-signal-core/src/policy.rs:538`](crates/carrick-signal-core/src/policy.rs#L538) | `struct` | `DeliveryTarget` | signals/SigSet | signals/SigSet: ['SigBlockMask'] |
-
 ## Mixed Crates Census
 
-Mixed crates contain runtime or substrate mechanisms that currently embed Linux personality types, wire constants, or syscall dispatch interfaces. Each public type and function naming a Linux concept is inventoried below.
+Mixed crates contain runtime or substrate mechanisms that currently embed Linux personality types, wire constants, client bindings, or syscall dispatch interfaces. Each public type and function naming a Linux concept is inventoried below.
 
 ### `carrick-el1` (MIXED)
 
@@ -379,6 +301,42 @@ Contains 0 exported public types or functions with Linux concepts (binary carrie
 |---|---|---|---|---|
 | [`crates/carrick-engine/src/lib.rs:103`](crates/carrick-engine/src/lib.rs#L103) | `struct` | `RunRequest` | pid/tgid | pid/tgid: ['pid'] |
 | [`crates/carrick-engine/src/lib.rs:321`](crates/carrick-engine/src/lib.rs#L321) | `fn` | `resolve_run_spec` | carrick-abi, pid/tgid | carrick-abi: ['carrick_abi'], pid/tgid: ['pid'] |
+
+### `carrick-fd-core` (MIXED)
+
+**Linux Items Count:** 29.
+
+| File:Line | Item Kind | Item Name | Named Linux Concept(s) | Description |
+|---|---|---|---|---|
+| [`crates/carrick-fd-core/src/lib.rs:36`](crates/carrick-fd-core/src/lib.rs#L36) | `struct` | `Fd` | fd tables/Fd | fd tables/Fd: ['Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:63`](crates/carrick-fd-core/src/lib.rs#L63) | `enum` | `Error` | fd tables/Fd | fd tables/Fd: ['BadFd'] |
+| [`crates/carrick-fd-core/src/lib.rs:98`](crates/carrick-fd-core/src/lib.rs#L98) | `struct` | `TableId` | fd tables/Fd | fd tables/Fd: ['TableId'] |
+| [`crates/carrick-fd-core/src/lib.rs:753`](crates/carrick-fd-core/src/lib.rs#L753) | `fn` | `install_pair` | fd tables/Fd | fd tables/Fd: ['Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:808`](crates/carrick-fd-core/src/lib.rs#L808) | `fn` | `transaction` | fd tables/Fd | fd tables/Fd: ['TableId'] |
+| [`crates/carrick-fd-core/src/lib.rs:1102`](crates/carrick-fd-core/src/lib.rs#L1102) | `fn` | `create_table` | fd tables/Fd | fd tables/Fd: ['TableId'] |
+| [`crates/carrick-fd-core/src/lib.rs:1124`](crates/carrick-fd-core/src/lib.rs#L1124) | `fn` | `set_limit` | fd tables/Fd | fd tables/Fd: ['TableId'] |
+| [`crates/carrick-fd-core/src/lib.rs:1133`](crates/carrick-fd-core/src/lib.rs#L1133) | `fn` | `open` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1152`](crates/carrick-fd-core/src/lib.rs#L1152) | `fn` | `get` | fd tables/Fd | fd tables/Fd: ['TableId', 'BadFd', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1201`](crates/carrick-fd-core/src/lib.rs#L1201) | `fn` | `refcount` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1206`](crates/carrick-fd-core/src/lib.rs#L1206) | `fn` | `set_offset` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1212`](crates/carrick-fd-core/src/lib.rs#L1212) | `fn` | `getfd` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1216`](crates/carrick-fd-core/src/lib.rs#L1216) | `fn` | `setfd` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1223`](crates/carrick-fd-core/src/lib.rs#L1223) | `fn` | `getfl` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1231`](crates/carrick-fd-core/src/lib.rs#L1231) | `fn` | `setfl` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1254`](crates/carrick-fd-core/src/lib.rs#L1254) | `fn` | `dup` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1259`](crates/carrick-fd-core/src/lib.rs#L1259) | `fn` | `dupfd` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1288`](crates/carrick-fd-core/src/lib.rs#L1288) | `fn` | `dup2` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1297`](crates/carrick-fd-core/src/lib.rs#L1297) | `fn` | `dup3` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1350`](crates/carrick-fd-core/src/lib.rs#L1350) | `fn` | `close` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1358`](crates/carrick-fd-core/src/lib.rs#L1358) | `fn` | `close_range` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1388`](crates/carrick-fd-core/src/lib.rs#L1388) | `fn` | `unshare_close_range` | fd tables/Fd | fd tables/Fd: ['TableId'] |
+| [`crates/carrick-fd-core/src/lib.rs:1407`](crates/carrick-fd-core/src/lib.rs#L1407) | `fn` | `grow_table` | fd tables/Fd | fd tables/Fd: ['TableId'] |
+| [`crates/carrick-fd-core/src/lib.rs:1437`](crates/carrick-fd-core/src/lib.rs#L1437) | `fn` | `fork` | fd tables/Fd | fd tables/Fd: ['TableId'] |
+| [`crates/carrick-fd-core/src/lib.rs:1483`](crates/carrick-fd-core/src/lib.rs#L1483) | `fn` | `exec` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1496`](crates/carrick-fd-core/src/lib.rs#L1496) | `fn` | `destroy_table` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1529`](crates/carrick-fd-core/src/lib.rs#L1529) | `fn` | `pin` | fd tables/Fd | fd tables/Fd: ['TableId', 'BadFd', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1619`](crates/carrick-fd-core/src/lib.rs#L1619) | `fn` | `install_pin` | fd tables/Fd | fd tables/Fd: ['TableId', 'BadFd', 'Fd'] |
+| [`crates/carrick-fd-core/src/lib.rs:1655`](crates/carrick-fd-core/src/lib.rs#L1655) | `fn` | `replace_pin` | fd tables/Fd | fd tables/Fd: ['TableId', 'Fd'] |
 
 ### `carrick-hal` (MIXED)
 
@@ -640,6 +598,15 @@ Contains 0 exported public types or functions with Linux concepts (binary carrie
 | [`crates/carrick-observability/src/probes.rs:8411`](crates/carrick-observability/src/probes.rs#L8411) | `fn` | `native_x86_xstate` | pid/tgid | pid/tgid: ['pid'] |
 | [`crates/carrick-observability/src/probes.rs:8967`](crates/carrick-observability/src/probes.rs#L8967) | `fn` | `epoll_lookup` | epoll | epoll: ['epoll_lookup'] |
 
+### `carrick-pipe-core` (MIXED)
+
+**Linux Items Count:** 2.
+
+| File:Line | Item Kind | Item Name | Named Linux Concept(s) | Description |
+|---|---|---|---|---|
+| [`crates/carrick-pipe-core/src/lib.rs:20`](crates/carrick-pipe-core/src/lib.rs#L20) | `const` | `EVENTFD_MAX` | fd tables/Fd | fd tables/Fd: ['eventfd', 'EVENTFD_MAX'] |
+| [`crates/carrick-pipe-core/src/lib.rs:74`](crates/carrick-pipe-core/src/lib.rs#L74) | `fn` | `broken_pipe_signal` | signals/SigSet | signals/SigSet: ['SIGPIPE', 'BrokenPipe'] |
+
 ### `carrick-runtime` (MIXED)
 
 **Linux Items Count:** 7.
@@ -653,6 +620,21 @@ Contains 0 exported public types or functions with Linux concepts (binary carrie
 | [`crates/carrick-runtime/src/lib.rs:423`](crates/carrick-runtime/src/lib.rs#L423) | `fn` | `rosetta_interpreter_path` | /proc | /proc: ['/proc'] |
 | [`crates/carrick-runtime/src/runtime.rs:1030`](crates/carrick-runtime/src/runtime.rs#L1030) | `fn` | `run_combined_syscall_loop_with_dispatcher` | carrick-abi, LINUX_*/SYS_*, errno, signals/SigSet, pid/tgid | carrick-abi: ['carrick_abi'], LINUX_*/SYS_*: ['LINUX_ENOMEM', 'LINUX_EINTR', 'LINUX_ENOSYS'], errno: ['LinuxErrno'], signals/SigSet: ['SigSet'], pid/tgid: ['pid'] |
 | [`crates/carrick-runtime/src/threaded_loop.rs:40`](crates/carrick-runtime/src/threaded_loop.rs#L40) | `trait` | `HostBackend` | futex ops | futex ops: ['FutexTable', 'futex'] |
+
+### `carrick-sched-core` (MIXED)
+
+**Linux Items Count:** 8.
+
+| File:Line | Item Kind | Item Name | Named Linux Concept(s) | Description |
+|---|---|---|---|---|
+| [`crates/carrick-sched-core/src/lib.rs:381`](crates/carrick-sched-core/src/lib.rs#L381) | `struct` | `ThreadCtx` | carrick-abi | carrick-abi: ['AArch64-shaped register context: x[31], pc, sp_el0, tpidr_el0, tpidrro_el0, v[32]'] |
+| [`crates/carrick-sched-core/src/lib.rs:402`](crates/carrick-sched-core/src/lib.rs#L402) | `const` | `THREAD_CTX_V_OFFSET` | carrick-abi | carrick-abi: ['AArch64 FP/SIMD save area offset'] |
+| [`crates/carrick-sched-core/src/lib.rs:404`](crates/carrick-sched-core/src/lib.rs#L404) | `const` | `THREAD_CTX_FPSR_OFFSET` | carrick-abi | carrick-abi: ['AArch64 FPSR/FPCR register offset'] |
+| [`crates/carrick-sched-core/src/lib.rs:452`](crates/carrick-sched-core/src/lib.rs#L452) | `struct` | `ThreadIdentity` | pid/tgid, fd tables/Fd | pid/tgid: ['tid (Linux tid)'], fd tables/Fd: ['file_table (Linux file table pointer)'] |
+| [`crates/carrick-sched-core/src/lib.rs:588`](crates/carrick-sched-core/src/lib.rs#L588) | `fn` | `identity` | pid/tgid | pid/tgid: ['Returns ThreadIdentity carrying Linux tid and file_table'] |
+| [`crates/carrick-sched-core/src/lib.rs:698`](crates/carrick-sched-core/src/lib.rs#L698) | `unsafe fn` | `ctx_mut` | carrick-abi | carrick-abi: ['Mutable access to AArch64 ThreadCtx'] |
+| [`crates/carrick-sched-core/src/lib.rs:1450`](crates/carrick-sched-core/src/lib.rs#L1450) | `fn` | `alloc_record` | pid/tgid | pid/tgid: ['Allocates zone record bound to Linux ThreadIdentity'] |
+| [`crates/carrick-sched-core/src/lib.rs:1479`](crates/carrick-sched-core/src/lib.rs#L1479) | `fn` | `alloc_host_runnable` | pid/tgid | pid/tgid: ['Allocates host-runnable record bound to Linux ThreadIdentity'] |
 
 ### `carrick-spec` (MIXED)
 
@@ -686,6 +668,23 @@ Contains 0 exported public types or functions with Linux concepts (binary carrie
 | [`crates/carrick-thread/src/thread.rs:1758`](crates/carrick-thread/src/thread.rs#L1758) | `fn` | `notify_signal_pending_for` | futex ops | futex ops: ['FUTEX_SIGNAL_TOKEN'] |
 | [`crates/carrick-thread/src/thread.rs:1784`](crates/carrick-thread/src/thread.rs#L1784) | `fn` | `wake` | futex ops | futex ops: ['FUTEX_WAKE_TOKEN'] |
 | [`crates/carrick-thread/src/thread.rs:1860`](crates/carrick-thread/src/thread.rs#L1860) | `fn` | `requeue` | futex ops | futex ops: ['FUTEX_WAKE_TOKEN'] |
+
+### `carrick-timer-core` (MIXED)
+
+**Linux Items Count:** 10.
+
+| File:Line | Item Kind | Item Name | Named Linux Concept(s) | Description |
+|---|---|---|---|---|
+| [`crates/carrick-timer-core/src/itimer.rs:28`](crates/carrick-timer-core/src/itimer.rs#L28) | `const` | `ITIMER_COUNT` | carrick-abi | carrick-abi: ['ITIMER_REAL/VIRTUAL/PROF fixed slots'] |
+| [`crates/carrick-timer-core/src/itimer.rs:34`](crates/carrick-timer-core/src/itimer.rs#L34) | `const` | `TIMER_IDENT_BASE` | carrick-abi | carrick-abi: ['BSD/Darwin kqueue EVFILT_TIMER ident range'] |
+| [`crates/carrick-timer-core/src/itimer.rs:46`](crates/carrick-timer-core/src/itimer.rs#L46) | `const` | `TIMER_ARM_ADD` | carrick-abi | carrick-abi: ['BSD EV_ADD timer arm flag'] |
+| [`crates/carrick-timer-core/src/itimer.rs:48`](crates/carrick-timer-core/src/itimer.rs#L48) | `const` | `TIMER_ARM_ONESHOT` | carrick-abi | carrick-abi: ['BSD EV_ONESHOT timer arm flag'] |
+| [`crates/carrick-timer-core/src/itimer.rs:93`](crates/carrick-timer-core/src/itimer.rs#L93) | `fn` | `ident_for` | carrick-abi | carrick-abi: ['EVFILT_TIMER ident per itimer slot'] |
+| [`crates/carrick-timer-core/src/itimer.rs:121`](crates/carrick-timer-core/src/itimer.rs#L121) | `fn` | `is_cpu_timer` | carrick-abi | carrick-abi: ['ITIMER_VIRTUAL / ITIMER_PROF CPU timer check'] |
+| [`crates/carrick-timer-core/src/posix.rs:12`](crates/carrick-timer-core/src/posix.rs#L12) | `const` | `OVERRUN_MAX` | errno | errno: ['POSIX timer overrun saturation bound'] |
+| [`crates/carrick-timer-core/src/posix.rs:18`](crates/carrick-timer-core/src/posix.rs#L18) | `struct` | `PosixTimerSpec` | signals/SigSet | signals/SigSet: ['signum: i32', 'si_value: i64'] |
+| [`crates/carrick-timer-core/src/posix.rs:30`](crates/carrick-timer-core/src/posix.rs#L30) | `fn` | `remaining_time` | carrick-abi | carrick-abi: ['POSIX timer remaining time calculation'] |
+| [`crates/carrick-timer-core/src/posix.rs:47`](crates/carrick-timer-core/src/posix.rs#L47) | `fn` | `next_overrun` | errno | errno: ['POSIX timer overrun saturation'] |
 
 ### `carrick-vfs` (MIXED)
 
@@ -752,11 +751,12 @@ For each Linux-specific item family identified in the substrate and mixed crates
 | **Epoll Multiplexing and Readiness Rings (`carrick-el1-abi`, `carrick-el1`, `carrick-observability`, `carrick-vfs`)** | ``EpollState`, `IpcEpollItem`, `create_epoll`, `epoll_add`, `epoll_modify`, `epoll_delete`, `epoll_harvest`, `EpollReadyMask`, `epoll_ctl`.` | **WaitForMultipleObjects and I/O Completion Ports (`IOCP`)** | NT asynchronous I/O and multiplexing operate on completion queues rather than readiness polls. Proactive asynchronous operations use I/O Completion Ports (`NtCreateIoCompletion`, `NtSetIoCompletion`, `NtRemoveIoCompletion`). Multi-wait synchronization across handles uses `NtWaitForMultipleObjects`, which can wait simultaneously on up to 64 kernel dispatcher objects (`MAXIMUM_WAIT_OBJECTS`) with wait-all or wait-any semantics. There is no edge-triggered or level-triggered poll ring; synchronization objects become signaled when ready. |
 | **Asynchronous Signals and Frame Delivery (`carrick-signal-core`, `carrick-hal`, `carrick-runtime`)** | ``Signal` (KILL, CHLD, STOP, etc.), `SignalSet`, `SigBlockMask`, `sigaction`, `siginfo`, `build_sigframe`, `restore_sigframe`, `RestorerAddress`, `StandardSignalSlot`.` | **Alertable Waits, APCs, and Structured Exception Handling (SEH)** | NT has no POSIX asynchronous signal mechanism. Asynchronous notifications to user threads are delivered via Asynchronous Procedure Calls (User APCs) using `NtQueueApcThread` / `KiDeliverApc`. User APCs are only delivered when a thread enters an alertable wait state (`Alertable = TRUE` in `NtWaitForSingleObject` / `NtWaitForMultipleObjects` / `NtSleep`). Hardware faults and synchronous errors (access violations, illegal instructions, division by zero) are dispatched through Structured Exception Handling (`KiUserExceptionDispatcher`) in `ntdll.dll`, unwinding via static PE exception directory tables (`.pdata` and `.xdata`) rather than dynamic signal frames. |
 | **Memory Mapping and Anonymous Allocations (`carrick-mem`, `carrick-vfs`, `carrick-embed`)** | ``mmap`, `munmap`, `mprotect`, `PROT_NONE`, `MAP_SHARED`, `MAP_PRIVATE`, `LINUX_MMAP_BASE`, arbitrary address range unmapping.` | **Sections and Views (`NtCreateSection`, `NtMapViewOfSection`, `NtAllocateVirtualMemory`)** | NT separates private address space reservation/commitment from file/shared-memory mapping. Anonymous memory is managed via `NtAllocateVirtualMemory` (state transition from Reserved to Committed). Shared memory and file mappings are Section objects (`SECTION`) created with `NtCreateSection` and mapped into virtual address spaces using `NtMapViewOfSection`. Partial range unmapping (punching holes in a view with `munmap`) is not supported by NT: views must be unmapped in their entirety using `NtUnmapViewOfSection`. |
-| **Page Allocation Granularity (`carrick-guest-mem`, `carrick-mem`, `carrick-mmu-core`)** | `4 KiB and 16 KiB page boundary calculations (`HOST_PAGE_GRANULE = 0x4000`, `PIPE_BUF = 4096`, `PT_PAGE = 0x4000`), arbitrary page-aligned `mmap` placement.` | **64 KiB Allocation Granularity (`MM_ALLOCATION_GRANULARITY`)** | Although the underlying page size on x86_64 and AArch64 Windows is 4 KiB, the NT Virtual Memory Manager enforces a 64 KiB allocation granularity (`MM_ALLOCATION_GRANULARITY = 0x10000`). Base addresses for `VirtualAlloc` reservations, mapped section views, thread stacks, and PE image loads must be aligned to 64 KiB boundaries. Allocating at 4 KiB or 16 KiB boundaries violates NT memory manager alignment invariants. |
-| **Guest Page Translation Granule (`carrick-mmu-core`, `carrick-mem`, `carrick-guest-mem`)** | `AArch64 stage-1 page table entries and hardware EL1 translation assuming host 16 KiB granule.` | **4 KiB Translation Granule (`PAGE_SIZE = 4096`)** | Windows NT for AArch64 and x86_64 uses a 4 KiB page size exclusively (12-bit page offset, 4-level page tables). Apple Silicon macOS hosts run with a 16 KiB page size (14-bit page offset). Running NT guests on macOS HVF requires managing 4 KiB guest virtual translations over 16 KiB host physical pages without aliasing corruption or page fault misdirection. |
+| **Page Allocation Granularity (`carrick-guest-mem`, `carrick-mem`, `carrick-mmu-core`)** | `4 KiB and 16 KiB page boundary calculations (`HOST_PAGE_GRANULE = 0x4000`, `PIPE_BUF = 4096`, `PT_PAGE = 0x1000`), arbitrary page-aligned `mmap` placement.` | **64 KiB Allocation Granularity (`MM_ALLOCATION_GRANULARITY`)** | Although the underlying page size on x86_64 and AArch64 Windows is 4 KiB, the NT Virtual Memory Manager enforces a 64 KiB allocation granularity (`MM_ALLOCATION_GRANULARITY = 0x10000`). Base addresses for `VirtualAlloc` reservations, mapped section views, thread stacks, and PE image loads must be aligned to 64 KiB boundaries. Allocating at 4 KiB or 16 KiB boundaries violates NT memory manager alignment invariants. |
+| **Guest Page Translation Granule (`carrick-mmu-core`, `carrick-mem`, `carrick-guest-mem`)** | `AArch64 stage-1 page tables (`PT_PAGE = 0x1000`, 4 KiB granule) over 16 KiB host page backing custody.` | **4 KiB Translation Granule (`PAGE_SIZE = 4096`) and Reservation Policy** | `carrick-mmu-core/src/aarch64.rs::PT_PAGE` is already 0x1000 (4 KiB stage-1 table page). Windows NT for AArch64 and x86_64 uses a 4 KiB page size exclusively (12-bit page offset, 4-level page tables). Apple Silicon macOS hosts run with a 16 KiB page size (14-bit page offset). The NT personality requires 64 KiB reservation and 4 KiB commit policy; the stage-1 page tables are already 4 KiB, while host 16 KiB backing custody remains a separate host-side memory management domain. |
 | **Error Numbers and Return Codes (`carrick-vfs`, `carrick-inotify-core`, `carrick-el1`, `carrick-embed`)** | ``LinuxErrno`, `LINUX_EINVAL`, `LINUX_ENOSPC`, `ETIMEDOUT`, `EAGAIN`, `EFAULT`, `HostSyscallError`, `into_errno`.` | **NTSTATUS and Win32 Error Codes (`0xC0000000` / Win32 `DWORD`)** | NT kernel system services do not return negative errno integers. They return 32-bit `NTSTATUS` codes structured into Severity (2 bits), Customer flag (1 bit), Facility (12 bits), and Code (16 bits) (e.g., `STATUS_SUCCESS = 0x00000000`, `STATUS_INVALID_PARAMETER = 0xC000000D`, `STATUS_ACCESS_VIOLATION = 0xC0000005`, `STATUS_OBJECT_NAME_NOT_FOUND = 0xC0000034`). Win32 subsystems map `NTSTATUS` to Win32 error codes (`RtlNtStatusToDosError`), stored in the TEB's `LastErrorValue` (`GetLastError`). |
 | **Synthetic Filesystems and Namespace Path Hierarchies (`carrick-vfs`, `carrick-runtime`)** | ``/proc`, `/proc/<tid>/stat`, `/proc/self`, synthetic process directories, `devpts`, `AF_UNIX` path endpoints.` | **NT Object Manager Namespace (`\Device`, `\DosDevices`) and PEB Information** | NT has no rootfs `/proc` or `/sys` mount points. Process inspection occurs via query system calls (`NtQuerySystemInformation`, `NtQueryInformationProcess`) and direct user-mode access to the Process Environment Block (`PEB`). Device and filesystem paths reside in the unified Object Manager namespace (`\Device\HarddiskVolume1\...`, `\DosDevices\C:\...`, `\Global??`). Inter-process communication uses Named Pipes (`\Device\NamedPipe\...`) and ALPC ports (`\RPC Control\...`) rather than POSIX domain sockets (`AF_UNIX`). |
-| **Process, Thread, and Execution Graph (`carrick-thread`, `carrick-kernel-arena`, `carrick-spec`, `carrick-engine`)** | ``pid`/`tgid`, `ThreadId(i32)`, `CLONE_VM`, `CLONE_THREAD`, `CLONE_FILES`, `CLONE_CHILD_CLEARTID`, `ProcessRecord`.` | **Executive Processes (`EPROCESS`), Threads (`ETHREAD`), Client ID, and TEB** | NT processes are created through `NtCreateUserProcess` / `NtCreateProcessEx` and threads through `NtCreateThreadEx`. Processes and threads are identified by `CLIENT_ID` (containing `UniqueProcessId` and `UniqueThreadId` handles). NT has no `fork()` primitive and no concept of thread-group IDs (`tgid`) separate from process IDs. Every NT thread has a Thread Environment Block (`TEB`) whose pointer is held in `tpidr_el0` (ARM64) or the `gs` segment base (x86_64), housing the stack limits, SEH frame chain, and PEB pointer. |
+| **Process, Thread, and Execution Graph (`carrick-thread`, `carrick-kernel-arena`, `carrick-spec`, `carrick-engine`, `carrick-sched-core`)** | ``pid`/`tgid`, `ThreadId(i32)`, `ThreadIdentity` (tid, file_table), `ThreadCtx` (AArch64 registers), `CLONE_VM`, `CLONE_THREAD`, `CLONE_FILES`, `CLONE_CHILD_CLEARTID`, `ProcessRecord`.` | **Executive Processes (`EPROCESS`), Threads (`ETHREAD`), Client ID, and TEB (Register x18 on ARM64)** | NT processes are created through `NtCreateUserProcess` / `NtCreateProcessEx` and threads through `NtCreateThreadEx`. Processes and threads are identified by `CLIENT_ID` (containing `UniqueProcessId` and `UniqueThreadId` handles). NT has no `fork()` primitive and no concept of thread-group IDs (`tgid`) separate from process IDs. Every NT thread has a Thread Environment Block (`TEB`). On Windows ARM64, the platform register **x18** is reserved by the OS to point to the user TEB (per Microsoft's ARM64 ABI), while x86_64 uses the `gs` segment base. `tpidr_el0` is Linux TLS and must not be confused with the NT TEB register contract. |
 | **Userspace Synchronization and Futexes (`carrick-thread`, `carrick-sched-core`, `carrick-guest-mem`, `carrick-embed`)** | ``FutexTable`, `futex` wait/wake/requeue, `FUTEX_WAIT`, `FUTEX_WAKE`, `shared_futex_location`.` | **WaitOnAddress, Keyed Events, and Dispatcher Synchronization Objects** | Windows NT synchronization at the system call boundary uses handle-based dispatcher objects (`NtCreateEvent`, `NtSetEvent`, `NtCreateSemaphore`, `NtCreateMutant`). Modern NT userspace synchronization (SRW locks and condition variables) is built upon `RtlWaitOnAddress` / `RtlWakeAddressSingle`, which is implemented in kernel space via Keyed Events (`NtWaitForKeyedEvent` and `NtReleaseKeyedEvent`) keyed on virtual addresses, rather than Linux futex opcodes with requeue hashing. |
 | **Directory Change Notifications (`carrick-inotify-core`, `carrick-el1-abi`)** | ``LinuxInotifyEventHeader`, `alloc_wd`, `INOTIFY_EVENT_HEADER_SIZE`, `LINUX_IN_MODIFY`, `LINUX_IN_Q_OVERFLOW`.` | **Directory Change Notifications (`ReadDirectoryChangesW` / `NtNotifyChangeDirectoryFile`)** | NT filesystem notification uses asynchronous directory change queries (`NtNotifyChangeDirectoryFile` / `ReadDirectoryChangesW`) operating on directory handles with completion routines or I/O completion ports. Results are returned into caller-supplied `FILE_NOTIFY_INFORMATION` buffers rather than a central inotify instance with watch descriptors (`wd`) and `struct inotify_event` wire headers. |
 | **Inter-Task Pipes and Event Descriptors (`carrick-pipe-core`)** | ``EVENTFD_MAX`, `broken_pipe_signal` requesting SIGPIPE.` | **Anonymous Pipes (`NtCreatePipeFile`) and NT Events (`NtCreateEvent`)** | NT anonymous pipes are implemented via the Named Pipe File System (`NPFS`) driver via `NtCreatePipeFile` returning read and write handles. Broken pipes report `STATUS_PIPE_BROKEN` on subsequent read/write calls; NT never generates asynchronous signals (like SIGPIPE) on pipe disconnects. Event counters (Linux `eventfd`) correspond to NT Notification or Synchronization Event objects (`NtCreateEvent`). |
+| **Interval and POSIX Timers (`carrick-timer-core`)** | ``ITIMER_COUNT = 3` (REAL, VIRTUAL, PROF), `PosixTimerSpec` with `signum` and `si_value`, `OVERRUN_MAX`, BSD kqueue timer-ident flags.` | **Waitable Timers (`NtCreateTimer`, `NtSetTimer`) and APC Delivery** | NT timers are kernel dispatcher objects created via `NtCreateTimer` and armed with `NtSetTimer` (100-nanosecond negative relative or positive absolute intervals). Timers can trigger optional completion APC routines (`PTIMERAPCROUTINE`) executed when the calling thread enters an alertable wait state, rather than generating POSIX signals (`SIGALRM`, `SIGVTALRM`, `SIGPROF`) or filling POSIX overrun counters. |
