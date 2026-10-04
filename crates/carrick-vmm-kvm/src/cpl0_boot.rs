@@ -27,6 +27,7 @@ const BINDING_OFFSET: u64 = 0x8000;
 const TASK_OFFSET: u64 = 0x9000;
 const CONTROL_OFFSET: u64 = 0xa000;
 const STRIDE: u64 = 0x100;
+const IST_STACK_BASE: u64 = 0xf0_0000;
 pub const USER_CODE: u64 = 0x1_0000;
 const LAYOUT: BringupLayout = BringupLayout {
     trampoline_base: 0x10_0000,
@@ -85,6 +86,9 @@ pub struct Observation {
     pub completions: [u64; 2],
     pub kicks: u64,
     pub work_exits: u64,
+    pub captured_stack: u64,
+    pub returned_stack: u64,
+    pub preserved_rbx: u64,
 }
 
 /// The vCPUs drop before the VM, and its registered backing drops last.
@@ -129,7 +133,7 @@ impl Cpl0Carrier {
             maps.push(Pml4MapSpec {
                 va,
                 gpa: va,
-                len: (end + 0xfff & !0xfff) - va,
+                len: ((end + 0xfff) & !0xfff) - va,
                 user: false,
                 write: segment.perms.write,
                 exec: segment.perms.execute,
@@ -205,6 +209,18 @@ impl Cpl0Carrier {
         carrick_x86::write_fault_tables_with(LAYOUT, |gpa, bytes| {
             ram.write_gpa(gpa, bytes).map_err(|e| fail(e.to_string()))
         })?;
+        // Intel SDM vol. 3: 64-bit TSS IST1 occupies bytes 36..44; the IDT
+        // gate's byte 4 selects IST1. Keep double faults off the syscall stack.
+        // Reuse the existing descriptors/stubs rather than build another IDT.
+        for index in 0..2 {
+            let tss = carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), index)?;
+            let ist_top = IST_STACK_BASE + (index + 1) * 4096;
+            ram.write_gpa(tss + 36, &ist_top.to_le_bytes())
+                .map_err(|e| fail(e.to_string()))?;
+            let idt = carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index)?;
+            ram.write_gpa(idt + 8 * 16 + 4, &[1])
+                .map_err(|e| fail(e.to_string()))?;
+        }
         // SAFETY: private zeroed backing; typed objects fit and are aligned.
         // They are initialized before registration or any guest execution.
         unsafe {
@@ -267,6 +283,7 @@ impl Cpl0Carrier {
                     entries: AtomicU64::new(0),
                     publications: AtomicU64::new(0),
                     completions: AtomicU64::new(0),
+                    captured_stack: AtomicU64::new(0),
                 });
             }
         }
@@ -309,6 +326,17 @@ impl Cpl0Carrier {
             .map_err(|e| fail(e.to_string()))?;
             if cpu.fd().set_msrs(&msrs).map_err(|e| fail(e.to_string()))? != 1 {
                 return Err(fail("KERNEL_GS_BASE not installed"));
+            }
+            let system = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+            if system.tr.base
+                != carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), index as u64)?
+                || system.idt.base
+                    != carrick_x86::fault_slot_gpa(
+                        carrick_x86::fault_idt_base(LAYOUT),
+                        index as u64,
+                    )?
+            {
+                return Err(fail("private TSS/IDT not installed"));
             }
         }
         let metadata_base = NonNull::new(
@@ -367,7 +395,31 @@ impl Cpl0Carrier {
                 self.cpus[index].append_debug_state(&mut detail);
                 return Err(fail(detail));
             };
+            if !matches!(
+                port,
+                CONTROL_PORT
+                    | FORWARD_PORT
+                    | ENTRY_KICK_PORT
+                    | RETURN_KICK_PORT
+                    | WORK_PORT
+                    | FATAL_PORT
+            ) {
+                let mut detail = format!("unexpected CPL0 port {port:#x}");
+                self.cpus[index].append_debug_state(&mut detail);
+                return Err(fail(detail));
+            }
             let address = self.cpus[index].get_gpr(X86Reg::Rax)?;
+            let stack_end = self.binding(index).kernel_stack + 16;
+            if address & 7 != 0
+                || address < stack_end - 0x1_0000
+                || address
+                    .checked_add(size_of::<NativeFrame>() as u64)
+                    .is_none_or(|end| end > stack_end)
+            {
+                return Err(fail(
+                    "CPL0 control frame outside its private supervisor stack",
+                ));
+            }
             let ptr = self
                 .ram
                 .host_ptr(address, size_of::<NativeFrame>())
@@ -396,21 +448,14 @@ impl Cpl0Carrier {
                         }),
                         kicks: self.kicks,
                         work_exits: self.work_exits,
+                        captured_stack: self.binding(index).captured_stack.load(Ordering::Acquire),
+                        returned_stack: frame.rsp,
+                        preserved_rbx: frame.rbx,
                     });
                 }
                 FORWARD_PORT => {
-                    // RED-ONLY bring-up scaffold. M2 deletes this entire
-                    // successful/error host implementation after its witness.
-                    if frame.rax != 273 {
-                        return Err(fail("unported CPL0 call"));
-                    }
                     self.host_forwards += 1;
-                    if frame.rsi == 24 {
-                        self.slot(index).set_robust_list(frame.rdi, 24);
-                        frame.rax = 0;
-                    } else {
-                        frame.rax = (-22_i64) as u64;
-                    }
+                    return Err(fail(format!("unported CPL0 native call {}", frame.rax)));
                 }
                 ENTRY_KICK_PORT | RETURN_KICK_PORT => {
                     self.task(index).mark_pending_host_work();

@@ -4,7 +4,10 @@ extern crate std;
 use super::*;
 use crate::personality::dispatch::{Zone, dispatch_syscall_with_lifecycle};
 use crate::personality::sched::{FakeCpu, HardwareUserWord, SYS_FUTEX};
-use carrick_el1_abi::{InotifyNameCache, LifecycleHatches, PendingSignals, SlotId, ZoneTables};
+use carrick_el1_abi::{
+    EntryRef, InotifyNameCache, LifecycleHatches, PendingSignals, SlotId, ThreadControlSlot,
+    ThreadLifecyclePage, ZoneTables,
+};
 use carrick_sched_core::ExecutionSlot;
 use std::boxed::Box;
 use std::sync::Barrier;
@@ -802,16 +805,24 @@ fn set_robust_list_stores_the_head_or_returns_einval() {
     assert_eq!(action, Action::Served);
     assert_eq!(frame.x[0], 0);
     assert_eq!(w.venue.leader_slot().robust_list(), (0x9000, 24));
-    let (action, frame) = w.syscall(SYS_SET_ROBUST_LIST, &[0xa000, 23]);
-    assert_eq!(action, Action::Served);
-    assert_eq!(frame.x[0] as i64, -22);
-    assert_eq!(w.venue.leader_slot().robust_list(), (0x9000, 24));
+    // A wrong length is EINVAL from the shared body, served here, with the
+    // stored head untouched.
+    for len in [0, 23, 25, u64::MAX] {
+        let (action, frame) = w.syscall(SYS_SET_ROBUST_LIST, &[0xa000, len]);
+        assert_eq!(action, Action::Served);
+        assert_eq!(frame.x[0] as i64, -22);
+        assert_eq!(w.venue.leader_slot().robust_list(), (0x9000, 24));
+    }
+    assert_eq!(w.served(SYS_SET_ROBUST_LIST), 5);
     let mut w = World::new(LifecycleHatches {
         threads: true,
         sigmask: false,
     });
     let (action, _) = w.syscall(SYS_SET_ROBUST_LIST, &[0x9000, 24]);
     assert_eq!(action, Action::Forward);
+    let (action, _) = w.syscall(SYS_SET_ROBUST_LIST, &[0x9000, 23]);
+    assert_eq!(action, Action::Forward);
+    assert_eq!(w.venue.leader_slot().robust_list(), (0, 0));
 }
 
 // ---- exit ----

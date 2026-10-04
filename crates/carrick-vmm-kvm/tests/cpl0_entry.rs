@@ -20,6 +20,9 @@ fn image() -> PathBuf {
 fn program(calls: &[(u64, u64)]) -> Vec<u8> {
     let mut bytes = Vec::new();
     for &(head, len) in calls {
+        bytes.extend_from_slice(&[0x48, 0xbb]); // mov rbx, per-call state
+        bytes.extend_from_slice(&head.to_le_bytes());
+        bytes.push(0x53); // push rbx: syscall must capture this live user SP
         bytes.extend_from_slice(&[0x48, 0xbf]); // mov rdi, head
         bytes.extend_from_slice(&head.to_le_bytes());
         bytes.extend_from_slice(&[0x48, 0xbe]); // mov rsi, len
@@ -28,6 +31,7 @@ fn program(calls: &[(u64, u64)]) -> Vec<u8> {
         bytes.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]); // mov rdi, rax; observation
         bytes.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
         bytes.extend_from_slice(&[0x0f, 0x05]);
+        bytes.push(0x5b); // pop rbx after observation resumes
     }
     bytes.extend_from_slice(&[0x0f, 0x0b]); // running past the fixture is a fault
     bytes
@@ -60,6 +64,18 @@ fn two_live_tasks_serve_robust_lists_without_host_forwards() {
             assert_eq!(observation.entries, entries);
             assert_eq!(observation.completions, entries);
             assert_eq!(observation.publications, publications);
+            let stack = 0x3_1fe8 + task as u64 * 0x1_0000;
+            assert_eq!(observation.captured_stack, stack);
+            assert_eq!(observation.returned_stack, stack);
+            assert_eq!(
+                observation.preserved_rbx,
+                match (round, task) {
+                    (0..2, 0) => 0xa000 + round * 0x40,
+                    (0..2, _) => 0xb000 + round * 0x40,
+                    (_, 0) => 0xdead,
+                    _ => 0xbeef,
+                }
+            );
             forwards = observation.forwarded;
             host_exits = observation.semantic_host_exits;
             served = observation.served;
@@ -95,6 +111,11 @@ fn entry_and_return_kicks_never_republish_or_recomplete() {
             assert_eq!(observation.entries, entries);
             assert_eq!(observation.completions, entries);
             assert_eq!(observation.publications, publications);
+            assert_eq!(
+                observation.captured_stack,
+                0x3_1fe8 + task as u64 * 0x1_0000
+            );
+            assert_eq!(observation.returned_stack, observation.captured_stack);
             assert_eq!(observation.kicks, (entries[0] + entries[1]) * 2);
             assert_eq!(observation.work_exits, entries[0] + entries[1]);
             forwards = observation.forwarded + observation.semantic_host_exits;
