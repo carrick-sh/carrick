@@ -604,18 +604,32 @@ impl MemState {
         // Holes the host itself still records resident are not stock, and
         // no span this MM's committed backing still occupies is fresh.
         let mut blocked = owed;
+        // A guest MAP_FIXED may replace an immutable file page that the
+        // host had recorded resident. The EL1 editor either journals a live
+        // predecessor above, or proves there was no terminal to return.
+        // In the latter case the old host facts do not own this incarnation.
+        let mut block_old_host = |start: u64, end: u64| {
+            if start < mapping.range.start() {
+                blocked.push((start, end.min(mapping.range.start())));
+            }
+            if end > mapping.range.end() {
+                blocked.push((start.max(mapping.range.end()), end));
+            }
+        };
         if let Ok(len) = usize::try_from(max_len) {
-            blocked.extend(
-                self.deferred_anonymous
-                    .materialized_within(GuestVa(window_start), len)
-                    .into_iter()
-                    .map(|span| (span.start.raw(), span.end.raw())),
-            );
+            for span in self
+                .deferred_anonymous
+                .materialized_within(GuestVa(window_start), len)
+            {
+                block_old_host(span.start.raw(), span.end.raw());
+            }
         }
-        blocked.extend(
-            self.resident
-                .within(window_start, window_end, ResidencyOwner::Host),
-        );
+        for (start, end) in self
+            .resident
+            .within(window_start, window_end, ResidencyOwner::Host)
+        {
+            block_old_host(start, end);
+        }
         if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
             table.live_spans_overlapping(root.mm().raw(), window_start, max_len, |start, end| {
                 blocked.push((start, end));
@@ -1151,14 +1165,16 @@ impl<'a> MemView<'a> {
         let page = page_floor(address, self.linux_page_size());
         let mem_authority_32 = self.mem();
         let mem = mem_authority_32.lock();
-        if bus_fault_contains(&mem.bus_fault_ranges, page) {
-            return None;
-        }
         if mem.root_owes_backing_at(page) {
             return None;
         }
         let prot = match mem.first_touch_owner(page) {
-            FirstTouchOwner::Host => mem.resident_fault_ranges.prot_for_page(page)?,
+            FirstTouchOwner::Host => {
+                if bus_fault_contains(&mem.bus_fault_ranges, page) {
+                    return None;
+                }
+                mem.resident_fault_ranges.prot_for_page(page)?
+            }
             FirstTouchOwner::Root(mapping, incarnation) => {
                 mem.root_armed_prot(&mapping, incarnation, page)?
             }
@@ -1186,17 +1202,18 @@ impl<'a> MemView<'a> {
         let page = page_floor(address, page_size);
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        let (grant, root_owned) = match mem.first_touch_owner(page) {
+        let (grant, owner_span) = match mem.first_touch_owner(page) {
             FirstTouchOwner::Host => (
                 mem.resident_fault_ranges.grant_for_page(page, max_len)?,
-                false,
+                None,
             ),
             FirstTouchOwner::Root(mapping, incarnation) => (
                 mem.root_grant_for_page(&mapping, incarnation, page, max_len)?,
-                true,
+                Some(mapping.range),
             ),
             FirstTouchOwner::Unmapped => return None,
         };
+        let root_owned = owner_span.is_some();
         let mut start = grant.range.start().raw();
         let mut end = grant.range.end().raw();
         // First-touch arming may cover an eager private-file snapshot's BUS
@@ -1205,13 +1222,27 @@ impl<'a> MemView<'a> {
         // page as live EL1-private backing before signal classification.
         for &(bus_start, bus_len) in &mem.bus_fault_ranges {
             let bus_end = bus_start.checked_add(bus_len)?;
-            if bus_start <= page && page < bus_end {
-                return None;
-            }
-            if bus_end <= page {
-                start = start.max(bus_end);
-            } else if bus_start > page {
-                end = end.min(bus_start);
+            // The live root incarnation supersedes the host file's BUS
+            // tail. Keep any part outside that node as an obstacle.
+            for (piece_start, piece_end) in
+                owner_span.map_or([(bus_start, bus_end), (0, 0)], |owner| {
+                    [
+                        (bus_start, bus_end.min(owner.start())),
+                        (bus_start.max(owner.end()), bus_end),
+                    ]
+                })
+            {
+                if piece_start >= piece_end {
+                    continue;
+                }
+                if piece_start <= page && page < piece_end {
+                    return None;
+                }
+                if piece_end <= page {
+                    start = start.max(piece_end);
+                } else if piece_start > page {
+                    end = end.min(piece_start);
+                }
             }
         }
         if start >= end {
@@ -1311,7 +1342,9 @@ impl<'a> MemView<'a> {
         let exclusion = self.begin_host_alias_dispatch(permit);
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        if bus_fault_contains(&mem.bus_fault_ranges, resident.va) {
+        if matches!(mem.first_touch_owner(resident.va), FirstTouchOwner::Host)
+            && bus_fault_contains(&mem.bus_fault_ranges, resident.va)
+        {
             return Err(PublishedFrameGrantRefusal::BusFault);
         }
         if mem.root_owes_backing_within(publication.va, end) {
