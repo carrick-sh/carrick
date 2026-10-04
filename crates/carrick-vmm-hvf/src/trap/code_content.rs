@@ -30,6 +30,7 @@ struct ContentPage {
     running: AtomicUsize,
     drain: Mutex<()>,
     idle: Condvar,
+    completion: carrick_thread::completion::CompletionCallbacks,
 }
 impl ContentPage {
     fn new() -> Self {
@@ -38,9 +39,10 @@ impl ContentPage {
             running: AtomicUsize::new(0),
             drain: Mutex::new(()),
             idle: Condvar::new(),
+            completion: carrick_thread::completion::CompletionCallbacks::default(),
         }
     }
-    fn leave(&self) {
+    fn leave(&self) -> bool {
         let before = self.running.fetch_sub(1, Ordering::SeqCst);
         if before == 0 {
             carrick_fatal::carrick_fatal!(
@@ -51,8 +53,23 @@ impl ContentPage {
         // Warm exits need no lock. If revocation follows this check, its
         // SeqCst running check sees zero; otherwise we wake its locked wait.
         if before == 1 && !self.valid.load(Ordering::SeqCst) {
-            let _drain = self.drain.lock();
-            self.idle.notify_all();
+            {
+                let _drain = self.drain.lock();
+                self.idle.notify_all();
+            }
+            return true;
+        }
+        false
+    }
+    fn publish_completion(&self) {
+        let delivered =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.completion.publish(0)));
+        if let Err(payload) = delivered {
+            core::mem::forget(payload);
+            carrick_fatal::carrick_fatal!(
+                "hvf::code_content",
+                "content completion delivery panicked"
+            );
         }
     }
     fn wait_idle(&self) {
@@ -319,6 +336,12 @@ impl ContentObservation {
     /// ends. This covers content only: it does not authorize executable entry
     /// or prove absence of guest hardware stores and writable aliases.
     pub(crate) fn begin_execution(&mut self) -> Result<(), ContentError> {
+        self.begin_execution_with_hook(|| {})
+    }
+    pub(crate) fn begin_execution_with_hook(
+        &mut self,
+        mut after_increment: impl FnMut(),
+    ) -> Result<(), ContentError> {
         if self.executing != 0 {
             return Err(ContentError::AlreadyExecuting);
         }
@@ -332,6 +355,7 @@ impl ContentObservation {
                     )
                 });
             self.executing += 1;
+            after_increment();
             if !page.valid.load(Ordering::SeqCst) {
                 self.finish_execution();
                 return Err(ContentError::Changed);
@@ -341,8 +365,16 @@ impl ContentObservation {
     }
     pub(crate) fn finish_execution(&mut self) {
         let count = std::mem::take(&mut self.executing);
+        let mut completions = Vec::new();
         for (_, page) in &self.dependencies[..count] {
-            page.leave();
+            if page.leave() {
+                completions.push(page);
+            }
+        }
+        // All execution accounting is settled before invoking any callback.
+        // Warm (not revoked) exits allocate no completion storage.
+        for page in completions {
+            page.publish_completion();
         }
     }
 
@@ -366,6 +398,109 @@ impl Drop for ContentObservation {
                 pages.remove(&page);
             }
             drop(valid);
+        }
+    }
+}
+
+/// Owned revocation. Writer admission closes before dependencies are sampled;
+/// the exact affected dependencies remain retained until copy or cancellation.
+/// No executor waits for executing readers inside this constructor.
+#[derive(Debug)]
+pub(crate) struct PendingContentWrite<O: Deref<Target = CodeContent>> {
+    write: ContentWrite<O>,
+    dependencies: Vec<(usize, Arc<ContentPage>, AtomicBool)>,
+}
+impl<O: Deref<Target = CodeContent>> PendingContentWrite<O> {
+    pub(crate) fn new(content: O, offset: usize, len: usize) -> Result<Self, ContentError> {
+        let range = content.pages(offset, len)?;
+        content.mark_icache_dirty(offset, len);
+        content
+            .writers
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_add(1)
+            })
+            .unwrap_or_else(|_| {
+                carrick_fatal::carrick_fatal!("hvf::code_content", "content writer count exhausted")
+            });
+        let mut dependencies = Vec::new();
+        if content.observed.load(Ordering::SeqCst) {
+            let registry = content.registry.get().unwrap_or_else(|| {
+                carrick_fatal::carrick_fatal!(
+                    "hvf::code_content",
+                    "observed content lacks registry"
+                )
+            });
+            let pages = registry.pages.lock();
+            for (&page, dependency) in pages.range(range) {
+                if let Some(dependency) = dependency.upgrade() {
+                    dependency.valid.store(false, Ordering::SeqCst);
+                    let drained = dependency.running.load(Ordering::SeqCst) == 0;
+                    dependencies.push((page, dependency, AtomicBool::new(drained)));
+                }
+            }
+        }
+        Ok(Self {
+            write: ContentWrite {
+                content,
+                #[cfg(test)]
+                visited_pages: dependencies.len(),
+            },
+            dependencies,
+        })
+    }
+    pub(crate) fn is_ready(&self) -> bool {
+        self.dependencies.iter().all(|(_, dependency, drained)| {
+            if !drained.load(Ordering::Acquire) && dependency.running.load(Ordering::SeqCst) == 0 {
+                drained.store(true, Ordering::Release);
+            }
+            drained.load(Ordering::Acquire)
+        })
+    }
+    pub(crate) fn enroll(
+        &self,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> (Vec<carrick_thread::completion::CompletionEnrollment>, bool) {
+        let enrollments = self
+            .dependencies
+            .iter()
+            .map(|(_, dependency, _)| {
+                let wake = wake.clone();
+                dependency.completion.enroll(move |_| wake())
+            })
+            .collect();
+        // A leave before enrollment is visible here; a later leave owns the wake.
+        (enrollments, self.is_ready())
+    }
+}
+impl<O> carrick_guest_mem::PhysicalMemoryWait for PendingContentWrite<O>
+where
+    O: Deref<Target = CodeContent> + std::fmt::Debug + Send + Sync,
+{
+    fn is_ready(&self) -> bool {
+        PendingContentWrite::is_ready(self)
+    }
+    fn enroll(
+        &self,
+        wake: Arc<dyn Fn() + Send + Sync>,
+    ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+        let (enrollment, ready) = PendingContentWrite::enroll(self, wake);
+        (Box::new(enrollment), ready)
+    }
+}
+impl<O: Deref<Target = CodeContent>> Drop for PendingContentWrite<O> {
+    fn drop(&mut self) {
+        if let Some(registry) = self.write.content.registry.get() {
+            let mut pages = registry.pages.lock();
+            for (page, dependency, _) in self.dependencies.drain(..) {
+                if Arc::strong_count(&dependency) == 1
+                    && pages
+                        .get(&page)
+                        .is_some_and(|current| current.as_ptr() == Arc::as_ptr(&dependency))
+                {
+                    pages.remove(&page);
+                }
+                drop(dependency);
+            }
         }
     }
 }
@@ -428,6 +563,95 @@ impl<O: Deref<Target = CodeContent>> Drop for ContentWrite<O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod serial_host {
+        use super::*;
+        #[test]
+        fn serial_host_content_callback_panic_is_terminal_after_all_releases() {
+            const CHILD: &str = "CARRICK_CONTENT_CALLBACK_PANIC_CHILD";
+            if let Some(kind) = std::env::var_os(CHILD) {
+                struct PayloadBomb;
+                impl Drop for PayloadBomb {
+                    fn drop(&mut self) {
+                        panic!("payload destructor panic");
+                    }
+                }
+                let content = Arc::new(CodeContent::new(8192));
+                let mut execution = content.observe(0, 8192).unwrap();
+                execution.begin_execution().unwrap();
+                let pending = PendingContentWrite::new(content, 0, 8192).unwrap();
+                let all = execution.dependencies.clone();
+                let (_enrollment, ready) = pending.enroll(Arc::new(move || {
+                    assert!(
+                        all.iter()
+                            .all(|(_, page)| page.running.load(Ordering::SeqCst) == 0),
+                        "completion callback ran before all execution references released"
+                    );
+                    if kind == "payload" {
+                        std::panic::panic_any(PayloadBomb);
+                    }
+                    panic!("completion callback panic");
+                }));
+                assert!(!ready);
+                let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    execution.finish_execution()
+                }));
+                core::mem::forget(caught);
+                // The broken baseline strands a later page's running count;
+                // bypass fixture teardown so this red fails instead of hangs.
+                std::process::exit(0);
+            }
+            use std::os::unix::process::ExitStatusExt;
+            for kind in ["string", "payload"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg("trap::code_content::tests::serial_host::serial_host_content_callback_panic_is_terminal_after_all_releases")
+                    .arg("--nocapture").env(CHILD, kind).output().unwrap();
+                assert_eq!(
+                    output.status.signal(),
+                    Some(libc::SIGABRT),
+                    "callback panic must not return with abandoned release accounting: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_content_drain_enroll_then_probe_covers_both_leave_orders() {
+        for leave_first in [false, true] {
+            let content = Arc::new(CodeContent::new(8192));
+            let mut executing = content.observe(0, 4).unwrap();
+            let unrelated = content.observe(4096, 4).unwrap();
+            executing.begin_execution().unwrap();
+            let pending = PendingContentWrite::new(content.clone(), 0, 4).unwrap();
+            assert!(!pending.is_ready());
+            assert!(unrelated.is_current());
+            assert_eq!(
+                content.observe(0, 4).unwrap_err(),
+                ContentError::WriteInProgress
+            );
+            if leave_first {
+                executing.finish_execution();
+            }
+            let count = Arc::new(AtomicUsize::new(0));
+            let fired = count.clone();
+            let (_enrollments, ready) = pending.enroll(Arc::new(move || {
+                fired.fetch_add(1, Ordering::SeqCst);
+            }));
+            assert_eq!(ready, leave_first);
+            if !leave_first {
+                executing.finish_execution();
+            }
+            assert!(pending.is_ready());
+            assert_eq!(count.load(Ordering::SeqCst), usize::from(!leave_first));
+            assert_eq!(content.writers.load(Ordering::SeqCst), 1);
+            drop(executing);
+            drop(pending);
+            assert_eq!(content.writers.load(Ordering::SeqCst), 0);
+            assert_eq!(content.registry.get().unwrap().pages.lock().len(), 1);
+        }
+    }
 
     #[test]
     fn executable_publication_covers_disjoint_lines_on_one_dirty_page() {
