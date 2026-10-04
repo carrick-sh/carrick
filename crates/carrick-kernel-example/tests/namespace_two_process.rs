@@ -400,11 +400,10 @@ fn two_live_process_lower_copy_up_and_whiteout_matrix() {
                         .map(|_| "completed".to_owned())
                         .unwrap_or_else(|error| error.to_string());
                     let work = result.as_ref().ok().map(|run| run.work_snapshot().clone());
-                    if let Ok(receipt) = schedule.receipt(summary, work) {
-                        if let Ok(path) = std::env::var("VMFREE_TRACE") {
-                            std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap())
-                                .unwrap();
-                        }
+                    if let Ok(receipt) = schedule.receipt(summary, work)
+                        && let Ok(path) = std::env::var("VMFREE_TRACE")
+                    {
+                        std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
                     }
                 }
                 let run = match result {
