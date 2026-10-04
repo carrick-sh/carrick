@@ -521,9 +521,8 @@ impl<'a> FsView<'a> {
             LINUX_SEEK_SET => libc::SEEK_SET,
             LINUX_SEEK_CUR => libc::SEEK_CUR,
             LINUX_SEEK_END => libc::SEEK_END,
-            // macOS swaps Linux's SEEK_DATA and SEEK_HOLE numbers.
-            LINUX_SEEK_DATA => 4,
-            LINUX_SEEK_HOLE => 3,
+            LINUX_SEEK_DATA => libc::SEEK_DATA,
+            LINUX_SEEK_HOLE => libc::SEEK_HOLE,
             _ => return DispatchOutcome::errno(LINUX_EINVAL),
         };
         if (whence == LINUX_SEEK_DATA || whence == LINUX_SEEK_HOLE) && offset < 0 {
@@ -657,8 +656,8 @@ impl<'a> FsView<'a> {
                                     return Ok(DispatchOutcome::errno(LINUX_ENXIO));
                                 }
                                 let host_whence = match whence {
-                                    LINUX_SEEK_DATA => 4,
-                                    LINUX_SEEK_HOLE => 3,
+                                    LINUX_SEEK_DATA => libc::SEEK_DATA,
+                                    LINUX_SEEK_HOLE => libc::SEEK_HOLE,
                                     _ => unreachable!(),
                                 };
                                 let r = match (unsafe {
