@@ -1,4 +1,4 @@
-//! Exact-target EL1 publication for a guest-owned foreign MM.
+//! Exact-target descriptor publication before exclusive MM-owner admission.
 //!
 //! When guest EL1 owns a target MM's live descriptors, the host may not edit
 //! them; a foreign writer (process_vm_writev, ptrace POKE) instead submits an
@@ -32,6 +32,9 @@ pub(crate) struct ForeignEl1Publisher<'a> {
     mm_key: std::num::NonZeroU64,
     root: u64,
     ttbr0: u64,
+    // Struct fields drop in declaration order. Keep admission cleanup and
+    // retained table authority inside the legacy borrow's lifetime.
+    _legacy: carrick_guest_mem::LegacyProtectionRead<'a>,
 }
 
 impl<'a> ForeignEl1Publisher<'a> {
@@ -40,11 +43,18 @@ impl<'a> ForeignEl1Publisher<'a> {
     /// requested binding's root is the target authority's own live root.
     pub(crate) fn authenticate(
         invalidator: &'a mut dyn carrick_hal::ForeignMmInvalidator,
-        target: &MmAccessState,
+        target: &'a MmAccessState,
         mm: carrick_hal::ForeignMmId,
         binding: CarrierForeignMmBinding,
     ) -> Result<Self, carrick_hal::ForeignMmTransportError> {
         use carrick_hal::ForeignMmTransportError as Error;
+        // Descriptor ownership alone does not admit host plans against an
+        // exclusive MM owner. This borrow excludes owner selection until the
+        // legacy publication has settled, including failure/Drop paths.
+        let legacy = target
+            .protections
+            .legacy()
+            .ok_or(Error::AuthorityUnavailable)?;
         let tables = target.page_tables_authority();
         if tables.live_descriptor_owner() != carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest {
             return Err(Error::AuthorityUnavailable);
@@ -69,6 +79,7 @@ impl<'a> ForeignEl1Publisher<'a> {
         }
         let ttbr0 = root | (u64::from(binding.asid.raw_for_probe()) << 48);
         Ok(Self {
+            _legacy: legacy,
             caller,
             admission,
             tables,
@@ -152,6 +163,7 @@ pub(crate) enum ForeignStage1Services<'a> {
         invalidator: &'a mut dyn carrick_hal::ForeignMmInvalidator,
         binding: carrick_hal::ForeignMmBinding,
         deadline: std::time::Instant,
+        _legacy: carrick_guest_mem::LegacyProtectionRead<'a>,
     },
     Guest(ForeignEl1Publisher<'a>),
 }
@@ -161,10 +173,16 @@ impl<'a> ForeignStage1Services<'a> {
     /// (or with a binding that is not its own) refuses before any mutation.
     pub(crate) fn for_target(
         invalidator: &'a mut dyn carrick_hal::ForeignMmInvalidator,
-        target: &MmAccessState,
+        target: &'a MmAccessState,
         requested: &CarrierForeignMmSnapshot,
         deadline: std::time::Instant,
     ) -> Result<Self, carrick_hal::ForeignMmTransportError> {
+        // An admitted target requires UserTransfer, not either descriptor
+        // editor. Refusal does not select the host arm.
+        let legacy = target
+            .protections
+            .legacy()
+            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
         if target.page_tables_authority().live_descriptor_owner()
             == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
         {
@@ -177,6 +195,7 @@ impl<'a> ForeignStage1Services<'a> {
             .map(Self::Guest);
         }
         Ok(Self::Host {
+            _legacy: legacy,
             invalidator,
             binding: carrick_hal::ForeignMmSnapshot::binding(requested),
             deadline,
@@ -191,6 +210,7 @@ impl carrick_aarch64::vmm::Stage1Services for ForeignStage1Services<'_> {
                 invalidator,
                 binding,
                 deadline,
+                ..
             } => invalidator
                 .invalidate_exact_asid(*binding, *deadline)
                 .map_err(|error| TrapError::Hypervisor(format!("foreign sparse TLBI: {error:?}"))),
@@ -215,5 +235,90 @@ impl carrick_aarch64::vmm::Stage1Services for ForeignStage1Services<'_> {
             )
             .into()),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+    use carrick_guest_mem::{UserMemoryAdmissionError, UserMemoryAuthority};
+    use std::sync::Arc;
+
+    struct NoCall;
+    impl carrick_guest_mem::CallerEl1Call for NoCall {
+        fn slot(&self) -> Option<usize> {
+            Some(0)
+        }
+        fn drain_foreign(
+            &mut self,
+            _: u64,
+            _: u64,
+            _: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
+        ) -> Result<u64, String> {
+            Err("drop-order witness must not execute a guest service".to_owned())
+        }
+    }
+
+    struct AdmissionDrop {
+        authority: UserMemoryAuthority,
+        handle: carrick_el1_abi::El1MmHandle,
+        result: Arc<parking_lot::Mutex<Option<Result<(), UserMemoryAdmissionError>>>>,
+    }
+    impl carrick_guest_mem::BorrowedTtbr0Admission for AdmissionDrop {
+        fn arm(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+    }
+    impl Drop for AdmissionDrop {
+        fn drop(&mut self) {
+            *self.result.lock() = Some(self.authority.admit_owner(self.handle));
+        }
+    }
+
+    #[test]
+    fn n1_foreign_publisher_drop_keeps_legacy_exclusion_through_admission_cleanup() {
+        let _guard = crate::trap::foreign_mm_tests::FOREIGN_MM_TEST_LOCK.lock();
+        use carrick_el1::personality::mm_portal::{MmPortal, test_support as owner};
+        let region = owner::Region::new();
+        let mm = owner::admit_notified(&region, 77, owner::ROOT, 1, 0);
+        let nodes = owner::nodes(&region);
+        let portal = MmPortal::new(
+            std::num::NonZeroU64::MIN,
+            region.table(),
+            &region.zone().spaces,
+            &nodes,
+        )
+        .with_zone(region.zone())
+        .unwrap();
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let authority = UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default()));
+        let result = Arc::new(parking_lot::Mutex::new(None));
+        let mut caller = NoCall;
+        // This exercises the real publisher's field destruction. No service
+        // or replacement MM model participates in the cleanup interleaving.
+        let publisher = ForeignEl1Publisher {
+            caller: &mut caller,
+            admission: Box::new(AdmissionDrop {
+                authority: authority.clone(),
+                handle,
+                result: result.clone(),
+            }),
+            tables: carrick_aarch64::Stage1Authority::new_with_manager(None),
+            slots: None,
+            mm_key: std::num::NonZeroU64::new(mm.raw()).unwrap(),
+            root: owner::ROOT,
+            ttbr0: owner::ROOT,
+            _legacy: authority.legacy().unwrap(),
+        };
+        drop(publisher);
+        assert_eq!(
+            *result.lock(),
+            Some(Err(UserMemoryAdmissionError::LegacyReadActive))
+        );
+        assert_eq!(
+            authority.admit_owner(handle),
+            Ok(()),
+            "cleanup leaked exclusion"
+        );
     }
 }

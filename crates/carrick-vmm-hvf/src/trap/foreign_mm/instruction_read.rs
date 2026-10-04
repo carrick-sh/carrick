@@ -57,6 +57,14 @@ pub(super) fn read(
     if dst.is_empty() {
         return Err(Error::Translation(va));
     }
+    // Owner admission cannot retire the legacy venue between dependency
+    // observation and the matching byte copy. An owner reader requires the
+    // shared ReadInstruction service before either operation can start.
+    let _legacy = lease
+        .state
+        .protections
+        .legacy()
+        .ok_or(Error::AuthorityUnavailable)?;
     let content = match observe_resident(lease, authority, snapshot, va, dst.len(), deadline) {
         Ok(content) => content,
         // The normal reader also authenticates deferred pristine recipes.

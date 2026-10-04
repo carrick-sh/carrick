@@ -168,6 +168,23 @@ fn is_pidfd_get_info(request: u64) -> bool {
     request & 0xc000_ffff == 0xc000_ff0b
 }
 
+fn procmap_bounds(
+    map: &carrick_vfs::ProcMapsEntry,
+    brk_current: carrick_guest_mem::GuestVa,
+    mmap_next: carrick_guest_mem::GuestVa,
+) -> crate::vfs::proc::ProcMapBounds {
+    let used_end = match map.start {
+        crate::memory::LINUX_HEAP_BASE => Some(brk_current),
+        crate::memory::LINUX_MMAP_BASE => Some(mmap_next),
+        _ => None,
+    };
+    crate::vfs::proc::ProcMapBounds::render(
+        carrick_guest_mem::GuestVa(map.start),
+        carrick_guest_mem::GuestVa(map.end),
+        used_end,
+    )
+}
+
 fn procmap_query(
     this: &FsView<'_>,
     context: &crate::kernel::KernelContext,
@@ -197,8 +214,8 @@ fn procmap_query(
     let proc_context = this.synthetic_proc_context(context);
     let executable_path = proc_context.executable_path;
     let mut maps = proc_context.address_space_regions.unwrap_or_default();
-    let brk_current = proc_context.brk_current;
-    let mmap_next = proc_context.mmap_next;
+    let brk_current = carrick_guest_mem::GuestVa(proc_context.brk_current);
+    let mmap_next = carrick_guest_mem::GuestVa(proc_context.mmap_next);
     maps.sort_by_key(|map| map.start);
     let query_addr = query.query_addr;
     let covering_or_next = flags & carrick_abi::LINUX_PROCMAP_QUERY_COVERING_OR_NEXT_VMA != 0;
@@ -228,20 +245,9 @@ fn procmap_query(
         map_flags & (flags & FILTER_FLAGS) == flags & FILTER_FLAGS
     };
     let selected = maps.into_iter().find(|map| {
-        let start = map.start & !(page - 1);
-        let mut semantic_end = map.end;
-        if map.start == crate::memory::LINUX_HEAP_BASE
-            && brk_current > map.start
-            && brk_current <= map.end
-        {
-            semantic_end = brk_current;
-        } else if map.start == crate::memory::LINUX_MMAP_BASE
-            && mmap_next > map.start
-            && mmap_next <= map.end
-        {
-            semantic_end = mmap_next;
-        }
-        let end = semantic_end.div_ceil(page) * page;
+        let bounds = procmap_bounds(map, brk_current, mmap_next);
+        let start = bounds.start.raw();
+        let end = bounds.end.raw();
         let address_matches = if covering_or_next {
             end > query_addr
         } else {
@@ -253,20 +259,9 @@ fn procmap_query(
         return DispatchOutcome::errno(LINUX_ENOENT);
     };
 
-    let start = map.start & !(page - 1);
-    let mut semantic_end = map.end;
-    if map.start == crate::memory::LINUX_HEAP_BASE
-        && brk_current > map.start
-        && brk_current <= map.end
-    {
-        semantic_end = brk_current;
-    } else if map.start == crate::memory::LINUX_MMAP_BASE
-        && mmap_next > map.start
-        && mmap_next <= map.end
-    {
-        semantic_end = mmap_next;
-    }
-    let end = semantic_end.div_ceil(page) * page;
+    let bounds = procmap_bounds(&map, brk_current, mmap_next);
+    let start = bounds.start.raw();
+    let end = bounds.end.raw();
     let mut map_flags = 0;
     if map.read {
         map_flags |= carrick_abi::LINUX_PROCMAP_QUERY_VMA_READABLE;
