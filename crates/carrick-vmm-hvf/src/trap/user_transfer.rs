@@ -346,6 +346,10 @@ impl UserTransferCustody {
         if len == 0 || len > 4096 || selected.ipa.checked_add(len as u64).is_none() {
             return Err(error());
         }
+        let Some(identity) = self.custody.stage2_record_covering(selected.ipa, len) else {
+            carrick_observability::probes::hvpatch_el1_host_read_retention(selected.ipa, 1);
+            return Ok(None);
+        };
         let global = {
             let owners = self.custody.global_frame_host_owners.lock();
             if let Some((&(base, length), entry)) =
@@ -356,7 +360,10 @@ impl UserTransferCustody {
                     if selected.ipa + len as u64 > end {
                         return Err(error());
                     }
-                    entry.live_owner().cloned()
+                    entry
+                        .live_owner()
+                        .filter(|owner| owner.record_identity == identity)
+                        .cloned()
                 } else {
                     None
                 }
@@ -364,40 +371,32 @@ impl UserTransferCustody {
                 None
             }
         };
-        let (identity, mapping) = if let Some(owner) = global {
-            (owner.record_identity, Some(Arc::clone(&owner.mapping)))
+        let mapping = if let Some(owner) = global {
+            Some(Arc::clone(&owner.mapping))
         } else {
-            let identity = {
-                let records = self.custody.carrier_stage2_records.lock();
-                let Some((&(base, length), identity)) =
-                    records.range(..=(selected.ipa, u64::MAX)).next_back()
-                else {
-                    return Ok(None);
-                };
-                let end = base.saturating_add(length);
-                if selected.ipa >= end {
-                    return Ok(None);
-                }
-                if selected.ipa + len as u64 > end {
-                    return Err(error());
-                }
-                *identity
-            };
-            let mapping = self
-                .custody
+            self.custody
                 .structural_backings
                 .lock()
                 .get(&identity.record_id)
-                .map(|entry| Arc::clone(&entry.mapping));
-            (identity, mapping)
+                .map(|entry| Arc::clone(&entry.mapping))
         };
         let pin = match self.custody.pin_stage2_record(identity) {
             Ok(pin) => pin,
             Err(
-                CarrierStage2PinError::NotFound
+                reason @ (CarrierStage2PinError::NotFound
                 | CarrierStage2PinError::NotMapped
-                | CarrierStage2PinError::RetirementRequested,
-            ) => return Ok(None),
+                | CarrierStage2PinError::RetirementRequested),
+            ) => {
+                carrick_observability::probes::hvpatch_el1_host_read_retention(
+                    selected.ipa,
+                    match reason {
+                        CarrierStage2PinError::NotFound => 3,
+                        CarrierStage2PinError::NotMapped => 4,
+                        _ => 5,
+                    },
+                );
+                return Ok(None);
+            }
             Err(reason) => {
                 return Err(TrapError::Hypervisor(format!(
                     "UserTransfer physical pin refused: {reason:?}"
