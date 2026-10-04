@@ -220,6 +220,23 @@ fn merge_epoll_edge_sample(
     }
 }
 
+/// Linux epoll supplies listener arrival edges, not accept-queue counts.
+/// Its host level must not get ahead of the drain and report the same arrival
+/// twice. In-zone arrivals retain their own generation-based readiness.
+fn listener_level_ready(
+    sample: &crate::kernel::objects::ListenerReadinessSample,
+    interest: LinuxEpollEvents,
+) -> u32 {
+    if cfg!(target_os = "linux")
+        && interest.contains(LinuxEpollEvents::ET)
+        && sample.inzone.is_none_or(|snapshot| snapshot.pending == 0)
+    {
+        (sample.ready & !LinuxEpollEvents::IN).bits()
+    } else {
+        sample.ready.bits()
+    }
+}
+
 fn epoll_wait_sample_needs_host_rebind(
     before: u32,
     raw: u32,
@@ -1662,6 +1679,14 @@ impl<'a> NetView<'a> {
                                     });
                                 let clear_write_backpressure =
                                     write_backpressured && raw & LINUX_EPOLLOUT != 0;
+                                // Linux's native EPOLLET listener wake is the
+                                // arrival authority: epoll supplies no queue
+                                // depth, and listener FIONREAD stays zero.
+                                let native_listener_arrival = cfg!(target_os = "linux")
+                                    && edge_bits & LINUX_EPOLLIN != 0
+                                    && listener_sample.as_ref().is_some_and(|sample| {
+                                        sample.host_ready.contains(LinuxEpollEvents::IN)
+                                    });
                                 // Growth over the recorded baseline delivers a
                                 // SECOND ET edge while the first is still
                                 // unconsumed. It is not the mechanism that
@@ -1675,7 +1700,9 @@ impl<'a> NetView<'a> {
                                 // its accept-queue depth is non-monotone.
                                 let read_growth = if requested & LINUX_EPOLLET != 0
                                     && raw & READ_READY_BITS != 0
-                                    && if inzone_arrival_generation.is_some() {
+                                    && if native_listener_arrival {
+                                        true
+                                    } else if inzone_arrival_generation.is_some() {
                                         inzone_arrival_generation != last_inzone_arrival_generation
                                             || host_listener_count > last_host_listener_count
                                     } else {
@@ -1793,7 +1820,9 @@ impl<'a> NetView<'a> {
                 let ipc_arrival_generation = this.ipc_read_arrival_for_interest(interest, *fd);
                 let raw_ready = listener_sample.as_ref().map_or_else(
                     || this.epoll_ready_events_for_interest(interest, *fd, requested),
-                    |sample| sample.ready.bits(),
+                    |sample| {
+                        listener_level_ready(sample, LinuxEpollEvents::from_bits_retain(requested))
+                    },
                 );
                 let read_avail = if raw_ready & READ_READY_BITS != 0 {
                     this.host_read_avail_for_interest(interest, *fd)
