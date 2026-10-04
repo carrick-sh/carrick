@@ -1163,6 +1163,27 @@ fn reap_outcome(pid: i32, total: Duration) -> ReapOutcome {
     }
 }
 
+extern "C" fn fork_storm_child_thread(_: *mut libc::c_void) -> *mut libc::c_void {
+    std::ptr::null_mut()
+}
+
+/// The forked child must not enter Rust's thread startup path: a sibling can
+/// hold std's process-local stack-overflow bookkeeping lock at fork, leaving
+/// the child with a locked copy and no thread that can release it. A direct
+/// pthread still exercises the guest's clone, clear-child-tid, and join path.
+fn spawn_and_join_after_fork() -> bool {
+    let mut thread: libc::pthread_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::pthread_create(
+            &mut thread,
+            std::ptr::null(),
+            fork_storm_child_thread,
+            std::ptr::null_mut(),
+        ) == 0
+            && libc::pthread_join(thread, std::ptr::null_mut()) == 0
+    }
+}
+
 pub fn fork_storm(forks: usize) -> i32 {
     let stop = std::sync::Arc::new(AtomicU32::new(0));
     let storm = start_storm(8, stop.clone());
@@ -1192,9 +1213,7 @@ pub fn fork_storm(forks: usize) -> i32 {
             unsafe { libc::close(pipe[0]) };
             let ids = task_ids().unwrap_or_default();
             let single = ids.len() == 1 && ids[0] == current_pid();
-            let spawned = spawn_small(|| {})
-                .map(|handle| handle.join().is_ok())
-                .unwrap_or(false);
+            let spawned = spawn_and_join_after_fork();
             let packed = ids.len() as u64 | (u64::from(single && spawned) << 32);
             write_count(pipe[1], packed);
             unsafe { libc::_exit(0) };
