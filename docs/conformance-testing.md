@@ -54,8 +54,9 @@ extraction validates every Git archive member before writing; Python versions
 with extraction filters also apply the data filter, while Python 3.11 uses the
 same manifest validation before extraction.
 
-Linux host-policy test exceptions are named with reasons in
-[`scripts/linux-host-test-allowlist.json`](../scripts/linux-host-test-allowlist.json).
+Any Linux host-policy test exceptions must be named with reasons in
+[`scripts/linux-host-test-allowlist.json`](../scripts/linux-host-test-allowlist.json),
+which is currently empty.
 The receipt annotates matching failures and separately names unallowlisted ones;
 no failing command is silently turned green. Backend ABI failures require fixes,
 not additions to this allowlist. All steps run even after an earlier step fails.
