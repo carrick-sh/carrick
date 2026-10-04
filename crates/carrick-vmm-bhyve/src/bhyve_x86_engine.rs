@@ -2698,9 +2698,11 @@ mod tests {
     /// once and re-finds it thereafter).
     #[test]
     fn mirror_slot_is_stable_per_key() {
-        // A key unlikely to collide with any real guest VA the process-global table
-        // may already hold from a sibling test.
-        let key = 0xDEAD_BEEF_1000u64;
+        let ram = BhyveGuestRam::new();
+        let va = 0xDEAD_BEEF_1000u64;
+        let gpa = ram.add_bump(va, 4096, true, true, false).expect("anon gpa");
+        ram.publish_mapping_sharing(va, 4096, MappingSharing::Shared);
+        let key = ram.shared_futex_key(gpa, 4).expect("shared object key");
         let a1 = shared_futex_mirror_slot(key).expect("mirror slot");
         let a2 = shared_futex_mirror_slot(key).expect("mirror slot");
         assert_eq!(
