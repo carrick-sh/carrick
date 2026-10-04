@@ -3,6 +3,7 @@
 
 use carrick_kernel::dispatch::SyscallDispatcher;
 use carrick_kernel::network::NetworkHostsEntry;
+#[cfg(any(test, feature = "platform-macos"))]
 use carrick_kernel::run_result::{RunResult, RuntimeError};
 #[cfg(feature = "fs-memory")]
 use carrick_spec::FsBackendKind;
@@ -19,6 +20,7 @@ use std::path::PathBuf;
 /// could not be found/read. The runc/shell convention is to exit 127 for that —
 /// `docker run img /nope` and `sh -c nope` both yield 127 — not the generic 1 a
 /// propagated error would produce.
+#[cfg(any(test, feature = "platform-macos"))]
 pub(crate) fn is_entrypoint_not_found(e: &RuntimeError) -> bool {
     matches!(
         e,
@@ -28,6 +30,7 @@ pub(crate) fn is_entrypoint_not_found(e: &RuntimeError) -> bool {
 }
 
 /// A 127 ("command not found") result for a failed entrypoint load.
+#[cfg(any(test, feature = "platform-macos"))]
 pub(crate) fn entrypoint_not_found_result() -> RunResult {
     RunResult {
         exit_code: 127,
@@ -46,6 +49,7 @@ pub(crate) fn entrypoint_not_found_result() -> RunResult {
 /// permission denial (EACCES). The runc/shell convention is to exit 126 for
 /// that — `docker run img /etc/hostname` yields 126 — distinct from 127 (not
 /// found) and the generic 1 a propagated error would produce.
+#[cfg(any(test, feature = "platform-macos"))]
 pub(crate) fn is_entrypoint_not_executable(e: &RuntimeError) -> bool {
     match e {
         // A file that isn't a loadable AArch64 ELF (wrong magic, truncated,
@@ -61,6 +65,7 @@ pub(crate) fn is_entrypoint_not_executable(e: &RuntimeError) -> bool {
 
 /// A 126 ("command found but not executable") result for an entrypoint that
 /// exists but cannot be loaded/exec'd.
+#[cfg(any(test, feature = "platform-macos"))]
 pub(crate) fn entrypoint_not_executable_result() -> RunResult {
     RunResult {
         exit_code: 126,

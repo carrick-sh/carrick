@@ -1,24 +1,36 @@
+#![cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(
+        dead_code,
+        reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
+    )
+)]
+
 //! Fork and clone lifecycle for the HVPatch vCPU loop.
 //!
 //! Owns process fork preparation and commit/rollback boundaries, clone thread
 //! request and retry lifecycle, failpoints, and child identity bootstrap.
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::sync::Arc;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::CurrentMmMemory;
 use carrick_hal::TrapError;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use carrick_hal::threaded::ThreadedEngine;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use carrick_hal::VcpuRegistry;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::terminal::CloneAdmissionChangeSubscription;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::threads;
-use super::{
-    Kernel, RuntimeError, SyscallDispatcher, ThreadRuntimeState, executor,
-    stamp_ns_visible_guest_tid,
-};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::{Kernel, ThreadRuntimeState, executor, stamp_ns_visible_guest_tid};
+use super::{RuntimeError, SyscallDispatcher};
 use carrick_kernel::kernel::identity_page::stamp_identity_values;
 
 pub(crate) enum ProcessChildBootstrap {
@@ -586,7 +598,7 @@ pub(crate) enum HvpatchCloneFailpoint {
     Activation = 6,
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(crate) enum HvpatchProcessFailpoint {
@@ -603,7 +615,7 @@ pub(crate) enum HvpatchProcessFailpoint {
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 static HVPATCH_CLONE_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
 static HVPATCH_PROCESS_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
@@ -611,7 +623,7 @@ pub(crate) fn install_hvpatch_clone_failpoint(phase: HvpatchCloneFailpoint) {
     HVPATCH_CLONE_FAILPOINT.store(phase as u8, std::sync::atomic::Ordering::Release);
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
 pub(crate) fn install_hvpatch_process_failpoint(phase: HvpatchProcessFailpoint) {
     HVPATCH_PROCESS_FAILPOINT.store(phase as u8, std::sync::atomic::Ordering::Release);
 }
@@ -639,7 +651,7 @@ pub(crate) fn check_hvpatch_clone_failpoint(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) fn check_hvpatch_process_failpoint(
     phase: HvpatchProcessFailpoint,
 ) -> Result<(), RuntimeError> {
@@ -985,6 +997,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn production_clone_failpoints_are_exact_and_consumed_once() {
         #[derive(Default)]
         pub(crate) struct Memory(pub(crate) std::collections::BTreeMap<u64, Vec<u8>>);
@@ -1381,6 +1394,7 @@ pub(crate) mod tests {
     }
 
     #[derive(Default)]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) struct FakeBackendOps {
         pub(crate) parent_commits: usize,
         pub(crate) parent_rollbacks: usize,
@@ -1398,6 +1412,7 @@ pub(crate) mod tests {
         pub(crate) request_child_mm: Option<u64>,
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl<E: ThreadedEngine> HvpatchProcessBackendOps<E, Memory> for FakeBackendOps {
         type Prepared = ();
         type Backend = ();
@@ -1658,6 +1673,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn production_process_failpoints_run_the_real_kernel_copyout_and_publication_body() {
         for (case, phase) in [
             Some(HvpatchProcessFailpoint::ParentCopyout),
@@ -1850,6 +1866,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn backend_prepare_error_does_not_double_rollback() {
         let pid = 42;
         let dispatcher = SyscallDispatcher::new();
@@ -1928,6 +1945,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn backend_staleness_after_successful_prepare_aborts_and_rolls_copied_parent_back_exactly_once()
     {
         let pid = 43;

@@ -1,3 +1,11 @@
+#![cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(
+        dead_code,
+        reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
+    )
+)]
+
 //! Outcome publication, process graph liveness, and carrier abort recording.
 //!
 //! Owns the `ProcessGraphLiveness` invariant that supervises container jobs,

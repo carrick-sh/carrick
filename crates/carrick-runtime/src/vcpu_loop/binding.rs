@@ -1,3 +1,11 @@
+#![cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(
+        dead_code,
+        reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
+    )
+)]
+
 //! HVPatch kernel execution and task binding.
 
 use std::sync::Arc;
@@ -14,6 +22,7 @@ use carrick_kernel::dispatch::DispatchOutcome;
 use carrick_kernel::run_result::RuntimeError;
 
 use super::exec::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::lifecycle::*;
 use super::outcome::*;
 use super::terminal::*;
@@ -3011,7 +3020,17 @@ where
                     }
                 };
                 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-                let spawned = threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN);
+                let spawned = {
+                    let _ = (
+                        stack,
+                        tls,
+                        flags,
+                        parent_tid_addr,
+                        child_tid_addr,
+                        clear_child_tid_addr,
+                    );
+                    threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EAGAIN)
+                };
                 let (completed_internal_tid, completed_visible_tid, completed_errno) = match spawned
                 {
                     threads::CloneThreadSpawn::Started { internal, visible } => {
@@ -5355,7 +5374,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn launch_persistent_hvpatch_job<E: ThreadedEngine + 'static>(
     kernel: Kernel,
-    mut engine: E,
+    engine: E,
     registry: Arc<ThreadRegistry>,
     futex: Arc<FutexTable>,
     platform_futex: Arc<dyn PlatformFutex>,
@@ -5387,13 +5406,14 @@ where
             in_guest,
             max_traps,
         );
-        return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(
+        VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(
             "HVPatch persistent executors require macOS/aarch64 HVF".to_owned(),
-        )));
+        )))
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
+        let mut engine = engine;
         type HvfEngine = carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine;
 
         let mut prepared = match prepare_initial_runner_handoff(

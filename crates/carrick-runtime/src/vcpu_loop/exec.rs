@@ -1,3 +1,11 @@
+#![cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(
+        dead_code,
+        reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
+    )
+)]
+
 //! PROC concern: execve of the vCPU run loop.
 //!
 //! Split out of `vcpu_loop/mod.rs` (Task A2). Pure relocation — no logic
@@ -4392,6 +4400,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn interception_completion_dynamic_guest_exec_failure_completes_errno_once() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let returns = Arc::new(Mutex::new(Vec::new()));

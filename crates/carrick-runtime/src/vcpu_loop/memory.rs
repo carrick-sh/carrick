@@ -806,7 +806,9 @@ pub(crate) fn proc_maps_from_address_space(image: &AddressSpace) -> Vec<ProcMaps
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     mod native_buffers;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     mod native_floor;
     use super::*;
 
@@ -1091,6 +1093,7 @@ mod tests {
         child
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     struct RealProductionCowFixture {
         child: KernelContext,
         stage1: Arc<crate::hvpatch::Stage1MmLease>,
@@ -1099,6 +1102,7 @@ mod tests {
             carrick_vmm_hvf::trap::foreign_cow_test_support::ProductionCarrierForeignCowHarness,
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn real_production_cow_fixture(
         kernel: &Arc<Kernel>,
         parent: &KernelContext,
@@ -1119,6 +1123,7 @@ mod tests {
         )
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn production_cow_fixture_with_shape(
         kernel: &Arc<Kernel>,
         parent: &KernelContext,
@@ -1263,6 +1268,7 @@ mod tests {
 
     #[cfg(feature = "conformance-metrics")]
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_instruction_content_scope_contract() {
         use carrick_conformance_contract::{
             Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
@@ -1448,6 +1454,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn instruction_fetch_composes_kernel_lease_and_production_carrier() {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::{OWNER_LEN, TEST_VA};
         let (kernel, root) = bootstrap(31_170);
@@ -1554,6 +1561,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_carrier_elf_memory_control_round_trip() {
         use carrick_kernel::{
             compat::{CompatReporter, SyscallArgs},
@@ -1774,6 +1782,7 @@ mod tests {
     /// Historical hardware residency on the same executor stays pending until
     /// the actual hardware entry path services it.
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_admission_allows_carrier_cow_without_hardware_ack() {
         use carrick_kernel::kernel::mm_access::MmAccessTarget;
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
@@ -1888,6 +1897,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_data_activation_outlives_mutation_but_not_execution() {
         use carrick_kernel::kernel::mm_access::MmAccessTarget;
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
@@ -2049,6 +2059,7 @@ mod tests {
 
     #[cfg(feature = "conformance-metrics")]
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_data_activation_cost_contract() {
         use carrick_kernel::kernel::mm_access::MmAccessTarget;
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
@@ -2204,6 +2215,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_data_activation_rejects_changes_after_preparation() {
         use carrick_kernel::kernel::mm_access::MmAccessTarget;
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
@@ -2357,6 +2369,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_data_activation_requires_exact_authority_and_real_drain() {
         use carrick_kernel::{
             dispatch::mm_quiesce::{
@@ -2511,6 +2524,7 @@ mod tests {
         clippy::assertions_on_constants,
         reason = "The ignored diagnostic must compile in debug and refuse only when run; a const assertion would break unrelated debug tests"
     )]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_data_activation_entry_cost() {
         use carrick_kernel::kernel::mm_access::MmAccessTarget;
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
@@ -2612,6 +2626,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_data_borrow_composes_execution_lease_and_production_cow() {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
         let (kernel, root) = bootstrap(31_180);
@@ -2681,6 +2696,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_data_borrow_rechecks_all_vma_permissions_and_revision() {
         use carrick_kernel::kernel::mm_access::MmAccessTarget;
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
@@ -2749,6 +2765,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_data_borrow_refuses_denied_second_leaf_and_stale_owner() {
         use carrick_kernel::kernel::mm_access::MmAccessTarget;
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
@@ -2806,6 +2823,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_data_borrow_isolates_same_va_and_accepts_private_identity() {
         use carrick_kernel::kernel::mm_access::MmAccessTarget;
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
@@ -2911,6 +2929,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn production_carrier_foreign_cow_runs_end_to_end_through_runtime_facade() {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
 
@@ -2947,6 +2966,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn production_rx_ptrace_text_commit_accepts_post_cow_inventory_revision() {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
 
@@ -3006,6 +3026,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn production_ptrace_text_carries_executable_authority_when_snapshot_is_writable_but_source_is_rx()
      {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
@@ -3095,6 +3116,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn production_carrier_budget_one_full_occupancy_defers_caller_self_ack_to_entry() {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
 
@@ -3191,6 +3213,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn production_carrier_active_target_services_publication_at_its_next_entry() {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
 
@@ -3343,6 +3366,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn production_carrier_clone_vm_target_reuses_exact_cow_authority() {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
 
@@ -3391,6 +3415,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn production_carrier_target_exec_and_retirement_race_foreign_acquisition() {
         use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
 

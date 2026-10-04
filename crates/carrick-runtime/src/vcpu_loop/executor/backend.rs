@@ -1,25 +1,36 @@
+#![cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(
+        dead_code,
+        reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
+    )
+)]
+
 //! Persistent executor backend abstractions and HVPatch hardware executor implementation.
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use parking_lot::Mutex;
 
 use carrick_fatal::carrick_fatal;
 
 #[path = "residency.rs"]
 pub mod residency;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::binding::HvpatchQuantumControl;
 use crate::trap::TrapError;
-use crate::vcpu_loop::executor::binding::{
-    ExecutorSubmissionContext, HvpatchQuantumControl, PersistentTaskBinding,
-};
+use crate::vcpu_loop::executor::binding::{ExecutorSubmissionContext, PersistentTaskBinding};
 use crate::vcpu_loop::executor::settlement::{
     ExecutorCpuReceipt, ExecutorExit, ExecutorSaveError, RunnableTask, SavedRunnable,
 };
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use carrick_kernel::kernel::objects::MigratableTaskState;
 use carrick_kernel::kernel::objects::{
-    ExecutionFailure, ExecutionGeneration, ExecutorId, MigratableTaskState, ThreadExecutionLease,
-    ThreadKey,
+    ExecutionFailure, ExecutionGeneration, ExecutorId, ThreadExecutionLease, ThreadKey,
 };
 use carrick_kernel::kernel::{Scheduler, SchedulerError};
 pub use residency::*;
