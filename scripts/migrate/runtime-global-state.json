@@ -341,7 +341,7 @@
       "kind": "env_var",
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
       "symbol": "tests::native_data_activation_cost_contract::CARRICK_NATIVE_SCOPE_REVISION",
-      "fingerprint": "37f7985a81952af5d5ab1c66677521aadfc38b67dc31557ac98ebac928c8c427",
+      "fingerprint": "56de4e35afeed7effaab2efddc9d59086962fe660bbc31bea9247b0bf527d40c",
       "classification": "test_only",
       "rationale": "Test-only source-identity stamp for the native-scope cost contract receipt; read once inside the test and never by product code."
     },
@@ -1005,7 +1005,7 @@
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
       "symbol": "tests::native_carrier_elf_memory_control_round_trip::CARRICK_NATIVE_SCOPE_RECEIPT_DIR",
-      "fingerprint": "e13a662ed63255904a3cc1bc232804da59a77373fc9a1b0fcbb0cf3ad40328b9",
+      "fingerprint": "5271633163da0c83e6c581ed8ab9eb6c6b1f490dff0cf8c0e83c332e617bc9fc",
       "classification": "test_only",
       "rationale": "Test-only output directory CARRICK_NATIVE_SCOPE_RECEIPT_DIR: when set, the test writes its receipt there; it never influences guest or carrier behaviour."
     },
@@ -1013,7 +1013,7 @@
       "kind": "env_var_os",
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
       "symbol": "tests::production_carrier_budget_one_full_occupancy_defers_caller_self_ack_to_entry::ISOLATED_ENV",
-      "fingerprint": "db47b947bff4c3855c8dadde05cd337b2537f37926863719961a524d914ad7de",
+      "fingerprint": "35533a87923ac30a38f476fde25b01a28ca41c254ce705a37635a63eca9d06ed",
       "classification": "test_only",
       "rationale": "Test-only subprocess sentinel isolates the one-vCPU full-occupancy handshake case and is absent from production builds."
     },
@@ -2301,9 +2301,9 @@
       "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs",
       "symbol": "HVPATCH_PROCESS_FAILPOINT",
-      "fingerprint": "0d9de7352b8882bd355ab2e7281ecc5a77a1d3653aaa55f91d6ab260b150b585",
-      "classification": "config_debug",
-      "rationale": "Process-global configuration or failpoint cache HVPATCH_PROCESS_FAILPOINT in crates/carrick-runtime/src/vcpu_loop/lifecycle.rs initialized from environment flags."
+      "fingerprint": "268cd2aeca841ba69d180fdcc2194cfd95b18c69679f0671006d2c6fe04fb6bd",
+      "classification": "test_only",
+      "rationale": "Test-only atomic failure injection for HVPatch process activation; installed and consumed only under cfg(test), including the portable vfork rollback test. Absent from production builds."
     },
     {
       "kind": "static",
