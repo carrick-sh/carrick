@@ -22,7 +22,7 @@ if ! rustup target list --installed 2>/dev/null | grep -qx "$target"; then
     exit 1
 fi
 
-(cd "$crate_dir" && cargo build --release --target "$target")
+(cd "$crate_dir" && cargo build --locked --release --target "$target")
 cp -f "$crate_dir/target/$target/release/zone-readers" "$output_path"
 chmod 0755 "$output_path"
 
