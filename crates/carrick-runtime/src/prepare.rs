@@ -28,11 +28,13 @@ use std::sync::Arc;
 use camino::Utf8PathBuf;
 use carrick_spec::{FsBackendKind, InitialIdentity, PidMode, Platform, RunSpec, StdioMode};
 
+#[cfg(target_os = "macos")]
+use crate::execute::rosetta_license_notice;
 use crate::execute::{
     HostRootLayout, cached_lower_enabled, detached_stable_scratch_path, effective_guest_hostname,
     entrypoint_not_executable_result, entrypoint_not_found_result, install_rosetta_mounts,
     is_entrypoint_not_executable, is_entrypoint_not_found, prepare_host_root,
-    record_detached_scratch, rosetta_license_notice, seed_guest_baseline,
+    record_detached_scratch, seed_guest_baseline,
 };
 use crate::interactive_supervisor::InteractiveSession;
 #[cfg(feature = "platform-macos")]
@@ -672,6 +674,7 @@ fn prepare_with_lease(
         carrier.install_scheduling_policy(policy)?;
     }
     let sink = resolve_stdio(spec, stdio)?;
+    #[cfg(target_os = "macos")]
     if spec.platform == Platform::Amd64 {
         rosetta_license_notice();
     }
