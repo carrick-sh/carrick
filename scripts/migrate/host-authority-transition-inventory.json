@@ -39,18 +39,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1047 in `run_cli`, `libc::geteuid` acts only on the current CLI trace privilege state used by `run_cli`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1048 in `run_cli`, `libc::geteuid` acts only on the current CLI trace privilege state used by `run_cli`; no guest identity selects its host target.",
     "review_id": "HA-000003",
     "source": {
-      "byte_end": 47313,
-      "byte_start": 47300,
+      "byte_end": 47373,
+      "byte_start": 47360,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1047,
-      "line_end": 1047,
-      "line_start": 1047
+      "line": 1048,
+      "line_end": 1048,
+      "line_start": 1048
     }
   },
   {
@@ -410,18 +410,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/main.rs:261 in `main`, `libc::getpid` acts only on the current CLI DSR lifecycle probe used by `main`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/main.rs:265 in `main`, `libc::getpid` acts only on the current CLI DSR lifecycle probe used by `main`; no guest identity selects its host target.",
     "review_id": "HA-000016",
     "source": {
-      "byte_end": 13150,
-      "byte_start": 13138,
+      "byte_end": 13306,
+      "byte_start": 13294,
       "column": 18,
       "column_end": 30,
       "column_start": 18,
       "file": "crates/carrick-cli/src/main.rs",
-      "line": 261,
-      "line_end": 261,
-      "line_start": 261
+      "line": 265,
+      "line_end": 265,
+      "line_start": 265
     }
   },
   {
@@ -1407,18 +1407,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1082 in `run_cli`, `libc::getuid` acts only on the CLI trace credential handoff used by `run_cli`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1083 in `run_cli`, `libc::getuid` acts only on the CLI trace credential handoff used by `run_cli`; no guest identity selects its host target.",
     "review_id": "HA-000062",
     "source": {
-      "byte_end": 49470,
-      "byte_start": 49458,
+      "byte_end": 49530,
+      "byte_start": 49518,
       "column": 39,
       "column_end": 51,
       "column_start": 39,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1082,
-      "line_end": 1082,
-      "line_start": 1082
+      "line": 1083,
+      "line_end": 1083,
+      "line_start": 1083
     }
   },
   {
@@ -5646,18 +5646,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/hvpatch_core_profile.rs:134 in `from_path`, `std::fs::read` accesses only the user-selected HVPatch core profile receipt.",
+    "rationale": "At crates/carrick-cli/src/hvpatch_core_profile.rs:137 in `from_path`, `std::fs::read` accesses only the user-selected HVPatch core profile receipt.",
     "review_id": "HA-000211",
     "source": {
-      "byte_end": 3997,
-      "byte_start": 3989,
+      "byte_end": 4085,
+      "byte_start": 4077,
       "column": 24,
       "column_end": 32,
       "column_start": 24,
       "file": "crates/carrick-cli/src/hvpatch_core_profile.rs",
-      "line": 134,
-      "line_end": 134,
-      "line_start": 134
+      "line": 137,
+      "line_end": 137,
+      "line_start": 137
     }
   },
   {
@@ -6183,18 +6183,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1512 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_hvpatch`.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1541 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_hvpatch`.",
     "review_id": "HA-000231",
     "source": {
-      "byte_end": 55450,
-      "byte_start": 55437,
+      "byte_end": 56566,
+      "byte_start": 56553,
       "column": 16,
       "column_end": 29,
       "column_start": 16,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1512,
-      "line_end": 1512,
-      "line_start": 1512
+      "line": 1541,
+      "line_end": 1541,
+      "line_start": 1541
     }
   },
   {
@@ -6210,18 +6210,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1520 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest executable image used by `run_static_hvpatch`.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1549 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest executable image used by `run_static_hvpatch`.",
     "review_id": "HA-000232",
     "source": {
-      "byte_end": 55929,
-      "byte_start": 55916,
+      "byte_end": 57045,
+      "byte_start": 57032,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1520,
-      "line_end": 1520,
-      "line_start": 1520
+      "line": 1549,
+      "line_end": 1549,
+      "line_start": 1549
     }
   },
   {
@@ -7549,18 +7549,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1105 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected DTrace script.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1106 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected DTrace script.",
     "review_id": "HA-000276",
     "source": {
-      "byte_end": 50647,
-      "byte_start": 50624,
+      "byte_end": 50707,
+      "byte_start": 50684,
       "column": 30,
       "column_end": 53,
       "column_start": 30,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1105,
-      "line_end": 1105,
-      "line_start": 1105
+      "line": 1106,
+      "line_end": 1106,
+      "line_start": 1106
     }
   },
   {
@@ -7575,18 +7575,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1353 in `run_cli`, `std::fs::read_to_string` acts only on operator-selected namespace census capture or executable, hashed and checked by the trace diagnostic; it does not delegate Linux namespace or process authority to the host.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1354 in `run_cli`, `std::fs::read_to_string` acts only on operator-selected namespace census capture or executable, hashed and checked by the trace diagnostic; it does not delegate Linux namespace or process authority to the host.",
     "review_id": "HA-000711",
     "source": {
-      "byte_end": 64534,
-      "byte_start": 64511,
+      "byte_end": 64594,
+      "byte_start": 64571,
       "column": 39,
       "column_end": 62,
       "column_start": 39,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1353,
-      "line_end": 1353,
-      "line_start": 1353
+      "line": 1354,
+      "line_end": 1354,
+      "line_start": 1354
     }
   },
   {
@@ -7601,18 +7601,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1409 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected completed inotify09 population capture.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1410 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected completed inotify09 population capture.",
     "review_id": "HA-000670",
     "source": {
-      "byte_end": 68333,
-      "byte_start": 68310,
+      "byte_end": 68393,
+      "byte_start": 68370,
       "column": 39,
       "column_end": 62,
       "column_start": 39,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1409,
-      "line_end": 1409,
-      "line_start": 1409
+      "line": 1410,
+      "line_end": 1410,
+      "line_start": 1410
     }
   },
   {
@@ -7708,18 +7708,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/hvpatch_core_profile.rs:132 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch core profile receipt.",
+    "rationale": "At crates/carrick-cli/src/hvpatch_core_profile.rs:135 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch core profile receipt.",
     "review_id": "HA-000280",
     "source": {
-      "byte_end": 3872,
-      "byte_start": 3854,
+      "byte_end": 3960,
+      "byte_start": 3942,
       "column": 24,
       "column_end": 42,
       "column_start": 24,
       "file": "crates/carrick-cli/src/hvpatch_core_profile.rs",
-      "line": 132,
-      "line_end": 132,
-      "line_start": 132
+      "line": 135,
+      "line_end": 135,
+      "line_start": 135
     }
   },
   {
@@ -7734,18 +7734,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/hvpatch_exec_runtime_profile.rs:19 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch exec-runtime profile receipt.",
+    "rationale": "At crates/carrick-cli/src/hvpatch_exec_runtime_profile.rs:22 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch exec-runtime profile receipt.",
     "review_id": "HA-000281",
     "source": {
-      "byte_end": 577,
-      "byte_start": 559,
+      "byte_end": 665,
+      "byte_start": 647,
       "column": 24,
       "column_end": 42,
       "column_start": 24,
       "file": "crates/carrick-cli/src/hvpatch_exec_runtime_profile.rs",
-      "line": 19,
-      "line_end": 19,
-      "line_start": 19
+      "line": 22,
+      "line_end": 22,
+      "line_start": 22
     }
   },
   {
@@ -7787,18 +7787,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/hvpatch_identity_host_safety_profile.rs:21 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch identity-safety profile receipt.",
+    "rationale": "At crates/carrick-cli/src/hvpatch_identity_host_safety_profile.rs:24 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch identity-safety profile receipt.",
     "review_id": "HA-000282",
     "source": {
-      "byte_end": 665,
-      "byte_start": 647,
+      "byte_end": 753,
+      "byte_start": 735,
       "column": 24,
       "column_end": 42,
       "column_start": 24,
       "file": "crates/carrick-cli/src/hvpatch_identity_host_safety_profile.rs",
-      "line": 21,
-      "line_end": 21,
-      "line_start": 21
+      "line": 24,
+      "line_end": 24,
+      "line_start": 24
     }
   },
   {
@@ -7813,18 +7813,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/hvpatch_k1_profile.rs:217 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch K1 profile receipt.",
+    "rationale": "At crates/carrick-cli/src/hvpatch_k1_profile.rs:220 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch K1 profile receipt.",
     "review_id": "HA-000283",
     "source": {
-      "byte_end": 6754,
-      "byte_start": 6736,
+      "byte_end": 6842,
+      "byte_start": 6824,
       "column": 24,
       "column_end": 42,
       "column_start": 24,
       "file": "crates/carrick-cli/src/hvpatch_k1_profile.rs",
-      "line": 217,
-      "line_end": 217,
-      "line_start": 217
+      "line": 220,
+      "line_end": 220,
+      "line_start": 220
     }
   },
   {
@@ -11207,18 +11207,18 @@
     "profiles": [
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-cli/src/commands.rs:1544 in `run_cli`, `std::fs::write` accesses only the operator-selected `--summary-jsonl` path, publishing the HVPatch carrier CPU attribution profile's parsed summary as JSON.",
+    "rationale": "At crates/carrick-cli/src/commands.rs:1548 in `run_cli`, `std::fs::write` accesses only the operator-selected `--summary-jsonl` path, publishing the HVPatch carrier CPU attribution profile's parsed summary as JSON.",
     "review_id": "HA-000690",
     "source": {
-      "byte_end": 74902,
-      "byte_start": 74888,
+      "byte_end": 75081,
+      "byte_start": 75067,
       "column": 5,
       "column_end": 19,
       "column_start": 5,
       "file": "crates/carrick-cli/src/commands.rs",
-      "line": 1544,
-      "line_end": 1544,
-      "line_start": 1544
+      "line": 1548,
+      "line_end": 1548,
+      "line_start": 1548
     }
   },
   {
