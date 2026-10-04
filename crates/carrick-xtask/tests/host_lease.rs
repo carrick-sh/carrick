@@ -1,6 +1,183 @@
 use carrick_xtask::host_lease::{HostLease, HostLeaseMode};
 use std::process::{Command, Stdio};
 
+const FORK_FIXTURE: &str = "fork_without_exec_fixture";
+
+#[test]
+#[ignore = "isolated fork fixture, invoked by lease regression"]
+fn fork_without_exec_fixture() {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::env::var_os("CARRICK_HOST_LEASE_PATH").unwrap();
+    let path = std::ffi::CString::new(path.as_bytes()).unwrap();
+    // SAFETY: stat initializes the output for a valid C pathname.
+    let mut lock = unsafe { std::mem::zeroed::<libc::stat>() };
+    assert_eq!(unsafe { libc::stat(path.as_ptr(), &mut lock) }, 0);
+    let fds: Vec<libc::c_int> = std::fs::read_dir("/dev/fd")
+        .unwrap()
+        .map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect();
+    let mut control = [0; 2];
+    let mut ready = [0; 2];
+    // SAFETY: valid pipe arrays; after fork the child uses only libc and _exit.
+    unsafe {
+        assert_eq!(libc::pipe(control.as_mut_ptr()), 0);
+        assert_eq!(libc::pipe(ready.as_mut_ptr()), 0);
+        let pid = libc::fork();
+        assert!(pid >= 0);
+        if pid == 0 {
+            libc::close(control[1]);
+            libc::close(ready[0]);
+            let mut count = 0u32;
+            for &fd in &fds {
+                let mut stat = std::mem::zeroed::<libc::stat>();
+                if libc::fstat(fd, &mut stat) == 0
+                    && stat.st_dev == lock.st_dev
+                    && stat.st_ino == lock.st_ino
+                {
+                    count += 1;
+                }
+            }
+            libc::write(ready[1], (&count as *const u32).cast(), 4);
+            let mut byte = 0u8;
+            libc::read(control[0], (&mut byte as *mut u8).cast(), 1);
+            libc::_exit(0);
+        }
+        libc::close(control[0]);
+        libc::close(ready[1]);
+        let mut count = 0u32;
+        assert_eq!(libc::read(ready[0], (&mut count as *mut u32).cast(), 4), 4);
+        libc::close(ready[0]);
+        std::fs::write(
+            std::env::var_os("CARRICK_LEASE_READY").unwrap(),
+            format!("{pid} {count} {}", std::process::id()),
+        )
+        .unwrap();
+        // Parent keeps stdin open after killing the lease runner. EOF is the
+        // cleanup handshake on both red and green, so this fixture reaps its fork.
+        std::io::stdin().read_exact(&mut [0]).ok();
+        libc::close(control[1]);
+        assert_eq!(libc::waitpid(pid, std::ptr::null_mut(), 0), pid);
+    }
+}
+
+#[test]
+fn forked_test_child_cannot_keep_lease_after_holder_is_killed() {
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    struct Subreaper(libc::c_int);
+    #[cfg(target_os = "linux")]
+    impl Drop for Subreaper {
+        fn drop(&mut self) {
+            // SAFETY: restore this fixture's prior process-wide setting.
+            unsafe {
+                libc::prctl(libc::PR_SET_CHILD_SUBREAPER, self.0);
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let _subreaper = {
+        let mut previous = 0;
+        // SAFETY: valid output and a process-scoped fixture setting. Cleanup
+        // waits only its exact helper PID, never another parallel test's child.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &mut previous), 0);
+            assert_eq!(libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1), 0);
+        }
+        Subreaper(previous)
+    };
+    struct Cleanup {
+        child: std::process::Child,
+        control: Option<std::process::ChildStdin>,
+        helper: Option<libc::pid_t>,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            drop(self.control.take());
+            drop(self.child.stdin.take());
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            #[cfg(target_os = "linux")]
+            if let Some(pid) = self.helper {
+                // SAFETY: our adopted helper exits after EOF and reaps its fork.
+                unsafe {
+                    libc::waitpid(pid, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+    }
+    let lock = tempfile::NamedTempFile::new().unwrap();
+    let ready = tempfile::NamedTempFile::new().unwrap();
+    let mut holder = Cleanup {
+        child: Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["host-lease", "--mode", "gate", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", FORK_FIXTURE])
+            .env_remove("CARRICK_HOST_LEASE_FD")
+            .env_remove("CARRICK_HOST_LEASE_SOCKET")
+            .env("CARRICK_HOST_LEASE_PATH", lock.path())
+            .env("CARRICK_LEASE_READY", ready.path())
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap(),
+        control: None,
+        helper: None,
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (pid, count) = loop {
+        let data = std::fs::read_to_string(ready.path()).unwrap();
+        let fields: Vec<_> = data.split_whitespace().collect();
+        if fields.len() == 3 {
+            holder.helper = Some(fields[2].parse().unwrap());
+            break (
+                fields[0].parse::<libc::pid_t>().unwrap(),
+                fields[1].parse::<u32>().unwrap(),
+            );
+        }
+        assert!(
+            holder.child.try_wait().unwrap().is_none(),
+            "fixture exited before fork"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "fork readiness timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    // SAFETY: independent flock and existence checks do not modify the child.
+    unsafe {
+        assert_eq!(
+            libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
+            -1
+        );
+        holder.child.kill().unwrap();
+        // Child::wait closes its stdin. Preserve the fixture control channel
+        // until the live-child and lock-release assertions have finished.
+        holder.control = holder.child.stdin.take();
+        holder.child.wait().unwrap();
+        assert_eq!(
+            libc::kill(pid, 0),
+            0,
+            "fork child must remain alive for the assertion"
+        );
+        let release = libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
+        assert_eq!(
+            (count, release),
+            (0, 0),
+            "live test fork inherited descriptors or retained lease after holder died"
+        );
+        drop(holder.control.take());
+    }
+}
+
 #[test]
 fn nested_cli_reuses_exclusive_gate_without_deadlock_or_downgrade() {
     let temp = tempfile::NamedTempFile::new().unwrap();
@@ -60,6 +237,7 @@ fn cli_load_check_runs_portable_ps_before_command() {
         ])
         .env_remove("CARRICK_HOST_LEASE_FD")
         .env_remove("CARRICK_HOST_LEASE_MODE")
+        .env_remove("CARRICK_HOST_LEASE_SOCKET")
         .env("CARRICK_HOST_LEASE_PATH", temp.path())
         // This test must not depend on unrelated load elsewhere on a CI host.
         .env("CARRICK_ALLOW_LOAD", "1")
@@ -88,7 +266,8 @@ fn fake_ps_refuses_load_and_override_records_parent_command() {
             .env("CARRICK_ALLOW_LOAD", allow_load)
             .env("CARRICK_HOST_LEASE_PATH", &lock)
             .env_remove("CARRICK_HOST_LEASE_FD")
-            .env_remove("CARRICK_HOST_LEASE_MODE");
+            .env_remove("CARRICK_HOST_LEASE_MODE")
+            .env_remove("CARRICK_HOST_LEASE_SOCKET");
         command
     };
     for allow in ["0", "true", ""] {

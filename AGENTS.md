@@ -142,8 +142,10 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   lock file.
 - **Lock order:** remote-accept checkout lock → host lease → build/test work.
   No host-lease holder may acquire a remote checkout lock. Nested signed runs
-  inherit the gate's descriptor and reuse its exclusive lock without downgrade
-  or reacquisition. Never upgrade a shared lease into a gate/Docker lease.
+  validate the gate's live Unix socket; only the outer runner owns the
+  lock descriptor. Commands and tests never inherit it, and nested runners
+  never downgrade or reacquire it. Never upgrade a shared lease into a
+  gate/Docker lease.
 - **Stamp `CARRICK_RUN_ID`; reap with [`scripts/sudo/kill.sh`](scripts/sudo/kill.sh) `<run-id>`**,
   never `pkill -f carrick` (kills other lanes/worktrees). `timeout` wrappers can't be lldb-attached and a
   wedged CLI ignores SIGTERM.
