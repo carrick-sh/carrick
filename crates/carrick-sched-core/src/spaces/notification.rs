@@ -253,6 +253,13 @@ pub struct SpaceNotificationLease<'a> {
     identity: SpaceNotificationIdentity,
 }
 impl<'a> SpaceNotificationLease<'a> {
+    /// Closing admission is visible to a waiter before it publishes a park.
+    pub fn is_live(&self) -> bool {
+        let state = self.source.state.load(Ordering::Acquire);
+        state & (ACTIVE | CLOSING) == ACTIVE
+            && self.source.retirement.load(Ordering::Acquire) == 0
+            && self.zone.spaces.key(self.index) == self.identity.mm.get()
+    }
     pub fn identity(&self) -> SpaceNotificationIdentity {
         self.identity
     }
@@ -300,6 +307,12 @@ impl<'a> SpaceNotificationLease<'a> {
             }
         }
         drop(release);
+    }
+
+    /// Reattach an owner-service revision to this still-live exact source.
+    /// Enrollment checks that revision again after linking the saved operation.
+    pub fn observed_revision(&self, cause: SpaceWaitCause, revision: u64) -> ObjectWaitSnapshot {
+        ObjectWaitSnapshot::at_revision(self.key(cause), revision)
     }
 
     pub fn observe(&self, cause: SpaceWaitCause) -> ObjectWaitSnapshot {

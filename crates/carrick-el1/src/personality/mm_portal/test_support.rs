@@ -39,6 +39,16 @@ impl Region {
             bank: None,
         }
     }
+    pub fn portal_slots(&self) -> &carrick_el1_abi::MmPortalSlots {
+        // SAFETY: exact zero-initialized retained carrier region and ABI offset.
+        unsafe {
+            &*self
+                .ptr
+                .as_ptr()
+                .add(carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                .cast()
+        }
+    }
     pub fn zone(&self) -> &carrick_sched_core::ZoneTables {
         unsafe {
             &*self
