@@ -66,9 +66,12 @@ deletion.
 
 Repo Cargo recipes and the direct signed entry points acquire a shared Rust
 `worktree-run` lifetime guard. Signed entry points retain it through linking,
-signing, tests and scoped EXIT cleanup. The persistent authority is keyed by
-checkout device/inode under the Git common directory, outside removable
-checkouts. GC only considers managed checkouts, claims their exclusive guard
+signing, tests and scoped EXIT cleanup. Each Git worktree administrative
+directory atomically records a random checkout-generation token authenticated
+with the root device/inode. The persistent authority is keyed by that token
+under the Git common directory, outside removable checkouts. Replacing a
+checkout, even with a reused directory inode, cannot inherit its old live
+authority or retirement tombstone. GC only considers managed checkouts, claims their exclusive guard
 without waiting, and holds it through deletion. Active admission keeps the
 checkout; a retirement tombstone rejects waiting commands after removal.
 Unmanaged checkouts are reported and preserved.
@@ -79,7 +82,12 @@ the exact native Cargo lock descriptors owned by GC are exempted from that
 census; unrelated descriptors and cwd stay visible, including GC's own.
 Apply adds owner read/write/search permission to directories (including read-only
 census directories), and uses `git worktree remove` without force. Symlinks are
-not traversed. Git also refuses dirty or newly locked worktrees. Branch refs
+refused at the supplied checkout root and at registered roots; a registered
+root must equal its canonical path. These checks run before permission changes
+and again before removal. Git can partially delete a checkout before returning
+an error, so any attempted removal keeps its retirement tombstone even on
+failure. Inspect/recover such a checkout before explicitly re-enrolling a new
+Git worktree generation. Git also refuses dirty or newly locked worktrees. Branch refs
 are retained. This authority covers foreground repo entry points and explicit
 `just worktree-run` sessions. Arbitrary processes and external worker launchers
 do not participate; root lsof still checks them, but its census cannot
