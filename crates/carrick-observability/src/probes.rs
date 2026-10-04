@@ -5265,6 +5265,15 @@ mod real {
         /// reason (1 no indexed stage-2 record, 3 missing, 4 unmapped,
         /// 5 retiring). Diagnostic only; it grants no custody.
         fn hvpatch__el1__host__read__retention(_: u64, _: u32) {}
+        /// Root mapping observed at synchronous-fault delivery. Args: FAR,
+        /// live mapping start/end (zero if absent), retained host-source
+        /// handle and offset (zero if the mapping has no owner file source).
+        /// This is an observation, never a grant or signal classifier.
+        fn hvpatch__el1__fault__root__mapping(_: u64, _: u64, _: u64, _: u64, _: u64) {}
+        /// Host view of the owner file-fault handoff: FAR, mailbox state,
+        /// route (0 no fault selection, 1 selected, 2 resolved, 3 refused,
+        /// 4 BUS). The guest's owner alone chooses the source.
+        fn hvpatch__el1__file__fault__handoff(_: u64, _: u32, _: u32) {}
         /// A host-venue step on a delegated MM's reservation root was
         /// refused and fails its syscall. Arg: the `Refusal` ordinal (0 Busy,
         /// 1 Stale, 2 Invalid, 3 Collision, 4 Hole, 5 ForeignMapping,
@@ -6679,6 +6688,23 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_el1_host_read_retention(ipa: u64, reason: u32) {
         carrick_usdt::hvpatch__el1__host__read__retention!(|| (ipa, reason));
+    }
+
+    /// Read the root only while this diagnostic probe is enabled.
+    #[inline(never)]
+    pub fn hvpatch_el1_fault_root_mapping_with(
+        far: u64,
+        mapping: impl FnOnce() -> (u64, u64, u64, u64),
+    ) {
+        carrick_usdt::hvpatch__el1__fault__root__mapping!(|| {
+            let (start, end, handle, offset) = mapping();
+            (far, start, end, handle, offset)
+        });
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_el1_file_fault_handoff(far: u64, state: u32, route: u32) {
+        carrick_usdt::hvpatch__el1__file__fault__handoff!(|| (far, state, route));
     }
 
     /// See the `hvpatch__el1__root__host__refusal` provider doc.
@@ -9067,6 +9093,14 @@ mod stub {
     stub!(hvpatch_el1_owner_bind_result(errno: u64));
     stub!(hvpatch_el1_host_read_progress(address: u64, length: u64, offset: u64, class: u32, detail: u64));
     stub!(hvpatch_el1_host_read_retention(ipa: u64, reason: u32));
+    #[allow(dead_code, unused_variables)]
+    #[inline(always)]
+    pub fn hvpatch_el1_fault_root_mapping_with(
+        far: u64,
+        mapping: impl FnOnce() -> (u64, u64, u64, u64),
+    ) {
+    }
+    stub!(hvpatch_el1_file_fault_handoff(far: u64, state: u32, route: u32));
     stub!(hvpatch_el1_root_host_refusal(refusal: u32));
     stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));
     stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));
