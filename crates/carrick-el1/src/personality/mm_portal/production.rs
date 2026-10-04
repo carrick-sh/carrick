@@ -1,11 +1,10 @@
 //! Transfers borrow the admitted production owner. No table or frame ledger
 //! is constructed here. Physical pinning happens after selection, on host.
 use super::{El1MmHandle, GuestVa, MmError, TransferIntent};
-use crate::fault::{CowResolver, PreparedPageResolver, request_lazy_frames};
+use crate::fault::{CowResolver, PreparedPageResolver};
 use crate::memory::reservations::{Reservations, ResolvedReservationNodes, SharedReservations};
 use carrick_el1_abi::{
-    FrameGrantMailbox, FrameGrantResidencyTable, PinnedMetadataExtent, ReservationMm,
-    ReservationProtection,
+    FrameGrantResidencyTable, PinnedMetadataExtent, ReservationMm, ReservationProtection,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
 use carrick_mmu_core::aarch64::{GuestPreparedCommit, LeafAccess, terminal_descriptor_permits_el0};
@@ -115,6 +114,7 @@ impl TransferContinuation {
 /// physical record identity and retains the matching stage-2 pin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SelectedChunk {
+    pub(super) retry: Option<carrick_el1_abi::PortalOwnerWait>,
     fork_sequence: Option<NonZeroU64>,
     handle: El1MmHandle,
     sequence: NonZeroU64,
@@ -250,9 +250,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         }
         #[cfg(any(test, feature = "host-test"))]
         {
-            return Ok(
-                carrick_sched_core::spaces::notification::SpaceAccess::source_free(self.spaces),
-            );
+            Ok(carrick_sched_core::spaces::notification::SpaceAccess::source_free(self.spaces))
         }
         #[cfg(not(any(test, feature = "host-test")))]
         Err(MmError::Stale)
@@ -272,10 +270,10 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         }
         #[cfg(any(test, feature = "host-test"))]
         {
-            return match self.nodes {
+            match self.nodes {
                 Some(nodes) => Ok(self.roots.lock_el1_resolved(index, mm, nodes, slot)?),
                 None => Ok(self.roots.lock_el1(index, mm, slot)?),
-            };
+            }
         }
         #[cfg(not(any(test, feature = "host-test")))]
         Err(MmError::Stale)
@@ -469,12 +467,15 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         prepared: &mut R,
         cow: &mut C,
         residency: &FrameGrantResidencyTable,
-        mailbox: &FrameGrantMailbox,
         slot: u32,
     ) -> Result<TransferStep, MmError> {
         if continuation.is_complete() {
             return Ok(TransferStep::Complete);
         }
+        let retry = self.observe_wait(
+            continuation.handle,
+            carrick_el1_abi::PortalWaitCause::Reservations,
+        )?;
         let mm = continuation.handle.mm().raw();
         let index = self.spaces.find(mm).ok_or(MmError::Stale)?;
         let _editor = match self.editor_for(continuation.handle, slot) {
@@ -596,7 +597,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         }
         let Some((ipa, executable)) = leaf else {
             // Permission policy was already checked. Reuse the one lazy supply
-            // mailbox; failed admission keeps the same continuation position.
+            // owner receipt; no fault-mailbox transport is consumed by selection.
             let bits = match access {
                 LeafAccess::Read => 1,
                 LeafAccess::Write => 2,
@@ -626,9 +627,6 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
                     .and_then(|source| source.advance(plan.range.start() - mapping.range.start()))
             });
             drop(root);
-            if !request_lazy_frames(mailbox, mm, va, bits) {
-                return Ok(TransferStep::Suspended);
-            }
             return Ok(TransferStep::Supply(carrick_el1_abi::PortalGrantWindow {
                 operation: carrick_el1_abi::PortalOperation {
                     carrier: continuation.handle.carrier(),
@@ -645,6 +643,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             }));
         };
         Ok(TransferStep::Selected(SelectedChunk {
+            retry,
             fork_sequence: continuation.fork_sequence,
             handle: continuation.handle,
             sequence: continuation.sequence,
@@ -823,6 +822,7 @@ pub fn prepare_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized
         fork_sequence: request.fork_sequence,
     };
     let selected = SelectedChunk {
+        retry: None,
         fork_sequence: request.fork_sequence,
         handle,
         sequence: request.operation.sequence,
@@ -864,12 +864,36 @@ pub fn serve_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
     let request = service.request();
     let permit = match service.phase() {
         PortalTransferPhase::Transfer | PortalTransferPhase::Prepare => {
+            // Sample before probing. A rejected selection names completed
+            // owner mutation; metadata supply names its distinct producer.
+            // COMMIT/CANCEL deliberately never revisit these admissions.
+            let handle = unsafe {
+                El1MmHandle::from_admitted_owner(
+                    request.operation.carrier,
+                    request.operation.mm,
+                    request.operation.incarnation,
+                )
+            };
+            let observations = (|| {
+                Ok::<_, MmError>((
+                    portal.observe_wait(handle, carrick_el1_abi::PortalWaitCause::Reservations)?,
+                    portal.observe_wait(handle, carrick_el1_abi::PortalWaitCause::Metadata)?,
+                ))
+            })();
+            let (changed, metadata) = match observations {
+                Ok(observations) => observations,
+                Err(error) => {
+                    service.complete(0, error.errno());
+                    return Err(error);
+                }
+            };
             match prepare_transfer(portal, request, words, slot) {
                 Ok(Some(permit)) => permit,
                 Ok(None) => {
-                    service.suspend_prepare(
+                    service.suspend_prepare(changed.map_or(
                         carrick_el1_abi::PortalPrepareSuspension::SelectionChanged,
-                    );
+                        carrick_el1_abi::PortalPrepareSuspension::Owner,
+                    ));
                     return Ok(());
                 }
                 Err(MmError::Wait(wait)) => {
@@ -881,9 +905,10 @@ pub fn serve_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
                     return Ok(());
                 }
                 Err(MmError::MetadataRequired) => {
-                    service.suspend_prepare(
+                    service.suspend_prepare(metadata.map_or(
                         carrick_el1_abi::PortalPrepareSuspension::ReservationMetadata,
-                    );
+                        carrick_el1_abi::PortalPrepareSuspension::Owner,
+                    ));
                     return Ok(());
                 }
                 Err(error) => {
@@ -1149,8 +1174,6 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
         }
         .map_err(|_| MmError::Core)?;
-        let mailbox = carrick_el1_abi::frame_grant_mailbox_guest_for_slot(frame.slot as usize)
-            .ok_or(MmError::Invalid)?;
         match portal.select(
             &continuation,
             &words,
@@ -1161,7 +1184,6 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
                 service_slot: Some(executor_slot),
             },
             carrick_el1_abi::frame_grant_residency_guest(),
-            mailbox,
             frame.slot as u32,
         )? {
             TransferStep::Selected(selected) => {
@@ -1169,6 +1191,9 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
                 frame.x[9] = selected.generation;
                 frame.x[10] = selected.ipa;
                 frame.x[15] = u64::from(selected.executable);
+                let retry = selected.retry.ok_or(MmError::Stale)?;
+                frame.x[16] = retry.cause().encode();
+                frame.x[17] = retry.revision();
                 Ok(())
             }
             step @ (TransferStep::Supply(_) | TransferStep::CowSupply(_)) => {

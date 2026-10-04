@@ -2071,3 +2071,71 @@ Registry reentry/cancellation test1/1 and existing WaitQueue tests5/5 passed:
 `/tmp/venue3-completion-extraction-green.log`,
 `/tmp/venue3-waitqueue-extraction-green.log`. This extraction alone makes no
 claim about the new ContentPage panic boundary or physical-wait activation.
+
+##### Venue-3 window-two checkpoint — 2026-10-03 (unaccepted WIP)
+
+The consumer cutover is NOT complete. This checkpoint preserves the bounded
+prepared service, owned physical/read suspension, and shared authority
+representation while the original milestone remains open. In particular:
+
+- Root activation is absent: `install_user_memory_authority` has no caller.
+  Owner-fork child construction already carries its exact owner handle, so
+  this WIP must not be used as a guest-acceptance artifact. Initial root
+  admission and descriptor authority selection need one pre-execution
+  transaction; a failed transition must leave both authorities unchanged.
+- `dispatch/outcome.rs::From<MemoryError>` still maps to EFAULT, and explicit
+  consumer EFAULT mappings remain. Runtime memory wait/supply/read continuation
+  lowering and all prepare-before-consume handlers remain to be connected.
+- The public prepared API is stream-bounded before selection: total bytes
+  and range population cannot exceed the existing 4096-byte chunk limit.
+  Atomic-record preparation still needs the approved typed socket bound.
+  Generic writes larger than one chunk are not yet migrated.
+- Owned cursor admission is not yet activated across every current-offset
+  peer; internal control writes and default-pool exhaustion proofs are open.
+- The six original frozen host-consumer witnesses, inventory reconciliation,
+  the complete final gate sequence and host acceptance receipt are open.
+
+Shared root authority uses a nonblocking transition: active legacy borrows
+refuse admission without modifying state. Successful admission deletes mirror
+storage from existing cloned task/foreign-MM holders. Raw host/COW/sparse
+legacy entry points refuse owner roots before guessed translation or policy.
+GuestMemory and SplitView have explicit owner prepare/resume/internal-read
+entry points. These are integration prerequisites, not closure receipts.
+
+Native-content staging now retains writer exclusion and exact dependency
+Arcs in an owned wait; no transfer CPU loan or prepared permit crosses that
+wait. Enrollment is followed by a readiness probe. Drained dependencies latch
+ready; rejected stale native-entry attempts cannot revoke prepared readiness.
+Release accounting completes before wake callbacks; callback panic is terminal
+without running an arbitrary panic-payload destructor. Other existing blocking
+content-write callers are not migrated by this unit.
+
+Actual new regressions and receipts:
+
+- Physical retention parked behind a native reader: RED0/1 then GREEN1/1,
+  `/tmp/venue3-content-retention-{red,green}.log`. This uses the real retention
+  hook but does not claim the default guest-pool exhaustion witness.
+- Callback unwind could resume with incomplete release: RED0/1 then GREEN1/1,
+  `/tmp/venue3-content-panic-{red,green}.log` (isolated host subprocess).
+- Rejected stale execution entry invalidated a prepared physical copy:
+  RED0/1 then GREEN1/1, `/tmp/venue3-content-monotonic-{red,green}.log`.
+- Ordinary stale physical selection aborted instead of returning its exact
+  owner observation: actual SIGABRT RED then GREEN1/1,
+  `/tmp/venue3-stale-physical-{red,green}.log`. SELECT now carries the observed
+  reservation revision taken before selection. Owner retirement remains typed
+  through copy-in instead of becoming EFAULT; portal protocol/hash version
+  changes with the new wire meaning.
+
+Additional scope exceptions are mechanical shared-interface maintenance:
+KVM/x86 legacy guard adapters, runtime SplitView/new error telemetry, and HAL
+signal-frame telemetry. Observability appends Suspended/OwnerRetired tags
+without changing existing ordinals; this does not implement clone/signal
+suspension. No signed, guest or Docker runs occurred.
+
+Checkpoint validation: guest-memory53, EL1256, ABI125 plus2 doc tests, serial
+HVF722 passed/3 ignored, `just test-kernel` and full `just clippy` passed during
+this window. The final physical-retention classification correction passed
+12 focused tests after actual invalid-request RED0/1
+(`/tmp/venue3-retain-classification-{red,green}.log`). Permanent custody errors
+now propagate separately from absent/retired records. The final complete
+verification sequence remains open; no host acceptance receipt is claimed.
