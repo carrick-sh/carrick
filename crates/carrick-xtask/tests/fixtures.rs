@@ -748,6 +748,180 @@ fn actions_restore_entrypoint_preserves_modes_and_passes_fixture_preflight() {
 }
 
 #[test]
+fn trusted_hardware_workflow_prepares_exact_sha_fixtures_before_signed_execution() {
+    use yaml_rust2::{Yaml, YamlLoader};
+    let workflow = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/kernel-runtime.yml"),
+    )
+    .unwrap();
+    let documents = YamlLoader::load_from_str(&workflow).unwrap();
+    let jobs = &documents[0]["jobs"];
+    let step = |job: &Yaml, name: &str| -> Yaml {
+        job["steps"]
+            .as_vec()
+            .unwrap()
+            .iter()
+            .find(|step| step["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("missing workflow step: {name}"))
+            .clone()
+    };
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    // Only Linux compilation, signing and HVF execution are replaced here.
+    // Run the workflow's actual shell, just lease/restore recipes, archive
+    // extraction, source validation and signed fixture preflight.
+    write(&p.bin, "just", br#"#!/bin/sh
+case "$1" in
+    fixtures-publish)
+        [ "$2" = "$GITHUB_SHA" ] || exit 94
+        "$FIXTURE_TEST_XTASK" fixtures verify --manifest "$FIXTURE_TEST_MANIFEST" --sha "$2" || exit $?
+        mkdir -p "target/fixtures/published/$2"
+        cp "$FIXTURE_TEST_ARCHIVE" "target/fixtures/published/$2/bundle.tar.gz"
+        ;;
+    ci) : ;;
+    build|test-embed|conformance-probes)
+        "$FIXTURE_TEST_XTASK" fixtures verify || exit $?
+        [ "$CARRICK_HOST_LEASE_MODE" = gate ] || exit 92
+        printf '%s\n' "$1" >> "$FIXTURE_TEST_EXECUTIONS"
+        ;;
+    *) exec "$FIXTURE_TEST_JUST" --justfile "$FIXTURE_TEST_JUSTFILE" --working-directory "$PWD" "$@" ;;
+esac
+"#);
+    write(
+        &p.bin,
+        "codesign",
+        b"#!/bin/sh\nprintf 'com.apple.security.hypervisor\\n'\n",
+    );
+    write(&p.bin, "otool", b"#!/bin/sh\nprintf '__dof_carrick\\n'\n");
+    write(
+        &p.checkout,
+        "scripts/sudo/kill.sh",
+        br#"#!/bin/sh
+[ "$1" = "$CARRICK_RUN_ID" ] || exit 95
+[ "$CARRICK_HOST_LEASE_MODE" = gate ] || exit 92
+printf '%s\n' "$1" > "$FIXTURE_TEST_CLEANED"
+"#,
+    );
+    for name in ["just", "codesign", "otool"] {
+        fs::set_permissions(p.bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    fs::set_permissions(
+        p.checkout.join("scripts/sudo/kill.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let executions = p.scratch.path().join("executions");
+    let cleaned = p.scratch.path().join("cleaned");
+    let sha = git(&p.checkout, &["rev-parse", "HEAD"]);
+    let run = |script: &str| {
+        p.command("bash")
+            .current_dir(&p.checkout)
+            .args(["-e", "-c", script])
+            .env("GITHUB_SHA", &sha)
+            .env("GITHUB_RUN_ID", "fixture-workflow-test")
+            .env("GITHUB_RUN_ATTEMPT", "1")
+            .env("FIXTURE_TEST_ARCHIVE", &p.archive)
+            .env("FIXTURE_TEST_MANIFEST", &f.path)
+            .env("FIXTURE_TEST_EXECUTIONS", &executions)
+            .env("FIXTURE_TEST_CLEANED", &cleaned)
+            .output()
+            .unwrap()
+    };
+    let producer = &jobs["signed-fixtures"];
+    if !producer.is_badvalue() {
+        assert_eq!(producer["runs-on"].as_str(), Some("ubuntu-24.04-arm"));
+        assert_eq!(producer["if"], jobs["hvf-kernel"]["if"]);
+        let publish = step(producer, "Publish exact-SHA fixture bundle");
+        let out = run(publish["run"].as_str().unwrap());
+        assert!(
+            out.status.success(),
+            "publisher failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let upload = step(producer, "Upload exact-SHA fixture bundle");
+        let download = step(&jobs["hvf-kernel"], "Download exact-SHA fixture bundle");
+        assert_eq!(upload["uses"].as_str(), Some("actions/upload-artifact@v4"));
+        assert_eq!(
+            download["uses"].as_str(),
+            Some("actions/download-artifact@v4")
+        );
+        assert_eq!(
+            upload["with"]["name"].as_str(),
+            Some("signed-fixtures-${{ github.sha }}")
+        );
+        assert_eq!(download["with"]["name"], upload["with"]["name"]);
+        assert_eq!(
+            upload["with"]["path"].as_str(),
+            Some("target/fixtures/published/${{ github.sha }}/*.tar.gz")
+        );
+        assert_eq!(upload["with"]["if-no-files-found"].as_str(), Some("error"));
+        assert_eq!(
+            jobs["hvf-kernel"]["needs"].as_vec().unwrap(),
+            &[Yaml::String("signed-fixtures".into())]
+        );
+        let incoming = download["with"]["path"].as_str().unwrap();
+        assert_eq!(incoming, "target/fixtures/incoming");
+        fs::create_dir_all(p.checkout.join(incoming)).unwrap();
+        fs::copy(
+            p.checkout
+                .join(format!("target/fixtures/published/{sha}/bundle.tar.gz")),
+            p.checkout.join(incoming).join("bundle.tar.gz"),
+        )
+        .unwrap();
+    }
+    assert!(fixtures::verify_installed(&p.checkout).is_err());
+    let signed = step(&jobs["hvf-kernel"], "Signed embedded guest tests");
+    let out = run(signed["run"].as_str().unwrap());
+    assert!(
+        out.status.success(),
+        "workflow signed preparation failed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !producer.is_badvalue(),
+        "native ARM fixture producer is required"
+    );
+    assert_eq!(
+        fs::read_to_string(&executions).unwrap(),
+        "build\ntest-embed\nconformance-probes\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&cleaned).unwrap(),
+        "signed-fixtures-fixture-workflow-test-1\n"
+    );
+    carrick_xtask::accept::verify_signed_fixtures(&p.checkout).unwrap();
+    // Same-SHA cleanup removes raw fixtures; the workflow must reinstall them.
+    fs::remove_dir_all(p.checkout.join("fixtures/linux-aarch64-hello/target")).unwrap();
+    assert!(fixtures::verify_installed(&p.checkout).is_err());
+    let out = run(signed["run"].as_str().unwrap());
+    assert!(
+        out.status.success(),
+        "same-SHA preparation failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    carrick_xtask::accept::verify_signed_fixtures(&p.checkout).unwrap();
+    let cleanup_script = p.checkout.join("scripts/sudo/kill.sh");
+    let cleanup_bytes = fs::read(&cleanup_script).unwrap();
+    fs::write(&cleanup_script, b"#!/bin/sh\nexit 1\n").unwrap();
+    let out = run(signed["run"].as_str().unwrap());
+    assert!(
+        !out.status.success(),
+        "failed cleanup must fail the signed workflow"
+    );
+    fs::write(&cleanup_script, cleanup_bytes).unwrap();
+    // A new checkout cannot consume the previous SHA's downloaded artifact.
+    write(&p.checkout, "README.md", b"next workflow commit\n");
+    git(&p.checkout, &["add", "README.md"]);
+    git(&p.checkout, &["commit", "-qm", "next workflow commit"]);
+    let before = fs::read(&executions).unwrap();
+    let out = run(signed["run"].as_str().unwrap());
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("wrong SHA"));
+    assert_eq!(fs::read(&executions).unwrap(), before);
+}
+
+#[test]
 fn fixture_preparation_lease_preserves_shell_argument_boundaries() {
     let f = Fixture::new();
     let p = Preparation::new(&f);

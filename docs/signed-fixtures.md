@@ -150,6 +150,14 @@ complete bundle even on same-SHA reuse, so lost ignored outputs cannot be
 mistaken for a valid previous receipt. Its preparation script fails if the
 checkout lock is absent or a signed/all job has no bundle.
 
+The existing trusted-hardware `kernel-runtime.yml` workflow publishes on
+native ARM Linux and passes the same-run, exact-SHA archive to its dependent
+HVF job. After checkout and artifact download, one exclusive host lease
+covers restore, signing, embedded tests, cached probes and scoped cleanup.
+Its VM-free regression executes that workflow preparation on an empty
+checkout, repeats it after same-SHA raw-fixture removal, and rejects a
+previous-SHA artifact before either signed test command can execute.
+
 PR #2's merge-queue worker will replace `land-provision` with these publisher
 and restore entry points after this PR lands, per director coordination. Its
 workflow topology is not imported into this branch. That workflow must retain

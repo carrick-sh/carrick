@@ -15,12 +15,45 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  signed-fixtures:
+    name: Linux ARM64 · exact-SHA signed fixtures
+    if: ${{ vars.CARRICK_SELF_HOSTED == 'true' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify native ARM Linux publisher
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = aarch64
+
+      - name: Install pinned Rust toolchain and guest targets
+        run: rustup show active-toolchain
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Publish exact-SHA fixture bundle
+        run: just fixtures-publish "$GITHUB_SHA"
+
+      - name: Upload exact-SHA fixture bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-fixtures-${{ github.sha }}
+          path: target/fixtures/published/${{ github.sha }}/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+
   # Focused signed execution on physical Apple Silicon. This is deliberately
   # separate from public pull-request CI: hosted macOS Arm64 does not support
   # the nested virtualization HVPatch requires.
   hvf-kernel:
     name: HVF · signed embed + cached probes
     if: ${{ vars.CARRICK_SELF_HOSTED == 'true' }}
+    needs: [signed-fixtures]
     runs-on: [self-hosted, macos, arm64, carrick-hvf]
     timeout-minutes: 180
     concurrency:
@@ -43,6 +76,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Download exact-SHA fixture bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-fixtures-${{ github.sha }}
+          path: target/fixtures/incoming
+
       - name: Install just and cargo-deny
         uses: taiki-e/install-action@v2
         with:
@@ -52,22 +91,35 @@ jobs:
         run: brew install semgrep || python3 -m pip install semgrep
 
       - name: Host-only source gate
-        run: RUST_TEST_THREADS=1 just ci
-
-      - name: Build and codesign HVPatch artifact
-        run: just build
-
-      - name: Verify entitlement and DTrace section
-        run: |
-          codesign -d --entitlements - target/release/carrick 2>&1 \
-            | grep -q com.apple.security.hypervisor
-          otool -l target/release/carrick | grep -q __dof_carrick
+        run: RUST_TEST_THREADS=1 just lease gate just ci
 
       - name: Signed embedded guest tests
-        run: RUST_TEST_THREADS=1 just test-embed
-
-      - name: Cached public probe gate
-        run: RUST_TEST_THREADS=1 CARRICK_PROBE_WORKERS=1 just conformance-probes
+        run: |
+          shopt -s nullglob
+          bundles=(target/fixtures/incoming/*.tar.gz)
+          test "${#bundles[@]}" -eq 1
+          export CARRICK_RUN_ID="signed-fixtures-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          just lease gate bash -c '
+            set -euo pipefail
+            cleanup() {
+              status=$?
+              trap - EXIT
+              if ! scripts/sudo/kill.sh "$CARRICK_RUN_ID"; then
+                exit 1
+              fi
+              exit "$status"
+            }
+            trap cleanup EXIT
+            just fixtures-restore "$1"
+            just build
+            codesign -d --entitlements - target/release/carrick \
+              > target/fixtures/signed-entitlements.txt 2>&1
+            grep -q com.apple.security.hypervisor target/fixtures/signed-entitlements.txt
+            otool -l target/release/carrick > target/fixtures/signed-load-commands.txt
+            grep -q __dof_carrick target/fixtures/signed-load-commands.txt
+            RUST_TEST_THREADS=1 just test-embed
+            RUST_TEST_THREADS=1 CARRICK_PROBE_WORKERS=1 just conformance-probes
+          ' signed-fixtures "${bundles[0]}"
 
   # The focused job above is not suite closure. This separate baseline-free
   # gate is intentionally expensive, trusted-event-only, and dormant until the
