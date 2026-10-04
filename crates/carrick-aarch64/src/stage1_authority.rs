@@ -267,6 +267,29 @@ impl Stage1Authority {
         &self,
         resolver: Arc<dyn HostArenaResolver + Send + Sync>,
     ) -> bool {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.bind_live_backing_with_promotion(resolver, true) }
+    }
+
+    /// Bind backing without completing a deferred guest selection. The
+    /// production MM state uses this until its exact pending user-memory
+    /// owner can be consumed in the same admission transaction.
+    ///
+    /// # Safety
+    /// `resolver` must be authenticated for this authority's arenas.
+    pub unsafe fn bind_live_backing_without_promotion(
+        &self,
+        resolver: Arc<dyn HostArenaResolver + Send + Sync>,
+    ) {
+        // SAFETY: forwarded caller contract.
+        unsafe { self.bind_live_backing_with_promotion(resolver, false) };
+    }
+
+    unsafe fn bind_live_backing_with_promotion(
+        &self,
+        resolver: Arc<dyn HostArenaResolver + Send + Sync>,
+        permit_promotion: bool,
+    ) -> bool {
         let mut inner = self.inner.lock();
         inner.host_resolver = Some(Arc::clone(&resolver));
         // Making the manager live discards its owned descriptor copy. Host
@@ -282,7 +305,8 @@ impl Stage1Authority {
             }
             _ => true,
         };
-        let promote = synced
+        let promote = permit_promotion
+            && synced
             && inner.guest_lane_pending
             && inner.live_owner == LiveDescriptorOwner::Host
             && inner
@@ -348,6 +372,18 @@ impl Stage1Authority {
         };
         // SAFETY: forwarded contract.
         pending && unsafe { self.bind_live_backing(resolver) }
+    }
+
+    /// Record backing while preserving a pending guest selection until the
+    /// shared MM owner guard can authenticate and commit it.
+    ///
+    /// # Safety
+    /// `resolver` must be authenticated for this authority's arenas.
+    pub unsafe fn record_live_backing_without_promotion(
+        &self,
+        resolver: Arc<dyn HostArenaResolver + Send + Sync>,
+    ) {
+        self.inner.lock().host_resolver = Some(resolver);
     }
 
     /// Create the `Exclusive` authority of a forked child around its private
