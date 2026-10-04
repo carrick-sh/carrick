@@ -26,13 +26,14 @@ pub const UNSUPPORTED_INOTIFY_MASK_FLAGS: u32 = LINUX_IN_MASK_ADD
 
 /// Service `inotify_add_watch(fd, pathname, mask)` (nr 27) at EL1.
 #[allow(clippy::too_many_arguments)]
-pub fn el1_inotify_add_watch(
+pub fn el1_inotify_add_watch<'a>(
+    access: crate::substrate::file_notification::FileAccess<'a>,
     inotify_fd: i32,
     pathname_va: u64,
     mask: u32,
     cur_task: &CurrentTask,
     fd_map: &[FdMapSlot],
-    object_table: &[DelegatedFile],
+    object_table: &'a [DelegatedFile],
     inotify_table: &[DelegatedInotify],
     name_cache: &InotifyNameCache,
     validator: &impl MemoryValidator,
@@ -103,16 +104,24 @@ pub fn el1_inotify_add_watch(
         _ => return Err(Action::Forward),
     };
 
-    crate::substrate::watches::add(file, inotify, inotify_handle, target_file_handle, mask)
+    crate::substrate::watches::add(
+        access,
+        file,
+        inotify,
+        inotify_handle,
+        target_file_handle,
+        mask,
+    )
 }
 
 /// Service `inotify_rm_watch(fd, wd)` (nr 28) at EL1.
-pub fn el1_inotify_rm_watch(
+pub fn el1_inotify_rm_watch<'a>(
+    access: crate::substrate::file_notification::FileAccess<'a>,
     inotify_fd: i32,
     wd: i32,
     cur_task: &CurrentTask,
     fd_map: &[FdMapSlot],
-    object_table: &[DelegatedFile],
+    object_table: &'a [DelegatedFile],
     inotify_table: &[DelegatedInotify],
 ) -> Result<i64, Action> {
     let file_table = cur_task.file_table.load(Ordering::Acquire);
@@ -147,6 +156,7 @@ pub fn el1_inotify_rm_watch(
     };
 
     crate::substrate::watches::remove(
+        access,
         file,
         inotify,
         inotify_handle,
