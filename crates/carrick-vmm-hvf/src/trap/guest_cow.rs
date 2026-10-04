@@ -740,6 +740,8 @@ pub(super) mod n1_physical_tests {
         _guard: &parking_lot::MutexGuard<'static, ()>,
     ) -> Vec<String> {
         let mut violations = Vec::new();
+        let mut retired_generation = None;
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
         for failure in [
             Failure::Stage2,
             Failure::BackendInventory,
@@ -748,7 +750,6 @@ pub(super) mod n1_physical_tests {
             Failure::Cancel,
         ] {
             let stub = ScopedStage2MapTestStub::enable();
-            let custody = Arc::new(CarrierVmCustody::new_live_fixture());
             stub.set_fail_next_map(failure == Failure::Stage2);
             // Exercise the real backend map and registration primitives; the
             // ordinary guest-COW allocator deliberately bypasses hv_vm_map
@@ -834,12 +835,13 @@ pub(super) mod n1_physical_tests {
                     violations.push("CowGrantPool accepts a duplicate physical grant".into());
                 }
                 let stale = carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
-                    owner_generation: nz(generation + 1),
+                    owner_generation: retired_generation.unwrap(),
                     ..backing
                 };
+                assert_ne!(stale.owner_generation, backing.owner_generation);
                 if pool.publish(7, ipa, stale).is_some() {
                     violations.push(
-                        "CowGrantPool accepts a grant with a non-live physical generation".into(),
+                        "CowGrantPool accepts a grant with a retired physical generation".into(),
                     );
                 }
             }
@@ -866,6 +868,7 @@ pub(super) mod n1_physical_tests {
                 !ScopedStage2MapTestStub::is_mapped(ipa, CowArmedRanges::COMPOUND_SIZE as usize),
                 "{failure:?}"
             );
+            retired_generation = Some(nz(generation));
         }
         violations
     }
