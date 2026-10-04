@@ -523,18 +523,22 @@ pub enum DispatchOutcome {
     OwnerMemoryWait {
         #[serde(skip_serializing)]
         wait: carrick_el1_abi::PortalOwnerWait,
+        /// Bytes already committed and consumed in this dispatch attempt.
+        committed: u64,
     },
     /// Physical supply was not yet published. No source byte was consumed;
     /// retry the same saved syscall after serving this exact owner receipt.
     OwnerMemorySupply {
         #[serde(skip_serializing)]
         request: carrick_guest_mem::MemorySupplyRequest,
+        committed: u64,
     },
     /// A retained physical writer must drain before an owner permit can be
     /// issued. The executor parks on the exact retained dependency.
     OwnerPhysicalWait {
         #[serde(skip_serializing)]
         wait: carrick_guest_mem::OwnedMemoryWait,
+        committed: u64,
     },
     /// Backend: retire the syscall and take this Linux PROCESS through its terminal
     /// with `code`; nothing is written back.

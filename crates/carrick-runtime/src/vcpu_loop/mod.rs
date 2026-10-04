@@ -949,6 +949,10 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     #[cfg(test)]
     pub(super) committed_exec_context_for_test: Option<carrick_kernel::kernel::KernelContext>,
     pub(super) syscall_completion: SyscallCompletionOwnership,
+    /// Committed prefix of one suspended scalar owner-file read. The saved
+    /// syscall still owns its single terminal return; redispatch uses only
+    /// the remaining destination/count (and positioned source offset).
+    pub(super) owner_read_progress: u64,
     pub(super) continuation_restart: Option<carrick_kernel::kernel::continuation::RestartDecision>,
     /// Consecutive identical (FAR, ESR) COW faults "successfully" resolved.
     /// A resolution that does not change the faulting translation refaults
@@ -1035,6 +1039,7 @@ where
             #[cfg(test)]
             committed_exec_context_for_test: None,
             syscall_completion: SyscallCompletionOwnership::Idle,
+            owner_read_progress: 0,
             continuation_restart: None,
             cow_refault_watch: None,
             reserved_signal: None,
@@ -1621,15 +1626,39 @@ where
         engine: &mut E,
         host_wait: Option<carrick_kernel::dispatch::HostWaitContext<'_>>,
     ) -> Result<DispatchOutcome, RuntimeError> {
+        let mut syscall = self
+            .syscall_completion
+            .guest("syscall redispatch lost completion token")?
+            .syscall();
+        if self.owner_read_progress != 0 {
+            let progress = self.owner_read_progress;
+            let number = syscall.request.number.raw();
+            if number != 63 && number != 67 {
+                return Err(RuntimeError::Configuration(format!(
+                    "owner read progress belongs to unsupported syscall {number}"
+                )));
+            }
+            syscall.request.args.0[1] = syscall.request.args.0[1]
+                .checked_add(progress)
+                .ok_or_else(|| RuntimeError::Configuration("owner read VA overflow".to_owned()))?;
+            syscall.request.args.0[2] = syscall.request.args.0[2]
+                .checked_sub(progress)
+                .ok_or_else(|| {
+                    RuntimeError::Configuration("owner read count overflow".to_owned())
+                })?;
+            if number == 67 {
+                syscall.request.args.0[3] = syscall.request.args.0[3]
+                    .checked_add(progress)
+                    .ok_or_else(|| {
+                        RuntimeError::Configuration("owner pread offset overflow".to_owned())
+                    })?;
+            }
+        }
         let mut executor = self.guest_execution.take().ok_or_else(|| {
             RuntimeError::Configuration(
                 "syscall redispatch lacks MM executor participation".to_owned(),
             )
         })?;
-        let syscall = self
-            .syscall_completion
-            .guest("syscall redispatch lost completion token")?
-            .syscall();
         let result = self.redispatch_threaded_syscall_for_executor(
             kernel,
             engine,
@@ -2164,6 +2193,7 @@ where
     }
 
     pub(super) fn retire_syscall(&mut self) -> Result<(), RuntimeError> {
+        self.owner_read_progress = 0;
         match std::mem::replace(
             &mut self.syscall_completion,
             SyscallCompletionOwnership::Idle,
