@@ -5261,6 +5261,10 @@ mod real {
         /// detail is the PortalWaitCause or refused errno for classes 3/6,
         /// zero otherwise. Never reports guest bytes.
         fn hvpatch__el1__host__read__progress(_: u64, _: u64, _: u64, _: u32, _: u64) {}
+        /// Physical retention refusal for an EL1 owner read: selected IPA and
+        /// reason (1 no indexed stage-2 record, 3 missing, 4 unmapped,
+        /// 5 retiring). Diagnostic only; it grants no custody.
+        fn hvpatch__el1__host__read__retention(_: u64, _: u32) {}
         /// A host-venue step on a delegated MM's reservation root was
         /// refused and fails its syscall. Arg: the `Refusal` ordinal (0 Busy,
         /// 1 Stale, 2 Invalid, 3 Collision, 4 Hole, 5 ForeignMapping,
@@ -6670,6 +6674,11 @@ mod real {
         carrick_usdt::hvpatch__el1__host__read__progress!(|| (
             address, length, offset, class, detail
         ));
+    }
+
+    #[inline(never)]
+    pub fn hvpatch_el1_host_read_retention(ipa: u64, reason: u32) {
+        carrick_usdt::hvpatch__el1__host__read__retention!(|| (ipa, reason));
     }
 
     /// See the `hvpatch__el1__root__host__refusal` provider doc.
@@ -9057,6 +9066,7 @@ mod stub {
     stub!(hvpatch_el1_owner_selection(phase: u32));
     stub!(hvpatch_el1_owner_bind_result(errno: u64));
     stub!(hvpatch_el1_host_read_progress(address: u64, length: u64, offset: u64, class: u32, detail: u64));
+    stub!(hvpatch_el1_host_read_retention(ipa: u64, reason: u32));
     stub!(hvpatch_el1_root_host_refusal(refusal: u32));
     stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));
     stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));
