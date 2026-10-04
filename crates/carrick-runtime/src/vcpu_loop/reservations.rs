@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use carrick_el1::memory::reservations::{
-    Refusal, Reservations, ResolvedReservationNodes, SharedReservations,
+    Refusal, Reservations, ResolvedReservationNodes, RootReleaseVenue, SharedReservations,
 };
 use carrick_el1_abi::ReservationMm;
 use carrick_guest_mem::HostVa;
@@ -143,7 +143,26 @@ impl PreparedHostReservations for PreparedView {
                 .cast::<carrick_el1_abi::ZoneTables>()
         };
         let index = zone.spaces.find(mm.raw()).ok_or(Refusal::Stale)?.index();
-        table(&self.0.access)?.lock_resolved(
+        fn deliver(
+            zone: &carrick_sched_core::ZoneTables,
+            _: carrick_sched_core::Waker,
+            effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+        ) {
+            carrick_sched_core::LockWait::complete_object_wake(
+                &carrick_kernel::el1_zone::HostLockWait,
+                zone,
+                effects,
+            );
+        }
+        RootReleaseVenue::new(
+            table(&self.0.access)?,
+            carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+                zone,
+                waker: carrick_sched_core::Waker::Host,
+                deliver,
+            },
+        )?
+        .lock_resolved(
             index,
             mm,
             &self.0.nodes,
