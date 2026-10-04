@@ -2020,3 +2020,20 @@ all consumers to owned continuations is open. The storage-capacity witness
 exhausts the two recall workers' possible inode waits, not the guest executor
 pool; the actual default guest-pool witness remains open. No frozen mmap
 probe, consumer cutover, mirror deletion, final gate, or acceptance is claimed.
+
+
+#### Venue 3 queued cursor functional lifetime (2026-10-03)
+
+`FileCursorAdmission` retains a functional fd lease before queueing for the
+exact description cursor. Its private stage carries that lease through the
+cursor grant into the existing owned recall request; readiness moves the same
+cursor and functional lifetime into the opaque ready token. Numeric fd close
+cannot invalidate an admitted waiter. Cancellation drops the exact ticket and
+lease, and enrollment probes the durable grant/completion after subscribing.
+
+`RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-kernel dispatch::host_io --lib`
+passes7/7 (/tmp/venue3-cursor-admission-opaque-green.log), including close while
+queued, release before enrollment, and cancellation handing the next ticket
+its reservation. Source review approved this inactive token unit. These are
+new API custody tests, not fabricated baseline behavioral reds. Production
+continuation integration and all competing current-offset callers remain open.
