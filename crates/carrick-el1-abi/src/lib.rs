@@ -550,6 +550,8 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(DelegatedFile, size) as u64,
         core::mem::offset_of!(DelegatedFile, dirty_mask) as u64,
         core::mem::offset_of!(DelegatedFile, notification_generation) as u64,
+        core::mem::offset_of!(DelegatedFile, host_recall_generation) as u64,
+        core::mem::offset_of!(DelegatedFile, host_recall_owed) as u64,
         core::mem::offset_of!(DelegatedFile, marks) as u64,
         core::mem::size_of::<DelegatedOpenFile>() as u64,
         core::mem::offset_of!(DelegatedOpenFile, inode_handle) as u64,
@@ -2173,7 +2175,10 @@ pub struct DelegatedFile {
     pub _reserved1: u32,
     /// Fixed table of active marks attached to this file.
     pub marks: UnsafeCell<[DelegatedMark; MAX_DELEGATED_MARKS_PER_FILE]>,
-    pub _pad: [u8; 40],
+    /// Exact owner-only recall subscription and its owed release edge.
+    pub(crate) host_recall_generation: AtomicU64,
+    pub(crate) host_recall_owed: AtomicU64,
+    pub _pad: [u8; 24],
 }
 
 unsafe impl Sync for DelegatedFile {}
@@ -2265,7 +2270,9 @@ impl DelegatedFile {
                     }
                 }; MAX_DELEGATED_MARKS_PER_FILE],
             ),
-            _pad: [0; 40],
+            host_recall_generation: AtomicU64::new(0),
+            host_recall_owed: AtomicU64::new(0),
+            _pad: [0; 24],
         }
     }
 
