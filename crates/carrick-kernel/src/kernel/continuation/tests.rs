@@ -60,11 +60,11 @@ fn direct_shared_word_location(word: &std::sync::atomic::AtomicU32) -> SharedFut
     }
 }
 
-fn shared_queue_key(location: SharedFutexLocation) -> u64 {
+fn shared_queue_key(location: SharedFutexLocation) -> carrick_thread::thread::FutexKey {
     carrick_thread::platform_futex::carrier_shared_futex_key(location)
 }
 
-fn synthetic_shared_queue_key(word: usize, waiter_key: usize) -> u64 {
+fn synthetic_shared_queue_key(word: usize, waiter_key: usize) -> carrick_thread::thread::FutexKey {
     shared_queue_key(SharedFutexLocation::Direct {
         word: HostVa(word),
         waiter_key,

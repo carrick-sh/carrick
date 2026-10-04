@@ -267,6 +267,11 @@ legacy hash collision and proves separate wake cardinality; the continuation
 `two_live_owners_of_one_shared_word_receive_one_wake_each` witness proves that
 two real waiters on one key each require their own counted wake. Key admission
 uses one sharded map lookup per futex operation, with no live-waiter scan.
+Shared bucket entries hold weak references and disappear when their final wait,
+subscription, wake or requeue destination reference leaves. The VM-free
+`ten_thousand_retired_shared_words_leave_no_live_keys_per_table` witness waits
+and wakes 10,000 distinct direct and file words in each of two tables, then
+requires zero live shared entries in both.
 
 The signed binding reuses Carrick's futex probes to prove guest execution. A
 separate uninstrumented release run compares the pinned futex distribution with
