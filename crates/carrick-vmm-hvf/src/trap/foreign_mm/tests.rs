@@ -13289,7 +13289,11 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
             );
             continue;
         }
-        let mut pending = context.prepare_transfer(window).unwrap().unwrap();
+        let carrick_aarch64::user_transfer::TransferPreparation::Grant(mut pending) =
+            context.prepare_transfer(window).unwrap()
+        else {
+            panic!("fresh transfer must publish a grant");
+        };
         let txn = *pending.transaction();
         let DescriptorOp::Prepare {
             publication,
@@ -13357,7 +13361,10 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
             digest: txn.digest(),
             outcome: DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot),
         };
-        assert!(!pending.settle(&receipt).unwrap());
+        assert!(
+            pending.settle(&receipt).unwrap(),
+            "a settled stale root permits only a fresh owner selection"
+        );
         drop(pending);
         assert!(
             !installed
@@ -13548,7 +13555,11 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         window,
     )
     .unwrap();
-    let mut pending = context.prepare_transfer(window).unwrap().unwrap();
+    let carrick_aarch64::user_transfer::TransferPreparation::Grant(mut pending) =
+        context.prepare_transfer(window).unwrap()
+    else {
+        panic!("fresh transfer must publish a grant");
+    };
     let txn = *pending.transaction();
     let DescriptorOp::Prepare { publication, .. } = txn.op else {
         panic!()
