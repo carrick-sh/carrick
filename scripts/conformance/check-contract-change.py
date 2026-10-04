@@ -78,7 +78,7 @@ def is_evidence_path(path: str, contract_id: str, contracts: dict, surfaces: dic
     return False
 
 
-def load_and_validate_exemptions(exemptions_dir: Path, valid_contracts: set, diff_paths: set, base_sha: str, head_sha: str):
+def load_and_validate_exemptions(root: Path, exemptions_dir: Path, valid_contracts: set, diff_paths: set, base_sha: str, head_sha: str):
     exempted_paths = set()
     if not exemptions_dir.exists():
         return exempted_paths
@@ -122,13 +122,27 @@ def load_and_validate_exemptions(exemptions_dir: Path, valid_contracts: set, dif
                 sys.stderr.write(f"exemption error: {p.name} path contains glob or directory: {path}\n")
                 sys.exit(1)
 
-        # Check applicability to this diff
-        if base == base_sha and head == head_sha:
+        # A receipt must be committed AFTER its reviewed head is known. It can
+        # cover descendants (including a PR merge commit) only while every
+        # exact reviewed path remains byte-identical to that ancestor.
+        if base == base_sha:
+            ancestor = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", head, head_sha],
+                cwd=root, capture_output=True, check=False,
+            )
+            if ancestor.returncode != 0:
+                continue
             for path in paths:
                 if path not in diff_paths:
                     sys.stderr.write(f"exemption error: {p.name} path {path} not in diff\n")
                     sys.exit(1)
-                exempted_paths.add(path)
+            unchanged = subprocess.run(
+                ["git", "--literal-pathspecs", "diff", "--quiet", "--no-ext-diff",
+                 "--no-textconv", head, head_sha, "--", *paths],
+                cwd=root, capture_output=True, check=False,
+            )
+            if unchanged.returncode == 0:
+                exempted_paths.update(paths)
 
     return exempted_paths
 
@@ -199,7 +213,7 @@ def main():
                 modified_paths.add(path)
 
     # Load and validate exemptions
-    exempted_paths = load_and_validate_exemptions(exemptions_dir, valid_contracts, all_diff_paths, base_sha, head_sha)
+    exempted_paths = load_and_validate_exemptions(root, exemptions_dir, valid_contracts, all_diff_paths, base_sha, head_sha)
 
     # Check for unclassified new paths under crates/
     unclassified = []

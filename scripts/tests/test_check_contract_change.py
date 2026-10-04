@@ -66,6 +66,95 @@ class CheckContractChangeTest(unittest.TestCase):
             'contracts = ["kernel.futex.contention"]\n'
         )
 
+    def commit_reviewed_exemption(self):
+        self.use_single_contract_surface()
+        self.guest_file.write_text("// reviewed documentation change\n")
+        subprocess.run(["git", "commit", "-am", "review source change"], cwd=self.repo, check=True)
+        reviewed_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        directory = self.repo / "docs" / "conformance-exemptions"
+        directory.mkdir(parents=True)
+        (directory / "reviewed.toml").write_text(
+            'schema = "carrick.conformance-exemption.v1"\n'
+            f'base = "{self.base_sha}"\n'
+            f'head = "{reviewed_head}"\n'
+            'paths = ["crates/carrick-kernel/src/dispatch/futex.rs"]\n'
+            'contracts = ["kernel.futex.contention"]\n'
+            'rationale = "Only the reviewed documentation changed; guest behavior and work remain identical."\n'
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "record exact reviewed revision"], cwd=self.repo, check=True)
+        return reviewed_head
+
+    def test_committed_exemption_covers_unchanged_reviewed_source(self):
+        self.commit_reviewed_exemption()
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
+    def test_committed_exemption_refuses_later_source_edit(self):
+        self.commit_reviewed_exemption()
+        self.guest_file.write_text("fn changed_guest_behavior() {}\n")
+        subprocess.run(["git", "commit", "-am", "change source after review"], cwd=self.repo, check=True)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("uncovered guest surface", result.stderr)
+
+    def test_committed_exemption_refuses_nonancestor_review(self):
+        self.commit_reviewed_exemption()
+        receipt_head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+        subprocess.run(["git", "checkout", "--detach", self.base_sha], cwd=self.repo, check=True)
+        subprocess.run(["git", "checkout", receipt_head, "--", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "same source in unrelated history"], cwd=self.repo, check=True)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("uncovered guest surface", result.stderr)
+
+    def test_committed_exemption_refuses_rewritten_review(self):
+        reviewed_head = self.commit_reviewed_exemption()
+        subprocess.run(["git", "reset", "--soft", reviewed_head], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "--amend", "-m", "rewrite reviewed head"], cwd=self.repo, check=True)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("uncovered guest surface", result.stderr)
+
+    def test_one_later_edit_invalidates_the_entire_receipt(self):
+        reviewed_head = self.commit_reviewed_exemption()
+        receipt = self.repo / "docs" / "conformance-exemptions" / "reviewed.toml"
+        receipt.write_text(receipt.read_text().replace(
+            'paths = ["crates/carrick-kernel/src/dispatch/futex.rs"]',
+            'paths = ["crates/carrick-kernel/src/dispatch/futex.rs", "conformance-contracts/surfaces.toml"]',
+        ))
+        surfaces = self.repo / "conformance-contracts" / "surfaces.toml"
+        surfaces.write_text(surfaces.read_text() + "\n# later edit\n")
+        subprocess.run(["git", "commit", "-am", "change one reviewed path"], cwd=self.repo, check=True)
+        unchanged = subprocess.run(
+            ["git", "diff", "--quiet", reviewed_head, "HEAD", "--", str(self.guest_file)],
+            cwd=self.repo, check=False,
+        )
+        self.assertEqual(unchanged.returncode, 0)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("uncovered guest surface", result.stderr)
+
+    def test_committed_exemption_does_not_cover_another_surface(self):
+        self.commit_reviewed_exemption()
+        other = self.guest_file.with_name("other.rs")
+        other.write_text("fn changed_guest_behavior() {}\n")
+        surfaces = self.repo / "conformance-contracts" / "surfaces.toml"
+        surfaces.write_text(
+            surfaces.read_text()
+            + '\n[[surfaces]]\npath = "crates/carrick-kernel/src/dispatch/other.rs"\n'
+            + 'contracts = ["kernel.futex.contention"]\n'
+        )
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "change another surface"], cwd=self.repo, check=True)
+        result = self.run_check()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("other.rs", result.stderr)
+
     def test_descriptor_with_unrelated_filename_is_evidence(self):
         self.use_single_contract_surface()
         directory = self.repo / "conformance-contracts" / "contracts"
