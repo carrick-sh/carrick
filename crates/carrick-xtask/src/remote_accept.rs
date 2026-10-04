@@ -727,12 +727,33 @@ pub(crate) fn check_remote_disk_space(
 ) -> Result<(), RemoteAcceptError> {
     let df_cmd = build_df_check_cmd(remote_root);
     let df_output = run_ssh_command(host, &df_cmd)?;
-    let avail_kib =
+    let mut avail_kib =
         parse_df_available_kib(&df_output).map_err(|e| RemoteAcceptError::DiskSpace {
             host: host.to_string(),
             details: e,
         })?;
 
+    if avail_kib < MIN_FREE_DISK_KIB {
+        eprintln!(
+            "remote-accept: low disk space; attempting idle-only target pruning (artifacts >= 2 days old) before refusal"
+        );
+        let pruning = crate::target_prune::remote_script(remote_root).map_err(|error| {
+            RemoteAcceptError::DiskSpace {
+                host: host.to_string(),
+                details: error.to_string(),
+            }
+        })?;
+        match run_ssh_command(host, &pruning) {
+            Ok(output) => println!("{output}"),
+            Err(error) => eprintln!("remote-accept: target pruning unavailable: {error}"),
+        }
+        let output = run_ssh_command(host, &df_cmd)?;
+        avail_kib =
+            parse_df_available_kib(&output).map_err(|details| RemoteAcceptError::DiskSpace {
+                host: host.to_string(),
+                details,
+            })?;
+    }
     if avail_kib < MIN_FREE_DISK_KIB {
         let avail_gib = avail_kib as f64 / (1024.0 * 1024.0);
         let gate_worktrees_dir = format!("{remote_root}/gate-worktrees");

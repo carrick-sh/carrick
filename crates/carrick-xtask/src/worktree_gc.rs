@@ -11,10 +11,21 @@ pub struct WorktreeGcArgs {
     /// Remove eligible worktrees; otherwise only print the census.
     #[arg(long)]
     pub apply: bool,
+    /// Prune old Cargo intermediates instead of removing worktrees.
+    #[arg(long)]
+    pub prune_targets: bool,
+    /// Minimum artifact age, in days (target pruning only).
+    #[arg(long, default_value_t = 2, requires = "prune_targets")]
+    pub days: u64,
+    /// Prune this target directory instead of registered worktree targets.
+    #[arg(long, requires = "prune_targets")]
+    pub target_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
 pub enum GcError {
+    #[error(transparent)]
+    Lease(#[from] crate::host_lease::HostLeaseError),
     #[error(transparent)]
     Command(#[from] CommandError),
     #[error(transparent)]
@@ -149,7 +160,11 @@ fn process_use(path: &Path) -> UseState {
     };
     // +D includes cwd, mapped executables and open files anywhere in the tree.
     // Warnings or denied sudo access fail closed; never prompt or retry.
-    match census.args(["-F", "p", "+D"]).arg(path).output() {
+    census.args(["-F", "p"]);
+    if path.is_dir() {
+        census.arg("+D");
+    }
+    match census.arg(path).output() {
         Ok(out) => classify_use(out.status.code(), &out.stdout, &out.stderr),
         Err(_) => UseState::Unknown,
     }
@@ -192,6 +207,9 @@ fn writable_dirs(path: &Path) -> Result<(), GcError> {
 }
 
 pub fn run(root: &Path, args: WorktreeGcArgs, writer: &mut impl Write) -> Result<(), GcError> {
+    if args.prune_targets {
+        return crate::target_prune::run(root, args, writer);
+    }
     let common = PathBuf::from(
         git(
             root,

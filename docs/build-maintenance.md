@@ -71,3 +71,37 @@ are retained. Quiesce worktree creation/build launches during apply: neither
 Git nor lsof provides an atomic exclusion against a process starting after
 the final check. The command is deliberately dry-run by default; automation
 must explicitly pass `--apply`.
+
+## Persistent target cleanup
+
+```sh
+just worktree-gc --prune-targets                 # dry-run; default age 2 days
+just worktree-gc --prune-targets --days 3 --apply
+just worktree-gc --prune-targets --target-dir /Volumes/carrick/dev/gate-worktree/target --apply
+```
+
+This mode keeps every checkout and prunes only entries beneath
+`target/{debug,release}/{deps,build,.fingerprint}`. An entry and all its
+descendants must meet the age threshold. Recent or future timestamps,
+symlinks and hardlinked files are kept. Signed binaries, receipts and other
+target subdirectories are preserved. Cargo rebuilds removed intermediates.
+The output reports allocated bytes reclaimed (or eligible during dry-run).
+
+Before scanning, the command atomically claims the dev directory's
+`gate-worktree.lock`, then tries an exclusive host lease without waiting.
+If either lock is held, it skips without deleting anything. It retains both
+guards through removal and uses the same root-visible lsof checks as worktree
+cleanup. Run from another checkout when pruning a target containing the
+running xtask executable: its mapping correctly makes that target busy.
+Build launches that bypass the host lease must be quiesced during apply.
+
+When remote-accept sees less than 40 GiB free, it logs an idle-only pruning
+attempt before refusing. The client's Rust code sends the same find-based
+pruning body over SSH, targeting `gate-worktree/target` with the default
+two-day threshold, then checks free space again. No remote checkout or build
+is needed. macOS has no `flock(1)`; its stock `/usr/bin/perl` holds the existing
+host lease with `LOCK_EX|LOCK_NB` while the generated command runs. The remote
+wrapper claims the checkout lock first and honors `CARRICK_HOST_LEASE_PATH`
+from the host's `env.sh`, just as local pruning does. A busy lock, missing
+utility (including Perl), or insufficient reclaimed space preserves the
+existing refusal; the 40 GiB gate requirement is unchanged.
