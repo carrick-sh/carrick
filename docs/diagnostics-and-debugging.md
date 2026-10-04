@@ -677,3 +677,8 @@ batch aggregation, `carrick trace` is the live stream.
 - Skills: [`.agents/skills/carrick-trace/SKILL.md`](../.agents/skills/carrick-trace/SKILL.md)
   and [`.agents/skills/carrick-lldb/SKILL.md`](../.agents/skills/carrick-lldb/SKILL.md)
   carry the full, hard-won methodology for each tool.
+
+## Build storage maintenance
+
+See [build caches and worktree maintenance](build-maintenance.md) for the
+default per-host sccache configuration and the `CARRICK_SCCACHE=0` hatch.

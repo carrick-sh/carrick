@@ -44,6 +44,7 @@
 # terminal.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# Also loads the shared compiler-cache environment before any cargo call.
 . scripts/lib/post-link-sign.sh
 . scripts/lib/test-signed-args.sh
 
