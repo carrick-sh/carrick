@@ -39,6 +39,8 @@ carrick-observability = { path = "../carrick-observability" }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 parking_lot.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+sha2.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 

@@ -43,6 +43,7 @@ pub mod memory;
 pub mod operand;
 pub mod process;
 pub mod report;
+pub mod schedule;
 pub mod scripted;
 pub mod sys;
 
@@ -67,4 +68,5 @@ pub use process::{
     ExampleProcess, ExampleStage1Projection,
 };
 pub use report::{Completion, Output, RunReport};
+pub use schedule::{Decision, Point, Schedule, ScheduleReceipt};
 pub use scripted::{ExampleError, ScriptedBackend, WAIT_BOUND};

@@ -1,0 +1,747 @@
+{
+  "schema_version": 1,
+  "generator_version": 2,
+  "seed": 5,
+  "source_hash": "0e7f7dc34bb7330be04bb755918d217eed9e9e96b8f2b17a8cfe69ea6b999977",
+  "fixture_hash": "6a47a68a1a0927584bd921b389458458cdcce42be3238f13c9e13c67b14a9f03",
+  "backend": "kernel-example/linux/x86_64",
+  "scale": 1,
+  "decisions": [
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "step",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "dispatch-unlocked",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "step",
+      "visit": 1,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "dispatch-unlocked",
+      "visit": 1,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "step",
+      "visit": 2,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      },
+      "point": "step",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      },
+      "point": "dispatch-unlocked",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "dispatch-unlocked",
+      "visit": 2,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "step",
+      "visit": 3,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 7,
+          "task_serial": 19,
+          "thread_id": 7,
+          "thread_serial": 20,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "dispatch-unlocked",
+      "visit": 3,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 7,
+          "task_serial": 19,
+          "thread_id": 7,
+          "thread_serial": 20,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 7,
+        "task_serial": 19,
+        "thread_id": 7,
+        "thread_serial": 20,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 7,
+        "task_serial": 19,
+        "thread_id": 7,
+        "thread_serial": 20,
+        "execution_generation": 1
+      },
+      "point": "step",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 7,
+          "task_serial": 19,
+          "thread_id": 7,
+          "thread_serial": 20,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 7,
+        "task_serial": 19,
+        "thread_id": 7,
+        "thread_serial": 20,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 7,
+        "task_serial": 19,
+        "thread_id": 7,
+        "thread_serial": 20,
+        "execution_generation": 1
+      },
+      "point": "dispatch-unlocked",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 7,
+          "task_serial": 19,
+          "thread_id": 7,
+          "thread_serial": 20,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 7,
+        "task_serial": 19,
+        "thread_id": 7,
+        "thread_serial": 20,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 7,
+        "task_serial": 19,
+        "thread_id": 7,
+        "thread_serial": 20,
+        "execution_generation": 1
+      },
+      "point": "fd-drained",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 7,
+          "task_serial": 19,
+          "thread_id": 7,
+          "thread_serial": 20,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 7,
+        "task_serial": 19,
+        "thread_id": 7,
+        "thread_serial": 20,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 7,
+        "task_serial": 19,
+        "thread_id": 7,
+        "thread_serial": 20,
+        "execution_generation": 1
+      },
+      "point": "terminal-unlocked",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 7,
+          "task_serial": 19,
+          "thread_id": 7,
+          "thread_serial": 20,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 7,
+        "task_serial": 19,
+        "thread_id": 7,
+        "thread_serial": 20,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 7,
+        "task_serial": 19,
+        "thread_id": 7,
+        "thread_serial": 20,
+        "execution_generation": 1
+      },
+      "point": "terminal-published",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 7,
+          "task_serial": 19,
+          "thread_id": 7,
+          "thread_serial": 20,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 7,
+        "task_serial": 19,
+        "thread_id": 7,
+        "thread_serial": 20,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 7,
+        "task_serial": 19,
+        "thread_id": 7,
+        "thread_serial": 20,
+        "execution_generation": 1
+      },
+      "point": "finish",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "fd-drained",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "terminal-unlocked",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "terminal-published",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 1,
+          "thread_serial": 6,
+          "execution_generation": 1
+        },
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 1,
+        "thread_serial": 6,
+        "execution_generation": 1
+      },
+      "point": "finish",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      },
+      "point": "continuation-build",
+      "visit": 0,
+      "runnable": [
+        {
+          "task_id": 1,
+          "task_serial": 5,
+          "thread_id": 2,
+          "thread_serial": 7,
+          "execution_generation": 1
+        }
+      ],
+      "next": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      }
+    },
+    {
+      "actor": {
+        "task_id": 1,
+        "task_serial": 5,
+        "thread_id": 2,
+        "thread_serial": 7,
+        "execution_generation": 1
+      },
+      "point": "finish",
+      "visit": 0,
+      "runnable": [],
+      "next": null
+    }
+  ],
+  "result": "task 1 (tid 2) failed: a VM-less backend cannot interpret this outcome: continuation build failed: failed to pin an exact fd description",
+  "work_snapshot": null
+}

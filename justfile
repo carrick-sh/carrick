@@ -678,6 +678,12 @@ investigate *ARGS:
 check-layering:
     ./scripts/closure-assert-layering.sh
 
+# VM-free scenario scheduling is test-only; verify the release product closure
+# excludes its entire harness, then run the deterministic replay controls.
+test-vmfree-schedule:
+    ./scripts/closure-assert-vmfree-schedule.sh
+    cargo test -p carrick-kernel-example --test schedule_replay
+
 # VMM-less compile of the Carrick kernel: the public crate must build for a
 # target that has no Hypervisor.framework at all
 # (docs/superpowers/plans/2026-09-13-extract-carrick-vfs-and-carrick-kernel.md, Task 2.10).

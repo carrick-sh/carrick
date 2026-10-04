@@ -79,6 +79,8 @@ pub enum ExampleError {
     Unsupported(String),
     #[error("script: {0}")]
     Script(String),
+    #[error("schedule: {0}")]
+    Schedule(String),
     #[error("{0} did not complete within {bound} s", bound = WAIT_BOUND.as_secs())]
     WaitTimedOut(&'static str),
     #[error("dispatch: {0}")]
@@ -114,6 +116,7 @@ pub struct ScriptedBackend {
     rootfs_layer: Option<carrick_vfs::rootfs::RootFs>,
     root_exit_checkpoint: Option<crate::operand::ScriptCheckpoint>,
     pauses: Vec<ScriptPause>,
+    schedule: Option<crate::schedule::Schedule>,
 }
 
 struct ScriptPause {
@@ -142,6 +145,7 @@ impl ScriptedBackend {
             rootfs_layer: None,
             root_exit_checkpoint: None,
             pauses: Vec::new(),
+            schedule: None,
         }
     }
 
@@ -187,6 +191,12 @@ impl ScriptedBackend {
         self
     }
 
+    /// Opt a VM-free scenario into deterministic, graph-local scheduling.
+    pub fn with_schedule(mut self, schedule: crate::schedule::Schedule) -> Self {
+        self.schedule = Some(schedule);
+        self
+    }
+
     /// Boot the root task and run `script` on the calling thread; every
     /// child it forks runs on its own thread and is joined (bounded) before
     /// the report is returned.
@@ -196,6 +206,18 @@ impl ScriptedBackend {
     /// bound to the root's [`ExampleProcess`] so child waits resolve in the
     /// kernel graph.
     pub fn run_root(self, script: Vec<Step>) -> Result<RunReport, ExampleError> {
+        if self.schedule.is_some() && !cfg!(debug_assertions) {
+            return Err(ExampleError::Schedule(
+                "scheduled scenarios require a test build".into(),
+            ));
+        }
+        if self.schedule.is_some()
+            && (!self.pauses.is_empty() || self.root_exit_checkpoint.is_some())
+        {
+            return Err(ExampleError::Schedule(
+                "scheduled scenarios cannot use host checkpoints".into(),
+            ));
+        }
         let asids = AsidAllocator::new();
         let space = AddressSpace::allocate(&asids)?;
         let (process, root_context) = ExampleProcess::boot_root(
@@ -225,6 +247,7 @@ impl ScriptedBackend {
             process_exit_codes: Mutex::new(std::collections::HashMap::new()),
             work_scope: work_scope.clone(),
             pauses: Mutex::new(self.pauses),
+            schedule: self.schedule,
         });
         let process = Arc::new(process);
         let mut dispatcher = SyscallDispatcher::with_bridges(self.bridges);
@@ -263,9 +286,23 @@ impl ScriptedBackend {
             execution_generation: root_generation,
         };
         shared.ledger.lock().tasks_started = 1;
+        #[cfg(debug_assertions)]
+        if let Some(schedule) = &shared.schedule {
+            schedule
+                .start(&script, root.schedule_actor())
+                .map_err(ExampleError::Schedule)?;
+        }
         let root_exit = root.run(&script, &shared);
         if let Some(checkpoint) = self.root_exit_checkpoint {
             checkpoint.signal();
+        }
+        #[cfg(debug_assertions)]
+        if let Some(schedule) = &shared.schedule {
+            let actor = root.schedule_actor();
+            // The next actor may observe the retired task's host fd lifetime.
+            // Release this task's references before transferring the permit.
+            drop(root);
+            schedule.finish(actor).map_err(ExampleError::Schedule)?;
         }
         // Every child thread is joined before the verdict, whatever the root
         // did: a task that outlives its parent's script is a backend defect.
@@ -362,6 +399,7 @@ pub(crate) struct Shared {
     pub(crate) process_exit_codes: Mutex<std::collections::HashMap<i32, i32>>,
     pub(crate) work_scope: carrick_observability::work_meter::WorkScope,
     pauses: Mutex<Vec<ScriptPause>>,
+    pub(crate) schedule: Option<crate::schedule::Schedule>,
 }
 
 impl Shared {
@@ -489,6 +527,14 @@ pub(crate) struct Task {
 }
 
 impl Task {
+    #[cfg(debug_assertions)]
+    pub(crate) fn schedule_actor(&self) -> crate::schedule::Actor {
+        crate::schedule::Actor::from_kernel(
+            self.context.task().key(),
+            self.context.thread().key(),
+            self.execution_generation,
+        )
+    }
     /// Whether this exact thread generation is still live in a task-group
     /// that itself still exists in the kernel's registry.
     ///
@@ -510,8 +556,23 @@ impl Task {
 
     /// Run `script` to its `exit_group`, returning the exit code.
     fn run(&mut self, script: &[Step], shared: &Arc<Shared>) -> Result<i32, ExampleError> {
+        #[cfg(debug_assertions)]
+        if let Some(schedule) = &shared.schedule {
+            schedule
+                .enter(self.schedule_actor())
+                .map_err(ExampleError::Schedule)?;
+        }
+        self.run_scheduled(script, shared)
+    }
+
+    fn run_scheduled(
+        &mut self,
+        script: &[Step],
+        shared: &Arc<Shared>,
+    ) -> Result<i32, ExampleError> {
         let mut steps = script.iter();
         while let Some(step) = steps.next() {
+            crate::schedule_point!(shared, self, crate::schedule::Point::Step);
             if !self.is_live() {
                 return Ok(0);
             }
@@ -789,7 +850,22 @@ impl Task {
     fn run_child(mut self, script: &[Step], shared: &Arc<Shared>) {
         let pid = self.process.pid();
         let tid = self.tid;
-        if let Err(error) = self.run(script, shared) {
+        let result = self.run(script, shared);
+        #[cfg(debug_assertions)]
+        if let Some(schedule) = &shared.schedule {
+            let actor = self.schedule_actor();
+            // Finish only after every fd reference owned by this actor drops.
+            drop(self);
+            if let Err(error) = schedule.finish(actor) {
+                shared
+                    .ledger
+                    .lock()
+                    .task_failures
+                    .push((pid, tid, ExampleError::Schedule(error)));
+                return;
+            }
+        }
+        if let Err(error) = result {
             shared.ledger.lock().task_failures.push((pid, tid, error));
         }
     }
@@ -1237,9 +1313,21 @@ impl Task {
         let script = child_script.to_vec();
         let shared_for_child = Arc::clone(shared);
         shared.ledger.lock().tasks_started += 1;
+        #[cfg(debug_assertions)]
+        if let Some(schedule) = &shared.schedule {
+            schedule
+                .register(child.schedule_actor())
+                .map_err(ExampleError::Schedule)?;
+        }
         let handle = thread::Builder::new()
             .name(format!("linux-task-{child_pid}"))
-            .spawn(move || child.run_child(&script, &shared_for_child))?;
+            .spawn(move || child.run_child(&script, &shared_for_child))
+            .map_err(|error| {
+                if let Some(schedule) = &shared.schedule {
+                    schedule.abort(format!("spawn process actor: {error}"));
+                }
+                ExampleError::Spawn(error)
+            })?;
         shared.children.lock().push(handle);
         Ok(child_pid)
     }
@@ -1303,9 +1391,21 @@ impl Task {
         let script = child_script.to_vec();
         let shared_for_child = Arc::clone(shared);
         shared.ledger.lock().tasks_started += 1;
+        #[cfg(debug_assertions)]
+        if let Some(schedule) = &shared.schedule {
+            schedule
+                .register(child.schedule_actor())
+                .map_err(ExampleError::Schedule)?;
+        }
         let handle = thread::Builder::new()
             .name(format!("linux-thread-{child_tid}"))
-            .spawn(move || child.run_child(&script, &shared_for_child))?;
+            .spawn(move || child.run_child(&script, &shared_for_child))
+            .map_err(|error| {
+                if let Some(schedule) = &shared.schedule {
+                    schedule.abort(format!("spawn thread actor: {error}"));
+                }
+                ExampleError::Spawn(error)
+            })?;
         shared.children.lock().push(handle);
         Ok(Ok(child_tid))
     }
@@ -1330,6 +1430,9 @@ impl Task {
             return Ok(());
         }
         disp.retire_hvpatch_process_fds(&self.context);
+        // The close-event drain is complete here. This typed marker only
+        // observes: the dispatcher mutex is still held, so it cannot hand off.
+        crate::schedule_point!(shared, self, crate::schedule::Point::FdDrained);
         let adopter = disp.hvpatch_orphan_adopter();
         let zombie = self.context.kernel().exit_task_key_eventually_notifying(
             task_key,
@@ -1349,6 +1452,8 @@ impl Task {
             .entry(pid)
             .or_insert(winning_code);
         drop(disp);
+        crate::schedule_point!(shared, self, crate::schedule::Point::TerminalUnlocked);
+        crate::schedule_point!(shared, self, crate::schedule::Point::TerminalPublished);
         shared.wake_active_tokens_for_task(task_key);
         Ok(())
     }
