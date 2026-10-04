@@ -81,7 +81,7 @@ lifecycle semantics.
 | `carrick-conformance-next` | In-process conformance framework using `carrick-embed` (Phase J): `TestContainer` + `AuditObserver` `#[test]` ports of LTP/probe cases, semantic probe observers, fuzzing, and golden traces. `carrick-conformance` stays the verdict authority until the new framework reproduces every historical false-green rejection. |
 | `carrick-coordinator` | Host-wide resource coordinator enforcing mutual exclusion between Carrick guest execution and Docker oracle phases across checkouts, quiet timing windows, and campaign budgets. |
 | `carrick-investigation` | Durable event-sourced investigation engine driving validated stage transitions, experiment planning, and review-package assembly for contract-driven conformance investigations. |
-| `carrick-test-support` | Shared integration/CLI test helpers, mainly synthetic rootfs tar/gzip assembly. |
+| `carrick-test-support` | Shared test helpers: synthetic rootfs tar/gzip assembly and aligned EL1 region backing for VM-free ABI tests. |
 
 ## Feature Closure Rules
 

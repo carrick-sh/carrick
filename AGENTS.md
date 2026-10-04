@@ -358,6 +358,11 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
   `SigSet`/`SigBlockMask`/`WaitSigMask`, `CanonicalNr`/`NativeNr`,
   `GuestVa`/`Gpa`/`HostVa`, `LinuxErrno`, `bitflags`; named constructors where
   polarity matters; `just lint-domains`).
+- **ABI records need aligned test storage.** A `Vec<u8>` promises byte
+  alignment, not the alignment of EL1 records cast into it; Linux's allocator
+  exposed non-unwinding misaligned-pointer failures hidden by macOS allocation.
+  Fixtures use `carrick_test_support::TestEl1Region`, whose typed allocation
+  and compile-time ABI alignment checks preserve the storage contract.
 - Next frontier: **ownership, scope, lifetime.** Five defects on 2026-09-05
   came from one `Arc<Mutex<Option<PageTableManager>>>` whose comment-only rules
   (arena source belongs to the mm; vfork child shares until exec; rollback
