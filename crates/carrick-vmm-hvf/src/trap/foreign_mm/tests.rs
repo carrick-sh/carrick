@@ -12701,16 +12701,39 @@ mod guest_cow {
             carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
         );
         let engine_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
-        assert_eq!(
-            engine_authority.select_guest_descriptor_owner(),
-            Ok(GuestLaneSelection::Deferred)
-        );
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let mm = NonZeroU64::new(806).unwrap();
+        // SAFETY: the fixture stands for a completed bind against this carrier.
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                custody.transfer_carrier,
+                carrick_el1_abi::ReservationMm::new(mm.get()).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            )
+        };
+        let protections = carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::default(),
+        ));
+        assert_eq!(
+            protections
+                .select_owner(handle, || {
+                    engine_authority.select_guest_descriptor_owner().map(
+                        |selection| match selection {
+                            GuestLaneSelection::Selected => {
+                                carrick_guest_mem::OwnerMemorySelection::Immediate
+                            }
+                            GuestLaneSelection::Deferred => {
+                                carrick_guest_mem::OwnerMemorySelection::Deferred
+                            }
+                        },
+                    )
+                })
+                .unwrap(),
+            carrick_guest_mem::OwnerMemorySelection::Deferred
+        );
         let state = MmAccessState::new(
             carrick_aarch64::Stage1Authority::new(),
-            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
-                MemoryProtections::default(),
-            )),
+            protections,
             Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
             Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
             Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -12720,8 +12743,108 @@ mod guest_cow {
         state.bind_page_tables_authority(engine_authority.clone());
         assert_eq!(
             engine_authority.live_descriptor_owner(),
+            LiveDescriptorOwner::Host
+        );
+        assert_eq!(state.protections.pending_owner(), Some(handle));
+        state.install_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(mm),
+            CarrierForeignMmBinding {
+                asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(7).unwrap()),
+                stage1_root: Gpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
+            },
+        );
+        assert_eq!(
+            engine_authority.live_descriptor_owner(),
             LiveDescriptorOwner::Guest,
             "binding the selected authority completes its pending selection"
+        );
+        assert!(
+            state.protections.owner() == Some(handle),
+            "deferred descriptor promotion must publish the exact user-memory owner"
+        );
+    }
+
+    #[test]
+    fn deferred_owner_promotion_is_scoped_to_each_live_mm() {
+        use carrick_mmu_core::aarch64::LiveDescriptorOwner;
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let make_pending = |mm_key: u64| {
+            let manager = carrick_mmu_core::aarch64::PageTableManager::new(
+                carrick_mem::memory::stage1_hvpatch_page_tables(),
+                carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+                carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+            );
+            let authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
+            // SAFETY: each fixture handle represents a separate admitted MM
+            // incarnation in the same test carrier.
+            let handle = unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    custody.transfer_carrier,
+                    carrick_el1_abi::ReservationMm::new(mm_key).unwrap(),
+                    NonZeroU64::new(1).unwrap(),
+                )
+            };
+            let protections = carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            ));
+            assert_eq!(
+                protections
+                    .select_owner(handle, || {
+                        authority
+                            .select_guest_descriptor_owner()
+                            .map(|_| carrick_guest_mem::OwnerMemorySelection::Deferred)
+                    })
+                    .unwrap(),
+                carrick_guest_mem::OwnerMemorySelection::Deferred
+            );
+            let state = MmAccessState::new(
+                carrick_aarch64::Stage1Authority::new(),
+                protections,
+                Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+                Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+                Arc::new(parking_lot::Mutex::new(Vec::new())),
+                crate::hvf_aarch64_engine::HostCowStats::default(),
+                crate::trap::foreign_mm::LiveBacking::immediate(Arc::clone(&custody)),
+            );
+            state.bind_page_tables_authority(authority.clone());
+            (state, authority, handle)
+        };
+        let (first, first_tables, first_handle) = make_pending(807);
+        let (second, second_tables, second_handle) = make_pending(808);
+        let binding = CarrierForeignMmBinding {
+            asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(7).unwrap()),
+            stage1_root: Gpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
+        };
+        first.install_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(807).unwrap()),
+            binding,
+        );
+        // A state presented with the first MM's identity cannot consume the
+        // second MM's pending guard, despite the equal root virtual address.
+        second.install_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(807).unwrap()),
+            binding,
+        );
+        assert_eq!(first.protections.owner(), Some(first_handle));
+        assert_eq!(
+            first_tables.live_descriptor_owner(),
+            LiveDescriptorOwner::Guest
+        );
+        assert_eq!(second.protections.owner(), None);
+        assert_eq!(second.protections.pending_owner(), Some(second_handle));
+        assert_eq!(
+            second_tables.live_descriptor_owner(),
+            LiveDescriptorOwner::Host
+        );
+        second.install_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(808).unwrap()),
+            binding,
+        );
+        assert_eq!(second.protections.owner(), Some(second_handle));
+        assert_eq!(
+            second_tables.live_descriptor_owner(),
+            LiveDescriptorOwner::Guest
         );
     }
 
@@ -12782,12 +12905,10 @@ mod guest_cow {
         use carrick_mmu_core::aarch64::LiveDescriptorOwner;
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
-        let state_with = |binding| {
+        let state_with = |binding, protections| {
             MmAccessState::new(
                 carrick_aarch64::Stage1Authority::new(),
-                carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
-                    MemoryProtections::default(),
-                )),
+                protections,
                 Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
                 Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
                 Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -12801,6 +12922,11 @@ mod guest_cow {
                     }
                 },
             )
+        };
+        let legacy = || {
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            ))
         };
         let authority = || {
             carrick_aarch64::Stage1Authority::new_with_manager(Some(
@@ -12816,11 +12942,12 @@ mod guest_cow {
         };
         // Exec and fork children bind live at once.
         let child = authority();
-        state_with(LiveBackingBinding::Immediate).bind_page_tables_authority(child.clone());
+        state_with(LiveBackingBinding::Immediate, legacy())
+            .bind_page_tables_authority(child.clone());
         assert!(live(&child), "an exec/fork state makes its manager live");
         // The root stays an owned copy on the host lane.
         let root = authority();
-        state_with(LiveBackingBinding::Deferred).bind_page_tables_authority(root.clone());
+        state_with(LiveBackingBinding::Deferred, legacy()).bind_page_tables_authority(root.clone());
         assert!(
             !live(&root),
             "the root manager stays owned: host edits work"
@@ -12835,12 +12962,39 @@ mod guest_cow {
         assert!(live(&root));
         // A selection made before the backing was recorded completes at it.
         let pending = authority();
+        let protections = legacy();
+        let mm = NonZeroU64::new(809).unwrap();
+        // SAFETY: this fixture represents the exact owner's completed bind.
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                custody.transfer_carrier,
+                carrick_el1_abi::ReservationMm::new(mm.get()).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            )
+        };
         assert_eq!(
-            pending.select_guest_descriptor_owner(),
-            Ok(GuestLaneSelection::Deferred)
+            protections
+                .select_owner(handle, || {
+                    pending.select_guest_descriptor_owner().map(|selection| {
+                        assert_eq!(selection, GuestLaneSelection::Deferred);
+                        carrick_guest_mem::OwnerMemorySelection::Deferred
+                    })
+                })
+                .unwrap(),
+            carrick_guest_mem::OwnerMemorySelection::Deferred
         );
-        state_with(LiveBackingBinding::Deferred).bind_page_tables_authority(pending.clone());
+        let pending_state = state_with(LiveBackingBinding::Deferred, protections);
+        pending_state.bind_page_tables_authority(pending.clone());
+        assert_eq!(pending.live_descriptor_owner(), LiveDescriptorOwner::Host);
+        pending_state.install_identity(
+            carrick_hal::ForeignMmId::from_kernel_allocation(mm),
+            CarrierForeignMmBinding {
+                asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(7).unwrap()),
+                stage1_root: Gpa(carrick_mem::memory::LINUX_PAGE_TABLES_BASE),
+            },
+        );
         assert_eq!(pending.live_descriptor_owner(), LiveDescriptorOwner::Guest);
+        assert_eq!(pending_state.protections.owner(), Some(handle));
     }
 
     #[test]
