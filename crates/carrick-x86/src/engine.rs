@@ -1476,41 +1476,17 @@ fn x86_task_state_from_snapshot<V: X86Vmm>(
             "x86 snapshot has no exact MM/ASID generation binding".to_owned(),
         ));
     }
-    let xsave = snapshot.xsave.ok_or_else(|| {
-        TrapError::Hypervisor("x86 snapshot did not capture complete XSAVE state".to_owned())
+    let mm = std::num::NonZeroU64::new(engine.mm_generation)
+        .ok_or_else(|| TrapError::Hypervisor("x86 snapshot has no exact MM generation".into()))?;
+    let context = std::num::NonZeroU64::new(engine.asid_generation).ok_or_else(|| {
+        TrapError::Hypervisor("x86 snapshot has no exact context generation".into())
     })?;
-    X86TaskCpuStateV1::new(
-        snapshot.gprs,
-        snapshot.rip,
-        snapshot.rflags,
-        snapshot.rsp,
-        snapshot.cr0,
-        snapshot.cr3,
-        snapshot.cr4,
-        snapshot.efer,
-        snapshot.fs_base,
-        snapshot.gs_base,
-        engine.mm_generation,
-        engine.asid_generation,
-        xsave.to_vec(),
-        encode_x86_resume_metadata(engine).to_vec(),
+    crate::arch_context::task_state_from_snapshot(
+        snapshot,
+        carrick_hal::guest_arch_binding::core_arch::MmGeneration::new(mm),
+        carrick_hal::guest_arch_binding::core_arch::ContextGeneration::new(context),
+        encode_x86_resume_metadata(engine),
     )
-}
-
-fn x86_snapshot_from_task(state: &X86TaskCpuStateV1) -> X86VcpuSnapshot {
-    X86VcpuSnapshot {
-        gprs: *state.gprs(),
-        rip: state.rip(),
-        rsp: state.rsp(),
-        rflags: state.rflags(),
-        cr0: state.cr0(),
-        cr3: state.cr3(),
-        cr4: state.cr4(),
-        efer: state.efer(),
-        fs_base: state.fs_base(),
-        gs_base: state.gs_base(),
-        xsave: Some(*state.xsave()),
-    }
 }
 
 impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
@@ -1605,7 +1581,7 @@ impl<V: X86Vmm> ThreadedEngine for X86EngineCore<V> {
             )));
         }
         let metadata = decode_x86_resume_metadata(state.resume_payload())?;
-        let snapshot = x86_snapshot_from_task(state);
+        let snapshot = crate::arch_context::snapshot_from_task(state);
         self.vm
             .rebind_to_slot(&mut self.vcpu, slot, self.layout, &snapshot)?;
         self.pending_resume_pc = metadata.pending_resume_pc;

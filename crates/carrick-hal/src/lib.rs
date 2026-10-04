@@ -108,6 +108,7 @@ pub use host_signal_bridge::{
 #[cfg(any(test, feature = "test-support"))]
 pub use host_signal_bridge::{NullHostSignalBridge, NullHostSignalGlue};
 pub mod guest_arch;
+pub mod guest_arch_binding;
 pub use guest_arch::{GuestArch, PageTableCodec, PtGranule, SyscallRemap, SyscallTable};
 pub mod aarch64_arch;
 pub use aarch64_arch::{Aarch64BootSysregs, Aarch64GuestArch, Aarch64Mmu, Aarch64SyscallTable};
