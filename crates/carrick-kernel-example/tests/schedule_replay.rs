@@ -79,41 +79,39 @@ fn seeded_fd_pin_schedule_records_and_replays() {
     if let Ok(path) = std::env::var("VMFREE_TRACE") {
         std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap()).expect("write trace");
     }
-    if std::env::var_os("VMFREE_RECORD_ONLY").is_some() {
-        return;
-    }
-    let replay: ScheduleReceipt = std::env::var("VMFREE_REPLAY").ok().map_or_else(
-        || {
-            let retained: ScheduleReceipt =
-                serde_json::from_str(include_str!("fixtures/fdpin-seed5.json"))
-                    .expect("retained schedule");
-            if retained.backend == receipt.backend && retained.source_hash == receipt.source_hash {
-                retained
-            } else {
-                receipt.clone()
-            }
-        },
-        |path| {
-            serde_json::from_slice(&std::fs::read(path).expect("read replay"))
-                .expect("parse replay")
-        },
-    );
-    let expected_source = replay.source_hash.clone();
-    let schedule = if let Ok(fixed_source) = std::env::var("VMFREE_ALLOW_FIXED_SOURCE") {
-        Schedule::replay(replay).allow_source_pair(&expected_source, &fixed_source)
-    } else {
-        Schedule::replay(replay)
-    };
-    let (replayed, replay_receipt) = run(&schedule);
+    // The retained fixtures are historical evidence. Only an explicit
+    // VMFREE_REPLAY request uses them; this default check replays its own run.
+    let (replayed, replay_receipt) = run(&Schedule::replay(receipt.clone()));
     assert_eq!(receipt.decisions, replay_receipt.decisions);
     assert_eq!(format!("{result:?}"), format!("{replayed:?}"));
-    if std::env::var_os("VMFREE_REQUIRE_FIXED").is_some() {
-        assert_fd_pin_conformance(&result);
-    } else {
-        // This base deliberately lacks the fd-pin fix. Preserve the trace
-        // without classifying the historical error as a passing contract.
-        println!("schedule observation: {}", receipt.result);
+    assert_fd_pin_conformance(&result);
+
+    if let Ok(path) = std::env::var("VMFREE_REPLAY") {
+        let retained: ScheduleReceipt =
+            serde_json::from_slice(&std::fs::read(path).expect("read replay"))
+                .expect("parse replay");
+        let expected_source = retained.source_hash.clone();
+        let schedule = if let Ok(fixed_source) = std::env::var("VMFREE_ALLOW_FIXED_SOURCE") {
+            Schedule::replay(retained.clone()).allow_source_pair(&expected_source, &fixed_source)
+        } else {
+            Schedule::replay(retained.clone())
+        };
+        let (replayed, replay_receipt) = run(&schedule);
+        assert_eq!(retained.decisions, replay_receipt.decisions);
+        assert_fd_pin_conformance(&replayed);
     }
+}
+
+#[test]
+#[ignore = "explicit VMFREE_TRACE is required to record a historical revision"]
+fn record_fd_pin_schedule_on_historical_revision() {
+    let path = std::env::var("VMFREE_TRACE").expect("set VMFREE_TRACE to a receipt path");
+    let seed = std::env::var("VMFREE_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let (_, receipt) = run(&Schedule::explore(seed).max_transitions(128));
+    std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap()).expect("write trace");
 }
 
 fn expect_replay_rejection(

@@ -154,6 +154,7 @@ lint-domains: lint-domains-source
 lint-domains-source:
     python3 scripts/conformance/check-next-strategy.py
     cargo run --locked -p carrick-xtask -- probe-coverage
+    ./scripts/closure-assert-vmfree-schedule.sh
     ./scripts/lint-domains.sh
     # The self-tests run FIRST and in the same gate as --check: every one of
     # these scanners keys at least one rule on an exact source PATH, so a crate

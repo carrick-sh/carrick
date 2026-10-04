@@ -117,12 +117,16 @@ point, visit number, runnable set and decision, plus source/fixture hashes.
 comparison across the known-bad and fixed fd-pin revisions requires an
 explicit `allow_source_pair`.
 
-`just test-vmfree-schedule` checks the product closure and runs replay controls.
+`just lint-domains` checks the product closure; `just test-vmfree-schedule`
+also runs the replay controls. The default schedule test asserts fd-pin
+semantics and work on its fresh seeded run, then replays that run exactly.
 The Linux x86_64 retained `tests/fixtures/fdpin-seed5.json` witnesses the
-pre-fix `fork(2)`/`close(2)`/`exit_group(2)` ordering. Replay it explicitly
-with `VMFREE_REPLAY` and `VMFREE_REQUIRE_FIXED=1` on that revision to expose
-the fd-pin error. After applying the separately owned fd-pin correction in a
-scratch checkout, declare the exact source pair with
+pre-fix `fork(2)`/`close(2)`/`exit_group(2)` ordering. Retained fixtures are
+historical evidence and are replayed only when `VMFREE_REPLAY` names one.
+On a pre-fix scratch checkout, use the ignored
+`record_fd_pin_schedule_on_historical_revision` test with `VMFREE_TRACE` to
+record a receipt while the default conformance test fails. After applying the
+separately owned fd-pin correction, declare the exact source pair with
 `VMFREE_ALLOW_FIXED_SOURCE` to prove the same ordering passes. The pre-fix
 code borrows a raw host fd; host fd-number reuse can change its outcome on
 macOS even with identical guest decisions. Ordinary kernel semantics tests

@@ -403,6 +403,16 @@ pub(crate) fn drive(
                             .map_err(|e| {
                                 ExampleError::Unsupported(format!("continuation build failed: {e}"))
                             })?;
+                    // Building owns the exact fd pin even if exit_group won
+                    // after dispatch. A retired task has no wait to enroll:
+                    // the reactor could otherwise publish an incidental wake
+                    // before the cancellation below and vary the work receipt.
+                    if !task.is_live() {
+                        let _ = continuation.cancel(CancellationCause::ProcessExit);
+                        return Ok(InternalCompletion::Cancelled(
+                            CancellationCause::ProcessExit,
+                        ));
+                    }
                     continuation.install_temporary_signal_mask(&task.context);
                     continuation.bind_product_futex(&task.futex_table);
 
