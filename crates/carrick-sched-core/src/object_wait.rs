@@ -47,6 +47,9 @@ pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
         OBJECT_EXPIRED as u64,
         OBJECT_HOST_CONTINUATION as u64,
         ADMISSION_PENDING as u64,
+        ADMISSION_CUSTODY as u64,
+        ADMISSION_POSTED as u64,
+        ADMISSION_RELEASED as u64,
         core::mem::offset_of!(crate::ZoneTables, object_admission_handbacks) as u64,
         core::mem::offset_of!(crate::ZoneTables, delegated_host_pending) as u64,
         DELEGATED_FILE_WAIT_QUEUES.div_ceil(64) as u64,
@@ -305,12 +308,32 @@ impl OwnedObjectWakeEffects<'_> {
         assert_eq!(self.handed, 0, "owned handbacks require delivery");
         (self.waker, core::mem::take(&mut self.effects))
     }
+    fn take_ready_handback(&mut self) -> Option<RecordId> {
+        while let Some(id) = RecordId::from_raw(self.handed) {
+            let rec = self.zone.record(id);
+            // Read the successor before transferring custody: the final
+            // publisher can deliver and recycle this record immediately.
+            self.handed = rec.object.next.load(Ordering::Relaxed);
+            if rec.object.prev.load(Ordering::Acquire) & ADMISSION_CUSTODY != 0 {
+                let state = rec
+                    .object
+                    .prev
+                    .fetch_or(ADMISSION_RELEASED, Ordering::AcqRel);
+                if state & ADMISSION_POSTED == 0 {
+                    // Original publisher now owns the detached transfer. It
+                    // cannot return the operation before posting its edge.
+                    continue;
+                }
+                rec.object.prev.store(0, Ordering::Relaxed);
+            }
+            return Some(id);
+        }
+        None
+    }
     /// Host venue consumes exact detached claims after queue unlock.
     pub fn deliver_handbacks(mut self, handed: &mut impl FnMut(RecordRef)) -> (Waker, WakeEffects) {
         let zone = self.zone;
-        while let Some(id) = RecordId::from_raw(self.handed) {
-            let rec = zone.record(id);
-            self.handed = rec.object.next.load(Ordering::Relaxed);
+        while let Some(id) = self.take_ready_handback() {
             let transfer = zone.completion_transfer(id);
             if let Some(record) = transfer.publish() {
                 handed(record);
@@ -322,28 +345,29 @@ impl OwnedObjectWakeEffects<'_> {
     /// boundary. The caller must force that boundary after publication.
     pub fn defer_handbacks(mut self) -> (Waker, WakeEffects, bool) {
         let zone = self.zone;
-        let deferred = self.handed != 0;
-        if deferred {
-            let mut tail = self.handed;
-            loop {
-                let next = zone
-                    .record(RecordId(tail))
+        let mut head = 0;
+        let mut tail = 0;
+        while let Some(id) = self.take_ready_handback() {
+            zone.record(id).object.next.store(0, Ordering::Relaxed);
+            if tail == 0 {
+                head = id.raw();
+            } else {
+                zone.record(RecordId(tail))
                     .object
                     .next
-                    .load(Ordering::Relaxed);
-                if next == 0 {
-                    break;
-                }
-                tail = next;
+                    .store(id.raw(), Ordering::Relaxed);
             }
+            tail = id.raw();
+        }
+        let deferred = head != 0;
+        if deferred {
             zone.completion_handbacks
-                .push(self.handed, tail, |previous, next| {
+                .push(head, tail, |previous, next| {
                     zone.record(RecordId(previous))
                         .object
                         .next
                         .store(next, Ordering::Release)
                 });
-            self.handed = 0;
         }
         (self.waker, core::mem::take(&mut self.effects), deferred)
     }
@@ -480,6 +504,16 @@ impl<'a> ObjectNotificationTicket<'a> {
         completion: &dyn Fn(OwnedObjectWakeEffects),
         before_link: impl FnOnce(),
     ) -> Result<(), (ObjectWaitError, OperationToken)> {
+        self.defer_admission_with_hooks(record, operation, completion, before_link, || {})
+    }
+    fn defer_admission_with_hooks(
+        self,
+        record: RecordId,
+        operation: OperationToken,
+        completion: &dyn Fn(OwnedObjectWakeEffects),
+        before_link: impl FnOnce(),
+        after_link: impl FnOnce(),
+    ) -> Result<(), (ObjectWaitError, OperationToken)> {
         let zone = self.zone;
         let key = self.key;
         let rec = zone.record(record);
@@ -507,6 +541,7 @@ impl<'a> ObjectNotificationTicket<'a> {
             .expired
             .store(OBJECT_HOST_CONTINUATION, Ordering::Relaxed);
         rec.object.next.store(0, Ordering::Relaxed);
+        rec.object.prev.store(ADMISSION_CUSTODY, Ordering::Release);
         zone.mark_woken(rec, 0);
         // The chain and the in-flight publisher retain separate counts. A
         // different publisher can drain this linked record before we post our
@@ -531,9 +566,23 @@ impl<'a> ObjectNotificationTicket<'a> {
                     .store(next, Ordering::Release);
             },
         );
+        after_link();
         zone.object_queue(key.index as usize)
             .lock
             .fetch_or(ADMISSION_PENDING, Ordering::SeqCst);
+        let previous = rec.object.prev.fetch_or(ADMISSION_POSTED, Ordering::AcqRel);
+        if previous & ADMISSION_RELEASED != 0 {
+            // The earlier consumer already unlocked and transferred this
+            // exact claim to us. No record reuse precedes this pending post.
+            rec.object.next.store(0, Ordering::Relaxed);
+            completion(OwnedObjectWakeEffects {
+                zone,
+                key,
+                waker: Waker::Host,
+                effects: WakeEffects::default(),
+                handed: record.raw(),
+            });
+        }
         zone.try_drain_object_pending(key, completion);
         Ok(())
     }
@@ -632,6 +681,11 @@ const NOTIFY_PENDING: u32 = 4;
 const ADMISSION_PENDING: u32 = 8;
 const OBJECT_EXPIRED: u32 = 1;
 const OBJECT_HOST_CONTINUATION: u32 = 2;
+// `prev` is not a queue backlink while an admission handback is Transferring.
+// These bits couple its original publication to its after-unlock delivery.
+const ADMISSION_CUSTODY: u32 = 1 << 31;
+const ADMISSION_POSTED: u32 = 1 << 30;
+const ADMISSION_RELEASED: u32 = 1 << 29;
 /// Where an owned operation may execute after its producer completes.
 #[derive(Clone, Copy)]
 enum OperationDestination {
@@ -731,12 +785,14 @@ impl ObjectWaitGuard<'_> {
             {
                 break;
             }
-            // No handback callback runs until final unlock. Every admission
-            // pins a distinct Transferring record, so no such record can be
-            // reused to extend this loop. NOTIFY_PENDING stays sticky.
+            // Each record can contribute one inherited post whose earlier
+            // consumer already unlocked, then one fresh admission. The fresh
+            // transfer cannot return until this holder unlocks. Publication
+            // custody forbids accumulating old posts across record reuse.
+            // NOTIFY_PENDING contributes at most one sticky transition.
             transitions += 1;
             assert!(
-                transitions <= ZONE_RECORDS + 1,
+                transitions <= 2 * ZONE_RECORDS + 1,
                 "object release work exceeds retained record population"
             );
         }
@@ -1843,6 +1899,243 @@ mod host_tests {
             zone.object_queue_census(new.index()).unwrap().generation,
             12
         );
+    }
+
+    #[test]
+    fn admission_post_link_gap_keeps_record_unreusable_until_original_post() {
+        let zone = fixture(true);
+        let key = ObjectWaitKey::new(3, 11).unwrap();
+        let delivered = core::cell::RefCell::new(Vec::new());
+        let complete = |effects: OwnedObjectWakeEffects<'_>| {
+            let _ = effects.deliver_handbacks(&mut |r| delivered.borrow_mut().push(r));
+        };
+        zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &complete)
+            .unwrap();
+        let source = zone
+            .admit_object_notification(key, &BoundedSpin(0), &complete)
+            .unwrap()
+            .into_source();
+        let guard = zone
+            .object_wait_with_completion(key, &BoundedSpin(0), &complete)
+            .unwrap();
+        let record = allocate(&zone, 503);
+        let prior = allocate(&zone, 504);
+        source
+            .reserve()
+            .defer_admission_with(
+                prior,
+                OperationToken::new(504, 11).unwrap(),
+                &complete,
+                || {},
+            )
+            .unwrap();
+        source
+            .reserve()
+            .defer_admission_with_hooks(
+                record,
+                OperationToken::new(503, 11).unwrap(),
+                &complete,
+                || {},
+                || {
+                    drop(guard);
+                    assert!(
+                        matches!(zone.record(record).claim(), Claim::Transferring { .. }),
+                        "linked record must remain unreusable before its original pending post"
+                    );
+                    assert!(!delivered.borrow().contains(&zone.record_ref(record)));
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            delivered.borrow().iter().filter(|r| r.id == record).count(),
+            1
+        );
+        assert_eq!(
+            unsafe { zone.record(record).take_object_operation() }
+                .unwrap()
+                .index(),
+            503
+        );
+    }
+
+    #[test]
+    fn admission_inherited_post_and_reuse_reaches_exact_linear_release_bound() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for n in [1, 4, 16] {
+            let zone = fixture(true);
+            let key = ObjectWaitKey::new(3, 11).unwrap();
+            let delivered = std::sync::Mutex::new(Vec::new());
+            let complete = |effects: OwnedObjectWakeEffects<'_>| {
+                let _ = effects.deliver_handbacks(&mut |r| delivered.lock().unwrap().push(r));
+            };
+            zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &complete)
+                .unwrap();
+            let source = zone
+                .admit_object_notification(key, &BoundedSpin(0), &complete)
+                .unwrap()
+                .into_source();
+            let old_guard = zone
+                .object_wait_with_completion(key, &BoundedSpin(0), &complete)
+                .unwrap();
+            let seed = allocate(&zone, 600);
+            source
+                .reserve()
+                .defer_admission_with(
+                    seed,
+                    OperationToken::new(600, 11).unwrap(),
+                    &complete,
+                    || {},
+                )
+                .unwrap();
+            let records = (0..n).map(|i| allocate(&zone, 601 + i)).collect::<Vec<_>>();
+            std::thread::scope(|scope| {
+                let mut controls = Vec::new();
+                for (i, record) in records.iter().copied().enumerate() {
+                    let (linked_tx, linked_rx) = mpsc::channel();
+                    let (post_tx, post_rx) = mpsc::channel();
+                    let (go_tx, go_rx) = mpsc::channel();
+                    let (reuse_tx, reuse_rx) = mpsc::channel();
+                    let (done_tx, done_rx) = mpsc::channel();
+                    let source = &source;
+                    let zone = &zone;
+                    let complete = &complete;
+                    scope.spawn(move || {
+                        let publisher_complete = |effects: OwnedObjectWakeEffects<'_>| {
+                            let _ = effects.deliver_handbacks(&mut |r| {
+                                assert_eq!(r.id, record);
+                                post_tx.send(()).unwrap();
+                                reuse_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                                assert!(
+                                    unsafe { zone.record(record).take_object_operation() }
+                                        .is_some()
+                                );
+                                zone.free_record(record);
+                                let reused = allocate(zone, 1000 + i as u64);
+                                assert_eq!(
+                                    reused, record,
+                                    "same physical record is recycled only after original post"
+                                );
+                                source
+                                    .reserve()
+                                    .defer_admission_with(
+                                        reused,
+                                        OperationToken::new(1000 + i as u64, 12).unwrap(),
+                                        complete,
+                                        || {},
+                                    )
+                                    .unwrap();
+                                done_tx.send(()).unwrap();
+                            });
+                        };
+                        source
+                            .reserve()
+                            .defer_admission_with_hooks(
+                                record,
+                                OperationToken::new(601 + i as u64, 11).unwrap(),
+                                &publisher_complete,
+                                || {},
+                                || {
+                                    linked_tx.send(()).unwrap();
+                                    go_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                                },
+                            )
+                            .unwrap();
+                    });
+                    linked_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    controls.push((go_tx, post_rx, reuse_tx, done_rx));
+                }
+                drop(old_guard);
+                assert_eq!(
+                    delivered.lock().unwrap().len(),
+                    1,
+                    "only completed seed can return"
+                );
+                for record in &records {
+                    assert!(matches!(
+                        zone.record(*record).claim(),
+                        Claim::Transferring { .. }
+                    ));
+                }
+                let guard = core::mem::ManuallyDrop::new(
+                    zone.object_wait_with_completion(key, &BoundedSpin(0), &complete)
+                        .unwrap(),
+                );
+                let mut pass = 0;
+                guard.release_with(|| {
+                    if pass == 0 {
+                        source.reserve().publish(Waker::Host, &complete);
+                    } else if pass <= 2 * n as usize {
+                        let (go, posted, reuse, done) = &controls[(pass - 1) / 2];
+                        if pass % 2 == 1 {
+                            go.send(()).unwrap();
+                            posted.recv_timeout(Duration::from_secs(5)).unwrap();
+                        } else {
+                            reuse.send(()).unwrap();
+                            done.recv_timeout(Duration::from_secs(5)).unwrap();
+                        }
+                    }
+                    pass += 1;
+                });
+                assert_eq!(
+                    pass - 1,
+                    2 * n as usize + 1,
+                    "N inherited posts + N new admissions + one sticky resource edge"
+                );
+                assert_eq!(delivered.lock().unwrap().len(), n as usize + 1);
+            });
+        }
+    }
+
+    #[test]
+    fn admission_guest_handback_also_waits_for_original_pending_post() {
+        let zone = fixture(true);
+        let key = ObjectWaitKey::new(3, 11).unwrap();
+        let complete = |effects: OwnedObjectWakeEffects<'_>| {
+            let (_, work, _) = effects.defer_handbacks();
+            assert_eq!(work, WakeEffects::default());
+        };
+        zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &complete)
+            .unwrap();
+        let source = zone
+            .admit_object_notification(key, &BoundedSpin(0), &complete)
+            .unwrap()
+            .into_source();
+        let guard = zone
+            .object_wait_with_completion(key, &BoundedSpin(0), &complete)
+            .unwrap();
+        let first = allocate(&zone, 510);
+        let second = allocate(&zone, 511);
+        source
+            .reserve()
+            .defer_admission_with(
+                first,
+                OperationToken::new(510, 11).unwrap(),
+                &complete,
+                || {},
+            )
+            .unwrap();
+        let mut handed = Vec::new();
+        source
+            .reserve()
+            .defer_admission_with_hooks(
+                second,
+                OperationToken::new(511, 11).unwrap(),
+                &complete,
+                || {},
+                || {
+                    drop(guard);
+                    zone.take_completion_handbacks(&BoundedSpin(0), &mut |r| handed.push(r));
+                    assert_eq!(handed, [zone.record_ref(first)]);
+                    assert!(matches!(
+                        zone.record(second).claim(),
+                        Claim::Transferring { .. }
+                    ));
+                },
+            )
+            .unwrap();
+        zone.take_completion_handbacks(&BoundedSpin(0), &mut |r| handed.push(r));
+        assert_eq!(handed, [zone.record_ref(first), zone.record_ref(second)]);
     }
 
     #[test]
