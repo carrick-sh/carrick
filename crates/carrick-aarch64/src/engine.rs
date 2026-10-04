@@ -7898,6 +7898,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 }
                 crate::user_transfer::TransferProgress::Advanced => {}
                 crate::user_transfer::TransferProgress::Suspended
+                | crate::user_transfer::TransferProgress::OwnerWait(_)
                 | crate::user_transfer::TransferProgress::Refused(_) => {
                     return Err(TrapError::Hypervisor(
                         "owner parent transfer refused".into(),
