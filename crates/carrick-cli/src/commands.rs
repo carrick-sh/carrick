@@ -1243,7 +1243,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 if let Some(requested_profile) = profile {
                     let raw_path = output_path
                         .ok_or_else(|| anyhow::anyhow!("profile trace has no output path"))?;
-                    let capture_status = report.into();
+                    let capture_status: crate::trace_profile::ProfileCaptureStatus = report.into();
                     #[cfg(target_os = "macos")]
                     {
                         if requested_profile
