@@ -270,6 +270,12 @@ impl Stage1MmLease {
         if !matches!(*space, AddressSpaceState::Unpublished) {
             return;
         }
+        crate::probes::hvpatch_el1_root_candidate(
+            u64::from(self.asid.raw()),
+            0,
+            self.binding().ttbr0.raw(),
+            0,
+        );
         *space = if *lifecycle == Stage1MmLeaseLifecycle::Live {
             publish(self.binding().ttbr0.raw())
                 .map_or(AddressSpaceState::Never, AddressSpaceState::Published)

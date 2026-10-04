@@ -3580,19 +3580,46 @@ where
                     };
                     let mut owner_admission_error = None;
                     binding.publish_address_space(|lease_ttbr0| {
-                        let (ttbr0, ttbr1) = engine.el1_switchable_roots()?;
-                        let closed = (ttbr0 == lease_ttbr0)
-                            .then(|| {
-                                self.kernel.dispatcher.publish_bound_address_space(
-                                    participation,
-                                    &mut *engine,
-                                    ttbr0,
-                                    ttbr1,
-                                )
-                            })
-                            .flatten()?;
+                        let asid = lease_ttbr0 >> 48;
+                        carrick_observability::probes::hvpatch_el1_root_candidate(
+                            asid,
+                            1,
+                            lease_ttbr0,
+                            0,
+                        );
+                        let Some((ttbr0, ttbr1)) = engine.el1_switchable_roots() else {
+                            carrick_observability::probes::hvpatch_el1_root_candidate(
+                                asid,
+                                2,
+                                lease_ttbr0,
+                                0,
+                            );
+                            return None;
+                        };
+                        if ttbr0 != lease_ttbr0 {
+                            carrick_observability::probes::hvpatch_el1_root_candidate(
+                                asid, 3, ttbr0, ttbr1,
+                            );
+                            return None;
+                        }
+                        let Some(closed) = self.kernel.dispatcher.publish_bound_address_space(
+                            participation,
+                            &mut *engine,
+                            ttbr0,
+                            ttbr1,
+                        ) else {
+                            carrick_observability::probes::hvpatch_el1_root_candidate(
+                                asid, 4, ttbr0, ttbr1,
+                            );
+                            return None;
+                        };
                         match super::signal::open_first_address_space(engine, closed) {
-                            Ok(publication) => Some(publication),
+                            Ok(publication) => {
+                                carrick_observability::probes::hvpatch_el1_root_candidate(
+                                    asid, 5, ttbr0, ttbr1,
+                                );
+                                Some(publication)
+                            }
                             Err(error) => {
                                 owner_admission_error = Some(error);
                                 None
