@@ -1,8 +1,8 @@
 //! The live kernel debug server.
 //!
 //! One background thread owns a `UnixListener` for the run's endpoint and
-//! answers one snapshot request per connection. It never holds a kernel-object
-//! lock: it calls [`Kernel::snapshot`], which is itself deadline-aware and
+//! admits bounded workers, each serving one snapshot request per connection.
+//! It never holds a kernel-object lock: it calls [`Kernel::snapshot`], which is itself deadline-aware and
 //! `try_lock`-based, so a wedged guest produces a named `Busy`/`TimedOut`
 //! response instead of wedging the debugger too.
 //!
@@ -11,8 +11,8 @@
 //! a refusal, never a best-effort zero.
 
 use std::io;
-use std::os::fd::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::fd::{AsFd, AsRawFd};
+use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -23,10 +23,11 @@ use super::dto::{
 };
 use super::endpoint::{DebugEndpoint, EndpointError};
 use super::wire::{
-    self, DEADLINE, DEGRADED_BUDGET, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, STRICT_SNAPSHOT_BUDGET,
+    self, DEGRADED_BUDGET, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, STRICT_SNAPSHOT_BUDGET,
     WireError, encode_canonical,
 };
 use crate::kernel::core::Kernel;
+use crate::kernel::socket_rpc::{self, Cancellation, Connection, ConnectionSlots};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
@@ -53,6 +54,7 @@ const DISABLE_ENV: &str = "CARRICK_KERNEL_DEBUG";
 pub struct KernelDebugServer {
     endpoint: DebugEndpoint,
     shutdown: Arc<AtomicBool>,
+    cancellation: Arc<Cancellation>,
     join: Option<std::thread::JoinHandle<()>>,
     /// PID that bound the socket. Carrick forks real host processes for
     /// `clone(2)` on other backends, and a forked child inherits this struct
@@ -72,23 +74,23 @@ impl KernelDebugServer {
     /// Bind and serve at an exact endpoint. Used by tests and by callers that
     /// already resolved the run identity.
     pub fn start_at(kernel: Arc<Kernel>, endpoint: DebugEndpoint) -> Result<Self, ServerError> {
+        let cancellation = Arc::new(Cancellation::new()?);
         let nonce = server_nonce();
         endpoint.claim(nonce)?;
         let listener = UnixListener::bind(endpoint.socket_path())?;
         endpoint.secure_socket()?;
         endpoint.write_owner(nonce)?;
 
-        // A bounded accept timeout lets the thread notice shutdown promptly
-        // without a self-pipe.
-        listener.set_nonblocking(false)?;
+        listener.set_nonblocking(true)?;
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_endpoint = endpoint.clone();
+        let thread_cancellation = Arc::clone(&cancellation);
         let join = std::thread::Builder::new()
             .name("carrick-kernel-debug".to_owned())
             .spawn(move || {
-                serve_loop(&listener, &kernel, &thread_shutdown);
+                serve_loop(&listener, &kernel, &thread_shutdown, &thread_cancellation);
                 drop(listener);
                 thread_endpoint.release(nonce);
             })?;
@@ -96,6 +98,7 @@ impl KernelDebugServer {
         Ok(Self {
             endpoint,
             shutdown,
+            cancellation,
             join: Some(join),
             owner_pid: std::process::id(),
             nonce,
@@ -150,9 +153,8 @@ impl KernelDebugServer {
         if self.shutdown.swap(true, Ordering::SeqCst) {
             return;
         }
-        // Unblock a thread parked in `accept` by connecting to ourselves. The
-        // loop re-checks the shutdown flag before handling a connection.
-        let _ = UnixStream::connect(self.endpoint.socket_path());
+        // The same sticky pipe wakes accept and every blocked handler.
+        self.cancellation.cancel();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -176,38 +178,76 @@ fn server_nonce() -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-fn serve_loop(listener: &UnixListener, kernel: &Arc<Kernel>, shutdown: &AtomicBool) {
-    while !shutdown.load(Ordering::SeqCst) {
-        let Ok((stream, _address)) = listener.accept() else {
-            continue;
+fn serve_loop(
+    listener: &UnixListener,
+    kernel: &Arc<Kernel>,
+    shutdown: &AtomicBool,
+    cancellation: &Arc<Cancellation>,
+) {
+    let slots = Arc::new(ConnectionSlots::default());
+    let mut handlers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    while !shutdown.load(Ordering::Acquire) {
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if cancellation.wait(listener.as_fd(), libc::POLLIN).is_err() {
+                    break;
+                }
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
         };
-        if shutdown.load(Ordering::SeqCst) {
+        if shutdown.load(Ordering::Acquire) {
             break;
         }
-        // A failed connection is that peer's problem, never the run's.
-        let _ = handle_connection(stream, kernel);
+        let mut index = 0;
+        while index < handlers.len() {
+            if handlers[index].is_finished() {
+                let _ = handlers.swap_remove(index).join();
+            } else {
+                index += 1;
+            }
+        }
+        let Some(permit) = slots.try_acquire() else {
+            continue;
+        };
+        let Ok(connection) = Connection::new(stream, Arc::clone(cancellation)) else {
+            continue;
+        };
+        let kernel = Arc::clone(kernel);
+        if let Ok(handler) = std::thread::Builder::new()
+            .name("carrick-debug-conn".to_owned())
+            .spawn(move || {
+                // Permit drops last, after the socket and kernel context, also
+                // on unwind or a failed spawn.
+                let _permit = permit;
+                let mut connection = connection;
+                let kernel = kernel;
+                let _ = handle_connection(&mut connection, &kernel);
+            })
+        {
+            handlers.push(handler);
+        }
+    }
+    cancellation.cancel();
+    for handler in handlers {
+        let _ = handler.join();
     }
 }
 
-fn handle_connection(mut stream: UnixStream, kernel: &Arc<Kernel>) -> Result<(), WireError> {
-    let deadline = Instant::now() + DEADLINE;
-    authenticate(&stream)?;
-
-    let payload = wire::read_frame(&mut stream, MAX_REQUEST_BYTES, deadline, "server-read")?;
+fn handle_connection(stream: &mut Connection, kernel: &Arc<Kernel>) -> Result<(), WireError> {
+    authenticate(stream)?;
+    let payload = socket_rpc::read_frame(stream, MAX_REQUEST_BYTES)?;
     let request: KernelDebugRequest = wire::decode_exact(&payload)?;
     let response = build_response(&request, kernel, Instant::now());
     let encoded = encode_canonical(&response)?;
-    wire::write_frame(
-        &mut stream,
-        &encoded,
-        MAX_RESPONSE_BYTES,
-        deadline,
-        "server-write",
-    )
+    socket_rpc::write_frame(stream, &encoded, MAX_RESPONSE_BYTES)?;
+    Ok(())
 }
 
 /// Only a peer running as the runtime's own uid may read kernel state.
-fn authenticate(stream: &UnixStream) -> Result<(), WireError> {
+fn authenticate(stream: &impl AsRawFd) -> Result<(), WireError> {
     let credentials = carrick_portable::peer_credentials(stream.as_raw_fd()).map_err(|error| {
         WireError::Io(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -349,10 +389,74 @@ pub fn default_tables() -> Vec<KernelDebugTable> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
     use std::num::NonZeroU64;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
 
     use super::*;
     use crate::kernel::{Asid, MmBackend, MmBackendSnapshot, RootBootstrap, SnapshotError};
+
+    const COMPLETION_FAILURE_BOUND: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn a_partial_request_does_not_block_a_complete_frame_or_shutdown() {
+        let (_temp, endpoint) = super::super::endpoint::tests::scoped_endpoint("debug-partial");
+        let bootstrap = RootBootstrap::for_reference_model(
+            4242,
+            carrick_hal::ThreadId::synthetic_for_tests(4242),
+            "debug-partial".to_owned(),
+        )
+        .expect("bootstrap");
+        let (kernel, _context) = Kernel::bootstrap_root(bootstrap).expect("kernel");
+        let mut server = KernelDebugServer::start_at(kernel, endpoint.clone()).expect("server");
+        let mut stalled = UnixStream::connect(endpoint.socket_path()).expect("stalled peer");
+        stalled.write_all(&64_u32.to_be_bytes()).expect("prefix");
+        stalled.write_all(b"x").expect("partial payload");
+        assert!(
+            server
+                .cancellation
+                .wait_for_handlers(1, COMPLETION_FAILURE_BOUND),
+            "handler never reached the cancellable socket wait"
+        );
+
+        let mut complete = UnixStream::connect(endpoint.socket_path()).expect("second peer");
+        let request = encode_canonical(&KernelDebugRequest::for_tables(None)).expect("request");
+        // Deliberately do not half-close: the complete frame alone authorizes
+        // a response, while the first handler remains blocked on its payload.
+        complete
+            .write_all(&u32::try_from(request.len()).expect("length").to_be_bytes())
+            .expect("prefix");
+        complete.write_all(&request).expect("payload");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = tx.send(socket_rpc::read_frame(&mut complete, MAX_RESPONSE_BYTES));
+        });
+        let response = rx
+            .recv_timeout(COMPLETION_FAILURE_BOUND)
+            .expect("second request stalled behind the first")
+            .expect("response");
+        let response: serde_json::Value = wire::decode_exact(&response).expect("JSON response");
+        assert_eq!(response["schema"], KERNEL_DEBUG_RESPONSE_SCHEMA);
+        reader.join().expect("reader");
+        assert!(
+            server
+                .cancellation
+                .wait_for_handlers(1, COMPLETION_FAILURE_BOUND)
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shutdown = std::thread::spawn(move || {
+            server.shutdown();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(COMPLETION_FAILURE_BOUND)
+            .expect("shutdown did not cancel and join the partial-frame handler");
+        shutdown.join().expect("shutdown");
+        // The partial sender stayed alive until shutdown had joined its handler.
+        drop(stalled);
+        assert!(!endpoint.socket_path().exists());
+    }
 
     /// An `Mm` backend that reports a mapping id the frame inventory never
     /// recorded — the same class of alias-registry/backend disagreement as

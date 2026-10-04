@@ -31,6 +31,7 @@ pub mod process_lifecycle;
 pub mod registry;
 pub mod scheduler;
 pub mod snapshot;
+mod socket_rpc;
 pub mod thread_ledger;
 pub mod tty;
 pub mod wait_set;

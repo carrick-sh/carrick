@@ -4,8 +4,9 @@
 //!
 //! This is the K1 "observability is a kernel ABI" surface. The reader never
 //! sees a host pointer, never sees a partially collected snapshot, and cannot
-//! be made to wait on a wedged guest: every stage is deadline-bounded and
-//! fails closed with a named error.
+//! be made to wait on a wedged guest: snapshot collection has authority budgets
+//! and clients bound dead peers. Server I/O is interruptible by shutdown, independent of
+//! wall-clock transport deadlines.
 //!
 //! [`KernelSnapshotV1`]: super::snapshot::KernelSnapshotV1
 
@@ -47,6 +48,40 @@ mod tests {
 
     use super::*;
     use crate::kernel::core::Kernel;
+
+    const COMPLETION_FAILURE_BOUND: std::time::Duration = std::time::Duration::from_secs(30);
+
+    // Table semantics observe the actual reply, under a generous failure
+    // bound, without consuming the production client's dead-peer deadline.
+    fn observe_completion<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        let result = rx
+            .recv_timeout(COMPLETION_FAILURE_BOUND)
+            .expect("debug protocol did not complete");
+        worker.join().expect("debug completion client");
+        result
+    }
+
+    fn fetch_at(
+        endpoint: &DebugEndpoint,
+        tables: Option<Vec<KernelDebugTable>>,
+    ) -> Result<KernelDebugSnapshot, ClientError> {
+        let endpoint = endpoint.clone();
+        observe_completion(move || {
+            client::fetch_at_with_wait(&endpoint, tables, client::ResponseWait::Completion)
+        })
+    }
+
+    fn abort_at(endpoint: &DebugEndpoint, run_id: &str) -> Result<AbortAck, ClientError> {
+        let endpoint = endpoint.clone();
+        let run_id = run_id.to_owned();
+        observe_completion(move || {
+            client::abort_at_with_wait(&endpoint, &run_id, client::ResponseWait::Completion)
+        })
+    }
 
     /// Minimal `MmBackend` so a snapshot can complete. A root built with
     /// `for_reference_model` has NO mm backend, and the snapshot then fails
