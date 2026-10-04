@@ -17,6 +17,10 @@ pub const LABELS: [&str; 4] = ["self-hosted", "Linux", "X64", "willow-kvm"];
 
 #[derive(Debug, Error)]
 pub enum ScalerError {
+    #[error(
+        "projected Willow CPU {projected:.1}% exceeds director's 80% ceiling; controller stopped"
+    )]
+    CpuCeiling { projected: f64 },
     #[error("KVM_GET_API_VERSION returned {version}, errno={errno}; expected 12")]
     Kvm { version: i32, errno: i32 },
     #[error("{0}")]
@@ -99,6 +103,12 @@ pub struct Vm {
     pub pool: String,
     pub template: bool,
 }
+#[derive(Debug, Clone)]
+pub struct PoolMember {
+    pub id: u16,
+    pub pool: String,
+    pub template: bool,
+}
 impl Record {
     pub fn guard(&self, vm: &Vm) -> Result<(), ScalerError> {
         if vm.id != self.vm.get() || vm.pool != POOL || vm.name != self.name || vm.template {
@@ -116,14 +126,16 @@ impl Ledger {
     pub fn reserve(
         &mut self,
         key: JobKey,
-        inventory: &[Vm],
+        inventory: &[PoolMember],
         now: u64,
     ) -> Result<Record, ScalerError> {
         if self.rows.iter().any(|r| r.key == key) {
             return Err(ScalerError::Guard("job already reserved"));
         }
         if self.rows.iter().any(|r| r.state != State::Destroyed)
-            || inventory.iter().any(|v| v.pool == POOL && !v.template)
+            || inventory
+                .iter()
+                .any(|v| v.pool == POOL && !(v.template && (300..=307).contains(&v.id)))
         {
             return Err(ScalerError::Guard(
                 "one-clone budget occupied (including unknown objects)",
@@ -179,7 +191,7 @@ pub fn admit_resources(cpu_busy: f64, threads: u32, available: u64) -> bool {
     cpu_busy.is_finite()
         && (0.0..=1.0).contains(&cpu_busy)
         && threads > 0
-        && cpu_busy + 2.0 / f64::from(threads) < 0.85
+        && cpu_busy + 2.0 / f64::from(threads) <= 0.80
         && available >= 10 << 30 // 4 GiB clone + 6 GiB host reserve
 }
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
