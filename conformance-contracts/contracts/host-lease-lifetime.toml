@@ -1,0 +1,16 @@
+schema_version = 1
+id = "host.lease.workload-lifetime"
+title = "Host exclusion outlives cancellation and reaping of its admitted workload"
+guest_surfaces = ["host:lease-workload-lifetime"]
+semantic_authority = ["Native macOS/Linux flock exclusion and process exit readiness, exercised by the host-lease integration fixtures"]
+fixture = "native:lease-runner-death; native:nested-admission; native:two-checkouts"
+scale_points = [1, 2]
+structural_budgets = []
+rationale = "This is a native host-tooling contract outside guest execution. Commands and fork-without-exec test children hold zero flock descriptors. Killing an outer caller cancels its direct, nested and detached descendants; no exclusive successor acquires the lease until the admitted workload has stopped and been reaped. Nested admission owns the authenticated scope writer rather than relying on a one-shot socket check. Cancellation selects only the owning supervisor's session, descendants and exact scope pipe, preserving an identical command in another checkout. These obligations are assertions in the native integration fixtures, not guest syscall claims or guest timing budgets."
+
+[bindings]
+vm_free = "carrick-xtask::tests::host_lease::runner_death_cancels_workload_before_releasing_exclusion; carrick-xtask::tests::host_lease::runner_death_cancels_nested_workload_before_releasing_exclusion; carrick-xtask::tests::host_lease::runner_death_cancels_detached_nested_workload_before_releasing_exclusion; carrick-xtask::tests::host_lease::nested_admission_requires_the_supervisor_scope_writer; carrick-xtask::tests::host_lease::cancellation_preserves_another_checkout_with_identical_command"
+
+[bindings.unresolved]
+embed_structural = "Native lease/cancellation authority lives outside the guest and HVF carrier. The macOS/Linux subprocess integration fixtures exercise the actual host boundary without creating a VM."
+docker = "Docker is a lease participant, not an oracle for native host-process ownership. Independent native exclusive flock acquisition checks exclusion directly on macOS and Linux."
