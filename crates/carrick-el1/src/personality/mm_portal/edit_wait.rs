@@ -4,7 +4,6 @@ use crate::memory::reservations::SharedReservations;
 use crate::substrate::sched::object_wait::OperationResumePc;
 use crate::substrate::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1_abi::{ReservationMm, ReservationRange, TrapFrame};
-use carrick_sched_core::BoundedSpin;
 use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
 use core::sync::atomic::Ordering;
 
@@ -28,7 +27,14 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
     // consuming IPC operation, redispatch has no source effect to replay.
     let resumed = sched.take_object_operation().ok().flatten();
     loop {
-        let mut root = table.lock_el1(index.index(), mm, frame.slot as u32).ok()?;
+        let mut root = table
+            .lock_in(
+                crate::substrate::sched::object_wait::space_access(sched.zone, sched.slot),
+                index.index(),
+                mm,
+                frame.slot as u32,
+            )
+            .ok()?;
         let key = root.prepared_wait_key()?;
         if resumed.as_ref().is_some_and(|token| {
             token.index() != u64::from(key.index()) || token.generation() != key.generation()
@@ -38,23 +44,9 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
             return Some(Served::Returned { switched: false });
         }
 
-        let snapshot = match sched.observe_object(key) {
-            Ok(snapshot) => snapshot,
-            Err(ObjectWaitError::Stale) => {
-                let completion =
-                    |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
-                        crate::substrate::sched::object_wait::deliver_completion(
-                            sched.zone, sched.slot, effects,
-                        )
-                    };
-                sched
-                    .zone
-                    .bind_object_wait_with_completion(key, &BoundedSpin(256), &completion)
-                    .ok()?;
-                sched.observe_object(key).ok()?
-            }
-            Err(_) => return None,
-        };
+        // Source custody is established at root admission. Contention here
+        // must never try to bind a queue while retaining this root guard.
+        let snapshot = sched.observe_object(key).ok()?;
         let rounded = |start: u64, len: u64| {
             let end = start.checked_add(len)?.checked_add(4095)? & !4095;
             ReservationRange::new(start & !4095, end)
