@@ -695,8 +695,7 @@ fn provision(
     path: &Path,
     approval: (u64, &str),
 ) -> Result<(), ScalerError> {
-    let (group, sha) = approval;
-    let (key, hosts) = key_paths(dir, row);
+    let (key, _) = key_paths(dir, row);
     execute(
         Command::new("ssh-keygen").args([
             "-q",
@@ -725,7 +724,33 @@ fn provision(
             .as_deref()
             .ok_or(ScalerError::Guard("clone task missing"))?,
     )?;
+    boot_and_register(pve, gh, ledger, row, dir, path, approval)
+}
+
+fn boot_and_register(
+    pve: &Pve,
+    gh: &Github,
+    ledger: &mut Ledger,
+    row: &mut Record,
+    dir: &Path,
+    path: &Path,
+    approval: (u64, &str),
+) -> Result<(), ScalerError> {
+    let (group, sha) = approval;
+    let (key, hosts) = key_paths(dir, row);
+    let key_meta = std::fs::symlink_metadata(&key)?;
+    if !key_meta.is_file() || key_meta.uid() != 0 || key_meta.mode() & 0o077 != 0 {
+        return Err(ScalerError::Guard(
+            "owned clone lacks its root-only transport key",
+        ));
+    }
     pve.guard(row)?;
+    let status = pve.request(PveCall::Get, &format!("{}/status/current", base(row.vm)))?;
+    if status["status"] != "stopped" {
+        return Err(ScalerError::Guard(
+            "clone preparation requires a stopped owned VM",
+        ));
+    }
     pve.request(
         PveCall::Put(json!({
             "ciuser":"runner", "sshkeys":std::fs::read_to_string(key.with_extension("key.pub"))?,
@@ -742,6 +767,8 @@ fn provision(
     pve.deadline.set(Some(deadline));
     let shared_deadline = ApiDeadline(&pve.deadline);
     row.state = State::Booting;
+    row.task = None;
+    update(ledger, row, path)?;
     row.task = Some(task_id(pve.request(
         PveCall::Post(json!({})),
         &format!("{}/status/start", base(row.vm)),
@@ -898,6 +925,7 @@ fn reconcile_one(
     ledger: &mut Ledger,
     dir: &Path,
     path: &Path,
+    approval: (u64, &str),
 ) -> Result<bool, ScalerError> {
     let Some(mut row) = ledger
         .rows
@@ -931,6 +959,36 @@ fn reconcile_one(
             finish_destroyed(ledger, &mut row, dir, path)?;
             return Ok(true);
         }
+        Recovery::ResumeClone => {
+            pve.guard(&row)?;
+            let job = gh.job(row.key.job)?;
+            let run = gh.request(
+                "GET",
+                &format!("repos/{REPOSITORY}/actions/runs/{}", row.key.run.0),
+                None,
+                false,
+            )?;
+            if pending_owned_job(&row, &job, &run, approval.1) {
+                println!(
+                    "vm={} resuming completed clone in place; error history retained",
+                    row.vm.get()
+                );
+                if let Err(error) =
+                    boot_and_register(pve, gh, ledger, &mut row, dir, path, approval)
+                {
+                    row.failure = Some(match &row.failure {
+                        Some(previous) => format!("{previous}; resume: {error}"),
+                        None => error.to_string(),
+                    });
+                    if !matches!(error, ScalerError::CpuCeiling { .. }) {
+                        row.state = State::Reaping;
+                    }
+                    update(ledger, &row, path)?;
+                    return Err(error);
+                }
+                return Ok(false);
+            }
+        }
         Recovery::Inspect => {}
     }
     pve.guard(&row)?;
@@ -944,6 +1002,27 @@ fn reconcile_one(
         return cleanup(pve, gh, ledger, &mut row, dir, path, assignment);
     }
     Ok(false)
+}
+fn pending_owned_job(row: &Record, job: &Value, run: &Value, sha: &str) -> bool {
+    let labels: Vec<&str> = job["labels"]
+        .as_array()
+        .map(|labels| labels.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    job["id"].as_u64() == Some(row.key.job.0)
+        && job["status"] == "queued"
+        && eligible_labels(&labels)
+        && run["id"].as_u64() == Some(row.key.run.0)
+        && run["run_attempt"].as_u64() == Some(u64::from(row.key.attempt))
+        && approved_run(run, sha)
+}
+fn one_job_result(row: Option<&Record>) -> Result<(), ScalerError> {
+    if row.is_some_and(|r| r.assigned.is_some()) {
+        Ok(())
+    } else {
+        Err(ScalerError::External(
+            "pilot finished without an assigned job; cleanup completed",
+        ))
+    }
 }
 
 fn qualified_template(config: &Value) -> bool {
@@ -1014,15 +1093,9 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
     let mut reconcile = Instant::now() - Duration::from_secs(60);
     loop {
         if reconcile.elapsed() >= Duration::from_secs(60) {
-            match reconcile_one(&pve, &gh, &mut ledger, dir, &path) {
+            match reconcile_one(&pve, &gh, &mut ledger, dir, &path, (group, sha)) {
                 Ok(true) if one_job => {
-                    return if ledger.rows.last().is_some_and(|r| r.failure.is_some()) {
-                        Err(ScalerError::External(
-                            "pilot lifecycle failed; cleanup completed",
-                        ))
-                    } else {
-                        Ok(())
-                    };
+                    return one_job_result(ledger.rows.last());
                 }
                 Ok(_) => {}
                 Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
@@ -1065,6 +1138,32 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn recovered_one_job_preserves_error_history_and_requires_actual_assignment() {
+        let mut row = row();
+        row.failure = Some("missing cached display".into());
+        assert!(one_job_result(Some(&row)).is_err());
+        row.assigned = Some(row.key.job);
+        assert!(one_job_result(Some(&row)).is_ok());
+        assert_eq!(row.failure.as_deref(), Some("missing cached display"));
+    }
+    #[test]
+    fn resumed_clone_requires_the_same_queued_job_attempt_labels_and_approval() {
+        let row = row();
+        let sha = "a".repeat(40);
+        let mut job = json!({"id":row.key.job.0,"status":"queued","labels":LABELS});
+        let mut run = json!({"id":row.key.run.0,"run_attempt":row.key.attempt,"event":"workflow_dispatch","head_sha":sha,"head_branch":"work/willow-pilot","path":".github/workflows/willow-pilot.yml","repository":{"full_name":REPOSITORY}});
+        assert!(pending_owned_job(&row, &job, &run, &sha));
+        job["status"] = json!("completed");
+        assert!(!pending_owned_job(&row, &job, &run, &sha));
+        job["status"] = json!("queued");
+        run["run_attempt"] = json!(row.key.attempt + 1);
+        assert!(!pending_owned_job(&row, &job, &run, &sha));
+        run["run_attempt"] = json!(row.key.attempt);
+        assert!(!pending_owned_job(&row, &job, &run, &"b".repeat(40)));
+        job["labels"] = json!(["self-hosted", "Linux", "X64", "willow-kvm", "extra"]);
+        assert!(!pending_owned_job(&row, &job, &run, &sha));
+    }
     #[test]
     fn director_cpu_ceiling_is_a_stop_condition_above_eighty_percent() {
         assert!(enforce_cpu_ceiling(0.675, 16).is_ok());

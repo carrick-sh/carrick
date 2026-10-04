@@ -217,6 +217,7 @@ pub enum TaskState {
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Recovery {
     Wait,
+    ResumeClone,
     Inspect,
     FinishAbsent,
     Quarantine,
@@ -226,6 +227,9 @@ pub fn recovery_decision(row: &Record, present: bool, task: TaskState, now: u64)
         return Recovery::Wait;
     }
     if present {
+        if row.state == State::Cloning && task == TaskState::Succeeded {
+            return Recovery::ResumeClone;
+        }
         return Recovery::Inspect;
     }
     if task == TaskState::Failed
