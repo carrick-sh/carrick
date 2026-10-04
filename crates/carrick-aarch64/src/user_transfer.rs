@@ -96,6 +96,36 @@ impl TransferTarget {
         custody: &C,
         slots: &MmPortalSlots,
     ) -> Result<Option<Self>, TrapError> {
+        Self::bind_with(engine, mm, ttbr0, custody, slots, None)
+    }
+    pub fn bind_closed<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
+        engine: &Aarch64EngineCore<V>,
+        token: carrick_el1_abi::PortalClosedRootBind,
+        custody: &C,
+        slots: &MmPortalSlots,
+    ) -> Result<Option<Self>, TrapError> {
+        if token.carrier() != custody.carrier() {
+            return Err(TrapError::Hypervisor(
+                "closed BIND carrier differs from the transfer custodian".into(),
+            ));
+        }
+        Self::bind_with(
+            engine,
+            token.mm(),
+            token.ttbr0(),
+            custody,
+            slots,
+            Some(token),
+        )
+    }
+    fn bind_with<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
+        engine: &Aarch64EngineCore<V>,
+        mm: ReservationMm,
+        ttbr0: u64,
+        custody: &C,
+        slots: &MmPortalSlots,
+        closed: Option<carrick_el1_abi::PortalClosedRootBind>,
+    ) -> Result<Option<Self>, TrapError> {
         let mut service = engine.transfer_service_loan()?;
         let region = carrick_el1_abi::get_el1_region_host_ptr();
         if region == 0
@@ -113,6 +143,10 @@ impl TransferTarget {
         };
         frame.x[1] = custody.carrier().get();
         frame.x[2] = mm.raw();
+        if let Some(token) = closed {
+            frame.x[6] = 1;
+            frame.x[7] = token.ttbr0();
+        }
         let receipt = service.run_user(frame, &mut || false)?;
         if receipt.x[0] != 0 {
             return Ok(None);
