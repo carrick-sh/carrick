@@ -83,7 +83,16 @@ jobs:
       - name: Layering gate (crate closures + product feature closure)
         run: just check-layering
 
+      # carrick-kernel -> carrick-spec -> oci-client also compiles ring's C
+      # sources for Linux. A Rust target alone cannot supply its C compiler
+      # and glibc headers on a macOS runner.
+      - name: Install Linux C cross toolchain
+        run: brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu
+
       - name: Portable kernel compile (aarch64-linux, no HVF; lib, tests and semantics suites)
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-unknown-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-unknown-linux-gnu-ar
         run: just check-kernel-portable
 
       - name: Build
