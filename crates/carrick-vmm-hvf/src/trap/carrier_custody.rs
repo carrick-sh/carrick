@@ -3942,7 +3942,9 @@ mod carrier_vm_custody_tests {
         let identity = *owner.retained.record_identity.lock();
         let mm_access = super::MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
-            std::sync::Arc::new(super::MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+                super::MemoryProtections::default(),
+            )),
             std::sync::Arc::new(parking_lot::Mutex::new(
                 super::HvpatchFrameInventory::default(),
             )),
@@ -4088,7 +4090,9 @@ mod carrier_vm_custody_tests {
         let identity = *owner.retained.record_identity.lock();
         let mm_access = super::MmAccessState::new_unbound(
             carrick_aarch64::Stage1Authority::new(),
-            std::sync::Arc::new(super::MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+                super::MemoryProtections::default(),
+            )),
             std::sync::Arc::new(parking_lot::Mutex::new(
                 super::HvpatchFrameInventory::default(),
             )),

@@ -273,6 +273,10 @@ impl HvfVmState {
         address: u64,
         dst: &mut [u8],
     ) -> Result<(), MemoryError> {
+        let authority = self.protections.clone();
+        let _legacy = authority.legacy().ok_or_else(|| {
+            MemoryError::HostMap("admitted owner MM requires owner-selected user transfer".into())
+        })?;
         let length = dst.len();
         // PROT_NONE gated once in the default `GuestMemory::read_bytes`/`read_into`.
         let custody = self.carrier_vm_custody();
@@ -468,6 +472,10 @@ impl HvfVmState {
         address: u64,
         bytes: &[u8],
     ) -> Result<(), MemoryError> {
+        let authority = self.protections.clone();
+        let _legacy = authority.legacy().ok_or_else(|| {
+            MemoryError::HostMap("admitted owner MM requires owner-selected user transfer".into())
+        })?;
         let length = bytes.len();
         // PROT_NONE gated once in the default `GuestMemory::write_bytes`.
         self.validate_guest_write_range(address, length, false)?;
@@ -507,6 +515,7 @@ impl HvfVmState {
     /// to the same backing region and both its GPA and host pointer advance
     /// linearly. Otherwise the caller must use the already-segmented copy path.
     fn contiguous_guest_host_ptr(&self, address: u64, length: usize) -> Option<*mut u8> {
+        let _legacy = self.protections.legacy()?;
         let stripped = strip_pointer_tag(address);
         let mut checked = 0usize;
         let mut first: Option<(u64, u64, u64, usize, u64, *mut u8)> = None;
@@ -617,6 +626,10 @@ impl HvfVmState {
         address: u64,
         length: usize,
     ) -> Result<(), MemoryError> {
+        let authority = self.protections.clone();
+        let _legacy = authority.legacy().ok_or_else(|| {
+            MemoryError::HostMap("admitted owner MM requires owner-selected user transfer".into())
+        })?;
         let address = strip_pointer_tag(address);
         let _ = address
             .checked_add(length as u64)
@@ -833,6 +846,10 @@ impl HvfVmState {
         address: u64,
         bytes: &[u8],
     ) -> Result<(), MemoryError> {
+        let authority = self.protections.clone();
+        let _legacy = authority.legacy().ok_or_else(|| {
+            MemoryError::HostMap("admitted owner MM requires owner-selected user transfer".into())
+        })?;
         let length = bytes.len();
         // PROT_NONE gated once in the default `GuestMemory::write_bytes`.
         self.validate_guest_write_range(address, length, true)?;
@@ -887,6 +904,10 @@ impl HvfVmState {
         require_guest_writable: bool,
         allow_pristine: bool,
     ) -> Result<(), MemoryError> {
+        let authority = self.protections.clone();
+        let _legacy = authority.legacy().ok_or_else(|| {
+            MemoryError::HostMap("admitted owner MM requires owner-selected user transfer".into())
+        })?;
         let mut checked = 0usize;
         while checked < length {
             let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, checked, length)?;
@@ -898,9 +919,9 @@ impl HvfVmState {
             let mapping = if let Some(mapping) = mapping {
                 mapping
             } else if allow_pristine
-                && !self
-                    .protections
-                    .range_write_denied(chunk_address, chunk_len)
+                && !self.protections.legacy().is_none_or(|protections| {
+                    protections.range_write_denied(chunk_address, chunk_len)
+                })
             {
                 // Prevalidation may accept explicit pristine provenance. Actual
                 // writes still materialize and authenticate their physical owner.
@@ -940,9 +961,9 @@ impl HvfVmState {
             };
             if require_guest_writable
                 && (!mapping.guest_writable
-                    || self
-                        .protections
-                        .range_write_denied(chunk_address, chunk_len))
+                    || self.protections.legacy().is_none_or(|protections| {
+                        protections.range_write_denied(chunk_address, chunk_len)
+                    }))
             {
                 carrick_observability::probes::guest_internal_write_fault(
                     chunk_address,
@@ -973,8 +994,9 @@ impl HvfVmState {
             6,
             &format!(
                 "no authenticated mapping: allow_pristine={allow_pristine} denied_now={} mapping_now={} pristine_now={}",
-                self.protections
-                    .range_write_denied(chunk_address, chunk_len),
+                self.protections.legacy().is_none_or(
+                    |protections| protections.range_write_denied(chunk_address, chunk_len)
+                ),
                 self.mapping_for_range(lookup_address, chunk_len).is_some(),
                 self.deferred_anonymous_state().is_some_and(|state| state
                     .covers_pristine(carrick_guest_mem::GuestVa(chunk_address), chunk_len)),

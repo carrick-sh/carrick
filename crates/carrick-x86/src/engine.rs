@@ -428,8 +428,10 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
     /// The engine-owned PROT_NONE set, shared by every x86 backend (KVM, bhyve,
     /// NVMM) — the default `read_bytes`/`write_bytes` run it before the raw copy
     /// below, so bhyve/NVMM get the EFAULT gate with zero backend code.
-    fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
-        Some(&*self.protections)
+    fn protections(&self) -> Option<carrick_guest_mem::LegacyProtectionRead<'_>> {
+        Some(carrick_guest_mem::LegacyProtectionRead::borrowed(
+            &self.protections,
+        ))
     }
 
     /// Record/clear a guest PROT_NONE range (guest `mprotect(PROT_NONE)`/`munmap`).
@@ -2273,6 +2275,7 @@ mod tests {
             !prot.range_no_access(addr + 0x2000, 0x10),
             "outside the range stays clear"
         );
+        drop(prot);
 
         // The default gate faults syscall buffers in the range (TestVmm's None
         // host_ptr is never reached — the gate returns first).
