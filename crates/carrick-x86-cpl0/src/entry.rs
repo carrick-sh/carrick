@@ -1,4 +1,4 @@
-//! Thin native entry. The initial red witness forwards every Linux call.
+//! Thin native entry into Carrick's common in-guest Linux personality.
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 
@@ -80,6 +80,8 @@ core::arch::global_asm!(
 #[cfg(target_os = "none")]
 mod kernel {
     use super::adapter::*;
+    use carrick_el1::personality::common_entry::{EntryOutcome, serve_canonical};
+    use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
     use carrick_el1_abi::{Counters, CurrentTask};
     use core::sync::atomic::Ordering;
 
@@ -111,12 +113,23 @@ mod kernel {
             doorbell(ENTRY_KICK_PORT, frame);
         }
         let call = frame.decode();
-        if let Some(counter) = counters.forwarded.get(call.canonical.raw() as usize) {
-            counter.fetch_add(1, Ordering::Relaxed);
-        }
-        doorbell(FORWARD_PORT, frame);
-        if frame.rax == 0 {
-            binding.publications.fetch_add(1, Ordering::Relaxed);
+        binding
+            .captured_stack
+            .store(call.stack.raw(), Ordering::Release);
+        match serve_canonical(
+            &call,
+            counters,
+            task,
+            &GuestLifecycleVenue,
+            Some(&binding.publications),
+        ) {
+            EntryOutcome::Served(result) | EntryOutcome::ServedWithWork(result) => {
+                frame.rax = result.raw() as u64;
+            }
+            EntryOutcome::Forward => {
+                doorbell(FORWARD_PORT, frame);
+                halt();
+            }
         }
         binding.completions.fetch_add(1, Ordering::Relaxed);
         if binding.return_kick.swap(0, Ordering::AcqRel) != 0 {
