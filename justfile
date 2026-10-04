@@ -147,7 +147,11 @@ clippy *ARGS:
 # writable log path. The compiler census remains the semantic authority: it
 # checks this host's product profiles and reports all other required profiles
 # pending; a partial local pass is not matrix completeness.
-lint-domains:
+lint-domains: lint-domains-source
+    python3 scripts/migrate/check-host-authority-transitions.py --check
+
+# Host-independent domain checks; live compiler capture runs separately.
+lint-domains-source:
     python3 scripts/conformance/check-next-strategy.py
     cargo run --locked -p carrick-xtask -- probe-coverage
     ./scripts/lint-domains.sh
@@ -183,7 +187,7 @@ lint-domains:
     python3 scripts/migrate/check-runtime-aborts.py --check
     python3 scripts/migrate/check-task-participant-witnesses.py --check
     python3 scripts/migrate/check-mm-authority.py --check
-    python3 scripts/migrate/check-host-authority-transitions.py --check
+    python3 scripts/migrate/check-host-authority-transitions.py --static
     python3 scripts/migrate/check-dispatch-lock-authority.py --check
     python3 scripts/migrate/check-k1-file-authority-inventory.py
     python3 scripts/migrate/check-k1-file-authority-taxonomy.py

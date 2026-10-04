@@ -1,0 +1,6 @@
+[
+  {
+    "test": "dispatch::net::lifecycle::icmp_ping_tests::loopback_echo_reply_is_queued_with_valid_checksum",
+    "reason": "Linux host policy: an unprivileged ICMP datagram socket needs the worker gid in net.ipv4.ping_group_range; willow VM 210 returns EACCES. Diagnostic exception only: the command remains red, and no other failure is waived."
+  }
+]

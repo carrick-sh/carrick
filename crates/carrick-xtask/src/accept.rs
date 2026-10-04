@@ -27,7 +27,7 @@ pub struct AcceptArgs {
         value_enum,
         default_value = "no-docker",
         overrides_with = "profile",
-        help = "Acceptance profile: no-docker (default for workers) or full (director)"
+        help = "Acceptance profile: no-docker (default for workers), linux-portable (host only), or full (director)"
     )]
     pub profile: AcceptProfile,
 
@@ -60,6 +60,7 @@ impl fmt::Display for AcceptPhase {
 #[serde(rename_all = "kebab-case")]
 pub enum AcceptProfile {
     NoDocker,
+    LinuxPortable,
     Full,
 }
 
@@ -67,6 +68,7 @@ impl fmt::Display for AcceptProfile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoDocker => write!(f, "no-docker"),
+            Self::LinuxPortable => write!(f, "linux-portable"),
             Self::Full => write!(f, "full"),
         }
     }
@@ -218,6 +220,178 @@ pub const HOST_STEPS: &[StepSpec] = &[
         log_name: "06-closure-probe-inventory.log",
     },
 ];
+
+pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
+    StepSpec {
+        name: "test-kernel",
+        program: "just",
+        args: &["test-kernel"],
+        env: &[],
+        log_name: "01-test-kernel.log",
+    },
+    StepSpec {
+        name: "portable-tests",
+        program: "cargo",
+        args: &[
+            "test",
+            "--no-fail-fast",
+            "-p",
+            "carrick-el1",
+            "-p",
+            "carrick-el1-abi",
+            "-p",
+            "carrick-sched-core",
+            "-p",
+            "carrick-fd-core",
+            "-p",
+            "carrick-pipe-core",
+            "-p",
+            "carrick-signal-core",
+            "-p",
+            "carrick-kernel-example",
+            "-p",
+            "carrick-x86",
+            "-p",
+            "carrick-aarch64",
+            "-p",
+            "carrick-abi",
+            "-p",
+            "carrick-guest-mem",
+            "-p",
+            "carrick-mmu-core",
+            "-p",
+            "carrick-timer-core",
+            "-p",
+            "carrick-inotify-core",
+            "-p",
+            "carrick-hal",
+            "-p",
+            "carrick-portable",
+            "-p",
+            "carrick-host-linux",
+            "-p",
+            "carrick-signal-linux",
+            "-p",
+            "carrick-spec",
+            "-p",
+            "carrick-observability",
+            "-p",
+            "carrick-conformance-contract",
+            "-p",
+            "carrick-xtask",
+        ],
+        env: &[],
+        log_name: "02-portable-tests.log",
+    },
+    StepSpec {
+        name: "kvm-tests",
+        program: "cargo",
+        args: &["test", "-p", "carrick-vmm-kvm"],
+        env: &[],
+        log_name: "03-kvm-tests.log",
+    },
+    StepSpec {
+        name: "clippy-linux",
+        program: "cargo",
+        args: &[
+            "clippy",
+            "-p",
+            "carrick-cli",
+            "-p",
+            "carrick-xtask",
+            "-p",
+            "carrick-el1",
+            "-p",
+            "carrick-kernel-example",
+            "--no-default-features",
+            "--features",
+            "carrick-cli/platform-linux,carrick-cli/syscall-shim",
+            "--all-targets",
+            "--keep-going",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        env: &[],
+        log_name: "04-clippy-linux.log",
+    },
+    StepSpec {
+        name: "fmt-check",
+        program: "just",
+        args: &["fmt-check"],
+        env: &[],
+        log_name: "05-fmt-check.log",
+    },
+    StepSpec {
+        name: "lint-domains-source",
+        program: "just",
+        args: &["lint-domains-source"],
+        env: &[],
+        log_name: "06-lint-domains-source.log",
+    },
+    StepSpec {
+        name: "host-authority-linux",
+        program: "python3",
+        args: &[
+            "scripts/migrate/check-host-authority-transitions.py",
+            "--check",
+            "--profiles",
+            "linux-*",
+        ],
+        env: &[],
+        log_name: "07-host-authority-linux.log",
+    },
+];
+
+pub fn host_steps(profile: AcceptProfile) -> &'static [StepSpec] {
+    match profile {
+        AcceptProfile::LinuxPortable => LINUX_PORTABLE_STEPS,
+        AcceptProfile::NoDocker | AcceptProfile::Full => HOST_STEPS,
+    }
+}
+
+pub fn profile_phase(
+    profile: AcceptProfile,
+    phase: AcceptPhase,
+) -> Result<AcceptPhase, AcceptError> {
+    if profile == AcceptProfile::LinuxPortable {
+        if phase == AcceptPhase::Signed {
+            return Err(AcceptError::UnsupportedPlatform(
+                "linux-portable supports the host phase only; use remote-accept --phase signed on the gate Mac".to_string(),
+            ));
+        }
+        return Ok(AcceptPhase::Host);
+    }
+    Ok(phase)
+}
+
+#[derive(Debug, Deserialize)]
+struct LinuxHostTestException {
+    test: String,
+    reason: String,
+}
+
+fn linux_host_failure_details(log: &str, exceptions: &[LinuxHostTestException]) -> String {
+    let failed: Vec<_> = log
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("test ")?
+                .strip_suffix(" ... FAILED")
+        })
+        .collect();
+    failed
+        .into_iter()
+        .map(|test| {
+            if let Some(exception) = exceptions.iter().find(|entry| entry.test == test) {
+                format!("known Linux host exception {test}: {}", exception.reason)
+            } else {
+                format!("unallowlisted failure {test}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
 
 pub fn generate_timestamp() -> String {
     let now = SystemTime::now()
@@ -598,7 +772,8 @@ fn run_command_redirect(
     Ok((extract_exit_code(&status).into(), duration_s))
 }
 
-pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError> {
+pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptError> {
+    args.phase = profile_phase(args.profile, args.phase)?;
     // remote-accept holds its checkout lock first. Hold the host lease across
     // host compilation/tests, signing, cleanup, and receipt publication.
     crate::host_load::check().map_err(|e| AcceptError::Failed(e.to_string()))?;
@@ -642,10 +817,33 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
     let mut probe_diffs = Vec::new();
     let mut cleanup_counts = Vec::new();
 
+    if args.profile == AcceptProfile::LinuxPortable {
+        skipped_steps.push("host-authority live compiler profiles macos-*, freebsd-*, netbsd-*: require their respective hosts; lint-domains runs the Linux compiler profiles and source checks here".to_string());
+    }
+
+    let linux_exceptions: Vec<LinuxHostTestException> =
+        if args.profile == AcceptProfile::LinuxPortable {
+            let path = root.join("scripts/linux-host-test-allowlist.json");
+            let content =
+                fs::read_to_string(&path).map_err(|source| AcceptError::Io { path, source })?;
+            let entries: Vec<LinuxHostTestException> = serde_json::from_str(&content)?;
+            if entries
+                .iter()
+                .any(|entry| entry.test.is_empty() || entry.reason.is_empty())
+            {
+                return Err(AcceptError::Failed(
+                    "Linux host test exceptions must name a test and reason".to_string(),
+                ));
+            }
+            entries
+        } else {
+            Vec::new()
+        };
+
     // 1. Host Phase
     if matches!(args.phase, AcceptPhase::Host | AcceptPhase::All) {
         println!("--- Host phase starting ---");
-        for step in HOST_STEPS {
+        for step in host_steps(args.profile) {
             let log_path = run_dir.join(step.log_name);
             let display_cmd = format!("{} {}", step.program, step.args.join(" "));
             println!("  running: {display_cmd} (log: {})", log_path.display());
@@ -665,11 +863,18 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
 
             let passed = exit_code == Some(0);
             let error = if !passed {
-                let msg = format!(
+                let mut msg = format!(
                     "step '{}' failed with exit code {}",
                     step.name,
                     exit_code.unwrap_or(-1)
                 );
+                if args.profile == AcceptProfile::LinuxPortable {
+                    let log = fs::read_to_string(&log_path).unwrap_or_default();
+                    let details = linux_host_failure_details(&log, &linux_exceptions);
+                    if !details.is_empty() {
+                        msg.push_str(&format!(": {details}"));
+                    }
+                }
                 failures.push(msg.clone());
                 Some(msg)
             } else {
@@ -1461,6 +1666,87 @@ pub fn run(root_arg: Option<&Path>, args: AcceptArgs) -> Result<(), AcceptError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linux_exceptions_are_named_and_do_not_hide_unexpected_failures() {
+        let exceptions = vec![LinuxHostTestException {
+            test: "net::ping".to_string(),
+            reason: "host sysctl".to_string(),
+        }];
+        let details = linux_host_failure_details(
+            "test net::ping ... FAILED\ntest fs::memfd ... FAILED\n",
+            &exceptions,
+        );
+        assert!(details.contains("known Linux host exception net::ping: host sysctl"));
+        assert!(details.contains("unallowlisted failure fs::memfd"));
+    }
+
+    #[test]
+    fn linux_portable_steps_and_phase() {
+        use clap::Parser;
+        let parsed =
+            crate::cli::Cli::try_parse_from(["xtask", "accept", "--profile", "linux-portable"]);
+        assert!(parsed.is_ok(), "linux-portable must be a CLI profile");
+        let steps = host_steps(AcceptProfile::LinuxPortable);
+        assert_eq!(
+            steps.iter().map(|s| s.name).collect::<Vec<_>>(),
+            vec![
+                "test-kernel",
+                "portable-tests",
+                "kvm-tests",
+                "clippy-linux",
+                "fmt-check",
+                "lint-domains-source",
+                "host-authority-linux",
+            ]
+        );
+        assert_eq!(
+            profile_phase(AcceptProfile::LinuxPortable, AcceptPhase::All).unwrap(),
+            AcceptPhase::Host
+        );
+        let refusal = profile_phase(AcceptProfile::LinuxPortable, AcceptPhase::Signed)
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("host phase only"));
+        let refusal = run(
+            None,
+            AcceptArgs {
+                phase: AcceptPhase::Signed,
+                profile: AcceptProfile::LinuxPortable,
+                receipt: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refusal.contains("host phase only"));
+        let portable = steps
+            .iter()
+            .find(|step| step.name == "portable-tests")
+            .unwrap();
+        for package in [
+            "carrick-el1",
+            "carrick-el1-abi",
+            "carrick-sched-core",
+            "carrick-fd-core",
+            "carrick-pipe-core",
+            "carrick-signal-core",
+            "carrick-kernel-example",
+            "carrick-x86",
+        ] {
+            assert!(portable.args.windows(2).any(|pair| pair == ["-p", package]));
+        }
+        let clippy = steps
+            .iter()
+            .find(|step| step.name == "clippy-linux")
+            .unwrap();
+        assert!(clippy.args.contains(&"--no-default-features"));
+        assert!(
+            clippy
+                .args
+                .contains(&"carrick-cli/platform-linux,carrick-cli/syscall-shim")
+        );
+        assert!(clippy.args.ends_with(&["--", "-D", "warnings"]));
+    }
 
     #[test]
     fn test_git_status_clean_and_dirty() {
