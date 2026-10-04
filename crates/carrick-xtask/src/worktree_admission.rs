@@ -16,7 +16,7 @@ pub struct WorktreeRunArgs {
     pub command: Vec<OsString>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Identity {
     device: u64,
     inode: u64,
@@ -30,11 +30,77 @@ impl Identity {
             inode: meta.ino(),
         })
     }
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Generation {
+    identity: Identity,
+    token: String,
+}
+
+impl Generation {
+    fn read(root: &Path, create: bool) -> Result<Option<Self>, GcError> {
+        let admin = command::run_checked(
+            "git",
+            ["rev-parse", "--path-format=absolute", "--git-dir"],
+            Some(root),
+        )?;
+        let admin = fs::canonicalize(admin.stdout.trim())?;
+        let path = admin.join("carrick-checkout-generation");
+        let identity = Identity::read(root)?;
+        if create && !path.exists() {
+            // Atomic publication lets concurrent first admissions agree. Git
+            // removes this metadata on removal; replacement checkouts cannot
+            // recover a former authority even when their root inode is reused.
+            let mut temporary = tempfile::Builder::new()
+                .prefix("generation-")
+                .rand_bytes(32)
+                .tempfile_in(&admin)?;
+            let token = temporary
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| GcError::Census("generation filename is not UTF-8".into()))?
+                .to_owned();
+            serde_json::to_writer(
+                &mut temporary,
+                &Self {
+                    identity: Identity::read(root)?,
+                    token,
+                },
+            )
+            .map_err(|error| GcError::Census(error.to_string()))?;
+            temporary.as_file().sync_all()?;
+            match temporary.persist_noclobber(&path) {
+                Ok(_) => (),
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(error) => return Err(error.error.into()),
+            }
+        }
+        let file = match open(&path, false) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let generation: Self = serde_json::from_reader(file.take(1024))
+            .map_err(|error| GcError::Census(error.to_string()))?;
+        if generation.identity != identity
+            || Identity::read(root)? != identity
+            || !generation.token.starts_with("generation-")
+            || !generation
+                .token
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return Err(GcError::Census(
+                "checkout generation identity mismatch".into(),
+            ));
+        }
+        Ok(Some(generation))
+    }
 
     fn authority(&self, common: &Path) -> PathBuf {
-        common
-            .join("carrick-worktree-admission")
-            .join(format!("{}-{}", self.device, self.inode))
+        common.join("carrick-worktree-admission").join(&self.token)
     }
 }
 
@@ -70,15 +136,16 @@ pub(crate) struct Admission {
 
 impl Admission {
     pub(crate) fn acquire(root: &Path) -> Result<Self, GcError> {
-        let identity = Identity::read(root)?;
-        let path = identity.authority(&common(root)?);
+        let generation = Generation::read(root, true)?
+            .ok_or_else(|| GcError::Census("missing checkout generation".into()))?;
+        let path = generation.authority(&common(root)?);
         fs::create_dir_all(
             path.parent()
                 .ok_or_else(|| GcError::Census("authority has no parent".into()))?,
         )?;
         let file = open(&path, true)?;
         file.lock_shared()?;
-        if Identity::read(root)? != identity || !live(&file)? {
+        if Generation::read(root, false)?.as_ref() != Some(&generation) || !live(&file)? {
             return Err(GcError::Census(
                 "checkout has been retired; command refused".into(),
             ));
@@ -100,8 +167,10 @@ pub(crate) enum RemovalAuthority {
 
 impl Retirement {
     pub(crate) fn claim(root: &Path, common: &Path) -> Result<RemovalAuthority, GcError> {
-        let identity = Identity::read(root)?;
-        let file = match open(&identity.authority(common), false) {
+        let Some(generation) = Generation::read(root, false)? else {
+            return Ok(RemovalAuthority::Unmanaged);
+        };
+        let file = match open(&generation.authority(common), false) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(RemovalAuthority::Unmanaged);
@@ -113,7 +182,7 @@ impl Retirement {
             Err(std::fs::TryLockError::WouldBlock) => return Ok(RemovalAuthority::Busy),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
-        if Identity::read(root)? != identity || !live(&file)? {
+        if Generation::read(root, false)?.as_ref() != Some(&generation) || !live(&file)? {
             return Ok(RemovalAuthority::Busy);
         }
         Ok(RemovalAuthority::Acquired(Self { file }))
@@ -122,11 +191,6 @@ impl Retirement {
     pub(crate) fn retire(&mut self) -> std::io::Result<()> {
         self.file.seek(SeekFrom::Start(0))?;
         self.file.write_all(b"retired\n")?;
-        self.file.sync_all()
-    }
-
-    pub(crate) fn restore(&mut self) -> std::io::Result<()> {
-        self.file.set_len(0)?;
         self.file.sync_all()
     }
 }
@@ -205,6 +269,87 @@ mod tests {
         repo
     }
 
+    fn replacement_checkout_does_not_inherit_authority(retired: bool) {
+        let repo = repository();
+        let root = repo.path();
+        command::run_checked(
+            "git",
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+            Some(root),
+        )
+        .unwrap();
+        let worker = root.join("worker");
+        command::run_checked(
+            "git",
+            ["worktree", "add", "-b", "worker", worker.to_str().unwrap()],
+            Some(root),
+        )
+        .unwrap();
+        drop(Admission::acquire(&worker).unwrap());
+        let identity = Identity::read(&worker).unwrap();
+        let common = common(&worker).unwrap();
+        if retired {
+            let RemovalAuthority::Acquired(mut guard) =
+                Retirement::claim(&worker, &common).unwrap()
+            else {
+                panic!("managed old checkout")
+            };
+            guard.retire().unwrap();
+        }
+        let admin = command::run_checked(
+            "git",
+            ["rev-parse", "--path-format=absolute", "--git-dir"],
+            Some(&worker),
+        )
+        .unwrap();
+        // Preserve the empty directory to reproduce inode reuse deterministically;
+        // replace its Git administrative generation just as remove/add does.
+        fs::remove_file(worker.join(".git")).unwrap();
+        fs::remove_dir_all(admin.stdout.trim()).unwrap();
+        command::run_checked(
+            "git",
+            [
+                "worktree",
+                "add",
+                "-b",
+                "replacement",
+                worker.to_str().unwrap(),
+            ],
+            Some(root),
+        )
+        .unwrap();
+        assert_eq!(Identity::read(&worker).unwrap(), identity);
+        let unmanaged = matches!(
+            Retirement::claim(&worker, &common).unwrap(),
+            RemovalAuthority::Unmanaged
+        );
+        let admitted = Admission::acquire(&worker).is_ok();
+        assert!(
+            unmanaged && admitted,
+            "replacement inherited stale {} authority: unmanaged={unmanaged}, admitted={admitted}",
+            if retired { "tombstone" } else { "live" }
+        );
+    }
+
+    #[test]
+    fn replacement_checkout_cannot_inherit_stale_live_authority() {
+        replacement_checkout_does_not_inherit_authority(false);
+    }
+
+    #[test]
+    fn replacement_checkout_cannot_inherit_stale_tombstone() {
+        replacement_checkout_does_not_inherit_authority(true);
+    }
+
     #[test]
     fn active_command_excludes_retirement_for_its_entire_lifetime() {
         let repo = repository();
@@ -236,7 +381,14 @@ mod tests {
         else {
             panic!("idle managed checkout must acquire retirement")
         };
-        let file = open(&Identity::read(&root).unwrap().authority(&common), false).unwrap();
+        let file = open(
+            &Generation::read(&root, false)
+                .unwrap()
+                .unwrap()
+                .authority(&common),
+            false,
+        )
+        .unwrap();
         assert!(matches!(
             file.try_lock_shared(),
             Err(std::fs::TryLockError::WouldBlock)
@@ -266,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_removal_restores_admission_without_unlinking_the_authority() {
+    fn failed_removal_keeps_admission_retired() {
         let repo = repository();
         let root = repo.path();
         drop(Admission::acquire(root).unwrap());
@@ -276,8 +428,7 @@ mod tests {
             panic!("managed checkout")
         };
         retirement.retire().unwrap();
-        retirement.restore().unwrap();
         drop(retirement);
-        assert!(Admission::acquire(root).is_ok());
+        assert!(Admission::acquire(root).is_err());
     }
 }
