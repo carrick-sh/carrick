@@ -795,8 +795,50 @@ impl<'a> NetView<'a> {
                                 return Ok(DispatchOutcome::errno(LINUX_EAGAIN));
                             }
                         }
-                        let mut target_buf = vec![0u8; len];
                         let peek = flags & LinuxMsgFlags::PEEK.bits() != 0;
+                        if len > 0
+                            && socket.socket_type == LINUX_SOCK_STREAM
+                            && flags & LinuxMsgFlags::OOB.bits() == 0
+                            && memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
+                        {
+                            let copy_len = len.min(4096 - (buf_addr as usize & 4095));
+                            let Some(range) = carrick_guest_mem::GuestWriteRange::new(
+                                carrick_guest_mem::GuestVa(buf_addr), copy_len,
+                            ) else {
+                                return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                            };
+                            let permit = match memory.prepare_write(&[range]) {
+                                Ok(permit) => permit,
+                                Err(error) => return Ok(crate::el1_delegation::owner_prepare_refusal(error)),
+                            };
+                            let mut target_buf = vec![0u8; copy_len];
+                            match socket.recv_stream_flags(&mut target_buf, 0, peek) {
+                                Ok((read_len, _rights)) => {
+                                    permit.commit(&[&target_buf[..read_len]]);
+                                    if src_addr != 0 {
+                                        if src_len_addr == 0 {
+                                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                                        }
+                                        let len_bytes = match memory.read_bytes(src_len_addr, 4) {
+                                            Ok(bytes) => bytes,
+                                            Err(_) => return Ok(DispatchOutcome::errno(LINUX_EFAULT)),
+                                        };
+                                        if i32::from_ne_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) < 0 {
+                                            return Ok(DispatchOutcome::errno(LINUX_EINVAL));
+                                        }
+                                        if memory.write_bytes(src_len_addr, &0u32.to_ne_bytes()).is_err() {
+                                            return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                                        }
+                                    }
+                                    return Ok(DispatchOutcome::returned_len(read_len)?);
+                                }
+                                Err(LINUX_EAGAIN) if !this.io_is_nonblocking(fd, flags) => {
+                                    return Ok(this.wait_in_memory_slot(fd, libc::POLLIN, socket.get_rcvtimeo()));
+                                }
+                                Err(errno) => return Ok(DispatchOutcome::errno(errno)),
+                            }
+                        }
+                        let mut target_buf = vec![0u8; len];
                         if (flags & LinuxMsgFlags::OOB.bits()) != 0 {
                             if socket.family() == LINUX_AF_UNIX {
                                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
@@ -939,6 +981,56 @@ impl<'a> NetView<'a> {
             } else {
                 len
             };
+            if len > 0
+                && !atomic_record
+                && src_addr == 0
+                && this.socket_guest_type(fd) == Some(libc::SOCK_STREAM)
+                && memory.user_memory_venue() == carrick_guest_mem::UserMemoryVenue::Owner
+            {
+                let chunk = len.min(4096 - (buf_addr as usize & 4095));
+                let Some(range) = carrick_guest_mem::GuestWriteRange::new(
+                    carrick_guest_mem::GuestVa(buf_addr), chunk,
+                ) else {
+                    return Ok(DispatchOutcome::errno(LINUX_EFAULT));
+                };
+                let permit = match memory.prepare_write(&[range]) {
+                    Ok(permit) => permit,
+                    Err(error) => return Ok(crate::el1_delegation::owner_prepare_refusal(error)),
+                };
+                let mut bytes = vec![0u8; chunk];
+                // Host sockets are nonblocking and MSG_DONTWAIT is explicit.
+                // EAGAIN drops the permit before the runtime's readiness wait.
+                let received = unsafe {
+                    libc::recvfrom(
+                        host_fd.get(),
+                        bytes.as_mut_ptr() as *mut _,
+                        chunk,
+                        host_flags,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                    )
+                };
+                match received.host_syscall_errno() {
+                    Ok(count) => {
+                        permit.commit(&[&bytes[..count as usize]]);
+                        if count > 0 && flags & LinuxMsgFlags::PEEK.bits() == 0
+                            && let Some(flow) = this.open_file(fd).and_then(|file| file.description.common().inbound_flow())
+                        {
+                            flow.lock_ledger().consume_bytes(count as usize, true);
+                        }
+                        return Ok(DispatchOutcome::Returned { value: count as i64 });
+                    }
+                    Err(errno) => {
+                        drop(permit);
+                        if errno == LINUX_EAGAIN {
+                            let timeout = this.open_file(fd)
+                                .and_then(|file| file.description.inspect()?.recv_timeout());
+                            return Ok(this.blocking_io(fd, host_fd.get(), IoDir::Read, nonblocking, timeout, || Err(LINUX_EAGAIN)));
+                        }
+                        return Ok(DispatchOutcome::errno(errno));
+                    }
+                }
+            }
             // Zero-copy recv straight INTO guest memory when the destination is
             // one contiguous, guest-writable region; else recv into a bounce and
             // copy. host_ptr_for_write enforces guest-writability (a read-only
