@@ -37,6 +37,8 @@ impl Drop for CheckoutGuard {
 const IDLE_CENSUS: &str = r#"
 idle() {
     if [ -d "$1" ]; then set -- -F p +D "$1"; else set -- -F p "$1"; fi
+    # The Perl parent owns only the target lock descriptors, never artifacts.
+    if [ -n "${CARRICK_PRUNE_LOCK_PID:-}" ]; then set -- "$@" -a -p "^$CARRICK_PRUNE_LOCK_PID"; fi
     if [ "$uid" = 0 ]; then
         if "$lsof_bin" "$@" > "$state/use.out" 2> "$state/use.err"; then code=0; else code=$?; fi
     else
@@ -74,6 +76,31 @@ for entry do
 done
 "#;
 
+// Cargo holds the profile's .cargo-lock while using artifacts. An exclusive
+// lock excludes both older exclusive Cargo locks and newer shared Cargo locks.
+// Keep the handles in this parent through the complete census/removal command.
+const CARGO_TARGET_LOCKS: &str = r#"use Fcntl qw(:flock :DEFAULT);
+use File::Path qw(make_path);
+my $target = shift @ARGV;
+my @locks;
+for my $profile ('debug', 'release') {
+    my $directory = "$target/$profile";
+    next if -l $directory;
+    make_path($directory);
+    sysopen(my $lock, "$directory/.cargo-lock", O_RDWR | O_CREAT | O_NOFOLLOW, 0666)
+        or die "Cargo target lock open: $!\n";
+    unless (flock($lock, LOCK_EX | LOCK_NB)) {
+        print "keep target (Cargo lock is held) | $target\n";
+        exit 0;
+    }
+    push @locks, $lock;
+}
+$ENV{CARRICK_PRUNE_LOCK_PID} = $$;
+system(@ARGV);
+die "target prune spawn: $!\n" if $? == -1;
+exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
+"#;
+
 fn pruning_body(targets: &[PathBuf], days: u64, apply: bool) -> Result<String, GcError> {
     let older_than = days
         .checked_sub(1)
@@ -93,12 +120,31 @@ fn pruning_body(targets: &[PathBuf], days: u64, apply: bool) -> Result<String, G
         .collect::<Result<Vec<_>, _>>()?
         .join(" ");
     let candidate = shell_quote(&candidate);
+    let target_body = shell_quote(&format!(
+        r#"set -u
+target=$1; apply=$2; age=$3; state=$4; lsof_bin=$5; uid=$6
+{IDLE_CENSUS}
+if [ ! -x "$lsof_bin" ] || ! idle "$target"; then
+    printf 'keep target (in use or unknown visibility) | %s\n' "$target"
+    exit 0
+fi
+for profile in debug release; do
+    [ ! -L "$target/$profile" ] || continue
+    for kind in deps build .fingerprint; do
+        directory="$target/$profile/$kind"
+        [ -d "$directory" ] && [ ! -L "$directory" ] || continue
+        find "$directory" -mindepth 1 -maxdepth 1 -exec /bin/sh -c {candidate} sh "$apply" "$age" "$state" "$lsof_bin" "$uid" {{}} + || exit 1
+    done
+done
+"#
+    ));
+    let locks = shell_quote(CARGO_TARGET_LOCKS);
     let apply = u8::from(apply);
     Ok(format!(
         r#"set -u
 apply={apply}
 age=+{older_than}
-for tool in find du awk mktemp rm id /bin/sh; do
+for tool in find du awk mktemp rm id /bin/sh /usr/bin/perl; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         printf 'target pruning: missing required utility: %s\n' "$tool" >&2
         exit 1
@@ -109,22 +155,14 @@ trap 'rm -rf -- "$state"' EXIT
 : > "$state/bytes" || exit 1
 lsof_bin=$(command -v lsof) || lsof_bin=
 uid=$(id -u) || exit 1
-{IDLE_CENSUS}
 set -- {paths}
 for target do
     [ -d "$target" ] || continue
-    if [ -L "$target" ] || [ ! -x "$lsof_bin" ] || ! idle "$target"; then
-        printf 'keep target (in use, unknown visibility or symlink) | %s\n' "$target"
+    if [ -L "$target" ]; then
+        printf 'keep target (symlink) | %s\n' "$target"
         continue
     fi
-    for profile in debug release; do
-        [ ! -L "$target/$profile" ] || continue
-        for kind in deps build .fingerprint; do
-            directory="$target/$profile/$kind"
-            [ -d "$directory" ] && [ ! -L "$directory" ] || continue
-            find "$directory" -mindepth 1 -maxdepth 1 -exec /bin/sh -c {candidate} sh "$apply" "$age" "$state" "$lsof_bin" "$uid" {{}} + || exit 1
-        done
-    done
+    /usr/bin/perl -e {locks} "$target" /bin/sh -c {target_body} sh "$target" "$apply" "$age" "$state" "$lsof_bin" "$uid" || exit 1
 done
 if [ "$apply" = 1 ]; then action=freed; else action='would free'; fi
 bytes=$(awk '{{total += $1}} END {{printf "%.0f", total}}' "$state/bytes") || exit 1
@@ -256,6 +294,157 @@ mod tests {
             )
             .unwrap();
         (target, file)
+    }
+
+    #[test]
+    fn native_cargo_lock_preserves_old_artifacts_despite_idle_census() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, artifact) = old_artifact(temp.path());
+        let bin = utility_fixture(temp.path(), "");
+        let lock = fs::File::create(target.join("debug/.cargo-lock")).unwrap();
+        lock.lock().unwrap();
+        let body = pruning_body(&[target], 2, true)
+            .unwrap()
+            .replace(IDLE_CENSUS, "\nidle() { return 0; }\n");
+        let output = Command::new("/bin/sh")
+            .args(["-c", &body])
+            .env("PATH", bin)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && artifact.exists(),
+            "native Cargo lock must exclude pruning: exit={:?}, artifact_exists={}, stdout={}",
+            output.status.code(),
+            artifact.exists(),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn concurrent_cargo_admission_is_excluded_through_deletion() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::process::Stdio;
+        let temp = tempfile::tempdir().unwrap();
+        let (target, artifact) = old_artifact(temp.path());
+        let bin = utility_fixture(temp.path(), "");
+        let socket = temp.path().join("census.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sender.send(listener.accept()).unwrap();
+        });
+        let handshake = temp.path().join("census.pl");
+        fs::write(&handshake, r#"use IO::Socket::UNIX; my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $ARGV[0]) or die $!; print $s "ready\n"; $s->flush; my $reply = <$s>; die "lost controller" unless defined $reply;"#).unwrap();
+        let idle = format!(
+            "\nidle() {{\nif [ ! -f \"{marker}\" ]; then\n: > \"{marker}\"\n/usr/bin/perl \"{handshake}\" \"{socket}\" || exit 1\nfi\nreturn 0\n}}\n",
+            marker = temp.path().join("census.once").display(),
+            handshake = handshake.display(),
+            socket = socket.display()
+        );
+        let body = pruning_body(std::slice::from_ref(&target), 2, true)
+            .unwrap()
+            .replace(IDLE_CENSUS, &idle);
+        let child = Command::new("/bin/sh")
+            .args(["-c", &body])
+            .env("PATH", bin)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut peer, _) = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("pruning must reach its idle census")
+            .unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut ready = [0; 6];
+        peer.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready\n");
+        let lock = fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(target.join("debug/.cargo-lock"))
+            .unwrap();
+        let admission = lock.try_lock();
+        // Always release the fixture so the regression fails without hanging.
+        peer.write_all(b"continue\n").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            matches!(admission, Err(std::fs::TryLockError::WouldBlock)),
+            "Cargo admitted after idle census: {admission:?}; artifact_exists={}",
+            artifact.exists()
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!artifact.exists());
+        assert!(
+            lock.try_lock().is_ok(),
+            "Cargo must be admitted after deletion finishes"
+        );
+    }
+
+    #[test]
+    fn real_cargo_build_and_pruning_share_the_native_lock() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+        use std::process::Stdio;
+        let temp = tempfile::tempdir().unwrap();
+        let (target, artifact) = old_artifact(temp.path());
+        let bin = utility_fixture(temp.path(), "");
+        fs::write(temp.path().join("Cargo.toml"), "[package]\nname=\"native-lock-proof\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n").unwrap();
+        fs::create_dir(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(temp.path().join("build.rs"), r#"use std::io::{Read, Write}; fn main() { let mut s = std::os::unix::net::UnixStream::connect(std::env::var_os("BUILD_CENSUS_SOCKET").unwrap()).unwrap(); s.write_all(b"ready\n").unwrap(); let mut reply = [0]; s.read_exact(&mut reply).unwrap(); }"#).unwrap();
+        let socket = temp.path().join("cargo.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sender.send(listener.accept()).unwrap();
+        });
+        let cargo = Command::new("cargo")
+            .arg("build")
+            .current_dir(temp.path())
+            .env("CARGO_TARGET_DIR", &target)
+            .env("RUSTC_WRAPPER", "")
+            .env("BUILD_CENSUS_SOCKET", socket)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (mut peer, _) = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("Cargo build script must reach the barrier")
+            .unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut ready = [0; 6];
+        peer.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready\n");
+        let body = pruning_body(&[target], 2, true)
+            .unwrap()
+            .replace(IDLE_CENSUS, "\nidle() { return 0; }\n");
+        let output = Command::new("/bin/sh")
+            .args(["-c", &body])
+            .env("PATH", bin)
+            .output()
+            .unwrap();
+        peer.write_all(b"c").unwrap();
+        let built = cargo.wait_with_output().unwrap();
+        assert!(
+            built.status.success(),
+            "{}",
+            String::from_utf8_lossy(&built.stderr)
+        );
+        assert!(
+            output.status.success() && artifact.exists(),
+            "live Cargo build must exclude deletion: artifact_exists={}, stdout={}",
+            artifact.exists(),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Cargo lock is held"));
     }
 
     #[test]

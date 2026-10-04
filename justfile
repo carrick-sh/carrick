@@ -12,6 +12,9 @@ export RUSTC_WRAPPER := `sh -c '. scripts/lib/build-env.sh; printf "%s" "$RUSTC_
 export SCCACHE_DIR := `sh -c '. scripts/lib/build-env.sh; printf "%s" "$SCCACHE_DIR"'`
 export SCCACHE_CACHE_SIZE := `sh -c '. scripts/lib/build-env.sh; printf "%s" "$SCCACHE_CACHE_SIZE"'`
 
+# Shared checkout admission spans each foreground Cargo command.
+_admit := "cargo run --locked -p carrick-xtask -- worktree-run --"
+
 # Per-host backend feature flags for `cargo build`/`cargo test` of carrick-cli.
 # macOS uses the default features (+ codesign via build-signed.sh), so it is empty.
 _platform_features := if os() == "macos" { "" \
@@ -34,7 +37,7 @@ default:
 # Derived from `cargo tree` so it self-updates as crates are added/removed.
 [private]
 _platform_crates:
-    @cargo tree -p carrick-cli {{_platform_features}} --prefix none 2>/dev/null | grep -oE '^carrick-[a-z0-9-]+' | sort -u | sed 's/^/-p /' | tr '\n' ' '
+    @{{_admit}} cargo tree -p carrick-cli {{_platform_features}} --prefix none 2>/dev/null | grep -oE '^carrick-[a-z0-9-]+' | sort -u | sed 's/^/-p /' | tr '\n' ' '
 
 # Build the runnable release binary for the host (args go to cargo). macOS codesigns
 # the HVF entitlement; Linux/FreeBSD/NetBSD do a plain build with the backend features.
@@ -45,7 +48,7 @@ build *ARGS:
     if [ "{{os()}}" = "macos" ]; then
         exec ./scripts/build-signed.sh {{ARGS}}
     fi
-    exec cargo build --release -p carrick-cli {{_platform_features}} {{ARGS}}
+    exec {{_admit}} cargo build --release -p carrick-cli {{_platform_features}} {{ARGS}}
 
 # Build the runnable RELEASE binary with debug entitlements (get-task-allow) for
 # lldb attaching. NOTE: this is an optimized release build that is merely
@@ -58,7 +61,7 @@ build-debug *ARGS:
     if [ "{{os()}}" = "macos" ]; then
         exec ./scripts/build-signed.sh --debug {{ARGS}}
     fi
-    exec cargo build -p carrick-cli {{_platform_features}} {{ARGS}}
+    exec {{_admit}} cargo build -p carrick-cli {{_platform_features}} {{ARGS}}
 
 # Build + sign the DEBUG PROFILE so `debug_assert!` is live in a guest run.
 #
@@ -69,9 +72,13 @@ build-debug *ARGS:
 # an invariant that looks guarded and is not. Slow, and never a perf or
 # conformance artifact; use it to make a boot-path invariant actually assert.
 build-debug-profile *ARGS:
+    {{_admit}} just --justfile {{justfile()}} _build-debug-profile {{ARGS}}
+
+[private]
+_build-debug-profile *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo build -p carrick-cli {{_platform_features}} {{ARGS}}
+    {{_admit}} cargo build -p carrick-cli {{_platform_features}} {{ARGS}}
     if [ "{{os()}}" = "macos" ]; then
         codesign -f -s - --entitlements scripts/entitlements-debug.plist target/debug/carrick
         codesign -d --entitlements - target/debug/carrick 2>&1 | grep -q hypervisor \
@@ -81,7 +88,7 @@ build-debug-profile *ARGS:
 
 # Build + sign, then run the signed binary (e.g. `just run run ubuntu:24.04 /bin/echo hi`).
 run *ARGS: build
-    ./target/release/carrick {{ARGS}}
+    {{_admit}} ./target/release/carrick {{ARGS}}
 
 # Build/sign the exact HVF artifact, prove its entitlement/DOF identity, then
 # enforce one run-ID-scoped Carrick carrier in every supported topology. This is
@@ -89,9 +96,14 @@ run *ARGS: build
 carrier-topology-gate *ARGS: build
     python3 scripts/conformance/carrier-topology-gate.py {{ARGS}}
 
-# List worktrees and reclaim only clean, fully landed, idle ones (--apply).
+# Reclaim clean landed idle managed worktrees; keep unmanaged/busy checkouts.
+# Guards cover repo entry points; arbitrary launches are outside admission.
 worktree-gc *ARGS:
-    cargo run --locked -p carrick-xtask -- worktree-gc {{ARGS}}
+    {{_admit}} cargo run --locked -p carrick-xtask -- worktree-gc {{ARGS}}
+
+# Hold checkout admission for a foreground worker or command.
+worktree-run +CMD:
+    {{_admit}} {{CMD}}
 
 # Show compiler cache statistics (CARRICK_SCCACHE=0 disables build caching).
 build-cache:
@@ -99,7 +111,7 @@ build-cache:
 
 # Run the Carrick xtask maintenance tool.
 xtask *ARGS:
-    cargo run --locked -p carrick-xtask -- {{ARGS}}
+    {{_admit}} cargo run --locked -p carrick-xtask -- {{ARGS}}
 
 # Host flock; cancels on runner death or TERM/INT/HUP; cleanup failure releases with error.
 # One five-second cleanup deadline; owner SIGKILL releases immediately.
@@ -110,23 +122,23 @@ lease MODE +CMD:
     set -euo pipefail
     lease_mode="$1"
     shift
-    exec cargo run --locked -p carrick-xtask -- host-lease --mode "$lease_mode" -- "$@"
+    exec {{_admit}} cargo run --locked -p carrick-xtask -- host-lease --mode "$lease_mode" -- "$@"
 
 # Run the host and/or signed landing gate under an exclusive host lease (no Docker).
 accept *ARGS:
-    cargo run --locked -p carrick-xtask -- accept --profile no-docker {{ARGS}}
+    {{_admit}} cargo run --locked -p carrick-xtask -- accept --profile no-docker {{ARGS}}
 
 # Run `just accept` (no Docker) on the remote gate Mac and fetch the receipt.
 remote-accept *ARGS:
-    cargo run --locked -p carrick-xtask -- remote-accept {{ARGS}}
+    {{_admit}} cargo run --locked -p carrick-xtask -- remote-accept {{ARGS}}
 
 # Linux publisher: exact-SHA build plus immutable, mode-preserving .tar.gz artifact.
 fixtures-publish SHA:
-    cargo run --locked -p carrick-xtask -- fixtures publish --sha {{quote(SHA)}}
+    {{_admit}} cargo run --locked -p carrick-xtask -- fixtures publish --sha {{quote(SHA)}}
 
 # Restore the transferred artifact after checkout cleanup; signed jobs hold gate admission.
 fixtures-restore BUNDLE:
-    cargo run --locked -p carrick-xtask -- fixtures restore --bundle {{quote(BUNDLE)}}
+    {{_admit}} cargo run --locked -p carrick-xtask -- fixtures restore --bundle {{quote(BUNDLE)}}
 
 # Verify the exact-SHA fixture archive before restoration on the gate host.
 fixtures-verify BUNDLE:
@@ -136,7 +148,7 @@ fixtures-verify BUNDLE:
 # Return a reviewed-position-only patch from the same locked cloudmac worktree.
 # Apply and commit locally; this command never applies the patch for you.
 remote-recapture *ARGS:
-    cargo run --locked -p carrick-xtask -- remote-recapture {{ARGS}}
+    {{_admit}} cargo run --locked -p carrick-xtask -- remote-recapture {{ARGS}}
 
 # Provision fresh-worktree guest artifacts before signed execution.
 land-provision *ARGS:
@@ -144,14 +156,14 @@ land-provision *ARGS:
 
 # Fast unsigned debug build (cannot run a guest — for compile-checking only).
 check *ARGS:
-    cargo build -p carrick-cli {{_platform_features}} {{ARGS}}
+    {{_admit}} cargo build -p carrick-cli {{_platform_features}} {{ARGS}}
 
 # Compile-check the fuzz harness (a separate `[workspace]` excluded from the main
 # build, so a bit-rotted target / a changed carrick-runtime ABI-decode entry
 # point is otherwise invisible to CI). `cargo check` only — `cargo fuzz run`
 # needs the nightly sanitizer toolchain; this just keeps the harness compiling.
 check-fuzz:
-    cargo check --manifest-path fuzz/Cargo.toml
+    {{_admit}} cargo check --manifest-path fuzz/Cargo.toml
 
 # Install git hooks (.githooks/): fmt-check at commit, clippy gate at push.
 install-hooks:
@@ -166,14 +178,14 @@ clippy *ARGS:
     set -euo pipefail
     if [ "{{os()}}" = "macos" ]; then
         # macOS lints the whole workspace (HVF backend included) with default features.
-        exec cargo clippy --workspace --all-targets --keep-going {{ARGS}} -- -D warnings
+        exec {{_admit}} cargo clippy --workspace --all-targets --keep-going {{ARGS}} -- -D warnings
     fi
     # Off-macOS: lint carrick-cli + its platform dep-closure (carrick-runtime, the
     # shared x86/aarch64 engines, this host's VMM backend) under the backend feature
     # set, so the kvm/bhyve/nvmm code the macOS gate never sees is linted too. Scoping
     # to -p carrick-cli {{_platform_features}} keeps HVF/macos-defaults out (a root
     # --workspace --features is rejected on a virtual workspace).
-    exec cargo clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
+    exec {{_admit}} cargo clippy -p carrick-cli {{_platform_features}} --all-targets --keep-going {{ARGS}} -- -D warnings
 
 # Typed-domain semgrep gate: blocks the bug SHAPES the newtypes exist to kill
 # (raw wait-set complements, bit=signum masks, host pids in NsPid, hand-numbered
@@ -196,8 +208,8 @@ lint-domains-host:
 # Host-independent domain checks; live compiler capture runs separately.
 lint-domains-source:
     python3 scripts/conformance/check-next-strategy.py
-    cargo run --locked -p carrick-xtask -- probe-coverage
-    cargo test -p carrick-xtask --test probe_coverage
+    {{_admit}} cargo run --locked -p carrick-xtask -- probe-coverage
+    {{_admit}} cargo test -p carrick-xtask --test probe_coverage
     ./scripts/closure-assert-vmfree-schedule.sh
     ./scripts/lint-domains.sh
     # The self-tests run FIRST and in the same gate as --check: every one of
@@ -216,13 +228,13 @@ lint-domains-source:
     # so adding unrelated script tests does not silently change this gate.
     python3 -m unittest scripts/migrate/tests/test_reconcile_rename.py scripts/tests/test_rehome_line_pinned_inventories.py scripts/tests/test_host_authority_transitions.py
     python3 -m unittest scripts/tests/test_conformance_contract_policy.py
-    cargo run -p carrick-conformance-contract --bin check-contracts -- --root .
+    {{_admit}} cargo run -p carrick-conformance-contract --bin check-contracts -- --root .
     # All-feature metadata includes dependencies for other hosts and optional
     # features that this host's build never fetched. Populate the locked cache
     # before the offline personality-boundary graph check on fresh runners.
-    cargo fetch --locked
-    cargo metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
-    cargo run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
+    {{_admit}} cargo fetch --locked
+    {{_admit}} cargo metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
+    {{_admit}} cargo run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
     python3 -m unittest scripts/tests/test_check_contract_change.py
     python3 scripts/migrate/check-runtime-global-state.py --check
     python3 scripts/migrate/check-runtime-aborts.py --check
@@ -434,24 +446,24 @@ check-frame-pointers:
 
 # Formatting check (matches CI).
 fmt-check:
-    cargo fmt --all -- --check
+    {{_admit}} cargo fmt --all -- --check
 
 # Apply formatting.
 fmt:
-    cargo fmt --all
+    {{_admit}} cargo fmt --all
 
 # The kernel semantics inner loop: no VM, codesign, or Docker. Full `just test`
 # also runs the serial host tests; run it and the signed gates before pushing.
 test-kernel *ARGS:
-    cargo test -p carrick-fd-core -p carrick-el1-abi --lib {{ARGS}}
-    cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
+    {{_admit}} cargo test -p carrick-fd-core -p carrick-el1-abi --lib {{ARGS}}
+    {{_admit}} cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
     just --justfile {{justfile()}} test-kernel-semantics {{ARGS}}
 
 # Bounded fd atomic and kernel connect/wake protocols (2 actors, <=2 preemptions).
 # Pipe venue lock/wake model waits for N1; see the M2 handoff.
 test-loom:
-    cargo test --locked -p carrick-fd-core --features loom --lib loom_models
-    cargo test --locked -p carrick-kernel --features loom --lib loom_models
+    {{_admit}} cargo test --locked -p carrick-fd-core --features loom --lib loom_models
+    {{_admit}} cargo test --locked -p carrick-kernel --features loom --lib loom_models
 
 # The scripted kernel-semantics suites alone (crates/carrick-kernel-example):
 # two-process Linux semantics against the public kernel API with no VMM, no
@@ -461,7 +473,7 @@ test-loom:
 # semantics signal beside the macOS job. Measured 2026-09-17 in the lima
 # aarch64 VM: 94 tests, 0 failures, ~5 s.
 test-kernel-semantics *ARGS:
-    cargo test -p carrick-kernel-example --tests {{ARGS}}
+    {{_admit}} cargo test -p carrick-kernel-example --tests {{ARGS}}
 
 # Host unit/integration tests that do NOT need the HVF runtime or Docker.
 test *ARGS:
@@ -490,19 +502,19 @@ test *ARGS:
         # is defined as the tests that do NOT need the HVF runtime or Docker;
         # those belong to a guest-capable lane (`just conformance*`,
         # `cargo test -p carrick-cli --test <name>`).
-        cargo test --workspace --exclude carrick-runtime --exclude carrick-kernel --exclude carrick-cli --exclude carrick-host --exclude carrick-vfs --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
+        {{_admit}} cargo test --workspace --exclude carrick-runtime --exclude carrick-kernel --exclude carrick-cli --exclude carrick-host --exclude carrick-vfs --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
         # carrick-kernel-example's proof (`tests/fork_pipe_wait.rs`) is an
         # integration target, and the `--lib --bins` line above never reaches
         # a crate's `tests/` directory -- the same house trap the `--bins`
         # note describes -- so it is named here. Its Linux tasks are host
         # threads (no `libc::fork()` from the harness), so it needs no serial
         # slot. One case deliberately costs its 5 s wait bound.
-        cargo test -p carrick-kernel-example --tests {{ARGS}}
+        {{_admit}} cargo test -p carrick-kernel-example --tests {{ARGS}}
         # The contract registry's own tests (`tests/claims.rs` loads the live
         # conformance-contracts/ tree) are integration targets too, so the
         # `--lib --bins` line never ran them; name the crate.
-        cargo test -p carrick-conformance-contract --tests {{ARGS}}
-        cargo test -p carrick-xtask --test probe_coverage {{ARGS}}
+        {{_admit}} cargo test -p carrick-conformance-contract --tests {{ARGS}}
+        {{_admit}} cargo test -p carrick-xtask --test probe_coverage {{ARGS}}
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -511,7 +523,7 @@ test *ARGS:
         # crate (see `test(debug): bound the jit-shape publication test's stack`).
         # carrick-cli includes tests that fork and mutate process-wide env vars
         # (e.g. supervisor_perf), so serialize test execution to avoid host fork races.
-        env RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-cli --bin carrick {{ARGS}}
+        env RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 {{_admit}} {{_admit}} cargo test -p carrick-cli --bin carrick {{ARGS}}
         # carrick-host needs the same serial treatment, for the same reason and
         # one more. Its `guest_cpu` tests `libc::fork()` from the harness and
         # drive a real SIGSTOP/waitpid handshake with the child; its
@@ -524,23 +536,23 @@ test *ARGS:
         # parked in `raise(SIGSTOP)` (`guest_cpu.rs:1672`) and the run only
         # completed after a debugger attach resumed it — an indefinite gate
         # hang, not a slow test.
-        env RUST_TEST_THREADS=1 cargo test -p carrick-host --lib {{ARGS}}
+        env RUST_TEST_THREADS=1 {{_admit}} {{_admit}} cargo test -p carrick-host --lib {{ARGS}}
         # Parallel cache churn previously measured 47 host opens against an
         # expected 15; exact budgets and process-wide state stay serial.
         # carrick-vfs runs parallel tests with --skip serial_host, followed by
         # its process-global and budget tests serially under RUST_TEST_THREADS=1.
-        cargo test -p carrick-vfs --lib {{ARGS}} -- --skip serial_host
-        env RUST_TEST_THREADS=1 cargo test -p carrick-vfs --lib {{ARGS}} serial_host
+        {{_admit}} cargo test -p carrick-vfs --lib {{ARGS}} -- --skip serial_host
+        env RUST_TEST_THREADS=1 {{_admit}} {{_admit}} cargo test -p carrick-vfs --lib {{ARGS}} serial_host
         # carrick-kernel runs parallel tests with --skip serial_host, followed by
         # its harness-fork and shared-state tests serially under RUST_TEST_THREADS=1.
-        cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
-        env RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib --features test-support {{ARGS}} serial_host
+        {{_admit}} cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
+        env RUST_TEST_THREADS=1 {{_admit}} {{_admit}} cargo test -p carrick-kernel --lib --features test-support {{ARGS}} serial_host
         # Runtime's test injections are fixture-owned, but carrier/prepare tests
         # still share process-wide VM lifecycle windows. Artifact/preemption
         # tests mutate env, signal tests fork/reap host children, and owner-boundary
         # tests probe closed fd numbers. Stage-1 rollback tests assert reuse from
         # the process-wide root-slot pool. Keep the crate serial for these reasons.
-        env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
+        env RUST_TEST_THREADS=1 {{_admit}} {{_admit}} cargo test -p carrick-runtime --lib {{ARGS}}
         # carrick-vmm-hvf is serial for a THIRD reason, and it is structural
         # rather than a test-hygiene lapse: the carrier is process-global by
         # design, so its alias registry, replay mappings, global-frame owner
@@ -554,7 +566,7 @@ test *ARGS:
         # interleavings and exposed the frame-owner and custody registries
         # too. Serial: 0 of 8. A per-registry lock would have to cover every
         # carrier global to work, which is what one test process already is.
-        env RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib {{ARGS}}
+        env RUST_TEST_THREADS=1 {{_admit}} {{_admit}} cargo test -p carrick-vmm-hvf --lib {{ARGS}}
         exit 0
     fi
     # Off-macOS: run the lib tests of THIS host's own crates only (-p list from
@@ -566,15 +578,15 @@ test *ARGS:
     pkgs="$(just --justfile {{justfile()}} _platform_crates | sed -E 's/-p carrick-(cli|runtime|host) //g')"
     # Runtime's self dev-dependency previously enabled these test doubles for
     # the whole selection. Keep them explicit when its test target is separate.
-    cargo test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} -- --skip serial_host
-    env RUST_TEST_THREADS=1 cargo test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} serial_host
-    env RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-cli {{_platform_features}} --bin carrick {{ARGS}}
-    env RUST_TEST_THREADS=1 cargo test -p carrick-host --lib {{ARGS}}
+    {{_admit}} cargo test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} -- --skip serial_host
+    env RUST_TEST_THREADS=1 {{_admit}} cargo test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} serial_host
+    env RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 {{_admit}} cargo test -p carrick-cli {{_platform_features}} --bin carrick {{ARGS}}
+    env RUST_TEST_THREADS=1 {{_admit}} cargo test -p carrick-host --lib {{ARGS}}
     # Runtime still has process-wide carrier lifecycle, root-slot pool, env and
     # host-fork tests; fixture-owned injections alone do not make it parallel-safe.
-    env RUST_TEST_THREADS=1 cargo test -p carrick-runtime {{_platform_features}} --lib {{ARGS}}
-    cargo test -p carrick-conformance-contract --tests {{ARGS}}
-    cargo test -p carrick-xtask --test probe_coverage {{ARGS}}
+    env RUST_TEST_THREADS=1 {{_admit}} cargo test -p carrick-runtime {{_platform_features}} --lib {{ARGS}}
+    {{_admit}} cargo test -p carrick-conformance-contract --tests {{ARGS}}
+    {{_admit}} cargo test -p carrick-xtask --test probe_coverage {{ARGS}}
 
 # Rustdoc gate: broken intra-doc links / unclosed-tag lints fail the build (matches CI).
 doc *ARGS:
@@ -582,7 +594,7 @@ doc *ARGS:
     set -euo pipefail
     if [ "{{os()}}" = "macos" ]; then
         # macOS documents every workspace crate (HVF backend included).
-        exec env RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items {{ARGS}}
+        exec env RUSTDOCFLAGS="-D warnings" {{_admit}} {{_admit}} cargo doc --workspace --no-deps --document-private-items {{ARGS}}
     fi
     # Off-macOS: document THIS host's own crates explicitly (-p list from
     # _platform_crates) under the backend feature set. The explicit -p list is
@@ -591,7 +603,7 @@ doc *ARGS:
     # bhyve/nvmm (cfg'd-empty on macOS, so the macOS gate never sees them) slip
     # through. --no-deps still keeps -D warnings off EXTERNAL crates.
     pkgs="$(just --justfile {{justfile()}} _platform_crates)"
-    exec env RUSTDOCFLAGS="-D warnings" cargo doc $pkgs {{_platform_features}} --no-deps --document-private-items {{ARGS}}
+    exec env RUSTDOCFLAGS="-D warnings" {{_admit}} {{_admit}} cargo doc $pkgs {{_platform_features}} --no-deps --document-private-items {{ARGS}}
 
 # Host integration suites (no HVF/Docker); syscall_process is its own binary (matches CI).
 # carrick-runtime and carrick-engine default to platform-macos (→ HVF), so off-macOS
@@ -600,18 +612,18 @@ test-integration:
     #!/usr/bin/env bash
     set -euo pipefail
     if [ "{{os()}}" = "macos" ]; then
-        cargo test -p carrick-runtime --test integration
+        {{_admit}} cargo test -p carrick-runtime --test integration
         # The kernel/dispatch half of that suite: every case that names no
         # carrier and no image store moved here with the code it exercises.
-        cargo test -p carrick-kernel --test integration
+        {{_admit}} cargo test -p carrick-kernel --test integration
         # The P5 blocking-host-I/O ratchet scans `dispatch/{net,fs,mod}.rs`
         # by path, so it lives in the crate that owns them. It has no crate
         # dependency at all -- it reads source and asserts.
-        cargo test -p carrick-kernel --test io_blocking_guard
-        cargo test -p carrick-runtime --test syscall_process
+        {{_admit}} cargo test -p carrick-kernel --test io_blocking_guard
+        {{_admit}} cargo test -p carrick-runtime --test syscall_process
         # `PreparedRun::execute(self)` single-use contract is a compile_fail
         # doctest; `just test`'s `--lib --bins` never runs doctests.
-        cargo test -p carrick-runtime --doc prepare
+        {{_admit}} cargo test -p carrick-runtime --doc prepare
         # `carrick-cli`'s trace_profile suite: the D-program contracts and the
         # DSRPROF1/DSRPROF2 stream parsers. It ran in NO gate until 2026-08-06
         # -- `just test`'s `--lib --bins` reaches carrick-cli's in-file tests
@@ -619,18 +631,18 @@ test-integration:
         # runtime/engine/image suites. Same house trap the `--bins` comment in
         # `test` describes. It needs no HVF, guest, or Docker: every case
         # parses fixtures or asserts on argument validation.
-        cargo test -p carrick-cli --test trace_profile
-        cargo test -p carrick-cli --test fs_backend_flag
-        cargo test -p carrick-cli --test cli
-        cargo test -p carrick-engine
-        cargo test -p carrick-image
+        {{_admit}} cargo test -p carrick-cli --test trace_profile
+        {{_admit}} cargo test -p carrick-cli --test fs_backend_flag
+        {{_admit}} cargo test -p carrick-cli --test cli
+        {{_admit}} cargo test -p carrick-engine
+        {{_admit}} cargo test -p carrick-image
         # carrick-conformance-next's shard consistency tests (materialized
         # shard lists vs probe-inventory.json, cached-oracle completeness,
         # baseline-gap derivation) need no HVF or Docker, but ran in NO gate
         # until 2026-09-01: `conformance-probes` filters the signed binaries to
         # `generic_probe_shard_`/`case_`, so a stale expectation sat unnoticed
         # at HEAD. Skip only the guest-running tests here.
-        cargo test -p carrick-conformance-next \
+        {{_admit}} cargo test -p carrick-conformance-next \
             --test probes_shard_0 --test probes_shard_1 --test probes_shard_2 \
             -- --skip generic_probe_shard_ --skip case_
         exit 0
@@ -640,19 +652,19 @@ test-integration:
     # bodies that aren't cfg-gated and a couple of cases that need a prebuilt
     # fixtures/linux-aarch64-hello image — those fail/skip ENVIRONMENTALLY off-macOS,
     # not because of feature wiring.)
-    cargo test -p carrick-runtime {{_platform_features}} --test integration
+    {{_admit}} cargo test -p carrick-runtime {{_platform_features}} --test integration
     # carrick-kernel takes no `platform-*` feature: its host-OS edges are
     # `cfg(target_os)` dependency tables, so the same invocation is correct on
     # every host.
-    cargo test -p carrick-kernel --test integration
-    cargo test -p carrick-kernel --test io_blocking_guard
-    cargo test -p carrick-runtime {{_platform_features}} --test syscall_process
-    cargo test -p carrick-cli {{_platform_features}} --test trace_profile
-    cargo test -p carrick-cli {{_platform_features}} --test fs_backend_flag
-    cargo test -p carrick-cli {{_platform_features}} --test cli
+    {{_admit}} cargo test -p carrick-kernel --test integration
+    {{_admit}} cargo test -p carrick-kernel --test io_blocking_guard
+    {{_admit}} cargo test -p carrick-runtime {{_platform_features}} --test syscall_process
+    {{_admit}} cargo test -p carrick-cli {{_platform_features}} --test trace_profile
+    {{_admit}} cargo test -p carrick-cli {{_platform_features}} --test fs_backend_flag
+    {{_admit}} cargo test -p carrick-cli {{_platform_features}} --test cli
     # syscall-shim belongs to the runtime dependency, not the engine API.
-    cargo test -p carrick-engine {{replace(_platform_features, "syscall-shim", "carrick-runtime/syscall-shim")}}
-    cargo test -p carrick-image
+    {{_admit}} cargo test -p carrick-engine {{replace(_platform_features, "syscall-shim", "carrick-runtime/syscall-shim")}}
+    {{_admit}} cargo test -p carrick-image
 
 # Run the full host CI gate locally (fmt · clippy · build · docs · tests) — the source of truth CI calls.
 # Composes the now-OS-aware leaf recipes. The only OS difference is the `check` arg:
@@ -685,7 +697,7 @@ ci:
 # `just conformance` = full tier; `just conformance smoke` = fast gate; extra args pass
 # through (e.g. `just conformance full --bless`, `just conformance full --ecosystem go`).
 conformance TIER="full" *ARGS: build
-    cargo run -p carrick-conformance -- --tier {{TIER}} {{ARGS}}
+    {{_admit}} cargo run -p carrick-conformance -- --tier {{TIER}} {{ARGS}}
 
 # Fast pre-merge regression gate: the smoke tier, non-zero exit on any regression.
 # Same `hvf` lane as `just conformance` — the local signed binary running whatever
@@ -693,7 +705,7 @@ conformance TIER="full" *ARGS: build
 # Verdicts here are load-coupled — run it on a quiet machine or you will bisect
 # onto the wrong commit.
 conformance-quick *ARGS: build
-    cargo run -p carrick-conformance -- --tier smoke {{ARGS}}
+    {{_admit}} cargo run -p carrick-conformance -- --tier smoke {{ARGS}}
 
 # KVM/lima Docker-parity gate (Phase 5). Builds carrick IN-GUEST for platform-linux,
 # then runs the smoke tier on the KVM lane vs the (backend-independent) docker oracles,
@@ -709,27 +721,27 @@ conformance-kvm *ARGS:
     # No explicit --baseline-overlay: the arm64 lima `kvm` lane auto-derives its
     # OWN overlay (baseline.kvm-arm64.jsonl), kept distinct from the amd64
     # `kvm-local` lane's baseline.kvm.jsonl so the two arches never cross-excuse.
-    cargo run -p carrick-conformance -- --lane kvm --tier smoke --workers 3 \
+    {{_admit}} cargo run -p carrick-conformance -- --lane kvm --tier smoke --workers 3 \
         --carrick-bin "$bin" {{ARGS}}
 
 # Re-render docs/support-matrix.md from the latest results (no run).
 matrix:
-    cargo run -p carrick-conformance -- --render-matrix
+    {{_admit}} cargo run -p carrick-conformance -- --render-matrix
 
 # Drift gate: docs/support-matrix.md must equal a fresh render of the checked-in
 # baseline (scripts/conformance/baseline.jsonl). Deterministic, no conformance
 # run — catches a hand-edited matrix or a baseline/render-logic change that
 # forgot to re-render. Runs inside `just ci`.
 check-matrix:
-    cargo run -p carrick-conformance -- --check-matrix
+    {{_admit}} cargo run -p carrick-conformance -- --check-matrix
 
 # Generate fresh syscall inventory from carrick-abi.
 inventory *ARGS:
-    cargo run -p carrick-conformance-contract --bin generate-inventory -- {{ARGS}}
+    {{_admit}} cargo run -p carrick-conformance-contract --bin generate-inventory -- {{ARGS}}
 
 # Contract-driven conformance investigation CLI.
 investigate *ARGS:
-    cargo run -p carrick-investigation --bin investigate -- {{ARGS}}
+    {{_admit}} cargo run -p carrick-investigation --bin investigate -- {{ARGS}}
 
 # Layering gate: carrick-vfs / carrick-kernel never depend upward; no VMM
 # depends on the kernel
@@ -743,7 +755,7 @@ check-layering:
 # excludes its entire harness, then run the deterministic replay controls.
 test-vmfree-schedule:
     ./scripts/closure-assert-vmfree-schedule.sh
-    cargo test -p carrick-kernel-example --test schedule_replay
+    {{_admit}} cargo test -p carrick-kernel-example --test schedule_replay
 
 # VMM-less compile of the Carrick kernel: the public crate must build for a
 # target that has no Hypervisor.framework at all
@@ -761,8 +773,8 @@ test-vmfree-schedule:
 # the seven host-specific failures, named in .github/workflows/ci.yml, are the
 # follow-up that lets the Linux job run the lib lane too.)
 check-kernel-portable:
-    cargo check -p carrick-kernel --lib --tests --features test-support --target aarch64-unknown-linux-gnu
-    cargo check -p carrick-kernel-example --tests --target aarch64-unknown-linux-gnu
+    {{_admit}} cargo check -p carrick-kernel --lib --tests --features test-support --target aarch64-unknown-linux-gnu
+    {{_admit}} cargo check -p carrick-kernel-example --tests --target aarch64-unknown-linux-gnu
 
 # Deterministic, line-exact ABI probe gate vs Docker (the precise gate; self-skips).
 # On the x86_64 fleet the AMD64 probe sets are built NATIVELY here (cheap: host
@@ -775,7 +787,7 @@ check-kernel-portable:
 # the probe gate, the LTP file/inotify set and the inotify09 screen, with no
 # rebuild or re-sign in between (re-signing changes the artifact).
 el1-gate: build
-    cargo run --locked -p carrick-xtask -- accept --phase signed --profile full
+    {{_admit}} cargo run --locked -p carrick-xtask -- accept --phase signed --profile full
 
 conformance-probes: build
     #!/usr/bin/env bash
@@ -793,13 +805,13 @@ conformance-probes: build
         ./scripts/test-signed.sh carrick-conformance-next case_ --nocapture
         cp target/test-results/carrick-conformance-next-signed-artifacts.jsonl \
           target/test-results/conformance-probes-dedicated-signed-artifacts.jsonl
-        cargo test -p carrick-cli --test conformance_cli_contract \
+        {{_admit}} cargo test -p carrick-cli --test conformance_cli_contract \
           conformance_default_run_contract -- --exact --nocapture
         retained_filter="$(paste -sd, scripts/conformance/retained-generic-probes.txt)"
         CARRICK_PROBE_LANE=arm64 CARRICK_PROBE_FILTER="$retained_filter" \
-          cargo test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
+          {{_admit}} cargo test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
     else
-        cargo test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
+        {{_admit}} cargo test -p carrick-cli --test conformance {{_platform_features}} -- --nocapture
     fi
 
 # Verify the frozen 2,127-suite discovery surface against the current clean
@@ -816,7 +828,7 @@ conformance-probes-closure: build
     ./scripts/build-probes.sh --closure-arm64 || exit $?
     generic_status=0
     CARRICK_PROBE_MODE=closure CARRICK_PROBE_LANE=arm64 CARRICK_EXEC_BACKEND=hvpatch \
-      cargo test -p carrick-cli --test conformance conformance_probes -- --exact --nocapture \
+      {{_admit}} cargo test -p carrick-cli --test conformance conformance_probes -- --exact --nocapture \
       || generic_status=$?
     dedicated_status=0
     python3 scripts/conformance/closure-probe-scenarios.py || dedicated_status=$?
@@ -833,7 +845,7 @@ gate-containers: build
     set -euo pipefail
     ./scripts/build-probes.sh --closure-arm64
     CARRICK_PROBE_MODE=closure CARRICK_PROBE_LANE=arm64 CARRICK_EXEC_BACKEND=hvpatch \
-    CARRICK_PROBE_SCENARIO_LIBC=musl cargo test -p carrick-cli --test conformance \
+    CARRICK_PROBE_SCENARIO_LIBC=musl {{_admit}} cargo test -p carrick-cli --test conformance \
       conformance_container_gate -- --exact --nocapture
 
 # Guest-running tests of the embedding crate, from SIGNED cargo test
@@ -893,7 +905,7 @@ build-x86-fixture:
 # aarch64-linux compile break is caught here; its native unit tests run on the
 # ubuntu CI runner (see .github/workflows/ci.yml `cross-check-linux`).
 check-linux:
-    cargo check --target aarch64-unknown-linux-gnu -p carrick-hal -p carrick-vmm-kvm -p carrick-host-linux
+    {{_admit}} cargo check --target aarch64-unknown-linux-gnu -p carrick-hal -p carrick-vmm-kvm -p carrick-host-linux
     ./scripts/closure-assert-no-hvf.sh
 
 # Cross-check the FULL carrick-cli + carrick-runtime closure for
@@ -907,7 +919,7 @@ check-linux:
 # CI (.github/workflows/ci.yml) fetches the sysroot + sets these. `cargo check`
 # does NOT link, so no FreeBSD linker is needed — only the cross C compiler.
 check-freebsd:
-    cargo check --target x86_64-unknown-freebsd --no-default-features --features platform-freebsd --all-targets -p carrick-cli -p carrick-runtime
+    {{_admit}} cargo check --target x86_64-unknown-freebsd --no-default-features --features platform-freebsd --all-targets -p carrick-cli -p carrick-runtime
 
 # Cross-check the NetBSD/NVMM backend closure for x86_64-unknown-netbsd. NVMM's
 # crate (carrick-vmm-nvmm) depends only on the shared backend/host crates — NOT
@@ -916,7 +928,7 @@ check-freebsd:
 # rust-toolchain.toml). This catches an nvmm trait-signature break that CI
 # previously could not see at all.
 check-netbsd:
-    cargo check --target x86_64-unknown-netbsd --all-targets -p carrick-vmm-nvmm
+    {{_admit}} cargo check --target x86_64-unknown-netbsd --all-targets -p carrick-vmm-nvmm
 
 # Verify that no macOS/HVF dependencies exist in the platform-linux closure (L1 closure assertion).
 closure-linux:
@@ -926,7 +938,7 @@ closure-linux:
 # The full CLI can't cross-compile from macOS (ring/oci-client need a C cross
 # toolchain), so the real Linux binary is built natively here.
 build-linux:
-    cargo build --release -p carrick-vmm-kvm
+    {{_admit}} cargo build --release -p carrick-vmm-kvm
 
 # ONE-TIME (Apple M3+/macOS 15+): create the lima `vz` nested-KVM Ubuntu VM that
 # serves as the local L2 lane. qemu's HVF backend can't provide nested virt;
@@ -1042,7 +1054,7 @@ ci-freebsd-sysroot:
 
 # These tests use the real host epoll backend but no KVM device or guest.
 test-host-linux:
-    cargo test -p carrick-host-linux
+    {{_admit}} cargo test -p carrick-host-linux
 
 # Limits belong to the shell that starts the tests; a separate setup step
 # cannot raise their soft limit. Preserve the hosted macOS fd headroom.
