@@ -23,6 +23,9 @@ pub enum Commands {
     #[command(about = "Display repository information as JSON")]
     Info,
 
+    #[command(about = "Owner-approved, one-job Willow ephemeral runner pilot")]
+    CiScaler(crate::ci_scaler::ScalerArgs),
+
     #[command(about = "Per-landing Carrick vs native Docker receipts")]
     Impact(crate::impact::ImpactArgs),
 
@@ -119,6 +122,8 @@ pub struct RepoInfo {
 
 #[derive(Debug, Error)]
 pub enum CliError {
+    #[error("ci-scaler: {0}")]
+    CiScaler(#[from] crate::ci_scaler::ScalerError),
     #[error("impact: {0}")]
     Impact(String),
     #[error("{0}")]
@@ -243,6 +248,10 @@ where
 {
     let cli = Cli::try_parse_from(args)?;
     match cli.command {
+        Commands::CiScaler(args) => {
+            crate::ci_scaler::run(args)?;
+            Ok(())
+        }
         Commands::Impact(args) => crate::impact::run(cli.root.as_deref(), args.action)
             .map_err(|e| CliError::Impact(e.to_string())),
         Commands::Info => {

@@ -1,4 +1,5 @@
 pub mod accept;
+pub mod ci_scaler;
 pub mod cli;
 pub mod command;
 pub mod host_lease;
