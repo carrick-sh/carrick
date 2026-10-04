@@ -105,3 +105,20 @@ The generic failed-lock adapter also remains an N1 dependency: expose one
 failed acquisition as a dependency parked until the real unlock notification.
 The current unlocked caller seams do not claim to model interior lock contention
 or replace that adapter with polling.
+
+## Batch 4 scheduler integration
+
+Rebased M2 onto `origin/land/batch4` (`bb1c8bad0`), dropping the two
+copied futex commits. The merged coordinator retains the version-3 portable
+backend, per-actor/point visit map, address-indexed futex parking, recorded
+wake-publication decisions and fail-closed rejection of external readiness.
+Admission dependencies and passive authority observations remain graph-local.
+Admission waiters are distinct from futex and dependency waiters; the real
+reservation owner publishes release through the shared hook, naming the exact
+waiter before the scheduler can grant that actor a permit. Condvar delivery
+cannot add an actor to the runnable set.
+
+The current futex and fixed setid receipts were re-recorded on the merged
+source. The futex decision sequence is unchanged; the receipt's source hash
+changes. Historical version-2 fd-pin receipts retain their original provenance
+and remain deliberately rejected by the version-3 replayer.
