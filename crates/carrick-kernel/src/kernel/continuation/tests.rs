@@ -51,6 +51,26 @@ fn await_event_timeout(
     block_on_timeout(async move { service.event(token).await }, timeout)
 }
 
+/// Match a direct shared futex's producer key to the word that owns it.
+fn direct_shared_word_location(word: &std::sync::atomic::AtomicU32) -> SharedFutexLocation {
+    let address = word as *const std::sync::atomic::AtomicU32 as usize;
+    SharedFutexLocation::Direct {
+        word: HostVa(address),
+        waiter_key: address,
+    }
+}
+
+fn shared_queue_key(location: SharedFutexLocation) -> u64 {
+    carrick_thread::platform_futex::carrier_shared_futex_key(location)
+}
+
+fn synthetic_shared_queue_key(word: usize, waiter_key: usize) -> u64 {
+    shared_queue_key(SharedFutexLocation::Direct {
+        word: HostVa(word),
+        waiter_key,
+    })
+}
+
 fn write_relative_timerfd_spec(
     memory: &mut crate::dispatch::LinearMemory,
     address: u64,
@@ -497,7 +517,7 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
                 waiter_key: 31,
             },
             generation: carrick_thread::platform_futex::carrier_shared_futex_table()
-                .prepare_wait(31),
+                .prepare_wait(synthetic_shared_queue_key(0x3000, 31)),
             value: 7,
             timeout: Some(Duration::from_secs(4)),
         },
@@ -510,7 +530,7 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
                 waiter_key: 41,
             },
             generation: carrick_thread::platform_futex::carrier_shared_futex_table()
-                .prepare_wait(41),
+                .prepare_wait(synthetic_shared_queue_key(0x4000, 41)),
             value: 8,
             timeout: Some(Duration::from_secs(5)),
             index: 9,
@@ -522,7 +542,7 @@ fn outcome_for(family: ContinuationFamily, tid: ThreadId) -> DispatchOutcome {
             },
             waiter_key: 51,
             generation: carrick_thread::platform_futex::carrier_shared_futex_table()
-                .prepare_wait(51),
+                .prepare_wait(synthetic_shared_queue_key(0x5000, 51)),
             value: 10,
             sysv: None,
         },
@@ -2417,16 +2437,13 @@ fn shared_reactor_rechecks_private_futex_and_shared_word_producer_state() {
     drop(private);
 
     let word = std::sync::atomic::AtomicU32::new(7);
-    let location = SharedFutexLocation::Direct {
-        word: HostVa((&word as *const std::sync::atomic::AtomicU32) as usize),
-        waiter_key: 0xbeef,
-    };
+    let location = direct_shared_word_location(&word);
     let shared = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::WaitOnSharedWord {
             location,
-            waiter_key: 0xbeef,
+            waiter_key: location.waiter_key(),
             generation: carrick_thread::platform_futex::carrier_shared_futex_table()
-                .prepare_wait(0xbeef),
+                .prepare_wait(shared_queue_key(location)),
             value: 7,
             sysv: None,
         },
@@ -2438,10 +2455,174 @@ fn shared_reactor_rechecks_private_futex_and_shared_word_producer_state() {
         .enroll(&mut registration)
         .expect("enroll shared word");
     word.store(8, Ordering::Release);
-    carrick_thread::platform_futex::carrier_shared_futex_table().wake(0xbeef, 1);
+    carrick_thread::platform_futex::carrier_shared_futex_table()
+        .wake(shared_queue_key(location), 1);
     assert_eq!(
         await_event(&service, registration.wake_token()).expect("shared word durable recheck"),
         ContinuationEvent::Ready
+    );
+}
+
+#[test]
+fn two_live_shared_word_owners_do_not_consume_each_others_wake() {
+    let (kernel_a, context_a) = bootstrap(15_234);
+    let (kernel_b, context_b) = bootstrap(15_235);
+    let generation_a = publish(&context_a, 0x556);
+    let generation_b = publish(&context_b, 0x557);
+    let service_a = CarrierWaitService::new(Arc::new(Scheduler::new(kernel_a)));
+    let service_b = CarrierWaitService::new(Arc::new(Scheduler::new(kernel_b)));
+    let word_a = std::sync::atomic::AtomicU32::new(7);
+    let word_b = std::sync::atomic::AtomicU32::new(42);
+    let identity_a = carrick_hal::SharedFutexFileIdentity {
+        device: 0x1234,
+        inode: 0,
+    };
+    let identity_b = carrick_hal::SharedFutexFileIdentity {
+        device: 0x1234 ^ 1_u64.rotate_left(32),
+        inode: 1,
+    };
+    let offset = 0x40;
+    let hint_a = carrick_host::futex_key::shared_futex_waiter_key(identity_a, offset);
+    let hint_b = carrick_host::futex_key::shared_futex_waiter_key(identity_b, offset);
+    assert_eq!(hint_a, hint_b, "force the legacy hash collision");
+    let location_a = SharedFutexLocation::File {
+        word: HostVa((&word_a as *const std::sync::atomic::AtomicU32) as usize),
+        identity: identity_a,
+        offset,
+        waiter_key: hint_a,
+    };
+    let location_b = SharedFutexLocation::File {
+        word: HostVa((&word_b as *const std::sync::atomic::AtomicU32) as usize),
+        identity: identity_b,
+        offset,
+        waiter_key: hint_b,
+    };
+    assert_ne!(location_a.key(), location_b.key());
+    assert_ne!(shared_queue_key(location_a), shared_queue_key(location_b));
+    let table = carrick_thread::platform_futex::carrier_shared_futex_table();
+
+    // Enroll B first. A one-waiter wake on A must never retire B's wait,
+    // even though the old hash would have put both owners on one queue.
+    let mut b = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnSharedWord {
+            location: location_b,
+            waiter_key: location_b.waiter_key(),
+            generation: table.prepare_wait(shared_queue_key(location_b)),
+            value: 42,
+            sysv: None,
+        },
+        capture(&context_b, generation_b),
+    )
+    .expect("second owner's wait");
+    let mut registration_b = service_b.prepare_registration(&b);
+    let token_b = registration_b.wake_token();
+    service_b.enroll(&mut registration_b).expect("enroll B");
+    b.attach_registration(registration_b).expect("attach B");
+
+    let a = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnSharedWord {
+            location: location_a,
+            waiter_key: location_a.waiter_key(),
+            generation: table.prepare_wait(shared_queue_key(location_a)),
+            value: 7,
+            sysv: None,
+        },
+        capture(&context_a, generation_a),
+    )
+    .expect("first owner's wait");
+    let mut registration_a = service_a.prepare_registration(&a);
+    service_a.enroll(&mut registration_a).expect("enroll A");
+
+    word_a.store(8, Ordering::Release);
+    assert_eq!(table.wake(shared_queue_key(location_a), 1), 1);
+    assert_eq!(
+        await_event_timeout(
+            &service_a,
+            registration_a.wake_token(),
+            Duration::from_millis(250)
+        ),
+        Some(Ok(ContinuationEvent::Ready)),
+        "A's wake must reach A's live waiter"
+    );
+    assert_eq!(word_b.load(Ordering::Acquire), 42);
+    assert_eq!(
+        await_event_timeout(&service_b, token_b, Duration::from_millis(10)),
+        None,
+        "B's unchanged word must remain blocked"
+    );
+    assert_eq!(
+        b.cancel(CancellationCause::ThreadExit).cause(),
+        CancellationCause::ThreadExit
+    );
+}
+
+#[test]
+fn two_live_owners_of_one_shared_word_receive_one_wake_each() {
+    let (kernel_a, context_a) = bootstrap(15_236);
+    let (kernel_b, context_b) = bootstrap(15_237);
+    let generation_a = publish(&context_a, 0x558);
+    let generation_b = publish(&context_b, 0x559);
+    let service_a = CarrierWaitService::new(Arc::new(Scheduler::new(kernel_a)));
+    let service_b = CarrierWaitService::new(Arc::new(Scheduler::new(kernel_b)));
+    let word = std::sync::atomic::AtomicU32::new(7);
+    let location = direct_shared_word_location(&word);
+    let table = carrick_thread::platform_futex::carrier_shared_futex_table();
+
+    let a = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnSharedWord {
+            location,
+            waiter_key: location.waiter_key(),
+            generation: table.prepare_wait(shared_queue_key(location)),
+            value: 7,
+            sysv: None,
+        },
+        capture(&context_a, generation_a),
+    )
+    .expect("first owner's wait");
+    let mut registration_a = service_a.prepare_registration(&a);
+    service_a.enroll(&mut registration_a).expect("enroll A");
+
+    let b = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::WaitOnSharedWord {
+            location,
+            waiter_key: location.waiter_key(),
+            generation: table.prepare_wait(shared_queue_key(location)),
+            value: 7,
+            sysv: None,
+        },
+        capture(&context_b, generation_b),
+    )
+    .expect("second owner's wait");
+    let mut registration_b = service_b.prepare_registration(&b);
+    service_b.enroll(&mut registration_b).expect("enroll B");
+
+    word.store(8, Ordering::Release);
+    assert_eq!(table.wake(shared_queue_key(location), 1), 1);
+    assert_eq!(
+        await_event_timeout(
+            &service_a,
+            registration_a.wake_token(),
+            Duration::from_millis(250)
+        ),
+        Some(Ok(ContinuationEvent::Ready))
+    );
+    assert_eq!(
+        await_event_timeout(
+            &service_b,
+            registration_b.wake_token(),
+            Duration::from_millis(10)
+        ),
+        None,
+        "FUTEX_WAKE(1) must leave the second waiter queued"
+    );
+    assert_eq!(table.wake(shared_queue_key(location), 1), 1);
+    assert_eq!(
+        await_event_timeout(
+            &service_b,
+            registration_b.wake_token(),
+            Duration::from_millis(250)
+        ),
+        Some(Ok(ContinuationEvent::Ready))
     );
 }
 
@@ -4705,15 +4886,15 @@ fn shared_word_lifetime_and_safety_through_cancellation_retirement() {
     let word_raw = Box::into_raw(word_box);
     let location = SharedFutexLocation::Direct {
         word: HostVa(word_raw as usize),
-        waiter_key: 0xbeef,
+        waiter_key: word_raw as usize,
     };
 
-    let futex_wait =
-        carrick_thread::platform_futex::carrier_shared_futex_table().prepare_wait(0xbeef);
+    let futex_wait = carrick_thread::platform_futex::carrier_shared_futex_table()
+        .prepare_wait(shared_queue_key(location));
     let mut continuation = BlockedContinuation::from_dispatch_outcome(
         DispatchOutcome::WaitOnSharedWord {
             location,
-            waiter_key: 0xbeef,
+            waiter_key: location.waiter_key(),
             generation: futex_wait,
             value: 42,
             sysv: None,

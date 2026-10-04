@@ -374,7 +374,7 @@ pub(crate) struct ExecMappingFingerprint {
     pub(crate) is_dynamic_alias: bool,
     pub(crate) sharing: GuestMappingSharing,
     pub(crate) guest_writable: bool,
-    pub(crate) shared_key_base: u64,
+    pub(crate) shared_key_base: Option<carrick_guest_mem::SharedFutexFileIdentity>,
     pub(crate) shared_key_offset: u64,
 }
 

@@ -319,12 +319,32 @@ pub struct NativePageGeometry {
     pub profile: NativePageProfile,
 }
 
+/// Stable identity of a host file backing a guest shared futex mapping.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize)]
+pub struct SharedFutexFileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+/// Equality for carrier futex queues. Hashing may choose a shard but must
+/// never replace this full identity: different file words can share a 64-bit
+/// hash, while aliases of one file word must rendezvous on one queue.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize)]
+pub enum SharedFutexKey {
+    Direct(usize),
+    File {
+        identity: SharedFutexFileIdentity,
+        offset: u64,
+    },
+}
+
 /// Fork-coherent host location for a guest `MAP_SHARED` futex word.
 ///
-/// [`SharedFutexLocation::Direct`] means the host address is the actual guest
-/// futex word and can be waited/woken directly. [`SharedFutexLocation::Mirror`]
-/// means the backend uses a separate fork-shared mirror word and supplies the
-/// explicit waiter-counter address, if the host futex primitive needs one.
+/// [`SharedFutexLocation::Direct`] names a word by its live host address;
+/// [`SharedFutexLocation::File`] names a file-backed word by the full file
+/// identity and offset, even when two mappings use different host addresses.
+/// [`SharedFutexLocation::Mirror`] uses a fork-shared mirror word and supplies
+/// the waiter-counter address required by some native host primitives.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 pub enum SharedFutexLocation {
     Direct {
@@ -336,6 +356,14 @@ pub enum SharedFutexLocation {
         waiter_count: HostVa,
         waiter_key: usize,
     },
+    File {
+        word: HostVa,
+        identity: SharedFutexFileIdentity,
+        offset: u64,
+        /// Legacy cross-process waiter-table hint. Carrier queue equality
+        /// uses `identity` and `offset`, never this lossy hash.
+        waiter_key: usize,
+    },
 }
 
 impl SharedFutexLocation {
@@ -343,6 +371,7 @@ impl SharedFutexLocation {
     pub const fn wait_addr(self) -> HostVa {
         match self {
             SharedFutexLocation::Direct { word, .. }
+            | SharedFutexLocation::File { word, .. }
             | SharedFutexLocation::Mirror {
                 word,
                 waiter_count: _,
@@ -355,14 +384,27 @@ impl SharedFutexLocation {
     pub const fn waiter_key(self) -> usize {
         match self {
             SharedFutexLocation::Direct { waiter_key, .. }
+            | SharedFutexLocation::File { waiter_key, .. }
             | SharedFutexLocation::Mirror { waiter_key, .. } => waiter_key,
+        }
+    }
+
+    #[inline]
+    pub const fn key(self) -> SharedFutexKey {
+        match self {
+            SharedFutexLocation::Direct { word, .. } | SharedFutexLocation::Mirror { word, .. } => {
+                SharedFutexKey::Direct(word.raw())
+            }
+            SharedFutexLocation::File {
+                identity, offset, ..
+            } => SharedFutexKey::File { identity, offset },
         }
     }
 
     #[inline]
     pub const fn waiter_count_addr(self) -> Option<HostVa> {
         match self {
-            SharedFutexLocation::Direct { .. } => None,
+            SharedFutexLocation::Direct { .. } | SharedFutexLocation::File { .. } => None,
             SharedFutexLocation::Mirror {
                 word: _,
                 waiter_count,

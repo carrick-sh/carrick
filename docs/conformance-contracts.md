@@ -259,6 +259,15 @@ park per blocking episode, no redispatch while parked, and queue work
 proportional to affected waiters rather than historical population. It runs at
 1, 8, 32, and 128 waiters.
 
+Carrier shared-word keys compare the full `(st_dev, st_ino, file offset)` for
+file mappings, or the exact host word address for direct and mirror mappings.
+A hash may select a shard but cannot decide queue equality. The VM-free
+`file_words_with_colliding_hints_have_distinct_carrier_queues` witness forces a
+legacy hash collision and proves separate wake cardinality; the continuation
+`two_live_owners_of_one_shared_word_receive_one_wake_each` witness proves that
+two real waiters on one key each require their own counted wake. Key admission
+uses one sharded map lookup per futex operation, with no live-waiter scan.
+
 The signed binding reuses Carrick's futex probes to prove guest execution. A
 separate uninstrumented release run compares the pinned futex distribution with
 same-image Docker. The existing tests remain until the contract has demonstrated

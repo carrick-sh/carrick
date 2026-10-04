@@ -7187,7 +7187,14 @@ mod tests {
                     },
                     waiter_key,
                 ),
-                generation: carrier_shared_futex_table().prepare_wait(waiter_key as u64),
+                generation: carrier_shared_futex_table().prepare_wait(
+                    carrick_thread::platform_futex::carrier_shared_futex_key(
+                        SharedFutexLocation::Direct {
+                            word: HostVa(waiter_key),
+                            waiter_key,
+                        },
+                    ),
+                ),
                 value: 0,
                 timeout: None,
             },
@@ -7234,7 +7241,15 @@ mod tests {
         assert_eq!(scheduler.queued_len(), 0);
 
         assert_eq!(
-            carrier_shared_futex_table().wake(waiter_key as u64, 1),
+            carrier_shared_futex_table().wake(
+                carrick_thread::platform_futex::carrier_shared_futex_key(
+                    SharedFutexLocation::Direct {
+                        word: HostVa(waiter_key),
+                        waiter_key,
+                    },
+                ),
+                1,
+            ),
             1,
             "the exact futex wake must still find the parked waiter",
         );

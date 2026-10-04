@@ -409,7 +409,9 @@ pub(crate) fn dispatch_threaded_futex(
                 return DispatchOutcome::SharedFutexWait {
                     target: SharedFutexTarget::new(location, location.waiter_key()),
                     generation: carrick_thread::platform_futex::carrier_shared_futex_table()
-                        .prepare_wait(location.waiter_key() as u64),
+                        .prepare_wait(carrick_thread::platform_futex::carrier_shared_futex_key(
+                            location,
+                        )),
                     value,
                     timeout,
                 };
@@ -752,7 +754,9 @@ pub(crate) fn dispatch_futex_waitv_args(
             return DispatchOutcome::SharedFutexWaitv {
                 target: SharedFutexTarget::new(location, location.waiter_key()),
                 generation: carrick_thread::platform_futex::carrier_shared_futex_table()
-                    .prepare_wait(location.waiter_key() as u64),
+                    .prepare_wait(carrick_thread::platform_futex::carrier_shared_futex_key(
+                        location,
+                    )),
                 value: entry.value,
                 timeout,
                 index: index as i64,

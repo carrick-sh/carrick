@@ -75,7 +75,7 @@ pub(crate) struct AliasBacking {
     pub(crate) sharing: GuestMappingSharing,
     pub(crate) ownership_scope: AliasOwnershipScope,
     pub(crate) inventory_backing: InventoryBackingIdentity,
-    pub(crate) shared_key_base: u64,
+    pub(crate) shared_key_base: Option<carrick_guest_mem::SharedFutexFileIdentity>,
     pub(crate) shared_key_offset: u64,
     /// Which incarnation of the global-frame lease this row was published
     /// against — see [`GlobalFrameHostOwner::generation`]. Without it a row that
@@ -86,6 +86,20 @@ pub(crate) struct AliasBacking {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn semantic_extent_size(start: u64, end: u64) -> usize {
     usize::try_from(end.saturating_sub(start)).unwrap_or(usize::MAX)
+}
+
+/// Never publish a saturated file offset: two different words would then
+/// acquire the same carrier queue. An unrepresentable offset loses its file
+/// projection and uses the live host word address instead.
+pub(crate) fn advance_shared_key(
+    base: Option<carrick_guest_mem::SharedFutexFileIdentity>,
+    offset: u64,
+    delta: u64,
+) -> (Option<carrick_guest_mem::SharedFutexFileIdentity>, u64) {
+    match offset.checked_add(delta) {
+        Some(next) => (base, next),
+        None => (None, 0),
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -116,6 +130,8 @@ pub(crate) fn split_local_mapping_rows_for_unmap(
         }
         if tail_survives {
             let delta = end.saturating_sub(row.start);
+            let (shared_key_base, shared_key_offset) =
+                advance_shared_key(row.shared_key_base, row.shared_key_offset, delta);
             tails.push(HvfMappedRegion {
                 start: end,
                 end: row.end,
@@ -132,8 +148,8 @@ pub(crate) fn split_local_mapping_rows_for_unmap(
                 is_dynamic_alias: true,
                 sharing: row.sharing,
                 guest_writable: row.guest_writable,
-                shared_key_base: row.shared_key_base,
-                shared_key_offset: row.shared_key_offset.saturating_add(delta),
+                shared_key_base,
+                shared_key_offset,
                 owner_generation: row.owner_generation,
             });
         }
@@ -146,7 +162,8 @@ pub(crate) fn split_local_mapping_rows_for_unmap(
             let delta = end.saturating_sub(row.start);
             row.ipa = row.ipa.saturating_add(delta);
             row.host_addr = row.host_addr.wrapping_add(delta as usize);
-            row.shared_key_offset = row.shared_key_offset.saturating_add(delta);
+            (row.shared_key_base, row.shared_key_offset) =
+                advance_shared_key(row.shared_key_base, row.shared_key_offset, delta);
             row.start = end;
             row.size = usize::try_from(row_end.saturating_sub(end)).unwrap_or_default();
             tails.pop();
@@ -3516,12 +3533,15 @@ pub(crate) fn unregister_alias_entries(
                 }
                 if entry_end > end {
                     let delta = end.saturating_sub(entry.start);
+                    let (shared_key_base, shared_key_offset) =
+                        advance_shared_key(entry.shared_key_base, entry.shared_key_offset, delta);
                     let tail = AliasBacking {
                         start: end,
                         ipa: entry.ipa.saturating_add(delta),
                         host_addr: entry.host_addr.saturating_add(delta as usize),
                         size: usize::try_from(entry_end - end).unwrap_or_default(),
-                        shared_key_offset: entry.shared_key_offset.saturating_add(delta),
+                        shared_key_base,
+                        shared_key_offset,
                         ..entry
                     };
                     fragments.push((seq, tail));
@@ -3706,7 +3726,7 @@ pub(crate) fn retained_private_reuse_alias_fragment_in(
             container_root,
         ),
         inventory_backing: source.inventory_backing,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: source.owner_generation,
     })
@@ -3966,7 +3986,7 @@ mod alias_differential_tests {
             sharing: GuestMappingSharing::Private,
             ownership_scope: scope,
             inventory_backing: InventoryBackingIdentity::Private(1),
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 1,
         }

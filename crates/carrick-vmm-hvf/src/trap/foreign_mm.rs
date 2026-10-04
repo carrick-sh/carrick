@@ -3349,7 +3349,7 @@ fn finish_foreign_cow_publication(
             runtime.container_root,
         ),
         inventory_backing: backing,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation,
     };
@@ -4443,7 +4443,7 @@ pub mod foreign_cow_test_support {
                     ContainerRootToken::ROOT,
                 ),
                 inventory_backing: data_backing,
-                shared_key_base: 0,
+                shared_key_base: None,
                 shared_key_offset: 0,
                 owner_generation: data_generation,
             });

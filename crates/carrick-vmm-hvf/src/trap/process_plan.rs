@@ -1533,7 +1533,7 @@ impl HvfTaskState {
                 is_dynamic_alias: false,
                 sharing: GuestMappingSharing::Private,
                 guest_writable: true,
-                shared_key_base: 0,
+                shared_key_base: None,
                 shared_key_offset: 0,
                 inherited_frame: None,
                 stage2_lease,

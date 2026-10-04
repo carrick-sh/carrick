@@ -765,7 +765,7 @@ fn alias(host: usize, perms: u64) -> AliasBacking {
             size: 0x4000,
         },
         inventory_backing: InventoryBackingIdentity::Private(0x41),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: 7,
     }
@@ -1525,7 +1525,7 @@ fn delayed_old_cow_alias_cleanup_cannot_remove_reused_generation() {
         is_dynamic_alias: true,
         sharing: retired.sharing,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation,
     };
@@ -3151,7 +3151,7 @@ fn serial_host_process_descriptor_lease_retires_while_host_backing_is_live() {
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: true,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         inherited_frame: None,
         owner_generation: 0,

@@ -289,7 +289,7 @@ fn native_code_content_syscall_alias_fallback_revokes_original_instruction_read(
             fixture.task.container_root,
         ),
         inventory_backing: InventoryBackingIdentity::Private(2010),
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: owner.generation(),
     });

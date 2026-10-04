@@ -1118,9 +1118,11 @@ fn can_coalesce_mappings(left: &HvfMappedRegion, right: &HvfMappedRegion) -> boo
     if left.shared_key_base != right.shared_key_base {
         return false;
     }
-    if left.shared_key_base == 0 && left.shared_key_offset == 0 && right.shared_key_offset == 0 {
+    if left.shared_key_base.is_none() && left.shared_key_offset == 0 && right.shared_key_offset == 0
+    {
         // Neither row carries a shared-key projection.
-    } else if left.shared_key_offset.saturating_add(left.size as u64) != right.shared_key_offset {
+    } else if left.shared_key_offset.checked_add(left.size as u64) != Some(right.shared_key_offset)
+    {
         return false;
     }
     let adjacent_physical =

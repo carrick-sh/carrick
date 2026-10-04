@@ -2476,7 +2476,7 @@ impl<'a> ProcView<'a> {
                             target: SharedFutexTarget::new(location, location.waiter_key()),
                             generation:
                                 carrick_thread::platform_futex::carrier_shared_futex_table()
-                                    .prepare_wait(location.waiter_key() as u64),
+                                    .prepare_wait(carrick_thread::platform_futex::carrier_shared_futex_key(location)),
                             value,
                             timeout,
                         });

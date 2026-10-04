@@ -78,13 +78,21 @@ impl MappingView {
             return None;
         }
         let word = carrick_guest_mem::HostVa(unsafe { self.host_addr.add(offset) } as usize);
-        let waiter_key = if self.shared_key_base == 0 {
-            word.raw()
+        if let Some(identity) = self.shared_key_base {
+            let file_offset = self.shared_key_offset.checked_add(offset as u64)?;
+            let waiter_key = shared_futex_waiter_key(identity, file_offset);
+            Some(carrick_guest_mem::SharedFutexLocation::File {
+                word,
+                identity,
+                offset: file_offset,
+                waiter_key,
+            })
         } else {
-            let file_offset = self.shared_key_offset.saturating_add(offset as u64);
-            shared_futex_waiter_key(self.shared_key_base, file_offset)
-        };
-        Some(carrick_guest_mem::SharedFutexLocation::Direct { word, waiter_key })
+            Some(carrick_guest_mem::SharedFutexLocation::Direct {
+                word,
+                waiter_key: word.raw(),
+            })
+        }
     }
 }
 
@@ -591,7 +599,7 @@ pub(crate) fn prepare_exec_region_raw_in_sized(
             GuestMappingSharing::Private
         },
         guest_writable: mapping.perms.write,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: global_frame_host_owner_generation_in(
             custody,
@@ -690,7 +698,7 @@ pub(crate) fn prepare_pooled_exec_root_region_in(
         is_dynamic_alias: false,
         sharing: GuestMappingSharing::Private,
         guest_writable: mapping.perms.write,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: global_frame_host_owner_generation_in(
             custody,
@@ -832,7 +840,7 @@ pub(crate) fn map_region_raw_in_using_epoch_allocator(
         // Boot regions carry their true guest write-intent (image=RX, page
         // tables=RO -> not writable; heap/stack/data=RW -> writable).
         guest_writable: mapping.perms.write,
-        shared_key_base: 0,
+        shared_key_base: None,
         shared_key_offset: 0,
         owner_generation: global_frame_host_owner_generation_in(
             custody,

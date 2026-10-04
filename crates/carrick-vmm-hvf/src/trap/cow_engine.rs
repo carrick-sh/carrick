@@ -914,7 +914,7 @@ impl HvfVmState {
             sharing,
             ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
             inventory_backing,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation,
         });
@@ -2599,7 +2599,7 @@ impl HvfTaskState {
             sharing,
             ownership_scope: alias_ownership_scope(sharing, self.mm_root_slot, self.container_root),
             inventory_backing: backing,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation,
         });
@@ -2619,7 +2619,7 @@ impl HvfTaskState {
             is_dynamic_alias: true,
             sharing,
             guest_writable: true,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation,
         });
@@ -2849,7 +2849,8 @@ impl HvfTaskState {
         // adapter commits ownership metadata, never a second descriptor edit.
         require_published_repoint(&self.page_tables_authority(), va, target_ipa, len, access)?;
 
-        let shared_key_offset = shared_key_offset.saturating_add(semantic_offset);
+        let (shared_key_base, shared_key_offset) =
+            advance_shared_key(shared_key_base, shared_key_offset, semantic_offset);
         let sharing = GuestMappingSharing::GlobalShared;
         register_shared_alias(AliasBacking {
             start: va,
@@ -4436,7 +4437,7 @@ impl HvfTaskState {
                 self.container_root,
             ),
             inventory_backing: backing,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation,
         };
@@ -4472,7 +4473,7 @@ impl HvfTaskState {
             is_dynamic_alias: true,
             sharing: GuestMappingSharing::Private,
             guest_writable: source_guest_writable,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation,
         });
@@ -5520,7 +5521,7 @@ impl HvfVmState {
                 sharing: HostAliasSharing::Private,
                 ..
             }
-            | HostAliasBacking::Anonymous { .. } => (0, 0),
+            | HostAliasBacking::Anonymous { .. } => (None, 0),
         };
         let host_mapping = match &backing {
             // Live MAP_SHARED file: back the guest region with the file's page

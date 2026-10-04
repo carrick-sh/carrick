@@ -19,7 +19,7 @@ pub(crate) struct ThreadMappingDesc {
     pub(crate) is_dynamic_alias: bool,
     pub(crate) sharing: GuestMappingSharing,
     pub(crate) guest_writable: bool,
-    pub(crate) shared_key_base: u64,
+    pub(crate) shared_key_base: Option<carrick_guest_mem::SharedFutexFileIdentity>,
     pub(crate) shared_key_offset: u64,
     pub(crate) owner_generation: u64,
     pub(crate) structural_owner: Option<std::sync::Arc<StructuralBackingOwner>>,
@@ -81,7 +81,7 @@ impl ThreadMappingDesc {
             sharing: self.sharing,
             guest_writable: self.guest_writable,
             shared_key_base: self.shared_key_base,
-            shared_key_offset: if self.shared_key_base == 0 && self.shared_key_offset == 0 {
+            shared_key_offset: if self.shared_key_base.is_none() && self.shared_key_offset == 0 {
                 0
             } else {
                 self.shared_key_offset.checked_add(offset)?
