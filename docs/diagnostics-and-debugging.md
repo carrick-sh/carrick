@@ -681,4 +681,5 @@ batch aggregation, `carrick trace` is the live stream.
 ## Build storage maintenance
 
 See [build caches and worktree maintenance](build-maintenance.md) for the
-default per-host sccache configuration and the `CARRICK_SCCACHE=0` hatch.
+default per-host sccache configuration, the `CARRICK_SCCACHE=0` hatch, and
+`just worktree-gc` dry-run and removal rules.
