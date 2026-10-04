@@ -1332,10 +1332,18 @@ impl<'a> MemView<'a> {
                 && map_flags.contains(LinuxMmapFlags::FIXED);
             let layout = this.mem().lock().layout;
             let in_arena = range_within(address, length, layout.mmap_base, layout.mmap_size);
+            let address_uses_alias_layout = mmap_address_uses_alias(address, length, layout);
+            // The backing query is only needed for a fixed, non-alias address
+            // outside the semantic arena. An admitted owner serves reads via
+            // EL1, and this syscall still holds the MM mutation gate.
+            let has_identity_backing = !address_uses_alias_layout
+                && map_flags.contains(LinuxMmapFlags::FIXED)
+                && !in_arena
+                && memory.read_bytes_raw(address, 1).is_ok();
             let address_uses_alias = mmap_request_uses_alias(
                 map_flags.contains(LinuxMmapFlags::FIXED),
-                mmap_address_uses_alias(address, length, layout),
-                memory.read_bytes_raw(address, 1).is_ok(),
+                address_uses_alias_layout,
+                has_identity_backing,
                 in_arena,
             );
             // Move-3 E1: an eligible MAP_PRIVATE file mmap lowers to ONE host
@@ -2056,11 +2064,15 @@ impl<'a> MemView<'a> {
                         && memory.supports_lazy_private_file_mmap()
                         && page_size == 4096
                         && lazy_len != 0
-                        && !map_flags.intersects(
-                            LinuxMmapFlags::FIXED
-                                | LinuxMmapFlags::POPULATE
-                                | LinuxMmapFlags::LOCKED,
-                        );
+                        // An admitted owner cannot use the host's eager
+                        // fixed-file stage-1 edit. Its retained HostBacking
+                        // is selected at fault time, after the replaced
+                        // anonymous grant is retired by the same owner.
+                        && (!map_flags.contains(LinuxMmapFlags::FIXED)
+                            || memory.user_memory_venue()
+                                == carrick_guest_mem::UserMemoryVenue::Owner)
+                        && !map_flags
+                            .intersects(LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED);
                     // SAFETY: the description read guard (`open`) keeps the
                     // owning fd (a `HostFdRef`, or the memfd's `OwnedFd`) alive
                     // across the borrow.
@@ -2255,6 +2267,23 @@ impl<'a> MemView<'a> {
             }
             let file_page_offset = (!proc_map_path.is_empty())
                 .then_some(offset / crate::core_dump::GUEST_PAGE as u64);
+            // `record_dynamic_mapping_with_file_offset` mirrors this row into
+            // the admitted owner immediately. Publish the replacement byte
+            // source first, after retiring any MAP_FIXED predecessor; otherwise
+            // the mirror can select the old file offset for a new fault.
+            {
+                let mem_authority = this.mem();
+                let mut mem = mem_authority.lock();
+                trim_private_file_maps(&mut mem.private_file_maps, address, length);
+                if let Some(source) = PrivateFileMapEntry::for_mapping(
+                    &private_file_description,
+                    address,
+                    length,
+                    offset,
+                ) {
+                    mem.private_file_maps.push(source);
+                }
+            }
             this.record_dynamic_mapping_with_file_offset(
                 address,
                 length,
@@ -2267,11 +2296,6 @@ impl<'a> MemView<'a> {
                     semantic_vmas: None,
                 },
             );
-            if let Some(source) = PrivateFileMapEntry::for_mapping(
-                &private_file_description, address, length, offset,
-            ) {
-                this.mem().lock().private_file_maps.push(source);
-            }
             if let Some(socket) = &packet_socket_desc {
                 socket.set_mapped_va(GuestVa(address));
             }
