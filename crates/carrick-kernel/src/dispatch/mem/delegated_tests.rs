@@ -582,6 +582,177 @@ fn admitted_private_file_mmap_publishes_owner_backing_before_fork() {
 }
 
 #[test]
+fn admitted_private_file_mmap_keeps_partial_last_page_in_owner_root() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let bytes = vec![0x5a; PAGE as usize + 1103];
+    install_host_file_fd(&dispatcher, FILE_FD, &bytes);
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    let file = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        0,
+        2 * PAGE,
+        LINUX_PROT_READ,
+        LINUX_MAP_PRIVATE,
+        FILE_FD,
+    )) as u64;
+    let mapping = root.lock().mapping(file + PAGE).unwrap();
+    let source = mapping
+        .host_backing
+        .expect("partial last page lost its owner file source")
+        .advance(file + PAGE - mapping.range.start())
+        .unwrap();
+    let tail = dispatcher
+        .mem_view()
+        .read_host_backing(source, PAGE as usize)
+        .unwrap();
+    assert_eq!(&tail[..1103], &bytes[PAGE as usize..]);
+    assert!(tail[1103..].iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn fixed_file_overlap_replaces_old_owner_source_offset() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let bytes: Vec<u8> = (0..4 * PAGE as usize)
+        .map(|index| (index / PAGE as usize) as u8 + 1)
+        .collect();
+    install_host_file_fd(&dispatcher, FILE_FD, &bytes);
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    let first = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        0,
+        3 * PAGE,
+        LINUX_PROT_READ | carrick_abi::LINUX_PROT_EXEC,
+        LINUX_MAP_PRIVATE,
+        FILE_FD,
+    )) as u64;
+    let executable = root.lock().mapping(first + PAGE).unwrap();
+    assert!(executable.host_backing.is_some());
+    assert!(
+        executable
+            .protection
+            .permits(ReservationProtection::from_bits(4).unwrap())
+    );
+    let replacement = first + 2 * PAGE;
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MMAP,
+            [
+                replacement,
+                2 * PAGE,
+                LINUX_PROT_READ,
+                LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+                FILE_FD as u64,
+                PAGE,
+            ],
+        )) as u64,
+        replacement,
+    );
+    let mapping = root.lock().mapping(replacement).unwrap();
+    let source = mapping
+        .host_backing
+        .unwrap()
+        .advance(replacement - mapping.range.start())
+        .unwrap();
+    assert_eq!(source.offset(), PAGE);
+    assert_eq!(
+        dispatcher
+            .mem_view()
+            .read_host_backing(source, PAGE as usize)
+            .unwrap(),
+        vec![2; PAGE as usize],
+    );
+}
+
+#[test]
+fn fixed_executable_file_replaces_owner_anonymous_reservation() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let file_len = 0x1bd * PAGE + 0xf90;
+    install_host_file_fd(&dispatcher, FILE_FD, &vec![0x5a; file_len as usize]);
+    let root = Root::admit(&dispatcher);
+    let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, (file_len + 4 * PAGE) as usize);
+    let reserve = returned(call(
+        &mut dispatcher,
+        &mut memory,
+        SYS_MMAP,
+        [
+            0,
+            file_len + 2 * PAGE,
+            0,
+            LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+            u64::MAX,
+            0,
+        ],
+    )) as u64;
+    let text = reserve + PAGE;
+    assert_eq!(
+        returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            text,
+            file_len,
+            LINUX_PROT_READ | carrick_abi::LINUX_PROT_EXEC,
+            LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+            FILE_FD,
+        )) as u64,
+        text,
+    );
+    let mapping = root.lock().mapping(text).unwrap();
+    assert!(mapping.host_backing.is_some(), "fixed file lost its source");
+    assert!(
+        root.lock()
+            .mapping(text + 0x9a * PAGE)
+            .unwrap()
+            .host_backing
+            .is_some(),
+        "fixed file lost its source in the interior"
+    );
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MMAP,
+            [
+                text + 0x1ad * PAGE,
+                5 * PAGE,
+                LINUX_PROT_READ | LINUX_PROT_WRITE,
+                LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+                FILE_FD as u64,
+                0x19d * PAGE,
+            ],
+        )) as u64,
+        text + 0x1ad * PAGE,
+    );
+    assert!(
+        root.lock()
+            .mapping(text + 0x9a * PAGE)
+            .unwrap()
+            .host_backing
+            .is_some(),
+        "overlapping data segment retired the untouched text source"
+    );
+    assert!(
+        root.lock()
+            .mapping(text + file_len - 2)
+            .unwrap()
+            .host_backing
+            .is_some(),
+        "overlapping data segment retired the untouched final source page"
+    );
+    assert!(
+        mapping
+            .protection
+            .permits(ReservationProtection::from_bits(4).unwrap()),
+        "fixed executable file lost execute authority"
+    );
+}
+
+#[test]
 fn admitted_private_file_fork_has_no_host_source_projection() {
     let mut parent = SyscallDispatcher::new();
     install_host_file_fd(&parent, FILE_FD, &[0x5a; 2 * PAGE as usize]);
