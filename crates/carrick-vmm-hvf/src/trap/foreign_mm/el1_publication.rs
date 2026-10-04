@@ -255,7 +255,7 @@ mod tests {
             _: u64,
             _: &mut dyn carrick_guest_mem::BorrowedTtbr0Admission,
         ) -> Result<u64, String> {
-            panic!("drop-order witness must not execute a guest service")
+            Err("drop-order witness must not execute a guest service".to_owned())
         }
     }
 

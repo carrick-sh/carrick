@@ -46,7 +46,7 @@ mod owner_tests {
         tables: &owner::Tables,
         ipa: u64,
         fill: u8,
-    ) -> (Arc<MmAccessState>, CarrierForeignMmSnapshot) {
+    ) -> Result<(Arc<MmAccessState>, CarrierForeignMmSnapshot), String> {
         let ordinal = handle.mm().raw();
         let mut inventory = HvpatchFrameInventory::default();
         let mut mappings = Vec::new();
@@ -58,7 +58,7 @@ mod owner_tests {
                 len,
                 crate::host_mapping::HostMappingKind::PerMmKernelState,
             )
-            .unwrap();
+            .map_err(|error| format!("physical fixture allocation: {error:?}"))?;
             let generation = next_global_frame_owner_generation();
             let host_addr = mapping.as_ptr() as usize;
             // SAFETY: this fixture owns the entire new allocation. Descriptor
@@ -86,7 +86,8 @@ mod owner_tests {
                 (base, len as u64),
                 GlobalFrameOwnerEntry::Live(Arc::new(physical)),
             );
-            let id = NonZeroU64::new(ordinal * 10 + u64::from(data)).unwrap();
+            let id = NonZeroU64::new(ordinal * 10 + u64::from(data))
+                .ok_or("physical fixture mapping identity is zero")?;
             let mapping = carrick_hal::MappingId::from_kernel_allocation(id);
             mappings.push(mapping);
             inventory.extents.insert(
@@ -106,12 +107,17 @@ mod owner_tests {
         }
         let binding = CarrierForeignMmBinding {
             asid: carrick_hal::ForeignAsid::from_kernel_allocation(
-                NonZeroU16::new(u16::try_from(ordinal).unwrap()).unwrap(),
+                NonZeroU16::new(
+                    u16::try_from(ordinal).map_err(|error| format!("fixture ASID: {error}"))?,
+                )
+                .ok_or("physical fixture ASID is zero")?,
             ),
             stage1_root: carrick_guest_mem::Gpa(tables.base),
         };
         let snapshot = CarrierForeignMmSnapshot {
-            mm: carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(ordinal).unwrap()),
+            mm: carrick_hal::ForeignMmId::from_kernel_allocation(
+                NonZeroU64::new(ordinal).ok_or("physical fixture MM identity is zero")?,
+            ),
             binding,
             backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(1),
             vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
@@ -124,7 +130,7 @@ mod owner_tests {
                     GuestVa(owner::VA),
                     GuestVa(owner::VA + 4096),
                 )
-                .unwrap(),
+                .ok_or("physical fixture readable range is invalid")?,
             ],
         };
         // An admitted handle carries no host page-table manager or mirror.
@@ -137,7 +143,7 @@ mod owner_tests {
             crate::hvf_aarch64_engine::HostCowStats::default(),
         );
         state.install_identity(snapshot.mm, binding);
-        (state, snapshot)
+        Ok((state, snapshot))
     }
 
     #[test]
@@ -194,7 +200,7 @@ mod owner_tests {
                 &tables,
             ));
             assert_eq!(selected.ipa, ipa, "production owner selected another MM");
-            let (state, snapshot) = install(&custody, handle, &tables, ipa, expected);
+            let (state, snapshot) = install(&custody, handle, &tables, ipa, expected).unwrap();
             let deadline = Instant::now() + Duration::from_secs(1);
             let backing = state
                 .retain_physical_backing_in(&custody, &snapshot, deadline)
