@@ -514,8 +514,17 @@ test *ARGS:
     # Off-macOS: run the lib tests of THIS host's own crates only (-p list from
     # _platform_crates) under the backend feature set — `--workspace --lib` would
     # pull in carrick-vmm-hvf + the macos-default features and fail to compile.
-    pkgs="$(just --justfile {{justfile()}} _platform_crates)"
-    cargo test $pkgs {{_platform_features}} --lib --bins {{ARGS}}
+    # CLI/runtime/host have the same process-global state on every host; keep
+    # their complete test processes serial, as above. The remaining package
+    # selection still comes from the platform closure, including all its bins.
+    pkgs="$(just --justfile {{justfile()}} _platform_crates | sed -E 's/-p carrick-(cli|runtime|host) //g')"
+    # Runtime's self dev-dependency previously enabled these test doubles for
+    # the whole selection. Keep them explicit when its test target is separate.
+    cargo test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} -- --skip serial_host
+    env RUST_TEST_THREADS=1 cargo test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} serial_host
+    env RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-cli {{_platform_features}} --bin carrick {{ARGS}}
+    env RUST_TEST_THREADS=1 cargo test -p carrick-host --lib {{ARGS}}
+    env RUST_TEST_THREADS=1 cargo test -p carrick-runtime {{_platform_features}} --lib {{ARGS}}
     cargo test -p carrick-conformance-contract --tests {{ARGS}}
 
 # Rustdoc gate: broken intra-doc links / unclosed-tag lints fail the build (matches CI).
