@@ -1,0 +1,80 @@
+//! Native CPL0 frame and boundary-control transport, shared by the thin image
+//! and its KVM bootstrap. No Linux syscall algorithm lives in this adapter.
+use carrick_guest_arch::{CanonicalCall, CanonicalOrdinal, GuestIsa, NativeOrdinal, UserVa};
+use core::sync::atomic::{AtomicU32, AtomicU64};
+
+pub const FORWARD_PORT: u16 = 0xc5;
+pub const CONTROL_PORT: u16 = 0xc8;
+pub const ENTRY_KICK_PORT: u16 = 0xc9;
+pub const RETURN_KICK_PORT: u16 = 0xca;
+pub const WORK_PORT: u16 = 0xcb;
+pub const FATAL_PORT: u16 = 0xcc;
+/// Fixture observation only, outside Linux semantic serving.
+pub const OBSERVE_NATIVE: u64 = u64::MAX;
+
+/// Stack order is enforced by the CPL0 assembly and these compile assertions.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct NativeFrame {
+    pub r15: u64,
+    pub r14: u64,
+    pub r13: u64,
+    pub r12: u64,
+    pub rbp: u64,
+    pub rbx: u64,
+    pub r9: u64,
+    pub r8: u64,
+    pub r10: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rax: u64,
+    pub rcx: u64,
+    pub r11: u64,
+    pub rsp: u64,
+}
+const _: () = assert!(core::mem::size_of::<NativeFrame>() == 128);
+const _: () = assert!(core::mem::offset_of!(NativeFrame, rax) == 96);
+
+impl NativeFrame {
+    pub fn decode(&self) -> CanonicalCall {
+        // M2 admits only this canonical route. Unported native ordinals remain
+        // distinguishable and cannot alias canonical 99.
+        let canonical = if self.rax == 273 { 99 } else { u64::MAX };
+        CanonicalCall {
+            isa: GuestIsa::X86_64,
+            canonical: CanonicalOrdinal::new(canonical),
+            native: NativeOrdinal::new(self.rax),
+            args: [self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9],
+            stack: UserVa::new(self.rsp),
+        }
+    }
+
+    /// IRETQ handles all admitted returns, including TF/RF. Reject privileged
+    /// flags and non-user targets before constructing the return frame.
+    pub fn valid_user_return(&self) -> bool {
+        self.rcx != 0
+            && self.rcx < (1 << 47)
+            && self.rsp != 0
+            && self.rsp < (1 << 47)
+            && self.r11 & 2 != 0
+            && self.r11 & ((3 << 12) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20)) == 0
+    }
+}
+
+/// Per-vCPU supervisor binding, private to this entry/bootstrap (not a change
+/// to the common ABI). SWAPGS accesses only its first three words.
+#[repr(C)]
+pub struct CpuBinding {
+    pub kernel_stack: u64,
+    pub user_stack: u64,
+    pub self_address: u64,
+    pub task_address: u64,
+    pub counters_address: u64,
+    pub entry_kick: AtomicU32,
+    pub return_kick: AtomicU32,
+    pub entries: AtomicU64,
+    pub publications: AtomicU64,
+    pub completions: AtomicU64,
+}
+const _: () = assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
