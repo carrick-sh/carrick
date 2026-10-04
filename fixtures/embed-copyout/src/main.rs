@@ -32,6 +32,7 @@ const AT_FDCWD: u64 = -100_i64 as u64;
 const O_RDWR_CREAT_TRUNC: u64 = 0o2 | 0o100 | 0o1000;
 const PROT_RW: u64 = 3;
 const MAP_PRIVATE_ANON: u64 = 0x02 | 0x20;
+const MAP_PRIVATE_FILE: u64 = 0x02;
 const AF_UNIX: u64 = 1;
 const SOCK_STREAM: u64 = 1;
 
@@ -142,6 +143,10 @@ fn source_file(len: usize) -> i64 {
 }
 
 fn main() {
+    if std::env::args().any(|arg| arg == "overlap") {
+        overlapping_file_mapping();
+        return;
+    }
     if std::env::args().any(|arg| arg == "reuse") {
         reused_mapping_two_live_processes();
         return;
@@ -260,6 +265,47 @@ fn main() {
 
     call(SYS_CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
     say(format_args!("copyout_ok"));
+}
+
+/// Replace one page of a live EL1-granted anonymous extent with file bytes.
+fn overlapping_file_mapping() {
+    let path = b"/etc/ld.so.cache\0";
+    let fd = call(SYS_OPENAT, [AT_FDCWD, path.as_ptr() as u64, 0, 0, 0, 0]);
+    if fd < 0 {
+        fail("overlap-open", format_args!("errno={}", -fd));
+    }
+    let mut expected = [0_u8; 32];
+    let got = call(SYS_PREAD64, [fd as u64, expected.as_mut_ptr() as u64, expected.len() as u64, 0x10d2, 0, 0]);
+    if got != expected.len() as i64 {
+        fail("overlap-pread", format_args!("ret={got}"));
+    }
+    let anon = fresh(2);
+    // SAFETY: the first page is mapped; touching it forces the EL1 extent
+    // grant before the next file mmap occupies a gap inside that stock.
+    unsafe { std::ptr::write_volatile(anon, 0xa5) };
+    let mapped = call(SYS_MMAP, [0, 0x144f, 1, MAP_PRIVATE_FILE, fd as u64, 0]);
+    if mapped < 0 {
+        fail("overlap-mmap", format_args!("ret={mapped}"));
+    }
+    if mapped as u64 >= anon as u64 + 1024 * 1024 || (mapped as u64) < anon as u64 + 2 * PAGE as u64 {
+        fail("overlap-place", format_args!("anon={:x} mapped={mapped:x}", anon as u64));
+    }
+    let target = mapped as *mut u8;
+    let mut first_expected = [0_u8; 1];
+    let got = call(SYS_PREAD64, [fd as u64, first_expected.as_mut_ptr() as u64, 1, 0, 0, 0]);
+    if got != 1 || byte(target, 0) != first_expected[0] {
+        fail("overlap-first", format_args!("ret={got}"));
+    }
+    for (offset, wanted) in expected.into_iter().enumerate() {
+        let actual = byte(target, 0x10d2 + offset);
+        if actual != wanted {
+            fail("overlap-bytes", format_args!("offset={offset} expected={wanted} actual={actual}"));
+        }
+    }
+    say(format_args!("overlap_ok"));
+    unmap(anon, 2);
+    unmap(target, 2);
+    call(SYS_CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
 }
 
 /// The child replaces a host-file VMA with an EL1-served anonymous VMA at
