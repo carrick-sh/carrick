@@ -61,6 +61,26 @@ The receipt annotates matching failures and separately names unallowlisted ones;
 no failing command is silently turned green. Backend ABI failures require fixes,
 not additions to this allowlist. All steps run even after an earlier step fails.
 
+When a Linux source edit moves reviewed shared sites, commit the edit first,
+then run `just remote-recapture --ref <commit>`. It uses remote-accept's host,
+gate ref namespace, persistent worktree and checkout lock, followed by an
+exclusive host lease for compiler capture. It refuses a dirty remote tree and
+checks that remote HEAD matches the requested commit. The partial macOS
+candidate's expected exit status is 1; other failures stop reconciliation.
+
+The command returns `target/remote-recapture/<run-id>/recapture.patch`, without
+applying it. Run `git apply <patch>`, review the diff, commit the two inventory
+artifacts, then run `just lint-domains` on the clean tree. Patch validation
+rejects any other path, file mode change, review addition/removal, classification,
+evidence, profile, operation or rationale prose change. Only source coordinates
+and the matching leading rationale location can move. Generated files on the
+Mac are restored before the checkout lock is released. Transfer failures never
+publish a validated patch. If the execution SSH connection fails, the checkout
+lock stays held until the remote completion marker permits the shared stale-lock
+recovery to reclaim it; a disconnect cannot prove compiler work stopped.
+Recapture is inventory maintenance, not an acceptance
+receipt; run the acceptance gates on the resulting commit.
+
 `remote-accept` pushes the committed ref to the gate Mac (default
 `rentamac@cloudmac`, `/Volumes/carrick/dev`), runs the regular macOS acceptance
 profile, prints its summary, and fetches the receipt/logs into

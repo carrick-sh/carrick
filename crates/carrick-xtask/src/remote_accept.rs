@@ -290,12 +290,33 @@ pub fn build_detached_start_cmd(
 }
 
 pub fn build_worktree_setup_cmd(bare_repo: &str, worktree_dir: &str, full_sha: &str) -> String {
+    build_worktree_setup(bare_repo, worktree_dir, full_sha, WorktreePolicy::Recreate)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorktreePolicy {
+    Recreate,
+    RequireClean,
+}
+
+fn build_worktree_setup(
+    bare_repo: &str,
+    worktree_dir: &str,
+    full_sha: &str,
+    policy: WorktreePolicy,
+) -> String {
     let q_bare = shell_quote(bare_repo);
     let q_wt = shell_quote(worktree_dir);
     let q_sha = shell_quote(full_sha);
 
+    let existing = match policy {
+        WorktreePolicy::Recreate => format!(
+            "git -C {q_wt} checkout --detach --force {q_sha} && git -C {q_wt} clean -fdx -e target -e conformance-probes/target"
+        ),
+        WorktreePolicy::RequireClean => format!("git -C {q_wt} checkout --detach {q_sha}"),
+    };
     format!(
-        "if [ ! -d {q_wt} ]; then git -C {q_bare} worktree add --detach {q_wt} {q_sha}; else git -C {q_wt} checkout --detach --force {q_sha} && git -C {q_wt} clean -fdx -e target -e conformance-probes/target; fi"
+        "if [ ! -d {q_wt} ]; then git -C {q_bare} worktree add --detach {q_wt} {q_sha}; else {existing}; fi"
     )
 }
 
@@ -572,7 +593,10 @@ fn copy_probe_executables(
     Ok(())
 }
 
-fn check_remote_disk_space(host: &str, remote_root: &str) -> Result<(), RemoteAcceptError> {
+pub(crate) fn check_remote_disk_space(
+    host: &str,
+    remote_root: &str,
+) -> Result<(), RemoteAcceptError> {
     let df_cmd = build_df_check_cmd(remote_root);
     let df_output = run_ssh_command(host, &df_cmd)?;
     let avail_kib =
@@ -599,6 +623,62 @@ fn check_remote_disk_space(host: &str, remote_root: &str) -> Result<(), RemoteAc
     }
 
     Ok(())
+}
+
+/// Called only while holding the remote checkout lock. Both remote workflows
+/// transport commits through the same gate ref namespace and persistent tree.
+pub(crate) fn prepare_remote_worktree(
+    local_root: &Path,
+    host: &str,
+    remote_root: &str,
+    full_sha: &str,
+    policy: WorktreePolicy,
+) -> Result<String, RemoteAcceptError> {
+    let worktree = remote_worktree_dir(Path::new(remote_root))
+        .to_string_lossy()
+        .into_owned();
+    if policy == WorktreePolicy::RequireClean {
+        let status = run_ssh_command(host, &build_worktree_clean_check_cmd(&worktree))?;
+        if !status.trim().is_empty() {
+            return Err(RemoteAcceptError::DirtyWorkingTree(status));
+        }
+    }
+    let push_target = if host == DEFAULT_HOST && remote_root == DEFAULT_REMOTE_ROOT {
+        let remotes = command::run_checked("git", ["remote"], Some(local_root))?;
+        if remotes.stdout.lines().any(|l| l.trim() == "cloudmac") {
+            "cloudmac".to_string()
+        } else {
+            format!("{host}:{remote_root}/carrick.git")
+        }
+    } else {
+        format!("{host}:{remote_root}/carrick.git")
+    };
+    let refspec = format!("{full_sha}:refs/heads/gate/{}", &full_sha[..12]);
+    println!("Pushing {full_sha} to {push_target} as {refspec}...");
+    command::run_checked("git", ["push", &push_target, &refspec], Some(local_root))?;
+    let setup = build_worktree_setup(
+        &format!("{remote_root}/carrick.git"),
+        &worktree,
+        full_sha,
+        policy,
+    );
+    run_ssh_command(host, &setup)?;
+    let actual = run_ssh_command(
+        host,
+        &format!("git -C {} rev-parse HEAD", shell_quote(&worktree)),
+    )?;
+    if actual.trim() != full_sha {
+        return Err(RemoteAcceptError::Git(format!(
+            "remote HEAD {} does not match requested {full_sha}",
+            actual.trim()
+        )));
+    }
+    Ok(worktree)
+}
+
+pub(crate) fn build_worktree_clean_check_cmd(worktree: &str) -> String {
+    let q_wt = shell_quote(worktree);
+    format!("if [ -d {q_wt} ]; then git -C {q_wt} status --porcelain --untracked-files=all; fi")
 }
 
 pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, RemoteAcceptError> {
@@ -656,27 +736,13 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         acquire_remote_lock(&host, &remote_root, &lock_dir, &run_id)?;
         let mut lock_guard = RemoteLockGuard::new(&host, lock_dir.clone());
 
-        // Step 2: Push it to the bare repo as refs/heads/gate/<sha12>
-        let push_target = if host == DEFAULT_HOST && remote_root == DEFAULT_REMOTE_ROOT {
-            let remotes = command::run_checked("git", ["remote"], Some(&local_root))?;
-            if remotes.stdout.lines().any(|l| l.trim() == "cloudmac") {
-                "cloudmac".to_string()
-            } else {
-                format!("{host}:{remote_root}/carrick.git")
-            }
-        } else {
-            format!("{host}:{remote_root}/carrick.git")
-        };
-
-        let refspec = format!("{full_sha}:refs/heads/gate/{sha12}");
-        println!("Pushing {full_sha} to {push_target} as refs/heads/gate/{sha12}...");
-        command::run_checked("git", ["push", &push_target, &refspec], Some(&local_root))?;
-
-        // Step 3: Setup persistent worktree <root>/gate-worktree from the bare repo
-        let bare_repo = format!("{remote_root}/carrick.git");
-        let setup_cmd = build_worktree_setup_cmd(&bare_repo, &worktree_dir, &full_sha);
-        println!("Setting up remote worktree at {worktree_dir}...");
-        run_ssh_command(&host, &setup_cmd)?;
+        prepare_remote_worktree(
+            &local_root,
+            &host,
+            &remote_root,
+            &full_sha,
+            WorktreePolicy::Recreate,
+        )?;
 
         // Copy probe executables
         println!("Syncing probe executables to remote worktree...");

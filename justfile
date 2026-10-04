@@ -99,6 +99,11 @@ accept *ARGS:
 remote-accept *ARGS:
     cargo run --locked -p carrick-xtask -- remote-accept {{ARGS}}
 
+# Return a reviewed-position-only patch from the same locked cloudmac worktree.
+# Apply and commit locally; this command never applies the patch for you.
+remote-recapture *ARGS:
+    cargo run --locked -p carrick-xtask -- remote-recapture {{ARGS}}
+
 # Provision fresh-worktree guest artifacts before signed execution.
 land-provision *ARGS:
     just --justfile {{justfile()}} xtask provision {{ARGS}}

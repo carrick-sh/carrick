@@ -71,6 +71,10 @@ pub enum Commands {
         about = "Run accept gate on a remote Mac over ssh and fetch the receipt"
     )]
     RemoteAccept(crate::remote_accept::RemoteAcceptArgs),
+    #[command(
+        about = "Recapture moved host-authority positions on the gate Mac and return a patch"
+    )]
+    RemoteRecapture(crate::remote_recapture::RemoteRecaptureArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -158,6 +162,8 @@ pub enum CliError {
     Accept(#[from] crate::accept::AcceptError),
     #[error("remote accept error: {0}")]
     RemoteAccept(#[from] crate::remote_accept::RemoteAcceptError),
+    #[error("remote recapture error: {0}")]
+    RemoteRecapture(#[from] crate::remote_recapture::RecaptureError),
 }
 
 pub fn resolve_repo_info(root: Option<&Path>) -> Result<RepoInfo, CliError> {
@@ -360,6 +366,10 @@ where
             if exit_code != 0 {
                 std::process::exit(exit_code);
             }
+            Ok(())
+        }
+        Commands::RemoteRecapture(args) => {
+            crate::remote_recapture::run(cli.root.as_deref(), args)?;
             Ok(())
         }
     }
