@@ -269,7 +269,9 @@ fn runtime_task_receipt_copy_drains_without_discharging_mm_authority() {
     let mut runtime = registration
         .runtime_task_state(
             carrick_aarch64::Stage1Authority::new(),
-            Arc::new(MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
         )
         .unwrap();
 
@@ -292,7 +294,9 @@ fn runtime_task_receipt_copy_drains_without_discharging_mm_authority() {
     let reloaded = registration
         .runtime_task_state(
             carrick_aarch64::Stage1Authority::new(),
-            Arc::new(MemoryProtections::default()),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
         )
         .unwrap();
     assert!(
@@ -2947,7 +2951,7 @@ fn shared_process_authority_preserves_the_exact_mm_access_arc() {
     let cow_deferred_publications = Arc::new(parking_lot::Mutex::new(Vec::new()));
     let inherited = MmAccessState::new_unbound(
         carrick_aarch64::Stage1Authority::new(),
-        Arc::new(MemoryProtections::default()),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
         Arc::clone(&ledger),
         Arc::clone(&cow_armed),
         Arc::clone(&cow_deferred_publications),

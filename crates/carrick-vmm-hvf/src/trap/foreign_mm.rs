@@ -340,7 +340,7 @@ pub(crate) struct MmAccessState {
     /// Installed on every stage-1 authority bound to this state's backing.
     pub(crate) arena_publisher: parking_lot::RwLock<Option<std::sync::Arc<MmArenaPublisher>>>,
     pub(crate) page_tables: parking_lot::RwLock<carrick_aarch64::Stage1Authority>,
-    pub(crate) protections: std::sync::Arc<MemoryProtections>,
+    pub(crate) protections: carrick_guest_mem::UserMemoryAuthority,
     pub(crate) frame_inventory: HvpatchFrameInventoryState,
     pub(crate) cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
     pub(crate) cow_deferred_publications:
@@ -744,7 +744,7 @@ impl MmAccessState {
     /// its parent's table reads, is [`Self::new_unbound`].
     pub(crate) fn new(
         page_tables: carrick_aarch64::Stage1Authority,
-        protections: std::sync::Arc<MemoryProtections>,
+        protections: carrick_guest_mem::UserMemoryAuthority,
         frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
         cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
         cow_deferred_publications: std::sync::Arc<
@@ -775,7 +775,7 @@ impl MmAccessState {
     /// table authority still belongs to a live MM, and for fixtures.
     pub(crate) fn new_unbound(
         page_tables: carrick_aarch64::Stage1Authority,
-        protections: std::sync::Arc<MemoryProtections>,
+        protections: carrick_guest_mem::UserMemoryAuthority,
         frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
         cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
         cow_deferred_publications: std::sync::Arc<
@@ -796,7 +796,7 @@ impl MmAccessState {
 
     fn build(
         page_tables: carrick_aarch64::Stage1Authority,
-        protections: std::sync::Arc<MemoryProtections>,
+        protections: carrick_guest_mem::UserMemoryAuthority,
         frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
         cow_armed: std::sync::Arc<parking_lot::Mutex<CowArmedRanges>>,
         cow_deferred_publications: std::sync::Arc<
@@ -860,7 +860,7 @@ impl MmAccessState {
     pub(crate) fn for_foreign_read_test(
         binding: CarrierForeignMmBinding,
         page_tables: carrick_aarch64::Stage1Authority,
-        protections: std::sync::Arc<MemoryProtections>,
+        protections: carrick_guest_mem::UserMemoryAuthority,
         frame_inventory: std::sync::Arc<parking_lot::Mutex<HvpatchFrameInventory>>,
         snapshot: &dyn carrick_hal::ForeignMmSnapshot,
     ) -> std::sync::Arc<Self> {
@@ -1840,7 +1840,8 @@ pub(crate) fn attest_foreign_identity_write_receipt(
         || lease
             .state
             .protections
-            .range_write_denied(page_va, PAGE as usize)
+            .legacy()
+            .is_none_or(|protections| protections.range_write_denied(page_va, PAGE as usize))
     {
         return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
     }
@@ -1949,8 +1950,16 @@ pub(crate) fn materialize_foreign_pristine_write(
             .raw()
             .checked_add(len as u64)
             .is_none_or(|limit| limit > end)
-        || lease.state.protections.range_no_access(start, PAGE)
-        || lease.state.protections.range_write_denied(start, PAGE)
+        || lease
+            .state
+            .protections
+            .legacy()
+            .is_none_or(|protections| protections.range_no_access(start, PAGE))
+        || lease
+            .state
+            .protections
+            .legacy()
+            .is_none_or(|protections| protections.range_write_denied(start, PAGE))
         || !deferred.covers_pristine(carrick_guest_mem::GuestVa(start), PAGE)
     {
         return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
@@ -2066,8 +2075,16 @@ pub(crate) fn materialize_foreign_private_file_write(
                     .map_err(|_| carrick_hal::ForeignMmTransportError::MutationFailed)?,
             )
             .is_none_or(|limit| limit > end)
-        || lease.state.protections.range_no_access(start, PAGE)
-        || lease.state.protections.range_write_denied(start, PAGE)
+        || lease
+            .state
+            .protections
+            .legacy()
+            .is_none_or(|protections| protections.range_no_access(start, PAGE))
+        || lease
+            .state
+            .protections
+            .legacy()
+            .is_none_or(|protections| protections.range_write_denied(start, PAGE))
     {
         return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
     }
@@ -2359,7 +2376,12 @@ pub(crate) fn perform_foreign_cow_transaction(
         .map(|alias| alias.guest_writable)
         .ok_or(carrick_hal::ForeignMmTransportError::OwnerStale)?;
     let source_guest_writable = source_alias_guest_writable;
-    if (!source_guest_writable || lease.state.protections.range_write_denied(va.raw(), len))
+    if (!source_guest_writable
+        || lease
+            .state
+            .protections
+            .legacy()
+            .is_none_or(|protections| protections.range_write_denied(va.raw(), len)))
         && !executable_authorized
     {
         return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
@@ -2619,7 +2641,12 @@ pub(crate) fn perform_foreign_cow_transaction(
             let span_end = span.va.saturating_add(span.len as u64);
             let mut page_va = span.va & !0xfff;
             while page_va < span_end {
-                if source_guest_writable && !lease.state.protections.range_write_denied(page_va, 1)
+                if source_guest_writable
+                    && !lease
+                        .state
+                        .protections
+                        .legacy()
+                        .is_none_or(|protections| protections.range_write_denied(page_va, 1))
                 {
                     tables
                         .set_writable_preserving_attributes(page_va, 0x1000)
@@ -2654,7 +2681,11 @@ pub(crate) fn perform_foreign_cow_transaction(
                     .checked_add(page_va.saturating_sub(span.va))
                     .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
                 let expected_ap = if source_guest_writable
-                    && !lease.state.protections.range_write_denied(page_va, 1)
+                    && !lease
+                        .state
+                        .protections
+                        .legacy()
+                        .is_none_or(|protections| protections.range_write_denied(page_va, 1))
                 {
                     AP_USER_RW
                 } else if executable_authorized {
@@ -3069,10 +3100,9 @@ fn perform_foreign_guest_cow(
         let mut writable_pages = 0_u8;
         for index in 0..(span.len as u64 / 0x1000) {
             if source_guest_writable
-                && !lease
-                    .state
-                    .protections
-                    .range_write_denied(span.va + index * 0x1000, 1)
+                && !lease.state.protections.legacy().is_none_or(|protections| {
+                    protections.range_write_denied(span.va + index * 0x1000, 1)
+                })
             {
                 writable_pages |= 1 << index;
             }
@@ -3619,11 +3649,9 @@ unsafe impl carrick_hal::ForeignNativeDataSpan for CarrierNativeDataSpan {
         ) {
             return Err(Error::OwnerStale);
         }
-        if self
-            .state
-            .protections
-            .range_write_denied(self.range.start.raw(), self.range.len)
-        {
+        if self.state.protections.legacy().is_none_or(|protections| {
+            protections.range_write_denied(self.range.start.raw(), self.range.len)
+        }) {
             return Err(Error::MutationFailed);
         }
         let end = self
@@ -4148,7 +4176,13 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
             .raw()
             .checked_add(len as u64)
             .ok_or(carrick_hal::ForeignMmTransportError::MutationFailed)?;
-        if len == 0 || self.state.protections.range_write_denied(start.raw(), len) {
+        if len == 0
+            || self
+                .state
+                .protections
+                .legacy()
+                .is_none_or(|protections| protections.range_write_denied(start.raw(), len))
+        {
             return Err(carrick_hal::ForeignMmTransportError::MutationFailed);
         }
         // A foreign-write COW receipt does not imply guest-store permission.
@@ -4443,7 +4477,9 @@ pub mod foreign_cow_test_support {
             }
             let state = MmAccessState::new_unbound(
                 carrick_aarch64::Stage1Authority::new_with_manager(Some(tables)),
-                std::sync::Arc::new(MemoryProtections::default()),
+                carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
+                    MemoryProtections::default(),
+                )),
                 std::sync::Arc::new(parking_lot::Mutex::new(ledger)),
                 std::sync::Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
                 std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
@@ -4597,7 +4633,9 @@ pub mod foreign_cow_test_support {
                     },
                 ),
                 1 => {
-                    self.state.protections.set_no_write(start, 0x1000, true);
+                    if let Some(protections) = self.state.protections.legacy() {
+                        protections.set_no_write(start, 0x1000, true);
+                    }
                     Ok(())
                 }
                 2 => self.state.page_tables_authority().edit(
@@ -4689,7 +4727,9 @@ pub mod foreign_cow_test_support {
                     Ok(())
                 }
                 7 => {
-                    self.state.protections.set_no_access(start, 0x1000, true);
+                    if let Some(protections) = self.state.protections.legacy() {
+                        protections.set_no_access(start, 0x1000, true);
+                    }
                     Ok(())
                 }
                 _ => Err("unknown fixture denial".into()),
