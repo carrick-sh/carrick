@@ -52,6 +52,11 @@ pub enum Commands {
     Provision(crate::provision::ProvisionArgs),
 
     #[command(
+        about = "Build, restore, or verify immutable signed-tier guest fixtures without Docker"
+    )]
+    Fixtures(crate::fixtures::FixturesArgs),
+
+    #[command(
         name = "probe-coverage",
         about = "Validate probe inventory coverage against baseline"
     )]
@@ -156,6 +161,8 @@ pub enum CliError {
     RegenerateContracts(#[from] crate::ledger_merge::RegenerateError),
     #[error("provision error: {0}")]
     Provision(#[from] crate::provision::ProvisionError),
+    #[error("fixtures error: {0}")]
+    Fixtures(#[from] crate::fixtures::FixturesError),
     #[error("host lease error: {0}")]
     HostLease(#[from] crate::host_lease::HostLeaseError),
     #[error("accept error: {0}")]
@@ -332,6 +339,11 @@ where
         }
         Commands::Provision(args) => {
             crate::provision::run(cli.root.as_deref(), args.action, writer)?;
+            Ok(())
+        }
+        Commands::Fixtures(args) => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::fixtures::run(&info.repository_root, args.action, writer)?;
             Ok(())
         }
         Commands::ProbeCoverage(args) => {
