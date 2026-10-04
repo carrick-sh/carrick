@@ -215,28 +215,16 @@ impl Kernel {
         let mut update = Some(update);
         loop {
             let observed = self.reservation_epoch();
-            // A task reservation owns its own birth close. Wait for that
-            // transaction before attempting to acquire conflicting custody.
-            {
-                let state = self.registry().settled().read();
-                if let Err(KernelOperationError::TaskBusy(_)) =
-                    ensure_task_unreserved(&state, task_id)
-                {
-                    drop(state);
-                    self.wait_for_reservation_change(observed);
-                    continue;
-                }
-                ensure_task_unreserved(&state, task_id)?;
-            }
-            let birth_admission =
-                super::super::thread_ledger::BirthAdmissionGuard::acquire(context.task())?;
-            // Settle births completed before the close, then revalidate the
-            // reservation and captured resource authority before COW.
+            // Credentials belong to this thread, not its thread group. A
+            // sibling's claimed birth must not close credential admission or
+            // produce EAGAIN in NPTL's setxid broadcast. A caller cannot run
+            // clone and set*id simultaneously: settle its completed births
+            // with the old credentials before publishing this COW. Sibling
+            // births continue to inherit their own caller's resources.
             let state = self.registry().settled().write();
             if let Err(KernelOperationError::TaskBusy(_)) = ensure_task_unreserved(&state, task_id)
             {
                 drop(state);
-                drop(birth_admission);
                 self.wait_for_reservation_change(observed);
                 continue;
             }
@@ -270,7 +258,8 @@ impl Kernel {
             // publication generation for this association.
             let revision = record.revision;
             let task = Arc::clone(&record.task);
-            // Reserved uid credits and runtime cells belong to the pre-change authority.
+            // Withdraw unused pre-change credits by CAS; claimed sibling
+            // births keep their identity, uid credit and runtime custody.
             record.thread_pool.revoke_unused();
             thread.replace_resources(Arc::clone(&resources));
             if thread.key().tid == LinuxTid::for_task_leader(task_id) {
