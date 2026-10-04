@@ -33,3 +33,11 @@ The ratchet enforces:
 3. `paths` must list exact repository-relative paths present in the diff (globs and directories are rejected).
 4. `contracts` must name registered contract IDs from `conformance-contracts/contracts/`.
 5. `rationale` must be at least 40 characters explaining why the change does not alter guest-visible semantics or work invariants. Phrases such as "performance out of scope" are rejected.
+
+Commit the reviewed source change first, then commit its receipt with that
+source revision as `head`. The receipt applies to the exact `base` and to
+descendants of its reviewed `head` only while each exempted path remains
+byte-identical to that revision. A later source edit requires fresh evidence
+or review; other changed surfaces remain subject to the contract gate. This
+also permits the PR merge commit to carry a receipt without requiring the
+receipt to contain its own commit hash.
