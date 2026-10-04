@@ -38,6 +38,8 @@ event-ring-dump = []
 # carrick-cli, and `just check-layering` fails if that selection does).
 test-support = ["carrick-hal/test-support", "carrick-vfs/test-support"]
 conformance-metrics = ["carrick-observability/conformance-metrics"]
+# Graph-local VM-free instrumentation; even explicit selection excludes release.
+schedule-hooks = []
 
 # NOTE: no `platform-*` features. This crate selects no VMM and no host
 # backend: the host-OS glue it needs (the kqueue/epoll readiness multiplexer,

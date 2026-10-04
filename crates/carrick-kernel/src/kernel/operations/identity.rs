@@ -213,6 +213,13 @@ impl Kernel {
         }
         let task_id = context.task.key().id;
         let mut update = Some(update);
+        crate::schedule_point!(
+            self.schedule_hooks(),
+            super::super::schedule::Event::thread(
+                context,
+                super::super::schedule::Point::BeforeCredentialAdmission
+            )
+        );
         loop {
             let observed = self.reservation_epoch();
             // Credentials belong to this thread, not its thread group. A
@@ -225,7 +232,21 @@ impl Kernel {
             if let Err(KernelOperationError::TaskBusy(_)) = ensure_task_unreserved(&state, task_id)
             {
                 drop(state);
+                crate::schedule_point!(
+                    self.schedule_hooks(),
+                    super::super::schedule::Event::thread(
+                        context,
+                        super::super::schedule::Point::CredentialWaiting
+                    )
+                );
                 self.wait_for_reservation_change(observed);
+                crate::schedule_point!(
+                    self.schedule_hooks(),
+                    super::super::schedule::Event::thread(
+                        context,
+                        super::super::schedule::Point::CredentialResumed
+                    )
+                );
                 continue;
             }
             ensure_task_unreserved(&state, task_id)?;
@@ -266,6 +287,14 @@ impl Kernel {
                 task.replace_process_credentials(resources.credentials());
             }
             self.observe_thread_publication(&thread, &resources, revision);
+            // Observation only: `state` still owns the registry write guard.
+            crate::schedule_point!(
+                self.schedule_hooks(),
+                super::super::schedule::Event::thread(
+                    context,
+                    super::super::schedule::Point::CredentialPublished
+                )
+            );
             return Ok(KernelContext::from_parts(
                 self.clone(),
                 task,

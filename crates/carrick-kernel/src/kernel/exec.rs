@@ -331,6 +331,10 @@ impl Kernel {
         failpoint: Option<KernelFailpoint>,
     ) -> Result<PreparedExec, ExecError> {
         self.sweep_retired_threads();
+        crate::schedule_point!(
+            self.schedule_hooks(),
+            super::schedule::Event::thread(context, super::schedule::Point::BeforeExecAdmission)
+        );
         if !Arc::ptr_eq(self, &context.kernel) {
             return Err(ExecError::ForeignContext);
         }
@@ -404,6 +408,10 @@ impl Kernel {
             .context(context.task().key().id, context.thread().key().tid)
             .map_err(|_| ExecError::CallerExited)?;
         let revision = settled.revision();
+        crate::schedule_point!(
+            self.schedule_hooks(),
+            super::schedule::Event::thread(context, super::schedule::Point::ExecAdmitted)
+        );
         check_exec_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
 
         // Stop every sibling before observing the shared file authority. A

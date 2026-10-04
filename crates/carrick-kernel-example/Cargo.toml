@@ -13,14 +13,13 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
-# carrick-kernel is taken with NO features: this crate is the
-# bring-your-own-backend template, so its backend is its OWN impls
+# This bring-your-own-backend template supplies its OWN impls
 # (`ExampleProcess`, `ExampleStage1Projection`, `ExampleMmBackend` in
 # `src/process.rs`) over the kernel's ordinary public surface -- which is the
-# point. It uses none of the kernel's `test-support`-gated doubles, and taking
-# the feature would have made the template quietly depend on a test surface a
-# real backend author does not get.
-carrick-kernel = { path = "../carrick-kernel" }
+# point. It uses none of the kernel's `test-support`-gated doubles. The selected
+# `schedule-hooks` instrumentation exists only in debug builds and is checked
+# absent from the product feature closure by closure-assert-vmfree-schedule.sh.
+carrick-kernel = { path = "../carrick-kernel", features = ["schedule-hooks"] }
 carrick-vfs = { path = "../carrick-vfs" }
 # carrick-hal's `test-support` IS required, and only for the two Null bridges
 # (`NullHostSignalBridge`, `NullGuestTimerBridge`), which are gated behind it so
@@ -50,6 +49,8 @@ allocation-metrics = []
 conformance-metrics = ["carrick-kernel/conformance-metrics", "carrick-observability/conformance-metrics"]
 
 [dev-dependencies]
+carrick-sched-core = { path = "../carrick-sched-core" }
+carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-kernel = { path = "../carrick-kernel", features = ["conformance-metrics"] }
 carrick-observability = { path = "../carrick-observability", features = ["conformance-metrics"] }
 carrick-vfs = { path = "../carrick-vfs", features = ["test-support"] }

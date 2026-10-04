@@ -575,7 +575,8 @@ impl Task {
     ) -> Result<i32, ExampleError> {
         let mut steps = script.iter();
         while let Some(step) = steps.next() {
-            crate::schedule_point!(shared, self, crate::schedule::Point::Step);
+            crate::schedule_point!(shared, self, crate::schedule::Point::Step)
+                .map_err(ExampleError::Schedule)?;
             if !self.is_live() {
                 return Ok(0);
             }
@@ -666,6 +667,7 @@ impl Task {
                             )));
                         }
                     };
+                    #[cfg(debug_assertions)]
                     if let Some(schedule) = &shared.schedule {
                         while !shared
                             .parked_notifications
@@ -679,6 +681,8 @@ impl Task {
                     } else {
                         shared.await_parked(resolved_id, label, WAIT_BOUND)?;
                     }
+                    #[cfg(not(debug_assertions))]
+                    shared.await_parked(resolved_id, label, WAIT_BOUND)?;
                 }
                 Step::Sys(syscall) | Step::SysBeforeContinuation { syscall, .. } => {
                     let (args, outs) = self.resolve(syscall)?;
@@ -1447,7 +1451,8 @@ impl Task {
         disp.retire_hvpatch_process_fds(&self.context);
         // The close-event drain is complete here. This typed marker only
         // observes: the dispatcher mutex is still held, so it cannot hand off.
-        crate::schedule_point!(shared, self, crate::schedule::Point::FdDrained);
+        crate::schedule_point!(shared, self, crate::schedule::Point::FdDrained)
+            .map_err(ExampleError::Schedule)?;
         let adopter = disp.hvpatch_orphan_adopter();
         let zombie = self.context.kernel().exit_task_key_eventually_notifying(
             task_key,
@@ -1467,8 +1472,10 @@ impl Task {
             .entry(pid)
             .or_insert(winning_code);
         drop(disp);
-        crate::schedule_point!(shared, self, crate::schedule::Point::TerminalUnlocked);
-        crate::schedule_point!(shared, self, crate::schedule::Point::TerminalPublished);
+        crate::schedule_point!(shared, self, crate::schedule::Point::TerminalUnlocked)
+            .map_err(ExampleError::Schedule)?;
+        crate::schedule_point!(shared, self, crate::schedule::Point::TerminalPublished)
+            .map_err(ExampleError::Schedule)?;
         shared.wake_active_tokens_for_task(task_key);
         Ok(())
     }

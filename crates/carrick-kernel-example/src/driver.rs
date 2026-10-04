@@ -282,7 +282,8 @@ pub(crate) fn drive(
                 .publish_futex_wake(task.schedule_actor(), args[0], *value as u64)
                 .map_err(ExampleError::Schedule)?;
         }
-        crate::schedule_point!(shared, task, crate::schedule::Point::DispatchUnlocked);
+        crate::schedule_point!(shared, task, crate::schedule::Point::DispatchUnlocked)
+            .map_err(ExampleError::Schedule)?;
 
         loop {
             match outcome {
@@ -413,7 +414,8 @@ pub(crate) fn drive(
                         }
                     }
 
-                    crate::schedule_point!(shared, task, crate::schedule::Point::ContinuationBuild);
+                    crate::schedule_point!(shared, task, crate::schedule::Point::ContinuationBuild)
+                        .map_err(ExampleError::Schedule)?;
                     let mut continuation =
                         BlockedContinuation::from_dispatch_outcome(blocking_outcome, capture)
                             .map_err(|e| {

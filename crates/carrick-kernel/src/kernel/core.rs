@@ -469,6 +469,8 @@ impl std::fmt::Debug for ContainerRootPublicationBarriers {
 /// One backend-neutral Linux kernel instance.
 #[derive(Debug)]
 pub struct Kernel {
+    #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
+    schedule_hooks: super::schedule::Hooks,
     ipc: Mutex<Option<Arc<crate::el1_ipc::HostIpc>>>,
     domain: Arc<KernelDomain>,
     registry: Registry,
@@ -1261,6 +1263,10 @@ impl std::fmt::Debug for TaskExitSubscribers {
 }
 
 impl Kernel {
+    #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
+    pub fn schedule_hooks(&self) -> &super::schedule::Hooks {
+        &self.schedule_hooks
+    }
     pub(crate) fn existing_ipc(&self) -> Option<Arc<crate::el1_ipc::HostIpc>> {
         self.ipc.lock().clone()
     }
@@ -1451,6 +1457,8 @@ impl Kernel {
             exit_subscribers: TaskExitSubscribers::default(),
             pending_file_closes: Mutex::new(Vec::new()),
             reservation_gate: ReservationGate::default(),
+            #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
+            schedule_hooks: super::schedule::Hooks::default(),
             keyrings: crate::keyring::KeyringService::new(),
             syslog: Arc::new(crate::syslog::SyslogService::new()),
             debug_aux_providers: Mutex::new(DebugAuxProviderRegistry::default()),

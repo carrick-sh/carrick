@@ -458,6 +458,8 @@ pub struct CarrierWaitServiceInner {
     reactor_poll_observer: Mutex<Option<(u64, Arc<std::sync::Barrier>)>>,
     #[cfg(test)]
     test_hooks: ReactorTestHooks,
+    #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
+    schedule_hooks: crate::kernel::schedule::Hooks,
     work_scope: Mutex<Option<carrick_observability::work_meter::WorkScope>>,
 }
 
@@ -661,6 +663,14 @@ impl CarrierWaitServiceInner {
             (true, task_waker)
         };
         let _ = self.scheduler.wake_exact(token.exact_target());
+        crate::schedule_point!(
+            self.schedule_hooks,
+            crate::kernel::schedule::Event {
+                point: crate::kernel::schedule::Point::WakePublished,
+                actor: None,
+                authority: crate::kernel::schedule::Authority::Wait(token),
+            }
+        );
         // The nudge tells the reactor to rebuild its work set without this
         // registration. The reactor itself never needs one: every cycle
         // rebuilds the set under the state lock after it has processed its
@@ -1067,6 +1077,10 @@ impl Drop for CarrierWaitService {
 }
 
 impl CarrierWaitService {
+    #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
+    pub fn schedule_hooks(&self) -> &crate::kernel::schedule::Hooks {
+        &self.inner.schedule_hooks
+    }
     pub fn try_new(scheduler: Arc<Scheduler>) -> Result<Self, RuntimeError> {
         let (control_read, control_write) = make_control_pipe()?;
         let inner = Arc::new(CarrierWaitServiceInner {
@@ -1086,6 +1100,8 @@ impl CarrierWaitService {
             reactor_poll_observer: Mutex::new(None),
             #[cfg(test)]
             test_hooks: ReactorTestHooks::default(),
+            #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
+            schedule_hooks: crate::kernel::schedule::Hooks::default(),
             work_scope: Mutex::new(None),
         });
         let weak = Arc::downgrade(&inner);
@@ -1173,6 +1189,14 @@ impl CarrierWaitService {
         &self,
         registration: &mut ContinuationRegistration,
     ) -> Result<(), WaitServiceError> {
+        crate::schedule_point!(
+            self.schedule_hooks(),
+            crate::kernel::schedule::Event {
+                point: crate::kernel::schedule::Point::BeforeWaitEnrollment,
+                actor: None,
+                authority: crate::kernel::schedule::Authority::Wait(registration.token),
+            }
+        );
         #[cfg(any(test, feature = "test-support"))]
         if self.inner.fail_next_enroll.swap(false, Ordering::AcqRel) {
             return Err(WaitServiceError::StaleRegistration);
@@ -1210,6 +1234,14 @@ impl CarrierWaitService {
         self.inner.add_metric(
             carrick_observability::work_meter::WorkMetric::ContinuationEnrollments,
             1,
+        );
+        crate::schedule_point!(
+            self.schedule_hooks(),
+            crate::kernel::schedule::Event {
+                point: crate::kernel::schedule::Point::WaitEnrolled,
+                actor: None,
+                authority: crate::kernel::schedule::Authority::Wait(registration.token),
+            }
         );
         Ok(())
     }
