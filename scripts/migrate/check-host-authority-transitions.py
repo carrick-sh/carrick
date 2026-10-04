@@ -2273,6 +2273,25 @@ def _validate_archive_members(
                 )
 
 
+def _extract_authenticated_archive(
+    archive: tarfile.TarFile,
+    snapshot_root: Path,
+    entries: Sequence[Mapping[str, str]],
+) -> None:
+    """Extract into the private empty snapshot after validating every member.
+
+    The authenticated Git manifest rejects absolute/traversing paths, external
+    symlinks, hardlinks, devices, and other special files before any extraction.
+    Keep that protection on Python 3.11 without extraction filters; newer
+    Python also applies its data filter as each member is materialized.
+    """
+    _validate_archive_members(archive, entries)
+    if hasattr(tarfile, "data_filter"):
+        archive.extractall(snapshot_root, filter="data")
+    else:
+        archive.extractall(snapshot_root)
+
+
 def _snapshot_records(
     snapshot_root: Path, entries: Sequence[Mapping[str, str]]
 ) -> list[dict[str, str]]:
@@ -2436,8 +2455,7 @@ def product_source_snapshot(root: Path):
     with tempfile.TemporaryDirectory(prefix="source-", dir=snapshot_parent) as directory:
         snapshot_root = Path(directory)
         with tarfile.open(fileobj=io.BytesIO(archive_bytes), mode="r:") as archive:
-            _validate_archive_members(archive, entries)
-            archive.extractall(snapshot_root, filter="fully_trusted")
+            _extract_authenticated_archive(archive, snapshot_root, entries)
         provenance = _snapshot_provenance(
             snapshot_root, source_head, source_git_tree, entries
         )

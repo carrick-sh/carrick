@@ -10,6 +10,7 @@ import json
 import os
 import pwd
 import subprocess
+import tarfile
 import tempfile
 import tomllib
 import unittest
@@ -401,6 +402,63 @@ def diagnostic(
             "children": children or [],
         },
     }
+
+
+class SnapshotExtractionTest(unittest.TestCase):
+    def archive(self, members):
+        stream = io.BytesIO()
+        entries = []
+        with tarfile.open(fileobj=stream, mode="w") as archive:
+            for name, kind, target in members:
+                member = tarfile.TarInfo(name)
+                member.type = kind
+                member.mode = 0o755 if kind == tarfile.DIRTYPE else 0o644
+                member.linkname = target
+                member.size = 5 if kind == tarfile.REGTYPE else 0
+                archive.addfile(member, io.BytesIO(b"hello") if member.size else None)
+                entries.append({"path": name, "type": "tree" if kind == tarfile.DIRTYPE else "blob"})
+        stream.seek(0)
+        return tarfile.open(fileobj=stream, mode="r:"), entries
+
+    def test_legacy_python_extracts_validated_files_and_internal_symlinks(self):
+        checker = load_host_authority()
+        archive, entries = self.archive([
+            ("value", tarfile.REGTYPE, ""), ("alias", tarfile.SYMTYPE, "value")
+        ])
+        with archive, tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(checker, "tarfile", wraps=tarfile) as legacy:
+                del legacy.data_filter
+                checker._extract_authenticated_archive(archive, Path(directory), entries)
+            self.assertEqual((Path(directory) / "alias").read_bytes(), b"hello")
+
+    def test_modern_python_uses_data_filter(self):
+        checker = load_host_authority()
+        archive, entries = self.archive([("value", tarfile.REGTYPE, "")])
+        with archive, tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(checker.tarfile, "data_filter", create=True), mock.patch.object(archive, "extractall") as extract:
+                checker._extract_authenticated_archive(archive, Path(directory), entries)
+            extract.assert_called_once_with(Path(directory), filter="data")
+
+    def test_legacy_python_rejects_unsafe_members_before_extracting(self):
+        checker = load_host_authority()
+        for name, kind, target in [
+            ("/absolute", tarfile.REGTYPE, ""),
+            ("../outside", tarfile.REGTYPE, ""),
+            ("nested/../value", tarfile.REGTYPE, ""),
+            ("device", tarfile.CHRTYPE, ""),
+            ("fifo", tarfile.FIFOTYPE, ""),
+            ("alias", tarfile.SYMTYPE, "../outside"),
+            ("alias", tarfile.SYMTYPE, "/outside"),
+            ("alias", tarfile.LNKTYPE, "../outside"),
+        ]:
+            with self.subTest(name=name, kind=kind, target=target):
+                archive, entries = self.archive([(name, kind, target)])
+                with archive, tempfile.TemporaryDirectory() as directory:
+                    with mock.patch.object(checker, "tarfile", wraps=tarfile) as legacy, mock.patch.object(archive, "extractall") as extract:
+                        del legacy.data_filter
+                        with self.assertRaises(checker.InventoryError):
+                            checker._extract_authenticated_archive(archive, Path(directory), entries)
+                        extract.assert_not_called()
 
 
 class DiagnosticNormalizationTest(unittest.TestCase):
