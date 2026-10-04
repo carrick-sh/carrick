@@ -99,6 +99,57 @@ receipt and every fixture. `test-signed.sh` verifies again for embed and
 conformance-next invocations; it consumes the restored bytes without building
 guest fixtures. Restore a new exact-SHA bundle after every checkout change.
 
+## Remote acceptance and Actions entry points
+
+The native ARM Linux publisher runs:
+
+```sh
+just fixtures-publish "$GITHUB_SHA"
+```
+
+It builds the exact commit and emits one content-addressed artifact under
+`target/fixtures/published/<sha>/<manifest-sha256>.tar.gz`. Upload that file
+with the Actions artifact service, using an artifact name containing the full
+SHA. Transfer the archive intact: Actions artifacts discard ordinary file
+permissions, while the tar envelope retains guest executable modes. The
+publisher never replaces an existing artifact with different bytes.
+
+After checkout and cleanup, download the same-run, exact-SHA artifact to the
+Mac. Both restore and acceptance belong inside one exclusive admission:
+
+```sh
+just lease gate sh -c 'just fixtures-restore "$1" && just accept --phase signed' fixtures "$bundle"
+```
+
+`fixtures-restore` extracts only regular manifest/object files and their
+declared directories into private staging, rejects links, traversal, duplicate
+entries and multiple roots, then uses the same complete manifest verifier and
+receipt-last restore as `--manifest`. Missing, changed or non-executable
+objects and a previous-SHA bundle fail before acceptance. `just lease`
+preserves command argument boundaries and accept inherits its existing gate
+descriptor, without reacquiring or upgrading a shared lease. Upload the
+fixture artifact separately from acceptance logs and receipts.
+
+`just remote-accept --ref <sha> --phase signed` selects the unique local
+`target/fixtures/bundles/<sha>/<digest>/manifest.json`, packages and transfers
+it to that run's directory, and restores it after checkout cleanup. Supply
+`--fixture-manifest <path>` when the bundle is elsewhere or multiple publishers
+produced distinct valid bundles for one SHA. Selection requires the requested
+commit's identity; there is no fallback to mutable local or remote probe
+directories. Host-only acceptance needs no guest fixtures.
+
+Remote acceptance holds the checkout lock before acquiring one host gate lease
+across restore, signed acceptance and scoped guest cleanup. It reinstalls the
+complete bundle even on same-SHA reuse, so lost ignored outputs cannot be
+mistaken for a valid previous receipt. Its preparation script fails if the
+checkout lock is absent or a signed/all job has no bundle.
+
+PR #2's merge-queue worker will replace `land-provision` with these publisher
+and restore entry points after this PR lands, per director coordination. Its
+workflow topology is not imported into this branch. That workflow must retain
+its trusted-event guards, wait for the Linux publisher, download the artifact
+from the same run, and perform restore after its own checkout cleanup.
+
 ## Contract and evidence
 
 This is host-only acceptance/provisioning code outside guest execution. The
@@ -110,6 +161,16 @@ source drift, incomplete/duplicate inventory, wrong targets/toolchain,
 permissions, symlinks, and missing/tampered installed files. The initial
 red-first CLI test failed with `unrecognized subcommand 'fixtures'` on
 `6a33e26b2` (see the implementation commit for the exact base SHA).
+
+Preparation bindings run real Git checkout/cleanup, the real just recipes,
+mode-preserving archive transport and xtask restore/preflight on empty and
+same-SHA reused checkouts, and reject stale-SHA artifacts. A full remote CLI
+binding runs real Git and rsync servers through a local SSH transport; only
+the physical network and HVF acceptance are replaced. The reviewed head
+failed empty/reused preparation with `No such file or directory (os error 2)`;
+the Actions entry point failed with `justfile does not contain recipe
+fixtures-restore`. The full remote CLI control returned guest preflight exit
+1 and could not fetch a receipt. Strict signed preflight remains unchanged.
 
 Signed execution and Docker differential acceptance remain director-owned.
 The worker proof transfers a real ARM64 bundle to a cloudmac scratch checkout
