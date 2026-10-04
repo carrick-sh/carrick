@@ -299,8 +299,9 @@ const _: () = assert!(
 // mapping: the EL1 stub can read it under PSTATE.PAN=1, and guest EL0 cannot.
 // The host (runtime layer) stamps it via `write_guest_bytes`, exactly as it
 // stamps the read-only vvar.
-pub const LINUX_IDENTITY_PAGE_BASE: u64 = LINUX_EL1_MAINT_BASE + LINUX_EL1_MAINT_SIZE;
-pub const LINUX_IDENTITY_PAGE_SIZE: u64 = 0x4000;
+pub const LINUX_IDENTITY_PAGE_BASE: u64 = carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE;
+pub const LINUX_IDENTITY_PAGE_SIZE: u64 = carrick_el1_abi::CARRICK_IDENTITY_PAGE_SIZE;
+const _: () = assert!(LINUX_IDENTITY_PAGE_BASE == LINUX_EL1_MAINT_BASE + LINUX_EL1_MAINT_SIZE);
 pub const LINUX_SYSCALL_MAILBOX_BASE: u64 = LINUX_IDENTITY_PAGE_BASE + LINUX_IDENTITY_PAGE_SIZE;
 pub const LINUX_SYSCALL_MAILBOX_ARENA_SIZE: u64 = 0x1_0000;
 pub const LINUX_SYSCALL_MAILBOX_SLOT_SIZE: u64 =
