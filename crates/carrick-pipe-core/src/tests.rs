@@ -672,14 +672,236 @@ fn b_prep_readiness_revision_detects_pre_enrollment_edge_at_1_8_64() {
         for _ in 0..population {
             let mut bytes = [0; PIPE_BUF];
             let mut slots = [Page::default(); 1];
-            let mut p = Pipe::with_capacity(&mut bytes, &mut slots, PIPE_BUF, PIPE_BUF).unwrap();
-            let before = p.readiness(End::Reader);
+            let mut revision = ReadinessRevision::default();
+            let mut p = Pipe::with_capacity(&mut bytes, &mut slots, PIPE_BUF, PIPE_BUF)
+                .unwrap()
+                .with_revision(&mut revision);
+            let before = p.readiness_snapshot(End::Reader).unwrap();
             assert_eq!(p.try_write(b"edge").result, Ok(4));
             assert_eq!(p.try_read(&mut [0; 4]).result, Ok(4));
             // Deterministic enrollment point: the old notification had no
             // enrolled target. Probe AFTER enrolling, never park blindly.
-            let after_enroll = p.readiness(End::Reader);
+            let after_enroll = p.readiness_snapshot(End::Reader).unwrap();
+            assert_eq!(after_enroll.readiness, before.readiness);
             assert_ne!(after_enroll, before, "the pre-enrollment edge was lost");
         }
     }
+}
+
+#[test]
+fn b_prep_readiness_publication_after_enrollment_retains_wake_and_revision() {
+    let mut bytes = [0; PIPE_BUF];
+    let mut pages = [Page::default(); 1];
+    let mut revision = ReadinessRevision::default();
+    let mut pipe = Pipe::with_capacity(&mut bytes, &mut pages, PIPE_BUF, PIPE_BUF)
+        .unwrap()
+        .with_revision(&mut revision);
+    let observed = pipe.readiness_snapshot(End::Reader).unwrap();
+    // Enrollment occurs with no intervening producer; its post-enroll probe
+    // is unchanged. A later producer must both wake and advance the revision.
+    assert_eq!(pipe.readiness_snapshot(End::Reader).unwrap(), observed);
+    let step = pipe.try_write(b"ready");
+    assert!(step.wake.readers);
+    assert!(!step.broken_pipe_signal());
+    let published = pipe.readiness_snapshot(End::Reader).unwrap();
+    assert!(published.readiness.readable);
+    assert_ne!(published.revision, observed.revision);
+    assert_eq!(pipe.try_read(&mut [0; 5]).result, Ok(5));
+    let drained = pipe.readiness_snapshot(End::Reader).unwrap();
+    assert_eq!(drained.readiness, observed.readiness);
+    assert_ne!(drained.revision, published.revision);
+}
+
+#[test]
+fn b_prep_blocked_writers_keep_endpoints_offsets_and_linear_work_at_1_8_64() {
+    use std::vec::Vec;
+    struct Pending {
+        record: PipeRecord,
+        bytes: [u8; PIPE_BUF],
+        pages: [Page; 1],
+        revision: ReadinessRevision,
+        progress: WriteProgress,
+        output: Vec<u8>,
+    }
+    let source: Vec<_> = (0..2 * PIPE_BUF + 31).map(|at| (at % 251) as u8).collect();
+    for population in [1, 8, 64] {
+        // All population members coexist, and all writers block before any
+        // reader runs. No worker, clock, sleep, scheduler or host fd is used.
+        let mut population: Vec<_> = (0..population)
+            .map(|_| Pending {
+                record: PipeRecord::new(PIPE_BUF, 1, PIPE_BUF, PIPE_BUF).unwrap(),
+                bytes: [0; PIPE_BUF],
+                pages: [Page::default(); 1],
+                revision: ReadinessRevision::default(),
+                progress: WriteProgress::new(source.len() as u64),
+                output: Vec::new(),
+            })
+            .collect();
+        let mut copied = 0;
+        let mut visits = 0;
+        for pending in &mut population {
+            let mut pipe =
+                Pipe::attach(&mut pending.record, &mut pending.bytes, &mut pending.pages)
+                    .unwrap()
+                    .with_revision(&mut pending.revision);
+            // Descriptor's last close leaves the blocked operation's lease.
+            pipe.retain(End::Writer).unwrap();
+            assert_eq!(
+                pipe.write_progress(&mut pending.progress, |at, dst| {
+                    dst.copy_from_slice(&source[at..at + dst.len()]);
+                    dst.len()
+                })
+                .result,
+                Ok(PIPE_BUF)
+            );
+            assert_eq!(
+                pipe.write_progress(&mut pending.progress, |_, _| 0).result,
+                Err(Error::WouldBlock(WaitFor::Writable))
+            );
+            assert_eq!(pipe.release(End::Writer).result, Ok(()));
+            assert_eq!(pipe.references(End::Writer), 1);
+            assert!(!pipe.readiness(End::Reader).hup);
+            copied += pipe.work.copied;
+            visits += pipe.work.visits;
+        }
+        for pending in &mut population {
+            let mut pipe =
+                Pipe::attach(&mut pending.record, &mut pending.bytes, &mut pending.pages)
+                    .unwrap()
+                    .with_revision(&mut pending.revision);
+            for _ in 0..3 {
+                // Exactly three page deliveries, a deterministic bound.
+                let mut chunk = [0; PIPE_BUF];
+                let n = pipe.try_read(&mut chunk).result.unwrap();
+                pending.output.extend_from_slice(&chunk[..n]);
+                if !pending.progress.is_complete() {
+                    let expected_offset = pending.progress.written as usize;
+                    let step = pipe.write_progress(&mut pending.progress, |at, dst| {
+                        assert_eq!(at, expected_offset);
+                        dst.copy_from_slice(&source[at..at + dst.len()]);
+                        dst.len()
+                    });
+                    assert!(step.result.unwrap() > 0);
+                }
+            }
+            assert!(pending.progress.is_complete());
+            assert_eq!(pending.output, source);
+            assert!(pipe.release(End::Writer).wake.readers);
+            assert_eq!(pipe.try_read(&mut [0]).result, Ok(0));
+            assert_eq!(pipe.references(End::Writer), 0);
+            assert_eq!(pipe.retain(End::Writer), Err(Error::Refcount));
+            copied += pipe.work.copied;
+            visits += pipe.work.visits;
+        }
+        assert_eq!(copied, 2 * source.len() * population.len());
+        assert_eq!(visits, 6 * population.len());
+    }
+}
+
+#[test]
+fn b_prep_revision_survives_views_and_reback_and_refuses_wrap_before_effects() {
+    let mut record = PipeRecord::new(PIPE_BUF, 1, PIPE_BUF, PIPE_BUF).unwrap();
+    let mut revision = ReadinessRevision::default();
+    let mut bytes = [0; PIPE_BUF];
+    let mut pages = [Page::default(); 1];
+    let initial = {
+        let mut pipe = Pipe::attach(&mut record, &mut bytes, &mut pages)
+            .unwrap()
+            .with_revision(&mut revision);
+        let initial = pipe.readiness_snapshot(End::Reader).unwrap();
+        assert_eq!(pipe.try_write(b"x").result, Ok(1));
+        assert_eq!(pipe.peek_with(1, |_| 1), Ok(1));
+        initial
+    };
+    let mut larger_bytes = [0; 2 * PIPE_BUF];
+    let mut larger_pages = [Page::default(); 2];
+    {
+        let pipe = Pipe::attach(&mut record, &mut bytes, &mut pages)
+            .unwrap()
+            .with_revision(&mut revision);
+        assert_ne!(
+            pipe.readiness_snapshot(End::Reader).unwrap().revision,
+            initial.revision
+        );
+        let mut pipe = pipe
+            .replace_storage(&mut larger_bytes, &mut larger_pages)
+            .unwrap();
+        let before = pipe.readiness_snapshot(End::Reader).unwrap();
+        assert_eq!(pipe.peek_with(1, |_| 1), Ok(1));
+        assert_eq!(pipe.readiness_snapshot(End::Reader).unwrap(), before);
+        assert_eq!(pipe.write_with(1, |_, _| 0).result, Err(Error::Fault));
+        assert_eq!(pipe.readiness_snapshot(End::Reader).unwrap(), before);
+        assert_eq!(
+            pipe.set_capacity(2 * PIPE_BUF, 2 * PIPE_BUF).result,
+            Ok(2 * PIPE_BUF)
+        );
+        assert_ne!(
+            pipe.readiness_snapshot(End::Reader).unwrap().revision,
+            before.revision
+        );
+    }
+    revision.0 = u64::MAX;
+    let saved = record;
+    let mut pipe = Pipe::attach(&mut record, &mut larger_bytes, &mut larger_pages)
+        .unwrap()
+        .with_revision(&mut revision);
+    assert_eq!(
+        pipe.read_with(1, |_| unreachable!()).result,
+        Err(Error::RevisionExhausted)
+    );
+    assert_eq!(
+        pipe.write_with(1, |_, _| unreachable!()).result,
+        Err(Error::RevisionExhausted)
+    );
+    assert_eq!(
+        pipe.release(End::Writer).result,
+        Err(Error::RevisionExhausted)
+    );
+    assert_eq!(
+        pipe.set_capacity(PIPE_BUF, 2 * PIPE_BUF).result,
+        Err(Error::RevisionExhausted)
+    );
+    assert_eq!(*pipe.st(), saved);
+}
+
+#[test]
+fn b_prep_signal_decision_is_data_even_after_partial_progress() {
+    for partial in [false, true] {
+        let mut bytes = [0; PIPE_BUF];
+        let mut pages = [Page::default(); 1];
+        let mut revision = ReadinessRevision::default();
+        let mut pipe = Pipe::with_capacity(&mut bytes, &mut pages, PIPE_BUF, PIPE_BUF)
+            .unwrap()
+            .with_revision(&mut revision);
+        let mut progress = WriteProgress::new(PIPE_BUF as u64 + 1);
+        if partial {
+            assert_eq!(
+                pipe.write_progress(&mut progress, |_, dst| {
+                    dst.fill(7);
+                    dst.len()
+                })
+                .result,
+                Ok(PIPE_BUF)
+            );
+        }
+        let before = pipe.readiness_snapshot(End::Writer).unwrap();
+        assert!(pipe.release(End::Reader).wake.writers);
+        let after_enroll = pipe.readiness_snapshot(End::Writer).unwrap();
+        assert!(after_enroll.readiness.err);
+        assert_ne!(after_enroll.revision, before.revision);
+        let result = pipe.write_progress(&mut progress, |_, _| unreachable!());
+        assert_eq!(result.result, Err(Error::BrokenPipe));
+        assert!(result.broken_pipe_signal());
+        assert_eq!(progress.written, if partial { PIPE_BUF as u64 } else { 0 });
+        assert!(!pipe.try_write(&[]).broken_pipe_signal());
+    }
+    let mut bytes = [0; PIPE_BUF];
+    let mut pages = [Page::default(); 1];
+    let pipe = Pipe::with_capacity(&mut bytes, &mut pages, PIPE_BUF, PIPE_BUF).unwrap();
+    assert_eq!(
+        pipe.readiness_snapshot(End::Reader),
+        Err(Error::RevisionUnavailable)
+    );
+    // Keep the shared record's existing ABI; sidecar storage is venue-owned.
+    assert_eq!(core::mem::size_of::<PipeRecord>(), 7 * 8);
 }

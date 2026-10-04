@@ -68,6 +68,44 @@ execution or checkpoint-3 acceptance.
 
 ## Venue obligations
 
+### Landing B preparation: readiness revision and owned progress
+
+Bind `Pipe::with_revision(&mut ReadinessRevision)` to the persistent word for
+that exact object incarnation, under the object's lock, on every view that
+mutates an object with revision observers. `PipeRecord` keeps its existing
+56-byte shared layout; this word is caller-supplied storage. A bound view
+advances it on published bytes, consumed bytes, final endpoint close and
+capacity change. Peeks, refused operations and zero-byte I/O leave it alone.
+`replace_storage` preserves the binding and revision. A revision cannot wrap:
+`RevisionExhausted` refuses before effects or copy callbacks. It is a venue
+lifetime failure, not a guest errno. `readiness_snapshot` on an unbound view
+returns `RevisionUnavailable`, never a fabricated revision.
+
+Observe, enroll, then probe `readiness_snapshot` again under the same object
+authority before parking. A changed revision requires rechecking the operation
+even if readiness returned to the earlier bits; a snapshot never grants bytes.
+The scheduler owns enrollment/park/wake authentication. Revisions do not replace
+`WakeSet`, exact object incarnation, OFD pins or the enroll/recheck protocol.
+The future shared-layout word and ABI hash/version update belong to landing B
+after N1; existing adapters do not automatically bind this API.
+
+`Step::broken_pipe_signal()` returns the signal decision as data; the
+personality applies SIGPIPE and returns EPIPE or the already-delivered prefix.
+It reuses `Error::BrokenPipe` and raises no signal. Retain the same writer
+endpoint and `WriteProgress` across close/reuse and suspension.
+
+VM-free `b_prep_*` bindings extend `kernel.el1.ipc-object-state` and
+`kernel.el1.ipc-lifecycle`. The readiness write/drain witness failed on main
+`ad3e127a9`: bits alone lose the pre-enrollment edge. At 1/8/64 simultaneously
+live blocked writers, reattached views resume precisely at `written`, deliver
+each source byte once, and release the final writer only after completion.
+The deterministic budget is exactly `2 * delivered_bytes` copied and six page
+visits per three-page stream, independent of unrelated pipe population.
+These are core proofs, not guest scheduling, executor exhaustion, user-copy
+admission or signed integration acceptance.
+
+### Existing venue obligations
+
 - Serialize operations and waiter enrollment under the same object authority.
   On `WouldBlock(Readable/Writable)` (the `WaitFor` enum), either map to EAGAIN
   for O_NONBLOCK/EFD_NONBLOCK, or enroll/recheck and park. Deliver `WakeSet`

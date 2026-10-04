@@ -4,24 +4,14 @@ use super::*;
 use std::sync::{Mutex, OnceLock};
 use std::{boxed::Box, vec::Vec};
 
-// Baseline adapter: main has only single-slot installation. Replace this
-// composition with the owner transaction after capturing its behavioral red.
+// The red commit used two single installs here; the owner now uses one
+// typed transaction without a temporary fd, host type or second table.
 fn b_prep_install_pair<const T: usize>(
     c: &View<T>,
     table: TableId,
     pins: [&OfdPin; 2],
 ) -> Result<[Fd; 2], Error> {
-    let first = {
-        let (_guard, t) = c.lock(table)?;
-        Fd(t.allocate(0)? as i32)
-    };
-    c.install_pin(table, first, pins[0], true)?;
-    let second = {
-        let (_guard, t) = c.lock(table)?;
-        Fd(t.allocate(0)? as i32)
-    };
-    c.install_pin(table, second, pins[1], true)?;
-    Ok([first, second])
+    c.transaction(table)?.install_pair(Fd(0), pins, true)
 }
 
 #[test]
@@ -1248,4 +1238,142 @@ fn el1_ipc_lock_free_pins_race_close_reuse_and_growth() {
         opened.load(Ordering::Relaxed),
         "every description released exactly once"
     );
+}
+
+#[test]
+fn b_prep_pair_publication_hides_intermediate_slot_from_lock_free_readers() {
+    let (core, arena) = core_with::<1>(2);
+    let c = core.bind(arena, BoundedSpin(0));
+    let table = c.create_table(2, &mut storage(2)).unwrap();
+    let reader = c.create_pinned(description(10)).unwrap();
+    let writer = c.create_pinned(description(11)).unwrap();
+    let mut transaction = c.transaction(table).unwrap();
+    transaction.after_first_publication = Some(|transaction| {
+        let c = transaction.authority;
+        let record = transaction.guard.record;
+        let table = TableId {
+            authority: c.core.identity(),
+            index: 0,
+            generation: record.generation.load(Ordering::Relaxed),
+        };
+        // Exactly after the first atomic slot store, the sequence is odd:
+        // neither a description snapshot nor an owned pin can escape.
+        assert_eq!(record.seq.load(Ordering::Acquire) & 1, 1);
+        for fd in [Fd(0), Fd(1)] {
+            assert_eq!(c.get(table, fd), Err(Error::Contended));
+            assert_eq!(c.pin(table, fd), Err(Error::Contended));
+        }
+    });
+    assert_eq!(
+        transaction.install_pair(Fd(0), [&reader, &writer], true),
+        Ok([Fd(0), Fd(1)])
+    );
+    drop(transaction);
+    for (fd, token) in [(Fd(0), 10), (Fd(1), 11)] {
+        assert_eq!(c.get(table, fd).unwrap().backing, BackingToken(token));
+        assert_eq!(c.getfd(table, fd), Ok(true));
+    }
+    c.unpin(reader).unwrap();
+    c.unpin(writer).unwrap();
+    let mut releases = 0;
+    c.destroy_table(table, |_| releases += 1).unwrap();
+    assert_eq!(releases, 2);
+}
+
+#[test]
+fn b_prep_pair_holes_backing_stale_pin_and_transaction_drop() {
+    let c = authority::<2, 5>();
+    let table = c.create_table(8, &mut storage(4)).unwrap();
+    let reader = c.create_pinned(description(1)).unwrap();
+    let writer = c.create_pinned(description(2)).unwrap();
+    c.open(table, Fd(0), description(3), false).unwrap();
+    c.open(table, Fd(2), description(4), false).unwrap();
+    assert_eq!(
+        b_prep_install_pair(&c, table, [&reader, &writer]),
+        Ok([Fd(1), Fd(3)])
+    );
+    assert_eq!(c.holds(&reader), Ok((1, 1)));
+    assert_eq!(c.holds(&writer), Ok((1, 1)));
+    c.close(table, Fd(1)).unwrap();
+    c.close(table, Fd(3)).unwrap();
+    c.open(table, Fd(1), description(5), false).unwrap();
+    assert_eq!(
+        b_prep_install_pair(&c, table, [&reader, &writer]),
+        Err(Error::NeedsBacking { descriptors: 5 })
+    );
+    assert_eq!(c.get(table, Fd(3)), Err(Error::BadFd));
+    assert_eq!(c.holds(&reader), Ok((0, 1)));
+    assert_eq!(c.holds(&writer), Ok((0, 1)));
+    assert_eq!(
+        c.transaction(table)
+            .unwrap()
+            .install_pair(Fd(-1), [&reader, &writer], false),
+        Err(Error::InvalidArgument)
+    );
+    let raw = writer.into_raw();
+    c.unpin(OfdPin::from_raw(raw)).unwrap();
+    let writer = OfdPin::from_raw(raw);
+    assert_eq!(
+        b_prep_install_pair(&c, table, [&reader, &writer]),
+        Err(Error::StalePin)
+    );
+    // Dropping a transaction without committing releases the table lock and
+    // owns no scratch slots, description references or backing extents.
+    drop(c.transaction(table).unwrap());
+    c.setfd(table, Fd(0), true).unwrap();
+    let retired = c.destroy_table(table, |_| {}).unwrap();
+    assert!(matches!(c.transaction(table), Err(Error::StaleTable)));
+    let replacement = c.create_table(8, &mut { retired }).unwrap();
+    assert_ne!(replacement, table);
+    c.unpin(reader).unwrap();
+    c.destroy_table(replacement, |_| {}).unwrap();
+}
+
+#[test]
+fn b_prep_pair_population_has_logarithmic_search_and_balanced_holds() {
+    for population in [1, 8, 64] {
+        let c = authority::<1, 128>();
+        let table = c
+            .create_table(2 * population, &mut storage(2 * population))
+            .unwrap();
+        let levels = c.lock(table).unwrap().1.storage.levels;
+        let mut prepared = Vec::new();
+        for pair in 0..population {
+            let reader = c
+                .create_pinned(Description::new(
+                    BackingToken(2 * pair as u64),
+                    AccessMode::ReadOnly,
+                    StatusFlags::default(),
+                ))
+                .unwrap();
+            let writer = c
+                .create_pinned(Description::new(
+                    BackingToken(2 * pair as u64 + 1),
+                    AccessMode::WriteOnly,
+                    StatusFlags::default(),
+                ))
+                .unwrap();
+            let before = BITMAP_READS.with(|n| n.get());
+            assert_eq!(
+                b_prep_install_pair(&c, table, [&reader, &writer]),
+                Ok([Fd(2 * pair as i32), Fd(2 * pair as i32 + 1)])
+            );
+            let reads = BITMAP_READS.with(|n| n.get()) - before;
+            assert!(
+                reads <= 2 * (2 * levels - 1),
+                "pair search: {reads} at {population}"
+            );
+            assert_eq!(c.holds(&reader), Ok((1, 1)));
+            assert_eq!(c.holds(&writer), Ok((1, 1)));
+            prepared.push((reader, writer));
+        }
+        c.destroy_table(table, |_| panic!("preparation pins still retain endpoints"))
+            .unwrap();
+        let mut releases = 0;
+        for (reader, writer) in prepared {
+            releases += usize::from(c.unpin(reader).unwrap().is_some());
+            releases += usize::from(c.unpin(writer).unwrap().is_some());
+        }
+        assert_eq!(releases, 2 * population);
+    }
 }

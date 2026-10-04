@@ -116,6 +116,29 @@ The director owns those later gates. No existing runtime behavior changes.
 
 ## Venue responsibilities
 
+### Landing B preparation: atomic pair transaction
+
+`Authority::transaction(TableId)` returns a typed `SlotTableTransaction`.
+`install_pair(min, [&reader_pin, &writer_pin], cloexec)` finds the two lowest
+free slots and retains both descriptions before publishing either. Capacity,
+stale-pin and second-retain refusals leave slots, bitmap and holds unchanged.
+The existing table sequence count hides the intermediate store from lock-free
+`get`/`pin`; this adds no shared-record layout. Pins remain caller-owned.
+Drop the transaction before copy, I/O, service, waiter enrollment or backing
+release; no lock may span those operations. Pair copyout admission/rollback
+belongs to the future owner, not this allocation-free table operation.
+
+VM-free `b_prep_*` bindings extend `kernel.el1.ipc-fd-authority` at 1/8/64
+populated descriptors/pairs. Each pair searches at most
+`2 * (2 * bitmap_levels - 1)` words, allocates no heap objects, and releases
+exactly two descriptions after final slot and preparation-pin release.
+The two-refusal witnesses failed behaviorally on main `ad3e127a9` using two
+single-slot installs (reader left published); the green binding uses one
+transaction. Existing fork/CLONE_FILES/exec/pin algorithms are reused, with
+1/8/64 checks of successor-only CLOEXEC and generation rejection after reuse.
+
+### Existing venue responsibilities
+
 - Host and EL1 bind the SAME core in shared memory; never construct a second
   authority for the same descriptor namespace, and never copy records.
   Constructor identity allocation belongs to one initialization venue.
