@@ -35,6 +35,50 @@ fn thread_plan() -> ClonePlan {
 }
 
 #[test]
+fn thread_publication_receipt_names_creator_and_child_once() {
+    let (_, contexts) = pair();
+    let kernel = contexts[0].kernel().clone();
+    let prepared = kernel
+        .reserve_thread_clone(&contexts[0], thread_plan(), None)
+        .unwrap()
+        .prepare(ThreadId::from_guest_supplied_tid(3))
+        .unwrap();
+    let child = prepared.prepared_execution_identity().1;
+    let prepared = Mutex::new(Some(prepared));
+    let receipt = Schedule::explore(7)
+        .run_operations(
+            &kernel,
+            "thread-publication-authority",
+            1,
+            &contexts,
+            |index, _| {
+                if index == 0 {
+                    let prepared = prepared.lock().take().unwrap();
+                    let published = prepared.commit().unwrap();
+                    let context = published.into_context().unwrap();
+                    assert_eq!(context.thread().key(), child);
+                }
+            },
+        )
+        .unwrap();
+    let publications: Vec<_> = receipt
+        .decisions
+        .iter()
+        .filter(|d| d.point == Point::Kernel(KPoint::ThreadPublished))
+        .collect();
+    assert_eq!(publications.len(), 1);
+    assert_eq!(publications[0].actor, actor(&contexts[0]));
+    let Some(carrick_kernel::kernel::schedule::AuthorityStamp::Thread(stamp)) =
+        &publications[0].authority
+    else {
+        panic!("publication must name the child's authority")
+    };
+    assert_eq!(stamp.thread_id, child.tid.raw());
+    assert_eq!(stamp.thread_serial, child.serial.raw());
+    kernel.validate_invariants().unwrap();
+}
+
+#[test]
 fn admitted_credential_wait_releases_permit_without_redispatch() {
     for scale in [1, 8, 32] {
         for seed in 0..16 {
@@ -438,7 +482,8 @@ fn setresuid_during_sibling_birth_completes_once() {
                             page.unclaim(claimed.lock().take().unwrap()).unwrap();
                             // One real ledger birth; its inherited resources came
                             // from the unaffected sibling, not the setid caller.
-                            assert_eq!(pending.lock().take().unwrap().record_birth(), born_key);
+                            let pending = pending.lock().take().unwrap();
+                            assert_eq!(pending.record_birth(), born_key);
                             lane.point(KPoint::AdmissionReleased);
                         }
                     },
