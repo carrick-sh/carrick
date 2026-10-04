@@ -17,6 +17,7 @@ rm -f /home/runner/.ssh/authorized_keys
   export SCCACHE_DIR=/home/runner/.cache/sccache
   export SCCACHE_CACHE_SIZE=2G
   export RUSTC_WRAPPER=/usr/local/bin/sccache
+  export ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/carrick-ci-admit-job
   set +e
   ./run.sh --jitconfig "$jit"
   result=$?

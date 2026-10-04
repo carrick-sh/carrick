@@ -14,6 +14,7 @@ struct Token {
 }
 struct Pve {
     token: Token,
+    deadline: std::cell::Cell<Option<Instant>>,
 }
 impl Pve {
     fn local() -> Result<Self, ScalerError> {
@@ -36,9 +37,13 @@ impl Pve {
                 "unexpected scoped token identity/encoding",
             ));
         }
-        Ok(Self { token })
+        Ok(Self {
+            token,
+            deadline: std::cell::Cell::new(None),
+        })
     }
     fn request(&self, method: &str, path: &str, data: Option<Value>) -> Result<Value, ScalerError> {
+        let limit = remaining(self.deadline.get(), Duration::from_secs(45))?;
         let header = format!(
             "Authorization: PVEAPIToken={}={}",
             self.token.id, self.token.secret
@@ -67,7 +72,7 @@ impl Pve {
                 &format!("https://willow.atxconsulting.com:8006/api2/json{path}"),
             ]),
             config.as_bytes(),
-            Duration::from_secs(45),
+            limit,
         )?;
         let response: Value = serde_json::from_slice(&bytes)?;
         response
@@ -121,21 +126,31 @@ impl Pve {
         Ok(vm)
     }
     fn task_done(&self, task: &str) -> Result<bool, ScalerError> {
+        match self.task_state(task)? {
+            TaskState::Succeeded => Ok(true),
+            TaskState::Failed => Err(ScalerError::External("PVE task failed")),
+            _ => Ok(false),
+        }
+    }
+    fn task_state(&self, task: &str) -> Result<TaskState, ScalerError> {
         if !task.starts_with("UPID:willow:") || task.contains('/') {
             return Err(ScalerError::Guard("task belongs to another node"));
         }
         let result = self.request("GET", &format!("/nodes/willow/tasks/{task}/status"), None)?;
         if result["status"] == "stopped" {
             if result["exitstatus"] != "OK" {
-                return Err(ScalerError::External("PVE task failed"));
+                return Ok(TaskState::Failed);
             }
-            Ok(true)
+            Ok(TaskState::Succeeded)
         } else {
-            Ok(false)
+            Ok(TaskState::Running)
         }
     }
     fn wait_task(&self, task: &str) -> Result<(), ScalerError> {
-        let deadline = Instant::now() + Duration::from_secs(300);
+        let deadline = self
+            .deadline
+            .get()
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(300));
         while Instant::now() < deadline {
             if self.task_done(task)? {
                 return Ok(());
@@ -201,6 +216,23 @@ impl Pve {
 }
 fn base(id: CloneId) -> String {
     format!("/nodes/willow/qemu/{}", id.get())
+}
+fn remaining(deadline: Option<Instant>, cap: Duration) -> Result<Duration, ScalerError> {
+    let remaining = deadline
+        .map(|d| d.saturating_duration_since(Instant::now()))
+        .unwrap_or(cap)
+        .min(cap);
+    if remaining.is_zero() {
+        Err(ScalerError::External("shared readiness deadline"))
+    } else {
+        Ok(remaining)
+    }
+}
+struct ApiDeadline<'a>(&'a std::cell::Cell<Option<Instant>>);
+impl Drop for ApiDeadline<'_> {
+    fn drop(&mut self) {
+        self.0.set(None);
+    }
 }
 fn string(value: &Value, field: &str) -> Result<String, ScalerError> {
     value[field]
@@ -303,6 +335,15 @@ impl Github {
         )
     }
     fn assignment(&self, row: &mut Record) -> Result<Assignment, ScalerError> {
+        if row.runner.is_none() {
+            let data = self.request(
+                "GET",
+                &format!("repos/{REPOSITORY}/actions/runners?per_page=100"),
+                None,
+                true,
+            )?;
+            row.runner = recover_registration(row, &pages(&data, "runners")?)?;
+        }
         let Some(runner) = row.runner else {
             return Ok(Assignment::Unassigned);
         };
@@ -321,19 +362,10 @@ impl Github {
                 Assignment::Busy
             });
         }
-        for run in self.runs("in_progress")? {
-            for job in self.jobs(&run)? {
-                if job["runner_id"].as_u64() == Some(runner.0) {
-                    row.assigned = Some(JobId(
-                        job["id"]
-                            .as_u64()
-                            .ok_or(ScalerError::External("assigned id"))?,
-                    ));
-                    return Ok(if job["status"] == "completed" {
-                        Assignment::Completed
-                    } else {
-                        Assignment::Busy
-                    });
+        for status in ["in_progress", "completed"] {
+            for run in self.runs(status)? {
+                if let Some(assignment) = observed_assignment(row, &self.jobs(&run)?) {
+                    return Ok(assignment);
                 }
             }
         }
@@ -356,17 +388,25 @@ impl Github {
         // polling. Never infer unassigned from absence and destroy live work.
         Ok(Assignment::Unknown)
     }
-    fn remove_runner(&self, id: RunnerId) -> Result<(), ScalerError> {
+    fn remove_runner(&self, row: &Record) -> Result<(), ScalerError> {
+        let Some(id) = row.runner else {
+            return Ok(());
+        };
         let runners = self.request(
             "GET",
             &format!("repos/{REPOSITORY}/actions/runners?per_page=100"),
             None,
             true,
         )?;
-        if pages(&runners, "runners")?
-            .iter()
-            .any(|r| r["id"].as_u64() == Some(id.0))
+        if let Some(runner) = pages(&runners, "runners")?
+            .into_iter()
+            .find(|r| r["id"].as_u64() == Some(id.0))
         {
+            if runner["name"] != row.name || runner["busy"] != false {
+                return Err(ScalerError::Guard(
+                    "runner identity changed or still busy; defer removal",
+                ));
+            }
             self.request(
                 "DELETE",
                 &format!("repos/{REPOSITORY}/actions/runners/{}", id.0),
@@ -384,6 +424,34 @@ fn approved_run(run: &Value, sha: &str) -> bool {
         && run["path"] == ".github/workflows/willow-pilot.yml"
         && run["repository"]["full_name"] == REPOSITORY
 }
+
+fn recover_registration(row: &Record, runners: &[Value]) -> Result<Option<RunnerId>, ScalerError> {
+    let matches: Vec<&Value> = runners.iter().filter(|r| r["name"] == row.name).collect();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [runner] => Ok(Some(RunnerId(
+            runner["id"]
+                .as_u64()
+                .ok_or(ScalerError::External("recovered runner ID"))?,
+        ))),
+        _ => Err(ScalerError::Guard(
+            "duplicate registration identity; quarantine",
+        )),
+    }
+}
+fn observed_assignment(row: &mut Record, jobs: &[Value]) -> Option<Assignment> {
+    let runner = row.runner?;
+    let job = jobs
+        .iter()
+        .find(|job| job["runner_id"].as_u64() == Some(runner.0))?;
+    row.assigned = Some(JobId(job["id"].as_u64()?));
+    Some(if job["status"] == "completed" {
+        Assignment::Completed
+    } else {
+        Assignment::Busy
+    })
+}
+
 fn pages(data: &Value, field: &str) -> Result<Vec<Value>, ScalerError> {
     let mut result = Vec::new();
     for page in data
@@ -484,7 +552,13 @@ fn key_paths(dir: &Path, row: &Record) -> (PathBuf, PathBuf) {
         dir.join(format!("{}.hosts", row.name)),
     )
 }
-fn ssh(dir: &Path, row: &Record, input: &[u8], command: &str) -> Result<Vec<u8>, ScalerError> {
+fn ssh(
+    dir: &Path,
+    row: &Record,
+    input: &[u8],
+    command: &str,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>, ScalerError> {
     let (key, hosts) = key_paths(dir, row);
     let ip = row
         .ip
@@ -496,6 +570,12 @@ fn ssh(dir: &Path, row: &Record, input: &[u8], command: &str) -> Result<Vec<u8>,
             "BatchMode=yes",
             "-o",
             "IdentitiesOnly=yes",
+            "-o",
+            "ForwardAgent=no",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "SendEnv=-*",
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
@@ -512,7 +592,7 @@ fn ssh(dir: &Path, row: &Record, input: &[u8], command: &str) -> Result<Vec<u8>,
             command,
         ]),
         input,
-        Duration::from_secs(45),
+        remaining(deadline, Duration::from_secs(45))?,
     )
 }
 fn update(ledger: &mut Ledger, row: &Record, path: &Path) -> Result<(), ScalerError> {
@@ -532,8 +612,9 @@ fn provision(
     row: &mut Record,
     dir: &Path,
     path: &Path,
-    group: u64,
+    approval: (u64, &str),
 ) -> Result<(), ScalerError> {
+    let (group, sha) = approval;
     let (key, hosts) = key_paths(dir, row);
     execute(
         Command::new("ssh-keygen").args([
@@ -577,6 +658,10 @@ fn provision(
     if !resource_admission()? {
         return Err(ScalerError::Guard("host admission denied before boot"));
     }
+    pve.guard(row)?;
+    let deadline = Instant::now() + Duration::from_secs(300);
+    pve.deadline.set(Some(deadline));
+    let shared_deadline = ApiDeadline(&pve.deadline);
     row.state = State::Booting;
     row.task = Some(task_id(pve.request(
         "POST",
@@ -589,7 +674,6 @@ fn provision(
             .as_deref()
             .ok_or(ScalerError::Guard("start task missing"))?,
     )?;
-    let deadline = Instant::now() + Duration::from_secs(300);
     let mut ready = false;
     while Instant::now() < deadline {
         let qualification = pve.agent(row, &["/usr/bin/timeout", "20", "/bin/sh", "-c",
@@ -604,18 +688,28 @@ fn provision(
             }
             std::fs::write(&hosts, format!("{ip} {}\n", key.trim()))?;
             std::fs::set_permissions(&hosts, std::fs::Permissions::from_mode(0o600))?;
-            if ssh(dir, row, &[], "test -x /usr/local/bin/carrick-ci-run-once").is_ok() {
+            if ssh(
+                dir,
+                row,
+                &[],
+                "test -x /usr/local/bin/carrick-ci-run-once",
+                Some(deadline),
+            )
+            .is_ok()
+            {
                 ready = true;
                 break;
             }
         }
-        std::thread::sleep(Duration::from_secs(5));
+        std::thread::sleep(remaining(Some(deadline), Duration::from_secs(5))?);
     }
     if !ready {
         return Err(ScalerError::External(
             "guest five-minute readiness deadline",
         ));
     }
+    drop(shared_deadline);
+    pve.agent(row, &["/bin/sh", "-c", &format!("install -d -m 755 /etc/carrick-ci; printf '%s\\n' {sha} > /etc/carrick-ci/approved-sha; chmod 644 /etc/carrick-ci/approved-sha")])?;
     println!("vm={} ready; non-root KVM API 12 verified", row.vm.get());
     // Write registration intent before asking GitHub. No JIT material in ledger.
     row.state = State::Registered;
@@ -637,7 +731,7 @@ fn provision(
     let jit = string(&config, "encoded_jit_config")?;
     let mut input = jit.into_bytes();
     input.push(b'\n');
-    ssh(dir, row, &input, "/usr/local/bin/carrick-ci-run-once")?;
+    ssh(dir, row, &input, "/usr/local/bin/carrick-ci-run-once", None)?;
     row.state = State::Running;
     update(ledger, row, path)?;
     println!(
@@ -655,13 +749,34 @@ fn cleanup(
     row: &mut Record,
     dir: &Path,
     path: &Path,
-) -> Result<(), ScalerError> {
+    assignment: Assignment,
+) -> Result<bool, ScalerError> {
     pve.guard(row)?;
+    if assignment == Assignment::Unassigned && row.runner.is_some() {
+        // Atomically deny further job starts, using the same guest flock as
+        // the admission hook. A passed hook leaves a durable busy marker.
+        let quiet = pve.agent(
+            row,
+            &[
+                "/usr/bin/timeout",
+                "15",
+                "/usr/local/bin/carrick-xtask",
+                "ci-scaler",
+                "quiesce",
+            ],
+        )?;
+        if quiet.trim() != "Unassigned" {
+            return Ok(false);
+        }
+        let latest = gh.assignment(row)?;
+        update(ledger, row, path)?;
+        if matches!(latest, Assignment::Busy | Assignment::Unknown) {
+            return Ok(false);
+        }
+    }
     row.state = State::Reaping;
     update(ledger, row, path)?;
-    if let Some(runner) = row.runner {
-        gh.remove_runner(runner)?;
-    }
+    gh.remove_runner(row)?;
     // Export guest logs via the authenticated agent: bootstrap consumed its SSH
     // authorization, and no credential is recovered by this path.
     if let Ok(log) = pve.agent(
@@ -712,7 +827,62 @@ fn cleanup(
         "vm={} destroyed; pool inventory confirms absence",
         row.vm.get()
     );
-    Ok(())
+    Ok(true)
+}
+
+fn reconcile_one(
+    pve: &Pve,
+    gh: &Github,
+    ledger: &mut Ledger,
+    dir: &Path,
+    path: &Path,
+) -> Result<bool, ScalerError> {
+    let Some(mut row) = ledger
+        .rows
+        .iter()
+        .find(|r| r.state != State::Destroyed)
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    let present = pve.inventory()?.iter().any(|v| v.id == row.vm.get());
+    let task = match &row.task {
+        Some(task) => pve.task_state(task)?,
+        None => TaskState::Absent,
+    };
+    match recovery_decision(&row, present, task, now()?) {
+        Recovery::Wait => return Ok(false),
+        Recovery::Quarantine => {
+            eprintln!(
+                "vm={} ambiguous/missing state; admission frozen, owner inspection required",
+                row.vm.get()
+            );
+            return Ok(false);
+        }
+        Recovery::FinishAbsent => {
+            if task == TaskState::Failed {
+                row.failure = Some("recorded PVE task failed; VM absent".into());
+            }
+            // Recover a registration whose POST succeeded before its ID save.
+            let _ = gh.assignment(&mut row)?;
+            gh.remove_runner(&row)?;
+            row.state = State::Destroyed;
+            update(ledger, &row, path)?;
+            return Ok(true);
+        }
+        Recovery::Inspect => {}
+    }
+    pve.guard(&row)?;
+    if task == TaskState::Failed {
+        row.failure = Some("recorded PVE task failed; owned VM retained for reap".into());
+        row.task = None;
+    }
+    let assignment = gh.assignment(&mut row)?;
+    update(ledger, &row, path)?;
+    if reap_decision(&row, now()?, assignment) == Reap::Destroy {
+        return cleanup(pve, gh, ledger, &mut row, dir, path, assignment);
+    }
+    Ok(false)
 }
 
 pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<(), ScalerError> {
@@ -774,40 +944,19 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
     let mut reconcile = Instant::now() - Duration::from_secs(60);
     loop {
         if reconcile.elapsed() >= Duration::from_secs(60) {
-            if let Some(mut row) = ledger
-                .rows
-                .iter()
-                .find(|r| r.state != State::Destroyed)
-                .cloned()
-            {
-                // Restart: wait recorded asynchronous tasks, never clone again.
-                if let Some(task) = &row.task {
-                    pve.wait_task(task)?;
+            match reconcile_one(&pve, &gh, &mut ledger, dir, &path) {
+                Ok(true) if one_job => {
+                    return if ledger.rows.last().is_some_and(|r| r.failure.is_some()) {
+                        Err(ScalerError::External(
+                            "pilot lifecycle failed; cleanup completed",
+                        ))
+                    } else {
+                        Ok(())
+                    };
                 }
-                if row.state == State::Reaping
-                    && !pve.inventory()?.iter().any(|v| v.id == row.vm.get())
-                {
-                    row.state = State::Destroyed;
-                    update(&mut ledger, &row, &path)?;
-                    if one_job {
-                        return Ok(());
-                    }
-                } else {
-                    pve.guard(&row)?;
-                    let assignment = gh.assignment(&mut row)?;
-                    update(&mut ledger, &row, &path)?;
-                    if reap_decision(&row, now()?, assignment) == Reap::Destroy {
-                        cleanup(&pve, &gh, &mut ledger, &mut row, dir, &path)?;
-                        if one_job {
-                            return if row.failure.is_some() {
-                                Err(ScalerError::External(
-                                    "pilot provision failed; clone reaped",
-                                ))
-                            } else {
-                                Ok(())
-                            };
-                        }
-                    }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("reconcile failed: {error}; admission frozen for active ledger")
                 }
             }
             reconcile = Instant::now();
@@ -824,7 +973,9 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
                 let mut row = ledger.reserve(job, &inventory, now()?)?;
                 ledger.save(&path)?; // Must reach durable storage before clone.
                 println!("reserved vm={} job={}", row.vm.get(), job.job.0);
-                if let Err(error) = provision(&pve, &gh, &mut ledger, &mut row, dir, &path, group) {
+                if let Err(error) =
+                    provision(&pve, &gh, &mut ledger, &mut row, dir, &path, (group, sha))
+                {
                     row.failure = Some(error.to_string());
                     update(&mut ledger, &row, &path)?;
                     eprintln!("provision failed: {error}; preserving ledger for reconciliation");
@@ -833,5 +984,72 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
             }
         }
         std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    #[test]
+    fn shared_readiness_deadline_bounds_a_nested_external_command() {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let result = execute(
+            Command::new("sh").args(["-c", "sleep 2"]),
+            &[],
+            remaining(Some(deadline), Duration::from_secs(3)).unwrap(),
+        );
+        assert!(
+            result.is_err(),
+            "nested command ran beyond the shared deadline"
+        );
+        assert!(
+            remaining(
+                Some(Instant::now() - Duration::from_millis(1)),
+                Duration::from_secs(45)
+            )
+            .is_err()
+        );
+    }
+    fn row() -> Record {
+        Ledger::default()
+            .reserve(
+                JobKey {
+                    run: RunId(1),
+                    attempt: 1,
+                    job: JobId(2),
+                },
+                &[],
+                0,
+            )
+            .unwrap()
+    }
+    #[test]
+    fn jit_post_crash_recovers_only_one_exact_registration_identity() {
+        let row = row();
+        let registration = json!({"id":99,"name":row.name});
+        assert_eq!(
+            recover_registration(&row, std::slice::from_ref(&registration)).unwrap(),
+            Some(RunnerId(99))
+        );
+        assert!(recover_registration(&row, &[registration.clone(), registration]).is_err());
+        assert_eq!(
+            recover_registration(&row, &[json!({"id":99,"name":"someone-else"})]).unwrap(),
+            None
+        );
+    }
+    #[test]
+    fn completed_alternate_assignment_is_recovered_by_runner_id() {
+        let mut row = row();
+        row.runner = Some(RunnerId(99));
+        let jobs = [
+            json!({"id":500,"runner_id":98,"status":"completed"}),
+            json!({"id":501,"runner_id":99,"status":"completed"}),
+        ];
+        assert_eq!(
+            observed_assignment(&mut row, &jobs),
+            Some(Assignment::Completed)
+        );
+        assert_eq!(row.assigned, Some(JobId(501)));
     }
 }

@@ -11,6 +11,13 @@ xtask=$(realpath "$3")
 [[ $commit =~ ^[0-9a-f]{40}$ ]] || exit 1
 [[ -f $inputs/rust-toolchain.toml && -f $inputs/Cargo.lock ]] || exit 1
 for tool in qm pvesh curl jq genisoimage sha512sum; do command -v "$tool" >/dev/null; done
+pve_call() {
+  # The credential exists only in this on-host pipe, never argv or output.
+  jq -r '"header = \"Authorization: PVEAPIToken=" + .["full-tokenid"] + "=" + .value + "\""' /root/carrick-ci-token.json |
+    curl --fail --silent --show-error --max-time 40 --config - \
+      --resolve willow.atxconsulting.com:8006:127.0.0.1 --request "$1" \
+      "https://willow.atxconsulting.com:8006/api2/json$2"
+}
 ! qm status 300 >/dev/null 2>&1 || { echo 'VM 300 already exists; refusing replacement' >&2; exit 1; }
 pvesh get /pools/carrick-ci --output-format json | jq -e '.poolid == "carrick-ci"' >/dev/null
 [[ $(cat /sys/module/kvm_amd/parameters/nested) == 1 ]] || { echo 'Nested SVM is disabled; director action required' >&2; exit 1; }
@@ -103,11 +110,24 @@ After=cloud-final.service
 Requires=cloud-final.service
 [Service]
 Type=oneshot
-ExecStart=/bin/rm -f /etc/sudoers.d/90-cloud-init-users
+ExecStart=/usr/local/bin/carrick-ci-ready
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 READY
+cat > /usr/local/bin/carrick-ci-ready <<'GUEST_READY'
+#!/bin/bash
+set -euo pipefail
+rm -f /etc/sudoers.d/90-cloud-init-users
+install -d -m 755 /run/carrick-ci
+install -m 660 -o root -g runner /dev/null /run/carrick-ci/admission.lock
+GUEST_READY
+chmod 755 /usr/local/bin/carrick-ci-ready
+cat > /usr/local/bin/carrick-ci-admit-job <<'ADMIT'
+#!/bin/sh
+exec /usr/local/bin/carrick-xtask ci-scaler admit-job
+ADMIT
+chmod 755 /usr/local/bin/carrick-ci-admit-job
 systemctl enable carrick-ci-ready.service
 runuser -u runner -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
 mkdir -p /var/lib/carrick-ci
@@ -134,7 +154,7 @@ busy=$(awk -v a="${before[*]}" -v b="${after[*]}" -v n="$(nproc)" -v load="$(cut
 }')
 awk -v projected="$busy" 'BEGIN { print "template projected CPU=" projected; exit !(projected<0.85) }'
 awk '/MemAvailable:/ {exit !($2 >= 10485760)}' /proc/meminfo
-qm start 300
+pve_call POST /nodes/willow/qemu/300/status/start
 # Provisioning is bounded; the clone readiness deadline is separately five minutes.
 qualified=false
 for ((attempt=0; attempt<180; attempt++)); do
@@ -145,7 +165,8 @@ done
 qm guest exec 300 -- /bin/cat /var/lib/carrick-ci/qualification.json | jq -r '."out-data"' > qualification.json
 qm guest exec 300 -- /bin/cat /var/lib/carrick-ci/packages.txt | jq -r '."out-data"' > packages.txt
 # Clean clone identities/SSH credentials and shut down from inside the template.
-qm guest exec 300 -- /bin/bash -c 'cloud-init clean --logs --machine-id; rm -f /etc/ssh/ssh_host_* /home/runner/.ssh/authorized_keys; rm -rf /var/lib/cloud/instances /home/runner/.cache; sync; shutdown -h +0' || true
+qm guest exec 300 -- /bin/bash -c 'cloud-init clean --logs --machine-id; rm -f /etc/ssh/ssh_host_* /home/runner/.ssh/authorized_keys; rm -rf /var/lib/cloud/instances /home/runner/.cache; sync'
+pve_call POST /nodes/willow/qemu/300/status/stop
 for ((attempt=0; attempt<60; attempt++)); do
   [[ $(qm status 300) == 'status: stopped' ]] && break
   sleep 2
@@ -158,9 +179,10 @@ jq -n --arg commit "$commit" --arg script_hash "$(sha256sum "$inputs/scripts/ci/
   --arg sccache_sha256 "$sccache_sha256" --arg rustup_sha256 "$rustup_sha256" --arg toolchain_hash "$(sha256sum seed/rust-toolchain.toml | cut -d' ' -f1)" \
   --arg lock_hash "$(sha256sum seed/Cargo.lock | cut -d' ' -f1)" --arg xtask_hash "$(sha256sum seed/carrick-xtask | cut -d' ' -f1)" \
   --arg packages_hash "$(sha256sum packages.txt | cut -d' ' -f1)" --slurpfile qualification qualification.json \
+  --arg bootstrap_hash "$(sha256sum seed/runner-once.sh | cut -d' ' -f1)" \
   '{vmid:300,pool:"carrick-ci",cpu:"host",vcpus:2,memory_mib:4096,disk_gib:64,storage:"local-lvm",bridge:"vmbr0",script_commit:$commit,
     script_sha256:$script_hash,image_url:$image_url,image_sha512:$image_sha512,runner_version:$runner_version,runner_sha256:$runner_sha256,
     sccache_sha256:$sccache_sha256,rustup_sha256:$rustup_sha256,toolchain_sha256:$toolchain_hash,cargo_lock_sha256:$lock_hash,
-    xtask_sha256:$xtask_hash,packages_sha256:$packages_hash,qualification:$qualification[0]}' > manifest.json
+    xtask_sha256:$xtask_hash,bootstrap_sha256:$bootstrap_hash,packages_sha256:$packages_hash,qualification:$qualification[0]}' > manifest.json
 qm config 300
 cat manifest.json
