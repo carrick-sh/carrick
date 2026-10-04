@@ -38,8 +38,7 @@ call counts or wrong checksums fail; no skips or retry-to-green.
 | CPL0 synthetic identity | Benchmark-only LSTAR stub returns 123 without an exit for each getpid; one final exit_group doorbell | 24.2 | 21.1–27.5 |
 
 The native control uses the cataloged libc identity operation rather than a raw
-host-syscall escape. `objdump -d --disassemble=__getpid
-/lib/x86_64-linux-gnu/libc.so.6` shows `mov $0x27,%eax; syscall; ret`;
+host-syscall escape. `objdump -d --disassemble=__getpid /lib/x86_64-linux-gnu/libc.so.6` shows `mov $0x27,%eax; syscall; ret`;
 `objdump -T` confirms `getpid` aliases it on this installed glibc.
 
 The host arm is about 72x native getpid on this host. The exit control
