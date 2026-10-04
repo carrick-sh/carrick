@@ -7204,7 +7204,19 @@ mod tests {
             .and_then(|tail| tail.split("\n    fn ").next())
             .expect("reclaiming retirement");
         assert!(retire.contains("unmap_aliased_op") && retire.contains("ReclaimCapacity"));
-        for path in ["fn protect_range", "fn mark_bus_fault"] {
+        for path in ["fn protect_range", "fn protect_owner_reserved_range"] {
+            let body = production
+                .split(path)
+                .nth(1)
+                .and_then(|tail| tail.split("\n    fn ").next())
+                .unwrap_or_else(|| panic!("production writer {path}"));
+            assert!(body.contains("self.publish_protection("), "{path}");
+            assert!(
+                !body.contains("pt_edit"),
+                "{path} must not use the host-only funnel"
+            );
+        }
+        for path in ["fn publish_protection", "fn mark_bus_fault"] {
             let body = production
                 .split(path)
                 .nth(1)
