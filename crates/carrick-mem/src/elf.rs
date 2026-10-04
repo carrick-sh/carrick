@@ -391,6 +391,15 @@ pub fn plan_elf_load_bytes_for(bytes: &[u8], machine: u16) -> Result<LoadPlan, E
     if elf.header.e_machine != machine {
         return Err(ElfInspectError::UnsupportedMachine(elf.header.e_machine));
     }
+    // elf(5): relocatable objects and core files are not executable images.
+    // Keep inspection available for these objects, but never prepare a load.
+    if !matches!(elf.header.e_type, ET_EXEC | ET_DYN) {
+        return Err(goblin::error::Error::Malformed(format!(
+            "unsupported executable ELF type: {}",
+            elf.header.e_type
+        ))
+        .into());
+    }
     Ok(load_plan_from_elf(&elf))
 }
 
@@ -399,7 +408,33 @@ fn parse_elf_bytes(bytes: &[u8]) -> Result<Elf<'_>, ElfInspectError> {
         return Err(ElfInspectError::NotElf);
     }
 
-    Ok(Elf::parse(bytes)?)
+    let elf = Elf::parse(bytes)?;
+    for header in &elf.program_headers {
+        // elf(5) / System V ABI: file bytes must fit in the loaded segment.
+        if header.p_type == PT_LOAD && header.p_filesz > header.p_memsz {
+            return Err(goblin::error::Error::Malformed(
+                "PT_LOAD file size exceeds memory size".into(),
+            )
+            .into());
+        }
+        if header.p_type == goblin::elf::program_header::PT_INTERP {
+            // Goblin decodes p_filesz - 1 bytes without checking the byte it
+            // drops. Authenticate that terminator inside the declared extent
+            // before publishing a pathname for inspection or load planning.
+            let path = usize::try_from(header.p_offset)
+                .ok()
+                .zip(usize::try_from(header.p_filesz).ok())
+                .and_then(|(start, len)| start.checked_add(len).map(|end| (start, end)))
+                .and_then(|(start, end)| bytes.get(start..end));
+            if !path.is_some_and(|path| path.len() >= 2 && path.last() == Some(&0)) {
+                return Err(goblin::error::Error::Malformed(
+                    "PT_INTERP must contain a terminated pathname within its file extent".into(),
+                )
+                .into());
+            }
+        }
+    }
+    Ok(elf)
 }
 
 fn metadata_from_elf(elf: &Elf<'_>) -> ElfMetadata {

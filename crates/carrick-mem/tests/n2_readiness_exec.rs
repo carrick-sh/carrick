@@ -11,7 +11,7 @@
 
 #![allow(clippy::expect_used)]
 
-use carrick_mem::elf::plan_elf_load_bytes_for;
+use carrick_mem::elf::{ElfType, inspect_elf_bytes, plan_elf_load_bytes_for};
 use goblin::elf::{
     header::{EM_AARCH64, ET_EXEC, ET_REL},
     program_header::{PF_R, PF_X, PT_INTERP, PT_LOAD},
@@ -58,13 +58,18 @@ fn executable(interpreter: Option<&[u8]>) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "N2 red witness: row 11: relocatable ELF is accepted as an executable load plan"]
 fn relocatable_elf_cannot_prepare_an_exec_image() {
     let mut bytes = executable(None);
     let valid = plan_elf_load_bytes_for(&bytes, EM_AARCH64).expect("valid executable control");
     assert_eq!(valid.entry, ENTRY);
     assert_eq!(valid.segments.len(), 1);
     bytes[16..18].copy_from_slice(&ET_REL.to_le_bytes());
+    assert_eq!(
+        inspect_elf_bytes(&bytes)
+            .expect("relocatable inspection")
+            .e_type,
+        ElfType::Other(ET_REL)
+    );
 
     let result = plan_elf_load_bytes_for(&bytes, EM_AARCH64);
     assert!(
@@ -74,13 +79,13 @@ fn relocatable_elf_cannot_prepare_an_exec_image() {
 }
 
 #[test]
-#[ignore = "N2 red witness: row 11: PT_LOAD file size exceeds memory size in a successful plan"]
 fn oversized_load_file_cannot_prepare_an_exec_image() {
     let mut bytes = executable(None);
     let valid = plan_elf_load_bytes_for(&bytes, EM_AARCH64).expect("valid executable control");
     assert_eq!(valid.segments[0].file_size, 4);
     // Change only p_memsz. All four file bytes remain present in the fixture.
     bytes[PHOFF + 40..PHOFF + 48].copy_from_slice(&3_u64.to_le_bytes());
+    assert!(inspect_elf_bytes(&bytes).is_err());
 
     let result = plan_elf_load_bytes_for(&bytes, EM_AARCH64);
     assert!(
@@ -90,7 +95,6 @@ fn oversized_load_file_cannot_prepare_an_exec_image() {
 }
 
 #[test]
-#[ignore = "N2 red witness: row 11: unterminated PT_INTERP silently selects a truncated interpreter"]
 fn unterminated_interp_cannot_select_a_different_interpreter() {
     let mut bytes = executable(Some(b"/ld.so\0"));
     let valid = plan_elf_load_bytes_for(&bytes, EM_AARCH64).expect("valid interpreter control");
@@ -98,6 +102,7 @@ fn unterminated_interp_cannot_select_a_different_interpreter() {
     // Leave the NUL in the file, but outside the declared PT_INTERP extent.
     // A parser must not read the following byte to repair a malformed extent.
     bytes[PHOFF + 32..PHOFF + 40].copy_from_slice(&6_u64.to_le_bytes());
+    assert!(inspect_elf_bytes(&bytes).is_err());
 
     let result = plan_elf_load_bytes_for(&bytes, EM_AARCH64);
     assert!(

@@ -1,0 +1,6 @@
+{
+  "status": "pending-director-bless",
+  "source_sha256": "055501760e40d5af4f56330a2859b3475618782a3aea86ec161b3c627c7aed1d",
+  "authority": "Linux elf(5), execve(2); exact per-case oracle pending native arm64 director run",
+  "stdout": "fixture_source_sha256=055501760e40d5af4f56330a2859b3475618782a3aea86ec161b3c627c7aed1d\nvalid_errno=-1\nvalid_signal=0\nvalid_exit=0\net_rel_errno=8\net_rel_signal=0\net_rel_exit=0\nfilesz_gt_memsz_errno=8\nfilesz_gt_memsz_signal=0\nfilesz_gt_memsz_exit=0\nunterminated_interp_errno=8\nunterminated_interp_signal=0\nunterminated_interp_exit=0\n"
+}

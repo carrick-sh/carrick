@@ -1,0 +1,10 @@
+[package]
+name = "elf-exec-errno"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+libc = "0.2"
+
+[workspace]
