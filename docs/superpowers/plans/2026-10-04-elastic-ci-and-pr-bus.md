@@ -38,18 +38,11 @@ The owner's 2026-10-04 operational evidence explains the change:
 | Gate | Runner and boundary |
 | --- | --- |
 | fmt, clippy, doc, test, cross-check, BSD builds | GitHub-hosted Ubuntu and **`macos-15` pinned**: the `hv_gic` APIs require SDK 15. Hosted macOS cannot run Hypervisor.framework guests. Hosted BSD builds/cross-checks do not prove bhyve/NVMM runtime behavior. |
-| `linux-portable`, x86 KVM/CPL0 | Ephemeral willow Proxmox clones first, plus AWS Spot **`c8i.4xlarge` (16 vCPU/32 GiB)**, about **$0.30/h in us-west-2** in the owner's 2026-10-04 snapshot. C8i virtual instances support nested virtualization since February 2026, also reported by `describe-instance-types`; live Carrick qualification on the chosen AMI is **UNVERIFIED**. |
-| aarch64 Linux with KVM | The owner's biggest capacity gap. Proposed AWS Spot **`c7g.metal` (64 vCPU/128 GiB)** at about **$0.82/h**, or **`c6g.metal`** at about **$0.72/h** in the same dated snapshot. Graviton exposes KVM only on bare metal; hosted ARM semantics tests do not fill this gap. Availability and live ARM KVM/Carrick results are **UNVERIFIED**. |
+| `linux-portable`, x86 KVM/CPL0 | willow Proxmox clones (additional provider TBD) |
+| aarch64 Linux with KVM | provider TBD (owner's biggest gap) |
 | Signed HVF | **cloudmac self-hosted runner — OWNER APPROVED 2026-10-04.** JIT ephemeral registration; only `merge_group` and owner-triggered `workflow_dispatch`, never untrusted `pull_request` events. Workers stop using cloudmac directly for gates. |
 | Docker oracle | Dedicated director-controlled job/host, never sharing a host with Carrick runs. Native ARM Linux for the canonical ARM oracle; x86 results prove only x86. No Docker on cloudmac or VM 210. |
 | EC2 Mac fallback only | On-demand Dedicated Host, **24 h minimum**, no Spot. Obtain a current quote and approval before use; minute-scale elasticity does not apply. |
-
-Prices above are owner-supplied historical observations, **UNVERIFIED in this
-revision**, not launch quotes or guarantees of Spot capacity. Recheck region/AZ,
-price history and instance capabilities before provisioning. AWS documents
-[C8i nesting from 2026-02-16](https://aws.amazon.com/about-aws/whats-new/2026/02/amazon-ec2-nested-virtualization-on-virtual/),
-[current nested-virtualization support](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html)
-and [EC2 Mac restrictions](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-mac-instances.html).
 
 ## Prerequisites, in order
 
@@ -75,48 +68,21 @@ and [EC2 Mac restrictions](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/e
    ruleset requirements aligned (`host-linux-arm64`, `host-linux-x86-kvm`,
    `macos-host`, `signed`, `merge-queue`); signed checks are required at the merge
    group stage, not an impossible untrusted-PR prerequisite.
-4. Register runners: willow pilot first, then the AWS Spot fleet. Fleet activation
-   needs a spend cap, a standard Spot vCPU quota increase from the reported **32**
-   to about **128** (on-demand quota currently **16**), and a **NON-ROOT scoped IAM
-   role**. The account CLI currently uses root credentials; rotate or remove them
-   as part of credential remediation, and never give them to the fleet. These
-   account observations are owner-reported and **UNVERIFIED in this revision**.
+4. Register runners: willow pilot first.
 5. Enable PR-bus phase 2, then switch every worker brief to **push-and-react**.
    Update conflicting full-gate requirements in AGENTS.md, skills and hooks in
    that cutover PR. Do not describe workers as switched while briefs still demand
    local acceptance. Until required runner coverage is qualified, keep the queue
    paused where coverage is missing; do not treat missing checks as success.
 
-## AWS Spot fleet
+## Additional elastic capacity (provider TBD)
 
-Provision through reviewed **CloudFormation/CDK**, with separate x86 and arm64
-launch templates. Require IMDSv2, encrypted EBS and **no SSH**; use SSM Session
-Manager for authorized diagnosis. Prebake AMIs with KVM, Rust **1.96**, just,
-cargo-deny and semgrep, recording image/toolchain/package hashes. Enable nested
-virtualization explicitly for C8i. Job credentials cannot launch instances,
-register more runners or change IAM; the controller uses the scoped non-root role.
+AWS was evaluated on 2026-10-04 (c8i nested-virt spot, c7g.metal spot) and declined by the owner on cost. The cloud capacity provider will be chosen later.
 
-Reuse the willow demand/ledger contract below: approved workflow/event/SHA,
-complete label matching, one JIT registration per job, durable instance ownership,
-external cleanup and exported logs. Terminate idle instances and remove stale
-registrations. A Spot interruption invalidates that attempt: preserve its logs
-and **rerun the gate from scratch** on a fresh runner, because receipts bind one
-artifact. Infrastructure retries must not hide a conformance failure.
-
-The requested **AWS Budgets hard cap** needs automatic deny-launch/stop actions
-plus controller admission limits, bounded job lifetime and idle termination.
-Reserve worst-case job cost before launch, including storage/transfer and cleanup
-headroom. [AWS Budgets actions](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-controls.html)
-provide a backstop, but [billing notifications can lag](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html):
-Budgets alone cannot guarantee an instantaneous dollar ceiling. Enforce the
-owner-approved operating cap in the controller and report residual billing risk.
-
-Before a lane becomes required, record architecture, AMI, kernel/page size,
-non-root `/dev/kvm` open, KVM API 12, VM/vCPU execution and actual Carrick tests
-with zero skips. For x86 include CPL0; for ARM include live ARM trap/exec tests
-and `just kvm-smoke`. Device presence and `describe-instance-types` are capability
-signals, not runtime acceptance. Graviton metal Spot is the proposed ARM path;
-ARM boards, Asahi and cloudmac nested Linux experiments are no longer prerequisites.
+Any provider must meet these requirements: an x86_64 host exposing KVM to the
+guest (nested virtualization or bare metal) for `linux-portable` and CPL0; an
+aarch64 host with KVM for the ARM lanes; ephemeral JIT runners; idle termination;
+a hard spend cap; no SSH (or a managed equivalent); non-root scoped credentials.
 
 ## Willow runner pool
 
@@ -339,10 +305,9 @@ request; surrounding prose is never interpreted as commands. Example values:
 
 | Decision | Proposed choice / activation boundary |
 | --- | --- |
-| AWS spend, quotas and IAM | Set the operating spend cap and budget actions; request about 128 standard Spot vCPUs from the reported 32 (16 on-demand today); establish a non-root scoped role and rotate/remove existing root CLI credentials. No fleet launch under root. |
+| Elastic capacity provider | choose an elastic capacity provider for x86 KVM and aarch64 KVM (AWS declined on cost) |
 | Review identity | Agents share the owner's GitHub identity, which cannot provide an independent approving review of its own PR. Choose a distinct authorized reviewer identity or an explicit revised review policy before enabling the ruleset. Read-only agent reviews remain required director evidence. |
 | VM 210 sizing | Keep pilot sizing until the owner decides whether to drain/resize 210 to 24 GiB/6 vCPU/CPU limit 4. Expanded pool/storage/network ACLs require approval and recaptured host capacity. |
-| aarch64 KVM capacity | Choose **Graviton metal Spot**, concretely `c7g.metal` or `c6g.metal`, region/AZ and budget. Confirm capacity and live KVM before requiring the lane. Hosted ARM and willow cannot substitute for this proof. |
 
 ## Rollout evidence and rollback
 
