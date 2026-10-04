@@ -29,14 +29,9 @@ impl InterruptMask {
 
 /// Supervisor interrupt gate, no error code, no IST. Existing exception IDT
 /// and double-fault IST stay installed.
+#[cfg(not(target_os = "none"))]
 pub fn interrupt_gate(entry: u64) -> [u8; 16] {
-    let mut bytes = [0; 16];
-    bytes[0..2].copy_from_slice(&(entry as u16).to_le_bytes());
-    bytes[2..4].copy_from_slice(&8u16.to_le_bytes());
-    bytes[5] = 0x8e;
-    bytes[6..8].copy_from_slice(&((entry >> 16) as u16).to_le_bytes());
-    bytes[8..12].copy_from_slice(&((entry >> 32) as u32).to_le_bytes());
-    bytes
+    crate::fault::interrupt_gate_bytes(entry)
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
