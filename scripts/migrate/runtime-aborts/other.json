@@ -709,7 +709,7 @@
     },
     {
       "file": "crates/carrick-aarch64/src/engine.rs",
-      "function": "<Aarch64EngineCore<V> as GuestMemory>::prepare_write",
+      "function": "Aarch64EngineCore<V>::prepare_owner_write",
       "ordinal_in_function": 1,
       "fingerprint": "e8e944d6bf996a1d7e6e12ddcea3c953735b1df1f5d680ad5dc03ed444a7ba90",
       "verdict": "carrier_fault",
@@ -720,7 +720,7 @@
     },
     {
       "file": "crates/carrick-aarch64/src/engine.rs",
-      "function": "<Aarch64EngineCore<V> as GuestMemory>::prepare_write",
+      "function": "Aarch64EngineCore<V>::prepare_owner_write",
       "ordinal_in_function": 2,
       "fingerprint": "00be9614f5e5787ab96e6b7d15685c981a567aaa457acbf42c9604a612c812a2",
       "verdict": "carrier_fault",
@@ -731,7 +731,7 @@
     },
     {
       "file": "crates/carrick-aarch64/src/engine.rs",
-      "function": "<Aarch64EngineCore<V> as GuestMemory>::prepare_write",
+      "function": "Aarch64EngineCore<V>::prepare_owner_write",
       "ordinal_in_function": 3,
       "fingerprint": "43cb02d390bca204bba2e3e26af0d17eab8c2d4e294589bba86da9db15f00c75",
       "verdict": "carrier_fault",
@@ -1003,6 +1003,17 @@
       "verdict": "carrier_fault",
       "failure_domain": "aarch64::user_transfer",
       "rationale": "Service returned without exact completion receipt; dropping physical custody could invalidate the suspended editor."
+    },
+    {
+      "file": "crates/carrick-aarch64/src/user_transfer.rs",
+      "function": "supply",
+      "ordinal_in_function": 1,
+      "fingerprint": "2dd799f0332ac3375f173e653e98b34cefd378716c069ae1303285c5609e06ed",
+      "sink": "fatal",
+      "domain": "aarch64::user_transfer",
+      "verdict": "carrier_fault",
+      "failure_domain": "aarch64::user_transfer",
+      "rationale": "An owner grant has neither an exact settled receipt nor a successful withdrawal. Releasing physical custody would race a possibly published descriptor, so continuing is unsafe."
     }
   ]
 }
