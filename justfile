@@ -172,19 +172,10 @@ lint-domains-source:
     python3 scripts/migrate/check-dispatch-lock-authority.py --self-test
     python3 scripts/migrate/check-k1-burndown.py --self-test
     python3 scripts/migrate/check-serial-host-tests.py --self-test
-    # The two inventory-maintenance tools carry their own unittest files
-    # rather than a `--self-test` flag, and until now no gate executed
-    # them -- a test no gate runs is not a test. They belong here for the
-    # same reason as the self-tests above: both tools REWRITE the
-    # line-pinned inventories (a rename map, a rehome of pinned positions),
-    # so a silent break in either corrupts the very files
-    # `check-host-authority-transitions.py --check` then validates below.
-    # NAMED, not `unittest discover`: `scripts/tests/` also holds
-    # `test_host_authority_transitions.py`, which is red at this branch's
-    # base, and a discover run would turn that pre-existing red into a
-    # blocked gate for every unrelated change.
-    python3 -m unittest scripts/migrate/tests/test_reconcile_rename.py scripts/tests/test_rehome_line_pinned_inventories.py
-    python3 -m unittest scripts.tests.test_host_authority_transitions.SnapshotExtractionTest
+    # Inventory rewriters and the compiler-capture checker run their complete
+    # fixture suites here, before their production checks. Keep the list named
+    # so adding unrelated script tests does not silently change this gate.
+    python3 -m unittest scripts/migrate/tests/test_reconcile_rename.py scripts/tests/test_rehome_line_pinned_inventories.py scripts/tests/test_host_authority_transitions.py
     python3 -m unittest scripts/tests/test_conformance_contract_policy.py
     cargo run -p carrick-conformance-contract --bin check-contracts -- --root .
     cargo metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
