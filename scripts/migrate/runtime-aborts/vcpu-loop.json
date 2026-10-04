@@ -370,7 +370,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
       "ordinal_in_function": 1,
-      "fingerprint": "23ad48ee2d900cee8af3341c7082bb9a6a367569290fd557a15b18f38298c005",
+      "fingerprint": "68367f3dafa95da8f23a3b75a5986a210f3440480989d69f575d2f9ab4fe2a7f",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::slot_admission",
       "rationale": "MM participation vanished during slot admission: guest_execution was checked Some before the admission loop and only this job clears it; parking for slot release keeps the participation. Re-reviewed 2026-10-01 (s3-t2): unchanged abort re-fingerprinted because the pre-run sequence it sits in is now inside the suspended-EL1 guard.",
@@ -381,7 +381,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
       "ordinal_in_function": 2,
-      "fingerprint": "23ad48ee2d900cee8af3341c7082bb9a6a367569290fd557a15b18f38298c005",
+      "fingerprint": "68367f3dafa95da8f23a3b75a5986a210f3440480989d69f575d2f9ab4fe2a7f",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::slot_admission",
       "rationale": "Admitted MM vanished before address-space publication: slot admission just succeeded with this job's participation, which only this job clears. Re-reviewed 2026-10-01 (s3-t2): unchanged abort re-fingerprinted because the pre-run sequence it sits in is now inside the suspended-EL1 guard.",
@@ -392,12 +392,23 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
       "ordinal_in_function": 3,
-      "fingerprint": "23ad48ee2d900cee8af3341c7082bb9a6a367569290fd557a15b18f38298c005",
+      "fingerprint": "68367f3dafa95da8f23a3b75a5986a210f3440480989d69f575d2f9ab4fe2a7f",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::service_context",
       "rationale": "ThreadRuntimeState missing service_kernel_context on trap limit outcome assembly. Re-reviewed 2026-10-01 (s3-t2): unchanged abort re-fingerprinted because the pre-run sequence it sits in is now inside the suspended-EL1 guard.",
       "sink": "fatal",
       "domain": "vcpu_loop::service_context"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
+      "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
+      "ordinal_in_function": 4,
+      "fingerprint": "cdeceb21afe8ab20a19a145452c3a560a1ceed168f8959c73285945a563c922e",
+      "verdict": "carrier_fault",
+      "failure_domain": "vcpu_loop::el1_cow_fault",
+      "rationale": "EL1 took a copy-on-write write fault while its vCPU slot still held a reservation root guard. EL1 user copies never run under a root guard, so this is a broken EL1 invariant; resolving the fault in the runtime would leave every host venue waiting on that root (holding the MM's MemState) behind host code on this thread.",
+      "sink": "fatal",
+      "domain": "vcpu_loop::el1_cow_fault"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
@@ -1305,7 +1316,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 6,
-      "fingerprint": "1066c1f1ac2aa38be9d6c0745548920b045ffbb862ba3ab2583d85a91043109c",
+      "fingerprint": "70b9495be4f658b7ce609b7560428699fa4ad119aa2e3eafd4dd0e3c3ee321b7",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore original parent_tid memory bytes during fork copyout rollback; parent memory is corrupted.",
@@ -1316,7 +1327,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 7,
-      "fingerprint": "1066c1f1ac2aa38be9d6c0745548920b045ffbb862ba3ab2583d85a91043109c",
+      "fingerprint": "70b9495be4f658b7ce609b7560428699fa4ad119aa2e3eafd4dd0e3c3ee321b7",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore original pidfd memory bytes during fork copyout rollback; parent memory is corrupted.",
@@ -1327,7 +1338,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 8,
-      "fingerprint": "bafa2bcc08671b2c56824e1f4e90235a2a57f1857eaf62c5ec98688ad464eeeb",
+      "fingerprint": "69548a5d335dda734c7fe441cdd9f90d7fc71eca0696304d7d3da142803ff9eb",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore parent_tid bytes on failpoint rollback; parent memory is corrupted.",
@@ -1338,7 +1349,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 9,
-      "fingerprint": "bafa2bcc08671b2c56824e1f4e90235a2a57f1857eaf62c5ec98688ad464eeeb",
+      "fingerprint": "69548a5d335dda734c7fe441cdd9f90d7fc71eca0696304d7d3da142803ff9eb",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore pidfd bytes on failpoint rollback; parent memory is corrupted.",
@@ -1349,7 +1360,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 10,
-      "fingerprint": "825948262029ef99ef5cd0829971d86cfd636914913b96f273731b5d8bfc18a6",
+      "fingerprint": "a05c0201fe53996a49f82c877ce6fdaf5b0d6fea65c43adffeb3482c3938cfd7",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore parent_tid memory on child materialization failure; parent memory is corrupted.",
@@ -1360,7 +1371,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 11,
-      "fingerprint": "825948262029ef99ef5cd0829971d86cfd636914913b96f273731b5d8bfc18a6",
+      "fingerprint": "a05c0201fe53996a49f82c877ce6fdaf5b0d6fea65c43adffeb3482c3938cfd7",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::quiesce_rollback",
       "rationale": "Failed to restore pidfd memory on child materialization failure; parent memory is corrupted.",
@@ -1368,246 +1379,312 @@
       "domain": "vcpu_loop::quiesce_rollback"
     },
     {
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::fork_commit",
+      "rationale": "A built owner child lost its exact completion, commit authority or authenticated root opening. Continuing cannot prove that its table graph and physical custody belong to the published MM.",
+      "sink": "fatal",
+      "domain": "hvpatch::fork_commit",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 12,
-      "fingerprint": "3466cda4bc639661def82de4c209c38e122d71498d6495a89d1a72278496999f",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::fork_parent_commit",
-      "rationale": "Failed to commit parent HVPatch fork transaction; parent stage-1 translation state is inconsistent.",
-      "sink": "fatal",
-      "domain": "hvpatch::fork_parent_commit"
+      "fingerprint": "71e1eae52675eacf5056c4b7119db6b687350bbc4f45c308b9f905c61ff739ab"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 13,
-      "fingerprint": "183b7caa6c12dde1bea71c01e7f0f1cd005701d031411076062ff69847f08788",
+      "fingerprint": "71e1eae52675eacf5056c4b7119db6b687350bbc4f45c308b9f905c61ff739ab",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::fork_commit",
+      "rationale": "The fork commit authority over the prepared child MM was refused (a foreign transaction, a shared MM, an already-published child or not this parent's twin); the parent's fork transaction is committed past rollback, so the child cannot be published with a consistent root admission.",
+      "sink": "fatal",
+      "domain": "hvpatch::fork_commit"
+    },
+    {
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::fork_commit",
+      "rationale": "A built owner child lost its exact completion, commit authority or authenticated root opening. Continuing cannot prove that its table graph and physical custody belong to the published MM.",
+      "sink": "fatal",
+      "domain": "hvpatch::fork_commit",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
+      "ordinal_in_function": 14,
+      "fingerprint": "71e1eae52675eacf5056c4b7119db6b687350bbc4f45c308b9f905c61ff739ab"
+    },
+    {
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::fork_parent_commit",
+      "rationale": "Owner Fork FINISH could not settle the exact parent/child transaction. The live descriptor graph and retained physical pins cannot be released or rolled back without its completion.",
+      "sink": "fatal",
+      "domain": "hvpatch::fork_parent_commit",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
+      "ordinal_in_function": 15,
+      "fingerprint": "71e1eae52675eacf5056c4b7119db6b687350bbc4f45c308b9f905c61ff739ab"
+    },
+    {
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::fork_commit",
+      "rationale": "A built owner child lost its exact completion, commit authority or authenticated root opening. Continuing cannot prove that its table graph and physical custody belong to the published MM.",
+      "sink": "fatal",
+      "domain": "hvpatch::fork_commit",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
+      "ordinal_in_function": 16,
+      "fingerprint": "71e1eae52675eacf5056c4b7119db6b687350bbc4f45c308b9f905c61ff739ab"
+    },
+    {
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::fork_commit",
+      "rationale": "A built owner child lost its exact completion, commit authority or authenticated root opening. Continuing cannot prove that its table graph and physical custody belong to the published MM.",
+      "sink": "fatal",
+      "domain": "hvpatch::fork_commit",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
+      "ordinal_in_function": 17,
+      "fingerprint": "71e1eae52675eacf5056c4b7119db6b687350bbc4f45c308b9f905c61ff739ab"
+    },
+    {
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::fork_commit",
+      "rationale": "A built owner child lost its exact completion, commit authority or authenticated root opening. Continuing cannot prove that its table graph and physical custody belong to the published MM.",
+      "sink": "fatal",
+      "domain": "hvpatch::fork_commit",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
+      "ordinal_in_function": 18,
+      "fingerprint": "71e1eae52675eacf5056c4b7119db6b687350bbc4f45c308b9f905c61ff739ab"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::fork_publication",
       "rationale": "Authoritative child publication failed after frame inventory was committed; global frame allocation cannot be rolled back.",
       "sink": "fatal",
-      "domain": "hvpatch::fork_publication"
-    },
-    {
+      "domain": "hvpatch::fork_publication",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 14,
-      "fingerprint": "70464e39bbec1f6a22d234ad2177271c1be7883113d78de520d1d1b63734f46e",
+      "ordinal_in_function": 19,
+      "fingerprint": "183b7caa6c12dde1bea71c01e7f0f1cd005701d031411076062ff69847f08788"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::fork_publication",
-      "rationale": "Published child process missing execution context after authoritative publication.",
+      "rationale": "Authoritative child publication failed after frame inventory was committed; global frame allocation cannot be rolled back.",
       "sink": "fatal",
-      "domain": "hvpatch::fork_publication"
-    },
-    {
+      "domain": "hvpatch::fork_publication",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 15,
-      "fingerprint": "7a1c08b8346bd3ef729762f2d03ccc5d30d3ed3dd2f8383980e6f1c86b20c9a0",
+      "ordinal_in_function": 20,
+      "fingerprint": "70464e39bbec1f6a22d234ad2177271c1be7883113d78de520d1d1b63734f46e"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::backend_root_slot",
       "rationale": "Child root slot collision after authoritative kernel publication indicates internal generation accounting corruption.",
       "sink": "fatal",
-      "domain": "hvpatch::backend_root_slot"
-    },
-    {
+      "domain": "hvpatch::backend_root_slot",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 16,
-      "fingerprint": "5b8d90c0b882ceb7e65e21045cdecc1775234024f639b3c792f895c55bb33180",
+      "ordinal_in_function": 21,
+      "fingerprint": "7a1c08b8346bd3ef729762f2d03ccc5d30d3ed3dd2f8383980e6f1c86b20c9a0"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "kernel::thread_initialization",
       "rationale": "Failed to publish initial task state to child thread after process publication.",
       "sink": "fatal",
-      "domain": "kernel::thread_initialization"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 17,
-      "fingerprint": "8f77b5725667c9a8f365c5ef1aaa5c0884d02b3be49c0926dbcd867f158e48c0",
-      "verdict": "carrier_fault",
-      "failure_domain": "kernel::runtime_binding",
-      "rationale": "Child KernelState missing HVPatch runtime binding during task backend initialization.",
-      "sink": "fatal",
-      "domain": "kernel::runtime_binding"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 18,
-      "fingerprint": "82c9648b03b37eb873815f2bdc2dffe6dd442537e8386709360923e5b2dd34e9",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_backend_commit",
-      "rationale": "Committing child task backend failed after parent committed; child hardware resources cannot be bound.",
-      "sink": "fatal",
-      "domain": "hvpatch::task_backend_commit"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 19,
-      "fingerprint": "18aefd908f7945cfb183e5d4146bb986ad1671c3735e51e3fd5edb6cf622f376",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "COW authority failed to issue child token after backend commit; child has no valid memory authority.",
-      "sink": "fatal",
-      "domain": "hvpatch::cow_token"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 20,
-      "fingerprint": "5e0f8c7584e89012552dfcbe4b7b077eaab0d3bbca1569dad03df1a28e9d6c5d",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::cow_token",
-      "rationale": "Failed to bind COW child token to task backend; stage-1 fault handler cannot authenticate child access.",
-      "sink": "fatal",
-      "domain": "hvpatch::cow_token"
-    },
-    {
-      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 21,
-      "fingerprint": "3036464a54dc944166a1d15ea98e490b686828c7b3dabb69610e2042953ce62a",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::frame_inventory",
-      "rationale": "Failed to apply frame inventory to child task backend; stage-2 page tables desynchronized from frame ownership.",
-      "sink": "fatal",
-      "domain": "hvpatch::frame_inventory"
-    },
-    {
+      "domain": "kernel::thread_initialization",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 22,
-      "fingerprint": "2951f558ebd8baab0b318d6be8f1cd4e286aa0baa1e64cd56a0b0fa68186fba8",
-      "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::task_activation",
-      "rationale": "Failed to activate child task backend after frame inventory publication.",
-      "sink": "fatal",
-      "domain": "hvpatch::task_activation"
+      "fingerprint": "5b8d90c0b882ceb7e65e21045cdecc1775234024f639b3c792f895c55bb33180"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
       "ordinal_in_function": 23,
-      "fingerprint": "eee1c051a8a2b00dcb1ba74c90e9a0a1c40c528958ea41eca6b6243859dbc188",
+      "fingerprint": "8f77b5725667c9a8f365c5ef1aaa5c0884d02b3be49c0926dbcd867f158e48c0",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::runtime_binding",
+      "rationale": "KernelState missing HVPatch runtime reference during fork barrier subscription setup.",
+      "sink": "fatal",
+      "domain": "kernel::runtime_binding"
+    },
+    {
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_backend_commit",
+      "rationale": "Committing child task backend failed after parent committed; child hardware resources cannot be bound.",
+      "sink": "fatal",
+      "domain": "hvpatch::task_backend_commit",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
+      "ordinal_in_function": 24,
+      "fingerprint": "82c9648b03b37eb873815f2bdc2dffe6dd442537e8386709360923e5b2dd34e9"
+    },
+    {
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "COW authority failed to issue child token after backend commit; child has no valid memory authority.",
+      "sink": "fatal",
+      "domain": "hvpatch::cow_token",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
+      "ordinal_in_function": 25,
+      "fingerprint": "18aefd908f7945cfb183e5d4146bb986ad1671c3735e51e3fd5edb6cf622f376"
+    },
+    {
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::cow_token",
+      "rationale": "COW authority failed to issue child token after backend commit; child has no valid memory authority.",
+      "sink": "fatal",
+      "domain": "hvpatch::cow_token",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
+      "ordinal_in_function": 26,
+      "fingerprint": "5e0f8c7584e89012552dfcbe4b7b077eaab0d3bbca1569dad03df1a28e9d6c5d"
+    },
+    {
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::frame_inventory",
+      "rationale": "Failed to apply frame inventory to child task backend; stage-2 page tables desynchronized from frame ownership.",
+      "sink": "fatal",
+      "domain": "hvpatch::frame_inventory",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
+      "ordinal_in_function": 27,
+      "fingerprint": "3036464a54dc944166a1d15ea98e490b686828c7b3dabb69610e2042953ce62a"
+    },
+    {
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::task_activation",
+      "rationale": "Failed to activate child task backend after frame inventory publication.",
+      "sink": "fatal",
+      "domain": "hvpatch::task_activation",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
+      "ordinal_in_function": 28,
+      "fingerprint": "2951f558ebd8baab0b318d6be8f1cd4e286aa0baa1e64cd56a0b0fa68186fba8"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::syscall_completion",
       "rationale": "Externally initiated exec child lost the exact parent syscall-completion token during publication; continuing would fabricate or replay a guest syscall return. Re-reviewed 2026-09-03: the abort is unchanged; the completion token moved from unconditional Box ownership to its allocation-free inline representation.",
       "sink": "fatal",
-      "domain": "vcpu_loop::syscall_completion"
-    },
-    {
+      "domain": "vcpu_loop::syscall_completion",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 24,
-      "fingerprint": "976af10f29a1625e76fe67655617a83f46337affbb14b06d1c8c0630929b0dee",
+      "ordinal_in_function": 29,
+      "fingerprint": "eee1c051a8a2b00dcb1ba74c90e9a0a1c40c528958ea41eca6b6243859dbc188"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::syscall_completion",
-      "rationale": "Externally initiated exec child could not establish typed internal-control completion ownership; running it would permit an unauthorized guest or compatibility return. Re-reviewed 2026-09-03: the abort is unchanged; its fingerprint context now contains the allocation-free inline guest completion token.",
+      "rationale": "Externally initiated exec child lost the exact parent syscall-completion token during publication; continuing would fabricate or replay a guest syscall return. Re-reviewed 2026-09-03: the abort is unchanged; the completion token moved from unconditional Box ownership to its allocation-free inline representation.",
       "sink": "fatal",
-      "domain": "vcpu_loop::syscall_completion"
-    },
-    {
+      "domain": "vcpu_loop::syscall_completion",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 25,
-      "fingerprint": "951d77eb7f9d2097213f84660be67f39766adf420da16e0e26dc2870e055eece",
+      "ordinal_in_function": 30,
+      "fingerprint": "976af10f29a1625e76fe67655617a83f46337affbb14b06d1c8c0630929b0dee"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::logical_job",
       "rationale": "Failed to prepare child logical job in executor after task backend activation.",
       "sink": "fatal",
-      "domain": "vcpu_loop::logical_job"
-    },
-    {
+      "domain": "vcpu_loop::logical_job",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 26,
-      "fingerprint": "8317dcdff2e37a240439c5ed60edc7e8852ddcb26e0d26910311e8e255605bb7",
+      "ordinal_in_function": 31,
+      "fingerprint": "951d77eb7f9d2097213f84660be67f39766adf420da16e0e26dc2870e055eece"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::executor_grant",
       "rationale": "ExecutorControl failed to provide valid submission grant key for child process worker.",
       "sink": "fatal",
-      "domain": "vcpu_loop::executor_grant"
-    },
-    {
+      "domain": "vcpu_loop::executor_grant",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 27,
-      "fingerprint": "f2b6de39b30c5255a1682b62b88f7ef9254f88a6c945377c63e587dfa9b46e86",
+      "ordinal_in_function": 32,
+      "fingerprint": "8317dcdff2e37a240439c5ed60edc7e8852ddcb26e0d26910311e8e255605bb7"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::dormant_child",
       "rationale": "Failed to prepare dormant child task structure after logical job creation.",
       "sink": "fatal",
-      "domain": "vcpu_loop::dormant_child"
-    },
-    {
+      "domain": "vcpu_loop::dormant_child",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 28,
-      "fingerprint": "78d3432cd023988f3438e5c0acc95e65c582f06ef0015b3bf670a4f35c08d397",
+      "ordinal_in_function": 33,
+      "fingerprint": "f2b6de39b30c5255a1682b62b88f7ef9254f88a6c945377c63e587dfa9b46e86"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "kernel::start_gate",
       "rationale": "Failed to open child process start gate after publication; child cannot transition to runnable.",
       "sink": "fatal",
-      "domain": "kernel::start_gate"
-    },
-    {
+      "domain": "kernel::start_gate",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 29,
-      "fingerprint": "0e6edb9888d4ab230358a1d65227a9d2051b87705e48c9500b3e4b3108eb8a96",
+      "ordinal_in_function": 34,
+      "fingerprint": "78d3432cd023988f3438e5c0acc95e65c582f06ef0015b3bf670a4f35c08d397"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "kernel::start_gate",
-      "rationale": "Opened start gate missing from child thread after start gate transition.",
+      "rationale": "Failed to open child process start gate after publication; child cannot transition to runnable.",
       "sink": "fatal",
-      "domain": "kernel::start_gate"
-    },
-    {
+      "domain": "kernel::start_gate",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 30,
-      "fingerprint": "1d79477ace338bafe5fed0ebb7724c6a417ee7daaada8c8a537987a53aae325c",
+      "ordinal_in_function": 35,
+      "fingerprint": "0e6edb9888d4ab230358a1d65227a9d2051b87705e48c9500b3e4b3108eb8a96"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::logical_job",
-      "rationale": "Failed to install start gate proof into child logical job.",
+      "rationale": "Failed to prepare child logical job in executor after task backend activation.",
       "sink": "fatal",
-      "domain": "vcpu_loop::logical_job"
-    },
-    {
+      "domain": "vcpu_loop::logical_job",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 31,
-      "fingerprint": "46f8b94e2dfa68bad6805b4acea8ca5912a57a7863265726a190b5d4cb105fe1",
+      "ordinal_in_function": 36,
+      "fingerprint": "1d79477ace338bafe5fed0ebb7724c6a417ee7daaada8c8a537987a53aae325c"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::logical_job",
-      "rationale": "Activation proof validation failed on child logical job; start gate token is invalid.",
+      "rationale": "Failed to prepare child logical job in executor after task backend activation.",
       "sink": "fatal",
-      "domain": "vcpu_loop::logical_job"
-    },
-    {
+      "domain": "vcpu_loop::logical_job",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 32,
-      "fingerprint": "114257ed8ca3c89f05d61dcce47d147a3ec191c6b81be44ee0fc3157ea8b4010",
+      "ordinal_in_function": 37,
+      "fingerprint": "46f8b94e2dfa68bad6805b4acea8ca5912a57a7863265726a190b5d4cb105fe1"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "kernel::scheduler",
       "rationale": "Scheduler failed to activate dormant child logical job with verified proof.",
       "sink": "fatal",
-      "domain": "kernel::scheduler"
-    },
-    {
+      "domain": "kernel::scheduler",
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
       "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
-      "ordinal_in_function": 33,
-      "fingerprint": "61f7495b1d5d09b0ebef15a47141dfb49e57ebe6b85ecec3afca29a52d0b43a3",
+      "ordinal_in_function": 38,
+      "fingerprint": "114257ed8ca3c89f05d61dcce47d147a3ec191c6b81be44ee0fc3157ea8b4010"
+    },
+    {
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::vfork_suspension",
       "rationale": "Missing child thread activation proof when constructing PreparedVforkSuspension.",
       "sink": "fatal",
-      "domain": "vcpu_loop::vfork_suspension"
+      "domain": "vcpu_loop::vfork_suspension",
+      "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
+      "function": "ThreadRuntimeState<E>::prepare_in_process_fork",
+      "ordinal_in_function": 39,
+      "fingerprint": "61f7495b1d5d09b0ebef15a47141dfb49e57ebe6b85ecec3afca29a52d0b43a3"
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
