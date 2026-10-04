@@ -57,8 +57,9 @@ pub enum El1MappingLeafPhase {
     AfterUnmap,
 }
 
-/// Sample the focused page and its neighbour under the caller's exact-MM
-/// authority. Disabled probes do not walk descriptors or build diagnostic data.
+/// Sample the focused page, its neighbour, and a page in the next 16 KiB
+/// under the caller's exact-MM authority. Disabled probes do not walk
+/// descriptors or build diagnostic data.
 pub fn trace_el1_mapping_leafs(
     engine: &impl ThreadedEngine,
     phase: El1MappingLeafPhase,
@@ -67,7 +68,14 @@ pub fn trace_el1_mapping_leafs(
     focus: u64,
 ) {
     let page = focus & !0xfff;
-    for va in [Some(page), page.checked_add(0x1000)].into_iter().flatten() {
+    for va in [
+        Some(page),
+        page.checked_add(0x1000),
+        page.checked_add(0x4000),
+    ]
+    .into_iter()
+    .flatten()
+    {
         if !span.contains(va) {
             continue;
         }
@@ -5300,14 +5308,34 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             }
             other => other?,
         };
-        let Some(mut grant) = prepared else {
-            carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 5);
-            if !slot.cancel_fault_selection(window, request_generation) {
-                return Err(TrapError::Hypervisor(
-                    "owner file fault cancellation is stale".into(),
-                ));
+        let mut grant = match prepared {
+            crate::user_transfer::TransferPreparation::Grant(grant) => grant,
+            crate::user_transfer::TransferPreparation::PeerResident => {
+                carrick_observability::probes::hvpatch_el1_file_fault_handoff(
+                    window.fault_page,
+                    0,
+                    5,
+                );
+                if !slot.cancel_fault_selection(window, request_generation) {
+                    return Err(TrapError::Hypervisor(
+                        "owner file fault cancellation is stale".into(),
+                    ));
+                }
+                return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Resolved));
             }
-            return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused));
+            crate::user_transfer::TransferPreparation::Declined => {
+                carrick_observability::probes::hvpatch_el1_file_fault_handoff(
+                    window.fault_page,
+                    0,
+                    5,
+                );
+                if !slot.cancel_fault_selection(window, request_generation) {
+                    return Err(TrapError::Hypervisor(
+                        "owner file fault cancellation is stale".into(),
+                    ));
+                }
+                return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused));
+            }
         };
         if !slot.submit(window, grant.transaction()) {
             return Err(TrapError::Hypervisor(
