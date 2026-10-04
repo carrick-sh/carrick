@@ -17,6 +17,7 @@ set -e
 cd "$(dirname "$0")/.."
 # The vtool + codesign post-link path is shared with scripts/test-signed.sh
 # (cargo test executables that boot guests need the identical treatment).
+# Also loads the shared compiler-cache environment before any cargo call.
 . scripts/lib/post-link-sign.sh
 
 # Entitlements selection.

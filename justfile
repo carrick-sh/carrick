@@ -6,6 +6,12 @@
 # `com.apple.security.hypervisor` entitlement → every run fails HV_DENIED
 # 0xfae94007; scripts/build-signed.sh re-signs it). Run `just --list` for all recipes.
 
+# One compiler cache per host, inherited by cargo and all child gate commands.
+# The same environment fragment is sourced by direct signed-script invocations.
+export RUSTC_WRAPPER := `sh -c '. scripts/lib/build-env.sh; printf "%s" "$RUSTC_WRAPPER"'`
+export SCCACHE_DIR := `sh -c '. scripts/lib/build-env.sh; printf "%s" "$SCCACHE_DIR"'`
+export SCCACHE_CACHE_SIZE := `sh -c '. scripts/lib/build-env.sh; printf "%s" "$SCCACHE_CACHE_SIZE"'`
+
 # Per-host backend feature flags for `cargo build`/`cargo test` of carrick-cli.
 # macOS uses the default features (+ codesign via build-signed.sh), so it is empty.
 _platform_features := if os() == "macos" { "" \
@@ -82,6 +88,10 @@ run *ARGS: build
 # intentionally red while `carrick exec` still starts a peer VM/carrier.
 carrier-topology-gate *ARGS: build
     python3 scripts/conformance/carrier-topology-gate.py {{ARGS}}
+
+# Show compiler cache statistics (CARRICK_SCCACHE=0 disables build caching).
+build-cache:
+    "{{env('HOME')}}/.cargo/bin/sccache" --show-stats
 
 # Run the Carrick xtask maintenance tool.
 xtask *ARGS:

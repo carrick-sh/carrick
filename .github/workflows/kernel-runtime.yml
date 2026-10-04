@@ -76,6 +76,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install per-user compiler cache
+        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
       - name: Download exact-SHA fixture bundle
         uses: actions/download-artifact@v4
         with:
@@ -153,6 +155,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install per-user compiler cache
+        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
       - name: Install just
         uses: taiki-e/install-action@v2
         with:
@@ -198,6 +202,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install per-user compiler cache
+        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
       - name: Build x86 CPL0 image
         run: |
           rustup target add x86_64-unknown-none
