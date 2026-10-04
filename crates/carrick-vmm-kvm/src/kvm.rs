@@ -1323,6 +1323,35 @@ impl KvmVm {
         })
     }
 
+    /// Dedicated carrier slot namespace; the legacy map_memory allocator is
+    /// never used on this privately retained VM.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn carrier_slot_limit(&self) -> Result<u32, OsError> {
+        let count = self
+            ._kvm
+            .as_ref()
+            .map_or(0, |kvm| kvm.check_extension_int(Cap::NrMemslots));
+        u32::try_from(count)
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| OsError {
+                context: "KVM_CAP_NR_MEMSLOTS unavailable".into(),
+                errno: libc::ENOTSUP,
+            })
+    }
+
+    /// The carrier retains the complete extent until successful deletion or
+    /// VM destruction, and excludes every memory ioctl/guest-run race.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) unsafe fn carrier_set_region(
+        &self,
+        region: kvm_userspace_memory_region,
+    ) -> Result<(), OsError> {
+        // SAFETY: the caller owns the extent lifetime and exclusive namespace.
+        unsafe { self.vm.set_user_memory_region(region) }
+            .map_err(|e| os_err("KVM_SET_USER_MEMORY_REGION(carrier)", e))
+    }
+
     /// Unregister a previously-mapped memory slot by re-issuing
     /// `KVM_SET_USER_MEMORY_REGION` with `memory_size = 0` — KVM's idiom for
     /// deleting a slot. Used by
