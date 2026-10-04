@@ -828,6 +828,55 @@ pub struct AddressSpacePublication {
         Option<Arc<dyn crate::dispatch::mem::el1_reservations::HostReservationProvider>>,
 }
 
+/// The initial MM's imported root while EL1 installation remains closed.
+/// BIND authenticates this root before its owner venue is published; no EL1
+/// executor can install it until one of these typed opening methods consumes
+/// the publication.
+pub struct UnpublishedInitialAddressSpace(AddressSpacePublication);
+impl UnpublishedInitialAddressSpace {
+    pub(crate) fn from_closed(publication: AddressSpacePublication) -> Self {
+        Self(publication)
+    }
+
+    pub fn bind_token(
+        &self,
+        carrier: std::num::NonZeroU64,
+    ) -> Option<carrick_el1_abi::PortalClosedRootBind> {
+        let ttbr0 = self
+            .0
+            .tables
+            .spaces
+            .closed_root_identity(self.0.index, self.0.mm.raw())?;
+        let mm = carrick_el1_abi::ReservationMm::new(self.0.mm.raw())?;
+        // SAFETY: this value owns the unpublished slot above, and the exact
+        // key/root/gate are rechecked immediately before minting the token.
+        Some(unsafe {
+            carrick_el1_abi::PortalClosedRootBind::from_unpublished_owner(carrier, mm, ttbr0)
+        })
+    }
+
+    pub fn open_admitted(
+        self,
+        guard: &carrick_guest_mem::UserMemoryAdmissionGuard<'_>,
+    ) -> Result<AddressSpacePublication, Self> {
+        if guard
+            .selection_handle()
+            .is_none_or(|handle| handle.mm().raw() != self.0.mm.raw())
+        {
+            return Err(self);
+        }
+        self.0.tables.open(self.0.index);
+        Ok(self.0)
+    }
+
+    /// A root refused by the owner selector retains the distinct legacy
+    /// venue; its exact root facts were released before this opening.
+    pub fn open_legacy(self) -> AddressSpacePublication {
+        self.0.tables.open(self.0.index);
+        self.0
+    }
+}
+
 /// A fork root exists for owner construction but is not installable by EL1.
 /// Dropping this proof uses normal exact-MM publication retirement.
 pub struct UnpublishedForkAddressSpace(AddressSpacePublication);
@@ -1023,6 +1072,34 @@ impl PreAdmissionGuard {
             },
             PublicationAdmission::Open,
         )
+    }
+    pub(crate) fn publish_closed(
+        &self,
+        fence: &MmFence,
+        ttbr0: u64,
+        ttbr1: u64,
+        brk_current: u64,
+        mmap_next: u64,
+        root: ReservationRootPublication,
+    ) -> Option<AddressSpacePublication> {
+        let publication = publish_in_held(
+            self,
+            fence,
+            ttbr0,
+            ttbr1,
+            Anchors {
+                brk_current,
+                mmap_next,
+                limits: root.limits,
+                reservation_provider: root.provider,
+            },
+            PublicationAdmission::OwnerForkClosed,
+        )?;
+        if !self.tables.spaces.mark_initial_bindable(publication.index) {
+            self.refuse(publication);
+            return None;
+        }
+        Some(publication)
     }
     /// Refused admission removes the exact root while its original owner is
     /// still held. Suppress Drop's separate lock acquisition, then settle.
