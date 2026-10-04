@@ -114,6 +114,8 @@ struct Machine {
     kick_acknowledged: bool,
     /// The EL1 image ran with an interrupt frame (syndrome 0).
     irq_frames: usize,
+    /// The EL1 image saw an owner-routed instruction or data abort.
+    fault_frames: usize,
 }
 
 impl Machine {
@@ -153,6 +155,7 @@ impl Machine {
             kick_pending: false,
             kick_acknowledged: false,
             irq_frames: 0,
+            fault_frames: 0,
         }
     }
 
@@ -176,6 +179,7 @@ impl Machine {
             kick_pending: false,
             kick_acknowledged: false,
             irq_frames: 0,
+            fault_frames: 0,
         }
     }
 
@@ -248,7 +252,10 @@ impl Machine {
         let frame = self.regs[0];
         let esr = self.read(frame + 264);
         let irq = esr == 0;
-        let is_fault = ((esr >> 26) & 0x3F) == 0x24;
+        let is_fault = matches!((esr >> 26) & 0x3F, 0x20 | 0x24);
+        if is_fault {
+            self.fault_frames += 1;
+        }
         if irq {
             self.irq_frames += 1;
             if self.kick_pending {
@@ -806,7 +813,7 @@ fn fault_hook_forward_restores_complete_architectural_context() {
 }
 
 #[test]
-fn non_data_abort_sync_exception_bypasses_fault_hook_to_host() {
+fn instruction_abort_enters_owner_fault_hook_then_forwards_to_host() {
     // Instruction Abort (EC = 0x20) from lower EL with nonzero high ESR bits
     let esr_inst_abort = (0xDEAD_BEEF_u64 << 32) | (0x20 << 26) | 0x12;
     let mut m = Machine {
@@ -821,6 +828,10 @@ fn non_data_abort_sync_exception_bypasses_fault_hook_to_host() {
     assert_eq!(
         exit,
         Exit::Host,
-        "non-data-abort exception must bypass EL1 hooks and exit to host via legacy HVC"
+        "unhandled instruction abort must forward to the host"
+    );
+    assert_eq!(
+        m.fault_frames, 1,
+        "instruction abort must enter the EL1 owner hook"
     );
 }
