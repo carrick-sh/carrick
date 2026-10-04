@@ -296,7 +296,7 @@ pub enum LeafAccess {
 }
 
 /// What a stage-1 data or instruction abort's fault status code (`DFSC` /
-/// `IFSC`, ESR bits [5:0]) says the faulting walk found. The discriminants
+/// `IFSC`, ESR bits `[5:0]`) says the faulting walk found. The discriminants
 /// are the wire encoding of the `hvpatch__stale__stage1__fault` probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -822,8 +822,11 @@ pub unsafe fn publish_existing_invalid_private_pages(
 ///
 /// # Safety
 ///
-/// The safety and exclusion requirements are identical to
-/// [`publish_existing_invalid_private_pages`].
+/// `words` must be an aligned, writable, hardware-visible array of atomic
+/// descriptor words covering `byte_len`. `physical_base` must name that same
+/// primary page-table arena in every live table descriptor reachable here.
+/// The caller holds exclusive mutation authority for this table graph and
+/// performs the architectural `DSB`/`TLBI`/`DSB`/`ISB` sequence after success.
 pub unsafe fn protect_existing_el1_private_pages(
     words: *mut core::sync::atomic::AtomicU64,
     physical_base: u64,
@@ -885,8 +888,11 @@ pub unsafe fn protect_existing_el1_private_pages(
 ///
 /// # Safety
 ///
-/// The safety and exclusion requirements are identical to
-/// [`publish_existing_invalid_private_pages`].
+/// `words` must be an aligned, writable, hardware-visible array of atomic
+/// descriptor words covering `byte_len`. `physical_base` must name that same
+/// primary page-table arena in every live table descriptor reachable here.
+/// The caller holds exclusive mutation authority for this table graph and
+/// performs the architectural `DSB`/`TLBI`/`DSB`/`ISB` sequence after success.
 pub unsafe fn retire_existing_el1_private_pages(
     words: *mut core::sync::atomic::AtomicU64,
     physical_base: u64,
@@ -945,8 +951,11 @@ pub enum GuestCowError {
 ///
 /// # Safety
 ///
-/// The safety and exclusion requirements are identical to
-/// [`publish_existing_invalid_private_pages`].
+/// `words` must be an aligned, writable, hardware-visible array of atomic
+/// descriptor words covering `byte_len`. `physical_base` must name that same
+/// primary page-table arena in every live table descriptor reachable here.
+/// The caller holds exclusive mutation authority for this table graph and
+/// performs the architectural `DSB`/`TLBI`/`DSB`/`ISB` sequence after success.
 pub unsafe fn arm_existing_el1_fork_pages(
     words: *mut core::sync::atomic::AtomicU64,
     physical_base: u64,
@@ -1828,7 +1837,7 @@ pub unsafe trait HostArenaResolver {
 }
 
 /// The output page a terminal descriptor makes executable at EL0, if any: a
-/// valid, EL0-accessible (AP[1]) L3 page (`0b11` in a non-table word) with
+/// valid, EL0-accessible (`AP[1]`) L3 page (`0b11` in a non-table word) with
 /// UXN clear. Blocks are deliberately not announced: the only EL0-executable
 /// blocks are the boot image's static identity aperture, which every MM image
 /// carries unchanged and the EL0 entry trampoline's `ic ialluis` makes
