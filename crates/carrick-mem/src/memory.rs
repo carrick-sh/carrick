@@ -7683,6 +7683,7 @@ mod stage1_tests {
             ("EL1 maintenance", LINUX_EL1_MAINT_BASE),
             ("EL1 ASID maintenance", LINUX_EL1_ASID_MAINT_BASE),
             ("EL1 vectors", LINUX_EL1_VECTORS_BASE),
+            ("fixed boot primary", LINUX_PAGE_TABLES_BASE),
             ("EL0 trampoline", LINUX_EL0_TRAMPOLINE_BASE),
             ("syscall mailbox", LINUX_SYSCALL_MAILBOX_BASE),
             ("fd ceiling control", LINUX_FD_CEILING_CONTROL_BASE),
