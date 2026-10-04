@@ -1,7 +1,8 @@
 //! Planning measurement, not a Linux conformance or carrier acceptance test.
 //! Reuses the real KVM/x86 ELF bring-up and SyscallTrap path. The host arm
 //! returns a fixed synthetic identity without kernel dispatch; the CPL0 control
-//! does the same inside a benchmark-only LSTAR stub. Native uses raw getpid.
+//! does the same inside a benchmark-only LSTAR stub. Native uses libc getpid
+//! (verify its uncached syscall instruction in the host libc before measuring).
 //! Creation/ELF loading are outside timing; final exit/checksum is inside.
 //! No tracing, retries, Docker, or production changes. Missing KVM is an error.
 //! Encodings: Intel SDM vol. 2, SYSCALL/SYSRET, MOV, ADD, DEC, Jcc and OUT.
@@ -136,7 +137,7 @@ mod benchmark {
         let mut identity = 0_i64;
         for _ in 0..CALLS {
             // SAFETY: getpid has no pointer arguments or caller preconditions.
-            identity = unsafe { libc::syscall(libc::SYS_getpid) };
+            identity = i64::from(unsafe { libc::getpid() });
             sum += std::hint::black_box(identity);
         }
         let elapsed = start.elapsed();
@@ -225,7 +226,7 @@ mod benchmark {
                 host.push(kvm_batch(&fixture, false)?);
                 guest.push(kvm_batch(&fixture, true)?);
             }
-            report("native_raw_getpid", &mut native);
+            report("native_getpid", &mut native);
             report("kvm_exit_control", &mut exit_control);
             report("kvm_host_synthetic_identity", &mut host);
             report("kvm_cpl0_synthetic_identity", &mut guest);
