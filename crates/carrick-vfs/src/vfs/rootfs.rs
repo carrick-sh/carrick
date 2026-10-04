@@ -3510,7 +3510,7 @@ mod tests {
     }
 
     struct MetadataOnlyBackend {
-        host_path: std::path::PathBuf,
+        host_path: tempfile::TempPath,
         lookup_payload_reads: Arc<AtomicUsize>,
         metadata_calls: Arc<AtomicUsize>,
         raw_open_calls: Arc<AtomicUsize>,
@@ -3533,10 +3533,7 @@ mod tests {
         }
 
         fn new_with_counters(size: usize) -> (Self, MetadataOnlyBackendCounters) {
-            let host_path = std::env::temp_dir().join(format!(
-                "carrick-rootfs-metadata-only-{}-{size}",
-                std::process::id()
-            ));
+            let host_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
             std::fs::write(&host_path, b"x").unwrap();
             let lookup_payload_reads = Arc::new(AtomicUsize::new(0));
             let metadata_calls = Arc::new(AtomicUsize::new(0));
@@ -3559,12 +3556,6 @@ mod tests {
                     combined_open_calls,
                 },
             )
-        }
-    }
-
-    impl Drop for MetadataOnlyBackend {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.host_path);
         }
     }
 
@@ -4106,6 +4097,11 @@ mod tests {
     #[test]
     fn open_for_dispatch_host_file_uses_raw_fd_without_loading_contents() {
         let (backend, payload_reads) = MetadataOnlyBackend::new(4 * 1024 * 1024);
+        // Force the interleaving with the same-size metadata lookup fixture:
+        // both are alive, then the other fixture is dropped before this open.
+        // Its cleanup must not unlink the backing file owned by this backend.
+        let (other_backend, _) = MetadataOnlyBackend::new(4 * 1024 * 1024);
+        drop(other_backend);
         let v = RootFsVfs {
             rootfs: None,
             overlay: Box::new(backend),
