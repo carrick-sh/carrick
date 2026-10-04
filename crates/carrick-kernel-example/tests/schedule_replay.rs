@@ -1,8 +1,83 @@
 //! Recorded ordering witness for fork/close/exit_group and strict replay.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 use carrick_kernel_example::{
-    ExampleError, Schedule, ScheduleReceipt, ScriptedBackend, Step, slot, sys,
+    ExampleError, Schedule, ScheduleReceipt, ScriptedBackend, Step, alloc_word, await_parked, slot,
+    sys,
 };
+
+fn futex_scenario() -> Vec<Step> {
+    vec![
+        alloc_word(0, 1),
+        Step::Sys(sys::clone_thread(0)),
+        Step::ChildMarker(vec![
+            await_parked(1, "wait_root"),
+            Step::Sys(sys::futex_wake_labeled("wake_root", slot(0), 1).ret(1)),
+            Step::Sys(sys::exit_thread(0)),
+        ]),
+        Step::Sys(sys::futex_wait_labeled("wait_root", slot(0), 1).ret(0)),
+        Step::Sys(sys::exit_group(0)),
+    ]
+}
+
+fn run_futex(
+    schedule: &Schedule,
+) -> (
+    Result<carrick_kernel_example::RunReport, ExampleError>,
+    ScheduleReceipt,
+) {
+    let result = ScriptedBackend::new()
+        .with_schedule(schedule.clone())
+        .run_root(futex_scenario());
+    let summary = result
+        .as_ref()
+        .map(|report| {
+            format!(
+                "wake-completed={}",
+                report
+                    .completions()
+                    .iter()
+                    .any(|completion| completion.label == "wake_root")
+            )
+        })
+        .unwrap_or_else(|error| error.to_string());
+    let work = result
+        .as_ref()
+        .ok()
+        .map(|report| report.work_snapshot().clone());
+    let receipt = schedule
+        .receipt(summary, work)
+        .expect("complete futex schedule");
+    (result, receipt)
+}
+
+#[test]
+fn futex_wake_exit_receipt_replays() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/futex-wake-exit-seed637.json"
+    );
+    let retained: ScheduleReceipt = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let (result, replayed) = run_futex(&Schedule::replay(retained.clone()));
+    assert_eq!(retained.decisions, replayed.decisions);
+    let report = result.expect("futex pair completes");
+    assert_eq!(report.ret("wait_root"), 0);
+    assert_eq!(report.ret("wake_root"), 1);
+}
+
+#[test]
+#[ignore = "VMFREE_TRACE must name the retained receipt output"]
+fn record_futex_wake_exit_receipt() {
+    let seed = std::env::var("VMFREE_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(637);
+    let (_, receipt) = run_futex(&Schedule::explore(seed));
+    std::fs::write(
+        std::env::var("VMFREE_TRACE").expect("VMFREE_TRACE is required"),
+        serde_json::to_vec_pretty(&receipt).unwrap(),
+    )
+    .unwrap();
+}
 
 fn scenario() -> Vec<Step> {
     vec![

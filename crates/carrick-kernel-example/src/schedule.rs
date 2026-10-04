@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use carrick_kernel::kernel::objects::ExecutionGeneration;
@@ -26,6 +27,9 @@ pub enum Point {
     Step,
     DispatchUnlocked,
     ContinuationBuild,
+    AwaitParked,
+    WaitEnrolled,
+    WaitResumed,
     FdDrained,
     TerminalUnlocked,
     TerminalPublished,
@@ -87,6 +91,7 @@ struct State {
     random: u64,
     max_transitions: usize,
     actors: BTreeSet<Actor>,
+    parked: BTreeSet<Actor>,
     current: Option<Actor>,
     decisions: Vec<Decision>,
     replay: Option<ScheduleReceipt>,
@@ -105,6 +110,7 @@ impl Schedule {
                 random: seed,
                 max_transitions: 10_000,
                 actors: BTreeSet::new(),
+                parked: BTreeSet::new(),
                 current: None,
                 decisions: Vec::new(),
                 replay: None,
@@ -172,7 +178,7 @@ impl Schedule {
 
     pub(crate) fn register(&self, actor: Actor) -> Result<(), String> {
         let mut state = self.0.0.lock();
-        if !state.started || !state.actors.insert(actor) {
+        if !state.started || state.parked.contains(&actor) || !state.actors.insert(actor) {
             return Err("duplicate or premature schedule actor".into());
         }
         Ok(())
@@ -278,11 +284,73 @@ impl Schedule {
         self.enter(actor)
     }
 
+    /// A guest continuation releases its permit after enrollment. Its host
+    /// thread may wait for the event, but it cannot occupy an execution lane.
+    pub(crate) fn park(&self, actor: Actor) -> Result<(), String> {
+        let (lock, wake) = &*self.0;
+        let mut state = lock.lock();
+        if state.current != Some(actor) || !state.actors.remove(&actor) {
+            return Err("parking actor lacks permit".into());
+        }
+        state.parked.insert(actor);
+        if let Err(error) = Self::choose(&mut state, actor, Point::WaitEnrolled) {
+            state.failure = Some(error.clone());
+            wake.notify_all();
+            return Err(error);
+        }
+        wake.notify_all();
+        Ok(())
+    }
+
+    /// A published event makes the exact actor eligible again. Re-entry waits
+    /// for a permit rather than consuming a host worker's guest capacity.
+    pub(crate) fn unpark(&self, actor: Actor) -> Result<(), String> {
+        let (lock, wake) = &*self.0;
+        {
+            let mut state = lock.lock();
+            if !state.parked.remove(&actor) || !state.actors.insert(actor) {
+                return Err("unparking actor was not parked".into());
+            }
+            if state.current.is_none() {
+                state.current = Some(actor);
+            }
+            wake.notify_all();
+        }
+        self.enter(actor)?;
+        self.point(actor, Point::WaitResumed)
+    }
+
+    pub(crate) fn parked_count(&self) -> usize {
+        self.0.0.lock().parked.len()
+    }
+
+    /// A successful in-zone wake publishes its event before the waker can
+    /// select the next actor. This closes the host-thread delivery gap between
+    /// the kernel producer and the test scheduler's runnable set.
+    pub(crate) fn await_wake_publication(
+        &self,
+        actor: Actor,
+        parked_before_wake: usize,
+    ) -> Result<(), String> {
+        let (lock, wake) = &*self.0;
+        let mut state = lock.lock();
+        while state.parked.len() >= parked_before_wake && state.failure.is_none() {
+            if state.current != Some(actor) {
+                return Err("wake publisher lacks permit".into());
+            }
+            if wake.wait_for(&mut state, WATCHDOG).timed_out() {
+                return Err("successful wake did not publish an event".into());
+            }
+        }
+        state.failure.clone().map_or(Ok(()), Err)
+    }
+
     pub(crate) fn finish(&self, actor: Actor) -> Result<(), String> {
         let (lock, wake) = &*self.0;
         let mut state = lock.lock();
         if state.failure.is_some() {
             state.actors.remove(&actor);
+            state.parked.remove(&actor);
             wake.notify_all();
             return Ok(());
         }
@@ -312,7 +380,7 @@ impl Schedule {
         if let Some(error) = &state.failure {
             return Err(error.clone());
         }
-        if !state.started || !state.actors.is_empty() {
+        if !state.started || !state.actors.is_empty() || !state.parked.is_empty() {
             return Err("schedule actors did not drain".into());
         }
         if let Some(replay) = &state.replay
@@ -347,7 +415,7 @@ impl Schedule {
 
 fn has_uncontrolled_step(step: &Step) -> bool {
     match step {
-        Step::AwaitCheckpoint(_) | Step::SignalCheckpoint(_) | Step::AwaitParked { .. } => true,
+        Step::AwaitCheckpoint(_) | Step::SignalCheckpoint(_) => true,
         Step::ChildMarker(children) => children.iter().any(has_uncontrolled_step),
         _ => false,
     }
@@ -366,6 +434,11 @@ fn backend_id() -> String {
 }
 
 fn source_hash() -> Result<String, String> {
+    static SOURCE_HASH: OnceLock<Result<String, String>> = OnceLock::new();
+    SOURCE_HASH.get_or_init(compute_source_hash).clone()
+}
+
+fn compute_source_hash() -> Result<String, String> {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut paths = Vec::new();
     collect_rust_sources(&root.join("crates/carrick-kernel/src"), &mut paths)?;
