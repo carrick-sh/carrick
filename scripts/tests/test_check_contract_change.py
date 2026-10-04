@@ -92,6 +92,42 @@ class CheckContractChangeTest(unittest.TestCase):
         result = self.run_check()
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
+    def test_hosted_pr_merge_requires_the_actual_base_and_unchanged_reviewed_source(self):
+        reviewed_head = self.commit_reviewed_exemption()
+        pr_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        subprocess.run(["git", "checkout", "-b", "advanced-main", self.base_sha], cwd=self.repo, check=True)
+        (self.repo / "README.md").write_text("Main advanced independently of the reviewed source.\n")
+        subprocess.run(["git", "add", "README.md"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-m", "advance actual PR base"], cwd=self.repo, check=True)
+        pr_base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        subprocess.run(["git", "checkout", "-b", "github-pr-merge", pr_head], cwd=self.repo, check=True)
+        subprocess.run(["git", "merge", "--no-ff", "advanced-main", "-m", "GitHub PR merge head"], cwd=self.repo, check=True)
+        merge_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+
+        # Hosted CI uses event.pull_request.base.sha and github.sha, rather
+        # than the branch's historical base. The same merge head exposes it.
+        historical = self.run_check(base_sha=self.base_sha, head_sha=merge_head)
+        self.assertEqual(historical.returncode, 0, msg=historical.stderr)
+        hosted = self.run_check(base_sha=pr_base, head_sha=merge_head)
+        self.assertEqual(hosted.returncode, 1)
+        self.assertIn("uncovered guest surface", hosted.stderr)
+
+        receipt = self.repo / "docs" / "conformance-exemptions" / "reviewed.toml"
+        receipt.write_text(receipt.read_text().replace(self.base_sha, pr_base).replace(reviewed_head, merge_head))
+        subprocess.run(["git", "commit", "-am", "review actual base and exact source"], cwd=self.repo, check=True)
+        pr_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        subprocess.run(["git", "checkout", "-b", "github-pr-merge-refreshed", pr_base], cwd=self.repo, check=True)
+        subprocess.run(["git", "merge", "--no-ff", pr_head, "-m", "GitHub refreshed PR merge head"], cwd=self.repo, check=True)
+        merge_head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        hosted = self.run_check(base_sha=pr_base, head_sha=merge_head)
+        self.assertEqual(hosted.returncode, 0, msg=hosted.stderr)
+
+        self.guest_file.write_text("fn changed_after_review() {}\n")
+        subprocess.run(["git", "commit", "-am", "change reviewed source after PR review"], cwd=self.repo, check=True)
+        hosted = self.run_check(base_sha=pr_base)
+        self.assertEqual(hosted.returncode, 1)
+        self.assertIn("uncovered guest surface", hosted.stderr)
+
     def test_committed_exemption_refuses_later_source_edit(self):
         self.commit_reviewed_exemption()
         self.guest_file.write_text("fn changed_guest_behavior() {}\n")
