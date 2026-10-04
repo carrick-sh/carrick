@@ -14,4 +14,5 @@ pub mod aarch64;
 
 mod host_backing;
 pub use host_backing::HostBackingIdentity;
+pub mod owner_mmu;
 pub mod x86;

@@ -1085,6 +1085,7 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let zone =
             unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
         let portal = MmPortal::<super::production::GuestMetadataPin> {
+            backend: core::marker::PhantomData,
             carrier: request.operation.carrier,
             roots: crate::memory::reservations::shared_guest(),
             spaces: &zone.spaces,
@@ -1171,6 +1172,7 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let zone =
             unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
         let portal = MmPortal::<super::production::GuestMetadataPin> {
+            backend: core::marker::PhantomData,
             carrier: request.operation.carrier,
             roots: crate::memory::reservations::shared_guest(),
             spaces: &zone.spaces,

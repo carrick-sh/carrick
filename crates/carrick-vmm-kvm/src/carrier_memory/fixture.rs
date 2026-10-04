@@ -73,6 +73,12 @@ pub struct MemoryWitness {
     pub drain_count: usize,
 }
 impl MemoryWitness {
+    pub fn context(&self, index: usize) -> AddressContext<RootGpa> {
+        self.contexts[index]
+    }
+    pub fn words(&self) -> DescriptorWords<'_> {
+        self.memory.words()
+    }
     pub fn boot(programs: [&[u8]; 2]) -> Result<Self, MemoryError> {
         let mut system = BackingExtent::private(FrameGpa::new(0), 16 * 1024 * 1024)?;
         let boot=<carrick_hal::x8664_arch::X8664GuestArch as carrick_hal::guest_arch::GuestArch>::bootstrap_sysregs();

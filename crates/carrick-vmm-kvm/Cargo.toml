@@ -26,8 +26,6 @@ carrick-fatal.workspace = true
 carrick-hal = { path = "../carrick-hal" }
 carrick-guest-mem = { path = "../carrick-guest-mem" }
 carrick-mem = { path = "../carrick-mem" }
-# Executable publication returns the neutral page-table error domain.
-carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-abi = { path = "../carrick-abi" }
 # The shared x86 engine scaffold (Stage 4-KVM): the KVM x86 lane is migrated onto
 # `X86EngineCore<KvmVmm>` instead of the hand-rolled `KvmX86TrapEngine`.
@@ -60,3 +58,7 @@ kvm-ioctls = "0.22.1"
 kvm-bindings = "0.12.1"
 vmm-sys-util = "0.14.0"
 zerocopy.workspace = true
+
+[dev-dependencies]
+carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
+carrick-sched-core = { path = "../carrick-sched-core", features = ["host-test"] }

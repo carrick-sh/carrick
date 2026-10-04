@@ -178,3 +178,75 @@ fn shared_revoke_requires_both_alias_unlinks_and_both_exact_context_drains() {
     assert_eq!(w.drain_count, drains + 2);
     fault(&mut w, 0, 4);
 }
+
+#[test]
+fn production_owner_selects_the_exact_live_kvm_mm() {
+    use carrick_el1::fault::{NoopCowResolver, NoopPreparedResolver};
+    use carrick_el1::personality::mm_portal::{test_support::*, *};
+    use carrick_sched_core::AddressSpaces;
+    use std::num::NonZeroU64;
+    let program = code(&[(DATA_VA, None)]);
+    let mut witness = MemoryWitness::boot([&program, &program]).unwrap();
+    let a = witness.private_extent(0x41).unwrap();
+    let b = witness.private_extent(0x42).unwrap();
+    witness.map(0, DATA_VA, a, true).unwrap();
+    witness.map(1, DATA_VA, b, true).unwrap();
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mms = [
+        admit(
+            &region,
+            &spaces,
+            1,
+            witness.context(0).root.address().raw(),
+            1,
+            0,
+        ),
+        admit(
+            &region,
+            &spaces,
+            2,
+            witness.context(1).root.address().raw(),
+            1,
+            0,
+        ),
+    ];
+    let nodes = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &nodes)
+        .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
+    let mut outputs = Vec::new();
+    for mm in mms {
+        let transfer = portal
+            .begin(
+                portal.admitted_handle(mm, 0).unwrap(),
+                GuestVa::new(DATA_VA),
+                4096,
+                TransferIntent::UserRead,
+                0,
+            )
+            .unwrap();
+        let step = portal
+            .select(
+                &transfer,
+                &witness.words(),
+                &mut NoopPreparedResolver,
+                &mut NoopCowResolver,
+                &residency(),
+                0,
+            )
+            .unwrap();
+        let TransferStep::Selected(selected) = step else {
+            panic!("production owner must select the hardware leaf: {step:?}")
+        };
+        outputs.push(selected.ipa);
+        assert!(
+            portal
+                .revalidate(&transfer, selected, &witness.words(), 0)
+                .unwrap()
+                .is_some()
+        );
+    }
+    assert_ne!(outputs[0], outputs[1]);
+    byte(&mut witness, 0, 0x41);
+    byte(&mut witness, 1, 0x42);
+}

@@ -6,8 +6,10 @@ use crate::memory::reservations::{Reservations, ResolvedReservationNodes, Shared
 use carrick_el1_abi::{
     FrameGrantResidencyTable, PinnedMetadataExtent, ReservationMm, ReservationProtection,
 };
+use carrick_guest_arch::UserVa;
 use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
-use carrick_mmu_core::aarch64::{GuestPreparedCommit, LeafAccess, terminal_descriptor_permits_el0};
+use carrick_mmu_core::aarch64::{GuestPreparedCommit, LeafAccess};
+use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerMmu, OwnerMmuRefusal};
 use carrick_sched_core::{AddressSpaces, SpaceEditor};
 use core::num::NonZeroU64;
 
@@ -16,7 +18,8 @@ use core::num::NonZeroU64;
 pub const TRANSFER_CHUNK_BYTES: u64 = 4096;
 const PA: u64 = 0x0000_ffff_ffff_f000;
 
-pub struct MmPortal<'a, P: PinnedMetadataExtent> {
+pub struct MmPortal<'a, P: PinnedMetadataExtent, B: OwnerMmu = Aarch64Mmu> {
+    pub(super) backend: core::marker::PhantomData<B>,
     pub(super) carrier: NonZeroU64,
     pub(super) roots: &'a SharedReservations,
     pub(super) spaces: &'a AddressSpaces,
@@ -168,6 +171,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         nodes: &'a ResolvedReservationNodes<P>,
     ) -> Self {
         Self {
+            backend: core::marker::PhantomData,
             carrier,
             roots,
             spaces,
@@ -177,6 +181,22 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             vma_visits: core::sync::atomic::AtomicUsize::new(0),
         }
     }
+    /// Select the ISA projection before borrowing the admitted owner. No
+    /// reservation, permit or continuation state is cloned or reconstructed.
+    pub fn with_mmu<B: OwnerMmu>(self, _: B) -> MmPortal<'a, P, B> {
+        MmPortal {
+            backend: core::marker::PhantomData,
+            carrier: self.carrier,
+            roots: self.roots,
+            spaces: self.spaces,
+            nodes: self.nodes,
+            zone: self.zone,
+            #[cfg(any(test, feature = "host-test"))]
+            vma_visits: self.vma_visits,
+        }
+    }
+}
+impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
     /// Add the production scheduler, using the same address-space authority.
     pub fn with_zone(mut self, zone: &'a carrick_sched_core::ZoneTables) -> Result<Self, MmError> {
         if !core::ptr::eq(self.spaces, &zone.spaces) {
@@ -501,25 +521,11 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             TransferIntent::ReadInstruction => LeafAccess::Execute,
             _ => LeafAccess::Read,
         };
-        let root = grant.ttbr0 & PA;
-        let mut leaf = match translated(words, root, va, access, continuation.intent) {
+        let root = B::root(grant.ttbr0).map_err(mmu_error)?;
+        let mut leaf = match translated::<B, W>(words, root, va, access, continuation.intent) {
             Err(MmError::Fault) if access == LeafAccess::Write => {
-                use carrick_mmu_core::aarch64::descriptor_txn::guest_cow::{
-                    GuestCowClass, GuestCowNotArmed, classify_guest_cow_write,
-                };
-                match classify_guest_cow_write(
-                    words,
-                    carrick_mmu_core::aarch64::SubstrateGpa(root),
-                    va,
-                    cow.executable_publication(),
-                ) {
-                    Ok(_) | Err(GuestCowClass::AlreadyWritable) => {}
-                    Err(GuestCowClass::NotArmed(GuestCowNotArmed::Executable)) => {
-                        return Err(MmError::UnsupportedExecutableCow);
-                    }
-                    Err(GuestCowClass::NotArmed(_)) => return Err(MmError::Fault),
-                    Err(GuestCowClass::Unreachable(_)) => return Err(MmError::Core),
-                }
+                B::classify_cow(words, root, UserVa::new(va), cow.executable_publication())
+                    .map_err(mmu_error)?;
                 match cow.resolve_cow_outcome(grant.ttbr0, mm, va) {
                     crate::fault::CowResolution::Resolved => {
                         #[cfg(target_os = "none")]
@@ -580,7 +586,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
                         ));
                     }
                 }
-                translated(words, root, va, access, continuation.intent)?
+                translated::<B, W>(words, root, va, access, continuation.intent)?
             }
             result => result?,
         };
@@ -593,7 +599,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             {
                 residency.record_commit(page);
             }
-            leaf = translated(words, root, va, access, continuation.intent)?;
+            leaf = translated::<B, W>(words, root, va, access, continuation.intent)?;
         }
         let Some((ipa, executable)) = leaf else {
             // Permission policy was already checked. Reuse the one lazy supply
@@ -695,9 +701,9 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
             TransferIntent::ReadInstruction => LeafAccess::Execute,
             _ => LeafAccess::Read,
         };
-        let current = match translated(
+        let current = match translated::<B, W>(
             words,
-            grant.ttbr0 & PA,
+            B::root(grant.ttbr0).map_err(mmu_error)?,
             selected.va.raw(),
             access,
             continuation.intent,
@@ -722,39 +728,29 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
     }
 }
 
-fn translated<W: LiveDescriptorWords + ?Sized>(
+fn mmu_error(error: OwnerMmuRefusal) -> MmError {
+    match error {
+        OwnerMmuRefusal::Protection => MmError::Fault,
+        OwnerMmuRefusal::Unreachable => MmError::Core,
+        OwnerMmuRefusal::ExecutableCow => MmError::UnsupportedExecutableCow,
+    }
+}
+fn translated<B: OwnerMmu, W: LiveDescriptorWords + ?Sized>(
     words: &W,
-    root: u64,
+    root: carrick_guest_arch::RootGpa,
     va: u64,
     access: LeafAccess,
     intent: TransferIntent,
 ) -> Result<Option<(u64, bool)>, MmError> {
-    let mut table = root;
-    for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
-        let descriptor = words
-            .load(table + ((va >> shift) & 511) * 8)
-            .map_err(|_| MmError::Core)?;
-        if descriptor & 1 == 0 {
-            return Ok(None);
-        }
-        if level == 3 || descriptor & 3 == 1 {
-            if level == 0 {
-                return Err(MmError::Core);
-            }
-            if intent != TransferIntent::CarrickInternalRead
-                && !terminal_descriptor_permits_el0(descriptor, access)
-            {
-                return Err(MmError::Fault);
-            }
-            let mask = (1u64 << shift) - 1;
-            return Ok(Some((
-                (descriptor & PA & !mask) + (va & mask),
-                terminal_descriptor_permits_el0(descriptor, LeafAccess::Execute),
-            )));
-        }
-        table = descriptor & PA;
-    }
-    Err(MmError::Core)
+    B::translate(
+        words,
+        root,
+        UserVa::new(va),
+        access,
+        intent != TransferIntent::CarrickInternalRead,
+    )
+    .map(|leaf| leaf.map(|leaf| (leaf.output.raw(), leaf.executable)))
+    .map_err(mmu_error)
 }
 
 impl SelectedChunk {
@@ -793,8 +789,8 @@ impl SelectedChunk {
 
 /// PREPARE finishes all fault/supply work and authenticates physical custody
 /// before publishing semantic admission. A refusal occurs before consumption.
-pub fn prepare_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
-    portal: &MmPortal<'_, P>,
+pub fn prepare_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized, B: OwnerMmu>(
+    portal: &MmPortal<'_, P, B>,
     request: carrick_el1_abi::PortalTransferRequest,
     words: &W,
     slot: u32,
@@ -853,8 +849,8 @@ pub fn prepare_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized
 
 /// One-shot transfers and two-phase ready-source copies share the same owner
 /// permit. COMMIT never revalidates or reacquires a root/editor after consuming.
-pub fn serve_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
-    portal: &MmPortal<'_, P>,
+pub fn serve_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized, B: OwnerMmu>(
+    portal: &MmPortal<'_, P, B>,
     service: carrick_el1_abi::PortalTransferService<'_>,
     words: &W,
     slot: u32,
@@ -932,8 +928,8 @@ pub fn serve_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
 }
 
 /// Exact prepared settlement has no descriptor-table or live-MM gate input.
-pub(super) fn settle_prepared_service<P: PinnedMetadataExtent>(
-    portal: &MmPortal<'_, P>,
+pub(super) fn settle_prepared_service<P: PinnedMetadataExtent, B: OwnerMmu>(
+    portal: &MmPortal<'_, P, B>,
     service: carrick_el1_abi::PortalTransferService<'_>,
     permit: carrick_el1_abi::PortalPreparedPermit,
     slot: u32,
@@ -1016,6 +1012,7 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     }
     let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
     let portal = MmPortal::<GuestMetadataPin> {
+        backend: core::marker::PhantomData,
         carrier: request.operation.carrier,
         roots: crate::memory::reservations::shared_guest(),
         spaces: &zone.spaces,
@@ -1113,6 +1110,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let zone =
             unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
         let portal = MmPortal::<GuestMetadataPin> {
+            backend: core::marker::PhantomData,
             carrier,
             roots: crate::memory::reservations::shared_guest(),
             spaces: &zone.spaces,
@@ -1423,6 +1421,7 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         return;
     };
     let portal = MmPortal::<GuestMetadataPin> {
+        backend: core::marker::PhantomData,
         carrier,
         roots: crate::memory::reservations::shared_guest(),
         spaces: &zone.spaces,
@@ -1508,6 +1507,7 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             return Err(MmError::Stale);
         }
         let portal = MmPortal::<GuestMetadataPin> {
+            backend: core::marker::PhantomData,
             carrier,
             roots: crate::memory::reservations::shared_guest(),
             spaces: &zone.spaces,

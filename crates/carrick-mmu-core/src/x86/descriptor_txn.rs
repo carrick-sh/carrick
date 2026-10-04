@@ -696,10 +696,30 @@ pub fn translate<W: LiveDescriptorWords + ?Sized>(
     access: Access,
     user: bool,
 ) -> Result<FrameGpa, FaultClass> {
+    translate_leaf(words, root, va, access, user).map(|leaf| leaf.output)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranslatedLeaf {
+    pub output: FrameGpa,
+    pub executable: bool,
+    pub ancestors_writable: bool,
+    pub descriptor: u64,
+    pub size: u64,
+}
+pub fn translate_leaf<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: RootGpa,
+    va: UserVa,
+    access: Access,
+    user: bool,
+) -> Result<TranslatedLeaf, FaultClass> {
     if !canonical(va.raw()) {
         return Err(FaultClass::Reserved);
     }
     let mut table = root.address().raw();
+    let mut executable = true;
+    let mut ancestors_writable = true;
     for level in 0..4 {
         let entry = words
             .load(table + ((va.raw() >> (39 - level * 9)) & 511) * 8)
@@ -708,6 +728,7 @@ pub fn translate<W: LiveDescriptorWords + ?Sized>(
         if entry & PRESENT == 0 {
             return Err(FaultClass::NotPresent);
         }
+        executable &= entry & NX == 0;
         if user && entry & USER == 0 {
             return Err(FaultClass::Protection);
         }
@@ -722,10 +743,17 @@ pub fn translate<W: LiveDescriptorWords + ?Sized>(
             });
         }
         if level == 3 || entry & HUGE != 0 {
-            return Ok(FrameGpa::new(
-                leaf_output(entry, level) + (va.raw() & (level_bytes(level) - 1)),
-            ));
+            return Ok(TranslatedLeaf {
+                output: FrameGpa::new(
+                    leaf_output(entry, level) + (va.raw() & (level_bytes(level) - 1)),
+                ),
+                executable,
+                ancestors_writable,
+                descriptor: entry,
+                size: level_bytes(level),
+            });
         }
+        ancestors_writable &= entry & WRITE != 0;
         table = entry & ADDRESS;
     }
     Err(FaultClass::Reserved)

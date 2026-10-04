@@ -78,3 +78,5 @@ pub use carrick_el1_abi::PortalTransferIntent as TransferIntent;
 pub mod test_support;
 #[cfg(test)]
 pub(crate) mod tests;
+#[cfg(test)]
+mod x86_tests;
