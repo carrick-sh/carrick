@@ -635,9 +635,26 @@ fn guest_fixed_anonymous_replacement_retires_stale_file_bus_range() {
     )
     .unwrap();
     assert!(root.lock().mapping(replaced).unwrap().anonymous);
+    assert!(root.owed().is_empty(), "this replacement retired no frame");
+    assert!(
+        dispatcher
+            .with_resident_frame_grant_plan_for_test(replaced, 4 * PAGE, |plan| plan.root_owned())
+            .is_some_and(|owned| owned),
+        "old host residency must not veto the current owner grant"
+    );
+    assert!(
+        dispatcher
+            .with_resident_fault_plan_for_test(replaced, |plan| plan.prot())
+            .is_some(),
+        "the single-page first-touch path also belongs to the new owner"
+    );
     assert!(
         !dispatcher.mmap_fault_is_sigbus(replaced),
         "owner replacement must supersede the host's stale EOF record"
+    );
+    assert!(
+        dispatcher.mmap_fault_is_sigbus(replaced + PAGE),
+        "the adjacent file EOF page still signals BUS"
     );
 }
 
