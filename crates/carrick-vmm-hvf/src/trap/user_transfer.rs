@@ -222,7 +222,7 @@ impl TransferCustody for UserTransferCustody {
         &self,
         target: carrick_aarch64::user_transfer::TransferTarget,
         window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<Option<Box<dyn carrick_aarch64::user_transfer::TransferGrant>>, TrapError> {
+    ) -> Result<carrick_aarch64::user_transfer::TransferPreparation, TrapError> {
         let Some(transport) = &self.transport else {
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                 window.range.start(),
@@ -230,7 +230,7 @@ impl TransferCustody for UserTransferCustody {
                 1,
                 0,
             );
-            return Ok(None);
+            return Ok(carrick_aarch64::user_transfer::TransferPreparation::Declined);
         };
         let Some(asid) = core::num::NonZeroU16::new((target.ttbr0() >> 48) as u16) else {
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
@@ -239,7 +239,7 @@ impl TransferCustody for UserTransferCustody {
                 2,
                 0,
             );
-            return Ok(None);
+            return Ok(carrick_aarch64::user_transfer::TransferPreparation::Declined);
         };
         let binding = CarrierForeignMmBinding {
             asid: carrick_hal::ForeignAsid::from_kernel_allocation(asid),
@@ -257,7 +257,7 @@ impl TransferCustody for UserTransferCustody {
                 3,
                 0,
             );
-            return Ok(None);
+            return Ok(carrick_aarch64::user_transfer::TransferPreparation::Declined);
         };
         sparse_materialization::PublicationContext::for_transfer(
             state,

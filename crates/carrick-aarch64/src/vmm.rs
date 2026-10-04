@@ -1361,8 +1361,8 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         &self,
         _target: crate::user_transfer::TransferTarget,
         _window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<Option<Box<dyn crate::user_transfer::TransferGrant>>, TrapError> {
-        Ok(None)
+    ) -> Result<crate::user_transfer::TransferPreparation, TrapError> {
+        Ok(crate::user_transfer::TransferPreparation::Declined)
     }
 
     fn owner_transfer_custody(&self) -> Option<Box<crate::user_transfer::ErasedPhysicalCustody>> {

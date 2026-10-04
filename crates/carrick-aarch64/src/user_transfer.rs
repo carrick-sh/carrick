@@ -36,8 +36,13 @@ pub fn supply<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
             "owner grant request differs from selected root".into(),
         ));
     }
-    let Some(mut grant) = custody.prepare(target, window)? else {
-        return Ok(false);
+    let mut grant = match custody.prepare(target, window)? {
+        TransferPreparation::Grant(grant) => grant,
+        // A peer installed the exact fault page while this physical request
+        // was in flight. No host bytes were delivered; select again under
+        // the owner's current root and source authority.
+        TransferPreparation::PeerResident => return Ok(true),
+        TransferPreparation::Declined => return Ok(false),
     };
     let mut service = engine.transfer_service_loan()?;
     let slot = slots
@@ -100,10 +105,18 @@ impl TransferPin for Box<dyn TransferPin> {
 }
 pub trait TransferGrant {
     fn transaction(&self) -> &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn;
+    /// Return true only when exact receipt settlement permits a fresh owner
+    /// selection: either the grant applied or EL1 refused a stale root before
+    /// publication. Physical custody is released before the caller retries.
     fn settle(
         &mut self,
         receipt: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt,
     ) -> Result<bool, TrapError>;
+}
+pub enum TransferPreparation {
+    Grant(Box<dyn TransferGrant>),
+    PeerResident,
+    Declined,
 }
 pub trait TransferCustody {
     type Pin: TransferPin;
@@ -112,7 +125,7 @@ pub trait TransferCustody {
         &self,
         target: TransferTarget,
         window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<Option<Box<dyn TransferGrant>>, TrapError>;
+    ) -> Result<TransferPreparation, TrapError>;
     fn publish_executable(
         &self,
         target: TransferTarget,
@@ -480,7 +493,7 @@ where
         &self,
         target: TransferTarget,
         window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<Option<Box<dyn TransferGrant>>, TrapError> {
+    ) -> Result<TransferPreparation, TrapError> {
         self.0.prepare(target, window)
     }
     fn publish_executable(
