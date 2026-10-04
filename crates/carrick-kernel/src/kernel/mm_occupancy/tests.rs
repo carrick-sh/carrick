@@ -898,6 +898,80 @@ fn pre_admission_owner_blocks_publication_and_refuses_without_relocking() {
 }
 
 #[test]
+fn initial_closed_publication_releases_legacy_facts_before_owner_guard() {
+    let (spaces, occupancy) = space_tables();
+    let key = mm(42_902);
+    let pre = PreAdmissionGuard::acquire_in(
+        SpaceTables {
+            spaces,
+            occupancy,
+            zone: None,
+        },
+        key,
+    )
+    .unwrap();
+    let publication = pre
+        .publish_closed(
+            &fence(),
+            0x10_000,
+            0x10_000,
+            0,
+            0,
+            ReservationRootPublication {
+                limits: ReservationLimits {
+                    address: u64::MAX,
+                    data: u64::MAX,
+                },
+                provider: None,
+            },
+        )
+        .unwrap();
+    drop(pre);
+    let closed = UnpublishedInitialAddressSpace::from_closed(publication);
+    let carrier = std::num::NonZeroU64::new(3).unwrap();
+    let token = closed.bind_token(carrier).unwrap();
+    assert_eq!(token.mm().raw(), key.raw());
+    assert_eq!(token.ttbr0(), 0x10_000);
+    assert!(!spaces.is_open(key.raw()));
+
+    let mirror = Arc::new(carrick_guest_mem::protections::MemoryProtections::default());
+    let weak = Arc::downgrade(&mirror);
+    let authority = carrick_guest_mem::UserMemoryAuthority::from_legacy(mirror);
+    // The real dispatcher clears root facts by borrowing this legacy mirror.
+    // A guard acquired before that release would self-deadlock here.
+    let legacy = authority.legacy().unwrap();
+    legacy.set_unmapped(0x4000, 0x1000, false);
+    drop(legacy);
+    let mut selection = authority.begin_selection().unwrap();
+    // SAFETY: this fixture stands for the exact EL1 BIND receipt for this
+    // still-closed MM root.
+    let handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(
+            carrier,
+            carrick_el1_abi::ReservationMm::new(key.raw()).unwrap(),
+            std::num::NonZeroU64::new(1).unwrap(),
+        )
+    };
+    assert!(matches!(
+        selection.select_owner(handle, || Ok::<_, ()>(
+            carrick_guest_mem::OwnerMemorySelection::Immediate
+        )),
+        Ok(carrick_guest_mem::OwnerMemorySelection::Immediate)
+    ));
+    let opened = closed.open_admitted(&selection).ok().unwrap();
+    drop(selection);
+    assert!(spaces.is_open(key.raw()));
+    assert_eq!(authority.owner(), Some(handle));
+    assert!(weak.upgrade().is_none());
+    assert!(
+        spaces
+            .find(key.raw())
+            .is_some_and(|index| spaces.closed_root_identity(index, key.raw()).is_none())
+    );
+    drop(opened);
+}
+
+#[test]
 fn owner_fork_publication_keeps_child_unswitchable_until_completion() {
     let (spaces, occupancy) = space_tables();
     let tables = SpaceTables {
