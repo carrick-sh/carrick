@@ -16596,5 +16596,32 @@
       "line_end": 1437,
       "line_start": 1437
     }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "run-scoped authenticated kernel-debug connection handlers, bounded by socket_rpc::MAX_CONNECTIONS and cancelled/joined on shutdown"
+    },
+    "expansion": null,
+    "operation": "std::thread::Builder::new",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/kernel/debug/server.rs:219 in `serve_loop`, `std::thread::Builder::new` acts only on run-scoped authenticated kernel-debug connection handlers; shared counted permits cap live handlers at 16, independently of join/reap; shutdown cancels and joins all handlers; no guest identity selects its host target.",
+    "review_id": "HA-000713",
+    "source": {
+      "byte_end": 8086,
+      "byte_start": 8061,
+      "column": 30,
+      "column_end": 55,
+      "column_start": 30,
+      "file": "crates/carrick-kernel/src/kernel/debug/server.rs",
+      "line": 219,
+      "line_end": 219,
+      "line_start": 219
+    }
   }
 ]
