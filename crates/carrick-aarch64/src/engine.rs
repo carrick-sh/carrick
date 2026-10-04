@@ -8959,7 +8959,7 @@ mod transfer_service_tests {
             &self,
             _: crate::user_transfer::TransferTarget,
             _: carrick_el1_abi::PortalGrantWindow,
-        ) -> Result<Option<Box<dyn crate::user_transfer::TransferGrant>>, TrapError> {
+        ) -> Result<crate::user_transfer::TransferPreparation, TrapError> {
             panic!("no grant expected")
         }
         fn publish_executable(
