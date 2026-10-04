@@ -1,5 +1,32 @@
 [
   {
+    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "once-created pair of carrier-owned inode recall storage workers"
+    },
+    "expansion": null,
+    "operation": "std::thread::Builder::new",
+    "profiles": [
+      "macos-cli-default",
+      "macos-runtime-default"
+    ],
+    "rationale": "At crates/carrick-kernel/src/el1_delegation/owned_recall.rs:46 in `driver`, `std::thread::Builder::new` creates exactly two carrier-owned storage workers for owned inode recall jobs. The inode owner retains each job; no guest identity selects a host thread, and these workers carry no guest executor lease.",
+    "review_id": "HA-000716",
+    "source": {
+      "byte_end": 1598,
+      "byte_start": 1573,
+      "column": 13,
+      "column_end": 38,
+      "column_start": 13,
+      "file": "crates/carrick-kernel/src/el1_delegation/owned_recall.rs",
+      "line": 46,
+      "line_end": 46,
+      "line_start": 46
+    }
+  },
+  {
     "catalog_id": "HA-CATALOG-HVF-VCPUS-EXIT",
     "classification": "declared_substrate",
     "evidence": {
@@ -18676,7 +18703,7 @@
       "macos-runtime-default"
     ],
     "rationale": "At crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs:62 in `RootHostWait::wait`, `std::thread::sleep` acts only on the current host thread waiting on an EL1 reservation root held by guest EL1, napping between holder-progress checks in `RootHostWait::wait`; no guest identity selects its host target.",
-    "review_id": "HA-000693",
+    "review_id": "HA-000715",
     "source": {
       "byte_end": 2898,
       "byte_start": 2880,
@@ -18703,7 +18730,7 @@
       "macos-runtime-default"
     ],
     "rationale": "At crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs:60 in `RootHostWait::wait`, `std::thread::yield_now` acts only on the current host thread waiting on an EL1 reservation root held by guest EL1 used by `RootHostWait::wait`; no guest identity selects its host target.",
-    "review_id": "HA-000692",
+    "review_id": "HA-000714",
     "source": {
       "byte_end": 2847,
       "byte_start": 2825,
