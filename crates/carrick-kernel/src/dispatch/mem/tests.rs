@@ -487,8 +487,10 @@ impl DeferredSetterFailureMemory {
 }
 
 impl GuestMemory for DeferredSetterFailureMemory {
-    fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
-        Some(&self.unmapped)
+    fn protections(&self) -> Option<carrick_guest_mem::LegacyProtectionRead<'_>> {
+        Some(carrick_guest_mem::LegacyProtectionRead::borrowed(
+            &self.unmapped,
+        ))
     }
 
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
@@ -587,8 +589,10 @@ impl ProtectionTrackingMemory {
 }
 
 impl GuestMemory for ProtectionTrackingMemory {
-    fn protections(&self) -> Option<&carrick_guest_mem::protections::MemoryProtections> {
-        Some(&self.protections)
+    fn protections(&self) -> Option<carrick_guest_mem::LegacyProtectionRead<'_>> {
+        Some(carrick_guest_mem::LegacyProtectionRead::borrowed(
+            &self.protections,
+        ))
     }
 
     fn has_complete_mapping_metadata(&self) -> bool {

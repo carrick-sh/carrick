@@ -5,7 +5,8 @@ use crate::ReservationMm;
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-pub const MM_PORTAL_PROTOCOL: u64 = 4;
+// SELECT success carries the pre-selection Reservations observation in x16/x17.
+pub const MM_PORTAL_PROTOCOL: u64 = 5;
 pub const MM_PORTAL_MAX_BYTES: u64 = 4096;
 pub const MM_PORTAL_BIND_ESR: u64 = 0x4352_4d4d_4249_0004;
 /// Identity of an admitted owner. It contains no editor, table, or host pointer.
@@ -351,7 +352,8 @@ pub struct PortalTransferSlot {
 /// when new words fit in the previous cache-line padding.
 pub const MM_TRANSFER_LAYOUT_HASH: u64 = {
     let words = [
-        2u64,
+        3u64,
+        MM_PORTAL_PROTOCOL,
         PortalWaitCause::ReservationPool as u64,
         PREPARED,
         SUSPENDED,
