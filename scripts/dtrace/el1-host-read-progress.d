@@ -22,6 +22,19 @@
  *     record-ID authority, absent from the old carrier-MM-only IPA index.
  *     The exact PortalWaitCause was Reservations, but no real reservation
  *     was held: this missing lookup could never wake itself.
+ *     hvpatch-el1-fault-root-mapping(far,start,end,source_handle,source_offset)
+ *     observes the admitted root at final fault delivery only. A zero range
+ *     means no root mapping; a zero source handle means no retained file
+ *     source. It does not authorize a grant or replace EL1's own decision.
+ *     hvpatch-el1-file-fault-handoff(far,mailbox_state,route) distinguishes
+ *     a missing owner selection (0) from selected (1), resolved (2), refused
+ *     (3) and BUS (4). State is the ABI mailbox AtomicU32 at the host exit.
+ *     Live-qualified on signed guest_smoke-504ebb617cfe4759, 2026-10-04:
+ *     hello's later execute fault at 0x6000042d20 retained source handle 4
+ *     in the root and selected a file fault with mailbox state 2 (requested),
+ *     then returned route 3 (refused) in state 3 (host working). Earlier
+ *     executable pages took the same route and resolved (route 2). This
+ *     excludes missing source and missing owner selection for that page.
  *     Companion fault, frame-grant, mapping-leaf, syscall-service and mmap
  *     lowering probes use their carrick-observability signatures. The
  *     mapping-leaf phases are 0 prepare, 1 submit, 3 applied, 4 settled,
@@ -51,6 +64,20 @@ carrick*:::hvpatch-el1-host-read-retention
 {
     printf("EL1HOSTREAD1|pid=%d|ipa=0x%x|retention=%d\n", pid, arg0, arg1);
     @retention[arg1] = count();
+}
+
+carrick*:::hvpatch-el1-fault-root-mapping
+/pid == $target || progenyof($target)/
+{
+    printf("EL1HOSTREAD1|fault-root|far=0x%x|start=0x%x|end=0x%x|handle=%d|offset=%d\n",
+        arg0, arg1, arg2, arg3, arg4);
+}
+
+carrick*:::hvpatch-el1-file-fault-handoff
+/pid == $target || progenyof($target)/
+{
+    printf("EL1HOSTREAD1|file-handoff|far=0x%x|mailbox-state=%d|route=%d\n",
+        arg0, arg1, arg2);
 }
 
 carrick*:::hvpatch-guest-fault
