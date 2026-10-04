@@ -40,13 +40,13 @@ fn fail(message: impl Into<String>) -> TrapError {
 }
 
 /// RAII deadline: one bounded blocking wait, one kick on expiry, always joined.
-struct Watchdog {
+pub(crate) struct Watchdog {
     cancel: mpsc::Sender<()>,
     worker: Option<std::thread::JoinHandle<()>>,
     expired: Arc<AtomicBool>,
 }
 impl Watchdog {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let kick = KvmKickHandle::for_current_thread();
         let (cancel, receiver) = mpsc::channel();
         let expired = Arc::new(AtomicBool::new(false));
@@ -63,6 +63,9 @@ impl Watchdog {
             worker: Some(worker),
             expired,
         }
+    }
+    pub(crate) fn expired(&self) -> bool {
+        self.expired.load(Ordering::Acquire)
     }
 }
 impl Drop for Watchdog {

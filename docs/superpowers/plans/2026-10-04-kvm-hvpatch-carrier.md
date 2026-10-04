@@ -391,6 +391,158 @@ accepted landing. No shared runtime, task graph or private cursor/permit model.
 - [ ] Accept: `cargo test -p carrick-el1 -p carrick-mmu-core --lib`;
   `CARRICK_RUN_ID=kvm-m3 cargo test -p carrick-vmm-kvm --test carrier_memory`.
 
+#### M3 preparation handoff to the accepted N1 owner
+
+N1-independent preparation on `work/x86-m3prep` adds the x86 descriptor backend
+and a dedicated carrier memslot owner. It does **not** bind a production
+MmPortal, execute Linux memory syscalls in CPL0, admit reservations/permits,
+implement the N1 cursor or claim M3 acceptance. No N1-owned file is edited.
+The real-KVM fixture has two stopped/run-controlled CPUs and permanent MM
+assignments; it is hardware evidence, not the M5 executor binding.
+
+The owner calls the following x86 hooks, with its existing exact-MM editor,
+entry exclusion, backing pins and publication/retirement transaction held.
+These are the signatures implemented by this preparation (generic bounds are
+shown once; paths are relative to `crates/`):
+
+```rust
+// carrick-mmu-core/src/x86/descriptor_txn.rs
+// W: LiveDescriptorWords + ?Sized; J: DescriptorJournal + ?Sized
+fn plan_descriptor_txn<W>(
+    words: &W, txn: &DescriptorTxn<'_>, live_root: RootGpa,
+) -> Result<DescriptorPlan, DescriptorRefusal>;
+fn apply_descriptor_plan<W, J>(
+    words: &W, plan: &DescriptorPlan, journal: &mut J,
+) -> DescriptorReceipt;
+fn rollback_descriptor_plan<W>(
+    words: &W, plan: &DescriptorPlan,
+) -> DescriptorOutcome;
+fn execute_descriptor_txn<W, J>(
+    words: &W, txn: &DescriptorTxn<'_>, live_root: RootGpa, journal: &mut J,
+) -> DescriptorReceipt;
+fn translate<W>(
+    words: &W, root: RootGpa, va: UserVa, access: Access, user: bool,
+) -> Result<FrameGpa, FaultClass>;
+fn DescriptorTxn::verify_receipt(
+    &self, receipt: &DescriptorReceipt,
+) -> Result<(), DescriptorRefusal>;
+
+// carrick-vmm-kvm/src/carrier_memory.rs
+fn CarrierMemory::install(
+    &mut self, backings: &[PreparedBacking],
+) -> Result<Vec<BackingHandle>, MemoryError>;
+fn CarrierMemory::install_root(
+    &mut self, mm: NonZeroU64, context: AddressContext<RootGpa>,
+) -> Result<(), MemoryError>;
+fn CarrierMemory::words(&self) -> DescriptorWords<'_>;
+fn CarrierMemory::publish<I: InventoryTransaction>(
+    &mut self, txn: &DescriptorTxn<'_>, backings: &[PreparedBacking],
+    inventory: &mut I,
+) -> Result<(DescriptorReceipt, Vec<BackingHandle>), MemoryError>;
+fn CarrierMemory::share(
+    &self, handle: BackingHandle,
+) -> Result<SharedFrameEdge, MemoryError>;
+fn CarrierMemory::attach_shared(
+    &mut self, mm: NonZeroU64, edge: &SharedFrameEdge,
+) -> Result<(), MemoryError>;
+fn CarrierMemory::revoke<D: TranslationDrain, I: InventoryRetirement>(
+    &mut self, handle: BackingHandle, drain: &mut D, inventory: &mut I,
+) -> Result<(), MemoryError>;
+fn CarrierMemory::read(
+    &self, pa: FrameGpa, len: usize,
+) -> Result<Vec<u8>, MemoryError>;
+fn CarrierMemory::write(
+    &mut self, pa: FrameGpa, bytes: &[u8],
+) -> Result<(), MemoryError>;
+```
+
+N1 supplies these implementations; the fixture callbacks are test scaffolding
+and cannot substitute for the accepted owner:
+
+```rust
+trait InventoryTransaction {
+    fn publish(&mut self) -> Result<(), MemoryError>;
+    fn commit(&mut self, receipt: &DescriptorReceipt) -> Result<(), MemoryError>;
+    fn rollback(&mut self) -> Result<(), MemoryError>;
+}
+trait InventoryRetirement {
+    fn retire(&mut self, identity: BackingIdentity) -> Result<(), MemoryError>;
+    fn rollback(&mut self) -> Result<(), MemoryError>;
+}
+unsafe trait TranslationDrain {
+    fn drain(&mut self, plan: ShootdownPlan) -> Result<(), MemoryError>;
+}
+```
+
+- **Admission / identity:** N1 issues the exact MM key, root, context generation,
+  transaction generation, unlinked zeroed table grants and BackingIdentity
+  (frame/mapping/owner generation/inventory revision). `RootGpa`, `FrameGpa`,
+  `UserVa` and `AddressContext` reuse `carrick-guest-arch`; transaction identity,
+  backing identity, PageSpan, descriptor words and journals reuse the existing
+  ARM-independent definitions exported by ARM's descriptor module. No ARM
+  descriptor encoding or EL1 ABI layout is copied or changed. A future common
+  owner interface can associate each ISA's operation/plan/receipt types while
+  retaining these same identity and word/journal types.
+- **Publication:** the root/table arena is installed before planning; grants remain inside that
+  retained primary extent, as in ARM's primary-table window. A published root
+  prevents arena revoke. Root arena retirement/reuse remains the accepted
+  N1/M5 root-retirement binding; this preparation retains it until carrier
+  destruction. New data
+  extents may be passed to `publish`. N1's `publish` callback authenticates and
+  publishes real inventory readiness after slot installation, before present
+  leaves. `commit` settles the exact verified descriptor result, never physical
+  old-owner retirement. Failed callbacks, descriptor stores and slot installs
+  undo the entire unit. Unprovable undo quarantines and retains registered
+  backing until VM destruction. Table grants are returned only after owner
+  settlement; coalesced table pages likewise require the owner's drain before
+  recycling. The backend never allocates a reservation arena or a shared-zero
+  COW source.
+- **First touch / COW / user transfer:** normalize x86 PF P/W/U/I and CR2 at the
+  architecture seam, then let the accepted reservation/owner policy choose the
+  operation. `Map { resident: false }` retains private prepared output;
+  `Publish` exposes that exact output. `ArmCow` removes write permission;
+  `CowRepoint` validates the old output and restores recorded write intent.
+  N1 copies pinned bytes before repoint and supplies the new identity. Its
+  UserTransfer permit authenticates the live root and exact backing generation
+  around `translate` and bounded `read`/`write`; a hardware walk or physical pin
+  alone grants no semantic rights. Foreign-MM/prefix/lease progress is still
+  the N1/M5 binding, not this fixture.
+- **Drain / retirement:** descriptor-word maintenance in the stopped adapter
+  deliberately has no hardware invalidation instruction. N1 must hold entry
+  exclusion and perform the trailing CPL0 drain after success **or rollback**
+  before re-entry. `revoke` rejects retained physical aliases, collects the
+  exact previously unlinked contexts and requests `ReloadCr3`; every live or
+  parked CPU that could hold that generation must acknowledge before deletion
+  and inventory retirement. A failed inventory retirement reinstalls the exact
+  old slot/backing/generation. The unsafe drain trait states that hardware
+  obligation explicitly; ioctl completion is insufficient. `Invlpg(PageSpan)`
+  is the narrow-range plan form, while this initial fixture uses one actual
+  CPL0 CR3 reload per affected context. PCID/global mappings are not admitted.
+  The fixture consumes pending KVM IO completion before saving and restoring
+  the temporary drain context, preventing replay of the interrupted doorbell.
+
+Preparation witnesses bind `kernel.el1.stage1-publication`,
+`kernel.mm.address-space-occupancy` and
+`kernel.mm.pt-pause-drain-acknowledgement`. Semantic authority is Linux
+`mmap(2)`, `mprotect(2)` and `fork(2)` plus the Intel SDM four-level paging/PF
+encoding; this lane uses direct executing hardware fixtures, without Docker.
+Deterministic budgets: a fresh n-page map uses n + 3 stores and three tables at
+16/64/256 pages; unrelated PML4 branches add no reads. Whole 1 GiB protection
+uses one store and no split tables. One extent uses one slot at 16/64/256
+pages, with retained bytes equal to its supplied size. Physical alias unlink
+visits one touched edge at 16/128/512 unrelated populations.
+
+Red evidence: the MissingTable descriptor stub failed publication/rollback;
+no-op physical undo left one slot after second-install failure and two after
+inventory failure. The executing revoke fixture initially replayed a previous
+byte doorbell across a drain context switch; consuming KVM IO completions made
+it detect actual first-touch faults after revoke. All six executing witnesses
+cover distinct same-VA bytes, explicit shared edges, first-touch retry, COW
+break, NX/RO fault classes, warm translation revoke, generation reuse and
+both-root shared retirement. Full verification and receipts are recorded below
+when completed; remote host receipt is **director-queued**, and macOS signed,
+Docker and accepted N1/M5 integration remain director-owned.
+
 ### M4 — shared scheduler, timer/wake and IPC on CPL0
 
 **Fence:** new x86 `cpl0_scheduler.rs`/`interrupts.rs`, KVM
