@@ -18,7 +18,7 @@ Index + rulebook for agents (and humans) in **Carrick**; depth in
   NetBSD/NVMM are additional hosts, x86_64 guests via the shared `carrick-x86`
   engine. Legacy 1:1 backends (`vmm`, `native`) are retired.
 - **Status — experimental, not production-ready.** Be honest in code, docs and
-  commits: partial syscall coverage (242 emulated, 95 deferred on the aarch64
+  commits: partial syscall coverage (247 emulated, 89 deferred on the aarch64
   table — `grep -c 'SupportLevel::BringUp' crates/carrick-abi/src/syscall.rs`;
   several partial; [`docs/syscalls-emulation-map.md`](docs/syscalls-emulation-map.md)),
   incomplete guest behaviour, **no adversarial security review**. Not a

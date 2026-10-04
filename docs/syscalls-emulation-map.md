@@ -23,15 +23,17 @@ Each row carries a `SupportLevel`, which maps to the **Quality** column below:
 | `SupportLevel` | Quality | Meaning |
 |---|---|---|
 | `BringUp` | **Emulated** (Full or Partial) | Routed to a real handler. *Full* = ABI-complete for the cases workloads hit; *Partial* = the common path works, edges/flags are stubbed or deferred (judged here from the handler + `compat_note`). |
-| `Planned` | **Stub** | Recognized by name but routes to `ENOSYS` today. Only two: `execveat` (#281) and `clone3` (#435) — the latter is partially wired for the clone/fork modes carrick supports (`compat_note_for_aarch64`). |
-| `Deferred` | **Not implemented** | `ENOSYS`, surfaced by its real name (e.g. `io_uring_register`, `process_madvise`) so the compat report shows `process_madvise`, not `unknown 440`. |
+| `Planned` | **Partial, not promoted** | `execveat` (#281) and `clone3` (#435) have working dispatch paths, but retain this level pending missing semantics documented in `compat_note_for_aarch64`. |
+| `Deferred` | **Not promoted** | Usually `ENOSYS`, surfaced by its real name. Some rows have partial implementations; dispatch presence alone does not establish support. See the [metadata audit](syscall-metadata-audit.md). |
 
-**242 syscalls are actively emulated** (`BringUp`), 2 are `Planned` stubs, and
-the remaining 95 table rows are `Deferred`. Counts are from the table itself
+**247 syscalls are marked emulated** (`BringUp`, including partial support),
+2 are `Planned` partial implementations, and 89 table rows are `Deferred`.
+Counts are from the table itself
 (`rg 'SupportLevel::BringUp' crates/carrick-abi/src/syscall.rs | wc -l`).
 
 > [!NOTE]
-> "Deferred → ENOSYS" is deliberate and load-bearing: glibc/musl and most
+> Where a deferred handler returns `ENOSYS`, the fallback is deliberate:
+> glibc/musl and most
 > runtimes treat an `ENOSYS` from an optional syscall as "feature absent" and
 > fall back. Returning `ENOSYS` by *name* (rather than crashing on an unknown
 > trap) is what lets `io_uring_register`, `landlock_*`, the
@@ -164,16 +166,17 @@ reparent-to-init, and `wait4`/`waitid` status all match Linux semantics.
 | Syscall(s) | nr | Quality | Darwin backing | Notes |
 |---|---|---|---|---|
 | `clone` | 220 | Emulated (Full) | `libc::fork` (process) or `pthread` + fresh per-thread vCPU (thread) | Flag-consistency validated: `CLONE_THREAD` without `CLONE_VM\|CLONE_SIGHAND` → EINVAL. |
-| `clone3` | 435 | **Stub/Partial** | partially wired to `clone` modes | `Planned`; strict `args_size`/flag/stack validation, then the supported clone/fork modes proceed, else EINVAL/ENOSYS (`compat_note` #435). |
+| `clone3` | 435 | **Partial, not promoted** | kernel fork/thread outcomes | `Planned`; validates sizes/flags/stack and supports fork/thread paths, but ignores `set_tid`, `set_tid_size`, and `cgroup`. |
 | `execve` | 221 | Emulated (Full) | re-exec the ELF loader in-process | Resets caught handlers→SIG_DFL, keeps SIG_IGN, preserves mask + pending + sigaltstack. |
-| `execveat` | 281 | **Stub** | — | `Planned`; routes to `ENOSYS` today (`compat_note` #281). |
+| `execveat` | 281 | **Partial, not promoted** | shared exec loader | `Planned`; path/dirfd, flag validation and `AT_EMPTY_PATH` work. Ordinary fds execute by recorded path, losing opened-inode identity after unlink/replacement. |
 | `exit`, `exit_group` | 93,94 | Emulated (Full) | thread/process teardown | |
 | `wait4`, `waitid` | 260,95 | Emulated (Full) | host `waitpid` + kqueue `EVFILT_PROC` park; SA_RESTART restart logic | Awaited-child exit never spurious-EINTRs; `waitid` fills CLD_EXITED/CLD_KILLED siginfo + WNOWAIT. |
 | `getpid`/`getppid`/`gettid`, `getpgid`/`setpgid`/`getsid`/`setsid` | 172,173,178,155,154,156,157 | Emulated (Full) | host pid/pgrp accessors over the process mirror | `/proc/self/status` Pid/Tgid agree with `getpid`/`gettid`; orphan reparents to PID 1. |
 | `set_tid_address`, `set_robust_list` | 96,99 | Emulated (Partial) | recorded per-thread | `set_robust_list` validates `len == 24`; no robust-futex death cleanup. |
 | `prctl` | 167 | Emulated (Partial) | per-process state | `PR_SET_DUMPABLE`/`NO_NEW_PRIVS`/`KEEPCAPS`/`CHILD_SUBREAPER`/`TIMERSLACK`/comm round-trip. |
 | `pidfd_open`, `pidfd_send_signal` | 434,424 | Emulated (Partial) | host pid handle + signal | `pidfd_open` sets FD_CLOEXEC. |
-| `capget`/`capset`, `seccomp`, `personality`, `membarrier`, `rseq`, `ptrace` | 90,91,277,92,283,293,117 | Emulated (Partial) | per-process model / no-op-accept | `ptrace` Phase 1: guest BRK/step/HW-debug deliver SIGTRAP; `ptrace(2)` op surface itself is otherwise `ENOSYS`. `unshare`/`reboot` accepted in a degraded form. |
+| `capget`/`capset`, `seccomp`, `personality`, `membarrier`, `ptrace` | 90,91,277,92,283,117 | Emulated (Partial) | per-process model / no-op-accept | `ptrace` Phase 1: guest BRK/step/HW-debug deliver SIGTRAP; `ptrace(2)` op surface itself is otherwise `ENOSYS`. `unshare`/`reboot` accepted in a degraded form. |
+| `rseq` | 293 | Deferred | — | Registration always returns `ENOSYS`; libc takes its bootstrap fallback. |
 | `getrusage` | 165 | Emulated (Full) | Darwin `getrusage` + `task_info` | HVF guest CPU is folded in via wall-time-in-`hv_vcpu_run` (not in host rusage). |
 | `process_vm_readv`, `process_vm_writev` | 270,271 | Emulated (Partial) | in-address-space iovec walk | SELF-transfer only (`pid == getpid()`), plus the full argument contract: `flags != 0` → EINVAL, `iov_len`/total overflow → EINVAL, bad iov array → EFAULT, `pid == 0` or unknown task → ESRCH, unprivileged non-owner → EPERM. A permitted CROSS-process transfer is unimplemented and lowers to EFAULT — carrick has no foreign-mm VA→IPA→host path and does not publish peer-side VMA protections. (Not a "peer VM" problem: under HVPatch every Linux process is a thread of one carrier in one VM.) |
 | `bpf` | 280 | Emulated (Partial) | in-carrier map objects behind anon fds (`dispatch/bpf.rs`) | `BPF_MAP_CREATE` (hash + array), `BPF_MAP_LOOKUP/UPDATE/DELETE_ELEM`, `BPF_MAP_GET_NEXT_KEY` with `bpf(2)` element semantics (pre-allocated zeroed arrays, `BPF_ANY`/`NOEXIST`/`EXIST`, `E2BIG`/`EEXIST`/`ENOENT`). `BPF_PROG_LOAD` accepts `SOCKET_FILTER` with STRUCTURAL validation only — no data-flow verifier, programs are never executed, attachment (`SO_ATTACH_BPF`) is unsupported. Every other command is `EINVAL` (older-kernel shape). Under a default `carrick run` the syscall is EPERM — Docker's launch-time seccomp model (gated on `CAP_SYS_ADMIN` there), not a handler decision; the oracle kernel itself allows unprivileged bpf (`unprivileged_bpf_disabled=0`). |
@@ -200,7 +203,8 @@ PRIVATE/anonymous futexes park in-process via `parking_lot_core`
 | `futex` | 98 | Emulated (Full) | PRIVATE → `parking_lot_core`; SHARED → `os_sync_wait_on_address` | WAIT/WAKE/WAIT_BITSET/CMP_REQUEUE/REQUEUE; `FUTEX_WAKE(INT_MAX)` returns exactly N; shared CMP_REQUEUE degrades to wake-all (spurious-wake-tolerant). |
 | `sched_getaffinity`/`sched_setaffinity`, `getcpu`, `sched_yield` | 123,122,168,124 | Emulated (Full) | Darwin `hw.ncpu`/affinity, `sched_yield` | Real cpu count + affinity. |
 | `getpriority`/`setpriority`, `ioprio_get`/`ioprio_set` | 141,140,31,30 | Emulated (Partial) | per-process nice model | nice clamped to [-20,19]; non-root nice-lower → EPERM. |
-| `sched_setparam`/`getparam`/`setscheduler`/`getscheduler`/`get_priority_max`/`get_priority_min`/`rr_get_interval` | 118–121,125–127 | Emulated (Partial) | constant model (`SCHED_OTHER`) | Probe-owned Linux-conformant constants, though several rows read `Deferred` in the table — the report reflects the table; behavior is exercised by `schedparam`/`schedprio`. |
+| `sched_get_priority_max`/`sched_get_priority_min` | 125,126 | Emulated (Full) | pure policy query | FIFO/RR expose 99/1; OTHER/BATCH/IDLE/DEADLINE expose 0/0; unknown policy → EINVAL. Exercised by `schedparam`. |
+| `sched_setparam`/`getparam`/`setscheduler`/`getscheduler`/`rr_get_interval` | 118–121,127 | Partial, not promoted | constant model (`SCHED_OTHER`) | `Deferred`; the scheduling model does not implement arbitrary policies/priorities. Exercised by `schedparam`/`schedprio`. |
 | `sched_getattr` | 275 | Emulated (Partial) | zeroed `SCHED_OTHER` sched_attr | `Deferred` in table; validation path probe-owned. |
 
 **Deferred:** `sched_setattr` (write side), `futex_waitv`, the new
@@ -342,12 +346,15 @@ remaining unassigned/reserved numbers.
 
 > [!IMPORTANT]
 > The `SupportLevel` in the table is the source of truth for the compat report
-> and for "is this ENOSYS today?". A handful of rows here are noted as `Deferred`
+> but dispatch and handler code determine whether a call returns `ENOSYS`.
+> A handful of rows here are noted as `Deferred`
 > in the table while a conformance probe exercises an emulated code path added
-> after the table row was last set (e.g. `memfd_create`, `cachestat`, several
+> after the table row was last set (e.g. `cachestat`, several
 > `sched_*` and `timer_*` numbers). Where they disagree, the table governs what
 > the *reporter* claims; the probe governs what *behavior* is gated. Treat any
-> such divergence as a TODO to reconcile the `SupportLevel`.
+> such divergence as a TODO to reconcile the `SupportLevel`. The
+> [2026-10-04 audit](syscall-metadata-audit.md) records the current candidates
+> and why partial implementations were not promoted.
 
 ## See also
 

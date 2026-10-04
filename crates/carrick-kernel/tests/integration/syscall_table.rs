@@ -155,6 +155,8 @@ fn names_linux_aarch64_bringup_syscalls() {
         (113, "clock_gettime"),
         (114, "clock_getres"),
         (115, "clock_nanosleep"),
+        (125, "sched_get_priority_max"),
+        (126, "sched_get_priority_min"),
         (117, "ptrace"),
         (123, "sched_getaffinity"),
         (124, "sched_yield"),
@@ -208,7 +210,6 @@ fn names_linux_aarch64_bringup_syscalls() {
         (278, "getrandom"),
         (283, "membarrier"),
         (291, "statx"),
-        (293, "rseq"),
         (437, "openat2"),
         (439, "faccessat2"),
     ] {
@@ -245,13 +246,20 @@ fn manifest_records_group_handler_and_compatibility_notes() {
 
     let execveat = lookup_aarch64(281).unwrap();
     assert_eq!(execveat.support, SupportLevel::Planned);
-    assert_eq!(execveat.handler, SyscallHandler::Unimplemented);
+    assert_eq!(execveat.handler, SyscallHandler::Lifecycle);
     assert!(execveat.compat_note.is_some());
 
     let clone3 = lookup_aarch64(435).unwrap();
     assert_eq!(clone3.support, SupportLevel::Planned);
     assert_eq!(clone3.handler, SyscallHandler::Lifecycle);
     assert!(clone3.compat_note.is_some());
+
+    // The dispatched rseq refusal is a libc fallback, not registration support.
+    // syscall_creds::rseq_reports_clean_bootstrap_fallback pins errno 38.
+    let rseq = lookup_aarch64(293).unwrap();
+    assert_eq!(rseq.support, SupportLevel::Deferred);
+    assert_eq!(rseq.handler, SyscallHandler::Process);
+    assert!(rseq.compat_note.is_some());
 }
 
 #[test]

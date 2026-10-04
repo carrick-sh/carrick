@@ -219,6 +219,8 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 117
         | 122
         | 123
+        | 125
+        | 126
         | 142
         | 154..=157
         | 160..=162
@@ -243,7 +245,7 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
         | 434
         | 438
         | 180..=197 => SyscallHandler::Process,
-        93 | 94 | 220 | 221 | 260 | 435 => SyscallHandler::Lifecycle,
+        93 | 94 | 220 | 221 | 260 | 281 | 435 => SyscallHandler::Lifecycle,
         74 | 129..=139 => SyscallHandler::Signal,
         96 | 98 | 99 | 124 | 178 => SyscallHandler::ThreadLocal,
         _ => SyscallHandler::Unimplemented,
@@ -253,14 +255,19 @@ pub const fn handler_for_aarch64(number: u64) -> SyscallHandler {
 pub const fn compat_note_for_aarch64(number: u64) -> Option<&'static str> {
     match number {
         14..=16 => Some("xattr removal is reported as unsupported for bring-up compatibility"),
-        281 => Some("execveat remains planned and currently routes to unimplemented ENOSYS"),
+        281 => Some(
+            "partial execveat: path/dirfd and AT_EMPTY_PATH are dispatched, but ordinary fds execute by recorded path rather than retained inode",
+        ),
         282 => Some(
             "container policy only: EPERM without CAP_SYS_PTRACE (Docker-default caps), ENOSYS with it — no userfaultfd emulation",
         ),
         447 => Some(
             "guest-visible ABI (fd, MAP_SHARED-only mmap, EINVAL file I/O, /proc mem hiding); host direct-map removal and mlock accounting are not modeled",
         ),
-        435 => Some("clone3 is partially handled for the clone/fork modes Carrick supports"),
+        293 => Some("rseq registration is not emulated; the handler always returns ENOSYS"),
+        435 => Some(
+            "partial clone3: supported clone/fork modes and argument validation; set_tid, set_tid_size and cgroup are not modeled",
+        ),
         _ => None,
     }
 }
@@ -268,9 +275,8 @@ pub const fn compat_note_for_aarch64(number: u64) -> Option<&'static str> {
 // The complete Linux generic (aarch64) syscall table per the kernel
 // `include/uapi/asm-generic/unistd.h` (v6.12). Every assigned aarch64 number
 // is listed so `lookup_aarch64` can name *any* syscall a guest issues; numbers
-// Carrick does not yet emulate are `SupportLevel::Deferred` with the
-// `Unimplemented` handler, so the compat reporter shows a real name (e.g.
-// "io_uring_setup") instead of "unknown 425". Gaps (244..=259, 295..=402, 415)
+// Carrick does not yet emulate are marked `Deferred`, so the compat reporter
+// shows a real name (e.g. "io_uring_register") instead of "unknown 427". Gaps (244..=259, 295..=402, 415)
 // are unassigned on aarch64 and intentionally absent. MUST stay sorted by
 // number for the binary search in `lookup_aarch64`.
 macro_rules! define_aarch64_syscall_table {
@@ -455,8 +461,8 @@ define_aarch64_syscall_table! {
     (SCHED_SETAFFINITY, 122, "sched_setaffinity", "sched", SupportLevel::BringUp);
     (SCHED_GETAFFINITY, 123, "sched_getaffinity", "sched", SupportLevel::BringUp);
     (SCHED_YIELD, 124, "sched_yield", "sched", SupportLevel::BringUp);
-    (SCHED_GET_PRIORITY_MAX, 125, "sched_get_priority_max", "sched", SupportLevel::Deferred);
-    (SCHED_GET_PRIORITY_MIN, 126, "sched_get_priority_min", "sched", SupportLevel::Deferred);
+    (SCHED_GET_PRIORITY_MAX, 125, "sched_get_priority_max", "sched", SupportLevel::BringUp);
+    (SCHED_GET_PRIORITY_MIN, 126, "sched_get_priority_min", "sched", SupportLevel::BringUp);
     (SCHED_RR_GET_INTERVAL, 127, "sched_rr_get_interval", "sched", SupportLevel::Deferred);
     (RESTART_SYSCALL, 128, "restart_syscall", "signal", SupportLevel::Deferred);
     (KILL, 129, "kill", "signal", SupportLevel::BringUp);
@@ -607,7 +613,7 @@ define_aarch64_syscall_table! {
     (PKEY_FREE, 290, "pkey_free", "mm", SupportLevel::Deferred);
     (STATX, 291, "statx", "fs", SupportLevel::BringUp);
     (IO_PGETEVENTS, 292, "io_pgetevents", "io", SupportLevel::Deferred);
-    (RSEQ, 293, "rseq", "process", SupportLevel::BringUp);
+    (RSEQ, 293, "rseq", "process", SupportLevel::Deferred);
     (KEXEC_FILE_LOAD, 294, "kexec_file_load", "process", SupportLevel::Deferred);
     (CLOCK_GETTIME64, 403, "clock_gettime64", "time", SupportLevel::Deferred);
     (CLOCK_SETTIME64, 404, "clock_settime64", "time", SupportLevel::Deferred);

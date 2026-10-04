@@ -1,8 +1,8 @@
 {
   "summary": {
     "total_entries": 338,
-    "bring_up": 246,
-    "deferred": 90,
+    "bring_up": 247,
+    "deferred": 89,
     "planned": 2,
     "with_claims": 14,
     "without_claims": 324,
@@ -1817,26 +1817,26 @@
       "number": 125,
       "name": "sched_get_priority_max",
       "group": "sched",
-      "support": "deferred",
-      "handler": "unimplemented",
+      "support": "bring_up",
+      "handler": "process",
       "authority": "guest",
       "contracts": [],
       "claims": [],
       "uncovered_behaviors": [
-        "deferred refusal behavior unverified by contract"
+        "emulated in bring-up without explicit contract claim"
       ]
     },
     {
       "number": 126,
       "name": "sched_get_priority_min",
       "group": "sched",
-      "support": "deferred",
-      "handler": "unimplemented",
+      "support": "bring_up",
+      "handler": "process",
       "authority": "guest",
       "contracts": [],
       "claims": [],
       "uncovered_behaviors": [
-        "deferred refusal behavior unverified by contract"
+        "emulated in bring-up without explicit contract claim"
       ]
     },
     {
@@ -3823,9 +3823,9 @@
       "name": "execveat",
       "group": "process",
       "support": "planned",
-      "handler": "unimplemented",
+      "handler": "lifecycle",
       "authority": "guest",
-      "compat_note": "execveat remains planned and currently routes to unimplemented ENOSYS",
+      "compat_note": "partial execveat: path/dirfd and AT_EMPTY_PATH are dispatched, but ordinary fds execute by recorded path rather than retained inode",
       "contracts": [],
       "claims": [],
       "uncovered_behaviors": [
@@ -3982,13 +3982,14 @@
       "number": 293,
       "name": "rseq",
       "group": "process",
-      "support": "bring_up",
+      "support": "deferred",
       "handler": "process",
       "authority": "guest",
+      "compat_note": "rseq registration is not emulated; the handler always returns ENOSYS",
       "contracts": [],
       "claims": [],
       "uncovered_behaviors": [
-        "emulated in bring-up without explicit contract claim"
+        "deferred refusal behavior unverified by contract"
       ]
     },
     {
@@ -4414,7 +4415,7 @@
       "support": "planned",
       "handler": "lifecycle",
       "authority": "guest",
-      "compat_note": "clone3 is partially handled for the clone/fork modes Carrick supports",
+      "compat_note": "partial clone3: supported clone/fork modes and argument validation; set_tid, set_tid_size and cgroup are not modeled",
       "contracts": [],
       "claims": [],
       "uncovered_behaviors": [
