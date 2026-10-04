@@ -44,6 +44,12 @@ rules:
         - /crates/carrick-el1/src/entry.rs
         # Reviewed x86 CPL0 hardware boundary: entry/return, port I/O and halt; no host operation.
         - /crates/carrick-x86-cpl0/src/entry.rs
+        # Reviewed target_os=none CPL0 hardware leaves: native IRQ/IRET and
+        # XSAVE, FS/GS MSRs, CR3, IF/HLT, declared fixture control port I/O.
+        # No host instruction path or host semantic syscall dispatch.
+        - /crates/carrick-x86-cpl0/src/progress.rs
+        - /crates/carrick-x86/src/cpl0_scheduler.rs
+        - /crates/carrick-x86/src/interrupts.rs
         - /crates/carrick-kernel-example/src/bin/kernel-syscall-floor/gateway.rs
         - /crates/carrick-runtime/src/vcpu_loop/native_probe.rs
         - /crates/carrick-runtime/tools/vdso_getrandom_blob.rs
