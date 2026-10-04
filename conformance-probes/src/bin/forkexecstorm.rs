@@ -417,9 +417,9 @@ pub unsafe fn bounded_reap_pid(pid: libc::pid_t, timeout: Duration) -> (libc::pi
     let deadline = std::time::Instant::now() + timeout;
     let mut status = 0i32;
     loop {
-        if std::time::Instant::now() >= deadline {
-            return (0, 0, true);
-        }
+        // The waiter may be descheduled past its deadline after the child
+        // exits. Inspect the child before deciding that elapsed wall time
+        // means it is still running.
         let rc = libc::waitpid(pid, &mut status, libc::WNOHANG);
         if rc == pid {
             return (rc, status, false);
@@ -1390,6 +1390,40 @@ mod tests {
         assert!(!timed_out);
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 127);
+    }
+
+    /// A descheduled waiter can resume after its deadline even though the
+    /// child already exited. WNOHANG must inspect the ready child once before
+    /// reporting a timeout; WNOWAIT proves the child is ready without reaping.
+    #[test]
+    #[allow(clippy::disallowed_methods)]
+    fn test_bounded_reap_attempts_ready_child_at_expired_deadline() {
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        assert!(child > 1, "fork must return a child PID");
+        let mut guard = TestProcessGuard::new(child);
+        let mut info = core::mem::MaybeUninit::<libc::siginfo_t>::uninit();
+        assert_eq!(
+            unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child as libc::id_t,
+                    info.as_mut_ptr(),
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            },
+            0,
+            "child must have exited and remain unreaped"
+        );
+
+        let (reaped, status, timed_out) = unsafe { bounded_reap_pid(child, Duration::ZERO) };
+        assert_eq!(reaped, child, "ready child must be checked before timeout");
+        guard.disarm();
+        assert!(!timed_out);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
     #[test]
