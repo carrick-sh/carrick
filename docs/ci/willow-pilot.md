@@ -67,7 +67,9 @@ delete operations all use the scoped token. The controller records PVE task
 IDs and checks that the token has no rights over VM 105.
 
 Admission uses a five-second CPU sample and one-minute load average, taking
-the larger value and reserving two additional threads below 85%. It retains
+the larger value and reserving two additional threads within the director's
+80% ceiling. Exceeding that ceiling stops the foreground controller and
+preserves the ledger for owner follow-up. It retains
 6 GiB host memory, 150 GiB thin-pool data headroom, and metadata below 80%.
 It checks again before boot. A shared five-minute deadline spans start,
 guest-agent checks, authenticated host-key discovery and SSH readiness.

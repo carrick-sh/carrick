@@ -103,37 +103,9 @@ impl Pve {
             .cloned()
             .ok_or(ScalerError::External("PVE response lacks data"))
     }
-    fn inventory(&self) -> Result<Vec<Vm>, ScalerError> {
+    fn inventory(&self) -> Result<Vec<PoolMember>, ScalerError> {
         let pool = self.request(PveCall::Get, "/pools/carrick-ci")?;
-        if pool["poolid"] != POOL {
-            return Err(ScalerError::Guard("PVE returned another pool"));
-        }
-        let members = pool["members"]
-            .as_array()
-            .ok_or(ScalerError::External("pool members"))?;
-        let mut result = Vec::new();
-        for member in members {
-            if member["type"] == "qemu" {
-                if member["node"] != "willow" {
-                    return Err(ScalerError::Guard("unexpected pool node"));
-                }
-                let id = member["vmid"]
-                    .as_u64()
-                    .and_then(|n| u16::try_from(n).ok())
-                    .ok_or(ScalerError::External("VMID"))?;
-                result.push(Vm {
-                    id,
-                    name: string(member, "name")?,
-                    pool: POOL.into(),
-                    template: member["template"].as_u64() == Some(1),
-                });
-            } else if member["type"] == "lxc" {
-                return Err(ScalerError::Guard(
-                    "unknown container occupies pool; owner inspection needed",
-                ));
-            }
-        }
-        Ok(result)
+        pool_inventory(&pool)
     }
     fn guard(&self, row: &Record) -> Result<Vm, ScalerError> {
         let inventory = self.inventory()?;
@@ -144,6 +116,38 @@ impl Pve {
         let config = self.request(PveCall::Get, &format!("{}/config", base(row.vm)))?;
         authenticate_config(row, vm, &config)
     }
+}
+fn pool_inventory(pool: &Value) -> Result<Vec<PoolMember>, ScalerError> {
+    if pool["poolid"] != POOL {
+        return Err(ScalerError::Guard("PVE returned another pool"));
+    }
+    let members = pool["members"]
+        .as_array()
+        .ok_or(ScalerError::External("pool members"))?;
+    let mut result = Vec::new();
+    for member in members {
+        if member["type"] == "qemu" {
+            if member["node"] != "willow" {
+                return Err(ScalerError::Guard("unexpected pool node"));
+            }
+            let id = member["vmid"]
+                .as_u64()
+                .and_then(|n| u16::try_from(n).ok())
+                .ok_or(ScalerError::External("VMID"))?;
+            result.push(PoolMember {
+                id,
+                pool: POOL.into(),
+                template: member["template"].as_u64() == Some(1),
+            });
+        } else if member["type"] == "lxc" {
+            return Err(ScalerError::Guard(
+                "unknown container occupies pool; owner inspection needed",
+            ));
+        }
+    }
+    Ok(result)
+}
+impl Pve {
     fn task_done(&self, task: &str) -> Result<bool, ScalerError> {
         match self.task_state(task)? {
             TaskState::Succeeded => Ok(true),
@@ -233,15 +237,28 @@ impl Pve {
 fn base(id: CloneId) -> String {
     format!("/nodes/willow/qemu/{}", id.get())
 }
-fn authenticate_config(row: &Record, mut vm: Vm, config: &Value) -> Result<Vm, ScalerError> {
+fn authenticate_config(
+    row: &Record,
+    member: PoolMember,
+    config: &Value,
+) -> Result<Vm, ScalerError> {
     // Pool membership licenses the VMID; its resource display can lag a clone.
     // Authenticate mutable identity from the live per-VM configuration.
-    vm.name = string(config, "name")?;
-    vm.template = match config.get("template") {
+    let name = config["name"]
+        .as_str()
+        .ok_or(ScalerError::Guard("live VM configuration lacks a name"))?
+        .to_owned();
+    let template = match config.get("template") {
         None => false,
         Some(value) if value.as_u64() == Some(0) => false,
         Some(value) if value.as_u64() == Some(1) => true,
         _ => return Err(ScalerError::Guard("unrecognized template flag")),
+    };
+    let vm = Vm {
+        id: member.id,
+        pool: member.pool,
+        name,
+        template,
     };
     row.guard(&vm)?;
     Ok(vm)
@@ -498,6 +515,19 @@ fn pages(data: &Value, field: &str) -> Result<Vec<Value>, ScalerError> {
     Ok(result)
 }
 
+fn enforce_cpu_ceiling(busy: f64, threads: u32) -> Result<(), ScalerError> {
+    if !busy.is_finite() || busy < 0.0 || threads == 0 {
+        return Err(ScalerError::Guard("CPU sample unavailable"));
+    }
+    let projected = busy + 2.0 / f64::from(threads);
+    if projected > 0.80 {
+        Err(ScalerError::CpuCeiling {
+            projected: projected * 100.0,
+        })
+    } else {
+        Ok(())
+    }
+}
 fn resource_admission() -> Result<bool, ScalerError> {
     fn cpu() -> Result<(u64, u64), ScalerError> {
         let stat = std::fs::read_to_string("/proc/stat")?;
@@ -544,6 +574,7 @@ fn resource_admission() -> Result<bool, ScalerError> {
         "admission busy={busy:.3} projected={:.3} memory_available={available}",
         busy + 2.0 / threads as f64
     );
+    enforce_cpu_ceiling(busy, u32::try_from(threads).unwrap_or(0))?;
     // No LVM mutation. Stop admission before thin data/metadata headroom runs out.
     let output = execute(
         Command::new("lvs").args([
@@ -994,6 +1025,7 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
                     };
                 }
                 Ok(_) => {}
+                Err(error @ ScalerError::CpuCeiling { .. }) => return Err(error),
                 Err(error) => {
                     eprintln!("reconcile failed: {error}; admission frozen for active ledger")
                 }
@@ -1017,6 +1049,9 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
                 {
                     row.failure = Some(error.to_string());
                     update(&mut ledger, &row, &path)?;
+                    if matches!(error, ScalerError::CpuCeiling { .. }) {
+                        return Err(error);
+                    }
                     eprintln!("provision failed: {error}; preserving ledger for reconciliation");
                 }
                 break;
@@ -1030,6 +1065,25 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn director_cpu_ceiling_is_a_stop_condition_above_eighty_percent() {
+        assert!(enforce_cpu_ceiling(0.675, 16).is_ok());
+        assert!(matches!(
+            enforce_cpu_ceiling(0.676, 16),
+            Err(ScalerError::CpuCeiling { .. })
+        ));
+    }
+    #[test]
+    fn pool_membership_does_not_require_a_cached_display_name() {
+        let pool = json!({"poolid":POOL,"members":[
+            {"type":"qemu","node":"willow","vmid":308,"template":0}
+        ]});
+        let members = pool_inventory(&pool).unwrap();
+        assert_eq!(members[0].id, 308);
+        let row = row();
+        assert!(authenticate_config(&row, members[0].clone(), &json!({"name":row.name})).is_ok());
+        assert!(authenticate_config(&row, members[0].clone(), &json!({})).is_err());
+    }
     #[test]
     fn recovered_destruction_removes_owned_transport_credentials_and_preserves_logs() {
         let dir = tempfile::tempdir().unwrap();
@@ -1087,10 +1141,9 @@ mod tests {
     #[test]
     fn ownership_uses_live_config_identity_and_retains_pool_and_template_fences() {
         let row = row();
-        let cached = Vm {
+        let cached = PoolMember {
             id: row.vm.get(),
             pool: POOL.into(),
-            name: "VM 308".into(),
             template: false,
         };
         let live = json!({"name":row.name});
