@@ -2,22 +2,22 @@
 use carrick_el1_abi::{
     Action, DelegatedFile, DelegatedInotify, DelegatedMark, EL1_GUEST_LOCK_SPINS,
 };
-pub fn add(
-    file: &DelegatedFile,
+pub fn add<'a>(
+    access: super::file_notification::FileAccess<'a>,
+    file: &'a DelegatedFile,
     instance: &DelegatedInotify,
     inotify_handle: u32,
     target_file_handle: u32,
     mask: u32,
 ) -> Result<i64, Action> {
     // Lock hierarchy: file lock first, then instance lock (bounded retry before forward)
-    let file_locked = file.lock_guest_bounded(EL1_GUEST_LOCK_SPINS);
-    if !file_locked {
+    let Some(file_guard) = access.lock(file, target_file_handle) else {
         return Err(Action::Forward);
-    }
+    };
 
     let inotify_locked = instance.lock_guest_bounded(EL1_GUEST_LOCK_SPINS);
     if !inotify_locked {
-        file.unlock();
+        drop(file_guard);
         return Err(Action::Forward);
     }
 
@@ -60,11 +60,12 @@ pub fn add(
     };
 
     instance.unlock();
-    file.unlock();
+    drop(file_guard);
     res
 }
-pub fn remove(
-    file: &DelegatedFile,
+pub fn remove<'a>(
+    access: super::file_notification::FileAccess<'a>,
+    file: &'a DelegatedFile,
     instance: &DelegatedInotify,
     inotify_handle: u32,
     target_file_handle: u32,
@@ -72,14 +73,13 @@ pub fn remove(
     removed_event: u32,
 ) -> Result<i64, Action> {
     // Lock hierarchy: file lock first, then instance lock (bounded retry before forward)
-    let file_locked = file.lock_guest_bounded(EL1_GUEST_LOCK_SPINS);
-    if !file_locked {
+    let Some(file_guard) = access.lock(file, target_file_handle) else {
         return Err(Action::Forward);
-    }
+    };
 
     let inotify_locked = instance.lock_guest_bounded(EL1_GUEST_LOCK_SPINS);
     if !inotify_locked {
-        file.unlock();
+        drop(file_guard);
         return Err(Action::Forward);
     }
 
@@ -90,7 +90,7 @@ pub fn remove(
     };
     if !watch_matches {
         instance.unlock();
-        file.unlock();
+        drop(file_guard);
         return Err(Action::Forward);
     }
 
@@ -102,6 +102,6 @@ pub fn remove(
     instance.push_record(wd, removed_event, 0, None);
 
     instance.unlock();
-    file.unlock();
+    drop(file_guard);
     Ok(0)
 }
