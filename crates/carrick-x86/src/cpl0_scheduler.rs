@@ -87,9 +87,10 @@ pub struct ProgressState {
 
 impl ContextBinding {
     pub fn owned_on(&self, zone: &ZoneTables, slot: SlotId) -> bool {
-        zone.live(self.record).is_some_and(
-            |record| matches!(record.claim(), Claim::OnCpu { slot: owner, .. } if owner == slot),
-        )
+        zone.live(self.record).is_some_and(|record| {
+            record.identity().mm == self.context.address.mm.raw().get()
+                && matches!(record.claim(), Claim::OnCpu { slot: owner, .. } if owner == slot)
+        })
     }
 }
 
@@ -205,6 +206,14 @@ mod tests {
         };
         stale.record.incarnation += 1;
         assert!(!admit_context(&zone, slot, &stale));
+        let mut wrong_mm = ContextBinding {
+            record: bindings[0].record,
+            context: bindings[1].context.clone(),
+        };
+        assert!(!admit_context(&zone, slot, &wrong_mm));
+        wrong_mm.context.address.mm = bindings[0].context.address.mm;
+        assert!(!admit_context(&zone, slot, &wrong_mm), "root mismatch");
+        assert_eq!(zone.installed_space(slot), 0, "refusal vacates occupancy");
         let index = zone.spaces.find(11).unwrap();
         zone.spaces.close(index);
         assert!(!admit_context(&zone, slot, &bindings[0]));

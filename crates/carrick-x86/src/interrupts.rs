@@ -17,6 +17,16 @@ pub struct ApicId(pub u8);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IpiBusy;
 
+#[derive(Clone, Copy, Debug)]
+pub struct InterruptMask {
+    enabled: bool,
+}
+impl InterruptMask {
+    pub const fn was_enabled(self) -> bool {
+        self.enabled
+    }
+}
+
 /// Supervisor interrupt gate, no error code, no IST. Existing exception IDT
 /// and double-fault IST stay installed.
 pub fn interrupt_gate(entry: u64) -> [u8; 16] {
@@ -37,6 +47,31 @@ pub mod hardware {
     /// mode. The caller serializes access with interrupts masked.
     unsafe fn write(offset: u64, value: u32) {
         unsafe { core::ptr::write_volatile((LAPIC_BASE + offset) as *mut u32, value) };
+    }
+    /// # Safety
+    /// CPL0 only; the caller restores this mask on the same execution lane.
+    pub unsafe fn mask_interrupts() -> InterruptMask {
+        let flags: u64;
+        unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+        InterruptMask {
+            enabled: flags & (1 << 9) != 0,
+        }
+    }
+    /// # Safety
+    /// CPL0 only; no scheduler/queue lock may cross re-enabling interrupts.
+    pub unsafe fn restore_interrupts(mask: InterruptMask) {
+        if mask.enabled {
+            unsafe { core::arch::asm!("sti", options(nostack)) };
+        } else {
+            unsafe { core::arch::asm!("cli", options(nostack)) };
+        }
+    }
+    /// # Safety
+    /// CPL0, IF masked, no locks held. STI's interrupt shadow makes HLT
+    /// atomic with interrupt admission: an already pending kick cannot be
+    /// lost between queue inspection and parking. Returns with IF masked.
+    pub unsafe fn park_until_interrupt() {
+        unsafe { core::arch::asm!("sti", "hlt", "cli", options(nostack)) };
     }
     /// # Safety
     /// Same hardware preconditions as `arm_timer`; vectors must be installed.
