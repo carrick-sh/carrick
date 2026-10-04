@@ -1139,6 +1139,13 @@ where
         let mut signal_interrupted_pc: Option<u64> = None;
 
         match outcome {
+            DispatchOutcome::OwnerMemoryWait { .. }
+            | DispatchOutcome::OwnerMemorySupply { .. }
+            | DispatchOutcome::OwnerPhysicalWait { .. } => {
+                return Err(RuntimeError::Configuration(
+                    "EL1 owner memory outcome reached the retired single-thread loop".into(),
+                ));
+            }
             DispatchOutcome::WaitOnFds { .. }
             | DispatchOutcome::BlockingOpen(_)
             | DispatchOutcome::BlockingWrite(_)
@@ -2407,6 +2414,12 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
         carrick_guest_mem::MemoryPrepareError,
     > {
         self.mem.prepare_write(ranges)
+    }
+    fn supply_memory(
+        &self,
+        request: carrick_guest_mem::MemorySupplyRequest,
+    ) -> Result<bool, MemoryError> {
+        self.mem.supply_memory(request)
     }
     fn resume_read(
         &self,

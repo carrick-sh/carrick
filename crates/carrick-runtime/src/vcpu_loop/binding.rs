@@ -2667,6 +2667,91 @@ where
         frame: carrick_hal::RawSyscall,
         outcome: DispatchOutcome,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        if let DispatchOutcome::OwnerMemorySupply { request } = outcome {
+            let (grant_va, grant_len) = match request {
+                carrick_guest_mem::MemorySupplyRequest::Grant(window)
+                | carrick_guest_mem::MemorySupplyRequest::Cow(window) => {
+                    (window.range.start(), window.range.len())
+                }
+                carrick_guest_mem::MemorySupplyRequest::Metadata { .. } => (0, 0),
+            };
+            let context = self
+                .state
+                .service_kernel_context
+                .as_ref()
+                .ok_or_else(|| {
+                    RuntimeError::Configuration(
+                        "owner supply lost its exact Kernel context".to_owned(),
+                    )
+                })?
+                .retain_exact();
+            let mut executor = self.state.guest_execution.take().ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "owner supply lost MM executor participation".to_owned(),
+                )
+            })?;
+            let result = (|| {
+                let reconciled = {
+                    let mutation =
+                        carrick_kernel::dispatch::mm_mutation::from_executor(&mut executor)
+                            .map_err(|error| {
+                                RuntimeError::Configuration(format!(
+                                    "owner supply could not exclude an EL1 edit: {error:?}"
+                                ))
+                            })?;
+                    let permit = mutation.host_alias_permit();
+                    if context.shared().mm().id() != permit.mm() {
+                        return Err(RuntimeError::Configuration(
+                            "owner supply MM differs from saved syscall".to_owned(),
+                        ));
+                    }
+                    self.kernel
+                        .dispatcher
+                        .with_kernel_resources(&context, || {
+                            self.kernel
+                                .dispatcher
+                                .reconcile_el1_deferred_returns(&permit, engine)
+                        })
+                        .map_err(|error| {
+                            RuntimeError::Configuration(format!(
+                                "owner supply could not settle EL1 predecessor: {error:?}"
+                            ))
+                        })?
+                };
+                carrick_observability::probes::hvpatch_el1_owner_grant_supply(
+                    grant_va,
+                    grant_len,
+                    6,
+                    reconciled as u64,
+                );
+                // The grant service takes its own EL1 editor after the host
+                // predecessor settlement releases its mutation exclusion.
+                let supplied = engine.supply_memory(request).map_err(|error| {
+                    RuntimeError::Configuration(format!("owner supply failed: {error}"))
+                })?;
+                carrick_observability::probes::hvpatch_el1_owner_grant_supply(
+                    grant_va,
+                    grant_len,
+                    7,
+                    u64::from(supplied),
+                );
+                if !supplied {
+                    return Err(RuntimeError::Configuration(
+                        "owner supply declined an exact grant after predecessor reconciliation"
+                            .to_owned(),
+                    ));
+                }
+                Ok(())
+            })();
+            self.state.guest_execution = Some(executor);
+            result?;
+            let outcome = self.state.redispatch_threaded_syscall(
+                &self.kernel,
+                engine,
+                control.submission.host_wait_context(),
+            )?;
+            return self.service_outcome(engine, control, frame, outcome);
+        }
         if carrick_kernel::kernel::continuation::is_blocking_dispatch_outcome(&outcome) {
             let _ = self.state.stash_parked_registers(engine);
             let request = self
