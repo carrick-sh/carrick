@@ -9,7 +9,9 @@ use carrick_abi::{
     LINUX_AT_FDCWD, LINUX_EEXIST, LINUX_ENOENT, LINUX_O_RDONLY, LINUX_RENAME_EXCHANGE,
     LINUX_RENAME_NOREPLACE,
 };
-use carrick_kernel_example::{ScriptedBackend, Step, await_parked, last_child, slot, sys};
+use carrick_kernel_example::{
+    Schedule, ScriptedBackend, Step, await_parked, last_child, slot, sys,
+};
 use carrick_vfs::fs_backend::{HostFsBackend, LowerEntryPublishHook};
 
 fn failing_archive(name: &str) -> std::io::Result<Vec<u8>> {
@@ -240,9 +242,15 @@ fn two_live_process_namespace_publication_matrix() {
 
 #[test]
 fn two_live_process_lower_copy_up_and_whiteout_matrix() {
+    let scheduled_seed = std::env::var("VMFREE_SEED")
+        .ok()
+        .and_then(|seed| seed.parse::<u64>().ok());
     for n in [1, 8, 32, 128] {
         for population in [0, 128] {
             for same_parent in [true, false] {
+                if scheduled_seed.is_some() && (n != 32 || population != 128 || !same_parent) {
+                    continue;
+                }
                 let lower = tempfile::TempDir::new().unwrap();
                 let upper = tempfile::TempDir::new().unwrap();
                 for parent in ["shared", "unrelated"] {
@@ -360,19 +368,37 @@ fn two_live_process_lower_copy_up_and_whiteout_matrix() {
                 ]);
                 let mut backend = HostFsBackend::from_path(upper.path()).unwrap();
                 backend.enable_sparse_upper_fast_miss();
-                let result = ScriptedBackend::new()
+                let schedule = scheduled_seed.map(Schedule::explore);
+                let mut run_backend = ScriptedBackend::new()
                     .with_fs_backend(Box::new(backend))
                     .with_rootfs_layer(
                         carrick_vfs::rootfs::RootFs::from_immutable_host_dir(lower.path()).unwrap(),
-                    )
-                    .run_root(script);
+                    );
+                if let Some(schedule) = &schedule {
+                    run_backend = run_backend.with_schedule(schedule.clone());
+                }
+                let result = run_backend.run_root(script);
+                if let Some(schedule) = &schedule {
+                    let summary = result
+                        .as_ref()
+                        .map(|_| "completed".to_owned())
+                        .unwrap_or_else(|error| error.to_string());
+                    let work = result.as_ref().ok().map(|run| run.work_snapshot().clone());
+                    if let Ok(receipt) = schedule.receipt(summary, work) {
+                        if let Ok(path) = std::env::var("VMFREE_TRACE") {
+                            std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap())
+                                .unwrap();
+                        }
+                    }
+                }
                 let run = match result {
                     Ok(run) => run,
                     Err(error) => {
                         let lower_evidence = lower.keep();
                         let upper_evidence = upper.keep();
                         panic!(
-                            "lower n={n} population={population} same_parent={same_parent}: {error:?}; lower evidence {}; upper evidence {}",
+                            "lower n={n} population={population} same_parent={same_parent} seed={:?}: {error:?}; lower evidence {}; upper evidence {}",
+                            scheduled_seed,
                             lower_evidence.display(),
                             upper_evidence.display()
                         );
@@ -417,6 +443,13 @@ fn two_live_process_lower_copy_up_and_whiteout_matrix() {
                         .filter(|o| o.label == "read" && o.bytes == b"lower")
                         .count(),
                     2 * n
+                );
+                assert_eq!(
+                    run.outputs()
+                        .iter()
+                        .filter(|o| o.label == "read" && o.bytes == b"c")
+                        .count(),
+                    n
                 );
             }
         }
