@@ -148,6 +148,7 @@ impl TransferTarget {
             frame.x[7] = token.ttbr0();
         }
         let receipt = service.run_user(frame, &mut || false)?;
+        carrick_observability::probes::hvpatch_el1_owner_bind_result(receipt.x[0]);
         if receipt.x[0] != 0 {
             return Ok(None);
         }
