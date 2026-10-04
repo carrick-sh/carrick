@@ -57,6 +57,9 @@ pub use run_elf::run_elf_kvm;
 #[cfg(target_arch = "aarch64")]
 pub use trap_engine::KvmTrapEngine;
 
+#[cfg(target_arch = "x86_64")]
+pub mod carrier_cpu;
+
 // x86_64 KVM backend modules.
 // Compiled only on Linux x86_64 — invisible to the aarch64 build.
 #[cfg(target_arch = "x86_64")]

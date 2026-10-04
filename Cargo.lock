@@ -535,6 +535,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-guest-arch"
+version = "0.1.0"
+
+[[package]]
 name = "carrick-guest-mem"
 version = "0.1.0"
 dependencies = [
@@ -552,6 +556,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-abi",
  "carrick-fatal",
+ "carrick-guest-arch",
  "carrick-guest-mem",
  "carrick-mem",
  "carrick-mmu-core",

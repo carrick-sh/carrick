@@ -1469,3 +1469,38 @@ fn el1_ipc_wait_cross_slot_wake_sends_sgi_after_queue_unlock() {
     );
     assert!(!task.has_pending_host_work());
 }
+
+/// Fixed pre-extraction trace: save A, load B, save B, load A, then roots/timer/
+/// wake. The FP/TLS negative control makes loss visible before refactoring.
+#[test]
+fn arm_fake_backend_context_trace_is_unchanged() {
+    let a = thread_ctx(0xa, 0x1000);
+    let b = thread_ctx(0xb, 0x2000);
+    let (mut frame, mut cpu) = live(0xa, 0x1000, FUTEX_WAIT_PRIVATE, 0);
+    frame.x = a.x;
+    cpu.skip_fpsimd = true; // red witness: injected FP-state loss
+    let mut saved = ThreadCtx::ZERO;
+    cpu.save(&frame, &mut saved);
+    assert_eq!(saved.v, a.v, "ARM FP state must survive the seam");
+    cpu.load(&mut frame, &b);
+    cpu.save(&frame, &mut saved);
+    assert_eq!(saved.x, b.x);
+    assert_eq!(saved.sp_el0, b.sp_el0);
+    assert_eq!(saved.tpidr_el0, b.tpidr_el0);
+    assert_eq!(saved.tpidrro_el0, b.tpidrro_el0);
+    assert_eq!(saved.contextidr_el1, b.contextidr_el1);
+    assert_eq!(saved.v, b.v);
+    assert_eq!(saved.fpsr, b.fpsr);
+    assert_eq!(saved.fpcr, b.fpcr);
+    cpu.load(&mut frame, &a);
+    cpu.set_translation(0x7000, 0x8000);
+    cpu.invalidate_asid(0x7000);
+    cpu.set_timer(Some(123));
+    cpu.send_sgi(456);
+    assert_eq!(frame.x, a.x);
+    assert_eq!(cpu.regs.v, a.v);
+    assert_eq!(cpu.translations, vec![(0x7000, 0x8000)]);
+    assert_eq!(cpu.asid_invalidations, vec![0x7000]);
+    assert_eq!(cpu.timer, Some(123));
+    assert_eq!(cpu.sgis, vec![456]);
+}

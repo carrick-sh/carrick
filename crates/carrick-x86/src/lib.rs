@@ -15,6 +15,7 @@
 //! the long-mode setup, register/snapshot model, fault tables, and service loop
 //! live here so those lanes do not reimplement the same x86 mechanics by copy.
 
+pub mod arch_context;
 pub mod bringup;
 pub mod bringup_fns;
 pub mod engine;

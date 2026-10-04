@@ -18,6 +18,7 @@ workspace = true
 test-support = []
 
 [dependencies]
+carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-abi = { path = "../carrick-abi" }
 carrick-fatal.workspace = true
 carrick-guest-mem = { path = "../carrick-guest-mem" }
