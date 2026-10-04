@@ -2457,18 +2457,27 @@ impl PublicationContext<'static> {
         );
         // This adapter supplies an unpublished window; a resident predecessor
         // requires its own owner retirement, never an overwrite of its alias.
-        if !alias_registry()
-            .lock()
-            .overlapping_process_aliases(
+        let overlapping = alias_registry().lock().overlapping_process_aliases(
+            window.range.start(),
+            window.range.len() as usize,
+            self.mm_root_slot,
+            self.container_root,
+        );
+        if !overlapping.is_empty() {
+            carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                 window.range.start(),
-                window.range.len() as usize,
-                self.mm_root_slot,
-                self.container_root,
-            )
-            .is_empty()
-        {
+                window.range.len(),
+                4,
+                overlapping.len() as u64,
+            );
             return Ok(None);
         }
+        carrick_observability::probes::hvpatch_el1_owner_grant_supply(
+            window.range.start(),
+            window.range.len(),
+            5,
+            0,
+        );
         let publication = publish_frame_grant_backing(
             &self,
             carrick_hal::El1FrameGrantRequest {
