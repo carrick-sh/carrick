@@ -17,6 +17,8 @@ pub const LABELS: [&str; 4] = ["self-hosted", "Linux", "X64", "willow-kvm"];
 
 #[derive(Debug, Error)]
 pub enum ScalerError {
+    #[error("KVM_GET_API_VERSION returned {version}, errno={errno}; expected 12")]
+    Kvm { version: i32, errno: i32 },
     #[error("{0}")]
     Guard(&'static str),
     #[error("I/O: {0}")]
@@ -364,9 +366,20 @@ fn verify_kvm() -> Result<(), ScalerError> {
         use std::os::fd::AsRawFd;
         let file = OpenOptions::new().read(true).write(true).open("/dev/kvm")?;
         // Linux KVM UAPI: KVM_GET_API_VERSION = _IO(0xAE, 0x00).
-        let version = unsafe { libc::ioctl(file.as_raw_fd(), 0xae00) };
+        // KVM rejects a nonzero argument even for this _IO request. Omitting
+        // the variadic argument leaves register garbage (live EINVAL=22).
+        let version = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                0xae00,
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        };
         if version != 12 {
-            return Err(ScalerError::Guard("KVM API version is not 12"));
+            return Err(ScalerError::Kvm {
+                version,
+                errno: std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+            });
         }
         println!("KVM_GET_API_VERSION={version}");
         Ok(())
