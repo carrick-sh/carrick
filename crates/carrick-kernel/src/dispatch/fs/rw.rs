@@ -1023,7 +1023,7 @@ impl<'a> FsView<'a> {
             let _read_lease = if open_file.description.inspect_kind(|open| matches!(
                 open, OpenDescription::PipeReader { .. } | OpenDescription::EventFd { .. }
             )) == Some(true) {
-                let Some(lease) = open_file.description.retain_fd_lease() else {
+                let Some(lease) = files.retain_slot_lease(slot_authority) else {
                     return Ok(DispatchOutcome::errno(LINUX_EBADF));
                 };
                 Some(lease)
@@ -1255,8 +1255,11 @@ impl<'a> FsView<'a> {
                     let pipe = Arc::clone(pipe);
                     let flags = open_file.description.common().status_flags();
                     drop(open);
+                    let Some(lease) = _read_lease else {
+                        return Ok(DispatchOutcome::errno(LINUX_EBADF));
+                    };
                     let wait_authority = WaitFdAuthority::logical(slot_authority);
-                    return Ok(read_pipe(
+                    let outcome = read_pipe(
                         memory,
                         address,
                         length,
@@ -1264,7 +1267,15 @@ impl<'a> FsView<'a> {
                         flags,
                         fd.0,
                         wait_authority,
-                    ));
+                    );
+                    return Ok(match outcome {
+                        DispatchOutcome::WaitOnFds { fds, timeout, sig_mask, completion } =>
+                            DispatchOutcome::WaitOnFds {
+                                fds: fds.with_description_lease(lease),
+                                timeout, sig_mask, completion,
+                            },
+                        outcome => outcome,
+                    });
                 }
                 OpenDescription::HostPipe {
                     host_fd,
@@ -1674,7 +1685,7 @@ impl<'a> FsView<'a> {
                     let pipe = Arc::clone(pipe);
                     let flags = open_file.description.common().status_flags();
                     drop(open);
-                    let Some(_read_lease) = open_file.description.retain_fd_lease() else {
+                    let Some(read_lease) = open_file.description.retain_fd_lease() else {
                         return Ok(DispatchOutcome::errno(LINUX_EBADF));
                     };
                     let mut total = 0i64;
@@ -1707,6 +1718,12 @@ impl<'a> FsView<'a> {
                                 if (value as usize) < len {
                                     break;
                                 }
+                            }
+                            DispatchOutcome::WaitOnFds { fds, timeout, sig_mask, completion } => {
+                                return Ok(DispatchOutcome::WaitOnFds {
+                                    fds: fds.with_description_lease(read_lease),
+                                    timeout, sig_mask, completion,
+                                });
                             }
                             other => return Ok(other),
                         }

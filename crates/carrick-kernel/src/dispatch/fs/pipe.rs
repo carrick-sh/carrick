@@ -669,7 +669,7 @@ pub(crate) fn wait_for_pipe_readable(
 ) -> DispatchOutcome {
     if let Some(host_fd) = pipe.read_poll_fd() {
         DispatchOutcome::WaitOnFds {
-            fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, authority),
+            fds: WaitFds::retained_one(host_fd, libc::POLLIN, authority),
             timeout: None,
             sig_mask: carrick_abi::WaitSigMask::NONE,
             completion: FdWaitCompletion::Fd {
@@ -901,7 +901,8 @@ pub(crate) fn write_pipe<I: Fn() -> bool>(
                 return DispatchOutcome::errno(LINUX_EMFILE);
             };
             return DispatchOutcome::WaitOnFds {
-                fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, operation.authority),
+                fds: WaitFds::retained_one(host_fd, libc::POLLIN, operation.authority)
+                    .with_description_lease(operation.writer_lease),
                 timeout: None,
                 sig_mask: carrick_abi::WaitSigMask::NONE,
                 completion: FdWaitCompletion::Fd {
@@ -1563,7 +1564,7 @@ mod tests {
         assert_eq!(
             out,
             DispatchOutcome::WaitOnFds {
-                fds: WaitFds::authorized_raw_one(host_fd.raw(), libc::POLLIN, authority),
+                fds: WaitFds::retained_one(host_fd, libc::POLLIN, authority),
                 timeout: None,
                 sig_mask: carrick_abi::WaitSigMask::NONE,
                 completion: FdWaitCompletion::Fd {

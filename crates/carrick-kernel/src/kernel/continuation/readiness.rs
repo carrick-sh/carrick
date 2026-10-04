@@ -659,7 +659,8 @@ impl ReadinessProbe {
                             .registrations()
                             .iter()
                             .map(|registration| OwnedFdRegistration {
-                                fd: Arc::clone(&registration.fd),
+                                fd: super::ContinuationFd::Duplicated(Arc::clone(&registration.fd)),
+                                _guards: Arc::new(Vec::new()),
                                 events: registration.events,
                                 generation: super::next_nonzero(&super::NEXT_RESOURCE_GENERATION),
                             })
@@ -684,7 +685,10 @@ impl ReadinessProbe {
                     if owned >= 0 {
                         Self::Fds {
                             registrations: vec![OwnedFdRegistration {
-                                fd: Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(owned) }),
+                                fd: super::ContinuationFd::Duplicated(Arc::new(unsafe {
+                                    std::os::fd::OwnedFd::from_raw_fd(owned)
+                                })),
+                                _guards: Arc::new(Vec::new()),
                                 events: libc::POLLIN,
                                 generation: super::next_nonzero(&super::NEXT_RESOURCE_GENERATION),
                             }],

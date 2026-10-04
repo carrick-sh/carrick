@@ -685,26 +685,62 @@ fn registration_diagnostic(binding: &RegistrationBinding) -> ContinuationRegistr
     }
 }
 
+/// A reactor fd either admitted with its exact host owner, or duplicated from
+/// an unowned adapter source. Admitted owners keep IPC subscriptions alive and
+/// need no late fcntl pin after dispatch authority has been released.
+#[derive(Clone, Debug)]
+pub(crate) enum ContinuationFd {
+    Admitted(crate::dispatch::fd_table::HostFdRef),
+    Duplicated(Arc<OwnedFd>),
+}
+
+impl AsRawFd for ContinuationFd {
+    fn as_raw_fd(&self) -> i32 {
+        match self {
+            Self::Admitted(owner) => owner.raw(),
+            Self::Duplicated(fd) => fd.as_raw_fd(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OwnedFdRegistration {
     #[allow(dead_code)]
-    pub(crate) fd: Arc<OwnedFd>,
+    pub(crate) fd: ContinuationFd,
+    pub(crate) _guards: Arc<Vec<crate::dispatch::wait_authority::WaitFdGuard>>,
     #[allow(dead_code)]
     pub(crate) events: i16,
     #[allow(dead_code)]
     pub(crate) generation: u64,
 }
 
-fn own_wait_fds(fds: &WaitFds) -> Result<Vec<OwnedFdRegistration>, ContinuationBuildError> {
-    fds.iter()
+fn own_wait_fds(fds: WaitFds) -> Result<Vec<OwnedFdRegistration>, ContinuationBuildError> {
+    let (fds, guards) = fds.into_fd_ownership();
+    let guards = Arc::new(guards);
+    fds.into_iter()
         .filter(|fd| fd.fd() >= 0)
         .map(|fd| {
-            let owned = unsafe { libc::fcntl(fd.fd(), libc::F_DUPFD_CLOEXEC, 0) };
-            if owned < 0 {
-                return Err(ContinuationBuildError::FdPinFailed);
-            }
+            let admitted = guards.iter().find_map(|guard| match guard {
+                crate::dispatch::wait_authority::WaitFdGuard::HostFd(owner)
+                    if owner.raw() == fd.fd() =>
+                {
+                    Some(owner.clone())
+                }
+                _ => None,
+            });
+            let owner = match admitted {
+                Some(owner) => ContinuationFd::Admitted(owner),
+                None => {
+                    let owned = unsafe { libc::fcntl(fd.fd(), libc::F_DUPFD_CLOEXEC, 0) };
+                    if owned < 0 {
+                        return Err(ContinuationBuildError::FdPinFailed);
+                    }
+                    ContinuationFd::Duplicated(Arc::new(unsafe { OwnedFd::from_raw_fd(owned) }))
+                }
+            };
             Ok(OwnedFdRegistration {
-                fd: Arc::new(unsafe { OwnedFd::from_raw_fd(owned) }),
+                fd: owner,
+                _guards: Arc::clone(&guards),
                 events: fd.events(),
                 generation: next_nonzero(&NEXT_RESOURCE_GENERATION),
             })
@@ -1189,8 +1225,8 @@ impl BlockedContinuation {
                 completion,
             } => match completion {
                 FdWaitCompletion::Fd { on_timeout } => {
-                    let registrations = own_wait_fds(&fds)?;
                     let fd_authority = exact_slot_authorities(&fds)?;
+                    let registrations = own_wait_fds(fds)?;
                     let caller_deadline = deadline(timeout);
                     Self::WaitOnFds(new_state(
                         caller_deadline,
@@ -1209,8 +1245,8 @@ impl BlockedContinuation {
                     ))
                 }
                 FdWaitCompletion::Select { clear_on_timeout } => {
-                    let registrations = own_wait_fds(&fds)?;
                     let fd_authority = exact_slot_authorities(&fds)?;
+                    let registrations = own_wait_fds(fds)?;
                     let timer_sources = Vec::new();
                     let timerfd_admission_stale = false;
                     let caller_deadline = deadline(timeout);
@@ -1236,8 +1272,8 @@ impl BlockedContinuation {
                     ))
                 }
                 FdWaitCompletion::Poll { on_timeout } => {
-                    let registrations = own_wait_fds(&fds)?;
                     let fd_authority = exact_slot_authorities(&fds)?;
+                    let registrations = own_wait_fds(fds)?;
                     let timer_sources = Vec::new();
                     let timerfd_admission_stale = false;
                     let caller_deadline = deadline(timeout);
