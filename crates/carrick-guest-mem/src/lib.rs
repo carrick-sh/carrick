@@ -64,6 +64,14 @@
 //! `serde::Serialize`, and `thiserror::Error` — precisely so it sits at the
 //! bottom of the build graph and almost never has to be rebuilt.
 
+mod prepared;
+pub use prepared::{
+    GuestWriteRange, LegacyProtectionRead, MemoryPrepareError, MemoryReadSuspension,
+    MemoryReadWait, MemorySupplyRequest, OwnedMemoryWait, OwnedReadContinuation,
+    PhysicalMemoryWait, PreparedGuestWrite, PreparedStreamRanges, PreparedWriteLimit,
+    UserMemoryAdmissionError, UserMemoryAuthority, UserMemoryVenue,
+};
+
 mod deferred_anonymous;
 pub use deferred_anonymous::{
     DeferredAnonymousError, DeferredAnonymousSnapshot, DeferredAnonymousState,
@@ -81,8 +89,8 @@ pub const HOST_PAGE_GRANULE: u64 = 0x4000; // 16 KiB: the host page granule ever
 /// forgetting the PROT_NONE gate (or vice versa). See the module docs.
 pub mod region;
 
-/// Process-wide PROT_NONE range bookkeeping — the single shared host-side EFAULT
-/// gate the [`GuestMemory`] default `read_bytes`/`write_bytes` run.
+/// Legacy-venue PROT_NONE bookkeeping. Admitted EL1 roots have no mirror;
+/// their checked and raw access implementations consult the owner directly.
 pub mod protections;
 
 /// The Linux AArch64 syscall argument registers carrick reads at an `svc` trap
@@ -445,14 +453,24 @@ impl RepointPrivateError {
 /// backend may be the real HVF-backed address space or the in-memory
 /// `LinearMemory` used by unit tests.
 pub trait GuestMemory {
-    /// The process-wide inaccessible/unmapped sets this backend enforces on the
-    /// syscall path, or `None` for a modelless backend (the in-memory test models). When
-    /// `Some`, the default [`read_bytes`](Self::read_bytes) /
-    /// [`write_bytes`](Self::write_bytes) fault any buffer overlapping a recorded
-    /// range with `EFAULT` BEFORE touching backing — the single shared host-side
-    /// gate every real backend (HVF, KVM, and every x86 VMM) inherits for free.
-    /// A new backend gets the gate just by surfacing its protections here.
-    fn protections(&self) -> Option<&protections::MemoryProtections> {
+    fn user_memory_venue(&self) -> UserMemoryVenue {
+        UserMemoryVenue::Legacy
+    }
+    /// Prepare bounded output ranges before consuming a ready source. The
+    /// caller chooses its stream chunk or whole-record bound before calling.
+    /// Admitted owner implementations never fall back after refusal.
+    fn prepare_write(
+        &mut self,
+        _ranges: &[GuestWriteRange],
+    ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+        Err(MemoryPrepareError::Fault(MemoryError::Unsupported))
+    }
+
+    /// Borrow the legacy venue's inaccessible/unmapped sets. Admitted roots
+    /// return `None` and authorize through their EL1 access implementation;
+    /// modelless test memories also return `None`. Absence of this mirror is
+    /// never authority to access an admitted root's host backing.
+    fn protections(&self) -> Option<LegacyProtectionRead<'_>> {
         None
     }
 
@@ -463,13 +481,23 @@ pub trait GuestMemory {
         false
     }
 
-    /// PERMISSION-CHECKED guest read. DEFAULT: run the inaccessible-range gate
-    /// (`protections()`), then delegate to [`read_bytes_raw`](Self::read_bytes_raw).
-    /// Backends normally implement only `read_bytes_raw` so this shared gate
-    /// always runs. An identity-mapped backend may override the checked method
-    /// only when permission metadata and fault-intolerant host copying must be
-    /// covered by one backend mapping lock; that override must reproduce this
-    /// gate under the same guard as the copy.
+    /// Continue a backend-owned copyin without rereading its completed prefix.
+    fn resume_read(&self, _continuation: OwnedReadContinuation) -> Result<Vec<u8>, MemoryError> {
+        Err(MemoryError::Unsupported)
+    }
+
+    /// Read one named Carrick control window. Owner backends independently
+    /// validate this capability through EL1; it cannot authorize user writes.
+    fn read_carrick_internal(
+        &self,
+        range: carrick_el1_abi::CarrickInternalReadRange,
+    ) -> Result<Vec<u8>, MemoryError> {
+        self.read_bytes_raw(range.address(), range.len() as usize)
+    }
+
+    /// Check the legacy inaccessible-range gate, then delegate to the concrete
+    /// access venue. Owner implementations authorize even raw reads through
+    /// EL1, so an absent legacy mirror cannot bypass owner permissions.
     fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
         if length > 0
             && self
@@ -1180,6 +1208,17 @@ impl<M: GuestMemory + ?Sized> Drop for HostWriteGuard<'_, M> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MemoryError {
+    #[error("owner memory incarnation retired: {0:?}")]
+    OwnerRetired(carrick_el1_abi::El1MmHandle),
+    #[error("owner read retains completed progress: {0:?}")]
+    ReadSuspended(Box<MemoryReadSuspension>),
+    #[error("physical memory preparation awaits retained code readers")]
+    Physical(OwnedMemoryWait),
+    #[error("owner memory wait: {0:?}")]
+    OwnerWait(carrick_el1_abi::PortalOwnerWait),
+    #[error("owner memory supply: {0:?}")]
+    Supply(Box<MemorySupplyRequest>),
+
     #[error("guest memory read is out of bounds at 0x{address:x} for {length} bytes")]
     OutOfBounds { address: u64, length: usize },
     /// The backend can't service a real shared file-backed mapping (e.g.
@@ -1218,8 +1257,8 @@ mod zero_tests {
     }
 
     impl GuestMemory for MockMem {
-        fn protections(&self) -> Option<&MemoryProtections> {
-            Some(&self.prot)
+        fn protections(&self) -> Option<LegacyProtectionRead<'_>> {
+            Some(LegacyProtectionRead::borrowed(&self.prot))
         }
         fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
             let a = address as usize;

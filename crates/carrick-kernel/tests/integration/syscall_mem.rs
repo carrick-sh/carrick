@@ -26,8 +26,10 @@ impl ProtectedAddressSpace {
 }
 
 impl GuestMemory for ProtectedAddressSpace {
-    fn protections(&self) -> Option<&MemoryProtections> {
-        Some(&self.protections)
+    fn protections(&self) -> Option<carrick_guest_mem::LegacyProtectionRead<'_>> {
+        Some(carrick_guest_mem::LegacyProtectionRead::borrowed(
+            &self.protections,
+        ))
     }
 
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
