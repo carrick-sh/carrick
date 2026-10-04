@@ -118,12 +118,8 @@ impl Pve {
             .into_iter()
             .find(|v| v.id == row.vm.get())
             .ok_or(ScalerError::Guard("ledger VM is absent"))?;
-        row.guard(&vm)?;
         let config = self.request("GET", &format!("{}/config", base(row.vm)), None)?;
-        if config["name"] != row.name || config["template"].as_u64() == Some(1) {
-            return Err(ScalerError::Guard("config identity mismatch"));
-        }
-        Ok(vm)
+        authenticate_config(row, vm, &config)
     }
     fn task_done(&self, task: &str) -> Result<bool, ScalerError> {
         match self.task_state(task)? {
@@ -216,6 +212,19 @@ impl Pve {
 }
 fn base(id: CloneId) -> String {
     format!("/nodes/willow/qemu/{}", id.get())
+}
+fn authenticate_config(row: &Record, mut vm: Vm, config: &Value) -> Result<Vm, ScalerError> {
+    // Pool membership licenses the VMID; its resource display can lag a clone.
+    // Authenticate mutable identity from the live per-VM configuration.
+    vm.name = string(config, "name")?;
+    vm.template = match config.get("template") {
+        None => false,
+        Some(value) if value.as_u64() == Some(0) => false,
+        Some(value) if value.as_u64() == Some(1) => true,
+        _ => return Err(ScalerError::Guard("unrecognized template flag")),
+    };
+    row.guard(&vm)?;
+    Ok(vm)
 }
 fn remaining(deadline: Option<Instant>, cap: Duration) -> Result<Duration, ScalerError> {
     let remaining = deadline
@@ -1000,6 +1009,42 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn ownership_uses_live_config_identity_and_retains_pool_and_template_fences() {
+        let row = row();
+        let cached = Vm {
+            id: row.vm.get(),
+            pool: POOL.into(),
+            name: "VM 308".into(),
+            template: false,
+        };
+        let live = json!({"name":row.name});
+        assert!(authenticate_config(&row, cached.clone(), &live).is_ok());
+        let mut stale_template = cached.clone();
+        stale_template.template = true;
+        assert!(authenticate_config(&row, stale_template, &live).is_ok());
+        assert!(
+            authenticate_config(&row, cached.clone(), &json!({"name":"someone-else"})).is_err()
+        );
+        assert!(
+            authenticate_config(&row, cached.clone(), &json!({"name":row.name,"template":1}))
+                .is_err()
+        );
+        assert!(
+            authenticate_config(
+                &row,
+                cached.clone(),
+                &json!({"name":row.name,"template":true})
+            )
+            .is_err()
+        );
+        let mut foreign = cached.clone();
+        foreign.pool = "another-pool".into();
+        assert!(authenticate_config(&row, foreign, &live).is_err());
+        let mut foreign = cached;
+        foreign.id += 1;
+        assert!(authenticate_config(&row, foreign, &live).is_err());
+    }
     #[test]
     fn template_guard_accepts_pve_string_memory_and_rejects_wrong_sizes() {
         let mut config = json!({
