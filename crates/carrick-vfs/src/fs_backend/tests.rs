@@ -2,6 +2,7 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 use super::*;
+#[cfg(target_os = "macos")]
 use crate::rootfs::RootFs;
 use carrick_abi::LINUX_ENFILE;
 
@@ -547,7 +548,6 @@ fn walk_paths(root: &Path) -> Vec<PathBuf> {
     paths
 }
 
-#[cfg(target_os = "macos")]
 fn host_backend() -> (HostFsBackend, tempfile::TempDir) {
     let scratch = tempfile::TempDir::new().unwrap();
     (HostFsBackend::from_path(scratch.path()).unwrap(), scratch)

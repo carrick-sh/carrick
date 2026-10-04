@@ -180,32 +180,6 @@ pub(crate) fn build_run_image_for(
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "netbsd"))]
-pub(crate) fn build_run_image_for_execfn(
-    bytes: &[u8],
-    argv: Vec<Vec<u8>>,
-    env: &[String],
-    execfn: &[u8],
-    dispatcher: &SyscallDispatcher,
-    options: RunImageBuildOptions,
-) -> Result<crate::memory::AddressSpace, crate::memory::AddressSpaceError> {
-    let mut image = crate::memory::AddressSpace::load_elf_bytes_with_reader_for(
-        bytes,
-        &|p| dispatcher.read_exec_file(p),
-        options.machine,
-    )?
-    .with_vdso_auxv(options.vdso_enabled);
-    if let Some(base) = options.at_base {
-        image = image.with_auxv_base(base);
-    }
-    image.with_linux_initial_stack_execfn_page_size(
-        argv,
-        env.iter().map(|s| s.as_bytes()),
-        execfn,
-        options.linux_page_size,
-    )
-}
-
 /// Parse a `#!` shebang line into (interpreter, optional single arg),
 /// matching Linux semantics: skip blanks after `#!`, take the interpreter up
 /// to the next whitespace, then the remainder of the line (trimmed) as ONE

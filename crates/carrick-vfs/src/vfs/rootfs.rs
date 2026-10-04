@@ -2649,11 +2649,11 @@ mod tests {
         old.make_dir("/old-only").unwrap();
         assert_eq!(second_cohort.current_generation(), before);
     }
-    #[cfg(target_os = "macos")]
     use crate::fs_backend::HostFsBackend;
     use crate::fs_backend::{BackendError, HostFdOpen, OverlayEntryKind};
     use crate::rootfs::LayerSource;
     use std::os::fd::IntoRawFd;
+    #[cfg(target_os = "macos")]
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2690,6 +2690,7 @@ mod tests {
     }
 
     mod serial_host {
+        #[cfg(target_os = "macos")]
         use super::*;
 
         #[cfg(target_os = "macos")]

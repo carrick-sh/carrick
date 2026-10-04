@@ -74,6 +74,7 @@ pub fn measure<T>(run: impl FnOnce() -> T) -> (T, u64) {
 }
 
 /// Host-heap bytes and allocation calls requested by this thread while `run` executes.
+#[cfg(target_os = "macos")]
 pub fn measure_with_count<T>(run: impl FnOnce() -> T) -> (T, u64, u64) {
     let (value, stats) = measure_stats(run);
     (value, stats.bytes, stats.calls)

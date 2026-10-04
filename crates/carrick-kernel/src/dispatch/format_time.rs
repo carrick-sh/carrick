@@ -751,7 +751,7 @@ pub(crate) fn monotonic_duration() -> Duration {
     // makes the invariant hold; it also matches what the guest asked for.
     #[cfg(target_os = "linux")]
     {
-        return host_clock_duration(libc::CLOCK_MONOTONIC).unwrap_or(Duration::ZERO);
+        host_clock_duration(libc::CLOCK_MONOTONIC).unwrap_or(Duration::ZERO)
     }
     // Linux CLOCK_MONOTONIC does NOT advance while the system is suspended.
     // On macOS that is CLOCK_UPTIME_RAW (mach_absolute_time) — NOT macOS
@@ -773,7 +773,7 @@ pub(crate) fn boottime_duration() -> Duration {
     // BOOTTIME >= MONOTONIC invariant holds.
     #[cfg(target_os = "linux")]
     {
-        return host_clock_duration(libc::CLOCK_BOOTTIME).unwrap_or_else(monotonic_duration);
+        host_clock_duration(libc::CLOCK_BOOTTIME).unwrap_or_else(monotonic_duration)
     }
     // On macOS/HVF the guest's BOOTTIME must MATCH its own vDSO fast path, which
     // serves CLOCK_BOOTTIME (clock id 7) as the bare guest CNTVCT/freq — i.e.

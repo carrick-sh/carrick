@@ -21,7 +21,9 @@
 //! Linux-style basename events. That dir-diff is macOS-only.
 
 use crate::linux_abi::{LINUX_EINVAL, LINUX_ENOSPC, LinuxErrno};
-use std::collections::{HashMap, HashSet, VecDeque};
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+use std::collections::HashSet;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
 
 use parking_lot::Mutex;

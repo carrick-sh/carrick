@@ -2733,7 +2733,7 @@ pub(in crate::dispatch) mod delegated_tests;
 #[path = "mem/metadata_budget_tests.rs"]
 pub(crate) mod metadata_budget_tests;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) use metadata_budget_tests::measure_host_heap;
 
 #[cfg(test)]

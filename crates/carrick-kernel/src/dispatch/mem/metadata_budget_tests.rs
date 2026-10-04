@@ -21,6 +21,7 @@ use super::*;
 use crate::dispatch::allocation_meter;
 
 /// Host-heap bytes and allocation calls requested by this thread while `run` executes.
+#[cfg(target_os = "macos")]
 pub(crate) fn measure_host_heap<T>(run: impl FnOnce() -> T) -> (T, u64, u64) {
     allocation_meter::measure_with_count(run)
 }
