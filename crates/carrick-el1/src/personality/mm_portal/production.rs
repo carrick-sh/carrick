@@ -310,7 +310,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         if handle.carrier() != self.carrier {
             return Err(MmError::Stale);
         }
-        let mut root = self.root(handle.mm(), slot)?;
+        let mut root = self.root_for(handle, slot)?;
         if root.incarnation().raw() != handle.incarnation().get() {
             return Err(MmError::Stale);
         }
@@ -331,7 +331,7 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         {
             return Err(MmError::Stale);
         }
-        let mut root = self.root(handle.mm(), slot)?;
+        let mut root = self.root_for(handle, slot)?;
         if root.incarnation().raw() != handle.incarnation().get() {
             return Err(MmError::Stale);
         }
@@ -339,6 +339,76 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         let mut continuation = TransferContinuation::new(handle, address, len, intent, sequence)?;
         continuation.fork_sequence = Some(fork_sequence);
         Ok(continuation)
+    }
+    fn observe_wait(
+        &self,
+        handle: El1MmHandle,
+        cause: carrick_el1_abi::PortalWaitCause,
+    ) -> Result<Option<carrick_el1_abi::PortalOwnerWait>, MmError> {
+        use carrick_el1_abi::PortalWaitCause as Wire;
+        use carrick_sched_core::spaces::notification::SpaceWaitCause as Cause;
+        if handle.carrier() != self.carrier {
+            return Err(MmError::Stale);
+        }
+        let Some(zone) = self.zone else {
+            #[cfg(any(test, feature = "host-test"))]
+            return Ok(None);
+            #[cfg(not(any(test, feature = "host-test")))]
+            return Err(MmError::Stale);
+        };
+        let entry = zone
+            .space_entry(NonZeroU64::new(handle.mm().raw()).ok_or(MmError::Stale)?)
+            .ok_or(MmError::Stale)?;
+        let source = entry
+            .notifications(handle.incarnation())
+            .map_err(|_| MmError::Stale)?;
+        let source_cause = match cause {
+            Wire::Editor => Cause::Editor,
+            Wire::Reservations => Cause::Reservations,
+            Wire::PendingEdit => Cause::PendingEdit,
+            Wire::Gate => Cause::Gate,
+            Wire::Metadata => Cause::Metadata,
+            Wire::ReservationPool => return Err(MmError::Invalid),
+        };
+        // SAFETY: exact live source authenticated above; caller probes afterward.
+        Ok(Some(unsafe {
+            carrick_el1_abi::PortalOwnerWait::from_owner(
+                handle,
+                cause,
+                source.observe(source_cause).revision(),
+            )
+        }))
+    }
+    fn editor_for(&self, handle: El1MmHandle, slot: u32) -> Result<SpaceEditor<'_>, MmError> {
+        use carrick_el1_abi::PortalWaitCause;
+        use carrick_sched_core::spaces::EditAdmissionRefusal;
+        let editor = self.observe_wait(handle, PortalWaitCause::Editor)?;
+        let gate = self.observe_wait(handle, PortalWaitCause::Gate)?;
+        let index = self.spaces.find(handle.mm().raw()).ok_or(MmError::Stale)?;
+        let access = self.space_access(slot)?;
+        self.spaces
+            .try_begin_edit_cause(
+                index,
+                handle.mm().raw(),
+                NonZeroU64::new(u64::from(slot) + 1).ok_or(MmError::Invalid)?,
+                access.venue(),
+            )
+            .map_err(|cause| match cause {
+                EditAdmissionRefusal::Editor => editor.map_or(MmError::Busy, MmError::Wait),
+                EditAdmissionRefusal::Gate => gate.map_or(MmError::Busy, MmError::Wait),
+                EditAdmissionRefusal::Stale => MmError::Stale,
+            })
+    }
+    fn root_for(&self, handle: El1MmHandle, slot: u32) -> Result<Reservations<'_>, MmError> {
+        let observed = self.observe_wait(handle, carrick_el1_abi::PortalWaitCause::Reservations)?;
+        let root = self.root(handle.mm(), slot).map_err(|error| match error {
+            MmError::Busy => observed.map_or(MmError::Busy, MmError::Wait),
+            other => other,
+        })?;
+        if root.incarnation().raw() != handle.incarnation().get() {
+            return Err(MmError::Stale);
+        }
+        Ok(root)
     }
     fn authorize(
         &self,
@@ -350,15 +420,19 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         if continuation.handle.carrier() != self.carrier {
             return Err(MmError::Stale);
         }
-        let mut root = self.root(continuation.handle.mm(), slot)?;
+        let pending = self.observe_wait(
+            continuation.handle,
+            carrick_el1_abi::PortalWaitCause::PendingEdit,
+        )?;
+        let mut root = self.root_for(continuation.handle, slot)?;
         if root.fork_pending() && !root.fork_write_authorized(continuation.fork_sequence) {
-            return Err(MmError::Busy);
+            return Err(pending.map_or(MmError::Busy, MmError::Wait));
         }
         if root.incarnation().raw() != continuation.handle.incarnation().get() {
             return Err(MmError::Stale);
         }
         if root.pending().is_some() {
-            return Err(MmError::Busy);
+            return Err(pending.map_or(MmError::Busy, MmError::Wait));
         }
         if continuation.intent == TransferIntent::CarrickInternalRead {
             // Production image header page: immutable after image admission,
@@ -401,12 +475,17 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         }
         let mm = continuation.handle.mm().raw();
         let index = self.spaces.find(mm).ok_or(MmError::Stale)?;
-        let owner = NonZeroU64::new(u64::from(slot) + 1).ok_or(MmError::Invalid)?;
-        let Some(_editor) = self.space_access(slot)?.try_begin_edit(index, mm, owner) else {
-            return Ok(TransferStep::Suspended);
+        let _editor = match self.editor_for(continuation.handle, slot) {
+            Err(MmError::Busy) => return Ok(TransferStep::Suspended),
+            result => result?,
         };
+        let gate =
+            self.observe_wait(continuation.handle, carrick_el1_abi::PortalWaitCause::Gate)?;
         let Some(grant) = self.spaces.grant(index, mm) else {
-            return Ok(TransferStep::Suspended);
+            return match gate {
+                Some(wait) => Err(MmError::Wait(wait)),
+                None => Ok(TransferStep::Suspended),
+            };
         };
         let va = continuation.address.raw() + continuation.offset;
         let len = (continuation.len - continuation.offset).min(4096 - (va & 4095));
@@ -595,15 +674,16 @@ impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
         }
         let mm = selected.handle.mm().raw();
         let index = self.spaces.find(mm).ok_or(MmError::Stale)?;
-        let Some(editor) = self.space_access(slot)?.try_begin_edit(
-            index,
-            mm,
-            NonZeroU64::new(u64::from(slot) + 1).unwrap(),
-        ) else {
-            return Ok(None);
+        let editor = match self.editor_for(selected.handle, slot) {
+            Err(MmError::Busy) => return Ok(None),
+            result => result?,
         };
+        let gate = self.observe_wait(selected.handle, carrick_el1_abi::PortalWaitCause::Gate)?;
         let Some(grant) = self.spaces.grant(index, mm) else {
-            return Ok(None);
+            return match gate {
+                Some(wait) => Err(MmError::Wait(wait)),
+                None => Ok(None),
+            };
         };
         let generation = match self.authorize(continuation, selected.va.raw(), selected.len, slot) {
             Err(MmError::Fault | MmError::Busy) => return Ok(None),
@@ -754,7 +834,7 @@ pub fn prepare_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized
     let Some(fence) = portal.revalidate(&continuation, selected, words, slot)? else {
         return Ok(None);
     };
-    let mut root = portal.root(handle.mm(), slot)?;
+    let mut root = portal.root_for(handle, slot)?;
     let notification = root.notification_ticket(
         carrick_sched_core::spaces::notification::SpaceWaitCause::PreparedOverlap,
     );
@@ -788,6 +868,14 @@ pub fn serve_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
                     service.suspend_prepare(
                         carrick_el1_abi::PortalPrepareSuspension::SelectionChanged,
                     );
+                    return Ok(());
+                }
+                Err(MmError::Wait(wait)) => {
+                    if !service
+                        .suspend_prepare(carrick_el1_abi::PortalPrepareSuspension::Owner(wait))
+                    {
+                        return Err(MmError::Stale);
+                    }
                     return Ok(());
                 }
                 Err(MmError::MetadataRequired) => {
@@ -997,14 +1085,6 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let intent = TransferIntent::decode(frame.x[6]).ok_or(MmError::Invalid)?;
         let zone =
             unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
-        let index = zone.spaces.find(mm.raw()).ok_or(MmError::Stale)?;
-        let grant = zone.spaces.grant(index, mm.raw()).ok_or(MmError::Busy)?;
-        let live_ttbr: u64;
-        unsafe {
-            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) live_ttbr, options(nomem, nostack));
-        }
-        let table = carrick_el1_abi::service_target_table_window(live_ttbr, grant.ttbr0)
-            .ok_or(MmError::Stale)?;
         let portal = MmPortal::<GuestMetadataPin> {
             carrier,
             roots: crate::memory::reservations::shared_guest(),
@@ -1012,10 +1092,26 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             nodes: None,
             zone: Some(zone),
         };
-        let handle = portal.admitted_handle(mm, frame.slot as u32)?;
-        if frame.x[3] != handle.incarnation().get() {
-            return Err(MmError::Stale);
+        // SAFETY: source and root authentication below validate this exact request.
+        let handle = unsafe {
+            El1MmHandle::from_admitted_owner(
+                carrier,
+                mm,
+                NonZeroU64::new(frame.x[3]).ok_or(MmError::Stale)?,
+            )
+        };
+        let gate = portal.observe_wait(handle, carrick_el1_abi::PortalWaitCause::Gate)?;
+        let index = zone.spaces.find(mm.raw()).ok_or(MmError::Stale)?;
+        let grant = zone
+            .spaces
+            .grant(index, mm.raw())
+            .ok_or_else(|| gate.map_or(MmError::Busy, MmError::Wait))?;
+        let live_ttbr: u64;
+        unsafe {
+            core::arch::asm!("mrs {}, ttbr0_el1", out(reg) live_ttbr, options(nomem, nostack));
         }
+        let table = carrick_el1_abi::service_target_table_window(live_ttbr, grant.ttbr0)
+            .ok_or(MmError::Stale)?;
         let range = carrick_el1_abi::PortalByteRange::new(frame.x[4], frame.x[5])
             .ok_or(MmError::Invalid)?;
         if range.is_empty() || range.len() > 4096 - (range.address() & 4095) {
@@ -1101,6 +1197,12 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     frame.x[0] = match run(frame) {
         Ok(()) => 0,
         Err(MmError::Busy) => 11,
+        Err(MmError::Wait(wait)) => {
+            frame.x[14] = 3;
+            frame.x[16] = wait.cause().encode();
+            frame.x[17] = wait.revision();
+            11
+        }
         Err(error) => u64::from(error.errno()),
     };
 }
