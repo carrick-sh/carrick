@@ -12,9 +12,9 @@
 //! mask publication in one transaction. No graph, lock or scheduler is created
 //! here. Exact-generation keys are the caller's existing task/thread keys.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 
-use crate::{PendingQueue, SignalSet};
+use crate::{SignalSet, StandardSignalSlot};
 
 /// Validated Linux kernel signal (1..=64), not libc's adjusted SIGRTMIN.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -365,14 +365,17 @@ pub struct PendingEntry<T> {
 }
 
 /// One process- or thread-owned pending set. Extracts the kernel queue's
-/// first-standard/FIFO-real-time algorithm using the existing payload queue.
+/// first-standard/FIFO-real-time algorithm. StandardSignalSlot explicitly
+/// retains the first instance; real-time instances use a FIFO VecDeque. The
+/// production PendingQueue's replacement flag is not used by this policy.
 /// Presence selection and count are O(1), enqueue/dequeue O(log 64), never a
 /// traversal of payloads or other owners. Allocation/RLIMIT admission is the
 /// consuming owner's responsibility before enqueue.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingSignals<T> {
     present: SignalSet,
-    queues: BTreeMap<Signal, PendingQueue<Option<T>>>,
+    standard: BTreeMap<Signal, StandardSignalSlot<Option<T>>>,
+    realtime: BTreeMap<Signal, VecDeque<Option<T>>>,
     count: usize,
 }
 
@@ -380,7 +383,8 @@ impl<T> Default for PendingSignals<T> {
     fn default() -> Self {
         Self {
             present: SignalSet::EMPTY,
-            queues: BTreeMap::new(),
+            standard: BTreeMap::new(),
+            realtime: BTreeMap::new(),
             count: 0,
         }
     }
@@ -398,13 +402,11 @@ impl<T> PendingSignals<T> {
     }
 
     pub fn enqueue(&mut self, signal: Signal, info: Option<T>) -> EnqueueOutcome {
-        if !signal.is_realtime() && self.present.contains(signal) {
+        if signal.is_realtime() {
+            self.realtime.entry(signal).or_default().push_back(info);
+        } else if !self.standard.entry(signal).or_default().publish_first(info) {
             return EnqueueOutcome::Coalesced;
         }
-        self.queues
-            .entry(signal)
-            .or_default()
-            .publish(info, !signal.is_realtime());
         self.present = self.present.with(signal);
         self.count += 1;
         EnqueueOutcome::Queued
@@ -412,12 +414,19 @@ impl<T> PendingSignals<T> {
 
     pub fn take_in(&mut self, selected: SignalSet) -> Option<PendingEntry<T>> {
         let signal = Signal::from_number(self.present.intersect(selected).lowest()?)?;
-        let queue = self.queues.get_mut(&signal)?;
-        let info = queue.take()?;
-        if queue.is_empty() {
-            self.queues.remove(&signal);
+        let info = if signal.is_realtime() {
+            let queue = self.realtime.get_mut(&signal)?;
+            let info = queue.pop_front()?;
+            if queue.is_empty() {
+                self.realtime.remove(&signal);
+                self.present = self.present.without(signal);
+            }
+            info
+        } else {
+            let info = self.standard.remove(&signal)?.take()?;
             self.present = self.present.without(signal);
-        }
+            info
+        };
         self.count -= 1;
         Some(PendingEntry { signal, info })
     }
@@ -426,9 +435,17 @@ impl<T> PendingSignals<T> {
     /// Work depends on at most 64 signal keys, never queued payload population
     /// except destruction of the discarded payloads themselves.
     pub fn discard(&mut self, selected: SignalSet) {
-        self.queues.retain(|signal, queue| {
+        self.standard.retain(|signal, _| {
             if selected.contains(*signal) {
-                self.count -= queue.0.len();
+                self.count -= 1;
+                false
+            } else {
+                true
+            }
+        });
+        self.realtime.retain(|signal, queue| {
+            if selected.contains(*signal) {
+                self.count -= queue.len();
                 false
             } else {
                 true
