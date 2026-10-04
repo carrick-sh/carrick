@@ -1,9 +1,13 @@
-//! Darwin has no child subreaper. Authenticate even detached descendants by
-//! the kernel identity of the inherited scope pipe, then stop, kill and observe
-//! launchd reaping them before releasing exclusion.
+//! Darwin has no child subreaper. Session or kernel pipe identity selects work.
+//! A detached descendant closing every inherited writer escapes this scope;
+//! the ignored close-all-fds regression pins that unsupported topology.
+//! Process start time is rechecked before signaling. The final proc_pidinfo to
+//! kill window remains: Darwin's PID-only kill is not an atomic incarnation API.
 
-use std::collections::BTreeSet;
+use super::ProcessIncarnation;
+use std::collections::BTreeMap;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 // libc exposes proc_pidfdinfo and vinfo_stat, but not these sys/proc_info.h
 // layouts or PROC_PIDFDPIPEINFO. Keep the native ABI here, outside guest ABI.
@@ -100,46 +104,179 @@ impl PipeWriter {
         }
     }
 
-    pub(super) fn cancel(&self, session: libc::pid_t) -> io::Result<Vec<libc::pid_t>> {
-        let mut stopped = BTreeSet::new();
+    pub(super) fn cancel(
+        &self,
+        session: libc::pid_t,
+        members: &mut BTreeMap<ProcessIncarnation, ProcessWatch>,
+    ) -> io::Result<()> {
         loop {
             let mut changed = false;
             for pid in all_pids()? {
-                // SAFETY: native session query. Pipe identity covers setsid.
+                if pid <= 0 || (unsafe { libc::getsid(pid) } != session && !self.owns_writer(pid)) {
+                    continue;
+                }
+                let Some(info) = process_info(pid)? else {
+                    continue;
+                };
+                let identity = incarnation(pid, &info);
+                // SAFETY: native session query. Pipe identity covers setsid
+                // while at least one scope descriptor remains open.
                 if pid > 0
                     && (unsafe { libc::getsid(pid) } == session || self.owns_writer(pid))
-                    && stopped.insert(pid)
+                    && let std::collections::btree_map::Entry::Vacant(entry) =
+                        members.entry(identity)
+                    && let Some(process) = ProcessWatch::new(identity)?
                 {
-                    signal(pid, libc::SIGSTOP)?;
+                    entry.insert(process);
                     changed = true;
                 }
             }
-            // Stop delivery is asynchronous. Require a native stopped/exited
-            // state before the final census, so no parent can fork past it.
-            if !changed && stopped.iter().all(|&pid| stopped_or_exited(pid)) {
-                break;
+            let mut pending = false;
+            for process in members.values_mut() {
+                if !process.exited()? {
+                    pending = true;
+                    process.cancel()?;
+                }
             }
-            std::thread::yield_now();
+            // Another census after all known members exited closes forks made
+            // before SIGKILL delivery. No SIGSTOP is issued: EPERM helpers keep
+            // running to natural exit while exclusion and exit watches stay live.
+            if !changed && !pending {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        for &pid in &stopped {
-            signal(pid, libc::SIGKILL)?;
-        }
-        Ok(stopped.into_iter().collect())
     }
 }
 
-fn signal(pid: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
-    // SAFETY: only an authenticated, scoped process is targeted.
-    if unsafe { libc::kill(pid, signal) } < 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            return Err(error);
-        }
-    }
-    Ok(())
+pub(super) struct ProcessWatch {
+    identity: ProcessIncarnation,
+    queue: Option<OwnedFd>,
+    permission_reported: bool,
 }
 
-fn stopped_or_exited(pid: libc::pid_t) -> bool {
+impl ProcessWatch {
+    fn new(identity: ProcessIncarnation) -> io::Result<Option<Self>> {
+        // SAFETY: uniquely owned kqueue; process exit events bind to the
+        // registered process, rather than a later occupant of its numeric PID.
+        let fd = unsafe { libc::kqueue() };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let queue = unsafe { OwnedFd::from_raw_fd(fd) };
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
+        event.ident = identity.pid as _;
+        event.filter = libc::EVFILT_PROC;
+        event.flags = libc::EV_ADD | libc::EV_ENABLE;
+        event.fflags = libc::NOTE_EXIT;
+        let queue = if unsafe {
+            libc::kevent(fd, &event, 1, std::ptr::null_mut(), 0, std::ptr::null())
+        } < 0
+        {
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::EPERM)) {
+                return Err(error);
+            }
+            // Privileged helpers can deny the exit watch as well as signaling.
+            // Native start-time/status observations still keep exclusion held.
+            None
+        } else {
+            Some(queue)
+        };
+        if !identity.present(observe(identity.pid)?) {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            identity,
+            queue,
+            permission_reported: false,
+        }))
+    }
+
+    fn cancel(&mut self) -> io::Result<()> {
+        let result = self.identity.signal(libc::SIGKILL, observe, |pid, signal| {
+            // SAFETY: incarnation checked immediately before this PID-only
+            // call. The documented final query-to-kill window remains.
+            if unsafe { libc::kill(pid, signal) } == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+        match result {
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+                if !self.permission_reported {
+                    eprintln!(
+                        "host-lease: privileged descendant {} refused cancellation; awaiting its exit with exclusion held",
+                        self.identity.pid
+                    );
+                    self.permission_reported = true;
+                }
+                Ok(())
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            result => result,
+        }
+    }
+
+    fn exited(&self) -> io::Result<bool> {
+        if let Some(queue) = &self.queue {
+            let mut event = unsafe { std::mem::zeroed::<libc::kevent>() };
+            let timeout = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            let result = unsafe {
+                libc::kevent(
+                    queue.as_raw_fd(),
+                    std::ptr::null(),
+                    0,
+                    &mut event,
+                    1,
+                    &timeout,
+                )
+            };
+            if result < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if result > 0 && event.fflags & libc::NOTE_EXIT != 0 {
+                return Ok(true);
+            }
+        }
+        let Some(info) = process_info(self.identity.pid)? else {
+            return Ok(true);
+        };
+        Ok(!self
+            .identity
+            .present(Some(incarnation(self.identity.pid, &info)))
+            || info.pbi_status == libc::SZOMB)
+    }
+
+    pub(super) fn reaped(&self) -> io::Result<bool> {
+        // A replacement is never waited upon or signaled with kill(pid, 0).
+        Ok(!self.identity.present(observe(self.identity.pid)?))
+    }
+}
+
+fn incarnation(pid: libc::pid_t, info: &libc::proc_bsdinfo) -> ProcessIncarnation {
+    ProcessIncarnation {
+        pid,
+        start_seconds: info.pbi_start_tvsec,
+        start_microseconds: info.pbi_start_tvusec,
+    }
+}
+
+fn observe(pid: libc::pid_t) -> io::Result<Option<ProcessIncarnation>> {
+    Ok(process_info(pid)?.map(|info| incarnation(pid, &info)))
+}
+
+fn process_info(pid: libc::pid_t) -> io::Result<Option<libc::proc_bsdinfo>> {
+    if pid <= 0 {
+        return Ok(None);
+    }
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let size = size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: correctly sized native process-info output.
@@ -153,13 +290,14 @@ fn stopped_or_exited(pid: libc::pid_t) -> bool {
         )
     };
     if got != size {
-        return io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        let error = io::Error::last_os_error();
+        if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::ENOENT)) {
+            return Ok(None);
+        }
+        return Err(error);
     }
     // SAFETY: libproc initialized the entire structure.
-    matches!(
-        unsafe { info.assume_init() }.pbi_status,
-        libc::SSTOP | libc::SZOMB
-    )
+    Ok(Some(unsafe { info.assume_init() }))
 }
 
 fn all_pids() -> io::Result<Vec<libc::pid_t>> {

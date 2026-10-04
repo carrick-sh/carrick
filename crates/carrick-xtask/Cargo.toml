@@ -23,6 +23,7 @@ sha2.workspace = true
 libc.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true
+signal-hook.workspace = true
 
 carrick-conformance = { path = "../carrick-conformance" }
 carrick-portable = { path = "../carrick-portable" }

@@ -28,6 +28,7 @@ fn fork_without_exec_fixture() {
     let mut control = [0; 2];
     let mut ready = [0; 2];
     let detached = std::env::var_os("CARRICK_LEASE_DETACHED").is_some();
+    let close_scope = std::env::var_os("CARRICK_LEASE_CLOSE_SCOPE").is_some();
     // SAFETY: valid pipe arrays; after fork the child uses only libc and _exit.
     unsafe {
         assert_eq!(libc::pipe(control.as_mut_ptr()), 0);
@@ -49,6 +50,15 @@ fn fork_without_exec_fixture() {
             }
             if detached && libc::setsid() < 0 {
                 libc::_exit(2);
+            }
+            if close_scope {
+                // Like close_fds=True: close every inherited duplicate, while
+                // retaining only this fixture's newly created control pipes.
+                for &fd in &fds {
+                    if fd > 2 && fd != control[0] && fd != ready[1] {
+                        libc::close(fd);
+                    }
+                }
             }
             libc::write(ready[1], (&count as *const u32).cast(), 4);
             if detached {
@@ -91,21 +101,56 @@ fn fork_without_exec_fixture() {
 
 #[test]
 fn runner_death_cancels_workload_before_releasing_exclusion() {
-    runner_death_preserves_exclusion(false, false);
+    runner_death_preserves_exclusion(false, false, false, None);
 }
 
 #[test]
 fn runner_death_cancels_nested_workload_before_releasing_exclusion() {
-    runner_death_preserves_exclusion(true, false);
+    runner_death_preserves_exclusion(true, false, false, None);
 }
 
 #[test]
 fn runner_death_cancels_detached_nested_workload_before_releasing_exclusion() {
-    runner_death_preserves_exclusion(true, true);
+    runner_death_preserves_exclusion(true, true, false, None);
+}
+
+#[test]
+fn supervisor_sigterm_cancels_before_releasing_exclusion() {
+    runner_death_preserves_exclusion(true, false, false, Some(libc::SIGTERM));
+}
+
+#[test]
+fn supervisor_sigint_cancels_before_releasing_exclusion() {
+    runner_death_preserves_exclusion(true, false, false, Some(libc::SIGINT));
+}
+
+#[test]
+fn supervisor_sighup_cancels_before_releasing_exclusion() {
+    runner_death_preserves_exclusion(true, false, false, Some(libc::SIGHUP));
+}
+
+#[test]
+#[ignore = "known exclusion limit: SIGKILL destroys the sole flock owner"]
+fn supervisor_sigkill_cannot_preserve_exclusion() {
+    runner_death_preserves_exclusion(true, false, false, Some(libc::SIGKILL));
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "known Darwin limit: detached descendants closing the scope writer escape"
+)]
+fn detached_closed_scope_descendant_is_cancelled() {
+    runner_death_preserves_exclusion(true, true, true, None);
 }
 
 #[cfg(test)]
-fn runner_death_preserves_exclusion(nested: bool, detached: bool) {
+fn runner_death_preserves_exclusion(
+    nested: bool,
+    detached: bool,
+    close_scope: bool,
+    supervisor_signal: Option<libc::c_int>,
+) {
     use std::os::fd::AsRawFd;
     // Linux subreaper configuration is process-wide; serialize that fixture
     // state only, while each admitted workload still runs its fork concurrently.
@@ -187,6 +232,9 @@ fn runner_death_preserves_exclusion(nested: bool, detached: bool) {
     if detached {
         command.env("CARRICK_LEASE_DETACHED", "1");
     }
+    if close_scope {
+        command.env("CARRICK_LEASE_CLOSE_SCOPE", "1");
+    }
     let mut holder = Cleanup {
         child: command
             .arg(std::env::current_exe().unwrap())
@@ -239,7 +287,12 @@ fn runner_death_preserves_exclusion(nested: bool, detached: bool) {
             libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
             -1
         );
-        holder.child.kill().unwrap();
+        if let Some(signal) = supervisor_signal {
+            // Readiness records the actual flock owner's PID, not the proxy.
+            assert_eq!(libc::kill(*holder.parents.last().unwrap(), signal), 0);
+        } else {
+            holder.child.kill().unwrap();
+        }
         // Child::wait closes its stdin. Preserve the fixture control channel
         // until the live-child and lock-release assertions have finished.
         holder.control = holder.child.stdin.take();
@@ -265,6 +318,39 @@ fn runner_death_preserves_exclusion(nested: bool, detached: bool) {
         }
         drop(holder.control.take());
     }
+}
+
+#[test]
+fn fork_fixture_rejects_abnormal_fork_exit() {
+    let lock = tempfile::NamedTempFile::new().unwrap();
+    let ready = tempfile::NamedTempFile::new().unwrap();
+    let mut fixture = Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", FORK_FIXTURE])
+        .env("CARRICK_HOST_LEASE_PATH", lock.path())
+        .env("CARRICK_LEASE_READY", ready.path())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let pid = loop {
+        let data = std::fs::read_to_string(ready.path()).unwrap();
+        if let Some(pid) = data.split_whitespace().next() {
+            break pid.parse::<libc::pid_t>().unwrap();
+        }
+        if std::time::Instant::now() >= deadline {
+            fixture.kill().unwrap();
+            fixture.wait().unwrap();
+            panic!("fork fixture readiness timed out");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    // SAFETY: the fixture retains and reaps this exact child until stdin EOF.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    drop(fixture.stdin.take());
+    assert!(
+        !fixture.wait().unwrap().success(),
+        "fixture accepted a SIGKILLed fork as normal completion"
+    );
 }
 
 #[test]
@@ -551,37 +637,3 @@ fn fake_ps_refuses_load_and_override_records_parent_command() {
         "accept must refuse before starting host work"
     );
 }
-
-#[test]
-fn fork_fixture_rejects_abnormal_fork_exit() {
-    let lock = tempfile::NamedTempFile::new().unwrap();
-    let ready = tempfile::NamedTempFile::new().unwrap();
-    let mut fixture = Command::new(std::env::current_exe().unwrap())
-        .args(["--ignored", "--exact", FORK_FIXTURE])
-        .env("CARRICK_HOST_LEASE_PATH", lock.path())
-        .env("CARRICK_LEASE_READY", ready.path())
-        .stdin(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let pid = loop {
-        let data = std::fs::read_to_string(ready.path()).unwrap();
-        if let Some(pid) = data.split_whitespace().next() {
-            break pid.parse::<libc::pid_t>().unwrap();
-        }
-        if std::time::Instant::now() >= deadline {
-            fixture.kill().unwrap();
-            fixture.wait().unwrap();
-            panic!("fork fixture readiness timed out");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
-    // SAFETY: the fixture retains and reaps this exact child until stdin EOF.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-    drop(fixture.stdin.take());
-    assert!(
-        !fixture.wait().unwrap().success(),
-        "fixture accepted a SIGKILLed fork as normal completion"
-    );
-}
-
