@@ -5276,14 +5276,121 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.record_guest_descriptor_lane(Err(reason));
     }
 
-    fn select_live_descriptor_owner(&mut self, owner: LiveDescriptorOwner) -> bool {
+    fn user_memory_admission_authority(&self) -> Option<UserMemoryAuthority> {
+        self.vm.owner_transfer_custody()?;
+        Some(self.protections.clone())
+    }
+
+    fn owner_transfer_carrier(&self) -> Option<std::num::NonZeroU64> {
+        self.vm
+            .owner_transfer_custody()
+            .map(|custody| custody.carrier())
+    }
+
+    fn select_live_descriptor_owner(
+        &mut self,
+        owner: LiveDescriptorOwner,
+    ) -> Result<bool, TrapError> {
+        if owner != LiveDescriptorOwner::Guest {
+            self.page_tables.select_live_descriptor_owner(owner);
+            return Ok(true);
+        }
+        let Some(authority) = self.user_memory_admission_authority() else {
+            return Ok(false);
+        };
+        let mut guard = authority.begin_selection().map_err(|reason| {
+            TrapError::Hypervisor(format!("user-memory publication guard refused: {reason:?}"))
+        })?;
+        self.select_live_descriptor_owner_under_guard(owner, &mut guard, None)
+    }
+
+    fn select_live_descriptor_owner_under_guard(
+        &mut self,
+        owner: LiveDescriptorOwner,
+        guard: &mut carrick_guest_mem::UserMemoryAdmissionGuard<'_>,
+        closed: Option<carrick_el1_abi::PortalClosedRootBind>,
+    ) -> Result<bool, TrapError> {
+        if !guard.belongs_to(&self.protections) {
+            return Err(TrapError::Hypervisor(
+                "user-memory publication guard belongs to another MM".into(),
+            ));
+        }
         if owner == LiveDescriptorOwner::Guest {
-            let outcome = self.page_tables.select_guest_descriptor_owner();
-            self.vm.record_guest_descriptor_lane(outcome);
-            return outcome == Ok(crate::stage1_authority::GuestLaneSelection::Selected);
+            let Some(custody) = self.vm.owner_transfer_custody() else {
+                return Ok(false);
+            };
+            let mm = carrick_el1_abi::ReservationMm::new(self.mm_generation)
+                .ok_or(TrapError::UnsupportedPlatform)?;
+            let ttbr0 = self.vcpu.get_mut().get_sys_reg(SysReg::Ttbr0)?;
+            let region = carrick_el1_abi::get_el1_region_host_ptr();
+            if region == 0 {
+                return Err(TrapError::UnsupportedPlatform);
+            }
+            // SAFETY: the live engine retains the complete carrier ABI region.
+            let slots = unsafe {
+                &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                    as *const carrick_el1_abi::MmPortalSlots)
+            };
+            let target = match closed {
+                Some(token) => crate::user_transfer::TransferTarget::bind_closed(
+                    self,
+                    token,
+                    custody.as_ref(),
+                    slots,
+                )?,
+                None => crate::user_transfer::TransferTarget::bind(
+                    self,
+                    mm,
+                    ttbr0,
+                    custody.as_ref(),
+                    slots,
+                )?,
+            };
+            let Some(target) = target else {
+                return Ok(false);
+            };
+            if target.ttbr0() != ttbr0 || target.handle().mm() != mm {
+                return Err(TrapError::Hypervisor(
+                    "owner BIND differs from the loaded task root".into(),
+                ));
+            }
+            let outcome = guard.select_owner(target.handle(), || {
+                self.page_tables
+                    .select_guest_descriptor_owner()
+                    .map(|lane| match lane {
+                        crate::stage1_authority::GuestLaneSelection::Selected => {
+                            carrick_guest_mem::OwnerMemorySelection::Immediate
+                        }
+                        crate::stage1_authority::GuestLaneSelection::Deferred => {
+                            carrick_guest_mem::OwnerMemorySelection::Deferred
+                        }
+                    })
+            });
+            return match outcome {
+                Ok(lane) => {
+                    self.vm.record_guest_descriptor_lane(Ok(match lane {
+                        carrick_guest_mem::OwnerMemorySelection::Immediate => {
+                            crate::stage1_authority::GuestLaneSelection::Selected
+                        }
+                        carrick_guest_mem::OwnerMemorySelection::Deferred => {
+                            crate::stage1_authority::GuestLaneSelection::Deferred
+                        }
+                    }));
+                    Ok(lane == carrick_guest_mem::OwnerMemorySelection::Immediate)
+                }
+                Err(carrick_guest_mem::OwnerMemorySelectionError::Selection(reason)) => {
+                    self.vm.record_guest_descriptor_lane(Err(reason));
+                    Ok(false)
+                }
+                Err(carrick_guest_mem::OwnerMemorySelectionError::Admission(reason)) => {
+                    Err(TrapError::Hypervisor(format!(
+                        "exact user-memory owner admission refused: {reason:?}"
+                    )))
+                }
+            };
         }
         self.page_tables.select_live_descriptor_owner(owner);
-        true
+        Ok(true)
     }
 
     fn settle_el1_descriptor_receipt(
