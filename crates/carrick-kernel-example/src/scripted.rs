@@ -368,11 +368,14 @@ impl ScriptedBackend {
     /// Join every task thread, each bounded by [`WAIT_BOUND`]. A thread that
     /// is still running past the bound is left detached and reported.
     fn join_children(shared: &Shared) -> Result<(), ExampleError> {
-        let deadline = Instant::now() + WAIT_BOUND;
         loop {
             let Some(handle) = shared.children.lock().pop() else {
                 return Ok(());
             };
+            // The bound belongs to this child's termination. A single clock
+            // across the entire join list turns N progressing children into a
+            // false timeout when their cumulative cleanup exceeds WAIT_BOUND.
+            let deadline = Instant::now() + WAIT_BOUND;
             while !handle.is_finished() {
                 if Instant::now() >= deadline {
                     return Err(ExampleError::WaitTimedOut("a child task thread"));

@@ -122,6 +122,11 @@ fn actor(parent: &str, actor: usize, n: usize) -> std::io::Result<Vec<Step>> {
             Step::Sys(sys::read(slot(4), 1).ret(1)),
             Step::Sys(sys::close(slot(4)).ret(0)),
         ]);
+        if actor == 1 {
+            // Keep the actors independent: the parent drains progress only
+            // after its own namespace batch has finished.
+            script.push(Step::Sys(sys::write(slot(3), b"c").ret(1)));
+        }
     }
     Ok(script)
 }
@@ -170,7 +175,6 @@ fn two_live_process_namespace_publication_matrix() {
                 let mut child = vec![Step::Sys(sys::read(slot(0), 1).ret(1))];
                 child.extend(actor(parents[1], 1, n).unwrap());
                 child.extend([
-                    Step::Sys(sys::write(slot(3), b"c").ret(1)),
                     Step::Sys(sys::read(slot(0), 1).ret(1)),
                     Step::Sys(sys::exit_group(0)),
                 ]);
@@ -178,8 +182,10 @@ fn two_live_process_namespace_publication_matrix() {
                 script.push(await_parked(last_child(), "read"));
                 script.push(Step::Sys(sys::write(slot(1), b"s").ret(1)));
                 script.extend(actor(parents[0], 0, n).unwrap());
+                for _ in 0..n {
+                    script.push(Step::Sys(sys::read(slot(2), 1).ret(1)));
+                }
                 script.extend([
-                    Step::Sys(sys::read(slot(2), 1).ret(1)),
                     Step::Sys(sys::write(slot(1), b"f").ret(1)),
                     Step::Sys(sys::wait4(last_child(), 0)),
                     Step::Sys(sys::exit_group(0)),
@@ -235,6 +241,7 @@ fn two_live_process_namespace_publication_matrix() {
                 assert_eq!(reads.iter().filter(|&&b| b == b'a').count(), 4 * n);
                 assert_eq!(reads.iter().filter(|&&b| b == b'b').count(), 2 * n);
                 assert_eq!(reads.iter().filter(|&&b| b == b'd').count(), 2 * n);
+                assert_eq!(reads.iter().filter(|&&b| b == b'c').count(), n);
             }
         }
     }
@@ -332,6 +339,14 @@ fn two_live_process_lower_copy_up_and_whiteout_matrix() {
                                     .errno(LINUX_ENOENT)
                             }),
                         ]);
+                        if id == 1 {
+                            // Report one completed unit of child work. The parent
+                            // drains these only after its own batch, so the two
+                            // namespace actors still run independently. Each
+                            // bounded read now measures one iteration's progress
+                            // instead of total host-FS time for the whole batch.
+                            actors[id].push(Step::Sys(sys::write(slot(3), b"c").ret(1)));
+                        }
                     }
                 }
                 let mut script = vec![
@@ -352,7 +367,6 @@ fn two_live_process_lower_copy_up_and_whiteout_matrix() {
                 let mut child = vec![Step::Sys(sys::read(slot(0), 1).ret(1))];
                 child.append(&mut actors[1]);
                 child.extend([
-                    Step::Sys(sys::write(slot(3), b"c").ret(1)),
                     Step::Sys(sys::read(slot(0), 1).ret(1)),
                     Step::Sys(sys::exit_group(0)),
                 ]);
@@ -360,8 +374,10 @@ fn two_live_process_lower_copy_up_and_whiteout_matrix() {
                 script.push(await_parked(last_child(), "read"));
                 script.push(Step::Sys(sys::write(slot(1), b"s").ret(1)));
                 script.append(&mut actors[0]);
+                for _ in 0..n {
+                    script.push(Step::Sys(sys::read(slot(2), 1).ret(1)));
+                }
                 script.extend([
-                    Step::Sys(sys::read(slot(2), 1).ret(1)),
                     Step::Sys(sys::write(slot(1), b"f").ret(1)),
                     Step::Sys(sys::wait4(last_child(), 0)),
                     Step::Sys(sys::exit_group(0)),
