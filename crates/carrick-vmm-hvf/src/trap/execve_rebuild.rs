@@ -696,6 +696,31 @@ impl ExecStage2Install {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn rollback_exec_stage2_switch(
+    predecessor: &[ExecStage2Install],
+    mapped_successor: &[ExecStage2Install],
+    unmap: &mut dyn FnMut(&ExecStage2Install) -> Result<(), TrapError>,
+    map: &mut dyn FnMut(&ExecStage2Install) -> Result<(), TrapError>,
+) {
+    for replacement in mapped_successor.iter().rev() {
+        unmap(replacement).unwrap_or_else(|error| {
+            carrick_fatal!(
+                "hvpatch::exec_commit",
+                "rollback HVPatch exec replacement stage-2 mapping: {error}"
+            );
+        });
+    }
+    for old in predecessor {
+        map(old).unwrap_or_else(|error| {
+            carrick_fatal!(
+                "hvpatch::exec_commit",
+                "restore HVPatch exec predecessor stage-2 mapping: {error}"
+            );
+        });
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn switch_exec_stage2_transaction(
     old: &[ExecStage2Install],
     new: &[ExecStage2Install],
@@ -705,56 +730,27 @@ pub(crate) fn switch_exec_stage2_transaction(
 ) -> Result<(), TrapError> {
     for (old_unmapped, extent) in old.iter().enumerate() {
         if let Err(error) = unmap(extent) {
-            for restore in &old[..old_unmapped] {
-                map(restore).unwrap_or_else(|rollback| {
-                    carrick_fatal!(
-                        "hvpatch::exec_commit",
-                        "restore HVPatch exec predecessor after unmap failure: {rollback}"
-                    );
-                });
-            }
+            rollback_exec_stage2_switch(&old[..old_unmapped], &[], &mut unmap, &mut map);
             return Err(error);
         }
     }
 
-    let rollback =
-        |mapped: usize,
-         unmap: &mut dyn FnMut(&ExecStage2Install) -> Result<(), TrapError>,
-         map: &mut dyn FnMut(&ExecStage2Install) -> Result<(), TrapError>| {
-            for replacement in new[..mapped].iter().rev() {
-                unmap(replacement).unwrap_or_else(|error| {
-                    carrick_fatal!(
-                        "hvpatch::exec_commit",
-                        "rollback HVPatch exec replacement stage-2 mapping: {error}"
-                    );
-                });
-            }
-            for predecessor in old {
-                map(predecessor).unwrap_or_else(|error| {
-                    carrick_fatal!(
-                        "hvpatch::exec_commit",
-                        "restore HVPatch exec predecessor stage-2 mapping: {error}"
-                    );
-                });
-            }
-        };
-
     for (new_mapped, extent) in new.iter().enumerate() {
         if fail_after_maps == Some(new_mapped) {
-            rollback(new_mapped, &mut unmap, &mut map);
+            rollback_exec_stage2_switch(old, &new[..new_mapped], &mut unmap, &mut map);
             return Err(TrapError::Hypervisor(format!(
                 "injected HVPatch exec stage-2 map failure after {new_mapped} maps"
             )));
         }
         if let Err(error) = map(extent) {
-            rollback(new_mapped, &mut unmap, &mut map);
+            rollback_exec_stage2_switch(old, &new[..new_mapped], &mut unmap, &mut map);
             return Err(error);
         }
     }
     // The last successful map is still before authority publication. Keep
     // that boundary faultable with the same rollback as every earlier map.
     if fail_after_maps == Some(new.len()) {
-        rollback(new.len(), &mut unmap, &mut map);
+        rollback_exec_stage2_switch(old, new, &mut unmap, &mut map);
         return Err(TrapError::Hypervisor(format!(
             "injected HVPatch exec stage-2 map failure after {} maps",
             new.len()
