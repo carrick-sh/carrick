@@ -1731,19 +1731,30 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = ImageStore::new(tmp.path());
 
-        let layer = gzip_layer("hello.txt", b"hello from amd64");
-        let config = br#"{"architecture":"amd64","os":"linux","config":{"Cmd":["/bin/sh"]}}"#;
+        let target = PlatformTarget::parse(if PlatformTarget::default_target().arch == "amd64" {
+            "linux/arm64"
+        } else {
+            "linux/amd64"
+        })
+        .unwrap();
+        assert_ne!(target, PlatformTarget::default_target());
+        let layer = gzip_layer("hello.txt", b"hello from a foreign platform");
+        let config = serde_json::json!({
+            "architecture": target.arch,
+            "os": "linux",
+            "config": {"Cmd": ["/bin/sh"]},
+        })
+        .to_string();
         let archive = docker_archive(
             &["trivial:latest"],
-            "amd64-config.json",
-            config,
-            "amd64/layer.tar.gz",
+            "foreign-config.json",
+            config.as_bytes(),
+            "foreign/layer.tar.gz",
             &layer,
         );
-        let tar_path = tmp.path().join("amd64.tar");
+        let tar_path = tmp.path().join("foreign.tar");
         std::fs::write(&tar_path, &archive).unwrap();
 
-        let target = PlatformTarget::parse("linux/amd64").unwrap();
         let summaries = store
             .load_docker_archive_for_platform(&tar_path, &target)
             .unwrap();
