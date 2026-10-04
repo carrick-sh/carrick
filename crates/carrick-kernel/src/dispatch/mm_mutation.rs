@@ -1,5 +1,6 @@
-//! Structural authority for the only permitted mutation order:
-//! page-table exclusion first, then a host-alias phase for the same MM.
+//! Structural authority for exact-MM custody transactions. Setup mutations
+//! hold page-table exclusion before host aliases. Admitted owner topology
+//! guards retain only task/custody identity, with no host table editor.
 
 use crate::kernel::MmId;
 use carrick_fatal::carrick_fatal;
@@ -244,33 +245,7 @@ impl<'authority> MmMutationGuard<'authority> {
     /// The transaction borrows the mutation guard so it cannot outlive
     /// the stage-1 page-table exclusion.
     pub fn begin_transaction(&self) -> MmTransactionGuard<'_> {
-        MmTransactionGuard {
-            mm: Some(self.mm),
-            depth: {
-                carrick_thread::fork_quiesce::emit_topology_lock(
-                    self.operation,
-                    carrick_observability::probes::HvpatchTopologyPhase::Requested,
-                    0,
-                    0,
-                    0,
-                );
-                let depth = carrick_thread::fork_quiesce::TopologyDepth::acquire();
-                // Depth acquisition is non-blocking (atomic thread counter), so Acquired elapsed_ns is 0.
-                carrick_thread::fork_quiesce::emit_topology_lock(
-                    self.operation,
-                    carrick_observability::probes::HvpatchTopologyPhase::Acquired,
-                    0,
-                    0,
-                    0,
-                );
-                depth
-            },
-            operation: self.operation,
-            guest_pid: 0,
-            guest_tid: 0,
-            acquired_at: std::time::Instant::now(),
-            _guard: PhantomData,
-        }
+        begin_mm_transaction(self)
     }
 
     #[allow(dead_code)] // Canonical process_vm consumer lands in Task 8.
@@ -491,18 +466,54 @@ pub fn from_sole_executor<'authority>(
 ///     owner
 /// }
 /// ```
+///
+/// A custody permit cannot outlive its owner topology guard:
+///
+/// ```compile_fail
+/// use carrick_kernel::dispatch::mm_mutation::{HostAliasPermit, OwnerMmTopologyGuard};
+/// fn leak(owner: &OwnerMmTopologyGuard<'_>) -> HostAliasPermit<'static> {
+///     owner.host_alias_permit()
+/// }
+/// ```
 pub struct OwnerMmTopologyGuard<'authority> {
-    inner: MmMutationGuard<'authority>,
+    inner: OwnerMmTopologyState,
+    // Preserve the executor-thread affinity of the former mutation wrapper
+    // without retaining any host stage-1 capability.
+    _authority: PhantomData<(
+        &'authority mut super::MmExecutorParticipation,
+        std::rc::Rc<()>,
+    )>,
+}
+
+/// Task and physical-custody identity only. In particular, an owner guard
+/// cannot retain a stage-1 lease, editor exclusion, or descriptor publisher.
+struct OwnerMmTopologyState {
+    coordinator: Arc<MmMutationCoordinator>,
+    mm: MmId,
+    operation: carrick_observability::probes::HvpatchTopologyOperation,
+    guest_tid: Option<carrick_hal::ThreadId>,
 }
 impl OwnerMmTopologyGuard<'_> {
     pub fn mm_id(&self) -> MmId {
-        self.inner.mm_id()
+        self.inner.mm
+    }
+    pub fn with_operation(
+        mut self,
+        operation: carrick_observability::probes::HvpatchTopologyOperation,
+    ) -> Self {
+        self.inner.operation = operation;
+        self
     }
     pub fn host_alias_permit(&self) -> HostAliasPermit<'_> {
-        self.inner.host_alias_permit()
+        HostAliasPermit {
+            coordinator: Arc::clone(&self.inner.coordinator),
+            mm: self.inner.mm,
+            guest_tid: self.inner.guest_tid,
+            _guard: PhantomData,
+        }
     }
     pub fn begin_transaction(&self) -> MmTransactionGuard<'_> {
-        self.inner.begin_transaction()
+        begin_mm_transaction(self)
     }
 }
 
@@ -513,17 +524,13 @@ pub fn from_owner_executor<'authority>(
         return None;
     }
     Some(OwnerMmTopologyGuard {
-        inner: MmMutationGuard {
+        inner: OwnerMmTopologyState {
             coordinator: participation.mutation_coordinator(),
             mm: participation.mm_id(),
             operation: carrick_observability::probes::HvpatchTopologyOperation::InProcessFork,
             guest_tid: participation.guest_tid(),
-            foreign_authority: None,
-            _el1_editor: None,
-            _stage1: None,
-            caller_el1: None,
-            _authority: PhantomData,
         },
+        _authority: PhantomData,
     })
 }
 
@@ -586,7 +593,7 @@ pub struct HostAliasPermit<'guard> {
     coordinator: Arc<MmMutationCoordinator>,
     mm: MmId,
     guest_tid: Option<carrick_hal::ThreadId>,
-    _guard: PhantomData<&'guard MmMutationGuard<'guard>>,
+    _guard: PhantomData<&'guard ()>,
 }
 
 impl HostAliasPermit<'_> {
@@ -603,9 +610,8 @@ impl HostAliasPermit<'_> {
 }
 
 /// Exclusion for one MM's fork/exec/retire transaction. Minted only by the
-/// MM's `MmMutationGuard` (`begin_transaction`), so holding it proves the
-/// stage-1 pause is already held: the P -> topology order becomes a type,
-/// not a comment.
+/// MM's setup mutation or owner topology guard (`begin_transaction`). Setup
+/// keeps its stage-1 pause; owner topology carries no host editor capability.
 pub struct MmTransactionGuard<'guard> {
     /// The MM whose mutation guard minted this transaction (`None`: the
     /// terminal retirement transaction, which has no guard).
@@ -615,7 +621,65 @@ pub struct MmTransactionGuard<'guard> {
     guest_pid: i32,
     guest_tid: i32,
     acquired_at: std::time::Instant,
-    _guard: PhantomData<&'guard MmMutationGuard<'guard>>,
+    _guard: PhantomData<&'guard ()>,
+}
+
+trait MmTopologyAuthority {
+    fn topology_identity(
+        &self,
+    ) -> (
+        MmId,
+        carrick_observability::probes::HvpatchTopologyOperation,
+    );
+}
+impl MmTopologyAuthority for MmMutationGuard<'_> {
+    fn topology_identity(
+        &self,
+    ) -> (
+        MmId,
+        carrick_observability::probes::HvpatchTopologyOperation,
+    ) {
+        (self.mm, self.operation)
+    }
+}
+impl MmTopologyAuthority for OwnerMmTopologyGuard<'_> {
+    fn topology_identity(
+        &self,
+    ) -> (
+        MmId,
+        carrick_observability::probes::HvpatchTopologyOperation,
+    ) {
+        (self.inner.mm, self.inner.operation)
+    }
+}
+
+fn begin_mm_transaction(authority: &impl MmTopologyAuthority) -> MmTransactionGuard<'_> {
+    let (mm, operation) = authority.topology_identity();
+    carrick_thread::fork_quiesce::emit_topology_lock(
+        operation,
+        carrick_observability::probes::HvpatchTopologyPhase::Requested,
+        0,
+        0,
+        0,
+    );
+    let depth = carrick_thread::fork_quiesce::TopologyDepth::acquire();
+    // Non-blocking depth acquisition has no wait time.
+    carrick_thread::fork_quiesce::emit_topology_lock(
+        operation,
+        carrick_observability::probes::HvpatchTopologyPhase::Acquired,
+        0,
+        0,
+        0,
+    );
+    MmTransactionGuard {
+        mm: Some(mm),
+        depth,
+        operation,
+        guest_pid: 0,
+        guest_tid: 0,
+        acquired_at: std::time::Instant::now(),
+        _guard: PhantomData,
+    }
 }
 
 impl<'guard> MmTransactionGuard<'guard> {
@@ -719,6 +783,7 @@ mod tests {
     assert_not_impl_any!(MmMutationGuard<'static>: Clone, Copy);
     assert_not_impl_any!(HostAliasPermit<'static>: Clone, Copy);
     assert_not_impl_any!(MmTransactionGuard<'static>: Clone, Copy);
+    assert_not_impl_any!(super::OwnerMmTopologyGuard<'static>: Clone, Copy, Send, Sync, carrick_hal::ForeignMmInvalidator);
 
     fn mm(raw: u64) -> MmId {
         MmId::from_registry_allocation(NonZeroU64::new(raw).expect("nonzero MM id"))
