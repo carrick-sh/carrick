@@ -289,12 +289,7 @@ struct ExitEvents {
 #[cfg(target_os = "linux")]
 impl ExitEvents {
     fn pidfd(pid: libc::pid_t) -> io::Result<OwnedFd> {
-        // SAFETY: pidfd_open creates an owned handle to one process incarnation.
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
+        carrick_portable::process_exit_fd(carrick_portable::HostProcessId::from_native(pid)?)
     }
     fn new(owner: libc::pid_t) -> io::Result<Self> {
         Ok(Self {

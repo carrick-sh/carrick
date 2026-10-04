@@ -5871,13 +5871,9 @@ mod ipc_set_tests {
 
             #[cfg(target_os = "linux")]
             fn pidfd(pid: libc::pid_t) -> std::io::Result<OwnedFd> {
-                // SAFETY: pidfd_open pins one process incarnation, flags zero.
-                let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // SAFETY: newly returned descriptor, uniquely owned.
-                Ok(unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) })
+                carrick_portable::process_exit_fd(carrick_portable::HostProcessId::from_native(
+                    pid,
+                )?)
             }
 
             #[cfg(not(target_os = "linux"))]
