@@ -24,6 +24,8 @@ mod cow_grants;
 pub use cow_grants::*;
 mod descriptor_txn;
 pub use descriptor_txn::*;
+mod delegated_notification;
+pub use delegated_notification::*;
 mod mm_portal;
 mod mm_portal_executable;
 mod mm_portal_fork;
@@ -547,6 +549,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::align_of::<DelegatedFile>() as u64,
         core::mem::offset_of!(DelegatedFile, size) as u64,
         core::mem::offset_of!(DelegatedFile, dirty_mask) as u64,
+        core::mem::offset_of!(DelegatedFile, notification_generation) as u64,
         core::mem::offset_of!(DelegatedFile, marks) as u64,
         core::mem::size_of::<DelegatedOpenFile>() as u64,
         core::mem::offset_of!(DelegatedOpenFile, inode_handle) as u64,
@@ -2080,7 +2083,7 @@ pub const DELEGATED_FLAG_WRITABLE: u32 = 1 << 1;
 pub const DELEGATED_FLAG_APPEND: u32 = 1 << 2;
 
 /// Maximum number of simultaneously delegated files.
-pub const MAX_DELEGATED_FILES: usize = 128;
+pub const MAX_DELEGATED_FILES: usize = carrick_sched_core::object_wait::DELEGATED_FILE_WAIT_QUEUES;
 
 /// Maximum size of a delegated regular file (256 KiB).
 pub const DELEGATED_FILE_MAX_SIZE: u64 = 256 * 1024;
@@ -2160,9 +2163,9 @@ pub struct DelegatedFile {
     pub dirty_mask: AtomicU64,
     /// 64-bit zero-filled gap page mask (bit i indicates 4 KiB page i was zero-filled on extension and never written).
     pub zero_filled_mask: AtomicU64,
-    /// Formerly the served-operation count that fed the delegation backoff;
-    /// a file now enters the zone only at open, so nothing reads it.
-    pub _reserved_served_ops: u64,
+    /// Exact incarnation of the detached notification source base pin.
+    /// Admission and retirement are protected by this inode's lock.
+    pub(crate) notification_generation: AtomicU64,
     /// Exact host inode identity for inotify correspondence.
     pub inode: DelegatedInodeIdentity,
     /// Count of active marks currently attached.
@@ -2248,7 +2251,7 @@ impl DelegatedFile {
             _reserved0: 0,
             dirty_mask: AtomicU64::new(0),
             zero_filled_mask: AtomicU64::new(0),
-            _reserved_served_ops: 0,
+            notification_generation: AtomicU64::new(0),
             inode: DelegatedInodeIdentity::new(0, 0),
             num_marks: AtomicU32::new(0),
             _reserved1: 0,
@@ -2369,6 +2372,11 @@ impl DelegatedFile {
     /// Release the spinlock.
     #[inline]
     pub fn unlock(&self) {
+        assert_eq!(
+            self.notification_generation.load(Ordering::Acquire),
+            0,
+            "admitted delegated inode requires owned release custody"
+        );
         self.lock.store(0, Ordering::Release);
     }
 
