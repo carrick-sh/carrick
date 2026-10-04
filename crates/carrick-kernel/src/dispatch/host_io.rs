@@ -412,9 +412,7 @@ mod cursor_tests {
             let expected = if available == 0 {
                 DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
             } else {
-                DispatchOutcome::Returned {
-                    value: available as i64,
-                }
+                DispatchOutcome::returned_len(available).unwrap()
             };
             assert_eq!(result, expected);
             assert_eq!(
