@@ -169,3 +169,37 @@ restored candidate source. SHA-256 inventory (`target/fes-load2/probe-sha256.txt
 
 - musl: `933b00afa8d2056a10a3473e171648aa5205c7f8ba37ab6120603e69cd6d4e33`
 - GNU: `dc27744bccd25e5b5a6b022f0fec130c01765b5153a06d1b129602c3713a4607`
+
+## Continuation: ten normal full-shard cycles
+
+All ten full `generic_probe_shard_2` cycles passed on the rebuilt candidate
+ELFs, including both libc variants (20 successful `forkexecstorm` executions),
+the unsigned negative control each cycle, and zero-process scoped cleanup.
+No probe filter, load generator, trace, retry, or changed budget was used.
+The normal host lease queue delayed cycles 2 and 9 behind exclusive gates.
+
+Commands: `CARRICK_RUN_ID=fes2-shard-N ./scripts/test-signed.sh
+carrick-conformance-next generic_probe_shard_2 --nocapture`, for N = 1..10,
+followed by `scripts/sudo/kill.sh fes2-shard-N`. Each complete shard ran once;
+the driver stopped on any failure. Full logs are
+`target/fes-load2/shard-{1..10}.log`; each signed artifact receipt is retained
+as `target/fes-load2/shard-N-artifacts.jsonl`. The cycle summary is
+`target/fes-load2/shards-driver.log` (exit 0).
+
+| Cycle | musl forkexecstorm ms | GNU forkexecstorm ms |
+| --- | ---: | ---: |
+| 1 | 403 | 3281 |
+| 2 | 956 | 1502 |
+| 3 | 379 | 339 |
+| 4 | 357 | 355 |
+| 5 | 333 | 337 |
+| 6 | 344 | 1823 |
+| 7 | 461 | 333 |
+| 8 | 332 | 345 |
+| 9 | 329 | 357 |
+| 10 | 313 | 366 |
+
+These are completion observations, not a controlled performance comparison.
+The canonical native-ARM64 Docker refresh remains outstanding; cloudmac has
+no Docker authority, and the inherited provisional oracle headers have not
+been blessed by these Carrick runs.
