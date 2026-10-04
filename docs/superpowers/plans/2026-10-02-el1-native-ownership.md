@@ -1798,3 +1798,28 @@ The existing VM-free HVF test
 `native_owner_matrix_moves_bytes_with_balanced_physical_pins` also passes after
 its fixture switched to actual same-region notified owner admission. It keeps
 all original byte, physical-pin and structural-budget assertions.
+
+#### Shared delegated-lock completion adapter — 2026-10-03
+
+The generic object-wait owner now reserves a disjoint128-entry delegated-inode
+queue domain and a carrier reservation-pool identity in the existing reserved
+slot4096. Inode queue storage appends after MM causes; prior offsets remain
+fixed and protocol5 hashes the new geometry. A bounded DelegatedFileWaitIndex
+is the constructor authority; no raw appended index enters through new().
+
+DelegatedReleaseVenue::retain_locked is an explicit unsafe boundary for an
+already authenticated exact inode lock and protected detached source base pin.
+It derives counted notification custody without queue admission or owning
+source reconstruction. The returned DelegatedLockRelease is the guard's sole
+unlock authority: Drop advances revision, atomically releases the u32 lock,
+then delivers, including guard unwinding. Its borrowed source view is licensed
+by the release custody's borrow. ABI file/zone/index/generation authentication
+and actual inode guard callsite activation belong to the separate recall unit.
+
+RUSTC_WRAPPER= cargo test -p carrick-sched-core --lib passes116 tests, including
+new domain geometry, held-queue after-unlock delivery, retirement with an old
+release ticket, stale incarnation refusal and unwind cleanup. Scheduler lib
+clippy with -D warnings passes. These adapter tests are not a substitute for
+the forthcoming actual old DelegatedFile::unlock behavioral red and live
+integration green. Reservation-pool source/producers and typed portal wait
+receipts remain open; adding its queue identity alone claims no wake closure.
