@@ -575,14 +575,17 @@ impl SyscallDispatcher {
             crate::kernel::MmId,
         ) -> Option<crate::kernel::mm_occupancy::PreAdmissionGuard>,
     ) -> Option<BoundAddressSpaceAdmission<'a>> {
+        let mm = participation.mm_id();
+        crate::probes::hvpatch_el1_root_prepublish(mm.raw(), 0);
         if !participation.authorizes(&self.mm_authority()) {
+            crate::probes::hvpatch_el1_root_prepublish(mm.raw(), 1);
             return None;
         }
         let owner = participation.address_space_publication_owner();
-        let mm = participation.mm_id();
         let mutation = match crate::dispatch::mm_mutation::from_executor(participation) {
             Ok(mutation) => mutation,
             Err(_) => {
+                crate::probes::hvpatch_el1_root_prepublish(mm.raw(), 1);
                 RootAdmission::NoAuthority.trace(
                     mm,
                     carrick_observability::probes::HvpatchEl1RootOrigin::Bind,
@@ -590,7 +593,10 @@ impl SyscallDispatcher {
                 return None;
             }
         };
-        let publication = acquire(mm)?;
+        let publication = acquire(mm).or_else(|| {
+            crate::probes::hvpatch_el1_root_prepublish(mm.raw(), 2);
+            None
+        })?;
         Some(BoundAddressSpaceAdmission {
             dispatcher: self,
             mutation,
@@ -624,11 +630,15 @@ impl BoundAddressSpaceAdmission<'_> {
         require_delegated: bool,
         closed: bool,
     ) -> Option<Option<carrick_hal::PreAdmissionReceipt<'_>>> {
-        *self.prepared.borrow_mut() =
-            Some(
-                self.owner
-                    .publish(&self.publication, ttbr0, ttbr1, closed)?,
-            );
+        let published = self
+            .owner
+            .publish(&self.publication, ttbr0, ttbr1, closed)
+            .or_else(|| {
+                crate::probes::hvpatch_el1_root_prepublish(self.mutation.mm_id().raw(), 3);
+                None
+            })?;
+        crate::probes::hvpatch_el1_root_prepublish(self.mutation.mm_id().raw(), 4);
+        *self.prepared.borrow_mut() = Some(published);
         #[cfg(test)]
         if let Some(hook) = self.after_publication.borrow_mut().take() {
             hook();

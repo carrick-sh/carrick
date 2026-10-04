@@ -5227,6 +5227,23 @@ mod real {
         /// exec; 1 = fork commit), outcome (`HvpatchEl1RootAdmission`
         /// ordinal). Fires once per published address space.
         fn hvpatch__el1__root__admission(_: u64, _: u32, _: u32) {}
+        /// First-load address-space publication decision, including branches
+        /// before reservation admission can fire. Args: numeric ASID, phase
+        /// (0 unsettled lease, 1 entered loaded-root closure, 2 no switchable
+        /// roots, 3 root mismatch, 4 publication refused, 5 opened), the
+        /// loaded TTBR0 (or lease TTBR0 at phase 0), and TTBR1 (zero when
+        /// unavailable). A phase-0 event without phase 1 means the lease was
+        /// not live at its first publication attempt.
+        fn hvpatch__el1__root__candidate(_: u64, _: u32, _: u64, _: u64) {}
+        /// First-load root publication before reservation admission. Args:
+        /// exact MM id and phase (0 admission requested, 1 executor authority
+        /// refused, 2 unpublished slot refused, 3 root publication refused,
+        /// 4 owner publication returned, 5 duplicate MM slot,
+        /// 6 address-space slot refused, 7 reservation-root installation
+        /// refused, 8 fence binding refused, 9 closed root published).
+        /// This separates a missing owner admission from a reservation
+        /// root's decision after publication.
+        fn hvpatch__el1__root__prepublish(_: u64, _: u32) {}
         /// A host-venue step on a delegated MM's reservation root was
         /// refused and fails its syscall. Arg: the `Refusal` ordinal (0 Busy,
         /// 1 Stale, 2 Invalid, 3 Collision, 4 Hole, 5 ForeignMapping,
@@ -6601,6 +6618,18 @@ mod real {
         outcome: super::HvpatchEl1RootAdmission,
     ) {
         carrick_usdt::hvpatch__el1__root__admission!(|| (mm, origin.raw(), outcome.raw()));
+    }
+
+    /// See the `hvpatch__el1__root__candidate` provider doc.
+    #[inline(never)]
+    pub fn hvpatch_el1_root_candidate(asid: u64, phase: u32, ttbr0: u64, ttbr1: u64) {
+        carrick_usdt::hvpatch__el1__root__candidate!(|| (asid, phase, ttbr0, ttbr1));
+    }
+
+    /// See the `hvpatch__el1__root__prepublish` provider doc.
+    #[inline(never)]
+    pub fn hvpatch_el1_root_prepublish(mm: u64, phase: u32) {
+        carrick_usdt::hvpatch__el1__root__prepublish!(|| (mm, phase));
     }
 
     /// See the `hvpatch__el1__root__host__refusal` provider doc.
@@ -8983,6 +9012,8 @@ mod stub {
     stub!(hvpatch_cow_runtime_bind(mm: u64, asid: u32, authority: u64, tid: i32, replaced: bool));
     stub!(hvpatch_first_touch_deliver(far: u64, reason: super::HvpatchFirstTouchDeliverReason, tid: i32));
     stub!(hvpatch_el1_root_admission(mm: u64, origin: super::HvpatchEl1RootOrigin, outcome: super::HvpatchEl1RootAdmission));
+    stub!(hvpatch_el1_root_candidate(asid: u64, phase: u32, ttbr0: u64, ttbr1: u64));
+    stub!(hvpatch_el1_root_prepublish(mm: u64, phase: u32));
     stub!(hvpatch_el1_root_host_refusal(refusal: u32));
     stub!(hvpatch_first_touch_refused(page: u64, access: u32, site: u32, error: &dyn std::fmt::Display));
     stub!(hvpatch_el1_frame_grant_plan(fault_va: u64, semantic_base: u64, semantic_len: u64, permissions: u64, request_generation: u64));
