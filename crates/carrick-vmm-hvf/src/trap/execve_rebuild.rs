@@ -1,5 +1,260 @@
 //! HVPatch execve stage-2 and authority rebuild logic.
 
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod n1_tests {
+    use super::*;
+    use carrick_el1::personality::mm_portal::{
+        GuestVa, MmError, MmPortal, TransferIntent, prepare_transfer,
+        test_support::{Region, Tables, VA, admit, nodes, select, selected},
+    };
+    use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
+    use std::{cell::RefCell, collections::BTreeMap, num::NonZeroU64, sync::Arc};
+
+    /// The current production successor constructor accepts both an admitted
+    /// owner identity and host table authority. This must stay red until the
+    /// common sealed constructor replaces that capability pair; the physical
+    /// switch reduction below cannot close this ownership obligation.
+    #[test]
+    fn n1_sealed_exec_successor_has_no_host_builder_or_editor() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let region = Region::new();
+        let zone = region.zone();
+        let root = 0x8000_0000;
+        let mm = admit(&region, &zone.spaces, 78, root, 2, 16);
+        let view = nodes(&region);
+        let portal = MmPortal::new(
+            custody.transfer_carrier,
+            region.table(),
+            &zone.spaces,
+            &view,
+        );
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let authority = carrick_guest_mem::UserMemoryAuthority::from_owner(handle);
+        let host_builder = carrick_mmu_core::aarch64::PageTableManager::new(
+            vec![0; 6 * 4096],
+            root,
+            carrick_mmu_core::aarch64::PageTableLayoutConfig::new(VA, 6 * 4096, 0, 0),
+        );
+        let state = MmAccessState::new(
+            carrick_aarch64::Stage1Authority::new_with_manager(Some(host_builder)),
+            authority,
+            Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
+            crate::trap::foreign_mm::LiveBacking::immediate(custody),
+        );
+        assert_eq!(state.protections.owner(), Some(handle));
+        assert!(state.protections.legacy().is_none());
+        assert!(
+            state.page_tables_authority().with_manager(|_| ()).is_none(),
+            "admitted exec successor retained a host manager: MmAccessState::new still accepts an owner/editor capability pair"
+        );
+    }
+
+    /// This exercises the production physical-switch and prepared-copy owners.
+    /// It does not simulate the absent owner ExecPrepare/ExecCommit operations.
+    #[test]
+    fn n1_exec_abort_preserves_exact_predecessor_and_rejects_stale_permit() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let predecessor = super::super::user_transfer::tests::backing(&custody, 0xa086_0000_0000);
+        let successor = super::super::user_transfer::tests::backing(&custody, 0xa087_0000_0000);
+        let predecessor_bytes = vec![0x6d; 4096];
+        // SAFETY: the retained owner contains this page and the fixture is serial.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                predecessor_bytes.as_ptr(),
+                predecessor.mapping.host_base(),
+                4096,
+            );
+        }
+        let region = Region::new();
+        let zone = region.zone();
+        let old_root = 0x8000_0000;
+        let new_root = old_root + 0x100_000;
+        let old_mm = admit(&region, &zone.spaces, 77, old_root, 2, 16);
+        let new_mm = admit(&region, &zone.spaces, 78, new_root, 2, 16);
+        let new_index = zone.spaces.find(new_mm.raw()).unwrap();
+        zone.spaces.close(new_index);
+        let view = nodes(&region);
+        let portal = MmPortal::new(
+            NonZeroU64::new(1).unwrap(),
+            region.table(),
+            &zone.spaces,
+            &view,
+        );
+        let old_handle = portal.admitted_handle(old_mm, 0).unwrap();
+        let tables = Tables::new(old_root, 0xa086_0000_0000, 2);
+        let original_tables: Vec<_> = tables
+            .words
+            .iter()
+            .map(|word| word.load(std::sync::atomic::Ordering::Acquire))
+            .collect();
+        let maintenance = CallerInvalidatesAsid;
+        let physical = super::super::user_transfer::UserTransferCustody::new(Arc::clone(&custody));
+        let transfer = portal
+            .begin(
+                old_handle,
+                GuestVa::new(VA),
+                4096,
+                TransferIntent::UserWrite,
+                0,
+            )
+            .unwrap();
+        let selection = selected(select(&portal, &transfer, &tables));
+        let selected_data = selection
+            .request(
+                TransferIntent::UserWrite,
+                carrick_el1_abi::PortalRetainedData {
+                    record: NonZeroU64::new(1).unwrap(),
+                    vm_generation: NonZeroU64::new(1).unwrap(),
+                    owner: None,
+                },
+            )
+            .unwrap()
+            .selected;
+        let pin = carrick_aarch64::user_transfer::TransferCustody::retain(
+            &physical,
+            selected_data,
+            usize::try_from(selection.len).unwrap(),
+            TransferIntent::UserWrite,
+        )
+        .unwrap()
+        .unwrap();
+        let request = selection
+            .request(
+                TransferIntent::UserWrite,
+                carrick_aarch64::user_transfer::TransferPin::identity(&pin),
+            )
+            .unwrap();
+        let permit = prepare_transfer(&portal, request, &tables.live(&maintenance), 0)
+            .unwrap()
+            .unwrap();
+        let old_index = zone.spaces.find(old_mm.raw()).unwrap();
+        // An outstanding semantic copy owns root lifetime independently of a vCPU.
+        assert_eq!(
+            region
+                .table()
+                .lock_el1_resolved(old_index.index(), old_mm, &view, 0)
+                .unwrap()
+                .retire(),
+            Err(carrick_el1::memory::reservations::Refusal::Busy)
+        );
+        let execution_slot = zone.occupancy.alloc_host_slot().unwrap();
+        assert!(zone.occupancy.replace(execution_slot, 0, old_mm.raw()));
+        assert!(zone.spaces.grant(new_index, new_mm.raw()).is_none());
+
+        let mut old = [
+            ExecStage2Install::for_test(0xa086_0000_0000, 4096),
+            ExecStage2Install::for_test(old_root, 4096),
+        ];
+        old[0].host = predecessor.mapping.host_base();
+        old[0].perms = 3;
+        old[1].perms = 1;
+        let mut new = [
+            ExecStage2Install::for_test(0xa087_0000_0000, 4096),
+            ExecStage2Install::for_test(new_root, 4096),
+        ];
+        new[0].host = successor.mapping.host_base();
+        new[0].perms = 1;
+        new[1].perms = 1;
+        let identity = |extent: &ExecStage2Install| (extent.host as usize, extent.perms);
+        let exact_old: BTreeMap<_, _> = old
+            .iter()
+            .map(|extent| (extent.key(), identity(extent)))
+            .collect();
+        // Fault each old unmap, each successor map, and final publication.
+        for boundary in 0..old.len() + new.len() + 1 {
+            let installed = RefCell::new(exact_old.clone());
+            let unmaps = std::cell::Cell::new(0);
+            let result = switch_exec_stage2_transaction(
+                &old,
+                &new,
+                (boundary >= old.len()).then(|| boundary - old.len()),
+                |extent| {
+                    let ordinal = unmaps.get();
+                    unmaps.set(ordinal + 1);
+                    if boundary < old.len() && ordinal == boundary {
+                        return Err(TrapError::Hypervisor(
+                            "injected predecessor unmap failure".into(),
+                        ));
+                    }
+                    assert_eq!(
+                        installed.borrow_mut().remove(&extent.key()),
+                        Some(identity(extent))
+                    );
+                    Ok(())
+                },
+                |extent| {
+                    assert!(
+                        installed
+                            .borrow_mut()
+                            .insert(extent.key(), identity(extent))
+                            .is_none()
+                    );
+                    Ok(())
+                },
+            );
+            assert!(
+                result.is_err(),
+                "exec commit boundary {boundary} was not faulted; final successor publication lacks rollback coverage"
+            );
+            assert_eq!(
+                *installed.borrow(),
+                exact_old,
+                "exact predecessor mapping/permissions at boundary {boundary}"
+            );
+            // SAFETY: retained physical owner and outstanding pin cover this page.
+            assert_eq!(
+                unsafe { core::slice::from_raw_parts(predecessor.mapping.host_base(), 4096) },
+                predecessor_bytes
+            );
+            assert_eq!(
+                tables
+                    .words
+                    .iter()
+                    .map(|word| word.load(std::sync::atomic::Ordering::Acquire))
+                    .collect::<Vec<_>>(),
+                original_tables
+            );
+            assert_eq!(zone.occupancy.running_raw(execution_slot), old_mm.raw());
+            assert!(zone.spaces.grant(new_index, new_mm.raw()).is_none());
+        }
+        // Abort settles the exact old permit before any delayed completion can copy.
+        portal.cancel_prepared(permit, request, 0).unwrap();
+        let mut root = region
+            .table()
+            .lock_el1_resolved(old_index.index(), old_mm, &view, 0)
+            .unwrap();
+        root.reap_prepared();
+        assert!(!root.has_prepared_copy());
+        drop(root);
+        assert!(matches!(
+            portal.cancel_prepared(permit, request, 0),
+            Err(MmError::Stale)
+        ));
+        assert!(
+            region
+                .table()
+                .claim_prepared(Some(&view), permit, request)
+                .is_err()
+        );
+        assert_eq!(zone.occupancy.running_raw(execution_slot), old_mm.raw());
+        assert!(zone.occupancy.replace(execution_slot, old_mm.raw(), 0));
+        assert!(zone.occupancy.free_host_slot(execution_slot));
+        drop(pin);
+        assert_eq!(
+            custody
+                .stage2_record_snapshot(predecessor.record_identity.record_id)
+                .unwrap()
+                .pin_count,
+            0
+        );
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::*;
 
@@ -441,6 +696,31 @@ impl ExecStage2Install {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn rollback_exec_stage2_switch(
+    predecessor: &[ExecStage2Install],
+    mapped_successor: &[ExecStage2Install],
+    unmap: &mut dyn FnMut(&ExecStage2Install) -> Result<(), TrapError>,
+    map: &mut dyn FnMut(&ExecStage2Install) -> Result<(), TrapError>,
+) {
+    for replacement in mapped_successor.iter().rev() {
+        unmap(replacement).unwrap_or_else(|error| {
+            carrick_fatal!(
+                "hvpatch::exec_commit",
+                "rollback HVPatch exec replacement stage-2 mapping: {error}"
+            );
+        });
+    }
+    for old in predecessor {
+        map(old).unwrap_or_else(|error| {
+            carrick_fatal!(
+                "hvpatch::exec_commit",
+                "restore HVPatch exec predecessor stage-2 mapping: {error}"
+            );
+        });
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn switch_exec_stage2_transaction(
     old: &[ExecStage2Install],
     new: &[ExecStage2Install],
@@ -450,51 +730,31 @@ pub(crate) fn switch_exec_stage2_transaction(
 ) -> Result<(), TrapError> {
     for (old_unmapped, extent) in old.iter().enumerate() {
         if let Err(error) = unmap(extent) {
-            for restore in &old[..old_unmapped] {
-                map(restore).unwrap_or_else(|rollback| {
-                    carrick_fatal!(
-                        "hvpatch::exec_commit",
-                        "restore HVPatch exec predecessor after unmap failure: {rollback}"
-                    );
-                });
-            }
+            rollback_exec_stage2_switch(&old[..old_unmapped], &[], &mut unmap, &mut map);
             return Err(error);
         }
     }
 
-    let rollback =
-        |mapped: usize,
-         unmap: &mut dyn FnMut(&ExecStage2Install) -> Result<(), TrapError>,
-         map: &mut dyn FnMut(&ExecStage2Install) -> Result<(), TrapError>| {
-            for replacement in new[..mapped].iter().rev() {
-                unmap(replacement).unwrap_or_else(|error| {
-                    carrick_fatal!(
-                        "hvpatch::exec_commit",
-                        "rollback HVPatch exec replacement stage-2 mapping: {error}"
-                    );
-                });
-            }
-            for predecessor in old {
-                map(predecessor).unwrap_or_else(|error| {
-                    carrick_fatal!(
-                        "hvpatch::exec_commit",
-                        "restore HVPatch exec predecessor stage-2 mapping: {error}"
-                    );
-                });
-            }
-        };
-
     for (new_mapped, extent) in new.iter().enumerate() {
         if fail_after_maps == Some(new_mapped) {
-            rollback(new_mapped, &mut unmap, &mut map);
+            rollback_exec_stage2_switch(old, &new[..new_mapped], &mut unmap, &mut map);
             return Err(TrapError::Hypervisor(format!(
                 "injected HVPatch exec stage-2 map failure after {new_mapped} maps"
             )));
         }
         if let Err(error) = map(extent) {
-            rollback(new_mapped, &mut unmap, &mut map);
+            rollback_exec_stage2_switch(old, &new[..new_mapped], &mut unmap, &mut map);
             return Err(error);
         }
+    }
+    // The last successful map is still before authority publication. Keep
+    // that boundary faultable with the same rollback as every earlier map.
+    if fail_after_maps == Some(new.len()) {
+        rollback_exec_stage2_switch(old, new, &mut unmap, &mut map);
+        return Err(TrapError::Hypervisor(format!(
+            "injected HVPatch exec stage-2 map failure after {} maps",
+            new.len()
+        )));
     }
     Ok(())
 }
