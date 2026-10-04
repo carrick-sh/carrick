@@ -281,8 +281,8 @@ impl Workload {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ProcessIncarnation {
     pid: libc::pid_t,
-    start_seconds: u64,
-    start_microseconds: u64,
+    unique_id: u64,
+    start: Option<(u64, u64)>,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -300,7 +300,14 @@ impl ProcessIncarnation {
     }
 
     fn present(self, observed: Option<Self>) -> bool {
-        observed == Some(self)
+        observed.is_some_and(|current| {
+            self.pid == current.pid
+                && self.unique_id == current.unique_id
+                && match (self.start, current.start) {
+                    (Some(expected), Some(actual)) => expected == actual,
+                    _ => true, // Kernel unique ID remains available across UID changes.
+                }
+        })
     }
 }
 
@@ -312,11 +319,12 @@ mod incarnation_tests {
     fn exit_reap_and_reuse_before_each_signal_does_not_target_replacement() {
         let selected = ProcessIncarnation {
             pid: 24,
-            start_seconds: 1,
-            start_microseconds: 10,
+            unique_id: 1,
+            start: Some((1, 10)),
         };
         let replacement = ProcessIncarnation {
-            start_seconds: 2,
+            unique_id: 2,
+            start: Some((2, 10)),
             ..selected
         };
         for signal in [libc::SIGSTOP, libc::SIGKILL] {
@@ -344,16 +352,41 @@ mod incarnation_tests {
     fn reaping_does_not_wait_on_a_replacement_incarnation() {
         let selected = ProcessIncarnation {
             pid: 24,
-            start_seconds: 1,
-            start_microseconds: 10,
+            unique_id: 1,
+            start: Some((1, 10)),
         };
         let replacement = ProcessIncarnation {
-            start_seconds: 2,
+            unique_id: 2,
+            start: Some((2, 10)),
             ..selected
         };
         assert!(
             !selected.present(Some(replacement)),
             "reaping waited on a reused PID"
+        );
+    }
+
+    #[test]
+    fn privilege_change_preserves_live_identity_without_matching_replacement() {
+        let selected = ProcessIncarnation {
+            pid: 24,
+            unique_id: 1,
+            start: Some((1, 10)),
+        };
+        let privileged = ProcessIncarnation {
+            start: None,
+            ..selected
+        };
+        assert!(
+            selected.present(Some(privileged)),
+            "UID change falsely certified exit"
+        );
+        assert!(
+            !selected.present(Some(ProcessIncarnation {
+                unique_id: 2,
+                ..privileged
+            })),
+            "privileged replacement reused cancellation authority"
         );
     }
 }
