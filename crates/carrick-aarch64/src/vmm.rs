@@ -943,6 +943,17 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     ) {
     }
 
+    /// Bind the exact first-load authority to its already retained live
+    /// backing before owner selection opens the address-space gate.
+    fn prepare_first_load_owner_backing(
+        &self,
+        _authority: &crate::stage1_authority::Stage1Authority,
+        _protections: &carrick_guest_mem::UserMemoryAuthority,
+        _token: carrick_el1_abi::PortalClosedRootBind,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::UnsupportedPlatform)
+    }
+
     fn bind_frame_cow(
         &mut self,
         _authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
