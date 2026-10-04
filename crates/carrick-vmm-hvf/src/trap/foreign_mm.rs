@@ -169,6 +169,38 @@ impl CarrierForeignMmTransport {
             .insert(binding, std::sync::Arc::downgrade(state));
     }
 
+    /// The closed first-load publication supplies its exact root while the
+    /// user-memory admission guard is held. Register that root without trying
+    /// to promote a pending owner through the guard's write lock.
+    pub(crate) fn register_closed_initial_identity(
+        &self,
+        mm: carrick_hal::ForeignMmId,
+        binding: CarrierForeignMmBinding,
+        state: &std::sync::Arc<MmAccessState>,
+    ) -> Result<(), TrapError> {
+        // Existing registration takes the state identity before the transport
+        // map; preserve that lock order while committing both edges.
+        let mut identity = state.identity.write();
+        if identity.is_some_and(|current| current != (mm, binding)) {
+            return Err(TrapError::Hypervisor(
+                "closed initial root conflicts with bound MM identity".into(),
+            ));
+        }
+        let mut states = self.states.write();
+        if states
+            .get(&binding)
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|current| !std::sync::Arc::ptr_eq(&current, state))
+        {
+            return Err(TrapError::Hypervisor(
+                "closed initial root already belongs to another MM state".into(),
+            ));
+        }
+        *identity = Some((mm, binding));
+        states.insert(binding, std::sync::Arc::downgrade(state));
+        Ok(())
+    }
+
     pub(crate) fn register_owned_identity(
         self: &std::sync::Arc<Self>,
         mm: carrick_hal::ForeignMmId,
@@ -992,6 +1024,71 @@ impl MmAccessState {
             },
         }
         false
+    }
+
+    pub(crate) fn prepare_first_load_owner_backing(
+        &self,
+        authority: &carrick_aarch64::Stage1Authority,
+        protections: &carrick_guest_mem::UserMemoryAuthority,
+        token: carrick_el1_abi::PortalClosedRootBind,
+    ) -> Result<(), TrapError> {
+        let root = token.ttbr0() & 0x0000_ffff_ffff_f000;
+        let identity = *self.identity.read();
+        let Some((mm, binding)) = identity else {
+            return Err(TrapError::Hypervisor(
+                "first-load backing has no published MM identity".into(),
+            ));
+        };
+        if mm.raw_for_probe() != token.mm().raw() {
+            return Err(TrapError::Hypervisor(
+                "first-load backing MM generation differs from closed root".into(),
+            ));
+        }
+        if u64::from(binding.asid.raw_for_probe()) != token.ttbr0() >> 48 {
+            return Err(TrapError::Hypervisor(
+                "first-load backing ASID differs from closed root".into(),
+            ));
+        }
+        if binding.stage1_root.raw() != root {
+            return Err(TrapError::Hypervisor(
+                "first-load backing stage-1 root differs from closed root".into(),
+            ));
+        }
+        if authority.root_base() != Some(root) {
+            return Err(TrapError::Hypervisor(
+                "first-load stage-1 authority names another root".into(),
+            ));
+        }
+        if !self
+            .page_tables_authority()
+            .shares_exact_authority(authority)
+        {
+            return Err(TrapError::Hypervisor(
+                "first-load backend and engine stage-1 authorities differ".into(),
+            ));
+        }
+        if !self.protections.same_authority(protections) {
+            return Err(TrapError::Hypervisor(
+                "first-load backend and engine user-memory authorities differ".into(),
+            ));
+        }
+        let resolver = self.live_resolver.read().clone().ok_or_else(|| {
+            TrapError::Hypervisor("first-load backing has no retained live resolver".into())
+        })?;
+        match self.backing_binding {
+            // SAFETY: the stored resolver was authenticated for this exact
+            // state, and the MM/root/authority identity was checked above.
+            LiveBackingBinding::Immediate => unsafe {
+                authority.bind_live_backing_without_promotion(resolver);
+            },
+            // Keep the initial owned image until the guarded owner selection
+            // makes it live. This is the existing deferred binding policy.
+            // SAFETY: same authenticated resolver and exact authority.
+            LiveBackingBinding::Deferred => unsafe {
+                authority.record_live_backing_without_promotion(resolver);
+            },
+        }
+        Ok(())
     }
 
     pub(crate) fn bind_page_tables_authority(&self, page_tables: carrick_aarch64::Stage1Authority) {

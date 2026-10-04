@@ -12998,6 +12998,99 @@ mod guest_cow {
     }
 
     #[test]
+    fn first_load_closed_bind_records_live_backing_before_owner_selection() {
+        use carrick_aarch64::stage1_authority::GuestLaneSelection;
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let root = carrick_mem::memory::LINUX_PAGE_TABLES_BASE;
+        let mm = NonZeroU64::new(819).unwrap();
+        let authority = carrick_aarch64::Stage1Authority::new();
+        let protections = carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+            MemoryProtections::default(),
+        ));
+        let state = MmAccessState::new(
+            authority.clone(),
+            protections.clone(),
+            Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
+            crate::trap::foreign_mm::LiveBacking::deferred(custody.clone()),
+        );
+        assert!(state.identity.read().is_none());
+        authority.set_manager(carrick_mmu_core::aarch64::PageTableManager::new(
+            carrick_mem::memory::stage1_hvpatch_page_tables(),
+            root,
+            carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+        ));
+        let token = unsafe {
+            carrick_el1_abi::PortalClosedRootBind::from_unpublished_owner(
+                custody.transfer_carrier,
+                carrick_el1_abi::ReservationMm::new(mm.get()).unwrap(),
+                root | (1 << 48),
+            )
+        };
+        let transport = CarrierForeignMmTransport::new();
+        let admission = protections.begin_selection().unwrap();
+        transport
+            .register_closed_initial_identity(
+                carrick_hal::ForeignMmId::from_kernel_allocation(mm),
+                CarrierForeignMmBinding {
+                    asid: carrick_hal::ForeignAsid::from_kernel_allocation(
+                        NonZeroU16::new(1).unwrap(),
+                    ),
+                    stage1_root: Gpa(root),
+                },
+                &state,
+            )
+            .expect("closed identity registers while admission guard is held");
+        let other_generation = unsafe {
+            carrick_el1_abi::PortalClosedRootBind::from_unpublished_owner(
+                custody.transfer_carrier,
+                carrick_el1_abi::ReservationMm::new(mm.get() + 1).unwrap(),
+                root | (1 << 48),
+            )
+        };
+        assert!(
+            state
+                .prepare_first_load_owner_backing(&authority, &protections, other_generation)
+                .is_err()
+        );
+        let other_root = unsafe {
+            carrick_el1_abi::PortalClosedRootBind::from_unpublished_owner(
+                custody.transfer_carrier,
+                carrick_el1_abi::ReservationMm::new(mm.get()).unwrap(),
+                (root + 4096) | (1 << 48),
+            )
+        };
+        assert!(
+            state
+                .prepare_first_load_owner_backing(&authority, &protections, other_root)
+                .is_err()
+        );
+        let other_authority = carrick_aarch64::Stage1Authority::new_with_manager(Some(
+            carrick_mmu_core::aarch64::PageTableManager::new(
+                carrick_mem::memory::stage1_hvpatch_page_tables(),
+                root,
+                carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+            ),
+        ));
+        assert!(
+            state
+                .prepare_first_load_owner_backing(&other_authority, &protections, token)
+                .is_err()
+        );
+        state
+            .prepare_first_load_owner_backing(&authority, &protections, token)
+            .expect("first-load backing is exact and retained");
+        drop(admission);
+        assert_eq!(
+            authority.select_guest_descriptor_owner(),
+            Ok(GuestLaneSelection::Selected)
+        );
+    }
+
+    #[test]
     fn grants_are_provisioned_only_for_a_guest_owned_mm() {
         let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let _external = ExternalAliasStateRestore::capture();
