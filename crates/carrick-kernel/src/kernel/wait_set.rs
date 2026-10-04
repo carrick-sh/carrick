@@ -44,28 +44,16 @@ impl Drop for WaitEnrollment {
 /// When dropped, this automatically unregisters the callback from the target queue.
 #[derive(Debug)]
 pub struct WaitCallbackEnrollment {
-    token: u64,
-    queue: Weak<WaitQueueInner>,
+    _enrollment: carrick_thread::completion::CompletionEnrollment,
     _subscription: Option<Box<dyn std::fmt::Debug + Send + Sync>>,
 }
-
 impl WaitCallbackEnrollment {
-    /// Disarm / unregister immediately rather than waiting for drop.
     pub fn unregister(self) {
         drop(self);
     }
 }
 
-impl Drop for WaitCallbackEnrollment {
-    fn drop(&mut self) {
-        if let Some(queue) = self.queue.upgrade() {
-            let mut callbacks = queue.callbacks.lock();
-            callbacks.remove(&self.token);
-        }
-    }
-}
-
-pub type WaitCallback = Arc<dyn Fn(usize) + Send + Sync + 'static>;
+pub type WaitCallback = carrick_thread::completion::CompletionCallback;
 
 type WaitSubscriptionFactory =
     Arc<dyn Fn() -> Option<Box<dyn std::fmt::Debug + Send + Sync>> + Send + Sync>;
@@ -73,7 +61,7 @@ type WaitSubscriptionFactory =
 #[derive(Default)]
 struct WaitQueueInner {
     waiters: Mutex<BTreeMap<u64, Weak<WaitSetInner>>>,
-    callbacks: Mutex<BTreeMap<u64, WaitCallback>>,
+    callbacks: carrick_thread::completion::CompletionCallbacks,
     next_token: AtomicU64,
     subscription: Option<WaitSubscriptionFactory>,
 }
@@ -82,7 +70,7 @@ impl std::fmt::Debug for WaitQueueInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WaitQueueInner")
             .field("waiters", &self.waiters)
-            .field("callbacks_count", &self.callbacks.lock().len())
+            .field("callbacks_count", &self.callbacks.len())
             .field("next_token", &self.next_token)
             .finish()
     }
@@ -108,7 +96,7 @@ impl WaitQueue {
         Self {
             inner: Arc::new(WaitQueueInner {
                 waiters: Mutex::new(BTreeMap::new()),
-                callbacks: Mutex::new(BTreeMap::new()),
+                callbacks: carrick_thread::completion::CompletionCallbacks::default(),
                 next_token: AtomicU64::new(1),
                 subscription: None,
             }),
@@ -123,7 +111,7 @@ impl WaitQueue {
         Self {
             inner: Arc::new(WaitQueueInner {
                 waiters: Mutex::new(BTreeMap::new()),
-                callbacks: Mutex::new(BTreeMap::new()),
+                callbacks: carrick_thread::completion::CompletionCallbacks::default(),
                 next_token: AtomicU64::new(1),
                 subscription: Some(Arc::new(subscribe)),
             }),
@@ -159,12 +147,8 @@ impl WaitQueue {
             .subscription
             .as_ref()
             .and_then(|subscribe| subscribe());
-        let token = self.inner.next_token.fetch_add(1, Ordering::Relaxed);
-        let mut callbacks = self.inner.callbacks.lock();
-        callbacks.insert(token, Arc::new(callback));
         WaitCallbackEnrollment {
-            token,
-            queue: Arc::downgrade(&self.inner),
+            _enrollment: self.inner.callbacks.enroll(callback),
             _subscription: subscription,
         }
     }
@@ -194,14 +178,7 @@ impl WaitQueue {
             return;
         }
 
-        let callbacks: Vec<Arc<dyn Fn(usize) + Send + Sync + 'static>> = {
-            let callbacks = self.inner.callbacks.lock();
-            callbacks.values().cloned().collect()
-        };
-
-        for cb in callbacks {
-            cb(depth + 1);
-        }
+        self.inner.callbacks.publish(depth + 1);
     }
 
     /// Return the count of active waiters (primarily for unit tests).
@@ -213,12 +190,12 @@ impl WaitQueue {
 
     #[cfg(test)]
     pub(crate) fn controller_callback_snapshot(&self) -> Vec<WaitCallback> {
-        self.inner.callbacks.lock().values().cloned().collect()
+        self.inner.callbacks.snapshot()
     }
 
     /// Return the count of enrolled callbacks (primarily for unit tests and census).
     pub fn callback_count(&self) -> usize {
-        self.inner.callbacks.lock().len()
+        self.inner.callbacks.len()
     }
 }
 
