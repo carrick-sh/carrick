@@ -92,15 +92,17 @@ impl HostIo for SystemHostIo {
 #[derive(Debug)]
 pub struct OwnedHostFileCursor {
     reservation: crate::kernel::objects::FileCursorReservation,
+    /// Functional lifetime remains owned after numeric close and after recall.
+    _lease: crate::kernel::objects::FileDescriptionFdLease,
     fd: super::fd_table::HostFdRef,
     offset: HostFileOffset,
 }
 impl OwnedHostFileCursor {
-    pub fn recall_and_capture(
-        reservation: crate::kernel::objects::FileCursorReservation,
+    pub fn capture_recalled(
+        ready: crate::el1_delegation::OwnedRecallReady,
     ) -> Result<Self, LinuxErrno> {
+        let (reservation, lease) = ready.into_parts();
         let description = reservation.description();
-        crate::el1_delegation::recall(description)?;
         let fd = {
             let open = description.inspect().ok_or(carrick_abi::LINUX_EBADF)?;
             match &*open {
@@ -115,6 +117,7 @@ impl OwnedHostFileCursor {
         let offset = HostFileOffset::new(raw_offset).ok_or(carrick_abi::LINUX_EINVAL)?;
         Ok(Self {
             reservation,
+            _lease: lease,
             fd,
             offset,
         })
@@ -228,7 +231,12 @@ mod cursor_tests {
             })),
             carrick_abi::LINUX_O_RDWR,
         );
+        description.retain_fd_ref();
         (description, fd)
+    }
+    fn ready_cursor(cursor: crate::kernel::objects::FileCursorReservation) -> OwnedHostFileCursor {
+        let request = crate::el1_delegation::begin_owned_recall(cursor).unwrap();
+        OwnedHostFileCursor::capture_recalled(request.try_ready().unwrap()).unwrap()
     }
     #[test]
     fn legacy_dispatch_file_fault_count_matches_shared_offset() {
@@ -293,14 +301,26 @@ mod cursor_tests {
     }
     impl carrick_guest_mem::CurrentMmMemory for ObservedCopy {}
     #[test]
+    fn recalled_cursor_retains_functional_lifetime_after_numeric_close() {
+        let (description, _) = description(b"owned");
+        let cursor = ready_cursor(description.try_reserve_cursor().unwrap());
+        description.release_fd_ref();
+        assert_eq!(description.common().fd_refs(), 1);
+        let staged = cursor
+            .stage_read(&SystemHostIo, HostReadLimit::new(5).unwrap())
+            .unwrap();
+        assert_eq!(staged.bytes(), b"owned");
+        drop(staged.commit(5));
+        assert_eq!(description.common().fd_refs(), 0);
+    }
+
+    #[test]
     fn file_cursor_is_unconsumed_during_guest_copy() {
         // Core-level successor to the legacy-dispatch red. Dispatch remains
         // on its old path until the separately reviewed consumer cutover.
         for available in [0, 4096] {
             let (description, fd) = description(&vec![0x73; 8192]);
-            let mut cursor =
-                OwnedHostFileCursor::recall_and_capture(description.try_reserve_cursor().unwrap())
-                    .unwrap();
+            let mut cursor = ready_cursor(description.try_reserve_cursor().unwrap());
             let mut memory = ObservedCopy {
                 memory: LinearMemory::new(0x4000, vec![0; available]),
                 fd,
@@ -338,9 +358,7 @@ mod cursor_tests {
     fn staged_file_cursor_commits_only_copied_prefix_and_zero_cancels() {
         let (description, fd) = description(&vec![0x5a; 8192]);
         for copied in [0, 23, 4096] {
-            let cursor =
-                OwnedHostFileCursor::recall_and_capture(description.try_reserve_cursor().unwrap())
-                    .unwrap();
+            let cursor = ready_cursor(description.try_reserve_cursor().unwrap());
             let start = cursor.offset().get();
             let staged = cursor
                 .stage_read(&SystemHostIo, HostReadLimit::new(4096).unwrap())
@@ -367,9 +385,7 @@ mod cursor_tests {
         let (commit_tx, commit_rx) = std::sync::mpsc::channel();
         let peer = description.clone();
         let first = std::thread::spawn(move || {
-            let cursor =
-                OwnedHostFileCursor::recall_and_capture(peer.try_reserve_cursor().unwrap())
-                    .unwrap();
+            let cursor = ready_cursor(peer.try_reserve_cursor().unwrap());
             let staged = cursor
                 .stage_read(&SystemHostIo, HostReadLimit::new(4096).unwrap())
                 .unwrap();
@@ -395,8 +411,7 @@ mod cursor_tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         drop(subscription);
-        let cursor =
-            OwnedHostFileCursor::recall_and_capture(wait.take_reservation().unwrap()).unwrap();
+        let cursor = ready_cursor(wait.take_reservation().unwrap());
         let staged = cursor
             .stage_read(&SystemHostIo, HostReadLimit::new(4096).unwrap())
             .unwrap();
