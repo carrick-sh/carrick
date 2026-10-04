@@ -287,6 +287,12 @@ impl PreparedThreadClone {
     /// task's identity pool back to depth.
     pub fn commit(self) -> Result<PublishedThreadClone, KernelOperationError> {
         let kernel = Arc::clone(&self.reservation.kernel);
+        #[cfg(all(debug_assertions, feature = "schedule-hooks"))]
+        let caller = super::super::schedule::Subject {
+            task: self.reservation.task.key(),
+            thread: self.reservation.caller.key(),
+            generation: self.reservation.caller.execution_state().generation(),
+        };
         let publication = {
             let mut state = kernel.registry().settled().write();
             self.publish_reserved(&mut state, PublicationLane::HostClone)?
@@ -296,10 +302,13 @@ impl PreparedThreadClone {
         if let Some(context) = published.context() {
             crate::schedule_point!(
                 kernel.schedule_hooks(),
-                super::super::schedule::Event::thread(
-                    context,
-                    super::super::schedule::Point::ThreadPublished
-                )
+                super::super::schedule::Event {
+                    point: super::super::schedule::Point::ThreadPublished,
+                    actor: Some(caller),
+                    authority: super::super::schedule::Authority::Thread(
+                        super::super::schedule::Subject::from_context(context)
+                    ),
+                }
             );
         }
         if let Some(context) = published.context() {
