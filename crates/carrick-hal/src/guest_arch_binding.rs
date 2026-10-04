@@ -27,7 +27,8 @@ impl GuestArchBinding {
     }
 
     pub fn validate_x86(self, state: &X86TaskCpuStateV1) -> Result<(), TrapError> {
-        if state.mm_generation() != self.context.mm.raw().get()
+        if state.gprs()[7] != state.rsp()
+            || state.mm_generation() != self.context.mm.raw().get()
             || state.asid_generation() != self.context.generation.raw().get()
             || state.cr3() != self.context.root.address().raw()
         {

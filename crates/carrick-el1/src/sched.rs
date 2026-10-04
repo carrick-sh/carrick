@@ -707,9 +707,7 @@ impl Default for FakeCpu {
 #[cfg(test)]
 impl ThreadCpu for FakeCpu {
     fn save(&mut self, frame: &TrapFrame, ctx: &mut ThreadCtx) {
-        ctx.x = frame.x;
-        ctx.pc = frame.elr;
-        ctx.pstate = frame.spsr;
+        hw::save_frame(frame, ctx);
         ctx.sp_el0 = self.regs.sp_el0;
         ctx.tpidr_el0 = self.regs.tpidr_el0;
         ctx.tpidrro_el0 = self.regs.tpidrro_el0;
@@ -722,9 +720,7 @@ impl ThreadCpu for FakeCpu {
     }
 
     fn load(&mut self, frame: &mut TrapFrame, ctx: &ThreadCtx) {
-        frame.x = ctx.x;
-        frame.elr = ctx.pc;
-        frame.spsr = ctx.pstate;
+        hw::load_frame(frame, ctx);
         self.regs.sp_el0 = ctx.sp_el0;
         self.regs.tpidr_el0 = ctx.tpidr_el0;
         self.regs.tpidrro_el0 = ctx.tpidrro_el0;

@@ -1478,13 +1478,23 @@ fn arm_fake_backend_context_trace_is_unchanged() {
     let b = thread_ctx(0xb, 0x2000);
     let (mut frame, mut cpu) = live(0xa, 0x1000, FUTEX_WAIT_PRIVATE, 0);
     frame.x = a.x;
-    cpu.skip_fpsimd = true; // red witness: injected FP-state loss
     let mut saved = ThreadCtx::ZERO;
     cpu.save(&frame, &mut saved);
+    assert_eq!(saved.x, a.x);
+    assert_eq!(saved.pc, a.pc);
+    assert_eq!(saved.pstate, a.pstate);
+    assert_eq!(saved.sp_el0, a.sp_el0);
+    assert_eq!(saved.tpidr_el0, a.tpidr_el0);
+    assert_eq!(saved.tpidrro_el0, a.tpidrro_el0);
+    assert_eq!(saved.contextidr_el1, a.contextidr_el1);
     assert_eq!(saved.v, a.v, "ARM FP state must survive the seam");
+    assert_eq!(saved.fpsr, a.fpsr);
+    assert_eq!(saved.fpcr, a.fpcr);
     cpu.load(&mut frame, &b);
     cpu.save(&frame, &mut saved);
     assert_eq!(saved.x, b.x);
+    assert_eq!(saved.pc, b.pc);
+    assert_eq!(saved.pstate, b.pstate);
     assert_eq!(saved.sp_el0, b.sp_el0);
     assert_eq!(saved.tpidr_el0, b.tpidr_el0);
     assert_eq!(saved.tpidrro_el0, b.tpidrro_el0);

@@ -668,7 +668,7 @@ fn ar_to_kvm_segment(base: u64, limit: u32, ar: u32, selector: u16) -> kvm_segme
     }
 }
 
-fn restore_kvm_vcpu(
+pub(crate) fn restore_kvm_vcpu(
     vcpu: &mut KvmVcpu,
     layout: BringupLayout,
     s: &X86VcpuSnapshot,
