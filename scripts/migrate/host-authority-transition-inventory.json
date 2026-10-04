@@ -89,6 +89,8 @@
     "expansion": null,
     "operation": "libc::geteuid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -116,6 +118,8 @@
     "expansion": null,
     "operation": "libc::geteuid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -143,6 +147,8 @@
     "expansion": null,
     "operation": "libc::geteuid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -170,6 +176,8 @@
     "expansion": null,
     "operation": "libc::geteuid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -197,6 +205,8 @@
     "expansion": null,
     "operation": "libc::geteuid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -224,6 +234,8 @@
     "expansion": null,
     "operation": "libc::geteuid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -251,6 +263,8 @@
     "expansion": null,
     "operation": "libc::geteuid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -278,6 +292,8 @@
     "expansion": null,
     "operation": "libc::geteuid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -305,6 +321,8 @@
     "expansion": null,
     "operation": "libc::getpgrp",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -332,6 +350,8 @@
     "expansion": null,
     "operation": "libc::getpgrp",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -359,6 +379,8 @@
     "expansion": null,
     "operation": "libc::getpgrp",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -412,6 +434,7 @@
     "expansion": null,
     "operation": "libc::getpid",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/main.rs:296 in `install_guest_abort_banner`, `libc::getpid` acts only on the current carrier panic diagnostic used by `install_guest_abort_banner`; no guest identity selects its host target.",
@@ -438,6 +461,8 @@
     "expansion": null,
     "operation": "libc::getpid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -466,6 +491,8 @@
     "expansion": null,
     "operation": "libc::getpid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -493,6 +520,8 @@
     "expansion": null,
     "operation": "libc::getpid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -520,6 +549,8 @@
     "expansion": null,
     "operation": "libc::getpid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -547,6 +578,8 @@
     "expansion": null,
     "operation": "libc::getpid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -574,6 +607,8 @@
     "expansion": null,
     "operation": "libc::getpid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -601,6 +636,8 @@
     "expansion": null,
     "operation": "libc::getpid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -628,6 +665,8 @@
     "expansion": null,
     "operation": "libc::getpid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -650,11 +689,40 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "carrier-unique temporary exchange name beneath the capability-rooted hostfs overlay used by `exchange_overlay_entries`"
+    },
+    "expansion": null,
+    "operation": "libc::getpid",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/fs_backend/host.rs:5759 in the non-macOS `exchange_overlay_entries`, `libc::getpid` only makes the temporary `.carrick_exchange.<pid>.<seq>` name beneath the capability-rooted hostfs overlay parent unique to this carrier.",
+    "review_id": "HA-000714",
+    "source": {
+      "byte_end": 240921,
+      "byte_start": 240909,
+      "column": 32,
+      "column_end": 44,
+      "column_start": 32,
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
+      "line": 5759,
+      "line_end": 5759,
+      "line_start": 5759
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-GETPID",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "anonymous regular-file object beneath the capability-rooted hostfs used by `open_anon_fd`"
     },
     "expansion": null,
     "operation": "libc::getpid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1009,6 +1077,33 @@
     }
   },
   {
+    "catalog_id": "HA-CATALOG-PROCESS-GETPID",
+    "classification": "forbidden_semantic",
+    "evidence": {
+      "authority": "guest_answer",
+      "resource": "guest set_tid_address thread-ID result in the run-elf service loop used by `run_elf_service_loop`"
+    },
+    "expansion": null,
+    "operation": "libc::getpid",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-x86/src/bringup_fns.rs:724 in `run_elf_service_loop`, the host result from `libc::getpid` determines the guest `set_tid_address` return value (the guest thread ID) in the M2 run-elf service loop.",
+    "review_id": "HA-000715",
+    "source": {
+      "byte_end": 27953,
+      "byte_start": 27941,
+      "column": 36,
+      "column_end": 48,
+      "column_start": 36,
+      "file": "crates/carrick-x86/src/bringup_fns.rs",
+      "line": 724,
+      "line_end": 724,
+      "line_start": 724
+    }
+  },
+  {
     "catalog_id": "HA-CATALOG-PROCESS-GETPPID",
     "classification": "forbidden_semantic",
     "evidence": {
@@ -1018,6 +1113,8 @@
     "expansion": null,
     "operation": "libc::getppid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -1046,6 +1143,8 @@
     "expansion": null,
     "operation": "libc::getppid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1073,6 +1172,8 @@
     "expansion": null,
     "operation": "libc::getppid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1100,6 +1201,8 @@
     "expansion": null,
     "operation": "libc::getppid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1127,6 +1230,8 @@
     "expansion": null,
     "operation": "libc::getppid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1154,6 +1259,8 @@
     "expansion": null,
     "operation": "libc::getppid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1181,6 +1288,8 @@
     "expansion": null,
     "operation": "libc::getrlimit",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -1209,6 +1318,8 @@
     "expansion": null,
     "operation": "libc::getrlimit",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1236,6 +1347,8 @@
     "expansion": null,
     "operation": "libc::getrlimit",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1263,6 +1376,8 @@
     "expansion": null,
     "operation": "libc::getsid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1316,6 +1431,8 @@
     "expansion": null,
     "operation": "libc::getuid",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1447,6 +1564,7 @@
     "expansion": null,
     "operation": "libc::kill",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:347 in `rollback_spawned_carrier`, `libc::kill` acts only on the exact direct carrier child minted by the current launcher transaction used by `rollback_spawned_carrier` at line 322; no guest identity selects its host target.",
@@ -1473,6 +1591,8 @@
     "expansion": null,
     "operation": "libc::kill",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1500,6 +1620,8 @@
     "expansion": null,
     "operation": "libc::kill",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1581,6 +1703,8 @@
     "expansion": null,
     "operation": "libc::setrlimit",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -1609,6 +1733,8 @@
     "expansion": null,
     "operation": "libc::setrlimit",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1627,6 +1753,87 @@
     }
   },
   {
+    "catalog_id": "HA-CATALOG-ESCAPE-SYSCALL",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "calling carrier thread's own host TID printed by the CARRICK_MAINT_DEBUG stage-1 TLBI line via `debug_tid`"
+    },
+    "expansion": null,
+    "operation": "libc::syscall",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-aarch64/src/engine.rs:2856 in `debug_tid`, `libc::syscall` issues only `SYS_gettid` for the calling carrier thread, whose host TID is printed in the opt-in `CARRICK_MAINT_DEBUG` stage-1 TLBI diagnostic; the value never reaches the guest and no guest identity selects its host target.",
+    "review_id": "HA-000716",
+    "source": {
+      "byte_end": 123027,
+      "byte_start": 123014,
+      "column": 18,
+      "column_end": 31,
+      "column_start": 18,
+      "file": "crates/carrick-aarch64/src/engine.rs",
+      "line": 2856,
+      "line_end": 2856,
+      "line_start": 2856
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-ESCAPE-SYSCALL",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "run-scoped SysV message-queue wait word mapped from its IPC backing object and parked on by `wait`"
+    },
+    "expansion": null,
+    "operation": "libc::syscall",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-host/src/shared_word.rs:37 in `wait`, `libc::syscall` issues only a shared (non-private) `SYS_futex` `FUTEX_WAIT` on the runtime-owned MAP_SHARED wait word of a run-scoped SysV message-queue backing object; the guest-visible queue semantics stay in Carrick's SysV model.",
+    "review_id": "HA-000717",
+    "source": {
+      "byte_end": 1678,
+      "byte_start": 1665,
+      "column": 13,
+      "column_end": 26,
+      "column_start": 13,
+      "file": "crates/carrick-host/src/shared_word.rs",
+      "line": 37,
+      "line_end": 37,
+      "line_start": 37
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-ESCAPE-SYSCALL",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "run-scoped SysV message-queue wait word mapped from its IPC backing object and woken by `wake`"
+    },
+    "expansion": null,
+    "operation": "libc::syscall",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-host/src/shared_word.rs:91 in `wake`, `libc::syscall` issues only a shared (non-private) `SYS_futex` `FUTEX_WAKE` on the runtime-owned MAP_SHARED wait word of a run-scoped SysV message-queue backing object (`MsgQueueWaitWord::wake_all`); no guest identity selects its host target.",
+    "review_id": "HA-000718",
+    "source": {
+      "byte_end": 3120,
+      "byte_start": 3107,
+      "column": 13,
+      "column_end": 26,
+      "column_start": 13,
+      "file": "crates/carrick-host/src/shared_word.rs",
+      "line": 91,
+      "line_end": 91,
+      "line_start": 91
+    }
+  },
+  {
     "catalog_id": "HA-CATALOG-PROCESS-WAITPID",
     "classification": "declared_substrate",
     "evidence": {
@@ -1636,6 +1843,7 @@
     "expansion": null,
     "operation": "libc::waitpid",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:350 in `rollback_spawned_carrier`, `libc::waitpid` acts only on the exact direct carrier child minted by the current launcher transaction used by `rollback_spawned_carrier` at line 325; no guest identity selects its host target.",
@@ -1662,6 +1870,7 @@
     "expansion": null,
     "operation": "libc::waitpid",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:1007 in `await_detached_ready`, `libc::waitpid` acts only on the exact direct carrier child minted by the current launcher transaction used by `await_detached_ready` at line 953; no guest identity selects its host target.",
@@ -1766,6 +1975,8 @@
     "expansion": null,
     "operation": "std::fs::File::create",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1820,6 +2031,8 @@
     "expansion": null,
     "operation": "std::fs::File::create",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -1847,6 +2060,7 @@
     "expansion": null,
     "operation": "std::fs::File::open",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/commands.rs:2349 in `preserve_build_archive`, `std::fs::File::open` accesses only the build archive source and preserved destination selected by the CLI request.",
@@ -1899,6 +2113,7 @@
     "expansion": null,
     "operation": "std::fs::File::open",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:2519 in `emit_appended`, `std::fs::File::open` accesses only the validated container log file.",
@@ -1925,6 +2140,7 @@
     "expansion": null,
     "operation": "std::fs::File::open",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/namespace_work_profile.rs:15 in `artifact_sha256`, `std::fs::File::open` acts only on operator-selected namespace census capture or executable, hashed and checked by the trace diagnostic; it does not delegate Linux namespace or process authority to the host.",
@@ -1951,6 +2167,7 @@
     "expansion": null,
     "operation": "std::fs::File::open",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:987 in `load_docker_archive_for_platform`, `std::fs::File::open` accesses only the configured OCI image-store object used by `load_docker_archive_for_platform`.",
@@ -1977,6 +2194,8 @@
     "expansion": null,
     "operation": "std::fs::File::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2004,6 +2223,8 @@
     "expansion": null,
     "operation": "std::fs::File::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -2032,6 +2253,8 @@
     "expansion": null,
     "operation": "std::fs::File::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -2060,6 +2283,8 @@
     "expansion": null,
     "operation": "std::fs::File::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -2115,6 +2340,8 @@
     "expansion": null,
     "operation": "std::fs::File::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2137,11 +2364,40 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "digest-keyed OCI layer-cache file copied into the per-run scratch by `reflink_or_copy_file`"
+    },
+    "expansion": null,
+    "operation": "std::fs::File::open",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:406 in `reflink_or_copy_file`, `std::fs::File::open` opens only the source file inside the digest-keyed OCI layer-cache entry for reflink or copy.",
+    "review_id": "HA-000719",
+    "source": {
+      "byte_end": 18410,
+      "byte_start": 18391,
+      "column": 13,
+      "column_end": 32,
+      "column_start": 13,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 406,
+      "line_end": 406,
+      "line_start": 406
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-FILE-OPEN",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "selected OCI rootfs object used by `extract_layer_paths_to_dir`"
     },
     "expansion": null,
     "operation": "std::fs::File::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2169,6 +2425,7 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/amplification_profile.rs:428 in `write_consumer_drops_record`, `std::fs::OpenOptions::new` accesses only the configured AMP1 consumer-drop evidence file.",
@@ -2195,6 +2452,7 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/commands.rs:2351 in `preserve_build_archive`, `std::fs::OpenOptions::new` accesses only the build archive source and preserved destination selected by the CLI request.",
@@ -2273,6 +2531,7 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:1139 in `redirect_detached_stdio`, `std::fs::OpenOptions::new` accesses only the fixed /dev/null and validated container log files.",
@@ -2299,6 +2558,7 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:1147 in `redirect_detached_stdio`, `std::fs::OpenOptions::new` accesses only the fixed /dev/null and validated container log files.",
@@ -2325,6 +2585,7 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/auth.rs:194 in `write_private`, `std::fs::OpenOptions::new` accesses only the configured OCI registry authentication object used by `write_private`.",
@@ -2351,6 +2612,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2378,6 +2641,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2405,6 +2670,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2432,6 +2699,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2459,6 +2728,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2486,6 +2757,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2513,6 +2786,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2540,6 +2815,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2567,6 +2844,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2594,6 +2873,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2621,6 +2902,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2648,6 +2931,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2670,11 +2955,40 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "digest-keyed OCI layer-cache file copied into the per-run scratch by `reflink_or_copy_file`"
+    },
+    "expansion": null,
+    "operation": "std::fs::OpenOptions::new",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:408 in `reflink_or_copy_file`, `std::fs::OpenOptions::new` builds the create/truncate options only for the replica file inside the per-run scratch.",
+    "review_id": "HA-000720",
+    "source": {
+      "byte_end": 18478,
+      "byte_start": 18453,
+      "column": 17,
+      "column_end": 42,
+      "column_start": 17,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 408,
+      "line_end": 408,
+      "line_start": 408
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-NEW",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "capability-resolved hostfs object beneath the configured root used by `create_socket`"
     },
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2702,6 +3016,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2757,6 +3073,7 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/amplification_profile.rs:430 in `write_consumer_drops_record`, `std::fs::OpenOptions::open` accesses only the configured AMP1 consumer-drop evidence file.",
@@ -2783,6 +3100,7 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/commands.rs:2354 in `preserve_build_archive`, `std::fs::OpenOptions::open` accesses only the build archive source and preserved destination selected by the CLI request.",
@@ -2861,6 +3179,7 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:1139 in `redirect_detached_stdio`, `std::fs::OpenOptions::open` accesses only the fixed /dev/null and validated container log files.",
@@ -2887,6 +3206,7 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:1150 in `redirect_detached_stdio`, `std::fs::OpenOptions::open` accesses only the fixed /dev/null and validated container log files.",
@@ -2913,6 +3233,7 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/auth.rs:199 in `write_private`, `std::fs::OpenOptions::open` accesses only the configured OCI registry authentication object used by `write_private`.",
@@ -2939,6 +3260,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2966,6 +3289,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -2993,6 +3318,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3020,6 +3347,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3047,6 +3376,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3074,6 +3405,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3101,6 +3434,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3128,6 +3463,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3155,6 +3492,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3182,6 +3521,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3209,6 +3550,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3236,6 +3579,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3258,11 +3603,40 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "digest-keyed OCI layer-cache file copied into the per-run scratch by `reflink_or_copy_file`"
+    },
+    "expansion": null,
+    "operation": "std::fs::OpenOptions::open",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:412 in `reflink_or_copy_file`, `std::fs::OpenOptions::open` creates only the replica file inside the per-run scratch that receives the reflinked or copied data.",
+    "review_id": "HA-000721",
+    "source": {
+      "byte_end": 18577,
+      "byte_start": 18573,
+      "column": 14,
+      "column_end": 18,
+      "column_start": 14,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 412,
+      "line_end": 412,
+      "line_start": 412
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-OPENOPTIONS-OPEN",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "capability-resolved hostfs object beneath the configured root used by `create_socket`"
     },
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3290,6 +3664,8 @@
     "expansion": null,
     "operation": "std::fs::OpenOptions::open",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3345,6 +3721,7 @@
     "expansion": null,
     "operation": "std::fs::copy",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/commands.rs:2421 in `copy_dir_recursive`, `std::fs::copy` accesses only the container-copy filesystem tree selected by the CLI request.",
@@ -3371,6 +3748,7 @@
     "expansion": null,
     "operation": "std::fs::copy",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:914 in `tag_image`, `std::fs::copy` accesses only the configured OCI image-store object used by `tag_image`.",
@@ -3388,6 +3766,33 @@
     }
   },
   {
+    "catalog_id": "HA-CATALOG-FS-COPY",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "digest-keyed OCI layer-cache file copied into the per-run scratch by `reflink_or_copy_file`"
+    },
+    "expansion": null,
+    "operation": "std::fs::copy",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:452 in `reflink_or_copy_file`, `std::fs::copy` copies only the cached file bytes into its replica inside the per-run scratch when no reflink is available.",
+    "review_id": "HA-000722",
+    "source": {
+      "byte_end": 20852,
+      "byte_start": 20839,
+      "column": 5,
+      "column_end": 18,
+      "column_start": 5,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 452,
+      "line_end": 452,
+      "line_start": 452
+    }
+  },
+  {
     "catalog_id": "HA-CATALOG-FS-CREATE-DIR",
     "classification": "declared_backing",
     "evidence": {
@@ -3397,6 +3802,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3424,6 +3831,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3446,11 +3855,40 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "digest-keyed OCI layer-cache entry replicated into the per-run scratch by `replicate_tree`"
+    },
+    "expansion": null,
+    "operation": "std::fs::create_dir",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:367 in `replicate_tree`, `std::fs::create_dir` creates only the replica directory inside the per-run scratch beneath a child name `clone_children_into` already validated.",
+    "review_id": "HA-000723",
+    "source": {
+      "byte_end": 16544,
+      "byte_start": 16525,
+      "column": 9,
+      "column_end": 28,
+      "column_start": 9,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 367,
+      "line_end": 367,
+      "line_start": 367
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-CREATE-DIR",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "capability-resolved hostfs object beneath the configured root used by `mkdir`"
     },
     "expansion": null,
     "operation": "std::fs::create_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3478,6 +3916,7 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/commands.rs:2387 in `copy_dir_recursive`, `std::fs::create_dir_all` accesses only the container-copy filesystem tree selected by the CLI request.",
@@ -3582,6 +4021,7 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/debug_amplification.rs:1679 in `publish_noclobber`, `std::fs::create_dir_all` accesses only the atomic amplification comparison output.",
@@ -3608,6 +4048,7 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/build.rs:234 in `send_error`, `std::fs::create_dir_all` accesses only the run-scoped API build-context directory.",
@@ -3634,6 +4075,7 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/resources.rs:355 in `create_volume`, `std::fs::create_dir_all` accesses only the validated named-volume directory.",
@@ -3660,6 +4102,7 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/resources.rs:410 in `resolve_or_create_volume_mountpoint`, `std::fs::create_dir_all` accesses only the validated named-volume mountpoint.",
@@ -3686,6 +4129,7 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/resources.rs:427 in `create_anonymous_volume_mountpoint`, `std::fs::create_dir_all` accesses only the validated anonymous-volume mountpoint.",
@@ -3712,6 +4156,7 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/resources.rs:1057 in `persist_named`, `std::fs::create_dir_all` accesses only the validated Docker-compatible resource state object and atomic temporary.",
@@ -3738,6 +4183,7 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/auth.rs:192 in `write_private`, `std::fs::create_dir_all` accesses only the configured OCI registry authentication object used by `write_private`.",
@@ -3764,6 +4210,7 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:909 in `tag_image`, `std::fs::create_dir_all` accesses only the configured OCI image-store object used by `tag_image`.",
@@ -3790,6 +4237,7 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:1027 in `load_docker_archive_for_platform`, `std::fs::create_dir_all` accesses only the configured OCI image-store object used by `load_docker_archive_for_platform`.",
@@ -3816,6 +4264,7 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:1038 in `load_docker_archive_for_platform`, `std::fs::create_dir_all` accesses only the configured OCI image-store object used by `load_docker_archive_for_platform`.",
@@ -3842,6 +4291,7 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:1104 in `load_docker_archive_for_platform`, `std::fs::create_dir_all` accesses only the configured OCI image-store object used by `load_docker_archive_for_platform`.",
@@ -3868,6 +4318,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3895,6 +4347,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3922,6 +4376,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3949,6 +4405,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -3976,6 +4434,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4003,6 +4463,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4030,6 +4492,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4057,6 +4521,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4084,6 +4550,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4111,6 +4579,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4138,6 +4608,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4165,6 +4637,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4192,6 +4666,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4219,6 +4695,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4246,6 +4724,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4273,6 +4753,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4300,6 +4782,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4327,6 +4811,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4349,11 +4835,40 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "per-run overlay scratch upper, work and merged directories used by `overlay_seed_scratch`"
+    },
+    "expansion": null,
+    "operation": "std::fs::create_dir_all",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:145 in `overlay_seed_scratch`, `std::fs::create_dir_all` creates only the upper, work and merged directories inside the per-run hostfs scratch beside the digest-keyed layer cache.",
+    "review_id": "HA-000724",
+    "source": {
+      "byte_end": 6663,
+      "byte_start": 6640,
+      "column": 9,
+      "column_end": 32,
+      "column_start": 9,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 145,
+      "line_end": 145,
+      "line_start": 145
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-CREATE-DIR-ALL",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "digest-keyed OCI layer-cache entry used by `build_cache_entry`"
     },
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4381,6 +4896,8 @@
     "expansion": null,
     "operation": "std::fs::create_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4408,6 +4925,7 @@
     "expansion": null,
     "operation": "std::fs::hard_link",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/commands.rs:2340 in `preserve_build_archive`, `std::fs::hard_link` accesses only the build archive source and preserved destination selected by the CLI request.",
@@ -4429,11 +4947,40 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "digest-keyed OCI layer-cache entry replicated into the per-run scratch by `replicate_tree`"
+    },
+    "expansion": null,
+    "operation": "std::fs::hard_link",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:387 in `replicate_tree`, `std::fs::hard_link` links only two replicas inside the per-run scratch, preserving hardlink identity recorded in the digest-keyed cache entry.",
+    "review_id": "HA-000725",
+    "source": {
+      "byte_end": 17538,
+      "byte_start": 17520,
+      "column": 13,
+      "column_end": 31,
+      "column_start": 13,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 387,
+      "line_end": 387,
+      "line_start": 387
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-HARD-LINK",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "capability-resolved hostfs object beneath the configured root used by `link`"
     },
     "expansion": null,
     "operation": "std::fs::hard_link",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4461,6 +5008,7 @@
     "expansion": null,
     "operation": "std::fs::metadata",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/commands.rs:2336 in `preserve_build_archive`, `std::fs::metadata` accesses only the build archive source and preserved destination selected by the CLI request.",
@@ -4505,6 +5053,33 @@
   },
   {
     "catalog_id": "HA-CATALOG-FS-METADATA",
+    "classification": "forbidden_semantic",
+    "evidence": {
+      "authority": "guest_answer",
+      "resource": "guest /proc process uid and gid used by `pid_info`"
+    },
+    "expansion": null,
+    "operation": "std::fs::metadata",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-host/src/host_proc.rs:1642 in `pid_info`, the host result from `std::fs::metadata` of host `/proc/<pid>` (its owner) determines the guest /proc process uid and gid returned on Linux hosts.",
+    "review_id": "HA-000726",
+    "source": {
+      "byte_end": 68964,
+      "byte_start": 68947,
+      "column": 26,
+      "column_end": 43,
+      "column_start": 26,
+      "file": "crates/carrick-host/src/host_proc.rs",
+      "line": 1642,
+      "line_end": 1642,
+      "line_start": 1642
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-METADATA",
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
@@ -4513,6 +5088,7 @@
     "expansion": null,
     "operation": "std::fs::metadata",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:776 in `image_info_from_summary`, `std::fs::metadata` accesses only the configured OCI image-store object used by `image_info_from_summary`.",
@@ -4539,6 +5115,7 @@
     "expansion": null,
     "operation": "std::fs::metadata",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:864 in `gc_blobs`, `std::fs::metadata` accesses only the configured OCI image-store object used by `gc_blobs`.",
@@ -4565,6 +5142,7 @@
     "expansion": null,
     "operation": "std::fs::metadata",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:885 in `blob_disk_usage`, `std::fs::metadata` accesses only the configured OCI image-store object used by `blob_disk_usage`.",
@@ -4591,6 +5169,8 @@
     "expansion": null,
     "operation": "std::fs::metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4618,6 +5198,8 @@
     "expansion": null,
     "operation": "std::fs::metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -4646,6 +5228,8 @@
     "expansion": null,
     "operation": "std::fs::metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -4701,6 +5285,8 @@
     "expansion": null,
     "operation": "std::fs::metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4728,6 +5314,8 @@
     "expansion": null,
     "operation": "std::fs::metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4755,6 +5343,8 @@
     "expansion": null,
     "operation": "std::fs::metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4782,6 +5372,8 @@
     "expansion": null,
     "operation": "std::fs::metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4809,6 +5401,8 @@
     "expansion": null,
     "operation": "std::fs::metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -4888,6 +5482,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/debug_amplification.rs:2326 in `run_amplification_compare_to`, `std::fs::read` accesses only the pair of user-selected amplification evidence streams.",
@@ -4914,6 +5509,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/debug_amplification.rs:2328 in `run_amplification_compare_to`, `std::fs::read` accesses only the pair of user-selected amplification evidence streams.",
@@ -4940,6 +5536,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/debug_core.rs:231 in `validate`, `std::fs::read` accesses only the user-selected core evidence artifact.",
@@ -4966,6 +5563,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/debug_el1_census.rs:26 in `load`, `std::fs::read` accesses only the census file named on the `carrick debug el1-census` command line, read by `load`.",
@@ -4992,6 +5590,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/debug_exec_stamps.rs:189 in `run_exec_stamp_census`, `std::fs::read` accesses only the user-selected exec-stamp evidence stream.",
@@ -5018,6 +5617,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/hvpatch_carrier_cpu_attribution_profile.rs:206 in `SymbolTable::from_binary`, `std::fs::read` accesses only the carrick executable located for in-process symbol resolution of the attribution profile's own captured stacks; no guest identity selects the path.",
@@ -5044,6 +5644,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/hvpatch_core_profile.rs:134 in `from_path`, `std::fs::read` accesses only the user-selected HVPatch core profile receipt.",
@@ -5070,6 +5671,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:2488 in `logs`, `std::fs::read` accesses only the validated container log file.",
@@ -5096,6 +5698,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/resources.rs:1075 in `load_named`, `std::fs::read` accesses only the validated Docker-compatible resource state object.",
@@ -5122,6 +5725,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/resources.rs:1091 in `read_resource_state`, `std::fs::read` accesses only the validated Docker-compatible resource state object.",
@@ -5148,6 +5752,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/trace_profile.rs:404 in `capture_provenance`, `std::fs::read` accesses only the selected traced binary and run-scoped profile identity.",
@@ -5174,6 +5779,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/auth.rs:74 in `load_config`, `std::fs::read` accesses only the configured OCI registry authentication object used by `load_config`.",
@@ -5200,6 +5806,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:766 in `image_info_from_summary`, `std::fs::read` accesses only the configured OCI image-store object used by `image_info_from_summary`.",
@@ -5226,6 +5833,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:798 in `referenced_blobs`, `std::fs::read` accesses only the configured OCI image-store object used by `referenced_blobs`.",
@@ -5252,6 +5860,7 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:906 in `tag_image`, `std::fs::read` accesses only the configured OCI image-store object used by `tag_image`.",
@@ -5278,6 +5887,8 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -5305,6 +5916,8 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -5332,6 +5945,8 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -5359,6 +5974,8 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -5386,6 +6003,8 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -5413,6 +6032,8 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -5440,6 +6061,8 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -5468,6 +6091,8 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -5496,6 +6121,8 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -5524,6 +6151,8 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -5709,11 +6338,40 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "selected absolute executable in explicitly enabled bare RunElf host-filesystem fallback"
+    },
+    "expansion": null,
+    "operation": "std::fs::read",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/mod.rs:231 in `load_execve_image`, `std::fs::read` accesses only the selected absolute executable in the explicitly enabled bare RunElf host-filesystem fallback (`exec_host_fs_fallback`); container dispatchers keep it disabled so an absent rootfs target ENOENTs.",
+    "review_id": "HA-000727",
+    "source": {
+      "byte_end": 10859,
+      "byte_start": 10846,
+      "column": 17,
+      "column_end": 30,
+      "column_start": 17,
+      "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
+      "line": 231,
+      "line_end": 231,
+      "line_start": 231
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "selected OCI rootfs object used by `from_path`"
     },
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -5736,11 +6394,40 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "symlink owner sidecar beside the capability-resolved bind backing used by `read_symlink_owner_sidecar`"
+    },
+    "expansion": null,
+    "operation": "std::fs::read",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/vfs/bind.rs:201 in the non-macOS `read_symlink_owner_sidecar`, `std::fs::read` reads only the guest-owner sidecar Carrick wrote beside a symlink in the resolved bind backing.",
+    "review_id": "HA-000728",
+    "source": {
+      "byte_end": 8777,
+      "byte_start": 8764,
+      "column": 19,
+      "column_end": 32,
+      "column_start": 19,
+      "file": "crates/carrick-vfs/src/vfs/bind.rs",
+      "line": 201,
+      "line_end": 201,
+      "line_start": 201
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "capability-resolved hostfs object beneath the configured root used by `read_file`"
     },
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -5768,6 +6455,8 @@
     "expansion": null,
     "operation": "std::fs::read",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -5795,6 +6484,7 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/commands.rs:2394 in `copy_dir_recursive`, `std::fs::read_dir` accesses only the container-copy filesystem tree selected by the CLI request.",
@@ -5821,6 +6511,7 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/debug_el1_census.rs:11 in `collect`, `std::fs::read_dir` accesses only the census directory named on the `carrick debug el1-census` command line, read by `collect`.",
@@ -5847,6 +6538,7 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:1292 in `dir_size`, `std::fs::read_dir` accesses only the validated container overlay directory.",
@@ -5873,6 +6565,7 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/resources.rs:1081 in `list_named`, `std::fs::read_dir` accesses only the validated Docker-compatible resource-state root.",
@@ -5899,6 +6592,7 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:916 in `audit_crate_source`, `std::fs::read_dir` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
@@ -5925,6 +6619,7 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:1087 in `collect_rs_files`, `std::fs::read_dir` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
@@ -5951,6 +6646,7 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-conformance-contract/src/registry.rs:118 in `read_contract_paths`, `std::fs::read_dir` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
@@ -5969,6 +6665,33 @@
   },
   {
     "catalog_id": "HA-CATALOG-FS-READ-DIR",
+    "classification": "forbidden_semantic",
+    "evidence": {
+      "authority": "guest_answer",
+      "resource": "guest /proc process run state aggregated from host threads by `aggregate_state`"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_dir",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-host/src/host_proc.rs:1621 in `aggregate_state`, the host result from `std::fs::read_dir` of host `/proc/<pid>/task` determines the guest /proc process run state that `pid_info` reports on Linux hosts.",
+    "review_id": "HA-000729",
+    "source": {
+      "byte_end": 68146,
+      "byte_start": 68129,
+      "column": 23,
+      "column_end": 40,
+      "column_start": 23,
+      "file": "crates/carrick-host/src/host_proc.rs",
+      "line": 1621,
+      "line_end": 1621,
+      "line_start": 1621
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-DIR",
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
@@ -5977,6 +6700,7 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:746 in `list_images`, `std::fs::read_dir` accesses only the configured OCI image-store object used by `list_images`.",
@@ -6003,6 +6727,7 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:852 in `gc_blobs`, `std::fs::read_dir` accesses only the configured OCI image-store object used by `gc_blobs`.",
@@ -6029,6 +6754,7 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:879 in `blob_disk_usage`, `std::fs::read_dir` accesses only the configured OCI image-store object used by `blob_disk_usage`.",
@@ -6055,6 +6781,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6082,6 +6810,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6109,6 +6839,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6136,10 +6868,12 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1255 in `host_open_descriptor_count`, `std::fs::read_dir` acts only on the current carrier open host-descriptor census used by `host_open_descriptor_count` (the `/dev/fd` listing that backs guest `/proc/sys/fs/file-nr`); no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/time.rs:1255 in `host_open_descriptor_count`, `std::fs::read_dir` acts only on the current carrier open host-descriptor census used by `host_open_descriptor_count` (the `/dev/fd` listing, `/proc/self/fd` on Linux, that backs guest `/proc/sys/fs/file-nr`); no guest identity selects its host target.",
     "review_id": "HA-000642",
     "source": {
       "byte_end": 62471,
@@ -6190,6 +6924,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6217,6 +6953,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6244,6 +6982,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6271,6 +7011,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6298,6 +7040,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6325,6 +7069,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6352,6 +7098,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6379,6 +7127,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6406,6 +7156,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6433,6 +7185,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6460,6 +7214,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6482,11 +7238,40 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "digest-keyed OCI layer-cache entry replicated into the per-run scratch by `replicate_tree`"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_dir",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:368 in `replicate_tree`, `std::fs::read_dir` lists only a directory of the digest-keyed OCI layer-cache entry being replicated.",
+    "review_id": "HA-000730",
+    "source": {
+      "byte_end": 16604,
+      "byte_start": 16587,
+      "column": 23,
+      "column_end": 40,
+      "column_start": 23,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 368,
+      "line_end": 368,
+      "line_start": 368
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-DIR",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "capability-resolved hostfs object beneath the configured root used by `readdir`"
     },
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6514,6 +7299,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6541,6 +7328,8 @@
     "expansion": null,
     "operation": "std::fs::read_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6568,6 +7357,7 @@
     "expansion": null,
     "operation": "std::fs::read_link",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/commands.rs:2407 in `copy_dir_recursive`, `std::fs::read_link` accesses only the container-copy filesystem tree selected by the CLI request.",
@@ -6589,11 +7379,67 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "carrier-held hostfs scratch directory descriptor named through /proc/self/fd by `fd_abs_path`"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_link",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-portable/src/lib.rs:1722 in the Linux `fd_abs_path`, `std::fs::read_link` reads only `/proc/self/fd/<fd>` for a descriptor the carrier already holds (the hostfs scratch directory passed by `HostFsBackend::from_existing_dir`) to name its backing path.",
+    "review_id": "HA-000731",
+    "source": {
+      "byte_end": 63137,
+      "byte_start": 63119,
+      "column": 9,
+      "column_end": 27,
+      "column_start": 9,
+      "file": "crates/carrick-portable/src/lib.rs",
+      "line": 1722,
+      "line_end": 1722,
+      "line_start": 1722
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-LINK",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "digest-keyed OCI layer-cache entry replicated into the per-run scratch by `replicate_tree`"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_link",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:358 in `replicate_tree`, `std::fs::read_link` reads only a symlink target stored in the digest-keyed OCI layer-cache entry, copied verbatim and never followed.",
+    "review_id": "HA-000732",
+    "source": {
+      "byte_end": 16188,
+      "byte_start": 16170,
+      "column": 22,
+      "column_end": 40,
+      "column_start": 22,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 358,
+      "line_end": 358,
+      "line_start": 358
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-LINK",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "capability-resolved hostfs object beneath the configured root used by `readlink`"
     },
     "expansion": null,
     "operation": "std::fs::read_link",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -6621,6 +7467,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/amplification_profile.rs:459 in `validate_amp1_path`, `std::fs::read_to_string` accesses only the user-selected AMP1 profile evidence stream.",
@@ -6647,6 +7494,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/commands.rs:170 in `run_cli`, `std::fs::read_to_string` accesses only the user-selected native profile evidence stream.",
@@ -6751,6 +7599,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/debug_el1_census.rs:40 in `per_suite`, `std::fs::read_to_string` accesses only the conformance results file named by `--results`, read by `per_suite`.",
@@ -6777,6 +7626,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/hvpatch_carrier_cpu_attribution_profile.rs:808 in `HvpatchCarrierCpuAttributionSummary::from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch carrier CPU attribution profile receipt.",
@@ -6803,6 +7653,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/hvpatch_carrier_cpu_low_rate_profile.rs:44 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch carrier low-rate profile receipt.",
@@ -6829,6 +7680,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/hvpatch_core_profile.rs:132 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch core profile receipt.",
@@ -6855,6 +7707,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/hvpatch_exec_runtime_profile.rs:19 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch exec-runtime profile receipt.",
@@ -6881,6 +7734,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/hvpatch_exit_attribution_profile.rs:161 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch exit-attribution profile receipt.",
@@ -6907,6 +7761,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/hvpatch_identity_host_safety_profile.rs:21 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch identity-safety profile receipt.",
@@ -6933,6 +7788,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/hvpatch_k1_profile.rs:217 in `from_path`, `std::fs::read_to_string` accesses only the user-selected HVPatch K1 profile receipt.",
@@ -6959,6 +7815,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/runtime_util.rs:238 in `parse_env_file`, `std::fs::read_to_string` accesses only the user-selected CLI environment file.",
@@ -6985,6 +7842,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:326 in `check_substrate_boundary`, `std::fs::read_to_string` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
@@ -7011,6 +7869,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:335 in `check_substrate_boundary`, `std::fs::read_to_string` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
@@ -7037,6 +7896,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:962 in `audit_source_file_tree`, `std::fs::read_to_string` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
@@ -7063,6 +7923,7 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-conformance-contract/src/registry.rs:146 in `read_to_string`, `std::fs::read_to_string` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
@@ -7084,11 +7945,67 @@
     "classification": "forbidden_semantic",
     "evidence": {
       "authority": "guest_answer",
+      "resource": "guest /proc process stat fields (comm, state, ppid, pgrp) used by `read_stat`"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_to_string",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-host/src/host_proc.rs:1606 in `read_stat`, the host result from `std::fs::read_to_string` of host `/proc/<pid>/stat` determines the guest /proc process stat fields (comm, state, ppid, pgrp) that `pid_info` and `parent_pid` return on Linux hosts.",
+    "review_id": "HA-000733",
+    "source": {
+      "byte_end": 67365,
+      "byte_start": 67342,
+      "column": 21,
+      "column_end": 44,
+      "column_start": 21,
+      "file": "crates/carrick-host/src/host_proc.rs",
+      "line": 1606,
+      "line_end": 1606,
+      "line_start": 1606
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+    "classification": "forbidden_semantic",
+    "evidence": {
+      "authority": "guest_answer",
+      "resource": "guest process resource-usage result used by `self_resource_usage`"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_to_string",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-host/src/host_proc.rs:1788 in the Linux `self_resource_usage`, the host result from `std::fs::read_to_string` of the carrier's `/proc/self/statm` determines the guest process resource-usage result (VSZ/RSS).",
+    "review_id": "HA-000734",
+    "source": {
+      "byte_end": 74868,
+      "byte_start": 74845,
+      "column": 32,
+      "column_end": 55,
+      "column_start": 32,
+      "file": "crates/carrick-host/src/host_proc.rs",
+      "line": 1788,
+      "line_end": 1788,
+      "line_start": 1788
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+    "classification": "forbidden_semantic",
+    "evidence": {
+      "authority": "guest_answer",
       "resource": "guest DNS resolution result used by `hosts_file_lookup`"
     },
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7116,6 +8033,8 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7143,6 +8062,8 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7170,6 +8091,8 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7197,6 +8120,8 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7216,6 +8141,33 @@
   },
   {
     "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
+    "classification": "forbidden_semantic",
+    "evidence": {
+      "authority": "guest_answer",
+      "resource": "guest-visible /proc/sys/kernel/threads-max value used by `host_kernel_threads_max`"
+    },
+    "expansion": null,
+    "operation": "std::fs::read_to_string",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:515 in the Linux `host_kernel_threads_max`, the host result from `std::fs::read_to_string` of host `/proc/sys/kernel/threads-max` determines the guest-visible /proc/sys/kernel/threads-max value when no RLIMIT_NPROC applies.",
+    "review_id": "HA-000735",
+    "source": {
+      "byte_end": 24163,
+      "byte_start": 24140,
+      "column": 15,
+      "column_end": 38,
+      "column_start": 15,
+      "file": "crates/carrick-kernel/src/vfs/proc.rs",
+      "line": 515,
+      "line_end": 515,
+      "line_start": 515
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-READ-TO-STRING",
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
@@ -7224,6 +8176,8 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7251,6 +8205,8 @@
     "expansion": null,
     "operation": "std::fs::read_to_string",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7278,6 +8234,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7305,6 +8263,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7332,6 +8292,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7359,6 +8321,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7386,6 +8350,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7413,6 +8379,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7440,6 +8408,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7467,6 +8437,7 @@
     "expansion": null,
     "operation": "std::fs::remove_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/resources.rs:1127 in `remove_named`, `std::fs::remove_dir_all` accesses only the validated Docker-compatible resource directory.",
@@ -7493,6 +8464,7 @@
     "expansion": null,
     "operation": "std::fs::remove_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:817 in `remove_image`, `std::fs::remove_dir_all` accesses only the configured OCI image-store object used by `remove_image`.",
@@ -7519,6 +8491,7 @@
     "expansion": null,
     "operation": "std::fs::remove_dir_all",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:842 in `remove_image_by_spec`, `std::fs::remove_dir_all` accesses only the configured OCI image-store object used by `remove_image_by_spec`.",
@@ -7545,6 +8518,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7572,6 +8547,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7599,6 +8576,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7621,11 +8600,94 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "per-run overlay scratch upper, work and merged directories used by `overlay_seed_scratch`"
+    },
+    "expansion": null,
+    "operation": "std::fs::remove_dir_all",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:149 in `overlay_seed_scratch`, `std::fs::remove_dir_all` removes only the per-run scratch `merged` directory after a failed overlay mount so the copy fallback can seed it.",
+    "review_id": "HA-000736",
+    "source": {
+      "byte_end": 6853,
+      "byte_start": 6830,
+      "column": 17,
+      "column_end": 40,
+      "column_start": 17,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 149,
+      "line_end": 149,
+      "line_start": 149
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-REMOVE-DIR-ALL",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "per-run overlay scratch upper, work and merged directories used by `overlay_seed_scratch`"
+    },
+    "expansion": null,
+    "operation": "std::fs::remove_dir_all",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:150 in `overlay_seed_scratch`, `std::fs::remove_dir_all` removes only the per-run scratch `work` directory after a failed overlay mount so the copy fallback can seed it.",
+    "review_id": "HA-000737",
+    "source": {
+      "byte_end": 6903,
+      "byte_start": 6880,
+      "column": 17,
+      "column_end": 40,
+      "column_start": 17,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 150,
+      "line_end": 150,
+      "line_start": 150
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-REMOVE-DIR-ALL",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "per-run overlay scratch upper, work and merged directories used by `overlay_seed_scratch`"
+    },
+    "expansion": null,
+    "operation": "std::fs::remove_dir_all",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:151 in `overlay_seed_scratch`, `std::fs::remove_dir_all` removes only the per-run scratch `upper` directory after a failed overlay mount so the copy fallback can seed it.",
+    "review_id": "HA-000738",
+    "source": {
+      "byte_end": 6951,
+      "byte_start": 6928,
+      "column": 17,
+      "column_end": 40,
+      "column_start": 17,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 151,
+      "line_end": 151,
+      "line_start": 151
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-REMOVE-DIR-ALL",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "digest-keyed OCI layer-cache entry used by `build_cache_entry`"
     },
     "expansion": null,
     "operation": "std::fs::remove_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7653,6 +8715,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7680,6 +8744,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7707,6 +8773,8 @@
     "expansion": null,
     "operation": "std::fs::remove_dir_all",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7734,6 +8802,7 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/commands.rs:2369 in `preserve_build_archive`, `std::fs::remove_file` accesses only the build archive source and preserved destination selected by the CLI request.",
@@ -7760,6 +8829,7 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/mod.rs:35 in `serve_loop`, `std::fs::remove_file` accesses only the run-scoped API Unix socket.",
@@ -7786,6 +8856,7 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/resources.rs:1066 in `persist_named`, `std::fs::remove_file` accesses only the validated Docker-compatible resource state object and atomic temporary.",
@@ -7812,6 +8883,7 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:865 in `gc_blobs`, `std::fs::remove_file` accesses only the configured OCI image-store object used by `gc_blobs`.",
@@ -7838,6 +8910,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7865,6 +8939,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7892,6 +8968,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7919,6 +8997,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7946,6 +9026,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -7973,6 +9055,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8000,6 +9084,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8027,6 +9113,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8054,6 +9142,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8081,6 +9171,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8108,6 +9200,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8135,6 +9229,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8162,6 +9258,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8189,6 +9287,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8216,6 +9316,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8243,6 +9345,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8270,6 +9374,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8324,6 +9430,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8351,6 +9459,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8378,6 +9488,8 @@
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8400,11 +9512,40 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "symlink owner sidecar beside the capability-resolved bind backing used by `unlink`"
+    },
+    "expansion": null,
+    "operation": "std::fs::remove_file",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/vfs/bind.rs:687 in the non-macOS branch of `unlink`, `std::fs::remove_file` removes only the guest-owner sidecar beside the resolved bind backing entry being unlinked.",
+    "review_id": "HA-000739",
+    "source": {
+      "byte_end": 26632,
+      "byte_start": 26612,
+      "column": 21,
+      "column_end": 41,
+      "column_start": 21,
+      "file": "crates/carrick-vfs/src/vfs/bind.rs",
+      "line": 687,
+      "line_end": 687,
+      "line_start": 687
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-REMOVE-FILE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "capability-resolved hostfs object beneath the configured root used by `unlink`"
     },
     "expansion": null,
     "operation": "std::fs::remove_file",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8420,6 +9561,33 @@
       "line": 689,
       "line_end": 689,
       "line_start": 689
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-REMOVE-FILE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "symlink owner sidecar beside the capability-resolved bind backing used by `rename`"
+    },
+    "expansion": null,
+    "operation": "std::fs::remove_file",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/vfs/bind.rs:737 in the non-macOS branch of `rename`, `std::fs::remove_file` removes only a stale guest-owner sidecar at the destination name inside the resolved bind backing.",
+    "review_id": "HA-000740",
+    "source": {
+      "byte_end": 28740,
+      "byte_start": 28720,
+      "column": 25,
+      "column_end": 45,
+      "column_start": 25,
+      "file": "crates/carrick-vfs/src/vfs/bind.rs",
+      "line": 737,
+      "line_end": 737,
+      "line_start": 737
     }
   },
   {
@@ -8488,6 +9656,7 @@
     "expansion": null,
     "operation": "std::fs::rename",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/resources.rs:1063 in `persist_named`, `std::fs::rename` accesses only the validated Docker-compatible resource state object and atomic temporary.",
@@ -8514,6 +9683,8 @@
     "expansion": null,
     "operation": "std::fs::rename",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8541,6 +9712,8 @@
     "expansion": null,
     "operation": "std::fs::rename",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8568,6 +9741,8 @@
     "expansion": null,
     "operation": "std::fs::rename",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8595,6 +9770,8 @@
     "expansion": null,
     "operation": "std::fs::rename",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8622,6 +9799,8 @@
     "expansion": null,
     "operation": "std::fs::rename",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8649,6 +9828,8 @@
     "expansion": null,
     "operation": "std::fs::rename",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8676,6 +9857,8 @@
     "expansion": null,
     "operation": "std::fs::rename",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8703,6 +9886,8 @@
     "expansion": null,
     "operation": "std::fs::rename",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8730,6 +9915,8 @@
     "expansion": null,
     "operation": "std::fs::rename",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8757,6 +9944,8 @@
     "expansion": null,
     "operation": "std::fs::rename",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8784,6 +9973,8 @@
     "expansion": null,
     "operation": "std::fs::rename",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8802,6 +9993,33 @@
     }
   },
   {
+    "catalog_id": "HA-CATALOG-FS-RENAME",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "symlink owner sidecar beside the capability-resolved bind backing used by `rename`"
+    },
+    "expansion": null,
+    "operation": "std::fs::rename",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/vfs/bind.rs:735 in the non-macOS branch of `rename`, `std::fs::rename` moves only the guest-owner sidecar to follow the renamed entry inside the resolved bind backing.",
+    "review_id": "HA-000741",
+    "source": {
+      "byte_end": 28661,
+      "byte_start": 28646,
+      "column": 25,
+      "column_end": 40,
+      "column_start": 25,
+      "file": "crates/carrick-vfs/src/vfs/bind.rs",
+      "line": 735,
+      "line_end": 735,
+      "line_start": 735
+    }
+  },
+  {
     "catalog_id": "HA-CATALOG-FS-SET-PERMISSIONS",
     "classification": "declared_backing",
     "evidence": {
@@ -8811,6 +10029,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8838,6 +10058,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8865,6 +10087,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8892,6 +10116,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8919,6 +10145,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8946,6 +10174,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -8973,6 +10203,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9000,6 +10232,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9027,6 +10261,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9054,6 +10290,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9081,6 +10319,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9108,6 +10348,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9135,6 +10377,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9162,6 +10406,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9189,6 +10435,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9216,6 +10464,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9238,11 +10488,67 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "digest-keyed OCI layer-cache entry replicated into the per-run scratch by `replicate_tree`"
+    },
+    "expansion": null,
+    "operation": "std::fs::set_permissions",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:378 in `replicate_tree`, `std::fs::set_permissions` applies the cached directory mode only to its replica inside the per-run scratch.",
+    "review_id": "HA-000742",
+    "source": {
+      "byte_end": 17174,
+      "byte_start": 17150,
+      "column": 9,
+      "column_end": 33,
+      "column_start": 9,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 378,
+      "line_end": 378,
+      "line_start": 378
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-SET-PERMISSIONS",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "digest-keyed OCI layer-cache entry replicated into the per-run scratch by `replicate_tree`"
+    },
+    "expansion": null,
+    "operation": "std::fs::set_permissions",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:395 in `replicate_tree`, `std::fs::set_permissions` applies the cached regular-file mode only to its replica inside the per-run scratch.",
+    "review_id": "HA-000743",
+    "source": {
+      "byte_end": 17820,
+      "byte_start": 17796,
+      "column": 5,
+      "column_end": 29,
+      "column_start": 5,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 395,
+      "line_end": 395,
+      "line_start": 395
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-SET-PERMISSIONS",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "capability-resolved hostfs object beneath the configured root used by `mkdir`"
     },
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9270,6 +10576,8 @@
     "expansion": null,
     "operation": "std::fs::set_permissions",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9297,6 +10605,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9324,6 +10634,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9351,6 +10663,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9378,6 +10692,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9405,6 +10721,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9432,6 +10750,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9459,6 +10779,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9486,6 +10808,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9513,6 +10837,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9540,6 +10866,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9567,6 +10895,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9594,6 +10924,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9621,6 +10953,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9643,11 +10977,40 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "digest-keyed OCI layer-cache entry replicated into the per-run scratch by `replicate_tree`"
+    },
+    "expansion": null,
+    "operation": "std::fs::symlink_metadata",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/layer_cache.rs:349 in `replicate_tree`, `std::fs::symlink_metadata` reads only a node of the digest-keyed OCI layer-cache entry being replicated into the per-run scratch.",
+    "review_id": "HA-000744",
+    "source": {
+      "byte_end": 15695,
+      "byte_start": 15670,
+      "column": 14,
+      "column_end": 39,
+      "column_start": 14,
+      "file": "crates/carrick-vfs/src/layer_cache.rs",
+      "line": 349,
+      "line_end": 349,
+      "line_start": 349
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-SYMLINK-METADATA",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "digest-keyed OCI layer-cache entry used by `remove_path`"
     },
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9675,6 +11038,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9702,6 +11067,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9729,6 +11096,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9756,6 +11125,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9783,6 +11154,8 @@
     "expansion": null,
     "operation": "std::fs::symlink_metadata",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -9914,6 +11287,7 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/resources.rs:1062 in `persist_named`, `std::fs::write` accesses only the validated Docker-compatible resource state object and atomic temporary.",
@@ -9940,6 +11314,7 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:919 in `tag_image`, `std::fs::write` accesses only the configured OCI image-store object used by `tag_image`.",
@@ -9966,6 +11341,7 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:1040 in `load_docker_archive_for_platform`, `std::fs::write` accesses only the configured OCI image-store object used by `load_docker_archive_for_platform`.",
@@ -9992,6 +11368,7 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:1105 in `load_docker_archive_for_platform`, `std::fs::write` accesses only the configured OCI image-store object used by `load_docker_archive_for_platform`.",
@@ -10018,6 +11395,7 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:1106 in `load_docker_archive_for_platform`, `std::fs::write` accesses only the configured OCI image-store object used by `load_docker_archive_for_platform`.",
@@ -10044,6 +11422,7 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-image/src/lib.rs:1114 in `load_docker_archive_for_platform`, `std::fs::write` accesses only the configured OCI image-store object used by `load_docker_archive_for_platform`.",
@@ -10070,6 +11449,8 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10097,6 +11478,8 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10124,6 +11507,8 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10205,6 +11590,8 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10232,6 +11619,8 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10259,6 +11648,8 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10286,6 +11677,8 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10313,6 +11706,8 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10340,6 +11735,8 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10367,6 +11764,8 @@
     "expansion": null,
     "operation": "std::fs::write",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10385,6 +11784,33 @@
     }
   },
   {
+    "catalog_id": "HA-CATALOG-FS-WRITE",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
+      "resource": "symlink owner sidecar beside the capability-resolved bind backing used by `write_symlink_owner_sidecar`"
+    },
+    "expansion": null,
+    "operation": "std::fs::write",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vfs/src/vfs/bind.rs:189 in the non-macOS `write_symlink_owner_sidecar`, `std::fs::write` writes only the guest-owner sidecar beside a symlink in the resolved bind backing; the stored uid/gid are Carrick's own guest metadata, not a host answer.",
+    "review_id": "HA-000745",
+    "source": {
+      "byte_end": 8298,
+      "byte_start": 8284,
+      "column": 5,
+      "column_end": 19,
+      "column_start": 5,
+      "file": "crates/carrick-vfs/src/vfs/bind.rs",
+      "line": 189,
+      "line_end": 189,
+      "line_start": 189
+    }
+  },
+  {
     "catalog_id": "HA-CATALOG-NET-TCP-LISTENER-BIND",
     "classification": "declared_backing",
     "evidence": {
@@ -10394,6 +11820,7 @@
     "expansion": null,
     "operation": "std::net::TcpListener::bind",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:1097 in `validate_published_port_availability`, `std::net::TcpListener::bind` accesses only the published host endpoint authorized by container configuration.",
@@ -10420,6 +11847,8 @@
     "expansion": null,
     "operation": "std::net::TcpListener::bind",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10447,6 +11876,7 @@
     "expansion": null,
     "operation": "std::net::UdpSocket::bind",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:1106 in `validate_published_port_availability`, `std::net::UdpSocket::bind` accesses only the published host endpoint authorized by container configuration.",
@@ -10473,6 +11903,8 @@
     "expansion": null,
     "operation": "std::net::UdpSocket::bind",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10500,6 +11932,8 @@
     "expansion": null,
     "operation": "std::net::UdpSocket::bind",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10527,6 +11961,8 @@
     "expansion": null,
     "operation": "std::net::UdpSocket::bind",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -10554,6 +11990,7 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/commands.rs:591 in `run_cli`, the host result from `std::process::id` determines the container identifier returned by the CLI run operation used by `run_cli`.",
@@ -10658,6 +12095,7 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:404 in `carrier_entry`, `std::process::id` acts only on the current launcher carrier identity used by `carrier_entry` at line 379; no guest identity selects its host target.",
@@ -10684,6 +12122,7 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:448 in `new_container_id`, the host result from `std::process::id` determines the detached or relaunched container identifier generated by `new_container_id`.",
@@ -10710,6 +12149,7 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/runtime_util.rs:56 in `anon_bridge_namespace_id`, `std::process::id` is sampled once to synthesize an anonymous network namespace ID for bridge containers that do not supply an explicit namespace name; no guest identity selects its host target.",
@@ -10736,6 +12176,7 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/handlers.rs:2331 in `create_exec`, the host result from `std::process::id` determines the Docker-compatible container exec identifier used by `create_exec`.",
@@ -10762,6 +12203,7 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/resources.rs:1061 in `persist_named`, `std::process::id` accesses only the validated Docker-compatible resource state object and atomic temporary.",
@@ -10788,6 +12230,7 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/supervisor_perf.rs:68 in `record_top_level_pid`, `std::process::id` acts only on the current CLI supervisor-performance probe used by `record_top_level_pid`; no guest identity selects its host target.",
@@ -10814,6 +12257,7 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/supervisor_perf.rs:148 in `emit_supervisor_record_if_profiling`, `std::process::id` acts only on the current CLI supervisor-performance probe used by `emit_supervisor_record_if_profiling`; no guest identity selects its host target.",
@@ -10840,6 +12284,7 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/supervisor_perf.rs:163 in `emit_supervisor_record_to_fd_if_top_level`, `std::process::id` acts only on the current CLI supervisor-performance probe used by `emit_supervisor_record_to_fd_if_top_level`; no guest identity selects its host target.",
@@ -10866,6 +12311,7 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/trace_profile.rs:413 in `capture_provenance`, `std::process::id` accesses only the selected traced binary and run-scoped profile identity.",
@@ -10892,6 +12338,7 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-embed/src/deadline.rs:230 in `wedged`, `std::process::id` acts only on owned Carrier deadline worker and current host Carrier PID used only for scoped wedge capture; it does not delegate Linux namespace or process authority to the host.",
@@ -10918,6 +12365,7 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-embed/src/prepared.rs:166 in `run_id_from`, `std::process::id` acts only on current host process entropy used only to construct a scoped container run ID; it does not delegate Linux namespace or process authority to the host.",
@@ -10944,6 +12392,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -10972,6 +12422,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -11000,6 +12452,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -11028,6 +12482,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -11056,6 +12512,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -11084,6 +12542,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -11112,6 +12572,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -11140,6 +12602,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -11168,6 +12632,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -11196,6 +12662,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -11300,6 +12768,33 @@
   },
   {
     "catalog_id": "HA-CATALOG-PROCESS-ID",
+    "classification": "forbidden_semantic",
+    "evidence": {
+      "authority": "guest_answer",
+      "resource": "guest /proc process-membership result used by `is_guest_process`"
+    },
+    "expansion": null,
+    "operation": "std::process::id",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-host/src/host_proc.rs:1725 in the non-macOS `is_guest_process`, the host result from `std::process::id` anchors the host ppid-chain walk that determines the guest /proc process-membership result.",
+    "review_id": "HA-000746",
+    "source": {
+      "byte_end": 72211,
+      "byte_start": 72195,
+      "column": 18,
+      "column_end": 34,
+      "column_start": 18,
+      "file": "crates/carrick-host/src/host_proc.rs",
+      "line": 1725,
+      "line_end": 1725,
+      "line_start": 1725
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-ID",
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
@@ -11336,6 +12831,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -11364,6 +12861,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11391,6 +12890,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11418,6 +12919,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11445,6 +12948,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11472,6 +12977,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11499,6 +13006,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11526,6 +13035,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11553,6 +13064,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11580,6 +13093,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11607,6 +13122,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11634,6 +13151,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11661,6 +13180,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11688,6 +13209,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11715,6 +13238,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11742,6 +13267,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11769,6 +13296,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11796,6 +13325,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11823,6 +13354,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11850,6 +13383,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11877,6 +13412,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11904,6 +13441,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11931,6 +13470,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11958,6 +13499,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -11985,6 +13528,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12012,6 +13557,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12039,6 +13586,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12120,6 +13669,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12147,6 +13698,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12174,6 +13727,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12201,6 +13756,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12228,6 +13785,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12255,6 +13814,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12282,6 +13843,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12309,6 +13872,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12336,6 +13901,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12363,6 +13930,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12390,6 +13959,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12417,6 +13988,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12444,6 +14017,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12471,6 +14046,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12498,6 +14075,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12525,6 +14104,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12552,6 +14133,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12579,6 +14162,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12606,6 +14191,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12633,6 +14220,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12660,6 +14249,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12687,6 +14278,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12714,6 +14307,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12741,6 +14336,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12768,6 +14365,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12795,6 +14394,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12822,6 +14423,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12849,6 +14452,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12876,6 +14481,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12903,6 +14510,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12930,6 +14539,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12957,6 +14568,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -12984,6 +14597,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -13011,6 +14626,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -13038,6 +14655,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -13065,6 +14684,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -13092,6 +14713,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -13119,6 +14742,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -13146,6 +14771,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -13173,6 +14800,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -13200,6 +14829,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -13227,6 +14858,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -13254,6 +14887,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13282,6 +14917,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13338,6 +14975,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13366,6 +15005,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13394,6 +15035,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13422,6 +15065,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13450,6 +15095,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13478,6 +15125,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13506,6 +15155,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13534,6 +15185,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13562,6 +15215,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13730,6 +15385,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13758,6 +15415,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13786,6 +15445,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13814,6 +15475,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13842,6 +15505,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13870,6 +15535,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13898,6 +15565,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13926,6 +15595,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13954,6 +15625,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -13982,6 +15655,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -14010,6 +15685,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -14038,6 +15715,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14065,6 +15744,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14092,6 +15773,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14119,6 +15802,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -14147,6 +15832,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -14175,6 +15862,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14202,6 +15891,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14229,6 +15920,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14256,6 +15949,8 @@
     "expansion": null,
     "operation": "std::process::id",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14358,6 +16053,87 @@
     }
   },
   {
+    "catalog_id": "HA-CATALOG-PROCESS-ID",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current carrier pid in the opt-in KVM exit-stats diagnostic line used by `print_kvm_stats_once`"
+    },
+    "expansion": null,
+    "operation": "std::process::id",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vmm-kvm/src/kvm.rs:201 in `print_kvm_stats_once`, `std::process::id` names only the current carrier in the `CARRICK_KVM_STATS` diagnostic line on stderr; no guest identity selects its host target.",
+    "review_id": "HA-000747",
+    "source": {
+      "byte_end": 7256,
+      "byte_start": 7240,
+      "column": 9,
+      "column_end": 25,
+      "column_start": 9,
+      "file": "crates/carrick-vmm-kvm/src/kvm.rs",
+      "line": 201,
+      "line_end": 201,
+      "line_start": 201
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-ID",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current carrier pid in the opt-in x86 syscall-stats diagnostic lines used by `print_x86_syscall_stats_once`"
+    },
+    "expansion": null,
+    "operation": "std::process::id",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-x86/src/engine.rs:116 in `print_x86_syscall_stats_once`, `std::process::id` names only the current carrier in the `CARRICK_X86_SYSCALL_STATS` summary line on stderr; no guest identity selects its host target.",
+    "review_id": "HA-000748",
+    "source": {
+      "byte_end": 4559,
+      "byte_start": 4543,
+      "column": 9,
+      "column_end": 25,
+      "column_start": 9,
+      "file": "crates/carrick-x86/src/engine.rs",
+      "line": 116,
+      "line_end": 116,
+      "line_start": 116
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-PROCESS-ID",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "current carrier pid in the opt-in x86 syscall-stats diagnostic lines used by `print_x86_syscall_stats_once`"
+    },
+    "expansion": null,
+    "operation": "std::process::id",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-x86/src/engine.rs:130 in `print_x86_syscall_stats_once`, `std::process::id` names only the current carrier in each `CARRICK_X86_SYSCALL_STATS` per-syscall line on stderr; no guest identity selects its host target.",
+    "review_id": "HA-000749",
+    "source": {
+      "byte_end": 5110,
+      "byte_start": 5094,
+      "column": 13,
+      "column_end": 29,
+      "column_start": 13,
+      "file": "crates/carrick-x86/src/engine.rs",
+      "line": 130,
+      "line_end": 130,
+      "line_start": 130
+    }
+  },
+  {
     "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
     "classification": "declared_substrate",
     "evidence": {
@@ -14419,6 +16195,7 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-embed/src/carrier.rs:117 in `new`, `std::thread::Builder::new` acts only on owned Carrier finalizer worker joined through shutdown completion; it does not delegate Linux namespace or process authority to the host.",
@@ -14445,6 +16222,7 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-embed/src/deadline.rs:177 in `run_with_carrier_budget`, `std::thread::Builder::new` acts only on owned Carrier deadline worker and current host Carrier PID used only for scoped wedge capture; it does not delegate Linux namespace or process authority to the host.",
@@ -14471,6 +16249,7 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-embed/src/testing/invariants.rs:156 in `fork_admitted`, `std::thread::Builder::new` acts only on owned audit deadline workers keyed by exact TaskKey and cancellation channels; it does not delegate Linux namespace or process authority to the host.",
@@ -14497,6 +16276,7 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-embed/src/testing/invariants.rs:252 in `arm_task`, `std::thread::Builder::new` acts only on owned audit deadline workers keyed by exact TaskKey and cancellation channels; it does not delegate Linux namespace or process authority to the host.",
@@ -14523,6 +16303,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -14551,6 +16333,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -14574,11 +16358,40 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
+      "resource": "carrier-owned host signal pump thread used by `spawn_pump_thread`"
+    },
+    "expansion": null,
+    "operation": "std::thread::Builder::new",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-hal/src/signal_pump.rs:254 in `spawn_pump_thread`, `std::thread::Builder::new` creates only the carrier-owned `carrick-sig-pump` thread that drains the self-pipe and kicks this carrier's registered vCPUs; no guest identity selects its host target.",
+    "review_id": "HA-000750",
+    "source": {
+      "byte_end": 10809,
+      "byte_start": 10784,
+      "column": 18,
+      "column_end": 43,
+      "column_start": 18,
+      "file": "crates/carrick-hal/src/signal_pump.rs",
+      "line": 254,
+      "line_end": 254,
+      "line_start": 254
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-THREAD-BUILDER-NEW",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
       "resource": "current carrier timer-delivery helper thread used by `arm_fallback_posix_timer`"
     },
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -14607,6 +16420,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14634,6 +16449,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14661,6 +16478,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14688,6 +16507,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14715,6 +16536,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14742,6 +16565,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14769,6 +16594,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14796,6 +16623,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14823,6 +16652,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14850,6 +16681,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14877,6 +16710,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14904,6 +16739,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14931,6 +16768,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14958,6 +16797,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -14985,6 +16826,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15012,6 +16855,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15039,6 +16884,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15066,6 +16913,8 @@
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15255,6 +17104,7 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:1040 in `await_detached_ready`, `std::thread::sleep` acts only on the current launcher carrier identity used by `await_detached_ready` at line 986; no guest identity selects its host target.",
@@ -15281,6 +17131,7 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:1783 in `wait_for_terminal_receipt`, `std::thread::sleep` acts only on the current launcher carrier identity used by `wait_for_terminal_receipt` at line 1707; no guest identity selects its host target.",
@@ -15307,6 +17158,7 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:1948 in `run_control_exec_capture`, `std::thread::sleep` acts only on the current launcher carrier identity used by `run_control_exec_capture` at line 1860; no guest identity selects its host target.",
@@ -15333,6 +17185,7 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:2065 in `wait_one`, `std::thread::sleep` acts only on the current container-lifecycle polling thread used by `wait_one`; no guest identity selects its host target.",
@@ -15359,6 +17212,7 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/lifecycle.rs:2510 in `logs`, `std::thread::sleep` acts only on the current container-lifecycle polling thread used by `logs`; no guest identity selects its host target.",
@@ -15385,6 +17239,7 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/quiet_host.rs:125 in `preflight_quiet_host`, `std::thread::sleep` acts only on the current quiet-host preflight worker used by `preflight_quiet_host`; no guest identity selects its host target.",
@@ -15411,6 +17266,7 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/handlers.rs:518 in `wait_container_stream`, `std::thread::sleep` acts only on the current API request polling worker used by `wait_container_stream`; no guest identity selects its host target.",
@@ -15437,6 +17293,7 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-cli/src/serve/spawn.rs:158 in `wait_container`, `std::thread::sleep` acts only on the current API helper polling worker used by `wait_container`; no guest identity selects its host target.",
@@ -15463,6 +17320,7 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-embed/src/contracts.rs:59 in `get_carrier`, `std::thread::sleep` acts only on explicit host-side workload measurement observer; it does not delegate Linux namespace or process authority to the host.",
@@ -15489,6 +17347,7 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
       "macos-cli-default"
     ],
     "rationale": "At crates/carrick-embed/src/testing.rs:804 in `intercept`, `std::thread::sleep` acts only on explicit test-interceptor jitter on the authenticated Carrier worker; it does not delegate Linux namespace or process authority to the host.",
@@ -15515,6 +17374,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -15543,6 +17404,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -15571,6 +17434,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -15599,6 +17464,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -15627,6 +17494,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -15655,6 +17524,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -15683,6 +17554,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15710,6 +17583,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15737,6 +17612,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15764,6 +17641,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15791,6 +17670,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15818,6 +17699,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15845,6 +17728,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15872,6 +17757,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15899,6 +17786,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15926,6 +17815,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15953,6 +17844,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -15980,6 +17873,8 @@
     "expansion": null,
     "operation": "std::thread::sleep",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16054,6 +17949,33 @@
     }
   },
   {
+    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "calling carrier thread's 20 ms host TSC calibration window used by `calibrate_host_tsc_hz`"
+    },
+    "expansion": null,
+    "operation": "std::thread::sleep",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-x86/src/vdso.rs:91 in `calibrate_host_tsc_hz`, `std::thread::sleep` pauses only the calling carrier thread for the fixed 20 ms window that times the host TSC for the x86 vDSO vvar page; no guest identity selects its host target.",
+    "review_id": "HA-000751",
+    "source": {
+      "byte_end": 4127,
+      "byte_start": 4109,
+      "column": 5,
+      "column_end": 23,
+      "column_start": 5,
+      "file": "crates/carrick-x86/src/vdso.rs",
+      "line": 91,
+      "line_end": 91,
+      "line_start": 91
+    }
+  },
+  {
     "catalog_id": "HA-CATALOG-THREAD-SPAWN",
     "classification": "declared_substrate",
     "evidence": {
@@ -16063,6 +17985,8 @@
     "expansion": null,
     "operation": "std::thread::spawn",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16090,6 +18014,8 @@
     "expansion": null,
     "operation": "std::thread::spawn",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16117,6 +18043,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -16145,6 +18073,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -16173,6 +18103,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -16201,6 +18133,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-hvf-default",
       "macos-runtime-default"
@@ -16229,6 +18163,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16256,6 +18192,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16283,6 +18221,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16310,6 +18250,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16337,6 +18279,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16364,6 +18308,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16391,6 +18337,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16418,6 +18366,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16445,6 +18395,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16472,6 +18424,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16499,6 +18453,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16526,6 +18482,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16580,6 +18538,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
@@ -16607,6 +18567,8 @@
     "expansion": null,
     "operation": "std::thread::yield_now",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],

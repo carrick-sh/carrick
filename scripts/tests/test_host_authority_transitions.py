@@ -338,11 +338,24 @@ def reviewed_row(
 
 
 def injected_receipt(reviewed):
+    host_authority = load_host_authority()
+    executed = list(host_authority.LOCAL_MACOS_PROFILES)
+    rows = []
+    for row in reviewed:
+        captured = sorted(set(row["profiles"]) & set(executed))
+        if captured:
+            rows.append(
+                {
+                    field: (captured if field == "profiles" else row[field])
+                    for field in host_authority.ACTUAL_FIELDS
+                }
+            )
     return {
-        "rows": [
-            {field: row[field] for field in load_host_authority().ACTUAL_FIELDS}
-            for row in reviewed
-        ]
+        "executed_profiles": executed,
+        "pending_profiles": sorted(
+            set(host_authority.EXPECTED_PROFILE_COMMANDS) - set(executed)
+        ),
+        "rows": rows,
     }
 
 
@@ -3082,6 +3095,44 @@ class IndependentAuthorityArtifactsTest(unittest.TestCase):
         ]
         with self.assertRaises(self.host_authority.InventoryError):
             validate(rows, injected_receipt(rows))
+
+    def test_receipt_validation_projects_inventory_onto_capture_slice(self):
+        validate = self.require_interface("validate_inventory_against_receipt")
+
+        def row(review_id, line, profiles):
+            return reviewed_row(
+                review_id=review_id,
+                location=source(line=line, byte_start=line * 10, byte_end=line * 10 + 5),
+                profiles=profiles,
+                rationale=(
+                    f"At crates/example/src/lib.rs:{line}, std::process::id "
+                    f"answers guest identity for {review_id}."
+                ),
+            )
+
+        mac_only = row("HA-000001", 10, ["macos-cli-default"])
+        shared = row("HA-000002", 20, ["linux-cli", "macos-cli-default"])
+        linux_only = row("HA-000003", 30, ["linux-cli", "linux-runtime"])
+        inventory = [mac_only, shared, linux_only]
+        receipt = injected_receipt(inventory)
+        self.assertEqual(len(receipt["rows"]), 2)
+        self.assertEqual(receipt["rows"][1]["profiles"], ["macos-cli-default"])
+        validate(inventory, receipt)
+        self.assertEqual(
+            self.host_authority.rows_outside_receipt(inventory, receipt), 1
+        )
+
+        unknown_profile = [mac_only, shared, {**linux_only, "profiles": ["plan9-cli"]}]
+        with self.assertRaisesRegex(self.host_authority.InventoryError, "outside"):
+            validate(unknown_profile, receipt)
+
+        lost_macos = [mac_only, {**shared, "profiles": ["linux-cli"]}, linux_only]
+        with self.assertRaises(self.host_authority.InventoryError):
+            validate(lost_macos, receipt)
+
+        unscoped = {"rows": receipt["rows"]}
+        with self.assertRaises(self.host_authority.InventoryError):
+            validate(inventory, unscoped)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,12 @@ SPEC.loader.exec_module(RECONCILE)
 
 RefusedError = RECONCILE.RefusedError
 
+# The reconciler rebinds only rows naming a profile the candidate compiled, and
+# replaces the capture only from a candidate of exactly the capture's slice.
+MACOS_SLICE = ["macos-cli-default", "macos-hvf-default", "macos-runtime-default"]
+LINUX_SLICE = ["linux-cli", "linux-runtime"]
+MACOS_CAPTURE_FIXTURE = {"kind": "macos_hvf", "executed_profiles": MACOS_SLICE, "rows": []}
+
 
 class RehomeInventoriesTests(unittest.TestCase):
     def setUp(self):
@@ -253,6 +259,7 @@ class RehomeInventoriesTests(unittest.TestCase):
         """A new group must not replace either reviewed artifact."""
         rel_file = "crates/carrick-runtime/src/new_profile.rs"
         candidate = {
+            "executed_profiles": MACOS_SLICE,
             "capture_receipt": {
                 "kind": "macos_hvf",
                 "rows": [{"capture": "new-row"}],
@@ -316,6 +323,7 @@ class RehomeInventoriesTests(unittest.TestCase):
         rel_b = "crates/carrick-vmm-hvf/src/target_ha.rs"
 
         cand_data = {
+            "executed_profiles": MACOS_SLICE,
             "capture_receipt": {"kind": "macos_hvf", "rows": []},
             "rows": [
                 {
@@ -342,7 +350,7 @@ class RehomeInventoriesTests(unittest.TestCase):
 
         inv_path = self.migrate_dir / "host-authority-transition-inventory.json"
         cap_path = self.migrate_dir / "host-authority-macos-capture.json"
-        cap_path.write_text(json.dumps({"kind": "macos_hvf", "rows": []}, indent=2) + "\n")
+        cap_path.write_text(json.dumps(MACOS_CAPTURE_FIXTURE, indent=2) + "\n")
 
         row = {
             "review_id": "HA-000001",
@@ -408,6 +416,7 @@ class RehomeInventoriesTests(unittest.TestCase):
         rel_b = "crates/carrick-vmm-hvf/src/target_ha.rs"
 
         cand_data = {
+            "executed_profiles": MACOS_SLICE,
             "capture_receipt": {"kind": "macos_hvf", "rows": []},
             "rows": [
                 {
@@ -434,7 +443,7 @@ class RehomeInventoriesTests(unittest.TestCase):
 
         inv_path = self.migrate_dir / "host-authority-transition-inventory.json"
         cap_path = self.migrate_dir / "host-authority-macos-capture.json"
-        cap_path.write_text(json.dumps({"kind": "macos_hvf", "rows": []}, indent=2) + "\n")
+        cap_path.write_text(json.dumps(MACOS_CAPTURE_FIXTURE, indent=2) + "\n")
 
         row = {
             "catalog_id": "HA-CATALOG-FS-READ-DIR",
@@ -483,6 +492,7 @@ class RehomeInventoriesTests(unittest.TestCase):
         rel_b = "crates/carrick-vmm-hvf/src/target_ha.rs"
 
         cand_data = {
+            "executed_profiles": MACOS_SLICE,
             "capture_receipt": {"kind": "macos_hvf", "rows": []},
             "rows": [
                 {
@@ -498,7 +508,7 @@ class RehomeInventoriesTests(unittest.TestCase):
         cand_path.write_text(json.dumps(cand_data, indent=2) + "\n")
         inv_path = self.migrate_dir / "host-authority-transition-inventory.json"
         cap_path = self.migrate_dir / "host-authority-macos-capture.json"
-        cap_path.write_text(json.dumps({"kind": "macos_hvf", "rows": []}, indent=2) + "\n")
+        cap_path.write_text(json.dumps(MACOS_CAPTURE_FIXTURE, indent=2) + "\n")
 
         row = {
             "review_id": "HA-000001",
@@ -530,6 +540,7 @@ class RehomeInventoriesTests(unittest.TestCase):
         rel_b = "crates/carrick-vmm-hvf/src/target_ha.rs"
 
         cand_data = {
+            "executed_profiles": MACOS_SLICE,
             "capture_receipt": {"kind": "macos_hvf", "rows": []},
             "rows": [
                 {
@@ -552,7 +563,7 @@ class RehomeInventoriesTests(unittest.TestCase):
         cand_path.write_text(json.dumps(cand_data, indent=2) + "\n")
         inv_path = self.migrate_dir / "host-authority-transition-inventory.json"
         cap_path = self.migrate_dir / "host-authority-macos-capture.json"
-        cap_path.write_text(json.dumps({"kind": "macos_hvf", "rows": []}, indent=2) + "\n")
+        cap_path.write_text(json.dumps(MACOS_CAPTURE_FIXTURE, indent=2) + "\n")
 
         row = {
             "review_id": "HA-000001",
@@ -579,6 +590,7 @@ class RehomeInventoriesTests(unittest.TestCase):
     def test_host_authority_vanished_site_refused(self):
         """Host authority row with no candidates is refused when rehome=True."""
         cand_data = {
+            "executed_profiles": MACOS_SLICE,
             "capture_receipt": {"kind": "macos_hvf", "rows": []},
             "rows": [],
         }
@@ -586,7 +598,7 @@ class RehomeInventoriesTests(unittest.TestCase):
         cand_path.write_text(json.dumps(cand_data, indent=2) + "\n")
         inv_path = self.migrate_dir / "host-authority-transition-inventory.json"
         cap_path = self.migrate_dir / "host-authority-macos-capture.json"
-        cap_path.write_text(json.dumps({"kind": "macos_hvf", "rows": []}, indent=2) + "\n")
+        cap_path.write_text(json.dumps(MACOS_CAPTURE_FIXTURE, indent=2) + "\n")
 
         rel_a = "crates/carrick-vmm-hvf/src/source_ha.rs"
         row = {
@@ -610,6 +622,103 @@ class RehomeInventoriesTests(unittest.TestCase):
                 rehome=True,
                 root=self.root,
             )
+
+    @staticmethod
+    def _ha_row(review_id: str, rel: str, line: int, profiles: list[str]) -> dict:
+        return {
+            "review_id": review_id,
+            "catalog_id": "HA-CATALOG-PROCESS-GETEUID",
+            "operation": "libc::geteuid",
+            "classification": "declared_substrate",
+            "evidence": {"authority": "authenticated_carrier", "resource": f"res {review_id}"},
+            "expansion": None,
+            "profiles": profiles,
+            "rationale": f"At {rel}:{line} in `f`, libc::geteuid acts on {review_id}.",
+            "source": {
+                "file": rel,
+                "line": line,
+                "column": 1,
+                "column_start": 1,
+                "column_end": 10,
+                "line_start": line,
+                "line_end": line,
+                "byte_start": line * 100,
+                "byte_end": line * 100 + 9,
+            },
+        }
+
+    def test_host_authority_linux_candidate_rebinds_only_linux_rows(self):
+        """A Linux candidate cannot see macOS profiles: it must leave macOS-only
+        rows and the macOS capture untouched, rebind its own rows, and only
+        narrow (never drop) a shared row whose call vanished on Linux."""
+        mac_only = self._ha_row("HA-000001", "crates/x/src/mac.rs", 10, ["macos-cli-default"])
+        shared = self._ha_row("HA-000002", "crates/x/src/both.rs", 20, ["linux-cli", "macos-cli-default"])
+        linux_only = self._ha_row("HA-000003", "crates/x/src/both.rs", 30, ["linux-cli"])
+        shared_gone = self._ha_row("HA-000004", "crates/x/src/gone.rs", 5, ["linux-cli", "macos-cli-default"])
+        linux_gone = self._ha_row("HA-000005", "crates/x/src/linux_gone.rs", 7, ["linux-cli"])
+        moved = []
+        for row, line in ((shared, 22), (linux_only, 32)):
+            fresh = self._ha_row("HA-999999", row["source"]["file"], line, ["linux-cli"])
+            moved.append({k: fresh[k] for k in ("catalog_id", "operation", "source", "expansion", "profiles")})
+        cand_path = self.root / "candidate.json"
+        cand_path.write_text(
+            json.dumps(
+                {
+                    "executed_profiles": LINUX_SLICE,
+                    "capture_receipt": {"kind": "linux-capture", "rows": moved},
+                    "rows": moved,
+                },
+                indent=2,
+            )
+            + "\n"
+        )
+        inv_path = self.migrate_dir / "host-authority-transition-inventory.json"
+        cap_path = self.migrate_dir / "host-authority-macos-capture.json"
+        inv_path.write_text(
+            json.dumps([mac_only, shared, linux_only, shared_gone, linux_gone], indent=2) + "\n"
+        )
+        cap_path.write_text(json.dumps(MACOS_CAPTURE_FIXTURE, indent=2) + "\n")
+        capture_before = cap_path.read_bytes()
+
+        RECONCILE.reconcile_host_authority(
+            candidate_path=cand_path,
+            inventory_path=inv_path,
+            capture_path=cap_path,
+            root=self.root,
+        )
+
+        self.assertEqual(cap_path.read_bytes(), capture_before)
+        rows = {row["review_id"]: row for row in json.loads(inv_path.read_text())}
+        self.assertEqual(rows["HA-000001"], mac_only)
+        self.assertEqual(rows["HA-000002"]["source"]["line"], 22)
+        self.assertIn("crates/x/src/both.rs:22", rows["HA-000002"]["rationale"])
+        self.assertEqual(rows["HA-000002"]["profiles"], ["linux-cli", "macos-cli-default"])
+        self.assertEqual(rows["HA-000003"]["source"]["line"], 32)
+        self.assertEqual(rows["HA-000004"]["profiles"], ["macos-cli-default"])
+        self.assertEqual(rows["HA-000004"]["source"], shared_gone["source"])
+        self.assertNotIn("HA-000005", rows)
+
+    def test_host_authority_candidate_without_executed_profiles_refused(self):
+        """A candidate that does not name its compiled profiles cannot say which
+        reviewed rows it may rebind; refuse before writing either artifact."""
+        row = self._ha_row("HA-000001", "crates/x/src/mac.rs", 10, ["macos-cli-default"])
+        cand_path = self.root / "candidate.json"
+        cand_path.write_text(json.dumps({"capture_receipt": {"rows": []}, "rows": []}) + "\n")
+        inv_path = self.migrate_dir / "host-authority-transition-inventory.json"
+        cap_path = self.migrate_dir / "host-authority-macos-capture.json"
+        inv_path.write_text(json.dumps([row], indent=2) + "\n")
+        cap_path.write_text(json.dumps(MACOS_CAPTURE_FIXTURE, indent=2) + "\n")
+        inventory_before = inv_path.read_bytes()
+        capture_before = cap_path.read_bytes()
+        with self.assertRaisesRegex(RefusedError, "executed_profiles"):
+            RECONCILE.reconcile_host_authority(
+                candidate_path=cand_path,
+                inventory_path=inv_path,
+                capture_path=cap_path,
+                root=self.root,
+            )
+        self.assertEqual(inv_path.read_bytes(), inventory_before)
+        self.assertEqual(cap_path.read_bytes(), capture_before)
 
     # --- Dispatch Lock Authority Tests ---
 

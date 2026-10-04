@@ -1761,21 +1761,73 @@ def load_capture_receipt(
     return raw
 
 
+def _receipt_profile_scope(
+    receipt: Mapping[str, object],
+) -> tuple[set[str], set[str]]:
+    """Return the receipt's (executed, required) profile sets, fail closed."""
+    executed = _profile_set(receipt.get("executed_profiles"), "capture executed")
+    pending_raw = receipt.get("pending_profiles")
+    if not isinstance(pending_raw, Sequence) or isinstance(pending_raw, (str, bytes)):
+        raise InventoryError("capture pending profiles must be a sequence")
+    pending = set(pending_raw)
+    if not all(isinstance(value, str) and value for value in pending):
+        raise InventoryError("capture pending profiles contain invalid IDs")
+    if executed & pending:
+        raise InventoryError(
+            "capture executed and pending profiles overlap: "
+            f"{sorted(executed & pending)}"
+        )
+    return executed, executed | pending
+
+
 def validate_inventory_against_receipt(
     inventory: Sequence[dict[str, object]], receipt: Mapping[str, object]
 ) -> None:
-    """Require exact actual-row equality while independently validating reviews."""
+    """Require exact actual-row equality on the receipt's executed slice.
+
+    Every row is review-validated. The receipt is one host's compiler capture
+    (the canonical macOS slice), so only each row's projection onto the
+    receipt's executed profiles is compared with it, exactly as a live
+    ``--check`` projects reviewed rows onto the profiles it executed. A row
+    whose profiles all lie outside that slice (a Linux-, FreeBSD- or
+    NetBSD-only site) is verified only by a live ``--check`` on its own host,
+    which reports every profile it cannot compile as pending. A row naming a
+    profile outside the checked matrix fails closed here.
+    """
     _reviewed_index(inventory, allow_unreviewed=False)
     validate_source_specific_reviews(inventory)
-    projected = [
-        {field: row[field] for field in ACTUAL_FIELDS}
-        for row in inventory
-    ]
+    executed, required = _receipt_profile_scope(receipt)
+    projected = []
+    for row in inventory:
+        row_profiles = set(row["profiles"])
+        unknown = sorted(row_profiles - required)
+        if unknown:
+            raise InventoryError(
+                f"reviewed row {row.get('review_id')} names profiles outside "
+                f"the checked matrix: {unknown}"
+            )
+        captured = sorted(row_profiles & executed)
+        if not captured:
+            continue
+        projected.append(
+            {
+                field: (captured if field == "profiles" else row[field])
+                for field in ACTUAL_FIELDS
+            }
+        )
     receipt_rows = receipt.get("rows")
     if projected != receipt_rows:
         raise InventoryError(
             "reviewed inventory actual projection disagrees with compiler capture"
         )
+
+
+def rows_outside_receipt(
+    inventory: Sequence[dict[str, object]], receipt: Mapping[str, object]
+) -> int:
+    """Count reviewed rows that the checked receipt cannot verify."""
+    executed, _ = _receipt_profile_scope(receipt)
+    return sum(not (set(row["profiles"]) & executed) for row in inventory)
 
 
 def validate_source_specific_reviews(
@@ -2752,9 +2804,12 @@ def _run_checked_mode(
         )
         validate_inventory_against_receipt(reviews, receipt)
         if arguments.static:
+            outside = rows_outside_receipt(reviews, receipt)
             print(
                 "host-authority static authority passed: exact catalog, "
-                "macOS compiler receipt, and reviewed inventory agree"
+                "macOS compiler receipt, and reviewed inventory agree; "
+                f"{outside} reviewed row(s) outside the macOS slice are "
+                "verified only by a live --check on their own host"
             )
             return 0
     if snapshot is None:

@@ -28,7 +28,15 @@ Usage:
 
 The macOS capture is a machine artifact with no human review, so it is replaced
 wholesale from the candidate's receipt, preserving the checked-in file's key set
-and its `kind` discriminator.
+and its `kind` discriminator -- but ONLY when the candidate executed exactly the
+canonical macOS slice the capture records.
+
+Each host compiles only its own profiles, so a candidate can rebind only the
+reviewed rows that name at least one profile it executed. Rows for other hosts'
+profiles (Linux rows reconciled on macOS, macOS rows reconciled on Linux) are
+left byte-for-byte untouched; their positions are verified by a live `--check`
+on their own host. A reviewed group that vanished from the candidate loses only
+the candidate's executed profiles: the row is dropped once no profile remains.
 """
 from __future__ import annotations
 
@@ -52,6 +60,52 @@ REHOME_FUNCTION_ALIASES: dict[str, str] = {
 
 class RefusedError(Exception):
     """A change that needs review, not a position rebind."""
+
+
+def candidate_profiles(candidate: dict) -> set[str]:
+    """The profiles the candidate actually compiled; refuse to guess."""
+    executed = candidate.get("executed_profiles")
+    if (
+        not isinstance(executed, list)
+        or not executed
+        or not all(isinstance(profile, str) and profile for profile in executed)
+    ):
+        raise RefusedError(
+            "candidate names no executed_profiles, so it cannot say which "
+            "reviewed rows it is able to rebind"
+        )
+    return set(executed)
+
+
+def in_candidate_scope(row: dict, executed: set[str]) -> bool:
+    return bool(set(row["profiles"]) & executed)
+
+
+def replace_capture(candidate: dict, capture_path: Path, executed: set[str]) -> int | None:
+    """Replace the capture only from a candidate of exactly its recorded slice.
+
+    Returns the new capture row count, or None when the candidate compiled a
+    different host's profiles and the capture was left untouched.
+    """
+    capture = json.loads(capture_path.read_text(encoding="utf-8"))
+    if capture.get("executed_profiles") != sorted(executed):
+        return None
+    receipt = candidate["capture_receipt"]
+    kind = capture["kind"]
+    refreshed = {k: receipt[k] for k in capture.keys() if k in receipt}
+    refreshed["kind"] = kind
+    capture_path.write_text(json.dumps(refreshed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return len(refreshed["rows"])
+
+
+def report_capture(capture_rows: int | None, executed: set[str]) -> None:
+    if capture_rows is None:
+        print(
+            "capture left untouched: candidate executed "
+            f"{sorted(executed)}, not the capture's recorded slice"
+        )
+    else:
+        print(f"capture rows: {capture_rows}")
 
 
 def key(row: dict) -> tuple:
@@ -142,13 +196,17 @@ def reconcile_host_authority_positions(
 
     candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
     inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+    executed = candidate_profiles(candidate)
+    # Only rows naming a profile this candidate compiled can be checked against
+    # it; every other row belongs to another host's live `--check`.
+    scoped = [row for row in inventory if in_candidate_scope(row, executed)]
 
     fresh = collections.defaultdict(list)
     for row in candidate["rows"]:
         fresh[key(row)].append(row)
 
     reviewed = collections.defaultdict(list)
-    for row in inventory:
+    for row in scoped:
         reviewed[key(row)].append(row)
 
     # A position-only reconciliation cannot manufacture a human review for a
@@ -171,6 +229,7 @@ def reconcile_host_authority_positions(
     moved = 0
     rebound = 0
     dropped: list[tuple] = []
+    narrowed: list[str] = []
     ambiguous: list[tuple] = []
     drop_ids: set[int] = set()
 
@@ -198,7 +257,14 @@ def reconcile_host_authority_positions(
         elif not rehome:
             if not candidates:
                 for row in rows:
-                    drop_ids.add(id(row))
+                    # The call vanished from THIS host's profiles only; another
+                    # host's profiles on the row stay for that host to judge.
+                    remaining = sorted(set(row["profiles"]) - executed)
+                    if remaining:
+                        row["profiles"] = remaining
+                        narrowed.append(str(row.get("review_id")))
+                    else:
+                        drop_ids.add(id(row))
                 dropped.append(group)
             else:
                 ambiguous.append((group, len(rows), len(candidates)))
@@ -218,22 +284,20 @@ def reconcile_host_authority_positions(
         inventory.sort(key=canonical_row_sort_key)
         inventory_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-        receipt = candidate["capture_receipt"]
-        capture = json.loads(capture_path.read_text(encoding="utf-8"))
-        kind = capture["kind"]
-        refreshed = {k: receipt[k] for k in capture.keys() if k in receipt}
-        refreshed["kind"] = kind
-        capture_path.write_text(json.dumps(refreshed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        capture_rows = replace_capture(candidate, capture_path, executed)
 
         print(f"positions updated: {moved}")
         print(f"rationale site references rebound: {rebound}")
         for group in dropped:
             print(f"dropped (call no longer present): {group[0]} {group[1]} {group[2]}")
-        print(f"inventory rows: {len(inventory)}; capture rows: {len(refreshed['rows'])}")
+        for review_id in narrowed:
+            print(f"kept for other hosts' profiles only: {review_id}")
+        print(f"inventory rows: {len(inventory)}")
+        report_capture(capture_rows, executed)
         return moved
 
     # --- Rehome path ---
-    unmatched_reviewed = [r for r in inventory if id(r) not in matched_reviewed_ids]
+    unmatched_reviewed = [r for r in scoped if id(r) not in matched_reviewed_ids]
     unmatched_candidates = [r for r in candidate["rows"] if id(r) not in matched_candidate_ids]
 
     if unmatched_reviewed or unmatched_candidates:
@@ -324,16 +388,12 @@ def reconcile_host_authority_positions(
     inventory.sort(key=canonical_row_sort_key)
     inventory_path.write_text(json.dumps(inventory, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-    receipt = candidate["capture_receipt"]
-    capture = json.loads(capture_path.read_text(encoding="utf-8"))
-    kind = capture["kind"]
-    refreshed = {k: receipt[k] for k in capture.keys() if k in receipt}
-    refreshed["kind"] = kind
-    capture_path.write_text(json.dumps(refreshed, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    capture_rows = replace_capture(candidate, capture_path, executed)
 
     print(f"positions updated: {moved}")
     print(f"rationale site references rebound: {rebound}")
-    print(f"inventory rows: {len(inventory)}; capture rows: {len(refreshed['rows'])}")
+    print(f"inventory rows: {len(inventory)}")
+    report_capture(capture_rows, executed)
     return moved
 
 
