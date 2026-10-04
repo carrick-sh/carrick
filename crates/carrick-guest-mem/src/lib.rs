@@ -467,6 +467,13 @@ pub trait GuestMemory {
         Err(MemoryPrepareError::Fault(MemoryError::Unsupported))
     }
 
+    /// Supply an exact owner-issued physical dependency. A completed supply
+    /// only makes a retry eligible; the owner revalidates its live root and
+    /// permissions when the caller prepares again.
+    fn supply_memory(&self, _request: MemorySupplyRequest) -> Result<bool, MemoryError> {
+        Err(MemoryError::Unsupported)
+    }
+
     /// Borrow the legacy venue's inaccessible/unmapped sets. Admitted roots
     /// return `None` and authorize through their EL1 access implementation;
     /// modelless test memories also return `None`. Absence of this mirror is
