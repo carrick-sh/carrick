@@ -239,13 +239,15 @@ fn main() {
         let map = fresh(1);
         let base = map as usize;
         GO.store(0, Ordering::SeqCst);
-        let toucher = std::thread::spawn(move || {
-            while GO.load(Ordering::Acquire) == 0 {
-                std::hint::spin_loop();
-            }
-            // SAFETY: the page is live until the main thread joins us.
-            unsafe { std::ptr::write_volatile((base + 3000) as *mut u8, 0x5a) };
-        });
+        let toucher = std::thread::Builder::new()
+            .spawn(move || {
+                while GO.load(Ordering::Acquire) == 0 {
+                    std::hint::spin_loop();
+                }
+                // SAFETY: the page is live until the main thread joins us.
+                unsafe { std::ptr::write_volatile((base + 3000) as *mut u8, 0x5a) };
+            })
+            .unwrap_or_else(|error| fail("race-thread", format_args!("round={round} error={error}")));
         GO.store(1, Ordering::Release);
         let got = call(SYS_PREAD64, [fd as u64, map as u64, 2048, 0, 0, 0]);
         toucher.join().unwrap();
