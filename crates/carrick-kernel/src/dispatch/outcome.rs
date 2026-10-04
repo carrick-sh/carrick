@@ -516,6 +516,26 @@ pub enum DispatchOutcome {
     /// Backend: complete the syscall with `errno.guest_retval()` (the negative
     /// errno), service pending signals, and resume the task.
     Errno { errno: LinuxErrno },
+    /// An admitted EL1 owner declined memory preparation before the host
+    /// source was consumed. The runtime enrolls this exact owner/cause/revision
+    /// in the zone, releases the executor, and retries the saved syscall only
+    /// after its producer publishes a wake.
+    OwnerMemoryWait {
+        #[serde(skip_serializing)]
+        wait: carrick_el1_abi::PortalOwnerWait,
+    },
+    /// Physical supply was not yet published. No source byte was consumed;
+    /// retry the same saved syscall after serving this exact owner receipt.
+    OwnerMemorySupply {
+        #[serde(skip_serializing)]
+        request: carrick_guest_mem::MemorySupplyRequest,
+    },
+    /// A retained physical writer must drain before an owner permit can be
+    /// issued. The executor parks on the exact retained dependency.
+    OwnerPhysicalWait {
+        #[serde(skip_serializing)]
+        wait: carrick_guest_mem::OwnedMemoryWait,
+    },
     /// Backend: retire the syscall and take this Linux PROCESS through its terminal
     /// with `code`; nothing is written back.
     Exit { code: i32 },
@@ -1104,6 +1124,8 @@ impl CurrentMmMemory for LinearMemory {}
 #[derive(Debug, Error)]
 #[allow(private_interfaces)]
 pub enum DispatchError {
+    #[error("owner memory preparation failed: {0}")]
+    MemoryPreparation(String),
     #[error("host wait requires the exact outer resource scope")]
     HostWaitResourceScope,
     #[error("host wait completed after its exact thread retired")]
