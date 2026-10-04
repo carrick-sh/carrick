@@ -1887,7 +1887,7 @@ fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
         }
         crate::el1_inotify::deliver_owed_wakes();
         delivered += value as u64;
-        if value < chunk as i64 {
+        if value == 0 {
             break;
         }
     }
