@@ -633,6 +633,27 @@ fn update(ledger: &mut Ledger, row: &Record, path: &Path) -> Result<(), ScalerEr
     *target = row.clone();
     ledger.save(path)
 }
+fn finish_destroyed(
+    ledger: &mut Ledger,
+    row: &mut Record,
+    dir: &Path,
+    path: &Path,
+) -> Result<(), ScalerError> {
+    let (key, hosts) = key_paths(dir, row);
+    for file in [key.clone(), key.with_extension("key.pub"), hosts] {
+        if file.exists() {
+            std::fs::remove_file(file)?;
+        }
+    }
+    // Release the ledger budget only after the one-use transport is removed.
+    row.state = State::Destroyed;
+    update(ledger, row, path)?;
+    println!(
+        "vm={} absent; owned transport keys removed; ledger closed",
+        row.vm.get()
+    );
+    Ok(())
+}
 
 fn provision(
     pve: &Pve,
@@ -836,18 +857,7 @@ fn cleanup(
     if pve.inventory()?.iter().any(|v| v.id == row.vm.get()) {
         return Err(ScalerError::Guard("clone still exists after deletion"));
     }
-    row.state = State::Destroyed;
-    update(ledger, row, path)?;
-    let (key, hosts) = key_paths(dir, row);
-    for file in [key.clone(), key.with_extension("key.pub"), hosts] {
-        if file.exists() {
-            std::fs::remove_file(file)?;
-        }
-    }
-    println!(
-        "vm={} destroyed; pool inventory confirms absence",
-        row.vm.get()
-    );
+    finish_destroyed(ledger, row, dir, path)?;
     Ok(true)
 }
 
@@ -887,8 +897,7 @@ fn reconcile_one(
             // Recover a registration whose POST succeeded before its ID save.
             let _ = gh.assignment(&mut row)?;
             gh.remove_runner(&row)?;
-            row.state = State::Destroyed;
-            update(ledger, &row, path)?;
+            finish_destroyed(ledger, &mut row, dir, path)?;
             return Ok(true);
         }
         Recovery::Inspect => {}
@@ -1021,6 +1030,36 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn recovered_destruction_removes_owned_transport_credentials_and_preserves_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut row = row();
+        row.state = State::Reaping;
+        let mut ledger = Ledger {
+            rows: vec![row.clone()],
+        };
+        let path = dir.path().join("ledger.json");
+        ledger.save(&path).unwrap();
+        let (key, hosts) = key_paths(dir.path(), &row);
+        let files = [key.clone(), key.with_extension("key.pub"), hosts];
+        for file in &files {
+            std::fs::write(file, "fixture").unwrap();
+        }
+        let log = dir.path().join(format!("{}.runner.log", row.name));
+        let unrelated = dir.path().join("someone-else.key");
+        std::fs::write(&log, "workload log").unwrap();
+        std::fs::write(&unrelated, "fixture").unwrap();
+        finish_destroyed(&mut ledger, &mut row, dir.path(), &path).unwrap();
+        for file in files {
+            assert!(
+                !file.exists(),
+                "recovered deletion retained transport credentials"
+            );
+        }
+        assert!(log.exists());
+        assert!(unrelated.exists());
+        assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Destroyed);
+    }
     #[test]
     fn pve_read_and_delete_have_no_body_or_global_purge() {
         let token = Token {
