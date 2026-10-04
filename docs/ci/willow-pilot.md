@@ -84,7 +84,11 @@ build and CPL0 execution logs.
 
 Restart recovers successful JIT registration by its exact ledger name. Failed
 recorded tasks and absent reservations are distinguished from ambiguous clone
-POST outcomes. An ambiguous submission with neither an observable VM nor a
+POST outcomes. A successful recorded clone resumes preparation in place only
+for the same queued job/attempt, labels and approved SHA, using its live
+configuration and existing transport key. Historical failures stay in the
+ledger; a one-job success requires an actual recorded assignment.
+An ambiguous submission with neither an observable VM nor a
 recorded task deliberately freezes admission for owner investigation; it is
 never silently retried or released. API errors while a VM is active also
 freeze admission and retain the ledger.
