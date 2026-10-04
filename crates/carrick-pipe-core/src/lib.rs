@@ -46,6 +46,11 @@ pub enum Error {
     /// A shared record violates the pipe's invariants. A venue bug (both
     /// venues are trusted kernel code); fail closed, never a guest errno.
     Corrupt,
+    /// Readiness revision cannot advance. Retire this object incarnation;
+    /// never wrap and mistake a new publication for an old observation.
+    RevisionExhausted,
+    /// This view did not bind the object's venue-owned revision storage.
+    RevisionUnavailable,
 }
 
 /// Wake all matching object waiters, including readiness subscribers. These
@@ -63,6 +68,12 @@ pub struct Step<T> {
     pub wake: WakeSet,
 }
 impl<T> Step<T> {
+    /// Signal policy stays with the personality. True requests its SIGPIPE
+    /// decision, including a blocking writer that already delivered a prefix.
+    /// No signal is raised by the substrate.
+    pub const fn broken_pipe_signal(&self) -> bool {
+        matches!(self.result, Err(Error::BrokenPipe))
+    }
     fn quiet(result: Result<T, Error>) -> Self {
         Self {
             result,
@@ -83,6 +94,54 @@ pub struct Readiness {
     pub writable: bool,
     pub hup: bool,
     pub err: bool,
+}
+
+/// Non-wrapping revision scoped to one pipe object incarnation. The venue
+/// must also authenticate that incarnation when retaining a wait observation.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadinessRevision(u64);
+
+mod revision_storage {
+    pub trait Sealed {}
+    impl Sealed for super::NoRevision {}
+    impl Sealed for &mut super::ReadinessRevision {}
+}
+
+/// A pipe view's revision storage, sealed to an unbound view or an exclusive
+/// borrow of the venue-owned word. Neither shape changes the PipeRecord ABI.
+pub trait RevisionStorage: revision_storage::Sealed {
+    fn revision(&self) -> Option<&ReadinessRevision>;
+    fn revision_mut(&mut self) -> Option<&mut ReadinessRevision>;
+}
+
+/// Existing venues without readiness revision storage. A snapshot on this
+/// shape refuses, so it cannot supply misleading enrollment evidence.
+pub struct NoRevision;
+impl RevisionStorage for NoRevision {
+    fn revision(&self) -> Option<&ReadinessRevision> {
+        None
+    }
+    fn revision_mut(&mut self) -> Option<&mut ReadinessRevision> {
+        None
+    }
+}
+impl RevisionStorage for &mut ReadinessRevision {
+    fn revision(&self) -> Option<&ReadinessRevision> {
+        Some(self)
+    }
+    fn revision_mut(&mut self) -> Option<&mut ReadinessRevision> {
+        Some(self)
+    }
+}
+
+/// Probe under the object lock AFTER enrollment. Changed revision means an
+/// intervening publication requires a recheck, even if the readiness bits
+/// returned to their earlier values; it is never permission to consume data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadinessSnapshot {
+    pub readiness: Readiness,
+    pub revision: ReadinessRevision,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,10 +179,11 @@ pub struct PipeRecord {
 /// Ordinary byte-stream pipe (no packet mode, splice or gifted pages).
 /// All methods require exclusive venue ownership. Backing can be host or guest
 /// memory; the borrowed slices are never persisted — only the record is.
-pub struct Pipe<'a, R: BorrowMut<PipeRecord> = PipeRecord> {
+pub struct Pipe<'a, R: BorrowMut<PipeRecord> = PipeRecord, V: RevisionStorage = NoRevision> {
     state: R,
     bytes: &'a mut [u8],
     slots: &'a mut [Page],
+    revision: V,
     #[cfg(test)]
     work: Work,
 }
@@ -217,6 +277,7 @@ impl<'a> Pipe<'a, PipeRecord> {
             state,
             bytes,
             slots,
+            revision: NoRevision,
             #[cfg(test)]
             work: Work::default(),
         })
@@ -248,6 +309,7 @@ impl<'a> Pipe<'a, &'a mut PipeRecord> {
             state: record,
             bytes,
             slots,
+            revision: NoRevision,
             #[cfg(test)]
             work: Work::default(),
         })
@@ -286,13 +348,44 @@ impl<'a> Pipe<'a, &'a mut PipeRecord> {
             state: record,
             bytes,
             slots,
+            revision: NoRevision,
             #[cfg(test)]
             work: Work::default(),
         })
     }
 }
 
-impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
+impl<'a, R: BorrowMut<PipeRecord>> Pipe<'a, R> {
+    /// Bind the same object-scoped revision word on every view, under the
+    /// same lock as its PipeRecord and waiter enrollment. Storage is supplied
+    /// by the venue; this does not grow the shared PipeRecord ABI. Never reset
+    /// the revision while that object incarnation or its waiters survive.
+    pub fn with_revision(
+        self,
+        revision: &mut ReadinessRevision,
+    ) -> Pipe<'a, R, &mut ReadinessRevision> {
+        Pipe {
+            state: self.state,
+            bytes: self.bytes,
+            slots: self.slots,
+            revision,
+            #[cfg(test)]
+            work: self.work,
+        }
+    }
+}
+
+impl<R: BorrowMut<PipeRecord>, V: RevisionStorage> Pipe<'_, R, V> {
+    fn revision_available(&self) -> bool {
+        self.revision.revision().is_none_or(|r| r.0 != u64::MAX)
+    }
+
+    fn advance_revision(&mut self) {
+        // Every mutating caller checks availability before effects/callbacks.
+        if let Some(revision) = self.revision.revision_mut() {
+            revision.0 += 1;
+        }
+    }
     fn st(&self) -> &PipeRecord {
         self.state.borrow()
     }
@@ -329,7 +422,7 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
         mut self,
         bytes: &'b mut [u8],
         slots: &'b mut [Page],
-    ) -> Result<Pipe<'b, R>, Error> {
+    ) -> Result<Pipe<'b, R, V>, Error> {
         let state = *self.st();
         let page_size = self.page_size();
         let pages = state.capacity_pages as usize;
@@ -364,6 +457,7 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
             state: self.state,
             bytes,
             slots,
+            revision: self.revision,
             #[cfg(test)]
             work: self.work,
         })
@@ -386,6 +480,9 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
     }
 
     pub fn release(&mut self, end: End) -> Step<()> {
+        if self.references(end) == 1 && !self.revision_available() {
+            return Step::quiet(Err(Error::RevisionExhausted));
+        }
         let s = self.state.borrow_mut();
         let count = match end {
             End::Reader => &mut s.readers,
@@ -395,10 +492,14 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
             return Step::quiet(Err(Error::Refcount));
         }
         *count -= 1;
+        let final_close = *count == 0;
+        if final_close {
+            self.advance_revision();
+        }
         Step::changed(
             (),
-            end == End::Writer && *count == 0,
-            end == End::Reader && *count == 0,
+            end == End::Writer && final_close,
+            end == End::Reader && final_close,
         )
     }
 
@@ -424,9 +525,13 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
             if pages == old_pages {
                 return Step::quiet(Ok(capacity));
             }
+            if !self.revision_available() {
+                return Step::quiet(Err(Error::RevisionExhausted));
+            }
             let s = self.state.borrow_mut();
             s.head = 0;
             s.capacity_pages = pages as u64;
+            self.advance_revision();
             return Step::changed(capacity, false, pages > old_pages);
         }
         if capacity > self.bytes.len() || pages > self.slots.len() {
@@ -435,6 +540,9 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
         if pages == old_pages {
             return Step::quiet(Ok(capacity));
         }
+        if !self.revision_available() {
+            return Step::quiet(Err(Error::RevisionExhausted));
+        }
         let old = self.capacity();
         let head = self.st().head as usize;
         self.bytes[..old].rotate_left(head * page_size);
@@ -442,6 +550,7 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
         let s = self.state.borrow_mut();
         s.head = 0;
         s.capacity_pages = pages as u64;
+        self.advance_revision();
         Step::changed(capacity, false, pages > old_pages)
     }
 
@@ -460,6 +569,13 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
                 ..Readiness::default()
             },
         }
+    }
+
+    pub fn readiness_snapshot(&self, end: End) -> Result<ReadinessSnapshot, Error> {
+        Ok(ReadinessSnapshot {
+            readiness: self.readiness(end),
+            revision: *self.revision.revision().ok_or(Error::RevisionUnavailable)?,
+        })
     }
 
     pub fn try_read(&mut self, dst: &mut [u8]) -> Step<usize> {
@@ -519,6 +635,9 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
                 Err(Error::WouldBlock(WaitFor::Readable))
             });
         }
+        if action != ReadAction::Peek && !self.revision_available() {
+            return Step::quiet(Err(Error::RevisionExhausted));
+        }
         let page_size = s.page_size as usize;
         let pages = s.capacity_pages as usize;
         let total = max.min(s.unread as usize);
@@ -565,6 +684,9 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
         if done == 0 {
             Step::quiet(Err(Error::Fault))
         } else {
+            if action != ReadAction::Peek {
+                self.advance_revision();
+            }
             Step::changed(done, false, action != ReadAction::Peek)
         }
     }
@@ -598,6 +720,9 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
         if !self.is_backed() {
             // Before any effect: the venue provides storage and retries.
             return Step::quiet(Err(Error::Storage));
+        }
+        if !self.revision_available() {
+            return Step::quiet(Err(Error::RevisionExhausted));
         }
         let page_size = s.page_size as usize;
         let pages = s.capacity_pages as usize;
@@ -650,6 +775,7 @@ impl<R: BorrowMut<PipeRecord>> Pipe<'_, R> {
         st.used = used as u64;
         st.unread += done as u64;
         if done != 0 {
+            self.advance_revision();
             Step::changed(done, true, false)
         } else if faulted {
             Step::quiet(Err(Error::Fault))
@@ -720,7 +846,10 @@ impl<'a> WriteCursor<'a> {
     pub fn is_complete(&self) -> bool {
         self.progress.is_complete()
     }
-    pub fn advance<R: BorrowMut<PipeRecord>>(&mut self, pipe: &mut Pipe<'_, R>) -> Step<usize> {
+    pub fn advance<R: BorrowMut<PipeRecord>, V: RevisionStorage>(
+        &mut self,
+        pipe: &mut Pipe<'_, R, V>,
+    ) -> Step<usize> {
         let source = self.source;
         pipe.write_progress(&mut self.progress, |at, dst| {
             dst.copy_from_slice(&source[at..at + dst.len()]);

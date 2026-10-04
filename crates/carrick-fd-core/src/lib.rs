@@ -280,6 +280,7 @@ pub trait SlotBacking {
 std::thread_local! {
     /// Descriptor-slot reads, for structural lookup budgets.
     static SLOT_READS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    static BITMAP_READS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 /// A view of one table's slots and free bitmap. Built per operation from the
@@ -385,6 +386,8 @@ impl<'a> TableStorage<'a> {
             return None;
         }
         *reads += 1;
+        #[cfg(test)]
+        BITMAP_READS.with(|n| n.set(n.get() + 1));
         let bits = self.bitmap[self.offsets[level] + word].load(Ordering::Relaxed)
             & (u64::MAX << (min % 64));
         if bits != 0 {
@@ -392,6 +395,8 @@ impl<'a> TableStorage<'a> {
         }
         let next = self.next_bit(level + 1, word + 1, reads)?;
         *reads += 1;
+        #[cfg(test)]
+        BITMAP_READS.with(|n| n.set(n.get() + 1));
         Some(
             next * 64
                 + self.bitmap[self.offsets[level] + next]
@@ -445,8 +450,8 @@ const PIN: u64 = 1;
 
 /// One table identity in shared memory. `lock` serializes every operation
 /// that changes the table's slots; the other words are written only under
-/// it. `seq` is a sequence count over `state`, `generation` and the extent
-/// (odd while a writer changes them): descriptor lookups ([`Authority::get`],
+/// it. `seq` covers `state`, `generation`, the extent and multi-slot pair
+/// publication (odd while a writer changes them): descriptor lookups ([`Authority::get`],
 /// [`Authority::pin`]) take no lock, they read those words and the slot and
 /// validate `seq`, so a lock holder stopped mid-section (a vCPU the host
 /// took out of the guest) never stalls or refuses a lookup.
@@ -715,6 +720,68 @@ pub struct Authority<'a, B: SlotBacking, W: LockWait, const T: usize> {
     wait: W,
 }
 
+/// An authenticated slot-table mutation scope. Drop releases its one table
+/// lock; no host types or storage references escape. Keep the scope strictly
+/// around descriptor mutation, never user copy, I/O, service or suspension.
+/// Each method commits wholly or refuses before publishing any slot.
+#[must_use = "drop releases the table mutation lock"]
+pub struct SlotTableTransaction<'view, 'core, B: SlotBacking, W: LockWait, const T: usize> {
+    authority: &'view Authority<'core, B, W, T>,
+    guard: Locked<'core>,
+    table: Table<'core>,
+    #[cfg(test)]
+    after_first_publication: Option<fn(&Self)>,
+}
+
+impl<B: SlotBacking, W: LockWait, const T: usize> SlotTableTransaction<'_, '_, B, W, T> {
+    /// Publish two prepared descriptions in the lowest free slots at or above
+    /// `min` (reader then writer for pipe2). The pins remain caller-owned on
+    /// both success and refusal. Provision backing and prepare user copy
+    /// outside this scope; release the preparation pins after publication.
+    /// Lock-free lookups cannot observe a half-published pair.
+    pub fn install_pair(
+        &mut self,
+        min: Fd,
+        pins: [&OfdPin; 2],
+        cloexec: bool,
+    ) -> Result<[Fd; 2], Error> {
+        if min.0 < 0 {
+            return Err(Error::InvalidArgument);
+        }
+        let c = self.authority;
+        c.check_pin(pins[0])?;
+        c.check_pin(pins[1])?;
+        let first = self.table.allocate(min.0 as usize)?;
+        // No bitmap/slot change during preparation: the next lowest hole is
+        // strictly above the first, so two searches suffice without a scan.
+        let second = self.table.allocate(first + 1)?;
+        c.retain(pins[0].key.index, REF)?;
+        if let Err(error) = c.retain(pins[1].key.index, REF) {
+            // The preparation pin prevents this rollback being a final hold.
+            c.drop_hold(pins[0].key.index, REF)?;
+            return Err(error);
+        }
+        self.guard.record.begin_write();
+        for (fd, pin) in [(first, pins[0]), (second, pins[1])] {
+            self.table.storage.set(
+                fd,
+                Some(Entry {
+                    ofd: pin.key.index,
+                    cloexec,
+                }),
+            );
+            #[cfg(test)]
+            if fd == first
+                && let Some(probe) = self.after_first_publication
+            {
+                probe(self);
+            }
+        }
+        self.guard.record.end_write();
+        Ok([Fd(first as i32), Fd(second as i32)])
+    }
+}
+
 struct Locked<'a> {
     record: &'a TableRecord,
 }
@@ -725,6 +792,21 @@ impl Drop for Locked<'_> {
 }
 
 impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
+    /// Authenticate and lock one table for a typed mutation transaction.
+    /// CLONE_FILES clients use the same TableId; no second table is created.
+    pub fn transaction(
+        &self,
+        table: TableId,
+    ) -> Result<SlotTableTransaction<'_, 'a, B, W, T>, Error> {
+        let (guard, table) = self.lock(table)?;
+        Ok(SlotTableTransaction {
+            authority: self,
+            guard,
+            table,
+            #[cfg(test)]
+            after_first_publication: None,
+        })
+    }
     fn identity(&self) -> Result<u64, Error> {
         match self.core.identity.load(Ordering::Acquire) {
             0 => Err(Error::StaleTable),

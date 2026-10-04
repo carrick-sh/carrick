@@ -397,6 +397,59 @@ GPL implementations.
 - **Accept:** `cargo test -p carrick-fd-core -p carrick-pipe-core`;
   `just test-kernel`; `just test-embed el1_ipc_ --nocapture`; A plus common gates.
 
+#### B-prep handoff
+
+Portable preparation on `work/n2b-core`, based on `ad3e127a9`, extends only
+fd-core/pipe-core code. It is not landing-B activation or signed acceptance.
+Red commit `96d3a60a5` records compiling behavioral failures: two single-slot
+installs leave a reader published after pair refusal, and readiness bits lose
+a write/drain edge before enrollment. Existing clone/fork/exec/pin semantics
+were green, and are reused rather than replaced. New bindings live in each
+crate's `b_prep_*` tests, extending ipc-fd-authority, ipc-object-state and
+ipc-lifecycle. Shared contract/probe registry edits wait for N1.
+
+- Call `Authority::transaction(table)?.install_pair(min, [&reader, &writer],
+  cloexec)` on the single descriptor authority after preparing both OFD pins
+  and resources. Refusal publishes neither slot and preserves both pins;
+  success leaves those preparation pins caller-owned. Drop the transaction
+  before copies, I/O, services or release effects. Pair copyout needs N1's
+  aggregate prepare/commit and owner cancellation/rollback. There is no
+  consuming copy callback under the table lock and no private scratch table.
+- CLONE_FILES keeps one TableId with venue-owned sharing counts. Fork retains
+  the existing OFDs in private slots; exec unshares before the existing
+  CLOEXEC sweep. Task successor publication and old-table last-owner release
+  stay with the task owner. Suspended I/O retains OfdPin plus exact endpoint,
+  source authority, operation token and WriteProgress, never a numeric fd.
+- `PipeRecord` IS a shared ABI record: `carrick-el1-abi/src/ipc.rs` embeds it
+  in IpcObjectState and includes its size in `LAYOUT_FACTS`/`IPC_LAYOUT_HASH`.
+  This preparation preserves its seven-u64/56-byte layout. The pipe-core
+  readiness API instead takes a caller-owned `ReadinessRevision` through
+  `Pipe::with_revision`. Landing B must supply one persistent revision word
+  per exact object incarnation and bind it on **all** mutation views under
+  the object lock. Adding that word to the shared object/PipeRecord after N1
+  requires coordinated IPC layout facts/hash and ABI version updates in both
+  venues, layout tests and signed verification; do not insert it independently.
+- The wait owner must observe/enroll/probe under the same object authority,
+  then recheck the operation if readiness or revision changed before parking.
+  An unbound snapshot returns RevisionUnavailable; revision overflow refuses
+  before effects. Neither is a Linux errno. Deliver WakeSet after unlocking
+  to exact enrolled waiters. Revisions are not readiness grants or a substitute
+  for authenticated operation/object incarnation. This slice owns no queue,
+  timer, temporary-mask policy, executor or host readiness proxy.
+- `Step::broken_pipe_signal()` returns the SIGPIPE decision as data, including
+  EPIPE after partial progress. The personality delivers the signal and chooses
+  EPIPE versus the preserved prefix; the core never raises it or restarts at
+  zero. The final OFD/pin release drives endpoint release exactly once.
+
+VM-free tests cover 1/8/64 descriptors/pairs and simultaneously blocked writers.
+Pair allocation uses at most `2 * (2 * bitmap_levels - 1)` bitmap reads; a
+three-page stream copies exactly twice its delivered bytes and visits six
+pages per pipe. These do not establish zero EL1 host dispatch or default-pool
+exhaustion. The integration director still owns task publication, actual
+copyout/park/resume/cancellation, the 32-writer default-pool witness, registry
+bindings, signed `el1_ipc_`, pinned native-arm64 Docker and common gates.
+No signed/HVF test, Docker or `just accept` runs on this Linux preparation box.
+
 ### C. Signal, timer and wait interruption have one EL1 owner
 
 - **Fence:** kernel `kernel/objects/signal.rs`, `dispatch/{signal,time}.rs`,
