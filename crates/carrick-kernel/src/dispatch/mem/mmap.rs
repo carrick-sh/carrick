@@ -3960,7 +3960,13 @@ impl<'a> MemView<'a> {
             // A committed high-VA alias has a live stage-1 translation, so its
             // protection must be edited just like the mmap arena below.
             if range_within(address.0, length, layout.mmap_base, layout.mmap_size) {
-                if let Err(error) = cx.memory.protect_range(address.0, len, prot) {
+                let owner_proposal = this.mem().lock().has_owner_proposal();
+                let publication = if owner_proposal {
+                    cx.memory.protect_owner_reserved_range(address.0, len, prot)
+                } else {
+                    cx.memory.protect_range(address.0, len, prot)
+                };
+                if let Err(error) = publication {
                     tracing::error!(
                         address = address.0,
                         length,
@@ -3987,11 +3993,8 @@ impl<'a> MemView<'a> {
                     let mut mem = mem_authority_27.lock();
                     mem.mmap_writable_high = mem.mmap_writable_high.max(end);
                 }
-                if let Err(error) = this.rearm_first_touch_after_mprotect(
-                    cx.memory,
-                    address.0,
-                    length,
-                    prot_flags,
+                if !owner_proposal && let Err(error) = this.rearm_first_touch_after_mprotect(
+                    cx.memory, address.0, length, prot_flags,
                 ) {
                     tracing::error!(
                         address = address.0,
