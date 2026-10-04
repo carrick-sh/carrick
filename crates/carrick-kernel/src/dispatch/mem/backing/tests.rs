@@ -52,14 +52,20 @@ fn readonly_host_fd_cannot_carry_a_writable_shared_file_mapping() {
     };
 
     let readonly = std::fs::File::open(&path).expect("open O_RDONLY");
+    #[cfg(target_os = "macos")]
     assert!(
         !host_fd_can_back_shared_alias(readonly.as_raw_fd()),
         "an O_RDONLY host fd must be refused as alias backing"
     );
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        host_fd_can_back_shared_alias(readonly.as_raw_fd()),
+        "non-HVF hosts admit a read-only alias without requiring writable stage-2 backing"
+    );
     let (granted, errno) = map_then_grant_write(&readonly);
     assert!(
         !granted && errno == libc::EACCES,
-        "Darwin must cap max_protection of an O_RDONLY MAP_SHARED mapping (granted={granted} errno={errno})"
+        "the host must reject adding write access to an O_RDONLY MAP_SHARED mapping (granted={granted} errno={errno})"
     );
 
     let readwrite = std::fs::OpenOptions::new()
