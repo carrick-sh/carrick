@@ -2150,3 +2150,19 @@ legacy permission helper. Actual engine-entry witness
 approved. This closes entry after admission; initial-admission exclusion of
 already-returned legacy pointers remains part of the open root transaction.
 `just test` passed on the preceding checkpoint (final HVF723 passed/3 ignored).
+
+Final prerequisite review at `cb7ba613b` approved all four prepared/content
+corrections; the later raw-entry fence was independently approved as well.
+K1 reconciliation adds exactly three reviewed rows and removes none:
+`detach_recalled_member` terminal metadata is lifecycle; the canceled-recall
+read and no-held-guard inspection are test/definition read_attempt and
+inspect_misc. Existing classifications are unchanged. Both K1 checkers pass.
+Dispatch-lock inventory changes only 31 positions. Runtime-abort additions and
+the owned-recall fixed-storage-worker host-authority row/capture still require
+inventory closure; the reconciliation command explicitly refused to bless
+them. No debt ceiling, allowlist or gate budget was weakened.
+
+The lint gate first found an unchecked integer cast in the legacy HostIo test's
+expected return. The expectation now uses `returned_len`; its unchanged
+behavior test passes. Latest full EL1 run257 and ABI125+2doc pass. Complete
+milestone acceptance remains open regardless of these prerequisite receipts.
