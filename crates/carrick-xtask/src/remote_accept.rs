@@ -74,6 +74,10 @@ pub enum RemoteAcceptError {
     },
     #[error("invalid run-id '{0}': {1}")]
     InvalidRunId(String, String),
+    #[error(
+        "remote rsync path '{0}' contains characters unsupported by portable rsync argument handling"
+    )]
+    InvalidRsyncPath(String),
 }
 
 pub fn shell_quote(s: &str) -> String {
@@ -484,18 +488,29 @@ pub fn resolve_short_sha_for_receipt(
     sha12[..9.min(sha12.len())].to_string()
 }
 
-fn rsync_command() -> Command {
-    let mut command = Command::new("rsync");
-    // Match the old macOS rsync shell-argument contract even with Linux rsync
-    // 3.2.4+, which otherwise escapes our shell quotes a second time. Older
-    // clients ignore these env vars; both sides receive the same quoted paths.
-    command.env("RSYNC_OLD_ARGS", "1");
-    command.env("RSYNC_PROTECT_ARGS", "0");
-    command
+fn rsync_remote_spec(host: &str, path: &str) -> Result<String, RemoteAcceptError> {
+    // GNU rsync protects shell-active characters, but rsync 2.6.9/openrsync
+    // splits remote arguments in the shell. Use their common safe subset;
+    // embedded quoting would instead become literal filename bytes on GNU.
+    if path.is_empty()
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-:@%+=,".contains(&b))
+    {
+        return Err(RemoteAcceptError::InvalidRsyncPath(path.to_string()));
+    }
+    Ok(format!("{host}:{path}"))
 }
 
-fn remote_rsync_path(host: &str, path: &str) -> String {
-    format!("{host}:{}", shell_quote(path))
+fn rsync_args(source: &str, destination: &str) -> [String; 6] {
+    [
+        "-avz".to_string(),
+        "-e".to_string(),
+        "ssh -o BatchMode=yes -o ConnectTimeout=10".to_string(),
+        "--".to_string(),
+        source.to_string(),
+        destination.to_string(),
+    ]
 }
 
 fn use_local_probes(local_dir: &Path) -> bool {
@@ -546,59 +561,13 @@ fn copy_probe_executables(
         run_ssh_command(host, &mkdir_cmd)?;
 
         let local_src = format!("{}/", local_dir.display());
-        let remote_target = remote_rsync_path(host, &format!("{remote_dest}/"));
-        let rsync_output = rsync_command()
-            .args([
-                "-avz",
-                "-e",
-                "ssh -o BatchMode=yes -o ConnectTimeout=10",
-                &local_src,
-                &remote_target,
-            ])
-            .output()
-            .map_err(|e| RemoteAcceptError::Io {
-                path: local_dir.clone(),
-                source: e,
-            })?;
-
-        if !rsync_output.status.success() {
-            let stderr = String::from_utf8_lossy(&rsync_output.stderr);
-            return Err(RemoteAcceptError::Ssh {
+        let remote_target = rsync_remote_spec(host, &format!("{remote_dest}/"))?;
+        command::run_checked("rsync", rsync_args(&local_src, &remote_target), None).map_err(
+            |e| RemoteAcceptError::Ssh {
                 host: host.to_string(),
-                details: format!("failed to rsync probes for {target}: {stderr}"),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn fetch_remote_path(
-    host: &str,
-    source: &str,
-    destination: &Path,
-) -> Result<(), RemoteAcceptError> {
-    let output = rsync_command()
-        .args([
-            "-avz",
-            "-e",
-            "ssh -o BatchMode=yes -o ConnectTimeout=10",
-            &remote_rsync_path(host, source),
-            &destination.to_string_lossy(),
-        ])
-        .output()
-        .map_err(|source| RemoteAcceptError::Io {
-            path: destination.to_path_buf(),
-            source,
-        })?;
-    if !output.status.success() {
-        return Err(RemoteAcceptError::Ssh {
-            host: host.to_string(),
-            details: format!(
-                "rsync fetch of {source} failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        });
+                details: format!("failed to rsync probes for {target}: {e}"),
+            },
+        )?;
     }
     Ok(())
 }
@@ -796,18 +765,35 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
     // Copy only target/el1-gate/<short_sha>/ for THIS sha
     let short_sha = resolve_short_sha_for_receipt(&host, &worktree_dir, &sha12, Some(&local_root));
     let remote_receipt_src = format!("{worktree_dir}/target/el1-gate/{short_sha}/");
-    let mut exit_code = exit_code;
-    if let Err(error) = fetch_remote_path(&host, &remote_receipt_src, &local_dest) {
-        eprintln!("Warning: failed to fetch remote receipt: {error}");
-        exit_code = 1;
-    }
+    let local_receipt_dest = format!("{}/", local_dest.display());
+    let remote_receipt_spec = rsync_remote_spec(&host, &remote_receipt_src)?;
     let remote_log_src = format!("{remote_run_dir_path}/accept.log");
+    let remote_log_spec = rsync_remote_spec(&host, &remote_log_src)?;
     let local_log_dest = local_dest.join("accept.log");
-    if let Err(error) = fetch_remote_path(&host, &remote_log_src, &local_log_dest) {
-        eprintln!("Warning: failed to fetch remote log: {error}");
-        exit_code = 1;
+
+    // Attempt both transfers so a missing receipt still lets us fetch the log.
+    // Report every failure before reading local files, which may be stale on attach.
+    let mut fetch_errors = Vec::new();
+    for (label, source, destination) in [
+        ("receipt", remote_receipt_spec, local_receipt_dest),
+        (
+            "accept.log",
+            remote_log_spec,
+            local_log_dest.to_string_lossy().into_owned(),
+        ),
+    ] {
+        if let Err(e) = command::run_checked("rsync", rsync_args(&source, &destination), None) {
+            fetch_errors.push(format!("failed to fetch {label} from {source}: {e}"));
+        }
+    }
+    if !fetch_errors.is_empty() {
+        return Err(RemoteAcceptError::Ssh {
+            host: host.clone(),
+            details: fetch_errors.join("\n"),
+        });
     }
 
+    let mut exit_code = exit_code;
     if let Ok(log_content) = fs::read_to_string(&local_log_dest) {
         if let Some(summary) = extract_summary(&log_content) {
             println!("\n{summary}");
@@ -853,22 +839,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn linux_rsync_paths_use_one_shell_quoting_layer() {
-        let path = "/remote root/worker's $receipt.log";
+    fn rsync_fetch_argv_has_raw_remote_spec_and_option_terminator() {
+        for (path, expected) in [
+            (
+                "/Volumes/carrick/dev/gate-worktree/target/el1-gate/012345678/",
+                "rentamac@cloudmac:/Volumes/carrick/dev/gate-worktree/target/el1-gate/012345678/",
+            ),
+            (
+                "/Volumes/carrick/dev/gate-runs/0123456789ab-20261004-120000/accept.log",
+                "rentamac@cloudmac:/Volumes/carrick/dev/gate-runs/0123456789ab-20261004-120000/accept.log",
+            ),
+        ] {
+            let spec = rsync_remote_spec("rentamac@cloudmac", path).expect("safe remote path");
+            assert_eq!(spec, expected);
+            assert_eq!(
+                rsync_args(&spec, "/local workspace/result/").as_slice(),
+                [
+                    "-avz",
+                    "-e",
+                    "ssh -o BatchMode=yes -o ConnectTimeout=10",
+                    "--",
+                    expected,
+                    "/local workspace/result/",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn rsync_probe_upload_argv_preserves_trailing_slash() {
+        let spec = rsync_remote_spec(
+            "cloudmac",
+            "/Volumes/carrick/dev/gate-worktree/conformance-probes/target/aarch64-unknown-linux-musl/release/",
+        )
+        .expect("safe remote path");
         assert_eq!(
-            remote_rsync_path("gate", path),
-            "gate:'/remote root/worker'\\''s $receipt.log'"
+            rsync_args("/local probes/release/", &spec).as_slice(),
+            [
+                "-avz",
+                "-e",
+                "ssh -o BatchMode=yes -o ConnectTimeout=10",
+                "--",
+                "/local probes/release/",
+                "cloudmac:/Volumes/carrick/dev/gate-worktree/conformance-probes/target/aarch64-unknown-linux-musl/release/",
+            ]
         );
-        let command = rsync_command();
-        let env: Vec<_> = command.get_envs().collect();
-        assert!(env.contains(&(
-            std::ffi::OsStr::new("RSYNC_OLD_ARGS"),
-            Some(std::ffi::OsStr::new("1"))
-        )));
-        assert!(env.contains(&(
-            std::ffi::OsStr::new("RSYNC_PROTECT_ARGS"),
-            Some(std::ffi::OsStr::new("0"))
-        )));
+    }
+
+    #[test]
+    fn rsync_remote_spec_refuses_shell_active_paths() {
+        for path in [
+            "",
+            "/remote/with spaces/",
+            "/remote/with\tseparator/",
+            "/remote/with\nnewline/",
+            "/remote/'quoted'/",
+            "/remote/\"quoted\"/",
+            "/remote/$variable/",
+            "/remote/`command`/",
+            "/remote/$(command)/",
+            "/remote/semicolon;command/",
+            "/remote/ampersand&command/",
+            "/remote/pipe|command/",
+            "/remote/glob*/",
+            "/remote/question?/",
+            "/remote/[pattern]/",
+            "/remote/{a,b}/",
+            "/remote/back\\slash/",
+        ] {
+            assert!(
+                rsync_remote_spec("cloudmac", path).is_err(),
+                "unsafe remote path accepted: {path:?}"
+            );
+        }
     }
 
     #[test]
