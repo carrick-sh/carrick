@@ -201,6 +201,23 @@ fn recovery_distinguishes_failed_absent_clone_from_ambiguous_submission() {
 }
 
 #[test]
+fn successful_owned_clone_is_resumed_in_place_without_another_reservation() {
+    let mut ledger = Ledger::default();
+    let mut row = ledger.reserve(job(1), &[], 0).unwrap();
+    row.state = State::Cloning;
+    assert_eq!(
+        recovery_decision(&row, true, TaskState::Succeeded, 10),
+        Recovery::ResumeClone
+    );
+    assert_eq!(
+        recovery_decision(&row, true, TaskState::Running, 10),
+        Recovery::Wait
+    );
+    assert!(ledger.reserve(job(2), &[], 10).is_err());
+    assert_eq!(ledger.rows.len(), 1);
+}
+
+#[test]
 fn job_start_authorization_rejects_wrong_repository_event_ref_and_sha() {
     let mut context = JobContext {
         repository: "carrick-sh/carrick".into(),
