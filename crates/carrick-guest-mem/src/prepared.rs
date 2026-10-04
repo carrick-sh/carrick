@@ -158,9 +158,33 @@ pub trait PreparedGuestWrite {
 /// task projection and foreign-MM holder, rather than replacing one clone.
 #[derive(Clone)]
 pub struct UserMemoryAuthority(std::sync::Arc<parking_lot::RwLock<UserMemoryAuthorityState>>);
+/// Exclusive root publication guard. Legacy copies cannot enter between an
+/// EL1 zone opening and the exact owner's selection and mirror retirement.
+pub struct UserMemoryAdmissionGuard<'a> {
+    authority: &'a UserMemoryAuthority,
+    state: parking_lot::RwLockWriteGuard<'a, UserMemoryAuthorityState>,
+}
 enum UserMemoryAuthorityState {
     Legacy(std::sync::Arc<crate::protections::MemoryProtections>),
+    /// The exact owner is bound, but live descriptor publication has not
+    /// completed. The old venue remains available until that transaction.
+    Pending {
+        handle: carrick_el1_abi::El1MmHandle,
+        legacy: std::sync::Arc<crate::protections::MemoryProtections>,
+    },
     Owner(carrick_el1_abi::El1MmHandle),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnerMemorySelection {
+    Immediate,
+    Deferred,
+}
+
+#[derive(Debug)]
+pub enum OwnerMemorySelectionError<E> {
+    Admission(UserMemoryAdmissionError),
+    Selection(E),
 }
 
 /// A legacy mirror borrow cannot escape the authority transition. Other
@@ -206,6 +230,7 @@ impl UserMemoryAuthority {
     pub fn legacy(&self) -> Option<LegacyProtectionRead<'_>> {
         parking_lot::RwLockReadGuard::try_map(self.0.read(), |state| match state {
             UserMemoryAuthorityState::Legacy(protections) => Some(protections.as_ref()),
+            UserMemoryAuthorityState::Pending { legacy, .. } => Some(legacy.as_ref()),
             UserMemoryAuthorityState::Owner(_) => None,
         })
         .ok()
@@ -213,9 +238,66 @@ impl UserMemoryAuthority {
     }
     pub fn owner(&self) -> Option<carrick_el1_abi::El1MmHandle> {
         match &*self.0.read() {
-            UserMemoryAuthorityState::Legacy(_) => None,
+            UserMemoryAuthorityState::Legacy(_) | UserMemoryAuthorityState::Pending { .. } => None,
             UserMemoryAuthorityState::Owner(handle) => Some(*handle),
         }
+    }
+    pub fn pending_owner(&self) -> Option<carrick_el1_abi::El1MmHandle> {
+        match &*self.0.read() {
+            UserMemoryAuthorityState::Pending { handle, .. } => Some(*handle),
+            _ => None,
+        }
+    }
+    pub fn begin_selection(
+        &self,
+    ) -> Result<UserMemoryAdmissionGuard<'_>, UserMemoryAdmissionError> {
+        let state = self
+            .0
+            .try_write()
+            .ok_or(UserMemoryAdmissionError::LegacyReadActive)?;
+        Ok(UserMemoryAdmissionGuard {
+            authority: self,
+            state,
+        })
+    }
+    /// The selector runs under one nonblocking admission guard. Immediate
+    /// descriptor publication and mirror retirement are one transaction;
+    /// deferred publication leaves an exact pending guard in the shared MM.
+    pub fn select_owner<E>(
+        &self,
+        handle: carrick_el1_abi::El1MmHandle,
+        select: impl FnOnce() -> Result<OwnerMemorySelection, E>,
+    ) -> Result<OwnerMemorySelection, OwnerMemorySelectionError<E>> {
+        self.begin_selection()
+            .map_err(OwnerMemorySelectionError::Admission)?
+            .select_owner(handle, select)
+    }
+    /// The live-backing owner calls this with its authenticated descriptor
+    /// transition. A busy legacy reader leaves both authorities unchanged.
+    pub fn promote_pending_with(
+        &self,
+        handle: carrick_el1_abi::El1MmHandle,
+        promote: impl FnOnce() -> bool,
+    ) -> Result<bool, UserMemoryAdmissionError> {
+        let Some(mut state) = self.0.try_write() else {
+            return Err(UserMemoryAdmissionError::LegacyReadActive);
+        };
+        let UserMemoryAuthorityState::Pending {
+            handle: current, ..
+        } = &*state
+        else {
+            return Err(UserMemoryAdmissionError::OwnerMismatch);
+        };
+        if *current != handle {
+            return Err(UserMemoryAdmissionError::OwnerMismatch);
+        }
+        if !promote() {
+            return Ok(false);
+        }
+        let retired = std::mem::replace(&mut *state, UserMemoryAuthorityState::Owner(handle));
+        drop(state);
+        drop(retired);
+        Ok(true)
     }
     /// Initial admission is one nonblocking transition. A live legacy borrow
     /// refuses admission before execution; never queue a writer behind a
@@ -224,28 +306,68 @@ impl UserMemoryAuthority {
         &self,
         handle: carrick_el1_abi::El1MmHandle,
     ) -> Result<(), UserMemoryAdmissionError> {
-        let Some(mut state) = self.0.try_write() else {
-            return Err(UserMemoryAdmissionError::LegacyReadActive);
-        };
-        match &*state {
-            UserMemoryAuthorityState::Owner(current) if *current != handle => {
-                Err(UserMemoryAdmissionError::OwnerMismatch)
-            }
-            UserMemoryAuthorityState::Owner(_) => Ok(()),
-            UserMemoryAuthorityState::Legacy(_) => {
-                let retired =
-                    std::mem::replace(&mut *state, UserMemoryAuthorityState::Owner(handle));
-                drop(state);
-                drop(retired);
-                Ok(())
-            }
-        }
+        self.select_owner(handle, || Ok::<_, ()>(OwnerMemorySelection::Immediate))
+            .map(|_| ())
+            .map_err(|error| match error {
+                OwnerMemorySelectionError::Admission(error) => error,
+                OwnerMemorySelectionError::Selection(()) => unreachable!(),
+            })
     }
     pub fn same_authority(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.0, &other.0)
             || self
                 .owner()
                 .is_some_and(|handle| other.owner() == Some(handle))
+    }
+}
+
+impl UserMemoryAdmissionGuard<'_> {
+    pub fn belongs_to(&self, authority: &UserMemoryAuthority) -> bool {
+        std::sync::Arc::ptr_eq(&self.authority.0, &authority.0)
+    }
+    pub fn selection_handle(&self) -> Option<carrick_el1_abi::El1MmHandle> {
+        match &*self.state {
+            UserMemoryAuthorityState::Pending { handle, .. }
+            | UserMemoryAuthorityState::Owner(handle) => Some(*handle),
+            UserMemoryAuthorityState::Legacy(_) => None,
+        }
+    }
+    pub fn select_owner<E>(
+        &mut self,
+        handle: carrick_el1_abi::El1MmHandle,
+        select: impl FnOnce() -> Result<OwnerMemorySelection, E>,
+    ) -> Result<OwnerMemorySelection, OwnerMemorySelectionError<E>> {
+        match &*self.state {
+            UserMemoryAuthorityState::Owner(current) if *current == handle => {
+                return Ok(OwnerMemorySelection::Immediate);
+            }
+            UserMemoryAuthorityState::Owner(current)
+            | UserMemoryAuthorityState::Pending {
+                handle: current, ..
+            } if *current != handle => {
+                return Err(OwnerMemorySelectionError::Admission(
+                    UserMemoryAdmissionError::OwnerMismatch,
+                ));
+            }
+            _ => {}
+        }
+        let selection = select().map_err(OwnerMemorySelectionError::Selection)?;
+        match selection {
+            OwnerMemorySelection::Immediate => {
+                let retired =
+                    std::mem::replace(&mut *self.state, UserMemoryAuthorityState::Owner(handle));
+                drop(retired);
+            }
+            OwnerMemorySelection::Deferred => {
+                if let UserMemoryAuthorityState::Legacy(legacy) = &*self.state {
+                    *self.state = UserMemoryAuthorityState::Pending {
+                        handle,
+                        legacy: std::sync::Arc::clone(legacy),
+                    };
+                }
+            }
+        }
+        Ok(selection)
     }
 }
 
@@ -326,6 +448,49 @@ mod authority_tests {
         assert_eq!(authority.owner(), Some(handle(7)));
         assert!(authority.same_authority(&UserMemoryAuthority::from_owner(handle(7))));
         assert!(!authority.same_authority(&UserMemoryAuthority::from_owner(handle(8))));
+    }
+
+    #[test]
+    fn deferred_selection_keeps_exact_guard_until_publication_commits() {
+        let mirror = std::sync::Arc::new(crate::protections::MemoryProtections::default());
+        let weak = std::sync::Arc::downgrade(&mirror);
+        let authority = UserMemoryAuthority::from_legacy(mirror);
+        let sibling = authority.clone();
+        let read = sibling.legacy().unwrap();
+        let mut selected = false;
+        assert!(matches!(
+            authority.select_owner(handle(7), || {
+                selected = true;
+                Ok::<_, ()>(OwnerMemorySelection::Deferred)
+            }),
+            Err(OwnerMemorySelectionError::Admission(
+                UserMemoryAdmissionError::LegacyReadActive
+            ))
+        ));
+        assert!(!selected, "a busy mirror may not select descriptors");
+        drop(read);
+        assert!(matches!(
+            authority.select_owner(handle(7), || Ok::<_, ()>(OwnerMemorySelection::Deferred)),
+            Ok(OwnerMemorySelection::Deferred)
+        ));
+        assert_eq!(sibling.pending_owner(), Some(handle(7)));
+        assert!(sibling.legacy().is_some());
+        assert_eq!(
+            sibling.promote_pending_with(handle(8), || panic!("wrong owner promoted")),
+            Err(UserMemoryAdmissionError::OwnerMismatch)
+        );
+        let mut published = false;
+        assert_eq!(
+            authority.promote_pending_with(handle(7), || {
+                published = true;
+                true
+            }),
+            Ok(true)
+        );
+        assert!(published);
+        assert_eq!(sibling.owner(), Some(handle(7)));
+        assert!(sibling.legacy().is_none());
+        assert!(weak.upgrade().is_none(), "retired mirror storage survived");
     }
 }
 

@@ -577,7 +577,10 @@ impl<'a> SpaceAccess<'a> {
                 .reserve(SpaceWaitCause::Gate)
                 .advance_revision(venue.waker, &completion);
             if opening {
-                entry.gate.fetch_and(!super::GATE_CLOSED, Ordering::SeqCst);
+                entry.gate.fetch_and(
+                    !(super::GATE_CLOSED | super::GATE_INITIAL_BIND),
+                    Ordering::SeqCst,
+                );
             } else {
                 entry.gate.fetch_sub(1, Ordering::SeqCst);
             }
