@@ -1,6 +1,7 @@
 pub mod accept;
 pub mod cli;
 pub mod command;
+pub mod fixtures;
 pub mod host_lease;
 pub mod host_load;
 pub mod impact;
