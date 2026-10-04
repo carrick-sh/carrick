@@ -768,6 +768,7 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
             deliver: |_, _, effects| {
                 let _ = effects.deliver_handbacks(&mut |_| {});
             },
+            owner_ready: |_, _| {},
         },
     )
     .unwrap();
