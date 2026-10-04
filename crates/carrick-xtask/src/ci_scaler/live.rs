@@ -46,6 +46,62 @@ fn request_config(token: &Token, call: &PveCall) -> Result<String, ScalerError> 
     }
     Ok(config)
 }
+fn clone_config(public_key: &str) -> Value {
+    let mut encoded = String::new();
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in public_key.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    json!({
+        "ciuser":"runner", "sshkeys":encoded,
+        "ipconfig0":"ip=dhcp", "tags":"carrick-ci;willow-pilot",
+        "cores":2,"memory":4096,"balloon":0,"cpulimit":2,"cpu":"host"
+    })
+}
+fn pve_response(bytes: &[u8]) -> Result<Value, ScalerError> {
+    let end = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .ok_or(ScalerError::External("PVE response lacks HTTP status"))?;
+    let code = &bytes[end + 1..];
+    if code.len() != 3 || !code.iter().all(u8::is_ascii_digit) {
+        return Err(ScalerError::External("invalid PVE HTTP status"));
+    }
+    let response: Value = serde_json::from_slice(&bytes[..end])?;
+    if code[0] != b'2' {
+        let fields = response
+            .get("errors")
+            .and_then(Value::as_object)
+            .map(|errors| {
+                errors
+                    .keys()
+                    .filter(|name| {
+                        name.len() <= 64
+                            && name
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return Err(ScalerError::PveRejected(format!(
+            "HTTP {}; fields: {fields}",
+            String::from_utf8_lossy(code)
+        )));
+    }
+    response
+        .get("data")
+        .cloned()
+        .ok_or(ScalerError::External("PVE response lacks data"))
+}
 struct Pve {
     token: Token,
     deadline: std::cell::Cell<Option<Instant>>,
@@ -81,9 +137,10 @@ impl Pve {
         let config = request_config(&self.token, &call)?;
         let bytes = execute(
             Command::new("curl").args([
-                "--fail",
                 "--silent",
                 "--show-error",
+                "--write-out",
+                "\n%{http_code}",
                 "--max-time",
                 "40",
                 "--resolve",
@@ -97,11 +154,7 @@ impl Pve {
             config.as_bytes(),
             limit,
         )?;
-        let response: Value = serde_json::from_slice(&bytes)?;
-        response
-            .get("data")
-            .cloned()
-            .ok_or(ScalerError::External("PVE response lacks data"))
+        pve_response(&bytes)
     }
     fn inventory(&self) -> Result<Vec<PoolMember>, ScalerError> {
         let pool = self.request(PveCall::Get, "/pools/carrick-ci")?;
@@ -752,11 +805,9 @@ fn boot_and_register(
         ));
     }
     pve.request(
-        PveCall::Put(json!({
-            "ciuser":"runner", "sshkeys":std::fs::read_to_string(key.with_extension("key.pub"))?,
-            "ipconfig0":"ip=dhcp", "tags":"carrick-ci;willow-pilot",
-            "cores":2,"memory":4096,"balloon":0,"cpulimit":2,"cpu":"host"
-        })),
+        PveCall::Put(clone_config(&std::fs::read_to_string(
+            key.with_extension("key.pub"),
+        )?)),
         &format!("{}/config", base(row.vm)),
     )?;
     if !resource_admission()? {
@@ -1138,6 +1189,32 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn pve_rejection_reports_status_and_field_names_without_echoing_values() {
+        let response = b"{\"errors\":{\"sshkeys\":\"invalid secret-value\"},\"message\":\"secret-value\",\"data\":null}\n400";
+        let error = pve_response(response).unwrap_err().to_string();
+        assert!(error.contains("400"));
+        assert!(error.contains("sshkeys"));
+        assert!(!error.contains("secret-value"));
+        assert_eq!(pve_response(b"{\"data\":null}\n200").unwrap(), Value::Null);
+    }
+    #[test]
+    fn provider_http_400_requires_urlencoded_sshkeys_in_json() {
+        // Exact provider response from a non-mutating cores=0 validation request.
+        let rejection: Value = serde_json::from_str(r#"{"message":"Parameter verification failed.\n","errors":{"sshkeys":"invalid format - invalid urlencoded string: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIATuCezuHC3VLhCpGfe7D7WL2w2gLXdNO9LxtCCsSyhz validation-only\n\n","cores":"value must have a minimum value of 1"},"data":null}"#).unwrap();
+        assert!(
+            rejection["errors"]["sshkeys"]
+                .as_str()
+                .unwrap()
+                .contains("invalid urlencoded string")
+        );
+        let config = clone_config("ssh-ed25519 AAAA+/= validation-only\n");
+        assert_eq!(
+            config["sshkeys"],
+            "ssh-ed25519%20AAAA%2B%2F%3D%20validation-only%0A"
+        );
+        assert_eq!(config["cores"], 2);
+    }
     #[test]
     fn recovered_one_job_preserves_error_history_and_requires_actual_assignment() {
         let mut row = row();

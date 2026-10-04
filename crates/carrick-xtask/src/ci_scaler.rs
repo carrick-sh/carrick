@@ -32,6 +32,9 @@ pub enum ScalerError {
     // Never include external output: API/runner responses may contain secrets.
     #[error("external operation failed: {0}")]
     External(&'static str),
+    // Contains only a validated HTTP status and parameter names, never values.
+    #[error("PVE rejected request: {0}")]
+    PveRejected(String),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
