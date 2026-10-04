@@ -4877,27 +4877,37 @@ mod tests {
 
     #[test]
     fn one_page_file_grants_do_not_fill_one_bulk_window_probe_chain() {
-        let table = FrameGrantResidencyTable::new();
         let base = 0x4000_0000;
-        for index in 0..EL1_FRAME_GRANT_TARGET_SIZE / GRANT_PAGE_SIZE {
-            let identity = FrameGrantResidencyIdentity {
-                mm_key: 41,
-                semantic_base: base + index * 4096,
-                physical_ipa: 0x9000_0000 + index * 4096,
-                len: 4096,
-                mapping_id: index + 1,
-                frame_id: index + 1,
-                owner_generation: 23,
-                inventory_revision: 29,
-            };
-            assert!(
-                table.publish(identity).is_some(),
-                "file page {index} rejected inside one 2 MiB window"
-            );
-            assert_eq!(
-                table.lookup(41, identity.semantic_base).unwrap().identity,
-                identity
-            );
+        let pages = EL1_FRAME_GRANT_TARGET_SIZE / GRANT_PAGE_SIZE;
+        for scattered in [false, true] {
+            let table = FrameGrantResidencyTable::new();
+            for ordinal in 0..pages {
+                // 73 is coprime to 512: every page is reached once, with
+                // non-contiguous insertion across the entire window.
+                let index = if scattered {
+                    (ordinal * 73) % pages
+                } else {
+                    ordinal
+                };
+                let identity = FrameGrantResidencyIdentity {
+                    mm_key: 41,
+                    semantic_base: base + index * GRANT_PAGE_SIZE,
+                    physical_ipa: 0x9000_0000 + index * GRANT_PAGE_SIZE,
+                    len: GRANT_PAGE_SIZE,
+                    mapping_id: index + 1,
+                    frame_id: index + 1,
+                    owner_generation: 23,
+                    inventory_revision: 29,
+                };
+                assert!(
+                    table.publish(identity).is_some(),
+                    "file page {index} rejected inside one 2 MiB window, scattered={scattered}"
+                );
+                assert_eq!(
+                    table.lookup(41, identity.semantic_base).unwrap().identity,
+                    identity
+                );
+            }
         }
     }
 
