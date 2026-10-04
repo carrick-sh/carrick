@@ -467,6 +467,34 @@ pub(crate) struct CarrierVmCustodyState {
     pub(crate) next_logical_owner_generation: u64,
     pub(crate) stage2_records:
         std::collections::BTreeMap<CarrierStage2RecordId, CarrierStage2Record>,
+    /// One physical index over every record, independent of the authority
+    /// that owns its lifetime. Rebind may briefly retain predecessor IDs.
+    stage2_extent_index:
+        std::collections::BTreeMap<(u64, u64), std::collections::BTreeSet<CarrierStage2RecordId>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl CarrierVmCustodyState {
+    fn index_record(&mut self, id: CarrierStage2RecordId, ipa: u64, len: usize) {
+        self.stage2_extent_index
+            .entry((ipa, len as u64))
+            .or_default()
+            .insert(id);
+    }
+
+    fn remove_record(&mut self, id: CarrierStage2RecordId) -> Option<CarrierStage2Record> {
+        let removed = self.stage2_records.remove(&id);
+        if let Some(record) = &removed {
+            let key = (record.snapshot.ipa, record.snapshot.len as u64);
+            if let Some(ids) = self.stage2_extent_index.get_mut(&key) {
+                ids.remove(&id);
+                if ids.is_empty() {
+                    self.stage2_extent_index.remove(&key);
+                }
+            }
+        }
+        removed
+    }
 }
 
 /// Carrier-owned VM lifecycle authority.
@@ -493,6 +521,9 @@ pub(crate) struct CarrierVmCustody {
             std::sync::Arc<StructuralBackingCustodyEntry>,
         >,
     >,
+    /// IPA lookup for mapped structural and carrier-owned stage-2 records.
+    /// The record-ID table owns their lifetime; this index only finds exact
+    /// physical custody for a selected IPA.
     pub(crate) carrier_stage2_records:
         parking_lot::Mutex<std::collections::BTreeMap<(u64, u64), CarrierStage2RecordIdentity>>,
     pub(crate) global_frame_host_owners: GlobalFrameHostOwnerDirectory,
@@ -700,6 +731,7 @@ impl CarrierVmCustody {
                 next_logical_owner_id: 1,
                 next_logical_owner_generation: 1,
                 stage2_records: std::collections::BTreeMap::new(),
+                stage2_extent_index: std::collections::BTreeMap::new(),
             }),
             structural_backings: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
             carrier_stage2_records: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
@@ -919,7 +951,7 @@ impl CarrierVmCustody {
                     pool.forget_backend_mapping();
                 }
                 metadata.release_destroyed_vm(generation.0, |identity| {
-                    state.stage2_records.remove(&identity.record_id);
+                    let _ = state.remove_record(identity.record_id);
                 });
                 state.lifecycle = CarrierVmLifecycle::Vacant;
                 Ok(())
@@ -1110,8 +1142,7 @@ impl CarrierVmCustody {
             return None;
         }
         state
-            .stage2_records
-            .remove(&identity.record_id)
+            .remove_record(identity.record_id)
             .map(|record| record.snapshot)
     }
 
@@ -1136,7 +1167,7 @@ impl CarrierVmCustody {
             return Err(CarrierStage2RecordError::ReleaseInFlight);
         }
         if !record.snapshot.release_ipa {
-            state.stage2_records.remove(&identity.record_id);
+            let _ = state.remove_record(identity.record_id);
             return Ok(None);
         }
         record.snapshot.release_in_flight = true;
@@ -1159,7 +1190,7 @@ impl CarrierVmCustody {
             "claimed terminal release identity must remain stable"
         );
         if removable {
-            state.stage2_records.remove(&identity.record_id);
+            let _ = state.remove_record(identity.record_id);
         }
     }
 
@@ -1214,7 +1245,7 @@ impl CarrierVmCustody {
         })?;
         let rc = map();
         if rc != 0 {
-            state.stage2_records.remove(&identity.record_id);
+            let _ = state.remove_record(identity.record_id);
             return Err(TrapError::Hypervisor(format!(
                 "stage-2 map failed: {rc:#x}"
             )));
@@ -1276,6 +1307,7 @@ impl CarrierVmCustody {
                 unmap_in_flight: false,
             },
         );
+        state.index_record(record_id, spec.ipa, spec.len);
         Ok(identity)
     }
 
@@ -1351,6 +1383,7 @@ impl CarrierVmCustody {
                 unmap_in_flight: false,
             },
         );
+        state.index_record(record_id, old.snapshot.ipa, old.snapshot.len);
         let old = state
             .stage2_records
             .get_mut(&old_identity.record_id)
@@ -1369,6 +1402,33 @@ impl CarrierVmCustody {
             .stage2_records
             .get(&record_id)
             .map(|record| record.snapshot)
+    }
+
+    pub(crate) fn stage2_record_covering(
+        &self,
+        ipa: u64,
+        len: usize,
+    ) -> Option<CarrierStage2RecordIdentity> {
+        let state = self.state.lock();
+        let (&(base, length), ids) = state
+            .stage2_extent_index
+            .range(..=(ipa, u64::MAX))
+            .next_back()?;
+        let end = ipa.checked_add(len as u64)?;
+        if end > base.checked_add(length)? {
+            return None;
+        }
+        ids.iter().rev().find_map(|id| {
+            let record = state.stage2_records.get(id)?;
+            let snapshot = record.snapshot;
+            (snapshot.mapped && !snapshot.terminalized_by_vm_destroy).then_some(
+                CarrierStage2RecordIdentity {
+                    record_id: *id,
+                    vm_generation: snapshot.vm_generation,
+                    logical_owner: snapshot.logical_owner,
+                },
+            )
+        })
     }
 
     pub(crate) fn stage2_identity_mismatch(
@@ -1581,7 +1641,7 @@ impl CarrierVmCustody {
             && record.snapshot.terminalized_by_vm_destroy
             && record.snapshot.superseded_by_rebind;
         if remove_terminal_predecessor {
-            state.stage2_records.remove(&identity.record_id);
+            let _ = state.remove_record(identity.record_id);
         }
     }
 }
