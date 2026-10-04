@@ -134,10 +134,6 @@ fn classify_use(code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> UseState {
     }
 }
 
-fn process_use(path: &Path) -> UseState {
-    process_use_with_locks(path, None)
-}
-
 fn classify_locked_use(
     code: Option<i32>,
     stdout: &[u8],
@@ -256,6 +252,15 @@ fn writable_dirs(path: &Path) -> Result<(), GcError> {
 }
 
 pub fn run(root: &Path, args: WorktreeGcArgs, writer: &mut impl Write) -> Result<(), GcError> {
+    run_with_census(root, args, writer, process_use_with_locks)
+}
+
+fn run_with_census(
+    root: &Path,
+    args: WorktreeGcArgs,
+    writer: &mut impl Write,
+    census_use: impl Fn(&Path, Option<&CargoLocks>) -> UseState,
+) -> Result<(), GcError> {
     if args.prune_targets {
         return crate::target_prune::run(root, args, writer);
     }
@@ -309,7 +314,7 @@ pub fn run(root: &Path, args: WorktreeGcArgs, writer: &mut impl Write) -> Result
         let managed = matches!(authority, Some(RemovalAuthority::Acquired(_)));
         let dirty = !git(&path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty();
         let landed = landing(root, main, &tree.head)?;
-        let usage = process_use(&path);
+        let usage = census_use(&path, None);
         let eligible = managed && removable(protected, dirty, landed.is_some(), &usage);
         writeln!(
             writer,
@@ -346,13 +351,13 @@ pub fn run(root: &Path, args: WorktreeGcArgs, writer: &mut impl Write) -> Result
             let clean = git(&path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty();
             if head.trim() != tree.head
                 || !clean
-                || process_use_with_locks(&path, Some(&cargo_locks)) != UseState::Idle
+                || census_use(&path, Some(&cargo_locks)) != UseState::Idle
             {
                 writeln!(writer, "keep (changed during census) | {}", path.display())?;
                 continue;
             }
             writable_dirs(&path)?;
-            if process_use_with_locks(&path, Some(&cargo_locks)) != UseState::Idle {
+            if census_use(&path, Some(&cargo_locks)) != UseState::Idle {
                 writeln!(writer, "keep (in use before removal) | {}", path.display())?;
                 continue;
             }
@@ -476,7 +481,7 @@ mod tests {
             &["worktree", "add", "-b", "landed", worker.to_str().unwrap()],
         );
         let mut output = Vec::new();
-        run(
+        run_with_census(
             &root,
             WorktreeGcArgs {
                 apply: true,
@@ -485,6 +490,7 @@ mod tests {
                 target_dir: None,
             },
             &mut output,
+            |_, _| UseState::Idle,
         )
         .unwrap();
         assert!(
