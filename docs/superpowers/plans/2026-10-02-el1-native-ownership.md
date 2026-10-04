@@ -2037,3 +2037,24 @@ queued, release before enrollment, and cancellation handing the next ticket
 its reservation. Source review approved this inactive token unit. These are
 new API custody tests, not fabricated baseline behavioral reds. Production
 continuation integration and all competing current-offset callers remain open.
+
+##### Venue-3 named internal read prerequisite — 2026-10-03
+
+The frozen address `0x2d001e4004` is the identity page's shim-enabled word,
+not the EL1 image header. `internal_read_selects_identity_control_from_exact_live_mm`
+reproduced the production owner's refusal (Fault, 0 passed / 1 failed) before
+extending the closed manifest; unchanged successor passed alongside the image
+header and arbitrary-window rejection tests (3/3). Receipts:
+`/tmp/venue3-internal-identity-red.log` and
+`/tmp/venue3-internal-identity-green.log`. ABI named-range bounds test passed
+(`/tmp/venue3-internal-range-green.log`). EL1 checks the whole continuation,
+then translates and revalidates the exact live MM. The new capability grants
+read authority only. Shared identity geometry replaces the duplicate host
+constant; the `carrick-mem` fence exception prevents host/EL1 manifest drift.
+Independent source review approved this prerequisite, not venue activation.
+
+This witness binds only the frozen internal control-word refusal. It does
+not reproduce `mmapv8align` or `mmapprivatefiletrack`; their host-consumer
+witnesses, the inverse EFAULT14 checks, prepared receive/edit interleavings,
+all consumer activation, control-window writes, and final acceptance remain
+open. The broader prepared-copy/GuestMemory integration is unaccepted WIP.

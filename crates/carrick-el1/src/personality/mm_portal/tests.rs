@@ -196,6 +196,37 @@ fn stopped_lazy_transfer_reuses_fault_grant_mailbox() {
 }
 
 #[test]
+fn internal_read_selects_identity_control_from_exact_live_mm() {
+    // Frozen host-buffer failure: identity shim-enabled word, not image header.
+    let address = 0x2d_001e_4004;
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 0);
+    tables.words[512 + 1].store(0, Ordering::Relaxed);
+    tables.words[512 + ((address >> 30) & 511) as usize]
+        .store((ROOT + 8192) | 3, Ordering::Relaxed);
+    tables.words[1024 + ((address >> 21) & 511) as usize]
+        .store((ROOT + 12288) | 3, Ordering::Relaxed);
+    tables.words[1536 + ((address >> 12) & 511) as usize]
+        .store(IPA | (RW & !(1 << 6)), Ordering::Relaxed);
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(address),
+            4,
+            TransferIntent::CarrickInternalRead,
+            0,
+        )
+        .unwrap();
+    let chunk = selected(select(&portal, &transfer, &tables));
+    assert_eq!(chunk.ipa, IPA + 4);
+    assert_eq!(chunk.len, 4);
+}
+
+#[test]
 fn internal_reads_cannot_name_arbitrary_user_windows() {
     let region = Region::new();
     let spaces = AddressSpaces::new();
@@ -205,27 +236,39 @@ fn internal_reads_cannot_name_arbitrary_user_windows() {
     let handle = portal.admitted_handle(mm, 0).unwrap();
     let tables = Tables::new(ROOT, IPA, 1);
     let maintenance = CallerInvalidatesAsid;
-    let transfer = portal
-        .begin(
-            handle,
-            GuestVa::new(VA),
-            1,
-            TransferIntent::CarrickInternalRead,
-            0,
-        )
-        .unwrap();
-    assert!(matches!(
-        portal.select(
-            &transfer,
-            &tables.live(&maintenance),
-            &mut NoopPreparedResolver,
-            &mut NoopCowResolver,
-            &residency(),
-            &FrameGrantMailbox::new(),
-            0
+    for (address, len) in [
+        (VA, 1),
+        (carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE - 1, 2),
+        (
+            carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE
+                + carrick_el1_abi::CARRICK_IDENTITY_PAGE_SIZE
+                - 1,
+            2,
         ),
-        Err(MmError::Fault)
-    ));
+        (carrick_el1_abi::EL1_REGION_BASE + 4095, 2),
+    ] {
+        let transfer = portal
+            .begin(
+                handle,
+                GuestVa::new(address),
+                len,
+                TransferIntent::CarrickInternalRead,
+                0,
+            )
+            .unwrap();
+        assert!(matches!(
+            portal.select(
+                &transfer,
+                &tables.live(&maintenance),
+                &mut NoopPreparedResolver,
+                &mut NoopCowResolver,
+                &residency(),
+                &carrick_el1_abi::FrameGrantMailbox::new(),
+                0
+            ),
+            Err(MmError::Fault)
+        ));
+    }
 }
 
 #[test]
