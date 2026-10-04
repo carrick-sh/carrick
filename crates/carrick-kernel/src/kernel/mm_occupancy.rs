@@ -1256,10 +1256,15 @@ fn publish_in_held(
     } = anchors;
     let spaces = tables.spaces;
     if spaces.find(mm.raw()).is_some() {
+        crate::probes::hvpatch_el1_root_prepublish(mm.raw(), 5);
         return None;
     }
-    let index =
-        spaces.publish_closed_with_layout(mm.raw(), ttbr0, ttbr1, brk_current, mmap_next)?;
+    let index = spaces
+        .publish_closed_with_layout(mm.raw(), ttbr0, ttbr1, brk_current, mmap_next)
+        .or_else(|| {
+            crate::probes::hvpatch_el1_root_prepublish(mm.raw(), 6);
+            None
+        })?;
     // Install the relocatable reservation root in this same slot while the MM
     // gate is closed. The dispatcher imports exact VMAs/limits before T2 opts
     // into reservation decisions; an unimported root refuses guest service.
@@ -1296,6 +1301,7 @@ fn publish_in_held(
                 .ok()
         })();
         if installed.is_none() {
+            crate::probes::hvpatch_el1_root_prepublish(mm.raw(), 7);
             tables.free(index);
             return None;
         }
@@ -1303,6 +1309,7 @@ fn publish_in_held(
     // Bound while closed: a pause in force now raises the gate before it
     // opens, and every later pause raises it before its occupancy scan.
     if !fence.bind_mirror(Arc::new(SpaceGate { tables, index })) {
+        crate::probes::hvpatch_el1_root_prepublish(mm.raw(), 8);
         retire_reservation_root(tables, index, mm, reservation_provider.as_ref());
         tables.free(index);
         return None;
@@ -1310,6 +1317,7 @@ fn publish_in_held(
     if matches!(admission, PublicationAdmission::Open) {
         tables.open(index);
     }
+    crate::probes::hvpatch_el1_root_prepublish(mm.raw(), 9);
     Some(AddressSpacePublication {
         tables,
         index,
