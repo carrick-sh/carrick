@@ -15,6 +15,7 @@ use carrick_hal::WaitFd;
 #[derive(Debug, Clone)]
 pub enum WaitFdGuard {
     HostFd(#[allow(dead_code)] HostFdRef),
+    Description(#[allow(dead_code)] crate::kernel::objects::FileDescriptionFdLease),
     ParkedOpener(#[allow(dead_code)] ParkedOpenerToken),
 }
 
@@ -247,6 +248,35 @@ impl WaitFds {
         Self::raw(vec![(fd, events)])
     }
 
+    /// Transfer an admitted readiness owner, including its IPC subscription.
+    /// Derive the reactor number from the owner so a borrowed or mismatched
+    /// descriptor cannot be supplied at this boundary.
+    pub(in crate::dispatch) fn retained_one(
+        owner: HostFdRef,
+        events: i16,
+        authority: WaitFdAuthority,
+    ) -> Self {
+        let fd = owner.raw();
+        Self {
+            fds: vec![WaitFd::anchored(fd, events)],
+            guards: vec![WaitFdGuard::HostFd(owner)],
+            authority: WaitFdAuthority::Missing,
+        }
+        .with_authority(authority)
+    }
+
+    pub(in crate::dispatch) fn with_description_lease(
+        mut self,
+        lease: crate::kernel::objects::FileDescriptionFdLease,
+    ) -> Self {
+        self.guards.push(WaitFdGuard::Description(lease));
+        self
+    }
+
+    pub(crate) fn into_fd_ownership(self) -> (Vec<WaitFd>, Vec<WaitFdGuard>) {
+        (self.fds, self.guards)
+    }
+
     /// Build the reactor lowering and the authority from ONE list: a `Host` or
     /// `Dual` source contributes its host descriptor, a `Description` source
     /// contributes none. There is no `-1` sentinel to write.
@@ -273,14 +303,6 @@ impl WaitFds {
                 watched,
             },
         })
-    }
-
-    pub(in crate::dispatch) fn authorized_raw_one(
-        fd: i32,
-        events: i16,
-        authority: WaitFdAuthority,
-    ) -> Self {
-        Self::raw_one(fd, events).with_authority(authority)
     }
 
     pub(in crate::dispatch) fn anchored_one(

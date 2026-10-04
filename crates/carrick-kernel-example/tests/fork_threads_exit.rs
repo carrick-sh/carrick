@@ -55,6 +55,7 @@ fn fork_parent_exit_between_pipe_readv_admission_and_continuation_build() {
     admitted_pipe_wait_after_parent_exit(readv, false);
 }
 
+#[allow(clippy::expect_used)] // Shared assertion fixture for the three tests above.
 fn admitted_pipe_wait_after_parent_exit(wait: carrick_kernel_example::Syscall, fill: bool) {
     let admitted = ScriptCheckpoint::default();
     let resume = ScriptCheckpoint::default();
