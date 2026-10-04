@@ -2660,6 +2660,31 @@ fn synthetic_proc_maps(ctx: &OpenContext<'_>) -> String {
     )
 }
 
+/// Bounds formatting over an already observed region; this has no MM lookup,
+/// permission decision, residency input or retained semantic authority.
+#[derive(Clone, Copy)]
+pub(crate) struct ProcMapBounds {
+    pub start: carrick_guest_mem::GuestVa,
+    pub end: carrick_guest_mem::GuestVa,
+}
+
+impl ProcMapBounds {
+    pub(crate) fn render(
+        start: carrick_guest_mem::GuestVa,
+        end: carrick_guest_mem::GuestVa,
+        used_end: Option<carrick_guest_mem::GuestVa>,
+    ) -> Self {
+        let end = used_end
+            .filter(|used| start.raw() < used.raw() && used.raw() <= end.raw())
+            .unwrap_or(end);
+        let page = carrick_abi::LINUX_PAGE_SIZE;
+        Self {
+            start: carrick_guest_mem::GuestVa(start.raw() & !(page - 1)),
+            end: carrick_guest_mem::GuestVa(end.raw().div_ceil(page) * page),
+        }
+    }
+}
+
 fn render_proc_maps_from_regions(
     regions: &[ProcMapsEntry],
     executable_path: &str,
@@ -2670,25 +2695,25 @@ fn render_proc_maps_from_regions(
     sorted.sort_by_key(|r| r.start);
     let mut out = String::new();
     for region in sorted {
-        let (start, mut end, label) = label_for_region(region, executable_path);
-        match label.as_str() {
-            "[heap]" if brk_current > start && brk_current <= region.end => {
-                end = brk_current;
-            }
-            "[carrick-mmap]" if mmap_next > start && mmap_next <= region.end => {
-                end = mmap_next;
-            }
-            _ => {}
-        }
+        let (start, end, label) = label_for_region(region, executable_path);
+        let used_end = match label.as_str() {
+            "[heap]" => Some(carrick_guest_mem::GuestVa(brk_current)),
+            "[carrick-mmap]" => Some(carrick_guest_mem::GuestVa(mmap_next)),
+            _ => None,
+        };
+        let bounds = ProcMapBounds::render(
+            carrick_guest_mem::GuestVa(start),
+            carrick_guest_mem::GuestVa(end),
+            used_end,
+        );
         let r = if region.read { 'r' } else { '-' };
         let w = if region.write { 'w' } else { '-' };
         let x = if region.execute { 'x' } else { '-' };
         let s = region.sharing.marker();
         // Real Linux /proc/self/maps reports Linux page-aligned VMA bounds.
         // LTP scans for an exact 4 KiB page start after MAP_FIXED remaps.
-        const PAGE: u64 = crate::linux_abi::LINUX_PAGE_SIZE;
-        let start = start & !(PAGE - 1);
-        let end = end.div_ceil(PAGE) * PAGE;
+        let start = bounds.start.raw();
+        let end = bounds.end.raw();
         out.push_str(&format!(
             "{start:08x}-{end:08x} {r}{w}{x}{s} 00000000 00:00 0                          {label}\n",
         ));

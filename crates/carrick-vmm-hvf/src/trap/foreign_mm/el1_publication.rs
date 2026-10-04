@@ -1,4 +1,4 @@
-//! Exact-target EL1 publication for a guest-owned foreign MM.
+//! Exact-target descriptor publication before exclusive MM-owner admission.
 //!
 //! When guest EL1 owns a target MM's live descriptors, the host may not edit
 //! them; a foreign writer (process_vm_writev, ptrace POKE) instead submits an
@@ -22,6 +22,7 @@ const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
 /// A lent caller vCPU bound to one authenticated target MM.
 pub(crate) struct ForeignEl1Publisher<'a> {
+    _legacy: carrick_guest_mem::LegacyProtectionRead<'a>,
     caller: &'a mut dyn carrick_guest_mem::CallerEl1Call,
     /// The target ASID generation's admission for the borrowed-TTBR0
     /// windows: it lives until this publisher drops, so the target cannot
@@ -40,11 +41,18 @@ impl<'a> ForeignEl1Publisher<'a> {
     /// requested binding's root is the target authority's own live root.
     pub(crate) fn authenticate(
         invalidator: &'a mut dyn carrick_hal::ForeignMmInvalidator,
-        target: &MmAccessState,
+        target: &'a MmAccessState,
         mm: carrick_hal::ForeignMmId,
         binding: CarrierForeignMmBinding,
     ) -> Result<Self, carrick_hal::ForeignMmTransportError> {
         use carrick_hal::ForeignMmTransportError as Error;
+        // Descriptor ownership alone does not admit host plans against an
+        // exclusive MM owner. This borrow excludes owner selection until the
+        // legacy publication has settled, including failure/Drop paths.
+        let legacy = target
+            .protections
+            .legacy()
+            .ok_or(Error::AuthorityUnavailable)?;
         let tables = target.page_tables_authority();
         if tables.live_descriptor_owner() != carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest {
             return Err(Error::AuthorityUnavailable);
@@ -69,6 +77,7 @@ impl<'a> ForeignEl1Publisher<'a> {
         }
         let ttbr0 = root | (u64::from(binding.asid.raw_for_probe()) << 48);
         Ok(Self {
+            _legacy: legacy,
             caller,
             admission,
             tables,
@@ -149,6 +158,7 @@ impl carrick_aarch64::descriptor_drain::GuestDrainVenue for ForeignEl1Publisher<
 /// the exact-target invalidator, or EL1 publication through the lent vCPU.
 pub(crate) enum ForeignStage1Services<'a> {
     Host {
+        _legacy: carrick_guest_mem::LegacyProtectionRead<'a>,
         invalidator: &'a mut dyn carrick_hal::ForeignMmInvalidator,
         binding: carrick_hal::ForeignMmBinding,
         deadline: std::time::Instant,
@@ -161,10 +171,16 @@ impl<'a> ForeignStage1Services<'a> {
     /// (or with a binding that is not its own) refuses before any mutation.
     pub(crate) fn for_target(
         invalidator: &'a mut dyn carrick_hal::ForeignMmInvalidator,
-        target: &MmAccessState,
+        target: &'a MmAccessState,
         requested: &CarrierForeignMmSnapshot,
         deadline: std::time::Instant,
     ) -> Result<Self, carrick_hal::ForeignMmTransportError> {
+        // An admitted target requires UserTransfer, not either descriptor
+        // editor. Refusal does not select the host arm.
+        let legacy = target
+            .protections
+            .legacy()
+            .ok_or(carrick_hal::ForeignMmTransportError::AuthorityUnavailable)?;
         if target.page_tables_authority().live_descriptor_owner()
             == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
         {
@@ -177,6 +193,7 @@ impl<'a> ForeignStage1Services<'a> {
             .map(Self::Guest);
         }
         Ok(Self::Host {
+            _legacy: legacy,
             invalidator,
             binding: carrick_hal::ForeignMmSnapshot::binding(requested),
             deadline,
@@ -191,6 +208,7 @@ impl carrick_aarch64::vmm::Stage1Services for ForeignStage1Services<'_> {
                 invalidator,
                 binding,
                 deadline,
+                ..
             } => invalidator
                 .invalidate_exact_asid(*binding, *deadline)
                 .map_err(|error| TrapError::Hypervisor(format!("foreign sparse TLBI: {error:?}"))),
