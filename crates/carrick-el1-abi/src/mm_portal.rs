@@ -9,6 +9,37 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const MM_PORTAL_PROTOCOL: u64 = 5;
 pub const MM_PORTAL_MAX_BYTES: u64 = 4096;
 pub const MM_PORTAL_BIND_ESR: u64 = 0x4352_4d4d_4249_0004;
+/// A closed initial root's one-publication identity, minted only by the
+/// holder of its unpublished address-space publication. It authorizes the
+/// BIND service to authenticate a root before its installation gate opens;
+/// the service rechecks that it is still never-opened and exact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortalClosedRootBind {
+    carrier: NonZeroU64,
+    mm: ReservationMm,
+    ttbr0: u64,
+}
+impl PortalClosedRootBind {
+    /// # Safety
+    /// Only the exact unpublished initial address-space owner may mint this,
+    /// after checking the still-closed slot and its MM/root identity.
+    pub unsafe fn from_unpublished_owner(
+        carrier: NonZeroU64,
+        mm: ReservationMm,
+        ttbr0: u64,
+    ) -> Self {
+        Self { carrier, mm, ttbr0 }
+    }
+    pub const fn carrier(self) -> NonZeroU64 {
+        self.carrier
+    }
+    pub const fn mm(self) -> ReservationMm {
+        self.mm
+    }
+    pub const fn ttbr0(self) -> u64 {
+        self.ttbr0
+    }
+}
 /// Identity of an admitted owner. It contains no editor, table, or host pointer.
 ///
 /// Safe callers cannot manufacture admitted ownership.
