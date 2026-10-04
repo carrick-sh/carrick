@@ -1558,4 +1558,28 @@ mod closed_bind_tests {
         spaces.close(first_index);
         assert!(bind_service_root(&spaces, first, true, 0x81_000).is_err());
     }
+
+    #[test]
+    fn fixed_boot_primary_requires_exact_closed_mm_generation() {
+        let spaces = carrick_sched_core::AddressSpaces::new();
+        let boot = ReservationMm::new(81).unwrap();
+        let successor = ReservationMm::new(82).unwrap();
+        let root = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE | (1 << 48);
+        let index = spaces.publish_closed(boot.raw(), root, root).unwrap();
+        assert!(spaces.mark_initial_bindable(index));
+        assert_eq!(bind_service_root(&spaces, boot, true, root), Ok(root));
+        assert_eq!(
+            bind_service_root(&spaces, successor, true, root),
+            Err(MmError::Stale)
+        );
+        assert_eq!(
+            bind_service_root(&spaces, boot, true, root + 4096),
+            Err(MmError::Stale)
+        );
+        spaces.open(index);
+        assert_eq!(
+            bind_service_root(&spaces, boot, true, root),
+            Err(MmError::Stale)
+        );
+    }
 }
