@@ -1,3 +1,11 @@
+#![cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(
+        dead_code,
+        reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
+    )
+)]
+
 //! HVF execution with static text patched to enter in-guest syscall islands.
 
 #[cfg(all(
@@ -11,6 +19,7 @@ use std::sync::Arc;
 
 use carrick_fatal::carrick_fatal;
 
+#[cfg(any(test, feature = "platform-macos"))]
 use crate::memory::{AddressSpace, AddressSpaceError};
 use carrick_hal::{SysReg, ThreadedEngine};
 use carrick_kernel::dispatch::SyscallDispatcher;
@@ -22,13 +31,18 @@ use carrick_kernel::kernel::CarrierProcess;
 ))]
 use carrick_kernel::run_result::RunResult;
 use carrick_kernel::run_result::RuntimeError;
+#[cfg(any(test, feature = "platform-macos"))]
 use carrick_mem::elf::SegmentPerms;
+#[cfg(any(test, feature = "platform-macos"))]
 use island::passthrough_island_bytes;
+#[cfg(any(test, feature = "platform-macos"))]
 use patcher::{ISLAND_STUB_SIZE, PatchError, PatchSite, patch_svc_zero};
 
 mod asid;
+#[cfg(any(test, feature = "platform-macos"))]
 mod island;
 mod mm_resources;
+#[cfg(any(test, feature = "platform-macos"))]
 mod patcher;
 mod stage1_mm;
 
@@ -36,14 +50,19 @@ pub(crate) use asid::{AsidGeneration, AsidLoad, BroadcastInvalidation};
 use mm_resources::MmResources;
 pub(crate) use mm_resources::{
     ExecMmDispositionKind, ExecMmReservation, ExecSettlementEnrollment, ExecSettlementSubscription,
-    MmResourcesError, OwnerSetEditHold, RetiredStage1Mm,
+    MmResourcesError, RetiredStage1Mm,
 };
 #[cfg(test)]
 pub(crate) use stage1_mm::Stage1MmPool;
 pub(crate) use stage1_mm::{
-    CowInvalidationObserver, PreparedStage1Mm, Stage1MmLease, Stage1MmRetirement,
-    Stage1RootRetirementReceipt, Stage1RootRetirementTicket,
+    CowInvalidationObserver, Stage1MmLease, Stage1MmRetirement, Stage1RootRetirementReceipt,
+    Stage1RootRetirementTicket,
 };
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use mm_resources::OwnerSetEditHold;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use stage1_mm::PreparedStage1Mm;
 
 /// Installation permission kept private to the HVPatch bootstrap/lifecycle
 /// module. Syscall handlers cannot replace the carrier endpoint on an MM.
@@ -1212,11 +1231,15 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
     }))
 }
 
+#[cfg(any(test, feature = "platform-macos"))]
 const PAGE_SIZE: u64 = 4096;
+#[cfg(any(test, feature = "platform-macos"))]
 const STAGE2_PAGE_SIZE: u64 = crate::trap::HVF_PAGE_SIZE;
+#[cfg(any(test, feature = "platform-macos"))]
 const SVC_ZERO: u32 = 0xd400_0001;
 
 #[derive(Debug)]
+#[cfg(any(test, feature = "platform-macos"))]
 struct PreparedImage {
     image: AddressSpace,
     manifest: Vec<PatchSite>,
@@ -1224,6 +1247,7 @@ struct PreparedImage {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[cfg(any(test, feature = "platform-macos"))]
 pub(crate) enum PrepareError {
     #[error(transparent)]
     AddressSpace(#[from] AddressSpaceError),
@@ -1235,12 +1259,14 @@ pub(crate) enum PrepareError {
     MissingRegion(usize),
 }
 
+#[cfg(any(test, feature = "platform-macos"))]
 fn align_up_stage2(value: u64) -> Option<u64> {
     value
         .checked_add(STAGE2_PAGE_SIZE - 1)
         .map(|v| v & !(STAGE2_PAGE_SIZE - 1))
 }
 
+#[cfg(any(test, feature = "platform-macos"))]
 fn span_is_free(base: u64, size: u64, ranges: &[(u64, u64)]) -> bool {
     let Some(end) = base.checked_add(size) else {
         return false;
@@ -1250,6 +1276,7 @@ fn span_is_free(base: u64, size: u64, ranges: &[(u64, u64)]) -> bool {
         .all(|&(occupied_start, occupied_end)| end <= occupied_start || base >= occupied_end)
 }
 
+#[cfg(any(test, feature = "platform-macos"))]
 fn find_island_base(
     region_start: u64,
     region_end: u64,
@@ -1327,6 +1354,7 @@ fn find_island_base(
     })
 }
 
+#[cfg(any(test, feature = "platform-macos"))]
 fn prepare_image(mut image: AddressSpace) -> Result<PreparedImage, PrepareError> {
     let mut occupied: Vec<(u64, u64)> = Vec::with_capacity(image.regions().len() + 1);
     for region in image.regions() {
@@ -1393,6 +1421,7 @@ fn prepare_image(mut image: AddressSpace) -> Result<PreparedImage, PrepareError>
 
 /// Patch an `execve` replacement image before the runtime adds its own
 /// executable trampoline/vector pages.
+#[cfg(any(test, feature = "platform-macos"))]
 pub(crate) fn prepare_exec_image_for_dispatcher(
     image: AddressSpace,
     dispatcher: &SyscallDispatcher,

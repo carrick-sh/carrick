@@ -1,3 +1,11 @@
+#![cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(
+        dead_code,
+        reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
+    )
+)]
+
 //! Persistent quantum jobs, task bindings, logical job completions, and process drains.
 
 use std::collections::BTreeMap;
@@ -511,7 +519,7 @@ impl HvpatchTaskBinding {
 
     pub(crate) fn retire_detached_address_space(
         &self,
-        root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+        _root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, crate::trap::TrapError> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -535,7 +543,7 @@ impl HvpatchTaskBinding {
             // (a published inventory must never leak), but for months it was
             // the only thing an operator saw.
             let retired = backend.retire_detached_address_space_with(
-                root_ticket,
+                _root_ticket,
                 |commit| {
                     self.quantum
                         .apply_detached_address_space_retirement_with_receipt(commit)
@@ -598,7 +606,7 @@ impl HvpatchTaskBinding {
 
     pub(crate) fn retire_detached_exec_predecessor(
         &self,
-        root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
+        _root_ticket: Option<crate::hvpatch::Stage1RootRetirementTicket>,
     ) -> Result<Option<crate::hvpatch::Stage1RootRetirementReceipt>, crate::trap::TrapError> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -615,7 +623,7 @@ impl HvpatchTaskBinding {
                         "detached exec cleanup backend type mismatch".to_owned(),
                     )
                 })?;
-            backend.retire_detached_exec_predecessor(root_ticket)
+            backend.retire_detached_exec_predecessor(_root_ticket)
         }
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         Err(crate::trap::TrapError::Hypervisor(

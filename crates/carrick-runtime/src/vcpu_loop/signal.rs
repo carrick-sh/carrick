@@ -1,3 +1,11 @@
+#![cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(
+        dead_code,
+        reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
+    )
+)]
+
 //! SIGNAL concern of the vCPU run loop.
 //!
 //! Split out of `vcpu_loop/mod.rs` (Task A2). Pure relocation — no logic
@@ -26,6 +34,7 @@ pub(crate) fn signal_wait_expired(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|target| Instant::now() >= target)
 }
 
+#[cfg(any(test, feature = "platform-macos"))]
 pub(crate) use carrick_kernel::kernel::continuation::raise_sigpipe_for_blocking_write;
 
 pub(crate) fn partial_write_interrupt_outcome(

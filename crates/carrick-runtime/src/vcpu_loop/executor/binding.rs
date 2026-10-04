@@ -1,3 +1,11 @@
+#![cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(
+        dead_code,
+        reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
+    )
+)]
+
 //! Persistent task binding and registration directory for the HVPatch executor.
 
 use std::sync::Arc;
@@ -13,7 +21,7 @@ use crate::vcpu_loop::{
     ContainerJobReservation, HvpatchLoopResult, PersistentProcessMemberPublication,
     ProcessPhysicalRetirement,
 };
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 use crate::vcpu_loop::{HvpatchProcessFailpoint, check_hvpatch_process_failpoint};
 #[cfg(test)]
 use carrick_kernel::kernel::SchedulerError;
@@ -1009,7 +1017,7 @@ impl PreparedVforkChildActivation {
             error
         };
 
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
         if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::Activation) {
             return Err(fail_unpublished_child(TrapError::Hypervisor(
                 error.to_string(),

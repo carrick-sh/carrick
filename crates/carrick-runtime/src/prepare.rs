@@ -32,9 +32,12 @@ use carrick_spec::{FsBackendKind, InitialIdentity, PidMode, Platform, RunSpec, S
 use crate::execute::rosetta_license_notice;
 use crate::execute::{
     HostRootLayout, cached_lower_enabled, detached_stable_scratch_path, effective_guest_hostname,
-    entrypoint_not_executable_result, entrypoint_not_found_result, install_rosetta_mounts,
-    is_entrypoint_not_executable, is_entrypoint_not_found, prepare_host_root,
-    record_detached_scratch, seed_guest_baseline,
+    install_rosetta_mounts, prepare_host_root, record_detached_scratch, seed_guest_baseline,
+};
+#[cfg(any(test, feature = "platform-macos"))]
+use crate::execute::{
+    entrypoint_not_executable_result, entrypoint_not_found_result, is_entrypoint_not_executable,
+    is_entrypoint_not_found,
 };
 use crate::interactive_supervisor::InteractiveSession;
 #[cfg(feature = "platform-macos")]
@@ -807,6 +810,7 @@ fn prepare_with_lease(
 /// runc/shell exit conventions for a failed entrypoint load: 127 for "not
 /// found", 126 for "found but not executable"; a configuration-time refusal
 /// passes through unwrapped so it surfaces labeled as what it is.
+#[cfg(any(test, feature = "platform-macos"))]
 fn classify_run_outcome(
     run: Result<RunResult, RuntimeError>,
     label: &str,

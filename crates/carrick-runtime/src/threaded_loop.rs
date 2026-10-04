@@ -1,3 +1,11 @@
+#![cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(
+        dead_code,
+        reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
+    )
+)]
+
 //! The platform-NEUTRAL shared threaded vCPU run loop + its `HostBackend` host
 //! seam. Extracted from the Linux-only inline `runtime` module (F3) so BOTH the
 //! kick+futex backends (KVM/bhyve/NVMM) and the macOS/HVF backend drive the SAME

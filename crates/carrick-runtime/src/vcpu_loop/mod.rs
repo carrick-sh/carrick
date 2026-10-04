@@ -1,3 +1,11 @@
+#![cfg_attr(
+    all(not(target_os = "macos"), not(test)),
+    expect(
+        dead_code,
+        reason = "bound by the KVM carrier at M5: docs/superpowers/plans/2026-10-04-kvm-hvpatch-carrier.md"
+    )
+)]
+
 //! The multi-threaded vCPU run loop, hoisted out of the macOS-only `runtime`
 //! module and made generic over [`carrick_hal::ThreadedEngine`].
 //!
@@ -72,10 +80,12 @@ const SIGNAL_WAIT_SLICE: Duration = Duration::from_millis(50);
 pub(crate) mod memory;
 #[cfg(test)]
 pub(crate) mod native_probe;
+#[cfg(feature = "platform-macos")]
+pub(crate) use memory::apply_image_proc_state;
 pub(crate) use memory::{
     KernelFrameCowAuthority, RefuseAliasInstallSpec, apply_alias_frame_inventory,
-    apply_exec_image_proc_state, apply_image_proc_state, refuse_alias_install,
-    requires_no_unwind_host_exit, stamp_ns_visible_guest_tid, syscall_edits_stage1,
+    apply_exec_image_proc_state, refuse_alias_install, requires_no_unwind_host_exit,
+    stamp_ns_visible_guest_tid, syscall_edits_stage1,
 };
 #[cfg(test)]
 pub(crate) use memory::{
@@ -353,8 +363,7 @@ mod macos_helper_stubs {
     feature = "platform-netbsd"
 ))]
 use macos_helper_stubs::{
-    forked_child_die_by_signal, hardware_tso_for_debug, load_execve_image, stop_after_traced_exec,
-    stop_by_signal,
+    forked_child_die_by_signal, hardware_tso_for_debug, stop_after_traced_exec, stop_by_signal,
 };
 
 // ===================================================================
@@ -380,13 +389,15 @@ pub(crate) use threads::{
 
 // The threaded loop owns its backend-specific fault resolution. Native Darwin
 // reuses the architecture lowering and Linux signal-frame half below.
+pub(crate) use signal::signal_progress_count;
 use signal::{
     SignalRestartContext, deliver_fault_signal, deliver_pending_signal_with_restart,
     deliver_reserved_signal_with_restart, lower_el0_fault,
 };
+#[cfg(feature = "platform-macos")]
 pub(crate) use signal::{
     deliver_pending_signal, partial_write_interrupt_outcome, raise_sigpipe_for_blocking_write,
-    signal_progress_count, signal_wait_expired, signal_wait_slice,
+    signal_wait_expired, signal_wait_slice,
 };
 pub(crate) use signal::{
     reset_signal_progress_for_executor_boundary, signal_progress_is_zero_for_executor_boundary,
@@ -403,13 +414,15 @@ pub(crate) use wait_wake::{
 };
 
 pub(crate) mod terminal;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) use terminal::ForkCloseAttempt;
 #[cfg(test)]
 pub(crate) use terminal::ProcessExitClaim;
 pub(crate) use terminal::{
     CloneAdmissionChangeSubscription, CloneAdmissionGate, CloneAdmissionPermit, CloneEnrollment,
     ExecCloneAdmission, ExecTerminalHandoff, FatalSignalAuthority, FatalSignalRecord,
-    ForkCloneAdmission, ForkCloseAttempt, ProcessExitClaimReceipt, VcpuLoopOutcome,
-    core_note_resume_pair, guest_visible_resume_pc, try_claim_persistent_process_exit_with,
+    ForkCloneAdmission, ProcessExitClaimReceipt, VcpuLoopOutcome, core_note_resume_pair,
+    guest_visible_resume_pc, try_claim_persistent_process_exit_with,
 };
 
 pub(crate) mod outcome;
@@ -424,20 +437,21 @@ pub(crate) mod crash;
 #[cfg(test)]
 use crash::CrashLeaseDrainBudget;
 pub(crate) mod lifecycle;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use lifecycle::ProcessChildBootstrap;
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use lifecycle::bootstrap_hvpatch_process_child;
-#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+#[cfg(test)]
 pub(crate) use lifecycle::install_hvpatch_process_failpoint;
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
 pub(in crate::vcpu_loop) use lifecycle::{
     HvpatchCloneBackendOps, HvpatchCloneThreadRequest, PersistentHvpatchCloneAttempt,
 };
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(crate) use lifecycle::{
-    HvpatchProcessBackendOps, HvpatchProcessFailpoint, HvpatchProcessInventoryPreparation,
-    check_hvpatch_process_failpoint,
-};
+pub(crate) use lifecycle::{HvpatchProcessBackendOps, HvpatchProcessInventoryPreparation};
+
+#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+pub(crate) use lifecycle::{HvpatchProcessFailpoint, check_hvpatch_process_failpoint};
 
 pub(crate) use crash::PreparedCorePublication;
 
@@ -2662,8 +2676,10 @@ pub(crate) mod tests {
         }
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) struct DynamicCloneBackendOps;
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl HvpatchCloneBackendOps<Memory> for DynamicCloneBackendOps {
         type Prepared = (u64, u64);
         type Backend = ();
@@ -2762,6 +2778,7 @@ pub(crate) mod tests {
     }
 
     #[derive(Default)]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(super) struct FakeBackendOps {
         parent_commits: usize,
         parent_rollbacks: usize,
@@ -2779,6 +2796,7 @@ pub(crate) mod tests {
         request_child_mm: Option<u64>,
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     impl<E: ThreadedEngine> HvpatchProcessBackendOps<E, Memory> for FakeBackendOps {
         type Prepared = ();
         type Backend = ();
