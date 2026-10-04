@@ -5130,6 +5130,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let target = crate::user_transfer::TransferTarget::from_handle(handle, ttbr0);
         let prepared = match self.vm.prepare_owner_frame_grant(target, window) {
             Err(TrapError::HostBackingEof) => {
+                carrick_observability::probes::hvpatch_el1_file_fault_handoff(
+                    window.fault_page,
+                    0,
+                    9,
+                );
                 if !slot.cancel_fault_selection(window, request_generation) {
                     return Err(TrapError::Hypervisor("owner EOF selection is stale".into()));
                 }
@@ -5138,6 +5143,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             other => other?,
         };
         let Some(mut grant) = prepared else {
+            carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 5);
             if !slot.cancel_fault_selection(window, request_generation) {
                 return Err(TrapError::Hypervisor(
                     "owner file fault cancellation is stale".into(),
@@ -5150,6 +5156,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 "owner file fault grant selection was displaced".into(),
             ));
         }
+        carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 6);
         let outcome = self.run_owner_fork_service(
             carrick_el1_abi::TrapFrame {
                 esr: carrick_el1_abi::MM_PORTAL_GRANT_ESR,
@@ -5158,7 +5165,19 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             &mut || false,
         );
         if let Some(receipt) = slot.take_receipt(window, grant.transaction()) {
+            let refusal = match receipt.outcome {
+                carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(reason)
+                | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::RolledBack(
+                    reason,
+                ) => reason as u32,
+                _ => 0,
+            };
             let settled = grant.settle(&receipt)?;
+            carrick_observability::probes::hvpatch_el1_file_fault_handoff(
+                window.fault_page,
+                refusal,
+                if settled { 10 } else { 7 },
+            );
             outcome?;
             Ok(Some(if settled {
                 carrick_hal::OwnerFileFaultOutcome::Resolved
@@ -5166,6 +5185,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 carrick_hal::OwnerFileFaultOutcome::Refused
             }))
         } else if slot.withdraw(window, grant.transaction()) {
+            carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 8);
             outcome?;
             Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused))
         } else {
