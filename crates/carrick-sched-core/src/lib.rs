@@ -1048,6 +1048,8 @@ pub struct ZoneTables {
     completion_consumer: AtomicU32,
     /// Cause-specific MM queues append storage without moving previous fields.
     space_cause_waits: [object_wait::ObjectQueue; object_wait::EXTRA_CAUSE_QUEUES],
+    /// Exact delegated-inode completion domain, appended after MM causes.
+    delegated_file_waits: [object_wait::ObjectQueue; object_wait::DELEGATED_FILE_WAIT_QUEUES],
 }
 
 /// How a bucket lock waits: EL1 gives up after a bounded spin (and forwards
