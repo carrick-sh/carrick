@@ -162,7 +162,9 @@ mod tests {
     use super::*;
     use carrick_hal::guest_arch_binding::core_arch::*;
     use carrick_hal::threaded::{X86_TASK_RESUME_MAGIC, X86TaskCpuStateV1};
+    use std::cell::Cell;
     use std::num::NonZeroU64;
+    use std::rc::Rc;
 
     struct TestIo {
         image: X86VcpuSnapshot,
@@ -311,6 +313,169 @@ mod tests {
             assert!(cpu.save_and_detach(a.binding().task()).is_err());
             assert!(cpu.audit_idle().is_err());
             assert!(cpu.load(context(3)).is_err());
+        }
+    }
+
+    // Supplementary kernel.el1.task-load-entry / execution-generation custody
+    // witness, not the ARM no-maintenance-exit contract. Fail exactly one read
+    // so a later refusal proves custody, rather than a permanently broken IO.
+    #[derive(Default)]
+    struct IoCalls {
+        reads: Cell<usize>,
+        writes: Cell<usize>,
+    }
+    impl IoCalls {
+        fn assert_budget(&self, reads: usize, writes: usize) {
+            assert_eq!((self.reads.get(), self.writes.get()), (reads, writes));
+        }
+    }
+    struct ReadFaultIo {
+        image: X86VcpuSnapshot,
+        calls: Rc<IoCalls>,
+        fail_read: usize,
+    }
+    impl ReadFaultIo {
+        fn new(fail_read: usize) -> Self {
+            Self {
+                image: context(1).hardware_image(),
+                calls: Rc::default(),
+                fail_read,
+            }
+        }
+    }
+    impl sealed::Sealed for ReadFaultIo {}
+    impl CarrierCpuIo for ReadFaultIo {
+        fn read_image(&self) -> Result<X86VcpuSnapshot, TrapError> {
+            let read = self.calls.reads.get() + 1;
+            self.calls.reads.set(read);
+            if read == self.fail_read {
+                return Err(boundary_error("injected read failure"));
+            }
+            Ok(self.image.clone())
+        }
+        fn write_image(&mut self, image: &X86VcpuSnapshot) -> Result<(), TrapError> {
+            self.calls.writes.set(self.calls.writes.get() + 1);
+            self.image = image.clone();
+            Ok(())
+        }
+    }
+    fn assert_read_failure<T>(result: Result<T, TrapError>) {
+        match result {
+            Err(TrapError::Hypervisor(message)) => assert_eq!(message, "injected read failure"),
+            _ => panic!("the failed read must refuse to return a CPU or detach receipt"),
+        }
+    }
+    fn read_fault_tasks() -> [X86ArchContext; 2] {
+        let a = context(2);
+        let b = context(3);
+        // Same carrier/task serial, distinct execution and MM generations.
+        let binding = GuestArchBinding::x86(
+            TaskIdentity {
+                task: a.binding().task().task,
+                ..b.binding().task()
+            },
+            b.binding().context(),
+        );
+        [a, X86ArchContext::new(binding, b.state().clone()).unwrap()]
+    }
+    fn assert_poisoned_without_io(
+        cpu: &mut KvmCarrierCpu<ReadFaultIo>,
+        tasks: &[X86ArchContext; 2],
+        reads: usize,
+        writes: usize,
+    ) {
+        for task in tasks {
+            assert!(
+                cpu.load(task.clone()).is_err(),
+                "failed transaction must refuse later load reuse"
+            );
+            cpu.io.calls.assert_budget(reads, writes);
+            assert!(
+                cpu.save_and_detach(task.binding().task()).is_err(),
+                "failed transaction must not manufacture a detach receipt"
+            );
+            cpu.io.calls.assert_budget(reads, writes);
+        }
+        assert!(cpu.audit_idle().is_err());
+        cpu.io.calls.assert_budget(reads, writes);
+    }
+
+    #[test]
+    fn initial_capture_read_failure_refuses_cpu_without_writes_or_retries() {
+        let io = ReadFaultIo::new(1);
+        let calls = Rc::clone(&io.calls);
+        assert_read_failure(KvmCarrierCpu::new(io));
+        // Construction consists solely of the initial capture.
+        calls.assert_budget(1, 0);
+    }
+
+    #[test]
+    fn idle_read_failure_refuses_before_mutation_and_preserves_reuse() {
+        for through_load in [false, true] {
+            let mut cpu = KvmCarrierCpu::new(ReadFaultIo::new(2)).unwrap();
+            let [a, b] = read_fault_tasks();
+            cpu.io.calls.assert_budget(1, 0);
+            if through_load {
+                assert_read_failure(cpu.load(a.clone()));
+            } else {
+                assert_read_failure(cpu.audit_idle());
+            }
+            // Capture + failed idle audit; no task image was installed.
+            cpu.io.calls.assert_budget(2, 0);
+            assert!(matches!(cpu.custody, Custody::Idle));
+            audit_image(&cpu.io.image, cpu.neutral_image()).unwrap();
+            // Retry is a new caller operation after a pre-mutation refusal.
+            for (turn, expected) in [a, b].into_iter().enumerate() {
+                cpu.load(expected.clone()).unwrap();
+                cpu.io.calls.assert_budget(4 + 4 * turn, 1 + 2 * turn);
+                let saved = cpu.save_and_detach(expected.binding().task()).unwrap();
+                assert_eq!(saved.binding(), expected.binding());
+                assert_eq!(saved.state(), expected.state());
+                cpu.io.calls.assert_budget(6 + 4 * turn, 2 + 2 * turn);
+            }
+        }
+    }
+
+    #[test]
+    fn post_load_read_failure_poisoning_blocks_both_task_generations_without_io() {
+        let tasks = read_fault_tasks();
+        for task in &tasks {
+            let mut cpu = KvmCarrierCpu::new(ReadFaultIo::new(3)).unwrap();
+            assert_read_failure(cpu.load(task.clone()));
+            // Capture + idle audit + failed load readback, one task write.
+            cpu.io.calls.assert_budget(3, 1);
+            audit_image(&cpu.io.image, &task.hardware_image()).unwrap();
+            assert_poisoned_without_io(&mut cpu, &tasks, 3, 1);
+        }
+    }
+
+    #[test]
+    fn pre_detach_read_failure_poisoning_blocks_both_task_generations_without_io() {
+        let tasks = read_fault_tasks();
+        for task in &tasks {
+            let mut cpu = KvmCarrierCpu::new(ReadFaultIo::new(4)).unwrap();
+            cpu.load(task.clone()).unwrap();
+            cpu.io.calls.assert_budget(3, 1);
+            assert_read_failure(cpu.save_and_detach(task.binding().task()));
+            // Successful capture/load + failed snapshot; no reset write.
+            cpu.io.calls.assert_budget(4, 1);
+            audit_image(&cpu.io.image, &task.hardware_image()).unwrap();
+            assert_poisoned_without_io(&mut cpu, &tasks, 4, 1);
+        }
+    }
+
+    #[test]
+    fn post_reset_read_failure_neutral_image_cannot_authorize_reuse_or_detach() {
+        let tasks = read_fault_tasks();
+        for task in &tasks {
+            let mut cpu = KvmCarrierCpu::new(ReadFaultIo::new(5)).unwrap();
+            cpu.load(task.clone()).unwrap();
+            cpu.io.calls.assert_budget(3, 1);
+            assert_read_failure(cpu.save_and_detach(task.binding().task()));
+            // Capture/load + snapshot + failed reset audit, task + reset writes.
+            cpu.io.calls.assert_budget(5, 2);
+            audit_image(&cpu.io.image, cpu.neutral_image()).unwrap();
+            assert_poisoned_without_io(&mut cpu, &tasks, 5, 2);
         }
     }
 
