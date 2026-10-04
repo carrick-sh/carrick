@@ -132,6 +132,7 @@ class HostAuthorityRenameTests(unittest.TestCase):
                         "source": _host_authority_row(NEW_FILE)["source"],
                     }
                 ],
+                "executed_profiles": ["macos-cli-default"],
                 "capture_receipt": {"rows": []},
             },
         )
@@ -178,7 +179,8 @@ class HostAuthorityRenameTests(unittest.TestCase):
                                 "source": _host_authority_row(NEW_FILE)["source"],
                             }
                         ],
-                        "capture_receipt": {"rows": []},
+                        "executed_profiles": ["macos-cli-default"],
+                "capture_receipt": {"rows": []},
                     }
                 ),
                 encoding="utf-8",
