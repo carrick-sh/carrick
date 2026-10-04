@@ -1967,3 +1967,56 @@ open. This unit does not claim either frozen mmap probe or signed acceptance.
   -p carrick-el1-abi -p carrick-el1 -p carrick-aarch64 --lib -- -D warnings`
   exited0. Shared-tree parent inode work is included in these compile/test
   receipts but excluded from this correction's source commit.
+
+
+#### Venue 3 owned inode recall and ready cursor (2026-10-03)
+
+The existing inode owner now retains an owned recall job and functional fd
+leases through terminal cleanup. Request cancellation drops result interest;
+last-reference release transfers its lease before reaching zero and never
+waits inline for an inode lock or storage. Two bounded storage workers perform
+writeback after releasing inode and description guards. Contended inodes
+subscribe, probe once, and return worker capacity until an actual release.
+The exact-generation owner subscription occupies existing inode padding;
+its offsets participate in the ABI hash. Typed Host/EL1 release callbacks
+publish the indexed owner bridge while source custody still excludes reuse.
+
+Terminal publication follows member offset restoration and fd cleanup. The
+inode allocation remains owned until then. Pending readiness cannot requeue a
+completed job; region clearing excludes the entire indexed bridge traversal.
+Member-only close preserves the surviving delegation, with a concurrent full
+recall atomically escalating the same job. `OwnedRecallRequest` consumes the
+exact cursor reservation and a functional fd lease. Its opaque ready token
+moves both into host staging, including across numeric fd close.
+
+Actual red-first witnesses and unchanged successors:
+- `last_functional_reference_hands_recall_off_without_waiting_for_inode`:
+  the old last-reference path blocked the releasing thread; RED0/1 then GREEN.
+- `actual_inode_unlock_drives_owner_only_recall_after_enrollment`: the old
+  producer failed to publish the enrolled owner index; RED0/1 then GREEN.
+- `aperture_clear_waits_for_the_entire_indexed_recall_drain`: removing the
+  clear-side aperture gate let teardown pass a live traversal; RED0/1 then GREEN.
+- `readiness_during_storage_never_requeues_a_terminal_recall`: the prior
+  run-end scheduling branch queued one terminal job instead of zero; RED0/1
+  then GREEN. The preceding compiler-refusal log is not a behavioral red.
+
+Receipts: /tmp/venue3-lastref-owned-recall-red.log,
+/tmp/venue3-owner-recall-release-{red,green}.log,
+/tmp/venue3-recall-aperture-red.log,
+/tmp/venue3-recall-terminal-requeue-red.log. Final parent commands:
+`RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-kernel el1_delegation --lib`
+passes27/27; `RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-kernel dispatch::host_io --lib`
+passes5/5; `RUSTC_WRAPPER= cargo clippy -p carrick-kernel --lib -- -D warnings`
+exits0. Scheduler127/EL1254/ABI124 and four-lib clippy receipts in the preceding
+unit include the shared inode producer changes. Source re-review approved
+teardown, terminal scheduling, and the exact ready-token custody.
+
+The scope exception is the actual inode authority and fd lifecycle in
+`el1_delegation` and `kernel/objects.rs`, plus their shared scheduler release
+adapter: dispatch alone cannot transfer the final functional reference or
+receive the actual inode unlock. No separate inode ownership registry was
+introduced. Legacy synchronous callers still join this one job; converting
+all consumers to owned continuations is open. The storage-capacity witness
+exhausts the two recall workers' possible inode waits, not the guest executor
+pool; the actual default guest-pool witness remains open. No frozen mmap
+probe, consumer cutover, mirror deletion, final gate, or acceptance is claimed.

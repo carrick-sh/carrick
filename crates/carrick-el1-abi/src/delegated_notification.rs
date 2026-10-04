@@ -36,13 +36,53 @@ impl<'a> DelegatedFileAuthority<'a> {
         if self
             .file
             .lock
-            .compare_exchange(0, LOCK_HOST, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(0, LOCK_HOST, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
             return Ok(None);
         }
         // SAFETY: the successful CAS exclusively claimed this exact inode.
         unsafe { self.from_locked() }.map(Some)
+    }
+
+    /// Register the inode owner's task-independent recall interest before its
+    /// one nonblocking lock probe. There is only one elected owner per inode.
+    ///
+    /// # Safety
+    /// The caller's elected inode owner retains this exact allocation and its
+    /// notification base admission until the returned subscription is dropped.
+    /// Requester cancellation must not discard that owner or this subscription.
+    pub unsafe fn subscribe_host_recall(
+        self,
+        generation: NonZeroU64,
+    ) -> Result<HostRecallSubscription<'a>, ObjectWaitError> {
+        let exact = || {
+            self.file.notification_generation.load(Ordering::Acquire) == generation.get()
+                && self.file.generation.load(Ordering::Acquire) == generation.get()
+        };
+        if !exact() {
+            return Err(ObjectWaitError::Stale);
+        }
+        self.file
+            .host_recall_generation
+            .compare_exchange(0, generation.get(), Ordering::SeqCst, Ordering::SeqCst)
+            .map_err(|_| ObjectWaitError::Occupied)?;
+        let subscription = HostRecallSubscription {
+            authority: self,
+            generation,
+        };
+        if !exact() {
+            return Err(ObjectWaitError::Stale);
+        }
+        Ok(subscription)
+    }
+
+    /// Consume only the edge owed to a strongly retained exact owner job.
+    pub fn take_host_recall_owed(self, generation: NonZeroU64) -> bool {
+        self.file
+            .host_recall_owed
+            .compare_exchange(generation.get(), 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 
     /// Transfer an already-held lock into its sole release authority.
@@ -135,6 +175,16 @@ impl DelegatedFileGuard<'_> {
     /// Retire the unique base pin under exclusion. This guard's independent
     /// release ticket still publishes the terminal transition after unlock.
     pub fn retire_notifications(&mut self) {
+        assert_eq!(
+            self.file().state.load(Ordering::Acquire),
+            crate::DELEGATED_STATE_DEAD,
+            "retire notification admission only after guest authority is withdrawn"
+        );
+        assert_eq!(
+            self.file().host_recall_generation.load(Ordering::SeqCst),
+            0,
+            "owner drops recall subscription before retiring its source"
+        );
         let generation = self
             .file()
             .notification_generation
@@ -154,9 +204,151 @@ impl DelegatedFileGuard<'_> {
 impl Drop for DelegatedFileGuard<'_> {
     fn drop(&mut self) {
         if let Some(release) = self.release.take() {
-            drop(release);
+            let authority = self.authority;
+            let generation = authority.file.generation.load(Ordering::Acquire);
+            release.release_with(|| {
+                // SC subscribe -> one SC try-CAS and SC unlock -> observe form
+                // a total order: either the probe acquires, or this producer
+                // observes the subscription. The source publication still pins
+                // this incarnation through indexing and callback delivery.
+                if generation != 0
+                    && authority.file.host_recall_generation.load(Ordering::SeqCst) == generation
+                {
+                    authority
+                        .file
+                        .host_recall_owed
+                        .store(generation, Ordering::Release);
+                    authority
+                        .venue
+                        .zone
+                        .mark_delegated_host_pending(authority.index);
+                    (authority.venue.owner_ready)(authority.venue.zone, authority.venue.waker);
+                }
+            });
         } else {
             self.authority.file.lock.store(0, Ordering::Release);
         }
+    }
+}
+
+/// Owner-held subscription; it is not tied to a requesting Task or fd number.
+pub struct HostRecallSubscription<'a> {
+    authority: DelegatedFileAuthority<'a>,
+    generation: NonZeroU64,
+}
+impl HostRecallSubscription<'_> {
+    pub fn generation(&self) -> NonZeroU64 {
+        self.generation
+    }
+}
+impl Drop for HostRecallSubscription<'_> {
+    fn drop(&mut self) {
+        let _ = self.authority.file.host_recall_generation.compare_exchange(
+            self.generation.get(),
+            0,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        let _ = self.authority.file.host_recall_owed.compare_exchange(
+            self.generation.get(),
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use carrick_sched_core::{Waker, ZoneTables};
+    struct Region {
+        ptr: core::ptr::NonNull<u8>,
+        layout: std::alloc::Layout,
+    }
+    impl Region {
+        fn new() -> Self {
+            let layout =
+                std::alloc::Layout::from_size_align(crate::EL1_REGION_SIZE as usize, 4096).unwrap();
+            Self {
+                ptr: core::ptr::NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap(),
+                layout,
+            }
+        }
+        fn authority(&self) -> DelegatedFileAuthority<'_> {
+            let file = unsafe {
+                &*self
+                    .ptr
+                    .as_ptr()
+                    .add(EL1_OBJECT_TABLE_OFFSET as usize)
+                    .cast::<DelegatedFile>()
+            };
+            let zone = unsafe {
+                &*self
+                    .ptr
+                    .as_ptr()
+                    .add(EL1_ZONE_OFFSET as usize)
+                    .cast::<ZoneTables>()
+            };
+            DelegatedFileAuthority::new(
+                file,
+                DelegatedFileWaitIndex::from_index(0).unwrap(),
+                DelegatedReleaseVenue {
+                    zone,
+                    waker: Waker::Host,
+                    deliver: |_, _, effects| {
+                        let _ = effects.deliver_handbacks(&mut |_| {});
+                    },
+                    owner_ready: |_, _| {},
+                },
+            )
+            .unwrap()
+        }
+    }
+    impl Drop for Region {
+        fn drop(&mut self) {
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+        }
+    }
+    #[test]
+    fn actual_inode_unlock_drives_owner_only_recall_after_enrollment() {
+        let region = Region::new();
+        let authority = region.authority();
+        let generation = NonZeroU64::new(7).unwrap();
+        let mut held = authority.try_host().unwrap().unwrap();
+        held.admit_notifications(generation).unwrap();
+        authority
+            .file
+            .generation
+            .store(generation.get(), Ordering::Release);
+        authority
+            .file
+            .state
+            .store(crate::DELEGATED_STATE_GUEST, Ordering::Release);
+        let subscription = unsafe { authority.subscribe_host_recall(generation) }.unwrap();
+        assert!(authority.try_host().unwrap().is_none());
+        drop(held);
+        let indexed = authority
+            .venue
+            .zone
+            .take_delegated_host_pending()
+            .collect::<std::vec::Vec<_>>();
+        let owed = authority.take_host_recall_owed(generation);
+        drop(subscription);
+        let mut terminal = authority.try_host().unwrap().unwrap();
+        authority
+            .file
+            .state
+            .store(crate::DELEGATED_STATE_DEAD, Ordering::Release);
+        terminal.retire_notifications();
+        drop(terminal);
+        assert_eq!(
+            indexed,
+            [authority.index],
+            "actual unlock lost owner-only index"
+        );
+        assert!(owed, "actual unlock lost exact owner generation");
     }
 }
