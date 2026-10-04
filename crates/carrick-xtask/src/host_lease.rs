@@ -274,6 +274,17 @@ impl HostLease {
                 "cannot verify active lease".into(),
             ));
         }
+        // Adoption ends the exec handoff. The original descriptor is also
+        // still open in this process; a CLOEXEC duplicate alone would leave it
+        // leaking into every unrelated command spawned after adoption.
+        // SAFETY: fd was validated above and still names the incoming lease.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        // SAFETY: descriptor flags are process-local, not shared with the parent.
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            return Err(HostLeaseError::Inherited(
+                io::Error::last_os_error().to_string(),
+            ));
+        }
         Ok(Self {
             fd: file.into_raw_fd(),
             path: path.to_path_buf(),
@@ -371,6 +382,154 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
+    // An unrelated parallel fork can briefly retain even CLOEXEC descriptions
+    // until it execs. Exclusion is immediate; release waits for that exec boundary.
+    const TEST_LEASE_RELEASE_LIMIT: Duration = Duration::from_secs(30);
+
+    // Run only in a dedicated subprocess, where a handed-off descriptor is
+    // genuinely non-CLOEXEC at entry and no test mutates another test's state.
+    #[test]
+    #[ignore = "subprocess fixture for unrelated-child descriptor regression"]
+    fn inherited_lease_child_fixture() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        struct ChildCleanup(std::process::Child);
+        impl Drop for ChildCleanup {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let fresh = std::env::var("CARRICK_LEASE_FIXTURE_FRESH").as_deref() == Ok("1");
+        let lease = HostLease::acquire(HostLeaseMode::Gate).unwrap();
+        let incoming = if fresh {
+            None
+        } else {
+            let fd = std::env::var(INHERITED_FD).unwrap().parse().unwrap();
+            // SAFETY: this fixture owns the original descriptor handed to it
+            // at exec; acquire owns a separate duplicate, not this descriptor.
+            Some(unsafe { std::fs::File::from_raw_fd(fd) })
+        };
+        let mut child = ChildCleanup(
+            Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let path = lease.path().to_path_buf();
+        drop(lease);
+        drop(incoming);
+        assert!(child.0.try_wait().unwrap().is_none());
+        if fresh {
+            HostLease::acquire_path_with_limit(&path, HostLeaseMode::Gate, Duration::ZERO)
+                .expect("unrelated live child must not retain fresh lease");
+        } else {
+            std::fs::write(
+                std::env::var_os("CARRICK_LEASE_CHILD_PID_FILE").unwrap(),
+                child.0.id().to_string(),
+            )
+            .unwrap();
+            // The parent checks release while sleep is alive, then closes this
+            // pipe. Keep the fixture alive to reap sleep on both pass and failure.
+            let mut stdin = libc::pollfd {
+                fd: 0,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: stdin points to one live pollfd; the timeout is bounded.
+            assert!(
+                unsafe {
+                    libc::poll(
+                        &mut stdin,
+                        1,
+                        TEST_LEASE_RELEASE_LIMIT.as_millis() as libc::c_int,
+                    )
+                } > 0,
+                "parent must finish its release assertion within TEST_LEASE_RELEASE_LIMIT"
+            );
+            let _ = std::io::stdin().read(&mut [0u8; 1]).unwrap();
+        }
+    }
+
+    #[test]
+    fn inherited_lease_does_not_leak_to_unrelated_child() {
+        struct FixtureCleanup(std::process::Child);
+        impl Drop for FixtureCleanup {
+            fn drop(&mut self) {
+                // EOF releases the fixture's bounded wait and reaps its sleep
+                // child even when the parent assertion fails red-first.
+                drop(self.0.stdin.take());
+                let _ = self.0.wait();
+            }
+        }
+        let temp = NamedTempFile::new().unwrap();
+        let pid_file = NamedTempFile::new().unwrap();
+        let gate = HostLease::acquire_path(temp.path(), HostLeaseMode::Gate).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "host_lease::tests::inherited_lease_child_fixture",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .env("CARRICK_LEASE_CHILD_PID_FILE", pid_file.path());
+        gate.configure_command(&mut command).unwrap();
+        let mut fixture = FixtureCleanup(command.spawn().unwrap());
+        drop(command);
+        drop(gate);
+        let deadline = Instant::now() + TEST_LEASE_RELEASE_LIMIT;
+        let pid: libc::pid_t = loop {
+            if let Ok(pid) = std::fs::read_to_string(pid_file.path()).unwrap().parse() {
+                break pid;
+            }
+            assert!(
+                fixture.0.try_wait().unwrap().is_none(),
+                "fixture exited before ready"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "fixture exceeded TEST_LEASE_RELEASE_LIMIT"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // SAFETY: signal zero checks existence without changing the child.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "unrelated child must still be alive"
+        );
+        HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Gate, Duration::ZERO)
+            .expect(
+                "unrelated child must not retain adopted lease after source descriptions close",
+            );
+        drop(fixture.0.stdin.take());
+        assert!(fixture.0.wait().unwrap().success());
+    }
+
+    #[test]
+    fn fresh_lease_does_not_leak_to_unrelated_child() {
+        let temp = NamedTempFile::new().unwrap();
+        // Isolate the zero-limit assertion from other tests' fork-before-exec
+        // windows. The helper runs concurrently with the rest of the suite.
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "host_lease::tests::inherited_lease_child_fixture",
+            ])
+            .env_remove(INHERITED_FD)
+            .env_remove(INHERITED_MODE)
+            .env("CARRICK_HOST_LEASE_PATH", temp.path())
+            .env("CARRICK_LEASE_FIXTURE_FRESH", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     #[test]
     fn gate_and_docker_exclude_all_other_modes() {
         for holder in [
@@ -395,7 +554,12 @@ mod tests {
                     "{holder} must exclude {contender}"
                 );
                 drop(held);
-                HostLease::acquire_path_with_limit(temp.path(), contender, Duration::ZERO).unwrap();
+                HostLease::acquire_path_with_limit(
+                    temp.path(),
+                    contender,
+                    TEST_LEASE_RELEASE_LIMIT,
+                )
+                .unwrap();
             }
         }
     }
@@ -431,8 +595,12 @@ mod tests {
             Err(HostLeaseError::Timeout { .. })
         ));
         drop(child);
-        HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Gate, Duration::ZERO)
-            .unwrap();
+        HostLease::acquire_path_with_limit(
+            temp.path(),
+            HostLeaseMode::Gate,
+            TEST_LEASE_RELEASE_LIMIT,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -448,8 +616,12 @@ mod tests {
         ));
         assert!(command.status().unwrap().success());
         drop(command);
-        HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Gate, Duration::ZERO)
-            .unwrap();
+        HostLease::acquire_path_with_limit(
+            temp.path(),
+            HostLeaseMode::Gate,
+            TEST_LEASE_RELEASE_LIMIT,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -482,11 +654,13 @@ mod tests {
         );
         drop(shared);
         use std::os::fd::AsRawFd;
+        // This inode has never been leased. The just-dropped inode may still
+        // be held by another test's child between fork and exec.
         assert!(
             HostLease::inherit(
-                temp.path(),
+                other.path(),
                 HostLeaseMode::Carrick,
-                &temp.as_raw_fd().to_string(),
+                &other.as_raw_fd().to_string(),
                 "carrick"
             )
             .is_err()
@@ -522,7 +696,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
         let c_path = CString::new(path_str).unwrap();
         // SAFETY: c_path is a valid null-terminated string.
-        let fd2 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
+        let fd2 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         assert!(fd2 >= 0, "open fd2 failed");
 
         // Non-blocking exclusive lock attempt must fail with EWOULDBLOCK
@@ -535,10 +709,13 @@ mod tests {
         // Drop the shared lease, releasing the lock
         drop(shared_lease);
 
-        // Now non-blocking exclusive lock must succeed immediately
-        // SAFETY: fd2 is an open file descriptor.
-        let ret = unsafe { libc::flock(fd2, libc::LOCK_EX | libc::LOCK_NB) };
-        assert_eq!(ret, 0, "exclusive lock should succeed after shared dropped");
+        // Release can cross a concurrent fork's exec boundary.
+        let _exclusive = HostLease::acquire_path_with_limit(
+            path,
+            HostLeaseMode::Docker,
+            TEST_LEASE_RELEASE_LIMIT,
+        )
+        .expect("exclusive lock should succeed after shared dropped");
 
         // SAFETY: fd2 is an open file descriptor.
         unsafe {
@@ -559,7 +736,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
         let c_path = CString::new(path_str).unwrap();
         // SAFETY: c_path is a valid null-terminated string.
-        let fd2 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR) };
+        let fd2 = unsafe { libc::open(c_path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         assert!(fd2 >= 0, "open fd2 failed");
 
         // Non-blocking shared lock attempt must fail with EWOULDBLOCK
@@ -572,10 +749,13 @@ mod tests {
         // Drop the exclusive lease, releasing the lock
         drop(exclusive_lease);
 
-        // Now non-blocking shared lock must succeed immediately
-        // SAFETY: fd2 is an open file descriptor.
-        let ret = unsafe { libc::flock(fd2, libc::LOCK_SH | libc::LOCK_NB) };
-        assert_eq!(ret, 0, "shared lock should succeed after exclusive dropped");
+        // Release can cross a concurrent fork's exec boundary.
+        let _shared = HostLease::acquire_path_with_limit(
+            path,
+            HostLeaseMode::Carrick,
+            TEST_LEASE_RELEASE_LIMIT,
+        )
+        .expect("shared lock should succeed after exclusive dropped");
 
         // SAFETY: fd2 is an open file descriptor.
         unsafe {

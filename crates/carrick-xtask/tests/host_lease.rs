@@ -41,11 +41,9 @@ fn nested_cli_reuses_exclusive_gate_without_deadlock_or_downgrade() {
     );
     drop(command);
     drop(gate);
-    // SAFETY: temp still owns the independent descriptor.
-    assert_eq!(
-        unsafe { libc::flock(temp.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) },
-        0
-    );
+    // Other parallel tests can be between fork and exec; the named production
+    // acquisition bound waits for that release instead of declaring a leak.
+    HostLease::acquire_path(temp.path(), HostLeaseMode::Carrick).unwrap();
 }
 
 #[test]
