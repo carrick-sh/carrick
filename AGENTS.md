@@ -60,6 +60,7 @@ with **`HV_DENIED` (`0xfae94007`)**.
 
 | Command | Purpose |
 |---|---|
+| `just worktree-gc [--apply]` | List sizes, branches, dirty/landed/use state; dry-run by default, delete only clean fully landed idle worktrees. See [build maintenance](docs/build-maintenance.md). |
 | `just build-cache` | Shared per-host compiler cache stats; builds enable sccache by default, `CARRICK_SCCACHE=0` disables it. See [build maintenance](docs/build-maintenance.md). |
 | `just build [ARGS]` 🔏 | Build + sign release binary. |
 | `just build-debug [ARGS]` 🔏 | Sign with debug entitlements (`get-task-allow`, lldb). |
