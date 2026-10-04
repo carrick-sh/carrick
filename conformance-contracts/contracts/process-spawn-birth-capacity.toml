@@ -1,0 +1,17 @@
+schema_version = 1
+id = "kernel.process-spawn.birth-capacity"
+title = "Process creation reserves sibling runtime capacity only after an actual thread clone"
+guest_surfaces = ["syscall:clone", "syscall:fork", "syscall:execve", "kernel:thread-ledger"]
+semantic_authority = ["man 2 fork: the child has exactly one thread", "man 2 execve: exec destroys sibling threads", "man 2 clone: CLONE_THREAD creates a sibling in the same thread group"]
+fixture = "spawn_birth_capacity: 1/8/32 process-only startups, plus first-host-thread-clone priming"
+scale_points = [1, 8, 32]
+rationale = "A process-only workload must not pay for executable runtime cells for threads it never creates. The existing host clone path admits the first actual sibling, then replenishes kernel-issued EL1 capacity before the parent returns. Installing or activating a process runtime is not thread demand. The work witness counts exact process-owned factory reservations: zero at every process-only scale; the first actual thread clone primes the existing four-entry pool and repeated binding does not duplicate it. Terminal first-entry admission and per-thread credentials retain their existing correctness contracts."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-kernel-example::spawn_birth_capacity::{process_only_startup_reserves_no_sibling_runtime_capacity,first_host_thread_clone_primes_executable_sibling_capacity}"
+embed = "carrick-embed::el1_sched::{el1_thread_lifecycle_spawn_slope,el1_thread_lifecycle_exit_group_and_exec_during_clone_storm,el1_thread_lifecycle_rlimit_nproc_exact}"
+
+[bindings.unresolved]
+docker = "This task prohibits Docker; the existing Phase B impact evidence supplies the historical reference, not a refreshed differential."
+observation = "The VM-free witness directly counts typed factory reservations at each scale; this is not a registered WorkObservation or a claim about total kernel work. Uninstrumented paired spawn-loop measurements compare signed exact artifacts on this Mac."

@@ -3168,7 +3168,8 @@
         "kernel.fork.mappings",
         "kernel.fork.stage1-image",
         "kernel.mm.address-space-occupancy",
-        "kernel.mm.anonymous-discard-fork-reuse"
+        "kernel.mm.anonymous-discard-fork-reuse",
+        "kernel.process-spawn.birth-capacity"
       ],
       "claims": [
         "kernel.fork.filetable.copy-scaling",
@@ -3196,6 +3197,7 @@
         "kernel.mm.carrier-window-isolation",
         "kernel.mm.exec-heap-window",
         "kernel.mm.image-page-permissions",
+        "kernel.process-spawn.birth-capacity",
         "kernel.time.realtime-calibration"
       ],
       "claims": [],

@@ -1,0 +1,16 @@
+Revision: 878fa1fd8 plus new witness only; runtime/kernel implementation unchanged.
+Command: cargo test -p carrick-kernel-example --test spawn_birth_capacity -- --nocapture
+Exit: 101
+
+running 2 tests
+process_only_startup_reserves_no_sibling_runtime_capacity:
+assertion `left == right` failed: 1 process-only creations reserved unused sibling runtime cells
+  left: 4
+ right: 0
+first_host_thread_clone_primes_executable_sibling_capacity ... ok
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored.
+
+The initial just test-kernel also reached this new witness and failed on the
+same 4 != 0 budget assertion, after the existing suites passed. The source of
+the witness does not modify admission, credentials or execution behavior.
