@@ -1,6 +1,8 @@
 //! Owned host bytes and exact retained-data handshake for the production EL1
 //! service. Selection and copy borrow the current executor on its maintenance
 //! root; neither installs target user translations or needs a spare CPU.
+mod prepared;
+mod staging;
 use crate::{Aarch64EngineCore, Aarch64Vmm};
 use carrick_el1_abi::{
     MmPortalSlots, PortalByteRange, PortalOperation, PortalRetainedData, PortalSelectedData,
@@ -8,20 +10,31 @@ use carrick_el1_abi::{
 };
 use carrick_hal::TrapError;
 use core::num::NonZeroU64;
+pub use staging::prepare_write;
 
 /// Host physical custody, with no permission or VA-translation authority.
 pub trait TransferPin {
+    fn pending(&self) -> Option<carrick_guest_mem::OwnedMemoryWait> {
+        None
+    }
     fn identity(&self) -> PortalRetainedData;
     /// Bounded memcpy only. All potentially blocking content revocation must
     /// finish during retention, before EL1 takes the copy editor.
     fn copy(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &mut [u8]) -> bool;
+    fn copy_out(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &[u8]) -> bool;
 }
 impl TransferPin for Box<dyn TransferPin> {
+    fn pending(&self) -> Option<carrick_guest_mem::OwnedMemoryWait> {
+        (**self).pending()
+    }
     fn identity(&self) -> PortalRetainedData {
         (**self).identity()
     }
     fn copy(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &mut [u8]) -> bool {
         (**self).copy(request, bytes)
+    }
+    fn copy_out(&mut self, request: carrick_el1_abi::PortalCopyRequest<'_>, bytes: &[u8]) -> bool {
+        (**self).copy_out(request, bytes)
     }
 }
 pub trait TransferGrant {
@@ -127,12 +140,15 @@ pub enum UserTransfer {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransferProgress {
+    Retired(carrick_el1_abi::El1MmHandle),
+    Physical(carrick_guest_mem::OwnedMemoryWait),
     Complete,
     Advanced,
     Suspended,
     OwnerWait(carrick_el1_abi::PortalOwnerWait),
+    Supply(carrick_guest_mem::MemorySupplyRequest),
     Refused(carrick_abi::LinuxErrno),
 }
 
@@ -191,6 +207,15 @@ impl OwnedUserTransfer {
         self.fork_sequence = Some(operation.sequence);
         true
     }
+    pub(crate) fn target_handle(&self) -> carrick_el1_abi::El1MmHandle {
+        self.target.handle
+    }
+    pub(crate) fn address(&self) -> u64 {
+        self.address
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.bytes.len()
+    }
     pub fn offset(&self) -> usize {
         self.offset
     }
@@ -207,197 +232,64 @@ impl OwnedUserTransfer {
         slots: &MmPortalSlots,
     ) -> Result<TransferProgress, TrapError> {
         let error = |message: &str| TrapError::Hypervisor(format!("UserTransfer: {message}"));
-        let mut service = engine.transfer_service_loan()?;
-        let region = carrick_el1_abi::get_el1_region_host_ptr();
-        if region == 0
-            || (slots as *const MmPortalSlots as usize)
-                != region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize
-        {
-            return Err(error("slots are not in the installed carrier region"));
-        }
-        if custody.carrier() != self.target.handle.carrier()
-            || !slots.bind_carrier(self.target.handle.carrier())
-        {
-            return Err(error("carrier custody differs from target"));
-        }
         if self.offset == self.bytes.len() {
             return Ok(TransferProgress::Complete);
         }
         let va = self.address + self.offset as u64;
-        let len = (self.bytes.len() - self.offset).min(4096 - (va as usize & 4095));
-        let mut frame = TrapFrame {
-            esr: carrick_el1_abi::MM_PORTAL_SELECT_ESR,
-            ..TrapFrame::default()
-        };
-        frame.x[1] = self.target.handle.carrier().get();
-        frame.x[2] = self.target.handle.mm().raw();
-        frame.x[3] = self.target.handle.incarnation().get();
-        frame.x[4] = va;
-        frame.x[5] = len as u64;
-        frame.x[6] = self.intent.encode();
-        frame.x[7] = self.offset as u64;
-        frame.x[19] = self.fork_sequence.map_or(0, NonZeroU64::get);
-        let caller = service.slot()?;
-        let executable = slots
-            .executable(caller)
-            .ok_or_else(|| error("invalid publication slot"))?;
-        let selected_frame = run_selected_service(
-            &mut service,
-            frame,
+        let len = (self.bytes.len() - self.offset)
+            .min(carrick_el1_abi::MM_PORTAL_MAX_BYTES as usize - (va as usize & 4095));
+        let page = match staging::stage_page(
+            engine,
+            custody,
+            slots,
             self.target,
+            va,
+            len,
+            0,
+            self.offset,
+            self.intent,
             self.fork_sequence,
-            &mut || executable.handle(|request| custody.publish_executable(self.target, request)),
-        )?;
-        match selected_frame.x[0] {
-            11 => {
-                if selected_frame.x[14] == 3 {
-                    let cause = carrick_el1_abi::PortalWaitCause::decode(selected_frame.x[16])
-                        .ok_or_else(|| error("invalid owner wait cause"))?;
-                    // SAFETY: returned through the exclusively loaned exact-target service.
-                    return Ok(TransferProgress::OwnerWait(unsafe {
-                        carrick_el1_abi::PortalOwnerWait::from_owner(
-                            self.target.handle,
-                            cause,
-                            selected_frame.x[17],
-                        )
-                    }));
-                }
-                if matches!(selected_frame.x[14], 1 | 2) {
-                    let nz = |value| {
-                        NonZeroU64::new(value).ok_or_else(|| error("invalid supply receipt"))
-                    };
-                    let window = carrick_el1_abi::PortalGrantWindow {
-                        operation: PortalOperation {
-                            carrier: self.target.handle.carrier(),
-                            mm: self.target.handle.mm(),
-                            incarnation: self.target.handle.incarnation(),
-                            sequence: nz(selected_frame.x[8])?,
-                        },
-                        generation: carrick_el1_abi::ReservationGeneration::new(
-                            selected_frame.x[9],
-                        )
-                        .ok_or_else(|| error("invalid supply generation"))?,
-                        range: carrick_el1_abi::ReservationRange::new(
-                            selected_frame.x[10],
-                            selected_frame.x[11],
-                        )
-                        .ok_or_else(|| error("invalid supply range"))?,
-                        protection: carrick_el1_abi::ReservationProtection::from_bits(
-                            selected_frame.x[12],
-                        )
-                        .ok_or_else(|| error("invalid supply permission"))?,
-                        fault_page: selected_frame.x[13],
-                        fork_sequence: self.fork_sequence,
-                        host_backing: if selected_frame.x[16] == 0 {
-                            if selected_frame.x[17] != 0 || selected_frame.x[18] != 0 {
-                                return Err(error("invalid backing receipt"));
-                            }
-                            None
-                        } else {
-                            Some(carrick_el1_abi::HostBackingIdentity::new(
-                                nz(selected_frame.x[16])?,
-                                nz(selected_frame.x[17])?,
-                                selected_frame.x[18],
-                            ))
-                        },
-                    };
-                    if selected_frame.x[14] == 2 {
-                        return Ok(if custody.refill_cow(self.target, window)? {
-                            TransferProgress::Advanced
-                        } else {
-                            TransferProgress::Refused(carrick_abi::LinuxErrno::new(12))
-                        });
-                    }
-                    let access = match self.intent {
-                        PortalTransferIntent::UserWrite => 2,
-                        PortalTransferIntent::ReadInstruction => 4,
-                        _ => 1,
-                    };
-                    let mailbox = carrick_el1_abi::frame_grant_mailbox_host_for_slot(
-                        selected_frame.slot as usize,
-                    )
-                    .ok_or_else(|| error("missing supply mailbox"))?;
-                    // Selection already issued this exact request. Withdraw its
-                    // scheduler-fault transport before the isolated service;
-                    // the owner receipt continues to carry its authorization.
-                    if !mailbox.cancel_request_for_fault(self.target.handle.mm().raw(), va, access)
-                    {
-                        return Ok(TransferProgress::Suspended);
-                    }
-                    if let Some(mut grant) = custody.prepare(self.target, window)? {
-                        let slot = slots
-                            .grant(selected_frame.slot as usize)
-                            .ok_or_else(|| error("invalid grant slot"))?;
-                        if slot.submit(window, grant.transaction()) {
-                            let frame = TrapFrame {
-                                esr: carrick_el1_abi::MM_PORTAL_GRANT_ESR,
-                                ..TrapFrame::default()
-                            };
-                            let outcome = run_selected_service(
-                                &mut service,
-                                frame,
-                                self.target,
-                                self.fork_sequence,
-                                &mut || false,
-                            );
-                            if let Some(receipt) = slot.take_receipt(window, grant.transaction()) {
-                                if grant.settle(&receipt)? {
-                                    outcome?;
-                                    return Ok(TransferProgress::Advanced);
-                                }
-                            } else if !slot.withdraw(window, grant.transaction()) {
-                                carrick_fatal::carrick_fatal!(
-                                    "aarch64::user_transfer",
-                                    "unsettled grant service"
-                                );
-                            }
-                            outcome?;
-                        }
-                    }
-                }
-                return Ok(TransferProgress::Suspended);
+        )? {
+            Ok(page) => page,
+            Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(wait)) => {
+                return Ok(TransferProgress::OwnerWait(wait));
             }
-            0 => {}
-            errno if (1..=4095).contains(&errno) => {
-                return Ok(TransferProgress::Refused(carrick_abi::LinuxErrno::new(
-                    errno as i32,
+            Err(carrick_guest_mem::MemoryPrepareError::Supply(supply)) => {
+                return Ok(TransferProgress::Supply(supply));
+            }
+            Err(carrick_guest_mem::MemoryPrepareError::Physical(wait)) => {
+                return Ok(TransferProgress::Physical(wait));
+            }
+            Err(carrick_guest_mem::MemoryPrepareError::Limit(limit)) => {
+                return Err(TrapError::Hypervisor(format!(
+                    "transfer exceeds prepared stream bound: {limit:?}"
                 )));
             }
-            _ => return Err(error("invalid selection errno")),
-        }
-        let operation = PortalOperation {
-            carrier: self.target.handle.carrier(),
-            mm: self.target.handle.mm(),
-            incarnation: self.target.handle.incarnation(),
-            sequence: NonZeroU64::new(selected_frame.x[8])
-                .ok_or_else(|| error("missing operation sequence"))?,
+            Err(carrick_guest_mem::MemoryPrepareError::Fault(
+                carrick_guest_mem::MemoryError::OwnerRetired(handle),
+            )) => {
+                return Ok(TransferProgress::Retired(handle));
+            }
+            Err(carrick_guest_mem::MemoryPrepareError::Fault(
+                carrick_guest_mem::MemoryError::OutOfBounds { .. },
+            )) => {
+                return Ok(TransferProgress::Refused(carrick_abi::LinuxErrno::new(14)));
+            }
+            Err(carrick_guest_mem::MemoryPrepareError::Fault(error)) => {
+                return Err(TrapError::Hypervisor(error.to_string()));
+            }
         };
-        let selected = PortalSelectedData {
-            ipa: selected_frame.x[10],
-            executable: selected_frame.x[15] == 1,
-            root_generation: NonZeroU64::new(selected_frame.x[9])
-                .ok_or_else(|| error("missing root generation"))?,
-            offset: self.offset as u64,
-        };
-        let Some(mut pin) = custody.retain(selected, len, self.intent)? else {
-            return Ok(TransferProgress::Suspended);
-        };
-        let mut request = PortalTransferRequest::new(
-            operation,
-            PortalByteRange::new(va, len as u64).ok_or_else(|| error("invalid range"))?,
-            self.intent,
-            selected,
-            pin.identity(),
-        )
-        .ok_or_else(|| error("invalid retained request"))?;
-        request.fork_sequence = self.fork_sequence;
+        let mut pin = page.pin;
+        let request = page.request;
+        let operation = request.operation;
+        let mut service = engine.transfer_service_loan()?;
         let slot = slots
-            .slot(selected_frame.slot as usize)
+            .slot(service.slot()?)
             .ok_or_else(|| error("invalid caller slot"))?;
         let Some(mut ticket) = slot.submit(request) else {
             return Ok(TransferProgress::Suspended);
         };
-        frame = TrapFrame {
+        let frame = TrapFrame {
             esr: carrick_el1_abi::MM_PORTAL_SERVICE_ESR,
             ..TrapFrame::default()
         };
@@ -454,6 +346,7 @@ impl OwnedUserTransfer {
             } else {
                 TransferProgress::Advanced
             }),
+            3 => Ok(TransferProgress::Retired(self.target.handle)),
             11 => Ok(TransferProgress::Suspended),
             errno if (1..=4095).contains(&errno) => Ok(TransferProgress::Refused(
                 carrick_abi::LinuxErrno::new(errno as i32),

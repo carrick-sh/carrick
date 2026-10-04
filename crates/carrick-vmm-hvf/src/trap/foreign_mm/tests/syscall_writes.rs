@@ -167,12 +167,20 @@ fn native_code_content_host_write_rejects_stale_owner_permissions_and_bounds() {
     let owner = fixture.owner();
     let observed = owner.mapping.code_content.observe(0, 4).unwrap();
     let valid = fixture.range(0, 4);
-    fixture.task.protections.set_no_write(TEST_VA, 4096, true);
+    if let Some(protections) = fixture.task.protections.legacy() {
+        protections.set_no_write(TEST_VA, 4096, true);
+    }
     assert!(HostWriteGuard::new(&mut fixture, &[valid]).is_err());
-    fixture.task.protections.set_no_write(TEST_VA, 4096, false);
-    fixture.task.protections.set_no_access(TEST_VA, 4096, true);
+    if let Some(protections) = fixture.task.protections.legacy() {
+        protections.set_no_write(TEST_VA, 4096, false);
+    }
+    if let Some(protections) = fixture.task.protections.legacy() {
+        protections.set_no_access(TEST_VA, 4096, true);
+    }
     assert!(HostWriteGuard::new(&mut fixture, &[valid]).is_err());
-    fixture.task.protections.set_no_access(TEST_VA, 4096, false);
+    if let Some(protections) = fixture.task.protections.legacy() {
+        protections.set_no_access(TEST_VA, 4096, false);
+    }
     let overflow = HostWriteRange {
         guest: GuestVa(u64::MAX),
         len: 2,

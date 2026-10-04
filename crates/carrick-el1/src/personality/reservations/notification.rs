@@ -45,7 +45,7 @@ impl SharedReservations {
         }
         #[cfg(any(test, feature = "host-test"))]
         {
-            return self.lock_el1(index, mm, slot);
+            self.lock_el1(index, mm, slot)
         }
         #[cfg(not(any(test, feature = "host-test")))]
         Err(Refusal::Stale)

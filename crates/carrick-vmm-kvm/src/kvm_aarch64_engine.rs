@@ -359,11 +359,13 @@ impl Aarch64Vmm for KvmAarch64Vmm {
         Ok(())
     }
 
-    fn protections(&self) -> Option<&MemoryProtections> {
+    fn protections(&self) -> Option<carrick_guest_mem::LegacyProtectionRead<'_>> {
         // The PROT_NONE set the shared default `read_bytes`/`write_bytes` gate on
         // (keyed on the guest VA). KVM's per-window set lives in `GuestRam`; the
         // engine reads it through here so a sibling thread's `mprotect` is seen.
-        Some(self.ram.protections_ref())
+        Some(carrick_guest_mem::LegacyProtectionRead::borrowed(
+            self.ram.protections_ref(),
+        ))
     }
 
     fn set_no_access(&mut self, address: u64, len: usize, no_access: bool) {
