@@ -15,26 +15,59 @@ pub(super) const CONTROL_MAX_CONNECTIONS: usize = 16;
 
 pub(super) struct ConnectionTracker {
     next_id: u64,
-    streams: Arc<Mutex<HashMap<u64, UnixStream>>>,
+    slots: Arc<ConnectionSlots>,
     handlers: Vec<JoinHandle<()>>,
 }
 
-struct RemoveOnDrop {
-    id: u64,
-    streams: Arc<Mutex<HashMap<u64, UnixStream>>>,
+#[derive(Default)]
+struct ConnectionState {
+    live: usize,
+    streams: HashMap<u64, UnixStream>,
 }
 
-impl Drop for RemoveOnDrop {
+#[derive(Default)]
+pub(super) struct ConnectionSlots {
+    state: Mutex<ConnectionState>,
+    #[cfg(test)]
+    changed: parking_lot::Condvar,
+}
+
+struct ConnectionPermit {
+    id: u64,
+    slots: Arc<ConnectionSlots>,
+}
+
+impl Drop for ConnectionPermit {
     fn drop(&mut self) {
-        self.streams.lock().remove(&self.id);
+        let mut state = self.slots.state.lock();
+        state.streams.remove(&self.id);
+        state.live -= 1;
+        #[cfg(test)]
+        self.slots.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl ConnectionSlots {
+    pub(super) fn wait_for_count(&self, expected: usize, bound: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + bound;
+        let mut state = self.state.lock();
+        while state.live != expected {
+            if self.changed.wait_until(&mut state, deadline).timed_out() {
+                return state.live == expected;
+            }
+        }
+        true
     }
 }
 
 impl std::fmt::Debug for ConnectionTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.slots.state.lock();
         f.debug_struct("ConnectionTracker")
             .field("next_id", &self.next_id)
-            .field("active_streams", &self.streams.lock().len())
+            .field("active_streams", &state.streams.len())
+            .field("live_handlers", &state.live)
             .field("handlers", &self.handlers.len())
             .finish()
     }
@@ -44,7 +77,7 @@ impl ConnectionTracker {
     pub(super) fn new() -> Self {
         Self {
             next_id: 0,
-            streams: Arc::new(Mutex::new(HashMap::new())),
+            slots: Arc::default(),
             handlers: Vec::new(),
         }
     }
@@ -67,7 +100,7 @@ impl ConnectionTracker {
 
     pub(super) fn spawn_handler(
         &mut self,
-        mut stream: UnixStream,
+        stream: UnixStream,
         kernel: Arc<super::super::Kernel>,
         init: super::super::TaskKey,
         nonce: ControlNonce,
@@ -75,7 +108,8 @@ impl ConnectionTracker {
         archive: Arc<dyn super::CarrierArchiveControl>,
     ) {
         self.reap_finished();
-        if self.handlers.len() >= CONTROL_MAX_CONNECTIONS {
+        let mut state = self.slots.state.lock();
+        if state.live >= CONTROL_MAX_CONNECTIONS {
             let _ = stream.shutdown(Shutdown::Both);
             drop(stream);
             return;
@@ -86,21 +120,40 @@ impl ConnectionTracker {
         };
         let id = self.next_id;
         self.next_id += 1;
-        self.streams.lock().insert(id, clone);
+        state.streams.insert(id, clone);
+        state.live += 1;
+        #[cfg(test)]
+        self.slots.changed.notify_all();
+        let permit = ConnectionPermit {
+            id,
+            slots: Arc::clone(&self.slots),
+        };
+        drop(state);
 
-        let streams = Arc::clone(&self.streams);
         let builder = std::thread::Builder::new();
         if let Ok(handle) = builder
             .name(format!("carrick-control-conn-{id}"))
             .spawn(move || {
-                let _guard = RemoveOnDrop { id, streams };
-                if let Err(_error) = super::handle(
-                    &mut stream,
-                    &kernel,
+                // Declare the permit first so it drops last, after the
+                // socket and request context, on return or unwinding. A
+                // failed spawn also drops the captured permit and rolls
+                // back admission without needing a handler to start.
+                let _permit = permit;
+                let mut connection = stream;
+                let context = ControlServerContext {
+                    kernel,
                     init,
                     nonce,
-                    exec.as_ref(),
-                    archive.as_ref(),
+                    exec,
+                    archive,
+                };
+                if let Err(_error) = super::handle(
+                    &mut connection,
+                    &context.kernel,
+                    context.init,
+                    context.nonce,
+                    context.exec.as_ref(),
+                    context.archive.as_ref(),
                 ) {
                     #[cfg(test)]
                     eprintln!("carrier control test connection failed: {_error}");
@@ -108,13 +161,21 @@ impl ConnectionTracker {
             })
         {
             self.handlers.push(handle);
-        } else {
-            self.streams.lock().remove(&id);
         }
     }
 
     pub(super) fn cancel_and_join(&mut self) {
-        let streams: Vec<UnixStream> = self.streams.lock().drain().map(|(_, s)| s).collect();
+        // Draining cancellation sockets does not release admission. Each
+        // handler retains its counted permit until it returns; joins hold
+        // no slot-state lock needed by the handler's final release.
+        let streams: Vec<UnixStream> = self
+            .slots
+            .state
+            .lock()
+            .streams
+            .drain()
+            .map(|(_, s)| s)
+            .collect();
         for s in streams {
             let _ = s.shutdown(Shutdown::Both);
         }
@@ -125,7 +186,17 @@ impl ConnectionTracker {
 
     #[cfg(test)]
     pub(super) fn live_handlers_count(&self) -> usize {
+        self.slots.state.lock().live
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_handlers_count(&self) -> usize {
         self.handlers.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn slot_observer(&self) -> Arc<ConnectionSlots> {
+        Arc::clone(&self.slots)
     }
 }
 
