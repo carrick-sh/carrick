@@ -1928,3 +1928,42 @@ omitted) was corrected by preserving actual publication callback delivery.
 Full current consumer lowering, pool/request metadata wakes, aggregate prepared
 host CPU custody, checked-memory activation and admitted mirror deletion remain
 open. This unit does not claim either frozen mmap probe or signed acceptance.
+
+#### Venue 3 owner-wait review correction (2026-10-03)
+
+- Review of `28b6999cd` found two real missing edges: closing a source could
+  abandon an enrolled operation, and a post-link publisher could survive
+  record reuse before posting its admission bit. Both remain pre-activation
+  corrections; this does not complete checked GuestMemory or consumers.
+- Exact source close and entry retirement require the authenticated release
+  venue and publish terminal epochs for every cause. Final reservation-root
+  retirement uses the typed close/unlock adapter: advance terminal epochs,
+  unlock, deliver. An operation resumed by terminal publication cannot pass
+  exact live-source authentication. Direct close during the enrollment
+  predicate is detected by the subsequent epoch check.
+- Admission transfers retain record custody until the original pending post.
+  Host delivery and guest handback deferral both arbitrate that custody with
+  the final publisher; neither can recycle the record early. ABI protocol 8
+  hashes the new high-bit meanings in the existing intrusive `prev` word;
+  geometry and previous offsets remain unchanged.
+- The newly introduced `N+1` assertion in `28b6999cd` was disproved, not an
+  established conformance budget. Director explicitly approved the tight
+  `2N+1` replacement with proof: each retained record can supply one inherited
+  post after an earlier holder unlocked, then one fresh admission to this
+  holder. Fresh admissions cannot return until this holder unlocks. The
+  sticky resource-notification bit adds at most one transition. Publication
+  custody excludes accumulating inherited posts across record reuse. The
+  adversarial actual release test reaches exactly `2N+1` at N=1,4,16;
+  repeated notifications retain the same linear budget. No timeout, frozen
+  contract budget, or workload concurrency was changed.
+- Actual behavioral reds: `source_retirement_completes_already_parked_gate_operation`
+  and `admission_post_link_gap_keeps_record_unreusable_until_original_post`
+  each exited101 with 0/1 on the prior respective release implementations.
+  Drivers and exact commands are preserved in the ignored host report.
+- Green validation: `RUSTC_WRAPPER= cargo test -p carrick-sched-core
+  -p carrick-el1 -p carrick-el1-abi --lib` (125/254/124); final scheduler
+  rerun with direct all-cause retirement and guest-deferred custody witnesses
+  (127/127). `RUSTC_WRAPPER= cargo clippy -p carrick-sched-core
+  -p carrick-el1-abi -p carrick-el1 -p carrick-aarch64 --lib -- -D warnings`
+  exited0. Shared-tree parent inode work is included in these compile/test
+  receipts but excluded from this correction's source commit.
