@@ -99,6 +99,7 @@ carrick-host = { path = "../carrick-host" }
 carrick-kernel-arena = { path = "../carrick-kernel-arena" }
 carrick-mem = { path = "../carrick-mem" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
+carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-observability = { path = "../carrick-observability" }
 carrick-signal-linux = { path = "../carrick-signal-linux" }
 carrick-timer-core = { path = "../carrick-timer-core" }
@@ -161,8 +162,6 @@ applevisor-sys.workspace = true
 mach2.workspace = true
 
 [dev-dependencies]
-# Lane tests hold an MM's EL1 editor exclusion from its sched-core proof.
-carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 # Self dev-dependency: enables `test-support` on this crate's own lib when it
 # is built for an integration test (`tests/`), which sees no `cfg(test)`.

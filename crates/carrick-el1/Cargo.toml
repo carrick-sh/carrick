@@ -13,7 +13,7 @@ carrick-sched-core = { path = "../carrick-sched-core" }
 
 [features]
 default = []
-host-test = []
+host-test = ["carrick-sched-core/host-test"]
 allocator-test-control = []
 
 [[bin]]
@@ -24,4 +24,5 @@ path = "src/entry.rs"
 path = "src/lib.rs"
 
 [dev-dependencies]
+carrick-sched-core = { path = "../carrick-sched-core", features = ["host-test"] }
 carrick-mem = { path = "../carrick-mem" }
