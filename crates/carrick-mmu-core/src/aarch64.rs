@@ -5196,6 +5196,25 @@ impl PageTableManager {
         Ok(())
     }
 
+    /// Read the covering block/page without splitting or allocating tables.
+    fn covering_terminal_offset(&self, va: u64) -> Result<(TableLocation, usize), PageTableError> {
+        let idx = indices(va);
+        let mut table_loc = TableLocation::new(0, 0);
+        #[allow(clippy::needless_range_loop)]
+        for level in 0..4usize {
+            let entry_loc = table_loc.entry(idx[level]);
+            if level == 3 {
+                return Ok((entry_loc, 3));
+            }
+            let desc = self.read_desc(entry_loc)?;
+            if desc & VALID == 0 || desc & TYPE_BITS != TYPE_TABLE_OR_PAGE {
+                return Ok((entry_loc, level));
+            }
+            table_loc = self.pa_to_loc(desc & PA_MASK_TABLE)?;
+        }
+        Err(PageTableError::BadAddress)
+    }
+
     /// Descend to the leaf descriptor for `va`. When `allocate`, split any
     /// covering block so the returned leaf is a 4 KiB page; otherwise stop at
     /// the first leaf (block or page) and report its level.
@@ -5205,6 +5224,9 @@ impl PageTableManager {
         allocate: bool,
         mut source: Option<&mut dyn TableArenaSource>,
     ) -> Result<(TableLocation, usize), PageTableError> {
+        if !allocate {
+            return self.covering_terminal_offset(va);
+        }
         let idx = indices(va);
         let mut table_loc = TableLocation::new(0, 0);
         #[allow(clippy::needless_range_loop)]
@@ -5219,9 +5241,6 @@ impl PageTableManager {
             if is_table && valid {
                 table_loc = self.pa_to_loc(desc & PA_MASK_TABLE)?;
                 continue;
-            }
-            if !allocate {
-                return Ok((entry_loc, level));
             }
             // A full-block first-touch/PROT_NONE edit clears VALID without
             // discarding the owned output. Fork may need to repoint only one
@@ -5675,12 +5694,12 @@ impl PageTableManager {
         Ok(())
     }
 
-    /// Physical aliases the offline child can inherit within a semantic VMA.
-    /// A live VMA can contain pristine pages with retired predecessor outputs;
-    /// those pages inherit the VMA, never that predecessor's physical alias.
-    /// Walk covering terminals, not every page in an empty/block span.
-    pub fn fork_backed_spans(
-        &mut self,
+    /// Live physical outputs within a semantic VMA. A reservation can contain
+    /// pristine pages with retired predecessor outputs; those pages have no
+    /// backing to protect or inherit. Walk covering terminals, not every page
+    /// in an empty/block span.
+    pub fn backed_terminal_spans(
+        &self,
         va: u64,
         len: usize,
     ) -> Result<Vec<core::ops::Range<u64>>, PageTableError> {
@@ -5690,7 +5709,7 @@ impl PageTableManager {
         let mut current = va;
         let mut spans: Vec<core::ops::Range<u64>> = Vec::new();
         while current < end {
-            let (location, level) = self.leaf_offset(current, false, None)?;
+            let (location, level) = self.covering_terminal_offset(current)?;
             let descriptor = self.read_desc(location)?;
             let (span, mask) = Self::level_span(level);
             let next = (current & mask)

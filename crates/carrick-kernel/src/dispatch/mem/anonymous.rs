@@ -1323,6 +1323,16 @@ impl MemState {
         Some((delegated.root.clone(), venue))
     }
 
+    pub(in crate::dispatch::mem) fn has_owner_proposal(&self) -> bool {
+        matches!(
+            &self.anonymous,
+            AnonymousAuthority::Delegated(DelegatedAnonymous {
+                venue: Some(HostVenue::Proposal(_)),
+                ..
+            })
+        )
+    }
+
     fn open_venue(&mut self, venue: HostVenue) {
         let AnonymousAuthority::Delegated(delegated) = &mut self.anonymous else {
             broken_root("a host venue on a host-setup MM", Refusal::Stale);
