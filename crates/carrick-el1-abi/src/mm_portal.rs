@@ -67,12 +67,75 @@ const COPY_DONE: u64 = 7;
 const PREPARED: u64 = 8;
 const SUSPENDED: u64 = 9;
 
+/// The resource whose real release completes an owner PREPARE wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u64)]
+pub enum PortalWaitCause {
+    Editor = 1,
+    Reservations = 2,
+    PendingEdit = 3,
+    Gate = 4,
+    Metadata = 5,
+    ReservationPool = 6,
+}
+impl PortalWaitCause {
+    pub const fn encode(self) -> u64 {
+        self as u64
+    }
+    pub const fn decode(raw: u64) -> Option<Self> {
+        match raw {
+            1 => Some(Self::Editor),
+            2 => Some(Self::Reservations),
+            3 => Some(Self::PendingEdit),
+            4 => Some(Self::Gate),
+            5 => Some(Self::Metadata),
+            6 => Some(Self::ReservationPool),
+            _ => None,
+        }
+    }
+}
+/// Exact admitted owner and producer revision sampled before a failed probe.
+/// Contains no resource guard or prepared semantic permit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortalOwnerWait {
+    handle: El1MmHandle,
+    cause: PortalWaitCause,
+    revision: u64,
+}
+impl PortalOwnerWait {
+    /// # Safety
+    /// `revision` must come from this admitted owner's exact cause source,
+    /// sampled before checking the resource predicate. Wire decoders must
+    /// authenticate the completed service against this same owner handle.
+    pub const unsafe fn from_owner(
+        handle: El1MmHandle,
+        cause: PortalWaitCause,
+        revision: u64,
+    ) -> Self {
+        Self {
+            handle,
+            cause,
+            revision,
+        }
+    }
+    pub const fn handle(self) -> El1MmHandle {
+        self.handle
+    }
+    pub const fn cause(self) -> PortalWaitCause {
+        self.cause
+    }
+    pub const fn revision(self) -> u64 {
+        self.revision
+    }
+}
+
 /// PREPARE refused before any consuming effect. Aggregate callers cancel all
 /// earlier page permits before requesting metadata capacity or reselecting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PortalPrepareSuspension {
     SelectionChanged,
     ReservationMetadata,
+    Owner(PortalOwnerWait),
 }
 
 /// Owner-issued semantic admission. The operation generation and slot
@@ -288,7 +351,8 @@ pub struct PortalTransferSlot {
 /// when new words fit in the previous cache-line padding.
 pub const MM_TRANSFER_LAYOUT_HASH: u64 = {
     let words = [
-        1u64,
+        2u64,
+        PortalWaitCause::ReservationPool as u64,
         PREPARED,
         SUSPENDED,
         core::mem::size_of::<PortalTransferSlot>() as u64,
@@ -538,7 +602,25 @@ impl PortalTransferTicket<'_> {
         let reason = match self.slot.errno.load(Ordering::Relaxed) {
             1 => PortalPrepareSuspension::SelectionChanged,
             2 => PortalPrepareSuspension::ReservationMetadata,
-            _ => return None,
+            tag => {
+                let cause = PortalWaitCause::decode(tag.checked_sub(2)?)?;
+                let operation = self.request.operation;
+                // SAFETY: exact request equality above authenticates the completed service.
+                let handle = unsafe {
+                    El1MmHandle::from_admitted_owner(
+                        operation.carrier,
+                        operation.mm,
+                        operation.incarnation,
+                    )
+                };
+                PortalPrepareSuspension::Owner(unsafe {
+                    PortalOwnerWait::from_owner(
+                        handle,
+                        cause,
+                        self.slot.completed.load(Ordering::Relaxed),
+                    )
+                })
+            }
         };
         self.slot
             .state
@@ -606,6 +688,16 @@ impl PortalTransferService<'_> {
             match reason {
                 PortalPrepareSuspension::SelectionChanged => 1,
                 PortalPrepareSuspension::ReservationMetadata => 2,
+                PortalPrepareSuspension::Owner(wait) => {
+                    if wait.handle.carrier() != self.request.operation.carrier
+                        || wait.handle.mm() != self.request.operation.mm
+                        || wait.handle.incarnation() != self.request.operation.incarnation
+                    {
+                        return false;
+                    }
+                    self.slot.completed.store(wait.revision, Ordering::Relaxed);
+                    wait.cause.encode() + 2
+                }
             },
             Ordering::Relaxed,
         );
@@ -650,6 +742,36 @@ impl PortalTransferService<'_> {
     }
 }
 
+/// Enrollment authority joined from one retained carrier region and its exact
+/// live MM source. It cannot be paired with another zone or recycled MM.
+pub struct PortalWaitEnrollment<'a> {
+    source: carrick_sched_core::spaces::notification::SpaceNotificationLease<'a>,
+    cause: carrick_sched_core::spaces::notification::SpaceWaitCause,
+    revision: u64,
+}
+impl PortalWaitEnrollment<'_> {
+    pub fn park_host(
+        self,
+        record: carrick_sched_core::RecordId,
+        operation: carrick_sched_core::object_wait::OperationToken,
+        completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>),
+    ) -> Result<
+        (),
+        (
+            carrick_sched_core::object_wait::ObjectWaitError,
+            carrick_sched_core::object_wait::OperationToken,
+        ),
+    > {
+        self.source.reserve(self.cause).park_host_rechecked(
+            self.source.observed_revision(self.cause, self.revision),
+            record,
+            operation,
+            completion,
+            || self.source.is_live(),
+        )
+    }
+}
+
 #[repr(C, align(64))]
 pub struct MmPortalSlots {
     carrier: AtomicU64,
@@ -673,6 +795,42 @@ impl MmPortalSlots {
             grants: [const { crate::PortalGrantSlot::new() }; crate::EL1_STACK_SLOTS as usize],
             slots: [const { PortalTransferSlot::new() }; crate::EL1_STACK_SLOTS as usize],
         }
+    }
+    /// Authenticate the service receipt using the bound carrier and both
+    /// actual retained-region views; no container dereference or global lookup.
+    pub fn authenticate_wait<'a>(
+        &'a self,
+        zone: &'a carrick_sched_core::ZoneTables,
+        receipt: PortalOwnerWait,
+    ) -> Result<PortalWaitEnrollment<'a>, carrick_sched_core::object_wait::ObjectWaitError> {
+        use carrick_sched_core::object_wait::ObjectWaitError;
+        use carrick_sched_core::spaces::notification::SpaceWaitCause;
+        let portal_region =
+            (self as *const Self as usize).checked_sub(EL1_MM_PORTAL_OFFSET as usize);
+        let zone_region = (zone as *const _ as usize).checked_sub(crate::EL1_ZONE_OFFSET as usize);
+        if portal_region.is_none()
+            || portal_region != zone_region
+            || self.carrier() != Some(receipt.handle.carrier())
+        {
+            return Err(ObjectWaitError::Stale);
+        }
+        let cause = match receipt.cause {
+            PortalWaitCause::Editor => SpaceWaitCause::Editor,
+            PortalWaitCause::Reservations => SpaceWaitCause::Reservations,
+            PortalWaitCause::PendingEdit => SpaceWaitCause::PendingEdit,
+            PortalWaitCause::Gate => SpaceWaitCause::Gate,
+            PortalWaitCause::Metadata => SpaceWaitCause::Metadata,
+            PortalWaitCause::ReservationPool => return Err(ObjectWaitError::Stale),
+        };
+        let entry = zone
+            .space_entry(NonZeroU64::new(receipt.handle.mm().raw()).ok_or(ObjectWaitError::Stale)?)
+            .ok_or(ObjectWaitError::Stale)?;
+        let source = entry.notifications(receipt.handle.incarnation())?;
+        Ok(PortalWaitEnrollment {
+            source,
+            cause,
+            revision: receipt.revision,
+        })
     }
     pub fn fork(&self, slot: usize) -> Option<&crate::PortalForkSlot> {
         self.forks.get(slot)
@@ -800,6 +958,38 @@ mod tests {
 #[cfg(test)]
 mod prepared_tests {
     use super::*;
+    #[test]
+    fn owner_wait_wire_preserves_exact_identity_revision_and_slot_geometry() {
+        assert_eq!(core::mem::size_of::<PortalTransferSlot>(), 192);
+        for cause in [
+            PortalWaitCause::Editor,
+            PortalWaitCause::Reservations,
+            PortalWaitCause::PendingEdit,
+            PortalWaitCause::Gate,
+            PortalWaitCause::Metadata,
+            PortalWaitCause::ReservationPool,
+        ] {
+            let slot = PortalTransferSlot::new();
+            let request = super::tests::request(1);
+            let mut ticket = slot.submit_prepare(request).unwrap();
+            let handle = unsafe {
+                El1MmHandle::from_admitted_owner(
+                    request.operation.carrier,
+                    request.operation.mm,
+                    request.operation.incarnation,
+                )
+            };
+            let reason = PortalPrepareSuspension::Owner(unsafe {
+                PortalOwnerWait::from_owner(handle, cause, u64::MAX - 3)
+            });
+            assert!(slot.claim().unwrap().suspend_prepare(reason));
+            assert!(ticket.take_completion().is_none());
+            assert_eq!(ticket.take_prepare_suspension(), Some(reason));
+            assert!(ticket.take_prepare_suspension().is_none());
+            assert!(slot.submit_prepare(request).is_some());
+        }
+    }
+
     #[test]
     fn detached_page_receipts_reuse_wire_slot_and_preserve_exact_settlement() {
         let slot = PortalTransferSlot::new();

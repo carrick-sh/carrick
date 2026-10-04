@@ -132,6 +132,7 @@ pub enum TransferProgress {
     Complete,
     Advanced,
     Suspended,
+    OwnerWait(carrick_el1_abi::PortalOwnerWait),
     Refused(carrick_abi::LinuxErrno),
 }
 
@@ -249,6 +250,18 @@ impl OwnedUserTransfer {
         )?;
         match selected_frame.x[0] {
             11 => {
+                if selected_frame.x[14] == 3 {
+                    let cause = carrick_el1_abi::PortalWaitCause::decode(selected_frame.x[16])
+                        .ok_or_else(|| error("invalid owner wait cause"))?;
+                    // SAFETY: returned through the exclusively loaned exact-target service.
+                    return Ok(TransferProgress::OwnerWait(unsafe {
+                        carrick_el1_abi::PortalOwnerWait::from_owner(
+                            self.target.handle,
+                            cause,
+                            selected_frame.x[17],
+                        )
+                    }));
+                }
                 if matches!(selected_frame.x[14], 1 | 2) {
                     let nz = |value| {
                         NonZeroU64::new(value).ok_or_else(|| error("invalid supply receipt"))
@@ -413,6 +426,17 @@ impl OwnedUserTransfer {
                 );
             }
             return Err(failure);
+        }
+        if let Some(suspension) = ticket.take_prepare_suspension() {
+            return Ok(match suspension {
+                carrick_el1_abi::PortalPrepareSuspension::Owner(wait) => {
+                    TransferProgress::OwnerWait(wait)
+                }
+                carrick_el1_abi::PortalPrepareSuspension::SelectionChanged
+                | carrick_el1_abi::PortalPrepareSuspension::ReservationMetadata => {
+                    TransferProgress::Suspended
+                }
+            });
         }
         let completion = ticket.take_completion().unwrap_or_else(|| {
             carrick_fatal::carrick_fatal!(
