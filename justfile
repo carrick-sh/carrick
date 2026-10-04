@@ -601,7 +601,8 @@ test-integration:
     cargo test -p carrick-cli {{_platform_features}} --test trace_profile
     cargo test -p carrick-cli {{_platform_features}} --test fs_backend_flag
     cargo test -p carrick-cli {{_platform_features}} --test cli
-    cargo test -p carrick-engine {{_platform_features}}
+    # syscall-shim belongs to the runtime dependency, not the engine API.
+    cargo test -p carrick-engine {{replace(_platform_features, "syscall-shim", "carrick-runtime/syscall-shim")}}
     cargo test -p carrick-image
 
 # Run the full host CI gate locally (fmt · clippy · build · docs · tests) — the source of truth CI calls.
