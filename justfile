@@ -178,6 +178,10 @@ lint-domains-source:
     python3 -m unittest scripts/migrate/tests/test_reconcile_rename.py scripts/tests/test_rehome_line_pinned_inventories.py scripts/tests/test_host_authority_transitions.py
     python3 -m unittest scripts/tests/test_conformance_contract_policy.py
     cargo run -p carrick-conformance-contract --bin check-contracts -- --root .
+    # All-feature metadata includes dependencies for other hosts and optional
+    # features that this host's build never fetched. Populate the locked cache
+    # before the offline personality-boundary graph check on fresh runners.
+    cargo fetch --locked
     cargo metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json
     cargo run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
     python3 -m unittest scripts/tests/test_check_contract_change.py
