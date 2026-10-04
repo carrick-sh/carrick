@@ -1,0 +1,42 @@
+name: Willow ephemeral runner pilot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kvm:
+    runs-on: [self-hosted, Linux, X64, willow-kvm]
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fresh guest identity and non-root KVM capability
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p pilot-logs
+          {
+            uname -a
+            id
+            cat /etc/machine-id
+            ls -l /dev/kvm
+            grep -m1 -o '\bsvm\b' /proc/cpuinfo
+            /usr/local/bin/carrick-xtask ci-scaler verify-kvm
+          } 2>&1 | tee pilot-logs/capability.log
+      - name: Build the CPL0 image and execute KVM entry tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p carrick-x86-cpl0 --target x86_64-unknown-none 2>&1 | tee pilot-logs/image-build.log
+          cargo test --locked -p carrick-vmm-kvm --test cpl0_entry -- --nocapture 2>&1 | tee pilot-logs/cpl0-entry.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: willow-pilot-${{ github.run_id }}-${{ github.run_attempt }}
+          path: pilot-logs/
+          if-no-files-found: error
