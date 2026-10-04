@@ -213,18 +213,51 @@ impl<'a> SpaceEntryHandle<'a> {
     /// Retire a closed entry without waiting for already admitted source
     /// borrowers. The last borrower owns cleanup; publication skips it until
     /// that unique cleanup finishes.
-    pub fn retire_entry(self) {
+    pub fn retire_entry(self, venue: SpaceReleaseVenue<'_>) {
+        assert!(
+            core::ptr::eq(venue.zone, self.zone),
+            "retirement source zone"
+        );
         assert!(self.zone.spaces.gate(self.index) & super::GATE_CLOSED != 0);
         assert!(self.zone.spaces.active_editor(self.index).is_none());
         assert_eq!(self.zone.spaces.key(self.index), self.mm.get());
         let source = &self.zone.spaces.entry(self.index).notifications;
+        // Pin before claiming retirement, so a concurrent last borrower cannot
+        // finish/recycle the entry underneath this terminal publisher. Inspect
+        // ACTIVE only after excluding new admissions: a binder may have become
+        // live between the pin and retirement claim.
+        let previous = source.state.fetch_add(1, Ordering::AcqRel);
+        assert!(
+            previous & COUNT != COUNT,
+            "notification admission exhaustion"
+        );
         source.claim_entry_retirement();
-        source.state.fetch_or(CLOSING, Ordering::AcqRel);
+        let closing = source.state.fetch_or(CLOSING, Ordering::SeqCst);
+        if closing & !COUNT == ACTIVE {
+            let Some(identity) = source.identity() else {
+                unreachable!("active source identity");
+            };
+            assert_eq!(identity.mm, self.mm);
+            SpaceNotificationLease {
+                zone: self.zone,
+                index: self.index,
+                source,
+                identity,
+            }
+            .publish_terminal(venue);
+        } else {
+            source.release(self.zone, self.index);
+        }
         source.finish(self.zone, self.index);
     }
-    pub fn close_notifications(self, incarnation: NonZeroU64) -> Result<(), ObjectWaitError> {
+    pub fn close_notifications(
+        self,
+        incarnation: NonZeroU64,
+        venue: SpaceReleaseVenue<'_>,
+    ) -> Result<(), ObjectWaitError> {
+        assert!(core::ptr::eq(venue.zone, self.zone), "closing source zone");
         self.zone
-            .close_space_notifications(self.index, self.identity(incarnation))
+            .close_space_notifications(self.index, self.identity(incarnation), venue)
     }
 }
 /// Private release custody: even unwinding while constructing several
@@ -253,6 +286,19 @@ pub struct SpaceNotificationLease<'a> {
     identity: SpaceNotificationIdentity,
 }
 impl<'a> SpaceNotificationLease<'a> {
+    fn publish_terminal(self, venue: SpaceReleaseVenue<'_>) {
+        // CLOSING is already visible: this edge means the exact source is
+        // unavailable, not that a resource is ready for another attempt.
+        // Retain all receipts before the first callback can run.
+        let complete =
+            |effects: OwnedObjectWakeEffects<'_>| (venue.deliver)(venue.zone, venue.waker, effects);
+        let publications = SpaceWaitCause::ALL
+            .map(|cause| self.reserve(cause).advance_revision(venue.waker, &complete));
+        for publication in publications {
+            publication.publish();
+        }
+    }
+
     /// Closing admission is visible to a waiter before it publishes a park.
     pub fn is_live(&self) -> bool {
         let state = self.source.state.load(Ordering::Acquire);
@@ -271,6 +317,25 @@ impl<'a> SpaceNotificationLease<'a> {
         // owning source reconstruction, queue admission or lock acquisition.
         BorrowedObjectNotificationSource::from_live_admission(self.zone, self.key(cause), self)
             .reserve()
+    }
+    /// Close an exact source and release its final protected resource before
+    /// delivering terminal edges. The counted lease keeps all cause pins live.
+    ///
+    /// # Safety
+    /// The caller owns `word` exclusively for this exact MM and has finished
+    /// all protected mutation. It must not unlock or access that resource again.
+    pub unsafe fn release_retiring_resource(
+        &self,
+        venue: SpaceReleaseVenue<'_>,
+        word: &AtomicU64,
+        unlocked: ResourceUnlocked,
+    ) {
+        assert!(core::ptr::eq(venue.zone, self.zone), "retiring source zone");
+        assert!(self.zone.spaces.gate(self.index) & super::GATE_CLOSED != 0);
+        assert!(self.zone.spaces.active_editor(self.index).is_none());
+        self.source.state.fetch_or(CLOSING, Ordering::SeqCst);
+        // SAFETY: the caller supplies the same exact exclusive resource custody.
+        unsafe { self.release_resource(venue, word, unlocked, &SpaceWaitCause::ALL) };
     }
     /// Unlock and publish as one release authority. No advanced receipt can
     /// escape to a caller or be destroyed before its resource unlock.
@@ -424,6 +489,7 @@ impl ZoneTables {
         &self,
         index: SpaceIndex,
         identity: SpaceNotificationIdentity,
+        venue: SpaceReleaseVenue<'_>,
     ) -> Result<(), ObjectWaitError> {
         if self.spaces.gate(index) & super::GATE_CLOSED == 0
             || self.spaces.active_editor(index).is_some()
@@ -431,8 +497,8 @@ impl ZoneTables {
             return Err(ObjectWaitError::Occupied);
         }
         let lease = self.borrow_space_notifications(index, identity)?;
-        lease.source.state.fetch_or(CLOSING, Ordering::AcqRel);
-        drop(lease);
+        lease.source.state.fetch_or(CLOSING, Ordering::SeqCst);
+        lease.publish_terminal(venue);
         Ok(())
     }
     pub(super) fn editor_notification(
@@ -597,6 +663,143 @@ mod tests {
         entry
     }
     #[test]
+    fn source_retirement_completes_already_parked_gate_operation() {
+        let zone = zone();
+        let entry = admitted(&zone);
+        let incarnation = NonZeroU64::new(1).unwrap();
+        let lease = entry.notifications(incarnation).unwrap();
+        let record = zone
+            .alloc_record(crate::ThreadIdentity {
+                tid: 77,
+                serial: 1,
+                mm: 77,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        let complete = |effects: OwnedObjectWakeEffects<'_>| {
+            let _ = effects.deliver_handbacks(&mut |_| {});
+        };
+        lease
+            .reserve(SpaceWaitCause::Gate)
+            .park_host_rechecked(
+                lease.observe(SpaceWaitCause::Gate),
+                record,
+                crate::object_wait::OperationToken::new(77, 1).unwrap(),
+                &complete,
+                || true,
+            )
+            .unwrap();
+        drop(lease);
+        entry
+            .close_notifications(incarnation, access(&zone).venue().unwrap())
+            .unwrap();
+        entry.retire_entry(access(&zone).venue().unwrap());
+        assert!(
+            matches!(zone.record(record).claim(), crate::Claim::Host { .. }),
+            "terminal source closure must return the owned operation"
+        );
+        assert_eq!(
+            unsafe { zone.record(record).take_object_operation() }
+                .unwrap()
+                .index(),
+            77
+        );
+    }
+
+    #[test]
+    fn source_close_after_predicate_observation_refuses_park_publication() {
+        let zone = zone();
+        let entry = admitted(&zone);
+        let incarnation = NonZeroU64::new(1).unwrap();
+        let lease = entry.notifications(incarnation).unwrap();
+        let record = zone
+            .alloc_record(crate::ThreadIdentity {
+                tid: 78,
+                serial: 1,
+                mm: 77,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        let complete = |effects: OwnedObjectWakeEffects<'_>| {
+            let _ = effects.deliver_handbacks(&mut |_| {});
+        };
+        let result = lease.reserve(SpaceWaitCause::Gate).park_host_rechecked(
+            lease.observe(SpaceWaitCause::Gate),
+            record,
+            crate::object_wait::OperationToken::new(78, 1).unwrap(),
+            &complete,
+            || {
+                let observed = lease.is_live();
+                entry
+                    .close_notifications(incarnation, access(&zone).venue().unwrap())
+                    .unwrap();
+                observed
+            },
+        );
+        assert_eq!(
+            result,
+            Err((
+                ObjectWaitError::Changed,
+                crate::object_wait::OperationToken::new(78, 1).unwrap()
+            ))
+        );
+        assert!(!zone.record(record).has_object_operation());
+        entry.retire_entry(access(&zone).venue().unwrap());
+    }
+
+    #[test]
+    fn direct_entry_retirement_returns_every_enrolled_cause() {
+        let zone = zone();
+        let entry = admitted(&zone);
+        let lease = entry.notifications(NonZeroU64::new(1).unwrap()).unwrap();
+        let complete = |effects: OwnedObjectWakeEffects<'_>| {
+            let _ = effects.deliver_handbacks(&mut |_| {});
+        };
+        let records = SpaceWaitCause::ALL.map(|cause| {
+            let record = zone
+                .alloc_record(crate::ThreadIdentity {
+                    tid: 90 + cause as u64,
+                    serial: 1,
+                    mm: 77,
+                    file_table: 1,
+                    generation: 1,
+                    affinity: 0,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
+            lease
+                .reserve(cause)
+                .park_host_rechecked(
+                    lease.observe(cause),
+                    record,
+                    crate::object_wait::OperationToken::new(90 + cause as u64, 1).unwrap(),
+                    &complete,
+                    || true,
+                )
+                .unwrap();
+            record
+        });
+        drop(lease);
+        entry.retire_entry(access(&zone).venue().unwrap());
+        for record in records {
+            assert!(matches!(
+                zone.record(record).claim(),
+                crate::Claim::Host { .. }
+            ));
+            assert!(unsafe { zone.record(record).take_object_operation() }.is_some());
+        }
+    }
+
+    #[test]
     fn nested_gate_release_keeps_count_and_publishes_final_edge() {
         let zone = zone();
         let entry = admitted(&zone);
@@ -627,7 +830,7 @@ mod tests {
         );
         spaces.close(entry.index());
         entry
-            .close_notifications(NonZeroU64::new(1).unwrap())
+            .close_notifications(NonZeroU64::new(1).unwrap(), access(&zone).venue().unwrap())
             .unwrap();
     }
     #[test]
@@ -638,7 +841,7 @@ mod tests {
         let incarnation = NonZeroU64::new(1).unwrap();
         let lease = entry.notifications(incarnation).unwrap();
         let ticket = lease.reserve(SpaceWaitCause::Editor);
-        entry.retire_entry();
+        entry.retire_entry(access(&zone).venue().unwrap());
         assert!(entry.notifications(incarnation).is_err());
         assert_eq!(
             zone.spaces.key(index),
@@ -669,7 +872,7 @@ mod tests {
         next.admit_notifications(NonZeroU64::new(2).unwrap(), &BoundedSpin(0), &complete)
             .unwrap();
         assert!(entry.notifications(incarnation).is_err());
-        next.retire_entry();
+        next.retire_entry(access(&zone).venue().unwrap());
     }
     #[test]
     fn source_binding_loses_to_entry_retirement_without_resurrection() {
@@ -680,7 +883,7 @@ mod tests {
         // Exact admission gap: the binder has won shared exclusion, but has
         // not validated the key or published any base pin yet.
         source.state.store(BINDING, Ordering::Release);
-        entry.retire_entry();
+        entry.retire_entry(access(&zone).venue().unwrap());
         assert_eq!(zone.spaces.key(index), 77);
         assert!(!source.reusable());
         source.state.fetch_and(!BINDING, Ordering::Release);
@@ -729,7 +932,7 @@ mod tests {
             core::mem::offset_of!(super::super::SpaceEntry, notifications),
             344
         );
-        entry.retire_entry();
+        entry.retire_entry(access(&zone).venue().unwrap());
     }
     #[test]
     fn every_cause_refuses_release_before_enrollment_and_ignores_other_causes() {
@@ -775,7 +978,7 @@ mod tests {
             ));
             assert!(!zone.record(record).has_object_operation());
             drop(queue);
-            entry.retire_entry();
+            entry.retire_entry(access(&zone).venue().unwrap());
         }
     }
 
@@ -811,7 +1014,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(word.load(Ordering::SeqCst), 0);
         assert_eq!(delivered.get(), 1);
-        entry.retire_entry();
+        entry.retire_entry(access(&zone).venue().unwrap());
     }
 
     #[test]
@@ -867,7 +1070,7 @@ mod tests {
                 0
             );
             drop(queue);
-            entry.retire_entry();
+            entry.retire_entry(access(&zone).venue().unwrap());
         }
     }
     #[test]
@@ -884,7 +1087,7 @@ mod tests {
         assert_ne!(lease.observe(SpaceWaitCause::Editor), before);
         assert!(zone.spaces.active_editor(entry.index()).is_none());
         entry
-            .close_notifications(NonZeroU64::new(1).unwrap())
+            .close_notifications(NonZeroU64::new(1).unwrap(), access(&zone).venue().unwrap())
             .unwrap();
         let before = lease.observe(SpaceWaitCause::Editor);
         assert!(
@@ -946,7 +1149,7 @@ mod tests {
         drop(queue);
         assert_eq!(delivered.get(), 1);
         spaces.close(entry.index());
-        entry.retire_entry();
+        entry.retire_entry(access(&zone).venue().unwrap());
     }
     #[test]
     fn enrollment_predicate_unwind_removes_unparked_registration() {
@@ -993,6 +1196,6 @@ mod tests {
         );
         assert!(!zone.record(record).has_object_operation());
         drop(queue);
-        entry.retire_entry();
+        entry.retire_entry(access(&zone).venue().unwrap());
     }
 }
