@@ -1545,20 +1545,20 @@ impl FileDescription {
         true
     }
 
-    pub(crate) fn release_fd_ref(&self) {
-        // Only the last fd reference ends an EL1 delegation: a transient
-        // reference (a dup, an in-flight syscall's lease) coming and going is
-        // not an ownership change. Recall runs outside `lifecycle_transition`,
-        // which is ordered before the description guard.
-        if self.common.fd_refs() <= 1 {
-            crate::el1_delegation::release_description(self);
-        }
-        let released_last;
+    pub(crate) fn release_fd_ref(self: &Arc<Self>) {
         let mut retired_ipc = None;
+        let mut recall_lease = None;
         let terminal_finalizers = {
             let mut lifecycle = self.lifecycle_transition.lock();
+            // Transfer the last functional reference to cleanup before it can
+            // reach zero. The releasing pool thread never waits for recall.
+            if self.common.fd_refs() == 1 && self.delegation_handle() != 0 {
+                self.common.retain_fd_ref();
+                recall_lease = Some(FileDescriptionFdLease {
+                    description: Arc::clone(self),
+                });
+            }
             let count = self.common.release_fd_ref();
-            released_last = count == 0;
             if count == 0 {
                 retired_ipc = self.common.ipc_forwarding.lock().take();
                 if let FileDescriptionKind::Concrete(backing) = &self.kind {
@@ -1573,15 +1573,9 @@ impl FileDescription {
             }
         };
         drop(retired_ipc);
-        // Two releases that both saw another reference outstanding can reach
-        // zero together; the description (and its host fd) is still alive, so
-        // write the delegation back now.
-        if released_last {
-            crate::el1_delegation::release_description(self);
+        if let Some(lease) = recall_lease {
+            crate::el1_delegation::handoff_last_reference(lease);
         }
-        // A finalizer may take subsystem state (for example logical-record
-        // locks). Do not nest that under `lifecycle_transition`; the terminal
-        // count has already made further lease admission impossible.
         for finalizer in terminal_finalizers {
             finalizer.finalize();
         }

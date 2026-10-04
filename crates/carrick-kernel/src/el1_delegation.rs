@@ -4,6 +4,8 @@
 //! in-guest EL1 kernel and recall back to the host. The ownership model and
 //! its lock order are documented at the top of the ownership section below.
 
+mod owned_recall;
+pub use owned_recall::{OwnedRecallReady, OwnedRecallRequest, begin as begin_owned_recall};
 mod writeback;
 use writeback::InodeWriteback;
 
@@ -61,6 +63,9 @@ pub fn settle_el1_boundary(
     }
     if served || pending {
         kernel.deliver_ipc_host_wakes();
+        if let Some(zone) = zone_tables() {
+            owned_recall::notify(zone, carrick_sched_core::Waker::Host);
+        }
     }
     boundary
 }
@@ -76,7 +81,7 @@ pub fn settle_el1_boundary_for(
 
 /// Clear the recorded host virtual address of the EL1 kernel aperture.
 pub fn clear_el1_region_host_ptr() {
-    carrick_el1_abi::record_el1_region_host_ptr(0);
+    owned_recall::clear_aperture();
 }
 
 /// Publish the current task binding for an executor vCPU mailbox slot into the EL1 aperture.
@@ -374,7 +379,7 @@ enum OwnerState {
     Host,
     Delegating { recall_requested: bool },
     Guest(GuestBinding),
-    Recalling,
+    Recalling(Arc<owned_recall::RecallJob>),
 }
 
 /// One description that has joined an in-zone inode.
@@ -489,7 +494,7 @@ pub(crate) fn register_open(identity: InodeIdentity) -> InodeOpenRegistration {
             state: OwnerState::Host,
         });
         let join_pending = match &mut owner.state {
-            OwnerState::Recalling => {
+            OwnerState::Recalling(_) => {
                 OWNERS_CHANGED.wait(&mut owners);
                 continue;
             }
@@ -539,18 +544,24 @@ pub(crate) fn recall_inode(identity: InodeIdentity) -> bool {
                 acted = true;
                 OWNERS_CHANGED.wait(&mut owners);
             }
-            OwnerState::Recalling => {
-                acted = true;
-                OWNERS_CHANGED.wait(&mut owners);
+            OwnerState::Recalling(job) => {
+                job.require_full();
+                let job = Arc::clone(job);
+                drop(owners);
+                job.wait();
+                return true;
             }
             OwnerState::Guest(_) => {
                 let OwnerState::Guest(binding) =
-                    std::mem::replace(&mut owner.state, OwnerState::Recalling)
+                    std::mem::replace(&mut owner.state, OwnerState::Host)
                 else {
                     unreachable!("matched Guest above");
                 };
+                let job = owned_recall::elect(identity, binding);
+                owner.state = OwnerState::Recalling(Arc::clone(&job));
                 drop(owners);
-                recall_binding(identity, binding);
+                owned_recall::start(&job);
+                job.wait();
                 return true;
             }
         }
@@ -562,7 +573,11 @@ pub(crate) fn recall_inode(identity: InodeIdentity) -> bool {
 /// into host watches, withdraws every member from the fd map and ends the
 /// inode record; members detach on their next host access.
 #[track_caller]
-fn recall_binding(identity: InodeIdentity, binding: GuestBinding) {
+fn execute_recall(
+    identity: InodeIdentity,
+    binding: GuestBinding,
+    mut file_guard: DelegatedFileGuard<'_>,
+) -> Vec<Arc<FileDescription>> {
     let region_ptr = get_el1_region_host_ptr();
     if region_ptr == 0 {
         carrick_fatal!(
@@ -579,7 +594,6 @@ fn recall_binding(identity: InodeIdentity, binding: GuestBinding) {
 
     let live = binding.live_members();
     let file = delegated_file_object(region_ptr, handle);
-    let mut file_guard = lock_delegated_file(file, handle);
     file.state
         .store(DELEGATED_STATE_RECALLING, Ordering::Release);
     // In-guest watches on this file become host watches on its path: the
@@ -621,18 +635,9 @@ fn recall_binding(identity: InodeIdentity, binding: GuestBinding) {
             member.common().record_writeback_error(err);
         }
     }
-    free_handle(handle);
-
-    let mut owners = OWNERS.lock();
-    if let Some(owner) = owners.as_mut().and_then(|map| map.get_mut(&identity)) {
-        owner.state = OwnerState::Host;
-    }
-    ACTIVE_DELEGATIONS.fetch_sub(1, Ordering::AcqRel);
-    OWNERS_CHANGED.notify_all();
-    drop(owners);
     drop(target);
-    drop(live);
     drop(binding);
+    live
 }
 
 /// Recall whatever delegation covers the rootfs file at `path`, if any;
@@ -675,13 +680,19 @@ pub(crate) fn sync_path(fs: &FsState, path: &str) -> bool {
 /// the inode is not in the zone; otherwise the write-back result and the
 /// size the zone holds.
 fn sync_owner(identity: InodeIdentity) -> Option<(Result<(), carrick_abi::LinuxErrno>, u64)> {
-    let (handle, snapshot) = {
+    let (handle, generation, snapshot) = {
         let owners = OWNERS.lock();
         match owners.as_ref().and_then(|map| map.get(&identity)) {
             Some(Owner {
                 state: OwnerState::Guest(binding),
                 ..
-            }) => (binding.inode, WriteBackTarget::of(binding)),
+            }) => (
+                binding.inode,
+                delegated_file_object(get_el1_region_host_ptr(), binding.inode)
+                    .generation
+                    .load(Ordering::Acquire),
+                WriteBackTarget::of(binding),
+            ),
             _ => return None,
         }
     };
@@ -691,7 +702,9 @@ fn sync_owner(identity: InodeIdentity) -> Option<(Result<(), carrick_abi::LinuxE
     }
     let file = delegated_file_object(region_ptr, handle);
     let file_guard = lock_delegated_file(file, handle);
-    let outcome = if file.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST {
+    let outcome = if file.state.load(Ordering::Acquire) == DELEGATED_STATE_GUEST
+        && file.generation.load(Ordering::Acquire) == generation
+    {
         let rootfs = snapshot.rootfs.upgrade();
         let result = InodeWriteback::capture(&file_guard, handle).apply(
             handle,
@@ -1168,6 +1181,7 @@ fn delegated_file_authority(file: &DelegatedFile, handle: u32) -> DelegatedFileA
             zone,
             waker: carrick_sched_core::Waker::Host,
             deliver,
+            owner_ready: owned_recall::notify,
         },
     )
     .unwrap_or_else(|_| {
@@ -1804,12 +1818,21 @@ pub(crate) fn recall(description: &FileDescription) -> Result<(), carrick_abi::L
     let Some(d) = description.open_description() else {
         return Ok(());
     };
-    let mut guard = d.write();
+    let _guard = d.write();
     let handle = description.delegation_handle();
     if handle == 0 {
         return Ok(());
     }
-    detach_member(description, &mut guard, handle)
+    if handle == JOIN_PENDING {
+        description.set_delegation_handle(0);
+        return Ok(());
+    }
+    // Actual members are restored by the owned job before its terminal
+    // publication; keeping a second host-storage detachment path would race it.
+    carrick_fatal!(
+        "el1_delegation",
+        "terminal recall left a live member handle={handle}"
+    )
 }
 
 /// Recall a file description's inode if the description is a member (or a
@@ -1822,89 +1845,52 @@ pub(crate) fn recall_if_delegated(description: &FileDescription) {
     }
 }
 
-/// A member of an inode that has left the zone takes its state back: its
-/// host fd's offset becomes the offset the zone kept for it, and its cached
-/// size is refreshed. The caller holds the description's write guard.
-fn detach_member(
-    description: &FileDescription,
-    open: &mut OpenDescription,
-    handle: u32,
-) -> Result<(), carrick_abi::LinuxErrno> {
-    if handle == JOIN_PENDING {
-        description.set_delegation_handle(0);
-        return Ok(());
-    }
-    let region_ptr = get_el1_region_host_ptr();
-    let mut result = Ok(());
-    if region_ptr != 0 && handle as usize <= MAX_ZONE_OPEN_FILES {
-        let record = open_file_object(region_ptr, handle);
-        let offset = record.offset.load(Ordering::Acquire);
-        if let OpenDescription::HostFile {
-            host_fd, metadata, ..
-        } = open
-        {
-            if unsafe { libc::lseek(host_fd.raw(), offset as libc::off_t, libc::SEEK_SET) } < 0 {
-                let err = crate::host_to_linux_errno(
-                    std::io::Error::last_os_error()
-                        .raw_os_error()
-                        .unwrap_or(libc::EIO),
-                );
-                description.common().record_writeback_error(err);
-                result = Err(err);
-            }
-            let mut st: libc::stat = unsafe { core::mem::zeroed() };
-            if unsafe { libc::fstat(host_fd.raw(), &mut st) } == 0 {
-                metadata.size = st.st_size.max(0) as usize;
-            }
-        }
-        retire_open_file(region_ptr, handle);
-    }
-    description.set_delegation_handle(0);
-    result
-}
-
-/// The last fd reference to `description` is going away. A member of an
-/// inode that other members keep in the zone just withdraws (its bytes stay
-/// in the zone); otherwise the inode leaves the zone.
-pub(crate) fn release_description(description: &FileDescription) {
+/// Restore one terminal member without a description guard across host I/O.
+/// The inode remains Recalling, so every competing I/O access joins that owner.
+fn detach_recalled_member(description: &FileDescription) {
     let handle = description.delegation_handle();
     if handle == 0 {
         return;
     }
-    if handle != JOIN_PENDING
-        && let Some(identity) = description.el1_identity()
-    {
-        let region_ptr = get_el1_region_host_ptr();
-        let inode = {
-            let mut owners = OWNERS.lock();
-            match owners
-                .as_mut()
-                .and_then(|map| map.get_mut(&identity))
-                .map(|owner| &mut owner.state)
-            {
-                Some(OwnerState::Guest(binding))
-                    if binding.members.len() > 1
-                        && binding.members.iter().any(|m| m.open_file == handle) =>
-                {
-                    binding.members.retain(|m| m.open_file != handle);
-                    Some(binding.inode)
-                }
-                _ => None,
-            }
-        };
-        if let Some(inode) = inode
-            && region_ptr != 0
-        {
-            fd_map_clear_handle(region_ptr, handle);
-            let file = delegated_file_object(region_ptr, inode);
-            let file_guard = lock_delegated_file(file, inode);
-            retire_open_file(region_ptr, handle);
-            drop(file_guard);
-            description.set_delegation_handle(0);
-            return;
+    if handle == JOIN_PENDING {
+        description.set_delegation_handle(0);
+        return;
+    }
+    let region = get_el1_region_host_ptr();
+    let record = open_file_object(region, handle);
+    let offset = record.offset.load(Ordering::Acquire);
+    let fd = description.inspect().and_then(|open| match &*open {
+        OpenDescription::HostFile { host_fd, .. } => Some(host_fd.clone()),
+        _ => None,
+    });
+    let mut size = None;
+    if let Some(fd) = fd {
+        if unsafe { libc::lseek(fd.raw(), offset as libc::off_t, libc::SEEK_SET) } < 0 {
+            description
+                .common()
+                .record_writeback_error(crate::host_to_linux_errno(
+                    std::io::Error::last_os_error()
+                        .raw_os_error()
+                        .unwrap_or(libc::EIO),
+                ));
+        }
+        let mut st: libc::stat = unsafe { core::mem::zeroed() };
+        if unsafe { libc::fstat(fd.raw(), &mut st) } == 0 {
+            size = Some(st.st_size.max(0) as usize);
         }
     }
-    recall_if_delegated(description);
+    if let Some(d) = description.open_description() {
+        let mut open = d.write();
+        if let (Some(size), OpenDescription::HostFile { metadata, .. }) = (size, &mut *open) {
+            metadata.size = size;
+        }
+        retire_open_file(region, handle);
+        description.set_delegation_handle(0);
+    }
+}
+
+pub(crate) fn handoff_last_reference(lease: crate::kernel::objects::FileDescriptionFdLease) {
+    drop(owned_recall::handoff(lease, false));
 }
 
 /// What a write-back needs from an owner, captured under OWNERS so the
@@ -2120,6 +2106,188 @@ mod tests {
         }
 
         #[test]
+        fn canceled_recall_request_keeps_cleanup_and_later_open_sees_bytes() {
+            let _region = Region::new();
+            let tmp = temp_with(b"before");
+            let open = open_host(&tmp);
+            delegate_default(&open, 3).unwrap();
+            let inode = inode_of(&open);
+            guest_write(inode, 0, b"after!");
+            let file = delegated_file_object(get_el1_region_host_ptr(), inode);
+            let held = lock_delegated_file(file, inode);
+            let cursor = open.description.try_reserve_cursor().unwrap();
+            let before = RECALLS.load(Ordering::Acquire);
+            let request = begin_owned_recall(cursor).unwrap();
+            assert!(!request.is_complete());
+            assert!(request.wait_queue().is_some());
+            drop(request); // cancellation drops requester cursor/result interest
+            open.description.release_fd_ref(); // close the original numeric fd
+            drop(held);
+            recall_all_delegated();
+            let later = open_host(&tmp);
+            let guard = later.description.read_for_io().unwrap();
+            let OpenDescription::HostFile { host_fd, .. } = &*guard else {
+                panic!("host file");
+            };
+            let mut bytes = [0u8; 6];
+            assert_eq!(
+                unsafe { libc::read(host_fd.raw(), bytes.as_mut_ptr().cast(), bytes.len()) },
+                6
+            );
+            assert_eq!(&bytes, b"after!");
+            assert_eq!(RECALLS.load(Ordering::Acquire) - before, 1);
+        }
+
+        #[test]
+        fn readiness_during_storage_never_requeues_a_terminal_recall() {
+            let _region = Region::new();
+            let tmp = temp_with(b"data");
+            let open = open_host(&tmp);
+            delegate_default(&open, 3).unwrap();
+            let inode = inode_of(&open);
+            let held = lock_delegated_file(
+                delegated_file_object(get_el1_region_host_ptr(), inode),
+                inode,
+            );
+            let cursor = open.description.try_reserve_cursor().unwrap();
+            let request = begin_owned_recall(cursor).unwrap();
+            let before = owned_recall::TERMINAL_ENQUEUES.load(Ordering::Acquire);
+            *WRITEBACK_HOOK.lock() = Some(owned_recall::requeue_while_running(&request));
+            let finished = owned_recall::observe_run_finished(&request);
+            drop(held);
+            finished
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(request.is_complete());
+            assert_eq!(
+                owned_recall::TERMINAL_ENQUEUES.load(Ordering::Acquire),
+                before,
+                "terminal recall consumed ready capacity after its inode was retired"
+            );
+        }
+
+        #[test]
+        fn inode_waits_do_not_occupy_the_bounded_recall_storage_workers() {
+            let _region = Region::new();
+            let mut temporaries = Vec::new();
+            let mut opens = Vec::new();
+            let mut held = Vec::new();
+            let mut requests = Vec::new();
+            // More unresolved inode waits than the two storage workers.
+            for fd in 3..6 {
+                temporaries.push(temp_with(b"held"));
+                let open = open_host(temporaries.last().unwrap());
+                delegate_default(&open, fd).unwrap();
+                let inode = inode_of(&open);
+                held.push(lock_delegated_file(
+                    delegated_file_object(get_el1_region_host_ptr(), inode),
+                    inode,
+                ));
+                let cursor = open.description.try_reserve_cursor().unwrap();
+                requests.push(begin_owned_recall(cursor).unwrap());
+                opens.push(open);
+            }
+            let ready_tmp = temp_with(b"ready");
+            let ready_open = open_host(&ready_tmp);
+            delegate_default(&ready_open, 6).unwrap();
+            let description = Arc::clone(&ready_open.description);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ready = std::thread::spawn(move || {
+                let _ = tx.send(recall(&description));
+            });
+            let progressed = rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
+            drop(held);
+            ready.join().unwrap();
+            recall_all_delegated();
+            assert!(
+                progressed,
+                "inode waits occupied all recall storage workers"
+            );
+            assert!(requests.iter().all(OwnedRecallRequest::is_complete));
+            drop(opens);
+        }
+
+        #[test]
+        fn terminal_recall_request_cannot_requeue_after_slot_retirement() {
+            let _region = Region::new();
+            let tmp = temp_with(b"data");
+            let open = open_host(&tmp);
+            delegate_default(&open, 3).unwrap();
+            let cursor = open.description.try_reserve_cursor().unwrap();
+            let request = begin_owned_recall(cursor).unwrap();
+            recall_all_delegated();
+            assert!(owned_recall::completed_schedule_is_ignored(&request));
+            assert!(request.is_complete());
+        }
+
+        #[test]
+        fn aperture_clear_waits_for_the_entire_indexed_recall_drain() {
+            let _region = Region::new();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *owned_recall::DRAIN_HOOK.lock() = Some(Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }));
+            let drain = std::thread::spawn(owned_recall::test_drain_external);
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let (cleared_tx, cleared_rx) = std::sync::mpsc::channel();
+            let clear = std::thread::spawn(move || {
+                clear_el1_region_host_ptr();
+                cleared_tx.send(()).unwrap();
+            });
+            let cleared_while_borrowed = cleared_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_ok();
+            release_tx.send(()).unwrap();
+            drain.join().unwrap();
+            clear.join().unwrap();
+            assert!(
+                !cleared_while_borrowed,
+                "aperture retired during an indexed drain borrow"
+            );
+            assert_eq!(get_el1_region_host_ptr(), 0);
+        }
+
+        #[test]
+        fn last_functional_reference_hands_recall_off_without_waiting_for_inode() {
+            let _region = Region::new();
+            let tmp = temp_with(b"before");
+            let open = open_host(&tmp);
+            delegate_default(&open, 3).expect("eligible");
+            let inode = inode_of(&open);
+            guest_write(inode, 0, b"after!");
+            let file = delegated_file_object(get_el1_region_host_ptr(), inode);
+            let held = lock_delegated_file(file, inode);
+            let description = Arc::clone(&open.description);
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                description.release_fd_ref();
+                done_tx.send(()).unwrap();
+            });
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let returned_before_release = done_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .is_ok();
+            drop(held);
+            worker.join().unwrap();
+            recall_all_delegated();
+            assert_eq!(host_bytes(&tmp), b"after!");
+            assert!(
+                returned_before_release,
+                "last fd reference parked its releasing worker on the inode"
+            );
+        }
+
+        #[test]
         fn recall_releases_inode_and_description_before_storage() {
             let _region = Region::new();
             let tmp = temp_with(b"before");
@@ -2317,7 +2485,8 @@ mod tests {
             let second = open_host(&tmp);
             delegate_default(&second, 4).unwrap();
             guest_write(handle, 3, b"two");
-            release_description(&second.description);
+            second.description.release_fd_ref();
+            owned_recall::wait_for_cleanup(second.description.el1_identity().unwrap());
             assert_eq!(second.description.delegation_handle(), 0);
             assert_eq!(inode_of(&first), handle);
             assert!(!no_active_delegations());

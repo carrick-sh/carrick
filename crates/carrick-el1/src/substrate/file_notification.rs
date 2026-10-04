@@ -24,6 +24,17 @@ impl<'a> FileAccess<'a> {
             zone,
             waker: Waker::El1 { slot },
             deliver,
+            owner_ready: |_, waker| {
+                let Waker::El1 { slot } = waker else {
+                    unreachable!("EL1 inode owner wake has an actual producer slot")
+                };
+                #[cfg(target_os = "none")]
+                if let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw())) {
+                    task.mark_pending_host_work();
+                }
+                #[cfg(not(target_os = "none"))]
+                let _ = slot;
+            },
         })
     }
     pub fn lock(self, file: &'a DelegatedFile, handle: u32) -> Option<FileGuard<'a>> {
