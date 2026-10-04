@@ -13256,6 +13256,7 @@ fn transfer_pending_grant_refusal_and_unmap_preserve_exact_successor() {
             fault_page: start,
             host_backing: None,
         };
+        installed.state.protections.admit_owner(handle).unwrap();
         let context = sparse_materialization::PublicationContext::for_transfer(
             installed.state.clone(),
             custody.clone(),
@@ -13548,6 +13549,7 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         fault_page: TEST_VA,
         host_backing: None,
     };
+    installed.state.protections.admit_owner(handle).unwrap();
     let context = sparse_materialization::PublicationContext::for_transfer(
         installed.state.clone(),
         custody.clone(),
@@ -13671,6 +13673,7 @@ fn transfer_cow_refill_uses_exact_target_physical_inventory_once() {
         fault_page: start,
         host_backing: None,
     };
+    installed.state.protections.admit_owner(handle).unwrap();
     let context = sparse_materialization::PublicationContext::for_transfer(
         installed.state.clone(),
         custody.clone(),
