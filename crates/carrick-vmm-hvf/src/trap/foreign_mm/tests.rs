@@ -5117,6 +5117,25 @@ fn initial_fixed_mapping_publishes_exact_structural_owner() {
     assert_eq!(owner.physical_size, len as usize);
     assert_eq!(region.owner_generation, owner.epoch().raw());
 
+    let transfer = UserTransferCustody::new(Arc::clone(&transport.custody));
+    let selected = carrick_el1_abi::PortalSelectedData {
+        ipa: ipa + 17,
+        executable: false,
+        root_generation: std::num::NonZeroU64::new(1).expect("test root generation"),
+        offset: 0,
+    };
+    assert!(
+        carrick_aarch64::user_transfer::TransferCustody::retain(
+            &transfer,
+            selected,
+            1,
+            carrick_el1_abi::PortalTransferIntent::UserRead,
+        )
+        .expect("first-load selected IPA must retain stage-2 custody")
+        .is_some(),
+        "first-load structural stage-2 custody must be visible to EL1 copyin"
+    );
+
     drop(region);
     retry_structural_backing_identities_in_using(
         &transport.custody,
@@ -5125,6 +5144,10 @@ fn initial_fixed_mapping_publishes_exact_structural_owner() {
         &mut release_retired_stage2_ipa,
     )
     .expect("retire initial fixed mapping fixture");
+    assert!(
+        transport.custody.stage2_record_covering(ipa, 1).is_none(),
+        "retired structural IPA must leave no lookup authority"
+    );
 }
 
 /// A fork must not re-derive every source mapping's inherited-extent
