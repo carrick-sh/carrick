@@ -1355,6 +1355,26 @@ impl FrameGrantMailbox {
         true
     }
 
+    /// Finish a claimed owner file fault after its descriptor transaction
+    /// committed. The faulting page is live, so EL1 will not fault again to
+    /// consume a refusal; leaving RESPONSE would strand every later page on
+    /// this vCPU's single-flight mailbox.
+    pub fn complete_resolved_owner_fault(&self, request: FrameGrantRequest) -> bool {
+        if self.state.load(Ordering::Acquire) != FRAME_GRANT_MAILBOX_HOST_WORKING
+            || self.load_request() != request
+        {
+            return false;
+        }
+        self.state
+            .compare_exchange(
+                FRAME_GRANT_MAILBOX_HOST_WORKING,
+                FRAME_GRANT_MAILBOX_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     fn load_response(&self, request: FrameGrantRequest) -> FrameGrantResponse {
         let status = self.status.load(Ordering::Relaxed);
         FrameGrantResponse { status, request }
@@ -4996,6 +5016,34 @@ mod tests {
         assert_eq!(mailbox.claim_response(41, 7), None);
         assert!(!mailbox.has_guest_work());
         assert!(mailbox.try_publish_request(request));
+    }
+
+    #[test]
+    fn resolved_owner_file_page_releases_mailbox_for_the_next_page() {
+        let mailbox = FrameGrantMailbox::new();
+        let first = FrameGrantRequest {
+            mm_key: 41,
+            request_generation: 7,
+            fault_va: 0x4000_3000,
+            requested_len: 4096,
+            access: 1,
+        };
+        let second = FrameGrantRequest {
+            request_generation: 8,
+            fault_va: first.fault_va + 4096,
+            ..first
+        };
+        assert!(mailbox.try_publish_request(first));
+        assert_eq!(
+            mailbox.claim_request_for_fault(41, first.fault_va, 1),
+            Some(first)
+        );
+        assert!(!mailbox.complete_resolved_owner_fault(second));
+        assert!(mailbox.complete_resolved_owner_fault(first));
+        assert!(
+            mailbox.try_publish_request(second),
+            "a resolved file page must release its slot before the next page faults"
+        );
     }
 
     #[test]
