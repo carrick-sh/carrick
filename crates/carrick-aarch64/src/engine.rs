@@ -2709,6 +2709,87 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             .map_err(|error| MemoryError::HostMap(format!("HVPatch frame COW: {error}")))
     }
 
+    fn publish_protection(
+        &mut self,
+        address: u64,
+        len: usize,
+        prot: u64,
+        owner_reserved: bool,
+    ) -> Result<(), MemoryError> {
+        use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
+        // An admitted anonymous root keeps untouched pages hidden. Publishing
+        // sparse host backing here would create a second owner for them.
+        if !owner_reserved && prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
+            self.ensure_sparse_mmap_backing(address, len)?;
+        }
+        let armed_cow = if prot & LINUX_PROT_WRITE != 0 {
+            self.vm.armed_frame_cow_ranges(address, len)
+        } else {
+            Vec::new()
+        };
+        let new_mapping = self.pending_new_mapping.take() == Some((address, len));
+        let plan = crate::stage1_authority::protection_terminal_rules(
+            address,
+            len,
+            prot,
+            &armed_cow,
+            new_mapping,
+        );
+        let plan = if owner_reserved {
+            self.load_live_stage1_manager()?;
+            let backed = self
+                .page_tables
+                .with_manager(|manager| manager.backed_terminal_spans(address, len))
+                .ok_or_else(|| MemoryError::HostMap("owner stage-1 image absent".to_owned()))?
+                .map_err(|error| {
+                    MemoryError::HostMap(format!("owner backed-terminal walk: {error}"))
+                })?;
+            // Both lists are ordered and disjoint. Walk them together so a
+            // large hidden reservation costs the number of live terminals,
+            // not one operation per untouched Linux page.
+            let mut selected = Vec::new();
+            let mut index = 0;
+            for &(va, rule_len, rule) in &plan {
+                let end = va
+                    .checked_add(rule_len as u64)
+                    .ok_or(MemoryError::OutOfBounds {
+                        address: va,
+                        length: rule_len,
+                    })?;
+                while index < backed.len() && backed[index].end <= va {
+                    index += 1;
+                }
+                let mut next = index;
+                while next < backed.len() && backed[next].start < end {
+                    let start = va.max(backed[next].start);
+                    let stop = end.min(backed[next].end);
+                    if start < stop {
+                        selected.push((start, (stop - start) as usize, rule));
+                    }
+                    if backed[next].end >= end {
+                        break;
+                    }
+                    next += 1;
+                }
+                index = next;
+            }
+            selected
+        } else {
+            plan
+        };
+        if let Err(error) = self.apply_stage1_rules((address, len), &plan) {
+            self.trace_read_fault(address, len, 3);
+            return Err(error);
+        }
+        self.vm
+            .observe_frame_cow_protection(address, len, prot)
+            .map_err(|error| {
+                MemoryError::HostMap(format!(
+                    "authenticate deferred HVPatch COW protection: {error}"
+                ))
+            })
+    }
+
     fn ensure_sparse_mmap_backing(&mut self, va: u64, len: usize) -> Result<(), MemoryError> {
         let in_sparse_arena = self.process_asid.is_some()
             && self.vm.sparse_mmap_arena_enabled()
@@ -4189,39 +4270,16 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// on the NX-by-default arena. (Boot regions — image text, trampolines, vDSO —
     /// are mapped executable at boot and never edited here.)
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
-        use carrick_abi::{LINUX_PROT_EXEC, LINUX_PROT_READ, LINUX_PROT_WRITE};
-        if prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC) != 0 {
-            self.ensure_sparse_mmap_backing(address, len)?;
-        }
-        let armed_cow = if prot & LINUX_PROT_WRITE != 0 {
-            self.vm.armed_frame_cow_ranges(address, len)
-        } else {
-            Vec::new()
-        };
-        let new_mapping = self.pending_new_mapping.take() == Some((address, len));
-        // One plan for both lanes. A guest can `mprotect` an ALREADY-TOUCHED
-        // page (e.g. RELRO RW→RO), so a changed valid leaf is invalidated:
-        // by the host TLBI, or by EL1 on the guest-owned lane.
-        let plan = crate::stage1_authority::protection_terminal_rules(
-            address,
-            len,
-            prot,
-            &armed_cow,
-            new_mapping,
-        );
-        if let Err(error) = self.apply_stage1_rules((address, len), &plan) {
-            // Phase 3: the stage-1 protection edit refused; name the first
-            // page's live terminal (the leaf the rule could not take).
-            self.trace_read_fault(address, len, 3);
-            return Err(error);
-        }
-        self.vm
-            .observe_frame_cow_protection(address, len, prot)
-            .map_err(|error| {
-                MemoryError::HostMap(format!(
-                    "authenticate deferred HVPatch COW protection: {error}"
-                ))
-            })
+        self.publish_protection(address, len, prot, false)
+    }
+
+    fn protect_owner_reserved_range(
+        &mut self,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
+        self.publish_protection(address, len, prot, true)
     }
 
     /// `munmap`: invalidate the stage-1 descriptors for `[address, address+len)` so
