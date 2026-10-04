@@ -6486,18 +6486,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:108 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:111 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
     "review_id": "HA-000752",
     "source": {
-      "byte_end": 3362,
-      "byte_start": 3349,
+      "byte_end": 3478,
+      "byte_start": 3465,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 108,
-      "line_end": 108,
-      "line_start": 108
+      "line": 111,
+      "line_end": 111,
+      "line_start": 111
     }
   },
   {
@@ -18071,8 +18071,8 @@
     "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:54 in `Watchdog::start`, `std::thread::spawn` creates only the bounded fixture watchdog for the currently observing KVM_RUN thread. Its retained KvmKickHandle targets that host thread; the cancellation channel and Drop join retain its lifetime. It does not create a guest task or implement a guest wait, and no guest identity selects the host target.",
     "review_id": "HA-000753",
     "source": {
-      "byte_end": 1979,
-      "byte_start": 1961,
+      "byte_end": 2001,
+      "byte_start": 1983,
       "column": 22,
       "column_end": 40,
       "column_start": 22,
