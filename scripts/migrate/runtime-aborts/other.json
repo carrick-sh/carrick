@@ -356,17 +356,6 @@
       "domain": "thread::fork_quiesce"
     },
     {
-      "file": "crates/carrick-thread/src/thread.rs",
-      "function": "FutexTable::intern_carrier_key",
-      "ordinal_in_function": 1,
-      "fingerprint": "a962dd00f60ed17aadb5cec65431b8bb63bd95523f852dd9aab3d06246356f05",
-      "verdict": "carrier_fault",
-      "failure_domain": "thread::shared_futex",
-      "rationale": "The table's queue ID allocator exhausted u64 identity space; recycling an ID could merge unrelated live futex owners.",
-      "sink": "fatal",
-      "domain": "thread::shared_futex"
-    },
-    {
       "file": "crates/carrick-vmm-bhyve/src/guest_setup_x86.rs",
       "function": "RamInner::remove_shared_backings",
       "ordinal_in_function": 1,

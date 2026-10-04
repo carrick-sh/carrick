@@ -658,6 +658,8 @@ pub enum FutexWaitOutcome {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FutexWait {
     pub addr: u64,
+    #[serde(skip_serializing)]
+    key: FutexKey,
     #[serde(serialize_with = "serialize_queue_ticket")]
     slot: Arc<FutexQueueSlot>,
 }
@@ -671,7 +673,7 @@ fn serialize_queue_ticket<S: serde::Serializer>(
 
 impl PartialEq for FutexWait {
     fn eq(&self, other: &Self) -> bool {
-        self.addr == other.addr && self.slot.id == other.slot.id
+        self.key == other.key && self.slot.id == other.slot.id
     }
 }
 
@@ -698,11 +700,20 @@ const FUTEX_SLOT_RELEASED: u8 = 2;
 /// queue entry. `state` moves QUEUED → WOKEN (a wake consumed the entry) or
 /// QUEUED → RELEASED (the waiter left without a wake), always under the
 /// table's queue lock, so a wake and a departure never both claim the slot.
-#[derive(Debug)]
 struct FutexQueueSlot {
     id: u64,
     state: AtomicU8,
     queue: ParkingMutex<Weak<ParkingMutex<FutexQueue>>>,
+    bucket: ParkingMutex<Arc<FutexBucket>>,
+}
+
+impl std::fmt::Debug for FutexQueueSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FutexQueueSlot")
+            .field("id", &self.id)
+            .finish()
+    }
 }
 
 impl Drop for FutexQueueSlot {
@@ -729,7 +740,7 @@ impl Drop for FutexQueueSlot {
 #[derive(Default)]
 struct FutexQueue {
     entries: BTreeMap<u64, FutexQueueEntry>,
-    by_addr: HashMap<u64, BTreeSet<u64>>,
+    by_addr: HashMap<FutexKey, BTreeSet<u64>>,
 }
 
 impl FutexQueue {
@@ -753,7 +764,7 @@ impl FutexQueue {
 }
 
 struct FutexQueueEntry {
-    addr: u64,
+    addr: FutexKey,
     slot: Weak<FutexQueueSlot>,
     callback: Option<FutexGenerationCallback>,
 }
@@ -842,6 +853,7 @@ fn futex_park_validation_active_for_tests() -> bool {
 }
 
 struct FutexBucket {
+    shared_owner: Option<(Weak<SharedBucketMap>, FutexKey)>,
     generation: AtomicU64,
     /// Waiters currently PARKED in parking_lot on this futex.
     waiters: AtomicUsize,
@@ -875,12 +887,19 @@ struct FutexBucket {
 impl FutexBucket {
     fn new() -> Self {
         Self {
+            shared_owner: None,
             generation: AtomicU64::new(0),
             waiters: AtomicUsize::new(0),
             enrolled: AtomicUsize::new(0),
             pending_redirects: AtomicUsize::new(0),
             credits: AtomicU32::new(0),
         }
+    }
+
+    fn new_shared(owner: Weak<SharedBucketMap>, key: FutexKey) -> Self {
+        let mut bucket = Self::new();
+        bucket.shared_owner = Some((owner, key));
+        bucket
     }
 
     /// Claim one owed wake, if any. Only a waiter that has actually enqueued may
@@ -915,6 +934,24 @@ impl FutexBucket {
                 Ok(_) => return add,
                 Err(observed) => owed = observed,
             }
+        }
+    }
+}
+
+impl Drop for FutexBucket {
+    fn drop(&mut self) {
+        let Some((owner, key)) = &self.shared_owner else {
+            return;
+        };
+        let Some(owner) = owner.upgrade() else {
+            return;
+        };
+        let mut shard = owner.shards[FutexTable::shard_index(*key)].lock();
+        if shard
+            .get(key)
+            .is_some_and(|entry| std::ptr::eq(entry.as_ptr(), self as *const FutexBucket))
+        {
+            shard.remove(key);
         }
     }
 }
@@ -983,6 +1020,19 @@ impl Drop for FutexEnrollment {
     }
 }
 
+/// A requeue destination must remain owned until the parked waiter adopts it
+/// or leaves. A timeout or signal can end the wait without another unpark.
+struct FutexRedirectCleanup<'a> {
+    table: &'a FutexTable,
+    tid: ThreadId,
+}
+
+impl Drop for FutexRedirectCleanup<'_> {
+    fn drop(&mut self) {
+        let _ = self.table.take_requeue_redirect(self.tid);
+    }
+}
+
 const FUTEX_WAKE_TOKEN: usize = 1;
 const FUTEX_SIGNAL_TOKEN: usize = 2;
 
@@ -1023,10 +1073,42 @@ fn reset_futex_halt_poll_ns_for_tests() {
     FUTEX_HALT_POLL_NS.store(FUTEX_HALT_POLL_NS_UNSET, Ordering::Relaxed);
 }
 
-/// Address-keyed futex wait queues. Each guest futex word is identified by a
-/// stable Carrick-owned bucket key derived from an `Arc<FutexBucket>`, not by
-/// feeding raw guest addresses to `parking_lot_core`. The address→bucket map is
-/// sharded so the lookup lock is not a global serialization point.
+/// Exact queue identity. Private futexes retain their process-local address;
+/// shared futexes compare the full word identity; SysV wait channels occupy a
+/// separate namespace even when their numeric key matches an address.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum FutexKey {
+    Private(u64),
+    Shared(SharedFutexKey),
+    Auxiliary(u64),
+}
+
+impl FutexKey {
+    const fn event_addr(self) -> u64 {
+        match self {
+            Self::Private(addr) | Self::Auxiliary(addr) => addr,
+            Self::Shared(SharedFutexKey::Direct(addr)) => addr as u64,
+            Self::Shared(SharedFutexKey::File { offset, .. }) => offset,
+        }
+    }
+}
+
+impl From<u64> for FutexKey {
+    fn from(addr: u64) -> Self {
+        Self::Private(addr)
+    }
+}
+
+type SharedBucketShard = ParkingMutex<HashMap<FutexKey, Weak<FutexBucket>>>;
+
+struct SharedBucketMap {
+    shards: Box<[SharedBucketShard; FUTEX_SHARDS]>,
+}
+
+/// Futex wait queues. Parking uses a Carrick-owned bucket address rather than
+/// feeding raw guest addresses to `parking_lot_core`. Private buckets retain
+/// their existing process-local map; shared and auxiliary buckets are sharded
+/// by exact key and leave the map when their last owner drops.
 pub struct FutexTable {
     #[allow(clippy::type_complexity)]
     shards: Box<[ParkingMutex<HashMap<u64, Arc<FutexBucket>>>; FUTEX_SHARDS]>,
@@ -1043,7 +1125,7 @@ pub struct FutexTable {
     ///
     /// So a requeue also INFORMS the waiter, which then moves its own key and its
     /// enrollment. Waiter state and parking_lot state cannot disagree.
-    requeue_redirects: ParkingMutex<HashMap<u64, u64>>,
+    requeue_redirects: ParkingMutex<HashMap<u64, Arc<FutexBucket>>>,
     /// Outstanding entries in `requeue_redirects`.
     ///
     /// Every unpark has to ask whether it was requeued, and taking the map's
@@ -1058,14 +1140,7 @@ pub struct FutexTable {
     next_ticket: AtomicU64,
     /// Exact shared-word identities belong to this queue owner. Two kernel
     /// instances may use the same file word without sharing a wait queue.
-    shared_keys: Box<[ParkingMutex<HashMap<CarrierKey, u64>>; FUTEX_SHARDS]>,
-    next_shared_key: AtomicU64,
-}
-
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
-enum CarrierKey {
-    Shared(SharedFutexKey),
-    Auxiliary(u64),
+    shared_buckets: Arc<SharedBucketMap>,
 }
 
 impl FutexTable {
@@ -1079,34 +1154,27 @@ impl FutexTable {
                 Arc::new(ParkingMutex::new(FutexQueue::default()))
             })),
             next_ticket: AtomicU64::new(0),
-            shared_keys: Box::new(std::array::from_fn(|_| ParkingMutex::new(HashMap::new()))),
-            next_shared_key: AtomicU64::new(1),
+            shared_buckets: Arc::new(SharedBucketMap {
+                shards: Box::new(std::array::from_fn(|_| ParkingMutex::new(HashMap::new()))),
+            }),
         }
     }
 
-    fn intern_carrier_key(&self, key: CarrierKey) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        let shard = (hasher.finish() as usize) % FUTEX_SHARDS;
-        let mut map = self.shared_keys[shard].lock();
-        *map.entry(key).or_insert_with(|| {
-            let id = self.next_shared_key.fetch_add(1, Ordering::Relaxed);
-            if id == u64::MAX {
-                carrick_fatal::carrick_fatal!(
-                    "thread::shared_futex",
-                    "carrier futex key ID overflow"
-                );
-            }
-            id
-        })
+    pub fn shared_key(&self, location: SharedFutexLocation) -> FutexKey {
+        FutexKey::Shared(location.key())
     }
 
-    pub fn shared_key(&self, location: SharedFutexLocation) -> u64 {
-        self.intern_carrier_key(CarrierKey::Shared(location.key()))
+    pub fn auxiliary_key(&self, key: u64) -> FutexKey {
+        FutexKey::Auxiliary(key)
     }
 
-    pub fn auxiliary_key(&self, key: u64) -> u64 {
-        self.intern_carrier_key(CarrierKey::Auxiliary(key))
+    #[cfg(test)]
+    pub fn live_shared_key_count(&self) -> usize {
+        self.shared_buckets
+            .shards
+            .iter()
+            .map(|shard| shard.lock().len())
+            .sum()
     }
 
     /// Attach the wake callback to a queued wait. `Ready` means a wake already
@@ -1125,7 +1193,7 @@ impl FutexTable {
         if wait.is_woken() {
             return FutexGenerationEnrollment::Ready(FutexGenerationEvent {
                 addr: wait.addr,
-                generation: self.bucket(wait.addr).generation.load(Ordering::Acquire),
+                generation: wait.slot.bucket.lock().generation.load(Ordering::Acquire),
             });
         }
 
@@ -1137,7 +1205,7 @@ impl FutexTable {
                 if wait.is_woken() {
                     return FutexGenerationEnrollment::Ready(FutexGenerationEvent {
                         addr: wait.addr,
-                        generation: self.bucket(wait.addr).generation.load(Ordering::Acquire),
+                        generation: wait.slot.bucket.lock().generation.load(Ordering::Acquire),
                     });
                 }
                 std::hint::spin_loop();
@@ -1147,7 +1215,7 @@ impl FutexTable {
         let Some(queue_arc) = wait.slot.queue.lock().clone().upgrade() else {
             return FutexGenerationEnrollment::Ready(FutexGenerationEvent {
                 addr: wait.addr,
-                generation: self.bucket(wait.addr).generation.load(Ordering::Acquire),
+                generation: wait.slot.bucket.lock().generation.load(Ordering::Acquire),
             });
         };
         let mut queue = queue_arc.lock();
@@ -1162,7 +1230,7 @@ impl FutexTable {
         drop(queue);
         FutexGenerationEnrollment::Ready(FutexGenerationEvent {
             addr: wait.addr,
-            generation: self.bucket(wait.addr).generation.load(Ordering::Acquire),
+            generation: wait.slot.bucket.lock().generation.load(Ordering::Acquire),
         })
     }
 
@@ -1179,7 +1247,7 @@ impl FutexTable {
     /// generation to park against, snapshotted under the queue lock so a wake
     /// that consumed some OTHER slot cannot release this waiter spuriously.
     fn dequeue(&self, wait: &FutexWait) -> (bool, u64) {
-        let bucket = self.bucket(wait.addr);
+        let bucket = Arc::clone(&wait.slot.bucket.lock());
         let Some(queue_arc) = wait.slot.queue.lock().clone().upgrade() else {
             return (wait.is_woken(), bucket.generation.load(Ordering::Acquire));
         };
@@ -1207,7 +1275,7 @@ impl FutexTable {
     /// counted whether or not it has subscribed yet: a subscribed one gets its
     /// callback, an unsubscribed one finds `Ready` when it subscribes. Callbacks
     /// run with the queue lock released.
-    fn publish_generation(&self, addr: u64, generation: u64, limit: u32) -> u32 {
+    fn publish_generation(&self, addr: FutexKey, generation: u64, limit: u32) -> u32 {
         let queue_arc = self.queue_arc(addr);
         let callbacks = {
             let mut queue = queue_arc.lock();
@@ -1228,7 +1296,10 @@ impl FutexTable {
             callbacks
         };
         let count = u32::try_from(callbacks.len()).unwrap_or(u32::MAX);
-        let event = FutexGenerationEvent { addr, generation };
+        let event = FutexGenerationEvent {
+            addr: addr.event_addr(),
+            generation,
+        };
         for callback in callbacks.into_iter().flatten() {
             callback(event);
         }
@@ -1243,9 +1314,18 @@ impl FutexTable {
         self.interrupt_generation.fetch_add(1, Ordering::AcqRel);
     }
 
-    const fn shard_index(addr: u64) -> usize {
-        let h = addr.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58;
-        (h as usize) % FUTEX_SHARDS
+    fn shard_index(addr: impl Into<FutexKey>) -> usize {
+        match addr.into() {
+            FutexKey::Private(addr) => {
+                let h = addr.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58;
+                (h as usize) % FUTEX_SHARDS
+            }
+            key => {
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                key.hash(&mut hasher);
+                (hasher.finish() as usize) % FUTEX_SHARDS
+            }
+        }
     }
 
     /// Pick the shard for `addr`. A multiplicative (Fibonacci) hash spreads
@@ -1254,17 +1334,48 @@ impl FutexTable {
         &self.shards[Self::shard_index(addr)]
     }
 
-    fn queue_arc(&self, addr: u64) -> &Arc<ParkingMutex<FutexQueue>> {
+    fn queue_arc(&self, addr: impl Into<FutexKey>) -> &Arc<ParkingMutex<FutexQueue>> {
         &self.queues[Self::shard_index(addr)]
     }
 
-    fn bucket(&self, addr: u64) -> Arc<FutexBucket> {
-        let mut shard = self.shard(addr).lock();
-        Arc::clone(
-            shard
-                .entry(addr)
-                .or_insert_with(|| Arc::new(FutexBucket::new())),
-        )
+    fn bucket(&self, addr: impl Into<FutexKey>) -> Arc<FutexBucket> {
+        match addr.into() {
+            FutexKey::Private(addr) => {
+                let mut shard = self.shard(addr).lock();
+                Arc::clone(
+                    shard
+                        .entry(addr)
+                        .or_insert_with(|| Arc::new(FutexBucket::new())),
+                )
+            }
+            key => {
+                let mut shard = self.shared_buckets.shards[Self::shard_index(key)].lock();
+                if let Some(bucket) = shard.get(&key).and_then(Weak::upgrade) {
+                    return bucket;
+                }
+                let bucket = Arc::new(FutexBucket::new_shared(
+                    Arc::downgrade(&self.shared_buckets),
+                    key,
+                ));
+                shard.insert(key, Arc::downgrade(&bucket));
+                bucket
+            }
+        }
+    }
+
+    /// The registry lock orders a wake lookup against the final bucket drop.
+    /// An absent shared key has no enrolled waiter, so a wake reports zero and
+    /// creates no history. A new waiter holds its bucket before linking its
+    /// queue slot; the continuation reactor probes the word after enrollment
+    /// to close the store-and-wake window before subscription.
+    fn bucket_if_present(&self, addr: FutexKey) -> Option<Arc<FutexBucket>> {
+        match addr {
+            FutexKey::Private(_) => Some(self.bucket(addr)),
+            key => self.shared_buckets.shards[Self::shard_index(key)]
+                .lock()
+                .get(&key)
+                .and_then(Weak::upgrade),
+        }
     }
 
     /// Snapshot every live bucket across all shards (for process-/thread-directed
@@ -1273,6 +1384,9 @@ impl FutexTable {
         let mut all = Vec::new();
         for shard in self.shards.iter() {
             all.extend(shard.lock().values().cloned());
+        }
+        for shard in self.shared_buckets.shards.iter() {
+            all.extend(shard.lock().values().filter_map(Weak::upgrade));
         }
         all
     }
@@ -1287,13 +1401,16 @@ impl FutexTable {
     /// runtime later subscribes (continuation model) or parks (legacy path)
     /// with syscall locks released; a wake that races in between consumes the
     /// slot and the waiter completes without sleeping.
-    pub fn prepare_wait(&self, addr: u64) -> FutexWait {
+    pub fn prepare_wait(&self, addr: impl Into<FutexKey>) -> FutexWait {
+        let addr = addr.into();
+        let bucket = self.bucket(addr);
         let queue_arc = self.queue_arc(addr);
         let id = self.next_ticket.fetch_add(1, Ordering::Relaxed);
         let slot = Arc::new(FutexQueueSlot {
             id,
             state: AtomicU8::new(FUTEX_SLOT_QUEUED),
             queue: ParkingMutex::new(Arc::downgrade(queue_arc)),
+            bucket: ParkingMutex::new(bucket),
         });
         queue_arc.lock().insert(
             id,
@@ -1303,7 +1420,11 @@ impl FutexTable {
                 callback: None,
             },
         );
-        FutexWait { addr, slot }
+        FutexWait {
+            addr: addr.event_addr(),
+            key: addr,
+            slot,
+        }
     }
 
     pub fn wait(
@@ -1357,7 +1478,7 @@ impl FutexTable {
         if woken {
             return FutexWaitOutcome::Woken;
         }
-        let bucket = self.bucket(wait.addr);
+        let bucket = Arc::clone(&wait.slot.bucket.lock());
         let key = Self::bucket_key(&bucket);
         let deadline = timeout.map(|duration| Instant::now() + duration);
 
@@ -1486,7 +1607,7 @@ impl FutexTable {
     /// wait (the guest mapping backing it is alive for the wait's duration).
     pub unsafe fn wait_while_word_equals(
         &self,
-        addr: u64,
+        addr: impl Into<FutexKey>,
         word: *const std::sync::atomic::AtomicU32,
         val: u32,
         timeout: Option<std::time::Duration>,
@@ -1509,6 +1630,7 @@ impl FutexTable {
         // redirect still pending. It belongs to that wait, not this one — carrying
         // it forward would queue us on a futex this call never named.
         let _ = self.take_requeue_redirect(tid);
+        let _redirect_cleanup = FutexRedirectCleanup { table: self, tid };
 
         loop {
             let bucket = enrollment.bucket();
@@ -1593,7 +1715,7 @@ impl FutexTable {
                     // (`futex_cmp_requeue01`: 1,550 assertions, "waiters were not
                     // woken up normally"). So move, then honour the token.
                     if let Some(destination) = self.take_requeue_redirect(tid) {
-                        enrollment.move_to(self.bucket(destination));
+                        enrollment.move_to(destination);
                     }
                     match token.0 {
                         FUTEX_WAKE_TOKEN => return FutexWaitOutcome::Woken,
@@ -1659,11 +1781,14 @@ impl FutexTable {
 
     /// Wake up to `n` waiters on `addr`. Returns the number of waiters that
     /// `parking_lot_core` actually removed from this bucket.
-    pub fn wake(&self, addr: u64, n: u32) -> u32 {
+    pub fn wake(&self, addr: impl Into<FutexKey>, n: u32) -> u32 {
         if n == 0 {
             return 0;
         }
-        let bucket = self.bucket(addr);
+        let addr = addr.into();
+        let Some(bucket) = self.bucket_if_present(addr) else {
+            return 0;
+        };
         let generation = bucket.generation.fetch_add(1, Ordering::AcqRel) + 1;
         let woken_listeners = self.publish_generation(addr, generation, n);
         let key = Self::bucket_key(&bucket);
@@ -1732,8 +1857,18 @@ impl FutexTable {
     /// bounded `nr_requeue` loops `RequeueOne` so the count is exact. The
     /// caller is responsible for rejecting a negative `nr_requeue` (the kernel
     /// returns EINVAL) before calling this.
-    pub fn requeue(&self, from: u64, to: u64, nr_wake: u32, nr_requeue: u32) -> (u32, u32) {
-        let from_bucket = self.bucket(from);
+    pub fn requeue(
+        &self,
+        from: impl Into<FutexKey>,
+        to: impl Into<FutexKey>,
+        nr_wake: u32,
+        nr_requeue: u32,
+    ) -> (u32, u32) {
+        let from = from.into();
+        let to = to.into();
+        let Some(from_bucket) = self.bucket_if_present(from) else {
+            return (0, 0);
+        };
         let to_bucket = self.bucket(to);
         let key_from = Self::bucket_key(&from_bucket);
         let key_to = Self::bucket_key(&to_bucket);
@@ -1785,15 +1920,15 @@ impl FutexTable {
                         redirects.reserve(tokens.len());
                         let mut added = 0usize;
                         for &tok in tokens.iter() {
-                            if redirects.insert(tok, to).is_none() {
+                            if let Some(previous) = redirects.insert(tok, Arc::clone(&to_bucket)) {
+                                previous.pending_redirects.fetch_sub(1, Ordering::AcqRel);
+                            } else {
                                 added += 1;
                             }
+                            to_bucket.pending_redirects.fetch_add(1, Ordering::AcqRel);
                         }
                         if added > 0 {
                             self.outstanding_redirects
-                                .fetch_add(added, Ordering::AcqRel);
-                            to_bucket
-                                .pending_redirects
                                 .fetch_add(added, Ordering::AcqRel);
                         }
                     }
@@ -1819,8 +1954,9 @@ impl FutexTable {
                     let Some(mut entry) = queue.remove(id) else {
                         break;
                     };
-                    if let Some(_slot) = entry.slot.upgrade() {
+                    if let Some(slot) = entry.slot.upgrade() {
                         entry.addr = to;
+                        *slot.bucket.lock() = Arc::clone(&to_bucket);
                         queue.insert(id, entry);
                         requeued += 1;
                     }
@@ -1847,6 +1983,7 @@ impl FutexTable {
                     };
                     if let Some(slot) = entry.slot.upgrade() {
                         entry.addr = to;
+                        *slot.bucket.lock() = Arc::clone(&to_bucket);
                         *slot.queue.lock() = to_queue_weak.clone();
                         q_to.insert(id, entry);
                         requeued += 1;
@@ -1905,7 +2042,7 @@ impl FutexTable {
     /// The guard is dropped before the caller re-parks: a requeuer holds the
     /// parking-lot bucket lock and then this mutex, so holding this across a
     /// `park()` would invert that order.
-    fn take_requeue_redirect(&self, tid: ThreadId) -> Option<u64> {
+    fn take_requeue_redirect(&self, tid: ThreadId) -> Option<Arc<FutexBucket>> {
         // Requeues are rare and every unpark asks this question, so answer the
         // common "no" without touching the mutex at all.
         if self.outstanding_redirects.load(Ordering::Acquire) == 0 {
@@ -1917,14 +2054,12 @@ impl FutexTable {
         let destination = redirects.remove(&(token as u64))?;
         drop(redirects);
         self.outstanding_redirects.fetch_sub(1, Ordering::AcqRel);
-        self.bucket(destination)
-            .pending_redirects
-            .fetch_sub(1, Ordering::AcqRel);
+        destination.pending_redirects.fetch_sub(1, Ordering::AcqRel);
         Some(destination)
     }
 
     #[cfg(test)]
-    pub fn waiter_count(&self, addr: u64) -> usize {
+    pub fn waiter_count(&self, addr: impl Into<FutexKey>) -> usize {
         self.bucket(addr).waiters.load(Ordering::Acquire)
     }
 }
@@ -1942,6 +2077,27 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::{Arc, Barrier, Mutex, MutexGuard};
     use std::time::Duration;
+
+    #[test]
+    fn shared_bucket_survives_new_enrollment_before_last_departure() {
+        let table = FutexTable::new();
+        let key = FutexKey::Shared(SharedFutexKey::Direct(0x1234));
+        let first = table.prepare_wait(key);
+        let second = table.prepare_wait(key);
+        assert_eq!(table.live_shared_key_count(), 1);
+        drop(first);
+        assert_eq!(table.live_shared_key_count(), 1);
+        assert_eq!(table.wake(key, 1), 1);
+        assert!(table.take_woken(&second));
+        drop(second);
+        assert_eq!(table.live_shared_key_count(), 0);
+
+        let after_retirement = table.prepare_wait(key);
+        assert_eq!(table.wake(key, 1), 1);
+        assert!(table.take_woken(&after_retirement));
+        drop(after_retirement);
+        assert_eq!(table.live_shared_key_count(), 0);
+    }
 
     const FUTEX_HALT_POLL_ENV: &str = "CARRICK_FUTEX_HALT_POLL_NS";
     static FUTEX_HALT_POLL_ENV_LOCK: Mutex<()> = Mutex::new(());
