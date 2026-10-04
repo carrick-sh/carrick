@@ -630,6 +630,12 @@ impl MemState {
         {
             block_old_host(start, end);
         }
+        blocked.extend(
+            self.prepared_root_grants
+                .iter()
+                .filter(|(owner, _)| *owner == incarnation)
+                .map(|(_, span)| (span.start(), span.end())),
+        );
         if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
             table.live_spans_overlapping(root.mm().raw(), window_start, max_len, |start, end| {
                 blocked.push((start, end));
@@ -871,9 +877,32 @@ pub struct ResidentFrameGrantPlan<'permit> {
     /// Planned from a delegated root: its span may include first-touch
     /// stock over root holes, and its provenance is the root's.
     pub(crate) root_owned: bool,
+    pub(crate) root_incarnation: Option<ReservationIncarnation>,
     /// The span covers root holes: its grant holds first-touch stock.
     pub(crate) stock: bool,
     pub(crate) exclusion: super::HostAliasDispatchGuard<'permit>,
+}
+
+/// One prepared root span before its descriptor publication settles. The
+/// marker is kept across physical preparation and publication; dropping it
+/// also withdraws failed or refused preparations under the same MM authority.
+pub struct PreparedRootGrant {
+    authority: std::sync::Arc<super::MemAuthority>,
+    incarnation: ReservationIncarnation,
+    span: ReservationRange,
+}
+
+impl Drop for PreparedRootGrant {
+    fn drop(&mut self) {
+        let mut mem = self.authority.lock();
+        if let Some(index) = mem
+            .prepared_root_grants
+            .iter()
+            .position(|entry| *entry == (self.incarnation, self.span))
+        {
+            mem.prepared_root_grants.swap_remove(index);
+        }
+    }
 }
 
 impl ResidentFrameGrantPlan<'_> {
@@ -1219,14 +1248,16 @@ impl<'a> MemView<'a> {
         let page = page_floor(address, page_size);
         let mem_authority = self.mem();
         let mem = mem_authority.lock();
-        let (grant, owner_span) = match mem.first_touch_owner(page) {
+        let (grant, owner_span, root_incarnation) = match mem.first_touch_owner(page) {
             FirstTouchOwner::Host => (
                 mem.resident_fault_ranges.grant_for_page(page, max_len)?,
+                None,
                 None,
             ),
             FirstTouchOwner::Root(mapping, incarnation) => (
                 mem.root_grant_for_page(&mapping, incarnation, page, max_len)?,
                 Some(mapping.range),
+                Some(incarnation),
             ),
             FirstTouchOwner::Unmapped => return None,
         };
@@ -1274,6 +1305,7 @@ impl<'a> MemView<'a> {
             });
         Some(ResidentFrameGrantPlan {
             root_owned,
+            root_incarnation,
             stock,
             fault_page: page,
             start,
@@ -1407,6 +1439,7 @@ impl<'a> MemView<'a> {
             });
         Ok(PublishedFrameGrantPlan::Resident(ResidentFrameGrantPlan {
             root_owned,
+            root_incarnation: None,
             stock,
             fault_page: resident.va,
             start: publication.va,
@@ -1522,18 +1555,31 @@ impl<'a> MemView<'a> {
     /// root holes no live grant or owed return covers). A guest-venue mmap
     /// never reserved that provenance with the host; publish it now, under
     /// the same permit, for exactly the span about to be granted.
-    pub(crate) fn adopt_frame_grant_provenance(&self, plan: &ResidentFrameGrantPlan<'_>) {
+    pub(crate) fn adopt_frame_grant_provenance(
+        &self,
+        plan: &ResidentFrameGrantPlan<'_>,
+    ) -> Option<PreparedRootGrant> {
         if !plan.root_owned || !self.owns_host_alias_dispatch(&plan.exclusion) {
-            return;
+            return None;
         }
-        let Ok(len) = usize::try_from(plan.len) else {
-            return;
-        };
+        let incarnation = plan.root_incarnation?;
+        let span = ReservationRange::new(plan.start, plan.start.checked_add(plan.len)?)?;
+        let len = usize::try_from(plan.len).ok()?;
+        let authority = std::sync::Arc::clone(&self.mm_authority().mem);
         let _ = self
             .mem()
             .lock()
             .deferred_anonymous
             .adopt_pristine(GuestVa(plan.start), len);
+        authority
+            .lock()
+            .prepared_root_grants
+            .push((incarnation, span));
+        Some(PreparedRootGrant {
+            authority,
+            incarnation,
+            span,
+        })
     }
 
     pub(in crate::dispatch::mem) fn populate_resident_range(

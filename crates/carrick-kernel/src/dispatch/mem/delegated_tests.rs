@@ -4839,9 +4839,9 @@ fn published_grant_settlement(retired_page: Option<u64>) {
         ReservationProtection::READ_WRITE,
     )
     .unwrap();
-    let (start, len) = dispatcher
+    let ((start, len), _prepared) = dispatcher
         .with_resident_frame_grant_plan_for_test(fault, STOCK_WINDOW, |plan| {
-            dispatcher.adopt_frame_grant_provenance(&plan);
+            let prepared = dispatcher.adopt_frame_grant_provenance(&plan);
             let state = dispatcher
                 .deferred_anonymous_state(dispatcher.mm_authority().mm_id)
                 .unwrap();
@@ -4850,7 +4850,7 @@ fn published_grant_settlement(retired_page: Option<u64>) {
                 .unwrap()
                 .unwrap()
                 .commit();
-            (plan.start(), plan.len())
+            ((plan.start(), plan.len()), prepared)
         })
         .unwrap();
     assert!(
