@@ -193,6 +193,73 @@ fn owner_lazy_selection_keeps_supply_owned_when_fault_mailbox_is_occupied() {
 }
 
 #[test]
+fn owner_grant_rejects_recycled_range_after_host_reconciliation() {
+    use crate::memory::reservations::{Decision, Placement, ReservationFaultPlan};
+
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 0);
+    tables.words[1536].store(0, Ordering::Release);
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let TransferStep::Supply(window) = select(&portal, &transfer, &tables) else {
+        panic!("untouched mapping must request owner supply")
+    };
+    let stale = ReservationFaultPlan {
+        mm,
+        generation: window.generation,
+        range: window.range,
+        protection: window.protection,
+        fault_page: window.fault_page,
+    };
+    // Model a host munmap and fixed remap after deferred-return
+    // reconciliation, but before the grant's guest editor can enter.
+    let mut root = region
+        .table()
+        .lock_el1_resolved(spaces.find(mm.raw()).unwrap().index(), mm, &view, 0)
+        .unwrap();
+    for remap in [false, true] {
+        let decision = if remap {
+            root.mmap(
+                Placement::Fixed(VA),
+                4096,
+                ReservationProtection::READ_WRITE,
+            )
+            .unwrap()
+        } else {
+            root.munmap(ReservationRange::new(VA, VA + 4096).unwrap())
+                .unwrap()
+        };
+        let Decision::Work(request) = decision else {
+            panic!("recycled mapping needs exact root transaction")
+        };
+        let completion = unsafe {
+            carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                carrick_el1_abi::ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .unwrap();
+        root.complete(completion).unwrap();
+    }
+    assert!(!root.authenticate_fork_transfer_fault(stale, None, None));
+}
+
+#[test]
 fn stopped_lazy_transfer_reuses_fault_grant_mailbox() {
     let region = Region::new();
     let spaces = AddressSpaces::new();
