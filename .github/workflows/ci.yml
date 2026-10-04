@@ -226,7 +226,7 @@ jobs:
     name: x86_64-freebsd cross-check · cli + runtime
     runs-on: ubuntu-latest
     env:
-      # Bump when this release is archived off the main mirror (the fetch 404s).
+      # Use the permanent release archive so a cold cache survives mirror expiry.
       FBSD_VERSION: 14.3-RELEASE
       FBSD_MAJOR: "14"
       FBSD_SYSROOT: ${{ github.workspace }}/.freebsd-sysroot
@@ -259,7 +259,7 @@ jobs:
         if: steps.fbsd-sysroot.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$FBSD_SYSROOT"
-          curl -fSL "https://download.freebsd.org/releases/amd64/${FBSD_VERSION}/base.txz" -o /tmp/base.txz
+          curl -fSL "https://archive.freebsd.org/old-releases/amd64/${FBSD_VERSION}/base.txz" -o /tmp/base.txz
           tar -xf /tmp/base.txz -C "$FBSD_SYSROOT" ./usr/include ./usr/lib ./lib
 
       # Point the cc crate (ring's build.rs) at the cross C toolchain. The
