@@ -3302,12 +3302,16 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     )));
                 }
                 TransferProgress::Supply(supply) => {
-                    return Err(MemoryError::ReadSuspended(Box::new(
-                        carrick_guest_mem::MemoryReadSuspension {
-                            wait: carrick_guest_mem::MemoryReadWait::Supply(supply),
-                            continuation: carrick_guest_mem::OwnedReadContinuation::new(transfer),
-                        },
-                    )));
+                    if !self.supply_memory(supply)? {
+                        return Err(MemoryError::ReadSuspended(Box::new(
+                            carrick_guest_mem::MemoryReadSuspension {
+                                wait: carrick_guest_mem::MemoryReadWait::Supply(supply),
+                                continuation: carrick_guest_mem::OwnedReadContinuation::new(
+                                    transfer,
+                                ),
+                            },
+                        )));
+                    }
                 }
                 TransferProgress::Retired(handle) => return Err(MemoryError::OwnerRetired(handle)),
                 TransferProgress::Refused(errno) if errno.get() != 14 => {
@@ -3347,9 +3351,152 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         prepared.commit(&[bytes]);
         Ok(())
     }
+
+    fn prepare_owner_write(
+        &self,
+        ranges: &[carrick_guest_mem::GuestWriteRange],
+    ) -> Result<
+        Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
+        carrick_guest_mem::MemoryPrepareError,
+    > {
+        use carrick_guest_mem::MemoryPrepareError;
+        let Some(handle) = self.protections.owner() else {
+            return Err(MemoryPrepareError::Fault(MemoryError::Unsupported));
+        };
+        if handle.mm().raw() != self.mm_generation {
+            carrick_fatal::carrick_fatal!(
+                "aarch64::prepared_copy",
+                "current task differs from admitted memory authority"
+            );
+        }
+        let custody = self.vm.owner_transfer_custody().unwrap_or_else(|| {
+            carrick_fatal::carrick_fatal!(
+                "aarch64::prepared_copy",
+                "admitted task lacks physical custody"
+            )
+        });
+        let ttbr0 = self
+            .transfer_service_loan()
+            .and_then(|loan| loan.target_ttbr0())
+            .map_err(|error| MemoryPrepareError::Fault(MemoryError::HostMap(error.to_string())))?;
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            carrick_fatal::carrick_fatal!(
+                "aarch64::prepared_copy",
+                "admitted carrier region absent"
+            );
+        }
+        // SAFETY: the live engine retains this carrier's complete ABI region;
+        // selection independently authenticates its address and binding.
+        let slots = unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        };
+        let target = crate::user_transfer::TransferTarget::from_handle(handle, ttbr0);
+        let address = ranges.first().map_or(0, |range| range.address().raw());
+        let length = ranges.iter().map(|range| range.len() as u64).sum();
+        carrick_observability::probes::hvpatch_el1_host_write_prepare(
+            address,
+            length,
+            0,
+            carrick_el1_abi::MM_PORTAL_MAX_BYTES,
+        );
+        loop {
+            match crate::user_transfer::prepare_write(self, custody.as_ref(), slots, target, ranges)
+            {
+                Err(MemoryPrepareError::Supply(request)) => {
+                    let kind = match request {
+                        carrick_guest_mem::MemorySupplyRequest::Grant(_) => 1,
+                        carrick_guest_mem::MemorySupplyRequest::Cow(_) => 2,
+                        carrick_guest_mem::MemorySupplyRequest::Metadata { .. } => 3,
+                    };
+                    carrick_observability::probes::hvpatch_el1_host_write_prepare(
+                        address, length, 1, kind,
+                    );
+                    // Physical supply is a separate host boundary. The runtime
+                    // first reconciles this MM's EL1-deferred returns under its
+                    // exact mutation permit, then serves this owner receipt.
+                    return Err(MemoryPrepareError::Supply(request));
+                }
+                Ok(prepared) => {
+                    carrick_observability::probes::hvpatch_el1_host_write_prepare(
+                        address, length, 3, 0,
+                    );
+                    return Ok(prepared);
+                }
+                Err(MemoryPrepareError::OwnerWait(wait)) => {
+                    carrick_observability::probes::hvpatch_el1_host_write_prepare(
+                        address,
+                        length,
+                        4,
+                        wait.cause().encode(),
+                    );
+                    return Err(MemoryPrepareError::OwnerWait(wait));
+                }
+                Err(MemoryPrepareError::Physical(wait)) => {
+                    carrick_observability::probes::hvpatch_el1_host_write_prepare(
+                        address, length, 5, 0,
+                    );
+                    return Err(MemoryPrepareError::Physical(wait));
+                }
+                Err(MemoryPrepareError::Fault(error)) => {
+                    let kind = match &error {
+                        MemoryError::OutOfBounds { .. } => 1,
+                        MemoryError::HostMap(_) => 2,
+                        MemoryError::OwnerRetired(_) => 3,
+                        MemoryError::Unsupported => 4,
+                        MemoryError::MetadataAllocation => 5,
+                        _ => 6,
+                    };
+                    carrick_observability::probes::hvpatch_el1_host_write_prepare(
+                        address, length, 6, kind,
+                    );
+                    return Err(MemoryPrepareError::Fault(error));
+                }
+                Err(MemoryPrepareError::Limit(limit)) => {
+                    carrick_observability::probes::hvpatch_el1_host_write_prepare(
+                        address, length, 7, 0,
+                    );
+                    return Err(MemoryPrepareError::Limit(limit));
+                }
+            }
+        }
+    }
 }
 
 impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
+    fn supply_memory(
+        &self,
+        request: carrick_guest_mem::MemorySupplyRequest,
+    ) -> Result<bool, MemoryError> {
+        let handle = self.protections.owner().ok_or(MemoryError::Unsupported)?;
+        let custody = self
+            .vm
+            .owner_transfer_custody()
+            .ok_or(MemoryError::Unsupported)?;
+        let ttbr0 = self
+            .transfer_service_loan()
+            .and_then(|loan| loan.target_ttbr0())
+            .map_err(|error| MemoryError::HostMap(error.to_string()))?;
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            return Err(MemoryError::Unsupported);
+        }
+        // SAFETY: the live engine retains this carrier's complete ABI region.
+        let slots = unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        };
+        crate::user_transfer::supply(
+            self,
+            custody.as_ref(),
+            slots,
+            crate::user_transfer::TransferTarget::from_handle(handle, ttbr0),
+            request,
+        )
+        .map_err(|error| MemoryError::HostMap(error.to_string()))
+    }
+
     fn read_carrick_internal(
         &self,
         range: carrick_el1_abi::CarrickInternalReadRange,
@@ -3421,51 +3568,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
         carrick_guest_mem::MemoryPrepareError,
     > {
-        let Some(handle) = self.protections.owner() else {
-            return Err(carrick_guest_mem::MemoryPrepareError::Fault(
-                MemoryError::Unsupported,
-            ));
-        };
-        if handle.mm().raw() != self.mm_generation {
-            carrick_fatal::carrick_fatal!(
-                "aarch64::prepared_copy",
-                "current task differs from admitted memory authority"
-            );
-        }
-        let custody = self.vm.owner_transfer_custody().unwrap_or_else(|| {
-            carrick_fatal::carrick_fatal!(
-                "aarch64::prepared_copy",
-                "admitted task lacks physical custody"
-            )
-        });
-        let ttbr0 = self
-            .transfer_service_loan()
-            .and_then(|loan| loan.target_ttbr0())
-            .map_err(|error| {
-                carrick_guest_mem::MemoryPrepareError::Fault(MemoryError::HostMap(
-                    error.to_string(),
-                ))
-            })?;
-        let region = carrick_el1_abi::get_el1_region_host_ptr();
-        if region == 0 {
-            carrick_fatal::carrick_fatal!(
-                "aarch64::prepared_copy",
-                "admitted carrier region absent"
-            );
-        }
-        // SAFETY: the live engine retains this carrier's complete ABI region;
-        // selection independently authenticates its address and carrier binding.
-        let slots = unsafe {
-            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
-                as *const carrick_el1_abi::MmPortalSlots)
-        };
-        crate::user_transfer::prepare_write(
-            self,
-            custody.as_ref(),
-            slots,
-            crate::user_transfer::TransferTarget::from_handle(handle, ttbr0),
-            ranges,
-        )
+        self.prepare_owner_write(ranges)
     }
 
     fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
