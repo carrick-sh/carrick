@@ -201,17 +201,23 @@ fn read_host_pipe_into_owner(
                 return Ok(DispatchOutcome::returned_len_or_errno(delivered));
             }
             Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(wait)) => {
-                return Ok(DispatchOutcome::OwnerMemoryWait { wait });
+                return Ok(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 });
             }
             Err(carrick_guest_mem::MemoryPrepareError::Physical(wait)) => {
-                return Ok(DispatchOutcome::OwnerPhysicalWait { wait });
+                return Ok(DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 });
             }
             Err(carrick_guest_mem::MemoryPrepareError::Supply(request)) => {
                 return Ok(match request {
                     carrick_guest_mem::MemorySupplyRequest::Metadata { observed, .. } => {
-                        DispatchOutcome::OwnerMemoryWait { wait: observed }
+                        DispatchOutcome::OwnerMemoryWait {
+                            wait: observed,
+                            committed: 0,
+                        }
                     }
-                    _ => DispatchOutcome::OwnerMemorySupply { request },
+                    _ => DispatchOutcome::OwnerMemorySupply {
+                        request,
+                        committed: 0,
+                    },
                 });
             }
             Err(carrick_guest_mem::MemoryPrepareError::Fault(_)) => {
@@ -1355,7 +1361,7 @@ mod host_pipe_read_pin_tests {
         )
         .unwrap();
         assert!(
-            matches!(outcome, DispatchOutcome::OwnerMemoryWait { wait: actual } if actual == wait)
+            matches!(outcome, DispatchOutcome::OwnerMemoryWait { wait: actual, committed: 0 } if actual == wait)
         );
         let mut remaining = [0u8; 20];
         assert_eq!(
