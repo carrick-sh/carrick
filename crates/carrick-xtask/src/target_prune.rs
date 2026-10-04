@@ -56,19 +56,21 @@ for entry do
     if ! AGE_QUERY > "$state/age"; then exit 1; fi
     [ ! -s "$state/age" ] || continue
     if ! du -sk "$entry" > "$state/du"; then exit 1; fi
-    allocated=$(awk '{printf "%.0f", $1 * 1024}' "$state/du")
+    allocated=$(awk '{printf "%.0f", $1 * 1024}' "$state/du") || exit 1
+    case "$allocated" in ''|*[!0-9]*) printf 'target pruning: invalid byte accounting\n' >&2; exit 1;; esac
     if [ "$apply" = 1 ]; then
         idle "$entry" || continue
         # Recheck the descendant age proof after the census.
         if ! AGE_QUERY > "$state/age"; then exit 1; fi
         [ ! -s "$state/age" ] || continue
+        printf '%s\n' "$allocated" >> "$state/bytes" || exit 1
         rm -rf -- "$entry" || exit 1
         action=pruned
     else
+        printf '%s\n' "$allocated" >> "$state/bytes" || exit 1
         action=eligible
     fi
-    printf '%s\n' "$allocated" >> "$state/bytes"
-    printf '%s %s allocated bytes | %s\n' "$action" "$allocated" "$entry"
+    printf '%s %s allocated bytes | %s\n' "$action" "$allocated" "$entry" || exit 1
 done
 "#;
 
@@ -96,9 +98,15 @@ fn pruning_body(targets: &[PathBuf], days: u64, apply: bool) -> Result<String, G
         r#"set -u
 apply={apply}
 age=+{older_than}
+for tool in find du awk mktemp rm id /bin/sh; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        printf 'target pruning: missing required utility: %s\n' "$tool" >&2
+        exit 1
+    fi
+done
 state=$(mktemp -d "${{TMPDIR:-/tmp}}/carrick-target-prune.XXXXXX") || exit 1
 trap 'rm -rf -- "$state"' EXIT
-: > "$state/bytes"
+: > "$state/bytes" || exit 1
 lsof_bin=$(command -v lsof) || lsof_bin=
 uid=$(id -u) || exit 1
 {IDLE_CENSUS}
@@ -119,7 +127,8 @@ for target do
     done
 done
 if [ "$apply" = 1 ]; then action=freed; else action='would free'; fi
-bytes=$(awk '{{total += $1}} END {{printf "%.0f", total}}' "$state/bytes")
+bytes=$(awk '{{total += $1}} END {{printf "%.0f", total}}' "$state/bytes") || exit 1
+case "$bytes" in ''|*[!0-9]*) printf 'target pruning: invalid total accounting\n' >&2; exit 1;; esac
 printf 'target pruning: %s %s allocated bytes (age >= {days} days)\n' "$action" "$bytes"
 "#
     ))
@@ -205,8 +214,97 @@ pub(crate) fn run(
 mod tests {
     use super::*;
     use crate::host_lease::HostLeaseMode;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::process::Command;
     use std::time::{Duration, SystemTime};
+
+    fn utility_fixture(root: &Path, omit: &str) -> PathBuf {
+        let bin = root.join("bin");
+        fs::create_dir(&bin).unwrap();
+        for tool in [
+            "find", "du", "awk", "mktemp", "rm", "id", "mkdir", "rmdir", "chmod",
+        ] {
+            if tool == omit {
+                continue;
+            }
+            let output = Command::new("/bin/sh")
+                .args(["-c", &format!("command -v {tool}")])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            symlink(
+                String::from_utf8(output.stdout).unwrap().trim(),
+                bin.join(tool),
+            )
+            .unwrap();
+        }
+        fs::write(bin.join("lsof"), "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(bin.join("lsof"), fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    fn old_artifact(root: &Path) -> (PathBuf, PathBuf) {
+        let target = root.join("target");
+        let file = target.join("debug/deps/old-output");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "keep on failed accounting").unwrap();
+        fs::File::open(&file)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(SystemTime::now() - Duration::from_secs(4 * 86_400)),
+            )
+            .unwrap();
+        (target, file)
+    }
+
+    #[test]
+    fn missing_awk_fails_before_deleting_an_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, file) = old_artifact(temp.path());
+        let bin = utility_fixture(temp.path(), "awk");
+        // Pin the external OS census to idle; exercise real find/du/deletion
+        // and shell accounting with the reviewed missing-utility PATH.
+        let body = pruning_body(&[target], 2, true)
+            .unwrap()
+            .replace(IDLE_CENSUS, "\nidle() { return 0; }\n");
+        let output = Command::new("/bin/sh")
+            .args(["-c", &body])
+            .env("PATH", bin)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success() && file.exists(),
+            "missing awk must fail before deletion: exit={:?}, artifact_exists={}, stderr={}, stdout={}",
+            output.status.code(),
+            file.exists(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn failed_awk_accounting_preserves_the_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, file) = old_artifact(temp.path());
+        let bin = utility_fixture(temp.path(), "awk");
+        fs::write(bin.join("awk"), "#!/bin/sh\nexit 75\n").unwrap();
+        fs::set_permissions(bin.join("awk"), fs::Permissions::from_mode(0o755)).unwrap();
+        let body = pruning_body(&[target], 2, true)
+            .unwrap()
+            .replace(IDLE_CENSUS, "\nidle() { return 0; }\n");
+        let output = Command::new("/bin/sh")
+            .args(["-c", &body])
+            .env("PATH", bin)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success() && file.exists(),
+            "failed accounting must preserve the artifact: exit={:?}, artifact_exists={}",
+            output.status.code(),
+            file.exists()
+        );
+    }
 
     #[test]
     fn held_checkout_lock_skips_local_and_remote_pruning() {
