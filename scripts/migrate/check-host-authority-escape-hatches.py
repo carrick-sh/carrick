@@ -61,6 +61,8 @@ ASSEMBLY_BOUNDARIES = frozenset(
         PurePosixPath("crates/carrick-el1/src/entry.rs"),
         PurePosixPath("crates/carrick-el1/src/sched/hw.rs"),
         PurePosixPath("crates/carrick-el1/src/sched/aarch64_context.rs"),
+        # Reviewed x86 CPL0 hardware boundary: entry/return, port I/O and halt; no host operation.
+        PurePosixPath("crates/carrick-x86-cpl0/src/entry.rs"),
     }
 )
 
