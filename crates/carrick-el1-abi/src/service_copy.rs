@@ -33,8 +33,12 @@ pub fn service_target_table_window(
     let in_pool = root >= crate::AARCH64_STAGE1_TABLE_POOL_BASE
         && root.checked_add(bytes)?
             <= crate::AARCH64_STAGE1_TABLE_POOL_BASE + crate::AARCH64_STAGE1_TABLE_POOL_SIZE;
+    let fixed_boot_primary = root == crate::AARCH64_STAGE1_TABLES_ALIAS_BASE;
     let words = if live_ttbr == EL1_CARRIER_MAINT_ROOT_BASE {
-        if !in_pool {
+        // The first image uses the fixed physical primary before any pool
+        // root exists. The maintenance root maps that exact EL1-only kernel
+        // span as well as the pool; no neighboring address is a table root.
+        if !in_pool && !fixed_boot_primary {
             return None;
         }
         root
@@ -169,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_service_authenticates_target_pool_not_current_alias() {
+    fn maintenance_service_authenticates_target_pool_and_rejects_other_roots() {
         let root = crate::AARCH64_STAGE1_TABLE_POOL_BASE + 0x20_0000;
         let target = root | (23 << 48);
         let window = service_target_table_window(EL1_CARRIER_MAINT_ROOT_BASE, target).unwrap();
@@ -188,6 +192,19 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn maintenance_service_reaches_exact_fixed_boot_primary() {
+        let root = crate::AARCH64_STAGE1_TABLES_ALIAS_BASE;
+        let target = root | (1 << 48);
+        let window = service_target_table_window(EL1_CARRIER_MAINT_ROOT_BASE, target)
+            .expect("fixed boot primary is mapped on the maintenance root");
+        assert_eq!(window.physical_base, root);
+        assert_eq!(window.words as u64, root);
+        assert!(service_target_table_window(EL1_CARRIER_MAINT_ROOT_BASE, target + 4096).is_none());
+        let unrelated = (root + 0x10_0000) | (2 << 48);
+        assert!(service_target_table_window(EL1_CARRIER_MAINT_ROOT_BASE, unrelated).is_none());
     }
 
     #[test]

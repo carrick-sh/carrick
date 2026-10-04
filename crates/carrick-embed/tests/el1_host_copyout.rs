@@ -20,20 +20,31 @@ use carrick_image::PullPolicy;
 fn el1_host_copyout_into_and_out_of_untouched_reserved_memory() {
     let _guard = common::guest_lock();
     let watchdog = common::Watchdog::start(std::time::Duration::from_secs(120));
+    let carrier = carrick_embed::Carrier::new().expect("create retained copyout carrier");
     let result = common::run_or_fail(
-        ContainerBuilder::from_image(common::SMOKE_IMAGE)
+        carrier
+            .container(common::SMOKE_IMAGE)
             .pull_policy(PullPolicy::Missing)
             .command(["/opt/carrick/copyout"])
             .vfs_mount("/opt/carrick", Box::new(common::copyout_vfs()))
             .run_blocking(),
     );
     watchdog.disarm();
+    let lane = carrick_embed::host_cow_snapshot();
     assert!(
         result.success() && result.stdout_utf8().trim() == "copyout_ok",
-        "exit_code={} stdout={:?} stderr={}",
+        "exit_code={} stdout={:?} stderr={} lane={lane:?}",
         result.exit_code,
         result.stdout_utf8(),
         result.stderr_utf8()
+    );
+    assert!(
+        lane.complete,
+        "copyout must publish a complete carrier ledger"
+    );
+    assert!(
+        lane.guest_lane_selected > 0,
+        "copyout passed without selecting the production EL1 descriptor lane: {lane:?}"
     );
 }
 
