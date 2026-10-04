@@ -372,6 +372,98 @@ GPL implementations.
   `just test-embed el1_fork_cow_resolves_in_guest --nocapture` retains expected
   pre-change failure, not an acceptance pass. Common host checks below.
 
+#### Landing A: VM-free witness receipt (2026-10-04)
+
+Prepared on `work/n2a-witness` from main `b148d69eb`, on the dedicated
+x86_64 Linux VM. Only the two new test files and this section change. No
+product routing, contract registry, observability, CLI or DTrace edits; the
+creation contract remains N1-owned until handoff. Linux authority is the
+linked [fork(2)](https://man7.org/linux/man-pages/man2/fork.2.html),
+[clone(2)](https://man7.org/linux/man-pages/man2/clone.2.html),
+[vfork(2)](https://man7.org/linux/man-pages/man2/vfork.2.html),
+[wait(2)](https://man7.org/linux/man-pages/man2/wait.2.html),
+[pipe(7)](https://man7.org/linux/man-pages/man7/pipe.7.html), and
+[execve(2)](https://man7.org/linux/man-pages/man2/execve.2.html) contracts.
+
+This work is split into two ordered commits:
+
+1. `test(conformance): add n2 creation semantic witnesses` contains the three
+   green kernel witnesses, two green owner witnesses and this plan receipt.
+   This is the independently green commit to land on main now.
+2. `test(conformance): add n2 zero-dispatch budget reds` is the following
+   **branch-only commit on `work/n2a-witness` (the branch tip)**. It adds only
+   the three `*_budget_red` tests listed below. Land it together with the N2
+   ownership change that turns its zero-dispatch assertions green; it is that
+   landing's red-first witness, not part of the semantic-witness landing.
+
+The red baseline, measured on the original unsplit `e3355e9db` fixture before
+this history split, is **[1, 8, 32]** clone dispatches for both fork and thread,
+and **[2, 16, 64]** forwards for vfork plus exec. Measured composed work is
+**23 dispatches/fork**, **15 dispatches/thread** and **96 fd-copy bytes/vfork**.
+The branch-only commit retains the same zero budgets and semantic composition.
+
+All scale columns below are **1 / 8 / 32 creators**; none are timings or
+signed exit counts. Each composed script holds all creator processes live
+before a shared bounded checkpoint releases them. The root and creators use
+the same inherited marker VA: root retains 11, creators observe 22. Threads
+share their creator's marker and clear-TID word. No slot/executor override or
+larger identity pool is installed.
+
+| Witness | Result and exact accounting at 1 / 8 / 32 |
+| --- | --- |
+| `n2_creation::fork_pipe_wait_at_1_8_32` | Green. Child exit 7, wait status `7 << 8`, one reap then errno 10 (`ECHILD`); copied fd slots retain the old pipe while the parent's writer fd is closed/reused for a new pipe. Source returns 2 of 4 requested bytes (`hi`), then EOF; reused pipe returns `new`. Exactly **23 / 184 / 736** measured dispatches across creator and child; each source-prefix read and child wait dispatches twice but completes once. |
+| `n2_creation::thread_create_join_at_1_8_32` | Green. Shared fd close/reuse, shared marker 22, one clear-TID futex join returning zero and a cleared word; creator remains live. Exactly **15 / 120 / 480** measured dispatches, one dispatch/completion per join. |
+| `n2_creation::vfork_failed_prepare_exec_wait_at_1_8_32` | Green public kernel transaction composition with concrete Example MM backends: child shares the parent's exact MM; failure at `AfterBackendPrepare` leaves it and the vfork gate unchanged; successful exec detaches, releases with `Exec`, and later exit cannot change that reason. One status `7 << 8` is consumed, then NoChild. Existing graph-scoped fork-copy metric is exactly **96 / 768 / 3072 bytes**, one empty-fd-table header per vfork, including the failed prepare. |
+| `n2_creation::fork_creation_budget_red` (commit 2 only) | **Branch-only RED**, after composed semantics pass: measured clone dispatches **1 / 8 / 32**, required **0 / 0 / 0**. |
+| `n2_creation::thread_creation_budget_red` (commit 2 only) | **Branch-only RED**, after composed semantics pass: measured clone dispatches **1 / 8 / 32**, required **0 / 0 / 0**. |
+| `n2_creation_owner::admitted_thread_creation_owns_one_completion_at_1_8_32` | Green production region/lifecycle dispatcher. Default eight-entry pools, two live MM roots, same stack VA; **1 / 8 / 32** served clones, zero forwards, exactly one saved context/Born entry/queued child per operation. Child x0 is zero, parent's result is the visible child TID, MM/files/mask are inherited; no owner or host parks. |
+| `n2_creation_owner::complete_creation_surface_census_counts_each_nonadmitted_forward_once` | Green **baseline characterization**, not budget acceptance. All 18 plan IDs plus 99, 221 and 281 preserve all six arguments and count one forward per call: exactly **21 / 168 / 672** forwards total, zero served. Memory/IPC/futex/lifecycle admission is deliberately absent in this census. |
+| `n2_creation_owner::vfork_exec_owner_budget_red` (commit 2 only) | **Branch-only RED** production dispatcher with stocked lifecycle venues: vfork clone plus execve count **2 / 16 / 64** semantic forwards, required **0 / 0 / 0**. Each forwarded call preserves its arguments. This is a routing witness, not a loader execution. |
+
+The clone reds measure a necessary subset of the zero-semantic-dispatch
+contract, not a complete per-operation host-service/exit census. Whole-script
+scaffolding remains bounded by `26*N+5` dispatches for fork and `18*N+5` for
+thread; at most one extra root wait dispatch per creator is included. Scoped
+work snapshots must have no dropped/unknown metrics; scripted dispatch
+accounting must equal the existing work meter. These current-path counts do
+not relax the N2 zero budget or register a new ceiling.
+
+**Unsupported layers, per witness:** ScriptedBackend uses a host thread per
+actor, so both fork/pipe/wait and thread/join lack default runtime executor-pool
+exhaustion evidence. It explicitly rejects vfork/exec outcomes; the vfork
+witness therefore proves graph rollback/cutover, not instruction returns,
+ELF/interpreter byte loading, page-table projection or executor placement.
+Its injected failure is image-transaction preparation, not a corrupt ELF.
+The short source in the fork witness is a pipe, not a loader file/cursor.
+Owner witnesses prove portable admission/accounting only; hardware copy,
+physical backing, backend byte/extent batch bounds, real IPC waits and runtime
+executor exhaustion remain unsupported. The director approved this split and
+assigned default-pool/runtime proof to A's signed binding. No higher-layer
+acceptance or N1 ownership handoff is inferred.
+
+No established automatic expected-red exclusion was found for these portable
+targets. The three `*_budget_red` tests remain ordinary assertions in commit 2,
+without `#[ignore]`, `#[should_panic]`, environment gates or inverted budgets.
+Keeping that commit off main preserves the host gates while retaining the
+red-first proof for N2. Foreground verification of **commit 1 alone**, before
+applying the branch-only red commit:
+
+```text
+cargo test -p carrick-kernel-example --test n2_creation
+  exit 0: 3 passed, 0 failed, 0 ignored
+cargo test -p carrick-el1 --test n2_creation_owner
+  exit 0: 2 passed, 0 failed, 0 ignored
+cargo clippy -p carrick-kernel-example -p carrick-el1 --all-targets --no-deps -- -D warnings
+  exit 0 (existing dependency/platform-configuration warnings remain)
+just fmt-check
+  exit 0
+```
+
+`just accept --profile linux-portable` is absent on this base (the profile
+enum has only `no-docker` and `full`); no acceptance receipt is claimed.
+Signed/HVF gates and Docker were not run on this VM. Landing A's registry,
+signed composed witness and full attribution work remain open.
+
 ### B. One descriptor owner and creation IPC waits
 
 - **Fence:** `carrick-fd-core/src/lib.rs`, `carrick-pipe-core/src/lib.rs`,
