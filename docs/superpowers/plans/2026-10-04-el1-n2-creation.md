@@ -705,6 +705,95 @@ section 3; no new graph, lock, host timer or scheduler is supplied here.
 - **Accept:** `cargo test -p carrick-sched-core`; `just test-kernel`;
   `just test-embed el1_ --nocapture`; `just conformance-probes`; A/common gates.
 
+#### D-prep handoff
+
+Preparation on `work/n2d-prep`, base `652e0dcde`, changes only VM-free tests
+and this subsection. It does not move task ownership. Contracts are
+creation-native-path, thread-lifecycle, child exit notification and scheduler
+lifecycle. No product hook or substitute task graph was introduced.
+
+All witnesses below run at **1/8/32** with two parents in one graph (two
+occupied MM owners for scheduler storage). Scripted populations are held live
+by bounded checkpoints; UID-limit tests hold N sibling threads per parent.
+Transaction tests inject N operations per parent against the public kernel
+API and concrete Example MM backends. Linux authority is
+[clone(2)](https://man7.org/linux/man-pages/man2/clone.2.html),
+[wait4(2)](https://man7.org/linux/man-pages/man2/wait4.2.html),
+[exit_group(2)](https://man7.org/linux/man-pages/man2/exit_group.2.html),
+[sigaction(2)](https://man7.org/linux/man-pages/man2/sigaction.2.html) and
+[vfork(2)](https://man7.org/linux/man-pages/man2/vfork.2.html).
+Internal TaskBusy is custody, not a guessed Linux clone errno.
+
+| Witness (test target / function) | Today / exact authority bound |
+| --- | --- |
+| `n2_task_lifecycle / wnohang_echild_two_parents_at_1_8_32` | Semantic green. Exact child PID/status `7 << 8`, WNOHANG zero while live, one reap then errno 10. Birth/exit/nohang attempts are exactly `2N / 2N+2 / 2N`. |
+| `n2_task_lifecycle / sa_nocldwait_two_parents_at_1_8_32` | Semantic green. Each parent's sighand action independently prevents zombies; live-child WNOHANG is zero, blocking wait ends in ECHILD. SIGCHLD handler delivery remains C/signed work. |
+| `n2_task_lifecycle / exit_group_parked_siblings_at_1_8_32` | Semantic green. Two independent thread groups, N parked readers each; status 37 per group and no sibling sentinel runs. Exactly `2N+2` birth/exit dispatch entries. |
+| `n2_task_lifecycle / reparent_reap_two_parents_at_1_8_32` | Semantic green. Both parents hold N children before exit; namespace init adopts all `2N`, getppid is 1, statuses 5/6 are consumed once, then ECHILD. |
+| `n2_task_lifecycle / {wnohang_echild,sa_nocldwait,exit_group,reparent_reap}_budget_red` | **Budget red**, separate ignored tests with an explicit N2 reason. Each runs the full semantic fixture at all scales, then requires exactly zero host birth/exit/wait dispatch attempts, including restarts and failed waits. |
+| `n2_task_transactions / failed_birth_stages_unwind_edges_once_at_1_8_32` | Semantic green. All four public failpoints restore identity counts, registry, MM/files/sighand/credential references; child backend destruction occurs once. Existing empty-fd-copy work is exactly `2 * N * 3 * 96` bytes, including failures. |
+| `n2_task_transactions / failed_thread_birth_restores_claim_and_shared_edges_at_1_8_32` | Semantic green. All four failpoints restore thread identity claims and shared MM/files/sighand references; no extra thread is published. |
+| `n2_task_transactions / cancelled_prepublication_birth_cancels_start_and_releases_edges_at_1_8_32` | Semantic green. Prepared child's exact key stays undiscoverable; drop cancels its sole start token and restores identity/file edges. Models prepublication cancellation, not TID copyout errno. |
+| `n2_task_transactions / uid_limit_counts_both_live_parents_and_shared_threads_at_1_8_32` | Semantic green. Nonprivileged real UID 1000 owns both parents plus `2N` live siblings; process/thread reservation refuses at the common limit, one exit frees one charge, abort returns that charge once. |
+| `n2_task_transactions / clone_publication_during_fork_reservation_keeps_exact_shared_edges_at_1_8_32` | Semantic green. Prepared clone retains custody while fork owns publication; after fork commit, sibling shares exact MM/files/sighand while process child owns private MM/files. |
+| `n2_task_transactions / clone_during_exec_close_cannot_publish_and_rollback_reopens_birth_at_1_8_32` | Semantic green. Exec's reserved predecessor blocks new publication; abort preserves old MM/files and reopens clone admission. This is graph custody, not scheduled sibling cancellation or CLOEXEC close execution. |
+| `n2_task_transactions / delayed_parent_notification_preserves_durable_exact_status_at_1_8_32` | Semantic green. Exit callback is held after graph commit; parent consumes exact child's status 9 before notification resumes, then NoChild. The callback authenticates exact parent TaskKey. |
+| `n2_task_transactions / vfork_releases_only_on_exact_child_mm_release_at_1_8_32` | Semantic green. Both Exec and Exit cases at every scale: unrelated child exit and failed exec cannot release this gate; exact child MM detach/exit chooses one stable reason, subsequent exit/reap cannot replace it. Parent MM stays unchanged. |
+| `n2_task_identity / stale_completion_after_exact_identity_reuse_at_1_8_32` | Semantic and scheduler-service budget green. Reuse identical MM/TID/serial fields in the same record; old incarnation wake/cancel/control cannot mutate the replacement. Two parent records remain occupied. |
+| `n2_task_identity / full_record_pool_refuses_birth_without_mutating_two_parents_at_1_8_32` | Semantic and scheduler-service budget green. Fill the actual 4095 usable records, refuse `2N` attempts, preserve both parents; one retirement admits exactly one replacement. This is record capacity, not executor exhaustion. |
+
+Scripted work snapshots require zero dropped/unknown metrics and equality
+between metered and recorded dispatch totals. The zero budget is unchanged.
+Wait redispatch attempts are measured in full; concurrent child notifications
+do not justify assuming one redispatch per consume wait. Final explicit red
+run (exit 101) measured, at 1/8/32: ordinary wait **14/84/324**, SA_NOCLDWAIT
+**12/57/205**, group exit **4/18/66**, reparent **13/59/199**. These are observed
+host-dispatch counts, not timings or a total EL1/host-service census; concurrent
+notification order can change the wait counts, never the required zero budget.
+The scheduler fixtures assert zero existing service-exit/adoption/placement
+and host worker park/claim counters. Direct graph transactions have no common
+router/service census; they prove edges and copy work, not zero host services.
+
+**Minimal D transaction:** extract `task_lifecycle.rs` into sched-core as the
+single reducer over venue-supplied graph storage, not another task table.
+An owned PreparedBirth authenticates creator/parent TaskKey and ThreadKey,
+claims identity plus real-UID credit and capacity, retains MM/files/sighand
+edges, and obtains N1's aggregate TID-output commit/cancellation authority.
+Abort consumes each owned rollback token once. Commit publishes all graph and
+output edges before child runnable, with no fallible tail or lock held across
+copy/service/wait. Exec/exit close admission on the exact predecessor; losers
+retain an owned continuation or cancellation, never guest-visible contention.
+PreparedExit authenticates group generation, joins sibling cancellation and
+robust/clear-TID cleanup, retires fd/MM reachability, publishes rusage/zombie
+or autoreap plus reparent edges, then emits exact-generation notification and
+vfork-MM-release effects. Wait consumes that owner's durable child record
+once; delayed or stale effects never authenticate via a reusable PID/TID.
+
+**Director-approved hook gaps:** default executor/lease exhaustion waits for
+VM-free **M3**; it is not modeled by ScriptedBackend's one host thread/actor.
+Scheduled clone-vs-exec/CLOEXEC and injectable MM/fd/TID-output commit seams
+need **M4** plus N1's copy handoff; the current acquisition failpoints and
+prepared-drop witness do not prove their Linux errno/ordering. Robust death
+needs **M5**'s real common-entry/guest-memory route and **M6** composition:
+[set_robust_list(2)](https://man7.org/linux/man-pages/man2/set_robust_list.2.html)
+requires FUTEX_OWNER_DIED and a waiter wake on owner death. The scripted exit
+adapter has only clear-TID cleanup, so no fake robust walker was added.
+Complete zero task-service measurement for transactions and real routing
+belongs to **M5/M6** and D activation. No dependency on an unlanded branch.
+Signed TRACECLONE/seccomp, real register capture, MM projection and runtime
+vfork return remain director-owned; this prep claims no HVF/Docker acceptance.
+
+Local verification: `cargo test -p carrick-sched-core` (96 passed),
+`cargo test -p carrick-kernel-example --test n2_task_lifecycle --test
+n2_task_transactions` (12 passed, four documented budget reds ignored),
+`just test-kernel`, scoped Clippy for both changed crates and `just fmt-check`
+exit zero. Explicit budget-red execution exits 101 as recorded above.
+Workspace `just clippy` produces the same 518 runtime diagnostics on this
+Linux branch and a clean `origin/main` (`652e0dcde`); both logs were compared.
+The director substituted these local checks for the not-yet-landed
+`linux-portable` accept profile. Exact-commit remote host acceptance and its
+receipt are reported separately in the worker handoff.
+
 ### E. Exec loader and successor commit run in EL1
 
 - **Fence:** kernel `kernel/exec.rs`, `dispatch/proc.rs` and existing executable
