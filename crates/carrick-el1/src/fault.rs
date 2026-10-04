@@ -46,10 +46,16 @@ pub fn request_lazy_frames(mailbox: &FrameGrantMailbox, mm_key: u64, va: u64, ac
 fn frame_grant_access(esr: u64) -> Option<u64> {
     let ec = (esr >> 26) & 0x3f;
     let dfsc = esr & 0x3f;
-    if !matches!(ec, 0x24 | 0x25) || !(0x04..=0x07).contains(&dfsc) {
+    if !matches!(ec, 0x20 | 0x21 | 0x24 | 0x25) || !(0x04..=0x07).contains(&dfsc) {
         return None;
     }
-    Some(if esr & (1 << 6) != 0 { 2 } else { 1 })
+    Some(if matches!(ec, 0x20 | 0x21) {
+        4
+    } else if esr & (1 << 6) != 0 {
+        2
+    } else {
+        1
+    })
 }
 
 fn prepared_fault_access(esr: u64) -> Option<LeafAccess> {
@@ -1221,6 +1227,12 @@ mod tests {
         EL1_FRAME_GRANT_TARGET_SIZE, FRAME_GRANT_ERR_DENIED, FrameGrantMailbox, FrameGrantReady,
     };
     use carrick_sched_core::AddressSpaces;
+
+    #[test]
+    fn instruction_translation_fault_can_request_owner_file_grant() {
+        assert_eq!(frame_grant_access((0x20 << 26) | 0x07), Some(4));
+        assert_eq!(frame_grant_access((0x20 << 26) | 0x0f), None);
+    }
 
     fn write_translation_fault(slot: u64, address: u64) -> TrapFrame {
         TrapFrame {
