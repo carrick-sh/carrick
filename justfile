@@ -404,6 +404,11 @@ test-kernel *ARGS:
     cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
     just --justfile {{justfile()}} test-kernel-semantics {{ARGS}}
 
+# Bounded production fd atomic protocols (2 actors, <=2 preemptions).
+# Pipe venue lock/wake model waits for N1; see the M2 handoff.
+test-loom:
+    cargo test --locked -p carrick-fd-core --features loom --lib loom_models
+
 # The scripted kernel-semantics suites alone (crates/carrick-kernel-example):
 # two-process Linux semantics against the public kernel API with no VMM, no
 # codesign, no Docker and no host-specific state, so they run natively on ANY

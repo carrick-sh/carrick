@@ -11,14 +11,25 @@
 #![no_std]
 
 pub use carrick_sched_core::{BoundedSpin, LockWait};
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(not(all(test, feature = "loom")))]
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
+#[cfg(all(test, feature = "loom"))]
+use loom::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
 #[cfg(test)]
 extern crate std;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests;
 
+#[cfg(all(test, feature = "loom"))]
+mod loom_models;
+
+#[cfg(not(all(test, feature = "loom")))]
 static NEXT_AUTHORITY: AtomicU64 = AtomicU64::new(1);
+#[cfg(all(test, feature = "loom"))]
+loom::lazy_static! {
+    static ref NEXT_AUTHORITY: AtomicU64 = AtomicU64::new(1);
+}
 
 /// Guest descriptor number, including invalid negative syscall arguments.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -474,7 +485,7 @@ impl TableRecord {
     fn begin_write(&self) {
         let seq = self.seq.load(Ordering::Relaxed);
         self.seq.store(seq | 1, Ordering::Relaxed);
-        core::sync::atomic::fence(Ordering::Release);
+        fence(Ordering::Release);
     }
     /// Under the table lock, after the change: publish it.
     fn end_write(&self) {
@@ -483,7 +494,7 @@ impl TableRecord {
     }
     /// A lookup that began at `seq` saw no concurrent writer.
     fn unchanged_since(&self, seq: u64) -> bool {
-        core::sync::atomic::fence(Ordering::Acquire);
+        fence(Ordering::Acquire);
         self.seq.load(Ordering::Relaxed) == seq
     }
 }
@@ -597,7 +608,7 @@ pub const LAYOUT_FACTS: [u64; 13] = [
 /// index + 1. Push and pop never block, so a final release can always free
 /// its record, even from EL1.
 pub mod free_list {
-    use core::sync::atomic::{AtomicU64, Ordering};
+    use super::{AtomicU64, Ordering};
     const INDEX: u64 = u32::MAX as u64;
 
     /// Pop the top index; `link(i)` reads record `i`'s link (None: out of range).
@@ -1676,7 +1687,7 @@ impl<'a, B: SlotBacking, W: LockWait, const T: usize> Authority<'a, B, W, T> {
         Ok(((holds >> 32) as usize, (holds & FREE_INDEX) as usize))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "loom")))]
     fn probe_lowest(&self, table: TableId, min: usize) -> (Option<usize>, usize, usize) {
         let Ok((_guard, t)) = self.lock(table) else {
             return (None, usize::MAX, 0);
