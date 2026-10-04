@@ -590,6 +590,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transfer_grant_rejects_recycled_root_with_stale_owner_incarnation() {
+        let mm = carrick_el1_abi::ReservationMm::new(7).unwrap();
+        let carrier = std::num::NonZeroU64::new(3).unwrap();
+        // Test-only construction of successive admitted identities at the
+        // same physical table base. Production handles come from EL1 bind.
+        let old = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                carrier,
+                mm,
+                std::num::NonZeroU64::new(11).unwrap(),
+            )
+        };
+        let current = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                carrier,
+                mm,
+                std::num::NonZeroU64::new(12).unwrap(),
+            )
+        };
+        assert!(!transfer_root_is_current(
+            Some(current),
+            Some(0x4000),
+            old,
+            0x4000
+        ));
+        assert!(transfer_root_is_current(
+            Some(current),
+            Some(0x4000),
+            current,
+            0x4000
+        ));
+    }
+
+    #[test]
     fn a_live_physical_owner_without_an_mm_alias_is_not_a_grant_predecessor() {
         let lease = (0x8000, 16384, 7);
         assert!(!frame_grant_local_lease_is_current(
@@ -915,30 +949,54 @@ impl<'a> PublicationContext<'a> {
         target: carrick_aarch64::user_transfer::TransferTarget,
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<Self, TrapError> {
-        let invalid =
-            || TrapError::Hypervisor("EL1 transfer grant target authority mismatch".to_owned());
+        let invalid = |reason: &'static str| {
+            TrapError::Hypervisor(format!(
+                "EL1 transfer grant target authority mismatch: {reason}"
+            ))
+        };
         if target.handle().carrier() != custody.transfer_carrier
             || window.operation.carrier != target.handle().carrier()
             || window.operation.mm != target.handle().mm()
             || window.operation.incarnation != target.handle().incarnation()
             || !window.valid()
         {
-            return Err(invalid());
+            return Err(invalid("window or owner identity"));
         }
-        let binding = state.cow_runtime.read().clone().ok_or_else(invalid)?;
+        let binding = state
+            .cow_runtime
+            .read()
+            .clone()
+            .ok_or_else(|| invalid("COW runtime unbound"))?;
         let root = target.ttbr0() & 0x0000_ffff_ffff_f000;
         let asid = (target.ttbr0() >> 48) as u16;
-        if binding.identity.mm != target.handle().mm().raw()
-            || binding.identity.asid != asid
-            || binding.mm_root_slot.map(|root| root.0) != Some(root)
-            || !binding.persistent_vm_lifecycle
-            || state.page_tables_authority().live_descriptor_owner()
-                != carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
+        if binding.identity.mm != target.handle().mm().raw() {
+            return Err(invalid("MM"));
+        }
+        if binding.identity.asid != asid {
+            return Err(invalid("ASID"));
+        }
+        // The first carrier root uses the boot stage-1 tables without a pooled
+        // root slot. Authenticate its live owner handle as well as the table
+        // base: a later incarnation may reuse that physical root address.
+        if !transfer_root_is_current(
+            state.protections.owner(),
+            state.page_tables_authority().root_base(),
+            target.handle(),
+            root,
+        ) {
+            return Err(invalid("stage-1 root or owner incarnation"));
+        }
+        if !binding.persistent_vm_lifecycle {
+            return Err(invalid("persistent VM lifecycle"));
+        }
+        if state.page_tables_authority().live_descriptor_owner()
+            != carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
         {
-            return Err(invalid());
+            return Err(invalid("descriptor owner"));
         }
         Ok(Self {
-            mm_key: std::num::NonZeroU64::new(target.handle().mm().raw()).ok_or_else(invalid)?,
+            mm_key: std::num::NonZeroU64::new(target.handle().mm().raw())
+                .ok_or_else(|| invalid("zero MM"))?,
             state,
             custody,
             authority: binding.authority,
@@ -1064,6 +1122,15 @@ impl<'a> PublicationContext<'a> {
             foreign: None,
         })
     }
+}
+
+fn transfer_root_is_current(
+    owner: Option<carrick_el1_abi::El1MmHandle>,
+    live_root: Option<u64>,
+    selected: carrick_el1_abi::El1MmHandle,
+    selected_root: u64,
+) -> bool {
+    owner == Some(selected) && live_root == Some(selected_root)
 }
 
 pub(super) struct PublishedSparseExtent {
