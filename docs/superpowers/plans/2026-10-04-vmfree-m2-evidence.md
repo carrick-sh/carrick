@@ -122,3 +122,13 @@ The current futex and fixed setid receipts were re-recorded on the merged
 source. The futex decision sequence is unchanged; the receipt's source hash
 changes. Historical version-2 fd-pin receipts retain their original provenance
 and remain deliberately rejected by the version-3 replayer.
+
+The batch 4 setid red was re-run in `/tmp/vmfree-m2-batch4-red` at the
+merged receipt commit, checking out only `800247419^`'s entire `identity.rs`.
+The scratch file's Git blob matches the historical file exactly. Seed 0 at
+scale 1 still returns `LinuxErrno(11)` and fails the expected return 0
+assertion. The historical receipt was re-recorded with generator version 3
+and the merged surrounding source. The current fixed receipt records return
+0 for the same fixture and seed. Scratch build artifacts use a separate target
+directory so they cannot leave root build-script paths pointing at a removed
+worktree.
