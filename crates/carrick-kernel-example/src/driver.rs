@@ -229,8 +229,6 @@ pub(crate) fn drive(
         task.context = fresh;
         let tid = task.context.thread().registry_id();
 
-        #[cfg(debug_assertions)]
-        let parked_before_wake = shared.schedule.as_ref().map_or(0, |s| s.parked_count());
         let (mut outcome, request) = {
             let disp = task.dispatcher.lock();
             if !task.is_live() {
@@ -277,11 +275,11 @@ pub(crate) fn drive(
         if let Some(schedule) = &shared.schedule
             && syscall.nr == carrick_abi::syscall::nr::FUTEX
             && args[1] & carrick_abi::LINUX_FUTEX_CMD_MASK == carrick_abi::LINUX_FUTEX_WAKE
-            && matches!(outcome, DispatchOutcome::Returned { value } if value > 0)
-            && parked_before_wake > 0
+            && let DispatchOutcome::Returned { value } = &outcome
+            && *value > 0
         {
             schedule
-                .await_wake_publication(task.schedule_actor(), parked_before_wake)
+                .publish_futex_wake(task.schedule_actor(), args[0], *value as u64)
                 .map_err(ExampleError::Schedule)?;
         }
         crate::schedule_point!(shared, task, crate::schedule::Point::DispatchUnlocked);
@@ -386,6 +384,11 @@ pub(crate) fn drive(
                     return Ok(InternalCompletion::Returned(0));
                 }
                 blocking_outcome if is_blocking_dispatch_outcome(&blocking_outcome) => {
+                    #[cfg(debug_assertions)]
+                    let scheduled_in_zone_futex = matches!(
+                        &blocking_outcome,
+                        DispatchOutcome::FutexWait { timeout: None, .. }
+                    );
                     let restart = if is_restartable_syscall(syscall.nr.raw()) {
                         RestartClass::RestartSyscall
                     } else {
@@ -425,6 +428,15 @@ pub(crate) fn drive(
                         return Ok(InternalCompletion::Cancelled(
                             CancellationCause::ProcessExit,
                         ));
+                    }
+                    #[cfg(debug_assertions)]
+                    if let Some(schedule) = &shared.schedule
+                        && !scheduled_in_zone_futex
+                    {
+                        let error = "external readiness: scheduled runs support only untimed private futex waits".to_owned();
+                        schedule.abort(error.clone());
+                        let _ = continuation.cancel(CancellationCause::ServiceShutdown);
+                        return Err(ExampleError::Schedule(error));
                     }
                     continuation.install_temporary_signal_mask(&task.context);
                     continuation.bind_product_futex(&task.futex_table);
@@ -468,14 +480,39 @@ pub(crate) fn drive(
 
                     #[cfg(debug_assertions)]
                     if let Some(schedule) = &shared.schedule {
+                        let _ = shared.work_scope.add(
+                            carrick_observability::work_meter::WorkMetric::ContinuationParks,
+                            1,
+                        );
                         schedule
-                            .park(task.schedule_actor())
+                            .park(task.schedule_actor(), args[0])
                             .map_err(ExampleError::Schedule)?;
                     }
 
-                    // Drive wait service event on host thread. Note: `shared.wake_active_tokens_for_task`
-                    // calling `publish_ready` for a retired task is transport notification only:
-                    // it prompts this host thread loop to wake and observe exact liveness/retirement.
+                    // A scheduled futex wake was published synchronously by
+                    // the producer. Its scheduler decision admits this actor;
+                    // polling the event once must therefore be ready. A host
+                    // event or reactor tick can never make an actor runnable.
+                    #[cfg(debug_assertions)]
+                    let event_result = if let Some(schedule) = &shared.schedule {
+                        if let Err(error) = schedule.enter(task.schedule_actor()) {
+                            shared.unregister_active_token(token);
+                            let _ = continuation.cancel(CancellationCause::ServiceShutdown);
+                            return Err(ExampleError::Schedule(error));
+                        }
+                        block_on_timeout_with_scope(
+                            shared.wait_service.event(token),
+                            Duration::ZERO,
+                            Some(&shared.work_scope),
+                        )
+                    } else {
+                        block_on_timeout_with_scope(
+                            shared.wait_service.event(token),
+                            remaining,
+                            Some(&shared.work_scope),
+                        )
+                    };
+                    #[cfg(not(debug_assertions))]
                     let event_result = block_on_timeout_with_scope(
                         shared.wait_service.event(token),
                         remaining,
@@ -484,10 +521,19 @@ pub(crate) fn drive(
                     shared.unregister_active_token(token);
                     #[cfg(debug_assertions)]
                     if let Some(schedule) = &shared.schedule {
+                        if event_result.is_none() {
+                            let error = "external readiness: scheduled futex event was not published by its wake decision".to_owned();
+                            schedule.abort(error.clone());
+                            let _ = continuation.cancel(CancellationCause::ServiceShutdown);
+                            return Err(ExampleError::Schedule(error));
+                        }
                         schedule
-                            .unpark(task.schedule_actor())
+                            .point(task.schedule_actor(), crate::schedule::Point::WaitResumed)
                             .map_err(ExampleError::Schedule)?;
                     }
+                    // Outside scheduled runs, wait-service readiness still
+                    // parks this host thread. A task retirement publishes a
+                    // transport wake so it can observe exact liveness.
                     let Some(event_result) = event_result else {
                         let _ = continuation.cancel(CancellationCause::ServiceShutdown);
                         return Err(ExampleError::WaitTimedOut(syscall.label));

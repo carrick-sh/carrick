@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 use crate::operand::Step;
 
 const SCHEMA_VERSION: u32 = 1;
-const GENERATOR_VERSION: u32 = 2;
+const GENERATOR_VERSION: u32 = 3;
 const WATCHDOG: Duration = Duration::from_secs(5);
 
 /// A source boundary at which an actor may relinquish its test permit.
@@ -29,6 +29,7 @@ pub enum Point {
     ContinuationBuild,
     AwaitParked,
     WaitEnrolled,
+    FutexWakePublished,
     WaitResumed,
     FdDrained,
     TerminalUnlocked,
@@ -91,7 +92,7 @@ struct State {
     random: u64,
     max_transitions: usize,
     actors: BTreeSet<Actor>,
-    parked: BTreeSet<Actor>,
+    parked: BTreeMap<Actor, u64>,
     current: Option<Actor>,
     decisions: Vec<Decision>,
     visits: BTreeMap<(Actor, Point), usize>,
@@ -111,7 +112,7 @@ impl Schedule {
                 random: seed,
                 max_transitions: 10_000,
                 actors: BTreeSet::new(),
-                parked: BTreeSet::new(),
+                parked: BTreeMap::new(),
                 current: None,
                 decisions: Vec::new(),
                 visits: BTreeMap::new(),
@@ -180,7 +181,7 @@ impl Schedule {
 
     pub(crate) fn register(&self, actor: Actor) -> Result<(), String> {
         let mut state = self.0.0.lock();
-        if !state.started || state.parked.contains(&actor) || !state.actors.insert(actor) {
+        if !state.started || state.parked.contains_key(&actor) || !state.actors.insert(actor) {
             return Err("duplicate or premature schedule actor".into());
         }
         Ok(())
@@ -189,7 +190,7 @@ impl Schedule {
     pub(crate) fn enter(&self, actor: Actor) -> Result<(), String> {
         let (lock, wake) = &*self.0;
         let mut state = lock.lock();
-        if !state.actors.contains(&actor) {
+        if !state.actors.contains(&actor) && !state.parked.contains_key(&actor) {
             return Err("unregistered schedule actor".into());
         }
         while state.current != Some(actor) && state.failure.is_none() {
@@ -284,15 +285,15 @@ impl Schedule {
         self.enter(actor)
     }
 
-    /// A guest continuation releases its permit after enrollment. Its host
-    /// thread may wait for the event, but it cannot occupy an execution lane.
-    pub(crate) fn park(&self, actor: Actor) -> Result<(), String> {
+    /// A guest futex continuation releases its permit after enrollment. The
+    /// host thread waits for the scheduler, never for host event timing.
+    pub(crate) fn park(&self, actor: Actor, futex_addr: u64) -> Result<(), String> {
         let (lock, wake) = &*self.0;
         let mut state = lock.lock();
         if state.current != Some(actor) || !state.actors.remove(&actor) {
             return Err("parking actor lacks permit".into());
         }
-        state.parked.insert(actor);
+        state.parked.insert(actor, futex_addr);
         if let Err(error) = Self::choose(&mut state, actor, Point::WaitEnrolled) {
             state.failure = Some(error.clone());
             wake.notify_all();
@@ -302,47 +303,45 @@ impl Schedule {
         Ok(())
     }
 
-    /// A published event makes the exact actor eligible again. Re-entry waits
-    /// for a permit rather than consuming a host worker's guest capacity.
-    pub(crate) fn unpark(&self, actor: Actor) -> Result<(), String> {
-        let (lock, wake) = &*self.0;
-        {
-            let mut state = lock.lock();
-            if !state.parked.remove(&actor) || !state.actors.insert(actor) {
-                return Err("unparking actor was not parked".into());
-            }
-            if state.current.is_none() {
-                state.current = Some(actor);
-            }
-            wake.notify_all();
-        }
-        self.enter(actor)?;
-        self.point(actor, Point::WaitResumed)
-    }
-
-    pub(crate) fn parked_count(&self) -> usize {
-        self.0.0.lock().parked.len()
-    }
-
-    /// A successful in-zone wake publishes its event before the waker can
-    /// select the next actor. This closes the host-thread delivery gap between
-    /// the kernel producer and the test scheduler's runnable set.
-    pub(crate) fn await_wake_publication(
+    /// A successful in-zone futex wake has already published the wait-service
+    /// event synchronously. Admit its sole matching waiter as a recorded
+    /// scheduler decision, before the waker can relinquish its permit.
+    pub(crate) fn publish_futex_wake(
         &self,
         actor: Actor,
-        parked_before_wake: usize,
+        futex_addr: u64,
+        count: u64,
     ) -> Result<(), String> {
         let (lock, wake) = &*self.0;
         let mut state = lock.lock();
-        while state.parked.len() >= parked_before_wake && state.failure.is_none() {
-            if state.current != Some(actor) {
-                return Err("wake publisher lacks permit".into());
-            }
-            if wake.wait_for(&mut state, WATCHDOG).timed_out() {
-                return Err("successful wake did not publish an event".into());
-            }
+        if state.current != Some(actor) {
+            return Err("futex wake publisher lacks permit".into());
         }
-        state.failure.clone().map_or(Ok(()), Err)
+        let matching: Vec<_> = state
+            .parked
+            .iter()
+            .filter_map(|(waiter, addr)| (*addr == futex_addr).then_some(*waiter))
+            .collect();
+        if count != 1 || matching.len() != 1 {
+            let error = format!(
+                "external readiness: scheduled futex wake cannot identify one waiter (count={count}, matching={})",
+                matching.len()
+            );
+            state.failure = Some(error.clone());
+            wake.notify_all();
+            return Err(error);
+        }
+        let waiter = matching[0];
+        state.parked.remove(&waiter);
+        state.actors.insert(waiter);
+        if let Err(error) = Self::choose(&mut state, actor, Point::FutexWakePublished) {
+            state.failure = Some(error.clone());
+            wake.notify_all();
+            return Err(error);
+        }
+        wake.notify_all();
+        drop(state);
+        self.enter(actor)
     }
 
     pub(crate) fn finish(&self, actor: Actor) -> Result<(), String> {
@@ -426,11 +425,7 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 fn backend_id() -> String {
-    format!(
-        "kernel-example/{}/{}",
-        std::env::consts::OS,
-        std::env::consts::ARCH
-    )
+    "kernel-example/portable".into()
 }
 
 fn source_hash() -> Result<String, String> {
