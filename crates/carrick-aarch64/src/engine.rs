@@ -3247,10 +3247,42 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         };
         loop {
             use crate::user_transfer::TransferProgress;
-            match transfer
-                .advance(self, custody.as_ref(), slots)
-                .map_err(|error| MemoryError::HostMap(error.to_string()))?
-            {
+            let progress = match transfer.advance(self, custody.as_ref(), slots) {
+                Ok(progress) => progress,
+                Err(error) => {
+                    carrick_observability::probes::hvpatch_el1_host_read_progress(
+                        address,
+                        length as u64,
+                        transfer.offset() as u64,
+                        8,
+                        0,
+                    );
+                    return Err(MemoryError::HostMap(error.to_string()));
+                }
+            };
+            let class = match &progress {
+                TransferProgress::Complete => 0,
+                TransferProgress::Advanced => 1,
+                TransferProgress::Physical(_) => 2,
+                TransferProgress::OwnerWait(_) => 3,
+                TransferProgress::Supply(_) => 4,
+                TransferProgress::Retired(_) => 5,
+                TransferProgress::Refused(_) => 6,
+                TransferProgress::Suspended => 7,
+            };
+            let detail = match &progress {
+                TransferProgress::OwnerWait(wait) => wait.cause().encode(),
+                TransferProgress::Refused(errno) => errno.get() as u64,
+                _ => 0,
+            };
+            carrick_observability::probes::hvpatch_el1_host_read_progress(
+                address,
+                length as u64,
+                transfer.offset() as u64,
+                class,
+                detail,
+            );
+            match progress {
                 TransferProgress::Complete => return Ok(transfer.into_bytes()),
                 TransferProgress::Physical(wait) => {
                     return Err(MemoryError::ReadSuspended(Box::new(
