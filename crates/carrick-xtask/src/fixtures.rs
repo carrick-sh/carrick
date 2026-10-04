@@ -187,6 +187,27 @@ fn hash_bytes(bytes: &[u8]) -> ContentHash {
 fn hash_file(path: &Path) -> Result<ContentHash> {
     Ok(ContentHash(provision::compute_sha256(path)?))
 }
+
+fn hash_source(root: &Path, relative: &str) -> Result<ContentHash> {
+    // Git tracks a symlink declaration rather than its referent. Hash source
+    // link bytes without following them; executable paths reject all links.
+    let relative_path = Path::new(relative);
+    let parent = match relative_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(parent) => safe_path(root, &parent.to_string_lossy())?,
+        None => root.to_path_buf(),
+    };
+    let name = relative_path
+        .file_name()
+        .ok_or_else(|| fail("empty source path"))?;
+    let path = parent.join(name);
+    if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+        Ok(hash_bytes(
+            fs::read_link(path)?.as_os_str().as_encoded_bytes(),
+        ))
+    } else {
+        hash_file(&path)
+    }
+}
 fn fail(message: impl Into<String>) -> FixturesError {
     FixturesError::Invalid(message.into())
 }
@@ -240,7 +261,7 @@ fn source_hashes(root: &Path) -> Result<BTreeMap<String, ContentHash>> {
     let paths = git(root, &args)?;
     let mut sources = BTreeMap::new();
     for relative in paths.split('\0').filter(|p| !p.is_empty()) {
-        sources.insert(relative.to_owned(), hash_file(&safe_path(root, relative)?)?);
+        sources.insert(relative.to_owned(), hash_source(root, relative)?);
     }
     if sources.is_empty() {
         return Err(fail("empty fixture source inventory"));
@@ -609,7 +630,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     let sources = source_hashes(root)?;
     // Match the build snapshot byte-for-byte with the recorded source inputs.
     for (path, hash) in &sources {
-        if &hash_file(&safe_path(&source, path)?)? != hash {
+        if &hash_source(&source, path)? != hash {
             return Err(fail(format!("build snapshot source mismatch: {path}")));
         }
     }
