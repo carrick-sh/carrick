@@ -3864,6 +3864,38 @@
       "fingerprint": "45bc010bdbb41963d263ca602e8a97759c89d7012ee1f19bbb6056b47b1b1735",
       "classification": "monotonic_allocator",
       "rationale": "Host-process-wide non-reusing allocator for opaque child COW authority token identities. It stores no task, MM, membership, policy or measurement state; exact TaskKey, MM, ASID and owner generation remain authenticated by the token authority. Concurrent carriers may share the allocator without sharing Linux state. Checked exhaustion refuses reservation before birth and never wraps or reissues an identity."
+    },
+    {
+      "kind": "env_var",
+      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
+      "symbol": "ipc_set_tests::serial_host::supervise_watchdog_child::CARRICK_SYSVIPC_WATCHDOG_PARENT",
+      "fingerprint": "6af42d41c22308c341a3f4c9d219d38c2639f535ed718015739f4ef51c9e5d2d",
+      "classification": "test_only",
+      "rationale": "Test-only self-exec supervisor protocol authenticates its live native parent before creating a worker; cfg(test) serial_host only, never guest or production configuration."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
+      "symbol": "ipc_set_tests::serial_host::supervise_watchdog_child::CARRICK_SYSVIPC_WATCHDOG_FD",
+      "fingerprint": "8171b311b65253ec7bb65d4f34a76b36e31684e38c57af1facfef69508257455",
+      "classification": "test_only",
+      "rationale": "Test-only inherited Unix control socket selects the self-exec supervisor and carries cancellation/readiness; worker exec removes the sentinel, and production never reads it."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
+      "symbol": "ipc_set_tests::serial_host::watchdog_kills_and_reaps_on_deadlock_timeout::CARRICK_SYSVIPC_WATCHDOG_PARENT_HOLD",
+      "fingerprint": "e616d0b77ca12d6698b7bb9add201af71dc06a8fee85268f83a10441552615bd",
+      "classification": "test_only",
+      "rationale": "Test-only parent-death regression pauses the isolated parent after supervisor readiness so the outer fixture can SIGKILL it; cfg(test) serial_host only."
+    },
+    {
+      "kind": "env_var_os",
+      "file": "crates/carrick-kernel/src/dispatch/sysv.rs",
+      "symbol": "ipc_set_tests::serial_host::watchdog_kills_and_reaps_on_deadlock_timeout::CARRICK_SYSVIPC_WATCHDOG_READY",
+      "fingerprint": "9801e0e967649c49aa50f58434e118519eb8f76e908043ff8c5e3ae13e58163a",
+      "classification": "test_only",
+      "rationale": "Test-only parent-death regression readiness path reports exact worker/supervisor PIDs to the isolated outer fixture for cancellation and reaping assertions; no production state."
     }
   ]
 }
