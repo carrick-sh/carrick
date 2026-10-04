@@ -575,6 +575,22 @@ where
     // served futex wait or for its slice to end (EL1 plan 1d: other
     // syscalls are served or forwarded as usual; 1b forwarded them all so
     // the host could run the queued threads).
+    let file_access = match zone.as_ref() {
+        Some(zone) => crate::substrate::file_notification::FileAccess::notified(
+            zone.tables,
+            SlotId::new(slot as u8),
+        ),
+        None => {
+            #[cfg(any(test, feature = "host-test"))]
+            {
+                crate::substrate::file_notification::FileAccess::SourceFreeModel
+            }
+            #[cfg(not(any(test, feature = "host-test")))]
+            {
+                crate::substrate::file_notification::FileAccess::Unavailable
+            }
+        }
+    };
     if let (Some(zone), Some(task), Some(zslot)) =
         (zone.as_mut(), cur_task, SlotId::from_index(slot))
         && sched::is_served_futex_op(frame)
@@ -615,6 +631,7 @@ where
             if let Some(task) = cur_task {
                 let validator = file::HardwareValidator;
                 if let Ok(res) = inotify::el1_inotify_add_watch(
+                    file_access,
                     frame.x[0] as i32,
                     frame.x[1],
                     frame.x[2] as u32,
@@ -639,6 +656,7 @@ where
             let orig_x0 = frame.x[0];
             if let Some(task) = cur_task
                 && let Ok(res) = inotify::el1_inotify_rm_watch(
+                    file_access,
                     frame.x[0] as i32,
                     frame.x[1] as i32,
                     task,
@@ -660,6 +678,7 @@ where
         63 => {
             let orig_x0 = frame.x[0];
             let res = try_serve_file_syscall(
+                file_access,
                 frame,
                 nr,
                 current_tasks,
@@ -702,6 +721,7 @@ where
         62 | 64 | 67 | 68 => {
             let orig_x0 = frame.x[0];
             if let Some(res) = try_serve_file_syscall(
+                file_access,
                 frame,
                 nr,
                 current_tasks,
@@ -823,12 +843,13 @@ fn claim_owed_inotify_wake(task: &CurrentTask, inotify_table: &[DelegatedInotify
 }
 
 #[allow(clippy::too_many_arguments)]
-fn try_serve_file_syscall<F>(
+fn try_serve_file_syscall<'a, F>(
+    access: crate::substrate::file_notification::FileAccess<'a>,
     frame: &TrapFrame,
     nr: usize,
     current_tasks: &[CurrentTask],
     fd_map: &[FdMapSlot],
-    object_table: &[DelegatedFile],
+    object_table: &'a [DelegatedFile],
     open_table: &[DelegatedOpenFile],
     inotify_table: &[DelegatedInotify],
     cache_lookup: &F,
@@ -857,9 +878,7 @@ where
     if file.state.load(Ordering::Acquire) != DELEGATED_STATE_GUEST {
         return None;
     }
-    if !file.lock_guest_bounded(EL1_GUEST_LOCK_SPINS) {
-        return None;
-    }
+    let file_guard = access.lock(file, inode_handle)?;
     // Re-validate the fd-map slot, the open file and its inode under the
     // inode's lock (which also guards the open-file record).
     let map_slot = fd_map.get(slot_idx)?;
@@ -872,7 +891,7 @@ where
         || open.inode_handle.load(Ordering::Acquire) != inode_handle
         || !open.is_bound_to(file)
     {
-        file.unlock();
+        drop(file_guard);
         return None;
     }
 
@@ -895,7 +914,7 @@ where
             &TryInstanceLock,
         )
     };
-    file.unlock();
+    drop(file_guard);
     outcome.ok()
 }
 

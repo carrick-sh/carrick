@@ -1823,3 +1823,29 @@ clippy with -D warnings passes. These adapter tests are not a substitute for
 the forthcoming actual old DelegatedFile::unlock behavioral red and live
 integration green. Reservation-pool source/producers and typed portal wait
 receipts remain open; adding its queue identity alone claims no wake closure.
+
+#### Actual delegated inode release custody — 2026-10-03
+
+Authenticated DelegatedFileAuthority binds the actual inode index and carrier
+region to its notification queue. Initial publication admits a durable source
+in the record's former reserved word; terminal recall and publication rollback
+retire its base pin under exclusion. The record keeps its 256-byte geometry.
+Actual host and EL1 file/watch lock guards now retain the release ticket, advance
+revision before unlock and deliver afterward. Unpublished source-free guards
+remain explicit; the EL1 source-free model venue only exists in test builds.
+
+The actual producer witness is
+`actual_inode_release_advances_its_exact_notification`. With the new admission
+fixture retained and guard Drop ablated to the former raw unlock, it failed
+cleanly (epoch1 == epoch1; 0 passed, 1 failed). Restoring release custody made the
+same driver pass. Logs: /tmp/venue3-actual-inode-release-{red,green}.log.
+`RUSTC_WRAPPER= RUST_TEST_THREADS=1 cargo test -p carrick-kernel
+el1_delegation::tests --lib -- --nocapture` passed all20 tests. Independent source
+review approved the unit. This producer witness does not reproduce either
+frozen mmap probe: those still require the production GuestMemory cutover.
+
+Scope exception: kernel/el1_delegation.rs must own source admission/retirement
+and the real host unlocks; dispatch-only changes cannot supply those producers.
+Blocking legacy recall, owner-held cancellation-independent cleanup, host MM
+continuation enrollment, consumer activation and admitted mirror deletion remain
+open. No final verification or acceptance receipt is claimed by this unit.
