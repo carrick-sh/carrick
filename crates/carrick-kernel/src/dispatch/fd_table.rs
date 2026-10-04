@@ -2956,6 +2956,12 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 if interest.contains(LinuxEpollEvents::PRI) {
                     pfd.events |= libc::POLLPRI;
                 }
+                // Linux reports a read half-close only when POLLRDHUP is
+                // requested. An RDHUP-only guest interest need not include IN.
+                #[cfg(target_os = "linux")]
+                if interest.contains(LinuxEpollEvents::RDHUP) {
+                    pfd.events |= libc::POLLRDHUP;
+                }
                 let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
                 let mut ready = LinuxEpollEvents::empty();
                 if rc > 0 {
@@ -2967,6 +2973,10 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                     }
                     if pfd.revents & libc::POLLPRI != 0 {
                         ready |= LinuxEpollEvents::PRI;
+                    }
+                    #[cfg(target_os = "linux")]
+                    if pfd.revents & libc::POLLRDHUP != 0 {
+                        ready |= LinuxEpollEvents::RDHUP;
                     }
                     if pfd.revents & libc::POLLERR != 0 {
                         ready |= LinuxEpollEvents::ERR;
@@ -3000,6 +3010,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
                 {
                     ready |= LinuxEpollEvents::PRI;
                 }
+                #[cfg(not(target_os = "linux"))]
                 if interest.contains(LinuxEpollEvents::RDHUP)
                     && (ready.contains(LinuxEpollEvents::IN)
                         || ready.contains(LinuxEpollEvents::HUP))
