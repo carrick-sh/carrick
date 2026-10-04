@@ -73,6 +73,7 @@ carrick-host-bsd = { path = "../carrick-host-bsd" }
 cc = "1"
 
 [dev-dependencies]
+carrick-test-support = { path = "../carrick-test-support" }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 # The real EL1 guest-COW resolver drives the host settlement model tests.
 carrick-el1 = { path = "../carrick-el1" }

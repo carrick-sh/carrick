@@ -1702,7 +1702,10 @@ mod tests {
     }
 
     /// The EL1 current-task record of `slot` in the region at `region`.
-    fn current_task(region: &[u8], slot: usize) -> &carrick_el1_abi::CurrentTask {
+    fn current_task(
+        region: &carrick_test_support::TestEl1Region,
+        slot: usize,
+    ) -> &carrick_el1_abi::CurrentTask {
         let offset = carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize
             + slot * std::mem::size_of::<carrick_el1_abi::CurrentTask>();
         // SAFETY: `region` is a whole EL1 region and the record lies inside it.
@@ -1720,7 +1723,7 @@ mod tests {
     /// moved thread.
     #[test]
     fn a_mailbox_lease_owns_its_el1_current_task_record() {
-        let region = vec![0u8; carrick_el1_abi::EL1_REGION_SIZE as usize];
+        let region = carrick_test_support::TestEl1Region::zeroed();
         let previous = carrick_el1_abi::get_el1_region_host_ptr();
         carrick_el1_abi::record_el1_region_host_ptr(region.as_ptr() as usize);
         let allocator = Arc::new(MailboxSlotAllocator::new());
