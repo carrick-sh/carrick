@@ -3758,7 +3758,7 @@ impl<'a> ProcView<'a> {
                     remote_iov,
                     riovcnt,
                     flags,
-                    is_read: true,
+                    direction: ProcessVmDirection::Read,
                 },
             )
         }
@@ -3779,11 +3779,19 @@ impl<'a> ProcView<'a> {
                     remote_iov,
                     riovcnt,
                     flags,
-                    is_read: false,
+                    direction: ProcessVmDirection::Write,
                 },
             )
         }
     }
+}
+
+/// Ordinary user access. Privileged ptrace POKE uses its existing distinct
+/// stop/text authority and cannot be represented as this write direction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessVmDirection {
+    Read,
+    Write,
 }
 
 pub(super) struct ProcessVmRwArgs {
@@ -3793,7 +3801,7 @@ pub(super) struct ProcessVmRwArgs {
     remote_iov: GuestPtr,
     riovcnt: u64,
     flags: u64,
-    is_read: bool,
+    direction: ProcessVmDirection,
 }
 
 /// Copy the flattened byte stream from `src` iovecs into `dst` iovecs WITHIN a
@@ -3857,8 +3865,8 @@ fn process_vm_copy_self<M: CurrentMmMemory>(
 }
 
 impl<'a> ProcView<'a> {
-    /// Shared body of `process_vm_readv` (270, `is_read=true`) and
-    /// `process_vm_writev` (271, `is_read=false`): transfer between the caller's
+    /// Shared body of `process_vm_readv` (270, `Read`) and
+    /// `process_vm_writev` (271, `Write`): transfer between the caller's
     /// `local_iov` and the target process's `remote_iov`. readv copies
     /// remote→local, writev copies local→remote.
     ///
@@ -3897,7 +3905,7 @@ impl<'a> ProcView<'a> {
             remote_iov,
             riovcnt,
             flags,
-            is_read,
+            direction,
         } = args;
         // Only flags == 0 is defined; anything else is EINVAL (process_vm01
         // test_flags exercises -INT_MAX/-1/1/INT_MAX). Invalid nonzero flags
@@ -3949,7 +3957,7 @@ impl<'a> ProcView<'a> {
         }
 
         if target_task.key() == cx.kernel.task().key() {
-            let (src, dst) = if is_read {
+            let (src, dst) = if direction == ProcessVmDirection::Read {
                 (&remote, &local)
             } else {
                 (&local, &remote)
@@ -3975,7 +3983,7 @@ impl<'a> ProcView<'a> {
 
         match relation {
             crate::kernel::MmRelation::Current(_) => {
-                let (src, dst) = if is_read {
+                let (src, dst) = if direction == ProcessVmDirection::Read {
                     (&remote, &local)
                 } else {
                     (&local, &remote)
@@ -4001,7 +4009,7 @@ impl<'a> ProcView<'a> {
                 let mut li = 0usize;
                 let mut lo = 0u64;
 
-                if is_read {
+                if direction == ProcessVmDirection::Read {
                     let mut chunk_buf = vec![0u8; CHUNK_SIZE];
 
                     while ri < remote.len() && li < local.len() {
@@ -5256,6 +5264,85 @@ mod kernel_process_dispatch_tests {
             DispatchOutcome::Returned { value: 4 },
         );
         assert_eq!(memory.read_bytes(LOCAL_BUF, 4).unwrap(), b"PEER");
+    }
+
+    /// Dispatcher preservation witness over the existing test transport.
+    /// Production owner binding and default-pool pressure remain separate.
+    #[test]
+    fn n1_stopped_observer_preserves_exact_bytes_prefix_and_errno() {
+        let (_lane, mut dispatcher, _process, root, lease) = bound_dispatcher(61_060);
+        let stopped = process_vm_target_with_payload(&root, 61_061, b"STOP");
+        let live = process_vm_target_with_payload(&root, 61_062, b"LIVE");
+        let root = refreshed(&root);
+        arm_ptrace_memory_access(&root, &stopped);
+        let stopped_key = stopped.task().key();
+        let mut memory = LinearMemory::new(0x1000, vec![0; 0x4000]);
+        memory.write_bytes(TARGET_VA, b"SELF").unwrap();
+        write_iovec(&mut memory, LOCAL_IOV, LOCAL_BUF, 8);
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+        write_iovec(&mut memory, REMOTE_IOV + 16, 0x9999_0000, 4);
+
+        for (target, expected) in [(&stopped, b"STOP"), (&live, b"LIVE")] {
+            assert_eq!(
+                dispatch_with_lease(
+                    &mut dispatcher,
+                    &root,
+                    &mut memory,
+                    SYS_PROCESS_VM_READV,
+                    [
+                        target.task().key().id.raw() as u64,
+                        LOCAL_IOV,
+                        1,
+                        REMOTE_IOV,
+                        2,
+                        0
+                    ],
+                    Some(&lease),
+                ),
+                DispatchOutcome::Returned { value: 4 },
+                "later remote fault must preserve the exact delivered prefix",
+            );
+            assert_eq!(memory.read_bytes(LOCAL_BUF, 4).unwrap(), expected);
+            assert_eq!(memory.read_bytes(LOCAL_BUF + 4, 4).unwrap(), [0; 4]);
+            assert!(
+                root.kernel()
+                    .ptrace_stop_admission(root.task().key(), stopped_key)
+                    .is_ok()
+            );
+        }
+        write_iovec(&mut memory, REMOTE_IOV, 0x9999_0000, 4);
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [stopped_key.id.raw() as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_EFAULT),
+        );
+        assert!(
+            root.kernel()
+                .ptrace_stop_admission(root.task().key(), stopped_key)
+                .is_ok()
+        );
+        stopped
+            .kernel()
+            .exit_task(stopped_key.id, LinuxWaitStatus::from_wait_encoding(0), None)
+            .unwrap();
+        write_iovec(&mut memory, REMOTE_IOV, TARGET_VA, 4);
+        assert_eq!(
+            dispatch_with_lease(
+                &mut dispatcher,
+                &root,
+                &mut memory,
+                SYS_PROCESS_VM_READV,
+                [stopped_key.id.raw() as u64, LOCAL_IOV, 1, REMOTE_IOV, 1, 0],
+                Some(&lease),
+            ),
+            DispatchOutcome::errno(LINUX_ESRCH),
+        );
     }
 
     #[test]
