@@ -429,8 +429,23 @@ mod tests {
 
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn lock_test() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock_test() -> (
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        // Lock in this order for every lib.rs test. The owner-module tests
+        // take only their own lock, so none can clear a seeded store while a
+        // lib.rs test is using it.
+        (
+            TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+            child_watch::TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+            host_disposition::MASK_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
     }
 
     /// The supervisor reset test and the owner-module tests all mutate these
