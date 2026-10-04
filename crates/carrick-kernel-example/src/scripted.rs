@@ -110,6 +110,7 @@ pub struct ScriptedBackend {
     bridges: CarrierBridges,
     fs_backend: Option<Box<dyn carrick_vfs::fs_backend::FsBackend>>,
     rootfs_layer: Option<carrick_vfs::rootfs::RootFs>,
+    root_exit_checkpoint: Option<crate::operand::ScriptCheckpoint>,
 }
 
 impl Default for ScriptedBackend {
@@ -129,6 +130,7 @@ impl ScriptedBackend {
             },
             fs_backend: None,
             rootfs_layer: None,
+            root_exit_checkpoint: None,
         }
     }
 
@@ -142,6 +144,16 @@ impl ScriptedBackend {
     /// same dispatcher surface used by a carrier.
     pub fn with_rootfs_layer(mut self, rootfs: carrick_vfs::rootfs::RootFs) -> Self {
         self.rootfs_layer = Some(rootfs);
+        self
+    }
+
+    /// Notify a deterministic host observer after the root script has ended
+    /// and published its exit, before joining any remaining task threads.
+    pub fn with_root_exit_checkpoint(
+        mut self,
+        checkpoint: crate::operand::ScriptCheckpoint,
+    ) -> Self {
+        self.root_exit_checkpoint = Some(checkpoint);
         self
     }
 
@@ -221,6 +233,9 @@ impl ScriptedBackend {
         };
         shared.ledger.lock().tasks_started = 1;
         let root_exit = root.run(&script, &shared);
+        if let Some(checkpoint) = self.root_exit_checkpoint {
+            checkpoint.signal();
+        }
         // Every child thread is joined before the verdict, whatever the root
         // did: a task that outlives its parent's script is a backend defect.
         let joined = Self::join_children(&shared);
@@ -530,9 +545,15 @@ impl Task {
                     };
                     shared.await_parked(resolved_id, label, WAIT_BOUND)?;
                 }
-                Step::Sys(syscall) => {
+                Step::Sys(syscall) | Step::SysBeforeContinuation { syscall, .. } => {
                     let (args, outs) = self.resolve(syscall)?;
-                    let completion = crate::driver::drive(self, syscall, args, shared)?;
+                    let gate = match step {
+                        Step::SysBeforeContinuation {
+                            admitted, resume, ..
+                        } => Some((admitted, resume)),
+                        _ => None,
+                    };
+                    let completion = crate::driver::drive(self, syscall, args, shared, gate)?;
                     match completion {
                         InternalCompletion::Fork { flags, exit_signal } => {
                             let Some(Step::ChildMarker(child_script)) = steps.next() else {

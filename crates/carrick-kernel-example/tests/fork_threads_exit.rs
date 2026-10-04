@@ -22,7 +22,76 @@
 //! cannot itself make progress, so every one of these scripts retires with a
 //! bounded number of dispatches and no task parked at the end.
 
+use carrick_kernel_example::operand::ScriptCheckpoint;
 use carrick_kernel_example::{ScriptedBackend, Step, await_parked, last_child, slot, sys};
+
+/// Contract `kernel.fd.wait-admission-retirement`.
+/// Linux authority: fork(2) copies slots referencing the same descriptions;
+/// close(2) retains an admitted blocking operation's description; exit_group(2)
+/// terminates every sibling, so the parked read never returns to the guest.
+/// Budget: exactly one read admission, no redispatch or retry after retirement.
+#[test]
+fn fork_parent_exit_between_pipe_wait_admission_and_continuation_build() {
+    let admitted = ScriptCheckpoint::default();
+    let resume = ScriptCheckpoint::default();
+    let child_live = ScriptCheckpoint::default();
+    let child_exit = ScriptCheckpoint::default();
+    let retired = ScriptCheckpoint::default();
+    let script = vec![
+        Step::Sys(
+            sys::pipe2(0)
+                .ret(0)
+                .save_out_i32(0, 0, 0)
+                .save_out_i32(0, 1, 1),
+        ),
+        Step::Sys(sys::clone_thread(0)),
+        Step::ChildMarker(vec![
+            Step::SysBeforeContinuation {
+                syscall: sys::read(slot(0), 1).ret(1),
+                admitted: admitted.clone(),
+                resume: resume.clone(),
+            },
+            Step::Sys(sys::exit_thread(0)),
+        ]),
+        Step::AwaitCheckpoint(admitted),
+        Step::Sys(sys::fork()),
+        Step::ChildMarker(vec![
+            Step::SignalCheckpoint(child_live.clone()),
+            Step::AwaitCheckpoint(child_exit.clone()),
+            Step::Sys(sys::exit_group(0)),
+        ]),
+        // Both processes are live, sharing descriptions but separate fd tables.
+        Step::AwaitCheckpoint(child_live),
+        Step::SignalCheckpoint(child_exit),
+        Step::Sys(sys::wait4(last_child(), 0)),
+        // Retire the last fd-table owners while the sibling holds its outcome.
+        Step::Sys(sys::exit_group(0)),
+    ];
+    let handle = std::thread::spawn({
+        let retired = retired.clone();
+        move || {
+            ScriptedBackend::new()
+                .with_root_exit_checkpoint(retired)
+                .run_root(script)
+        }
+    });
+    let exited = retired.wait();
+    // Release even if a harness failure hit the bound, so the thread is joined.
+    resume.signal();
+    let result = handle.join().expect("join scripted backend");
+    assert!(
+        exited,
+        "root must publish exit before continuation construction"
+    );
+    let report = result.expect("retired sibling must cancel, never return Unsupported");
+    assert_eq!(report.exit_code(), 0);
+    assert_eq!(report.tasks_started(), 3);
+    assert_eq!(report.dispatches_for_tid(2, "read"), 1);
+    assert!(
+        report.completions().iter().all(|row| row.label != "read"),
+        "exit_group tears down the read instead of returning a guest result"
+    );
+}
 
 /// A process with two live sibling threads forks; the child exits, the parent
 /// reaps it, its siblings exit, and the leader calls `exit_group`.

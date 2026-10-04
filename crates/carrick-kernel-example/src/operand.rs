@@ -325,6 +325,13 @@ pub enum Step {
     },
     /// Issue a syscall.
     Sys(Syscall),
+    /// Pause after a blocking outcome and its execution capture, before
+    /// continuation construction. Neither dispatcher nor memory is locked.
+    SysBeforeContinuation {
+        syscall: Syscall,
+        admitted: ScriptCheckpoint,
+        resume: ScriptCheckpoint,
+    },
     /// The script the child of the preceding fork runs.
     ChildMarker(Vec<Step>),
     /// Wait for another task to park/enroll in a specific syscall before continuing.
