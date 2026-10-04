@@ -1087,6 +1087,17 @@ impl GlobalFrameSharedMapping {
         self.backing.as_ptr()
     }
 
+    pub(crate) fn prepare_content_write(
+        self: &std::sync::Arc<Self>,
+        offset: usize,
+        len: usize,
+    ) -> Result<
+        super::code_content::PendingContentWrite<OwnedCodeContent>,
+        super::code_content::ContentError,
+    > {
+        super::code_content::PendingContentWrite::new(OwnedCodeContent(self.clone()), offset, len)
+    }
+
     pub(crate) fn begin_content_write(
         self: &std::sync::Arc<Self>,
         offset: usize,

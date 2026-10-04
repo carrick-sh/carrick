@@ -19,8 +19,8 @@
 use std::sync::Arc;
 
 pub use crate::descriptor_drain::GuestPublishError;
-use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{Aarch64SyscallFrame, Gpa, MemoryError, SharedFutexLocation};
+use carrick_guest_mem::{LegacyProtectionRead, UserMemoryAuthority};
 use carrick_hal::{
     GuestEntryRegs, GuestVmBackend, HostAliasBacking, MemPerms, ProcessForkRequest, Reg, SysReg,
     TrapError, VcpuKick, VcpuRegistry,
@@ -884,7 +884,7 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// (keyed on the guest VA). `Some(..)` so the gate fires; the backend owns the
     /// set (KVM in `GuestRam`, shared across siblings) so a sibling thread's
     /// `mprotect(PROT_NONE)` is observed here.
-    fn protections(&self) -> Option<&MemoryProtections>;
+    fn protections(&self) -> Option<LegacyProtectionRead<'_>>;
 
     /// Exact private writable ranges owned by this mm. HVPatch consumes this
     /// before cloning the stage-1 graph; reference backends retain the empty
@@ -1301,8 +1301,19 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// keep the default; HVPatch returns the exact Arc owned by its new task
     /// projection so a persistent detach/reload cannot resurrect the
     /// predecessor's ranges.
-    fn exec_protections(&self) -> Option<Arc<MemoryProtections>> {
+    fn exec_protections(&self) -> Option<UserMemoryAuthority> {
         None
+    }
+    fn install_user_memory_authority(
+        &mut self,
+        authority: UserMemoryAuthority,
+    ) -> Result<(), TrapError> {
+        if authority.owner().is_some() {
+            return Err(TrapError::Hypervisor(
+                "backend lacks owner memory authority admission".into(),
+            ));
+        }
+        Ok(())
     }
 
     // NOTE: `process_exit_cleanup` is inherited from the shared [`GuestVmBackend`]
