@@ -228,6 +228,18 @@ if [ "$pkg" = "carrick-embed" ]; then
     scripts/build-embed-el1-sched.sh
 fi
 
+if [ "$pkg" = "carrick-conformance-next" ]; then
+    # This dedicated numeric ELF witness is not a generic blessed probe.
+    # Rebuild it here so the public signed gate never depends on a manual
+    # fixture build. Its compiled fingerprint detects a stale executable.
+    elf_errno_fixture="crates/carrick-conformance-next/tests/fixtures/elf-exec-errno"
+    elf_errno_source_sha256="$(shasum -a 256 "$elf_errno_fixture/src/main.rs" | cut -d ' ' -f 1)"
+    CARRICK_ELF_FIXTURE_SOURCE_SHA256="$elf_errno_source_sha256" \
+        CARGO_TARGET_DIR="$PWD/target/elf-exec-errno" \
+        cargo build --manifest-path "$elf_errno_fixture/Cargo.toml" \
+        --target aarch64-unknown-linux-musl --release --locked
+fi
+
 # 1. Build (never run) the package's test executables and collect their
 #    paths. Only the package's OWN test-profile artifacts carry
 #    `profile.test == true` plus an `executable`; dependencies compile with
