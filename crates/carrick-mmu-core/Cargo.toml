@@ -12,6 +12,7 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+carrick-guest-arch = { path = "../carrick-guest-arch" }
 hashbrown = { version = "0.15.5", default-features = false, features = ["default-hasher"] }
 
 [dev-dependencies]
