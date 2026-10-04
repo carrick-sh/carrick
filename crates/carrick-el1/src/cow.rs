@@ -1001,7 +1001,7 @@ mod tests {
             &mut frame,
             &Counters::default(),
             &[task],
-            spaces,
+            carrick_sched_core::spaces::notification::SpaceAccess::source_free(spaces),
             GrantMailboxes::own(&FrameGrantMailbox::new()),
             None::<PreparedFaultPath<'_, NoopPreparedResolver>>,
             resolver,

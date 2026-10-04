@@ -1042,10 +1042,12 @@ pub struct ZoneTables {
     pub occupancy: Occupancy,
     /// Address spaces EL1 may install itself, with their gates.
     pub spaces: AddressSpaces,
-    object_waits: [object_wait::ObjectQueue; object_wait::OBJECT_WAIT_QUEUES],
+    object_waits: [object_wait::ObjectQueue; object_wait::ORIGINAL_OBJECT_WAIT_QUEUES],
     /// Carrier-owned completion handbacks, appended after existing tables.
     completion_handbacks: completion_queue::CompletionQueue,
     completion_consumer: AtomicU32,
+    /// Cause-specific MM queues append storage without moving previous fields.
+    space_cause_waits: [object_wait::ObjectQueue; object_wait::EXTRA_CAUSE_QUEUES],
 }
 
 /// How a bucket lock waits: EL1 gives up after a bounded spin (and forwards
