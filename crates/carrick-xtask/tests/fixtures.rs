@@ -86,6 +86,11 @@ impl Fixture {
             b"local fixture dependency\n",
         );
         write(root, "conformance-probes/probe-inventory.json", br#"{"probeinit":{"class":"helper","runner":"generic","excluded":false},"hello":{"class":"conformance","runner":"generic","excluded":false}}"#);
+        std::os::unix::fs::symlink(
+            "carrick-el1-abi/src/lib.rs",
+            root.join("crates/source-link"),
+        )
+        .unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "-qm", "fixture inputs"]);
         let sha = git(root, &["rev-parse", "HEAD"]);
@@ -94,7 +99,22 @@ impl Fixture {
             .lines()
             .filter(|p| *p != ".gitignore")
         {
-            sources.insert(path.to_owned(), hash(&fs::read(root.join(path)).unwrap()));
+            let source = root.join(path);
+            let digest = if fs::symlink_metadata(&source)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+            {
+                hash(
+                    fs::read_link(source)
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes(),
+                )
+            } else {
+                hash(&fs::read(source).unwrap())
+            };
+            sources.insert(path.to_owned(), digest);
         }
         let store = tempfile::tempdir().unwrap();
         let mut executables = Vec::new();

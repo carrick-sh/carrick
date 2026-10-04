@@ -50,6 +50,8 @@ The source inventory conservatively includes all tracked workspace crates and
 root Cargo manifests/lockfile: the EL1 scheduler fixture has local path
 dependencies, whose source changes must also invalidate verification. Restore
 does not need Cargo metadata resolution or registry access for this check.
+Tracked source symlinks are hashed as their Git link declarations without
+following them; executable objects and destination paths reject symlinks.
 The manifest also records `rustc -vV`, Cargo, GNU linker identity, target triple
 per executable, and SHA-256 of every executable. Builds check that the
 checkout and snapshot still agree before publishing.
