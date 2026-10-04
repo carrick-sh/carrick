@@ -1005,8 +1005,9 @@ pub trait GuestMemory {
 
     /// Retain an immutable private file-view recipe without publishing physical
     /// backing. Called only when `supports_lazy_private_file_mmap` is true and
-    /// the map is neither fixed, populated nor locked. Its first permitted
-    /// access must materialize through the backend's MM-owned transaction.
+    /// the map is neither populated nor locked. A fixed mapping is eligible
+    /// only after EL1 owner admission; its first permitted access must use
+    /// the owner's retained-source transaction.
     fn defer_private_file_backed(
         &mut self,
         _address: u64,
