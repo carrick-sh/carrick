@@ -1875,3 +1875,56 @@ el1_delegation::tests --lib -- --nocapture` passed21 tests; source review approv
 The scheduler's queued-thread/lseek fixture now uses a same-region admitted
 inode; all its previous assertions remain. Combined scheduler/EL1/ABI lib tests
 passed117/251/123. No frozen probe or final acceptance closure is claimed.
+
+#### Exact owner wait receipts and owned enrollment — 2026-10-03
+
+PREPARE and selection preserve Editor, Reservations, PendingEdit and Gate
+refusals with the exact admitted handle and the cause queue revision sampled
+before the resource probe. Editor admission returns its observed refusal cause;
+callers do not infer it from a later gate read. The portal uses existing wire
+words in SUSPENDED state (192-byte transfer slot unchanged). Host transfer
+service decodes the receipt and consumes pre-effect suspension instead of
+requiring an ordinary copy completion. Metadata supply/pool integration remains
+open; its ABI vocabulary alone is not an operational wake source.
+
+MmPortalSlots authenticates enrollment against the actual same-region zone,
+bound carrier and live MM incarnation. Enrollment consumes its live-source
+lease, rechecks liveness and revision after linking, and retains the original
+operation in the existing scheduler queue. An explicit host destination keeps
+that operation out of guest SVC replay even when guest executors are available.
+
+A contended queue admission performs one strong try-acquire. Busy transfers the
+same saved record into an owned admission handback; the queue's real unlock
+owns completion. It uses the existing intrusive MPSC CompletionQueue, not a
+second wait engine. Separate in-flight publisher and queued-record counts
+exclude rebind through the final-link/pending-bit gap. Cancellation marks the
+Transferring record and returns the same operation for cleanup. Queue admission
+does not advance resource revisions or wake unrelated resource waiters.
+
+The unlock drain accumulates transfers before callbacks. Each failed strong
+unlock consumes a newly posted admission record, or the single sticky resource
+notification transition; a record cannot be reused before callback. The bound
+is asserted at ZONE_RECORDS+1. The 256-record witness injects16 notifications
+per pass and requires exactly257 passes. Per-object admission queue storage
+appends166912 bytes (10432*16), preserving prior offsets. The shared delegated
+owner bridge's two-word bitmap appends another16 bytes; geometry alone does not
+activate that bridge. Protocol7 hashes both offsets and counts.
+
+Actual red-first commands (same assertions after the fix):
+- `RUSTC_WRAPPER= cargo test -p carrick-el1 prepare_reports_ --lib -- --nocapture`
+  failed0/3: editor/gate produced SelectionChanged; root produced EBUSY16. Green3/3.
+- `RUSTC_WRAPPER= cargo test -p carrick-el1 owner_wait_queue_admission_busy_retains_owned_handback_until_unlock --lib -- --nocapture`
+  failed0/1 with unowned Busy; subsequent owner_wait_ family passed3/3.
+Logs are /tmp/venue3-prepare-cause-{red,green}.log and
+/tmp/venue3-owner-wait-admission-{red,green}.log; both red drivers are retained
+in ignored SDD scratch. New host-destination/admission APIs have positive
+custody, cancellation and deterministic work witnesses, not fabricated baseline
+API reds. Cause enrollment covers real editor/root/gate/pending release before
+enrollment, unrelated release isolation and exactly-once host handback.
+
+`RUSTC_WRAPPER= cargo test -p carrick-sched-core -p carrick-el1 -p carrick-el1-abi --lib`
+passes120/254/124. The intermediate scheduler failure (empty-effect callback
+omitted) was corrected by preserving actual publication callback delivery.
+Full current consumer lowering, pool/request metadata wakes, aggregate prepared
+host CPU custody, checked-memory activation and admitted mirror deletion remain
+open. This unit does not claim either frozen mmap probe or signed acceptance.
