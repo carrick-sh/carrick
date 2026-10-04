@@ -40,7 +40,8 @@ remove landed worktrees to reclaim those outputs.
 
 ```sh
 just worktree-gc          # census only; never deletes
-just worktree-gc --apply  # remove eligible worktrees
+just worktree-gc --apply  # remove eligible managed worktrees
+just worktree-run bash   # hold admission for a foreground worker session
 ```
 
 The census prints size (allocated disk usage), branch, dirty state, landing
@@ -63,14 +64,29 @@ warnings or an ambiguous exit status keep the worktree without prompting.
 Install lsof in your user PATH if needed. `Busy` or `Unknown` never permits
 deletion.
 
-Apply rechecks HEAD, cleanliness and process use immediately before deletion,
-adds owner read/write/search permission to directories (including read-only
+Repo Cargo recipes and the direct signed entry points acquire a shared Rust
+`worktree-run` lifetime guard. Signed entry points retain it through linking,
+signing, tests and scoped EXIT cleanup. The persistent authority is keyed by
+checkout device/inode under the Git common directory, outside removable
+checkouts. GC only considers managed checkouts, claims their exclusive guard
+without waiting, and holds it through deletion. Active admission keeps the
+checkout; a retirement tombstone rejects waiting commands after removal.
+Unmanaged checkouts are reported and preserved.
+
+Apply also acquires existing native Cargo target locks and rechecks HEAD,
+cleanliness and root-visible process use immediately before deletion. Only
+the exact native Cargo lock descriptors owned by GC are exempted from that
+census; unrelated descriptors and cwd stay visible, including GC's own.
+Apply adds owner read/write/search permission to directories (including read-only
 census directories), and uses `git worktree remove` without force. Symlinks are
 not traversed. Git also refuses dirty or newly locked worktrees. Branch refs
-are retained. Quiesce worktree creation/build launches during apply: neither
-Git nor lsof provides an atomic exclusion against a process starting after
-the final check. The command is deliberately dry-run by default; automation
-must explicitly pass `--apply`.
+are retained. This authority covers foreground repo entry points and explicit
+`just worktree-run` sessions. Arbitrary processes and external worker launchers
+do not participate; root lsof still checks them, but its census cannot
+exclude a new arbitrary launch. The command does not claim arbitrary-launch
+safety. Keep such worker sessions under `worktree-run` or a Git worktree lock.
+The separate worker launcher is unchanged. Cleanup is dry-run by default;
+automation must explicitly pass `--apply`.
 
 ## Persistent target cleanup
 
@@ -90,10 +106,16 @@ The output reports allocated bytes reclaimed (or eligible during dry-run).
 Before scanning, the command atomically claims the dev directory's
 `gate-worktree.lock`, then tries an exclusive host lease without waiting.
 If either lock is held, it skips without deleting anything. It retains both
-guards through removal and uses the same root-visible lsof checks as worktree
-cleanup. Run from another checkout when pruning a target containing the
+guards through removal. Before any census or deletion it also holds exclusive
+locks on Cargo's native `target/{debug,release}/.cargo-lock` files. Ordinary
+Cargo builds participate in these locks even when bypassing the host lease.
+These lock files are never pruned, and the stock Perl parent retains their
+descriptors through the complete pruning command. Root-visible lsof checks
+exclude only that parent, which owns lock files rather than artifacts.
+All accounting utilities are checked before scanning; failed or invalid byte
+accounting stops before unlinking the candidate. It uses the same root-visible
+lsof checks as worktree cleanup. Run from another checkout when pruning a target containing the
 running xtask executable: its mapping correctly makes that target busy.
-Build launches that bypass the host lease must be quiesced during apply.
 
 When remote-accept sees less than 40 GiB free, it logs an idle-only pruning
 attempt before refusing. The client's Rust code sends the same find-based
