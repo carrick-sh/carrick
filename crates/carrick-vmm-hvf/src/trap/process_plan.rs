@@ -21,7 +21,7 @@ fn build_projected_fork_mappings(
             continue;
         }
         let spans = tables
-            .fork_backed_spans(projected.mapping.start, projected.mapping.size)
+            .backed_terminal_spans(projected.mapping.start, projected.mapping.size)
             .map_err(|error| {
                 TrapError::Hypervisor(format!("project child fork backing: {error:?}"))
             })?;
@@ -1921,7 +1921,7 @@ mod tests {
             structural_owner: None,
         };
         assert_eq!(
-            tables.fork_backed_spans(va, 0x8000).unwrap(),
+            tables.backed_terminal_spans(va, 0x8000).unwrap(),
             vec![va + 0x4000..va + 0x8000],
             "a mapped VMA's retired predecessor is not an inherited physical alias"
         );

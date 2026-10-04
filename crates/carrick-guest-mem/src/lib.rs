@@ -886,6 +886,18 @@ pub trait GuestMemory {
         Ok(())
     }
 
+    /// Publish a protection edit already admitted by the exact anonymous
+    /// reservation owner. Hidden pages remain unbacked; the owner supplies
+    /// them on first touch. Other backends use their ordinary protection path.
+    fn protect_owner_reserved_range(
+        &mut self,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
+        self.protect_range(address, len, prot)
+    }
+
     /// Bind the pristine backing authority of this exact MM. Copied MMs must
     /// receive a fork-private state before guest execution; shared MMs share it.
     fn bind_deferred_anonymous_state(&mut self, _state: std::sync::Arc<DeferredAnonymousState>) {}
