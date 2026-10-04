@@ -13,13 +13,13 @@ use sha2::{Digest, Sha256};
 use crate::trace_profile::ProfileCaptureStatus;
 
 const PREFIX: &str = "HVPCARRIERLOW";
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) const PROGRAM_SHA256_PLACEHOLDER: &str = "/* CARRICK_HVPCARRIERLOW_PROGRAM_SHA256 */";
 
 /// Render the bundled template's immutable digest into the raw-stream header.
 /// The digest is of the unrendered template, as in AMP1, so a capture from an
 /// edited `--script` cannot authenticate itself.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "freebsd"))]
 pub(crate) fn render_profile_script(template: &str) -> Result<String> {
     let slots = template.match_indices(PROGRAM_SHA256_PLACEHOLDER).count();
     if slots != 1 {
