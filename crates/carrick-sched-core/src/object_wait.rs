@@ -20,18 +20,40 @@ pub use delegated::{
 
 /// Admission capacity, independent of the number of execution slots. Queue
 /// storage is provisioned once with the zone; transfers allocate no entries.
-/// IPC retains the original queue domain. Carrier metadata uses the next
-/// queue; MM permit waits use the following disjoint domain. Round the total
-/// for the queue census bitmap.
+/// IPC retains its original queue domain. Carrier metadata uses the next
+/// queue; MM permits follow it; reservation-pool progress uses the first
+/// rounded spare. Further cause and delegated-file queues follow that range.
 pub const ADDRESS_SPACE_WAIT_BASE: usize = ZONE_RECORDS;
 pub const ORIGINAL_OBJECT_WAIT_QUEUES: usize =
     (ADDRESS_SPACE_WAIT_BASE + 1 + spaces::ADDRESS_SPACES).div_ceil(64) * 64;
-/// A dedicated carrier metadata queue in the rounded, otherwise unused tail.
-const METADATA_WAIT_INDEX: usize = ADDRESS_SPACE_WAIT_BASE + 1 + spaces::ADDRESS_SPACES;
-const _: () = assert!(METADATA_WAIT_INDEX < ORIGINAL_OBJECT_WAIT_QUEUES);
+const METADATA_WAIT_INDEX: usize = ADDRESS_SPACE_WAIT_BASE;
+const RESERVATION_POOL_WAIT_INDEX: usize = ADDRESS_SPACE_WAIT_BASE + 1 + spaces::ADDRESS_SPACES;
 pub const EXTRA_CAUSE_QUEUES: usize = 5 * spaces::ADDRESS_SPACES;
 const DELEGATED_FILE_WAIT_BASE: usize = ORIGINAL_OBJECT_WAIT_QUEUES + EXTRA_CAUSE_QUEUES;
 pub const OBJECT_WAIT_QUEUES: usize = DELEGATED_FILE_WAIT_BASE + DELEGATED_FILE_WAIT_QUEUES;
+
+// Every producer owns one disjoint index range. Keep this a compile-time gate
+// so adding a queue cannot silently alias another owner or its generation.
+const _: () = {
+    let domains = [
+        (1, ZONE_RECORDS),
+        (METADATA_WAIT_INDEX, METADATA_WAIT_INDEX + 1),
+        (ADDRESS_SPACE_WAIT_BASE + 1, RESERVATION_POOL_WAIT_INDEX),
+        (RESERVATION_POOL_WAIT_INDEX, RESERVATION_POOL_WAIT_INDEX + 1),
+        (ORIGINAL_OBJECT_WAIT_QUEUES, DELEGATED_FILE_WAIT_BASE),
+        (DELEGATED_FILE_WAIT_BASE, OBJECT_WAIT_QUEUES),
+    ];
+    let mut i = 0;
+    while i < domains.len() {
+        assert!(domains[i].0 < domains[i].1 && domains[i].1 <= OBJECT_WAIT_QUEUES);
+        let mut j = i + 1;
+        while j < domains.len() {
+            assert!(domains[i].1 <= domains[j].0 || domains[j].1 <= domains[i].0);
+            j += 1;
+        }
+        i += 1;
+    }
+};
 
 const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitCause) -> usize {
     if cause as usize == 0 {
@@ -40,7 +62,7 @@ const fn cause_queue_index(index: usize, cause: spaces::notification::SpaceWaitC
         ORIGINAL_OBJECT_WAIT_QUEUES + (cause as usize - 1) * spaces::ADDRESS_SPACES + index
     }
 }
-pub const OBJECT_WAIT_PROTOCOL: u64 = 8;
+pub const OBJECT_WAIT_PROTOCOL: u64 = 9;
 pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
     let words = [
         OBJECT_WAIT_PROTOCOL,
@@ -59,6 +81,7 @@ pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
         OBJECT_WAIT_QUEUES as u64,
         ORIGINAL_OBJECT_WAIT_QUEUES as u64,
         METADATA_WAIT_INDEX as u64,
+        RESERVATION_POOL_WAIT_INDEX as u64,
         DELEGATED_FILE_WAIT_BASE as u64,
         DELEGATED_FILE_WAIT_QUEUES as u64,
         core::mem::offset_of!(crate::ZoneTables, delegated_file_waits) as u64,
@@ -119,11 +142,11 @@ impl ObjectWaitKey {
             generation: generation.get(),
         }
     }
-    /// Carrier reservation-pool progress uses the original reserved queue,
+    /// Carrier reservation-pool progress uses the first rounded spare queue,
     /// disjoint from metadata, IPC objects and exact-MM prepared-overlap queues.
     pub const fn reservation_pool(generation: core::num::NonZeroU64) -> Self {
         Self {
-            index: ADDRESS_SPACE_WAIT_BASE as u32,
+            index: RESERVATION_POOL_WAIT_INDEX as u32,
             generation: generation.get(),
         }
     }
