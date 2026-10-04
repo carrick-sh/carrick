@@ -83,7 +83,7 @@ with **`HV_DENIED` (`0xfae94007`)**.
 | `just install-hooks` | Install git hooks (once per clone). |
 | `just accept [ARGS]` | Run host and/or signed landing gate (no Docker). |
 | `just remote-accept [ARGS]` | Run `just accept` (no Docker) on the remote gate Mac and fetch the receipt. |
-| `just lease MODE +CMD` | Run command under host flock lease (carrick shared, docker exclusive). |
+| `just lease MODE +CMD` | Run command under host flock lease (carrick shared, gate/docker exclusive). |
 
 **Toolchain:** pin, edition, members, `deny`ed lints: [`rust-toolchain.toml`](rust-toolchain.toml) and
 [`Cargo.toml`](Cargo.toml). CI uses moving `@stable`, which can flag lints
@@ -128,6 +128,20 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
 **Running**
 - **Never run carrick and Docker concurrently** (VMs starve → wrong verdicts).
   Two-phase gate; `carrick‖carrick`/`docker‖docker` OK.
+- **Machine quietness:** `just accept` holds the host lease in exclusive `gate`
+  mode for its entire host/signed run; `scripts/test-signed.sh` holds shared
+  `carrick` mode through build, signing, execution and scoped cleanup. Host
+  tests/compilation compete for CPU and memory too. Both refuse `yes`, `stress`
+  and `stress-ng`, reporting PIDs and parent commands. Deliberate load requires
+  `CARRICK_ALLOW_LOAD=1`; logs record detected load and acceptance receipts
+  include it. Contention fails explicitly after `HOST_LEASE_WAIT_LIMIT` (one
+  hour), never skips. `CARRICK_HOST_LEASE_PATH` changes the lock file for tests;
+  every participant on a gate host must use the same path. Never unlink a live
+  lock file.
+- **Lock order:** remote-accept checkout lock → host lease → build/test work.
+  No host-lease holder may acquire a remote checkout lock. Nested signed runs
+  inherit the gate's descriptor and reuse its exclusive lock without downgrade
+  or reacquisition. Never upgrade a shared lease into a gate/Docker lease.
 - **Stamp `CARRICK_RUN_ID`; reap with [`scripts/sudo/kill.sh`](scripts/sudo/kill.sh) `<run-id>`**,
   never `pkill -f carrick` (kills other lanes/worktrees). `timeout` wrappers can't be lldb-attached and a
   wedged CLI ignores SIGTERM.

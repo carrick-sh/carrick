@@ -2,6 +2,7 @@ pub mod accept;
 pub mod cli;
 pub mod command;
 pub mod host_lease;
+pub mod host_load;
 pub mod impact;
 pub mod ledger_merge;
 pub mod probe_coverage;
