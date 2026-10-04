@@ -7,7 +7,7 @@ teardown), the replaced child resumes at this image's `_start` and issues a
 single `exit_group(1)` — nothing else. It proves the parent reads a NON-ZERO
 execve-d exit status faithfully.
 
-The smoke script (`scripts/kvm-smoke-lima.sh`) stages this binary at
+The retired 1:1 smoke runner staged this binary at
 `/tmp/carrick-exec-target-false`, the absolute path baked into the driver.
 
 ## Build (Mac-native, no extra toolchain)

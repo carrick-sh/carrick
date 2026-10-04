@@ -433,8 +433,7 @@ pub(crate) enum Commands {
         find_text: Option<String>,
     },
     /// `run-elf` drives a freestanding ELF straight through the HVF run loop
-    /// (`run_static_elf_with_hvf_…`), macOS-only. On Linux use `carrick run
-    /// <oci>`, or the `carrick-kvm run-elf` dev driver for a bare ELF.
+    /// (`run_static_elf_with_hvf_…`), macOS-only.
     #[cfg(feature = "platform-macos")]
     RunElf {
         #[clap(flatten)]

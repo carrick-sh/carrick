@@ -58,8 +58,8 @@ use carrick_runtime::elf::{inspect_elf, plan_elf_load};
 use carrick_runtime::memory::AddressSpace;
 use carrick_vfs::rootfs::RootFs;
 // HVF-only diagnostics — the `run-elf`, `trap-capabilities`, and full
-// `syscalls`-table subcommands are macOS-only for now (Linux uses `carrick run
-// <oci>` / `carrick-kvm run-elf`; per-number `syscalls <n>` works on both).
+// `syscalls`-table subcommands are macOS-only for now; per-number
+// `syscalls <n>` works across supported hosts.
 #[cfg(feature = "platform-macos")]
 use carrick_runtime::syscall::aarch64_table;
 use carrick_runtime::syscall::lookup_aarch64;

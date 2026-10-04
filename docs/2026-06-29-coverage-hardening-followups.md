@@ -4,7 +4,7 @@ Companion to [`2026-06-29-coverage-regression-audit.md`](2026-06-29-coverage-reg
 The audit's R1–R7 + Phase-1 landed on branch `feat/coverage-regression-hardening`
 (seccomp live-bug fix, the futex errno-ABI guard + cross-backend observability,
 the x86 syscall-completeness gate, sigframe guards, the CI cross-checks +
-dormant kvm-smoke lane, the carrick-portable hoists, and the carrick-runtime
+retired AArch64 smoke lane, the carrick-portable hoists, and the carrick-runtime
 Phase-1 guards). What remains is the tail that **cannot meet the project's
 "Definition of Done = live-verified end-to-end" bar from an Apple-Silicon dev
 host** — it needs the FreeBSD/NetBSD/Linux fleet (and, for the reclaim path,

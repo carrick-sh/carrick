@@ -6,7 +6,7 @@ replaces the guest image in place (slot remap + sysreg reprogram, no VM
 teardown), the replaced child resumes at this image's `_start` and issues a
 single `exit_group(0)` — nothing else.
 
-The smoke script (`scripts/kvm-smoke-lima.sh`) stages this binary at
+The retired 1:1 smoke runner staged this binary at
 `/tmp/carrick-exec-target-true`, the absolute path baked into the driver.
 
 ## Build (Mac-native, no extra toolchain)
