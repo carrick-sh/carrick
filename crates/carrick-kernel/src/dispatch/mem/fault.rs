@@ -935,6 +935,23 @@ impl<'a> MemView<'a> {
     }
 
     pub(crate) fn mmap_fault_is_sigbus(&self, addr: u64) -> bool {
+        crate::probes::hvpatch_el1_fault_root_mapping_with(addr, || {
+            let owner = self.mem().lock().delegated_root().cloned();
+            let mapping = owner.and_then(|root| {
+                root.with_root(|model| Ok(model.mapping(addr)))
+                    .ok()
+                    .flatten()
+            });
+            mapping.map_or((0, 0, 0, 0), |mapping| {
+                let source = mapping.host_backing;
+                (
+                    mapping.range.start(),
+                    mapping.range.end(),
+                    source.map_or(0, |backing| backing.handle().get()),
+                    source.map_or(0, |backing| backing.offset()),
+                )
+            })
+        });
         let (host_bus, owner) = {
             let authority = self.mem();
             let mem = authority.lock();
