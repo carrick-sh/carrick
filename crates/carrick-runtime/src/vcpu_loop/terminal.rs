@@ -19,6 +19,7 @@ pub(crate) enum CloneAdmissionClose {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CloneAdmissionKind {
     ThreadClone,
+    BornThreadAdoption,
     ProcessFork { owner: ThreadId },
 }
 
@@ -157,7 +158,9 @@ impl CloneAdmissionGate {
     pub(crate) fn enroll_kind(self: &Arc<Self>, kind: CloneAdmissionKind) -> CloneEnrollment {
         let mut state = self.state.lock();
         match state.closing {
-            Some(CloneAdmissionClose::Fork { .. }) => {
+            Some(CloneAdmissionClose::Fork { .. })
+                if kind != CloneAdmissionKind::BornThreadAdoption =>
+            {
                 return CloneEnrollment::Deferred {
                     observed_epoch: state.change_epoch,
                 };
@@ -165,7 +168,7 @@ impl CloneAdmissionGate {
             Some(CloneAdmissionClose::Exec { .. } | CloneAdmissionClose::Exit { .. }) => {
                 return CloneEnrollment::Refused;
             }
-            None => {}
+            Some(CloneAdmissionClose::Fork { .. }) | None => {}
         }
         let Some(in_flight) = state.in_flight.checked_add(1) else {
             return CloneEnrollment::Refused;
@@ -181,6 +184,14 @@ impl CloneAdmissionGate {
 
     pub(crate) fn enroll_thread_clone(self: &Arc<Self>) -> CloneEnrollment {
         self.enroll_kind(CloneAdmissionKind::ThreadClone)
+    }
+
+    /// The birth already belongs to the kernel graph. First host entry must
+    /// join the same publication drain as host clones before it can create a
+    /// runtime member. A fork may finish adopting its pre-existing siblings;
+    /// exec and exit own their retirement instead.
+    pub(crate) fn enroll_born_thread_adoption(self: &Arc<Self>) -> CloneEnrollment {
+        self.enroll_kind(CloneAdmissionKind::BornThreadAdoption)
     }
 
     pub(crate) fn enroll_process_fork(self: &Arc<Self>, owner: ThreadId) -> CloneEnrollment {
@@ -361,7 +372,7 @@ impl CloneAdmissionPermit {
         match state.closing {
             Some(CloneAdmissionClose::Exec { .. } | CloneAdmissionClose::Exit { .. }) => true,
             Some(CloneAdmissionClose::Fork { owner, generation }) => match self.kind {
-                CloneAdmissionKind::ThreadClone => false,
+                CloneAdmissionKind::ThreadClone | CloneAdmissionKind::BornThreadAdoption => false,
                 CloneAdmissionKind::ProcessFork {
                     owner: permit_owner,
                 } => permit_owner != owner || self.generation != generation,
