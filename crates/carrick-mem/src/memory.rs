@@ -4765,7 +4765,8 @@ const EL1_VECTOR_HOOK_OFFSET: usize = 0x1000;
 /// The EL0 IRQ hook ([`El1IrqMode::Gic`]): the lower-EL IRQ slot branches
 /// here, and it enters the EL1 image with an interrupt frame.
 const EL0_IRQ_HOOK_OFFSET: usize = 0x2000;
-/// The EL0 Data Abort hook: the lower-EL sync slot branches here for EC 0x24 data aborts,
+/// The EL0 fault hook: the lower-EL sync slot branches here for EC 0x20
+/// instruction aborts and EC 0x24 data aborts,
 /// saving all architectural registers, ESR and FAR, calling the EL1 image, and forwarding
 /// via legacy HVC if unhandled.
 const EL0_FAULT_HOOK_OFFSET: usize = 0x3000;
@@ -4800,7 +4801,7 @@ enum HookEntry {
     /// syndrome is 0, and a forward leaves through `hvc #4` at that EL0
     /// boundary.
     Irq,
-    /// An EL0 Data Abort (EC 0x24): a forward restores all registers and
+    /// An EL0 instruction or data abort (EC 0x20 or 0x24): a forward restores all registers and
     /// leaves through `legacy_hvc` (`hvc #2`).
     Fault,
 }
@@ -5747,11 +5748,15 @@ fn el1_vectors_bytes_mailbox_with_layout(
     emit(&mut bytes, &mut cursor, AARCH64_MSR_TPIDR_EL1_X16_OPCODE);
     emit(&mut bytes, &mut cursor, AARCH64_MRS_ESR_EL1_X16_OPCODE);
     emit(&mut bytes, &mut cursor, AARCH64_UBFX_X16_X16_26_6_OPCODE);
+    emit(&mut bytes, &mut cursor, enc_cmp_xn_imm(16, 0x20));
+    let instruction_abort_branch = cursor;
+    emit(&mut bytes, &mut cursor, 0);
     emit(&mut bytes, &mut cursor, AARCH64_CMP_X16_DATA_ABORT_OPCODE);
     let not_data_abort_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
 
-    // Data abort (EC 0x24):
+    // Instruction or data abort (EC 0x20 or 0x24):
+    let owner_fault = cursor;
     emit(&mut bytes, &mut cursor, AARCH64_MRS_TPIDR_EL1_X16_OPCODE);
     let fault_dest_branch = cursor;
     emit(&mut bytes, &mut cursor, 0);
@@ -5766,6 +5771,11 @@ fn el1_vectors_bytes_mailbox_with_layout(
         &mut bytes,
         not_svc_branch,
         enc_bne(not_svc_branch as u64, not_svc as u64),
+    );
+    put(
+        &mut bytes,
+        instruction_abort_branch,
+        enc_beq(instruction_abort_branch as u64, owner_fault as u64),
     );
     put(
         &mut bytes,
@@ -8998,6 +9008,14 @@ mod el1_shim_tests {
     fn el1_data_abort_vector_routing_and_hook_installation() {
         let enabled = el1_vectors_bytes_mailbox_configured(true, false, true);
         let disabled = el1_vectors_bytes_mailbox_configured(true, false, false);
+
+        assert!(
+            enabled
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+                .any(|op| op == enc_cmp_xn_imm(16, 0x20)),
+            "EL0 instruction aborts must enter the EL1 owner fault hook"
+        );
 
         // Verify Data Abort opcode and UBFX EC extraction opcode are emitted
         assert!(
