@@ -3706,6 +3706,14 @@
       "rationale": "Test-support per-thread counter of OCI layer merges, read by the getdents64 structural budget tests; compiled only with cfg(test) or the test-support feature."
     },
     {
+      "kind": "thread_local",
+      "file": "crates/carrick-vfs/src/fs_backend/host.rs",
+      "symbol": "ORPHAN_DISCOVERY_ENTRIES",
+      "fingerprint": "51f84ef279e3463e2a073f9d00e30f554d80edacebac7f6da3e082ecc71dc39f",
+      "classification": "test_only",
+      "rationale": "#[cfg(test)] thread-local count of root entries inspected by orphan discovery; read only by fs_backend tests to assert the bounded startup discovery budget structurally. Compiled out of non-test builds; holds no container or carrier state."
+    },
+    {
       "kind": "static",
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
       "symbol": "VCPU_HVC_NOT_SVC_BY_EC",
