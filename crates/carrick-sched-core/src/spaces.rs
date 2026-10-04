@@ -76,6 +76,14 @@ struct JournalSlot {
     end_prot: AtomicU64,
 }
 
+/// Refusal from the exact admission observation, never inferred afterward.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditAdmissionRefusal {
+    Stale,
+    Editor,
+    Gate,
+}
+
 /// One published address space.
 #[repr(C, align(64))]
 pub struct SpaceEntry {
@@ -592,26 +600,41 @@ impl AddressSpaces {
         owner: NonZeroU64,
         venue: Option<SpaceReleaseVenue<'a>>,
     ) -> Option<SpaceEditor<'a>> {
+        self.try_begin_edit_cause(index, key, owner, venue).ok()
+    }
+    pub fn try_begin_edit_cause<'a>(
+        &'a self,
+        index: SpaceIndex,
+        key: u64,
+        owner: NonZeroU64,
+        venue: Option<SpaceReleaseVenue<'a>>,
+    ) -> Result<SpaceEditor<'a>, EditAdmissionRefusal> {
         let entry = self.entry(index);
         assert!(
             !entry.notifications.attached() || venue.is_some(),
             "admitted editor requires release venue"
         );
         if venue.is_some_and(|v| !core::ptr::eq(&v.zone.spaces, self)) {
-            return None;
+            return Err(EditAdmissionRefusal::Stale);
         }
         // Take live source custody before publishing an editor other probes
         // can observe. A closing admitted source refuses before the CAS.
         let release = if entry.notifications.attached() {
-            let venue = venue?;
-            Some((venue, venue.zone.editor_notification(index, key)?))
+            let venue = venue.ok_or(EditAdmissionRefusal::Stale)?;
+            Some((
+                venue,
+                venue
+                    .zone
+                    .editor_notification(index, key)
+                    .ok_or(EditAdmissionRefusal::Stale)?,
+            ))
         } else {
             None
         };
         entry
             .active_editor
             .compare_exchange(0, owner.get(), Ordering::SeqCst, Ordering::SeqCst)
-            .ok()?;
+            .map_err(|_| EditAdmissionRefusal::Editor)?;
         let editor = SpaceEditor {
             entry,
             owner,
@@ -620,10 +643,13 @@ impl AddressSpaces {
             index,
             key,
         };
-        if entry.gate.load(Ordering::SeqCst) != 0 || entry.key.load(Ordering::SeqCst) != key {
-            return None; // The same RAII release publishes the rollback edge.
+        if entry.key.load(Ordering::SeqCst) != key {
+            return Err(EditAdmissionRefusal::Stale);
         }
-        Some(editor)
+        if entry.gate.load(Ordering::SeqCst) != 0 {
+            return Err(EditAdmissionRefusal::Gate); // RAII publishes rollback.
+        }
+        Ok(editor)
     }
 
     /// Claim a never-runnable child while its publication gate remains closed.

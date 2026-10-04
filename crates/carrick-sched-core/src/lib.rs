@@ -1050,6 +1050,11 @@ pub struct ZoneTables {
     space_cause_waits: [object_wait::ObjectQueue; object_wait::EXTRA_CAUSE_QUEUES],
     /// Exact delegated-inode completion domain, appended after MM causes.
     delegated_file_waits: [object_wait::ObjectQueue; object_wait::DELEGATED_FILE_WAIT_QUEUES],
+    /// Saved host enrollment attempts handed back by the actual queue release.
+    object_admission_handbacks:
+        [completion_queue::CompletionQueue; object_wait::OBJECT_WAIT_QUEUES],
+    /// Indexed owner-only delegated inode callbacks; no guest record is needed.
+    delegated_host_pending: [AtomicU64; object_wait::DELEGATED_FILE_WAIT_QUEUES.div_ceil(64)],
 }
 
 /// How a bucket lock waits: EL1 gives up after a bounded spin (and forwards
