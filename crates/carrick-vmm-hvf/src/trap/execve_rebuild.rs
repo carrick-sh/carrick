@@ -10,6 +10,49 @@ mod n1_tests {
     use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
     use std::{cell::RefCell, collections::BTreeMap, num::NonZeroU64, sync::Arc};
 
+    /// The current production successor constructor accepts both an admitted
+    /// owner identity and host table authority. This must stay red until the
+    /// common sealed constructor replaces that capability pair; the physical
+    /// switch reduction below cannot close this ownership obligation.
+    #[test]
+    fn n1_sealed_exec_successor_has_no_host_builder_or_editor() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let region = Region::new();
+        let zone = region.zone();
+        let root = 0x8000_0000;
+        let mm = admit(&region, &zone.spaces, 78, root, 2, 16);
+        let view = nodes(&region);
+        let portal = MmPortal::new(
+            custody.transfer_carrier,
+            region.table(),
+            &zone.spaces,
+            &view,
+        );
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let authority = carrick_guest_mem::UserMemoryAuthority::from_owner(handle);
+        let host_builder = carrick_mmu_core::aarch64::PageTableManager::new(
+            vec![0; 6 * 4096],
+            root,
+            carrick_mmu_core::aarch64::PageTableLayoutConfig::new(VA, 6 * 4096, 0, 0),
+        );
+        let state = MmAccessState::new(
+            carrick_aarch64::Stage1Authority::new_with_manager(Some(host_builder)),
+            authority,
+            Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
+            crate::trap::foreign_mm::LiveBacking::immediate(custody),
+        );
+        assert_eq!(state.protections.owner(), Some(handle));
+        assert!(state.protections.legacy().is_none());
+        assert!(
+            state.page_tables_authority().with_manager(|_| ()).is_none(),
+            "admitted exec successor retained a host manager: MmAccessState::new still accepts an owner/editor capability pair"
+        );
+    }
+
     /// This exercises the production physical-switch and prepared-copy owners.
     /// It does not simulate the absent owner ExecPrepare/ExecCommit operations.
     #[test]
