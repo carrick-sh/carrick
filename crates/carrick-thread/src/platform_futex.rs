@@ -5,7 +5,7 @@
 //! thread of one carrier, so both the private and the `MAP_SHARED` guest futex
 //! are intra-process rendezvous: the private path parks on the per-process
 //! [`crate::thread::FutexTable`], the shared path on the carrier-wide
-//! `carrier_shared_futex_table`. No host futex primitive is involved.
+//! [`SharedFutexTable`] owned by that kernel. No host futex primitive is involved.
 //!
 //! This replaces the per-host `SharedFutexSyscall` shim (macOS
 //! `os_sync_wait_on_address`, Linux bare `SYS_futex`, FreeBSD `_umtx_op`),
@@ -30,13 +30,14 @@ use crate::thread::{FutexKey, FutexTable, FutexWaitOutcome};
 /// private path, the carrier-wide table for the shared path.
 pub struct FutexTableFutex {
     table: Arc<FutexTable>,
+    shared: SharedFutexTable,
 }
 
 impl FutexTableFutex {
     /// Wrap the process-private table. The runtime loop separately registers
     /// it beside the exact container's thread registry for helper-thread wakes.
-    pub fn new(table: Arc<FutexTable>) -> Self {
-        Self { table }
+    pub fn new(table: Arc<FutexTable>, shared: SharedFutexTable) -> Self {
+        Self { table, shared }
     }
 }
 
@@ -47,9 +48,34 @@ impl FutexTableFutex {
 /// per-process [`FutexTable`]. A shared futex must rendezvous ACROSS guest
 /// processes, so it cannot live in a table that fork replaces — parent and
 /// child would park in different tables and never meet.
-pub fn carrier_shared_futex_table() -> &'static Arc<FutexTable> {
-    static TABLE: std::sync::OnceLock<Arc<FutexTable>> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| Arc::new(FutexTable::new()))
+#[derive(Clone)]
+pub struct SharedFutexTable(Arc<FutexTable>);
+
+impl SharedFutexTable {
+    /// Establish a new kernel's shared-word authority. Descendants clone it;
+    /// they do not replace it when creating a fresh private futex table.
+    pub fn new() -> Self {
+        Self(Arc::new(FutexTable::new()))
+    }
+
+    pub fn table(&self) -> &Arc<FutexTable> {
+        &self.0
+    }
+}
+
+impl Default for SharedFutexTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for SharedFutexTable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("SharedFutexTable")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
+    }
 }
 
 /// Name the queue by its exact word identity. Hashing selects a shard, while
@@ -93,9 +119,6 @@ impl PlatformFutex for FutexTableFutex {
         self.table.wake(addr, n)
     }
 
-    /// Wait on a `MAP_SHARED` (cross-process) futex. The deadline/slice/interrupt
-    /// loop is shared; only the single kernel wait slice + its host-errno
-    /// classification is the host's (`SharedFutexSyscall::wait_one_slice`).
     /// Wait on a `MAP_SHARED` guest futex — in-process, no host primitive.
     ///
     /// Under the HVPatch kernel every Linux process is a THREAD of one carrier
@@ -122,7 +145,7 @@ impl PlatformFutex for FutexTableFutex {
         interrupted: &dyn Fn() -> bool,
         wait_enrolled: &dyn Fn(),
     ) -> i64 {
-        let table = carrier_shared_futex_table();
+        let table = self.shared.table();
         let waiter_key = carrier_shared_futex_key(location);
         // SAFETY: the futex word is a live, 4-byte-aligned host word for as
         // long as the guest mapping naming it is alive; the wait does not
@@ -146,7 +169,11 @@ impl PlatformFutex for FutexTableFutex {
         // released. `FutexTable::wake` reports `unparked_threads`, and shared
         // waiters park word-validated (never generation-validated), so a wake
         // that unparks nobody genuinely woke nobody.
-        i64::from(carrier_shared_futex_table().wake(carrier_shared_futex_key(location), n))
+        i64::from(
+            self.shared
+                .table()
+                .wake(carrier_shared_futex_key(location), n),
+        )
     }
 
     /// `FUTEX_CMP_REQUEUE` on a shared futex: a real queue relink
@@ -163,7 +190,7 @@ impl PlatformFutex for FutexTableFutex {
         wake: u32,
         requeue: u32,
     ) -> (u32, u32) {
-        carrier_shared_futex_table().requeue(
+        self.shared.table().requeue(
             carrier_shared_futex_key(from),
             carrier_shared_futex_key(to),
             wake,
@@ -181,13 +208,13 @@ impl PlatformFutex for FutexTableFutex {
         // Shared waiters park in the carrier-wide table, not the per-process
         // one — a signal that only poked `self.table` would leave a shared
         // waiter asleep until its timeout.
-        carrier_shared_futex_table().notify_signal_pending();
+        self.shared.table().notify_signal_pending();
     }
 
     #[inline]
     fn notify_signal_pending_for(&self, tid: ThreadId) {
         self.table.notify_signal_pending_for(tid);
-        carrier_shared_futex_table().notify_signal_pending_for(tid);
+        self.shared.table().notify_signal_pending_for(tid);
     }
 }
 
@@ -381,6 +408,75 @@ mod tests {
     use carrick_hal::{HostVa, SharedFutexFileIdentity};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    #[test]
+    fn two_shared_authorities_have_no_cross_instance_entries() {
+        for count in [1, 8, 32, 128] {
+            let shared_a = SharedFutexTable::new();
+            let shared_b = SharedFutexTable::new();
+            // A descendant replaces only the private table. Its shared wakes
+            // must still find A's queues, never B's identical file keys.
+            let descendant_a = FutexTableFutex::new(Arc::new(FutexTable::new()), shared_a.clone());
+            let peer_b = FutexTableFutex::new(Arc::new(FutexTable::new()), shared_b.clone());
+            let word = std::sync::atomic::AtomicU32::new(7);
+            let mut subscriptions = Vec::new();
+            let hits_a = Arc::new(AtomicUsize::new(0));
+            let hits_b = Arc::new(AtomicUsize::new(0));
+            let locations: Vec<_> = (0..count)
+                .map(|offset| SharedFutexLocation::File {
+                    word: HostVa(std::ptr::from_ref(&word) as usize),
+                    identity: SharedFutexFileIdentity {
+                        device: 42,
+                        inode: 73,
+                    },
+                    offset: offset * 4,
+                    waiter_key: offset as usize,
+                })
+                .collect();
+            for location in &locations {
+                for (shared, hits) in [(&shared_b, &hits_b), (&shared_a, &hits_a)] {
+                    let hits = Arc::clone(hits);
+                    let wait = shared
+                        .table()
+                        .prepare_wait(carrier_shared_futex_key(*location));
+                    let enrollment = shared.table().subscribe_generation(
+                        wait,
+                        Arc::new(move |_| {
+                            hits.fetch_add(1, Ordering::Relaxed);
+                        }),
+                    );
+                    match enrollment {
+                        FutexGenerationEnrollment::Subscribed(subscription) => {
+                            subscriptions.push(subscription)
+                        }
+                        FutexGenerationEnrollment::Ready(_) => panic!("fresh wait must subscribe"),
+                    }
+                }
+            }
+            assert_eq!(shared_a.table().live_shared_key_count(), count as usize);
+            assert_eq!(shared_b.table().live_shared_key_count(), count as usize);
+            for location in &locations {
+                assert_eq!(
+                    descendant_a.shared_wake(*location, location.waiter_key(), u32::MAX),
+                    1
+                );
+                assert_eq!(
+                    descendant_a.shared_wake(*location, location.waiter_key(), u32::MAX),
+                    0,
+                    "zero foreign waiters in A"
+                );
+            }
+            assert_eq!(hits_a.load(Ordering::Relaxed), count as usize);
+            assert_eq!(hits_b.load(Ordering::Relaxed), 0);
+            for location in &locations {
+                assert_eq!(peer_b.shared_wake(*location, location.waiter_key(), 1), 1);
+            }
+            assert_eq!(hits_b.load(Ordering::Relaxed), count as usize);
+            drop(subscriptions);
+            assert_eq!(shared_a.table().live_shared_key_count(), 0);
+            assert_eq!(shared_b.table().live_shared_key_count(), 0);
+        }
+    }
+
     /// A shared guest futex rendezvous is now entirely in-process: one waiter
     /// parks on the carrier-wide table and a wake on the SAME `waiter_key`
     /// releases it, with no host primitive involved.
@@ -392,7 +488,10 @@ mod tests {
             word: HostVa(addr),
             waiter_key: addr,
         };
-        let futex = Arc::new(FutexTableFutex::new(Arc::new(FutexTable::default())));
+        let futex = Arc::new(FutexTableFutex::new(
+            Arc::new(FutexTable::default()),
+            SharedFutexTable::new(),
+        ));
 
         let waiter = {
             let futex = Arc::clone(&futex);
@@ -405,7 +504,12 @@ mod tests {
         // is not a lost wake — it advances the bucket generation, so the waiter
         // returns without parking — but then the wake reports 0 and this test
         // would be asserting the wrong thing.
-        while carrier_shared_futex_table().waiter_count(carrier_shared_futex_key(location)) == 0 {
+        while futex
+            .shared
+            .table()
+            .waiter_count(carrier_shared_futex_key(location))
+            == 0
+        {
             std::thread::yield_now();
         }
         // The wake is keyed on `waiter_key`, which is what makes two guest
@@ -449,7 +553,8 @@ mod tests {
             offset,
             waiter_key: second_hint,
         };
-        let table = carrier_shared_futex_table();
+        let shared = SharedFutexTable::new();
+        let table = shared.table();
         let first_key = carrier_shared_futex_key(first);
         let second_key = carrier_shared_futex_key(second);
         assert_ne!(first_key, second_key);
@@ -673,7 +778,8 @@ mod tests {
             word: HostVa(addr),
             waiter_key: key,
         };
-        let table = carrier_shared_futex_table();
+        let shared = SharedFutexTable::new();
+        let table = shared.table();
         let generation = table.prepare_wait(carrier_shared_futex_key(location));
         let calls = Arc::new(AtomicUsize::new(0));
         let observed = Arc::clone(&calls);
@@ -686,7 +792,7 @@ mod tests {
             FutexGenerationEnrollment::Subscribed(subscription) => subscription,
             FutexGenerationEnrollment::Ready(_) => panic!("stable generation must subscribe"),
         };
-        let futex = FutexTableFutex::new(Arc::new(FutexTable::default()));
+        let futex = FutexTableFutex::new(Arc::new(FutexTable::default()), shared.clone());
         assert_eq!(futex.shared_wake(location, key, 1), 1);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -701,7 +807,7 @@ mod tests {
             word: HostVa(addr),
             waiter_key: addr,
         };
-        let futex = FutexTableFutex::new(Arc::new(FutexTable::default()));
+        let futex = FutexTableFutex::new(Arc::new(FutexTable::default()), SharedFutexTable::new());
         assert_eq!(
             futex.shared_wait(location, 7, test_tid(), None, &|| false, &|| {}),
             0,
@@ -718,7 +824,7 @@ mod tests {
             word: HostVa(addr),
             waiter_key: addr,
         };
-        let futex = FutexTableFutex::new(Arc::new(FutexTable::default()));
+        let futex = FutexTableFutex::new(Arc::new(FutexTable::default()), SharedFutexTable::new());
         let mark_enrolled = || {
             state.store(1, Ordering::SeqCst);
         };

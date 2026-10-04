@@ -960,6 +960,7 @@ impl SysvIpcService {
     }
 
     fn msgsnd(
+        shared: &carrick_thread::platform_futex::SharedFutexTable,
         namespace: &SysvIpcNamespace,
         id: MsgQueueId,
         creds: &crate::kernel::Credentials,
@@ -967,7 +968,7 @@ impl SysvIpcService {
         payload: &[u8],
         operator: i32,
     ) -> Result<bool, LinuxErrno> {
-        msg_queue_try_send(namespace, id, creds, msg_type, payload, operator)
+        msg_queue_try_send(shared, namespace, id, creds, msg_type, payload, operator)
     }
 
     fn msgrcv<M: CurrentMmMemory>(
@@ -1531,7 +1532,10 @@ impl SysvWaitState {
         }
     }
 
-    fn wait_outcome(self) -> DispatchOutcome {
+    fn wait_outcome(
+        self,
+        shared: &carrick_thread::platform_futex::SharedFutexTable,
+    ) -> DispatchOutcome {
         let waiter_key = self.blocked_id as usize;
         DispatchOutcome::WaitOnSharedWord {
             location: carrick_guest_mem::SharedFutexLocation::Direct {
@@ -1539,7 +1543,7 @@ impl SysvWaitState {
                 waiter_key,
             },
             waiter_key,
-            generation: carrick_thread::platform_futex::carrier_shared_futex_table().prepare_wait(
+            generation: shared.table().prepare_wait(
                 carrick_thread::platform_futex::carrier_aux_futex_key(waiter_key as u64),
             ),
             value: self.word.load(),
@@ -1586,11 +1590,15 @@ impl SysvWaitState {
 ///
 /// The host wake is kept for the DSR native lanes, which really do run separate
 /// host processes and still rendezvous on the physical page.
-fn wake_msg_queue_waiters(path: &Path, id: MsgQueueId) {
+fn wake_msg_queue_waiters(
+    path: &Path,
+    id: MsgQueueId,
+    shared: &carrick_thread::platform_futex::SharedFutexTable,
+) {
     if let Ok(word) = MsgQueueWaitWord::open(path) {
         word.wake_all();
     }
-    carrick_thread::platform_futex::carrier_shared_futex_table().wake(
+    shared.table().wake(
         carrick_thread::platform_futex::carrier_aux_futex_key(id.raw() as u64),
         u32::MAX,
     );
@@ -2546,6 +2554,7 @@ impl<'a> IpcView<'a> {
             let mut saw_would_block = false;
             loop {
                 match SysvIpcService::msgsnd(
+                    cx.kernel.kernel().shared_futex(),
                     this.sysv,
                     msqid,
                     &creds,
@@ -2566,6 +2575,7 @@ impl<'a> IpcView<'a> {
                         }
                         if let Ok(token) = SysvWaitState::for_queue(msqid) {
                             match SysvIpcService::msgsnd(
+                                cx.kernel.kernel().shared_futex(),
                                 this.sysv,
                                 msqid,
                                 &creds,
@@ -2580,7 +2590,7 @@ impl<'a> IpcView<'a> {
                                     if sysv_msg_wait_interrupted(this, cx.kernel, tid) {
                                         return Ok(DispatchOutcome::errno(LINUX_EINTR));
                                     }
-                                    return Ok(token.wait_outcome());
+                                    return Ok(token.wait_outcome(cx.kernel.kernel().shared_futex()));
                                 }
                                 Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
                                     return Ok(DispatchOutcome::errno(
@@ -2682,7 +2692,7 @@ impl<'a> IpcView<'a> {
                                     if sysv_msg_wait_interrupted(this, cx.kernel, tid) {
                                         return Ok(DispatchOutcome::errno(LINUX_EINTR));
                                     }
-                                    return Ok(token.wait_outcome());
+                                    return Ok(token.wait_outcome(cx.kernel.kernel().shared_futex()));
                                 }
                                 Err(errno) if errno == LINUX_EINVAL && saw_would_block => {
                                     return Ok(DispatchOutcome::errno(
@@ -3077,6 +3087,7 @@ fn msgget_open(
 }
 
 fn msg_queue_try_send(
+    shared: &carrick_thread::platform_futex::SharedFutexTable,
     namespace: &SysvIpcNamespace,
     id: MsgQueueId,
     creds: &crate::kernel::Credentials,
@@ -3106,7 +3117,7 @@ fn msg_queue_try_send(
     queue.stime = unix_now_secs();
     queue.lspid = operator;
     drop(queue);
-    wake_msg_queue_waiters(&entry.path, id);
+    wake_msg_queue_waiters(&entry.path, id, shared);
     Ok(true)
 }
 
@@ -3203,7 +3214,7 @@ fn msg_queue_receive<M: CurrentMmMemory>(
         queue.rtime = unix_now_secs();
         queue.lrpid = operator;
         drop(queue);
-        wake_msg_queue_waiters(&entry.path, id);
+        wake_msg_queue_waiters(&entry.path, id, cx.kernel.kernel().shared_futex());
     }
     Ok(Some(copy_len))
 }
@@ -3334,7 +3345,7 @@ fn sysv_msgctl<M: CurrentMmMemory>(
             }
             let _ = std::fs::remove_file(path);
             let _ = std::fs::remove_file(msg_queue_wait_path(path));
-            carrick_thread::platform_futex::carrier_shared_futex_table().wake(
+            cx.kernel.kernel().shared_futex().table().wake(
                 carrick_thread::platform_futex::carrier_aux_futex_key(msqid.raw() as u64),
                 u32::MAX,
             );
@@ -5784,6 +5795,7 @@ mod ipc_set_tests {
 
             assert!(
                 msg_queue_try_send(
+                    &dispatcher.shared_futex(),
                     &dispatcher.sysv,
                     id,
                     &creds,
@@ -5837,7 +5849,8 @@ mod ipc_set_tests {
             let wait = SysvWaitState::for_tests(0x5a5a).expect("owned SysV wait state");
             assert_send_static(&wait);
             let owned_fd = wait.wait_word_fd();
-            let outcome = wait.wait_outcome();
+            let outcome =
+                wait.wait_outcome(&carrick_thread::platform_futex::SharedFutexTable::new());
             match outcome {
                 DispatchOutcome::WaitOnSharedWord {
                     waiter_key,

@@ -8,15 +8,15 @@
 
 use std::sync::Arc;
 
-use carrick_thread::platform_futex::FutexTableFutex;
+use carrick_thread::platform_futex::{FutexTableFutex, SharedFutexTable};
 use carrick_thread::thread::FutexTable;
 
 /// The KVM `PlatformFutex`. Construct with [`make_kvm_futex`].
 pub type KvmFutex = FutexTableFutex;
 
 /// Wrap the process-private `FutexTable`.
-pub fn make_kvm_futex(table: Arc<FutexTable>) -> KvmFutex {
-    FutexTableFutex::new(table)
+pub fn make_kvm_futex(table: Arc<FutexTable>, shared: SharedFutexTable) -> KvmFutex {
+    FutexTableFutex::new(table, shared)
 }
 
 #[cfg(test)]
@@ -33,7 +33,10 @@ mod tests {
     /// `private_wake` from another thread (delegated straight to `FutexTable`).
     #[test]
     fn private_wait_woken_by_other_thread() {
-        let futex = Arc::new(make_kvm_futex(Arc::new(FutexTable::new())));
+        let futex = Arc::new(make_kvm_futex(
+            Arc::new(FutexTable::new()),
+            SharedFutexTable::new(),
+        ));
         const ADDR: u64 = 0x4000;
         let f2 = Arc::clone(&futex);
         let waiter = thread::spawn(move || {
@@ -59,7 +62,7 @@ mod tests {
     /// PRIVATE path: with no waker, `private_wait` returns `TimedOut`.
     #[test]
     fn private_wait_times_out() {
-        let futex = make_kvm_futex(Arc::new(FutexTable::new()));
+        let futex = make_kvm_futex(Arc::new(FutexTable::new()), SharedFutexTable::new());
         let outcome = futex.private_wait(
             0x5000,
             0,

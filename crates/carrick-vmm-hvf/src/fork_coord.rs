@@ -87,7 +87,10 @@ mod tests {
 
     fn dyn_context() -> (Arc<dyn VcpuRegistry>, Arc<dyn PlatformFutex>) {
         let registry: Arc<dyn VcpuRegistry> = Arc::new(VcpuKicker::new());
-        let futex: Arc<dyn PlatformFutex> = Arc::new(hvf_futex(Arc::new(FutexTable::new())));
+        let futex: Arc<dyn PlatformFutex> = Arc::new(hvf_futex(
+            Arc::new(FutexTable::new()),
+            carrick_thread::platform_futex::SharedFutexTable::new(),
+        ));
         (registry, futex)
     }
 

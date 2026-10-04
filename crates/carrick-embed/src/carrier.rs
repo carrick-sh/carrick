@@ -99,6 +99,11 @@ pub struct Carrier {
 }
 
 impl Carrier {
+    /// Authority for host shared-buffer leases that rendezvous with this
+    /// carrier's guest tasks. Independent carriers have independent tables.
+    pub fn shared_futex(&self) -> &carrick_thread::platform_futex::SharedFutexTable {
+        self.inner.runtime.shared_futex()
+    }
     /// Start an explicit carrier. A process may own only one at a time.
     pub fn new() -> Result<Self, EmbedError> {
         carrick_runtime::host_process::prepare();

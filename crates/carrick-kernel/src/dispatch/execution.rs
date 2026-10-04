@@ -514,6 +514,7 @@ impl SyscallDispatcher {
                 let clock = Arc::clone(kernel.task().container().clock());
                 dispatch_threaded_futex(
                     &clock,
+                    kernel.kernel().shared_futex(),
                     request,
                     memory,
                     reporter,
@@ -593,6 +594,7 @@ impl SyscallDispatcher {
                 let clock = Arc::clone(kernel.task().container().clock());
                 dispatch_futex_waitv_args(
                     &clock,
+                    kernel.kernel().shared_futex(),
                     memory,
                     Some(thread.futex),
                     thread.zone,

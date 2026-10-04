@@ -406,6 +406,7 @@ impl CarrierKernelRoot {
 }
 
 struct CarrierInner {
+    shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     bind_cache_cohorts: Arc<carrick_vfs::fs_resolve_cache::BindCacheCohorts>,
     generation: u64,
     scope: CarrierScopeId,
@@ -440,6 +441,10 @@ pub struct CarrierRuntime {
 }
 
 impl CarrierRuntime {
+    /// Shared-word authority retained by this carrier's kernel and host leases.
+    pub fn shared_futex(&self) -> &carrick_thread::platform_futex::SharedFutexTable {
+        &self.inner.shared_futex
+    }
     pub(crate) fn bind_cache_cohorts(
         &self,
     ) -> Arc<carrick_vfs::fs_resolve_cache::BindCacheCohorts> {
@@ -493,6 +498,7 @@ impl CarrierRuntime {
             .map_err(|error| RuntimeError::CarrierFailed(error.to_string()))?;
         let scope = CarrierScopeId::from_process_env_or_random()?;
         let inner = Arc::new(CarrierInner {
+            shared_futex: carrick_thread::platform_futex::SharedFutexTable::new(),
             bind_cache_cohorts: Arc::default(),
             generation,
             scope,
@@ -620,6 +626,7 @@ impl CarrierRuntime {
             &carrick_kernel::kernel::KernelContext,
         ) -> Result<Prepared, RuntimeError>,
     ) -> Result<(CarrierKernelRoot, Prepared), RuntimeError> {
+        let bootstrap = bootstrap.with_shared_futex(self.shared_futex().clone());
         self.ensure_current_process()?;
         let mut slot = self.inner.kernel_runtime.lock();
         loop {
@@ -1789,6 +1796,13 @@ mod tests {
         let alpha = workers.remove(0).join().expect("alpha worker");
         let beta = workers.remove(0).join().expect("beta worker");
         assert!(Arc::ptr_eq(alpha.kernel(), beta.kernel()));
+        assert!(
+            Arc::ptr_eq(
+                carrier.shared_futex().table(),
+                alpha.kernel().shared_futex().table(),
+            ),
+            "pre-boot host leases and both roots must retain one authority"
+        );
         assert!(Arc::ptr_eq(alpha.directory(), beta.directory()));
         assert_eq!(alpha.kernel().container_count(), 2);
         let snapshot = carrier.snapshot().expect("carrier snapshot");

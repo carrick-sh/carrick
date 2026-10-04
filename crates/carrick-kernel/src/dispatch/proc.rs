@@ -2475,7 +2475,7 @@ impl<'a> ProcView<'a> {
                         return Ok(DispatchOutcome::SharedFutexWait {
                             target: SharedFutexTarget::new(location, location.waiter_key()),
                             generation:
-                                carrick_thread::platform_futex::carrier_shared_futex_table()
+                                cx.kernel.kernel().shared_futex().table()
                                     .prepare_wait(carrick_thread::platform_futex::carrier_shared_futex_key(location)),
                             value,
                             timeout,
@@ -2543,6 +2543,7 @@ impl<'a> ProcView<'a> {
             let clock = Arc::clone(cx.kernel.task().container().clock());
             Ok(dispatch_futex_waitv_args(
                 &clock,
+                cx.kernel.kernel().shared_futex(),
                 &mut *cx.memory,
                 cx.thread.map(|t| t.futex),
                 cx.thread.and_then(|t| t.zone),

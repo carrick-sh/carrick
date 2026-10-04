@@ -8,13 +8,13 @@
 
 use std::sync::Arc;
 
-use carrick_thread::platform_futex::FutexTableFutex;
+use carrick_thread::platform_futex::{FutexTableFutex, SharedFutexTable};
 use carrick_thread::thread::FutexTable;
 
 /// The NVMM `PlatformFutex`. Construct with [`make_nvmm_futex`].
 pub type NvmmFutex = FutexTableFutex;
 
 /// Wrap the process-private `FutexTable`.
-pub fn make_nvmm_futex(table: Arc<FutexTable>) -> NvmmFutex {
-    FutexTableFutex::new(table)
+pub fn make_nvmm_futex(table: Arc<FutexTable>, shared: SharedFutexTable) -> NvmmFutex {
+    FutexTableFutex::new(table, shared)
 }

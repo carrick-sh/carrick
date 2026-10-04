@@ -201,6 +201,7 @@ struct RuntimeEndpointEntry {
     generation: u64,
     registry: Weak<ThreadRegistry>,
     futex: Weak<FutexTable>,
+    shared_futex: Weak<FutexTable>,
 }
 
 static RUNTIME_ENDPOINTS: std::sync::LazyLock<
@@ -233,6 +234,7 @@ pub fn register_container_runtime_endpoint(
     container: carrick_hal::ContainerId,
     registry: &Arc<ThreadRegistry>,
     futex: &Arc<FutexTable>,
+    shared: &crate::platform_futex::SharedFutexTable,
 ) -> ContainerRuntimeEndpointRegistration {
     let generation = NEXT_RUNTIME_ENDPOINT_GENERATION.fetch_add(1, Ordering::Relaxed);
     RUNTIME_ENDPOINTS.lock().insert(
@@ -241,6 +243,7 @@ pub fn register_container_runtime_endpoint(
             generation,
             registry: Arc::downgrade(registry),
             futex: Arc::downgrade(futex),
+            shared_futex: Arc::downgrade(shared.table()),
         },
     );
     ContainerRuntimeEndpointRegistration {
@@ -268,12 +271,19 @@ fn container_runtime_endpoint(
     }
 }
 
-/// Wake only this container's private futex waiters for an asynchronous signal.
+/// Notify this container's private waiters and its kernel's shared waiters.
 pub fn notify_container_futex_signal_pending(container: carrick_hal::ContainerId) {
-    if let Some((_, futex)) = container_runtime_endpoint(container) {
-        futex.notify_signal_pending();
+    // Snapshot one endpoint generation. A replacement between separate
+    // lookups must not combine an old private table with a new shared one.
+    let entry = RUNTIME_ENDPOINTS.lock().get(&container).cloned();
+    if let Some(entry) = entry {
+        if let Some(futex) = entry.futex.upgrade() {
+            futex.notify_signal_pending();
+        }
+        if let Some(shared) = entry.shared_futex.upgrade() {
+            shared.notify_signal_pending();
+        }
     }
-    crate::platform_futex::carrier_shared_futex_table().notify_signal_pending();
 }
 
 pub fn container_thread_name(
@@ -2673,7 +2683,12 @@ mod tests {
         let container = carrick_hal::ContainerId::allocate();
         let registry = Arc::new(ThreadRegistry::new(ThreadId::synthetic_for_tests(30_001)));
         let table = Arc::new(FutexTable::new());
-        let _endpoint = register_container_runtime_endpoint(container, &registry, &table);
+        let _endpoint = register_container_runtime_endpoint(
+            container,
+            &registry,
+            &table,
+            &crate::platform_futex::SharedFutexTable::new(),
+        );
         let addr = 0xfeed_beef_u64;
         let pending = Arc::new(AtomicBool::new(false));
         let pending2 = Arc::clone(&pending);
@@ -2702,9 +2717,18 @@ mod tests {
         beta_registry.set_thread_name(beta_tid, b"beta-thread");
         let alpha_futex = Arc::new(FutexTable::new());
         let beta_futex = Arc::new(FutexTable::new());
-        let _alpha_endpoint =
-            register_container_runtime_endpoint(alpha, &alpha_registry, &alpha_futex);
-        let _beta_endpoint = register_container_runtime_endpoint(beta, &beta_registry, &beta_futex);
+        let _alpha_endpoint = register_container_runtime_endpoint(
+            alpha,
+            &alpha_registry,
+            &alpha_futex,
+            &crate::platform_futex::SharedFutexTable::new(),
+        );
+        let _beta_endpoint = register_container_runtime_endpoint(
+            beta,
+            &beta_registry,
+            &beta_futex,
+            &crate::platform_futex::SharedFutexTable::new(),
+        );
 
         assert_eq!(
             container_thread_name(alpha, alpha_tid),
@@ -2730,8 +2754,18 @@ mod tests {
         let new_registry = Arc::new(ThreadRegistry::new(new_tid));
         let old_futex = Arc::new(FutexTable::new());
         let new_futex = Arc::new(FutexTable::new());
-        let old = register_container_runtime_endpoint(container, &old_registry, &old_futex);
-        let new = register_container_runtime_endpoint(container, &new_registry, &new_futex);
+        let old = register_container_runtime_endpoint(
+            container,
+            &old_registry,
+            &old_futex,
+            &crate::platform_futex::SharedFutexTable::new(),
+        );
+        let new = register_container_runtime_endpoint(
+            container,
+            &new_registry,
+            &new_futex,
+            &crate::platform_futex::SharedFutexTable::new(),
+        );
 
         drop(old);
         assert_eq!(container_registry_liveness(container, new_tid), Some(true));

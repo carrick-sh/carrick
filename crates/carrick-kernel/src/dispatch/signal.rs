@@ -4626,6 +4626,7 @@ mod tests {
             dispatcher.exact_signal_context_for_test().container().id(),
             &registry,
             &futex,
+            &dispatcher.shared_futex(),
         );
         (registry, futex, registration)
     }

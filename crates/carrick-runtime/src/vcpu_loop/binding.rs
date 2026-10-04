@@ -3207,7 +3207,11 @@ where
                 executor::ExecutorExit::Syscall
             }
             DispatchOutcome::SharedFutexWake { target, count } => {
-                let value = shared_futex_wake(target.location, count);
+                let value = shared_futex_wake(
+                    &self.kernel.dispatcher.shared_futex(),
+                    target.location,
+                    count,
+                );
                 self.state
                     .complete_returned(engine, &self.kernel.reporter, value)?;
                 self.state.trace_syscall_return(self.traps, Some(value));
@@ -3244,7 +3248,7 @@ where
             } => {
                 trace_shared_futex_requeue(0, from.waiter_key, to.waiter_key, wake, requeue, 0, 0);
                 let (carrier_woken, carrier_requeued) =
-                    carrick_thread::platform_futex::carrier_shared_futex_table().requeue(
+                    self.kernel.dispatcher.shared_futex().table().requeue(
                         carrick_thread::platform_futex::carrier_shared_futex_key(from.location),
                         carrick_thread::platform_futex::carrier_shared_futex_key(to.location),
                         wake,

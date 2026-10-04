@@ -157,9 +157,11 @@ impl SharedBuffer {
         run_id: RunId,
         container_id: ContainerId,
         generation: u64,
+        shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     ) -> SharedBufferLease {
         SharedBufferLease {
             inner: Arc::clone(&self.inner),
+            shared_futex,
             run_id,
             container_id,
             generation,
@@ -169,9 +171,14 @@ impl SharedBuffer {
     }
 
     /// Mint a lease bound to a live [`Container`] kernel object.
-    pub fn lease_for_container(&self, container: &Arc<Container>) -> SharedBufferLease {
+    pub fn lease_for_container(
+        &self,
+        container: &Arc<Container>,
+        shared_futex: carrick_thread::platform_futex::SharedFutexTable,
+    ) -> SharedBufferLease {
         SharedBufferLease {
             inner: Arc::clone(&self.inner),
+            shared_futex,
             run_id: container.run_id().clone(),
             container_id: container.id(),
             generation: container.generation(),
@@ -188,9 +195,11 @@ impl SharedBuffer {
         generation: u64,
         retired: Arc<AtomicBool>,
         current_generation: Arc<AtomicU64>,
+        shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     ) -> SharedBufferLease {
         SharedBufferLease {
             inner: Arc::clone(&self.inner),
+            shared_futex,
             run_id,
             container_id,
             generation,
@@ -212,6 +221,7 @@ pub struct SharedBufferLease {
     run_id: RunId,
     container_id: ContainerId,
     generation: u64,
+    shared_futex: carrick_thread::platform_futex::SharedFutexTable,
     retired: Arc<AtomicBool>,
     current_generation: Arc<AtomicU64>,
 }
@@ -383,7 +393,7 @@ impl SharedBufferLease {
     ) -> Result<(), SharedBufferError> {
         let location = self.shared_futex_location(offset)?;
         let word_ptr = location.wait_addr().raw() as *const AtomicU32;
-        let table = carrick_thread::platform_futex::carrier_shared_futex_table();
+        let table = self.shared_futex.table();
         let tid = carrick_hal::ThreadId::main_from_host_pid();
 
         let outcome = unsafe {
@@ -408,7 +418,7 @@ impl SharedBufferLease {
     /// Wake up to `count` waiters parked on the futex word at `offset`.
     pub fn futex_wake(&self, offset: usize, count: u32) -> Result<u32, SharedBufferError> {
         let location = self.shared_futex_location(offset)?;
-        let table = carrick_thread::platform_futex::carrier_shared_futex_table();
+        let table = self.shared_futex.table();
         let woken = table.wake(
             carrick_thread::platform_futex::carrier_shared_futex_key(location),
             count,
@@ -442,7 +452,12 @@ mod tests {
         let mut read_back = vec![0u8; data.len()];
         let run_id = RunId::new("test-run");
         let container_id = ContainerId::allocate();
-        let lease = buf.lease(run_id, container_id, 1);
+        let lease = buf.lease(
+            run_id,
+            container_id,
+            1,
+            carrick_thread::platform_futex::SharedFutexTable::new(),
+        );
 
         assert_eq!(lease.read_at(0, &mut read_back).unwrap(), data.len());
         assert_eq!(&read_back, data);
@@ -473,6 +488,7 @@ mod tests {
             1,
             Arc::clone(&retired),
             Arc::clone(&cur_gen),
+            carrick_thread::platform_futex::SharedFutexTable::new(),
         );
 
         // Initial access succeeds
@@ -560,7 +576,12 @@ mod tests {
         let buf = SharedBuffer::new(4096).expect("allocate buffer");
         let run_id = RunId::new("futex-run");
         let container_id = ContainerId::allocate();
-        let lease = buf.lease(run_id, container_id, 1);
+        let lease = buf.lease(
+            run_id,
+            container_id,
+            1,
+            carrick_thread::platform_futex::SharedFutexTable::new(),
+        );
 
         // Word alignment checks
         assert!(lease.shared_futex_location(0).is_ok());
@@ -614,8 +635,18 @@ mod tests {
         let cid_b = ContainerId::allocate();
         assert_ne!(cid_a, cid_b);
 
-        let lease_a = buf_a.lease(run_a, cid_a, 1);
-        let lease_b = buf_b.lease(run_b, cid_b, 1);
+        let lease_a = buf_a.lease(
+            run_a,
+            cid_a,
+            1,
+            carrick_thread::platform_futex::SharedFutexTable::new(),
+        );
+        let lease_b = buf_b.lease(
+            run_b,
+            cid_b,
+            1,
+            carrick_thread::platform_futex::SharedFutexTable::new(),
+        );
 
         lease_a.write_at(0, &[0xAA; 32]).unwrap();
         lease_b.write_at(0, &[0xBB; 32]).unwrap();

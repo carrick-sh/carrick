@@ -106,6 +106,7 @@ fn shared_buffer_lease_after_retirement_fails_closed() {
         1,
         Arc::clone(&retired),
         Arc::clone(&current_gen),
+        carrick_thread::platform_futex::SharedFutexTable::new(),
     );
 
     // 1. While active, operations succeed
@@ -155,7 +156,7 @@ fn shared_buffer_futex_pingpong_latency() {
     let buf = SharedBuffer::new(4096).expect("allocate shared buffer");
     let run_id = RunId::new("pingpong-test");
     let container_id = ContainerId::allocate();
-    let lease = buf.lease(run_id, container_id, 1);
+    let lease = buf.lease(run_id, container_id, 1, carrier.shared_futex().clone());
 
     // Offset 0: ping word (written by host, awaited by guest)
     // Offset 4: pong word (written by guest, awaited by host)

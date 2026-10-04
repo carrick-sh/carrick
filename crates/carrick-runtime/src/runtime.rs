@@ -1430,7 +1430,7 @@ where
                 // legacy `dispatch_threaded`-only short-circuit was the
                 // root cause of LTP pause01 TBROKing on
                 // `tst_checkpoint_wake ETIMEDOUT`.
-                let prewoken = carrick_thread::platform_futex::carrier_shared_futex_table()
+                let prewoken = kernel_context.kernel().shared_futex().table()
                     .take_woken(&generation);
                 let retval = if prewoken {
                     0
@@ -1453,7 +1453,7 @@ where
                 timeout,
                 index,
             } => {
-                let prewoken = carrick_thread::platform_futex::carrier_shared_futex_table()
+                let prewoken = kernel_context.kernel().shared_futex().table()
                     .take_woken(&generation);
                 let retval = if prewoken {
                     0
@@ -1477,7 +1477,7 @@ where
                 mut value,
                 mut sysv,
             } => loop {
-                let prewoken = carrick_thread::platform_futex::carrier_shared_futex_table()
+                let prewoken = kernel_context.kernel().shared_futex().table()
                     .take_woken(&generation);
                 let retval = if prewoken {
                     0
@@ -2027,7 +2027,10 @@ where
                 value,
                 sysv,
             } => {
-                let prewoken = carrick_thread::platform_futex::carrier_shared_futex_table()
+                let prewoken = kernel_context
+                    .kernel()
+                    .shared_futex()
+                    .table()
                     .take_woken(&generation);
                 let retval = if prewoken {
                     0
@@ -2074,8 +2077,12 @@ use std::sync::Arc;
 struct HvfHostBackend;
 
 impl crate::threaded_loop::HostBackend for HvfHostBackend {
-    fn make_futex(&self, table: Arc<FutexTable>) -> Arc<dyn carrick_hal::PlatformFutex> {
-        Arc::new(crate::threaded_impl::hvf_futex(table))
+    fn make_futex(
+        &self,
+        table: Arc<FutexTable>,
+        shared: carrick_thread::platform_futex::SharedFutexTable,
+    ) -> Arc<dyn carrick_hal::PlatformFutex> {
+        Arc::new(crate::threaded_impl::hvf_futex(table, shared))
     }
 
     fn make_signal_pump(&self) -> Box<dyn carrick_hal::SignalPumpControl> {
