@@ -140,3 +140,32 @@ remaining carrick procs (run-id fes2-witness-green) = 0
 Green logs: `target/fes-load2/witness-green{,-driver}.log`. These results prove
 the ordering defect and its correction. They do not establish whether the
 original unreaped child was ready when the USB-stalled waiter timed out.
+
+Green ELF SHA-256:
+`0c0884d01f7ad6e1013a6ca8816dfc8311110c5e56113e4056fd340aa360a500`.
+Green CLI SHA-256:
+`be8779bf069deeac13a7cd18847959cf15e73c3b51daf2235f875f7ea7ed7a45`;
+CDHash `a1cd4940b0ad561783ffa26c91013158fa71bc4a`;
+LC_UUID `9E984D2B-0270-3B12-805E-577627FC1404`.
+Hypervisor entitlement and `__dof_carrick` were present.
+
+Both witness arms used `just build` and this cross-build/guest command under
+`just lease carrick`, with the generated test executable copied to the
+corresponding `target/fes-load2/witness-{red,green}.elf`:
+
+```sh
+cd conformance-probes
+cargo test --release --target aarch64-unknown-linux-musl \
+  --bin forkexecstorm --no-run --message-format=json
+cd ..
+target/release/carrick run-elf --raw target/fes-load2/witness-green.elf -- \
+  --exact tests::test_bounded_reap_attempts_ready_child_at_expired_deadline \
+  --nocapture
+scripts/sudo/kill.sh fes2-witness-green
+```
+
+Before shard validation, both production probe ELFs were rebuilt from the
+restored candidate source. SHA-256 inventory (`target/fes-load2/probe-sha256.txt`):
+
+- musl: `933b00afa8d2056a10a3473e171648aa5205c7f8ba37ab6120603e69cd6d4e33`
+- GNU: `dc27744bccd25e5b5a6b022f0fec130c01765b5153a06d1b129602c3713a4607`
