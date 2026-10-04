@@ -1726,16 +1726,35 @@ impl carrick_el1::file::UserCopy for HostPreparedRead {
 pub(crate) fn owner_prepare_refusal(
     error: carrick_guest_mem::MemoryPrepareError,
 ) -> crate::dispatch::DispatchOutcome {
+    owner_prepare_refusal_after(error, 0)
+}
+
+pub(crate) fn owner_prepare_refusal_after(
+    error: carrick_guest_mem::MemoryPrepareError,
+    committed: u64,
+) -> crate::dispatch::DispatchOutcome {
     use carrick_guest_mem::MemoryPrepareError;
     match error {
         MemoryPrepareError::OwnerWait(wait) => {
-            crate::dispatch::DispatchOutcome::OwnerMemoryWait { wait }
+            crate::dispatch::DispatchOutcome::OwnerMemoryWait { wait, committed }
         }
         MemoryPrepareError::Physical(wait) => {
-            crate::dispatch::DispatchOutcome::OwnerPhysicalWait { wait }
+            crate::dispatch::DispatchOutcome::OwnerPhysicalWait { wait, committed }
         }
+        MemoryPrepareError::Supply(carrick_guest_mem::MemorySupplyRequest::Metadata {
+            observed,
+            ..
+        }) => crate::dispatch::DispatchOutcome::OwnerMemoryWait {
+            wait: observed,
+            committed,
+        },
         MemoryPrepareError::Supply(request) => {
-            crate::dispatch::DispatchOutcome::OwnerMemorySupply { request }
+            crate::dispatch::DispatchOutcome::OwnerMemorySupply { request, committed }
+        }
+        MemoryPrepareError::Fault(_) if committed > 0 => {
+            crate::dispatch::DispatchOutcome::Returned {
+                value: committed as i64,
+            }
         }
         MemoryPrepareError::Fault(_) => {
             crate::dispatch::DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
@@ -1773,22 +1792,30 @@ fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
     let mut delivered = 0u64;
     while delivered < args[1] {
         let Some(destination) = args[0].checked_add(delivered) else {
-            return Some(crate::dispatch::DispatchOutcome::errno(
-                carrick_abi::LINUX_EFAULT,
-            ));
+            return Some(if delivered > 0 {
+                crate::dispatch::DispatchOutcome::Returned {
+                    value: delivered as i64,
+                }
+            } else {
+                crate::dispatch::DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
+            });
         };
         let chunk =
             (args[1] - delivered).min((4096 - (destination as usize & 4095)) as u64) as usize;
         let Some(range) =
             carrick_guest_mem::GuestWriteRange::new(carrick_guest_mem::GuestVa(destination), chunk)
         else {
-            return Some(crate::dispatch::DispatchOutcome::errno(
-                carrick_abi::LINUX_EFAULT,
-            ));
+            return Some(if delivered > 0 {
+                crate::dispatch::DispatchOutcome::Returned {
+                    value: delivered as i64,
+                }
+            } else {
+                crate::dispatch::DispatchOutcome::errno(carrick_abi::LINUX_EFAULT)
+            });
         };
         let permit = match memory.prepare_write(&[range]) {
             Ok(permit) => permit,
-            Err(error) => return Some(owner_prepare_refusal(error)),
+            Err(error) => return Some(owner_prepare_refusal_after(error, delivered)),
         };
         let file_guard = lock_delegated_file(file, handle);
         if !record.is_bound_to(file)
@@ -1796,7 +1823,13 @@ fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
             || description.delegation_handle() != open_handle
         {
             drop(file_guard);
-            return None;
+            return if delivered > 0 {
+                Some(crate::dispatch::DispatchOutcome::Returned {
+                    value: delivered as i64,
+                })
+            } else {
+                None
+            };
         }
         let mut user = HostPreparedRead {
             destination,
@@ -1808,9 +1841,13 @@ fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
         bounded_args[1] = chunk as u64;
         if nr == 67 {
             let Some(offset) = args[2].checked_add(delivered) else {
-                return Some(crate::dispatch::DispatchOutcome::errno(
-                    carrick_abi::LINUX_EINVAL,
-                ));
+                return Some(if delivered > 0 {
+                    crate::dispatch::DispatchOutcome::Returned {
+                        value: delivered as i64,
+                    }
+                } else {
+                    crate::dispatch::DispatchOutcome::errno(carrick_abi::LINUX_EINVAL)
+                });
             };
             bounded_args[2] = offset;
         }
@@ -1827,9 +1864,23 @@ fn serve_prepared_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
             )
         };
         drop(file_guard);
-        let value = result.ok()?;
+        let value = match result {
+            Ok(value) => value,
+            Err(_) if delivered > 0 => {
+                return Some(crate::dispatch::DispatchOutcome::Returned {
+                    value: delivered as i64,
+                });
+            }
+            Err(_) => return None,
+        };
         if let Some(errno) = carrick_abi::LinuxErrno::from_guest_retval(value) {
-            return Some(crate::dispatch::DispatchOutcome::errno(errno));
+            return Some(if delivered > 0 {
+                crate::dispatch::DispatchOutcome::Returned {
+                    value: delivered as i64,
+                }
+            } else {
+                crate::dispatch::DispatchOutcome::errno(errno)
+            });
         }
         if let Some(bytes) = user.pending {
             permit.commit(&[&bytes]);
