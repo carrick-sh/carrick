@@ -584,25 +584,6 @@ impl GuestDescriptorLanePrecondition {
     }
 }
 
-/// Select the guest-owned lane for `engine`'s MM when the precondition
-/// admits it. Called where an engine binds an MM (initial runner and exec);
-/// fork children inherit their parent's lane. Never demotes a guest-owned MM.
-fn select_guest_descriptor_lane<E: ThreadedEngine>(
-    engine: &mut E,
-    precondition: GuestDescriptorLanePrecondition,
-    hatch: DescriptorLaneHatch,
-) -> bool {
-    use carrick_mmu_core::aarch64::LiveDescriptorOwner;
-    if engine.live_descriptor_owner() == LiveDescriptorOwner::Guest {
-        return true;
-    }
-    if let Err(reason) = precondition.admission(hatch) {
-        engine.record_guest_descriptor_lane_refusal(reason);
-        return false;
-    }
-    engine.select_live_descriptor_owner(LiveDescriptorOwner::Guest)
-}
-
 /// An MM an engine has just made its own: the initial runner's MM, or the
 /// replacement MM an exec committed. It carries the kernel's ownership of
 /// the MM, so the MM's admission to guest ownership decides from the MM
@@ -612,18 +593,60 @@ pub(super) struct BoundMm {
     pub(super) asid_generation: u64,
 }
 
-/// Admit an MM an engine binds: bind the engine's snapshot identity to it
-/// and select its live descriptor lane. This is the single admission point
-/// for the initial runner and exec commit. Fork children do not pass here:
-/// they inherit their parent's lane with their stage-1 authority
-/// (`Stage1Authority::child_with_manager`) at fork commit.
-pub(super) fn admit_bound_mm<E: ThreadedEngine>(engine: &mut E, bound: &BoundMm) -> bool {
+/// Bind the exact kernel MM identity before the initial runner or exec task
+/// can enter its first slot. EL1 cannot bind user-memory ownership until the
+/// address space is published at that first load.
+pub(super) fn admit_bound_mm<E: ThreadedEngine>(engine: &mut E, bound: &BoundMm) {
     engine.bind_task_snapshot_identity(bound.mm.id().raw(), bound.asid_generation);
-    select_guest_descriptor_lane(
-        engine,
-        GuestDescriptorLanePrecondition::current(),
-        DescriptorLaneHatch::current(),
-    )
+}
+
+/// Finish the first-load publication while its root is still closed. Exact
+/// reservation import and legacy root-fact release ran before this call;
+/// the owner guard excludes host copies from BIND through descriptor/venue
+/// selection and the final EL1 installation-gate opening.
+pub(super) fn open_first_address_space<E: ThreadedEngine>(
+    engine: &mut E,
+    closed: carrick_kernel::kernel::UnpublishedInitialAddressSpace,
+) -> Result<carrick_kernel::kernel::AddressSpacePublication, carrick_hal::TrapError> {
+    use carrick_mmu_core::aarch64::LiveDescriptorOwner;
+    if engine.live_descriptor_owner() != LiveDescriptorOwner::Guest {
+        if let Err(reason) =
+            GuestDescriptorLanePrecondition::current().admission(DescriptorLaneHatch::current())
+        {
+            engine.record_guest_descriptor_lane_refusal(reason);
+            return Ok(closed.open_legacy());
+        }
+    }
+    let Some(authority) = engine.user_memory_admission_authority() else {
+        return Ok(closed.open_legacy());
+    };
+    let carrier = engine.owner_transfer_carrier().ok_or_else(|| {
+        carrick_hal::TrapError::Hypervisor(
+            "admitted user-memory backend lost its transfer carrier".into(),
+        )
+    })?;
+    let token = closed.bind_token(carrier).ok_or_else(|| {
+        carrick_hal::TrapError::Hypervisor(
+            "first-load root is not an exact closed BIND publication".into(),
+        )
+    })?;
+    let mut guard = authority.begin_selection().map_err(|reason| {
+        carrick_hal::TrapError::Hypervisor(format!(
+            "first-load user-memory admission guard refused: {reason:?}"
+        ))
+    })?;
+    engine.select_live_descriptor_owner_under_guard(
+        LiveDescriptorOwner::Guest,
+        &mut guard,
+        Some(token),
+    )?;
+    if guard.selection_handle().is_some() {
+        closed.open_admitted(&guard).map_err(|_| {
+            carrick_hal::TrapError::Hypervisor("first-load owner guard selected another MM".into())
+        })
+    } else {
+        Ok(closed.open_legacy())
+    }
 }
 
 /// Whether EL1 completed fork-COW copies of `mm` the host has not settled
