@@ -79,6 +79,13 @@ impl MemoryWitness {
     pub fn words(&self) -> DescriptorWords<'_> {
         self.memory.words()
     }
+    pub fn retain_output(
+        &self,
+        output: FrameGpa,
+        len: usize,
+    ) -> Result<RetainedX86Data<'_>, MemoryError> {
+        self.memory.retain_output(output, len)
+    }
     pub fn boot(programs: [&[u8]; 2]) -> Result<Self, MemoryError> {
         let mut system = BackingExtent::private(FrameGpa::new(0), 16 * 1024 * 1024)?;
         let boot=<carrick_hal::x8664_arch::X8664GuestArch as carrick_hal::guest_arch::GuestArch>::bootstrap_sysregs();

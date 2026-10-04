@@ -181,8 +181,11 @@ fn shared_revoke_requires_both_alias_unlinks_and_both_exact_context_drains() {
 
 #[test]
 fn production_owner_selects_the_exact_live_kvm_mm() {
+    use carrick_aarch64::user_transfer::TransferPin;
     use carrick_el1::fault::{NoopCowResolver, NoopPreparedResolver};
     use carrick_el1::personality::mm_portal::{test_support::*, *};
+    use carrick_el1_abi::PortalTransferSlot;
+    use carrick_guest_arch::FrameGpa;
     use carrick_sched_core::AddressSpaces;
     use std::num::NonZeroU64;
     let program = code(&[(DATA_VA, None)]);
@@ -215,7 +218,7 @@ fn production_owner_selects_the_exact_live_kvm_mm() {
     let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &nodes)
         .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
     let mut outputs = Vec::new();
-    for mm in mms {
+    for (index, mm) in mms.into_iter().enumerate() {
         let transfer = portal
             .begin(
                 portal.admitted_handle(mm, 0).unwrap(),
@@ -245,6 +248,48 @@ fn production_owner_selects_the_exact_live_kvm_mm() {
                 .unwrap()
                 .is_some()
         );
+        let mut pin = witness
+            .retain_output(FrameGpa::new(selected.ipa), selected.len as usize)
+            .unwrap();
+        let request = selected
+            .request(TransferIntent::UserRead, pin.identity())
+            .unwrap();
+        let slot = PortalTransferSlot::new();
+        let mut ticket = slot.submit(request).unwrap();
+        let mut bytes = vec![0; selected.len as usize];
+        serve_transfer(&portal, slot.claim().unwrap(), &witness.words(), 0, || {
+            assert!(ticket.copy_requested(|copy| pin.copy(copy, &mut bytes)));
+        })
+        .unwrap();
+        let completion = ticket.take_completion().unwrap();
+        assert_eq!((completion.completed, completion.errno), (4096, 0));
+        assert_eq!(bytes[0], [0x41, 0x42][index]);
+        // A physical pin for the other MM's distinct output cannot service
+        // this selection, even when its own retained identity is supplied.
+        if index == 1 {
+            let mut wrong = witness
+                .retain_output(FrameGpa::new(outputs[0]), 4096)
+                .unwrap();
+            let wrong_request = selected
+                .request(TransferIntent::UserRead, wrong.identity())
+                .unwrap();
+            let mut wrong_ticket = slot.submit(wrong_request).unwrap();
+            bytes.fill(0xaa);
+            serve_transfer(&portal, slot.claim().unwrap(), &witness.words(), 0, || {
+                assert!(wrong_ticket.copy_requested(|copy| {
+                    let copied = wrong.copy(copy, &mut bytes);
+                    assert!(
+                        !copied,
+                        "a valid physical pin for another output grants no copy authority"
+                    );
+                    copied
+                }));
+            })
+            .unwrap();
+            let completion = wrong_ticket.take_completion().unwrap();
+            assert_eq!((completion.completed, completion.errno), (0, 125));
+            assert!(bytes.iter().all(|&byte| byte == 0xaa));
+        }
     }
     assert_ne!(outputs[0], outputs[1]);
     byte(&mut witness, 0, 0x41);

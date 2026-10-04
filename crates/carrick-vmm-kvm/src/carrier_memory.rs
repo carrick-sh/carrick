@@ -12,6 +12,10 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod user_transfer;
+pub use user_transfer::RetainedX86Data;
+static NEXT_VM_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryError(pub String);
 impl std::fmt::Display for MemoryError {
@@ -143,6 +147,7 @@ pub unsafe trait TranslationDrain {
 /// namespace; legacy HvVm::map_memory is never called on this VM.
 pub struct CarrierMemory {
     vm: KvmVm,
+    vm_generation: NonZeroU64,
     slots: BTreeMap<u32, Slot>,
     by_gpa: BTreeMap<u64, u32>,
     free: BTreeSet<u32>,
@@ -159,8 +164,16 @@ impl CarrierMemory {
     pub fn create() -> Result<Self, MemoryError> {
         let vm = KvmVm::create_empty().map_err(|e| error(e.to_string()))?;
         let limit = vm.carrier_slot_limit().map_err(|e| error(e.to_string()))?;
+        let generation = NEXT_VM_GENERATION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
+            .map_err(|_| error("carrier backing generation exhausted"))?;
+        let vm_generation =
+            NonZeroU64::new(generation).ok_or_else(|| error("zero carrier generation"))?;
         Ok(Self {
             vm,
+            vm_generation,
             slots: BTreeMap::new(),
             by_gpa: BTreeMap::new(),
             free: (0..limit).collect(),
