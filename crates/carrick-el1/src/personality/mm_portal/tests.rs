@@ -3008,3 +3008,328 @@ fn prepared_copy_hardware_settlement_seam_needs_no_live_grant_or_descriptor_word
     assert_eq!(ticket.take_completion().unwrap().completed, 4096);
     drop(root);
 }
+
+fn prepare_reports_exact_release_cause(cause: carrick_el1_abi::PortalWaitCause) {
+    use carrick_el1_abi::{PortalOwnerWait, PortalPrepareSuspension, PortalWaitCause};
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(
+        NonZeroU64::new(1).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(zone)
+    .unwrap();
+    let tables = Tables::new(ROOT, IPA, 1);
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let transfer = portal
+        .begin(handle, GuestVa::new(VA), 4096, TransferIntent::UserWrite, 0)
+        .unwrap();
+    let request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let entry = zone
+        .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+        .unwrap();
+    let source = entry.notifications(handle.incarnation()).unwrap();
+    let space_cause = match cause {
+        PortalWaitCause::Editor => SpaceWaitCause::Editor,
+        PortalWaitCause::Reservations => SpaceWaitCause::Reservations,
+        PortalWaitCause::Gate => SpaceWaitCause::Gate,
+        _ => unreachable!(),
+    };
+    let access = portal.space_access(1).unwrap();
+    let editor = (cause == PortalWaitCause::Editor).then(|| {
+        access
+            .try_begin_edit(entry.index(), mm.raw(), NonZeroU64::new(2).unwrap())
+            .unwrap()
+    });
+    let root = (cause == PortalWaitCause::Reservations).then(|| portal.root(mm, 1).unwrap());
+    if cause == PortalWaitCause::Gate {
+        access.raise(entry.index());
+    }
+    let revision = source.observe(space_cause).revision();
+    let wire = carrick_el1_abi::PortalTransferSlot::new();
+    let mut ticket = wire.submit_prepare(request).unwrap();
+    let result = serve_transfer(
+        &portal,
+        wire.claim().unwrap(),
+        &tables.live(&CallerInvalidatesAsid),
+        0,
+        || panic!("PREPARE suspension must precede source consumption"),
+    );
+    let actual = ticket.take_prepare_suspension();
+    // Clean up before assertions, including the historical completed-error path.
+    let _ = ticket.take_completion();
+    drop(root);
+    drop(editor);
+    if cause == PortalWaitCause::Gate {
+        access.lower(entry.index());
+    }
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        actual,
+        Some(PortalPrepareSuspension::Owner(unsafe {
+            PortalOwnerWait::from_owner(handle, cause, revision)
+        }))
+    );
+}
+#[test]
+fn prepare_reports_editor_release_cause() {
+    prepare_reports_exact_release_cause(carrick_el1_abi::PortalWaitCause::Editor);
+}
+#[test]
+fn prepare_reports_root_release_cause() {
+    prepare_reports_exact_release_cause(carrick_el1_abi::PortalWaitCause::Reservations);
+}
+#[test]
+fn prepare_reports_gate_release_cause() {
+    prepare_reports_exact_release_cause(carrick_el1_abi::PortalWaitCause::Gate);
+}
+
+fn owner_wait_enrollment_follows_only_its_real_release(
+    cause: carrick_el1_abi::PortalWaitCause,
+    before: bool,
+) {
+    use carrick_el1_abi::{PortalPrepareSuspension, PortalWaitCause};
+    use carrick_sched_core::object_wait::{
+        ObjectWaitError, OperationToken, OwnedObjectWakeEffects,
+    };
+    use carrick_sched_core::{BoundedSpin, Claim, ThreadIdentity};
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(
+        NonZeroU64::new(1).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(zone)
+    .unwrap();
+    let tables = Tables::new(ROOT, IPA, 1);
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let transfer = portal
+        .begin(handle, GuestVa::new(VA), 4096, TransferIntent::UserWrite, 0)
+        .unwrap();
+    let request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let entry = zone
+        .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+        .unwrap();
+    let access = portal.space_access(1).unwrap();
+    let mut editor = (cause == PortalWaitCause::Editor).then(|| {
+        access
+            .try_begin_edit(entry.index(), mm.raw(), NonZeroU64::new(2).unwrap())
+            .unwrap()
+    });
+    let mut root = (cause == PortalWaitCause::Reservations).then(|| portal.root(mm, 1).unwrap());
+    if cause == PortalWaitCause::Gate {
+        access.raise(entry.index());
+    }
+    let pending = if cause == PortalWaitCause::PendingEdit {
+        let mut root = portal.root(mm, 1).unwrap();
+        let crate::memory::reservations::Decision::Work(request) = root
+            .mprotect(
+                ReservationRange::new(VA, VA + 4096).unwrap(),
+                ReservationProtection::from_bits(1).unwrap(),
+            )
+            .unwrap()
+        else {
+            panic!("fixture needs pending proposal");
+        };
+        Some(request)
+    } else {
+        None
+    };
+    let wire = carrick_el1_abi::PortalTransferSlot::new();
+    let mut ticket = wire.submit_prepare(request).unwrap();
+    serve_transfer(
+        &portal,
+        wire.claim().unwrap(),
+        &tables.live(&CallerInvalidatesAsid),
+        0,
+        || panic!("no consuming effect"),
+    )
+    .unwrap();
+    let Some(PortalPrepareSuspension::Owner(receipt)) = ticket.take_prepare_suspension() else {
+        panic!("exact owner wait required");
+    };
+    assert_eq!(receipt.cause(), cause);
+    let slots = region.portal_slots();
+    assert!(slots.bind_carrier(handle.carrier()));
+    let enrollment = slots.authenticate_wait(zone, receipt).unwrap();
+    let other = Region::new();
+    assert!(
+        slots.authenticate_wait(other.zone(), receipt).is_err(),
+        "same numeric identity cannot cross carrier regions"
+    );
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            tid: 101,
+            serial: 1001,
+            mm: mm.raw(),
+            file_table: 1,
+            generation: 1,
+            affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    let operation = OperationToken::new(701, 11).unwrap();
+    let complete = |owned: OwnedObjectWakeEffects<'_>| {
+        let _ = owned.defer_handbacks();
+    };
+    let release = |editor: &mut Option<_>, root: &mut Option<_>| {
+        drop(root.take());
+        drop(editor.take());
+        if cause == PortalWaitCause::Gate {
+            access.lower(entry.index());
+        }
+        if let Some(request) = pending {
+            portal.root(mm, 1).unwrap().refuse(request).unwrap();
+        }
+    };
+    if before {
+        release(&mut editor, &mut root);
+        let (error, returned) = enrollment
+            .park_host(record, operation, &complete)
+            .unwrap_err();
+        assert_eq!(error, ObjectWaitError::Changed);
+        assert_eq!(returned.index(), 701);
+        assert!(!zone.record(record).has_object_operation());
+    } else {
+        enrollment.park_host(record, operation, &complete).unwrap();
+        // A real, unrelated root/editor release must neither consume nor reschedule this operation.
+        if cause != PortalWaitCause::Reservations {
+            drop(portal.root(mm, 2).unwrap());
+        } else {
+            drop(
+                access
+                    .try_begin_edit(entry.index(), mm.raw(), NonZeroU64::new(3).unwrap())
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(zone.record(record).claim(), Claim::Parked { .. }));
+        release(&mut editor, &mut root);
+        let mut delivered = Vec::new();
+        zone.take_completion_handbacks(&BoundedSpin(0), &mut |record| delivered.push(record));
+        assert_eq!(delivered, [zone.record_ref(record)]);
+        assert!(zone.record(record).object_host_continuation());
+        assert_eq!(
+            unsafe { zone.record(record).take_object_operation() }
+                .unwrap()
+                .index(),
+            701
+        );
+        zone.take_completion_handbacks(&BoundedSpin(0), &mut |_| panic!("duplicate completion"));
+    }
+    zone.free_record(record);
+}
+#[test]
+fn owner_wait_release_before_enrollment_never_parks_a_lost_edge() {
+    use carrick_el1_abi::PortalWaitCause::*;
+    for cause in [Editor, Reservations, Gate, PendingEdit] {
+        owner_wait_enrollment_follows_only_its_real_release(cause, true);
+    }
+}
+#[test]
+fn owner_wait_unrelated_release_cannot_reschedule_and_real_release_delivers_once() {
+    use carrick_el1_abi::PortalWaitCause::*;
+    for cause in [Editor, Reservations, Gate, PendingEdit] {
+        owner_wait_enrollment_follows_only_its_real_release(cause, false);
+    }
+}
+
+#[test]
+fn owner_wait_queue_admission_busy_retains_owned_handback_until_unlock() {
+    use carrick_el1_abi::{PortalOwnerWait, PortalWaitCause};
+    use carrick_sched_core::object_wait::{OperationToken, OwnedObjectWakeEffects};
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+    use carrick_sched_core::{BoundedSpin, ThreadIdentity};
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(
+        NonZeroU64::new(1).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(zone)
+    .unwrap();
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let entry = zone
+        .space_entry(NonZeroU64::new(mm.raw()).unwrap())
+        .unwrap();
+    let source = entry.notifications(handle.incarnation()).unwrap();
+    let revision = source.observe(SpaceWaitCause::Editor).revision();
+    let editor = portal
+        .space_access(1)
+        .unwrap()
+        .try_begin_edit(entry.index(), mm.raw(), NonZeroU64::new(2).unwrap())
+        .unwrap();
+    assert!(
+        portal
+            .space_access(0)
+            .unwrap()
+            .try_begin_edit(entry.index(), mm.raw(), NonZeroU64::new(1).unwrap())
+            .is_none()
+    );
+    let receipt = unsafe { PortalOwnerWait::from_owner(handle, PortalWaitCause::Editor, revision) };
+    let slots = region.portal_slots();
+    assert!(slots.bind_carrier(handle.carrier()));
+    let enrollment = slots.authenticate_wait(zone, receipt).unwrap();
+    let delivered = core::cell::RefCell::new(Vec::new());
+    let complete = |owned: OwnedObjectWakeEffects<'_>| {
+        let _ = owned.deliver_handbacks(&mut |r| delivered.borrow_mut().push(r));
+    };
+    let queue = zone
+        .object_wait_with_completion(
+            source.key(SpaceWaitCause::Editor),
+            &BoundedSpin(0),
+            &complete,
+        )
+        .unwrap();
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            tid: 101,
+            serial: 1001,
+            mm: mm.raw(),
+            file_table: 1,
+            generation: 1,
+            affinity: 0,
+            lifecycle_page: 0,
+            control_slot: 0,
+        })
+        .unwrap();
+    let result = enrollment.park_host(record, OperationToken::new(701, 11).unwrap(), &complete);
+    assert!(
+        delivered.borrow().is_empty(),
+        "queue release is the admission producer"
+    );
+    drop(queue);
+    let actual = delivered.borrow().clone();
+    let expected = zone.record_ref(record);
+    let operation = unsafe { zone.record(record).take_object_operation() };
+    zone.free_record(record);
+    drop(editor);
+    assert_eq!(
+        source.observe(SpaceWaitCause::Editor).revision(),
+        revision + 1,
+        "admission does not manufacture resource revisions"
+    );
+    assert!(
+        result.is_ok(),
+        "Busy must retain an owned admission handback: {result:?}"
+    );
+    assert_eq!(actual, [expected]);
+    assert_eq!(operation.unwrap().index(), 701);
+}

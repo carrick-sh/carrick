@@ -31,6 +31,7 @@ pub enum MmError {
     UnsupportedExecutableCow,
     Stale,
     Busy,
+    Wait(carrick_el1_abi::PortalOwnerWait),
     NoMemory,
     MetadataRequired,
     Invalid,
@@ -46,7 +47,7 @@ impl MmError {
             Self::Stale => 3,
             Self::Busy => 16,
             Self::NoMemory => 12,
-            Self::MetadataRequired => 11,
+            Self::MetadataRequired | Self::Wait(_) => 11,
             Self::Invalid => 22,
             Self::Core | Self::Reservation(_) | Self::Table(_) => 5,
         }
