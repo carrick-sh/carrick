@@ -2,6 +2,13 @@
 
 This document provides an exhaustive, line-by-line census comparing Linux syscall support between the mature AArch64/HVF reference implementation and the x86_64 guest emulation engine in Carrick.
 
+## Corrections (2026-10-04)
+
+Following code-checked review against the personality/core split specification (`docs/superpowers/specs/2026-10-04-personality-core-split.md`), earlier claims of full emulation parity and zero missing calls have been corrected:
+1. **Routing vs. Runtime Semantics:** Syscall normalization in `carrick_hal::x8664_arch::normalize_syscall` (`crates/carrick-hal/src/x8664_arch.rs:1105`) swaps clone TLS/ctid arguments and routes legacy `stat`, `poll`, and `dup2` forms into the shared dispatcher or dedicated handlers (`crates/carrick-x86/src/engine.rs:1052`). This proves **dispatch routing**, not runtime semantics, behavioral conformance, or privileged-kernel parity under guest workloads. Routing is not verified behavior; mapped calls cannot be classified as fully working without dedicated execution suites.
+2. **Metadata Discrepancies (`clone3` and `execveat`):** `execveat` (canonical #281) and `clone3` (canonical #435) are implemented in `crates/carrick-kernel/src/dispatch/proc.rs:101, 114, 1270, 3374, 3737`, despite stale `SupportLevel::Planned` metadata in `crates/carrick-abi/src/syscall.rs:598, 643`. They are actively dispatched rather than being unimplemented stubs.
+3. **Census Category Renaming:** Top-level metrics now distinguish entrypoint reachability ("routed on both", "routed on x86") from verified emulation, removing overclaims of complete parity.
+
 ## Theory of Operation & Dispatch Architecture
 
 Carrick implements Linux system calls without a guest Linux kernel. System calls are trapped by the hypervisor and dispatched to host-native primitives in Rust. Carrick's BKL-free `SyscallDispatcher` (`crates/carrick-kernel/src/dispatch/mod.rs`) is partitioned into narrow subsystem locks (`io`, `mem`, `proc`, `creds`, `signal`, `sysv`, etc.).
@@ -29,17 +36,17 @@ Any x86 syscall not intercepted by `normalize_syscall` is resolved through `X86_
 
 ## Census Counts
 
-Top-level census comparing AArch64 and x86_64 Linux system call support in Carrick:
+Top-level census comparing AArch64 and x86_64 Linux system call support in Carrick. Note: reachability through normalization and remap tables establishes entrypoint routing to the shared dispatcher or dedicated handlers; it does not prove runtime semantics, behavioral conformance, or privileged-kernel parity under real guest workloads.
 
 | Category | Count | Definition & Scope |
 |---|---:|---|
-| **Emulated on both** | **246** | Canonical syscalls with `SupportLevel::BringUp` on AArch64 that are reachable and actively serviced on x86_64 (244 via `Direct`, 2 via x86 stat handlers). Plus 2 `Planned` stubs (`execveat`, `clone3`) supported on both. |
-| **AArch64-only (active emulation)** | **0** | Zero syscalls are emulated on AArch64 but missing on x86_64. 100% emulation parity across all implemented system calls. |
+| **Routed on both** | **246** | Canonical syscalls with `SupportLevel::BringUp` on AArch64 that have dispatch routing paths on x86_64 (244 via `Direct`, 2 via x86 stat handlers). In addition, `execveat` and `clone3` are implemented in `dispatch/proc.rs` despite stale `Planned` ABI metadata. Note: routing proves entrypoint dispatch, not runtime semantics or privileged-kernel parity. |
+| **AArch64-only routed** | **0** | Zero canonical syscalls routed on AArch64 lack an x86 dispatch route. However, shared entrypoint routing does not demonstrate identical runtime semantics or behavioral equivalence. |
 | **AArch64-only (ABI table presence)** | **20** | 20 `*_time64` syscalls (#403..414, 416..423 in `carrick_abi::syscall::AARCH64_SYSCALLS`) exist in asm-generic for 32-bit time migration; they do not exist in the 64-bit x86_64 Linux ABI and are `Deferred` in Carrick. |
-| **x86-only (actively emulated)** | **32** | 32 x86 syscalls with no asm-generic counterpart are emulated: 1 architecture-native (`arch_prctl`), 8 with dedicated x86 handlers (`stat`, `lstat`, `poll`, `select`, `dup2`, `alarm`, `time`, `epoll_create`), and 23 normalized into canonical `*at`/`2` forms. |
+| **x86-only routed / handled** | **32** | 32 x86 syscalls with no asm-generic counterpart have routing or handling paths: 1 architecture-native (`arch_prctl`), 8 with dedicated x86 handlers (`stat`, `lstat`, `poll`, `select`, `dup2`, `alarm`, `time`, `epoll_create`), and 23 normalized into canonical `*at`/`2` forms. |
 | **x86-only (deferred / unsupported)** | **25** | 4 deferred legacy shims (`getdents`, `utime`, `utimes`, `futimesat`) returning -ENOSYS pending argument conversion, plus 21 obsolete/unsupported Linux x86 syscalls (`uselib`, `iopl`, `modify_ldt`, etc.) returning honest -ENOSYS. |
-| **x86-only (total Linux ABI)** | **57** | Total Linux system calls present in the x86_64 ABI that have no direct asm-generic number (32 emulated + 25 deferred/unsupported). |
-| **Missing on x86 but emulated on AArch64** | **0** | Exactly 0. Parity is complete for every emulated system call. |
+| **x86-only (total Linux ABI)** | **57** | Total Linux system calls present in the x86_64 ABI that have no direct asm-generic number (32 routed/handled + 25 deferred/unsupported). |
+| **Missing on x86 but routed on AArch64** | **0** | Exactly 0 canonical syscalls routed on AArch64 lack an x86 routing path. Note: routing to the shared dispatcher is not verified behavior or proof of runtime parity. |
 
 ---
 
@@ -314,7 +321,7 @@ This table enumerates every canonical system call defined in `carrick_abi::sysca
 | 278 | 318 | `getrandom` | `BringUp` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:753`: `direct(318, "getrandom", 278)` |
 | 279 | 319 | `memfd_create` | `BringUp` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:755`: `direct(319, "memfd_create", 279)` |
 | 280 | 321 | `bpf` | `BringUp` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:759`: `direct(321, "bpf", 280)` |
-| 281 | 322 | `execveat` | `Planned` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:761`: `direct(322, "execveat", 281)` |
+| 281 | 322 | `execveat` | `Planned` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:761`: `direct(322, "execveat", 281)`. **Metadata discrepancy:** Marked `Planned` in `crates/carrick-abi/src/syscall.rs:598`, but implemented in `crates/carrick-kernel/src/dispatch/proc.rs:101, 3374`. |
 | 282 | 323 | `userfaultfd` | `BringUp` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:763`: `direct(323, "userfaultfd", 282)` |
 | 283 | 324 | `membarrier` | `BringUp` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:765`: `direct(324, "membarrier", 283)` |
 | 284 | 325 | `mlock2` | `BringUp` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:767`: `direct(325, "mlock2", 284)` |
@@ -359,7 +366,7 @@ This table enumerates every canonical system call defined in `carrick_abi::sysca
 | 432 | 432 | `fsmount` | `BringUp` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:803`: `direct(432, "fsmount", 432)` |
 | 433 | 433 | `fspick` | `BringUp` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:805`: `direct(433, "fspick", 433)` |
 | 434 | 434 | `pidfd_open` | `BringUp` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:807`: `direct(434, "pidfd_open", 434)` |
-| 435 | 435 | `clone3` | `Planned` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:810`: `direct(435, "clone3", 435)` |
+| 435 | 435 | `clone3` | `Planned` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:810`: `direct(435, "clone3", 435)`. **Metadata discrepancy:** Marked `Planned` in `crates/carrick-abi/src/syscall.rs:643`, but implemented in `crates/carrick-kernel/src/dispatch/proc.rs:114, 1270, 3737`. |
 | 436 | 436 | `close_range` | `BringUp` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:812`: `direct(436, "close_range", 436)` |
 | 437 | 437 | `openat2` | `BringUp` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:814`: `direct(437, "openat2", 437)` |
 | 438 | 438 | `pidfd_getfd` | `BringUp` | routed to shared dispatcher | `crates/carrick-abi/src/syscall_x86_64.rs:816`: `direct(438, "pidfd_getfd", 438)` |
