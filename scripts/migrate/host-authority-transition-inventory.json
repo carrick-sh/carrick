@@ -18634,5 +18634,32 @@
       "line_end": 1437,
       "line_start": 1437
     }
+  },
+  {
+    "catalog_id": "HA-CATALOG-ESCAPE-SYSCALL",
+    "classification": "declared_substrate",
+    "evidence": {
+      "authority": "authenticated_carrier",
+      "resource": "native lease/watchdog supervisor owner and spawned worker process identities registered as owned exit-notification pidfds by process_exit_fd"
+    },
+    "expansion": null,
+    "operation": "libc::syscall",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-portable/src/lib.rs:2042, process_exit_fd uses libc::syscall to issue only SYS_pidfd_open on a typed positive HostProcessId supplied by a native supervisor. The lease/watchdog callers validate their owner against getppid and obtain their worker identity from the Child they spawned; guest process IDs never select this native exit watch. The returned descriptor is uniquely owned as OwnedFd and the kernel creates it close-on-exec. This is native parent-death/cancellation substrate, not forwarding of a guest syscall.",
+    "review_id": "HA-000754",
+    "source": {
+      "byte_end": 74612,
+      "byte_start": 74599,
+      "column": 23,
+      "column_end": 36,
+      "column_start": 23,
+      "file": "crates/carrick-portable/src/lib.rs",
+      "line": 2042,
+      "line_end": 2042,
+      "line_start": 2042
+    }
   }
 ]
