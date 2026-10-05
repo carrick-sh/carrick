@@ -1776,31 +1776,37 @@ fn owner_fork_refuses_outstanding_copy_and_keeps_peer_same_va_separate() {
 /// one transaction; none of those steps may consult the peer's translation.
 #[test]
 fn owner_fork_publishes_child_with_two_live_same_va_mms() {
+    let parent_root = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE;
+    let pool_root = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
     let region = Region::new();
     let spaces = AddressSpaces::new();
-    let parent = admit(&region, &spaces, 2, ROOT, 2, 0);
-    let peer_root = ROOT + 0xc00000;
+    let parent = admit(&region, &spaces, 2, parent_root, 2, 0);
+    let peer_root = pool_root + 0xc00000;
     let peer = admit(&region, &spaces, 4, peer_root, 1, 0);
     let view = nodes(&region);
     let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
-    let parent_tables = Tables::new(ROOT, IPA, 2);
+    let parent_tables = Tables::new(parent_root, IPA, 2);
     let peer_tables = Tables::new(peer_root, IPA + 0x300000, 1);
     let child = Tables {
-        base: ROOT + 0x400000,
+        base: pool_root + 0x400000,
         words: (0..(2 * 1024 * 1024 / 8))
             .map(|_| core::sync::atomic::AtomicU64::new(0))
             .collect::<Vec<_>>()
             .into_boxed_slice(),
     };
-    let supply = Tables::new(ROOT + 0x800000, 0, 0);
+    let supply = Tables::new(pool_root + 0x800000, 0, 0);
     // The production bootstrap has an EL1-only control window followed by
     // its table alias. Model the full 2 MiB structural block so Fork must
     // request control-copy custody and rebind every child table alias.
     let control = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE - 0x20000;
     let indices = carrick_mmu_core::aarch64::indices(control);
-    parent_tables.words[512 + indices[1]].store((ROOT + 0x4000) | 3, Ordering::Release);
+    parent_tables.words[512 + indices[1]].store((parent_root + 0x4000) | 3, Ordering::Release);
     parent_tables.words[2048 + indices[2]].store(0xb000_0000 | (RW & !3) | 1, Ordering::Release);
     let request = fork_request(&region, &spaces, parent, 3, &child, &supply);
+    // The fixed boot primary was an admitted HVF root before N1's pool
+    // relocation; BIND accepts it on the carrier maintenance root. Fork must
+    // use the same authenticated window while both MM identities are live.
+    assert!(fork::fork_table_window(request, parent_root).is_ok());
     let arenas = [&parent_tables, &child, &supply, &peer_tables];
     let words = ForkWords {
         arenas: &arenas,
