@@ -8,3 +8,6 @@ license.workspace = true
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-sched-core = { path = "../carrick-sched-core" }
+
+[lints]
+workspace = true

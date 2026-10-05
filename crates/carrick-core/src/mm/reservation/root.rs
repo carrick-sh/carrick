@@ -99,7 +99,7 @@ struct Pending {
 #[repr(C)]
 struct State {
     version: u64,
-    generation: u64,
+    generation: ReservationGeneration,
     sequence: u64,
     fork_origin_node: u32,
     /// Elastic permit queue node; its payload owns the active list head.
@@ -217,35 +217,45 @@ impl<'v, Policy: ReservationPolicy> Runs<'v, Policy> {
             visit,
         }
     }
-    fn push(&mut self, node: NodeData) {
+    fn push(&mut self, node: NodeData) -> Result<(), Refusal> {
         match &mut self.run {
             Some(run) if run.end == node.start && Policy::same_mapping(run, &node) => {
                 run.end = node.end
             }
             _ => {
                 if let Some(done) = self.run.replace(node) {
-                    (self.visit)(Policy::mapping(&done, self.generation));
+                    (self.visit)(Policy::mapping(&done, self.generation)?);
                 }
             }
         }
+        Ok(())
     }
-    fn finish(mut self) {
+    fn finish(mut self) -> Result<(), Refusal> {
         if let Some(done) = self.run.take() {
-            (self.visit)(Policy::mapping(&done, self.generation));
+            (self.visit)(Policy::mapping(&done, self.generation)?);
         }
+        Ok(())
     }
 }
 
 /// Pre-allocated nodes for one committed edit. Every split consumes at most
 /// one; the caller proves sufficiency before the first mutation.
+struct RootStorageAccess<'a> {
+    banks: Option<&'a dyn storage::NodeBanks>,
+    identity: bool,
+}
 struct Spares([u32; 5]);
 impl Spares {
     fn available(&self) -> usize {
         self.0.iter().filter(|id| **id != 0).count()
     }
-    fn take(&mut self) -> u32 {
-        let slot = self.0.iter_mut().find(|id| **id != 0);
-        core::mem::take(slot.expect("spare sufficiency proven before mutation"))
+    fn take(&mut self) -> Result<u32, Refusal> {
+        let slot = self
+            .0
+            .iter_mut()
+            .find(|id| **id != 0)
+            .ok_or(Refusal::Stale)?;
+        Ok(core::mem::take(slot))
     }
 }
 
@@ -312,6 +322,7 @@ pub struct Reservations<'a, Policy: ReservationPolicy, Geometry: ReservationGeom
     table: &'a SharedReservations<Policy, Geometry>,
     root: &'a Root,
     mm: ReservationMm,
+    incarnation: ReservationGeneration,
     pub work: usize,
     banks: Option<&'a dyn storage::NodeBanks>,
     node_capacity: u32,
@@ -397,36 +408,41 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
                 Ordering::Relaxed,
             )
             .map_err(|_| Refusal::Busy)?;
-        let result = if root.key.load(Ordering::Acquire) != 0 {
-            Err(Refusal::Collision)
-        } else if !Policy::validates_layout(layout) {
-            Err(Refusal::Invalid)
-        } else if root.epoch.load(Ordering::Relaxed) == u64::MAX {
-            Err(Refusal::Stale)
-        } else {
-            // SAFETY: exclusive unpublished root; no state reference exists.
-            unsafe {
-                (*root.state.get()).write(State {
-                    version: VERSION,
-                    generation: root.epoch.load(Ordering::Relaxed) + 1,
-                    sequence: 0,
-                    fork_origin_node: 0,
-                    prepared_head: 0,
-                    tree: 0,
-                    host_reserve_head: 0,
-                    layout,
-                    pending: None,
-                    admitted: false,
-                    fork_pending: false,
-                    host_reserved: 0,
-                    minted: 0,
-                    retired_below: 0,
-                });
+        let result = (|| {
+            if root.key.load(Ordering::Acquire) != 0 {
+                Err(Refusal::Collision)
+            } else if !Policy::validates_layout(layout) {
+                Err(Refusal::Invalid)
+            } else if root.epoch.load(Ordering::Relaxed) == u64::MAX {
+                Err(Refusal::Stale)
+            } else {
+                // SAFETY: exclusive unpublished root; no state reference exists.
+                unsafe {
+                    (*root.state.get()).write(State {
+                        version: VERSION,
+                        generation: ReservationGeneration::new(
+                            root.epoch.load(Ordering::Relaxed) + 1,
+                        )
+                        .ok_or(Refusal::Stale)?,
+                        sequence: 0,
+                        fork_origin_node: 0,
+                        prepared_head: 0,
+                        tree: 0,
+                        host_reserve_head: 0,
+                        layout,
+                        pending: None,
+                        admitted: false,
+                        fork_pending: false,
+                        host_reserved: 0,
+                        minted: 0,
+                        retired_below: 0,
+                    });
+                }
+                self.set_admitted(index, false);
+                root.key.store(mm.raw(), Ordering::Release);
+                Ok(())
             }
-            self.set_admitted(index, false);
-            root.key.store(mm.raw(), Ordering::Release);
-            Ok(())
-        };
+        })();
         root.locked.store(0, Ordering::Release);
         result
     }
@@ -465,8 +481,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.lock_using(
             index,
             mm,
-            None,
-            cfg!(target_os = "none"),
+            RootStorageAccess {
+                banks: None,
+                identity: cfg!(target_os = "none"),
+            },
             &NoRootWait,
             RootHolder::El1Slot(slot).word(),
             RootAuthority::SourceFree(self.source_free()),
@@ -495,8 +513,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.lock_using(
             index,
             mm,
-            None,
-            cfg!(target_os = "none"),
+            RootStorageAccess {
+                banks: None,
+                identity: cfg!(target_os = "none"),
+            },
             wait,
             RootHolder::Host.word(),
             RootAuthority::SourceFree(self.source_free()),
@@ -515,17 +535,16 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         })
     }
 
-    #[allow(clippy::too_many_arguments)] // One admission transaction authenticates both storage and release venues.
     fn lock_using<'a>(
         &'a self,
         index: usize,
         mm: ReservationMm,
-        banks: Option<&'a dyn storage::NodeBanks>,
-        identity: bool,
+        storage: RootStorageAccess<'a>,
         wait: &dyn RootWait,
         holder: u64,
         authority: RootAuthority<'a, Policy, Geometry>,
     ) -> Result<Reservations<'a, Policy, Geometry>, Refusal> {
+        let RootStorageAccess { banks, identity } = storage;
         let release_venue = authority.release();
         if self.layout_hash.load(Ordering::Acquire) != Self::LAYOUT_HASH {
             return Err(Refusal::Stale);
@@ -596,6 +615,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             table: self,
             root,
             mm,
+            incarnation: ReservationGeneration::INITIAL,
             work: 0,
             banks,
             node_capacity: self.storage.capacity(),
@@ -624,6 +644,13 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         if guard.state().version != VERSION {
             return Err(Refusal::Stale);
         }
+        guard.incarnation = ReservationGeneration::new(
+            root.epoch
+                .load(Ordering::Acquire)
+                .checked_add(1)
+                .ok_or(Refusal::Stale)?,
+        )
+        .ok_or(Refusal::Stale)?;
         Ok(guard)
     }
 
@@ -895,42 +922,41 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         self.set_source_tree(tree);
         Ok(id)
     }
-    fn source_add(&mut self, backing: HostBackingIdentity, bytes: u64) {
+    fn source_add(&mut self, backing: HostBackingIdentity, bytes: u64) -> Result<(), Refusal> {
         let id = self.source_find(backing.handle().get(), backing.generation().get());
-        assert!(
-            id != 0,
-            "HostBacking counter must be reserved before mutation"
-        );
+        if id == 0 {
+            return Err(Refusal::Stale);
+        }
         let mut node = self.read(id);
-        node.first = node
-            .first
-            .checked_add(bytes)
-            .expect("disjoint source byte references");
+        node.first = node.first.checked_add(bytes).ok_or(Refusal::Stale)?;
         self.write(id, node);
+        Ok(())
     }
-    fn source_sub(&mut self, backing: HostBackingIdentity, bytes: u64) {
+    fn source_sub(&mut self, backing: HostBackingIdentity, bytes: u64) -> Result<(), Refusal> {
         let id = self.source_find(backing.handle().get(), backing.generation().get());
-        assert!(id != 0, "HostBacking counter must name the live mapping");
+        if id == 0 {
+            return Err(Refusal::Stale);
+        }
         let mut node = self.read(id);
-        node.first = node
-            .first
-            .checked_sub(bytes)
-            .expect("live source reference count");
+        node.first = node.first.checked_sub(bytes).ok_or(Refusal::Stale)?;
         if node.first == 0 && node.data == 0 {
             node.data = 1;
             node.gap = u64::from(self.source_retired());
             self.set_source_retired(id);
         }
         self.write(id, node);
+        Ok(())
     }
     /// Pop exact physical retirements, including those produced by the guest
     /// venue. A revived token is skipped; no reservation population is walked.
     pub fn take_retired_host_backing(
         &mut self,
-    ) -> Option<(core::num::NonZeroU64, core::num::NonZeroU64)> {
+    ) -> Result<Option<(core::num::NonZeroU64, core::num::NonZeroU64)>, Refusal> {
         while self.source_retired() != 0 {
             let id = self.source_retired();
             let mut node = self.read(id);
+            let handle = core::num::NonZeroU64::new(node.start).ok_or(Refusal::Stale)?;
+            let generation = core::num::NonZeroU64::new(node.end).ok_or(Refusal::Stale)?;
             self.set_source_retired(node.gap as u32);
             node.gap = 0;
             node.data = 0;
@@ -942,12 +968,9 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             let (tree, freed) = self.source_erase(source_tree, (node.start, node.end));
             self.set_source_tree(tree);
             self.free_node(freed);
-            return Some((
-                core::num::NonZeroU64::new(node.start).expect("source handle"),
-                core::num::NonZeroU64::new(node.end).expect("source generation"),
-            ));
+            return Ok(Some((handle, generation)));
         }
-        None
+        Ok(None)
     }
     pub fn mm(&self) -> ReservationMm {
         self.mm
@@ -965,8 +988,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     /// Stable occupancy identity. Policy edits change `generation`, while
     /// this value changes only when a retired slot is published again.
     pub fn incarnation(&self) -> ReservationGeneration {
-        ReservationGeneration::new(self.root.epoch.load(Ordering::Acquire) + 1)
-            .expect("published root incarnation")
+        self.incarnation
     }
     pub fn operation_sequence(&self) -> u64 {
         self.state().sequence
@@ -1010,18 +1032,23 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     pub fn publish_fork_parent(
         &mut self,
         request: impl ForkRequestRecord,
-    ) -> ReservationGeneration {
-        debug_assert!(!self.state().fork_pending && self.pending().is_none());
-        debug_assert!(self.state().generation < u64::MAX);
+    ) -> Result<ReservationGeneration, Refusal> {
+        if self.state().fork_pending || self.pending().is_some() {
+            return Err(Refusal::Stale);
+        }
+        let generation = self.generation().checked_next().ok_or(Refusal::Stale)?;
         self.state_mut().fork_pending = true;
         self.state_mut().sequence = request.operation().sequence.get();
-        self.state_mut().generation += 1;
-        self.generation()
+        self.state_mut().generation = generation;
+        Ok(generation)
     }
-    pub fn publish_fork_child(&mut self, request: impl ForkRequestRecord) {
-        debug_assert!(self.is_admitted() && self.pending().is_none() && !self.state().fork_pending);
+    pub fn publish_fork_child(&mut self, request: impl ForkRequestRecord) -> Result<(), Refusal> {
+        if !self.is_admitted() || self.pending().is_some() || self.state().fork_pending {
+            return Err(Refusal::Stale);
+        }
         self.state_mut().fork_pending = true;
         self.state_mut().sequence = request.operation().sequence.get();
+        Ok(())
     }
     pub fn begin_fork_publication(
         &mut self,
@@ -1128,7 +1155,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         let next = self
             .state()
             .generation
-            .checked_add(1)
+            .checked_next()
             .ok_or(Refusal::Stale)?;
         self.state_mut().generation = next;
         Ok(self.generation())
@@ -1142,7 +1169,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     }
 
     pub fn generation(&self) -> ReservationGeneration {
-        ReservationGeneration::new(self.state().generation).expect("published generation")
+        self.state().generation
     }
     pub fn brk_current(&self) -> u64 {
         Policy::active_value(self.state().layout.policy)
@@ -1202,14 +1229,14 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     pub fn mapping(&mut self, address: u64) -> Option<Mapping> {
         let generation = self.generation();
         self.node_at(address)
-            .map(|n| Policy::mapping(&n, generation))
+            .and_then(|n| Policy::mapping(&n, generation).ok())
     }
     /// The committed node holding `address`, with its incarnation.
     pub fn node(&mut self, address: u64) -> Option<(Mapping, ReservationIncarnation)> {
         let generation = self.generation();
         let n = self.node_at(address)?;
         Some((
-            Policy::mapping(&n, generation),
+            Policy::mapping(&n, generation).ok()?,
             ReservationIncarnation::new(n.incarnation)?,
         ))
     }
@@ -1222,19 +1249,19 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             return Err(Refusal::Stale);
         }
         let mut runs = Runs::<Policy>::new(self.generation(), visit);
-        self.observe_tree(self.state().tree, &mut runs);
-        runs.finish();
+        self.observe_tree(self.state().tree, &mut runs)?;
+        runs.finish()?;
         Ok(())
     }
 
-    fn observe_tree(&mut self, id: u32, runs: &mut Runs<'_, Policy>) {
+    fn observe_tree(&mut self, id: u32, runs: &mut Runs<'_, Policy>) -> Result<(), Refusal> {
         if id == 0 {
-            return;
+            return Ok(());
         }
         let node = self.read(id);
-        self.observe_tree(node.left, runs);
-        runs.push(node);
-        self.observe_tree(node.right, runs);
+        self.observe_tree(node.left, runs)?;
+        runs.push(node)?;
+        self.observe_tree(node.right, runs)
     }
     /// The committed nodes overlapping `range`, each with its incarnation,
     /// in address order: one bounded descent per node, independent of the
@@ -1254,7 +1281,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
                 break;
             }
             let incarnation = ReservationIncarnation::new(n.incarnation).ok_or(Refusal::Invalid)?;
-            visit(Policy::mapping(&n, generation), incarnation);
+            visit(Policy::mapping(&n, generation)?, incarnation);
             cursor = n.end;
         }
         Ok(())
@@ -1316,7 +1343,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         let generation = self.generation();
         found
             .filter(|n| n.end > range.start())
-            .map(|n| Policy::mapping(&n, generation))
+            .and_then(|n| Policy::mapping(&n, generation).ok())
     }
 
     pub fn fault_plan(
@@ -1592,18 +1619,18 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     fn splits_needed(&mut self, range: ReservationRange) -> usize {
         usize::from(self.straddles(range.start())) + usize::from(self.straddles(range.end()))
     }
-    #[allow(clippy::too_many_arguments)]
-    fn proposal(
-        &mut self,
-        range: ReservationRange,
-        prot: ReservationProtection,
-        operation: ReservationOperation,
-        result: u64,
-        policy_value: u64,
-        require_coverage: bool,
-        source: Option<ReservationRange>,
-        flags: ReservationNodeFlags,
-    ) -> Result<Decision, Refusal> {
+    fn proposal(&mut self, proposal: ReservationProposal) -> Result<Decision, Refusal> {
+        let ReservationProposal {
+            range,
+            protection: prot,
+            operation,
+            result,
+            policy_value,
+            require_coverage,
+            source,
+            flags,
+        } = proposal;
+        let (result, policy_value) = (result.raw(), policy_value.raw());
         if !self.state().admitted {
             return Err(Refusal::Stale);
         }
@@ -1694,7 +1721,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         let sequence = self.state().sequence.checked_add(1).ok_or(Refusal::Stale)?;
         self.state()
             .generation
-            .checked_add(1)
+            .checked_next()
             .ok_or(Refusal::Stale)?;
         let needed = if source.is_some() {
             // Four boundaries plus the destination node; a shared straddler
@@ -1886,10 +1913,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             if n.start >= range.end() {
                 break;
             }
-            runs.push(n);
+            runs.push(n)?;
             cursor = n.end;
         }
-        runs.finish();
+        runs.finish()?;
         Ok(())
     }
     /// The Linux mapping around `[start, end)`: the adjacent run of nodes of
@@ -1939,16 +1966,16 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         Policy::mmap(self, placement, GuestLen::new(len), prot)
     }
     pub fn munmap(&mut self, range: ReservationRange) -> Result<Decision, Refusal> {
-        self.proposal(
+        self.proposal(ReservationProposal {
             range,
-            ReservationProtection::NONE,
-            ReservationOperation::Retire,
-            0,
-            self.brk_current(),
-            false,
-            None,
-            ReservationNodeFlags::EMPTY,
-        )
+            protection: ReservationProtection::NONE,
+            operation: ReservationOperation::Retire,
+            result: UserVa::new(0),
+            policy_value: UserVa::new(self.brk_current()),
+            require_coverage: false,
+            source: None,
+            flags: ReservationNodeFlags::EMPTY,
+        })
     }
     /// Change the protection of every node in `range`; each keeps its own
     /// [`ReservationNodeFlags::CARRIED`] attributes.
@@ -1957,16 +1984,16 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         range: ReservationRange,
         prot: ReservationProtection,
     ) -> Result<Decision, Refusal> {
-        self.proposal(
+        self.proposal(ReservationProposal {
             range,
-            prot,
-            ReservationOperation::Protect,
-            0,
-            self.brk_current(),
-            true,
-            None,
-            ReservationNodeFlags::EMPTY,
-        )
+            protection: prot,
+            operation: ReservationOperation::Protect,
+            result: UserVa::new(0),
+            policy_value: UserVa::new(self.brk_current()),
+            require_coverage: true,
+            source: None,
+            flags: ReservationNodeFlags::EMPTY,
+        })
     }
     /// `mremap(2)` of an anonymous range as one proposal. `source` must lie in
     /// one root-editable node (`Hole` otherwise: the decoder's EFAULT); a
@@ -1993,10 +2020,11 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         Policy::brk(self, UserVa::new(requested))
     }
     /// Split the node straddling `address`, both halves keeping its attributes.
-    fn split_at(&mut self, address: u64, spares: &mut Spares) {
+    fn split_at(&mut self, address: u64, spares: &mut Spares) -> Result<(), Refusal> {
         let Some(n) = self.next(address).filter(|n| n.start < address) else {
-            return;
+            return Ok(());
         };
+        let id = spares.take()?;
         let (tree, freed) = self.erase(self.state().tree, n.start);
         self.state_mut().tree = tree;
         let mut low = n;
@@ -2012,15 +2040,19 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         self.write(freed, low);
         let tree = self.insert(self.state().tree, freed);
         self.state_mut().tree = tree;
-        let id = spares.take();
         self.write(id, high);
         let tree = self.insert(self.state().tree, id);
         self.state_mut().tree = tree;
+        Ok(())
     }
     /// Remove every node inside `range`, keeping straddlers' outside pieces.
-    fn remove_range(&mut self, range: ReservationRange, spares: &mut Spares) {
-        self.split_at(range.start(), spares);
-        self.split_at(range.end(), spares);
+    fn remove_range(
+        &mut self,
+        range: ReservationRange,
+        spares: &mut Spares,
+    ) -> Result<(), Refusal> {
+        self.split_at(range.start(), spares)?;
+        self.split_at(range.end(), spares)?;
         while let Some(n) = self.next(range.start()) {
             if n.start >= range.end() {
                 break;
@@ -2033,10 +2065,11 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             let (tree, freed) = self.erase(self.state().tree, n.start);
             self.state_mut().tree = tree;
             if let Some(source) = n.host_backing {
-                self.source_sub(source, n.end - n.start);
+                self.source_sub(source, n.end - n.start)?;
             }
             self.free_node(freed);
         }
+        Ok(())
     }
     /// Rewrite the protection of every node inside the fully covered `range`,
     /// splitting straddlers at its bounds and keeping each node's flags.
@@ -2045,9 +2078,9 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         range: ReservationRange,
         prot: ReservationProtection,
         spares: &mut Spares,
-    ) {
-        self.split_at(range.start(), spares);
-        self.split_at(range.end(), spares);
+    ) -> Result<(), Refusal> {
+        self.split_at(range.start(), spares)?;
+        self.split_at(range.end(), spares)?;
         let mut cursor = range.start();
         while cursor < range.end() {
             let Some(n) = self.next(cursor).filter(|n| n.start < range.end()) else {
@@ -2063,6 +2096,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             self.insert_coalescing(freed);
             cursor = n.end;
         }
+        Ok(())
     }
     pub fn complete(&mut self, completion: ReservationCompletion) -> Result<u64, Refusal> {
         self.complete_as(completion, false)
@@ -2124,16 +2158,16 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             return Err(Refusal::Stale);
         }
         if let Some(source) = pending.request.source {
-            self.remove_range(source, &mut spares);
+            self.remove_range(source, &mut spares)?;
         }
         if pending.request.operation == ReservationOperation::Protect {
             // Each covered node keeps its own carried attributes.
-            self.reprotect_range(range, pending.request.protection, &mut spares);
+            self.reprotect_range(range, pending.request.protection, &mut spares)?;
         } else {
-            self.remove_range(range, &mut spares);
+            self.remove_range(range, &mut spares)?;
         }
         if creates && pending.request.operation != ReservationOperation::Protect {
-            let id = spares.take();
+            let id = spares.take()?;
             let mut node = NodeData {
                 start: range.start(),
                 end: range.end(),
@@ -2145,13 +2179,17 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             node.incarnation = self.incarnation_for(&node);
             self.write(id, node);
             if let Some(source) = created_backing {
-                self.source_add(source, range.len());
+                self.source_add(source, range.len())?;
             }
             self.insert_coalescing(id);
         }
         self.release_spares(spares.0);
         Policy::apply_value(&mut self.state_mut().layout.policy, pending.policy_value);
-        self.state_mut().generation += 1;
+        self.state_mut().generation = self
+            .state()
+            .generation
+            .checked_next()
+            .ok_or(Refusal::Stale)?;
         self.state_mut().pending = None;
         Ok(pending.result)
     }
@@ -2444,12 +2482,12 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         node.incarnation = self.incarnation_for(&node);
         self.write(id, node);
         if let Some(source) = host_backing {
-            self.source_add(source, range.len());
+            self.source_add(source, range.len())?;
         }
         self.insert_coalescing(id);
         Ok(())
     }
-    fn host_edit_admitted(&mut self) -> Result<u64, Refusal> {
+    fn host_edit_admitted(&mut self) -> Result<ReservationGeneration, Refusal> {
         self.host_venue = true;
         if !self.state().admitted {
             return Err(Refusal::Stale);
@@ -2457,7 +2495,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         if self.pending().is_some() || self.state().fork_pending {
             return Err(Refusal::Busy);
         }
-        self.state().generation.checked_add(1).ok_or(Refusal::Stale)
+        self.state().generation.checked_next().ok_or(Refusal::Stale)
     }
     /// Host commit of a mapping it served itself (file, shared, stack, device,
     /// out-of-arena alias): an opaque placement obstacle that EL1 never edits.
@@ -2501,7 +2539,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         let generation = self.host_edit_admitted()?;
         let needed = self.splits_needed(range);
         let mut spares = Spares(self.host_spares(needed)?);
-        self.remove_range(range, &mut spares);
+        self.remove_range(range, &mut spares)?;
         self.release_spares(spares.0);
         self.state_mut().generation = generation;
         Ok(())
@@ -2538,8 +2576,8 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         }
         let needed = self.splits_needed(range);
         let mut spares = Spares(self.host_spares(needed)?);
-        self.split_at(range.start(), &mut spares);
-        self.split_at(range.end(), &mut spares);
+        self.split_at(range.start(), &mut spares)?;
+        self.split_at(range.end(), &mut spares)?;
         self.release_spares(spares.0);
         let mut cursor = range.start();
         while cursor < range.end() {
@@ -2589,7 +2627,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         child
             .state()
             .generation
-            .checked_add(1)
+            .checked_next()
             .ok_or(Refusal::Stale)?;
         // Admission must not publish a child that cannot forward even one
         // host request. This reserve remains private across the copy.
@@ -2626,7 +2664,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         state.minted = minted;
         state.retired_below = retired_below;
         state.admitted = true;
-        state.generation += 1;
+        state.generation = state.generation.checked_next().ok_or(Refusal::Stale)?;
         child.mark_admitted();
         Ok(())
     }
@@ -2658,7 +2696,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             list.len += 1;
             if let Some(source) = n.host_backing {
                 child.source_reserve(source)?;
-                child.source_add(source, n.end - n.start);
+                child.source_add(source, n.end - n.start)?;
             }
         }
         self.copy_in_order(n.right, list, child)
@@ -2803,7 +2841,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         }
         self.root
             .epoch
-            .store(self.state().generation, Ordering::Relaxed);
+            .store(self.state().generation.raw(), Ordering::Relaxed);
         self.table.set_admitted(self.index(), false);
         self.root.key.store(0, Ordering::Release);
         Ok(())
@@ -2874,7 +2912,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         let generation = self
             .state()
             .generation
-            .checked_add(1)
+            .checked_next()
             .ok_or(Refusal::Stale)?;
         Policy::apply_value(&mut self.state_mut().layout.policy, requested.raw());
         self.state_mut().generation = generation;
@@ -2883,27 +2921,8 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     fn refuse(&mut self, request: ReservationRequest) -> Result<(), Refusal> {
         self.refuse(request)
     }
-    fn propose(
-        &mut self,
-        range: ReservationRange,
-        protection: ReservationProtection,
-        operation: ReservationOperation,
-        result: UserVa,
-        byte_break: UserVa,
-        preserve: bool,
-        source: Option<ReservationRange>,
-        flags: ReservationNodeFlags,
-    ) -> Result<Decision, Refusal> {
-        self.proposal(
-            range,
-            protection,
-            operation,
-            result.raw(),
-            byte_break.raw(),
-            preserve,
-            source,
-            flags,
-        )
+    fn propose(&mut self, proposal: ReservationProposal) -> Result<Decision, Refusal> {
+        self.proposal(proposal)
     }
 }
 
@@ -3938,11 +3957,11 @@ mod tests {
             0x4000
         );
         assert_eq!(
-            child.take_retired_host_backing(),
+            child.take_retired_host_backing().unwrap(),
             Some((source.handle(), source.generation()))
         );
-        assert_eq!(child.take_retired_host_backing(), None);
-        assert_eq!(parent.take_retired_host_backing(), None);
+        assert_eq!(child.take_retired_host_backing().unwrap(), None);
+        assert_eq!(parent.take_retired_host_backing().unwrap(), None);
     }
 
     #[test]
@@ -3959,7 +3978,7 @@ mod tests {
                 0,
             );
             root.source_reserve(source).unwrap();
-            root.source_add(source, 4096);
+            root.source_add(source, 4096).unwrap();
         }
         for token in 1..=128 {
             let before = root.work;
@@ -3970,7 +3989,7 @@ mod tests {
             assert!(root.work - before <= 9, "source lookup must be logarithmic");
         }
         let before = root.work;
-        assert_eq!(root.take_retired_host_backing(), None);
+        assert_eq!(root.take_retired_host_backing().unwrap(), None);
         assert!(
             root.work - before <= 1,
             "empty retirement queue must not scan sources"
@@ -3981,13 +4000,13 @@ mod tests {
                 NonZeroU64::new(1).unwrap(),
                 0,
             );
-            root.source_sub(source, 4096);
+            root.source_sub(source, 4096).unwrap();
         }
         let revived =
             HostBackingIdentity::new(NonZeroU64::new(64).unwrap(), NonZeroU64::new(1).unwrap(), 0);
-        root.source_add(revived, 4096);
+        root.source_add(revived, 4096).unwrap();
         let mut retired = 0;
-        while let Some((handle, generation)) = root.take_retired_host_backing() {
+        while let Some((handle, generation)) = root.take_retired_host_backing().unwrap() {
             assert_ne!(handle.get(), 64);
             assert_eq!(generation.get(), 1);
             assert_eq!(root.source_ref_count(handle, generation), 0);
@@ -3998,12 +4017,12 @@ mod tests {
             root.source_ref_count(revived.handle(), revived.generation()),
             4096
         );
-        root.source_sub(revived, 4096);
+        root.source_sub(revived, 4096).unwrap();
         assert_eq!(
-            root.take_retired_host_backing(),
+            root.take_retired_host_backing().unwrap(),
             Some((revived.handle(), revived.generation()))
         );
-        assert_eq!(root.take_retired_host_backing(), None);
+        assert_eq!(root.take_retired_host_backing().unwrap(), None);
     }
 
     #[test]
