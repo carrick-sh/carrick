@@ -125,11 +125,13 @@ pub const EL1_FRAME_GRANT_TARGET_SIZE: u64 = 2 * 1024 * 1024;
 
 /// EL1-only virtual alias of the current MM's primary AArch64 stage-1 table
 /// arena. Every published address space maps its own arena at this fixed VA.
-pub const AARCH64_STAGE1_TABLES_ALIAS_BASE: u64 = 0x2D_0002_0000;
+pub const AARCH64_STAGE1_TABLES_ALIAS_BASE: u64 =
+    carrick_mmu_core::aarch64::owner_fork::STAGE1_TABLES_ALIAS_BASE;
 
 /// Bytes available through [`AARCH64_STAGE1_TABLES_ALIAS_BASE`]. Guest leaf
 /// publication must reject every descriptor outside this primary arena.
-pub const AARCH64_STAGE1_TABLES_PRIMARY_SIZE: u64 = 0x1C_0000;
+pub const AARCH64_STAGE1_TABLES_PRIMARY_SIZE: u64 =
+    carrick_mmu_core::aarch64::owner_fork::STAGE1_TABLES_PRIMARY_SIZE;
 
 /// Guest-physical base of the carrier's dense pool of 2 MiB stage-1 table
 /// arenas: every MM's primary arena (its root slot) and every extension arena

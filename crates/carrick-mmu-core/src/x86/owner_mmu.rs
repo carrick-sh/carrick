@@ -8,7 +8,18 @@ use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
 pub struct X86Mmu;
 impl OwnerForkMmu for X86Mmu {
     const ADDRESS_MASK: u64 = ADDRESS;
-    const PRIVATE_CONTROL_WINDOW: bool = false;
+    fn control_window() -> Option<(UserVa, UserVa)> {
+        None
+    }
+    fn is_control_alias(_: UserVa) -> bool {
+        false
+    }
+    fn control_alias_destination(_: UserVa, _: FrameGpa) -> Result<FrameGpa, OwnerMmuRefusal> {
+        Err(OwnerMmuRefusal::Unreachable)
+    }
+    fn control_copy_destination(_: UserVa, _: FrameGpa) -> Result<FrameGpa, OwnerMmuRefusal> {
+        Err(OwnerMmuRefusal::Unreachable)
+    }
     fn is_table(word: u64, level: usize) -> bool {
         level < 3 && word & PRESENT != 0 && word & HUGE == 0
     }
