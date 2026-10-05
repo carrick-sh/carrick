@@ -8295,6 +8295,41 @@ mod tests {
     }
 
     #[test]
+    fn exec_successor_preserves_retained_predecessor_table_authority() {
+        let manager = |root| {
+            PageTableManager::new(
+                carrick_mem::memory::stage1_identity_page_tables(),
+                root,
+                carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+            )
+        };
+        let old_root = 0x9a_0020_0000;
+        let new_root = 0x9a_0040_0000;
+        let mut engine = Stage1Authority::new_with_manager(Some(manager(old_root)));
+        let pending_predecessor = engine.clone();
+        let backend_successor = Stage1Authority::new_with_manager(Some(manager(new_root)));
+        let mut bound = None;
+        replace_page_tables_authority(
+            &mut engine,
+            backend_successor.snapshot_image(),
+            |_| Ok(()),
+            |authority| bound = Some(authority),
+        )
+        .unwrap();
+        assert_eq!(
+            pending_predecessor.root_base(),
+            Some(old_root),
+            "deferred old-MM cleanup must retain its own table image"
+        );
+        assert!(
+            engine.shares_exact_authority(&backend_successor),
+            "engine must adopt the backend's exact successor MM authority"
+        );
+        assert!(!engine.shares_exact_authority(&pending_predecessor));
+        assert!(bound.unwrap().shares_exact_authority(&backend_successor));
+    }
+
+    #[test]
     fn execve_sharing_governed_solely_by_authority_even_on_disagreement() {
         let bytes = carrick_mem::memory::stage1_identity_page_tables();
         let manager = PageTableManager::new(
