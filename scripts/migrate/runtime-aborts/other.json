@@ -1014,6 +1014,17 @@
       "verdict": "carrier_fault",
       "failure_domain": "aarch64::user_transfer",
       "rationale": "An owner grant has neither an exact settled receipt nor a successful withdrawal. Releasing physical custody would race a possibly published descriptor, so continuing is unsafe."
+    },
+    {
+      "file": "crates/carrick-thread/src/thread.rs",
+      "function": "RegistryInner::new_clear",
+      "ordinal_in_function": 1,
+      "verdict": "carrier_fault",
+      "rationale": "The clear-child-tid incarnation counter exhausted; wrapping could alias a still-retained clear claim and route its wake to another incarnation.",
+      "failure_domain": "thread::clear_child_tid",
+      "domain": "thread::clear_child_tid",
+      "fingerprint": "d982339958ce78e5a18251ad1957951eda6d34aaa64191f6aa0b092668e62935",
+      "sink": "fatal"
     }
   ]
 }

@@ -1891,7 +1891,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
-      "function": "Kernel::commit_task_exit_notifying",
+      "function": "Kernel::retire_task_exit_notifying",
       "ordinal_in_function": 1,
       "fingerprint": "bacdf1e940b9eb1cea493ce7019ea2f566fe9f76ba599b7d07969dab72f4edaa",
       "verdict": "carrier_fault",
@@ -1902,9 +1902,9 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
-      "function": "Kernel::commit_task_exit_notifying",
-      "ordinal_in_function": 2,
-      "fingerprint": "1dc72bc02397521efa28f3c97cbef0a19d1775fe08356768c0e419ca34505dad",
+      "function": "Kernel::retire_task_exit_notifying",
+      "ordinal_in_function": 3,
+      "fingerprint": "c0bd6597988b6d3e13d67089e15098dc3f28ae60966be8f4612851d5bf784bcd",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::task_exit_identity",
       "rationale": "The PID namespace refused to remove a secondary TID already retired by the committed task-exit transaction; continuing would leave stale membership.",
@@ -1913,9 +1913,9 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
-      "function": "Kernel::commit_task_exit_notifying",
-      "ordinal_in_function": 3,
-      "fingerprint": "1dc72bc02397521efa28f3c97cbef0a19d1775fe08356768c0e419ca34505dad",
+      "function": "Kernel::retire_task_exit_notifying",
+      "ordinal_in_function": 4,
+      "fingerprint": "c0bd6597988b6d3e13d67089e15098dc3f28ae60966be8f4612851d5bf784bcd",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::task_exit_identity",
       "rationale": "A published autoreaped leader TID exceeded the namespace member domain after task-exit commit; continuing would prevent exact namespace cleanup.",
@@ -1924,9 +1924,9 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
-      "function": "Kernel::commit_task_exit_notifying",
-      "ordinal_in_function": 4,
-      "fingerprint": "1dc72bc02397521efa28f3c97cbef0a19d1775fe08356768c0e419ca34505dad",
+      "function": "Kernel::retire_task_exit_notifying",
+      "ordinal_in_function": 5,
+      "fingerprint": "c0bd6597988b6d3e13d67089e15098dc3f28ae60966be8f4612851d5bf784bcd",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::task_exit_identity",
       "rationale": "The PID namespace refused to remove the autoreaped leader already retired by the committed task-exit transaction; continuing would leave stale membership.",
@@ -3565,7 +3565,7 @@
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
       "function": "Kernel::retire_thread_in_registry",
       "ordinal_in_function": 1,
-      "fingerprint": "af8787c5facdb39736b7572c927be4cc9bb8b4c9936fa5056d1bb07cc01cec1e",
+      "fingerprint": "242140ef10b96b978238fa20bba5d13de66856a829b737338e114f964b7dd947",
       "verdict": "carrier_fault",
       "failure_domain": "kernel::thread_retirement",
       "rationale": "A non-final host retirement could not consume its exact process live-count credit after last-thread admission was checked. Birth publication charges that same page exactly once; failure means duplicate retirement or foreign page custody, not resource exhaustion.",
@@ -3824,6 +3824,39 @@
       "verdict": "carrier_fault",
       "failure_domain": "metadata::wake",
       "rationale": "An admitted metadata wake failed record ownership validation; continuing could resume the wrong transaction or leak its execution capacity."
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
+      "function": "<RetiredTaskExit<F> as Drop>::drop",
+      "ordinal_in_function": 1,
+      "verdict": "carrier_fault",
+      "rationale": "Signal-visible task retirement committed but its reserved completion was abandoned; continuing would strand waiters and identity custody.",
+      "failure_domain": "kernel::task_exit_publication",
+      "domain": "kernel::task_exit_publication",
+      "fingerprint": "0cb4e824167b9ca7957c656f0f35d86e378408809f865606eb43f70165fd2542",
+      "sink": "fatal"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
+      "function": "Kernel::retire_task_exit_notifying",
+      "ordinal_in_function": 2,
+      "verdict": "carrier_fault",
+      "rationale": "The publication token lost its exact staged task incarnation after signal retirement; continuing could publish completion for a reused identity.",
+      "failure_domain": "kernel::task_exit_publication",
+      "domain": "kernel::task_exit_publication",
+      "fingerprint": "c0bd6597988b6d3e13d67089e15098dc3f28ae60966be8f4612851d5bf784bcd",
+      "sink": "fatal"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
+      "function": "RetiredTaskExit<F>::publish",
+      "ordinal_in_function": 1,
+      "verdict": "carrier_fault",
+      "rationale": "A retired task completion token lost its one-shot publisher; recovery could publish exit twice or abandon terminal clear ordering.",
+      "failure_domain": "kernel::task_exit_publication",
+      "domain": "kernel::task_exit_publication",
+      "fingerprint": "7ee6f9b0fd4b46702ea7f2e10d4e25f66abdd5a25e87501cd038728eb86a961a",
+      "sink": "fatal"
     }
   ]
 }
