@@ -6675,18 +6675,18 @@
       "linux-cli",
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:916 in `audit_crate_source`, `std::fs::read_dir` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
+    "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:928 in `audit_crate_source`, `std::fs::read_dir` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
     "review_id": "HA-000696",
     "source": {
-      "byte_end": 31475,
-      "byte_start": 31463,
+      "byte_end": 31953,
+      "byte_start": 31941,
       "column": 26,
       "column_end": 38,
       "column_start": 26,
       "file": "crates/carrick-conformance-contract/src/personality_boundary.rs",
-      "line": 916,
-      "line_end": 916,
-      "line_start": 916
+      "line": 928,
+      "line_end": 928,
+      "line_start": 928
     }
   },
   {
@@ -6702,18 +6702,18 @@
       "linux-cli",
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:1087 in `collect_rs_files`, `std::fs::read_dir` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
+    "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:1099 in `collect_rs_files`, `std::fs::read_dir` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
     "review_id": "HA-000697",
     "source": {
-      "byte_end": 36749,
-      "byte_start": 36737,
+      "byte_end": 37227,
+      "byte_start": 37215,
       "column": 19,
       "column_end": 31,
       "column_start": 19,
       "file": "crates/carrick-conformance-contract/src/personality_boundary.rs",
-      "line": 1087,
-      "line_end": 1087,
-      "line_start": 1087
+      "line": 1099,
+      "line_end": 1099,
+      "line_start": 1099
     }
   },
   {
@@ -7921,18 +7921,18 @@
       "linux-cli",
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:326 in `check_substrate_boundary`, `std::fs::read_to_string` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
+    "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:329 in `check_substrate_boundary`, `std::fs::read_to_string` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
     "review_id": "HA-000699",
     "source": {
-      "byte_end": 10981,
-      "byte_start": 10963,
+      "byte_end": 11058,
+      "byte_start": 11040,
       "column": 23,
       "column_end": 41,
       "column_start": 23,
       "file": "crates/carrick-conformance-contract/src/personality_boundary.rs",
-      "line": 326,
-      "line_end": 326,
-      "line_start": 326
+      "line": 329,
+      "line_end": 329,
+      "line_start": 329
     }
   },
   {
@@ -7948,18 +7948,18 @@
       "linux-cli",
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:335 in `check_substrate_boundary`, `std::fs::read_to_string` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
+    "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:338 in `check_substrate_boundary`, `std::fs::read_to_string` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
     "review_id": "HA-000700",
     "source": {
-      "byte_end": 11395,
-      "byte_start": 11377,
+      "byte_end": 11472,
+      "byte_start": 11454,
       "column": 17,
       "column_end": 35,
       "column_start": 17,
       "file": "crates/carrick-conformance-contract/src/personality_boundary.rs",
-      "line": 335,
-      "line_end": 335,
-      "line_start": 335
+      "line": 338,
+      "line_end": 338,
+      "line_start": 338
     }
   },
   {
@@ -7975,18 +7975,18 @@
       "linux-cli",
       "macos-cli-default"
     ],
-    "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:962 in `audit_source_file_tree`, `std::fs::read_to_string` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
+    "rationale": "At crates/carrick-conformance-contract/src/personality_boundary.rs:974 in `audit_source_file_tree`, `std::fs::read_to_string` acts only on operator-selected repository source, Cargo metadata and contract descriptors read by the conformance diagnostic; it does not delegate Linux namespace or process authority to the host.",
     "review_id": "HA-000701",
     "source": {
-      "byte_end": 32930,
-      "byte_start": 32912,
+      "byte_end": 33408,
+      "byte_start": 33390,
       "column": 19,
       "column_end": 37,
       "column_start": 19,
       "file": "crates/carrick-conformance-contract/src/personality_boundary.rs",
-      "line": 962,
-      "line_end": 962,
-      "line_start": 962
+      "line": 974,
+      "line_end": 974,
+      "line_start": 974
     }
   },
   {
