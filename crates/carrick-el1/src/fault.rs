@@ -211,17 +211,16 @@ impl CowResolver for HardwareCowResolver {
         slot: u32,
         handle: carrick_el1_abi::El1MmHandle,
         sequence: core::num::NonZeroU64,
+        completion: carrick_el1_abi::CowGrantCompletion,
         words: &W,
     ) -> Result<(), crate::personality::mm_portal::MmError> {
-        if let Some(completion) = self.take_cow_completion() {
-            crate::personality::mm_portal::reconcile_pending_parent_write(
-                slot as usize,
-                handle,
-                sequence,
-                completion,
-                words,
-            )?;
-        }
+        crate::personality::mm_portal::reconcile_pending_parent_write(
+            slot as usize,
+            handle,
+            sequence,
+            completion,
+            words,
+        )?;
         Ok(())
     }
 
