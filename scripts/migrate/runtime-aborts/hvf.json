@@ -985,7 +985,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::prepare_el1_frame_grant",
-      "ordinal_in_function": 2,
+      "ordinal_in_function": 3,
       "fingerprint": "6f5c52739cdeaf3262a592fcb1b84c335d44b28016f187dbf8d8994f47fcbba5",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::el1_frame_grant",
@@ -996,7 +996,7 @@
     {
       "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
       "function": "HvfVmState::prepare_el1_frame_grant",
-      "ordinal_in_function": 3,
+      "ordinal_in_function": 4,
       "fingerprint": "5bcab621e68692ffb58e95060d95fa86be22d654dd9338b6820bcb71ee4aa37d",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::el1_frame_grant",
@@ -2796,6 +2796,39 @@
       "rationale": "Executable user write publication failed after memcpy, leaving cache and instruction coherence unproven.",
       "sink": "fatal",
       "domain": "hvpatch::user_transfer"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/cow_engine.rs",
+      "function": "HvfVmState::prepare_el1_frame_grant",
+      "ordinal_in_function": 2,
+      "fingerprint": "c13c2188c1ff73a5aba4348961565f4979dca60358c4e6ff1c05c037a11c2b8e",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::physical_grant",
+      "rationale": "An MM publication ledger overlaps despite its mutation-authority overlap check; another uncommitted owner would make exact completion and rollback ambiguous.",
+      "sink": "fatal",
+      "domain": "hvpatch::physical_grant"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/global_frame.rs",
+      "function": "GlobalFrameHostOwner::begin_grant_publication",
+      "ordinal_in_function": 1,
+      "fingerprint": "91b64fd278287fba320aa499af2fe021d4ec38f19420a77d8bc2757a9fbc10dc",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::physical_grant",
+      "rationale": "A physical incarnation acquired two publication producers; completion waiters could be awakened for the wrong publication.",
+      "sink": "fatal",
+      "domain": "hvpatch::physical_grant"
+    },
+    {
+      "file": "crates/carrick-vmm-hvf/src/trap/sparse_materialization.rs",
+      "function": "publish_frame_grant_backing",
+      "ordinal_in_function": 8,
+      "fingerprint": "61e661a59a1d4aa788a245d399883e94d97658f66655521da3a0010f67023aa5",
+      "verdict": "carrier_fault",
+      "failure_domain": "hvpatch::physical_grant",
+      "rationale": "The just-published authenticated physical owner disappeared or changed generation before exact completion custody was attached under frame-registry exclusion.",
+      "sink": "fatal",
+      "domain": "hvpatch::physical_grant"
     }
   ]
 }
