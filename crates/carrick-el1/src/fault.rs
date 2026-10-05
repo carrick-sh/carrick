@@ -257,7 +257,7 @@ impl CowResolver for HardwareCowResolver {
                     },
                 )
             });
-        let Ok(outcome) = outcome else {
+        let Ok(Ok(outcome)) = outcome else {
             return CowResolution::Refused;
         };
         self.completion = match outcome {
