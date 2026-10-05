@@ -61,7 +61,7 @@ questions. Phase 1 deletes all three aborts.
 
 - **Rust first.** New capability lands in our own crates, not a new script.
   Mechanical repeated-shape passes go through `scripts/migrate/rewrite.py` with
-  a committed, count-asserted spec (AGENTS.md, "Engineering standards").
+  a temporary, count-asserted spec during migration; completed specs are retired rather than gating landing permanently.
 - **No backward compatibility, no second path.** Every task that adds a
   forwarding shim names the later task that deletes it. Nothing in this plan may
   merge behind a feature flag or an `=1` opt-in.
@@ -100,7 +100,7 @@ questions. Phase 1 deletes all three aborts.
 | `crates/carrick-abi/src/lib.rs` | Gains `LinuxPollEvents ↔ LinuxEpollEvents` conversions so the two syscall surfaces share one readiness domain. |
 | `crates/carrick-runtime/src/file_authority/backing.rs` | `AuthorityBacking` becomes an open trait with typed downcast instead of a closed 10-variant enum. |
 | `scripts/migrate/check-k1-burndown.py` (new) | Gates the K1 ledger: authority-escape counts may fall, never rise. |
-| `scripts/migrate/2026-08-27-description-common-*.json` (new) | The committed, count-asserted rewrite specs for Tasks 3, 4 and 5. |
+| `scripts/migrate/2026-08-27-description-common-*.json` (retired) | Historical count-asserted rewrite specs for Tasks 3, 4 and 5 (retired after completion). |
 | `justfile` | `lint-domains` runs the K1 inventory, taxonomy and burndown checkers. |
 
 ---

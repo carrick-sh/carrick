@@ -22,9 +22,9 @@ Usage:
   scripts/migrate/rewrite.py --check spec.json   # dry run
   scripts/migrate/rewrite.py --emit file old new [count]  # print a spec entry
 
-Specs used for a landed migration stage belong next to the commit (attach the
-spec path in the commit message body) so the pass can be audited and, on a
-revert+redo, replayed.
+Specs used for a migration stage may be attached in the commit message body for
+review, but completed specs are not retained as permanent landing gates;
+historical transformations are preserved in git history.
 """
 
 import json
