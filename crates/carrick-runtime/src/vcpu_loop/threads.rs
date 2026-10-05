@@ -24,7 +24,9 @@ impl PendingChildTidClear {
         clear: carrick_thread::thread::ChildTidClear,
         context: &carrick_kernel::kernel::KernelContext,
     ) -> Result<Self, RuntimeError> {
-        if clear.tid().raw() != context.thread().key().tid.raw() {
+        // Exec may promote a nonleader to the Linux leader TID while its
+        // runtime registry identity survives. The Kernel owns this mapping.
+        if clear.tid() != context.thread().registry_id() {
             return Err(RuntimeError::Configuration(
                 "clear-child-tid claim differs from its captured thread".to_owned(),
             ));
@@ -849,10 +851,10 @@ impl PersistentSiblingStopAuthority {
             RuntimeError::Configuration(format!("capture sibling clear custody: {error}"))
         })?;
         for witness in witnesses {
-            if witness.thread().key().tid.raw() == keeper.raw() {
+            if witness.thread().registry_id() == keeper {
                 continue;
             }
-            let tid = ThreadId::from_kernel_thread_identity(witness.thread().key().tid.raw());
+            let tid = witness.thread().registry_id();
             if let Some(clear) = registry.claim_clear_child_tid(tid) {
                 threads.retain_clear(PendingChildTidClear::new(clear, &witness)?);
             } else if witness.thread().execution_state().generation().is_none()
@@ -1215,10 +1217,7 @@ pub(super) fn wake_removed_persistent_sibling_threads(
     removed: &[ThreadId],
 ) -> Result<(), RuntimeError> {
     for thread in context.task().threads() {
-        if !removed
-            .iter()
-            .any(|tid| tid.raw() == thread.key().tid.raw())
-        {
+        if !removed.iter().any(|tid| *tid == thread.registry_id()) {
             continue;
         }
         if let Err(error) = scheduler.wake_control(thread.key())
@@ -1398,7 +1397,7 @@ mod child_tid_owner_tests {
         threads: VcpuThreadRegistry,
     ) -> ThreadRuntimeState<super::super::tests::CrashCaptureTestEngine> {
         use super::super::tests::{CrashCaptureTestEngine, NoopPlatformFutex};
-        let tid = ThreadId::from_kernel_thread_identity(context.thread().key().tid.raw());
+        let tid = context.thread().registry_id();
         let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
             registry,
             Arc::new(FutexTable::new()),
@@ -1520,6 +1519,38 @@ mod child_tid_owner_tests {
             pending.validate(&root).is_err(),
             "old MM cannot finish the new image clear"
         );
+        let wrong = ThreadRegistry::new(root.thread().registry_id());
+        wrong.set_clear_child_tid(root.thread().registry_id(), VA);
+        assert!(
+            PendingChildTidClear::new(
+                wrong
+                    .claim_clear_child_tid(root.thread().registry_id())
+                    .unwrap(),
+                &committed,
+            )
+            .is_err(),
+            "another registry runner cannot claim this exact thread"
+        );
+        let dependency = Arc::new(ClearDependency::default());
+        dependency.0.store(true, Ordering::Release);
+        let mut engine = clear_engine(&committed, &dependency);
+        let (wakes, _subscription) = clear_wakes(&state.futex);
+        let exit = committed
+            .kernel()
+            .prepare_task_exit_key(
+                committed.task().key(),
+                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+        let publication = state
+            .commit_terminal_child_tid(&kernel, &mut engine, || exit.retire_notifying(|_| {}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(engine.guest_memory[&VA], [0; 4]);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(!registry.is_clear_child_tid_addr(VA));
+        publication.publish().unwrap();
     }
 
     #[test]
