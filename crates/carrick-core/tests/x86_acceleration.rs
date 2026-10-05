@@ -11,10 +11,11 @@ use carrick_el1_abi::{
     ReservationGeneration, ReservationMm, ReservationNodeFlags, ReservationProtection,
     ReservationRange,
 };
+use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
 use carrick_mmu_core::aarch64::descriptor_txn::{
     BackingIdentity, DescriptorRefusal, LiveDescriptorWords,
 };
-use carrick_mmu_core::owner_mmu::Aarch64Mmu;
+use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerMmuRefusal, OwnerTranslation};
 use carrick_mmu_core::x86::descriptor_txn::{
     COW, HUGE, MAY_WRITE, NX, PREPARED, PRESENT, USER, WRITE,
 };
@@ -744,4 +745,226 @@ fn x2_shared_fork_cow() {
         0,
         "child split table entry must not carry leaf-only metadata bits"
     );
+}
+
+// A test ISA with an unrelated control window and a deliberately different
+// copy layout. Shared fork must use its capabilities rather than ARM addresses.
+struct RelocatedControlMmu;
+const TEST_CONTROL_BASE: u64 = 0x80_0000;
+const TEST_ALIAS_BASE: u64 = TEST_CONTROL_BASE + 0x3000;
+
+impl carrick_mmu_core::owner_mmu::OwnerMmu for RelocatedControlMmu {
+    fn root(register: u64) -> Result<RootGpa, OwnerMmuRefusal> {
+        X86Mmu::root(register)
+    }
+    fn translate<W: LiveDescriptorWords + ?Sized>(
+        words: &W,
+        root: RootGpa,
+        va: UserVa,
+        access: carrick_mmu_core::aarch64::LeafAccess,
+        user: bool,
+    ) -> Result<Option<OwnerTranslation>, OwnerMmuRefusal> {
+        X86Mmu::translate(words, root, va, access, user)
+    }
+    fn classify_cow<W: LiveDescriptorWords + ?Sized>(
+        words: &W,
+        root: RootGpa,
+        va: UserVa,
+        executable_publication: bool,
+    ) -> Result<(), OwnerMmuRefusal> {
+        X86Mmu::classify_cow(words, root, va, executable_publication)
+    }
+}
+
+impl carrick_mmu_core::owner_mmu::OwnerForkMmu for RelocatedControlMmu {
+    const ADDRESS_MASK: u64 = X86Mmu::ADDRESS_MASK;
+    fn control_window() -> Option<(UserVa, UserVa)> {
+        Some((
+            UserVa::new(TEST_CONTROL_BASE),
+            UserVa::new(TEST_CONTROL_BASE + 0x20_0000),
+        ))
+    }
+    fn is_control_alias(va: UserVa) -> bool {
+        (TEST_ALIAS_BASE..TEST_ALIAS_BASE + 8192).contains(&va.raw())
+    }
+    fn control_alias_destination(
+        va: UserVa,
+        child_tables: FrameGpa,
+    ) -> Result<FrameGpa, OwnerMmuRefusal> {
+        if !Self::is_control_alias(va) {
+            return Err(OwnerMmuRefusal::Unreachable);
+        }
+        Ok(FrameGpa::new(
+            child_tables.raw() + va.raw() - TEST_ALIAS_BASE,
+        ))
+    }
+    fn control_copy_destination(
+        va: UserVa,
+        child_control: FrameGpa,
+    ) -> Result<FrameGpa, OwnerMmuRefusal> {
+        if !(TEST_CONTROL_BASE..TEST_CONTROL_BASE + 0x20_0000).contains(&va.raw()) {
+            return Err(OwnerMmuRefusal::Unreachable);
+        }
+        Ok(FrameGpa::new(
+            child_control.raw() + 0x1_0000 + 2 * (va.raw() - TEST_CONTROL_BASE),
+        ))
+    }
+    fn is_table(word: u64, level: usize) -> bool {
+        X86Mmu::is_table(word, level)
+    }
+    fn table_word(output: FrameGpa, inherited: Option<u64>) -> u64 {
+        X86Mmu::table_word(output, inherited)
+    }
+    fn is_user(word: u64) -> bool {
+        X86Mmu::is_user(word)
+    }
+    fn is_retired(word: u64) -> bool {
+        X86Mmu::is_retired(word)
+    }
+    fn is_absent_unowned(word: u64) -> bool {
+        X86Mmu::is_absent_unowned(word)
+    }
+    fn is_owned_resident(word: u64) -> bool {
+        X86Mmu::is_owned_resident(word)
+    }
+    fn is_writable_user(word: u64) -> bool {
+        X86Mmu::is_writable_user(word)
+    }
+    fn is_executable_control(word: u64) -> bool {
+        X86Mmu::is_executable_control(word)
+    }
+    fn control_needs_copy(word: u64) -> bool {
+        word & WRITE != 0
+    }
+    fn split(word: u64, level: usize, index: usize) -> Result<u64, OwnerMmuRefusal> {
+        X86Mmu::split(word, level, index)
+    }
+    fn arm_private(word: u64, level: usize, va: UserVa) -> Result<u64, OwnerMmuRefusal> {
+        X86Mmu::arm_private(word, level, va)
+    }
+    fn needs_break_before_make(before: u64, after: u64, level: usize) -> bool {
+        X86Mmu::needs_break_before_make(before, after, level)
+    }
+}
+
+#[test]
+fn x2_fork_control_window_census_uses_adapter_bounds_and_aliases() {
+    let mut count = carrick_core::mm::fork::ForkCensus {
+        child: 0,
+        parent: 0,
+        live: 0,
+        custody: 0,
+    };
+    carrick_core::mm::fork::census_entry::<RelocatedControlMmu, _, _>(
+        &LinuxForkPolicy,
+        &TestMemory::new(),
+        &[],
+        0x100_0000 | PRESENT | WRITE | HUGE | NX,
+        2,
+        TEST_CONTROL_BASE,
+        &mut count,
+    )
+    .unwrap();
+    assert_eq!(
+        count.child, 512,
+        "control block splits into one child table"
+    );
+    assert_eq!(count.parent, 0, "structural split leaves parent unchanged");
+    assert_eq!(count.custody, 510, "two alias pages need no custody");
+    assert_eq!(
+        count.live, 0,
+        "splitting a terminal needs no live table scan"
+    );
+}
+
+#[test]
+fn x2_fork_control_alias_destination_comes_from_adapter() {
+    let request = sample_request(5);
+    let mut scratch = ForkScratch::new(request, 0).unwrap();
+    let descriptor = 0x100_0000 | PRESENT | WRITE | NX;
+    let (parent, child) = carrick_core::mm::fork::copy_entry::<RelocatedControlMmu, _, _>(
+        &LinuxForkPolicy,
+        &TestMemory::new(),
+        request,
+        &mut scratch,
+        descriptor,
+        3,
+        TEST_ALIAS_BASE + 4096,
+    )
+    .unwrap();
+    assert_eq!(parent, descriptor);
+    assert_eq!(
+        child,
+        (request.child_tables.base + 4096) | PRESENT | WRITE | NX
+    );
+    assert!(scratch.custody.is_empty());
+
+    let short_request = PortalForkRequest {
+        child_tables: PortalForkTableArena::new(request.child_tables.base, 4096).unwrap(),
+        ..request
+    };
+    assert_eq!(
+        carrick_core::mm::fork::copy_entry::<RelocatedControlMmu, _, _>(
+            &LinuxForkPolicy,
+            &TestMemory::new(),
+            short_request,
+            &mut scratch,
+            descriptor,
+            3,
+            TEST_ALIAS_BASE + 4096,
+        ),
+        Err(ForkError::NoMemory)
+    );
+}
+
+#[test]
+fn x2_fork_structural_copy_destination_comes_from_adapter() {
+    let request = sample_request(5);
+    let mut scratch = ForkScratch::bounded(request, 0, 1024, 0, 0, 512).unwrap();
+    let descriptor = 0x100_0000 | PRESENT | WRITE | HUGE | NX;
+    let (parent, child) = carrick_core::mm::fork::copy_entry::<RelocatedControlMmu, _, _>(
+        &LinuxForkPolicy,
+        &TestMemory::new(),
+        request,
+        &mut scratch,
+        descriptor,
+        2,
+        TEST_CONTROL_BASE,
+    )
+    .unwrap();
+    assert_eq!(parent, descriptor);
+    assert_eq!(
+        child,
+        (request.child_tables.base + 4096) | PRESENT | WRITE | NX
+    );
+    assert_eq!(scratch.child_used, 1024);
+    assert_eq!(scratch.parent_used, 0);
+    assert_eq!(scratch.custody.len(), 510);
+    for index in 0..512 {
+        let destination = if (3..5).contains(&index) {
+            request.child_tables.base + (index - 3) * 4096
+        } else {
+            request.kernel_control_ipa + 0x1_0000 + index * 8192
+        };
+        assert_eq!(
+            scratch.child[512 + index as usize],
+            destination | PRESENT | WRITE | NX
+        );
+    }
+    for (index, custody) in (0..512)
+        .filter(|i| !(3..5).contains(i))
+        .zip(&scratch.custody)
+    {
+        assert_eq!(
+            *custody,
+            PortalForkCustody::StructuralCopy {
+                source_ipa: 0x100_0000 + index * 4096,
+                destination_ipa: request.kernel_control_ipa + 0x1_0000 + index * 8192,
+                len: 4096,
+                executable: false,
+            }
+        );
+    }
+    assert!(scratch.edits.is_empty());
+    assert!(scratch.reads.is_empty());
 }
