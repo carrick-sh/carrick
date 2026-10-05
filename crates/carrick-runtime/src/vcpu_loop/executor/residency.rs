@@ -332,4 +332,180 @@ mod tests {
             assert!(materialize_zone_in(&zone, &saved, reference).is_err());
         }
     }
+
+    #[derive(Default)]
+    struct SignalBoundaryTrap {
+        completed: Vec<i64>,
+        injected: Vec<(Option<i64>, Option<u64>, bool)>,
+    }
+
+    impl carrick_hal::SyscallTrap for SignalBoundaryTrap {
+        fn next_syscall(&mut self) -> Result<Option<carrick_hal::RawSyscall>, TrapError> {
+            Err(TrapError::UnsupportedPlatform)
+        }
+        fn current_pc(&self) -> Result<u64, TrapError> {
+            Ok(0x8000)
+        }
+        fn last_syscall_nr(&self) -> Option<u64> {
+            Some(63)
+        }
+        fn complete_syscall(&mut self, value: i64) -> Result<(), TrapError> {
+            self.completed.push(value);
+            Ok(())
+        }
+        fn execve_into(&mut self, _: &crate::memory::AddressSpace) -> Result<(), TrapError> {
+            Err(TrapError::UnsupportedPlatform)
+        }
+        fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
+            assert_eq!(
+                self.completed.len(),
+                1,
+                "complete the syscall before its handler"
+            );
+            self.injected.push((
+                signal.pending_syscall_retval,
+                signal.interrupted_pc,
+                signal.restart_syscall,
+            ));
+            Ok(())
+        }
+        fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
+            Err(TrapError::UnsupportedPlatform)
+        }
+    }
+
+    #[test]
+    fn signal_during_owner_memory_wait_completes_before_handler_and_keeps_restart_policy() {
+        use carrick_hal::SyscallTrap;
+        use carrick_kernel::kernel::continuation::{
+            BlockedContinuation, ContinuationCapture, ContinuationEvent, ReservedSignal,
+            RestartClass, ZoneWait,
+        };
+        for restart in [false, true] {
+            let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+            let context = dispatcher.capture_one_task_context().unwrap();
+            let mm = context.shared().mm().id();
+            let mut saved = pending_read();
+            let GuestCpuState::Aarch64V1(cpu) = &mut saved else {
+                panic!("AArch64 fixture");
+            };
+            std::sync::Arc::make_mut(cpu).mm_generation = mm.raw();
+            let generation = context
+                .thread()
+                .publish_initial_task_state(carrick_kernel::kernel::objects::MigratableTaskState {
+                    cpu: saved.clone(),
+                    mm,
+                    asid_generation: 1,
+                })
+                .unwrap();
+            let zone = zone();
+            let key = ObjectWaitKey::metadata_request(17).unwrap();
+            let complete = |owned: OwnedObjectWakeEffects<'_>| {
+                owned.deliver_handbacks(&mut |_| {});
+            };
+            zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &complete)
+                .unwrap();
+            let source = zone
+                .admit_object_notification(key, &BoundedSpin(0), &complete)
+                .unwrap();
+            let record = zone
+                .alloc_record(ThreadIdentity {
+                    tid: context.thread().key().tid.raw() as u64,
+                    serial: context.thread().key().serial.raw(),
+                    mm: mm.raw(),
+                    file_table: 1,
+                    generation: 1,
+                    affinity: 0,
+                    lifecycle_page: 0,
+                    control_slot: 0,
+                })
+                .unwrap();
+            let reference = zone.record_ref(record);
+            let seq = zone.next_seq(record);
+            {
+                let guard = zone
+                    .object_wait_with_completion(key, &BoundedSpin(0), &complete)
+                    .unwrap();
+                guard
+                    .park_host_rechecked(
+                        guard.snapshot(),
+                        record,
+                        OperationToken::metadata_request(17).unwrap(),
+                        || true,
+                    )
+                    .unwrap();
+            }
+            let capture = ContinuationCapture::new(
+                &context,
+                generation,
+                carrick_kernel::dispatch::SyscallRequest::new(
+                    63,
+                    crate::compat::SyscallArgs([7, 0x6000, 0x2000, 0, 0, 0]),
+                ),
+                RestartClass::Never,
+            )
+            .unwrap();
+            let continuation =
+                BlockedContinuation::from_zone_park(capture, ZoneWait::new(reference, seq), None);
+
+            // SIGUSR1 arrives while the exact owner operation is parked.
+            let authority = context.signal_authority();
+            let signal = carrick_kernel::kernel::LinuxSignal::for_signal_number(10).unwrap();
+            let mut action = carrick_abi::LinuxSigaction::empty();
+            action.sa_handler = 0x5000;
+            action.sa_flags = if restart {
+                carrick_abi::LINUX_SA_RESTART
+            } else {
+                0
+            };
+            authority.install_action(signal, action);
+            authority.enqueue_thread_standard(signal, None);
+            let dequeued = authority
+                .take_lowest_in(carrick_abi::SigSet::EMPTY.with(10))
+                .unwrap();
+            let (action_generation, action) = authority.action_with_generation(signal);
+            let reserved = ReservedSignal::kernel(
+                authority.clone(),
+                dequeued,
+                action_generation,
+                action,
+                carrick_abi::SigSet::EMPTY,
+            );
+            source.publish(Waker::Host, &complete);
+            let restored = materialize_zone_in(&zone, &saved, reference).unwrap();
+            assert_eq!(restored, saved);
+            let mut result = continuation
+                .resume(ContinuationEvent::ReservedSignal(reserved), &context)
+                .unwrap();
+            let outcome = crate::vcpu_loop::zone::owner_wait_interruption(&result.completion)
+                .expect("a signal wake must complete the original call before handler delivery");
+            let carrick_kernel::dispatch::DispatchOutcome::Errno { errno } = outcome else {
+                panic!("interrupted owner wait must return EINTR");
+            };
+            assert_eq!(errno, carrick_abi::LINUX_EINTR);
+            let reserved = result.take_reserved_signal().unwrap();
+            let mut trap = SignalBoundaryTrap::default();
+            trap.complete_syscall(errno.guest_retval()).unwrap();
+            crate::vcpu_loop::signal::deliver_reserved_signal_with_restart(
+                &mut trap,
+                &dispatcher,
+                &context,
+                crate::vcpu_loop::signal::SignalRestartContext {
+                    last_syscall_retval: Some(errno.guest_retval()),
+                    interrupted_pc: None,
+                    // The internal zone wait's Never policy cannot override
+                    // the original read syscall's Linux restart policy.
+                    continuation_restart: None,
+                },
+                carrick_hal::ThreadId::synthetic_for_tests(context.thread().key().tid.raw()),
+                reserved,
+            )
+            .unwrap();
+            assert_eq!(trap.injected, [(Some(-4), None, restart)]);
+            assert_eq!(trap.completed, [-4]);
+            // SAFETY: this test owns the exact host-handed-back record.
+            assert!(unsafe { zone.record(record).take_object_operation() }.is_some());
+            zone.free_record(record);
+        }
+    }
 }

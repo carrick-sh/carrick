@@ -169,6 +169,23 @@ fn apply_zone_exit(
     Ok(())
 }
 
+pub(super) fn owner_wait_interruption(
+    completion: &carrick_kernel::kernel::continuation::ContinuationCompletion,
+) -> Option<DispatchOutcome> {
+    // A producer notification is not a guest result. A signal interruption
+    // must, however, complete the original syscall before entering a handler.
+    // service_outcome preserves any committed read prefix and derives restart
+    // from the original syscall, not this internal zone wait's Never policy.
+    match completion {
+        carrick_kernel::kernel::continuation::ContinuationCompletion::Errno(errno)
+            if *errno == carrick_abi::LINUX_EINTR =>
+        {
+            Some(DispatchOutcome::Errno { errno: *errno })
+        }
+        _ => None,
+    }
+}
+
 /// Hand each host-owned zone thread (a host wake no vCPU could take) back
 /// to its host continuation.
 pub(super) fn publish_zone_handbacks(_kernel: &Kernel, records: &[RecordRef]) {
@@ -749,26 +766,21 @@ where
         }
         zone.free_record(record.id);
         self.state.service_kernel_context = Some(context.retain_exact());
-        let pc = engine.current_pc()?;
-        if let Some(outcome) = service_signals_threaded(
-            &self.kernel,
-            &context,
-            engine,
-            self.state.this_tid,
-            self.state.fatal_image_generation,
-            None,
-            Some(pc),
-            None,
-            reserved,
-            self.traps,
-        )? {
-            return Ok(self.enter_terminal_with_outcome(engine, outcome));
-        }
-        let outcome = self.state.redispatch_threaded_syscall(
-            &self.kernel,
-            engine,
-            control.submission.host_wait_context(),
-        )?;
+        let interruption = owner_wait_interruption(&result.completion);
+        // The restored CPU still owns the pending syscall's EL1 trap frame.
+        // Carry the reservation to common completion, which publishes the
+        // actual return value before signal delivery at the EL0 boundary.
+        // Dropping any later reservation requeues it through its authority.
+        self.state.reserved_signal = self.state.reserved_signal.take().or(reserved);
+        self.state.continuation_restart = None;
+        let outcome = match interruption {
+            Some(outcome) => outcome,
+            None => self.state.redispatch_threaded_syscall(
+                &self.kernel,
+                engine,
+                control.submission.host_wait_context(),
+            )?,
+        };
         self.service_outcome(engine, control, frame, outcome)
     }
 
