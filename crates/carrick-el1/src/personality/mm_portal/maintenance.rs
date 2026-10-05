@@ -2,6 +2,7 @@
 use super::{MmError, MmPortal};
 use crate::cow::GuestCowVenue;
 use crate::memory::reservations::Reservations;
+use carrick_core::mm::cow::CowRepointOutcome;
 use carrick_el1_abi::{CowGrantCompletion, PinnedMetadataExtent, PortalBackingMaintenance};
 use carrick_mmu_core::aarch64::SubstrateGpa;
 use carrick_mmu_core::aarch64::descriptor_txn::{
@@ -130,8 +131,8 @@ impl BackingMaintenance<'_> {
             .with_page(old_ipa, new_ipa, &mut zero_page)
         {
             Ok(()) => {}
-            Err(DescriptorOutcome::Indeterminate(reason)) => {
-                panic!("maintenance copy alias rollback failed: {reason:?}")
+            Err(CowRepointOutcome::Indeterminate) => {
+                panic!("maintenance copy alias rollback failed")
             }
             Err(_) => return refuse(),
         }
