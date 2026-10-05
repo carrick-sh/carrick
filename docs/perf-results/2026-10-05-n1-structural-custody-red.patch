@@ -1,0 +1,62 @@
+# N1 structural fork custody RED witness; no production correction.
+# Exact base: d7151718089625289b6665546e0bc10da8b5f3ab
+# Apply: git apply docs/perf-results/2026-10-05-n1-structural-custody-red.patch
+# Run: cargo test -p carrick-vmm-hvf --lib owner_fork_retains_live_structural_capacity_without_carrier_mm_alias_index
+# This overlay failed 0/1 after the signed gate and was removed from active
+# source. It is not an ignored test or part of the passing CI receipt.
+diff --git a/crates/carrick-vmm-hvf/src/trap/owner_fork.rs b/crates/carrick-vmm-hvf/src/trap/owner_fork.rs
+index fe9e9ce91..7e1084576 100644
+--- a/crates/carrick-vmm-hvf/src/trap/owner_fork.rs
++++ b/crates/carrick-vmm-hvf/src/trap/owner_fork.rs
+@@ -732,6 +732,51 @@ mod tests {
+         }
+     }
+     #[test]
++    fn owner_fork_retains_live_structural_capacity_without_carrier_mm_alias_index() {
++        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
++        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
++        let request = request(&custody, 1);
++        let source = 0xa090_2000_0000;
++        let mut owners = Vec::new();
++        for ipa in [source, request.kernel_control_ipa] {
++            let mapping = crate::host_mapping::OwnedHostMapping::map_shared_anon(
++                0x4000,
++                crate::host_mapping::HostMappingKind::PerMmKernelState,
++            )
++            .unwrap();
++            let mut lease = GlobalFrameStage2Lease::fixed(ipa, 0x4000);
++            lease.mark_test_mapped_without_backend();
++            let owner = StructuralBackingOwner::new_in(
++                &custody,
++                mapping,
++                lease,
++                u64::from(applevisor::memory::MemPerms::ReadWriteExec),
++                next_structural_epoch().unwrap(),
++                ipa,
++                0x4000,
++            )
++            .unwrap();
++            assert_eq!(
++                custody.stage2_record_covering(ipa, 4096),
++                Some(owner.record_identity())
++            );
++            owners.push(owner);
++        }
++        assert!(custody.carrier_stage2_records.lock().is_empty());
++        let physical = ForkPhysicalCustody::new(custody.clone(), Arc::new(|_, _| false));
++        let selected = PortalForkCustody::StructuralCopy {
++            source_ipa: source,
++            destination_ipa: request.kernel_control_ipa,
++            len: 4096,
++            executable: false,
++        };
++        assert!(
++            physical.retain(request, selected).unwrap().is_some(),
++            "exact live structural custody must not be declined by the legacy carrier-MM alias index"
++        );
++        drop(owners);
++    }
++    #[test]
+     fn owner_structural_copy_publishes_selected_executable_bytes() {
+         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+         let custody = Arc::new(CarrierVmCustody::new_live_fixture());
