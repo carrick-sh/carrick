@@ -414,10 +414,6 @@ fmt-check:
 fmt:
     cargo fmt --all
 
-# Bounded models for the terminal clear/wake/publication protocol.
-test-loom:
-    cargo test --locked -p carrick-runtime --features loom --lib terminal_clear_loom
-
 # The kernel semantics inner loop: no VM, codesign, or Docker. Full `just test`
 # also runs the serial host tests; run it and the signed gates before pushing.
 test-kernel *ARGS:
@@ -425,10 +421,11 @@ test-kernel *ARGS:
     cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
     just --justfile {{justfile()}} test-kernel-semantics {{ARGS}}
 
-# Bounded production fd atomic protocols (2 actors, <=2 preemptions).
+# Bounded production fd and terminal clear protocols (2 actors, <=2 preemptions).
 # Pipe venue lock/wake model waits for N1; see the M2 handoff.
 test-loom:
     cargo test --locked -p carrick-fd-core --features loom --lib loom_models
+    cargo test --locked -p carrick-runtime --features loom --lib terminal_clear_loom
 
 # The scripted kernel-semantics suites alone (crates/carrick-kernel-example):
 # two-process Linux semantics against the public kernel API with no VMM, no
