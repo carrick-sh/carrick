@@ -865,6 +865,7 @@ struct EntrantTestObserver {
     park: std::sync::mpsc::Sender<(bool, u64)>,
     release: Mutex<std::sync::mpsc::Receiver<()>>,
     guard_waiting: std::sync::mpsc::Sender<()>,
+    spurious_wake_pending: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -1010,9 +1011,28 @@ impl PtQuiesce {
                 observer.park.send((false, refused_wakes)).unwrap();
             }
             #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
-            let next = self.cv.wait(g).unwrap();
-            g = next;
-            let ended = self.pauses_ended.load(Ordering::SeqCst);
+            let ended = loop {
+                // A deterministic condvar return with no predicate transition.
+                #[cfg(test)]
+                let next = if self.test_observer.as_ref().is_some_and(|observer| {
+                    observer.spurious_wake_pending.swap(false, Ordering::SeqCst)
+                }) {
+                    g
+                } else {
+                    self.cv.wait(g).unwrap()
+                };
+                #[cfg(not(test))]
+                let next = self.cv.wait(g).unwrap();
+                g = next;
+                let ended = self.pauses_ended.load(Ordering::SeqCst);
+                if ended != seen || !self.quiescing.load(Ordering::SeqCst) {
+                    break ended;
+                }
+                // A spurious wake neither refuses admission nor enters the
+                // test release gate. Keep waiting on the same predicate.
+            };
+            #[cfg(test)]
+            let transitioned = ended != seen;
             if ended != seen && self.quiescing.load(Ordering::SeqCst) {
                 refused_wakes += 1;
                 if refused_wakes >= ENTRANT_REFUSAL_LIMIT {
@@ -1023,7 +1043,7 @@ impl PtQuiesce {
             #[cfg(test)]
             #[allow(clippy::unwrap_used)]
             // test-owned handshake failures fail the fixture
-            if let Some(observer) = &self.test_observer {
+            if let Some(observer) = self.test_observer.as_ref().filter(|_| transitioned) {
                 // The fixture owns when this running entrant can retry entry.
                 // Release the mutex so the coordinator can end/re-elect.
                 drop(g);
@@ -1617,6 +1637,7 @@ mod tests {
             park: park_tx,
             release: Mutex::new(release_rx),
             guard_waiting: guard_tx,
+            spurious_wake_pending: AtomicBool::new(true),
         });
         let barrier = Arc::new(fixture);
         assert!(barrier.try_become_coordinator());

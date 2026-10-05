@@ -117,14 +117,14 @@ and deadline cancellation. Linux `timerfd_settime(2)`, `read(2)`, `poll(2)` and
 The VM-free fixtures prove named deadline/work invariants only; signed execution,
 Docker differentials and batch acceptance remain director-owned.
 
-## Verification receipts
+## Initial correction verification receipts
 
 All commands ran in the foreground. Linux logs are in
 `/tmp/wallclock2-evidence/`; individual macOS mutation logs are copied into
 its `mac/` directory. The macOS scratch source was
-`8b88791ee3949a28084eeb72ecf023a32f4a7632`. Final amendments change the
-foreign-read **test** clock and documentation only; the tested HVF files remain
-byte-identical. Every remote build/test held `just lease carrick`; no signed
+`8b88791ee3949a28084eeb72ecf023a32f4a7632`. Before this re-review correction, the final amendments changed the
+foreign-read **test** clock and documentation only; those tested HVF files
+remained byte-identical through `25e634df0`. Every remote build/test held `just lease carrick`; no signed
 execution or Docker was run.
 
 | Command | EXIT | Receipt |
@@ -157,4 +157,89 @@ read helper is byte-identical to `51bfe67f4`, including all printed oracle
 reports. No oracle refresh is necessary for changed report text because none
 changed; guest execution acceptance still belongs to the director.
 
-`just lint-domains` is run against the final clean committed source below.
+`just lint-domains` on `25e634df0`: EXIT 0 (director-run, 2026-10-05).
+
+
+## Re-review correction (2026-10-05)
+
+The refusal observer now enrolls once and loops on condvar returns without a
+predicate transition. A test-only, one-shot spurious return is injected before
+refusal 1. With the old handshake it fails `(true, 0) != (true, 1)` (EXIT 101);
+with transition-only observation it passes (EXIT 0).
+
+The HVF deadline fixture now calls
+`create_with_no_resources_backpressure_bounded` with a controllable clock/park
+observer. The retry decision records the budget received from that adapter;
+the fixture requires exactly 20 ms, 21 attempts, 20 parks and the lowered
+`NoResources` error. The default clock still uses `Instant` and `vcpu_gate`.
+The pipe fixture installs per-thread clock/poll observations and calls the
+production `read_exact_timeout` wrapper. A wrapper forwarding 5050 ms produces
+`[5050] != [50]` (EXIT 101); restoration passes (EXIT 0). Host clock/poll and
+all production report sections retain their original behavior and bytes.
+
+All unmap setup, planning, disarm discovery, removal and thread-local work
+measurements now run on one worker. An independent 30-second completion
+observer fails with process EXIT 101 on expiry: it cannot leave a stuck worker
+holding the global test lock and strand other tests. Population and visit
+budgets and the ignored benchmark are unchanged.
+
+Receipts for this correction use `/tmp/wallclock2-evidence/r3-*.log`.
+macOS unsigned tests and compilation used pushed source
+`5984209cf9d40e456d8ccdad8ea704afa0d9a662` under `just lease carrick`.
+Subsequent edits are audit/commit metadata and mechanical inventory positions;
+the five source files tested in this correction are unchanged. The scratch
+macOS worktree was removed after verifying restoration. No signed guest,
+Docker or batch acceptance result is claimed.
+
+| Fixture | Real implementation mutation | Red EXIT | Restored EXIT | Receipt |
+|---|---|---:|---:|---|
+| Starving entrant | Treat the injected spurious condvar return as a transition and enter the release gate | 101: `(true, 0) != (true, 1)` | 0 | `/tmp/wallclock2-evidence/r3-red-spurious-observer.log`, `r3-green-spurious-observer.log` |
+| Admission backpressure | Adapter forwards supplied 20 ms plus 4980 ms to the retry decision | 101: `5s != 20ms` at the deadline observer | 0 | `/tmp/wallclock2-evidence/r3-mac/red-adapter-forwarding.log`, `green-adapter-forwarding.log` |
+| Empty-pipe timeout | Production wrapper forwards 5050 ms for the supplied 50 ms | 101: `[5050] != [50]` | 0 | `/tmp/wallclock2-evidence/r3-red-pipe-forwarding.log`, `r3-green-pipe-forwarding.log` |
+| Single-row unmap | Binary-search traversal forgets to advance its lower bound | 101: independent 30-second watchdog expires and fails the process | 0 | `/tmp/wallclock2-evidence/r3-mac/red-unmap-stuck-traversal.log`, `green-unmap-stuck-traversal.log` |
+
+Each mutant was local and uncommitted, and restored byte-for-byte. The spurious
+return is retained as fixture input; the mutation bypasses the predicate loop
+and enables acknowledgment of that return. No assertion was inverted.
+
+| Verification command | EXIT | Receipt |
+|---|---:|---|
+
+| `cargo test -p carrick-kernel --features test-support -- --skip serial_host` | 0 | `/tmp/wallclock2-evidence/r3-kernel.log` |
+| `env RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib --features test-support serial_host` | 0 | `/tmp/wallclock2-evidence/r3-kernel-serial.log` |
+| `env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --no-default-features --features syscall-shim,platform-linux` | 0 | `/tmp/wallclock2-evidence/r3-runtime.log` |
+| `env RUST_TEST_THREADS=1 cargo test -p carrick-thread` | 0 | `/tmp/wallclock2-evidence/r3-thread.log` |
+| `cargo test -p carrick-kernel-example --no-fail-fast` | 101 | `/tmp/wallclock2-evidence/r3-kernel-example.log` |
+| `env RUST_TEST_THREADS=1 cargo test --manifest-path conformance-probes/Cargo.toml --bin ptyjobcontrol` | 0 | `/tmp/wallclock2-evidence/r3-ptyjobcontrol.log` |
+| `just test-kernel-semantics` | 101 | `/tmp/wallclock2-evidence/r3-kernel-semantics.log` |
+| `just check` | 0 | `/tmp/wallclock2-evidence/r3-check.log` |
+| `just clippy` | 0 | `/tmp/wallclock2-evidence/r3-clippy-final.log` |
+| `just fmt-check` | 0 | `/tmp/wallclock2-evidence/r3-fmt-check.log` |
+| `ssh rentamac@cloudmac 'source /Volumes/carrick/dev/env.sh; unset CARGO_TARGET_DIR; cd /Volumes/carrick-build/wt/wt-wallclock-mac; just lease carrick just check --tests'` | 0 | `/tmp/wallclock2-evidence/r3-mac-check.log` |
+| `ssh rentamac@cloudmac 'source /Volumes/carrick/dev/env.sh; unset CARGO_TARGET_DIR; cd /Volumes/carrick-build/wt/wt-wallclock-mac; just lease carrick cargo clippy -p carrick-vmm-hvf --all-targets -- -D warnings'` | 0 | `/tmp/wallclock2-evidence/r3-mac-clippy.log` |
+
+The macOS focused restored command
+`cargo test -p carrick-vmm-hvf --lib no_resources_backpressure -- --nocapture`
+passes all three adapter cases (EXIT 0). The restored unmap command with
+`--lib unmap_single_row_in_5000_row_registry_is_fast -- --nocapture` passes
+all three populations (EXIT 0). Detailed commands/exits are retained in
+`/tmp/wallclock2-evidence/r3-mac/commands.jsonl` and the aggregate
+`/tmp/wallclock2-evidence/r3-mac-mutations.log`.
+
+The two EXIT 101 integration gates fail only at
+`futex_wake_exit_receipt_replays` with `replay source hash mismatch`.
+The fixture remains byte-identical to main's reviewed base; PR #46 remains
+an explicit integration dependency.
+
+
+Final clean-tree reconciliation (EXIT 0,
+`/tmp/wallclock2-evidence/r3-reconcile.log`) required no inventory changes.
+Static source verification (EXIT 0,
+`/tmp/wallclock2-evidence/r3-source-invariants.log`) confirms unchanged probe
+report sections, the unchanged replay fixture and identical macOS-tested source.
+
+Final `just lint-domains`: EXIT 0, run on the clean committed tree after
+reconciliation (`/tmp/wallclock2-evidence/r3-lint-domains.log`). The live
+host-authority subset covers `linux-cli` and `linux-runtime`; other profiles
+remain pending in that census. This receipt amendment changes documentation
+only. Full acceptance still belongs to the director.
