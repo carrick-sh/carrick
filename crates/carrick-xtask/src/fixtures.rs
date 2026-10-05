@@ -28,11 +28,13 @@ const INPUTS: &[&str] = &[
     "fixtures/embed-interceptor-probe",
     "fixtures/embed-zone-readers",
     "fixtures/embed-icache-reuse",
+    "fixtures/embed-copyout",
     "fixtures/embed-el1-sched",
     "scripts/build-linux-fixtures.sh",
     "scripts/build-embed-interceptor-probe.sh",
     "scripts/build-embed-zone-readers.sh",
     "scripts/build-embed-icache-reuse.sh",
+    "scripts/build-embed-copyout.sh",
     "scripts/build-embed-el1-sched.sh",
     "rust-toolchain.toml",
     ".cargo/config.toml",
@@ -41,6 +43,7 @@ const EMBED: &[(&str, &str)] = &[
     ("embed-interceptor-probe", "interceptor-probe"),
     ("embed-zone-readers", "zone-readers"),
     ("embed-icache-reuse", "icache-reuse"),
+    ("embed-copyout", "copyout"),
     ("embed-el1-sched", "el1-sched"),
 ];
 
@@ -699,6 +702,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
         "scripts/build-embed-interceptor-probe.sh",
         "scripts/build-embed-zone-readers.sh",
         "scripts/build-embed-icache-reuse.sh",
+        "scripts/build-embed-copyout.sh",
         "scripts/build-embed-el1-sched.sh",
     ] {
         run_build(

@@ -197,6 +197,12 @@ impl Fixture {
         write(root, "conformance-probes/src/bin/hello.rs", b"probe\n");
         write(
             root,
+            "fixtures/embed-copyout/src/main.rs",
+            b"copyout fixture\n",
+        );
+        write(root, "scripts/build-embed-copyout.sh", b"copyout builder\n");
+        write(
+            root,
             "crates/carrick-el1-abi/src/lib.rs",
             b"local fixture dependency\n",
         );
@@ -341,7 +347,7 @@ fn roundtrip_restores_exact_paths_and_verifies_installed_bytes() {
             .unwrap()
             .executables
             .len(),
-        9
+        10
     );
     for e in &f.manifest.executables {
         assert_eq!(
@@ -558,8 +564,11 @@ impl Preparation {
         let scratch = tempfile::tempdir().unwrap();
         let archive = scratch.path().join("fixtures.tar.gz");
         let bundle = f.path.parent().unwrap();
+        // These tests intentionally archive invalid bundles too; the production
+        // packer rejects them before restore can exercise its negative cases.
         assert!(
             Command::new("tar")
+                .env("COPYFILE_DISABLE", "1")
                 .args(["-czf"])
                 .arg(&archive)
                 .arg("-C")
