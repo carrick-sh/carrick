@@ -5697,6 +5697,10 @@ mod real {
         /// carrick-host pid; correlate with `execve__loaded` (same pid) to
         /// see which binary exited with which code.
         fn guest__exit(_: u32, _: i32) {}
+        /// Completion of an external `carrick trace` witness after waitpid.
+        /// Argument: raw Unix wait status. This terminal
+        /// control remains available when SIP blocks proc:::exit.
+        fn trace__witness__exit(_: i32) {}
         /// M:N scheduler — a guest thread was ADMITTED to a vCPU slot (a new
         /// `clone` sibling, or the main reservation). `tid` guest thread, `slot`
         /// the granted vCPU id, `budget` the pool size N (`usize::MAX`-clamped to
@@ -6484,6 +6488,10 @@ mod real {
 
     pub fn guest_exit(code: i32) {
         carrick_usdt::guest__exit!(|| (std::process::id(), code));
+    }
+
+    pub fn trace_witness_exit(wait_status: i32) {
+        carrick_usdt::trace__witness__exit!(|| wait_status);
     }
 
     pub fn mn_admit(tid: i32, slot: u32, budget: u32) {
@@ -9150,6 +9158,7 @@ mod stub {
     stub!(ulock_requeue(sample: super::UlockRequeueProbe));
     stub!(futex_unexpected_errno(host_addr: u64, errno: i32));
     stub!(guest_exit(code: i32));
+    stub!(trace_witness_exit(wait_status: i32));
     stub!(mn_admit(tid: i32, slot: u32, budget: u32));
     stub!(mn_reclaim(tid: i32, old_slot: u32, new_slot: u32, kind: i32));
     stub!(mn_clone_outcome(tid: i32, phase: super::HvpatchCloneThreadPhase, errno: i32));
