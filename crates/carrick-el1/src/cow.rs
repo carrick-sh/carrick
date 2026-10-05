@@ -11,7 +11,23 @@
 //! I2 cache authority after the copy and before an executable repoint. Other
 //! fault callers retain their existing decline path.
 
-pub use carrick_core::mm::cow::{CowCopyWindow, GuestCowOutcome, GuestCowVenue, resolve_guest_cow};
+pub use carrick_core::mm::cow::{CowCopyWindow, CowError, GuestCowOutcome, GuestCowVenue};
+
+pub fn resolve_guest_cow<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized, C: FnMut(u64, u64), I: FnMut()>(
+    venue: &GuestCowVenue<'_, W>,
+    mm_key: u64,
+    far: u64,
+    copy_page: C,
+    invalidate_asid: I,
+) -> Result<GuestCowOutcome, CowError> {
+    carrick_core::mm::cow::resolve_guest_cow::<carrick_mmu_core::owner_mmu::Aarch64Mmu, W, C, I>(
+        venue,
+        mm_key,
+        far,
+        copy_page,
+        invalidate_asid,
+    )
+}
 
 #[cfg(test)]
 mod tests {
@@ -229,6 +245,7 @@ mod tests {
             |source, destination| memory.copy_through(arena, source, destination),
             || invalidations.set(invalidations.get() + 1),
         )
+        .unwrap()
     }
 
     #[test]
@@ -312,7 +329,7 @@ mod tests {
             |_, _| panic!("failed destination publication must not copy"),
             || {},
         );
-        assert_eq!(outcome, GuestCowOutcome::Declined(CowDecline::Refused));
+        assert_eq!(outcome, Ok(GuestCowOutcome::Declined(CowDecline::Refused)));
         assert_eq!(target.leaf(VA), armed(OLD, true));
         drop(lease);
         drop(table.try_claim(slot).unwrap());
@@ -415,7 +432,7 @@ mod tests {
                         || {},
                     );
                     assert!(
-                        matches!(outcome, GuestCowOutcome::Resolved(_)),
+                        matches!(outcome, Ok(GuestCowOutcome::Resolved(_))),
                         "{outcome:?}"
                     );
                     assert_eq!(memory.page(replacement_ipa), vec![index + 11; 4096]);
@@ -452,7 +469,7 @@ mod tests {
             || {},
         );
         assert!(
-            matches!(outcome, GuestCowOutcome::Resolved(_)),
+            matches!(outcome, Ok(GuestCowOutcome::Resolved(_))),
             "maintenance-root COW must resolve without target-root copy aliases: {outcome:?}"
         );
         assert_eq!(memory.page(GRANT), memory.page(OLD));
@@ -496,7 +513,7 @@ mod tests {
             |source, destination| memory.copy_through(&arena, source, destination),
             || {},
         );
-        assert!(matches!(outcome, GuestCowOutcome::Resolved(_)));
+        assert!(matches!(outcome, Ok(GuestCowOutcome::Resolved(_))));
         assert!(!residency.record_commit(stale));
         for offset in (0..4 * PAGE).step_by(PAGE as usize) {
             let page = residency.lookup(MM, VA + offset).unwrap();
@@ -546,7 +563,7 @@ mod tests {
                 |_, _| panic!("leased grant must not be copied"),
                 || panic!("unchanged leaves")
             ),
-            GuestCowOutcome::Declined(CowDecline::Refused)
+            Ok(GuestCowOutcome::Declined(CowDecline::Refused))
         );
         assert_eq!(arena.leaf(VA) & PA, OLD);
         assert_eq!(residency.lookup(MM, VA).unwrap(), page);
@@ -559,7 +576,7 @@ mod tests {
                 |source, destination| memory.copy_through(&arena, source, destination),
                 || {}
             ),
-            GuestCowOutcome::Resolved(_)
+            Ok(GuestCowOutcome::Resolved(_))
         ));
     }
 
@@ -763,7 +780,7 @@ mod tests {
                 |source, destination| self.memory.copy_through(self.arena, source, destination),
                 || {},
             );
-            !matches!(outcome, GuestCowOutcome::Declined(_))
+            matches!(outcome, Ok(GuestCowOutcome::Resolved(_) | GuestCowOutcome::AlreadyWritable))
         }
         fn editor_busy(&mut self) {
             self.pool.note_declined(CowDecline::EditorBusy);
