@@ -3406,6 +3406,16 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 }
                 TransferProgress::Supply(supply) => {
                     let supplied = match self.supply_memory(supply) {
+                        Err(MemoryError::Physical(wait)) => {
+                            return Err(MemoryError::ReadSuspended(Box::new(
+                                carrick_guest_mem::MemoryReadSuspension {
+                                    wait: carrick_guest_mem::MemoryReadWait::Physical(wait),
+                                    continuation: carrick_guest_mem::OwnedReadContinuation::new(
+                                        transfer,
+                                    ),
+                                },
+                            )));
+                        }
                         Err(MemoryError::OwnerWait(wait)) => {
                             return Err(MemoryError::ReadSuspended(Box::new(
                                 carrick_guest_mem::MemoryReadSuspension {
@@ -3610,6 +3620,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         .map_err(|error| MemoryError::HostMap(error.to_string()))
         .and_then(|progress| match progress {
             crate::user_transfer::SupplyProgress::Ready => Ok(true),
+            crate::user_transfer::SupplyProgress::Physical(wait) => {
+                Err(MemoryError::Physical(wait))
+            }
             crate::user_transfer::SupplyProgress::Declined => Ok(false),
             crate::user_transfer::SupplyProgress::OwnerWait(wait) => {
                 Err(MemoryError::OwnerWait(wait))
@@ -5370,6 +5383,14 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     ));
                 }
                 return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Resolved));
+            }
+            crate::user_transfer::TransferPreparation::Pending(wait) => {
+                if !slot.cancel_fault_selection(window, request_generation) {
+                    return Err(TrapError::Hypervisor(
+                        "owner pending fault selection is stale".into(),
+                    ));
+                }
+                return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Pending(wait)));
             }
             crate::user_transfer::TransferPreparation::Declined => {
                 carrick_observability::probes::hvpatch_el1_file_fault_handoff(

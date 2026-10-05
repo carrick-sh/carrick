@@ -46,8 +46,26 @@ both an unaccounted alias and a still-owned provisional publication as
 brk maintenance or relocated table resolution.
 
 Red logs: `/tmp/n1g2-grant-witness-red.log`,
-`/tmp/n1g2-grant-witness-red-2.log`,
 `/tmp/n1g2-grant-base-witness-red.log`,
 `/tmp/n1g2-grant-base-witness-red-2.log`.
 The witness patch used on baseline is
 `/tmp/n1g2-uncommitted-grant-witness.patch`.
+
+The attempted second integrated red build (`/tmp/n1g2-grant-witness-red-2.log`)
+failed to compile after cross-worktree debug target reuse; it is not a
+semantic red. The workspace debug artifacts were invalidated before green
+verification. Retained signed artifacts were not modified.
+
+The correction retains a completion producer for each exact unpublished
+physical incarnation, through descriptor settlement or rollback. Consumers
+hold only the wait, enroll then recheck readiness, release execution capacity,
+and reselect through the owner after completion. Scalar read continuations
+retain their completed prefix; owner-selected file faults park without a
+syscall token. The existing MM grant ledger now retains fresh publications
+as well as replacements. No timeout, retry budget or timing knob changes.
+
+VM-free verification covers actual preparation, no second allocation,
+rollback wake, late enrollment, distinct completion at the same VA, and an
+applied descriptor receipt. The full HVF non-serial library run passes
+713 tests (3 ignored, 18 serial-host tests excluded); runtime compile-check
+passes. Full CI, loom and exact signed acceptance remain pending.
