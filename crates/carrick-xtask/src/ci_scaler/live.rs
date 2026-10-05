@@ -563,19 +563,17 @@ impl Github {
         Ok(Assignment::Unknown)
     }
     fn remove_runner(&self, row: &Record) -> Result<(), ScalerError> {
-        let Some(id) = row.runner else {
-            return Ok(());
-        };
         let runners = self.request(
             "GET",
             &format!("repos/{REPOSITORY}/actions/runners?per_page=100"),
             None,
             true,
         )?;
-        if let Some(runner) = pages(&runners, "runners")?
-            .into_iter()
-            .find(|r| r["id"].as_u64() == Some(id.0))
-        {
+        let runners = pages(&runners, "runners")?;
+        let Some(id) = row.runner.or(recover_registration(row, &runners)?) else {
+            return Ok(());
+        };
+        if let Some(runner) = runners.into_iter().find(|r| r["id"].as_u64() == Some(id.0)) {
             if runner["name"] != row.name || runner["busy"] != false {
                 return Err(ScalerError::Guard(
                     "runner identity changed or still busy; defer removal",
@@ -1038,6 +1036,97 @@ fn boot_and_register(
     Ok(())
 }
 
+// Reaping is durable authorization obtained after the admission/drain checks.
+// Its continuation depends on owned VM state, never a surviving registration.
+trait TeardownApi {
+    fn present(&mut self, row: &Record) -> Result<bool, ScalerError>;
+    fn stop(&mut self, row: &Record, dir: &Path) -> Result<Option<String>, ScalerError>;
+    fn destroy(&mut self, row: &Record) -> Result<String, ScalerError>;
+    fn wait_task(&mut self, task: &str) -> Result<(), ScalerError>;
+    fn remove_runner(&mut self, row: &Record) -> Result<(), ScalerError>;
+}
+struct LiveTeardown<'a> {
+    pve: &'a Pve,
+    gh: &'a Github,
+}
+impl TeardownApi for LiveTeardown<'_> {
+    fn present(&mut self, row: &Record) -> Result<bool, ScalerError> {
+        Ok(self.pve.inventory()?.iter().any(|v| v.id == row.vm.get()))
+    }
+    fn stop(&mut self, row: &Record, dir: &Path) -> Result<Option<String>, ScalerError> {
+        self.pve.guard(row)?;
+        let status = self
+            .pve
+            .request(PveCall::Get, &format!("{}/status/current", base(row.vm)))?;
+        if status["status"] == "stopped" {
+            return Ok(None);
+        }
+        // A stopped guest cannot answer its agent. Preserve logs opportunistically
+        // while running, without making the teardown continuation depend on them.
+        if let Ok(log) = self.pve.agent(
+            row,
+            &["/bin/sh", "-c", "tail -c 1048576 /home/runner/runner.log"],
+        ) {
+            std::fs::write(dir.join(format!("{}.runner.log", row.name)), log)?;
+        }
+        self.pve.guard(row)?;
+        Ok(Some(task_id(self.pve.request(
+            PveCall::Post(json!({})),
+            &format!("{}/status/stop", base(row.vm)),
+        )?)?))
+    }
+    fn destroy(&mut self, row: &Record) -> Result<String, ScalerError> {
+        self.pve.guard(row)?;
+        task_id(self.pve.request(PveCall::Delete, &base(row.vm))?)
+    }
+    fn wait_task(&mut self, task: &str) -> Result<(), ScalerError> {
+        self.pve.wait_task(task)
+    }
+    fn remove_runner(&mut self, row: &Record) -> Result<(), ScalerError> {
+        self.gh.remove_runner(row)
+    }
+}
+fn continue_teardown(
+    api: &mut impl TeardownApi,
+    ledger: &mut Ledger,
+    row: &mut Record,
+    dir: &Path,
+    path: &Path,
+) -> Result<bool, ScalerError> {
+    if row.state != State::Reaping {
+        return Err(ScalerError::Guard("teardown lacks durable authorization"));
+    }
+    // A failed prior fsync must not turn an in-memory state into permission for
+    // side effects. Re-publish the license before every continuation attempt.
+    update(ledger, row, path)?;
+    if api.present(row)? {
+        if let Some(task) = api.stop(row, dir)? {
+            row.task = Some(task);
+            update(ledger, row, path)?;
+            api.wait_task(
+                row.task
+                    .as_deref()
+                    .ok_or(ScalerError::Guard("stop task missing"))?,
+            )?;
+        }
+        row.task = Some(api.destroy(row)?);
+        update(ledger, row, path)?;
+        api.wait_task(
+            row.task
+                .as_deref()
+                .ok_or(ScalerError::Guard("destroy task missing"))?,
+        )?;
+        if api.present(row)? {
+            return Err(ScalerError::Guard("clone still exists after deletion"));
+        }
+    }
+    // Removing registration cannot strand a running VM: the VM is absent first.
+    // If GitHub fails or this process dies, Reaping remains a resumable license.
+    api.remove_runner(row)?;
+    finish_destroyed(ledger, row, dir, path)?;
+    Ok(true)
+}
+
 fn cleanup(
     pve: &Pve,
     gh: &Github,
@@ -1071,43 +1160,9 @@ fn cleanup(
         }
     }
     row.state = State::Reaping;
+    row.task = None;
     update(ledger, row, path)?;
-    gh.remove_runner(row)?;
-    // Export guest logs via the authenticated agent: bootstrap consumed its SSH
-    // authorization, and no credential is recovered by this path.
-    if let Ok(log) = pve.agent(
-        row,
-        &["/bin/sh", "-c", "tail -c 1048576 /home/runner/runner.log"],
-    ) {
-        std::fs::write(dir.join(format!("{}.runner.log", row.name)), log)?;
-    }
-    pve.guard(row)?;
-    let status = pve.request(PveCall::Get, &format!("{}/status/current", base(row.vm)))?;
-    if status["status"] != "stopped" {
-        row.task = Some(task_id(pve.request(
-            PveCall::Post(json!({})),
-            &format!("{}/status/stop", base(row.vm)),
-        )?)?);
-        update(ledger, row, path)?;
-        pve.wait_task(
-            row.task
-                .as_deref()
-                .ok_or(ScalerError::Guard("stop task missing"))?,
-        )?;
-    }
-    pve.guard(row)?;
-    row.task = Some(task_id(pve.request(PveCall::Delete, &base(row.vm))?)?);
-    update(ledger, row, path)?;
-    pve.wait_task(
-        row.task
-            .as_deref()
-            .ok_or(ScalerError::Guard("destroy task missing"))?,
-    )?;
-    if pve.inventory()?.iter().any(|v| v.id == row.vm.get()) {
-        return Err(ScalerError::Guard("clone still exists after deletion"));
-    }
-    finish_destroyed(ledger, row, dir, path)?;
-    Ok(true)
+    continue_teardown(&mut LiveTeardown { pve, gh }, ledger, row, dir, path)
 }
 
 fn reconcile_one(
@@ -1144,11 +1199,27 @@ fn reconcile_one(
             if task == TaskState::Failed {
                 row.failure = Some("recorded PVE task failed; VM absent".into());
             }
-            // Recover a registration whose POST succeeded before its ID save.
-            let _ = gh.assignment(&mut row)?;
+            if row.state == State::Reaping {
+                return continue_teardown(
+                    &mut LiveTeardown { pve, gh },
+                    ledger,
+                    &mut row,
+                    dir,
+                    path,
+                );
+            }
+            // Removal recovers a POST whose ID save was interrupted by name;
+            // never query job assignment after the VM has disappeared.
             gh.remove_runner(&row)?;
             finish_destroyed(ledger, &mut row, dir, path)?;
             return Ok(true);
+        }
+        Recovery::ResumeReaping => {
+            if task == TaskState::Failed {
+                row.failure
+                    .get_or_insert_with(|| "recorded PVE task failed during licensed reap".into());
+            }
+            return continue_teardown(&mut LiveTeardown { pve, gh }, ledger, &mut row, dir, path);
         }
         Recovery::ResumeClone => {
             pve.guard(&row)?;
@@ -1171,9 +1242,9 @@ fn reconcile_one(
                         Some(previous) => format!("{previous}; resume: {error}"),
                         None => error.to_string(),
                     });
-                    if !matches!(error, ScalerError::CpuCeiling { .. }) {
-                        row.state = State::Reaping;
-                    }
+                    // A failed/ambiguous JIT delivery is not a licensed reap.
+                    // Preserve its actual preparation state for assignment and
+                    // drain checks, which may discover a job already running.
                     update(ledger, &row, path)?;
                     return Err(error);
                 }
