@@ -211,3 +211,72 @@ mod tests {
         assert!(!completion.authenticates(changed));
     }
 }
+
+/// Attributes of one reservation node, fixed when the node is inserted (host
+/// import, host opaque insertion, or a host attribute edit). EL1 edits only
+/// plain private anonymous nodes; any edit touching another node is a
+/// host-served operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct ReservationNodeFlags(u32);
+impl ReservationNodeFlags {
+    pub const EMPTY: Self = Self(0);
+    /// The root describes anonymous contents (faults may be planned from it).
+    /// Absent: an opaque host mapping that is only a placement obstacle.
+    pub const ANONYMOUS: Self = Self(1 << 0);
+    /// `MAP_PRIVATE`; absent means `MAP_SHARED`.
+    pub const PRIVATE: Self = Self(1 << 1);
+    /// `MAP_GROWSDOWN`/stack mapping.
+    pub const GROWSDOWN: Self = Self(1 << 2);
+    /// `mlock(2)`/`MAP_LOCKED`.
+    pub const LOCKED: Self = Self(1 << 3);
+    /// `MADV_DONTFORK`: absent from a forked child.
+    pub const DONTFORK: Self = Self(1 << 4);
+    /// `MADV_WIPEONFORK`: copied to a forked child without contents.
+    pub const WIPEONFORK: Self = Self(1 << 5);
+    /// `MADV_DONTDUMP`.
+    pub const DONTDUMP: Self = Self(1 << 6);
+    /// File-backed mapping provenance; source custody remains in HostBacking.
+    pub const FILE: Self = Self(1 << 7);
+    /// Shared anonymous provenance without private anonymous edit authority.
+    pub const SHARED_ANONYMOUS: Self = Self(1 << 8);
+    pub const ANONYMOUS_PRIVATE: Self = Self(Self::ANONYMOUS.0 | Self::PRIVATE.0);
+    /// Attributes the host sets with `set_flags` (`mlock`, `madvise`).
+    pub const ATTRIBUTES: Self = Self(
+        Self::GROWSDOWN.0
+            | Self::LOCKED.0
+            | Self::DONTFORK.0
+            | Self::WIPEONFORK.0
+            | Self::DONTDUMP.0,
+    );
+    /// Attributes a private anonymous VMA keeps across EL1 edits: they ride
+    /// `mprotect` splits and `mremap` moves, and never make the node
+    /// host-owned. `GROWSDOWN` is not one of them (a stack is host-owned).
+    pub const CARRIED: Self =
+        Self(Self::LOCKED.0 | Self::DONTFORK.0 | Self::WIPEONFORK.0 | Self::DONTDUMP.0);
+    const ALL: u32 =
+        Self::ANONYMOUS_PRIVATE.0 | Self::ATTRIBUTES.0 | Self::FILE.0 | Self::SHARED_ANONYMOUS.0;
+
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !Self::ALL == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}

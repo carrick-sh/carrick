@@ -3,7 +3,13 @@
 //! Proposals reserve metadata but do not change the committed tree. T2 owns
 //! descriptor/backing work; only an exact completion commits the proposal.
 
+pub use carrick_core::mm::reservation::{Charges, Mapping};
+use carrick_core::mm::reservation::{
+    PreparedNodeHeader as PreparedHeader, ReservationNode as Node, ReservationNodeData as NodeData,
+    ReservationNodePayload as NodePayload,
+};
 use carrick_el1_abi::*;
+use carrick_personality_linux::mm::{NodeDataPolicy, NodeFlagsPolicy};
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -52,28 +58,6 @@ pub enum Refusal {
     ForeignMapping,
     Limit,
     MetadataRequired,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Mapping {
-    pub range: ReservationRange,
-    pub protection: ReservationProtection,
-    /// Non-anonymous mappings participate in placement but cannot be edited.
-    pub anonymous: bool,
-    /// Insertion-time attributes; anything but plain private anonymous is
-    /// host-owned and every EL1 edit touching it forwards.
-    pub flags: ReservationNodeFlags,
-    pub generation: ReservationGeneration,
-    pub host_backing: Option<carrick_el1_abi::HostBackingIdentity>,
-}
-
-/// Byte charges of committed nodes, whole-root or within one range: every
-/// node (`RLIMIT_AS`), `RLIMIT_DATA` nodes, and `LOCKED` anonymous nodes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Charges {
-    pub bytes: u64,
-    pub data: u64,
-    pub locked: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -256,29 +240,6 @@ struct DeferredSlot {
 // Access to state requires the root's nonblocking exclusive guard.
 unsafe impl Sync for Root {}
 
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-struct NodeData {
-    start: u64,
-    end: u64,
-    first: u64,
-    last: u64,
-    gap: u64,
-    bytes: u64,
-    data: u64,
-    /// Subtree bytes of `LOCKED` anonymous nodes.
-    locked: u64,
-    /// This node's [`ReservationIncarnation`]; zero never names one.
-    incarnation: u64,
-    left: u32,
-    right: u32,
-    height: u32,
-    /// [`ReservationProtection`] bits (three) and [`ReservationNodeFlags`]
-    /// bits (seven), packed so the bootstrap table fits its region.
-    prot: u16,
-    flags: u16,
-    host_backing: Option<carrick_el1_abi::HostBackingIdentity>,
-}
 /// Lossless: validated protections use three bits.
 const fn pack_prot(prot: ReservationProtection) -> u16 {
     prot.bits() as u16
@@ -286,71 +247,6 @@ const fn pack_prot(prot: ReservationProtection) -> u16 {
 /// Lossless: validated node flags use nine bits.
 const fn pack_flags(flags: ReservationNodeFlags) -> u16 {
     flags.bits() as u16
-}
-impl NodeData {
-    fn root_editable(&self) -> bool {
-        self.flags().root_editable()
-            && (!self.flags().contains(ReservationNodeFlags::FILE) || self.host_backing.is_some())
-    }
-    fn flags(&self) -> ReservationNodeFlags {
-        // Nodes are only written from validated flags.
-        ReservationNodeFlags::from_bits(u32::from(self.flags))
-            .unwrap_or(ReservationNodeFlags::EMPTY)
-    }
-    fn protection(&self) -> ReservationProtection {
-        ReservationProtection::from_bits(u64::from(self.prot))
-            .unwrap_or(ReservationProtection::NONE)
-    }
-    fn charged_data(&self) -> u64 {
-        if self.flags().charges_data(self.protection()) {
-            self.end - self.start
-        } else {
-            0
-        }
-    }
-    fn charged_locked(&self) -> u64 {
-        if self.flags().contains(ReservationNodeFlags::ANONYMOUS)
-            && self.flags().contains(ReservationNodeFlags::LOCKED)
-        {
-            self.end - self.start
-        } else {
-            0
-        }
-    }
-    /// Charges of the part of this one node inside `[start, end)`.
-    fn charges_within(&self, start: u64, end: u64) -> Charges {
-        let bytes = self.end.min(end).saturating_sub(self.start.max(start));
-        Charges {
-            bytes,
-            data: if self.charged_data() != 0 { bytes } else { 0 },
-            locked: if self.charged_locked() != 0 { bytes } else { 0 },
-        }
-    }
-    fn mapping(&self, generation: ReservationGeneration) -> Mapping {
-        // Nodes are only constructed from validated ABI ranges/protections.
-        Mapping {
-            range: ReservationRange::new(self.start, self.end).expect("reservation range"),
-            protection: self.protection(),
-            anonymous: self.flags().contains(ReservationNodeFlags::ANONYMOUS),
-            flags: self.flags(),
-            generation,
-            host_backing: self.host_backing,
-        }
-    }
-    /// Whether an adjacent node is the same Linux mapping (a VMA boundary
-    /// the tree keeps only to separate incarnations).
-    fn same_mapping(&self, other: &NodeData) -> bool {
-        self.prot == other.prot
-            && self.flags == other.flags
-            && match (self.host_backing, other.host_backing) {
-                (None, None) => true,
-                (Some(a), Some(b)) if self.start <= other.start => {
-                    a.advance(other.start - self.start) == Some(b)
-                }
-                (Some(a), Some(b)) => b.advance(self.start - other.start) == Some(a),
-                _ => false,
-            }
-    }
 }
 
 #[derive(Default)]
@@ -404,30 +300,6 @@ impl Spares {
         core::mem::take(slot.expect("spare sufficiency proven before mutation"))
     }
 }
-#[repr(C)]
-struct Node {
-    // The original AtomicU32 had four bytes of alignment padding here.
-    // AtomicU64 preserves the stride and carries exact generation+phase CAS.
-    next_free: AtomicU64,
-    data: UnsafeCell<NodePayload>,
-}
-#[derive(Clone, Copy)]
-#[repr(C)]
-struct PreparedHeader {
-    next: u32,
-    tail: u32,
-    words: [u64; 13],
-}
-#[derive(Clone, Copy)]
-union NodePayload {
-    mapping: NodeData,
-    prepared: PreparedHeader,
-    words: [u64; 14],
-}
-const _: () = assert!(core::mem::size_of::<NodePayload>() == core::mem::size_of::<NodeData>());
-// A live node belongs to exactly one locked root. Free nodes are handed over
-// using the generation-qualified free list's release/acquire operations.
-unsafe impl Sync for Node {}
 
 #[repr(C)]
 pub struct SharedReservations {
