@@ -43,12 +43,18 @@ fn main() {
     let (answer_tx, answer_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
         let tid = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
-        let _ = ready_tx.send(tid);
+        // Read the child's own mask before exposing its TID. Besides checking
+        // inheritance, this makes the witness name a host-admitted thread;
+        // guest-only Born/zone ownership is sequenced separately after N1.
+        let initial = get(0);
+        let _ = ready_tx.send((tid, initial));
         if query_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
             let _ = answer_tx.send((get(0), get(leader)));
         }
     });
-    let tid = ready_rx.recv_timeout(Duration::from_secs(5)).unwrap_or(-1);
+    let (tid, (worker_initial_mask, worker_initial_errno)) = ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap_or((-1, ([0; 128], libc::ETIMEDOUT)));
     let (sibling_before, sibling_get_errno) = get(tid);
     let same_mask_set_errno = set(tid, &sibling_before);
     report!(sibling_affinity_ok = tid > 0 && sibling_get_errno == 0 && same_mask_set_errno == 0);
@@ -71,7 +77,9 @@ fn main() {
         answer.unwrap_or((([0; 128], libc::ETIMEDOUT), ([0; 128], libc::ETIMEDOUT)));
     let _ = worker.join();
     report!(
-        distinct_masks_exercised = caller_before != requested && caller_before == sibling_before
+        distinct_masks_exercised = caller_before != requested
+            && caller_before == sibling_before
+            && caller_before == worker_initial_mask
     );
     report!(caller_mask_unchanged = caller_before == caller_after);
     report!(sibling_mask_from_caller = sibling_after == requested);
@@ -84,5 +92,6 @@ fn main() {
     report!(caller_after_errno = caller_after_errno);
     report!(sibling_after_errno = sibling_after_errno);
     report!(worker_get_errno = worker_errno);
+    report!(worker_initial_errno = worker_initial_errno);
     report!(leader_get_errno = leader_errno);
 }

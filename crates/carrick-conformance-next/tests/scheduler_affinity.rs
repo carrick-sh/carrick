@@ -41,6 +41,7 @@ fn cross_thread_affinity_changes_only_the_named_thread() {
             "caller_after_errno=0",
             "sibling_after_errno=0",
             "worker_get_errno=0",
+            "worker_initial_errno=0",
             "leader_get_errno=0",
         ] {
             assert!(
