@@ -293,3 +293,38 @@ fn affinity_errors_leave_both_masks_unchanged() {
         "queries require no ownership permission"
     );
 }
+
+#[test]
+fn affinity_permission_uses_the_named_threads_credentials() {
+    let mut f = Fixture::new();
+    let caller = f.root.retain_exact();
+    let sibling = f.sibling.retain_exact();
+    assert!(matches!(
+        f.dispatch(&caller, nr::SETUID, 100, &[]),
+        DispatchOutcome::Returned { value: 0 }
+    ));
+    assert!(matches!(
+        f.dispatch(&sibling, nr::SETUID, 200, &[]),
+        DispatchOutcome::Returned { value: 0 }
+    ));
+    // Raw setuid changes the calling thread's credentials; the leader's
+    // process credential projection cannot authorize a sibling's own mask.
+    assert_eq!(caller.task().process_credentials().euid().raw(), 100);
+    let own = f.dispatch(&sibling, nr::SCHED_SETAFFINITY, 0, &2u64.to_le_bytes());
+    assert!(
+        matches!(own, DispatchOutcome::Returned { value: 0 }),
+        "own thread must retain permission: {own:?}"
+    );
+    let denied = f.dispatch(
+        &caller,
+        nr::SCHED_SETAFFINITY,
+        sibling.thread().key().tid.raw() as u64,
+        &1u64.to_le_bytes(),
+    );
+    assert!(
+        matches!(denied, DispatchOutcome::Errno { errno } if errno == carrick_abi::LINUX_EPERM),
+        "a different target thread owner requires EPERM 1: {denied:?}"
+    );
+    assert_eq!(caller.thread().affinity().words()[0], 3);
+    assert_eq!(sibling.thread().affinity().words()[0], 2);
+}
