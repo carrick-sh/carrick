@@ -22776,7 +22776,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 825,
+      "line": 827,
       "categories": [
         "mapping"
       ],
@@ -22785,7 +22785,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 855,
+      "line": 857,
       "categories": [
         "mapping"
       ],
@@ -22794,7 +22794,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 937,
+      "line": 939,
       "categories": [
         "mapping"
       ],
@@ -22803,7 +22803,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 948,
+      "line": 950,
       "categories": [
         "mapping"
       ],
@@ -22812,7 +22812,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 992,
+      "line": 994,
       "categories": [
         "mapping"
       ],
@@ -22821,7 +22821,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 1007,
+      "line": 1009,
       "categories": [
         "mapping"
       ],
@@ -22830,7 +22830,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 1058,
+      "line": 1060,
       "categories": [
         "mapping"
       ],
@@ -22839,7 +22839,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 1068,
+      "line": 1070,
       "categories": [
         "mapping"
       ],
@@ -22848,7 +22848,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 1082,
+      "line": 1084,
       "categories": [
         "mapping"
       ],
@@ -22857,7 +22857,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2280,
+      "line": 2285,
       "categories": [
         "mapping"
       ],
@@ -22866,7 +22866,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 2537,
+      "line": 2542,
       "categories": [
         "mapping"
       ],
@@ -22875,7 +22875,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3596,
+      "line": 3601,
       "categories": [
         "mapping"
       ],
@@ -22884,7 +22884,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3606,
+      "line": 3611,
       "categories": [
         "mapping"
       ],
@@ -22893,7 +22893,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3620,
+      "line": 3625,
       "categories": [
         "mapping"
       ],
@@ -22902,7 +22902,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3641,
+      "line": 3646,
       "categories": [
         "mapping"
       ],
@@ -22911,7 +22911,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3662,
+      "line": 3667,
       "categories": [
         "mapping"
       ],
@@ -22920,7 +22920,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3677,
+      "line": 3682,
       "categories": [
         "mapping"
       ],
@@ -22929,7 +22929,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3701,
+      "line": 3706,
       "categories": [
         "mapping"
       ],
@@ -22938,7 +22938,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3710,
+      "line": 3715,
       "categories": [
         "mapping"
       ],
@@ -22947,7 +22947,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3724,
+      "line": 3729,
       "categories": [
         "mapping"
       ],
@@ -22956,7 +22956,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3728,
+      "line": 3733,
       "categories": [
         "mapping"
       ],
@@ -22965,7 +22965,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3772,
+      "line": 3777,
       "categories": [
         "mapping"
       ],
@@ -22974,7 +22974,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3773,
+      "line": 3778,
       "categories": [
         "mapping"
       ],
@@ -22983,7 +22983,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3775,
+      "line": 3780,
       "categories": [
         "mapping"
       ],
@@ -22992,7 +22992,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3800,
+      "line": 3805,
       "categories": [
         "mapping"
       ],
@@ -23001,7 +23001,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3810,
+      "line": 3815,
       "categories": [
         "mapping"
       ],
@@ -23010,7 +23010,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3824,
+      "line": 3829,
       "categories": [
         "mapping"
       ],
@@ -23019,7 +23019,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3863,
+      "line": 3868,
       "categories": [
         "mapping"
       ],
@@ -23028,7 +23028,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3866,
+      "line": 3871,
       "categories": [
         "mapping"
       ],
@@ -23037,7 +23037,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3871,
+      "line": 3876,
       "categories": [
         "mapping"
       ],
@@ -23046,7 +23046,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3879,
+      "line": 3884,
       "categories": [
         "mapping"
       ],
@@ -23055,7 +23055,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3888,
+      "line": 3893,
       "categories": [
         "mapping"
       ],
@@ -23064,7 +23064,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3902,
+      "line": 3907,
       "categories": [
         "mapping"
       ],
@@ -23073,7 +23073,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3919,
+      "line": 3924,
       "categories": [
         "mapping"
       ],
@@ -23082,7 +23082,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3936,
+      "line": 3941,
       "categories": [
         "mapping"
       ],
@@ -23091,7 +23091,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3952,
+      "line": 3957,
       "categories": [
         "mapping"
       ],
@@ -23100,7 +23100,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3964,
+      "line": 3969,
       "categories": [
         "mapping"
       ],
@@ -23109,7 +23109,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3985,
+      "line": 3990,
       "categories": [
         "mapping"
       ],
@@ -23118,7 +23118,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 3995,
+      "line": 4000,
       "categories": [
         "mapping"
       ],
@@ -23127,7 +23127,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 4009,
+      "line": 4014,
       "categories": [
         "mapping"
       ],
@@ -23136,7 +23136,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/memory.rs",
-      "line": 4025,
+      "line": 4030,
       "categories": [
         "mapping"
       ],
