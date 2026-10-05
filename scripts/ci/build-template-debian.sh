@@ -43,6 +43,7 @@ printf '%s  %s\n' "$rustup_sha256" seed/rustup-init | sha256sum -c -
 cp "$xtask" seed/carrick-xtask
 cp "$inputs/rust-toolchain.toml" "$inputs/Cargo.lock" seed/
 cp "$inputs/scripts/ci/runner-once.sh" seed/
+cp "$inputs/scripts/ci/admit-job.sh" seed/
 cat > seed/meta-data <<'DATA'
 instance-id: carrick-template-300
 local-hostname: carrick-template-300
@@ -123,11 +124,7 @@ install -d -m 755 /run/carrick-ci
 install -m 660 -o root -g runner /dev/null /run/carrick-ci/admission.lock
 GUEST_READY
 chmod 755 /usr/local/bin/carrick-ci-ready
-cat > /usr/local/bin/carrick-ci-admit-job <<'ADMIT'
-#!/bin/sh
-exec /usr/local/bin/carrick-xtask ci-scaler admit-job
-ADMIT
-chmod 755 /usr/local/bin/carrick-ci-admit-job
+install -m 755 admit-job.sh /usr/local/bin/carrick-ci-admit-job.sh
 systemctl daemon-reload
 runuser -u runner -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
 mkdir -p /var/lib/carrick-ci
@@ -179,10 +176,10 @@ jq -n --arg commit "$commit" --arg script_hash "$(sha256sum "$inputs/scripts/ci/
   --arg sccache_sha256 "$sccache_sha256" --arg rustup_sha256 "$rustup_sha256" --arg toolchain_hash "$(sha256sum seed/rust-toolchain.toml | cut -d' ' -f1)" \
   --arg lock_hash "$(sha256sum seed/Cargo.lock | cut -d' ' -f1)" --arg xtask_hash "$(sha256sum seed/carrick-xtask | cut -d' ' -f1)" \
   --arg packages_hash "$(sha256sum packages.txt | cut -d' ' -f1)" --slurpfile qualification qualification.json \
-  --arg bootstrap_hash "$(sha256sum seed/runner-once.sh | cut -d' ' -f1)" \
+  --arg bootstrap_hash "$(sha256sum seed/runner-once.sh | cut -d' ' -f1)" --arg hook_hash "$(sha256sum seed/admit-job.sh | cut -d' ' -f1)" \
   '{vmid:300,pool:"carrick-ci",cpu:"host",vcpus:2,memory_mib:4096,disk_gib:64,storage:"local-lvm",bridge:"vmbr0",script_commit:$commit,
     script_sha256:$script_hash,image_url:$image_url,image_sha512:$image_sha512,runner_version:$runner_version,runner_sha256:$runner_sha256,
     sccache_sha256:$sccache_sha256,rustup_sha256:$rustup_sha256,toolchain_sha256:$toolchain_hash,cargo_lock_sha256:$lock_hash,
-    xtask_sha256:$xtask_hash,bootstrap_sha256:$bootstrap_hash,packages_sha256:$packages_hash,qualification:$qualification[0]}' > manifest.json
+    xtask_sha256:$xtask_hash,bootstrap_sha256:$bootstrap_hash,hook_sha256:$hook_hash,packages_sha256:$packages_hash,qualification:$qualification[0]}' > manifest.json
 qm config 300
 cat manifest.json
