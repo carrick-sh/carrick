@@ -11,7 +11,167 @@
 //! I2 cache authority after the copy and before an executable repoint. Other
 //! fault callers retain their existing decline path.
 
-pub use carrick_core::mm::cow::{CowCopyWindow, CowError, GuestCowOutcome, GuestCowVenue};
+pub use carrick_core::mm::cow::{CowError, GuestCowOutcome};
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Aarch64CowMmu;
+
+impl carrick_core::mm::cow::OwnerCowMmu for Aarch64CowMmu {
+    const CARRIER_MAINT_ROOT_BASE: u64 = carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE;
+    const DEFAULT_COW_COPY_BASE: u64 = carrick_el1_abi::EL1_COW_COPY_BASE;
+
+    fn classify_cow_write<
+        W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    >(
+        words: &W,
+        root: u64,
+        far: u64,
+        publish_executable: bool,
+    ) -> carrick_core::mm::cow::CowClassifyOutcome {
+        use carrick_mmu_core::aarch64::SubstrateGpa;
+        use carrick_mmu_core::aarch64::descriptor_txn::guest_cow::{
+            GuestCowClass, GuestCowNotArmed, classify_guest_cow_write,
+        };
+        match classify_guest_cow_write(words, SubstrateGpa(root), far, publish_executable) {
+            Ok(run) => carrick_core::mm::cow::CowClassifyOutcome::Armed(
+                carrick_core::mm::cow::GuestCowRun {
+                    va: run.va,
+                    len: run.len,
+                    old_ipa: run.old_ipa.raw(),
+                    compound_offset: run.compound_offset(),
+                    executable: run.executable,
+                },
+            ),
+            Err(GuestCowClass::AlreadyWritable) => {
+                carrick_core::mm::cow::CowClassifyOutcome::AlreadyWritable
+            }
+            Err(class @ (GuestCowClass::NotArmed(_) | GuestCowClass::Unreachable(_))) => {
+                let reason = match class {
+                    GuestCowClass::NotArmed(GuestCowNotArmed::Unmapped) => {
+                        carrick_el1_abi::CowDecline::Unmapped
+                    }
+                    GuestCowClass::NotArmed(GuestCowNotArmed::NotCowArmed) => {
+                        carrick_el1_abi::CowDecline::NotCowArmed
+                    }
+                    GuestCowClass::NotArmed(GuestCowNotArmed::NotEl1Private) => {
+                        carrick_el1_abi::CowDecline::NotEl1Private
+                    }
+                    GuestCowClass::NotArmed(GuestCowNotArmed::NoWriteIntent) => {
+                        carrick_el1_abi::CowDecline::NoWriteIntent
+                    }
+                    GuestCowClass::NotArmed(GuestCowNotArmed::Executable) => {
+                        carrick_el1_abi::CowDecline::Executable
+                    }
+                    _ => carrick_el1_abi::CowDecline::Unreachable,
+                };
+                carrick_core::mm::cow::CowClassifyOutcome::Declined(reason)
+            }
+        }
+    }
+
+    fn plan_cow_repoint<
+        W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    >(
+        words: &W,
+        root: u64,
+        op: carrick_core::mm::cow::CowRepointOp,
+    ) -> bool {
+        use carrick_mmu_core::aarch64::SubstrateGpa;
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            CowRepointAccess, DescriptorOp, plan_descriptor_op,
+        };
+        let desc_op = DescriptorOp::CowRepoint {
+            access: CowRepointAccess::RecordedPrivate,
+            va: op.va,
+            len: op.len,
+            old_ipa: SubstrateGpa(op.old_ipa),
+            new_ipa: SubstrateGpa(op.new_ipa),
+            backing: op.backing,
+        };
+        match plan_descriptor_op(words, SubstrateGpa(root), desc_op) {
+            Ok(plan) => plan.table_grants == 0,
+            _ => false,
+        }
+    }
+
+    fn with_copy_aliases<
+        W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+        F: FnMut(u64, u64),
+    >(
+        words: &W,
+        root: u64,
+        copy_base: u64,
+        source_ipa: u64,
+        destination_ipa: u64,
+        effect: &mut F,
+    ) -> Result<(), carrick_core::mm::cow::CowRepointOutcome> {
+        use carrick_mmu_core::aarch64::SubstrateGpa;
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome;
+        carrick_mmu_core::aarch64::descriptor_txn::copy_window::with_cow_copy_aliases(
+            words,
+            SubstrateGpa(root),
+            copy_base,
+            SubstrateGpa(source_ipa),
+            SubstrateGpa(destination_ipa),
+            effect,
+        )
+        .map_err(|e| match e {
+            DescriptorOutcome::Indeterminate(_) => {
+                carrick_core::mm::cow::CowRepointOutcome::Indeterminate
+            }
+            DescriptorOutcome::RolledBack(_) => {
+                carrick_core::mm::cow::CowRepointOutcome::RolledBack
+            }
+            _ => carrick_core::mm::cow::CowRepointOutcome::Refused,
+        })
+    }
+
+    fn execute_cow_repoint<
+        W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    >(
+        words: &W,
+        root: u64,
+        op: carrick_core::mm::cow::CowRepointOp,
+    ) -> carrick_core::mm::cow::CowRepointOutcome {
+        use carrick_mmu_core::aarch64::SubstrateGpa;
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            CowRepointAccess, DescriptorOp, DescriptorOutcome, InlineJournal, TableGrants,
+            execute_descriptor_op,
+        };
+        let desc_op = DescriptorOp::CowRepoint {
+            access: CowRepointAccess::RecordedPrivate,
+            va: op.va,
+            len: op.len,
+            old_ipa: SubstrateGpa(op.old_ipa),
+            new_ipa: SubstrateGpa(op.new_ipa),
+            backing: op.backing,
+        };
+        let mut journal = InlineJournal::new();
+        match execute_descriptor_op(
+            words,
+            SubstrateGpa(root),
+            desc_op,
+            &TableGrants::NONE,
+            &mut journal,
+        ) {
+            DescriptorOutcome::Applied(applied) => {
+                carrick_core::mm::cow::CowRepointOutcome::Applied {
+                    flush_required: applied.flush_required,
+                }
+            }
+            DescriptorOutcome::Refused(_) => carrick_core::mm::cow::CowRepointOutcome::Refused,
+            DescriptorOutcome::RolledBack(_) => {
+                carrick_core::mm::cow::CowRepointOutcome::RolledBack
+            }
+            DescriptorOutcome::Indeterminate(_) => {
+                carrick_core::mm::cow::CowRepointOutcome::Indeterminate
+            }
+        }
+    }
+}
+
+pub type CowCopyWindow<'a> = carrick_core::mm::cow::CowCopyWindow<'a, Aarch64CowMmu>;
+pub type GuestCowVenue<'a, W> = carrick_core::mm::cow::GuestCowVenue<'a, Aarch64CowMmu, W>;
 
 pub fn resolve_guest_cow<
     W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
@@ -24,7 +184,7 @@ pub fn resolve_guest_cow<
     copy_page: C,
     invalidate_asid: I,
 ) -> Result<GuestCowOutcome, CowError> {
-    carrick_core::mm::cow::resolve_guest_cow::<carrick_mmu_core::owner_mmu::Aarch64Mmu, W, C, I>(
+    carrick_core::mm::cow::resolve_guest_cow::<Aarch64CowMmu, W, C, I>(
         venue,
         mm_key,
         far,
