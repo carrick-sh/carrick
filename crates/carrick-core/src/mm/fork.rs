@@ -33,6 +33,7 @@ pub struct Mapping {
 
 /// All allocation occurs before borrowing either owner. Unlinked table words
 /// and parent undo storage stay owned across physical custody suspension.
+#[derive(Clone, Debug)]
 pub struct ForkScratch {
     pub child: Vec<u64>,
     pub parent: Vec<u64>,
@@ -321,6 +322,7 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct UnpublishedChild<B: OwnerForkMmu = Aarch64Mmu> {
     pub completion: PortalForkCompletion,
     pub parent_root: u64,
@@ -383,7 +385,9 @@ impl<B: OwnerForkMmu> UnpublishedChild<B> {
         self.completion.parent_generation = parent.commit_fork_generation()?;
         if !self.scratch.edits.iter().any(|edit| {
             B::is_table(edit.before, 0)
-                && request.parent_tables.contains(edit.before & B::ADDRESS_MASK)
+                && request
+                    .parent_tables
+                    .contains(edit.before & B::ADDRESS_MASK)
         }) {
             self.completion.parent_tables_used = 0;
         }
@@ -559,7 +563,11 @@ pub struct ForkCensus {
     pub custody: usize,
 }
 
-pub fn census_table<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescriptorWords + ?Sized>(
+pub fn census_table<
+    B: OwnerForkMmu,
+    P: MappingInheritancePolicy,
+    W: LiveDescriptorWords + ?Sized,
+>(
     policy_provider: &P,
     words: &W,
     mappings: &[Mapping],
@@ -584,7 +592,11 @@ pub fn census_table<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescrip
     Ok(())
 }
 
-pub fn census_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescriptorWords + ?Sized>(
+pub fn census_entry<
+    B: OwnerForkMmu,
+    P: MappingInheritancePolicy,
+    W: LiveDescriptorWords + ?Sized,
+>(
     policy_provider: &P,
     words: &W,
     mappings: &[Mapping],
@@ -668,8 +680,15 @@ pub fn copy_table<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
         }
         scratch.reads.push((address, descriptor));
         let va = base + ((index as u64) << SHIFTS[level]);
-        let (parent, child) =
-            copy_entry::<B, P, W>(policy_provider, words, request, scratch, descriptor, level, va)?;
+        let (parent, child) = copy_entry::<B, P, W>(
+            policy_provider,
+            words,
+            request,
+            scratch,
+            descriptor,
+            level,
+            va,
+        )?;
         scratch.child[child_offset + index] = child;
         if parent != descriptor {
             if scratch.edits.len() == scratch.edits.capacity() {
@@ -861,9 +880,10 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
                     len: span,
                     shared: {
                         let index = scratch.mappings.partition_point(|m| m.range.end() <= va);
-                        scratch.mappings.get(index).is_some_and(|m| {
-                            m.range.contains(va) && policy_provider.is_shared(m)
-                        })
+                        scratch
+                            .mappings
+                            .get(index)
+                            .is_some_and(|m| m.range.contains(va) && policy_provider.is_shared(m))
                     },
                 })?;
             }
