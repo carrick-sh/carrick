@@ -102,6 +102,30 @@ impl carrick_core_abi::ReservationPolicy for LinuxReservationPolicy {
     }
 }
 
+use carrick_core::mm::transaction::MmError;
+/// Linux wire encoding of the neutral owner's typed refusal.
+pub trait MmErrorLinux {
+    fn errno(self) -> u32;
+}
+impl MmErrorLinux for MmError {
+    fn errno(self) -> u32 {
+        match self {
+            Self::Fault => 14,
+            Self::UnsupportedExecutableCow => 95,
+            Self::Stale => 3,
+            Self::Busy => 16,
+            Self::NoMemory => 12,
+            Self::MetadataRequired | Self::Wait(_) => 11,
+            Self::Invalid => 22,
+            Self::Core | Self::Reservation(_) | Self::Table(_) => 5,
+        }
+    }
+}
+
+pub const fn cancelled_copy_errno() -> u32 {
+    125
+}
+
 #[cfg(test)]
 mod flag_tests {
     use super::*;

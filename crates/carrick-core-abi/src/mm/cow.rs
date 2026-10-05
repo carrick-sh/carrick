@@ -1,0 +1,58 @@
+//! One original exact COW completion record, shared by ISA adapters.
+use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
+/// Bytes of one grant: the host COW compound.
+pub const COW_GRANT_SIZE: u64 = 16 * 1024;
+const PAGE: u64 = 4096;
+
+/// One ready grant as EL1 claimed it, or as the host published it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CowGrant {
+    pub slot: usize,
+    /// The record's state word at publication, without the state bits.
+    pub epoch: u64,
+    pub mm_key: u64,
+    /// 16 KiB-aligned IPA of the replacement compound.
+    pub physical_ipa: u64,
+    pub backing: BackingIdentity,
+}
+
+/// Which owner operation licensed the physical replacement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum CowGrantPurpose {
+    UserWrite = 0,
+    RetiredBacking = 1,
+    /// Malformed wire receipt; never accepted for publication or settlement.
+    Invalid = 2,
+}
+
+/// One guest COW EL1 completed with a grant: `[span_va, span_va + span_len)`
+/// moved from `old_ipa` (the span's first page) to `new_ipa`, both inside
+/// their 16 KiB compounds at the same offset.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CowGrantCompletion {
+    pub purpose: CowGrantPurpose,
+    pub grant: CowGrant,
+    pub span_va: u64,
+    pub span_len: u64,
+    pub old_ipa: u64,
+    pub new_ipa: u64,
+}
+
+impl CowGrantCompletion {
+    /// Whether the completion describes a repoint inside one grant compound
+    /// from one old compound at the same offset, page-granular and nonempty.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        let offset = self.new_ipa.wrapping_sub(self.grant.physical_ipa);
+        self.purpose != CowGrantPurpose::Invalid
+            && self.span_len != 0
+            && self.span_len.is_multiple_of(PAGE)
+            && self.span_va.is_multiple_of(PAGE)
+            && self.old_ipa.is_multiple_of(PAGE)
+            && self.new_ipa >= self.grant.physical_ipa
+            && offset + self.span_len <= COW_GRANT_SIZE
+            && (self.old_ipa & (COW_GRANT_SIZE - 1)) == offset
+            && self.span_va.checked_add(self.span_len).is_some()
+    }
+}

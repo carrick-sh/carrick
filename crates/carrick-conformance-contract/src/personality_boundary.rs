@@ -1563,6 +1563,52 @@ mod tests {
         assert!(!production.contains("carrick_el1"));
     }
 
+    #[test]
+    fn mm_selection_and_service_transaction_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let old = fs::read_to_string(
+            repo.join("crates/carrick-el1/src/personality/mm_portal/production.rs"),
+        )
+        .unwrap();
+        for body in [
+            "pub struct MmPortal",
+            "pub fn select<",
+            "pub fn revalidate<",
+            "fn settle_prepared_service<",
+        ] {
+            assert!(
+                !old.contains(body),
+                "move the original {body} body; do not retain an ARM owner"
+            );
+        }
+        let owner =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/transaction/owner.rs"))
+                .unwrap();
+        assert!(owner.contains("pub struct MmPortal"));
+        assert!(owner.contains("pub fn select<"));
+        assert!(owner.contains("pub fn revalidate<"));
+        assert!(!owner.contains("carrick_el1"));
+        assert!(!owner.contains("TrapFrame"));
+        let records =
+            fs::read_to_string(repo.join("crates/carrick-core-abi/src/mm/residency.rs")).unwrap();
+        assert!(records.contains("pub struct FrameGrantResidencyTable"));
+        let old_records =
+            fs::read_to_string(repo.join("crates/carrick-el1-abi/src/lib.rs")).unwrap();
+        assert!(!old_records.contains("pub struct FrameGrantResidencyTable"));
+        let old_tests =
+            fs::read_to_string(repo.join("crates/carrick-el1/src/personality/mm_portal/tests.rs"))
+                .unwrap();
+        for witness in [
+            "transfer_revalidates_exact_mm_before_copy",
+            "prepared_copy_commit_and_cancel_never_acquire_held_root_or_editor",
+        ] {
+            assert!(
+                !old_tests.contains(&format!("fn {witness}(")),
+                "move {witness} assertions with their owner"
+            );
+        }
+    }
+
     use serde_json::{Value, json};
 
     struct Fixture {
