@@ -784,10 +784,18 @@ mod tests {
                 |source, destination| self.memory.copy_through(self.arena, source, destination),
                 || {},
             );
-            matches!(
-                outcome,
-                Ok(GuestCowOutcome::Resolved(_) | GuestCowOutcome::AlreadyWritable)
-            )
+            match outcome {
+                Ok(GuestCowOutcome::Resolved(_) | GuestCowOutcome::AlreadyWritable) => true,
+                Ok(GuestCowOutcome::Declined(_)) => false,
+                Err(CowError::Indeterminate) => {
+                    panic!(
+                        "EL1 COW translation state indeterminate: failed rollback or alias restore"
+                    )
+                }
+                Err(CowError::Corrupt) => panic!("EL1 COW descriptor state corrupt"),
+                Err(CowError::Internal) => panic!("EL1 COW internal invariant violation"),
+                Err(CowError::Refused) => false,
+            }
         }
         fn editor_busy(&mut self) {
             self.pool.note_declined(CowDecline::EditorBusy);
@@ -905,5 +913,105 @@ mod tests {
         assert_eq!(memory.page(OLD + 4096), source);
         assert_eq!(memory.page(OLD), adjacent);
         assert_eq!(&memory.page(GRANT + 4096)[..4], b"edit");
+    }
+
+    #[test]
+    #[should_panic(expected = "EL1 COW translation state indeterminate")]
+    fn a_failed_copy_window_restore_panics_and_does_not_forward() {
+        let (arena, memory) = forked(true);
+        let pool = CowGrantPool::new();
+        pool.publish(MM, GRANT, backing()).unwrap();
+
+        let open = AddressSpaces::new();
+        let index = open.publish_closed(MM, ROOT | ASID, ROOT | ASID).unwrap();
+        open.open(index);
+
+        struct CorruptingResolver<'a> {
+            arena: &'a Arena,
+            memory: &'a Memory,
+            pool: &'a CowGrantPool,
+        }
+
+        impl CowResolver for CorruptingResolver<'_> {
+            fn resolve_cow(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> bool {
+                assert_eq!(ttbr0 & PA, ROOT);
+                let outcome = resolve_guest_cow(
+                    &GuestCowVenue {
+                        publish_executable: None,
+                        words: &self.arena.words(),
+                        root: SubstrateGpa(ttbr0 & PA),
+                        pool: self.pool,
+                        residency: &residency_table(),
+                        copy_window: crate::cow::CowCopyWindow::target(
+                            &self.arena.words(),
+                            SubstrateGpa(ttbr0 & PA),
+                        ),
+                    },
+                    mm_key,
+                    far,
+                    |source, destination| {
+                        self.memory.copy_through(self.arena, source, destination);
+                        // Corrupt the alias descriptor in the arena after copying so the copy window restore CAS fails
+                        self.arena.set_leaf(EL1_COW_COPY_BASE, 0xdead_beef);
+                    },
+                    || {},
+                );
+                // The resolver implementation under test: previously this was
+                // matches!(outcome, Ok(GuestCowOutcome::Resolved(_) | ...)) which
+                // treated Indeterminate as a non-fatal refusal (returning false),
+                // allowing execution to continue via Action::Forward!
+                self.handle_outcome(outcome)
+            }
+            fn editor_busy(&mut self) {
+                self.pool.note_declined(CowDecline::EditorBusy);
+            }
+        }
+
+        impl CorruptingResolver<'_> {
+            fn handle_outcome(&self, outcome: Result<GuestCowOutcome, CowError>) -> bool {
+                match outcome {
+                    Ok(GuestCowOutcome::Resolved(_) | GuestCowOutcome::AlreadyWritable) => true,
+                    Ok(GuestCowOutcome::Declined(_)) => false,
+                    Err(CowError::Indeterminate) => {
+                        panic!(
+                            "EL1 COW translation state indeterminate: failed rollback or alias restore"
+                        )
+                    }
+                    Err(CowError::Corrupt) => panic!("EL1 COW descriptor state corrupt"),
+                    Err(CowError::Internal) => panic!("EL1 COW internal invariant violation"),
+                    Err(CowError::Refused) => false,
+                }
+            }
+        }
+
+        let mut resolver = CorruptingResolver {
+            arena: &arena,
+            memory: &memory,
+            pool: &pool,
+        };
+
+        let task = CurrentTask::new();
+        task.zone_mm.store(MM, Ordering::Release);
+        let mut frame = TrapFrame {
+            esr: (0x24 << 26) | (1 << 6) | 0x0f,
+            far: VA + 0x10,
+            slot: 0,
+            ..TrapFrame::default()
+        };
+        let action = dispatch_fault_with_prepared(
+            &mut frame,
+            &Counters::default(),
+            &[task],
+            carrick_sched_core::spaces::notification::SpaceAccess::source_free(&open),
+            GrantMailboxes::own(&FrameGrantMailbox::new()),
+            None::<PreparedFaultPath<'_, NoopPreparedResolver>>,
+            &mut resolver,
+        );
+        // The old code returned Action::Forward instead of terminating.
+        assert_ne!(
+            action,
+            Action::Forward,
+            "must not continue via Action::Forward"
+        );
     }
 }
