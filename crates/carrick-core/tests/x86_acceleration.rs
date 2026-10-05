@@ -246,7 +246,9 @@ mod fork_cow {
         BackingIdentity, DescriptorRefusal, LiveDescriptorWords,
     };
     use carrick_mmu_core::owner_mmu::Aarch64Mmu;
-    use carrick_mmu_core::x86::descriptor_txn::{COW, MAY_WRITE, NX, PRESENT, USER, WRITE};
+    use carrick_mmu_core::x86::descriptor_txn::{
+        COW, HUGE, MAY_WRITE, NX, PREPARED, PRESENT, USER, WRITE,
+    };
     use carrick_mmu_core::x86::owner_mmu::X86Mmu;
     use core::num::NonZeroU64;
     use std::collections::BTreeMap;
@@ -847,6 +849,132 @@ mod fork_cow {
             pol_sup,
             carrick_core::mm::fork::Policy::Keep,
             "uncovered dirty x86 supervisor leaf must be kept"
+        );
+
+        // 6. Red-first witness: split a 2 MiB huge leaf spanning PRIVATE and DONTFORK.
+        // The newly created parent and child table entries must point to tables
+        // (HUGE / PS bit clear), carrying only non-terminal permission bits (P, RW, US, NX).
+        let huge_mem = TestMemory::new();
+        let root_pa = 0x20_0000;
+        let l3_pa = 0x20_1000;
+        let l2_pa = 0x20_2000;
+        let huge_leaf_2m_pa = 0x40_0000; // 2 MiB aligned
+
+        // L4 entry points to L3
+        huge_mem.store(root_pa, l3_pa | PRESENT | WRITE | USER);
+        // L3 entry points to L2
+        huge_mem.store(l3_pa, l2_pa | PRESENT | WRITE | USER);
+        // L2 entry is a 2 MiB huge leaf spanning [0..2 MiB)
+        let huge_leaf = huge_leaf_2m_pa | PRESENT | WRITE | USER | HUGE | NX;
+        huge_mem.store(l2_pa, huge_leaf);
+
+        let mut huge_scratch = ForkScratch::bounded(req, 1, 512 * 8, 512 * 8, 512 * 8, 512).unwrap();
+        // [0..1 MiB): PRIVATE
+        // [1..2 MiB): DONTFORK
+        huge_scratch.mappings = vec![
+            Mapping {
+                range: ReservationRange::new(0, 0x10_0000).unwrap(),
+                protection: ReservationProtection::READ_WRITE,
+                anonymous: true,
+                flags: ReservationNodeFlags::PRIVATE,
+                generation: ReservationGeneration::new(1).unwrap(),
+                host_backing: None,
+            },
+            Mapping {
+                range: ReservationRange::new(0x10_0000, 0x20_0000).unwrap(),
+                protection: ReservationProtection::READ_WRITE,
+                anonymous: true,
+                flags: ReservationNodeFlags::DONTFORK,
+                generation: ReservationGeneration::new(1).unwrap(),
+                host_backing: None,
+            },
+        ];
+
+        copy_table::<X86Mmu, _, _>(
+            &LinuxForkPolicy,
+            &huge_mem,
+            req,
+            &mut huge_scratch,
+            ForkTableCursor {
+                table: root_pa,
+                level: 0,
+                base: 0,
+                child_offset: 0,
+            },
+        )
+        .unwrap();
+
+        // The parent's L2 entry must be updated to a table pointer pointing to the new parent L1 table.
+        let parent_edit = huge_scratch
+            .edits
+            .iter()
+            .find(|e| e.pa == l2_pa)
+            .expect("parent L2 entry must be edited when huge leaf is split");
+        assert_eq!(
+            parent_edit.after & HUGE,
+            0,
+            "parent split entry must be a table pointer with HUGE (PS) bit clear"
+        );
+        assert_ne!(
+            parent_edit.after & PRESENT,
+            0,
+            "parent split entry must have PRESENT set"
+        );
+        assert_ne!(
+            parent_edit.after & WRITE,
+            0,
+            "parent split entry must preserve WRITE permission"
+        );
+        assert_ne!(
+            parent_edit.after & USER,
+            0,
+            "parent split entry must preserve USER permission"
+        );
+        assert_ne!(
+            parent_edit.after & NX,
+            0,
+            "parent split entry must preserve NX permission"
+        );
+        assert_eq!(
+            parent_edit.after & (COW | MAY_WRITE | PREPARED),
+            0,
+            "parent split table entry must not carry leaf-only metadata bits"
+        );
+
+        // The child's L2 entry must also be a table pointer with HUGE cleared.
+        // Child L4 is at child offset 0. Index 0 points to child L3 table.
+        // Child L3 table is at offset 512. Index 0 points to child L2 table.
+        // Child L2 table is at offset 1024. Index 0 is the split table pointer.
+        let child_l2_desc = huge_scratch.child[1024];
+        assert_eq!(
+            child_l2_desc & HUGE,
+            0,
+            "child split entry must be a table pointer with HUGE (PS) bit clear"
+        );
+        assert_ne!(
+            child_l2_desc & PRESENT,
+            0,
+            "child split entry must have PRESENT set"
+        );
+        assert_ne!(
+            child_l2_desc & WRITE,
+            0,
+            "child split entry must preserve WRITE permission"
+        );
+        assert_ne!(
+            child_l2_desc & USER,
+            0,
+            "child split entry must preserve USER permission"
+        );
+        assert_ne!(
+            child_l2_desc & NX,
+            0,
+            "child split entry must preserve NX permission"
+        );
+        assert_eq!(
+            child_l2_desc & (COW | MAY_WRITE | PREPARED),
+            0,
+            "child split table entry must not carry leaf-only metadata bits"
         );
     }
 }
