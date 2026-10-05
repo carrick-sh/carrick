@@ -125,6 +125,12 @@ impl ServiceCopyLease<'_> {
     }
 }
 
+impl carrick_core_abi::ServiceCopyWindowLease for ServiceCopyLease<'_> {
+    fn base(&self) -> u64 {
+        self.base()
+    }
+}
+
 impl Drop for ServiceCopyLease<'_> {
     fn drop(&mut self) {
         let index = usize::from(self.slot.raw());

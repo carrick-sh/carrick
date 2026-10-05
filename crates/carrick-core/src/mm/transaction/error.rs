@@ -41,3 +41,24 @@ impl From<PageTableError> for MmError {
         Self::Table(e)
     }
 }
+
+impl From<crate::mm::fork::ForkError> for MmError {
+    fn from(e: crate::mm::fork::ForkError) -> Self {
+        use crate::mm::fork::{ForkError, ForkOwnerRefusal};
+        match e {
+            ForkError::Invalid => Self::Invalid,
+            ForkError::NoMemory => Self::NoMemory,
+            ForkError::Busy => Self::Busy,
+            ForkError::Stale => Self::Stale,
+            ForkError::MetadataRequired => Self::MetadataRequired,
+            ForkError::OwnerRefusal(refusal) => Self::from(match refusal {
+                ForkOwnerRefusal::Invalid => Refusal::Invalid,
+                ForkOwnerRefusal::Collision => Refusal::Collision,
+                ForkOwnerRefusal::Hole => Refusal::Hole,
+                ForkOwnerRefusal::ForeignMapping => Refusal::ForeignMapping,
+                ForkOwnerRefusal::Limit => Refusal::Limit,
+            }),
+            ForkError::Core => Self::Core,
+        }
+    }
+}

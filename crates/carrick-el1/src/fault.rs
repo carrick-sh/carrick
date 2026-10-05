@@ -84,6 +84,40 @@ pub use carrick_core::mm::transfer::resolver::{
     CowResolution, CowResolver, NoopCowResolver, NoopPreparedResolver, PreparedPageResolver,
 };
 
+/// The hardware fault path and VM-free arena witnesses share this settlement.
+/// A failed rollback is fatal: the caller cannot resume or forward a fault with
+/// indeterminate live translations.
+#[cfg(any(target_os = "none", test))]
+pub(crate) fn handle_cow_outcome(
+    outcome: Result<crate::cow::GuestCowOutcome, crate::cow::CowError>,
+    completion: &mut Option<carrick_el1_abi::CowGrantCompletion>,
+) -> CowResolution {
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(crate::cow::CowError::Indeterminate) => {
+            panic!("EL1 COW translation state indeterminate: failed rollback or alias restore")
+        }
+        Err(crate::cow::CowError::Corrupt) => {
+            panic!("EL1 COW descriptor state corrupt")
+        }
+        Err(crate::cow::CowError::Internal) => {
+            panic!("EL1 COW internal invariant violation")
+        }
+        Err(crate::cow::CowError::Refused) => return CowResolution::Refused,
+    };
+    *completion = match outcome {
+        crate::cow::GuestCowOutcome::Resolved(completion) => Some(completion),
+        _ => None,
+    };
+    match outcome {
+        crate::cow::GuestCowOutcome::Declined(carrick_el1_abi::CowDecline::PoolEmpty) => {
+            CowResolution::NeedsSupply
+        }
+        crate::cow::GuestCowOutcome::Declined(_) => CowResolution::Refused,
+        _ => CowResolution::Resolved,
+    }
+}
+
 pub struct PreparedFaultPath<'a, P: PreparedPageResolver> {
     pub residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
     pub resolver: &'a mut P,
@@ -260,17 +294,7 @@ impl CowResolver for HardwareCowResolver {
         let Ok(outcome) = outcome else {
             return CowResolution::Refused;
         };
-        self.completion = match outcome {
-            crate::cow::GuestCowOutcome::Resolved(completion) => Some(completion),
-            _ => None,
-        };
-        match outcome {
-            crate::cow::GuestCowOutcome::Declined(carrick_el1_abi::CowDecline::PoolEmpty) => {
-                CowResolution::NeedsSupply
-            }
-            crate::cow::GuestCowOutcome::Declined(_) => CowResolution::Refused,
-            _ => CowResolution::Resolved,
-        }
+        handle_cow_outcome(outcome, &mut self.completion)
     }
 
     fn editor_busy(&mut self) {
