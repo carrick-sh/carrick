@@ -854,11 +854,67 @@ pub enum PublishedFrameGrantPlan<'permit> {
     Retired(RetiredFrameGrantPlan<'permit>),
 }
 
-/// An applied grant overtaken by an EL1 retirement. It carries accounting
-/// authority only; it cannot publish residency for the retired page.
+/// An applied grant partially or wholly overtaken by EL1 retirement.
+/// Only surviving fragments retain residency authority.
 pub struct RetiredFrameGrantPlan<'permit> {
     span: ReservationRange,
+    retired: Vec<ReservationRange>,
+    fault: Option<(GuestVa, LinuxProtFlags)>,
     exclusion: super::HostAliasDispatchGuard<'permit>,
+}
+
+pub(crate) struct GrantResidencyPublication {
+    retired: Vec<ReservationRange>,
+    resident: Option<GuestVa>,
+}
+
+impl GrantResidencyPublication {
+    /// Publish exact physical fragments under the caller's MM exclusion.
+    /// Retired pages are never temporarily visible in the residency index.
+    pub(crate) fn publish(
+        self,
+        table: &carrick_el1_abi::FrameGrantResidencyTable,
+        grant: carrick_el1_abi::FrameGrantResidencyIdentity,
+    ) {
+        let Self {
+            mut retired,
+            resident,
+        } = self;
+        let Some(end) = grant.semantic_base.checked_add(grant.len) else {
+            return;
+        };
+        retired.sort_unstable_by_key(|range| range.start());
+        let publish = |start: u64, end: u64| {
+            if start < end {
+                let Some(physical_ipa) =
+                    grant.physical_ipa.checked_add(start - grant.semantic_base)
+                else {
+                    return;
+                };
+                let fragment = carrick_el1_abi::FrameGrantResidencyIdentity {
+                    semantic_base: start,
+                    physical_ipa,
+                    len: end - start,
+                    ..grant
+                };
+                if let Some(slot) = table.publish(fragment)
+                    && let Some(va) = resident.filter(|va| start <= va.raw() && va.raw() < end)
+                    && let Some(page) = table.lookup(grant.mm_key, va.raw())
+                    && page.slot == slot
+                    && page.identity == fragment
+                {
+                    let _ = table.record_commit(page);
+                }
+            }
+        };
+        let mut cursor = grant.semantic_base;
+        for range in retired {
+            let start = range.start().max(grant.semantic_base).min(end);
+            publish(cursor, start);
+            cursor = cursor.max(range.end().min(end));
+        }
+        publish(cursor, end);
+    }
 }
 
 impl<'permit> From<ResidentFrameGrantPlan<'permit>> for PublishedFrameGrantPlan<'permit> {
@@ -1396,10 +1452,30 @@ impl<'a> MemView<'a> {
         {
             return Err(PublishedFrameGrantRefusal::BusFault);
         }
-        if mem.root_owes_backing_within(publication.va, end) {
+        let mut retired = Vec::new();
+        if let Some(root) = mem.delegated_root() {
+            root.with_root(|model| {
+                model.observe_deferred_returns(&mut |entry| {
+                    if let Some(range) = ReservationRange::new(
+                        publication.va.max(entry.range.start()),
+                        end.min(entry.range.end()),
+                    ) {
+                        retired.push(range);
+                    }
+                });
+                Ok(())
+            })
+            .unwrap_or_else(|refusal| broken_root("published grant retirement partition", refusal));
+        }
+        if retired
+            .iter()
+            .any(|range| range.start() <= resident.va && resident.va < range.end())
+        {
             return Ok(PublishedFrameGrantPlan::Retired(RetiredFrameGrantPlan {
                 span: ReservationRange::new(publication.va, end)
                     .ok_or(PublishedFrameGrantRefusal::ReceiptShape)?,
+                retired,
+                fault: None,
                 exclusion,
             }));
         }
@@ -1425,6 +1501,15 @@ impl<'a> MemView<'a> {
                 published: protection,
                 current: prot,
             });
+        }
+        if !retired.is_empty() {
+            return Ok(PublishedFrameGrantPlan::Retired(RetiredFrameGrantPlan {
+                span: ReservationRange::new(publication.va, end)
+                    .ok_or(PublishedFrameGrantRefusal::ReceiptShape)?,
+                retired,
+                fault: Some((GuestVa(resident.va), prot)),
+                exclusion,
+            }));
         }
         let stock = root_owned
             && mem.delegated_root().is_some_and(|root| {
@@ -1503,12 +1588,19 @@ impl<'a> MemView<'a> {
     }
 
     /// Settle accounting without reviving a page EL1 already retired.
-    /// Returns whether the live grant residency record may be published.
-    pub(crate) fn commit_published_frame_grant(&self, plan: PublishedFrameGrantPlan<'_>) -> bool {
+    /// Return the exact surviving physical residency publication.
+    pub(crate) fn commit_published_frame_grant(
+        &self,
+        plan: PublishedFrameGrantPlan<'_>,
+    ) -> GrantResidencyPublication {
         match plan {
             PublishedFrameGrantPlan::Resident(plan) => {
+                let resident = Some(GuestVa(plan.fault_page));
                 self.commit_resident_frame_grant(plan);
-                true
+                GrantResidencyPublication {
+                    retired: Vec::new(),
+                    resident,
+                }
             }
             PublishedFrameGrantPlan::Retired(plan) => {
                 if !self.owns_host_alias_dispatch(&plan.exclusion) {
@@ -1520,7 +1612,18 @@ impl<'a> MemView<'a> {
                 // The owed journal returns the retired pages. The stock
                 // list returns every remaining hole in this exact grant.
                 self.mem().lock().first_touch_stock.push(plan.span);
-                false
+                let resident = plan.fault.map(|(page, _)| page);
+                if let Some((page, prot)) = plan.fault {
+                    self.commit_resident_fault(ResidentFaultPlan {
+                        page: page.raw(),
+                        prot: prot.bits(),
+                        exclusion: plan.exclusion,
+                    });
+                }
+                GrantResidencyPublication {
+                    retired: plan.retired,
+                    resident,
+                }
             }
         }
     }
