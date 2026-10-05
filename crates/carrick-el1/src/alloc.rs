@@ -311,7 +311,10 @@ impl MetadataAllocatorCore {
 
         // Authenticate non-overlap with any currently active extents
         for ext in &self.extents {
-            if ext.state == ExtentState::Active || ext.state == ExtentState::PendingReturn {
+            if matches!(
+                ext.state,
+                ExtentState::Active | ExtentState::PendingReturn | ExtentState::ReturnRequested
+            ) {
                 let ext_end = ext.base_va.saturating_add(ext.size as u64);
                 if base_va < ext_end && end_va > ext.base_va {
                     return Err(ExtentAdmissionError::OverlapWithExisting);
@@ -596,40 +599,47 @@ impl MetadataAllocatorCore {
         to_return
     }
 
-    /// Complete dynamic extent return after host hypercall confirmation.
-    pub fn complete_extent_return(&mut self, slot_idx: usize) {
-        if slot_idx < MAX_EXTENTS
-            && matches!(
-                self.extents[slot_idx].state,
+    fn authenticates_return(&self, receipt: ExtentToReturn) -> bool {
+        self.extents.get(receipt.slot_idx).is_some_and(|extent| {
+            matches!(
+                extent.state,
                 ExtentState::PendingReturn | ExtentState::ReturnRequested
-            )
-        {
-            let size = self.extents[slot_idx].size;
-            self.extents[slot_idx].state = ExtentState::Returned;
-            self.active_extents_count = self.active_extents_count.saturating_sub(1);
-            self.total_capacity_bytes = self.total_capacity_bytes.saturating_sub(size);
-        }
+            ) && extent.base_va == receipt.base_va
+                && extent.size == receipt.size
+                && extent.kind
+                    == ExtentKind::Dynamic {
+                        token: receipt.token,
+                    }
+        })
     }
 
-    /// Cancel dynamic extent return if host hypercall was refused or failed.
-    pub fn cancel_extent_return(&mut self, slot_idx: usize) {
-        if slot_idx < MAX_EXTENTS
-            && matches!(
-                self.extents[slot_idx].state,
-                ExtentState::PendingReturn | ExtentState::ReturnRequested
-            )
-        {
-            self.extents[slot_idx].state = ExtentState::Active;
-            unsafe {
-                let initial_block = self.extents[slot_idx].base_va as *mut BlockHeader;
-                (*initial_block).size = self.extents[slot_idx].size;
-                (*initial_block).prev_phys_offset = NO_PREV_BLOCK;
-                (*initial_block).extent_idx = slot_idx as u8;
-                (*initial_block).is_allocated = false;
-                (*initial_block).magic = BLOCK_MAGIC;
-                self.insert_free_block(initial_block);
-            }
+    /// Complete the exact dynamic extent return after backend confirmation.
+    pub fn complete_extent_return(&mut self, receipt: ExtentToReturn) -> bool {
+        if !self.authenticates_return(receipt) {
+            return false;
         }
+        self.extents[receipt.slot_idx].state = ExtentState::Returned;
+        self.active_extents_count = self.active_extents_count.saturating_sub(1);
+        self.total_capacity_bytes = self.total_capacity_bytes.saturating_sub(receipt.size);
+        true
+    }
+
+    /// Cancel only the exact refused return, retaining the successor unchanged.
+    pub fn cancel_extent_return(&mut self, receipt: ExtentToReturn) -> bool {
+        if !self.authenticates_return(receipt) {
+            return false;
+        }
+        self.extents[receipt.slot_idx].state = ExtentState::Active;
+        unsafe {
+            let initial_block = receipt.base_va as *mut BlockHeader;
+            (*initial_block).size = receipt.size;
+            (*initial_block).prev_phys_offset = NO_PREV_BLOCK;
+            (*initial_block).extent_idx = receipt.slot_idx as u8;
+            (*initial_block).is_allocated = false;
+            (*initial_block).magic = BLOCK_MAGIC;
+            self.insert_free_block(initial_block);
+        }
+        true
     }
 
     /// Deallocate a previously allocated block.
@@ -852,10 +862,16 @@ impl MetadataStorage {
             carrick_el1_abi::METADATA_GRANT_OP_FREE => {
                 let slot_idx = response.cookie as usize;
                 if slot_idx != usize::MAX {
+                    let receipt = ExtentToReturn {
+                        base_va: response.arg1,
+                        size: response.arg2 as usize,
+                        token: response.arg3,
+                        slot_idx,
+                    };
                     if response.status == carrick_el1_abi::METADATA_GRANT_SUCCESS {
-                        core.complete_extent_return(slot_idx);
+                        core.complete_extent_return(receipt);
                     } else {
-                        core.cancel_extent_return(slot_idx);
+                        core.cancel_extent_return(receipt);
                     }
                 }
                 MailboxSync::ReturnFinished
@@ -1448,7 +1464,7 @@ mod tests {
                 slot_idx: 1,
             })
         );
-        alloc.complete_extent_return(1);
+        assert!(alloc.complete_extent_return(to_return.unwrap()));
 
         let diag = alloc.diagnostics();
         assert_eq!(diag.allocated_bytes, 0);
@@ -1525,7 +1541,7 @@ mod tests {
             .expect("to_return");
 
         // Simulate host refusal: cancel return
-        alloc.cancel_extent_return(to_return.slot_idx);
+        assert!(alloc.cancel_extent_return(to_return));
         let diag = alloc.diagnostics();
         assert_eq!(diag.active_extents, 1);
 
@@ -1587,5 +1603,53 @@ mod tests {
         assert!(ptr.is_none());
         assert_eq!(metrics, AllocMetrics::default());
         assert_eq!(alloc.diagnostics(), before);
+    }
+    #[test]
+    fn delayed_return_cannot_settle_or_cancel_a_reused_extent_slot() {
+        for complete in [true, false] {
+            let mut bytes = vec![0u128; 4096];
+            let base = bytes.as_mut_ptr() as u64;
+            let mut allocator = MetadataAllocatorCore::new();
+            let first = allocator
+                .admit_extent(base, bytes.len() * 16, ExtentKind::Dynamic { token: 41 })
+                .unwrap();
+            let ptr = allocator.allocate(4096, 16).unwrap();
+            let old = allocator.deallocate(ptr, 16).unwrap();
+            assert!(allocator.complete_extent_return(old));
+            let second = allocator
+                .admit_extent(base, bytes.len() * 16, ExtentKind::Dynamic { token: 42 })
+                .unwrap();
+            assert_eq!(first, second);
+            let ptr = allocator.allocate(4096, 16).unwrap();
+            let current = allocator.deallocate(ptr, 16).unwrap();
+            if complete {
+                assert!(!allocator.complete_extent_return(old));
+            } else {
+                assert!(!allocator.cancel_extent_return(old));
+            }
+            assert_eq!(
+                allocator.extents[second].state,
+                ExtentState::PendingReturn,
+                "delayed return changed successor custody"
+            );
+            assert_eq!(allocator.diagnostics().active_extents, 1);
+            assert!(allocator.complete_extent_return(current));
+        }
+    }
+    #[test]
+    fn return_in_flight_keeps_its_extent_excluded_from_admission() {
+        let mut bytes = vec![0u128; 4096];
+        let base = bytes.as_mut_ptr() as u64;
+        let mut allocator = MetadataAllocatorCore::new();
+        let slot = allocator
+            .admit_extent(base, bytes.len() * 16, ExtentKind::Dynamic { token: 41 })
+            .unwrap();
+        let ptr = allocator.allocate(4096, 16).unwrap();
+        allocator.deallocate(ptr, 16).unwrap();
+        allocator.extents[slot].state = ExtentState::ReturnRequested;
+        assert_eq!(
+            allocator.admit_extent(base, bytes.len() * 16, ExtentKind::Dynamic { token: 42 }),
+            Err(ExtentAdmissionError::OverlapWithExisting)
+        );
     }
 }

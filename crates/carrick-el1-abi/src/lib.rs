@@ -984,9 +984,13 @@ impl MetadataGrantMailbox {
             METADATA_MAILBOX_HOST_WORKING
         );
         self.status.store(status, Ordering::Relaxed);
-        self.arg1.store(arg1, Ordering::Relaxed);
-        self.arg2.store(arg2, Ordering::Relaxed);
-        self.arg3.store(arg3, Ordering::Relaxed);
+        // FREE completion preserves the exact request identity. Backend
+        // status carries no authority to substitute a successor extent.
+        if self.op.load(Ordering::Relaxed) as u64 != METADATA_GRANT_OP_FREE {
+            self.arg1.store(arg1, Ordering::Relaxed);
+            self.arg2.store(arg2, Ordering::Relaxed);
+            self.arg3.store(arg3, Ordering::Relaxed);
+        }
         self.state
             .store(METADATA_MAILBOX_RESPONSE, Ordering::Release);
     }
@@ -4879,6 +4883,25 @@ mod tests {
                 status: FRAME_GRANT_ERR_DENIED,
                 request,
             })
+        );
+    }
+    #[test]
+    fn metadata_free_response_retains_the_exact_return_request() {
+        let mailbox = MetadataGrantMailbox::new();
+        let request = MetadataGrantRequest {
+            op: METADATA_GRANT_OP_FREE,
+            arg1: 0x100000,
+            arg2: 0x80000,
+            arg3: 41,
+            cookie: 7,
+        };
+        assert!(mailbox.try_publish_request(request));
+        assert_eq!(mailbox.claim_request(), Some(request));
+        mailbox.publish_response(METADATA_GRANT_SUCCESS, 0, 0, 0);
+        let response = mailbox.claim_response().unwrap();
+        assert_eq!(
+            (response.arg1, response.arg2, response.arg3, response.cookie),
+            (request.arg1, request.arg2, request.arg3, request.cookie)
         );
     }
 }
