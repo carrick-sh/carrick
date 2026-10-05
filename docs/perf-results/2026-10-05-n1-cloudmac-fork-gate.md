@@ -221,3 +221,20 @@ CARRICK_RUN_ID=n1-cm-owner-cow-red just lease gate cargo test -p carrick-vmm-hvf
 The binding is recorded under `kernel.el1.fork-cow`. Its real-descriptor
 and physical-inventory proof does not execute EL0 faults or concurrent
 vCPUs; those remain the signed binding's responsibility.
+
+The physical settlement correction reads permissions from the exact live
+private replacement leaves, after authenticating the MM grant, inventory
+extent, live owner generation and retained outputs. Resident replacements
+must have lost their COW arm; prepared neighbors stay prepared. Host arm
+metadata no longer authorizes this guest-owned completion. Existing host
+arm cleanup remains harmless for the older host-armed path. The loop is
+bounded by the completion ABI's four-page compound; no host semantic range
+projection or extra guest exit is introduced.
+
+The red witness passes with the correction and now also refuses an
+unfinished live COW arm and preserves read-only and inaccessible neighbor
+descriptors byte-for-byte. All 11 composed guest-COW tests pass, including
+exact-MM exclusion, kernel/backend inventory publication and last-reference
+retirement. Logs: `owner-cow-green.log` and `owner-cow-suite.log`. The first
+focused green run exposed an unused candidate helper; it was removed before
+the clean 11-test suite. Signed verification still needs a new exact bundle.
