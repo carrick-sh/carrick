@@ -262,7 +262,7 @@ mod macos_helper_stubs {
         // The ELF machine this lane accepts. The byte-based loader otherwise
         // defaults to EM_AARCH64 (the aarch64 KVM lane); the x86_64 lanes
         // (KVM-x86, bhyve) MUST pass EM_X86_64 or an x86_64 execve target is
-        // rejected as a machine mismatch → the dispatcher would ENOENT the
+        // rejected as a machine mismatch → the dispatcher reports ENOEXEC for
         // execve (trap-confirmed on the bhyve lane: a static-musl x86_64 execd
         // failed to load until the machine was threaded through). Resolve it from
         // the build target arch (the engine's GuestArch::elf_machine()).
@@ -291,7 +291,7 @@ mod macos_helper_stubs {
             Ok(raw) => raw.with_main_file_path(path.clone()),
             Err(err) => {
                 trace_execve(&path, format_args!("elf-load path={path} err={err:?}"));
-                return Err(LINUX_ENOENT);
+                return Err(carrick_kernel::exec_helpers::exec_image_errno(err));
             }
         };
         // KVM boot-image shape: vdso (so AT_SYSINFO_EHDR resolves) + the Linux
@@ -2540,6 +2540,42 @@ pub(crate) mod tests {
 
         let loader: Loader = macos_helper_stubs::load_execve_image;
         let _ = loader;
+    }
+
+    #[test]
+    fn portable_exec_loader_distinguishes_existing_et_rel_from_missing_file() {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("relocatable");
+        let mut bytes = vec![0; 64];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        bytes[16..18].copy_from_slice(&1_u16.to_le_bytes()); // ET_REL
+        let machine: u16 = if cfg!(target_arch = "x86_64") {
+            62
+        } else {
+            183
+        };
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        std::fs::write(&path, bytes).expect("write existing ET_REL");
+        let dispatcher = SyscallDispatcher::new();
+        let load = || {
+            macos_helper_stubs::load_execve_image(
+                &dispatcher,
+                path.to_str().expect("UTF-8 fixture path"),
+                vec![],
+                vec![],
+                false,
+            )
+        };
+        let existing = load().expect_err("ET_REL is not executable");
+        std::fs::remove_file(&path).expect("remove fixture");
+        assert_eq!(
+            load().expect_err("missing file"),
+            crate::linux_abi::LINUX_ENOENT
+        );
+        assert_eq!(existing, crate::linux_abi::LINUX_ENOEXEC);
     }
 
     /// `SA_RESTART` must resume the calls `signal(7)` says it resumes, and must

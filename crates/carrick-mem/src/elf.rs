@@ -408,7 +408,7 @@ fn parse_elf_bytes(bytes: &[u8]) -> Result<Elf<'_>, ElfInspectError> {
         return Err(ElfInspectError::NotElf);
     }
 
-    let elf = Elf::parse(bytes)?;
+    let mut elf = Elf::parse(bytes)?;
     for header in &elf.program_headers {
         // elf(5) / System V ABI: file bytes must fit in the loaded segment.
         if header.p_type == PT_LOAD && header.p_filesz > header.p_memsz {
@@ -418,20 +418,29 @@ fn parse_elf_bytes(bytes: &[u8]) -> Result<Elf<'_>, ElfInspectError> {
             .into());
         }
         if header.p_type == goblin::elf::program_header::PT_INTERP {
-            // Goblin decodes p_filesz - 1 bytes without checking the byte it
-            // drops. Authenticate that terminator inside the declared extent
-            // before publishing a pathname for inspection or load planning.
+            // Decode pathname bytes ourselves: Goblin drops the last byte and
+            // silently loses non-UTF-8 interpreters. Validate the full extent,
+            // then stop at the first NUL, as pathname lookup does on Linux.
             let path = usize::try_from(header.p_offset)
                 .ok()
                 .zip(usize::try_from(header.p_filesz).ok())
                 .and_then(|(start, len)| start.checked_add(len).map(|end| (start, end)))
-                .and_then(|(start, end)| bytes.get(start..end));
-            if !path.is_some_and(|path| path.len() >= 2 && path.last() == Some(&0)) {
+                .and_then(|(start, end)| bytes.get(start..end))
+                .ok_or_else(|| {
+                    goblin::error::Error::Malformed("PT_INTERP extent exceeds file".into())
+                })?;
+            if path.len() < 2 || path.last() != Some(&0) {
                 return Err(goblin::error::Error::Malformed(
                     "PT_INTERP must contain a terminated pathname within its file extent".into(),
                 )
                 .into());
             }
+            let pathname = path.split(|byte| *byte == 0).next().unwrap_or_default();
+            elf.interpreter = Some(std::str::from_utf8(pathname).map_err(|_| {
+                goblin::error::Error::Malformed(
+                    "PT_INTERP pathname cannot be represented as UTF-8".into(),
+                )
+            })?);
         }
     }
     Ok(elf)
