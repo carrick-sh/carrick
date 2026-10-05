@@ -6210,18 +6210,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1506 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_hvpatch`.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1515 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_hvpatch`.",
     "review_id": "HA-000231",
     "source": {
-      "byte_end": 54629,
-      "byte_start": 54616,
+      "byte_end": 55074,
+      "byte_start": 55061,
       "column": 16,
       "column_end": 29,
       "column_start": 16,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1506,
-      "line_end": 1506,
-      "line_start": 1506
+      "line": 1515,
+      "line_end": 1515,
+      "line_start": 1515
     }
   },
   {
@@ -6237,18 +6237,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1514 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest executable image used by `run_static_hvpatch`.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1523 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest executable image used by `run_static_hvpatch`.",
     "review_id": "HA-000232",
     "source": {
-      "byte_end": 55108,
-      "byte_start": 55095,
+      "byte_end": 55553,
+      "byte_start": 55540,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1514,
-      "line_end": 1514,
-      "line_start": 1514
+      "line": 1523,
+      "line_end": 1523,
+      "line_start": 1523
     }
   },
   {
