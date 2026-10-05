@@ -2135,4 +2135,23 @@ mod tests {
             "moved grant and capacity tests must run in the host gate"
         );
     }
+    #[test]
+    fn grant_publication_and_wire_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let old = fs::read_to_string(
+            repo.join("crates/carrick-el1/src/personality/mm_portal/production.rs"),
+        )
+        .unwrap();
+        assert!(
+            !old.contains("fn apply_grant<"),
+            "grant owner must move, not be wrapped"
+        );
+        let wire =
+            fs::read_to_string(repo.join("crates/carrick-el1-abi/src/mm_portal_grant.rs")).unwrap();
+        assert!(!wire.contains("pub struct PortalGrantSlot"));
+        let owner = fs::read_to_string(repo.join("crates/carrick-core/src/mm/frames.rs")).unwrap();
+        assert!(owner.contains("fn apply_grant<"));
+        assert!(owner.contains("B::execute_grant"));
+        assert!(!owner.contains("carrick_el1"));
+    }
 }

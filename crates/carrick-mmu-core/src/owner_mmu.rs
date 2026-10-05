@@ -131,3 +131,29 @@ impl OwnerMmu for Aarch64Mmu {
         }
     }
 }
+
+/// ISA descriptor publication for an already authenticated owner grant.
+/// The entire prepared span and its first resident page share one journal.
+pub trait OwnerGrantMmu: OwnerForkMmu {
+    fn execute_grant<W: LiveDescriptorWords + ?Sized>(
+        words: &W,
+        register: u64,
+        txn: &crate::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> crate::aarch64::descriptor_txn::DescriptorOutcome;
+}
+impl OwnerGrantMmu for Aarch64Mmu {
+    fn execute_grant<W: LiveDescriptorWords + ?Sized>(
+        words: &W,
+        register: u64,
+        txn: &crate::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> crate::aarch64::descriptor_txn::DescriptorOutcome {
+        use crate::aarch64::descriptor_txn::{InlineJournal, execute_descriptor_txn};
+        execute_descriptor_txn(
+            words,
+            crate::aarch64::SubstrateGpa(register & Self::ADDRESS_MASK),
+            txn,
+            &mut InlineJournal::new(),
+        )
+        .outcome
+    }
+}
