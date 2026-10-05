@@ -1,14 +1,10 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use tempfile::TempDir;
 
 fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crate is nested under repo root")
-        .to_path_buf()
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn check_contracts_bin() -> &'static str {
@@ -44,13 +40,60 @@ rationale = "Each blocking waiter enrolls exactly once before parking."
 
 #[test]
 fn check_contracts_runs_without_persisted_inventory_file() {
-    let root = repo_root();
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path();
+
+    let contracts_dir = root.join("conformance-contracts/contracts");
+    fs::create_dir_all(&contracts_dir).expect("create contracts dir");
+    fs::write(contracts_dir.join("valid.toml"), VALID_CONTRACT).expect("write contract");
+
+    let surface_target = root.join("src/lib.rs");
+    if let Some(parent) = surface_target.parent() {
+        fs::create_dir_all(parent).expect("create surface parent");
+    }
+    fs::write(&surface_target, "// surface file").expect("write surface");
+
+    let surfaces_content = r#"
+schema_version = 1
+
+[[surfaces]]
+path = "src/lib.rs"
+contracts = ["test.contract.one"]
+"#;
+    fs::write(
+        root.join("conformance-contracts/surfaces.toml"),
+        surfaces_content,
+    )
+    .expect("write surfaces.toml");
+
+    fs::create_dir_all(root.join("crates/carrick-conformance-contract")).expect("create crate dir");
+
     let inventory_file = root.join("conformance-contracts/inventory.json");
     assert!(
         !inventory_file.exists(),
-        "inventory.json must not be present in the repository"
+        "isolated fixture root must not contain inventory.json"
     );
 
+    let output = Command::new(check_contracts_bin())
+        .arg("--root")
+        .arg(root)
+        .output()
+        .expect("run check-contracts");
+
+    assert!(
+        output.status.success(),
+        "check-contracts failed: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("conformance contracts checked:"));
+    assert!(stdout.contains("inventory: 338 syscalls"));
+}
+
+#[test]
+fn check_contracts_runs_against_workspace_repo() {
+    let root = repo_root();
     let output = Command::new(check_contracts_bin())
         .arg("--root")
         .arg(&root)
