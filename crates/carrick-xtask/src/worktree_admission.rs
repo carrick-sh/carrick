@@ -1,5 +1,6 @@
 //! Cooperative checkout admission. Authorities live outside removable checkouts.
 use crate::command;
+use crate::lock_file::OwnedFileLock;
 use crate::worktree_gc::GcError;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -119,7 +120,7 @@ fn open(path: &Path, create: bool) -> std::io::Result<File> {
         .read(true)
         .write(true)
         .create(create)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(path)
 }
 
@@ -133,10 +134,18 @@ fn live(mut file: &File) -> std::io::Result<bool> {
 /// Shared checkout lifetime authority; explicit exec handoff retains it in the
 /// command tree, including the lease supervisor through scoped cleanup.
 pub(crate) struct Admission {
-    _file: File,
+    _file: OwnedFileLock,
 }
 
 impl Admission {
+    fn handoff_exec(&self) -> std::io::Result<()> {
+        // SAFETY: explicit same-PID exec transfer of this one owned descriptor.
+        if unsafe { libc::fcntl(self._file.as_raw_fd(), libc::F_SETFD, 0) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub(crate) fn acquire(root: &Path) -> Result<Self, GcError> {
         let generation = Generation::read(root, true)?
             .ok_or_else(|| GcError::Census("missing checkout generation".into()))?;
@@ -147,6 +156,7 @@ impl Admission {
         )?;
         let file = open(&path, true)?;
         file.lock_shared()?;
+        let file = OwnedFileLock::from_locked(file);
         if Generation::read(root, false)?.as_ref() != Some(&generation) || !live(&file)? {
             return Err(GcError::Census(
                 "checkout has been retired; command refused".into(),
@@ -158,7 +168,7 @@ impl Admission {
 
 /// Only an already managed checkout can acquire exclusive removal authority.
 pub(crate) struct Retirement {
-    file: File,
+    file: OwnedFileLock,
 }
 
 pub(crate) enum RemovalAuthority {
@@ -184,6 +194,7 @@ impl Retirement {
             Err(std::fs::TryLockError::WouldBlock) => return Ok(RemovalAuthority::Busy),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
+        let file = OwnedFileLock::from_locked(file);
         if Generation::read(root, false)?.as_ref() != Some(&generation) || !live(&file)? {
             return Ok(RemovalAuthority::Busy);
         }
@@ -199,7 +210,7 @@ impl Retirement {
 
 /// Protect existing targets during whole-checkout removal, including cross targets.
 pub(crate) struct CargoLocks {
-    files: Vec<File>,
+    files: Vec<OwnedFileLock>,
 }
 
 impl CargoLocks {
@@ -210,7 +221,7 @@ impl CargoLocks {
     }
 
     pub(crate) fn claim(root: &Path) -> Result<Option<Self>, GcError> {
-        fn collect(path: &Path, files: &mut Vec<File>) -> std::io::Result<bool> {
+        fn collect(path: &Path, files: &mut Vec<OwnedFileLock>) -> std::io::Result<bool> {
             if !path.exists() {
                 return Ok(true);
             }
@@ -226,7 +237,7 @@ impl CargoLocks {
                 } else if entry.file_name() == ".cargo-lock" {
                     let file = open(&entry.path(), false)?;
                     match file.try_lock() {
-                        Ok(()) => files.push(file),
+                        Ok(()) => files.push(OwnedFileLock::from_locked(file)),
                         Err(std::fs::TryLockError::WouldBlock) => return Ok(false),
                         Err(std::fs::TryLockError::Error(error)) => return Err(error),
                     }
@@ -257,12 +268,7 @@ pub fn run(root: &Path, args: WorktreeRunArgs) -> Result<(), GcError> {
     // SAFETY: the guard owns this descriptor; fcntl is async-signal-safe. Keep
     // the handoff inside exec so ordinary Admission guards remain CLOEXEC.
     unsafe {
-        command.pre_exec(move || {
-            if libc::fcntl(admission._file.as_raw_fd(), libc::F_SETFD, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        command.pre_exec(move || admission.handoff_exec());
     }
     Err(command.exec().into())
 }
@@ -360,28 +366,6 @@ mod tests {
 
     #[test]
     fn active_command_excludes_retirement_for_its_entire_lifetime() {
-        // Other parallel tests fork while holding arbitrary file descriptors.
-        // CLOEXEC closes our guard at exec, but the immediate-release assertion
-        // must not depend on when an unrelated child crosses that boundary.
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "worktree_admission::tests::active_command_lifetime_fixture",
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[test]
-    #[ignore = "isolated file-lifetime fixture invoked by the admission regression"]
-    fn active_command_lifetime_fixture() {
         let repo = repository();
         let root = repo.path();
         let common = common(root).unwrap();
@@ -445,6 +429,89 @@ mod tests {
             "waiting admission must never execute in a retired checkout"
         );
         assert!(Admission::acquire(&root).is_err());
+    }
+
+    #[test]
+    fn unrelated_fork_exec_cannot_extend_admission() {
+        let repo = repository();
+        let root = repo.path();
+        let common = common(root).unwrap();
+        let admission = Admission::acquire(root).unwrap();
+        // CLOEXEC alone cannot prevent a hold between fork and exec.
+        assert_ne!(
+            unsafe { libc::fcntl(admission._file.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let immediate = crate::lock_file::tests::with_unrelated_fork_exec(
+            || {
+                drop(admission);
+                matches!(
+                    Retirement::claim(root, &common).unwrap(),
+                    RemovalAuthority::Acquired(_)
+                )
+            },
+            || {
+                assert!(matches!(
+                    Retirement::claim(root, &common).unwrap(),
+                    RemovalAuthority::Acquired(_)
+                ))
+            },
+        );
+        assert!(
+            immediate,
+            "unrelated pre-exec child retained dropped checkout admission despite CLOEXEC"
+        );
+    }
+
+    #[test]
+    fn unrelated_fork_exec_cannot_extend_retirement() {
+        let repo = repository();
+        let root = repo.path();
+        let common = common(root).unwrap();
+        drop(Admission::acquire(root).unwrap());
+        let RemovalAuthority::Acquired(retirement) = Retirement::claim(root, &common).unwrap()
+        else {
+            panic!("managed checkout");
+        };
+        let immediate = crate::lock_file::tests::with_unrelated_fork_exec(
+            || {
+                drop(retirement);
+                matches!(
+                    Retirement::claim(root, &common).unwrap(),
+                    RemovalAuthority::Acquired(_)
+                )
+            },
+            || {
+                assert!(matches!(
+                    Retirement::claim(root, &common).unwrap(),
+                    RemovalAuthority::Acquired(_)
+                ))
+            },
+        );
+        assert!(
+            immediate,
+            "unrelated pre-exec child retained dropped retirement authority"
+        );
+    }
+
+    #[test]
+    fn unrelated_fork_exec_cannot_extend_cargo_locks() {
+        let repo = repository();
+        let root = repo.path();
+        fs::create_dir_all(root.join("target/debug")).unwrap();
+        fs::write(root.join("target/debug/.cargo-lock"), b"").unwrap();
+        let locks = CargoLocks::claim(root).unwrap().unwrap();
+        let immediate = crate::lock_file::tests::with_unrelated_fork_exec(
+            || {
+                drop(locks);
+                CargoLocks::claim(root).unwrap().is_some()
+            },
+            || assert!(CargoLocks::claim(root).unwrap().is_some()),
+        );
+        assert!(
+            immediate,
+            "unrelated pre-exec child retained dropped native Cargo locks"
+        );
     }
 
     #[test]
