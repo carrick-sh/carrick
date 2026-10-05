@@ -384,7 +384,15 @@ pub fn check_substrate_boundary(
         let mixed_el1 = crate_name == "carrick-el1";
         let el1_forbidden = forbidden_crates
             .iter()
-            .filter(|name| name.as_str() != "carrick-el1-abi")
+            // The image binds both the neutral owner and its Linux client.
+            // Its neutral modules are independently checked below; permitting
+            // the image dependency never permits a substrate import of it.
+            .filter(|name| {
+                !matches!(
+                    name.as_str(),
+                    "carrick-el1-abi" | "carrick-personality-linux"
+                )
+            })
             .cloned()
             .collect();
         let substrate_pkg = audit_crate_dependencies_metadata(
@@ -818,6 +826,7 @@ fn audit_el1_modules(
             "dispatch_syscall",
             "serve_futex",
             "carrick_inotify_core",
+            "carrick_personality_linux",
         ]
         .map(str::to_string),
     );
@@ -1148,6 +1157,8 @@ impl<'a> SourceCheckerVisitor<'a> {
                 resolved.pop();
                 rest = &rest[1..];
             }
+        } else if parts[0] == "carrick_personality_linux" {
+            resolved.push("personality".to_string());
         } else {
             return;
         }
@@ -1482,7 +1493,7 @@ mod tests {
         let old = fs::read_to_string(
             repo.join("crates/carrick-el1/src/personality/reservations/prepared.rs"),
         )
-        .unwrap();
+        .unwrap_or_default();
         assert!(
             !old.contains("pub struct ClaimedPreparedCopy"),
             "prepared-copy claim custody must move out of the ARM personality"
@@ -1501,11 +1512,22 @@ mod tests {
         assert!(!neutral.contains("carrick_el1"));
         let policy =
             fs::read_to_string(repo.join("crates/carrick-personality-linux/src/mm.rs")).unwrap();
-        assert!(policy.contains("impl NodeDataPolicy"));
+        assert!(policy.contains("impl carrick_core_abi::ReservationPolicy"));
         let neutral_abi =
             fs::read_to_string(repo.join("crates/carrick-core-abi/src/mm/reservation.rs")).unwrap();
-        assert!(!neutral_abi.contains("fn root_editable"));
-        assert!(!neutral_abi.contains("fn charges_data"));
+        for item in syn::parse_file(&neutral_abi).unwrap().items {
+            if let syn::Item::Impl(implementation) = item {
+                for item in implementation.items {
+                    if let syn::ImplItem::Fn(method) = item {
+                        assert!(
+                            method.sig.ident != "root_editable"
+                                && method.sig.ident != "charges_data",
+                            "the neutral ABI may declare policy hooks, but must not interpret Linux ownership or limits"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1517,6 +1539,28 @@ mod tests {
             );
         }
         assert!(FORBIDDEN_PERSONALITY_CRATES.contains(&"carrick-personality-linux"));
+    }
+
+    #[test]
+    fn mm_reservation_root_storage_and_admission_have_one_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let old =
+            fs::read_to_string(repo.join("crates/carrick-el1/src/personality/reservations.rs"))
+                .unwrap();
+        assert!(
+            !old.contains("pub struct SharedReservations"),
+            "the physical owner table must move, not be wrapped"
+        );
+        assert!(
+            !old.contains("fn lock_using"),
+            "root admission must have one neutral implementation"
+        );
+        let owner = fs::read_to_string(repo.join("crates/carrick-core/src/mm/reservation/root.rs"))
+            .unwrap();
+        assert!(owner.contains("pub struct SharedReservations"));
+        assert!(owner.contains("fn lock_using"));
+        let production = owner.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(!production.contains("carrick_el1"));
     }
 
     use serde_json::{Value, json};
@@ -1613,6 +1657,7 @@ mod tests {
     fn el1_substrate_rejects_personality_imports_and_root_facades() {
         for code in [
             "use crate::personality::sched as linux;",
+            "use carrick_personality_linux::mm::LinuxReservationPolicy;",
             "use crate::file::read_with;",
             "use crate::*;",
             "use super::super::sched::Sched;",

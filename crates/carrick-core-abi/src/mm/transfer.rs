@@ -895,3 +895,10 @@ mod prepared_tests {
         assert_eq!(commit.take_completion().unwrap().completed, 2);
     }
 }
+
+/// Projection of the sole fork request record during the neutral owner move.
+pub trait ForkRequestRecord: Copy {
+    fn operation(self) -> PortalOperation;
+    fn parent_generation(self) -> crate::ReservationGeneration;
+    fn child_mm(self) -> crate::ReservationMm;
+}
