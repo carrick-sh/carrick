@@ -33,6 +33,7 @@ dtrace:::BEGIN
     refusals = 0;
     children = 0;
     errors = 0;
+    drops = 0;
     bounded = 0;
 }
 
@@ -53,6 +54,11 @@ carrick*:::hvpatch-owner-fork-refusal
         (uint64_t)arg4, pid);
 }
 
+dtrace:::DROP
+{
+    drops++;
+}
+
 dtrace:::ERROR
 {
     errors++;
@@ -61,18 +67,18 @@ dtrace:::ERROR
 proc:::exit
 /pid == $target/
 {
-    exit(0);
+    exit(children == 0 || errors != 0 || drops != 0 ? 3 : 0);
 }
 
 profile:::tick-1sec
 /timestamp - started > 45 * 1000000000/
 {
     bounded = 1;
-    exit(0);
+    exit(4);
 }
 
 dtrace:::END
 {
-    printf("OWNERFORKREFUSAL1|summary|closed_children=%d|refusals=%d|errors=%d|bounded=%d\n",
-        children, refusals, errors, bounded);
+    printf("OWNERFORKREFUSAL1|summary|closed_children=%d|refusals=%d|errors=%d|drops=%d|bounded=%d\n",
+        children, refusals, errors, drops, bounded);
 }
