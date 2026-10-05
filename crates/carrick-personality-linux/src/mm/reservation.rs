@@ -75,16 +75,16 @@ pub(super) fn mmap<M: ReservationPolicyAccess>(
     }
     let range = place(root, placement, GuestLen::new(len))?;
     let address = range.start();
-    root.propose(
+    root.propose(ReservationProposal {
         range,
-        prot,
-        ReservationOperation::Prepare,
-        UserVa::new(address),
-        UserVa::new(LinuxReservationLayout::from(root.layout()).brk),
-        false,
-        None,
-        ReservationNodeFlags::ANONYMOUS_PRIVATE,
-    )
+        protection: prot,
+        operation: ReservationOperation::Prepare,
+        result: UserVa::new(address),
+        policy_value: UserVa::new(LinuxReservationLayout::from(root.layout()).brk),
+        require_coverage: false,
+        source: None,
+        flags: ReservationNodeFlags::ANONYMOUS_PRIVATE,
+    })
 }
 
 pub(super) fn mremap<M: ReservationPolicyAccess>(
@@ -170,16 +170,16 @@ fn mremap_inner<M: ReservationPolicyAccess>(
         if range.start() < source.end() && source.start() < range.end() {
             return Err(Refusal::Invalid);
         }
-        return root.propose(
+        return root.propose(ReservationProposal {
             range,
-            prot,
+            protection: prot,
             operation,
-            UserVa::new(address),
-            UserVa::new(brk),
-            false,
-            moved,
+            result: UserVa::new(address),
+            policy_value: UserVa::new(brk),
+            require_coverage: false,
+            source: moved,
             flags,
-        );
+        });
     }
     if !keep_source {
         if new_len <= source.len() {
@@ -188,16 +188,16 @@ fn mremap_inner<M: ReservationPolicyAccess>(
             }
             let tail = ReservationRange::new(source.start() + new_len, source.end())
                 .ok_or(Refusal::Invalid)?;
-            return root.propose(
-                tail,
-                ReservationProtection::NONE,
-                ReservationOperation::Retire,
-                UserVa::new(source.start()),
-                UserVa::new(brk),
-                false,
-                None,
-                ReservationNodeFlags::EMPTY,
-            );
+            return root.propose(ReservationProposal {
+                range: tail,
+                protection: ReservationProtection::NONE,
+                operation: ReservationOperation::Retire,
+                result: UserVa::new(source.start()),
+                policy_value: UserVa::new(brk),
+                require_coverage: false,
+                source: None,
+                flags: ReservationNodeFlags::EMPTY,
+            });
         }
         let extension = source
             .start()
@@ -209,16 +209,16 @@ fn mremap_inner<M: ReservationPolicyAccess>(
                 .is_none_or(|n| n.start() >= r.end())
         });
         if let Some(extension) = extension.filter(|_| free) {
-            return root.propose(
-                extension,
-                prot,
-                ReservationOperation::Prepare,
-                UserVa::new(source.start()),
-                UserVa::new(brk),
-                false,
-                None,
+            return root.propose(ReservationProposal {
+                range: extension,
+                protection: prot,
+                operation: ReservationOperation::Prepare,
+                result: UserVa::new(source.start()),
+                policy_value: UserVa::new(brk),
+                require_coverage: false,
+                source: None,
                 flags,
-            );
+            });
         }
         if target == MoveTarget::InPlace {
             return Err(Refusal::Limit);
@@ -229,16 +229,16 @@ fn mremap_inner<M: ReservationPolicyAccess>(
         .ok_or(Refusal::Limit)?
         .raw();
     let range = ReservationRange::new(address, address + new_len).ok_or(Refusal::Invalid)?;
-    root.propose(
+    root.propose(ReservationProposal {
         range,
-        prot,
+        protection: prot,
         operation,
-        UserVa::new(address),
-        UserVa::new(brk),
-        false,
-        moved,
+        result: UserVa::new(address),
+        policy_value: UserVa::new(brk),
+        require_coverage: false,
+        source: moved,
         flags,
-    )
+    })
 }
 
 pub(super) fn brk<M: ReservationPolicyAccess>(
@@ -282,16 +282,16 @@ pub(super) fn brk<M: ReservationPolicyAccess>(
     } else {
         (ReservationProtection::NONE, ReservationOperation::Retire)
     };
-    match root.propose(
+    match root.propose(ReservationProposal {
         range,
-        prot,
-        op,
-        UserVa::new(requested),
-        UserVa::new(requested),
-        false,
-        None,
-        ReservationNodeFlags::ANONYMOUS_PRIVATE,
-    ) {
+        protection: prot,
+        operation: op,
+        result: UserVa::new(requested),
+        policy_value: UserVa::new(requested),
+        require_coverage: false,
+        source: None,
+        flags: ReservationNodeFlags::ANONYMOUS_PRIVATE,
+    }) {
         Err(Refusal::Limit | Refusal::ForeignMapping) => Ok(Decision::Complete(old)),
         result => result,
     }

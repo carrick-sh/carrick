@@ -327,10 +327,12 @@ pub fn select(
         .select(
             continuation,
             &tables.live(&maintenance),
-            &mut NoopPreparedResolver,
-            &mut NoopCowResolver,
-            &residency(),
-            0,
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency(),
+                slot: 0,
+            },
         )
         .unwrap()
 }
@@ -448,10 +450,12 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
                             .select(
                                 &transfer,
                                 &counted,
-                                &mut NoopPreparedResolver,
-                                &mut NoopCowResolver,
-                                &residency(),
-                                0,
+                                carrick_core::mm::transaction::SelectionVenues {
+                                    prepared: &mut NoopPreparedResolver,
+                                    cow: &mut NoopCowResolver,
+                                    residency: &residency(),
+                                    slot: 0,
+                                },
                             )
                             .unwrap(),
                     );
@@ -697,10 +701,12 @@ fn copy_one(
     let chunk = selected(portal.select(
         &transfer,
         &words,
-        &mut NoopPreparedResolver,
-        &mut NoopCowResolver,
-        &residency(),
-        0,
+        carrick_core::mm::transaction::SelectionVenues {
+            prepared: &mut NoopPreparedResolver,
+            cow: &mut NoopCowResolver,
+            residency: &residency(),
+            slot: 0,
+        },
     )?);
     let identity = physical.retain(
         carrick_el1_abi::PortalSelectedData {

@@ -291,8 +291,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.lock_using(
             index,
             mm,
-            Some(nodes),
-            false,
+            RootStorageAccess {
+                banks: Some(nodes),
+                identity: false,
+            },
             wait,
             RootHolder::Host.word(),
             RootAuthority::SourceFree(self.source_free()),
@@ -315,8 +317,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.lock_using(
             index,
             mm,
-            Some(nodes),
-            false,
+            RootStorageAccess {
+                banks: Some(nodes),
+                identity: false,
+            },
             &NoRootWait,
             RootHolder::El1Slot(slot).word(),
             RootAuthority::SourceFree(self.source_free()),
@@ -332,8 +336,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.lock_using(
             index,
             mm,
-            None,
-            true,
+            RootStorageAccess {
+                banks: None,
+                identity: true,
+            },
             &NoRootWait,
             RootHolder::Host.word(),
             RootAuthority::SourceFree(self.source_free()),

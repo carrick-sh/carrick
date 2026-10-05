@@ -4,8 +4,8 @@ use super::{El1MmHandle, GuestVa, TransferIntent};
 use super::{MmError, MmErrorLinux};
 use crate::memory::reservations::NativeReservationGeometry;
 pub use carrick_core::mm::transaction::{
-    GrantTarget, TRANSFER_CHUNK_BYTES, TransferStep, admit_service_root, bind_service_root,
-    grant_target, prepare_transfer, serve_transfer, settle_prepared_service,
+    GrantTarget, SelectionVenues, TRANSFER_CHUNK_BYTES, TransferStep, admit_service_root,
+    bind_service_root, grant_target, prepare_transfer, serve_transfer, settle_prepared_service,
 };
 #[cfg(any(test, target_os = "none"))]
 use carrick_el1_abi::ReservationMm;
@@ -245,14 +245,16 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         match portal.select(
             &continuation,
             &words,
-            &mut crate::fault::HardwarePreparedResolver,
-            &mut crate::fault::HardwareCowResolver {
-                publication: slots.executable(frame.slot as usize),
-                completion: None,
-                service_slot: Some(executor_slot),
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut crate::fault::HardwarePreparedResolver,
+                cow: &mut crate::fault::HardwareCowResolver {
+                    publication: slots.executable(frame.slot as usize),
+                    completion: None,
+                    service_slot: Some(executor_slot),
+                },
+                residency: carrick_el1_abi::frame_grant_residency_guest(),
+                slot: frame.slot as u32,
             },
-            carrick_el1_abi::frame_grant_residency_guest(),
-            frame.slot as u32,
         )? {
             TransferStep::Selected(selected) => {
                 frame.x[8] = selected.sequence().get();
