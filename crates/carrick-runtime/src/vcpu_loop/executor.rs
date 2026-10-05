@@ -390,6 +390,12 @@ where
         }
         backend.note_bound_cpu(registration.bound_cpu().map(|cpu| cpu.as_u32()));
         if let Err(error) = backend.load(&task) {
+            crate::probes::hvpatch_executor_load_failure(
+                thread.serial.raw(),
+                generation.raw(),
+                executor_id.raw_for_probe(),
+                &error.to_string(),
+            );
             // A load refused because the address space is retiring is not this
             // executor's failure: another thread in the group called `execve`
             // (or the process exited), and Linux terminates every other thread
