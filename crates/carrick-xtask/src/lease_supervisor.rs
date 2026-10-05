@@ -251,20 +251,7 @@ impl Cleanup {
     fn child_changed(&mut self) -> io::Result<()> {
         self.deadline.wait_fd(self.children.reader.as_raw_fd())?;
         let mut bytes = [0; 256];
-        loop {
-            match self.children.reader.read(&mut bytes) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "child exit signal channel closed",
-                    ));
-                }
-                Ok(_) => continue,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
+        drain_child_signals(&self.deadline, || self.children.reader.read(&mut bytes))
     }
 
     fn wait_child(&mut self, child: &mut Child) -> io::Result<ExitStatus> {
@@ -274,6 +261,27 @@ impl Cleanup {
                 return Ok(status);
             }
             self.child_changed()?;
+        }
+    }
+}
+
+fn drain_child_signals(
+    deadline: &CleanupDeadline,
+    mut read: impl FnMut() -> io::Result<usize>,
+) -> io::Result<()> {
+    loop {
+        deadline.remaining()?;
+        match read() {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "child exit signal channel closed",
+                ));
+            }
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
         }
     }
 }
@@ -316,6 +324,15 @@ mod cleanup_tests {
             Err(crate::host_lease::HostLeaseError::Cleanup { .. })
         ));
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn draining_exit_notifications_checks_the_cleanup_deadline() {
+        let deadline = super::CleanupDeadline(std::time::Instant::now());
+        let result = super::drain_child_signals(&deadline, || {
+            panic!("exit notifications read after cleanup deadline")
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]
@@ -559,6 +576,7 @@ fn reap_descendants_with(
         // CONFIG_PROC_CHILDREN, or belong to an ancestor PID namespace.
         if let Ok(children) = read_children() {
             for pid in children.split_whitespace() {
+                cleanup.deadline.remaining()?;
                 let pid: libc::pid_t = pid
                     .parse()
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;

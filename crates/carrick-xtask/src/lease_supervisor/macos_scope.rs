@@ -114,6 +114,7 @@ impl PipeWriter {
             deadline.remaining()?;
             let mut changed = false;
             for pid in all_pids()? {
+                deadline.remaining()?;
                 if pid <= 0 || (unsafe { libc::getsid(pid) } != session && !self.owns_writer(pid)) {
                     continue;
                 }
@@ -135,6 +136,7 @@ impl PipeWriter {
             }
             let mut pending = false;
             for process in members.values_mut() {
+                deadline.remaining()?;
                 if !process.exited()? {
                     pending = true;
                     process.cancel()?;
