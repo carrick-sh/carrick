@@ -95,7 +95,7 @@ pub(crate) fn load_execve_image(
     env: Vec<Vec<u8>>,
     requires_syscall_traps: bool,
 ) -> Result<LoadedExecImage, LinuxErrno> {
-    use crate::linux_abi::{LINUX_ENOENT, LINUX_ENOEXEC};
+    use crate::linux_abi::LINUX_ENOENT;
     let argv = if argv.is_empty() {
         vec![path.as_bytes().to_vec()]
     } else {
@@ -221,7 +221,7 @@ pub(crate) fn load_execve_image(
                     .read_exec_file(interpreter)
                     .or_else(|| host_read(interpreter))
             })
-            .map_err(|_| LINUX_ENOEXEC)?
+            .map_err(carrick_kernel::exec_helpers::exec_image_errno)?
             .with_main_file_path(path.clone());
             finalize_hvf_exec_base(dispatcher, raw, false, vdso_enabled, requires_syscall_traps)
         })?;
@@ -245,7 +245,7 @@ pub(crate) fn load_execve_image(
                 .read_exec_file(interpreter)
                 .or_else(|| host_read(interpreter))
         })
-        .map_err(|_| LINUX_ENOEXEC)?
+        .map_err(carrick_kernel::exec_helpers::exec_image_errno)?
         .with_main_file_path(path.clone());
         (
             finalize_hvf_exec_base(
