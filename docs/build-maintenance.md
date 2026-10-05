@@ -2,8 +2,9 @@
 
 All `just` recipes and direct `scripts/build-signed.sh` and
 `scripts/test-signed.sh` invocations load `scripts/lib/build-env.sh`.
-Builds use sccache through Cargo's `--config build.rustc-wrapper` by default.
-Install it per user:
+Builds use an available sccache through Cargo's `--config build.rustc-wrapper`
+by default. Resolve it from `PATH`, or set `CARRICK_SCCACHE_BIN` to an explicit
+executable. Install it per user:
 
 ```sh
 cargo install sccache --locked --root "$HOME/.cargo"
@@ -16,8 +17,14 @@ Only the exact value `0` disables automatic caching. An explicitly supplied
 The automatic wrapper is a Cargo option, so it does not enter test or fixture
 admission environments. Explicit ambient wrappers still fail fixture policy;
 controlled fixture builds retain their declared environment and configuration.
-A missing sccache executable fails the build; install it or use the hatch.
-Hosted and trusted-hardware CI install it per user after restoring Rust caches.
+Availability is checked once for the invocation. If the selected executable is
+missing or not executable, builds continue without automatic caching and print
+one `build-cache: ... building without compiler cache` notice. Nested recipes
+and signed scripts inherit that selection. `CARRICK_SCCACHE=0` always forces
+automatic caching off, without removing ambient compiler wrappers.
+Hosted and trusted-hardware CI install sccache per user after restoring Rust
+caches; setup recipes also work before installation. Hosted CI runs the real
+Cargo recipe regressions with sccache absent from PATH.
 No linker, Rust flags, entitlement, DOF processing, or signing steps change:
 macOS still uses Apple ld64 and the existing post-link signing path.
 

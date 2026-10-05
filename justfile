@@ -8,9 +8,16 @@
 
 # One compiler cache per host, inherited by cargo and all child gate commands.
 # The same environment fragment is sourced by direct signed-script invocations.
-export CARRICK_CARGO_CACHE_CONFIG := `sh -c '. scripts/lib/build-env.sh; printf "%s" "$CARRICK_CARGO_CACHE_CONFIG"'`
-export SCCACHE_DIR := `sh -c '. scripts/lib/build-env.sh; printf "%s" "$SCCACHE_DIR"'`
-export SCCACHE_CACHE_SIZE := `sh -c '. scripts/lib/build-env.sh; printf "%s" "$SCCACHE_CACHE_SIZE"'`
+# Evaluate the fragment once: six newline-delimited values share one tool
+# resolution and one missing-tool notice, including recipes with dependencies.
+_build_env := `sh -c '. scripts/lib/build-env.sh; printf "%s\n%s\n%s\n%s\n%s\n%s" "$CARRICK_CARGO_CACHE_CONFIG" "$CARRICK_SCCACHE_RESOLVED" "$SCCACHE_DIR" "$SCCACHE_CACHE_SIZE" "$CARRICK_SCCACHE_REQUEST" "$CARRICK_SCCACHE_SEARCH_PATH"'`
+_build_env_fields := '(?s)^([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)\n([^\n]*)$'
+export CARRICK_CARGO_CACHE_CONFIG := replace_regex(_build_env, _build_env_fields, '$1')
+export CARRICK_SCCACHE_RESOLVED := replace_regex(_build_env, _build_env_fields, '$2')
+export SCCACHE_DIR := replace_regex(_build_env, _build_env_fields, '$3')
+export SCCACHE_CACHE_SIZE := replace_regex(_build_env, _build_env_fields, '$4')
+export CARRICK_SCCACHE_REQUEST := replace_regex(_build_env, _build_env_fields, '$5')
+export CARRICK_SCCACHE_SEARCH_PATH := replace_regex(_build_env, _build_env_fields, '$6')
 
 # Shared checkout admission spans each foreground Cargo command.
 _cargo := "cargo --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
@@ -108,7 +115,7 @@ worktree-run +CMD:
 
 # Show compiler cache statistics (CARRICK_SCCACHE=0 disables build caching).
 build-cache:
-    "{{env('HOME')}}/.cargo/bin/sccache" --show-stats
+    @if [ -n "$CARRICK_SCCACHE_RESOLVED" ]; then "$CARRICK_SCCACHE_RESOLVED" --show-stats; fi
 
 # Run the Carrick xtask maintenance tool.
 xtask *ARGS:

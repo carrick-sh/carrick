@@ -110,6 +110,8 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+      - name: Compiler cache fallback without sccache
+        run: cargo test -p carrick-xtask --test build_cache
       - name: Install per-user compiler cache
         run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
       - name: Install Linux C cross toolchain
