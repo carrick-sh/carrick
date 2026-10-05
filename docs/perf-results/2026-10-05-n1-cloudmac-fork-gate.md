@@ -324,3 +324,31 @@ write intent. Wrong-MM, well-formed wrong-output and missing-private-owner
 controls still refuse. Both new red witnesses and all 13 composed guest-COW
 tests pass (`owner-cow-later-green.log`); the vvar and clone-copyout failures
 remain open for the next exact signed cycle.
+
+## Child vvar authority: live COW leaf, no host arm
+
+Retained VMA run `n1-cm-7af3fdfb6-lldb-vvar` stops before the vvar arm
+lookup. The exact child identity is MM 3/ASID 2; its live descriptor owner
+is Guest. The retained stage-2 root owner has physical base
+`661427060736` (`0x9a00200000`), length 2 MiB and host base `0x110200000`;
+record 20/logical owner 15/generation 15. An initial manual hexadecimal
+conversion was wrong and its range assertion refused the walk. The
+corrected walk stays inside that exact retained root owner at every level:
+`0x9a00201003`, `0x9a00209003`, `0x9a0020a003`, then terminal
+`0x07a0002e00000fc3` at VA `0x2e00000018`. The terminal is valid, private,
+COW-tagged, AP read-only, and retains the structural vvar output. Logs and
+core: `vvar-lldb.log`, `vvar-postmortem.log`, `vvar-leaf-walk.log`,
+`vvar.core`; scoped cleanup is zero. LLDB provides authority attribution,
+not timing.
+
+`owner_fork_refreshes_readonly_vvar_without_host_arm_ranges` extends the
+existing production fork-plan fixture with the owner lane. The fixture
+prepares a real child inventory, publishes adopting COW leaves, binds live
+tables, removes host arm ranges, and calls the real privileged refresh.
+Its EL1 model copies through the retained source/new grant and executes
+actual descriptor journal receipts. Parent generation and sentinel bytes
+must survive, child generation must change, guest access must remain
+read-only, a second fork must retain the exact new owner, and publication
+must cost one guest transaction and zero host COW resolutions.
+The first run executes one test and fails at the same missing-host-arm
+check as signed VMA/ptrace/fork-COW (`target/n1-cm/vvar-red.log`).
