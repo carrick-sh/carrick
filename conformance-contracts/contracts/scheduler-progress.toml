@@ -1,19 +1,19 @@
 schema_version = 1
 id = "kernel.scheduler.runnable-progress"
-title = "Runnable scheduler preemption progress"
-guest_surfaces = ["scheduler:preemption", "scheduler:rotation"]
+title = "Runnable scheduler affinity and preemption progress"
+guest_surfaces = ["syscall:sched_setaffinity", "scheduler:preemption", "scheduler:rotation"]
 semantic_authority = [
   "man 7 sched",
   "man 2 sched_yield",
-  "man 2 sched_setaffinity",
+  "man 2 sched_setaffinity: a thread running on a CPU excluded by the new mask migrates to an allowed CPU before the call returns",
 ]
 fixture = "fixture:scheduler_preemption"
 scale_points = [1, 8, 32, 128]
-rationale = "Eligible syscall-free tasks rotate under a finite execution budget; affinity and thread identity remain exact."
+rationale = "Eligible syscall-free tasks rotate under a finite execution budget; affinity and thread identity remain exact. A self-affinity change that excludes the current CPU requires one settlement and migration before guest re-entry even when no other task is queued. Widening a mask, an unrelated live process, and the migrated residency require zero additional preemptions."
 
 [bindings]
-vm_free = "carrick-kernel-example::scheduler_progress_contract; carrick-kernel::kernel::scheduler::tests::{a_deferred_zone_handback_does_not_audit_a_reaped_target,zone_handback_authenticates_the_registered_continuation,zone_handback_before_registration_kicks_the_running_owner_once} (zone delivery target authentication, retired no-op, and one kick/zero queue rows before enrollment; no new preemption-policy or runtime-cost acceptance); carrick-kernel::kernel::scheduler::tests::serial_host::failed_zone_load_settlement_retires_only_its_owned_continuation (test-only extension: exact continuation transfer and failed-load retirement, zero queued rows after failure/stale delivery; no new preemption, scaling or runtime-ratio acceptance)"
-embed = "carrick-embed::scheduler_progress_contract"
+vm_free = "carrick-kernel-example::scheduler_handoff::self_affinity_change_requires_migration_before_return (two live processes, empty queue, one migration and zero spurious preemptions); carrick-runtime::vcpu_loop::executor::tests::self_affinity_syscall_migrates_before_the_next_guest_entry (one migration before the next backend entry); carrick-kernel-example::scheduler_progress_contract; carrick-kernel::kernel::scheduler::tests::{a_deferred_zone_handback_does_not_audit_a_reaped_target,zone_handback_authenticates_the_registered_continuation,zone_handback_before_registration_kicks_the_running_owner_once} (zone delivery target authentication, retired no-op, and one kick/zero queue rows before enrollment; no new preemption-policy or runtime-cost acceptance); carrick-kernel::kernel::scheduler::tests::serial_host::failed_zone_load_settlement_retires_only_its_owned_continuation (test-only extension: exact continuation transfer and failed-load retirement, zero queued rows after failure/stale delivery; no new preemption, scaling or runtime-ratio acceptance)"
+embed = "carrick-embed::scheduler_progress_contract; carrick-embed::el1_sched::el1_sched_futex_handoff_after_self_affinity_change (inherited CPU-1 start, both futex partners request CPU 0; zero cross-vCPU wakes and at least 5000 in-guest switches)"
 docker = "fixture:scheduler_preemption"
 ecosystem = ["go:runtime", "cpython:threading"]
 

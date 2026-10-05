@@ -53,6 +53,7 @@ fn test_hardware_kick(raw_vcpu_id: u64) -> super::ExactHardwareKick {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Step {
     Syscalls(usize),
+    SetAffinity(GuestCpuId),
     /// Exits taken mid-EL1 (a stage-1 COW fault resolved), resumed in place.
     ResumeEl1(usize),
     ComputeUntilKick,
@@ -939,6 +940,15 @@ impl PersistentExecutor for FakeExecutor {
         self.system_ns = self.system_ns.saturating_add(3_000);
         match step {
             Step::Syscalls(_) => Ok(ExecutorExit::Syscall),
+            Step::SetAffinity(cpu) => {
+                binding
+                    .thread
+                    .lock()
+                    .as_ref()
+                    .expect("installed thread")
+                    .set_affinity(CpuAffinity::single(cpu));
+                Ok(ExecutorExit::Syscall)
+            }
             Step::ResumeEl1(_) => Ok(ExecutorExit::ResumeEl1),
             Step::HostWait => {
                 let guard = submission.begin_host_wait()?;
@@ -4073,6 +4083,57 @@ fn task_migrates_between_workers_only_after_complete_save_and_unbind() {
             "source worker unbound and audited before migration"
         );
     }
+    assert!(factory.concurrent_loads.lock().is_empty());
+}
+
+#[test]
+fn self_affinity_syscall_migrates_before_the_next_guest_entry() {
+    let (kernel, context) = bootstrap(14_019);
+    context
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    let scheduler = Arc::new(Scheduler::new_with_policy(
+        kernel,
+        Arc::new(GuestCpuPolicy::new(2)),
+    ));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(29, [Step::SetAffinity(GuestCpuId::new(1)), Step::Exit]);
+    factory.install(&context, binding);
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 2);
+    let authority = enqueue_root(&scheduler, &context, publish(&context, 29));
+    drop(authority);
+    pool.shutdown().expect("clean affinity migration shutdown");
+    let events = factory.events.lock();
+    let task_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event
+                .task
+                .is_some_and(|(key, _)| key == context.thread().key())
+        })
+        .collect();
+    let runs: Vec<_> = task_events
+        .iter()
+        .filter(|event| event.kind == BackendEventKind::Run)
+        .collect();
+    assert_eq!(
+        runs.len(),
+        2,
+        "one affinity syscall and one subsequent guest entry"
+    );
+    assert_ne!(
+        runs[0].executor, runs[1].executor,
+        "successful affinity change must migrate before guest re-entry"
+    );
+    assert_eq!(
+        task_events
+            .iter()
+            .filter(|event| event.kind == BackendEventKind::Load)
+            .count(),
+        2,
+        "exactly one migration, no retry or extra load"
+    );
+    assert_eq!(context.thread().last_cpu(), Some(GuestCpuId::new(1)));
     assert!(factory.concurrent_loads.lock().is_empty());
 }
 
