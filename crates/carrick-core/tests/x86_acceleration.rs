@@ -11,7 +11,7 @@ use carrick_el1_abi::{
 };
 use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorRefusal, LiveDescriptorWords};
 use carrick_mmu_core::owner_mmu::Aarch64Mmu;
-use carrick_mmu_core::x86::descriptor_txn::{COW, MAY_WRITE, PRESENT, USER, WRITE};
+use carrick_mmu_core::x86::descriptor_txn::{COW, MAY_WRITE, NX, PRESENT, USER, WRITE};
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 use core::num::NonZeroU64;
 use std::collections::BTreeMap;
@@ -281,4 +281,60 @@ fn x2_shared_fork_cow() {
         !arm_scratch.edits.is_empty(),
         "AArch64 copy_table runs using the exact same generic capsule"
     );
+
+    // 4. Red-first witness: x86 table-descriptor cloning must preserve ancestor
+    // permissions (NX, read-only, supervisor), never synthesize PRESENT|WRITE|USER.
+    let perms_mem = TestMemory::new();
+    let root_pa = 0x10_0000;
+    let l3_pa = 0x10_1000;
+    let l2_pa = 0x10_2000;
+    let l1_pa = 0x10_3000;
+    let leaf_pa = 0x10_4000;
+
+    // L4 entry: points to L3 with NX set
+    perms_mem.store(root_pa, l3_pa | PRESENT | WRITE | USER | NX);
+    // L3 entry: points to L2 with read-only (WRITE cleared)
+    perms_mem.store(l3_pa, l2_pa | PRESENT | USER);
+    // L2 entry: points to L1 with supervisor (USER cleared)
+    perms_mem.store(l2_pa, l1_pa | PRESENT | WRITE);
+    // L1 entry: points to leaf
+    perms_mem.store(l1_pa, leaf_pa | PRESENT | WRITE | USER);
+
+    let mut perms_scratch = ForkScratch::bounded(req, 1, 512 * 8, 512 * 8, 512 * 8, 512).unwrap();
+    perms_scratch.mappings = vec![Mapping {
+        range: ReservationRange::new(0, 0x0000_8000_0000_0000).unwrap(),
+        protection: ReservationProtection::READ_WRITE,
+        anonymous: true,
+        flags: ReservationNodeFlags::PRIVATE,
+        generation: ReservationGeneration::new(1).unwrap(),
+        host_backing: None,
+    }];
+
+    copy_table::<X86Mmu, _>(&perms_mem, req, &mut perms_scratch, root_pa, 0, 0, 0).unwrap();
+
+    // Check the child table descriptors created in perms_scratch.child
+    // Index 0 in child root table (offset 0) points to child L3 table.
+    let child_l3_desc = perms_scratch.child[0];
+    assert_ne!(
+        child_l3_desc & NX,
+        0,
+        "child table descriptor must preserve NX from parent ancestor"
+    );
+
+    // Child L3 table (offset 512) index 0 points to child L2 table.
+    let child_l2_desc = perms_scratch.child[512];
+    assert_eq!(
+        child_l2_desc & WRITE,
+        0,
+        "child table descriptor must preserve read-only (no WRITE) from parent ancestor"
+    );
+
+    // Child L2 table (offset 1024) index 0 points to child L1 table.
+    let child_l1_desc = perms_scratch.child[1024];
+    assert_eq!(
+        child_l1_desc & USER,
+        0,
+        "child table descriptor must preserve supervisor (no USER) from parent ancestor"
+    );
 }
+
