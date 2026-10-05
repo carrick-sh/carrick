@@ -1,4 +1,5 @@
 //! Linux reservation ownership, VMA interpretation and charges.
+mod reservation;
 use carrick_core_abi::*;
 
 /// Linux edit authority and rlimit charging for the neutral flag record.
@@ -25,6 +26,35 @@ impl NodeFlagsPolicy for ReservationNodeFlags {
 /// Linux interpretation of the one neutral root store.
 pub struct LinuxReservationPolicy;
 impl carrick_core_abi::ReservationPolicy for LinuxReservationPolicy {
+    fn place<M: carrick_core_abi::ReservationPolicyAccess>(
+        root: &mut M,
+        placement: Placement,
+        len: GuestLen,
+    ) -> Result<ReservationRange, Refusal> {
+        reservation::place(root, placement, len)
+    }
+    fn mmap<M: carrick_core_abi::ReservationPolicyAccess>(
+        root: &mut M,
+        placement: Placement,
+        len: GuestLen,
+        protection: ReservationProtection,
+    ) -> Result<Decision, Refusal> {
+        reservation::mmap(root, placement, len, protection)
+    }
+    fn mremap<M: carrick_core_abi::ReservationPolicyAccess>(
+        root: &mut M,
+        source: ReservationRange,
+        new_len: GuestLen,
+        target: MoveTarget,
+    ) -> Result<Decision, Refusal> {
+        reservation::mremap(root, source, new_len, target)
+    }
+    fn brk<M: carrick_core_abi::ReservationPolicyAccess>(
+        root: &mut M,
+        requested: UserVa,
+    ) -> Result<Decision, Refusal> {
+        reservation::brk(root, requested)
+    }
     fn root_editable(node: &ReservationNodeData) -> bool {
         Self::flags(node).root_editable()
             && (!Self::flags(node).contains(ReservationNodeFlags::FILE)

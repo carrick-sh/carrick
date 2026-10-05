@@ -1,4 +1,4 @@
-//! Shared anonymous Linux reservation authority. Both venues borrow the same
+//! Shared reservation storage and transaction authority. Both venues borrow the same
 //! records; persisted links are node indices, never pointers or Rust containers.
 //! Proposals reserve metadata but do not change the committed tree. T2 owns
 //! descriptor/backing work; only an exact completion commits the proposal.
@@ -11,6 +11,7 @@ use super::{
     ReservationNodePayload as NodePayload,
 };
 use carrick_core_abi::*;
+pub use carrick_core_abi::{Decision, Layout, MoveTarget, Placement, Refusal};
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -47,57 +48,6 @@ pub const DEFERRED_RETURNS: usize = 8;
 /// [`DEFERRED_RETURNS`] each). Per-root state has no room to grow.
 const DEFERRED_SLOTS: usize = 64;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Refusal {
-    Busy,
-    PreparedConflict,
-    Stale,
-    Invalid,
-    Collision,
-    Hole,
-    ForeignMapping,
-    Limit,
-    MetadataRequired,
-}
-
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-pub struct Layout {
-    pub heap: ReservationRange,
-    pub arena: ReservationRange,
-    pub brk: u64,
-    pub address_limit: u64,
-    pub data_limit: u64,
-    /// Charges outside this admitted anonymous arena/heap.
-    pub external_address_bytes: u64,
-    pub external_data_bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Placement {
-    Anywhere,
-    Hint(u64),
-    Fixed(u64),
-    NoReplace(u64),
-}
-
-/// `mremap(2)` destination policy for [`Reservations::mremap`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MoveTarget {
-    /// No `MREMAP_MAYMOVE`: resize in place or fail with ENOMEM.
-    InPlace,
-    /// `MREMAP_MAYMOVE`: resize in place when the following range is free,
-    /// otherwise relocate to a first-fit arena range.
-    MayMove,
-    /// `MREMAP_MAYMOVE | MREMAP_FIXED`: relocate to exactly this address,
-    /// replacing root-editable anonymous nodes there.
-    Fixed(u64),
-    /// `MREMAP_MAYMOVE | MREMAP_DONTUNMAP` (with `MREMAP_FIXED` when
-    /// `Some`): the source mapping stays, and a same-size destination is
-    /// prepared with the source's protection and attributes.
-    KeepSource(Option<u64>),
-}
-
 /// A resident extent EL1 retired at stage-1 (its terminals keep their output
 /// as `SW_RETIRED`) whose stage-2 and frame-inventory return is still owed.
 /// The frames stay unreusable, and no `Prepare` may hand the range out again,
@@ -119,12 +69,6 @@ pub struct ReturnSlot {
     index: usize,
     /// Joins the owed extent already in the slot.
     merge: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Decision {
-    Complete(u64),
-    Work(ReservationRequest),
 }
 
 /// Replacement for a host FirstTouchArming-derived frame-grant plan. The host
@@ -1919,49 +1863,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     /// EEXIST; `ForeignMapping` is a hint outside the layout (the host serves
     /// it); `Limit` is no fitting arena gap.
     pub fn place(&mut self, placement: Placement, len: u64) -> Result<ReservationRange, Refusal> {
-        if !self.state().admitted {
-            return Err(Refusal::Stale);
-        }
-        if len == 0
-            || matches!(placement, Placement::Fixed(addr) | Placement::NoReplace(addr) if !addr.is_multiple_of(4096))
-        {
-            return Err(Refusal::Invalid);
-        }
-        let len = len
-            .checked_add(4095)
-            .map(|v| v & !4095)
-            .ok_or(Refusal::Limit)?;
-        let address = match placement {
-            Placement::Fixed(addr) | Placement::NoReplace(addr) => addr,
-            Placement::Anywhere => self.first_fit(len).ok_or(Refusal::Limit)?,
-            Placement::Hint(addr) => {
-                let addr = addr & !4095;
-                match addr
-                    .checked_add(len)
-                    .and_then(|end| ReservationRange::new(addr, end))
-                {
-                    Some(r) if self.in_layout(r) => {
-                        if self.next(addr).is_none_or(|n| n.start >= r.end()) {
-                            addr
-                        } else {
-                            self.first_fit(len).ok_or(Refusal::Limit)?
-                        }
-                    }
-                    // Linux honours a free hint anywhere; the host serves
-                    // out-of-arena hints (Go's 0xc000000000 probe) with alias
-                    // VAs. Relocating here would give a second answer.
-                    _ => return Err(Refusal::ForeignMapping),
-                }
-            }
-        };
-        let end = address.checked_add(len).ok_or(Refusal::Limit)?;
-        let range = ReservationRange::new(address, end).ok_or(Refusal::Invalid)?;
-        if matches!(placement, Placement::NoReplace(_))
-            && self.next(address).is_some_and(|n| n.start < range.end())
-        {
-            return Err(Refusal::Collision);
-        }
-        Ok(range)
+        Policy::place(self, placement, GuestLen::new(len))
     }
     /// Visit the committed mappings overlapping `range` in address order:
     /// one bounded descent per mapping, independent of the population
@@ -2030,21 +1932,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         len: u64,
         prot: ReservationProtection,
     ) -> Result<Decision, Refusal> {
-        if self.pending().is_some() || self.state().fork_pending {
-            return Err(Refusal::Busy);
-        }
-        let range = self.place(placement, len)?;
-        let address = range.start();
-        self.proposal(
-            range,
-            prot,
-            ReservationOperation::Prepare,
-            address,
-            self.brk_current(),
-            false,
-            None,
-            ReservationNodeFlags::ANONYMOUS_PRIVATE,
-        )
+        Policy::mmap(self, placement, GuestLen::new(len), prot)
     }
     pub fn munmap(&mut self, range: ReservationRange) -> Result<Decision, Refusal> {
         self.proposal(
@@ -2094,191 +1982,11 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         new_len: u64,
         target: MoveTarget,
     ) -> Result<Decision, Refusal> {
-        let backing = self.mapping(source.start()).and_then(|mapping| {
-            mapping.host_backing.and_then(|source_backing| {
-                source_backing.advance(source.start() - mapping.range.start())
-            })
-        });
-        let decision = self.mremap_inner(source, new_len, target)?;
-        if let (Some(backing), Decision::Work(request)) = (backing, decision)
-            && matches!(
-                request.operation,
-                ReservationOperation::Prepare | ReservationOperation::Move
-            )
-        {
-            let pending = self.state().pending.ok_or(Refusal::Stale)?;
-            let backing =
-                if pending.result == source.start() && request.range.start() == source.end() {
-                    backing.advance(source.len()).ok_or(Refusal::Invalid)?
-                } else {
-                    backing
-                };
-            if backing.advance(request.range.len()).is_none() {
-                self.refuse(request)?;
-                return Err(Refusal::Invalid);
-            }
-            let id = pending.nodes[0];
-            if id == 0 {
-                return Err(Refusal::Stale);
-            }
-            self.write(
-                id,
-                NodeData {
-                    host_backing: Some(backing),
-                    ..NodeData::default()
-                },
-            );
-        }
-        Ok(decision)
+        Policy::mremap(self, source, GuestLen::new(new_len), target)
     }
-    fn mremap_inner(
-        &mut self,
-        source: ReservationRange,
-        new_len: u64,
-        target: MoveTarget,
-    ) -> Result<Decision, Refusal> {
-        if !self.state().admitted {
-            return Err(Refusal::Stale);
-        }
-        if self.pending().is_some() || self.state().fork_pending {
-            return Err(Refusal::Busy);
-        }
-        let fixed = match target {
-            MoveTarget::Fixed(address) | MoveTarget::KeepSource(Some(address)) => Some(address),
-            _ => None,
-        };
-        if new_len == 0 || fixed.is_some_and(|address| !address.is_multiple_of(4096)) {
-            return Err(Refusal::Invalid);
-        }
-        let new_len = new_len
-            .checked_add(4095)
-            .map(|v| v & !4095)
-            .ok_or(Refusal::Limit)?;
-        let keep_source = matches!(target, MoveTarget::KeepSource(_));
-        if keep_source && new_len != source.len() {
-            return Err(Refusal::Invalid);
-        }
-        let node = self
-            .run_covering(source.start(), source.end())
-            .ok_or(Refusal::Hole)?;
-        if !Policy::root_editable(&node) {
-            return Err(Refusal::ForeignMapping);
-        }
-        let prot = Policy::protection(&node);
-        let flags = Policy::flags(&node);
-        let brk = self.brk_current();
-        let (operation, moved) = if keep_source {
-            (ReservationOperation::Prepare, None)
-        } else {
-            (ReservationOperation::Move, Some(source))
-        };
-        if let Some(address) = fixed {
-            let range = address
-                .checked_add(new_len)
-                .and_then(|end| ReservationRange::new(address, end))
-                .ok_or(Refusal::Invalid)?;
-            if range.start() < source.end() && source.start() < range.end() {
-                return Err(Refusal::Invalid);
-            }
-            return self.proposal(range, prot, operation, address, brk, false, moved, flags);
-        }
-        if !keep_source {
-            if new_len <= source.len() {
-                if new_len == source.len() {
-                    return Ok(Decision::Complete(source.start()));
-                }
-                let tail = ReservationRange::new(source.start() + new_len, source.end())
-                    .ok_or(Refusal::Invalid)?;
-                return self.proposal(
-                    tail,
-                    ReservationProtection::NONE,
-                    ReservationOperation::Retire,
-                    source.start(),
-                    brk,
-                    false,
-                    None,
-                    ReservationNodeFlags::EMPTY,
-                );
-            }
-            let extension = source
-                .start()
-                .checked_add(new_len)
-                .and_then(|end| ReservationRange::new(source.end(), end))
-                .filter(|r| self.in_layout(*r));
-            let free =
-                extension.is_some_and(|r| self.next(r.start()).is_none_or(|n| n.start >= r.end()));
-            if let Some(extension) = extension.filter(|_| free) {
-                return self.proposal(
-                    extension,
-                    prot,
-                    ReservationOperation::Prepare,
-                    source.start(),
-                    brk,
-                    false,
-                    None,
-                    flags,
-                );
-            }
-            if target == MoveTarget::InPlace {
-                return Err(Refusal::Limit);
-            }
-        }
-        let address = self.first_fit(new_len).ok_or(Refusal::Limit)?;
-        let range = ReservationRange::new(address, address + new_len).ok_or(Refusal::Invalid)?;
-        self.proposal(range, prot, operation, address, brk, false, moved, flags)
-    }
+
     pub fn brk(&mut self, requested: u64) -> Result<Decision, Refusal> {
-        if !self.state().admitted {
-            return Err(Refusal::Stale);
-        }
-        if self.pending().is_some() || self.state().fork_pending {
-            return Err(Refusal::Busy);
-        }
-        let old = self.brk_current();
-        let heap = self.state().layout.heap;
-        if requested == 0 || requested < heap.start() || requested > heap.end() {
-            return Ok(Decision::Complete(old));
-        }
-        let old_end = old.checked_add(4095).ok_or(Refusal::Invalid)? & !4095;
-        let new_end = requested.checked_add(4095).ok_or(Refusal::Invalid)? & !4095;
-        if old_end == new_end {
-            if old != requested {
-                let generation = self
-                    .state()
-                    .generation
-                    .checked_add(1)
-                    .ok_or(Refusal::Stale)?;
-                self.state_mut().layout.brk = requested;
-                self.state_mut().generation = generation;
-            }
-            return Ok(Decision::Complete(requested));
-        }
-        if new_end > old_end && self.next(old_end).is_some_and(|n| n.start < new_end) {
-            return Ok(Decision::Complete(old));
-        }
-        let range = ReservationRange::new(old_end.min(new_end), old_end.max(new_end))
-            .ok_or(Refusal::Invalid)?;
-        let (prot, op) = if new_end > old_end {
-            (
-                ReservationProtection::READ_WRITE,
-                ReservationOperation::Prepare,
-            )
-        } else {
-            (ReservationProtection::NONE, ReservationOperation::Retire)
-        };
-        match self.proposal(
-            range,
-            prot,
-            op,
-            requested,
-            requested,
-            false,
-            None,
-            ReservationNodeFlags::ANONYMOUS_PRIVATE,
-        ) {
-            Err(Refusal::Limit | Refusal::ForeignMapping) => Ok(Decision::Complete(old)),
-            result => result,
-        }
+        Policy::brk(self, UserVa::new(requested))
     }
     /// Split the node straddling `address`, both halves keeping its attributes.
     fn split_at(&mut self, address: u64, spares: &mut Spares) {
@@ -3102,6 +2810,94 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         self.release_tree(n.left);
         self.release_tree(n.right);
         self.table.release(id, self.banks);
+    }
+}
+
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
+    carrick_core_abi::ReservationPolicyAccess for Reservations<'_, Policy, Geometry>
+{
+    fn is_admitted(&self) -> bool {
+        self.is_admitted()
+    }
+    fn has_pending_edit(&self) -> bool {
+        self.pending().is_some()
+    }
+    fn fork_pending(&self) -> bool {
+        self.fork_pending()
+    }
+    fn layout(&self) -> Layout {
+        self.layout()
+    }
+    fn next_range(&mut self, address: UserVa) -> Option<ReservationRange> {
+        self.next(address.raw())
+            .and_then(|node| ReservationRange::new(node.start, node.end))
+    }
+    fn first_fit(&mut self, len: GuestLen) -> Option<UserVa> {
+        self.first_fit(len.raw()).map(UserVa::new)
+    }
+    fn in_layout(&self, range: ReservationRange) -> bool {
+        self.in_layout(range)
+    }
+    fn mapping(&mut self, address: UserVa) -> Option<Mapping> {
+        self.mapping(address.raw())
+    }
+    fn run_covering(&mut self, range: ReservationRange) -> Option<NodeData> {
+        self.run_covering(range.start(), range.end())
+    }
+    fn pending_result(&self) -> Option<UserVa> {
+        self.state()
+            .pending
+            .map(|pending| UserVa::new(pending.result))
+    }
+    fn write_pending_backing(&mut self, backing: HostBackingIdentity) -> Result<(), Refusal> {
+        let pending = self.state().pending.ok_or(Refusal::Stale)?;
+        let id = pending.nodes[0];
+        if id == 0 {
+            return Err(Refusal::Stale);
+        }
+        self.write(
+            id,
+            NodeData {
+                host_backing: Some(backing),
+                ..NodeData::default()
+            },
+        );
+        Ok(())
+    }
+    fn set_byte_break(&mut self, requested: UserVa) -> Result<(), Refusal> {
+        let generation = self
+            .state()
+            .generation
+            .checked_add(1)
+            .ok_or(Refusal::Stale)?;
+        self.state_mut().layout.brk = requested.raw();
+        self.state_mut().generation = generation;
+        Ok(())
+    }
+    fn refuse(&mut self, request: ReservationRequest) -> Result<(), Refusal> {
+        self.refuse(request)
+    }
+    fn propose(
+        &mut self,
+        range: ReservationRange,
+        protection: ReservationProtection,
+        operation: ReservationOperation,
+        result: UserVa,
+        byte_break: UserVa,
+        preserve: bool,
+        source: Option<ReservationRange>,
+        flags: ReservationNodeFlags,
+    ) -> Result<Decision, Refusal> {
+        self.proposal(
+            range,
+            protection,
+            operation,
+            result.raw(),
+            byte_break.raw(),
+            preserve,
+            source,
+            flags,
+        )
     }
 }
 
