@@ -834,3 +834,348 @@ fn raw_crash_participation_requires_the_exact_licensed_owner() {
         assert!(error.contains("forbidden task authority"), "{error}");
     }
 }
+
+#[test]
+fn round3_shared_test_declaration_cannot_hide_production_k1() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        r#"
+#[path = "shared.rs"] mod production;
+#[cfg(test)] #[path = "shared.rs"] mod tests_copy;
+"#,
+    )
+    .unwrap();
+    write_source(
+        src.join("shared.rs"),
+        "fn access(table: &FileTable) { table.read_open_files(); }",
+    )
+    .unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert_eq!(
+        census.k1.len(),
+        1,
+        "a test declaration cannot erase a production incarnation"
+    );
+    assert_eq!(census.k1[0].owner, "carrick_kernel::production::access");
+    assert!(!census.is_test_at("crates/carrick-kernel/src/shared.rs", 1, 0));
+}
+
+#[test]
+fn round3_shared_test_declaration_cannot_hide_production_raw_locks() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        r#"
+#[path = "shared.rs"] mod production;
+#[cfg(test)] #[path = "shared.rs"] mod tests_copy;
+pub fn poll(table: &Table) { table.read_open_files(); }
+"#,
+    )
+    .unwrap();
+    write_source(
+        src.join("shared.rs"),
+        "fn access(this: &Dispatcher) { this.proc.lock(); }",
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+            .is_err(),
+        "shared production raw lock requires an assigned counter"
+    );
+}
+
+#[test]
+fn round3_macro_rules_crash_participation_is_rejected() {
+    let root = source_fixture();
+    write_source(
+        root.path().join("crates/carrick-kernel/src/lib.rs"),
+        r#"
+macro_rules! enter { ($thread:expr) => { $thread.enter_crash_safe_point_participation() }; }
+fn unlicensed(thread: &Thread) { enter!(thread); }
+"#,
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::authority_source::SourceCensus::load(root.path())
+            .and_then(|census| census.verify_task_rules())
+            .is_err(),
+        "macro body cannot hide unlicensed crash participation"
+    );
+}
+
+#[test]
+fn round3_macro_rules_crash_projection_is_rejected() {
+    let root = source_fixture();
+    write_source(
+        root.path()
+            .join("crates/carrick-kernel/src/kernel/crash_capture.rs"),
+        r#"
+macro_rules! threads { ($task:expr) => { $task.threads() }; }
+impl CrashQuorum { fn poll(&self) { for thread in threads!(self.task) {} } }
+"#,
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::authority_source::SourceCensus::load(root.path())
+            .and_then(|census| census.verify_task_rules())
+            .is_err(),
+        "macro body cannot hide generic crash membership"
+    );
+}
+
+#[test]
+fn round3_macro_rules_exact_mm_live_is_rejected() {
+    let root = source_fixture();
+    write_source(
+        root.path()
+            .join("crates/carrick-kernel/src/dispatch/mm_quiesce.rs"),
+        r#"
+macro_rules! live { ($census:expr) => { $census.live() }; }
+fn drain_exact_mm(census: &GuestExecutorCensus) { live!(census); }
+"#,
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::authority_source::SourceCensus::load(root.path())
+            .and_then(|census| census.verify_task_rules())
+            .is_err(),
+        "macro body cannot hide exact-MM census access"
+    );
+}
+
+#[test]
+fn round3_qualified_associated_storage_is_rejected() {
+    for projection in ["<Self as EscapeSlots>::Slots", "EscapeSlots::Slots"] {
+        let root = source_fixture();
+        write_source(
+            root.path().join("crates/carrick-kernel/src/lib.rs"),
+            format!(
+                r#"
+impl EscapeSlots for FileTable {{
+    type Slots = RwLock<FileSlotMap>;
+    fn raw_slots(&self) -> &{projection} {{ &self.open_files }}
+}}
+fn unlicensed(table: &FileTable) {{ EscapeSlots::raw_slots(table).read(); }}
+"#
+            ),
+        )
+        .unwrap();
+        assert!(
+            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            "qualified raw-storage projection {projection} must be classified"
+        );
+    }
+}
+
+#[test]
+fn round3_trait_helper_name_cannot_borrow_an_inherent_exemption() {
+    for method in [
+        "rw_write",
+        "mutex_write",
+        "try_mutex_write",
+        "try_lock_next_fd",
+        "lock_reserved_slots",
+        "stdio_guard",
+        "read_open_files",
+    ] {
+        let root = source_fixture();
+        write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), format!(r#"
+impl EscapeSlots for FileTable {{ fn {method}(&self) -> &RwLock<FileSlotMap> {{ &self.open_files }} }}
+fn unlicensed(table: &FileTable) {{ let slots = EscapeSlots::{method}(table); slots.read(); }}
+"#)).unwrap();
+        assert!(
+            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            "trait accessor {method} cannot inherit the inherent helper exemption"
+        );
+    }
+}
+
+#[test]
+fn round3_inherent_helper_exemptions_require_the_approved_module_and_signature() {
+    let root = source_fixture();
+    write_source(
+        root.path().join("crates/carrick-kernel/src/lib.rs"),
+        "impl FileTable { fn rw_write(&self) -> &RwLock<FileSlotMap> { &self.open_files } }",
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+        "same method name in another module is not an approved helper"
+    );
+    write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "").unwrap();
+    for signature in [
+        "fn rw_write(&self) -> &RwLock<FileSlotMap>",
+        "pub fn rw_write<'a, T>(&'a self, lock: &'a RwLock<T>) -> FileTableRwWriteGuard<'a, T>",
+    ] {
+        write_source(
+            root.path()
+                .join("crates/carrick-kernel/src/kernel/objects.rs"),
+            format!("impl FileTable {{ {signature} {{ todo!() }} }}"),
+        )
+        .unwrap();
+        assert!(
+            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            "changed approved helper signature/visibility must fail: {signature}"
+        );
+    }
+}
+
+#[test]
+fn production_declarations_override_test_directory_and_alias_exclusions() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    std::fs::create_dir_all(src.join("fixtures")).unwrap();
+    write_source(
+        src.join("lib.rs"),
+        r#"
+#[cfg(test)] mod fixtures;
+#[path = "fixtures/shared.rs"] mod production;
+impl FileTable { fn raw_slots(&self) -> &crate::production::Slots { todo!() } }
+"#,
+    )
+    .unwrap();
+    write_source(src.join("fixtures/mod.rs"), "mod shared;").unwrap();
+    write_source(
+        src.join("fixtures/shared.rs"),
+        "pub type Slots = RwLock<FileSlotMap>;",
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+        "a test directory cannot hide a production storage alias"
+    );
+    write_source(
+        src.join("fixtures/shared.rs"),
+        "fn access(table: &FileTable) { table.read_open_files(); }",
+    )
+    .unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert_eq!(census.k1.len(), 1);
+    assert_eq!(census.k1[0].owner, "carrick_kernel::production::access");
+}
+
+#[test]
+fn qualified_projections_keep_all_impl_alternatives_and_resolve_plain_data() {
+    let root = source_fixture();
+    let path = root.path().join("crates/carrick-kernel/src/lib.rs");
+    write_source(
+        &path,
+        r#"
+impl EscapeSlots<u8> for FileTable { type Slots = RwLock<FileSlotMap>; }
+impl EscapeSlots<u16> for FileTable { type Slots = Vec<u8>; }
+impl FileTable { fn raw_slots(&self) -> &<Self as EscapeSlots<u8>>::Slots { todo!() } }
+"#,
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+        "one plain-data impl alternative cannot erase a storage projection"
+    );
+    write_source(
+        &path,
+        r#"
+impl EscapeSlots for FileTable {
+    type Slots = Vec<u8>;
+    fn data(&self) -> &<Self as EscapeSlots>::Slots { todo!() }
+}
+impl FileTable { fn data(&self) -> &EscapeSlots::Slots { todo!() } }
+"#,
+    )
+    .unwrap();
+    carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    write_source(
+        &path,
+        "impl FileTable { fn opaque(&self) -> &<Self as Unresolved>::Slots { todo!() } }",
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+        "unresolved qualified return projections cannot hide storage"
+    );
+}
+
+#[test]
+fn exact_inherent_guard_boundary_accepts_layout_and_parameter_name_changes() {
+    let root = source_fixture();
+    write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), "").unwrap();
+    write_source(
+        root.path()
+            .join("crates/carrick-kernel/src/kernel/objects.rs"),
+        r#"
+impl FileTable {
+    fn rw_write<'a, T>(
+        &'a self,
+        renamed_lock: &'a RwLock<T>,
+    ) -> FileTableRwWriteGuard<'a, T> { todo!() }
+}
+"#,
+    )
+    .unwrap();
+    carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+}
+
+#[test]
+fn harmless_and_test_only_macro_definitions_remain_usable() {
+    let root = source_fixture();
+    write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), r#"
+macro_rules! identity { ($value:expr) => { $value }; }
+macro_rules! metadata { () => { mod constants { const NUMBER: u32 = 17; } }; }
+#[cfg(test)] macro_rules! test_access { ($thread:expr) => { $thread.enter_crash_safe_point_participation() }; }
+fn data() { identity!(17); }
+"#).unwrap();
+    carrick_xtask::authority_source::SourceCensus::load(root.path())
+        .unwrap()
+        .verify_task_rules()
+        .unwrap();
+}
+
+#[test]
+fn every_production_declaration_including_function_and_literal_macro_is_followed() {
+    for declaration in [
+        "fn launch() { #[path=\"shared.rs\"] mod production; }",
+        "items! { #[path=\"shared.rs\"] mod production; }",
+    ] {
+        let root = source_fixture();
+        let src = root.path().join("crates/carrick-kernel/src");
+        write_source(
+            src.join("lib.rs"),
+            format!("{declaration}\n#[cfg(test)] #[path=\"shared.rs\"] mod tests_copy;"),
+        )
+        .unwrap();
+        write_source(
+            src.join("shared.rs"),
+            "fn access(table: &FileTable) { table.read_open_files(); }",
+        )
+        .unwrap();
+        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        assert_eq!(census.k1.len(), 1, "production declaration: {declaration}");
+        assert!(!census.is_test_at("crates/carrick-kernel/src/shared.rs", 1, 0));
+    }
+}
+
+#[test]
+fn unexpanded_module_declarations_cannot_hide_production_files() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        r#"
+macro_rules! declare { () => { #[path="shared.rs"] mod production; }; }
+declare!();
+#[cfg(test)] #[path="shared.rs"] mod tests_copy;
+"#,
+    )
+    .unwrap();
+    write_source(
+        src.join("shared.rs"),
+        "fn access(table: &FileTable) { table.read_open_files(); }",
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+        "unresolved production declarations cannot confer test-only classification"
+    );
+}
