@@ -661,7 +661,7 @@
       "file": "crates/carrick-aarch64/src/fork.rs",
       "function": "prepare",
       "ordinal_in_function": 1,
-      "fingerprint": "f4b2552c5823a6b7b5ac39b00c62d9e958312dc82a97ccc31cab4479c38987fd"
+      "fingerprint": "9a4cd0995ba7ff57dca2656394a593d69a4256e9e1c236e8924d2f644406377c"
     },
     {
       "verdict": "carrier_fault",
