@@ -12,6 +12,8 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+carrick-core = { path = "../carrick-core" }
+carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-fatal.workspace = true
 # The shared aarch64 engine scaffold sits ABOVE carrick-hal/carrick-mem/
 # carrick-guest-mem and BELOW the per-VMM backend crates (carrick-vmm-hvf /
@@ -19,7 +21,6 @@ carrick-fatal.workspace = true
 # (`TrapError`), the syscall-frame type, the stage-1 page-table manager, and the
 # guest-memory protection gate from those leaves; it pulls in NO backend crate
 # (those depend on IT, once Stage 2+ wires callers).
-carrick-core = { path = "../carrick-core" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-mem = { path = "../carrick-mem" }
