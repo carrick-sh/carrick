@@ -952,41 +952,6 @@ impl ProcessContext {
         .map(|(event, _)| event)
     }
 
-    /// Publish Linux lifecycle state before any irreversible backend teardown.
-    /// The callback runs after the zombie is durable and the exiting task is no
-    /// longer live, but while the exit reservation still excludes waiters; the
-    /// runtime queues SIGCHLD there. The process file table is already retired
-    /// by then — the terminal path closes every fd before it takes the
-    /// retirement topology lock (`retire_hvpatch_process_fds`), so Linux's
-    /// "every fd closed before the parent can observe exit" still holds.
-    /// Root-slot/ASID retirement remains deliberately separate and follows output
-    /// and fd finalization.
-    /// `status` is the Linux `wait(2)` encoding, built by
-    /// [`carrick_kernel::run_result::RunResult::wait_status_encoding`] so that signal death and
-    /// normal exit cannot be confused. This used to take a bare exit code and
-    /// encode `(code & 0xff) << 8` unconditionally, which reported every guest
-    /// crash as a NORMAL exit with status `128 + signum`: `WIFSIGNALED` false,
-    /// `WTERMSIG` never consulted. Under the VMM/native lanes the host child
-    /// genuinely died of the signal and the host `waitpid` carried the truth;
-    /// here a Linux process is a thread, so this is the only place the truth
-    /// can come from.
-    pub(crate) fn publish_exit_status(
-        &self,
-        status: carrick_kernel::kernel::LinuxWaitStatus,
-        orphan_adopter: Option<carrick_kernel::kernel::TaskKey>,
-        notify_parent: impl FnOnce(Option<carrick_kernel::kernel::TaskKey>),
-    ) -> Result<Option<carrick_kernel::kernel::TaskKey>, String> {
-        self.kernel_graph()
-            .exit_task_key_eventually_notifying(
-                self.task_key(),
-                status,
-                orphan_adopter,
-                notify_parent,
-            )
-            .map(|zombie| zombie.parent)
-            .map_err(|error| error.to_string())
-    }
-
     pub(crate) fn begin_address_space_retirement(
         &self,
         exit_code: i32,
@@ -1711,7 +1676,9 @@ mod tests {
     fn finalize_test_child(process: &ProcessContext, exit_code: i32, tid: crate::thread::ThreadId) {
         let event = process.record_process_exit_begin(exit_code, tid);
         let _ = process
-            .publish_exit_status(
+            .kernel_graph()
+            .exit_task_key_eventually_notifying(
+                process.task_key(),
                 carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(
                     (exit_code & 0xff) << 8,
                 ),
@@ -3130,7 +3097,9 @@ mod tests {
         };
         assert_eq!(grandchild_parent(), Some(child_process.pid()));
         child_process
-            .publish_exit_status(
+            .kernel_graph()
+            .exit_task_key_eventually_notifying(
+                child_process.task_key(),
                 carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
                 None,
                 |_| {},

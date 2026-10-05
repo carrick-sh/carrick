@@ -13,37 +13,129 @@
 
 use super::*;
 
-/// `CLONE_CHILD_CLEARTID` at thread exit: clear the word and wake one waiter.
-/// A zone process's waiters are in the in-guest zone's queue (`zone`), whose
-/// woken records `handback` returns to their threads.
-pub(super) fn clear_persistent_child_tid_and_wake<M: carrick_guest_mem::CurrentMmMemory>(
-    memory: &mut M,
-    registry: &ThreadRegistry,
-    futex: &FutexTable,
-    tid: ThreadId,
-    zone: Option<(&'static carrick_el1_abi::ZoneTables, u64)>,
-    handback: impl FnOnce(&[carrick_el1_abi::RecordRef]),
-) {
-    if let Some(address) = registry.clear_child_tid(tid)
-        && address != 0
-    {
-        if let Err(error) = memory.write_bytes(address, &0_i32.to_le_bytes()) {
-            carrick_observability::probes::guest_internal_write_fault(
-                address,
-                4,
-                25,
-                &format!("clear_child_tid tid={}: {error}", tid.raw()),
-            );
+pub(crate) struct PendingChildTidClear {
+    clear: carrick_thread::thread::ChildTidClear,
+    context: carrick_kernel::kernel::KernelContext,
+    mm: carrick_kernel::kernel::MmId,
+}
+
+impl PendingChildTidClear {
+    fn new(
+        clear: carrick_thread::thread::ChildTidClear,
+        context: &carrick_kernel::kernel::KernelContext,
+    ) -> Result<Self, RuntimeError> {
+        if clear.tid().raw() != context.thread().key().tid.raw() {
+            return Err(RuntimeError::Configuration(
+                "clear-child-tid claim differs from its captured thread".to_owned(),
+            ));
         }
-        let woken = if let Some((zone, mm)) = zone {
-            let woken = carrick_kernel::el1_zone::wake(zone, mm, address, u32::MAX, 1);
-            handback(&woken.handed);
-            woken.count
-        } else {
-            futex.wake(address, 1)
-        };
-        carrick_kernel::event_ring::rec_futex_wake(address, woken);
+        Ok(Self {
+            clear,
+            context: context.retain_exact(),
+            mm: context.shared().mm().id(),
+        })
     }
+
+    fn validate(
+        &self,
+        current: &carrick_kernel::kernel::KernelContext,
+    ) -> Result<(), RuntimeError> {
+        if self.context.task().key() != current.task().key()
+            || self.mm != current.shared().mm().id()
+            || !Arc::ptr_eq(self.context.kernel(), current.kernel())
+        {
+            return Err(RuntimeError::Configuration(
+                "clear-child-tid crossed its retained task or MM incarnation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// A clear's physical authority is local to one retirement attempt. Dropping
+/// this value on a graph reservation refusal cancels every owner permit.
+enum PreparedChildTidClear<'a, M> {
+    Owner(Box<dyn carrick_guest_mem::PreparedGuestWrite + 'a>),
+    Legacy { memory: &'a mut M, address: u64 },
+    Invalid,
+}
+
+impl<'a, M: carrick_guest_mem::CurrentMmMemory> PreparedChildTidClear<'a, M> {
+    fn prepare(
+        memory: &'a mut M,
+        address: carrick_guest_mem::GuestVa,
+    ) -> Result<Self, carrick_guest_mem::MemoryPrepareError> {
+        use carrick_guest_mem::{GuestWriteRange, MemoryPrepareError, UserMemoryVenue};
+        if memory.user_memory_venue() == UserMemoryVenue::Legacy {
+            return Ok(Self::Legacy {
+                memory,
+                address: address.raw(),
+            });
+        }
+        let Some(range) = GuestWriteRange::new(address, 4) else {
+            return Ok(Self::Invalid);
+        };
+        match memory.prepare_write(&[range]) {
+            Ok(write) => Ok(Self::Owner(write)),
+            Err(MemoryPrepareError::Fault(carrick_guest_mem::MemoryError::OutOfBounds {
+                ..
+            })) => Ok(Self::Invalid),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn commit(self) {
+        match self {
+            Self::Owner(write) => write.commit(&[&0_i32.to_le_bytes()]),
+            Self::Legacy { memory, address } => {
+                // Legacy backends have no owner suspension protocol. Preserve
+                // their invalid-address exit disposition.
+                let _ = memory.write_bytes(address, &0_i32.to_le_bytes());
+            }
+            Self::Invalid => {}
+        }
+    }
+}
+
+/// Prepare while the exact thread is still signal-visible; only a successful
+/// graph retirement permits clear and wake. No permit survives a refusal.
+pub(super) fn retire_with_child_tid_clear<M, R, D>(
+    memory: &mut M,
+    clear: &carrick_thread::thread::ChildTidClear,
+    retire: impl FnOnce() -> Result<R, D>,
+    wake: impl FnOnce(),
+) -> Result<Result<R, D>, carrick_guest_mem::MemoryPrepareError>
+where
+    M: carrick_guest_mem::CurrentMmMemory,
+{
+    let prepared = PreparedChildTidClear::prepare(memory, clear.address())?;
+    match retire() {
+        Ok(retired) => {
+            prepared.commit();
+            wake();
+            Ok(Ok(retired))
+        }
+        Err(deferred) => {
+            drop(prepared);
+            Ok(Err(deferred))
+        }
+    }
+}
+
+fn wake_persistent_child_tid(
+    kernel: &Kernel,
+    futex: &FutexTable,
+    address: u64,
+    zone_mm: Option<u64>,
+) {
+    let count = if let Some((zone, mm)) = zone::zone_for(zone_mm) {
+        let woken = carrick_kernel::el1_zone::wake(zone, mm, address, u32::MAX, 1);
+        zone::publish_zone_handbacks(kernel, &woken.handed);
+        woken.count
+    } else {
+        futex.wake(address, 1)
+    };
+    carrick_kernel::event_ring::rec_futex_wake(address, count);
 }
 
 pub(super) enum CloneThreadSpawn {
@@ -361,13 +453,30 @@ impl Drop for PersistentProcessMemberPublication {
     }
 }
 
+#[derive(Default)]
+struct ChildTidDrainCustody {
+    pending: Vec<PendingChildTidClear>,
+    births: std::collections::BTreeSet<carrick_kernel::kernel::ThreadKey>,
+}
+
 /// Encapsulates the collection of active persistent vCPU thread handles for a process.
 #[derive(Clone, Default)]
-pub(crate) struct VcpuThreadRegistry(Arc<parking_lot::Mutex<Vec<VcpuThreadHandle>>>);
+pub(crate) struct VcpuThreadRegistry(
+    Arc<parking_lot::Mutex<Vec<VcpuThreadHandle>>>,
+    Arc<parking_lot::Mutex<ChildTidDrainCustody>>,
+);
 
 impl VcpuThreadRegistry {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(parking_lot::Mutex::new(Vec::new())))
+        Self::default()
+    }
+
+    fn retain_clear(&self, clear: PendingChildTidClear) {
+        self.1.lock().pending.push(clear);
+    }
+
+    pub(super) fn take_drained_clears(&self) -> Vec<PendingChildTidClear> {
+        std::mem::take(&mut self.1.lock().pending)
     }
 
     pub(crate) fn register(&self, terminal_settlement: &HvpatchExternalTerminalSettlement) -> bool {
@@ -422,7 +531,7 @@ impl VcpuThreadRegistry {
 
 impl From<Arc<parking_lot::Mutex<Vec<VcpuThreadHandle>>>> for VcpuThreadRegistry {
     fn from(handles: Arc<parking_lot::Mutex<Vec<VcpuThreadHandle>>>) -> Self {
-        Self(handles)
+        Self(handles, Arc::default())
     }
 }
 
@@ -628,6 +737,7 @@ where
             )
         })?;
         Ok(PersistentSiblingStopAuthority {
+            threads: self.threads.clone(),
             registry: Arc::clone(&self.registry),
             keeper: self.this_tid,
             kicker: Arc::clone(&self.kicker),
@@ -712,6 +822,7 @@ where
             )
         })?;
         publish_persistent_sibling_stop_with(
+            &self.threads,
             &self.registry,
             self.this_tid,
             self.kicker.as_ref(),
@@ -724,6 +835,7 @@ where
 }
 
 pub(super) struct PersistentSiblingStopAuthority {
+    threads: VcpuThreadRegistry,
     registry: Arc<ThreadRegistry>,
     keeper: ThreadId,
     kicker: Arc<dyn VcpuRegistry>,
@@ -735,6 +847,7 @@ pub(super) struct PersistentSiblingStopAuthority {
 impl PersistentSiblingStopAuthority {
     pub(super) fn publish(&self, kernel: &Kernel) -> Result<(), RuntimeError> {
         publish_persistent_sibling_stop_with(
+            &self.threads,
             &self.registry,
             self.keeper,
             self.kicker.as_ref(),
@@ -747,6 +860,7 @@ impl PersistentSiblingStopAuthority {
 }
 
 fn publish_persistent_sibling_stop_with(
+    threads: &VcpuThreadRegistry,
     registry: &ThreadRegistry,
     keeper: ThreadId,
     kicker: &dyn VcpuRegistry,
@@ -755,6 +869,28 @@ fn publish_persistent_sibling_stop_with(
     context: &carrick_kernel::kernel::KernelContext,
     kernel: &Kernel,
 ) -> Result<(), RuntimeError> {
+    // Clone/adoption admission is already closed and drained by the caller.
+    // Bind before removing numeric membership; retained contexts pin exact
+    // thread claims across a concurrent retirement and subsequent TID reuse.
+    let witnesses = context.task_binding().capture_threads().map_err(|error| {
+        RuntimeError::Configuration(format!("capture sibling clear custody: {error}"))
+    })?;
+    for witness in witnesses {
+        if witness.thread().key().tid.raw() == keeper.raw() {
+            continue;
+        }
+        let tid = ThreadId::from_kernel_thread_identity(witness.thread().key().tid.raw());
+        if let Some(clear) = registry.claim_clear_child_tid(tid) {
+            threads.retain_clear(PendingChildTidClear::new(clear, &witness)?);
+        } else if witness.thread().execution_state().generation().is_none()
+            && !witness.thread().child_tid_cleared_in_zone()
+            && threads.1.lock().births.insert(witness.thread().key())
+            && let Some(clear) = registry
+                .claim_detached_child_tid(tid, witness.thread().control_slot().clear_child_tid())
+        {
+            threads.retain_clear(PendingChildTidClear::new(clear, &witness)?);
+        }
+    }
     let removed = registry.remove_all_except(keeper);
     kicker.kick_all_except(keeper);
     futex.notify_signal_pending();
@@ -814,20 +950,12 @@ where
     /// persistent worker. Kernel execution settlement and vCPU detach are
     /// deliberately left to Task 4 after this method returns `Exited`.
     pub(super) fn withdraw_persistent_terminal_owner_runtime(
-        &self,
+        &mut self,
         kernel: &Kernel,
-        engine: &mut E,
+        _engine: &mut E,
     ) -> bool {
         let _cleanup_gate = crate::fork_quiesce::begin_exit_cleanup();
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 1);
-        clear_persistent_child_tid_and_wake(
-            engine,
-            &self.registry,
-            &self.futex,
-            self.this_tid,
-            zone::zone_for(self.zone_mm),
-            |woken| zone::publish_zone_handbacks(kernel, woken),
-        );
         let last = self.registry.exit(self.this_tid);
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 2);
         carrick_kernel::run_state::clear_guest_tid(self.this_tid.raw());
@@ -838,6 +966,145 @@ where
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 4);
         trace_hvpatch_thread_teardown(kernel, self.this_tid, 5);
         last
+    }
+
+    pub(super) fn commit_terminal_child_tid<R, D>(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+        retire: impl FnOnce() -> Result<R, D>,
+    ) -> Result<Result<R, D>, carrick_guest_mem::MemoryPrepareError> {
+        let Some(clear) = self.child_tid_clear.as_ref() else {
+            return Ok(retire());
+        };
+        let result = retire_with_child_tid_clear(engine, &clear.clear, retire, || {
+            wake_persistent_child_tid(
+                kernel,
+                &self.futex,
+                clear.clear.address().raw(),
+                self.zone_mm,
+            );
+        })?;
+        if result.is_ok()
+            && let Some(clear) = self.child_tid_clear.take()
+        {
+            clear.clear.settle();
+        }
+        Ok(result)
+    }
+
+    pub(super) fn drain_child_tid_clears(
+        &mut self,
+        kernel: &Kernel,
+        engine: &mut E,
+    ) -> Result<(), PersistentThreadExitDisposition> {
+        let pending = self
+            .drained_child_tid_clears
+            .get_or_insert_with(|| self.threads.take_drained_clears());
+        let context = self.service_kernel_context.as_ref().ok_or_else(|| {
+            PersistentThreadExitDisposition::Failed(RuntimeError::Configuration(
+                "clear drain lost live owner context".to_owned(),
+            ))
+        })?;
+        let process = kernel.hvpatch_process.as_ref().ok_or_else(|| {
+            PersistentThreadExitDisposition::Failed(RuntimeError::Configuration(
+                "clear drain lost carrier process".to_owned(),
+            ))
+        })?;
+        while let Some(clear) = pending.pop() {
+            // settled() may have folded an EL1 exit since the census. Its
+            // exact-incarnation receipt survives ABI EntryRef reuse: never
+            // clear a stack the completed in-zone wake already released.
+            if clear.context.thread().child_tid_cleared_in_zone() {
+                clear.clear.settle();
+                continue;
+            }
+            if let Err(error) = clear.validate(context) {
+                pending.push(clear);
+                return Err(PersistentThreadExitDisposition::Failed(error));
+            }
+            let result = retire_with_child_tid_clear(
+                engine,
+                &clear.clear,
+                || {
+                    let retired = process.exit_exact_thread(&clear.context);
+                    if clear.context.thread().child_tid_cleared_in_zone() {
+                        return Err(retired);
+                    }
+                    match retired {
+                        retired @ Ok(
+                            carrick_kernel::kernel::ProcessThreadExit::Retired(_)
+                            | carrick_kernel::kernel::ProcessThreadExit::AlreadyRetired,
+                        ) => Ok(retired),
+                        deferred => Err(deferred),
+                    }
+                },
+                || {
+                    wake_persistent_child_tid(
+                        kernel,
+                        &self.futex,
+                        clear.clear.address().raw(),
+                        self.zone_mm,
+                    )
+                },
+            );
+            match result {
+                Ok(Ok(Ok(retired))) => {
+                    clear.clear.settle();
+                    if let carrick_kernel::kernel::ProcessThreadExit::Retired(retired) = retired {
+                        kernel.dispatcher.close_draining_file_table(
+                            process.kernel_graph(),
+                            &retired.files(),
+                            Some(retired.owner()),
+                            None,
+                        );
+                    }
+                }
+                Ok(Err(Ok(carrick_kernel::kernel::ProcessThreadExit::AlreadyRetired)))
+                    if clear.context.thread().child_tid_cleared_in_zone() =>
+                {
+                    clear.clear.settle();
+                }
+                result => {
+                    pending.push(clear);
+                    return Err(match result {
+                        Err(error) => PersistentThreadExitDisposition::Memory(error),
+                        Ok(Err(Ok(carrick_kernel::kernel::ProcessThreadExit::Busy {
+                            observed_epoch,
+                        }))) => PersistentThreadExitDisposition::Busy { observed_epoch },
+                        other => {
+                            PersistentThreadExitDisposition::Failed(RuntimeError::Configuration(
+                                format!("clear drain could not retire exact sibling: {other:?}"),
+                            ))
+                        }
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_child_tid_drain(&mut self) {
+        self.drained_child_tid_clears = None;
+        self.threads.1.lock().births.clear();
+    }
+
+    pub(super) fn capture_child_tid_clear(&mut self) -> Result<(), RuntimeError> {
+        if self.child_tid_clear.is_none()
+            && let Some(clear) = self.registry.claim_clear_child_tid(self.this_tid)
+        {
+            let context = self.service_kernel_context.as_ref().ok_or_else(|| {
+                RuntimeError::Configuration("clear-child-tid lost exact context".to_owned())
+            })?;
+            self.child_tid_clear = Some(PendingChildTidClear::new(clear, context)?);
+        }
+        Ok(())
+    }
+
+    pub(super) fn handoff_child_tid_clear(&mut self) {
+        if let Some(clear) = self.child_tid_clear.take() {
+            self.threads.retain_clear(clear);
+        }
     }
 
     pub(super) fn handle_persistent_thread_exit(
@@ -853,15 +1120,59 @@ where
                 self.withdraw_from_crash_capture();
             }
         }
-        // Sibling signals (e.g. glibc setxid tgkill) must see this thread as
-        // undeliverable (ESRCH) BEFORE clear_child_tid wakes futex / stack
-        // allocators or runtime state is withdrawn. In HVPatch, retiring the
-        // thread from the authoritative task graph first closes the window
-        // where a signal could be posted to or delivered on a torn-down stack.
+        if let Err(error) = self.capture_child_tid_clear() {
+            return PersistentThreadExitDisposition::Failed(error);
+        }
         let mut last = false;
         if let Some(process) = kernel.hvpatch_process.as_ref() {
-            match process.exit_thread(self.linux_tid) {
+            let Some(context) = self.service_kernel_context.as_ref() else {
+                return PersistentThreadExitDisposition::Failed(RuntimeError::Configuration(
+                    "thread exit lost its exact Kernel context".to_owned(),
+                ));
+            };
+            let retire = || {
+                let context = self
+                    .child_tid_clear
+                    .as_ref()
+                    .map_or(context, |clear| &clear.context);
+                match process.exit_exact_thread(context) {
+                    retired @ Ok(
+                        carrick_kernel::kernel::ProcessThreadExit::Retired(_)
+                        | carrick_kernel::kernel::ProcessThreadExit::AlreadyRetired,
+                    ) => Ok(retired),
+                    deferred => Err(deferred),
+                }
+            };
+            let retirement = if let Some(clear) = self.child_tid_clear.as_ref() {
+                if let Err(error) = clear.validate(context) {
+                    return PersistentThreadExitDisposition::Failed(error);
+                }
+                match retire_with_child_tid_clear(engine, &clear.clear, retire, || {
+                    wake_persistent_child_tid(
+                        kernel,
+                        &self.futex,
+                        clear.clear.address().raw(),
+                        self.zone_mm,
+                    );
+                }) {
+                    Ok(Ok(retired)) => {
+                        if let Some(clear) = self.child_tid_clear.take() {
+                            clear.clear.settle();
+                        }
+                        retired
+                    }
+                    Ok(Err(deferred)) => deferred,
+                    Err(wait) => return PersistentThreadExitDisposition::Memory(wait),
+                }
+            } else {
+                match retire() {
+                    Ok(result) | Err(result) => result,
+                }
+            };
+            match retirement {
                 Ok(carrick_kernel::kernel::ProcessThreadExit::Retired(retired)) => {
+                    // No physical permit or execution loan survives the clear
+                    // and wake above into these potentially blocking closes.
                     kernel.dispatcher.close_draining_file_table(
                         process.kernel_graph(),
                         &retired.files(),
@@ -873,7 +1184,12 @@ where
                 Ok(carrick_kernel::kernel::ProcessThreadExit::Busy { observed_epoch }) => {
                     return PersistentThreadExitDisposition::Busy { observed_epoch };
                 }
-                Ok(carrick_kernel::kernel::ProcessThreadExit::LastThread) | Err(_) => last = true,
+                Ok(carrick_kernel::kernel::ProcessThreadExit::LastThread) => last = true,
+                Err(error) => {
+                    return PersistentThreadExitDisposition::Failed(RuntimeError::Configuration(
+                        format!("retire exact clear-child-tid thread: {error}"),
+                    ));
+                }
             }
         }
         // Runtime withdrawal (registry exit, kick unregister, host-signal
@@ -905,12 +1221,16 @@ where
 pub(super) enum PersistentThreadExitDisposition {
     /// The exit completed; the job finishes with this outcome.
     Done(VcpuLoopOutcome),
+    Memory(carrick_guest_mem::MemoryPrepareError),
+    Failed(RuntimeError),
     /// The kernel graph holds a task reservation (a sibling exec/fork/exit
     /// transaction). The job parks as a scheduler-visible retry subscribed
     /// to the reservation-change epoch — blocking the executor here
     /// deadlocks against a holder that needs this executor's
     /// command-service point (the execfromthread ABBA wedge).
-    Busy { observed_epoch: u64 },
+    Busy {
+        observed_epoch: u64,
+    },
 }
 
 pub(super) fn wake_removed_persistent_sibling_threads(
@@ -964,6 +1284,21 @@ mod child_tid_owner_tests {
     impl GuestMemory for OwnerClearMemory<'_> {
         fn user_memory_venue(&self) -> UserMemoryVenue {
             UserMemoryVenue::Owner
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[carrick_guest_mem::GuestWriteRange],
+        ) -> Result<
+            Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
+            carrick_guest_mem::MemoryPrepareError,
+        > {
+            assert_eq!(ranges.len(), 1);
+            match self.write_bytes_raw(ranges[0].address().raw(), &0_i32.to_le_bytes()) {
+                Err(MemoryError::OwnerWait(wait)) => {
+                    Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(wait))
+                }
+                other => panic!("closed real owner gate unexpectedly prepared: {other:?}"),
+            }
         }
         fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
             assert_eq!((address, length), (VA, 4));
@@ -1042,7 +1377,19 @@ mod child_tid_owner_tests {
             carrick_el1::sched::object_wait::space_access(zone, carrick_sched_core::SlotId::new(1));
         let index = zone.spaces.find(mm.raw()).unwrap();
         access.raise(index);
-        clear_persistent_child_tid_and_wake(&mut memory, &registry, &futex, owner, None, |_| {});
+        let clear = registry.claim_clear_child_tid(owner).unwrap();
+        let result = retire_with_child_tid_clear(
+            &mut memory,
+            &clear,
+            || -> Result<(), ()> { panic!("owner wait retired the signal-visible thread") },
+            || {
+                futex.wake(VA, 1);
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(_))
+        ));
         access.lower(index);
         assert_eq!(memory.waits, 1, "must exercise the production owner's gate");
         assert_eq!(memory.bytes, owner.raw().to_le_bytes());
@@ -1052,5 +1399,282 @@ mod child_tid_owner_tests {
             "owner wait must retain clear_child_tid before waking or retiring the thread"
         );
         drop(enrollment);
+    }
+
+    #[derive(Debug, Default)]
+    struct ClearDependency(std::sync::atomic::AtomicBool);
+    impl carrick_guest_mem::PhysicalMemoryWait for ClearDependency {
+        fn is_ready(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+        fn enroll(
+            &self,
+            _wake: Arc<dyn Fn() + Send + Sync>,
+        ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+            (Box::new(()), self.is_ready())
+        }
+    }
+
+    fn clear_state(
+        kernel: &Kernel,
+        context: &carrick_kernel::kernel::KernelContext,
+        registry: Arc<ThreadRegistry>,
+        threads: VcpuThreadRegistry,
+    ) -> ThreadRuntimeState<super::super::tests::CrashCaptureTestEngine> {
+        use super::super::tests::{CrashCaptureTestEngine, NoopPlatformFutex};
+        let tid = ThreadId::from_kernel_thread_identity(context.thread().key().tid.raw());
+        let mut state = ThreadRuntimeState::<CrashCaptureTestEngine>::new(
+            registry,
+            Arc::new(FutexTable::new()),
+            Arc::new(NoopPlatformFutex),
+            Arc::new(|_| Arc::new(NoopPlatformFutex)),
+            kernel.process_fork_barrier.clone(),
+            kernel.crash_capture.clone(),
+            Some(Arc::clone(context.thread())),
+            Some(context.task().key().id.raw()),
+            context.thread().key().tid,
+            kernel.fatal_signal.current_generation(),
+            tid,
+            threads,
+            Arc::new(carrick_hal::GenericVcpuRegistry::new()),
+            carrick_hal::InGuestFlag::for_guest_thread(),
+            1_000,
+        );
+        state.service_kernel_context = Some(context.retain_exact());
+        state
+    }
+
+    fn clear_kernel(pid: i32) -> (Kernel, carrick_kernel::kernel::KernelContext) {
+        use super::super::tests::{EndpointTestSignalArrival, EndpointTestSignalPump};
+        let (process, root) = crate::hvpatch::process_context_for_tests(pid);
+        let dispatcher = carrick_kernel::dispatch::SyscallDispatcher::new();
+        dispatcher.bind_hvpatch_process(Arc::new(process.clone()));
+        (
+            Arc::new(KernelState::new(
+                dispatcher,
+                Arc::new(EndpointTestSignalPump),
+                Arc::new(EndpointTestSignalArrival),
+                Some(process),
+                None,
+            )),
+            root,
+        )
+    }
+
+    fn clear_sibling(
+        root: &carrick_kernel::kernel::KernelContext,
+    ) -> carrick_kernel::kernel::KernelContext {
+        root.kernel()
+            .reserve_thread_clone(
+                root,
+                carrick_kernel::kernel::ClonePlan::from_flags(
+                    carrick_abi::LinuxCloneFlags::THREAD
+                        | carrick_abi::LinuxCloneFlags::SIGHAND
+                        | carrick_abi::LinuxCloneFlags::VM,
+                )
+                .unwrap(),
+                None,
+            )
+            .unwrap()
+            .prepare(ThreadId::synthetic_for_tests(
+                root.thread().key().tid.raw() + 1,
+            ))
+            .unwrap()
+            .commit()
+            .unwrap()
+            .start_thread()
+            .unwrap()
+            .into_context()
+    }
+
+    fn clear_engine(
+        context: &carrick_kernel::kernel::KernelContext,
+        dependency: &Arc<ClearDependency>,
+    ) -> super::super::tests::CrashCaptureTestEngine {
+        let mut engine = super::super::tests::CrashCaptureTestEngine {
+            prepare_dependency: Some(carrick_guest_mem::OwnedMemoryWait(dependency.clone())),
+            prepared_write_context: Some(context.retain_exact()),
+            ..Default::default()
+        };
+        engine
+            .guest_memory
+            .insert(VA, context.thread().key().tid.raw().to_le_bytes().to_vec());
+        engine
+    }
+
+    fn clear_wakes(futex: &FutexTable) -> (Arc<AtomicUsize>, impl Sized + use<>) {
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&wakes);
+        let subscription = futex.subscribe_generation(
+            futex.prepare_wait(VA),
+            Arc::new(move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        (wakes, subscription)
+    }
+
+    #[test]
+    fn serial_host_normal_child_tid_exit_waits_and_cancels_permit_before_graph_retry() {
+        let (kernel, root) = clear_kernel(72_510);
+        let sibling = clear_sibling(&root);
+        let tid = ThreadId::from_kernel_thread_identity(sibling.thread().key().tid.raw());
+        let registry = Arc::new(ThreadRegistry::new(tid));
+        registry.set_clear_child_tid(tid, VA);
+        let mut state = clear_state(
+            &kernel,
+            &sibling,
+            registry.clone(),
+            VcpuThreadRegistry::new(),
+        );
+        let dependency = Arc::new(ClearDependency::default());
+        let mut engine = clear_engine(&sibling, &dependency);
+        let (wakes, _subscription) = clear_wakes(&state.futex);
+        assert!(matches!(
+            state.handle_persistent_thread_exit(&kernel, &mut engine, 0, 0),
+            PersistentThreadExitDisposition::Memory(
+                carrick_guest_mem::MemoryPrepareError::Physical(_)
+            )
+        ));
+        assert!(sibling.exact_thread_is_live());
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        dependency.0.store(true, Ordering::Release);
+        let reservation = root
+            .kernel()
+            .prepare_task_exit_key(
+                root.task().key(),
+                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            state.handle_persistent_thread_exit(&kernel, &mut engine, 0, 0),
+            PersistentThreadExitDisposition::Busy { .. }
+        ));
+        assert_eq!((engine.prepared_cancels, engine.prepared_commits), (1, 0));
+        assert!(sibling.exact_thread_is_live());
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        drop(reservation);
+        assert!(matches!(
+            state.handle_persistent_thread_exit(&kernel, &mut engine, 0, 0),
+            PersistentThreadExitDisposition::Done(VcpuLoopOutcome::ThreadDone)
+        ));
+        assert_eq!(engine.guest_memory[&VA], [0; 4]);
+        assert_eq!(engine.prepared_commits, 1);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(!registry.is_clear_child_tid_addr(VA));
+    }
+
+    #[test]
+    fn serial_host_terminal_owner_child_tid_wait_keeps_graph_live_until_commit() {
+        let (kernel, root) = clear_kernel(72_520);
+        let tid = ThreadId::from_kernel_thread_identity(root.thread().key().tid.raw());
+        let registry = Arc::new(ThreadRegistry::new(tid));
+        registry.set_clear_child_tid(tid, VA);
+        let mut state = clear_state(&kernel, &root, registry.clone(), VcpuThreadRegistry::new());
+        state.capture_child_tid_clear().unwrap();
+        let dependency = Arc::new(ClearDependency::default());
+        let mut engine = clear_engine(&root, &dependency);
+        let (wakes, _subscription) = clear_wakes(&state.futex);
+        state.withdraw_persistent_terminal_owner_runtime(&kernel, &mut engine);
+        let prepare = || {
+            root.kernel()
+                .prepare_task_exit_key(
+                    root.task().key(),
+                    carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                    None,
+                )
+                .unwrap()
+        };
+        let graph_exit = prepare();
+        assert!(matches!(
+            state.commit_terminal_child_tid(&kernel, &mut engine, || graph_exit
+                .retire_notifying(|_| {})),
+            Err(carrick_guest_mem::MemoryPrepareError::Physical(_))
+        ));
+        assert!(root.exact_thread_is_live());
+        assert!(root.kernel().task_key_is_live(root.task().key()));
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        assert!(registry.is_clear_child_tid_addr(VA));
+        dependency.0.store(true, Ordering::Release);
+        let graph_exit = prepare();
+        let publication = state
+            .commit_terminal_child_tid(&kernel, &mut engine, || graph_exit.retire_notifying(|_| {}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(engine.guest_memory[&VA], [0; 4]);
+        assert_eq!(engine.prepared_commits, 1);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(!registry.is_clear_child_tid_addr(VA));
+        publication.publish().unwrap();
+    }
+
+    #[test]
+    fn serial_host_unadopted_child_tid_is_captured_without_runtime_member() {
+        let (kernel, root) = clear_kernel(72_540);
+        let sibling = clear_sibling(&root);
+        assert!(sibling.thread().execution_state().generation().is_none());
+        sibling.thread().control_slot().set_clear_child_tid(VA);
+        let root_tid = ThreadId::from_kernel_thread_identity(root.thread().key().tid.raw());
+        let registry = Arc::new(ThreadRegistry::new(root_tid));
+        let threads = VcpuThreadRegistry::new();
+        let mut owner = clear_state(&kernel, &root, registry.clone(), threads.clone());
+        let receipt = kernel.try_claim_persistent_process_exit(root_tid).unwrap();
+        assert_eq!(receipt.claim, ProcessExitClaim::Owner);
+        // No runtime row, scheduler activation or member completion exists for
+        // this born thread. The closed-admission graph census is its authority.
+        owner.publish_persistent_sibling_stop(&kernel).unwrap();
+        owner.publish_persistent_sibling_stop(&kernel).unwrap();
+        assert_eq!(threads.1.lock().pending.len(), 1);
+        let dependency = Arc::new(ClearDependency::default());
+        dependency.0.store(true, Ordering::Release);
+        let mut engine = clear_engine(&sibling, &dependency);
+        let (wakes, _subscription) = clear_wakes(&owner.futex);
+        assert!(owner.drain_child_tid_clears(&kernel, &mut engine).is_ok());
+        assert!(!sibling.exact_thread_is_live());
+        assert_eq!(engine.guest_memory[&VA], [0; 4]);
+        assert_eq!(engine.prepared_commits, 1);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(!registry.is_clear_child_tid_addr(VA));
+    }
+
+    #[test]
+    fn serial_host_retired_loser_child_tid_moves_to_live_drain_before_completion() {
+        let (kernel, root) = clear_kernel(72_530);
+        let sibling = clear_sibling(&root);
+        let root_tid = ThreadId::from_kernel_thread_identity(root.thread().key().tid.raw());
+        let tid = ThreadId::from_kernel_thread_identity(sibling.thread().key().tid.raw());
+        let registry = Arc::new(ThreadRegistry::new(root_tid));
+        registry.register_child_with_tid(tid, VA);
+        let threads = VcpuThreadRegistry::new();
+        let mut loser = clear_state(&kernel, &sibling, registry.clone(), threads.clone());
+        let mut owner = clear_state(&kernel, &root, registry.clone(), threads.clone());
+        let dependency = Arc::new(ClearDependency::default());
+        let mut engine = clear_engine(&sibling, &dependency);
+        let (wakes, _subscription) = clear_wakes(&owner.futex);
+        loser.capture_child_tid_clear().unwrap();
+        registry.remove_all_except(root_tid);
+        root.kernel().exit_thread(&sibling, None).unwrap();
+        loser.handoff_child_tid_clear();
+        drop(loser);
+        assert!(matches!(
+            owner.drain_child_tid_clears(&kernel, &mut engine),
+            Err(PersistentThreadExitDisposition::Memory(
+                carrick_guest_mem::MemoryPrepareError::Physical(_)
+            ))
+        ));
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+        assert!(registry.is_clear_child_tid_addr(VA));
+        assert!(
+            threads.take_drained_clears().is_empty(),
+            "retry must retain its batch, not reclaim the population"
+        );
+        dependency.0.store(true, Ordering::Release);
+        assert!(owner.drain_child_tid_clears(&kernel, &mut engine).is_ok());
+        assert!(owner.drain_child_tid_clears(&kernel, &mut engine).is_ok());
+        assert_eq!(engine.guest_memory[&VA], [0; 4]);
+        assert_eq!(engine.prepared_commits, 1);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+        assert!(!registry.is_clear_child_tid_addr(VA));
     }
 }
