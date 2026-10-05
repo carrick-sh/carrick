@@ -3462,14 +3462,21 @@ fn owner_wait_enrollment_follows_only_its_real_release(
     };
     let wire = carrick_el1_abi::PortalTransferSlot::new();
     let mut ticket = wire.submit_prepare(request).unwrap();
-    serve_transfer(
-        &portal,
-        wire.claim().unwrap(),
-        &tables.live(&CallerInvalidatesAsid),
-        0,
-        || panic!("no consuming effect"),
-    )
-    .unwrap();
+    if cause == PortalWaitCause::Gate {
+        // A peer's first-touch publication may close the gate AFTER SELECT.
+        // Exercise the actual hardware preamble, before descriptor access or
+        // the transfer body's already-tested owner wait handling.
+        assert!(admit_service_root(&portal, wire.claim().unwrap()).is_none());
+    } else {
+        serve_transfer(
+            &portal,
+            wire.claim().unwrap(),
+            &tables.live(&CallerInvalidatesAsid),
+            0,
+            || panic!("no consuming effect"),
+        )
+        .unwrap();
+    }
     let Some(PortalPrepareSuspension::Owner(receipt)) = ticket.take_prepare_suspension() else {
         panic!("exact owner wait required");
     };
@@ -3543,6 +3550,26 @@ fn owner_wait_enrollment_follows_only_its_real_release(
         zone.take_completion_handbacks(&BoundedSpin(0), &mut |_| panic!("duplicate completion"));
     }
     zone.free_record(record);
+    if cause == PortalWaitCause::Gate {
+        // Resume the original selection and operation after the real producer
+        // released it; no host byte has been consumed while parked.
+        let mut resumed = wire.submit_prepare(request).unwrap();
+        let (service, grant) = admit_service_root(&portal, wire.claim().unwrap()).unwrap();
+        assert_eq!(grant.ttbr0, ROOT);
+        serve_transfer(
+            &portal,
+            service,
+            &tables.live(&CallerInvalidatesAsid),
+            0,
+            || panic!("PREPARE must not consume host bytes"),
+        )
+        .unwrap();
+        let permit = resumed
+            .take_prepared()
+            .expect("gate release admits the exact original operation");
+        portal.cancel_prepared(permit, request, 0).unwrap();
+        assert_eq!(transfer.offset(), 0);
+    }
 }
 #[test]
 fn owner_wait_release_before_enrollment_never_parks_a_lost_edge() {
@@ -3557,6 +3584,42 @@ fn owner_wait_unrelated_release_cannot_reschedule_and_real_release_delivers_once
     for cause in [Editor, Reservations, Gate, PendingEdit] {
         owner_wait_enrollment_follows_only_its_real_release(cause, false);
     }
+}
+
+#[test]
+fn prepare_entry_refuses_another_incarnation_before_gate_wait() {
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(
+        NonZeroU64::new(1).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(zone)
+    .unwrap();
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let transfer = portal
+        .begin(handle, GuestVa::new(VA), 4096, TransferIntent::UserWrite, 0)
+        .unwrap();
+    let tables = Tables::new(ROOT, IPA, 1);
+    let mut request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    request.operation.incarnation = NonZeroU64::new(handle.incarnation().get() + 1).unwrap();
+    let index = zone.spaces.find(mm.raw()).unwrap();
+    let access = portal.space_access(1).unwrap();
+    access.raise(index);
+    let wire = carrick_el1_abi::PortalTransferSlot::new();
+    let mut ticket = wire.submit_prepare(request).unwrap();
+    assert!(admit_service_root(&portal, wire.claim().unwrap()).is_none());
+    assert!(ticket.take_prepare_suspension().is_none());
+    let completion = ticket.take_completion().unwrap();
+    assert_eq!(completion.completed, 0);
+    assert_eq!(completion.errno, MmError::Stale.errno());
+    access.lower(index);
 }
 
 #[test]
