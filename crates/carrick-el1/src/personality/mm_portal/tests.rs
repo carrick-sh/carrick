@@ -1806,7 +1806,29 @@ fn owner_fork_publishes_child_with_two_live_same_va_mms() {
     // The fixed boot primary was an admitted HVF root before N1's pool
     // relocation; BIND accepts it on the carrier maintenance root. Fork must
     // use the same authenticated window while both MM identities are live.
-    assert!(fork::fork_table_window(request, parent_root).is_ok());
+    let primary = fork::fork_table_window(request, parent_root).unwrap();
+    assert_eq!(primary.physical_base, parent_root);
+    assert_eq!(primary.words as u64, parent_root);
+    let outside_pool = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE
+        + carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_SIZE;
+    let mut wrong_child = request;
+    wrong_child.child_tables =
+        carrick_el1_abi::PortalForkTableArena::new(outside_pool, 0x200000).unwrap();
+    assert_eq!(
+        fork::fork_table_window(wrong_child, parent_root).err(),
+        Some(1)
+    );
+    let mut wrong_parent = request;
+    wrong_parent.parent_tables =
+        carrick_el1_abi::PortalForkTableArena::new(outside_pool, 0x200000).unwrap();
+    assert_eq!(
+        fork::fork_table_window(wrong_parent, parent_root).err(),
+        Some(2)
+    );
+    assert_eq!(
+        fork::fork_table_window(request, outside_pool).err(),
+        Some(3)
+    );
     let arenas = [&parent_tables, &child, &supply, &peer_tables];
     let words = ForkWords {
         arenas: &arenas,
