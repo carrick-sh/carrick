@@ -254,6 +254,29 @@ unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for ForkTableResolver {
     }
 }
 
+fn inherited_futex_identity(
+    backing: InventoryBackingIdentity,
+    physical_offset: u64,
+) -> Result<(Option<carrick_guest_mem::SharedFutexFileIdentity>, u64), TrapError> {
+    match backing {
+        InventoryBackingIdentity::SharedFile {
+            device,
+            inode,
+            offset,
+            ..
+        } => {
+            let offset = offset.checked_add(physical_offset).ok_or_else(|| {
+                TrapError::Hypervisor("owner fork shared-file offset overflow".into())
+            })?;
+            Ok((
+                Some(carrick_guest_mem::SharedFutexFileIdentity { device, inode }),
+                offset,
+            ))
+        }
+        _ => Ok((None, 0)),
+    }
+}
+
 pub(crate) struct OwnerPhysicalForkBuilder {
     physical: ForkPhysicalCustody,
     state: Arc<MmAccessState>,
@@ -383,6 +406,13 @@ impl carrick_aarch64::fork::PhysicalForkBuilder<ProcessSpec> for OwnerPhysicalFo
                     source.map_or(0, |entry| entry.stage2_owner.generation),
                     |owner| owner.epoch().raw(),
                 );
+                let physical_offset = cursor
+                    .checked_sub(source.map_or(record.ipa, |entry| entry.stage2_base))
+                    .ok_or_else(|| {
+                        TrapError::Hypervisor("owner fork physical offset underflow".into())
+                    })?;
+                let (shared_key_base, shared_key_offset) =
+                    inherited_futex_identity(backing, physical_offset)?;
                 mappings.push(ProcessMappingDesc {
                     start,
                     ipa: cursor,
@@ -406,8 +436,8 @@ impl carrick_aarch64::fork::PhysicalForkBuilder<ProcessSpec> for OwnerPhysicalFo
                     guest_writable: false,
                     inherited_frame: source.map(|entry| entry.frame),
                     stage2_lease: None,
-                    shared_key_base: record.ipa,
-                    shared_key_offset: cursor - record.ipa,
+                    shared_key_base,
+                    shared_key_offset,
                     owner_generation,
                 });
                 if inherited.insert((cursor, take)) {
@@ -464,7 +494,7 @@ impl carrick_aarch64::fork::PhysicalForkBuilder<ProcessSpec> for OwnerPhysicalFo
                 guest_writable: false,
                 inherited_frame: None,
                 stage2_lease: None,
-                shared_key_base: 0,
+                shared_key_base: None,
                 shared_key_offset: 0,
                 owner_generation: generation,
             });
@@ -648,6 +678,44 @@ impl HvfVmState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn owner_fork_retains_file_futex_identity_across_physical_slices() {
+        let backing = InventoryBackingIdentity::SharedFile {
+            device: 71,
+            inode: 72,
+            offset: 0x8000,
+            length: 0x4000,
+        };
+        let (identity, offset) = inherited_futex_identity(backing, 0x104).unwrap();
+        let expected = carrick_guest_mem::SharedFutexFileIdentity {
+            device: 71,
+            inode: 72,
+        };
+        assert_eq!(identity, Some(expected));
+        assert_eq!(offset, 0x8104);
+        let shifted = InventoryBackingIdentity::SharedFile {
+            device: 71,
+            inode: 72,
+            offset: 0x8100,
+            length: 0x100,
+        };
+        assert_eq!(
+            inherited_futex_identity(shifted, 4).unwrap(),
+            (identity, offset)
+        );
+        assert_eq!(
+            inherited_futex_identity(InventoryBackingIdentity::SharedAnon(71), 0x104).unwrap(),
+            (None, 0)
+        );
+        let overflow = InventoryBackingIdentity::SharedFile {
+            device: 71,
+            inode: 72,
+            offset: u64::MAX,
+            length: 4,
+        };
+        assert!(inherited_futex_identity(overflow, 1).is_err());
+    }
+
     fn request(custody: &CarrierVmCustody, mm: u64) -> PortalForkRequest {
         PortalForkRequest {
             operation: carrick_el1_abi::PortalOperation {
