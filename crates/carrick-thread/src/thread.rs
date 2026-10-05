@@ -2201,6 +2201,19 @@ mod tests {
     }
 
     #[test]
+    fn removed_sibling_retains_clear_tid_routing_until_drain_commits() {
+        let owner = ThreadId::synthetic_for_tests(1_020);
+        let registry = ThreadRegistry::new(owner);
+        let sibling = registry.register_child(0x4000);
+        assert_eq!(registry.remove_all_except(owner), vec![sibling]);
+        assert!(!registry.is_live(sibling));
+        assert!(
+            registry.is_clear_child_tid_addr(0x4000),
+            "runtime removal cannot discard the pending clear or reroute its joiners",
+        );
+    }
+
+    #[test]
     fn remove_all_except_keeps_exec_owner_live() {
         let reg = ThreadRegistry::new(ThreadId::synthetic_for_tests(1000));
         let a = reg.register_child(0);
