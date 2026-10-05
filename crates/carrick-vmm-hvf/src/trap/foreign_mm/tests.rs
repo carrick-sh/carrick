@@ -14242,3 +14242,82 @@ fn exercise_retained_import(journal_case: u8) {
     assert_eq!(&bytes, b"away");
     installed.owners.0.push((owner.ipa(), owner.length()));
 }
+
+#[test]
+fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
+    use carrick_aarch64::user_transfer::TransferPreparation;
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let installed = install_mm(
+        &transport,
+        297,
+        0x9a00_6100_0000,
+        0x9b00_6100_0000,
+        *b"keep",
+    );
+    let (authority, _lease, _invalidator) = prepare_foreign_cow(&installed);
+    installed
+        .state
+        .page_tables_authority()
+        .select_live_descriptor_owner(carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest);
+    let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+    let mm = carrick_el1_abi::ReservationMm::new(installed.snapshot.mm.get()).unwrap();
+    // Model receipt of the borrowed target's admitted owner.
+    let handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(custody.transfer_carrier, mm, nonzero(1))
+    };
+    let target = carrick_aarch64::user_transfer::TransferTarget::from_handle(
+        handle,
+        (u64::from(installed.snapshot.asid.get()) << 48) | installed.snapshot.stage1_root.0,
+    );
+    let start = TEST_VA + 0x10_0000;
+    let window = carrick_el1_abi::PortalGrantWindow {
+        fork_sequence: None,
+        operation: carrick_el1_abi::PortalOperation {
+            carrier: custody.transfer_carrier,
+            mm,
+            incarnation: nonzero(1),
+            sequence: nonzero(1),
+        },
+        generation: carrick_el1_abi::ReservationGeneration::new(1).unwrap(),
+        range: carrick_el1_abi::ReservationRange::new(start, start + 4096).unwrap(),
+        protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
+        fault_page: start,
+        host_backing: None,
+    };
+    installed.state.protections.admit_owner(handle).unwrap();
+    let context = sparse_materialization::PublicationContext::for_transfer(
+        installed.state.clone(),
+        custody.clone(),
+        target,
+        window,
+    )
+    .unwrap();
+    let TransferPreparation::Grant(pending) = context.prepare_transfer(window).unwrap() else {
+        panic!("first supply must retain one unpublished physical grant");
+    };
+    let before = installed.state.frame_inventory.ledger.lock().extents.len();
+    let mut second = window;
+    second.operation.sequence = nonzero(2);
+    let peer = sparse_materialization::PublicationContext::for_transfer(
+        installed.state.clone(),
+        custody.clone(),
+        target,
+        second,
+    )
+    .unwrap()
+    .prepare_transfer(second)
+    .unwrap();
+    assert!(
+        !matches!(peer, TransferPreparation::Declined),
+        "a live unpublished predecessor must own a completion wait, not decline exact supply"
+    );
+    assert_eq!(
+        installed.state.frame_inventory.ledger.lock().extents.len(),
+        before,
+        "the contender must not allocate a second physical frame"
+    );
+    drop(pending);
+}
