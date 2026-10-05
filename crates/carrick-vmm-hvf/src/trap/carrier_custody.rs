@@ -2994,8 +2994,8 @@ mod carrier_vm_custody_tests {
             current_record_id
         );
         let g2_pin = current.pin().expect("owner auth pins current G2 record");
-        assert_eq!(old_pin._stage2_pin.identity.vm_generation, g1);
-        assert_eq!(g2_pin._stage2_pin.identity.vm_generation, g2);
+        assert_eq!(old_pin._stage2_pin.identity().vm_generation, g1);
+        assert_eq!(g2_pin._stage2_pin.identity().vm_generation, g2);
         assert_eq!(unsafe { *old_pin.owner().ptr() }, unsafe {
             *g2_pin.owner().ptr()
         });
