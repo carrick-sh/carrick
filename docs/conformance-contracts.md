@@ -444,3 +444,24 @@ prepared rather than becoming resident. The VM-free bindings are
 published-grant settlement cases in `mem/delegated_tests.rs`. Signed binding:
 `el1_anonymous_reservations_stay_in_guest`; copyout also exercises the peer
 resident selection that consumes this committed evidence.
+
+## Pending heap retirement backing maintenance (open)
+
+`kernel.mm.pending-brk-backing-maintenance` covers heap shrink and later
+regrowth: removed pages must become inaccessible before their physical bytes
+are scrubbed, and regrowth must not expose the old bytes. The existing
+`brk_shrink_scrubs_backing_before_regrowth` and restrictive-ordering tests
+cover the host semantic sequence. An admitted root additionally requires a
+typed maintenance operation tied to its exact pending retirement, carrier/MM
+incarnation, live descriptor output and retained physical owner. It cannot
+select ordinary UserWrite or wait for its own transaction's Gate. Wrong-MM,
+stale request/physical generation, reused VA, and fork-shared physical pages
+must not authorize a scrub. Selection and cleanup scale with touched backing,
+not carrier-wide mappings; no lock spans host I/O or a scheduler wait.
+
+The signed red is `el1_anonymous_reservations_stay_in_guest` on `77b7d5e71`:
+4 KiB heap contraction reaches PREPARE and receives its own Gate wait before
+aborting. A VM-free reproduction and its failing assertion are preserved in
+the 2026-10-05 backing-maintenance handoff. The new typed production binding,
+its negative and deterministic-work witnesses, and signed green are pending;
+this contract is not accepted.
