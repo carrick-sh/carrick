@@ -314,3 +314,13 @@ require the current semantic state to equal its earlier write completion.
 No serialization, retry or wider bound was introduced. Red log:
 `owner-cow-later-red.log`. The existing negative control now removes private
 ownership instead of simulating a later valid fork arm.
+
+The late-edit correction accepts an authenticated private retained output
+in prepared, resident or retired state, including a subsequent fork arm.
+It reconciles physical inventory without changing any descriptor. The
+replacement alias's write intent now follows current owner host-buffer
+access, so retirement revokes it and a valid later COW arm keeps its Linux
+write intent. Wrong-MM, well-formed wrong-output and missing-private-owner
+controls still refuse. Both new red witnesses and all 13 composed guest-COW
+tests pass (`owner-cow-later-green.log`); the vvar and clone-copyout failures
+remain open for the next exact signed cycle.
