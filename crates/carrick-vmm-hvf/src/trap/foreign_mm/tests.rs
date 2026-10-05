@@ -12506,6 +12506,7 @@ mod guest_cow {
             },
             || {},
         )
+        .expect("guest cow resolution")
     }
 
     #[test]
