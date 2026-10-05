@@ -398,8 +398,25 @@ pub(crate) fn settle_one(
         .filter(|live| *live)
         .ok_or_else(|| TrapError::Hypervisor("live leaves do not name the grant".to_owned()))?;
 
-    // Every page of the span was fork-armed; EL1 moves only armed leaves.
-    let armed = {
+    let retired = completion.purpose == carrick_el1_abi::CowGrantPurpose::RetiredBacking;
+    let executable = if retired {
+        // The owner-maintenance completion cannot widen access. Its exact
+        // retained outputs were checked above; every replacement stays invalid.
+        let invalid = tables
+            .with_manager(|manager| {
+                (0..completion.span_len / PAGE).all(|index| {
+                    carrick_mmu_core::aarch64::terminal_descriptor(
+                        manager.debug_walk(completion.span_va + index * PAGE),
+                    ) & 1
+                        == 0
+                })
+            })
+            .unwrap_or(false);
+        if !invalid {
+            return refuse("maintenance replacement became accessible");
+        }
+        false
+    } else {
         let cow_armed = state.cow_armed.lock();
         let first = cow_armed.span_for(completion.span_va);
         let covered = (0..completion.span_len / PAGE).all(|index| {
@@ -407,13 +424,15 @@ pub(crate) fn settle_one(
                 .span_for(completion.span_va + index * PAGE)
                 .is_some()
         });
-        first.filter(|_| covered)
-    }
-    .ok_or_else(|| TrapError::Hypervisor("span is not COW-armed".to_owned()))?;
+        first
+            .filter(|_| covered)
+            .ok_or_else(|| TrapError::Hypervisor("span is not COW-armed".to_owned()))?
+            .executable()
+    };
     let span = CowArmedSpan {
         va: completion.span_va,
         len: span_len,
-        executable: armed.executable(),
+        executable,
         kernel_only: false,
     };
 
