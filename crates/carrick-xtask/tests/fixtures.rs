@@ -892,10 +892,26 @@ if [ "$1" = accept ]; then
     "$FIXTURE_TEST_XTASK" fixtures verify || exit $?
     "$FIXTURE_TEST_XTASK" host-lease --mode gate -- /bin/true || exit $?
     [ -d "$FIXTURE_TEST_CHECKOUT_LOCK" ] || exit 93
+    if [ "$FIXTURE_TEST_REQUIRE_PROVENANCE" = 1 ]; then
+        provenance_dir="$FIXTURE_TEST_ACCEPTED_DIR"
+        for path in "$provenance_dir"/remote/gate-runs/*; do
+            [ ! -d "$path" ] || provenance_dir="$path"
+        done
+        [ -f "$provenance_dir/fixture-bundle.json" ] || exit 95
+    fi
     touch "$FIXTURE_TEST_ACCEPTED"
     receipt_dir="target/el1-gate/$(git rev-parse --short HEAD)"
     mkdir -p "$receipt_dir"
-    printf '{"head":"%s","phase":"signed","overall":"PASS"}\n' "$(git rev-parse HEAD)" > "$receipt_dir/receipt.json"
+    receipt_path="$receipt_dir/receipt.json"
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --receipt ]; then
+            shift
+            receipt_path="$1"
+        fi
+        shift
+    done
+    printf '{"schema_version":1,"timestamp":"test","head":"%s","clean_tree":true,"phase":"signed","profile":"no-docker","overall":"PASS","steps":[],"skipped_steps":[],"artifact":null,"el1":null,"probe_diffs":[],"cleanup_counts":[],"host_load":{"allow_load":false,"generators":[]},"failures":[],"fixture_bundle":null}\n' "$(git rev-parse HEAD)" > "$receipt_path"
+    [ "$FIXTURE_TEST_INVALID_RECEIPT" != 1 ] || printf '{}' > "$receipt_path"
     printf '%s\n' '==================== ACCEPT GATE SUMMARY ====================' 'fixture preparation preflight passed (HVF acceptance replaced in this test)' '============================================================='
 else
     exec "$FIXTURE_TEST_JUST" --justfile "$FIXTURE_TEST_JUSTFILE" --working-directory "$PWD" "$@"
@@ -936,6 +952,7 @@ fi
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("../../justfile"),
             )
             .env("FIXTURE_TEST_CHECKOUT_LOCK", &self.lock)
+            .env("FIXTURE_TEST_ACCEPTED_DIR", self.scratch.path())
             .env(
                 "FIXTURE_TEST_ACCEPTED",
                 self.scratch.path().join("accepted"),
@@ -1289,6 +1306,20 @@ fn fixture_preparation_lease_preserves_shell_argument_boundaries() {
 
 #[test]
 fn remote_accept_cli_transfers_the_bundle_and_prepares_a_fresh_checkout() {
+    check_remote_accept_cli(false, false);
+}
+
+#[test]
+fn remote_accept_cli_attach_recovers_remote_bundle_provenance() {
+    check_remote_accept_cli(true, false);
+}
+
+#[test]
+fn remote_accept_cli_propagates_receipt_annotation_failure() {
+    check_remote_accept_cli(false, true);
+}
+
+fn check_remote_accept_cli(remote_bundle: bool, invalid_receipt: bool) {
     let f = Fixture::new();
     let mut p = Preparation::new(&f);
     let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
@@ -1346,9 +1377,30 @@ exec sh -c "$script"
 "#,
     );
     fs::set_permissions(p.bin.join("ssh"), fs::Permissions::from_mode(0o755)).unwrap();
-    let out = p
-        .command(env!("CARGO_BIN_EXE_carrick-xtask"))
-        .arg("--root")
+    let real_rsync = Command::new("sh")
+        .args(["-c", "command -v rsync"])
+        .output()
+        .unwrap();
+    write(
+        &p.bin,
+        "rsync",
+        br#"#!/bin/sh
+if [ "$FIXTURE_TEST_INTERRUPT_FETCH" = 1 ]; then
+    for arg in "$@"; do
+        case "$arg" in *:*/target/el1-gate/*) exit 94 ;; esac
+    done
+fi
+exec "$FIXTURE_TEST_RSYNC" "$@"
+"#,
+    );
+    fs::set_permissions(p.bin.join("rsync"), fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cli = p.command(env!("CARGO_BIN_EXE_carrick-xtask"));
+    cli.env("FIXTURE_TEST_REQUIRE_PROVENANCE", "1");
+    cli.env(
+        "FIXTURE_TEST_RSYNC",
+        String::from_utf8_lossy(&real_rsync.stdout).trim(),
+    );
+    cli.arg("--root")
         .arg(f.repo.path())
         .args([
             "remote-accept",
@@ -1360,14 +1412,99 @@ exec sh -c "$script"
             "fixture-test-local",
         ])
         .arg("--remote-root")
-        .arg(&remote)
-        .output()
-        .unwrap();
+        .arg(&remote);
+    if remote_bundle {
+        cli.arg("--remote-bundle").arg(&p.archive);
+    }
+    if invalid_receipt {
+        cli.env("FIXTURE_TEST_INVALID_RECEIPT", "1");
+    }
+    let out = cli.output().unwrap();
+    if invalid_receipt {
+        assert!(
+            !out.status.success(),
+            "annotation failure returned zero: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
     assert!(
         out.status.success(),
         "normal remote preparation failed:\n{}\n{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    let run_id = fs::read_dir(remote.join("gate-runs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    let local_receipt =
+        carrick_xtask::remote_accept::local_receipt_path(f.repo.path(), run_id.to_str().unwrap());
+    let mut receipt: serde_json::Value =
+        serde_json::from_slice(&fs::read(&local_receipt).unwrap()).unwrap();
+    let provenance = receipt["fixture_bundle"].clone();
+    assert!(!provenance.is_null(), "fresh run lacks verified provenance");
+    receipt["fixture_bundle"] = serde_json::Value::Null;
+    fs::write(&local_receipt, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    let interrupted = p
+        .command(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .env(
+            "FIXTURE_TEST_RSYNC",
+            String::from_utf8_lossy(&real_rsync.stdout).trim(),
+        )
+        .env("FIXTURE_TEST_INTERRUPT_FETCH", "1")
+        .arg("--root")
+        .arg(f.repo.path())
+        .args(["remote-accept", "--host", "fixture-test-local", "--attach"])
+        .arg(&run_id)
+        .arg("--remote-root")
+        .arg(&remote)
+        .output()
+        .unwrap();
+    assert!(
+        !interrupted.status.success(),
+        "interrupted fetch returned zero"
+    );
+    fs::remove_dir_all(local_receipt.parent().unwrap()).unwrap();
+    // A later run may reuse the same worktree and SHA. Attach must recover
+    // this run's receipt, rather than pairing its provenance with a new gate.
+    let worktree_receipt = p
+        .checkout
+        .join("target/el1-gate")
+        .join(git(&p.checkout, &["rev-parse", "--short", "HEAD"]))
+        .join("receipt.json");
+    receipt["timestamp"] = serde_json::json!("another-run");
+    fs::write(worktree_receipt, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    let attach = p
+        .command(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .env(
+            "FIXTURE_TEST_RSYNC",
+            String::from_utf8_lossy(&real_rsync.stdout).trim(),
+        )
+        .arg("--root")
+        .arg(f.repo.path())
+        .args(["remote-accept", "--host", "fixture-test-local", "--attach"])
+        .arg(&run_id)
+        .arg("--remote-root")
+        .arg(&remote)
+        .output()
+        .unwrap();
+    assert!(
+        attach.status.success(),
+        "attach failed: {}",
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    let attached: serde_json::Value =
+        serde_json::from_slice(&fs::read(&local_receipt).unwrap()).unwrap();
+    assert_eq!(
+        attached["fixture_bundle"], provenance,
+        "attach lost run provenance"
+    );
+    assert_eq!(
+        attached["timestamp"], "test",
+        "attach fetched another run's receipt"
     );
     carrick_xtask::accept::verify_signed_fixtures(&p.checkout).unwrap();
     assert!(
@@ -1476,4 +1613,183 @@ fn signed_preparation_requires_a_bundle_and_checkout_admission() {
     assert_ne!(exit, "0");
     assert!(!p.checkout.join(fixtures::INSTALLED_MANIFEST).exists());
     assert!(!p.scratch.path().join("accepted").exists());
+}
+
+#[test]
+fn remote_preparation_rejects_unpublished_or_linked_archives() {
+    for case in ["symlink", "parent-symlink", "partial", "directory"] {
+        let f = Fixture::new();
+        let p = Preparation::new(&f);
+        p.setup(&f);
+        let input = p.scratch.path().join(if case == "partial" {
+            "bundle.partial-upload.tar.gz"
+        } else {
+            "input"
+        });
+        match case {
+            "symlink" => std::os::unix::fs::symlink(&p.archive, &input).unwrap(),
+            "parent-symlink" => std::os::unix::fs::symlink(p.scratch.path(), &input).unwrap(),
+            "partial" => {
+                fs::copy(&p.archive, &input).unwrap();
+            }
+            "directory" => fs::create_dir(&input).unwrap(),
+            _ => unreachable!(),
+        }
+        let input = if case == "parent-symlink" {
+            input.join("fixtures.tar.gz")
+        } else {
+            input
+        };
+        let (exit, log) = p.remote_job_with_bundle(Some(
+            carrick_xtask::remote_accept::FixtureBundle::remote(input.to_str().unwrap()),
+        ));
+        assert_ne!(exit, "0", "{case} admitted: {log}");
+        assert!(!p.scratch.path().join("accepted").exists());
+        assert!(!p.scratch.path().join("fixture-bundle.json").exists());
+    }
+}
+
+fn check_gzip_transport(case: &str) {
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    let mut bytes = fs::read(&p.archive).unwrap();
+    let n = bytes.len();
+    match case {
+        "trailer" => bytes.truncate(n - 8),
+        "crc" => bytes[n - 8] ^= 1,
+        "length" => bytes[n - 4] ^= 1,
+        "garbage" => bytes.extend_from_slice(b"trailing garbage"),
+        _ => unreachable!(),
+    }
+    fs::write(&p.archive, bytes).unwrap();
+    let out = p
+        .command(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .current_dir(&p.checkout)
+        .args(["fixtures", "verify", "--bundle"])
+        .arg(&p.archive)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "{case} verified: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let (exit, log) = p.remote_job_with_bundle(Some(
+        carrick_xtask::remote_accept::FixtureBundle::remote(p.archive.to_str().unwrap()),
+    ));
+    assert_ne!(exit, "0", "{case} admitted: {log}");
+    assert!(!p.checkout.join(fixtures::INSTALLED_MANIFEST).exists());
+}
+
+#[test]
+fn fixture_verification_rejects_truncated_trailer() {
+    check_gzip_transport("trailer");
+}
+#[test]
+fn fixture_verification_rejects_corrupted_crc() {
+    check_gzip_transport("crc");
+}
+#[test]
+fn fixture_verification_rejects_corrupted_length() {
+    check_gzip_transport("length");
+}
+#[test]
+fn fixture_verification_rejects_trailing_garbage() {
+    check_gzip_transport("garbage");
+}
+
+#[test]
+fn remote_preparation_persists_verified_provenance_for_both_sources() {
+    for remote in [false, true] {
+        let f = Fixture::new();
+        let p = Preparation::new(&f);
+        p.setup(&f);
+        let bundle = if remote {
+            carrick_xtask::remote_accept::FixtureBundle::remote(p.archive.to_str().unwrap())
+        } else {
+            carrick_xtask::remote_accept::FixtureBundle::local(p.archive.to_str().unwrap())
+        };
+        let (exit, log) = p.remote_job_with_bundle(Some(bundle));
+        assert_eq!(exit, "0", "{log}");
+        let value: serde_json::Value = serde_json::from_slice(
+            &fs::read(p.scratch.path().join("fixture-bundle.json"))
+                .expect("run provenance missing"),
+        )
+        .unwrap();
+        assert_eq!(value["source"], if remote { "remote" } else { "local" });
+        assert_eq!(value["path"], p.archive.to_str().unwrap());
+        let captured = value["captured_path"].as_str().unwrap();
+        assert_ne!(captured, p.archive.to_str().unwrap());
+        assert_eq!(fs::read(captured).unwrap(), fs::read(&p.archive).unwrap());
+        assert_eq!(
+            value["archive_sha256"],
+            format!("{:x}", Sha256::digest(fs::read(captured).unwrap()))
+        );
+    }
+}
+
+#[test]
+fn replacing_shared_archive_after_verification_restores_captured_bytes() {
+    let mut f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    let original = fs::read(f.object()).unwrap();
+    let original_archive = fs::read(&p.archive).unwrap();
+    let provenance = carrick_xtask::remote_accept::capture_fixture_bundle(
+        &p.checkout,
+        &p.archive,
+        p.scratch.path(),
+        carrick_xtask::remote_accept::FixtureBundleSource::Remote,
+    )
+    .unwrap();
+    let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
+    let identity = provenance.identity;
+    let captured_path = PathBuf::from(provenance.captured_path);
+    let captured_sha = provenance.archive_sha256;
+
+    let replacement = elf(f.manifest.executables[0].target, 240);
+    let digest = hash(&replacement);
+    let object_name: String = digest.clone().into();
+    write(
+        f.store.path(),
+        &format!("objects/{object_name}"),
+        &replacement,
+    );
+    fs::set_permissions(
+        f.store.path().join("objects").join(&object_name),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    f.manifest.executables[0].sha256 = digest;
+    f.republish();
+    let output = tempfile::tempdir().unwrap();
+    let second = fixtures::archive::pack(&f.path, output.path()).unwrap();
+    assert_ne!(
+        fixtures::archive::verify(&second, &sha).unwrap().1,
+        identity
+    );
+    fs::rename(second, &p.archive).unwrap();
+    assert_ne!(fs::read(&p.archive).unwrap(), original_archive);
+    fixtures::archive::restore(&p.checkout, &captured_path, None).unwrap();
+    assert_eq!(
+        fs::read(p.checkout.join(&f.manifest.executables[0].path)).unwrap(),
+        original
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(fs::read(&captured_path).unwrap())),
+        captured_sha
+    );
+}
+
+#[test]
+fn remote_preparation_provenance_write_failure_stops_acceptance() {
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    fs::create_dir(p.scratch.path().join("fixture-bundle.json")).unwrap();
+    let (exit, log) = p.remote_job();
+    assert_ne!(exit, "0", "provenance write failure ignored: {log}");
+    assert!(!p.scratch.path().join("accepted").exists());
+    assert!(!p.checkout.join(fixtures::INSTALLED_MANIFEST).exists());
 }

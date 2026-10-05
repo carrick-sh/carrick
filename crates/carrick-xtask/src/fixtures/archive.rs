@@ -5,7 +5,7 @@ use super::{
 use flate2::{Compression, read::MultiGzDecoder, write::GzEncoder};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
@@ -115,6 +115,19 @@ fn unpack(bundle: &Path) -> Result<Unpacked> {
         fs::set_permissions(&target, fs::Permissions::from_mode(mode))?;
         if parts.len() == 2 {
             manifest = Some(target);
+        }
+    }
+    // Tar iteration stops at its end marker. Reading the decoder to EOF
+    // validates every gzip member's CRC/length and rejects transport garbage.
+    let mut gzip = archive.into_inner();
+    let mut padding = [0; 8192];
+    loop {
+        let count = gzip.read(&mut padding)?;
+        if count == 0 {
+            break;
+        }
+        if padding[..count].iter().any(|byte| *byte != 0) {
+            return Err(fail("trailing fixture archive content"));
         }
     }
     Ok(Unpacked {

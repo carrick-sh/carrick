@@ -96,3 +96,20 @@ fn fixtures_verify_rejects_conflicting_manifest_and_bundle() {
     ])
     .unwrap_err();
 }
+
+#[test]
+fn remote_accept_rejects_bundle_arguments_on_attach() {
+    for flag in ["--remote-bundle", "--fixture-manifest"] {
+        assert!(
+            carrick_xtask::cli::Cli::try_parse_from([
+                "carrick-xtask",
+                "remote-accept",
+                "--attach",
+                "0123456789ab-20261005-120000",
+                flag,
+                "/unverified/bundle",
+            ])
+            .is_err()
+        );
+    }
+}

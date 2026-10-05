@@ -49,14 +49,14 @@ pub struct RemoteAcceptArgs {
     #[arg(
         long,
         help = "Exact-SHA fixture manifest (default: unique local target/fixtures/bundles/<sha> bundle)",
-        conflicts_with = "remote_bundle"
+        conflicts_with_all = ["remote_bundle", "attach"]
     )]
     pub fixture_manifest: Option<PathBuf>,
 
     #[arg(
         long,
         help = "Path to exact-SHA fixture bundle already present on gate host",
-        conflicts_with = "fixture_manifest"
+        conflicts_with_all = ["fixture_manifest", "attach"]
     )]
     pub remote_bundle: Option<String>,
 }
@@ -282,26 +282,23 @@ pub fn build_accept_job_script(
     let q_exit = shell_quote(exit_file);
     let q_exit_tmp = shell_quote(&format!("{exit_file}.tmp"));
     let q_lock = shell_quote(lock_dir);
+    let run_dir = Path::new(exit_file).parent().unwrap_or(Path::new("."));
+    let q_receipt = shell_quote(&run_dir.join("receipt.json").to_string_lossy());
     let command = if phase == AcceptPhase::Host {
-        format!("just accept --phase {phase}")
+        format!("just accept --phase {phase} --receipt {q_receipt}")
     } else {
         let bundle = fixture_bundle.ok_or(RemoteAcceptError::MissingFixtureBundle)?;
         // One gate lease spans restoration/verification, accept and scoped guest cleanup.
         // The checkout lock is already held and remains held until job exit.
-        let preparation = match bundle {
-            FixtureBundle::Local(b) => {
-                format!(
-                    "test -d {q_lock} && just fixtures-restore {} && just accept --phase {phase}",
-                    shell_quote(&b)
-                )
-            }
-            FixtureBundle::Remote(b) => {
-                let q_bundle = shell_quote(&b);
-                format!(
-                    "test -d {q_lock} && just fixtures-verify {q_bundle} && just fixtures-restore {q_bundle} && just accept --phase {phase}"
-                )
-            }
+        let source = match &bundle {
+            FixtureBundle::Local(_) => "local",
+            FixtureBundle::Remote(_) => "remote",
         };
+        let preparation = format!(
+            "test -d {q_lock} && cargo run --locked -p carrick-xtask -- fixtures prepare --bundle {} --run-dir {} --source {source} && just accept --phase {phase} --receipt {q_receipt}",
+            shell_quote(bundle.path()),
+            shell_quote(&run_dir.to_string_lossy()),
+        );
         format!("just lease gate sh -c {}", shell_quote(&preparation))
     };
     Ok(format!(
@@ -585,16 +582,10 @@ fn copy_fixture_bundle(
     run_dir: &str,
     sha: &str,
     manifest: Option<&Path>,
-) -> Result<(String, String, String), RemoteAcceptError> {
+) -> Result<String, RemoteAcceptError> {
     let manifest = crate::fixtures::resolve_bundle(local_root, sha, manifest)?;
     let artifact =
         crate::fixtures::archive::pack(&manifest, &local_root.join("target/fixtures/published"))?;
-    let (_verified_manifest, identity) = crate::fixtures::archive::verify(&artifact, sha)?;
-    let archive_sha256 =
-        crate::provision::compute_sha256(&artifact).map_err(|e| RemoteAcceptError::Io {
-            path: artifact.clone(),
-            source: e,
-        })?;
     let destination = format!("{run_dir}/fixtures");
     run_ssh_command(host, &format!("mkdir -p {}", shell_quote(&destination)))?;
     let filename = artifact
@@ -608,24 +599,105 @@ fn copy_fixture_bundle(
         rsync_args(&artifact.to_string_lossy(), &remote_spec),
         None,
     )?;
-    Ok((remote_artifact, identity, archive_sha256))
+    Ok(remote_artifact)
 }
 
-pub fn parse_remote_bundle_verification(log: &str) -> Option<(String, String)> {
-    for line in log.lines().rev() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("fixtures: verified ") {
-            let identity_part = trimmed.split("identity=").nth(1)?;
-            let mut parts = identity_part.split_whitespace();
-            let identity = parts.next()?;
-            let sha_part = trimmed.split("archive_sha256=").nth(1)?;
-            let archive_sha256 = sha_part.split_whitespace().next()?;
-            if !identity.is_empty() && !archive_sha256.is_empty() {
-                return Some((identity.to_string(), archive_sha256.to_string()));
-            }
-        }
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+pub enum FixtureBundleSource {
+    Local,
+    Remote,
+}
+
+/// Walk directory descriptors so neither a final nor an intermediate symlink
+/// can redirect admission. Nonblocking open avoids waiting on a FIFO before
+/// fstat can reject it; only a regular file can be copied.
+fn open_bundle_source(path: &Path) -> Result<fs::File, crate::fixtures::FixturesError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let parts: Vec<_> = path
+        .components()
+        .filter(|part| !matches!(part, Component::RootDir | Component::CurDir))
+        .collect();
+    if parts.is_empty() {
+        return Err(crate::fixtures::FixturesError::Invalid(
+            "empty archive path".to_string(),
+        ));
     }
-    None
+    let mut file = fs::File::open(if path.is_absolute() { "/" } else { "." })?;
+    for (index, part) in parts.iter().enumerate() {
+        let Component::Normal(name) = part else {
+            return Err(crate::fixtures::FixturesError::Invalid(
+                "unsafe archive source path".to_string(),
+            ));
+        };
+        if name.to_string_lossy().contains(".partial-") {
+            return Err(crate::fixtures::FixturesError::Invalid(
+                "unfinished archive publication".to_string(),
+            ));
+        }
+        let name = CString::new(name.as_bytes()).map_err(|_| {
+            crate::fixtures::FixturesError::Invalid("invalid archive source path".to_string())
+        })?;
+        let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
+        if index + 1 < parts.len() {
+            flags |= libc::O_DIRECTORY;
+        }
+        // SAFETY: the live directory descriptor and NUL-terminated component
+        // remain valid for this call. O_CREAT is absent, so no mode is needed.
+        let fd = unsafe { libc::openat(file.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        // SAFETY: openat returned a new owned descriptor, transferred once.
+        file = unsafe { fs::File::from_raw_fd(fd) };
+    }
+    if !file.metadata()?.is_file() {
+        return Err(crate::fixtures::FixturesError::Invalid(
+            "fixture archive source is not a regular file".to_string(),
+        ));
+    }
+    Ok(file)
+}
+
+/// One private capture drives verification, hashing, restore and provenance.
+/// This runs on the gate host for uploads as well as shared-store bundles.
+pub fn capture_fixture_bundle(
+    root: &Path,
+    bundle: &Path,
+    run_dir: &Path,
+    source: FixtureBundleSource,
+) -> Result<crate::accept::FixtureBundleReceipt, crate::fixtures::FixturesError> {
+    let mut input = open_bundle_source(bundle)?;
+    let directory = run_dir.join("fixtures");
+    fs::create_dir_all(&directory)?;
+    let mut captured = tempfile::NamedTempFile::new_in(&directory)?;
+    io::copy(&mut input, captured.as_file_mut())?;
+    let expected = crate::fixtures::expected_head(root, None)?;
+    let (_, identity) = crate::fixtures::archive::verify(captured.path(), &String::from(expected))?;
+    let archive_sha256 = crate::provision::compute_sha256(captured.path())?;
+    let captured_path = directory.join("captured.tar.gz");
+    captured
+        .persist_noclobber(&captured_path)
+        .map_err(|e| e.error)?;
+    let provenance = crate::accept::FixtureBundleReceipt {
+        source: match source {
+            FixtureBundleSource::Local => "local",
+            FixtureBundleSource::Remote => "remote",
+        }
+        .to_string(),
+        path: bundle.to_string_lossy().into_owned(),
+        captured_path: captured_path.to_string_lossy().into_owned(),
+        identity,
+        archive_sha256,
+    };
+    crate::atomic_file::write(
+        &run_dir.join("fixture-bundle.json"),
+        &serde_json::to_vec_pretty(&provenance)?,
+    )?;
+    Ok(provenance)
 }
 
 pub fn record_bundle_in_receipt(
@@ -641,23 +713,11 @@ pub fn record_bundle_in_receipt(
     receipt.fixture_bundle = Some(bundle_receipt.clone());
     let serialized = serde_json::to_vec_pretty(&receipt)
         .map_err(|e| RemoteAcceptError::Receipt(e.to_string()))?;
-    fs::write(receipt_path, serialized).map_err(|e| RemoteAcceptError::Io {
+    crate::atomic_file::write(receipt_path, &serialized).map_err(|e| RemoteAcceptError::Io {
         path: receipt_path.to_path_buf(),
         source: e,
     })?;
     Ok(())
-}
-
-fn record_bundle_if_receipt_present(
-    local_receipt: &Path,
-    receipt_entry: &crate::accept::FixtureBundleReceipt,
-) {
-    if !local_receipt.is_file() {
-        return;
-    }
-    if let Err(e) = record_bundle_in_receipt(local_receipt, receipt_entry) {
-        eprintln!("Warning: failed to record fixture bundle in receipt: {e}");
-    }
 }
 
 pub(crate) fn check_remote_disk_space(
@@ -748,17 +808,6 @@ pub(crate) fn build_worktree_clean_check_cmd(worktree: &str) -> String {
     format!("if [ -d {q_wt} ]; then git -C {q_wt} status --porcelain --untracked-files=all; fi")
 }
 
-enum BundleTracking {
-    Local {
-        remote_artifact: String,
-        identity: String,
-        archive_sha256: String,
-    },
-    Remote {
-        path: String,
-    },
-}
-
 pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, RemoteAcceptError> {
     let local_root = match root_opt {
         Some(r) => r.to_path_buf(),
@@ -779,14 +828,10 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         .to_string_lossy()
         .to_string();
 
-    let (run_id, sha12, bundle_tracking) = if let Some(existing_run_id) = &args.attach {
+    let (run_id, sha12) = if let Some(existing_run_id) = &args.attach {
         let (parsed_sha, _) = parse_run_id(existing_run_id)?;
         println!("Attaching to remote run: {existing_run_id}");
-        let tracking = args
-            .remote_bundle
-            .as_ref()
-            .map(|path| BundleTracking::Remote { path: path.clone() });
-        (existing_run_id.clone(), parsed_sha.to_string(), tracking)
+        (existing_run_id.clone(), parsed_sha.to_string())
     } else {
         // Step 1: Resolve the ref to a full SHA locally. Refuse if local tracked tree is dirty AND ref is HEAD.
         let full_sha_out =
@@ -827,33 +872,21 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         )?;
 
         let run_dir = format!("{remote_root}/gate-runs/{run_id}");
-        let (bundle, bundle_tracking) = if args.phase == AcceptPhase::Host {
-            (None, None)
+        let bundle = if args.phase == AcceptPhase::Host {
+            None
         } else if let Some(remote_bundle_path) = &args.remote_bundle {
             println!("Using remote fixture bundle on {host}: {remote_bundle_path}...");
-            (
-                Some(FixtureBundle::Remote(remote_bundle_path.clone())),
-                Some(BundleTracking::Remote {
-                    path: remote_bundle_path.clone(),
-                }),
-            )
+            Some(FixtureBundle::Remote(remote_bundle_path.clone()))
         } else {
             println!("Transferring exact-SHA fixture bundle...");
-            let (remote_artifact, identity, archive_sha256) = copy_fixture_bundle(
+            let remote_artifact = copy_fixture_bundle(
                 &local_root,
                 &host,
                 &run_dir,
                 &full_sha,
                 args.fixture_manifest.as_deref(),
             )?;
-            (
-                Some(FixtureBundle::Local(remote_artifact.clone())),
-                Some(BundleTracking::Local {
-                    remote_artifact,
-                    identity,
-                    archive_sha256,
-                }),
-            )
+            Some(FixtureBundle::Local(remote_artifact))
         };
 
         // Step 4: Start detached accept gate on remote
@@ -878,7 +911,7 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         // Disarm the local guard so it never removes the lock on drop.
         lock_guard.disarm();
 
-        (run_id, sha12, bundle_tracking)
+        (run_id, sha12)
     };
 
     let gate_runs_dir = format!("{remote_root}/gate-runs");
@@ -945,11 +978,19 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
     let remote_log_spec = rsync_remote_spec(&host, &remote_log_src)?;
     let local_log_dest = local_dest.join("accept.log");
 
-    // Attempt both transfers so a missing receipt still lets us fetch the log.
+    // Attempt all transfers so a missing receipt still lets us fetch the log.
     // Report every failure before reading local files, which may be stale on attach.
     let mut fetch_errors = Vec::new();
     for (label, source, destination) in [
-        ("receipt", remote_receipt_spec, local_receipt_dest),
+        ("gate logs", remote_receipt_spec, local_receipt_dest),
+        (
+            "receipt",
+            rsync_remote_spec(&host, &format!("{remote_run_dir_path}/receipt.json"))?,
+            local_dest
+                .join("receipt.json")
+                .to_string_lossy()
+                .into_owned(),
+        ),
         (
             "accept.log",
             remote_log_spec,
@@ -1001,45 +1042,34 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         exit_code = 1;
     }
 
-    if let Some(tracking) = bundle_tracking {
-        match tracking {
-            BundleTracking::Local {
-                remote_artifact,
-                identity,
-                archive_sha256,
-            } => {
-                let receipt_entry = crate::accept::FixtureBundleReceipt {
-                    source: "local".to_string(),
-                    path: remote_artifact,
-                    identity,
-                    archive_sha256,
-                };
-                record_bundle_if_receipt_present(&local_receipt, &receipt_entry);
-            }
-            BundleTracking::Remote { path } => {
-                if let Ok(log) = &log_read_result {
-                    if let Some((identity, archive_sha256)) = parse_remote_bundle_verification(log)
-                    {
-                        let receipt_entry = crate::accept::FixtureBundleReceipt {
-                            source: "remote".to_string(),
-                            path,
-                            identity,
-                            archive_sha256,
-                        };
-                        record_bundle_if_receipt_present(&local_receipt, &receipt_entry);
-                    } else {
-                        eprintln!("Error: remote bundle verification missing in accept.log");
-                        if exit_code == 0 {
-                            exit_code = 1;
-                        }
-                    }
-                } else {
-                    eprintln!("Error: could not read accept.log to verify remote bundle");
-                    if exit_code == 0 {
-                        exit_code = 1;
-                    }
+    // Provenance belongs to the remote run, including after interrupted polling.
+    // Never infer it from the attaching caller's arguments or the human log.
+    let provenance_path = format!("{remote_run_dir_path}/fixture-bundle.json");
+    let provenance_json = run_ssh_command(
+        &host,
+        &format!(
+            "if [ -f {0} ]; then cat {0}; fi",
+            shell_quote(&provenance_path),
+        ),
+    )?;
+    if !provenance_json.trim().is_empty() {
+        let provenance: crate::accept::FixtureBundleReceipt =
+            serde_json::from_str(&provenance_json)
+                .map_err(|e| RemoteAcceptError::Receipt(e.to_string()))?;
+        record_bundle_in_receipt(&local_receipt, &provenance)?;
+    } else if exit_code == 0 {
+        let receipt: crate::accept::AcceptReceipt =
+            serde_json::from_slice(&fs::read(&local_receipt).map_err(|source| {
+                RemoteAcceptError::Io {
+                    path: local_receipt.clone(),
+                    source,
                 }
-            }
+            })?)
+            .map_err(|e| RemoteAcceptError::Receipt(e.to_string()))?;
+        if receipt.phase != "host" {
+            return Err(RemoteAcceptError::Receipt(
+                "verified run bundle provenance is missing".to_string(),
+            ));
         }
     }
 
@@ -1478,56 +1508,24 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
         .unwrap();
 
         let q_bundle_escaped = shell_quote(remote_bundle_path).replace('\'', "'\\''");
-        let expected_verify = format!("just fixtures-verify {q_bundle_escaped}");
-        let expected_restore = format!("just fixtures-restore {q_bundle_escaped}");
-
-        assert!(script.contains(&expected_verify));
-        assert!(script.contains(&expected_restore));
-        assert!(script.contains("just accept --phase signed"));
-
-        let verify_idx = script.find(&expected_verify).expect("verify in script");
-        let restore_idx = script.find(&expected_restore).expect("restore in script");
+        assert!(script.contains(&format!("fixtures prepare --bundle {q_bundle_escaped}")));
+        assert!(script.contains("--source remote"));
+        assert!(script.contains("--run-dir"));
         assert!(
-            verify_idx < restore_idx,
-            "fixtures-verify must occur before fixtures-restore"
+            script.find("fixtures prepare").unwrap()
+                < script.find("just accept --phase signed").unwrap()
         );
-
-        // Local bundle must NOT run fixtures-verify on the remote host
         let local_script = build_accept_job_script(
             worktree,
             AcceptPhase::Signed,
             log_file,
             exit_file,
             lock_dir,
-            Some(FixtureBundle::local("/Volumes/carrick/local.tar.gz")),
+            Some(FixtureBundle::local("/local.tar.gz")),
         )
         .unwrap();
-
-        assert!(!local_script.contains("just fixtures-verify"));
-        let local_escaped = shell_quote("/Volumes/carrick/local.tar.gz").replace('\'', "'\\''");
-        assert!(local_script.contains(&format!("just fixtures-restore {local_escaped}")));
-    }
-
-    #[test]
-    fn test_parse_remote_bundle_verification() {
-        let sample_log = r#"
-just fixtures-verify '/Volumes/carrick-build/fixtures/published/sha/identity.tar.gz'
-fixtures: verified 14 executables for 51bfe67f40123456789abcdef0123456789abcdef; identity=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 archive_sha256=ca978112ca1bbdccafac231b39a23dc4da786eff8147c4e72b9807785afee48b
-just fixtures-restore '/Volumes/carrick-build/fixtures/published/sha/identity.tar.gz'
-just accept --phase signed
-"#;
-        let (identity, archive_sha) =
-            parse_remote_bundle_verification(sample_log).expect("parse remote bundle verification");
-        assert_eq!(
-            identity,
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            archive_sha,
-            "ca978112ca1bbdccafac231b39a23dc4da786eff8147c4e72b9807785afee48b"
-        );
-
-        assert!(parse_remote_bundle_verification("no fixtures line here").is_none());
+        assert!(local_script.contains("fixtures prepare --bundle"));
+        assert!(local_script.contains("--source local"));
     }
 
     #[test]
@@ -1561,13 +1559,21 @@ just accept --phase signed
         let remote_bundle_receipt = crate::accept::FixtureBundleReceipt {
             source: "remote".to_string(),
             path: "/Volumes/carrick-build/fixtures/published/sha/identity.tar.gz".to_string(),
+            captured_path: "/gate-runs/123/fixtures/captured.tar.gz".to_string(),
             identity: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
                 .to_string(),
             archive_sha256: "ca978112ca1bbdccafac231b39a23dc4da786eff8147c4e72b9807785afee48b"
                 .to_string(),
         };
 
+        let opened_receipt = fs::File::open(&receipt_path).unwrap();
         record_bundle_in_receipt(&receipt_path, &remote_bundle_receipt).unwrap();
+        // Atomic publication leaves readers of the previous inode intact.
+        use std::os::unix::fs::MetadataExt;
+        assert_ne!(
+            opened_receipt.metadata().unwrap().ino(),
+            fs::metadata(&receipt_path).unwrap().ino()
+        );
 
         let updated_bytes = fs::read(&receipt_path).unwrap();
         let updated: crate::accept::AcceptReceipt = serde_json::from_slice(&updated_bytes).unwrap();
@@ -1577,6 +1583,7 @@ just accept --phase signed
         let local_bundle_receipt = crate::accept::FixtureBundleReceipt {
             source: "local".to_string(),
             path: "/Volumes/carrick/dev/gate-runs/123/fixtures/identity.tar.gz".to_string(),
+            captured_path: "/gate-runs/123/fixtures/captured.tar.gz".to_string(),
             identity: "1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
             archive_sha256: "2222222222222222222222222222222222222222222222222222222222222222"

@@ -222,6 +222,24 @@ produced distinct valid bundles for one SHA. Selection requires the requested
 commit's identity; there is no fallback to mutable local or remote probe
 directories. Host-only acceptance needs no guest fixtures.
 
+Use `--remote-bundle /absolute/gate-host/path/bundle.tar.gz` to consume a
+published archive already on the gate host instead of uploading a local
+manifest. Gate-host preparation opens each source path component without
+following symlinks, rejects non-regular files and `.partial-` publication
+names, and copies the admitted file into the run's private `fixtures`
+directory. Verification, SHA-256 hashing and restoration use only this
+capture. Archive verification reads the gzip stream through EOF, validating
+all member trailers and rejecting trailing garbage for local uploads too.
+
+Preparation atomically writes `gate-runs/<run-id>/fixture-bundle.json` after
+verification and before restoration. It records the source kind and path,
+captured path, manifest identity and archive SHA-256. Both fresh polling and
+`--attach <run-id>` read this gate-host provenance to annotate the fetched
+receipt. The gate also writes its receipt in the private run directory, so
+reattaching after worktree reuse cannot fetch another run's receipt. Attach
+rejects `--remote-bundle` and `--fixture-manifest`; the caller cannot attribute a run to an unverified path. Receipts publish by temporary
+file and rename, and annotation errors fail remote acceptance.
+
 Remote acceptance holds the checkout lock before acquiring one host gate lease
 across restore, signed acceptance and scoped guest cleanup. It reinstalls the
 complete bundle even on same-SHA reuse, so lost ignored outputs cannot be
