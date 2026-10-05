@@ -2168,4 +2168,34 @@ mod tests {
         assert!(owner.contains("pub fn request_lazy_frames("));
         assert!(!owner.contains("carrick_el1"));
     }
+    #[test]
+    fn residency_retirement_has_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let native =
+            fs::read_to_string(repo.join("crates/carrick-runtime/src/hvpatch/asid.rs")).unwrap();
+        assert!(!native.contains("struct ResidencyState"));
+        assert!(!native.contains("struct AsidResidency {"));
+        assert!(!native.contains("struct AsidLoad {"));
+        let owner =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/retirement.rs")).unwrap();
+        assert!(owner.contains("pub struct AddressResidency"));
+        assert!(owner.contains("pub fn wait_for_admitted_loads"));
+        assert!(!owner.contains("carrick_runtime"));
+        assert!(!owner.contains("carrick_el1"));
+    }
+    #[test]
+    fn root_retirement_receipt_has_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let native =
+            fs::read_to_string(repo.join("crates/carrick-runtime/src/hvpatch/stage1_mm.rs"))
+                .unwrap();
+        assert!(!native.contains("pub struct Stage1RootRetirementTicket"));
+        assert!(!native.contains("root_retirement_nonce:"));
+        assert!(!native.contains("root_ticket_issued:"));
+        let owner =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/retirement.rs")).unwrap();
+        assert!(owner.contains("pub struct RootQuarantine"));
+        assert!(owner.contains("pub fn complete_root"));
+        assert!(owner.contains("!self.is_complete()"));
+    }
 }
