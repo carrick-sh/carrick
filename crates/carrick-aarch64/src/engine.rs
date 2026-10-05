@@ -90,7 +90,10 @@ pub fn trace_el1_mapping_leafs(
     }
 }
 
-use crate::vmm::{Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, FrameCowWriteIntent};
+use crate::vmm::{
+    Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ExecStage1Replacement,
+    FrameCowWriteIntent,
+};
 
 /// HVPatch installs this scoped-ASID routine into the existing EL1 maintenance
 /// page's NOP tail. Other AArch64 backends do not invoke it until they install
@@ -1257,22 +1260,38 @@ fn seed_heap_unmapped(protections: &MemoryProtections) {
     }
 }
 
-/// Pure transition for replacing an engine's stage-1 page-table authority.
-/// When `page_tables` is shared (`Arc::strong_count > 1`, e.g. after a
-/// `CLONE_VM` / `vfork` before child's `execve`), the existing authority
-/// belongs to the other threads/processes. Taking its manager or retiring
-/// its extension arenas would strip the parent's live address space and
-/// arena source.
+/// Install the exec successor without modifying a backend-retained old MM.
+fn replace_page_tables_authority(
+    page_tables: &mut Stage1Authority,
+    replacement: ExecStage1Replacement,
+    mut retire_old: impl FnMut(&mut PageTableManager) -> Result<(), TrapError>,
+) -> Result<bool, TrapError> {
+    match replacement {
+        ExecStage1Replacement::Authority(successor) => page_tables
+            .install_exec_successor(successor)
+            .map_err(TrapError::Hypervisor),
+        ExecStage1Replacement::Image(manager) => {
+            let (successor, shared) =
+                page_tables.replace_for_exec_internal(|| Ok(manager), |old| retire_old(old))?;
+            *page_tables = successor;
+            Ok(shared)
+        }
+    }
+}
+
 #[cfg(test)]
-pub(crate) fn replace_page_tables_authority(
+fn replace_and_bind_page_tables_authority(
     page_tables: &mut Stage1Authority,
     manager: Option<PageTableManager>,
-    mut retire_old: impl FnMut(&mut PageTableManager) -> Result<(), TrapError>,
+    retire_old: impl FnMut(&mut PageTableManager) -> Result<(), TrapError>,
     mut bind_new: impl FnMut(Stage1Authority),
 ) -> Result<(), TrapError> {
-    let new_authority = page_tables.replace_for_exec(|| Ok(manager), |old| retire_old(old))?;
-    bind_new(new_authority.clone());
-    *page_tables = new_authority;
+    replace_page_tables_authority(
+        page_tables,
+        ExecStage1Replacement::Image(manager),
+        retire_old,
+    )?;
+    bind_new(page_tables.clone());
     Ok(())
 }
 
@@ -1448,14 +1467,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// shared (and therefore preserved for other siblings/parent).
     fn replace_page_tables(
         &mut self,
-        manager: Option<PageTableManager>,
+        replacement: ExecStage1Replacement,
     ) -> Result<bool, TrapError> {
-        let (new_authority, was_shared) = self.page_tables.replace_for_exec_internal(
-            || Ok(manager),
-            |old| self.vm.retire_stage1_extension_arenas(old),
-        )?;
-        self.vm.bind_stage1_page_tables(new_authority.clone());
-        self.page_tables = new_authority;
+        let was_shared =
+            replace_page_tables_authority(&mut self.page_tables, replacement, |old| {
+                self.vm.retire_stage1_extension_arenas(old)
+            })?;
+        self.vm.bind_stage1_page_tables(self.page_tables.clone());
         Ok(was_shared)
     }
 
@@ -4769,10 +4787,10 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         // path even after it execve's into a different image. The flag is a plain
         // field on `self`, untouched by the remap.
         self.vm.execve_rebuild(self.vcpu.get_mut(), new_image)?;
-        // `execve_rebuild` installed a fresh table image. Drop the manager for
-        // the old image before the hvpatch ASID configuration reserves its
-        // per-mm root-slot aperture in the NEW tables.
-        let was_shared = self.replace_page_tables(self.vm.exec_page_tables())?;
+        // Adopt the replacement's MM authority before reserving its aperture.
+        // A backend retaining detached predecessor cleanup keeps the old
+        // tables and publisher until that exact MM's retirement proof.
+        let was_shared = self.replace_page_tables(self.vm.exec_stage1_replacement())?;
         if let Some(expected) = expected_shared
             && expected != was_shared
         {
@@ -8161,7 +8179,7 @@ mod tests {
 
         let mut retired = false;
         let mut bound = false;
-        replace_page_tables_authority(
+        replace_and_bind_page_tables_authority(
             &mut child_authority,
             None,
             |_| {
@@ -8226,7 +8244,7 @@ mod tests {
         // Child 1 execs first
         let mut retired1 = false;
         let mut bound1 = false;
-        replace_page_tables_authority(
+        replace_and_bind_page_tables_authority(
             &mut child1_authority,
             None,
             |_| {
@@ -8264,7 +8282,7 @@ mod tests {
         // Child 2 execs second
         let mut retired2 = false;
         let mut bound2 = false;
-        replace_page_tables_authority(
+        replace_and_bind_page_tables_authority(
             &mut child2_authority,
             None,
             |_| {
@@ -8308,12 +8326,10 @@ mod tests {
         let mut engine = Stage1Authority::new_with_manager(Some(manager(old_root)));
         let pending_predecessor = engine.clone();
         let backend_successor = Stage1Authority::new_with_manager(Some(manager(new_root)));
-        let mut bound = None;
         replace_page_tables_authority(
             &mut engine,
-            backend_successor.snapshot_image(),
+            ExecStage1Replacement::Authority(backend_successor.clone()),
             |_| Ok(()),
-            |authority| bound = Some(authority),
         )
         .unwrap();
         assert_eq!(
@@ -8326,7 +8342,6 @@ mod tests {
             "engine must adopt the backend's exact successor MM authority"
         );
         assert!(!engine.shares_exact_authority(&pending_predecessor));
-        assert!(bound.unwrap().shares_exact_authority(&backend_successor));
     }
 
     #[test]
@@ -8354,7 +8369,7 @@ mod tests {
         // Even if external caller/runtime expected exclusive (disagreement),
         // replace_page_tables_authority drives through replace_for_exec where
         // vfork_shares > 0 guarantees the exclusive path is NOT taken.
-        replace_page_tables_authority(
+        replace_and_bind_page_tables_authority(
             &mut child_authority,
             None,
             |_| {
@@ -8399,7 +8414,7 @@ mod tests {
         assert!(authority.is_exclusive());
 
         let mut retired = false;
-        replace_page_tables_authority(
+        replace_and_bind_page_tables_authority(
             &mut authority,
             None,
             |_| {

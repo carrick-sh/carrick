@@ -2888,12 +2888,6 @@ impl HvfVmState {
         self.frame_inventory.lock().retirement_commit.take()
     }
 
-    pub(crate) fn page_tables_snapshot(
-        &self,
-    ) -> Option<carrick_mmu_core::aarch64::PageTableManager> {
-        self.page_tables_authority().snapshot_image()
-    }
-
     pub(crate) fn bind_stage1_page_tables(
         &mut self,
         page_tables: carrick_aarch64::Stage1Authority,
