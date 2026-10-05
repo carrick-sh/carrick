@@ -41,6 +41,9 @@ static ACKS: AtomicU32 = AtomicU32::new(0);
 static FAULTS: [AtomicU64; MAX_WORKERS] = [const { AtomicU64::new(0) }; MAX_WORKERS];
 static STALE: AtomicU64 = AtomicU64::new(0);
 static ERRORS: AtomicU64 = AtomicU64::new(0);
+// Deterministic witness: omit exactly one worker's acknowledgement of the
+// first read-only write probe. Its work still finishes; only the ack is lost.
+static OMIT_ACK: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 thread_local! {
     static WORKER: Cell<usize> = const { Cell::new(usize::MAX) };
@@ -173,6 +176,13 @@ fn spawn_worker(index: usize, cpu: u32) -> std::thread::JoinHandle<()> {
                     let _ = futex_wake(&ACKS, 1);
                     return;
                 }
+            }
+            if cmd == (2 << 8) | OP_WRITE_PROBE
+                && OMIT_ACK
+                    .compare_exchange(index, usize::MAX, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                continue;
             }
             ACKS.fetch_add(1, Ordering::SeqCst);
             let _ = futex_wake(&ACKS, 1);
@@ -388,7 +398,7 @@ pub(crate) fn edit_budget(exe: &str, rounds: usize, force_gap_allocation: bool) 
 }
 
 /// `tlb-stale-threads <rounds> <workers>`.
-pub(crate) fn stale_threads(rounds: usize, workers: usize) -> i32 {
+pub(crate) fn stale_threads(rounds: usize, workers: usize, omit_ack: bool) -> i32 {
     if rounds == 0 || rounds > 10_000 || workers == 0 || workers > MAX_WORKERS {
         println!("tlb-stale-threads invalid rounds={rounds} workers={workers}");
         return 1;
@@ -404,6 +414,9 @@ pub(crate) fn stale_threads(rounds: usize, workers: usize) -> i32 {
         return 1;
     }
     PROBE_PAGE.store(base, Ordering::SeqCst);
+    if omit_ack {
+        OMIT_ACK.store(workers - 1, Ordering::SeqCst);
+    }
     let handles: Vec<_> = (0..workers)
         .map(|index| spawn_worker(index, index as u32 + 1))
         .collect();

@@ -3402,6 +3402,7 @@ fn main() {
         "tlb-stale-threads" => tlb::stale_threads(
             args.get(2).and_then(|n| n.parse().ok()).unwrap_or(200),
             args.get(3).and_then(|n| n.parse().ok()).unwrap_or(2),
+            args.get(4).is_some_and(|arg| arg == "omit-first-write-ack"),
         ),
         "tlb-fork-stale" => {
             tlb::fork_stale(args.get(2).and_then(|n| n.parse().ok()).unwrap_or(50))
