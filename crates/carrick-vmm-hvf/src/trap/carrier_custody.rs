@@ -317,125 +317,13 @@ impl Drop for SetupVcpuGuard {
     }
 }
 
-/// Carrier-local identity for one installed Hypervisor.framework VM.
-///
-/// Generations are monotonically allocated by [`CarrierVmCustody`] and never
-/// reused inside that carrier, so a teardown retry cannot accidentally operate
-/// on a successor VM that happens to reuse the same stage-2 coordinates.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CarrierVmGeneration(pub(crate) u64);
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct CarrierStage2RecordId(pub(crate) u64);
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CarrierLogicalOwner {
-    pub(crate) id: u64,
-    pub(crate) generation: u64,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CarrierStage2RecordSpec {
-    pub(crate) vm_generation: CarrierVmGeneration,
-    pub(crate) ipa: u64,
-    pub(crate) len: usize,
-    pub(crate) host_addr: usize,
-    pub(crate) mapped: bool,
-    pub(crate) backend_map_installed: bool,
-    pub(crate) release_ipa: bool,
-    pub(crate) perms: u64,
-    pub(crate) logical_owner: Option<CarrierLogicalOwner>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CarrierStage2RecordIdentity {
-    pub(crate) record_id: CarrierStage2RecordId,
-    pub(crate) vm_generation: CarrierVmGeneration,
-    pub(crate) logical_owner: Option<CarrierLogicalOwner>,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // the real HV return adapter is wired in the next migration slice
-pub(crate) enum CarrierStage2BackendError {
-    HvReturn(u32),
-    ConcurrentRetirement,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CarrierStage2RetireOutcome {
-    RetiredUnmapped,
-    DeferredActivePins,
-    RetryPending(CarrierStage2BackendError),
-    TerminalizedByVmDestroy,
-    NotFound,
-    OwnerIdentityMismatch,
-    OwnerGenerationMismatch,
-    VmGenerationMismatch,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CarrierStage2RecordError {
-    InvalidExtent,
-    NoLiveVm,
-    VmGenerationMismatch,
-    RecordIdExhausted,
-    RecordNotFound,
-    RecordNotTerminal,
-    RecordIdentityMismatch,
-    ReleaseInFlight,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CarrierStage2PinError {
-    NotFound,
-    VmNotLive,
-    OwnerIdentityMismatch,
-    OwnerGenerationMismatch,
-    VmGenerationMismatch,
-    TerminalizedByVmDestroy,
-    NotMapped,
-    RetirementRequested,
-    PinCountExhausted,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CarrierStage2RecordSnapshot {
-    pub(crate) record_id: CarrierStage2RecordId,
-    pub(crate) vm_generation: CarrierVmGeneration,
-    pub(crate) ipa: u64,
-    pub(crate) len: usize,
-    pub(crate) host_addr: usize,
-    pub(crate) mapped: bool,
-    pub(crate) backend_map_installed: bool,
-    pub(crate) release_ipa: bool,
-    pub(crate) perms: u64,
-    pub(crate) logical_owner: Option<CarrierLogicalOwner>,
-    pub(crate) pin_count: u64,
-    pub(crate) retirement_requested: bool,
-    pub(crate) retry_eligible: bool,
-    pub(crate) retry_pending: Option<CarrierStage2BackendError>,
-    pub(crate) terminalized_by_vm_destroy: bool,
-    pub(crate) superseded_by_rebind: bool,
-    pub(crate) release_in_flight: bool,
-    pub(crate) release_retry_pending: bool,
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct CarrierStage2Record {
-    pub(crate) snapshot: CarrierStage2RecordSnapshot,
-    pub(crate) unmap_in_flight: bool,
-}
+pub(crate) use carrick_core::mm::retirement::{
+    CarrierLogicalOwner, CarrierStage2BackendError, CarrierStage2PinError, CarrierStage2Record,
+    CarrierStage2RecordError, CarrierStage2RecordId, CarrierStage2RecordIdentity,
+    CarrierStage2RecordSnapshot, CarrierStage2RecordSpec, CarrierStage2RetireOutcome,
+    CarrierVmGeneration,
+};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -860,13 +748,7 @@ impl CarrierVmCustody {
                     .values_mut()
                     .filter(|record| record.snapshot.vm_generation == generation)
                 {
-                    record.snapshot.mapped = false;
-                    record.snapshot.backend_map_installed = false;
-                    record.snapshot.retirement_requested = true;
-                    record.snapshot.retry_eligible = false;
-                    record.snapshot.retry_pending = None;
-                    record.snapshot.terminalized_by_vm_destroy = true;
-                    record.unmap_in_flight = false;
+                    carrick_core::mm::retirement::terminalize_record(record);
                 }
                 state.lifecycle = CarrierVmLifecycle::Vacant;
                 Ok(())
@@ -930,13 +812,7 @@ impl CarrierVmCustody {
                     .values_mut()
                     .filter(|record| record.snapshot.vm_generation == generation)
                 {
-                    record.snapshot.mapped = false;
-                    record.snapshot.backend_map_installed = false;
-                    record.snapshot.retirement_requested = true;
-                    record.snapshot.retry_eligible = false;
-                    record.snapshot.retry_pending = None;
-                    record.snapshot.terminalized_by_vm_destroy = true;
-                    record.unmap_in_flight = false;
+                    carrick_core::mm::retirement::terminalize_record(record);
                 }
                 if let CarrierFramePoolState::Active(pool) = std::mem::replace(
                     &mut *self.frame_pool.lock(),
@@ -1435,21 +1311,7 @@ impl CarrierVmCustody {
         record: &CarrierStage2Record,
         identity: CarrierStage2RecordIdentity,
     ) -> Option<CarrierStage2RetireOutcome> {
-        if record.snapshot.vm_generation != identity.vm_generation {
-            return Some(CarrierStage2RetireOutcome::VmGenerationMismatch);
-        }
-        match (record.snapshot.logical_owner, identity.logical_owner) {
-            (Some(expected), Some(actual)) if expected.id != actual.id => {
-                Some(CarrierStage2RetireOutcome::OwnerIdentityMismatch)
-            }
-            (Some(expected), Some(actual)) if expected.generation != actual.generation => {
-                Some(CarrierStage2RetireOutcome::OwnerGenerationMismatch)
-            }
-            (None, None) | (Some(_), Some(_)) => None,
-            (None, Some(_)) | (Some(_), None) => {
-                Some(CarrierStage2RetireOutcome::OwnerIdentityMismatch)
-            }
-        }
+        carrick_core::mm::retirement::record_identity_mismatch(record, identity)
     }
 
     pub(crate) fn pin_stage2_record(
@@ -1472,39 +1334,11 @@ impl CarrierVmCustody {
             .stage2_records
             .get_mut(&identity.record_id)
             .ok_or(CarrierStage2PinError::NotFound)?;
-        if let Some(mismatch) = Self::stage2_identity_mismatch(record, identity) {
-            return Err(match mismatch {
-                CarrierStage2RetireOutcome::VmGenerationMismatch => {
-                    CarrierStage2PinError::VmGenerationMismatch
-                }
-                CarrierStage2RetireOutcome::OwnerIdentityMismatch => {
-                    CarrierStage2PinError::OwnerIdentityMismatch
-                }
-                CarrierStage2RetireOutcome::OwnerGenerationMismatch => {
-                    CarrierStage2PinError::OwnerGenerationMismatch
-                }
-                _ => CarrierStage2PinError::NotFound,
-            });
-        }
-        if record.snapshot.terminalized_by_vm_destroy {
-            return Err(CarrierStage2PinError::TerminalizedByVmDestroy);
-        }
-        if record.snapshot.retirement_requested || record.unmap_in_flight {
-            return Err(CarrierStage2PinError::RetirementRequested);
-        }
-        if !record.snapshot.mapped {
-            return Err(CarrierStage2PinError::NotMapped);
-        }
-        record.snapshot.pin_count = record
-            .snapshot
-            .pin_count
-            .checked_add(1)
-            .ok_or(CarrierStage2PinError::PinCountExhausted)?;
-        Ok(CarrierStage2Pin {
-            custody: std::sync::Arc::clone(self),
+        carrick_core::mm::retirement::pin_record(
+            record,
             identity,
-            active: true,
-        })
+            CarrierPinVenue(std::sync::Arc::clone(self)),
+        )
     }
 
     pub(crate) fn request_stage2_record_retirement(
@@ -1515,15 +1349,7 @@ impl CarrierVmCustody {
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };
-        if let Some(mismatch) = Self::stage2_identity_mismatch(record, identity) {
-            return mismatch;
-        }
-        if record.snapshot.terminalized_by_vm_destroy {
-            return CarrierStage2RetireOutcome::TerminalizedByVmDestroy;
-        }
-        record.snapshot.retirement_requested = true;
-        record.snapshot.retry_eligible = record.snapshot.pin_count == 0;
-        CarrierStage2RetireOutcome::DeferredActivePins
+        carrick_core::mm::retirement::request_record_retirement(record, identity)
     }
 
     pub(crate) fn retire_stage2_record_using(
@@ -1536,36 +1362,12 @@ impl CarrierVmCustody {
             let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
                 return CarrierStage2RetireOutcome::NotFound;
             };
-            if let Some(mismatch) = Self::stage2_identity_mismatch(record, identity) {
-                return mismatch;
+            match carrick_core::mm::retirement::prepare_record_retirement(record, identity) {
+                carrick_core::mm::retirement::RecordRetirement::Complete(outcome) => {
+                    return outcome;
+                }
+                carrick_core::mm::retirement::RecordRetirement::Unmap { ipa, len } => (ipa, len),
             }
-            if record.snapshot.terminalized_by_vm_destroy {
-                return CarrierStage2RetireOutcome::TerminalizedByVmDestroy;
-            }
-            record.snapshot.retirement_requested = true;
-            if record.snapshot.pin_count != 0 {
-                record.snapshot.retry_eligible = false;
-                return CarrierStage2RetireOutcome::DeferredActivePins;
-            }
-            if !record.snapshot.mapped {
-                record.snapshot.retry_eligible = false;
-                record.snapshot.retry_pending = None;
-                return CarrierStage2RetireOutcome::RetiredUnmapped;
-            }
-            if record.unmap_in_flight {
-                return CarrierStage2RetireOutcome::RetryPending(
-                    CarrierStage2BackendError::ConcurrentRetirement,
-                );
-            }
-            if !record.snapshot.backend_map_installed {
-                record.snapshot.mapped = false;
-                record.snapshot.retry_eligible = false;
-                record.snapshot.retry_pending = None;
-                return CarrierStage2RetireOutcome::RetiredUnmapped;
-            }
-            record.unmap_in_flight = true;
-            record.snapshot.retry_eligible = false;
-            (record.snapshot.ipa, record.snapshot.len)
         };
 
         let backend_result = unmap(ipa, len);
@@ -1573,49 +1375,21 @@ impl CarrierVmCustody {
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return CarrierStage2RetireOutcome::NotFound;
         };
-        if let Some(mismatch) = Self::stage2_identity_mismatch(record, identity) {
-            return mismatch;
-        }
-        record.unmap_in_flight = false;
-        if record.snapshot.terminalized_by_vm_destroy {
-            return CarrierStage2RetireOutcome::TerminalizedByVmDestroy;
-        }
-        match backend_result {
-            Ok(()) => {
-                record.snapshot.mapped = false;
-                record.snapshot.backend_map_installed = false;
-                record.snapshot.retry_eligible = false;
-                record.snapshot.retry_pending = None;
-                CarrierStage2RetireOutcome::RetiredUnmapped
-            }
-            Err(error) => {
-                record.snapshot.retry_eligible = true;
-                record.snapshot.retry_pending = Some(error);
-                CarrierStage2RetireOutcome::RetryPending(error)
-            }
-        }
+        carrick_core::mm::retirement::settle_record_retirement(record, identity, backend_result)
     }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
-pub(crate) struct CarrierStage2Pin {
-    custody: std::sync::Arc<CarrierVmCustody>,
-    identity: CarrierStage2RecordIdentity,
-    active: bool,
-}
-
+pub(crate) struct CarrierPinVenue(std::sync::Arc<CarrierVmCustody>);
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl CarrierStage2Pin {
-    /// Hand this exact record pin to a caller that releases it later with
-    /// [`CarrierVmCustody::release_stage2_pin`] (an allocation-free
-    /// type-erased retention). Dropping the returned identity releases
-    /// nothing.
-    pub(crate) fn into_transferred_identity(mut self) -> CarrierStage2RecordIdentity {
-        self.active = false;
-        self.identity
+impl carrick_core::mm::retirement::RecordPinVenue for CarrierPinVenue {
+    fn release_pin(&self, identity: CarrierStage2RecordIdentity) {
+        self.0.release_stage2_pin(identity);
     }
 }
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) type CarrierStage2Pin = carrick_core::mm::retirement::RecordPin<CarrierPinVenue>;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierVmCustody {
@@ -1626,34 +1400,11 @@ impl CarrierVmCustody {
         let Some(record) = state.stage2_records.get_mut(&identity.record_id) else {
             return;
         };
-        if CarrierVmCustody::stage2_identity_mismatch(record, identity).is_some() {
-            return;
-        }
-        record.snapshot.pin_count = record.snapshot.pin_count.saturating_sub(1);
-        if record.snapshot.pin_count == 0
-            && record.snapshot.retirement_requested
-            && record.snapshot.mapped
-            && !record.snapshot.terminalized_by_vm_destroy
-        {
-            record.snapshot.retry_eligible = true;
-        }
-        let remove_terminal_predecessor = record.snapshot.pin_count == 0
-            && record.snapshot.terminalized_by_vm_destroy
-            && record.snapshot.superseded_by_rebind;
+        let remove_terminal_predecessor =
+            carrick_core::mm::retirement::release_record_pin(record, identity);
         if remove_terminal_predecessor {
             let _ = state.remove_record(identity.record_id);
         }
-    }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl Drop for CarrierStage2Pin {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        self.custody.release_stage2_pin(self.identity);
-        self.active = false;
     }
 }
 

@@ -313,6 +313,7 @@ dependencies = [
  "carrick-abi",
  "carrick-conformance-contract",
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-mem",
@@ -600,6 +601,7 @@ name = "carrick-hal"
 version = "0.1.0"
 dependencies = [
  "carrick-abi",
+ "carrick-core-abi",
  "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-arch",
@@ -695,6 +697,7 @@ dependencies = [
  "camino",
  "carrick-abi",
  "carrick-conformance-contract",
+ "carrick-core",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",
@@ -1018,6 +1021,7 @@ dependencies = [
  "carrick-abi",
  "carrick-conformance-contract",
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",

@@ -30,6 +30,7 @@ metadata-grant-test-support = []
 
 [dependencies]
 carrick-core = { path = "../carrick-core" }
+carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-abi = { path = "../carrick-abi" }
 carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
