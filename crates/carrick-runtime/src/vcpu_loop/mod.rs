@@ -70,6 +70,8 @@ pub mod executor;
 mod fd_ceiling;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod reservations;
+#[cfg(all(test, feature = "loom"))]
+mod terminal_clear_loom;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod thread_adoption;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

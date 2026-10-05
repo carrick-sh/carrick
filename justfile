@@ -414,6 +414,10 @@ fmt-check:
 fmt:
     cargo fmt --all
 
+# Bounded models for the terminal clear/wake/publication protocol.
+test-loom:
+    cargo test --locked -p carrick-runtime --features loom --lib terminal_clear_loom
+
 # The kernel semantics inner loop: no VM, codesign, or Docker. Full `just test`
 # also runs the serial host tests; run it and the signed gates before pushing.
 test-kernel *ARGS:
