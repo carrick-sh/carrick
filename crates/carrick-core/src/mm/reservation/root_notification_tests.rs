@@ -39,7 +39,7 @@ fn actual_root_release_publishes_blocked_probe() {
         .publish(
             index.index(),
             mm,
-            Layout {
+            carrick_personality_linux::mm::LinuxReservationLayout {
                 heap: ReservationRange::new(0x1000, 0x100000).unwrap(),
                 arena: ReservationRange::new(0x100000, 0x1000000).unwrap(),
                 brk: 0x1000,
@@ -189,7 +189,7 @@ fn delayed_old_root_admission_cannot_demote_reused_notification_word() {
             .publish(
                 index.index(),
                 mm,
-                Layout {
+                carrick_personality_linux::mm::LinuxReservationLayout {
                     heap: ReservationRange::new(0x1000, 0x100000).unwrap(),
                     arena: ReservationRange::new(0x100000, 0x1000000).unwrap(),
                     brk: 0x1000,

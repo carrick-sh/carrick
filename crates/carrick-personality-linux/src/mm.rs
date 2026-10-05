@@ -23,9 +23,145 @@ impl NodeFlagsPolicy for ReservationNodeFlags {
             && protection.bits() & 2 != 0
     }
 }
+/// Linux-owned state projected through the neutral root's opaque wire payload.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct LinuxReservationState {
+    pub brk: u64,
+    pub address_limit: u64,
+    pub data_limit: u64,
+    pub external_address_bytes: u64,
+    pub external_data_bytes: u64,
+}
+impl From<ReservationPolicyPayload> for LinuxReservationState {
+    fn from(payload: ReservationPolicyPayload) -> Self {
+        let [
+            brk,
+            address_limit,
+            data_limit,
+            external_address_bytes,
+            external_data_bytes,
+        ] = payload.words();
+        Self {
+            brk,
+            address_limit,
+            data_limit,
+            external_address_bytes,
+            external_data_bytes,
+        }
+    }
+}
+impl From<LinuxReservationState> for ReservationPolicyPayload {
+    fn from(state: LinuxReservationState) -> Self {
+        Self::new([
+            state.brk,
+            state.address_limit,
+            state.data_limit,
+            state.external_address_bytes,
+            state.external_data_bytes,
+        ])
+    }
+}
+/// Linux admission record. This is an input projection, never a second store.
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct LinuxReservationLayout {
+    pub heap: ReservationRange,
+    pub arena: ReservationRange,
+    pub brk: u64,
+    pub address_limit: u64,
+    pub data_limit: u64,
+    pub external_address_bytes: u64,
+    pub external_data_bytes: u64,
+}
+impl From<LinuxReservationLayout> for Layout {
+    fn from(l: LinuxReservationLayout) -> Self {
+        Self {
+            heap: l.heap,
+            arena: l.arena,
+            policy: LinuxReservationState {
+                brk: l.brk,
+                address_limit: l.address_limit,
+                data_limit: l.data_limit,
+                external_address_bytes: l.external_address_bytes,
+                external_data_bytes: l.external_data_bytes,
+            }
+            .into(),
+        }
+    }
+}
+impl From<Layout> for LinuxReservationLayout {
+    fn from(l: Layout) -> Self {
+        let state = LinuxReservationState::from(l.policy);
+        Self {
+            heap: l.heap,
+            arena: l.arena,
+            brk: state.brk,
+            address_limit: state.address_limit,
+            data_limit: state.data_limit,
+            external_address_bytes: state.external_address_bytes,
+            external_data_bytes: state.external_data_bytes,
+        }
+    }
+}
+
 /// Linux interpretation of the one neutral root store.
 pub struct LinuxReservationPolicy;
 impl carrick_core_abi::ReservationPolicy for LinuxReservationPolicy {
+    fn validates_layout(layout: Layout) -> bool {
+        let brk = LinuxReservationState::from(layout.policy).brk;
+        layout.heap.contains(brk) || brk == layout.heap.end()
+    }
+    fn active_value(policy: ReservationPolicyPayload) -> u64 {
+        LinuxReservationState::from(policy).brk
+    }
+    fn apply_value(policy: &mut ReservationPolicyPayload, value: u64) {
+        let mut state = LinuxReservationState::from(*policy);
+        state.brk = value;
+        *policy = state.into();
+    }
+    fn admits_charges(
+        policy: ReservationPolicyPayload,
+        total: Charges,
+        removed: Charges,
+        added: Charges,
+    ) -> Result<(), Refusal> {
+        let layout = LinuxReservationState::from(policy);
+        reservation::admits_charges(layout, total, removed, added)
+    }
+    fn update_limits(policy: &mut ReservationPolicyPayload, address: u64, data: u64) {
+        let mut state = LinuxReservationState::from(*policy);
+        state.address_limit = address;
+        state.data_limit = data;
+        *policy = state.into();
+    }
+    fn update_external_charges(policy: &mut ReservationPolicyPayload, address: u64, data: u64) {
+        let mut state = LinuxReservationState::from(*policy);
+        state.external_address_bytes = address;
+        state.external_data_bytes = data;
+        *policy = state.into();
+    }
+    fn authenticates_maintenance(
+        layout: Layout,
+        request: ReservationRequest,
+        pending_value: u64,
+    ) -> bool {
+        let old = LinuxReservationState::from(layout.policy).brk;
+        request.operation == ReservationOperation::Retire
+            && request.protection == ReservationProtection::NONE
+            && request.source.is_none()
+            && pending_value < old
+            && pending_value.checked_add(4095).map(|end| end & !4095) == Some(request.range.start())
+            && old.checked_add(4095).map(|end| end & !4095) == Some(request.range.end())
+    }
+    fn validates_attributes(node: &ReservationNodeData, set: ReservationNodeFlags) -> bool {
+        !set.contains(ReservationNodeFlags::WIPEONFORK)
+            || Self::flags(node).contains(ReservationNodeFlags::ANONYMOUS_PRIVATE)
+    }
+    fn inherits(node: &ReservationNodeData) -> bool {
+        !Self::flags(node).contains(ReservationNodeFlags::DONTFORK)
+    }
+
     fn place<M: carrick_core_abi::ReservationPolicyAccess>(
         root: &mut M,
         placement: Placement,
