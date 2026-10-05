@@ -8778,8 +8778,8 @@ mod el1_resume_tests {
         use carrick_el1_abi::{ReservationMm, ReservationRange};
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        /// A host waiter that waits on the holder's progress, as the
-        /// kernel's `RootHostWait` does: the holder slot must be running.
+        /// This fixture models an exclusion caller waiting for the EL1
+        /// critical section to finish: the holder slot must be running.
         struct Waiter;
         impl carrick_el1::memory::reservations::RootWait for Waiter {
             fn wait(
