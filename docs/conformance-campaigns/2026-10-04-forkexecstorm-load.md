@@ -84,13 +84,13 @@ failures are outside the forkexecstorm change and are not waived by later
 passes. Full logs and scoped zero-process cleanup lines remain in ignored
 `target/fes-load/mon-main-*.log` on cloudmac.
 
-## Remaining promotion
+## Promotion requested at the handoff
 
 Run ten normal shard cycles, `just test-kernel`, `just clippy`,
 `just lint-domains`, `just ci`, and the exclusive host and signed acceptance
 phases. No additional trace or stress campaign is authorized. A fresh signed
 receipt and a native ARM64 Linux oracle refresh are separate from the
-deterministic witness above.
+deterministic witness above. Continuation results are recorded below.
 
 ## Continuation: fresh red-first proof
 
@@ -203,3 +203,32 @@ These are completion observations, not a controlled performance comparison.
 The canonical native-ARM64 Docker refresh remains outstanding; cloudmac has
 no Docker authority, and the inherited provisional oracle headers have not
 been blessed by these Carrick runs.
+
+## Continuation: host checks
+
+On `eba45ebca`, under exclusive host leases:
+
+| Command | Result | Full log |
+| --- | --- | --- |
+| `just test-kernel` | PASS, exit 0 | `target/fes-load2/test-kernel.log` |
+| `just clippy` | PASS, exit 0 | `target/fes-load2/clippy.log` |
+| `just lint-domains` | PASS, exit 0 | `target/fes-load2/lint-domains.log` |
+| `just ci` | FAIL at rustdoc, exit 101 | `target/fes-load2/ci.log` |
+
+Domain lint covered all three macOS compiler profiles and 618 reviewed rows;
+its result explicitly leaves the Linux, FreeBSD and NetBSD profiles pending.
+CI passed the stages before `doc`, then failed on inherited unresolved links
+in `crates/carrick-mmu-core/src/aarch64.rs`: `[5:0]` at line 299,
+`publish_existing_invalid_private_pages` at lines 826/889/949, and `AP[1]`
+at line 1831. That file is unchanged from base main `0250e7f2a`.
+[PR #3](https://github.com/carrick-sh/carrick/pull/3) contains the rustdoc
+repairs; it was not folded into this probe-only investigation.
+
+The failed CI result remains red. Its later `test` and `test-integration`
+stages did not execute in that invocation. Host acceptance includes `just
+test`; the skipped integration stage is also run separately. Final host and
+signed acceptance run after this note is committed, so their receipts name
+the final branch head. Their results and receipt paths are recorded in
+[PR #20](https://github.com/carrick-sh/carrick/pull/20), with fixed local
+receipt paths `target/fes-load2/host-receipt.json` and
+`target/fes-load2/signed-receipt.json`.
