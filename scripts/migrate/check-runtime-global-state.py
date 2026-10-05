@@ -9,7 +9,7 @@ fingerprints remain lexical test details; no ledger or landing identity uses the
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -51,6 +51,9 @@ class Finding:
     symbol: str
     fingerprint: str  # transient scanner detail; never part of landing identity
     production: bool = True
+    line: int = field(default=0, compare=False)
+    argument: str | None = None
+    column: int = field(default=0, compare=False)
 
 
 @dataclass(frozen=True)
@@ -542,7 +545,7 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
             fingerprint = hashlib.sha256(
                 fingerprint_text.encode("utf-8")
             ).hexdigest()
-            findings.append(Finding(op_kind, posix_path, symbol, fingerprint, _production_attributes(file_cfgs + enclosing_cfg_tokens + direct_stmt_attr_tokens)))
+            findings.append(Finding(op_kind, posix_path, symbol, fingerprint, _production_attributes(file_cfgs + enclosing_cfg_tokens + direct_stmt_attr_tokens), source.count("\n", 0, tokens[call_start].pos) + 1, arg_name, tokens[call_start].pos - source.rfind("\n", 0, tokens[call_start].pos) - 1))
             continue
 
         # 7. Check for static declarations
@@ -628,7 +631,7 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
                         fingerprint_text.encode("utf-8")
                     ).hexdigest()
                     findings.append(
-                        Finding(finding_kind, posix_path, symbol, fingerprint, _production_attributes(file_cfgs + enclosing_cfg_tokens + macro_attr_tokens + direct_attr_tokens))
+                        Finding(finding_kind, posix_path, symbol, fingerprint, _production_attributes(file_cfgs + enclosing_cfg_tokens + macro_attr_tokens + direct_attr_tokens), source.count("\n", 0, tok.pos) + 1, None, tok.pos - source.rfind("\n", 0, tok.pos) - 1)
                     )
                     pending_attributes = []
                     idx = cur_idx
@@ -737,7 +740,7 @@ def main(argv=None):
     try:
         validate_concurrent_tree(args.root)
         findings = discover(args.root)
-        print(json.dumps([{"file": f.file, "kind": f.kind, "symbol": f.symbol} for f in findings]))
+        print(json.dumps([{"file": f.file, "kind": f.kind, "symbol": f.symbol, "line": f.line, "argument": f.argument, "column": f.column} for f in findings]))
         return 0
     except (LedgerError, OSError) as error:
         print(f"error: check-runtime-global-state: {error}", file=sys.stderr)

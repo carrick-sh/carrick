@@ -4,7 +4,7 @@ use crate::authority_debt::{DebtError, Lane};
 use proc_macro2::{Delimiter, LineColumn, Span, TokenStream, TokenTree};
 use quote::ToTokens;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use syn::{
     spanned::Spanned,
     visit::{self, Visit},
@@ -21,15 +21,20 @@ pub struct ApiSite {
 #[derive(Debug)]
 struct Owner {
     name: String,
+    lane: Lane,
     start: LineColumn,
     end: LineColumn,
 }
 #[derive(Debug, Default)]
 pub struct SourceCensus {
     test_files: std::collections::BTreeSet<String>,
+    unbound_files: std::collections::BTreeSet<String>,
     owners: BTreeMap<String, Vec<Owner>>,
     pub k1: Vec<ApiSite>,
     unknown_apis: Vec<String>,
+    structural_errors: Vec<String>,
+    test_ranges: BTreeMap<String, Vec<(LineColumn, LineColumn)>>,
+    aliases: BTreeMap<String, Vec<syn::Type>>,
 }
 const TABLE_APIS: &[&str] = &[
     "read_open_files",
@@ -50,41 +55,41 @@ const TABLE_APIS: &[&str] = &[
 // Closed implementation owners, not source paths. Calls made inside these
 // authority primitives are definitions rather than legacy caller debt.
 const DEFINITION_OWNERS: &[&str] = &[
-    "carrick_kernel::FileTable::commit_exact_replacement",
-    "carrick_kernel::FileTable::commit_reserved_slot",
-    "carrick_kernel::FileTable::epoll_wake_handle",
-    "carrick_kernel::FileTable::epoll_wake_registry",
-    "carrick_kernel::FileTable::for_exec",
-    "carrick_kernel::FileTable::for_fork_copy",
-    "carrick_kernel::FileTable::install",
-    "carrick_kernel::FileTable::is_bare_stdio_open",
-    "carrick_kernel::FileTable::lock_closed_stdio",
-    "carrick_kernel::FileTable::lock_next_fd",
-    "carrick_kernel::FileTable::lock_stdio_cloexec",
-    "carrick_kernel::FileTable::read_epoll_fds",
-    "carrick_kernel::FileTable::read_fd_open_paths",
-    "carrick_kernel::FileTable::read_open_files",
-    "carrick_kernel::FileTable::record_fd_open_path",
-    "carrick_kernel::FileTable::rename_fd_open_paths",
-    "carrick_kernel::FileTable::reserve_slot_at_or_above",
-    "carrick_kernel::FileTable::with_fd_ceiling",
-    "carrick_kernel::FileTable::write_epoll_fds",
-    "carrick_kernel::FileTable::write_fd_open_paths",
-    "carrick_kernel::FileTable::write_open_files",
-    "carrick_kernel::HostSocketAuthority::set_ipv6_v6only",
-    "carrick_kernel::OpenFile::is_io_uring_backing",
-    "carrick_kernel::OpenFile::record_host_file_absolute_offset",
-    "carrick_kernel::attach_el1_registration",
-    "carrick_kernel::crate::kernel::FileDescription::inspect",
-    "carrick_kernel::crate::kernel::FileDescription::open_description",
-    "carrick_kernel::crate::kernel::FileDescription::read_for_io",
-    "carrick_kernel::crate::kernel::FileDescription::try_inspect",
-    "carrick_kernel::crate::kernel::FileDescription::write_for_io",
-    "carrick_kernel::crate::kernel::FileSlot::from_open_description_with_common",
-    "carrick_kernel::crate::kernel::FileSlot::from_open_description_with_status_flags",
-    "carrick_kernel::kernel_file_description",
-    "carrick_kernel::kernel_file_description_unregistered",
-    "carrick_kernel::super::SyscallDispatcher::rename_open_paths",
+    "carrick_kernel::kernel::objects::FileTable::commit_exact_replacement",
+    "carrick_kernel::kernel::objects::FileTable::commit_reserved_slot",
+    "carrick_kernel::kernel::objects::FileTable::epoll_wake_handle",
+    "carrick_kernel::kernel::objects::FileTable::epoll_wake_registry",
+    "carrick_kernel::kernel::objects::FileTable::for_exec",
+    "carrick_kernel::kernel::objects::FileTable::for_fork_copy",
+    "carrick_kernel::kernel::objects::FileTable::install",
+    "carrick_kernel::kernel::objects::FileTable::is_bare_stdio_open",
+    "carrick_kernel::kernel::objects::FileTable::lock_closed_stdio",
+    "carrick_kernel::kernel::objects::FileTable::lock_next_fd",
+    "carrick_kernel::kernel::objects::FileTable::lock_stdio_cloexec",
+    "carrick_kernel::kernel::objects::FileTable::read_epoll_fds",
+    "carrick_kernel::kernel::objects::FileTable::read_fd_open_paths",
+    "carrick_kernel::kernel::objects::FileTable::read_open_files",
+    "carrick_kernel::kernel::objects::FileTable::record_fd_open_path",
+    "carrick_kernel::kernel::objects::FileTable::rename_fd_open_paths",
+    "carrick_kernel::kernel::objects::FileTable::reserve_slot_at_or_above",
+    "carrick_kernel::kernel::objects::FileTable::with_fd_ceiling",
+    "carrick_kernel::kernel::objects::FileTable::write_epoll_fds",
+    "carrick_kernel::kernel::objects::FileTable::write_fd_open_paths",
+    "carrick_kernel::kernel::objects::FileTable::write_open_files",
+    "carrick_kernel::dispatch::fd_table::HostSocketAuthority::set_ipv6_v6only",
+    "carrick_kernel::dispatch::fd_table::OpenFile::is_io_uring_backing",
+    "carrick_kernel::dispatch::fd_table::OpenFile::record_host_file_absolute_offset",
+    "carrick_kernel::dispatch::fd_table::attach_el1_registration",
+    "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::inspect",
+    "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::open_description",
+    "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::read_for_io",
+    "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::try_inspect",
+    "carrick_kernel::dispatch::fd_table::crate::kernel::FileDescription::write_for_io",
+    "carrick_kernel::dispatch::fd_table::crate::kernel::FileSlot::from_open_description_with_common",
+    "carrick_kernel::dispatch::fd_table::crate::kernel::FileSlot::from_open_description_with_status_flags",
+    "carrick_kernel::dispatch::fd_table::kernel_file_description",
+    "carrick_kernel::dispatch::fd_table::kernel_file_description_unregistered",
+    "carrick_kernel::dispatch::fd_table::super::SyscallDispatcher::rename_open_paths",
 ];
 
 fn test_only(attrs: &[syn::Attribute]) -> bool {
@@ -178,6 +183,124 @@ fn contains_authority_tokens(tokens: TokenStream) -> bool {
         _ => false,
     })
 }
+fn normalized_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => normalized.push(component),
+        }
+    }
+    normalized
+}
+// Resolve logical module ancestry from declarations, including #[path]. Physical
+// files are only inputs to this graph, never authority identities.
+fn declared_modules(
+    path: &Path,
+    modules: &[String],
+    explicit_path: bool,
+    parsed: &BTreeMap<PathBuf, syn::File>,
+    resolved: &mut BTreeMap<PathBuf, Vec<Vec<String>>>,
+) -> Result<(), DebtError> {
+    if resolved
+        .get(path)
+        .is_some_and(|previous| previous.iter().any(|identity| identity == modules))
+    {
+        return Ok(());
+    }
+    if modules.len() > 128 {
+        return Err(DebtError::Policy("recursive module graph".into()));
+    }
+    let syntax = parsed.get(path).ok_or_else(|| {
+        DebtError::Policy(format!(
+            "missing production module owner: {}",
+            path.display()
+        ))
+    })?;
+    resolved
+        .entry(path.to_path_buf())
+        .or_default()
+        .push(modules.to_vec());
+    let parent = path
+        .parent()
+        .ok_or_else(|| DebtError::Policy("missing module directory".into()))?;
+    let directory = if explicit_path
+        || matches!(
+            path.file_name().and_then(|s| s.to_str()),
+            Some("lib.rs" | "main.rs" | "mod.rs" | "entry.rs")
+        ) {
+        parent.to_path_buf()
+    } else {
+        path.with_extension("")
+    };
+    declared_items(&syntax.items, &directory, parent, modules, parsed, resolved)
+}
+fn declared_items(
+    items: &[syn::Item],
+    directory: &Path,
+    explicit_directory: &Path,
+    modules: &[String],
+    parsed: &BTreeMap<PathBuf, syn::File>,
+    resolved: &mut BTreeMap<PathBuf, Vec<Vec<String>>>,
+) -> Result<(), DebtError> {
+    for item in items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        if test_only(&module.attrs) {
+            continue;
+        }
+        let mut child_modules = modules.to_vec();
+        child_modules.push(module.ident.to_string());
+        let child_directory = directory.join(module.ident.to_string());
+        if let Some((_, children)) = &module.content {
+            declared_items(
+                children,
+                &child_directory,
+                &child_directory,
+                &child_modules,
+                parsed,
+                resolved,
+            )?;
+        } else {
+            let explicit = module.attrs.iter().find_map(|attr| {
+                if !attr.path().is_ident("path") {
+                    return None;
+                }
+                let syn::Meta::NameValue(value) = &attr.meta else {
+                    return None;
+                };
+                let syn::Expr::Lit(value) = &value.value else {
+                    return None;
+                };
+                let syn::Lit::Str(value) = &value.lit else {
+                    return None;
+                };
+                Some(explicit_directory.join(value.value()))
+            });
+            let explicit_path = explicit.is_some();
+            let file = explicit.unwrap_or_else(|| {
+                let flat = directory.join(format!("{}.rs", module.ident));
+                if parsed.contains_key(&flat) {
+                    flat
+                } else {
+                    child_directory.join("mod.rs")
+                }
+            });
+            declared_modules(
+                &normalized_path(&file),
+                &child_modules,
+                explicit_path,
+                parsed,
+                resolved,
+            )?;
+        }
+    }
+    Ok(())
+}
 impl SourceCensus {
     pub fn load(root: &Path) -> Result<Self, DebtError> {
         let mut result = Self::default();
@@ -193,38 +316,109 @@ impl SourceCensus {
             }
         }
         leaves.sort();
-        // Out-of-line test modules are omitted with their entire subtrees.
         let mut test_roots = Vec::new();
-        let mut parsed = Vec::new();
+        let mut parsed = BTreeMap::new();
         for path in &leaves {
             let source = std::fs::read_to_string(path)?;
             let syntax = syn::parse_file(&source)
                 .map_err(|error| DebtError::Policy(format!("{}: {error}", path.display())))?;
-            let parent = if matches!(
+            let parent = path
+                .parent()
+                .ok_or_else(|| DebtError::Policy("missing source parent".into()))?;
+            let directory = if matches!(
                 path.file_name().and_then(|s| s.to_str()),
                 Some("lib.rs" | "mod.rs" | "main.rs")
             ) {
-                path.parent()
-                    .ok_or_else(|| DebtError::Policy("missing source parent".into()))?
-                    .to_path_buf()
+                parent.to_path_buf()
             } else {
                 path.with_extension("")
             };
-            test_modules(
-                &syntax.items,
-                &parent,
-                path.parent()
-                    .ok_or_else(|| DebtError::Policy("missing source parent".into()))?,
-                &mut test_roots,
-            );
-            parsed.push((path.clone(), syntax));
+            test_modules(&syntax.items, &directory, parent, &mut test_roots);
+            parsed.insert(path.clone(), syntax);
         }
-        for (path, syntax) in parsed {
+        let mut resolved = BTreeMap::new();
+        for path in &leaves {
+            let parent = path
+                .parent()
+                .ok_or_else(|| DebtError::Policy("missing source parent".into()))?;
+            if parent.file_name().is_some_and(|name| name == "src")
+                && matches!(
+                    path.file_name().and_then(|s| s.to_str()),
+                    Some("lib.rs" | "main.rs" | "entry.rs")
+                )
+            {
+                let krate = path
+                    .strip_prefix(root)
+                    .map_err(|e| DebtError::Policy(e.to_string()))?
+                    .components()
+                    .nth(1)
+                    .ok_or_else(|| DebtError::Policy("missing root crate".into()))?
+                    .as_os_str()
+                    .to_string_lossy()
+                    .replace('-', "_");
+                let mut target = vec![krate];
+                if path.file_name().is_some_and(|s| s != "lib.rs")
+                    && parsed.contains_key(&parent.join("lib.rs"))
+                {
+                    target.push(format!(
+                        "target_{}",
+                        path.file_stem().unwrap_or_default().to_string_lossy()
+                    ));
+                }
+                declared_modules(path, &target, false, &parsed, &mut resolved)?;
+            }
+        }
+        // Parse aliases before any methods: a later type alias or renamed
+        // lock import cannot make a raw storage accessor opaque to the census.
+        for (path, syntax) in &parsed {
             let relative = path
                 .strip_prefix(root)
-                .map_err(|e| DebtError::Policy(e.to_string()))?
+                .map_err(|e| DebtError::Policy(e.to_string()))?;
+            if test_only(&syntax.attrs)
+                || test_roots
+                    .iter()
+                    .any(|test| path.starts_with(test) || *path == test.with_extension("rs"))
+            {
+                continue;
+            }
+            let krate = relative
+                .components()
+                .nth(1)
+                .ok_or_else(|| DebtError::Policy("missing crate".into()))?
+                .as_os_str()
                 .to_string_lossy()
-                .to_string();
+                .replace('-', "_");
+            let incarnations = resolved.get(path).cloned().unwrap_or_else(|| {
+                vec![
+                    std::iter::once(krate.clone())
+                        .chain(
+                            relative
+                                .components()
+                                .skip(3)
+                                .map(|part| {
+                                    part.as_os_str()
+                                        .to_string_lossy()
+                                        .trim_end_matches(".rs")
+                                        .to_owned()
+                                })
+                                .filter(|part| part != "mod"),
+                        )
+                        .collect(),
+                ]
+            });
+            for modules in incarnations {
+                let mut collector = AliasCollector {
+                    aliases: &mut result.aliases,
+                    prefix: modules,
+                };
+                collector.visit_file(syntax);
+            }
+        }
+        for (path, syntax) in parsed {
+            let relative_path = path
+                .strip_prefix(root)
+                .map_err(|e| DebtError::Policy(e.to_string()))?;
+            let relative = relative_path.to_string_lossy().to_string();
             if (relative.contains("/src/bin/") && !relative.starts_with("crates/carrick-cli/"))
                 || test_only(&syntax.attrs)
                 || test_roots
@@ -234,20 +428,47 @@ impl SourceCensus {
                 result.test_files.insert(relative);
                 continue;
             }
+            if !resolved.contains_key(&path) {
+                result.unbound_files.insert(relative.clone());
+            }
             let krate = relative
                 .split('/')
                 .nth(1)
                 .ok_or_else(|| DebtError::Policy("missing source crate".into()))?
                 .replace('-', "_");
-            let mut scanner = Scanner {
-                census: &mut result,
-                file: relative.clone(),
-                krate,
-                modules: Vec::new(),
-                implementation: None,
-                current_owner: None,
-            };
-            scanner.visit_file(&syntax);
+            let incarnations = resolved.get(&path).cloned().unwrap_or_else(|| {
+                vec![
+                    std::iter::once(krate.clone())
+                        .chain(
+                            relative_path
+                                .components()
+                                .skip(3)
+                                .map(|part| {
+                                    part.as_os_str()
+                                        .to_string_lossy()
+                                        .trim_end_matches(".rs")
+                                        .to_owned()
+                                })
+                                .filter(|part| part != "mod"),
+                        )
+                        .collect(),
+                ]
+            });
+            for modules in incarnations {
+                let (krate, modules) = modules
+                    .split_first()
+                    .ok_or_else(|| DebtError::Policy("missing declared crate owner".into()))?;
+                let mut scanner = Scanner {
+                    census: &mut result,
+                    file: relative.clone(),
+                    krate: krate.clone(),
+                    modules: modules.to_vec(),
+                    implementation: None,
+                    implementation_type: None,
+                    current_owner: None,
+                };
+                scanner.visit_file(&syntax);
+            }
         }
         if !result.unknown_apis.is_empty() {
             return Err(DebtError::Policy(format!(
@@ -257,33 +478,344 @@ impl SourceCensus {
         }
         Ok(result)
     }
+    pub fn verify_task_rules(&self) -> Result<(), DebtError> {
+        for required in [
+            "carrick_kernel::kernel::crash_capture::CrashQuorum::poll",
+            "carrick_kernel::dispatch::mm_quiesce::drain_exact_mm",
+            "carrick_runtime::vcpu_loop::quiesce::try_begin_hvpatch_process_fork_with_admission",
+            "carrick_kernel::dispatch::mm_authority::MmExecutorAdmissionRecipe::enter",
+            "carrick_kernel::kernel::objects::Thread::enter_crash_safe_point_participation",
+        ] {
+            if !self
+                .owners
+                .iter()
+                .filter(|(file, _)| !self.unbound_files.contains(*file))
+                .flat_map(|(_, owners)| owners)
+                .any(|owner| owner.name == required)
+            {
+                return Err(DebtError::Policy(format!(
+                    "missing task structural rule owner: {required}"
+                )));
+            }
+        }
+        if !self.structural_errors.is_empty() {
+            return Err(DebtError::Policy(format!(
+                "task structural rules: {:?}",
+                self.structural_errors
+            )));
+        }
+        Ok(())
+    }
+    pub fn is_test_at(&self, file: &str, line: usize, column: usize) -> bool {
+        self.test_files.contains(file)
+            || self.test_ranges.get(file).is_some_and(|ranges| {
+                ranges.iter().any(|(start, end)| {
+                    line >= start.line
+                        && line <= end.line
+                        && (line > start.line || column >= start.column)
+                        && (line < end.line || column <= end.column)
+                })
+            })
+    }
     pub fn is_test_file(&self, file: &str) -> bool {
         self.test_files.contains(file)
     }
     pub fn owner_at(&self, file: &str, line: usize, column: usize) -> Result<String, DebtError> {
+        self.resolve_owner(file, line, Some(column))
+    }
+    pub fn lane(&self, owner: &str) -> Result<Lane, DebtError> {
+        let nearest = self
+            .owners
+            .values()
+            .flatten()
+            .filter(|found| {
+                found.name == owner
+                    || owner
+                        .strip_prefix(&found.name)
+                        .is_some_and(|rest| rest.starts_with("::"))
+            })
+            .max_by_key(|found| found.name.len())
+            .ok_or_else(|| DebtError::Policy(format!("missing symbolic owner lane: {owner}")))?;
+        if self
+            .owners
+            .values()
+            .flatten()
+            .any(|found| found.name == nearest.name && found.lane != nearest.lane)
+        {
+            return Err(DebtError::Policy(format!(
+                "ambiguous symbolic owner lane: {owner}"
+            )));
+        }
+        Ok(nearest.lane)
+    }
+    pub fn owner_on_line(&self, file: &str, line: usize) -> Result<String, DebtError> {
+        self.resolve_owner(file, line, None)
+    }
+    fn resolve_owner(
+        &self,
+        file: &str,
+        line: usize,
+        column: Option<usize>,
+    ) -> Result<String, DebtError> {
+        if self.unbound_files.contains(file) {
+            return Err(DebtError::Policy(format!(
+                "undeclared production module owner: {file}"
+            )));
+        }
         let owners = self.owners.get(file).ok_or_else(|| {
             DebtError::Policy(format!("missing production owner discovery for {file}"))
         })?;
-        owners
+        let matches: Vec<_> = owners
             .iter()
             .filter(|owner| {
                 owner.start.line <= line
                     && owner.end.line >= line
-                    && (column == 0
-                        || ((line > owner.start.line || column >= owner.start.column)
-                            && (line < owner.end.line || column <= owner.end.column)))
+                    && column.is_none_or(|column| {
+                        (line > owner.start.line || column >= owner.start.column)
+                            && (line < owner.end.line || column <= owner.end.column)
+                    })
             })
+            .collect();
+        let nearest = matches
+            .iter()
             .min_by_key(|owner| {
                 (
                     owner.end.line - owner.start.line,
                     owner.end.column.saturating_sub(owner.start.column),
                 )
             })
-            .map(|owner| owner.name.clone())
             .ok_or_else(|| {
-                DebtError::Policy(format!("missing rule owner at {file}:{line}:{column}"))
+                DebtError::Policy(format!("missing rule owner at {file}:{line}:{column:?}"))
+            })?;
+        if column.is_none()
+            && matches.iter().any(|owner| {
+                owner.name != nearest.name
+                    && (owner.start > nearest.start || owner.end < nearest.end)
             })
+        {
+            return Err(DebtError::Policy(format!(
+                "ambiguous line-only rule owner at {file}:{line}"
+            )));
+        }
+        if matches.iter().any(|owner| {
+            owner.start == nearest.start && owner.end == nearest.end && owner.name != nearest.name
+        }) {
+            return Err(DebtError::Policy(format!(
+                "ambiguous compilation-target owner at {file}:{line}:{column:?}"
+            )));
+        }
+        Ok(nearest.name.clone())
     }
+}
+struct AliasCollector<'a> {
+    aliases: &'a mut BTreeMap<String, Vec<syn::Type>>,
+    prefix: Vec<String>,
+}
+fn implementation_name(item: &syn::ItemImpl) -> String {
+    let ty = item.self_ty.to_token_stream().to_string().replace(' ', "");
+    if let Some((_, path, _)) = &item.trait_ {
+        format!(
+            "<{ty} as {}>",
+            path.to_token_stream().to_string().replace(' ', "")
+        )
+    } else {
+        ty
+    }
+}
+impl<'ast> Visit<'ast> for AliasCollector<'_> {
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        if test_only(&item.attrs) {
+            return;
+        }
+        self.prefix.push(implementation_name(item));
+        visit::visit_item_impl(self, item);
+        self.prefix.pop();
+    }
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if test_only(&item.attrs) {
+            return;
+        }
+        self.prefix.push(item.sig.ident.to_string());
+        visit::visit_item_fn(self, item);
+        self.prefix.pop();
+    }
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if test_only(&item.attrs) {
+            return;
+        }
+        self.prefix.push(item.sig.ident.to_string());
+        visit::visit_impl_item_fn(self, item);
+        self.prefix.pop();
+    }
+    fn visit_impl_item_type(&mut self, item: &'ast syn::ImplItemType) {
+        if !test_only(&item.attrs) {
+            self.aliases
+                .entry(format!("{}::{}", self.prefix.join("::"), item.ident))
+                .or_default()
+                .push(item.ty.clone());
+        }
+    }
+    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+        if test_only(&item.attrs) {
+            return;
+        }
+        self.prefix.push(item.ident.to_string());
+        visit::visit_item_mod(self, item);
+        self.prefix.pop();
+    }
+    fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
+        if !test_only(&item.attrs) {
+            self.aliases
+                .entry(format!("{}::{}", self.prefix.join("::"), item.ident))
+                .or_default()
+                .push((*item.ty).clone());
+        }
+    }
+    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        if test_only(&item.attrs) {
+            return;
+        }
+        fn imports(
+            tree: &syn::UseTree,
+            prefix: TokenStream,
+            aliases: &mut BTreeMap<String, Vec<syn::Type>>,
+            scope: &str,
+        ) {
+            match tree {
+                syn::UseTree::Path(path) => {
+                    let ident = &path.ident;
+                    imports(&path.tree, quote::quote!(#prefix #ident ::), aliases, scope);
+                }
+                syn::UseTree::Group(group) => {
+                    for child in &group.items {
+                        imports(child, prefix.clone(), aliases, scope);
+                    }
+                }
+                syn::UseTree::Name(name) => {
+                    let ident = &name.ident;
+                    if let Ok(ty) = syn::parse2(quote::quote!(#prefix #ident)) {
+                        aliases
+                            .entry(format!("{scope}::{ident}"))
+                            .or_default()
+                            .push(ty);
+                    }
+                }
+                syn::UseTree::Rename(rename) => {
+                    let ident = &rename.ident;
+                    if let Ok(ty) = syn::parse2(quote::quote!(#prefix #ident)) {
+                        aliases
+                            .entry(format!("{scope}::{}", rename.rename))
+                            .or_default()
+                            .push(ty);
+                    }
+                }
+                _ => {}
+            }
+        }
+        imports(
+            &item.tree,
+            TokenStream::new(),
+            self.aliases,
+            &self.prefix.join("::"),
+        );
+    }
+}
+fn authority_type(
+    ty: &syn::Type,
+    aliases: &BTreeMap<String, Vec<syn::Type>>,
+    scope: &str,
+    seen: &mut Vec<String>,
+    names: &[&str],
+) -> bool {
+    struct Types<'a> {
+        aliases: &'a BTreeMap<String, Vec<syn::Type>>,
+        scope: &'a str,
+        seen: &'a mut Vec<String>,
+        names: &'a [&'a str],
+        protected: bool,
+    }
+    impl<'ast> Visit<'ast> for Types<'_> {
+        fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+            for segment in &path.path.segments {
+                let name = segment.ident.to_string();
+                if self.names.contains(&name.as_str()) {
+                    self.protected = true;
+                }
+            }
+            let path_name = path
+                .path
+                .segments
+                .iter()
+                .map(|s| s.ident.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            let mut prefix = self.scope.to_owned();
+            let mut keys = Vec::new();
+            loop {
+                keys.push(format!("{prefix}::{path_name}"));
+                let Some((parent, _)) = prefix.rsplit_once("::") else {
+                    break;
+                };
+                prefix = parent.to_owned();
+            }
+            if path_name.starts_with("crate::") {
+                keys.push(format!(
+                    "{}::{}",
+                    self.scope.split("::").next().unwrap_or(self.scope),
+                    path_name.trim_start_matches("crate::")
+                ));
+            }
+            if path_name.starts_with("self::") {
+                keys.push(format!(
+                    "{}::{}",
+                    self.scope,
+                    path_name.trim_start_matches("self::")
+                ));
+            }
+            if let Some(relative) = path_name.strip_prefix("Self::") {
+                keys.push(format!("{}::{relative}", self.scope));
+            }
+            let mut relative = path_name.as_str();
+            let mut parent = self.scope;
+            while let Some(rest) = relative.strip_prefix("super::") {
+                parent = parent.rsplit_once("::").map_or(parent, |(outer, _)| outer);
+                relative = rest;
+            }
+            if relative != path_name {
+                keys.push(format!("{parent}::{relative}"));
+            }
+            keys.push(path_name.clone());
+            for key in keys {
+                if let Some(alternatives) = self.aliases.get(&key) {
+                    if self.seen.contains(&key) {
+                        self.protected = true;
+                        break;
+                    }
+                    self.seen.push(key.clone());
+                    for alias in alternatives {
+                        self.protected |= authority_type(
+                            alias,
+                            self.aliases,
+                            key.rsplit_once("::").map_or(self.scope, |(scope, _)| scope),
+                            self.seen,
+                            self.names,
+                        );
+                    }
+                    self.seen.pop();
+                }
+            }
+            visit::visit_type_path(self, path);
+        }
+    }
+    let mut visitor = Types {
+        aliases,
+        scope,
+        seen,
+        names,
+        protected: false,
+    };
+    visitor.visit_type(ty);
+    visitor.protected
 }
 struct Scanner<'a> {
     census: &'a mut SourceCensus,
@@ -291,39 +823,65 @@ struct Scanner<'a> {
     krate: String,
     modules: Vec<String>,
     implementation: Option<String>,
+    implementation_type: Option<syn::Type>,
     current_owner: Option<String>,
 }
 impl Scanner<'_> {
     fn owner(&mut self, name: &str, span: Span) -> String {
-        // Impl symbols survive file relocation. Local inline module symbols
-        // distinguish free owners without admitting source-path exceptions.
-        let name = if let Some(implementation) = &self.implementation {
-            format!("{}::{implementation}::{name}", self.krate)
-        } else if self.modules.is_empty() {
-            format!("{}::{name}", self.krate)
-        } else {
-            format!("{}::{}::{name}", self.krate, self.modules.join("::"))
-        };
+        let mut parts = vec![self.krate.clone()];
+        parts.extend(self.modules.clone());
+        if let Some(implementation) = &self.implementation {
+            parts.push(implementation.clone());
+        }
+        parts.push(name.to_owned());
+        let name = self
+            .current_owner
+            .as_ref()
+            .map_or_else(|| parts.join("::"), |parent| format!("{parent}::{name}"));
         self.census
             .owners
             .entry(self.file.clone())
             .or_default()
             .push(Owner {
                 name: name.clone(),
+                lane: Lane::module(&self.krate, &self.modules),
                 start: span.start(),
                 end: span.end(),
             });
         name
     }
     fn macro_tokens(&mut self, tokens: TokenStream) {
+        // Literal Rust items retain their module, trait and impl boundaries.
+        // Expression-style macro inputs fall through to the token-tree walker.
+        if let Ok(syntax) = syn::parse2::<syn::File>(tokens.clone()) {
+            if test_only(&syntax.attrs) {
+                self.test_span(syntax.span());
+                return;
+            }
+            let prefix = self.scope().split("::").map(str::to_owned).collect();
+            AliasCollector {
+                aliases: &mut self.census.aliases,
+                prefix,
+            }
+            .visit_file(&syntax);
+            self.visit_file(&syntax);
+            return;
+        }
         let tokens: Vec<_> = tokens.into_iter().collect();
         let mut index = 0;
         while index < tokens.len() {
+            if matches!(&tokens[index], TokenTree::Ident(name) if name == "mod" || name == "impl" || name == "trait")
+            {
+                self.census
+                    .unknown_apis
+                    .push(format!("unclassified macro item scope in {}", self.file));
+                return;
+            }
             if matches!(&tokens[index], TokenTree::Ident(i) if i == "fn")
                 && let Some(TokenTree::Ident(name)) = tokens.get(index + 1)
                 && let Some((offset, TokenTree::Group(body))) = tokens[index + 2..].iter().enumerate().find(|(_, token)| matches!(token, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace))
             {
-                let span = name.span().join(body.span()).unwrap_or(body.span());
+                let span = tokens[index].span().join(body.span()).unwrap_or(body.span());
                 let owner = self.owner(&name.to_string(), span);
                 let previous = self.current_owner.replace(owner);
                 self.macro_tokens(body.stream());
@@ -331,25 +889,98 @@ impl Scanner<'_> {
                 index += offset + 3;
                 continue;
             }
+            if matches!(&tokens[index], TokenTree::Ident(name) if name == "static")
+                && let Some(TokenTree::Ident(name)) = tokens.get(index + 1)
+                && let Some(end) = tokens[index + 2..]
+                    .iter()
+                    .position(|token| matches!(token, TokenTree::Punct(p) if p.as_char() == ';'))
+            {
+                let end = index + 2 + end;
+                let span = tokens[index]
+                    .span()
+                    .join(tokens[end].span())
+                    .unwrap_or(name.span());
+                let owner = self.owner(&name.to_string(), span);
+                let previous = self.current_owner.replace(owner);
+                self.macro_tokens(tokens[index + 2..end].iter().cloned().collect());
+                self.current_owner = previous;
+                index = end + 1;
+                continue;
+            }
             if let TokenTree::Group(group) = &tokens[index] {
                 self.macro_tokens(group.stream());
             }
             if let TokenTree::Ident(method) = &tokens[index] {
                 let method_name = method.to_string();
-                let called = matches!(tokens.get(index + 1), Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Parenthesis);
+                self.task_call(&method_name);
                 let description = index >= 2
                     && matches!(&tokens[index - 2], TokenTree::Ident(i) if i == "description");
-                if called
-                    && (TABLE_APIS.contains(&method_name.as_str())
-                        || ["open_description", "concrete_backing"].contains(&method_name.as_str())
-                        || (description
-                            && ["read_for_io", "write_for_io", "inspect", "try_inspect"]
-                                .contains(&method_name.as_str())))
+                if TABLE_APIS.contains(&method_name.as_str())
+                    || [
+                        "OpenDescriptionRef",
+                        "open_description",
+                        "concrete_backing",
+                        "read_for_io",
+                        "write_for_io",
+                    ]
+                    .contains(&method_name.as_str())
+                    || (description && ["inspect", "try_inspect"].contains(&method_name.as_str()))
                 {
                     self.call(&method_name, method.span());
                 }
             }
             index += 1;
+        }
+    }
+    fn test_span(&mut self, span: Span) {
+        self.census
+            .test_ranges
+            .entry(self.file.clone())
+            .or_default()
+            .push((span.start(), span.end()));
+    }
+    fn prefix(&self) -> String {
+        std::iter::once(self.krate.as_str())
+            .chain(self.modules.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("::")
+    }
+    fn scope(&self) -> String {
+        self.current_owner.clone().unwrap_or_else(|| {
+            let prefix = self.prefix();
+            self.implementation.as_ref().map_or_else(
+                || prefix.clone(),
+                |implementation| format!("{prefix}::{implementation}"),
+            )
+        })
+    }
+    fn task_call(&mut self, operation: &str) {
+        let Some(owner) = &self.current_owner else {
+            return;
+        };
+        let forbidden = (operation == "threads"
+            && owner.starts_with("carrick_kernel::kernel::crash_capture::"))
+            || (operation == "live"
+                && [
+                    "carrick_kernel::dispatch::mm_quiesce::",
+                    "carrick_runtime::vcpu_loop::quiesce::",
+                ]
+                .iter()
+                .any(|prefix| owner.starts_with(prefix)))
+            || ([
+                "enter_crash_safe_point_participation",
+                "leave_crash_safe_point_participation",
+            ]
+            .contains(&operation)
+                && ![
+                    "carrick_kernel::dispatch::mm_authority::MmExecutorAdmissionRecipe::enter",
+                    "carrick_kernel::kernel::objects::Thread::enter_crash_safe_point_participation",
+                ]
+                .contains(&owner.as_str()));
+        if forbidden {
+            self.census
+                .structural_errors
+                .push(format!("{owner}: forbidden task authority {operation}"));
         }
     }
     fn call(&mut self, operation: &str, span: Span) {
@@ -359,6 +990,12 @@ impl Scanner<'_> {
                 .push(format!("{operation} has no production owner"));
             return;
         };
+        if self.census.unbound_files.contains(&self.file) {
+            self.census
+                .unknown_apis
+                .push(format!("undeclared authority module: {}", self.file));
+            return;
+        }
         if DEFINITION_OWNERS.contains(&owner.as_str()) {
             return;
         }
@@ -367,39 +1004,62 @@ impl Scanner<'_> {
             line: span.start().line,
             owner: owner.clone(),
             operation: operation.into(),
-            lane: Lane::source(&self.file),
+            lane: Lane::module(&self.krate, &self.modules),
         });
     }
 }
 impl<'ast> Visit<'ast> for Scanner<'_> {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         if test_only(&item.attrs) {
+            self.test_span(item.span());
             return;
         }
+        let previous = self.current_owner.take();
+        self.current_owner = previous
+            .as_ref()
+            .map(|parent| format!("{parent}::{}", item.ident));
         self.modules.push(item.ident.to_string());
         visit::visit_item_mod(self, item);
         self.modules.pop();
+        self.current_owner = previous;
     }
     fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
         if test_only(&item.attrs) {
+            self.test_span(item.span());
             return;
         }
-        let previous = self
-            .implementation
-            .replace(item.self_ty.to_token_stream().to_string().replace(' ', ""));
+        let previous_type = self.implementation_type.replace((*item.self_ty).clone());
+        let name = implementation_name(item);
+        let previous = self.implementation.replace(name.clone());
+        let previous_owner = self.current_owner.take();
+        self.current_owner = previous_owner
+            .as_ref()
+            .map(|parent| format!("{parent}::{name}"));
         visit::visit_item_impl(self, item);
         self.implementation = previous;
+        self.implementation_type = previous_type;
+        self.current_owner = previous_owner;
     }
     fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
         if test_only(&item.attrs) {
+            self.test_span(item.span());
             return;
         }
         let previous = self.implementation.replace(item.ident.to_string());
+        let previous_owner = self.current_owner.take();
+        self.current_owner = previous_owner
+            .as_ref()
+            .map(|parent| format!("{parent}::{}", item.ident));
         visit::visit_item_trait(self, item);
         self.implementation = previous;
+        self.current_owner = previous_owner;
     }
     fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
-        if test_only(&item.attrs) || item.default.is_none() {
+        if test_only(&item.attrs) {
+            self.test_span(item.span());
+            return;
+        }
+        if item.default.is_none() {
             return;
         }
         let owner = self.owner(&item.sig.ident.to_string(), item.span());
@@ -408,7 +1068,14 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         self.current_owner = previous;
     }
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        if self.implementation_type.is_some()
+            && let Ok(method) = syn::parse2::<syn::ImplItemFn>(item.to_token_stream())
+        {
+            self.visit_impl_item_fn(&method);
+            return;
+        }
         if test_only(&item.attrs) {
+            self.test_span(item.span());
             return;
         }
         let owner = self.owner(&item.sig.ident.to_string(), item.span());
@@ -418,28 +1085,41 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     }
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
         if test_only(&item.attrs) {
+            self.test_span(item.span());
             return;
         }
         // A renamed/new guard accessor must not disappear from the closed call
         // census. Existing private implementation helpers and the reservation
         // guard are explicit boundaries rather than migration API calls.
-        if self.implementation.as_deref() == Some("FileTable") {
-            let output = item.sig.output.to_token_stream().to_string();
-            let guard = [
-                "MutexGuard",
-                "RwLockReadGuard",
-                "RwLockWriteGuard",
-                "FileTableWriteGuard",
-                "FileTableMutexGuard",
-                "FileTableRwWriteGuard",
-                "FileTableStdioGuard",
-            ]
-            .iter()
-            .any(|name| {
-                output
-                    .split(|c: char| !c.is_alphanumeric() && c != '_')
-                    .any(|part| part == *name)
-            });
+        if self.implementation_type.as_ref().is_some_and(|ty| {
+            authority_type(
+                ty,
+                &self.census.aliases,
+                &self.scope(),
+                &mut Vec::new(),
+                &["FileTable"],
+            )
+        }) {
+            let guard = match &item.sig.output {
+                syn::ReturnType::Type(_, ty) => authority_type(
+                    ty,
+                    &self.census.aliases,
+                    &self.scope(),
+                    &mut Vec::new(),
+                    &[
+                        "RwLock",
+                        "Mutex",
+                        "MutexGuard",
+                        "RwLockReadGuard",
+                        "RwLockWriteGuard",
+                        "FileTableWriteGuard",
+                        "FileTableMutexGuard",
+                        "FileTableRwWriteGuard",
+                        "FileTableStdioGuard",
+                    ],
+                ),
+                syn::ReturnType::Default => false,
+            };
             let name = item.sig.ident.to_string();
             if guard
                 && !TABLE_APIS.contains(&name.as_str())
@@ -463,8 +1143,19 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         visit::visit_impl_item_fn(self, item);
         self.current_owner = previous;
     }
+    fn visit_item_foreign_mod(&mut self, item: &'ast syn::ItemForeignMod) {
+        if !test_only(&item.attrs) {
+            visit::visit_item_foreign_mod(self, item);
+        }
+    }
+    fn visit_foreign_item_static(&mut self, item: &'ast syn::ForeignItemStatic) {
+        if !test_only(&item.attrs) {
+            self.owner(&item.ident.to_string(), item.span());
+        }
+    }
     fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
         if test_only(&item.attrs) {
+            self.test_span(item.span());
             return;
         }
         let owner = self.owner(&item.ident.to_string(), item.span());
@@ -474,6 +1165,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     }
     fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
         if test_only(&item.attrs) {
+            self.test_span(item.span());
             return;
         }
         let owner = self.owner(&item.ident.to_string(), item.span());
@@ -483,6 +1175,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     }
     fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
         if test_only(&item.attrs) {
+            self.test_span(item.span());
             return;
         }
         let name = item
@@ -490,15 +1183,17 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             .as_ref()
             .map(|ident| ident.to_string())
             .unwrap_or_else(|| item.mac.path.to_token_stream().to_string());
-        let owner = self.owner(&name, item.span());
+        let owner = if let Some(owner) = &self.current_owner {
+            owner.clone()
+        } else {
+            self.owner(&name, item.span())
+        };
         if item.ident.is_some() && contains_authority_tokens(item.mac.tokens.clone()) {
             self.census.unknown_apis.push(format!(
                 "authority macro {owner} has no compiler-resolved call owner"
             ));
         } else if item.ident.is_none() {
-            let previous = self.current_owner.replace(owner);
             self.macro_tokens(item.mac.tokens.clone());
-            self.current_owner = previous;
         }
     }
     fn visit_impl_item_macro(&mut self, item: &'ast syn::ImplItemMacro) {
@@ -511,6 +1206,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     }
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = call.method.to_string();
+        self.task_call(&method);
         let description = if let syn::Expr::Field(field) = call.receiver.as_ref() {
             field.member.to_token_stream().to_string() == "description"
         } else {
@@ -536,7 +1232,9 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             MethodCall, Paren, Path, Range, RawAddr, Reference, Repeat, Return, Struct, Try,
             TryBlock, Tuple, Unary, Unsafe, While, Yield
         );
-        if !test_only(attributes) {
+        if test_only(attributes) {
+            self.test_span(expression.span());
+        } else {
             visit::visit_expr(self, expression);
         }
     }
@@ -562,6 +1260,9 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             {
                 self.call(&operation, path.span());
             }
+        }
+        if let Some(segment) = path.path.segments.last() {
+            self.task_call(&segment.ident.to_string());
         }
         visit::visit_expr_path(self, path);
     }
