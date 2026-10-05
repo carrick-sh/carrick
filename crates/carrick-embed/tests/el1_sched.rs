@@ -503,6 +503,50 @@ fn el1_sched_futex_handoff_has_no_host_exits() {
     );
 }
 
+/// Start the fixture on CPU 1 through inherited affinity, then exercise its
+/// own pin(0). The shell must fork (it has an exit status to consume), so the
+/// fixture's first scheduler claim is restricted to CPU 1 even when taskset's
+/// caller started elsewhere. Both ping-pong partners must end up on CPU 0.
+/// Inherited affinity preserves the suite's published CPU topology.
+#[test]
+fn el1_sched_futex_handoff_after_self_affinity_change() {
+    let _guard = common::guest_lock();
+    reset_el1_counters();
+    let carrier = carrier_or_fail();
+    let _watchdog = common::Watchdog::start(Duration::from_secs(120));
+    let result = common::run_or_fail(
+        carrier
+            .container(common::SMOKE_IMAGE)
+            .pull_policy(PullPolicy::Missing)
+            .command([
+                "/usr/bin/taskset",
+                "-c",
+                "1",
+                "/bin/sh",
+                "-c",
+                "/opt/carrick/el1-sched pingpong 5000; rc=$?; exit \"$rc\"",
+            ])
+            .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
+            .run_blocking(),
+    );
+    let zone = ZoneCounts::read();
+    println!(
+        "el1-sched affinity-handoff zone={zone:?} {}",
+        result.stdout_utf8()
+    );
+    assert!(
+        result.success(),
+        "exit={} stderr={}",
+        result.exit_code,
+        result.stderr_utf8()
+    );
+    assert_eq!(
+        zone.cross_wakes, 0,
+        "both futex partners requested CPU 0: {zone:?}"
+    );
+    assert!(zone.el1_switches >= 5000, "{zone:?}");
+}
+
 /// A signal to a thread parked in a futex wait is delivered: the handler
 /// runs, and without `SA_RESTART` the wait returns `EINTR`. With
 /// `SA_RESTART` the handler runs too; whether the wait then restarts is
