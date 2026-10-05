@@ -2641,7 +2641,7 @@
       "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
       "function": "PreparedStage1MmRetirement::commit",
       "ordinal_in_function": 3,
-      "fingerprint": "ad7a61223f2c3243ad4cc18487fc4199ffed69ab91dbaf479fe8c7b9f7ddf782",
+      "fingerprint": "97799eb794dbf23c6338ca373745a0010aa2ad232498357a515912260c8f0852",
       "verdict": "carrier_fault",
       "failure_domain": "hvpatch::stage1_retirement",
       "rationale": "Stage-1 root retirement nonce overflow would reuse proof identity and permit an old backend retirement proof to authenticate a later root-slot generation.",
