@@ -473,7 +473,7 @@ where
         attempt: ProcessForkAttempt,
     ) -> Result<PreparedInProcessFork, RuntimeError>
     where
-        M: CurrentMmMemory + 'static,
+        M: carrick_kernel::dispatch::CurrentMmMemory + 'static,
         O: HvpatchProcessBackendOps<E, M>,
     {
         let ProcessForkAttempt {
