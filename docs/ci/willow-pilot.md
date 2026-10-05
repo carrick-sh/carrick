@@ -7,8 +7,8 @@ configuration. The foreground controller runs **on Willow** through SSH from
 the Mac: the PVE secret remains in `/root/carrick-ci-token.json` and on-host
 memory/pipes. Jobs receive only one-use JIT material.
 
-The [pilot receipt](willow-pilot-evidence.md) records current qualification,
-cleanup and the incomplete live job proof.
+The [pilot receipt](willow-pilot-evidence.md) records the successful job,
+artifact digest, scoped API teardown and unchanged protected VM census.
 
 ## Build and supervise
 
@@ -76,6 +76,14 @@ preserves the ledger for owner follow-up. It retains
 6 GiB host memory, 150 GiB thin-pool data headroom, and metadata below 80%.
 It checks again before boot. A shared five-minute deadline spans start,
 guest-agent checks, authenticated host-key discovery and SSH readiness.
+Before JIT registration, the controller requires completed cloud-init with
+no errors; it accepts only the observed PVE deprecated `user` warning when
+cloud-init exits 2. It explicitly starts the existing guest cleanup unit and
+verifies it is active, then qualifies non-root KVM access. The controller
+installs the canonical public launcher and `.sh` job hook embedded in its
+own binary through the scoped guest-agent API. Template and controller share
+these source files; cached template bootstrap bytes cannot select an older
+hook. These preparations stay within the same five-minute deadline.
 
 Every 60 seconds reconciliation preserves busy/unknown assignments. After
 15 minutes, an unassigned registered guest is drained under the same flock as
@@ -90,7 +98,9 @@ recorded tasks and absent reservations are distinguished from ambiguous clone
 POST outcomes. A successful recorded clone resumes preparation in place only
 for the same queued job/attempt, labels and approved SHA, using its live
 configuration and existing transport key. Historical failures stay in the
-ledger; a one-job success requires an actual recorded assignment.
+ledger; a successful one-job controller exit requires an actual recorded
+assignment and teardown. Check the GitHub job conclusion separately: that
+exit does not assert that the workflow passed.
 An ambiguous submission with neither an observable VM nor a
 recorded task deliberately freezes admission for owner investigation; it is
 never silently retried or released. API errors while a VM is active also
