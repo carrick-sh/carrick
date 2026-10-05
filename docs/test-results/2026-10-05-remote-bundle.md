@@ -106,3 +106,85 @@ The scratch worktree and transfer files were removed after testing.
 Logs are retained on carrick-vm under
 `/tmp/remote-bundle-portability-{cloudmac-red,cloudmac-green,linux-tests,clippy,xtask-clippy,fmt}.log`.
 These were VM-free macOS tests, not signed/HVF acceptance.
+
+## Batch 6 rebase and combined fixture contracts
+
+PR #54 was rebased onto `github/main` at
+`b2e77e2ff2b9d1bdfe6d8d97f3ed7fbf4eb95fe2`. Prior commit authors and
+trailers were preserved. Conflict resolutions and semantic reconciliation:
+
+- `fixtures.rs` Verify combines `--bundle` and its manifest conflict with
+  #43's `--receipt` and fresh `input_identity` evidence. The archive verifier
+  now takes the receiver checkout and calls the existing `verify_bundle`
+  after fully draining gzip. Exact HEAD, v2 schema, scoped dependency/source
+  closure, recorded policy, controlled build environment, toolchain, ELF and
+  executable inventory are checked before capture provenance is written.
+- `accept.rs` retains #43's `fixture_validation` alongside `fixture_bundle`.
+  Clean-checkout admission at entry, signed preflight and final receipt
+  remains unchanged from main. Annotation and interrupted attach tests now
+  carry real fixture-validation evidence and check that it survives.
+- `lib.rs` keeps both the atomic publication helper and main's CI scaler.
+  Atomic writes cover acceptance, installed, run-provenance and fresh
+  verification receipts. Existing one-flush restore budgets still hold.
+- Fixture scaffolding retains main's resolved local dependency graphs,
+  default build policy, v2 schema, clean tracked workflow helper and all
+  #43 regressions, plus canonical temporary roots and specific negative
+  rejection reasons. Ancestor and final symlinks remain rejected.
+- #6's lease supervisor and inherited socket/scope validation remain intact.
+  Sandbox subprocesses clear all four inherited lease capability variables.
+  Test-only no-op commands now use `true` from PATH: cloudmac has
+  `/usr/bin/true` but no `/bin/true`.
+
+Fresh red controls against the rebased implementation:
+
+| Command | Exit | Observed failure |
+| --- | --- | --- |
+| `cargo test -p carrick-xtask --test fixtures archive_verification -- --nocapture` | 101 | All four new regressions failed: archive Verify admitted changed policy, scoped source and ambient override; verification overwrote the prior receipt inode |
+| `cargo test -p carrick-xtask --test fixtures archive_verification_rejects -- --nocapture` | 101 | Prepare published run provenance before policy/ambient rejection during restore; source rejection assertion was then aligned with #43's `dirty fixture source inputs` |
+| `cargo test -p carrick-xtask --test fixtures archive_verification_rejects_changed_scoped_inputs -- --nocapture` | 101 | Prepare left provenance behind despite invalid scoped inputs |
+
+After the fix, `cargo test -p carrick-xtask --test fixtures archive_verification
+-- --nocapture` exited **0**, all four tests passing. The rejected runs leave
+neither provenance, verification evidence nor installed fixtures.
+
+Cloudmac used `/Volumes/carrick-build/wt/remote-bundle-batch6-20261005-c`,
+sourced `/Volumes/carrick/dev/env.sh`, and ran the full suite under
+`just lease carrick`, with actual system `/var/folders` TMPDIR and a private
+fixture-test lock. The child cleared `CARRICK_HOST_LEASE_FD`,
+`CARRICK_HOST_LEASE_MODE`, `CARRICK_HOST_LEASE_SOCKET` and
+`CARRICK_HOST_LEASE_SCOPE_FD`; the outer supervisor retained the host lease.
+
+The first macOS suite exited **101**, with seven fixture failures naming the
+missing `/bin/true`. Replacing only these test no-op paths fixed that issue.
+Temporarily reverting root canonicalization then reran `remote_preparation`:
+exit **101**, all seven focused tests failed at `/var`, including the specific
+rejection assertions. A saved-file rename retained an older source timestamp,
+so the immediate next full run reused the negative control's executable and
+failed 17 tests. That result is not a green claim. Refreshing the restored
+file's timestamp forced a recompile; the final complete suite exited **0**,
+including all **54 fixture integration tests**. Its expected failing lease
+helper is checked by a passing parent test. Three platform/subprocess helpers
+remain ignored on macOS.
+
+The four changed Rust source/test hashes matched Linux, including fixture
+suite SHA-256:
+`601f0b183e679341781d2e69f6693523d644080bbea266bd57699a9762fe6415`.
+Cleanup exited **0** and printed `CLOUDMAC_SCRATCH_REMOVED`; the scratch
+worktree and both transferred files were removed.
+
+Logs on carrick-vm use `/tmp/remote-bundle-batch6-*`: `identity-red`,
+`capture-red`, `source-red`, `identity-green`, `cloudmac-lease-red`,
+`cloudmac-temp-red`, `cloudmac-green`, `cloudmac-cleanup`, `linux-tests`,
+`linux-isolated-tests`, `clippy`, `xtask-clippy`, `fmt` and `domains`.
+Final Linux check exit codes and the clean-snapshot lint result are recorded
+in the PR handoff. No full acceptance, signed/HVF or Docker gate ran here.
+
+Final Linux crate verification used
+`CARRICK_HOST_LEASE_PATH=/tmp/remote-bundle-batch6-fixture-test.lock cargo test -p carrick-xtask`:
+exit **0**, including all 54 fixture tests. The ordinary default-lock run was
+blocked by another worktree's exclusive lint lease; after the isolated run
+passed, only this task's blocked fixture process was stopped (SIGTERM),
+leaving that worker and the live host lock intact. Linux xtask clippy,
+`just clippy` and `just fmt-check` exited **0**. Clippy retains the existing
+Linux configuration warning for the macOS-only `libc::proc_listallpids`
+entry; it is not a new code warning.
