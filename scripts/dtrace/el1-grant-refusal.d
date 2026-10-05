@@ -21,6 +21,15 @@
  *     anonymous RW page 0x6000008000; no overlap events. That temporary
  *     route tag and pre-carrier hold are absent from the production repair.
  *     Production now encodes authenticated waits in row 24 instead.
+ *     hvpatch-thread-terminal reason 6 reports external settlement without
+ *     a logical result: Linux pid/tid, registry tid, reason, production phase.
+ *     It is included only for that failure, to correlate a removed peer with
+ *     an unresolved join. g08 live-qualified reason 6/phase 14 for Linux
+ *     tid 1 during the terminal-publication failure; g06 qualified row 24
+ *     errno 11 / Editor cause 2 and completed successfully after that wait.
+ *     guest-internal-write-fault phase 25 reports a failed clear_child_tid
+ *     copy before the existing unconditional wake. arg0/1 are VA/length;
+ *     arg3 is the USDT error string. Source-qualified pending live evidence.
  * (c) Only failed preparation emits the new probe. Existing overlap probes
  *     include peer-resident re-selections, so perturbation is proportional to
  *     conflicts, not syscalls. No events is failure, never absence evidence.
@@ -42,5 +51,21 @@ carrick*:::el1-grant-refusal
         timestamp, pid, tid, arg0, arg1, arg2, arg3, arg4);
 }
 tick-1s { seconds++; }
+carrick*:::guest-internal-write-fault
+/(pid == $target || progenyof($target)) && arg2 == 25/
+{
+    failures++;
+    printf("GRANT1|ns=%d|pid=%d|tid=%d|CLEAR_TID|va=0x%x|len=%d|error=%s\n",
+        timestamp, pid, tid, arg0, arg1, copyinstr(arg3));
+    ustack(24);
+}
+carrick*:::hvpatch-thread-terminal
+/(pid == $target || progenyof($target)) && arg3 == 6/
+{
+    failures++;
+    printf("GRANT1|ns=%d|pid=%d|tid=%d|TERMINAL|linux_pid=%d|linux_tid=%d|registry_tid=%d|reason=%d|phase=%d\n",
+        timestamp, pid, tid, arg0, arg1, arg2, arg3, arg4);
+    ustack(24);
+}
 tick-1s /seconds >= 30/ { exit(failures == 0 ? 1 : 0); }
 END { printf("GRANT1|failure_rows=%d\n", failures); }

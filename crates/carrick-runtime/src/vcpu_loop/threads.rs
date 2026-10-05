@@ -27,7 +27,14 @@ pub(super) fn clear_persistent_child_tid_and_wake<M: carrick_guest_mem::CurrentM
     if let Some(address) = registry.clear_child_tid(tid)
         && address != 0
     {
-        let _ = memory.write_bytes(address, &0_i32.to_le_bytes());
+        if let Err(error) = memory.write_bytes(address, &0_i32.to_le_bytes()) {
+            carrick_observability::probes::guest_internal_write_fault(
+                address,
+                4,
+                25,
+                &format!("clear_child_tid tid={}: {error}", tid.raw()),
+            );
+        }
         let woken = if let Some((zone, mm)) = zone {
             let woken = carrick_kernel::el1_zone::wake(zone, mm, address, u32::MAX, 1);
             handback(&woken.handed);
@@ -932,4 +939,118 @@ pub(super) fn wake_removed_persistent_sibling_threads(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod child_tid_owner_tests {
+    use super::*;
+    use carrick_el1::personality::mm_portal::{
+        GuestVa as OwnerVa, MmError, MmPortal, TransferIntent,
+        test_support::{IPA, NoPin, ROOT, Region, Tables, VA, admit_notified, nodes, residency},
+    };
+    use carrick_guest_mem::{GuestMemory, MemoryError, UserMemoryVenue};
+    use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
+    use std::num::NonZeroU64;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct OwnerClearMemory<'a> {
+        portal: &'a MmPortal<'a, NoPin>,
+        handle: carrick_el1_abi::El1MmHandle,
+        tables: &'a Tables,
+        bytes: [u8; 4],
+        waits: usize,
+    }
+    impl GuestMemory for OwnerClearMemory<'_> {
+        fn user_memory_venue(&self) -> UserMemoryVenue {
+            UserMemoryVenue::Owner
+        }
+        fn read_bytes_raw(&self, address: u64, length: usize) -> Result<Vec<u8>, MemoryError> {
+            assert_eq!((address, length), (VA, 4));
+            Ok(self.bytes.to_vec())
+        }
+        fn write_bytes_raw(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+            assert_eq!((address, bytes.len()), (VA, 4));
+            let transfer = self
+                .portal
+                .begin(
+                    self.handle,
+                    OwnerVa::new(address),
+                    4,
+                    TransferIntent::UserWrite,
+                    0,
+                )
+                .unwrap();
+            let result = self.portal.select(
+                &transfer,
+                &self.tables.live(&CallerInvalidatesAsid),
+                &mut carrick_el1::fault::NoopPreparedResolver,
+                &mut carrick_el1::fault::NoopCowResolver,
+                &residency(),
+                0,
+            );
+            match result {
+                Err(MmError::Wait(wait)) => {
+                    assert_eq!(wait.handle(), self.handle);
+                    assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Gate);
+                    self.waits += 1;
+                    Err(MemoryError::OwnerWait(wait))
+                }
+                other => panic!("closed owner gate must refuse before copying: {other:?}"),
+            }
+        }
+    }
+    impl carrick_guest_mem::CurrentMmMemory for OwnerClearMemory<'_> {}
+
+    #[test]
+    fn owner_clear_child_tid_wait_must_not_wake_joiner_before_clear() {
+        let region = Region::new();
+        let zone = region.zone();
+        let mm = admit_notified(&region, 77, ROOT, 1, 0);
+        let view = nodes(&region);
+        let portal = MmPortal::new(
+            NonZeroU64::new(1).unwrap(),
+            region.table(),
+            &zone.spaces,
+            &view,
+        )
+        .with_zone(zone)
+        .unwrap();
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let tables = Tables::new(ROOT, IPA, 1);
+        let owner = ThreadId::synthetic_for_tests(70_303);
+        let registry = ThreadRegistry::new(owner);
+        registry.set_clear_child_tid(owner, VA);
+        let futex = FutexTable::new();
+        let wait = futex.prepare_wait(VA);
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let observer = Arc::clone(&wakes);
+        let enrollment = futex.subscribe_generation(
+            wait,
+            Arc::new(move |_| {
+                observer.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let mut memory = OwnerClearMemory {
+            portal: &portal,
+            handle,
+            tables: &tables,
+            bytes: owner.raw().to_le_bytes(),
+            waits: 0,
+        };
+        let access =
+            carrick_el1::sched::object_wait::space_access(zone, carrick_sched_core::SlotId::new(1));
+        let index = zone.spaces.find(mm.raw()).unwrap();
+        access.raise(index);
+        clear_persistent_child_tid_and_wake(&mut memory, &registry, &futex, owner, None, |_| {});
+        access.lower(index);
+        assert_eq!(memory.waits, 1, "must exercise the production owner's gate");
+        assert_eq!(memory.bytes, owner.raw().to_le_bytes());
+        assert_eq!(
+            wakes.load(Ordering::SeqCst),
+            0,
+            "owner wait must retain clear_child_tid before waking or retiring the thread"
+        );
+        drop(enrollment);
+    }
 }
