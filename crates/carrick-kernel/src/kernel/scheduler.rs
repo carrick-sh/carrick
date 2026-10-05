@@ -7283,8 +7283,32 @@ mod tests {
     /// that finds work nudges the next idle CPU before it runs.
     #[test]
     fn a_burst_onto_one_cpu_wakes_every_parked_executor_through_the_chain() {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
         const CPUS: usize = 4;
+        const BOUND: Duration = Duration::from_secs(20);
+
+        struct ParkObserver(mpsc::Sender<GuestCpuId>);
+        impl crate::observe::KernelAuditor for ParkObserver {
+            fn executor_parked(
+                &self,
+                _executor: crate::kernel::objects::ExecutorId,
+                cpu: GuestCpuId,
+                _task: Option<crate::kernel::objects::TaskKey>,
+            ) -> crate::observe::AuditVerdict {
+                let _ = self.0.send(cpu);
+                crate::observe::AuditVerdict::Continue
+            }
+        }
         let (kernel, root) = bootstrap(12_400);
+        // This fixture owns four guest CPUs regardless of the host topology.
+        // Children inherit this mask, so every bound executor can steal a row.
+        root.thread().set_affinity(CpuAffinity::all(CPUS));
+        let (parked_tx, parked_rx) = mpsc::channel();
+        kernel.set_auditors(Arc::new(crate::observe::AuditorChain::new(vec![Arc::new(
+            ParkObserver(parked_tx),
+        )])));
         publish(&root, 40);
         let children: Vec<KernelContext> = (0..CPUS)
             .map(|index| {
@@ -7312,15 +7336,16 @@ mod tests {
         // One `M` per `P`. Each takes exactly ONE row and then HOLDS it, so a
         // row can only start on an executor the chain actually woke — no
         // executor is available to pick up a second row.
-        let ready = Arc::new(Barrier::new(CPUS + 1));
-        let hold = Arc::new(Barrier::new(CPUS + 1));
-        let taken = Arc::new(AtomicUsize::new(0));
+        let (taken_tx, taken_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut releases = Vec::new();
         let mut workers = Vec::new();
         for index in 0..CPUS {
             let scheduler = Arc::clone(&scheduler);
-            let ready = Arc::clone(&ready);
-            let hold = Arc::clone(&hold);
-            let taken = Arc::clone(&taken);
+            let taken = taken_tx.clone();
+            let done = done_tx.clone();
+            let (release_tx, release_rx) = mpsc::channel();
+            releases.push(release_tx);
             workers.push(thread::spawn(move || {
                 let executor = scheduler
                     .register_executor_bound(
@@ -7329,19 +7354,23 @@ mod tests {
                         false,
                     )
                     .unwrap();
-                ready.wait();
                 let running = scheduler
                     .take(&executor)
                     .expect("every executor is reached by the wake chain");
-                taken.fetch_add(1, Ordering::SeqCst);
-                hold.wait();
+                taken.send(index).unwrap();
+                release_rx.recv_timeout(BOUND).expect("release claimed row");
                 scheduler.settle_exited(running).unwrap();
                 scheduler.unregister_executor(&executor).unwrap();
+                done.send(()).unwrap();
             }));
         }
-        ready.wait();
-        while scheduler.waiter_count() != CPUS {
-            thread::yield_now();
+        let deadline = Instant::now() + BOUND;
+        let mut parked_cpus = std::collections::BTreeSet::new();
+        while parked_cpus.len() < CPUS {
+            let cpu = parked_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("every executor must park before the burst");
+            parked_cpus.insert(cpu);
         }
 
         // The burst. Every row is FORCED onto guest CPU 0, so placement
@@ -7365,16 +7394,16 @@ mod tests {
             })
             .collect();
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while taken.load(Ordering::SeqCst) < CPUS {
+        let deadline = Instant::now() + BOUND;
+        for taken in 0..CPUS {
             assert!(
-                std::time::Instant::now() < deadline,
-                "the wake chain stalled: {} of {CPUS} rows started, {} still queued, {} executors parked",
-                taken.load(Ordering::SeqCst),
+                taken_rx
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .is_ok(),
+                "the wake chain stalled: {taken} of {CPUS} rows started, {} still queued, {} executors parked",
                 scheduler.queued_len(),
                 scheduler.waiter_count(),
             );
-            thread::yield_now();
         }
 
         // The invariant: nothing runnable is left beside a parked executor.
@@ -7392,7 +7421,15 @@ mod tests {
             );
         }
 
-        hold.wait();
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        let deadline = Instant::now() + BOUND;
+        for _ in 0..CPUS {
+            done_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("worker must settle and unregister");
+        }
         for worker in workers {
             worker.join().unwrap();
         }
