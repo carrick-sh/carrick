@@ -231,14 +231,23 @@ directory. Verification, SHA-256 hashing and restoration use only this
 capture. Archive verification reads the gzip stream through EOF, validating
 all member trailers and rejecting trailing garbage for local uploads too.
 
+Admission deliberately rejects symlinks in **every ancestor component** as
+well as the final archive component. This keeps directory aliases from
+redirecting a descriptor walk. Supply the physical directory spelling if a
+store is reached through an alias; on macOS use `/private/var/...` rather
+than `/var/...`. Admission does not canonicalize a supplied path or follow
+its final symlink. The usual `/Volumes/...` store paths have physical
+ancestors. Tests canonicalize only their temporary root before constructing
+paths, leaving their own rejection-test symlinks unresolved.
+
 Preparation atomically writes `gate-runs/<run-id>/fixture-bundle.json` after
 verification and before restoration. It records the source kind and path,
 captured path, manifest identity and archive SHA-256. Both fresh polling and
 `--attach <run-id>` read this gate-host provenance to annotate the fetched
 receipt. The gate also writes its receipt in the private run directory, so
 reattaching after worktree reuse cannot fetch another run's receipt. Attach
-rejects `--remote-bundle` and `--fixture-manifest`; the caller cannot attribute a run to an unverified path. Receipts publish by temporary
-file and rename, and annotation errors fail remote acceptance.
+rejects `--remote-bundle` and `--fixture-manifest`; the caller cannot attribute
+a run to an unverified path. Receipts publish by temporary file and rename, and annotation errors fail remote acceptance.
 
 Remote acceptance holds the checkout lock before acquiring one host gate lease
 across restore, signed acceptance and scoped guest cleanup. It reinstalls the
