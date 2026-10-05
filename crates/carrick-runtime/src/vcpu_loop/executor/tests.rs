@@ -53,6 +53,7 @@ fn test_hardware_kick(raw_vcpu_id: u64) -> super::ExactHardwareKick {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Step {
     Syscalls(usize),
+    SetAffinity(GuestCpuId),
     /// Exits taken mid-EL1 (a stage-1 COW fault resolved), resumed in place.
     ResumeEl1(usize),
     ComputeUntilKick,
@@ -81,6 +82,7 @@ struct FakeBinding {
     thread: parking_lot::Mutex<Option<Arc<carrick_kernel::kernel::Thread>>>,
     steps: parking_lot::Mutex<VecDeque<Step>>,
     load_fails: AtomicBool,
+    affinity_on_load: parking_lot::Mutex<Option<GuestCpuId>>,
     save_fails: AtomicBool,
     audit_fails: AtomicBool,
     entered: parking_lot::Mutex<Option<Arc<Barrier>>>,
@@ -148,6 +150,7 @@ impl FakeBinding {
             thread: parking_lot::Mutex::new(None),
             steps: parking_lot::Mutex::new(steps.into_iter().collect()),
             load_fails: AtomicBool::new(false),
+            affinity_on_load: parking_lot::Mutex::new(None),
             save_fails: AtomicBool::new(false),
             audit_fails: AtomicBool::new(false),
             entered: parking_lot::Mutex::new(None),
@@ -834,6 +837,14 @@ impl PersistentExecutor for FakeExecutor {
         }
         self.factory
             .record(BackendEventKind::Load, self.id, Some(key));
+        if let Some(cpu) = binding.affinity_on_load.lock().take() {
+            binding
+                .thread
+                .lock()
+                .as_ref()
+                .expect("installed thread")
+                .set_affinity(CpuAffinity::single(cpu));
+        }
         let initial_residency = task.binding().cpu_residency();
         let matches_thread_token = match initial_residency {
             Some(super::residency::TaskCpuResidency::Resident {
@@ -939,6 +950,15 @@ impl PersistentExecutor for FakeExecutor {
         self.system_ns = self.system_ns.saturating_add(3_000);
         match step {
             Step::Syscalls(_) => Ok(ExecutorExit::Syscall),
+            Step::SetAffinity(cpu) => {
+                binding
+                    .thread
+                    .lock()
+                    .as_ref()
+                    .expect("installed thread")
+                    .set_affinity(CpuAffinity::single(cpu));
+                Ok(ExecutorExit::Syscall)
+            }
             Step::ResumeEl1(_) => Ok(ExecutorExit::ResumeEl1),
             Step::HostWait => {
                 let guard = submission.begin_host_wait()?;
@@ -3658,7 +3678,7 @@ fn exec_replacement_keeps_worker_identity_and_swaps_thread_mm_asid_binding() {
         .install_root_authority(&scheduler, Arc::clone(context.thread()), authority)
         .unwrap();
     let worker = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
-    let registration = scheduler.register_executor(worker).unwrap();
+    let registration = scheduler.register_executor(worker.clone()).unwrap();
     let mut running = scheduler.take(&registration).unwrap();
     let worker_id = running.executor();
     let predecessor_authority = directory
@@ -3733,10 +3753,25 @@ fn exec_replacement_keeps_worker_identity_and_swaps_thread_mm_asid_binding() {
             .unwrap(),
         &replacement_binding
     ));
+    context
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+    assert!(
+        !worker.need_resched.load(Ordering::Acquire),
+        "retired predecessor cannot kick its exec successor"
+    );
+    committed_context
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+    let successor_kicked = worker.need_resched.load(Ordering::Acquire);
     scheduler.settle_exited(running).unwrap();
     scheduler.unregister_executor(&registration).unwrap();
     scheduler.close();
     scheduler.wait_closed();
+    assert!(
+        successor_kicked,
+        "the running exec successor must own the affinity kick capability"
+    );
 }
 
 #[test]
@@ -4073,6 +4108,160 @@ fn task_migrates_between_workers_only_after_complete_save_and_unbind() {
             "source worker unbound and audited before migration"
         );
     }
+    assert!(factory.concurrent_loads.lock().is_empty());
+}
+
+#[test]
+fn self_affinity_syscall_migrates_before_the_next_guest_entry() {
+    let (kernel, context) = bootstrap(14_019);
+    context
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    let scheduler = Arc::new(Scheduler::new_with_policy(
+        kernel,
+        Arc::new(GuestCpuPolicy::new(2)),
+    ));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(29, [Step::SetAffinity(GuestCpuId::new(1)), Step::Exit]);
+    factory.install(&context, binding);
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 2);
+    let authority = enqueue_root(&scheduler, &context, publish(&context, 29));
+    drop(authority);
+    pool.shutdown().expect("clean affinity migration shutdown");
+    let events = factory.events.lock();
+    let task_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event
+                .task
+                .is_some_and(|(key, _)| key == context.thread().key())
+        })
+        .collect();
+    let runs: Vec<_> = task_events
+        .iter()
+        .filter(|event| event.kind == BackendEventKind::Run)
+        .collect();
+    assert_eq!(
+        runs.len(),
+        2,
+        "one affinity syscall and one subsequent guest entry"
+    );
+    assert_ne!(
+        runs[0].executor, runs[1].executor,
+        "successful affinity change must migrate before guest re-entry"
+    );
+    assert_eq!(
+        task_events
+            .iter()
+            .filter(|event| event.kind == BackendEventKind::Load)
+            .count(),
+        2,
+        "exactly one migration, no retry or extra load"
+    );
+    assert_eq!(context.thread().last_cpu(), Some(GuestCpuId::new(1)));
+    assert!(factory.concurrent_loads.lock().is_empty());
+}
+
+#[test]
+fn remote_affinity_change_migrates_a_compute_task_without_a_tick_or_syscall() {
+    let (kernel, caller) = bootstrap(14_021);
+    caller
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    let target = sibling(&kernel, &caller, 24_021);
+    target
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+    let scheduler = Arc::new(Scheduler::new_with_policy(
+        kernel,
+        Arc::new(GuestCpuPolicy::new(2)),
+    ));
+    let factory = Arc::new(FakeFactory::default());
+    let entered = Arc::new(Barrier::new(2));
+    let binding = FakeBinding::new(31, [Step::ComputeUntilKick, Step::Exit]);
+    *binding.entered.lock() = Some(Arc::clone(&entered));
+    factory.install(&target, binding);
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 2);
+    let authority = enqueue_root(&scheduler, &target, publish(&target, 31));
+    entered.wait();
+    assert_eq!(
+        scheduler.queued_len(),
+        0,
+        "no fairness demand can cause this kick"
+    );
+    target
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    drop(authority);
+    pool.shutdown()
+        .expect("remote mask change kicks and migrates the compute task");
+    let events = factory.events.lock();
+    let runs: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.kind == BackendEventKind::Run
+                && event
+                    .task
+                    .is_some_and(|(key, _)| key == target.thread().key())
+        })
+        .collect();
+    assert_eq!(runs.len(), 2, "compute boundary then one migrated entry");
+    assert_ne!(
+        runs[0].executor, runs[1].executor,
+        "excluded residency must migrate"
+    );
+    assert_eq!(target.thread().last_cpu(), Some(GuestCpuId::new(0)));
+    assert_eq!(
+        caller.thread().affinity().words()[0],
+        1,
+        "caller mask is unchanged"
+    );
+    assert!(factory.concurrent_loads.lock().is_empty());
+}
+
+#[test]
+fn affinity_change_after_claim_migrates_before_the_first_guest_entry() {
+    let (kernel, context) = bootstrap(14_022);
+    context
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    let scheduler = Arc::new(Scheduler::new_with_policy(
+        kernel,
+        Arc::new(GuestCpuPolicy::new(2)),
+    ));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(32, [Step::Exit]);
+    *binding.affinity_on_load.lock() = Some(GuestCpuId::new(1));
+    factory.install(&context, binding);
+    let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 2);
+    let authority = enqueue_root(&scheduler, &context, publish(&context, 32));
+    drop(authority);
+    pool.shutdown()
+        .expect("claim/entry race settles and migrates once");
+    let events = factory.events.lock();
+    let runs: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.kind == BackendEventKind::Run
+                && event
+                    .task
+                    .is_some_and(|(key, _)| key == context.thread().key())
+        })
+        .collect();
+    let first_load = events
+        .iter()
+        .find(|event| event.kind == BackendEventKind::Load)
+        .unwrap();
+    assert_eq!(
+        runs.len(),
+        1,
+        "an excluded claim must execute no guest instructions"
+    );
+    assert_ne!(
+        runs[0].executor, first_load.executor,
+        "load-time exclusion must migrate before entry"
+    );
+    assert_eq!(context.thread().last_cpu(), Some(GuestCpuId::new(1)));
     assert!(factory.concurrent_loads.lock().is_empty());
 }
 

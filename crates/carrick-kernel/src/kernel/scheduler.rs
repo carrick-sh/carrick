@@ -420,7 +420,7 @@ impl ExecutorBinding {
         self.generation
     }
 
-    const fn token(self) -> ExecutorKickToken {
+    pub(in crate::kernel) const fn token(self) -> ExecutorKickToken {
         ExecutorKickToken {
             executor: self.executor,
             executor_epoch: self.executor_epoch,
@@ -3022,7 +3022,8 @@ impl RunQueue {
             self.inner.finish_claim();
             return None;
         }
-        let lease = match row.thread.claim_runnable(executor.id) {
+        let cpu = executor.bound_cpu().unwrap_or(GuestCpuId::new(0));
+        let lease = match row.thread.claim_runnable_on_cpu(executor.id, cpu) {
             Ok(lease) if lease.generation() == row.key.generation => lease,
             Ok(lease) => {
                 let lease_generation = lease.generation();
@@ -3042,6 +3043,16 @@ impl RunQueue {
                         crate::observe::WakeRejectionReason::StaleGeneration,
                     );
                 }
+                self.inner.finish_claim();
+                return None;
+            }
+            Err(ThreadExecutionError::AffinityExcluded { .. }) => {
+                // The row was placed before its mask changed. This is the
+                // same runnable generation, so republish it using current
+                // affinity before releasing the accounted claim. A concurrent
+                // wake coalesces normally; it must never become a discarded
+                // or stranded task merely because its placement changed.
+                let _ = self.inner.enqueue(row, true, None);
                 self.inner.finish_claim();
                 return None;
             }
@@ -4573,6 +4584,8 @@ impl Scheduler {
             self.executors.deliver_kick_to(executor.id);
         }
         let bound_cpu = executor.bound_cpu().unwrap_or(GuestCpuId::new(0));
+        row.thread
+            .publish_affinity_residency(binding, bound_cpu, Arc::downgrade(&executor.kick));
         row.thread.set_last_cpu(bound_cpu);
         let thread_id = SchedThreadId::new(row.thread.key().serial.raw());
         let process_id = SchedProcessId::new(row.thread.task_key().serial.raw());
@@ -4929,6 +4942,13 @@ impl Scheduler {
         };
         running.binding = successor;
         running.lease = Some(lease);
+        if let Some(kick) = self.executors.kick_of(successor.executor()) {
+            running.thread.publish_affinity_residency(
+                successor,
+                running.guest_cpu,
+                Arc::downgrade(&kick),
+            );
+        }
         drop(generation_transition);
         self.kernel
             .release_vfork_after_exec_publication(committed.publication_receipt)?;
@@ -5394,8 +5414,15 @@ impl Scheduler {
         self.snapshot_count.load(Ordering::Relaxed)
     }
 
-    /// Demand-driven check: should this running thread yield now?
+    /// Whether this residency may continue after a guest boundary.
     pub fn should_preempt(&self, running: &RunnableThread) -> bool {
+        // sched_setaffinity changes the live thread's mask during a syscall.
+        // An excluded residency must settle even with an empty run queue:
+        // queue demand is a fairness concern, not permission to return to an
+        // excluded CPU. The next claim uses the ordinary affinity admission.
+        if !running.thread().affinity().is_allowed(running.guest_cpu()) {
+            return true;
+        }
         self.preemption
             .lock()
             .should_preempt(&running.binding, self.queue.len())
@@ -9788,6 +9815,167 @@ mod tests {
     }
     mod serial_host {
         use super::*;
+
+        #[test]
+        fn affinity_change_updates_a_host_blocked_guest_running_record() {
+            use carrick_el1_abi::{Claim, SlotId, ThreadIdentity, WakeRecord, Waker};
+            let _region = ZoneRegion::new();
+            let zone = carrick_el1_abi::zone_tables().unwrap();
+            let (kernel, caller) = bootstrap(12_502);
+            caller
+                .thread()
+                .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+            let target = sibling(&kernel, &caller, 9_502);
+            target
+                .thread()
+                .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+            publish(&target, 52);
+            let scheduler = Arc::new(Scheduler::new(kernel));
+            let service = CarrierWaitService::new(Arc::clone(&scheduler));
+            let executor = scheduler
+                .register_executor_bound(
+                    Arc::new(RecordingKick::default()),
+                    Some(GuestCpuId::new(1)),
+                    false,
+                )
+                .unwrap();
+            scheduler.make_runnable(target.thread().key()).unwrap();
+            let running = scheduler.take(&executor).unwrap();
+            let mm = target.shared().mm().id().raw();
+            let record_id = zone
+                .alloc_record(ThreadIdentity {
+                    tid: target.thread().key().tid.raw() as u64,
+                    serial: target.thread().key().serial.raw(),
+                    mm,
+                    generation: running.generation().raw(),
+                    affinity: target.thread().affinity().words()[0],
+                    ..ThreadIdentity::default()
+                })
+                .unwrap();
+            let record = zone.record_ref(record_id);
+            target.thread().control_slot().bind_zone_record(record);
+            let seq = zone.next_seq(record_id);
+            let address = 0x1000;
+            let guard = zone
+                .lock(
+                    carrick_el1_abi::ZoneTables::bucket_of(mm, address),
+                    &crate::el1_zone::HostLockWait,
+                )
+                .unwrap();
+            zone.enqueue(&guard, record_id, seq, mm, address, u32::MAX, 0)
+                .unwrap();
+            zone.publish_park(record_id, seq);
+            drop(guard);
+            let current = target
+                .task_binding()
+                .capture(target.thread().key().tid)
+                .unwrap();
+            let continuation = BlockedContinuation::from_zone_park(
+                ContinuationCapture::from_lease(
+                    &current,
+                    running.lease(),
+                    SyscallRequest::new(98, SyscallArgs([0; 6])),
+                    RestartClass::Never,
+                )
+                .unwrap(),
+                crate::kernel::continuation::ZoneWait::new(record, seq),
+                None,
+            );
+            let mut registration = service.prepare_registration(&continuation);
+            service.enroll(&mut registration).unwrap();
+            scheduler
+                .settle_blocked_continuation(running, continuation, registration)
+                .unwrap();
+            let slot = SlotId::from_index(1).unwrap();
+            zone.publish_slot(slot, mm, Some(1), 2);
+            let space = zone.spaces.publish_closed(mm, 0x10000, 0x10000).unwrap();
+            zone.spaces.open(space);
+            assert!(zone.install_space(slot, mm).is_some());
+            zone.enter_guest(slot);
+            let guard = zone
+                .lock(
+                    carrick_el1_abi::ZoneTables::bucket_of(mm, address),
+                    &crate::el1_zone::HostLockWait,
+                )
+                .unwrap();
+            let mut woken = [WakeRecord::Guest(record)];
+            assert_eq!(
+                zone.wake(
+                    &guard,
+                    mm,
+                    address,
+                    u32::MAX,
+                    1,
+                    Waker::El1 { slot },
+                    &mut woken
+                )
+                .unwrap(),
+                1
+            );
+            drop(guard);
+            assert_eq!(zone.switch_in(slot), Some(record_id));
+            assert!(matches!(
+                target.thread().execution_state(),
+                ThreadExecutionState::Blocked { .. }
+            ));
+            assert!(
+                matches!(zone.live(record).unwrap().claim(), Claim::OnCpu { slot: owner, .. } if owner == slot)
+            );
+            assert_eq!(target.thread().linux_run_state(), Some('R'));
+
+            target
+                .thread()
+                .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+            assert_eq!(caller.thread().affinity().words()[0], 1);
+            assert_eq!(target.thread().affinity().words()[0], 1);
+            assert_eq!(
+                zone.live(record).unwrap().identity().affinity,
+                1,
+                "the exact guest-running record retains CPU 1 after its thread excludes CPU 1"
+            );
+        }
+
+        #[test]
+        fn affinity_change_before_zone_reference_publication_is_not_lost() {
+            use carrick_el1_abi::{SlotId, ThreadIdentity};
+            let _region = ZoneRegion::new();
+            let zone = carrick_el1_abi::zone_tables().unwrap();
+            let (kernel, caller) = bootstrap(12_503);
+            caller
+                .thread()
+                .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+            let target = sibling(&kernel, &caller, 9_503);
+            target
+                .thread()
+                .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+            let slot = SlotId::from_index(1).unwrap();
+            let mm = target.shared().mm().id().raw();
+            zone.publish_slot(slot, mm, Some(1), target.thread().affinity().words()[0]);
+            // The real Sched::current_record order: read the slot's cached
+            // mask, allocate/current_or_new, then bind the exact RecordRef.
+            let identity = ThreadIdentity {
+                tid: target.thread().key().tid.raw() as u64,
+                serial: target.thread().key().serial.raw(),
+                mm,
+                affinity: zone.slot(slot).affinity(),
+                ..ThreadIdentity::default()
+            };
+            assert!(target.thread().control_slot().zone_record().is_none());
+            target
+                .thread()
+                .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+            let record_id = zone.current_or_new(slot, identity).unwrap();
+            let record = zone.record_ref(record_id);
+            target.thread().control_slot().bind_zone_record(record);
+            assert_eq!(target.thread().control_slot().zone_record(), Some(record));
+            zone.requeue_preempted(slot, record_id);
+            assert_eq!(caller.thread().affinity().words()[0], 1);
+            assert_eq!(
+                zone.live(record).unwrap().identity().affinity,
+                1,
+                "a pre-publication mask change is lost when the old slot mask becomes the new record"
+            );
+        }
 
         struct ZoneRegion {
             pointer: std::ptr::NonNull<u8>,

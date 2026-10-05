@@ -222,9 +222,15 @@ trap cleanup EXIT
 # replace the proven executable identity and require toolchains on cloudmac.
 # Also verify on direct test-embed/conformance-next invocations, before signing
 # or executing any test. The inherited lease covers this verification too.
+# Unrelated dirty sources are allowed: evidence records input_identity and
+# checkout dirtiness, while the bundle must still belong to checkout HEAD.
 case "$pkg" in
     carrick-embed|carrick-conformance-next)
-        cargo run --locked -p carrick-xtask -- fixtures verify
+        fixture_receipt="$(mktemp "${TMPDIR:-/tmp}/carrick-test-signed-fixtures.XXXXXX")"
+        scratch+=("$fixture_receipt")
+        cargo run --locked -p carrick-xtask -- fixtures verify --receipt "$fixture_receipt"
+        jq -c '. + {schema:"carrick.signed-embed-test.v1",record_type:"fixture_validation"}' \
+            "$fixture_receipt" >>"$receipt_tmp"
         ;;
 esac
 

@@ -46,10 +46,26 @@ Build requires the full current HEAD SHA and clean fixture source inputs. It
 builds in a fresh `git archive` snapshot: an old executable or Cargo target
 cache cannot stand in for a fresh output. Cargo locks, Cargo configuration,
 fixture sources, probe inventory, build scripts, and compiler pin are hashed.
-The source inventory conservatively includes all tracked workspace crates and
-root Cargo manifests/lockfile: the EL1 scheduler fixture has local path
-dependencies, whose source changes must also invalidate verification. Restore
-does not need Cargo metadata resolution or registry access for this check.
+For each fixture manifest, the source inventory runs `cargo metadata --locked
+--offline --format-version 1 --filter-platform <guest-triple>` against the
+fixture manifest and follows its resolved dependency graph. Metadata runs in
+an isolated directory with the checkout's tracked Cargo configs passed
+explicitly in Cargo precedence order. It hashes the
+tracked source trees of reachable local path packages, including transitive
+and build dependencies; dev-only edges are excluded because these binaries
+are built without tests. The probe crate resolves both musl and GNU targets;
+the remaining fixtures resolve musl. The inventory also includes root and
+ancestor Cargo manifests/locks/configuration and the Rust publisher's build
+and probe-selection sources. Unrelated workspace crate sources, such as
+`carrick-runtime`, are outside this inventory.
+
+Build, restore, and verification need Cargo and cached registry metadata/source
+packages for these locked graphs. Prepare a cold cache with `cargo fetch
+--locked --manifest-path <fixture>/Cargo.toml` for each fixture manifest before
+going offline. No cross compiler or guest target installation is needed just
+to resolve metadata. Missing manifests/locks, failed resolution, or path
+packages outside the checkout fail closed; there is no whole-workspace or
+incomplete-inventory fallback.
 Tracked source symlinks are hashed as their Git link declarations without
 following them; executable objects and destination paths reject symlinks.
 The manifest also records `rustc -vV`, Cargo, GNU linker identity, target triple
@@ -103,7 +119,69 @@ Signed acceptance in both profiles records a fixture verification step and
 fails before signing or guest execution if it cannot verify the installed
 receipt and every fixture. `test-signed.sh` verifies again for embed and
 conformance-next invocations; it consumes the restored bytes without building
-guest fixtures. Restore a new exact-SHA bundle after every checkout change.
+guest fixtures. Both the installed receipt and fresh verification evidence
+record `validation_method: "input_identity"`, bundle and checkout commit IDs,
+manifest and input-inventory SHA-256 digests, and checkout dirtiness. Acceptance
+includes this evidence as `fixture_validation`; signed-test JSONL includes a
+`fixture_validation` record. These fields describe fixture input equality,
+not full-tree SHA equality or acceptance of a dirty host build.
+
+## Controlled fixture build policy
+
+The v2 manifest records `build_policy`, and `inputs_sha256` hashes both the
+source inventory and that policy. Earlier manifests must be rebuilt; editing
+a manifest cannot supply evidence that its executables followed the policy.
+Verification requires the recorded policy to equal the current publisher's
+policy and refuses ambient `CARGO_PROFILE_*`, `CARGO_BUILD_*`, target linker
+or rustflag overrides, `RUSTFLAGS`, encoded rustflags, and compiler wrappers.
+Move intended fixture settings into tracked Cargo configuration and rebuild.
+
+Build and metadata commands clear the inherited environment. They retain only
+`PATH` for tool discovery, put the pinned Rust toolchain first, and explicitly
+set the Rustup location/toolchain, isolated `HOME`/`CARGO_HOME`, `LC_ALL=C`,
+`TZ=UTC`, and `CARGO_NET_OFFLINE=true`. The publisher supplies the declared
+musl/GNU linkers. The isolated Cargo home shares downloaded registry/git
+inputs and their existing cache lock domain; it contains no user config.
+Other ambient variables (including shell startup hooks and compiler flags)
+are absent from compiler and build-script processes.
+
+Metadata reads only explicitly selected tracked checkout configs. Builds run
+in the fresh archive snapshot beneath an isolated temporary directory whose
+ancestors must contain no Cargo config. Cargo-home and checkout-parent config
+files therefore cannot change the effective build. Untracked or symlinked
+checkout configs are rejected before Cargo runs. Toolchain and linker version
+identities remain in the manifest; this is a controlled build-input policy,
+not a sandbox for untrusted build scripts or a claim of bit reproducibility.
+
+## Scoped tests and red-first work
+
+An exact-HEAD bundle remains valid when unrelated checkout sources are dirty.
+For a runtime red-first test on macOS, restore the bundle for current HEAD
+once, then:
+
+```sh
+git checkout <pre-fix> -- crates/carrick-runtime/src/<file>.rs
+just xtask fixtures verify
+just test-embed <focused-test-filter>  # rebuilds and signs the test executable
+# Record the failing assertion, then restore the fixed version and repeat.
+git restore --source=HEAD --staged --worktree -- crates/carrick-runtime/src/<file>.rs
+just test-embed <focused-test-filter>
+```
+
+This example assumes the fixed version is committed at HEAD; preserve any
+uncommitted work before replacing a file. The same fixture validation applies
+to direct `scripts/test-signed.sh carrick-conformance-next <filter>` runs.
+A modified or untracked input inside a fixture or its resolved dependency
+closure still rejects the bundle. If the test changes such inputs, commit
+that variant, build and restore its exact-SHA bundle, and test that artifact.
+Restore a new exact-SHA bundle after changing HEAD, even if only unrelated
+sources changed. `just accept --phase signed` and `remote-accept` retain their
+fully clean-checkout and exact-SHA admission rules. Acceptance checks tracked
+and untracked files independently of fixture validation, overriding Git's
+untracked-file display preference; only gitignored outputs are excluded. It
+checks again before signed work and before issuing a PASS receipt. Focused
+dirty-tree receipts do
+not confer acceptance or carry signed executable identity across rebuilds.
 
 ## Remote acceptance and Actions entry points
 
@@ -171,7 +249,11 @@ applicable invariant is exact source and executable identity for every signed
 fixture, with work linear in input and executable bytes. No guest ABI, guest
 scheduler, or guest-operation budget changes. The VM-free xtask tests cover
 roundtrip installation, tampered/missing objects, manifest tamper, wrong SHA,
-source drift, incomplete/duplicate inventory, wrong targets/toolchain,
+source drift, acceptance refusal of untracked host tests, controlled build
+environment/config isolation and policy mismatch, unrelated dirty workspace
+edits, direct/transitive path dependency
+drift, failed metadata resolution, missing lockfiles, input-identity receipt
+fields, incomplete/duplicate inventory, wrong targets/toolchain,
 permissions, symlinks, and missing/tampered installed files. The initial
 red-first CLI test failed with `unrecognized subcommand 'fixtures'` on
 `6a33e26b2` (see the implementation commit for the exact base SHA).
@@ -190,3 +272,10 @@ Signed execution and Docker differential acceptance remain director-owned.
 The worker proof transfers a real ARM64 bundle to a cloudmac scratch checkout
 and runs restore plus verification without starting guests or using the gate
 worktree. Remote gate receipt: `director-queued`.
+
+The scope red witness `clean_restore_then_unrelated_edit_preserves_fixtures`
+uses the publisher's inventory to create its bundle. With the legacy broad
+inventory restored, it printed `clean restore succeeded before unrelated edit`,
+then `introduced only crates/carrick-runtime/src/lib.rs edit`, and failed with
+`dirty fixture source inputs`. Thus the red reaches the edit after proving
+clean installation; independent-inventory tests separately verify the new scope.

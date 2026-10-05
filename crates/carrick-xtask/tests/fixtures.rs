@@ -221,17 +221,72 @@ impl Fixture {
             &serde_json::to_vec(&inventory).unwrap(),
         );
         std::os::unix::fs::symlink(
-            "carrick-el1-abi/src/lib.rs",
-            root.join("crates/source-link"),
+            "src/lib.rs",
+            root.join("crates/carrick-el1-abi/source-link"),
         )
         .unwrap();
+        // Real, registry-free Cargo graphs exercise direct and transitive closure.
+        for name in [
+            "carrick-el1-abi",
+            "fixture-transitive",
+            "fixture-builder",
+            "carrick-runtime",
+        ] {
+            let dependency = if name == "carrick-el1-abi" {
+                "[dependencies]\nfixture-transitive = { path = \"../fixture-transitive\" }\n"
+            } else {
+                ""
+            };
+            write(root, &format!("crates/{name}/Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n{dependency}").as_bytes());
+            if name != "carrick-el1-abi" {
+                write(root, &format!("crates/{name}/src/lib.rs"), b"// source\n");
+            }
+        }
+        write(
+            root,
+            "Cargo.toml",
+            b"[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n",
+        );
+        for directory in [
+            "conformance-probes",
+            "fixtures/linux-aarch64-hello",
+            "fixtures/embed-interceptor-probe",
+            "fixtures/embed-zone-readers",
+            "fixtures/embed-icache-reuse",
+            "fixtures/embed-el1-sched",
+        ] {
+            let name = directory.rsplit('/').next().unwrap();
+            let dependency = if name == "embed-el1-sched" {
+                "[dependencies]\ncarrick-el1-abi = { path = \"../../crates/carrick-el1-abi\" }\n[build-dependencies]\nfixture-builder = { path = \"../../crates/fixture-builder\" }\n[dev-dependencies]\ncarrick-runtime = { path = \"../../crates/carrick-runtime\" }\n"
+            } else {
+                ""
+            };
+            write(root, &format!("{directory}/Cargo.toml"),
+                format!("[workspace]\n[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n{dependency}").as_bytes());
+            write(root, &format!("{directory}/src/lib.rs"), b"// source\n");
+            if name == "embed-el1-sched" {
+                write(root, &format!("{directory}/build.rs"), b"fn main() {}\n");
+            }
+            let output = Command::new("cargo")
+                .current_dir(root)
+                .args(["generate-lockfile", "--offline", "--manifest-path"])
+                .arg(format!("{directory}/Cargo.toml"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         git(root, &["add", "."]);
         git(root, &["commit", "-qm", "fixture inputs"]);
         let sha = git(root, &["rev-parse", "HEAD"]);
         let mut sources = BTreeMap::new();
         for path in git(root, &["ls-files"])
             .lines()
-            .filter(|p| *p != ".gitignore")
+            .filter(|p| *p != ".gitignore" && !p.starts_with("crates/carrick-runtime/"))
         {
             let source = root.join(path);
             let digest = if fs::symlink_metadata(&source)
@@ -273,9 +328,10 @@ impl Fixture {
             });
         }
         let manifest = Manifest {
-            schema: "carrick.fixtures.v1".into(),
+            schema: "carrick.fixtures.v2".into(),
             source_head: sha.try_into().unwrap(),
             sources,
+            build_policy: fixtures::BuildPolicy::default(),
             toolchain: Toolchain {
                 rustc: "release: 1.96.0\nhost: aarch64-unknown-linux-gnu\n".into(),
                 cargo: "cargo 1.96.0".into(),
@@ -444,6 +500,245 @@ fn local_workspace_dependency_sources_are_verified() {
     );
 }
 #[test]
+fn clean_restore_then_unrelated_edit_preserves_fixtures() {
+    let mut f = Fixture::new();
+    // Use the publisher's inventory for this behavioral witness. The other
+    // tests retain their independent expected inventory to check scope.
+    f.manifest.sources = fixtures::source_hashes(f.repo.path()).unwrap();
+    f.republish();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    println!("clean restore succeeded before unrelated edit");
+    write(
+        f.repo.path(),
+        "crates/carrick-runtime/src/lib.rs",
+        b"// temporary diagnostic\n",
+    );
+    println!("introduced only crates/carrick-runtime/src/lib.rs edit");
+    fixtures::verify_installed(f.repo.path()).unwrap();
+}
+
+#[test]
+fn acceptance_rejects_untracked_host_test_even_with_valid_fixtures() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).unwrap();
+    write(
+        f.repo.path(),
+        "crates/carrick-embed/tests/local_icache.rs",
+        b"#[test] fn extra() {}\n",
+    );
+    git(
+        f.repo.path(),
+        &["config", "status.showUntrackedFiles", "no"],
+    );
+    fixtures::verify_installed(f.repo.path()).unwrap();
+    assert!(carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).is_err());
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .current_dir(f.repo.path())
+        .args(["accept", "--phase", "signed"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("fully clean checkout"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn fixture_verification_rejects_ambient_profile_override() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    for (name, value) in [
+        ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0"),
+        ("CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS", "true"),
+        (
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS",
+            "-C opt-level=0",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .current_dir(f.repo.path())
+            .args(["fixtures", "verify"])
+            .env(name, value)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "old bundle accepted changed {name}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("build policy"));
+    }
+}
+
+#[test]
+fn fixture_policy_identity_rejects_changed_policy() {
+    let mut f = Fixture::new();
+    f.manifest
+        .build_policy
+        .fixed_environment
+        .insert("CARGO_PROFILE_RELEASE_OPT_LEVEL".into(), "0".into());
+    f.republish();
+    f.rejected("build policy mismatch");
+}
+
+#[test]
+fn cargo_home_and_parent_config_are_isolated() {
+    let f = Fixture::new();
+    let outside = tempfile::tempdir().unwrap();
+    let checkout = outside.path().join("checkout");
+    git(
+        outside.path(),
+        &[
+            "clone",
+            "--quiet",
+            f.repo.path().to_str().unwrap(),
+            "checkout",
+        ],
+    );
+    fixtures::restore(&checkout, &f.path, None).unwrap();
+    write(
+        outside.path(),
+        ".cargo/config.toml",
+        b"this is invalid TOML\n",
+    );
+    write(
+        outside.path(),
+        "cargo-home/config.toml",
+        b"this is invalid TOML\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .current_dir(&checkout)
+        .args(["fixtures", "verify"])
+        .env("CARGO_HOME", outside.path().join("cargo-home"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The same configuration inside the checkout is an input, not host policy.
+    write(
+        &checkout,
+        ".cargo/config.toml",
+        b"[build]\nrustflags = []\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .current_dir(&checkout)
+        .args(["fixtures", "verify"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("requires tracked Cargo configuration")
+    );
+}
+
+#[test]
+fn unrelated_workspace_edits_preserve_fixture_identity() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    write(
+        f.repo.path(),
+        "crates/carrick-runtime/src/lib.rs",
+        b"// diagnostic\n",
+    );
+    write(
+        f.repo.path(),
+        "crates/carrick-runtime/src/diagnostic.rs",
+        b"// untracked\n",
+    );
+    fixtures::verify_installed(f.repo.path()).unwrap();
+    fixtures::verify_bundle(f.repo.path(), &f.path, None).unwrap();
+    let receipt = f.store.path().join("verification.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .current_dir(f.repo.path())
+        .args(["fixtures", "verify", "--receipt"])
+        .arg(&receipt)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let validation: serde_json::Value =
+        serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
+    assert_eq!(validation["validation_method"], "input_identity");
+    assert_eq!(validation["checkout_dirty"], true);
+    assert_eq!(
+        validation["checkout_head"],
+        validation["bundle_source_head"]
+    );
+    assert_eq!(
+        validation["inputs_sha256"],
+        String::from(hash(
+            &serde_json::to_vec(&(&f.manifest.sources, &f.manifest.build_policy)).unwrap()
+        ))
+    );
+    assert!(carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).is_err());
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    let installed: serde_json::Value = serde_json::from_slice(
+        &fs::read(f.repo.path().join(fixtures::INSTALLED_MANIFEST)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(installed["validation"], validation);
+}
+
+#[test]
+fn unresolved_fixture_closure_fails_closed() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    write(
+        f.repo.path(),
+        "fixtures/embed-el1-sched/Cargo.toml",
+        b"not a manifest",
+    );
+    assert!(
+        fixtures::verify_installed(f.repo.path())
+            .unwrap_err()
+            .to_string()
+            .contains("controlled fixture command failed")
+    );
+    git(
+        f.repo.path(),
+        &["restore", "fixtures/embed-el1-sched/Cargo.toml"],
+    );
+    fs::remove_file(f.repo.path().join("fixtures/embed-el1-sched/Cargo.lock")).unwrap();
+    assert!(
+        fixtures::verify_installed(f.repo.path())
+            .unwrap_err()
+            .to_string()
+            .contains("missing fixture manifest or lockfile")
+    );
+}
+
+#[test]
+fn transitive_fixture_dependency_edits_are_rejected() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    write(
+        f.repo.path(),
+        "crates/fixture-transitive/src/lib.rs",
+        b"// changed\n",
+    );
+    assert!(fixtures::verify_installed(f.repo.path()).is_err());
+    git(
+        f.repo.path(),
+        &["restore", "crates/fixture-transitive/src/lib.rs"],
+    );
+    fixtures::verify_installed(f.repo.path()).unwrap();
+    write(
+        f.repo.path(),
+        "crates/fixture-builder/src/lib.rs",
+        b"// changed builder\n",
+    );
+    assert!(fixtures::verify_installed(f.repo.path()).is_err());
+}
+
+#[test]
 fn missing_source_hash_and_missing_executable_row_are_rejected() {
     let mut f = Fixture::new();
     f.manifest.sources.remove("rust-toolchain.toml");
@@ -578,6 +873,7 @@ impl Preparation {
             &bin,
             "cargo",
             br#"#!/bin/sh
+if [ "$1" = metadata ]; then exec "$FIXTURE_TEST_CARGO" "$@"; fi
 while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
 [ "$#" -gt 0 ] || exit 91
 shift
@@ -623,6 +919,7 @@ fi
                 format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap()),
             )
             .env("FIXTURE_TEST_XTASK", env!("CARGO_BIN_EXE_carrick-xtask"))
+            .env("FIXTURE_TEST_CARGO", env!("CARGO"))
             .env(
                 "FIXTURE_TEST_JUST",
                 String::from_utf8(just.stdout).unwrap().trim(),
@@ -765,7 +1062,32 @@ fn trusted_hardware_workflow_prepares_exact_sha_fixtures_before_signed_execution
             .unwrap_or_else(|| panic!("missing workflow step: {name}"))
             .clone()
     };
-    let f = Fixture::new();
+    let mut f = Fixture::new();
+    // The fake cleanup helper is still a build input: commit it before creating
+    // the exact-SHA bundle/checkout instead of relying on untracked admission.
+    write(
+        f.repo.path(),
+        "scripts/sudo/kill.sh",
+        br#"#!/bin/sh
+[ "$1" = "$CARRICK_RUN_ID" ] || exit 95
+[ "$CARRICK_HOST_LEASE_MODE" = gate ] || exit 92
+printf '%s\n' "$1" > "$FIXTURE_TEST_CLEANED"
+"#,
+    );
+    fs::set_permissions(
+        f.repo.path().join("scripts/sudo/kill.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    git(f.repo.path(), &["add", "scripts/sudo/kill.sh"]);
+    git(
+        f.repo.path(),
+        &["commit", "-qm", "track workflow cleanup helper"],
+    );
+    f.manifest.source_head = git(f.repo.path(), &["rev-parse", "HEAD"])
+        .try_into()
+        .unwrap();
+    f.republish();
     let p = Preparation::new(&f);
     p.setup(&f);
     // Only Linux compilation, signing and HVF execution are replaced here.
@@ -794,23 +1116,9 @@ esac
         b"#!/bin/sh\nprintf 'com.apple.security.hypervisor\\n'\n",
     );
     write(&p.bin, "otool", b"#!/bin/sh\nprintf '__dof_carrick\\n'\n");
-    write(
-        &p.checkout,
-        "scripts/sudo/kill.sh",
-        br#"#!/bin/sh
-[ "$1" = "$CARRICK_RUN_ID" ] || exit 95
-[ "$CARRICK_HOST_LEASE_MODE" = gate ] || exit 92
-printf '%s\n' "$1" > "$FIXTURE_TEST_CLEANED"
-"#,
-    );
     for name in ["just", "codesign", "otool"] {
         fs::set_permissions(p.bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
     }
-    fs::set_permissions(
-        p.checkout.join("scripts/sudo/kill.sh"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
     let executions = p.scratch.path().join("executions");
     let cleaned = p.scratch.path().join("cleaned");
     let sha = git(&p.checkout, &["rev-parse", "HEAD"]);

@@ -274,6 +274,27 @@ pub(super) fn sched_pid_is_live_guest_thread<M: CurrentMmMemory>(
     })
 }
 
+/// Affinity belongs to one exact thread, not to its thread group or the
+/// dispatcher's process. A positive pid names the leader even when a sibling
+/// supplies getpid(); only zero names the calling thread unconditionally.
+fn resolve_affinity_thread<M: CurrentMmMemory>(
+    cx: &SyscallCtx<'_, M>,
+    pid: u64,
+) -> Option<crate::kernel::objects::ThreadRef> {
+    if pid == 0 {
+        return Some(std::sync::Arc::clone(cx.kernel.thread()));
+    }
+    let pid = i32::try_from(pid).ok()?;
+    let internal = crate::namespace::pid::guest_tid_to_kernel_for(cx.kernel, pid)?;
+    let tid = crate::kernel::LinuxTid::from_abi_positive(internal).ok()?;
+    let (task_key, thread_key) = cx.kernel.kernel().live_keys_for_thread(None, tid)?;
+    let task = cx.kernel.kernel().live_task(task_key.id)?;
+    if task.key() != task_key || task.container().id() != cx.kernel.container().id() {
+        return None;
+    }
+    task.thread(tid).filter(|thread| thread.key() == thread_key)
+}
+
 /// Classification of a sched_*/priority `pid` argument relative to the caller,
 /// resolved against carrick's guest process model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2029,15 +2050,15 @@ impl<'a> ProcView<'a> {
 
             // Resolve the target BEFORE borrowing cx.memory (resolve reads
             // cx.thread; the mutable memory borrow below would otherwise alias).
-            if resolve_sched_target(this, cx, pid) == SchedTarget::NotFound {
+            let Some(target) = resolve_affinity_thread(cx, pid) else {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-            }
+            };
             let memory = &mut *cx.memory;
             let kernel_bytes = crate::kernel::scheduler::guest_cpu_count().div_ceil(64) * 8;
             if size < kernel_bytes {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            let mask = cx.kernel.thread().affinity();
+            let mask = target.affinity();
             let buf = affinity_to_bytes(mask.words(), kernel_bytes);
             memory.write_bytes(address.0, &buf)?;
             Ok(DispatchOutcome::returned_len(kernel_bytes)?)
@@ -2049,13 +2070,13 @@ impl<'a> ProcView<'a> {
 
             let read_len = size.min(128);
             let bytes = memory.read_bytes(address.0, read_len)?;
-            let target = resolve_sched_target(this, cx, pid);
-            if target == SchedTarget::NotFound {
+            let Some(target) = resolve_affinity_thread(cx, pid) else {
+                return Ok(DispatchOutcome::errno(LINUX_ESRCH));
+            };
+            if target.task().is_none() {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             }
-            if let SchedTarget::OtherGuest { euid } = target
-                && !sched_cross_owner_ok(euid, this.cred_snapshot().euid)
-            {
+            if !sched_cross_owner_ok(target.scheduling_credentials().euid(), this.cred_snapshot().euid) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             let ncpu = crate::kernel::scheduler::guest_cpu_count();
@@ -2068,12 +2089,7 @@ impl<'a> ProcView<'a> {
             if effective.is_empty() {
                 return Ok(DispatchOutcome::errno(LINUX_EINVAL));
             }
-            if target == SchedTarget::SelfProc {
-                // This is not decoration: the run queue reads the same mask
-                // when it places a wake and when an idle guest CPU tries to
-                // steal, so a pinned thread really does stay on its CPU.
-                cx.kernel.thread().set_affinity(effective);
-            }
+            target.set_affinity(effective);
             Ok(DispatchOutcome::Returned { value: 0 })
         }
 
