@@ -461,7 +461,7 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
                         carrick_el1_abi::PortalSelectedData {
                             ipa: chunk.ipa,
                             executable: chunk.executable,
-                            root_generation: NonZeroU64::new(chunk.generation).unwrap(),
+                            root_generation: NonZeroU64::new(chunk.generation()).unwrap(),
                             offset: transfer.offset(),
                         },
                         chunk.len as usize,
@@ -706,7 +706,7 @@ fn copy_one(
         carrick_el1_abi::PortalSelectedData {
             ipa: chunk.ipa,
             executable: chunk.executable,
-            root_generation: NonZeroU64::new(chunk.generation).unwrap(),
+            root_generation: NonZeroU64::new(chunk.generation()).unwrap(),
             offset: 0,
         },
         4,
