@@ -420,8 +420,9 @@ pub(crate) fn settle_one(
         // Owner fork arms COW in its live descriptors, without host semantic
         // arm ranges. The exact MM grant and outputs above authenticate the
         // physical handoff; permissions come from the completed live leaves.
-        // Prepared neighbors may move without becoming resident, and resident
-        // neighbors must have lost their COW arm without widening permissions.
+        // The owner can retire or rearm those leaves before the next host exit.
+        // Settlement reconciles the earlier physical move, preserving that
+        // later semantic state rather than requiring a completed-write shape.
         tables
             .with_manager(|manager| {
                 (0..completion.span_len / PAGE).try_fold(false, |executable, index| {
@@ -431,9 +432,10 @@ pub(crate) fn settle_one(
                     );
                     if !matches!(
                         carrick_mmu_core::aarch64::el1_private_leaf_state(leaf),
-                        El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident
-                    ) || carrick_mmu_core::aarch64::terminal_descriptor_is_fork_cow(leaf)
-                    {
+                        El1PrivateLeafState::Prepared
+                            | El1PrivateLeafState::Resident
+                            | El1PrivateLeafState::Retired
+                    ) {
                         return None;
                     }
                     Some(
@@ -447,7 +449,7 @@ pub(crate) fn settle_one(
             })
             .flatten()
             .ok_or_else(|| {
-                TrapError::Hypervisor("live leaves are not completed private COW".to_owned())
+                TrapError::Hypervisor("live leaves lack private owner authority".to_owned())
             })?
     };
     let span = CowArmedSpan {
@@ -459,17 +461,19 @@ pub(crate) fn settle_one(
 
     // The VMA's Linux write permission rides on the replacement's alias,
     // exactly as on the host COW path. Its source is the leaf itself, not a
-    // registry alias: fork arming recorded Linux's write intent in
-    // `SW_EL1_MAY_WRITE`, and EL1's repoint keeps it. A leaf the host
+    // registry alias: the owner may protect or retire after the repoint, so
+    // its current descriptor bounds access, including a later fork arm.
+    // A leaf the host
     // published (stack, image) has no registry alias at all, so requiring one
     // made every such span unsettleable.
     let source_guest_writable = tables
         .with_manager(|manager| {
             (0..completion.span_len / PAGE).any(|index| {
-                carrick_mmu_core::aarch64::terminal_descriptor_may_write(
+                carrick_mmu_core::aarch64::terminal_descriptor_permits_host_buffer(
                     carrick_mmu_core::aarch64::terminal_descriptor(
                         manager.debug_walk(completion.span_va + index * PAGE),
                     ),
+                    carrick_mmu_core::aarch64::LeafAccess::Write,
                 )
             })
         })
