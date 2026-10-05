@@ -3867,31 +3867,111 @@ fn retained_old_token_drop_only_enqueues_before_the_executor_safe_point() {
     );
 }
 
-const CONTENDED_HOLD: Duration = Duration::from_millis(250);
 const TEST_DEADLINE: Duration = Duration::from_millis(25);
-const MAX_BOUNDED_RETURN: Duration = Duration::from_millis(150);
+// Fixture liveness only, not the transport's deadline or a performance budget.
+const HOLDER_SAFETY_BOUND: Duration = Duration::from_secs(30);
+
+struct LockReleaseSignal {
+    ready: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+    safety_expired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl LockReleaseSignal {
+    fn hold_until_released(self) {
+        self.ready
+            .send(())
+            .expect("signal contended lock acquisition");
+        if matches!(
+            self.release.recv_timeout(HOLDER_SAFETY_BOUND),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            // Publish before dropping the lock guard in the holder closure.
+            self.safety_expired
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        // Disconnection means the test is unwinding; let its cleanup join us.
+    }
+}
+
+struct ContendedLockHolder {
+    ready: mpsc::Receiver<()>,
+    release: mpsc::Sender<()>,
+    safety_expired: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ContendedLockHolder {
+    fn wait_until_held(&self) {
+        self.ready
+            .recv_timeout(HOLDER_SAFETY_BOUND)
+            .expect("contended lock holder ready");
+    }
+
+    fn release_and_join(mut self) {
+        self.release.send(()).expect("release contended lock");
+        self.thread
+            .take()
+            .expect("contended lock holder thread")
+            .join()
+            .expect("contended lock holder");
+    }
+}
+
+impl Drop for ContendedLockHolder {
+    fn drop(&mut self) {
+        // An assertion failure must also release/join the holder before the
+        // fixture tears down its MM and owners. Preserve the original panic.
+        if let Some(holder) = self.thread.take() {
+            let _ = self.release.send(());
+            let _ = holder.join();
+        }
+    }
+}
 
 fn hold_lock_then_signal(
-    hold: impl FnOnce(mpsc::Sender<()>) + Send + 'static,
-) -> (mpsc::Receiver<()>, thread::JoinHandle<()>) {
+    hold: impl FnOnce(LockReleaseSignal) + Send + 'static,
+) -> ContendedLockHolder {
     let (ready_tx, ready_rx) = mpsc::channel();
-    let holder = thread::spawn(move || hold(ready_tx));
-    (ready_rx, holder)
+    let (release_tx, release_rx) = mpsc::channel();
+    let safety_expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let signal = LockReleaseSignal {
+        ready: ready_tx,
+        release: release_rx,
+        safety_expired: Arc::clone(&safety_expired),
+    };
+    let holder = thread::spawn(move || hold(signal));
+    ContendedLockHolder {
+        ready: ready_rx,
+        release: release_tx,
+        safety_expired,
+        thread: Some(holder),
+    }
 }
 
 fn assert_bounded_timeout<T>(
     result: Result<T, carrick_hal::ForeignMmTransportError>,
     elapsed: Duration,
     lock_name: &str,
+    holder: ContendedLockHolder,
 ) {
     assert!(
         matches!(result, Err(carrick_hal::ForeignMmTransportError::TimedOut)),
         "{lock_name} contention must fail closed with TimedOut",
     );
     assert!(
-        elapsed < MAX_BOUNDED_RETURN,
-        "{lock_name} contention exceeded the overall bound: {elapsed:?}",
+        !holder
+            .safety_expired
+            .load(std::sync::atomic::Ordering::Acquire),
+        "{lock_name} contention waited for the holder's safety bound to release the lock",
     );
+    assert!(
+        elapsed >= TEST_DEADLINE,
+        "{lock_name} contention gave up before the deadline: {elapsed:?}",
+    );
+    // Success is a timeout while the lock is still held, not a scheduling
+    // latency claim. Only the test's acknowledgement can now release it.
+    holder.release_and_join();
 }
 
 #[test]
@@ -3908,55 +3988,47 @@ fn foreign_mm_retain_deadline_bounds_directory_inventory_and_owner_contention() 
     let endpoint = carrick_hal::ForeignMmEndpoint::for_carrier(Arc::new(transport.clone()));
 
     let states = Arc::clone(&transport.states);
-    let (ready, holder) = hold_lock_then_signal(move |ready| {
+    let holder = hold_lock_then_signal(move |release| {
         let _guard = states.write();
-        ready.send(()).expect("signal directory lock acquisition");
-        thread::sleep(CONTENDED_HOLD);
+        release.hold_until_released();
     });
-    ready.recv().expect("directory lock holder ready");
+    holder.wait_until_held();
     let started = Instant::now();
     let result = endpoint.retain(&installed.snapshot, started + TEST_DEADLINE);
     let elapsed = started.elapsed();
-    holder.join().expect("directory lock holder");
-    assert_bounded_timeout(result, elapsed, "carrier directory");
+    assert_bounded_timeout(result, elapsed, "carrier directory", holder);
 
     let state = Arc::clone(&installed.state);
-    let (ready, holder) = hold_lock_then_signal(move |ready| {
+    let holder = hold_lock_then_signal(move |release| {
         let _guard = state.identity.write();
-        ready.send(()).expect("signal MM identity lock acquisition");
-        thread::sleep(CONTENDED_HOLD);
+        release.hold_until_released();
     });
-    ready.recv().expect("MM identity lock holder ready");
+    holder.wait_until_held();
     let started = Instant::now();
     let result = endpoint.retain(&installed.snapshot, started + TEST_DEADLINE);
     let elapsed = started.elapsed();
-    holder.join().expect("MM identity lock holder");
-    assert_bounded_timeout(result, elapsed, "MM identity");
+    assert_bounded_timeout(result, elapsed, "MM identity", holder);
 
     let ledger = installed.state.frame_inventory.shared_ledger();
-    let (ready, holder) = hold_lock_then_signal(move |ready| {
+    let holder = hold_lock_then_signal(move |release| {
         let _guard = ledger.lock();
-        ready.send(()).expect("signal inventory lock acquisition");
-        thread::sleep(CONTENDED_HOLD);
+        release.hold_until_released();
     });
-    ready.recv().expect("inventory lock holder ready");
+    holder.wait_until_held();
     let started = Instant::now();
     let result = endpoint.retain(&installed.snapshot, started + TEST_DEADLINE);
     let elapsed = started.elapsed();
-    holder.join().expect("inventory lock holder");
-    assert_bounded_timeout(result, elapsed, "frame inventory");
+    assert_bounded_timeout(result, elapsed, "frame inventory", holder);
 
-    let (ready, holder) = hold_lock_then_signal(|ready| {
+    let holder = hold_lock_then_signal(|release| {
         let _guard = global_frame_host_owners().lock();
-        ready.send(()).expect("signal owner lock acquisition");
-        thread::sleep(CONTENDED_HOLD);
+        release.hold_until_released();
     });
-    ready.recv().expect("owner lock holder ready");
+    holder.wait_until_held();
     let started = Instant::now();
     let result = endpoint.retain(&installed.snapshot, started + TEST_DEADLINE);
     let elapsed = started.elapsed();
-    holder.join().expect("owner lock holder");
-    assert_bounded_timeout(result, elapsed, "global owners");
+    assert_bounded_timeout(result, elapsed, "global owners", holder);
 }
 
 #[test]
@@ -3975,14 +4047,11 @@ fn foreign_mm_read_deadline_bounds_mutation_coordinator_contention() {
         .retain(&installed.snapshot, Instant::now() + Duration::from_secs(1))
         .expect("retain contended MM");
     let state = Arc::clone(&installed.state);
-    let (ready, holder) = hold_lock_then_signal(move |ready| {
+    let holder = hold_lock_then_signal(move |release| {
         let _guard = state.mutation_coordinator.lock();
-        ready
-            .send(())
-            .expect("signal mutation coordinator acquisition");
-        thread::sleep(CONTENDED_HOLD);
+        release.hold_until_released();
     });
-    ready.recv().expect("mutation coordinator holder ready");
+    holder.wait_until_held();
     let started = Instant::now();
     let mut bytes = [0_u8; 4];
     let result = lease.read(
@@ -3993,8 +4062,7 @@ fn foreign_mm_read_deadline_bounds_mutation_coordinator_contention() {
         started + TEST_DEADLINE,
     );
     let elapsed = started.elapsed();
-    holder.join().expect("mutation coordinator holder");
-    assert_bounded_timeout(result, elapsed, "mutation coordinator");
+    assert_bounded_timeout(result, elapsed, "mutation coordinator", holder);
 }
 
 #[test]
