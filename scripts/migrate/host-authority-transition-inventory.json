@@ -16599,15 +16599,17 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
-      "resource": "once-created pair of carrier-owned inode recall storage workers"
+      "resource": "fixed carrier storage workers applying retained inode writeback to authenticated host-file targets"
     },
     "expansion": null,
     "operation": "std::thread::Builder::new",
     "profiles": [
+      "linux-cli",
+      "linux-runtime",
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/el1_delegation/owned_recall.rs:46 in `driver`, `std::thread::Builder::new` creates exactly two carrier-owned storage workers for owned inode recall jobs. The inode owner retains each job; no guest identity selects a host thread, and these workers carry no guest executor lease.",
+    "rationale": "In `driver`, `std::thread::Builder::new` creates exactly two carrier-owned storage workers. `RecallJob::step` waits through the inode notification authority, then `execute_recall` withdraws guest mutation and `InodeWriteback::apply` writes retained bytes to the exact host file. The inode owner retains cleanup after requester cancellation. Guest result interest uses an owned WaitQueue continuation; these workers carry no guest execution lease. This real host-storage crossing is identical on Linux and macOS.",
     "review_id": "HA-000757",
     "source": {
       "byte_end": 1598,
@@ -17760,33 +17762,6 @@
     "classification": "declared_substrate",
     "evidence": {
       "authority": "authenticated_carrier",
-      "resource": "current host thread waiting on an EL1 reservation root held by guest EL1, napping between holder-progress checks in `RootHostWait::wait`"
-    },
-    "expansion": null,
-    "operation": "std::thread::sleep",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs:72 in `RootHostWait::wait`, `std::thread::sleep` acts only on the current host thread waiting on an EL1 reservation root held by guest EL1, napping between holder-progress checks in `RootHostWait::wait`; no guest identity selects its host target.",
-    "review_id": "HA-000756",
-    "source": {
-      "byte_end": 3475,
-      "byte_start": 3457,
-      "column": 13,
-      "column_end": 31,
-      "column_start": 13,
-      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs",
-      "line": 72,
-      "line_end": 72,
-      "line_start": 72
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-SLEEP",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
       "resource": "current process-dispatch wait worker used by `futex`"
     },
     "expansion": null,
@@ -18387,33 +18362,6 @@
       "line": 45,
       "line_end": 45,
       "line_start": 45
-    }
-  },
-  {
-    "catalog_id": "HA-CATALOG-THREAD-YIELD-NOW",
-    "classification": "declared_substrate",
-    "evidence": {
-      "authority": "authenticated_carrier",
-      "resource": "current host thread waiting on an EL1 reservation root held by guest EL1 used by `RootHostWait::wait`"
-    },
-    "expansion": null,
-    "operation": "std::thread::yield_now",
-    "profiles": [
-      "macos-cli-default",
-      "macos-runtime-default"
-    ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs:70 in `RootHostWait::wait`, `std::thread::yield_now` acts only on the current host thread waiting on an EL1 reservation root held by guest EL1 used by `RootHostWait::wait`; no guest identity selects its host target.",
-    "review_id": "HA-000758",
-    "source": {
-      "byte_end": 3424,
-      "byte_start": 3402,
-      "column": 13,
-      "column_end": 35,
-      "column_start": 13,
-      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs",
-      "line": 70,
-      "line_end": 70,
-      "line_start": 70
     }
   },
   {
