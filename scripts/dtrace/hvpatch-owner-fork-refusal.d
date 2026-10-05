@@ -15,7 +15,10 @@
  *     hvpatch-el1-root-prepublish(u64 mm, u32 phase) phase 9 records the
  *     closed child publication before this service starts. Live provider
  *     qualification on a signed artifact is pending; zero refusal events
- *     cannot be interpreted as a successful owner Fork.
+ *     cannot be interpreted as a successful owner Fork. Darwin has no
+ *     dtrace:::DROP probe (live-qualified 2026-10-05); carrick trace rejects
+ *     all libdtrace consumer drop counters. Require --require-script-exit
+ *     and a zero CLI exit in addition to this script summary.
  *
  * (c) Perturbation: one failure-only scalar probe per refused owner Fork,
  *     plus one low-frequency publication probe per child. No syscall or
@@ -33,7 +36,6 @@ dtrace:::BEGIN
     refusals = 0;
     children = 0;
     errors = 0;
-    drops = 0;
     bounded = 0;
 }
 
@@ -54,11 +56,6 @@ carrick*:::hvpatch-owner-fork-refusal
         (uint64_t)arg4, pid);
 }
 
-dtrace:::DROP
-{
-    drops++;
-}
-
 dtrace:::ERROR
 {
     errors++;
@@ -67,7 +64,7 @@ dtrace:::ERROR
 proc:::exit
 /pid == $target/
 {
-    exit(children == 0 || errors != 0 || drops != 0 ? 3 : 0);
+    exit(children == 0 || errors != 0 ? 3 : 0);
 }
 
 profile:::tick-1sec
@@ -79,6 +76,6 @@ profile:::tick-1sec
 
 dtrace:::END
 {
-    printf("OWNERFORKREFUSAL1|summary|closed_children=%d|refusals=%d|errors=%d|drops=%d|bounded=%d\n",
-        children, refusals, errors, drops, bounded);
+    printf("OWNERFORKREFUSAL1|summary|closed_children=%d|refusals=%d|errors=%d|bounded=%d\n",
+        children, refusals, errors, bounded);
 }
