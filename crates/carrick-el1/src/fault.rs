@@ -274,119 +274,32 @@ impl CowResolver for HardwareCowResolver {
         self.resolve_cow_outcome(ttbr0, mm_key, far) == CowResolution::Resolved
     }
     fn resolve_cow_outcome(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> CowResolution {
-        use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
-        let Some(table) = hardware_target_table_window(ttbr0) else {
-            return CowResolution::Refused;
-        };
-        let maintenance = El1TableMaintenance { ttbr0 };
-        // SAFETY: the alias maps this MM's primary arena, the pool window
-        // every other arena, and the caller holds the MM's exact editor.
-        let Ok(words) = (unsafe {
-            PrimaryTableWords::new(
-                table.words,
-                table.physical_base,
-                carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
-                &maintenance,
-            )
-            .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
-        }) else {
-            return CowResolution::Refused;
-        };
-        let live = hardware_live_ttbr();
-        let service_lease = if live == carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE {
-            let Some(slot) = self.service_slot else {
-                return CowResolution::Refused;
-            };
-            // SAFETY: the carrier owns this ABI region for its whole lifetime;
-            // only a successful exact-slot claim can touch this pair of leaves.
-            let table = unsafe {
-                &*(carrick_el1_abi::EL1_SERVICE_COPY_TABLE_BASE
-                    as *const carrick_el1_abi::ServiceCopyTable)
-            };
-            let Some(lease) = table.try_claim(slot) else {
-                return CowResolution::Refused;
-            };
-            Some(lease)
-        } else {
-            None
-        };
-        let service_maintenance = ServiceCopyMaintenance;
-        let service_words = if service_lease.is_some() {
-            let words = unsafe {
-                PrimaryTableWords::new(
-                    carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE as *mut AtomicU64,
-                    carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
-                    carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_SIZE as usize,
-                    &service_maintenance,
-                )
-                .and_then(|words| {
-                    words.with_window(carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
-                        words: carrick_el1_abi::EL1_SERVICE_COPY_TABLE_BASE as *mut AtomicU64,
-                        physical_base: carrick_el1_abi::EL1_SERVICE_COPY_TABLE_BASE,
-                        byte_len: 4096,
-                    })
-                })
-            };
-            let Ok(words) = words else {
-                return CowResolution::Refused;
-            };
-            Some(words)
-        } else {
-            None
-        };
-        let copy_window = match (&service_lease, &service_words) {
-            (Some(lease), Some(copy_words)) => {
-                let Some(window) = crate::cow::CowCopyWindow::maintenance(copy_words, live, lease)
-                else {
-                    return CowResolution::Refused;
-                };
-                window
-            }
-            (None, None) => crate::cow::CowCopyWindow::target(
-                &words,
-                carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
-            ),
-            _ => unreachable!(),
-        };
-        let publish = |grant, ipa, len| {
-            self.publication.is_some_and(|slot| {
-                slot.publish_with(
-                    carrick_el1_abi::PortalExecutablePublication { grant, ipa, len },
-                    || unsafe {
-                        core::arch::asm!("hvc #1", options(nostack));
+        let outcome =
+            with_hardware_cow_venue(ttbr0, self.service_slot, self.publication, |venue| {
+                crate::cow::resolve_guest_cow(
+                    venue,
+                    mm_key,
+                    far,
+                    |source, destination| {
+                        // SAFETY: both aliases are mapped, distinct pages (source
+                        // EL1-RO, destination EL1-RW) until the window restores them.
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                source as *const u8,
+                                destination as *mut u8,
+                                4096,
+                            )
+                        }
+                    },
+                    || {
+                        let mut cpu = crate::sched::HardwareCpu;
+                        crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
                     },
                 )
-            })
+            });
+        let Ok(outcome) = outcome else {
+            return CowResolution::Refused;
         };
-        let outcome = crate::cow::resolve_guest_cow(
-            &crate::cow::GuestCowVenue {
-                publish_executable: self
-                    .publication
-                    .map(|_| &publish as &dyn Fn(_, _, _) -> bool),
-                words: &words,
-                root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
-                pool: carrick_el1_abi::cow_grant_pool_guest(),
-                residency: carrick_el1_abi::frame_grant_residency_guest(),
-                copy_window,
-            },
-            mm_key,
-            far,
-            |source, destination| {
-                // SAFETY: both aliases are mapped, distinct pages (source
-                // EL1-RO, destination EL1-RW) until the window restores them.
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        source as *const u8,
-                        destination as *mut u8,
-                        4096,
-                    )
-                }
-            },
-            || {
-                let mut cpu = crate::sched::HardwareCpu;
-                crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
-            },
-        );
         self.completion = match outcome {
             crate::cow::GuestCowOutcome::Resolved(completion) => Some(completion),
             _ => None,
@@ -624,6 +537,113 @@ pub trait CowCopyWindow {
     ) -> Option<(&[u8], &mut [u8])>;
 }
 
+/// Borrow the existing slot-scoped copy aliases for one bounded owner operation.
+/// The closure cannot carry table words or copy aliases across a host supply.
+#[cfg(target_os = "none")]
+pub(crate) fn with_hardware_cow_venue<R>(
+    ttbr0: u64,
+    service_slot: Option<carrick_el1_abi::SlotId>,
+    publication: Option<&'static carrick_el1_abi::PortalExecutableSlot>,
+    run: impl for<'a> FnOnce(
+        &crate::cow::GuestCowVenue<
+            'a,
+            dyn carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + 'a,
+        >,
+    ) -> R,
+) -> Result<R, ()> {
+    use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
+    let Some(table) = hardware_target_table_window(ttbr0) else {
+        return Err(());
+    };
+    let maintenance = El1TableMaintenance { ttbr0 };
+    // SAFETY: the alias maps this MM's primary arena, the pool window
+    // every other arena, and the caller holds the MM's exact editor.
+    let Ok(words) = (unsafe {
+        PrimaryTableWords::new(
+            table.words,
+            table.physical_base,
+            carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
+            &maintenance,
+        )
+        .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
+    }) else {
+        return Err(());
+    };
+    let live = hardware_live_ttbr();
+    let service_lease = if live == carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE {
+        let Some(slot) = service_slot else {
+            return Err(());
+        };
+        // SAFETY: the carrier owns this ABI region for its whole lifetime;
+        // only a successful exact-slot claim can touch this pair of leaves.
+        let table = unsafe {
+            &*(carrick_el1_abi::EL1_SERVICE_COPY_TABLE_BASE
+                as *const carrick_el1_abi::ServiceCopyTable)
+        };
+        let Some(lease) = table.try_claim(slot) else {
+            return Err(());
+        };
+        Some(lease)
+    } else {
+        None
+    };
+    let service_maintenance = ServiceCopyMaintenance;
+    let service_words = if service_lease.is_some() {
+        let words = unsafe {
+            PrimaryTableWords::new(
+                carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE as *mut AtomicU64,
+                carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
+                carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_SIZE as usize,
+                &service_maintenance,
+            )
+            .and_then(|words| {
+                words.with_window(carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
+                    words: carrick_el1_abi::EL1_SERVICE_COPY_TABLE_BASE as *mut AtomicU64,
+                    physical_base: carrick_el1_abi::EL1_SERVICE_COPY_TABLE_BASE,
+                    byte_len: 4096,
+                })
+            })
+        };
+        let Ok(words) = words else {
+            return Err(());
+        };
+        Some(words)
+    } else {
+        None
+    };
+    let copy_window = match (&service_lease, &service_words) {
+        (Some(lease), Some(copy_words)) => {
+            let Some(window) = crate::cow::CowCopyWindow::maintenance(copy_words, live, lease)
+            else {
+                return Err(());
+            };
+            window
+        }
+        (None, None) => crate::cow::CowCopyWindow::target(
+            &words,
+            carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
+        ),
+        _ => unreachable!(),
+    };
+    let publish = |grant, ipa, len| {
+        publication.is_some_and(|slot| {
+            slot.publish_with(
+                carrick_el1_abi::PortalExecutablePublication { grant, ipa, len },
+                || unsafe {
+                    core::arch::asm!("hvc #1", options(nostack));
+                },
+            )
+        })
+    };
+    Ok(run(&crate::cow::GuestCowVenue {
+        publish_executable: publication.map(|_| &publish as &dyn Fn(_, _, _) -> bool),
+        words: &words,
+        root: carrick_mmu_core::aarch64::SubstrateGpa(ttbr0 & TTBR_BADDR_MASK),
+        pool: carrick_el1_abi::cow_grant_pool_guest(),
+        residency: carrick_el1_abi::frame_grant_residency_guest(),
+        copy_window,
+    }))
+}
 /// Guest COW copy: claim the grant MM's exact editor, check that the live
 /// leaf still maps the shared frame COW-armed, copy it into the granted
 /// replacement, and return the proof that authorizes exactly one repoint.

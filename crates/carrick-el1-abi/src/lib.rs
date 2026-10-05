@@ -396,6 +396,7 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         MM_PORTAL_SELECT_ESR,
         MM_PORTAL_SERVICE_ESR,
         MM_PORTAL_GRANT_ESR,
+        MM_PORTAL_MAINTENANCE_ESR,
         core::mem::size_of::<PortalGrantSlot>() as u64,
         core::mem::size_of::<PortalExecutableSlot>() as u64,
         core::mem::size_of::<PortalExecutablePublication>() as u64,

@@ -4063,3 +4063,312 @@ fn grant_resume_reselects_generation_range_protection_and_source_changed_while_p
         assert_eq!(tables.words[1536].load(Ordering::Acquire), 0);
     }
 }
+
+#[test]
+fn pending_brk_scrub_must_not_wait_for_its_own_gate() {
+    use crate::memory::reservations::Decision;
+    use carrick_el1_abi::{ReservationBackingReceipt, ReservationCompletion};
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
+    let peer_mm = admit_notified(&region, 78, ROOT + 0x100000, 1, 0);
+    let peer_tables = Tables::new(ROOT + 0x100000, IPA, 1);
+    let view = nodes(&region);
+    let portal = MmPortal::new(
+        NonZeroU64::new(1).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(zone)
+    .unwrap();
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let tables = Tables::new(ROOT, IPA, 0);
+    // Put the retained nonidentity heap page at VA 0x2000 instead of VA.
+    tables.words[512].store((ROOT + 8192) | 3, Ordering::Release);
+    tables.words[1537].store((IPA + 4096) | RW, Ordering::Release);
+    tables.words[1538].store(IPA | RW, Ordering::Release);
+    {
+        let mut root = portal.root(mm, 1).unwrap();
+        let Decision::Work(grow) = root.brk(0x3000).unwrap() else {
+            panic!("heap growth must produce a proposal");
+        };
+        // SAFETY: this VM-free substrate already installed the heap leaf above;
+        // the completion is for exactly the held root's pending growth.
+        root.complete(unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                grow,
+                ReservationBackingReceipt {
+                    receipt: 1,
+                    granted_bytes: 8192,
+                    returned_bytes: 0,
+                },
+            )
+            .unwrap()
+        })
+        .unwrap();
+    }
+    let transfer = portal
+        .begin(
+            handle,
+            GuestVa::new(0x2000),
+            4096,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let index = zone.spaces.find(mm.raw()).unwrap();
+    let access = portal.space_access(1).unwrap();
+    access.raise(index);
+    let pending = {
+        let venue = crate::memory::reservations::RootReleaseVenue::new(
+            region.table(),
+            access.venue().unwrap(),
+        )
+        .unwrap();
+        let mut root = venue
+            .lock_resolved(
+                index.index(),
+                mm,
+                &view,
+                &crate::memory::reservations::NoRootWait,
+            )
+            .unwrap();
+        root.begin_host_proposal().unwrap();
+        let Decision::Work(request) = root.brk(0x2000).unwrap() else {
+            panic!("heap contraction must produce a pending retirement");
+        };
+        request
+    };
+    // Match the production ordering: removed bytes are already inaccessible.
+    // Both live MMs initially share fork-armed backing. Retiring this MM
+    // must never zero the physical bytes visible through the peer's leaf.
+    const COW: u64 = (1 << 55) | (1 << 56) | (1 << 57) | (1 << 7);
+    tables.words[1538].fetch_or(COW, Ordering::AcqRel);
+    peer_tables.words[1536].fetch_or(COW, Ordering::AcqRel);
+    tables.words[1538].fetch_and(!1, Ordering::AcqRel);
+    let wire = carrick_el1_abi::PortalTransferSlot::new();
+    let mut ticket = wire.submit_prepare(request).unwrap();
+    let admitted = admit_service_root(&portal, wire.claim().unwrap());
+    let suspension = ticket.take_prepare_suspension();
+    assert!(admitted.is_none(), "ordinary UserWrite must stay excluded");
+    assert!(
+        matches!(suspension, Some(carrick_el1_abi::PortalPrepareSuspension::Owner(wait))
+        if wait.cause() == carrick_el1_abi::PortalWaitCause::Gate)
+    );
+    assert_eq!(portal.root(mm, 1).unwrap().pending(), Some(pending));
+    let maintenance =
+        carrick_el1_abi::PortalBackingMaintenance::new(handle, pending, 0x2000).unwrap();
+    assert_eq!(
+        carrick_el1_abi::PortalBackingMaintenance::decode(maintenance.words()),
+        Some(maintenance)
+    );
+    // All identity/range corruptions fail before physical selection or writes.
+    for (field, value) in [
+        (0, 2),
+        (1, 78),
+        (2, 2),
+        (3, pending.generation.raw() + 1),
+        (4, pending.sequence.raw() + 1),
+        (5, 0x1000),
+        (6, 0x4000),
+        (7, 0x3000),
+    ] {
+        let mut words = maintenance.words();
+        words[field] = value;
+        if let Some(wrong) = carrick_el1_abi::PortalBackingMaintenance::decode(words) {
+            assert!(
+                portal.begin_backing_maintenance(wrong, 0).is_err(),
+                "field {field}"
+            );
+        }
+    }
+    let copy_base = carrick_el1_abi::EL1_COW_COPY_BASE;
+    let indices = carrick_mmu_core::aarch64::indices(copy_base);
+    tables.words[512 + indices[1]].store((ROOT + 0x4000) | 3, Ordering::Release);
+    tables.words[2048 + indices[2]].store((ROOT + 0x5000) | 3, Ordering::Release);
+    for page in 0..2 {
+        tables.words[2560 + indices[3] + page]
+            .store(copy_base + page as u64 * 4096, Ordering::Release);
+    }
+    let pool = carrick_el1_abi::CowGrantPool::new();
+    let resident = residency();
+    // Hundreds of unrelated terminal leaves must not enlarge this scrub.
+    for (lane, word) in tables.words[1539..2048].iter().enumerate() {
+        word.store(
+            (IPA + 0x100000 + lane as u64 * 4096) | RW,
+            Ordering::Release,
+        );
+    }
+    let arenas = [&tables, &peer_tables];
+    let words = ForkWords {
+        arenas: &arenas,
+        loads: core::cell::Cell::new(0),
+    };
+    let venue = crate::cow::GuestCowVenue {
+        words: &words,
+        root: carrick_mmu_core::aarch64::SubstrateGpa(ROOT),
+        pool: &pool,
+        residency: &resident,
+        copy_window: crate::cow::CowCopyWindow::target(
+            &words,
+            carrick_mmu_core::aarch64::SubstrateGpa(ROOT),
+        ),
+        publish_executable: None,
+    };
+    assert_eq!(
+        portal
+            .begin_backing_maintenance(maintenance, 0)
+            .unwrap()
+            .scrub(&venue, |_, _| panic!("empty physical pool must not write"))
+            .unwrap(),
+        BackingMaintenanceProgress::Supply
+    );
+    // Physical supply is outside both root and editor custody.
+    assert_eq!(portal.root(mm, 1).unwrap().pending(), Some(pending));
+    let nz = |n| NonZeroU64::new(n).unwrap();
+    // A supplied alias of the predecessor is not private replacement custody.
+    let aliased = pool
+        .publish(
+            mm.raw(),
+            IPA,
+            carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                frame_id: nz(20),
+                mapping_id: nz(21),
+                owner_generation: nz(22),
+                inventory_revision: nz(23),
+            },
+        )
+        .unwrap();
+    assert!(
+        portal
+            .begin_backing_maintenance(maintenance, 0)
+            .unwrap()
+            .scrub(&venue, |_, _| panic!(
+                "shared predecessor must never be scrubbed in place"
+            ))
+            .is_err()
+    );
+    {
+        let excluded =
+            access.raise_and_wait_for_editor(index, || panic!("service retained editor"));
+        assert!(pool.revoke(&excluded, &aliased));
+    }
+    access.lower(index);
+    let grant = pool
+        .publish(
+            mm.raw(),
+            0xa000_0000,
+            carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                frame_id: nz(10),
+                mapping_id: nz(11),
+                owner_generation: nz(12),
+                inventory_revision: nz(13),
+            },
+        )
+        .unwrap();
+    let mut physical = std::collections::BTreeMap::from([
+        (IPA, vec![0xa5u8; 4096]),
+        (grant.physical_ipa, vec![0xcdu8; 16384]),
+    ]);
+    let adjacent = tables.words[1537].load(Ordering::Acquire);
+    words.loads.set(0);
+    assert_eq!(
+        portal
+            .begin_backing_maintenance(maintenance, 0)
+            .unwrap()
+            .scrub(&venue, |source, destination| {
+                assert_eq!(tables.words[1538].load(Ordering::Acquire) & 1, 0);
+                assert_eq!(fork_translate(&words, ROOT, source), IPA);
+                assert_eq!(
+                    fork_translate(&words, ROOT, destination),
+                    grant.physical_ipa
+                );
+                assert!(pool.authenticates_claimed(&grant));
+                let mut stale = grant;
+                stale.backing.owner_generation = nz(99);
+                assert!(!pool.authenticates_claimed(&stale));
+                let output = fork_translate(&words, ROOT, destination);
+                physical.get_mut(&output).unwrap()[..4096].fill(0);
+            })
+            .unwrap(),
+        BackingMaintenanceProgress::Complete { next: 0x3000 }
+    );
+    assert!(
+        words.loads.get() <= 96,
+        "one-page scrub walked {} descriptors",
+        words.loads.get()
+    );
+    assert_eq!(tables.words[1537].load(Ordering::Acquire), adjacent);
+    assert_eq!(tables.words[1538].load(Ordering::Acquire) & 1, 0);
+    assert_eq!(fork_translate(&words, ROOT, 0x2000), grant.physical_ipa);
+    let private_bytes = &physical[&grant.physical_ipa];
+    assert!(private_bytes[..4096].iter().all(|byte| *byte == 0));
+    assert!(private_bytes[4096..].iter().all(|byte| *byte == 0xcd));
+    assert!(physical[&IPA].iter().all(|byte| *byte == 0xa5));
+    let peer_read = portal
+        .begin(
+            portal.admitted_handle(peer_mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserRead,
+            0,
+        )
+        .unwrap();
+    assert_eq!(selected(select(&portal, &peer_read, &peer_tables)).ipa, IPA);
+    // The root commits only after the exact backing operation completed.
+    portal
+        .root(mm, 1)
+        .unwrap()
+        .complete(unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                pending,
+                ReservationBackingReceipt {
+                    receipt: 2,
+                    granted_bytes: 4096,
+                    returned_bytes: 4096,
+                },
+            )
+            .unwrap()
+        })
+        .unwrap();
+    assert!(portal.begin_backing_maintenance(maintenance, 0).is_err());
+    access.lower(index);
+    // Regrowth revalidates the replacement, never the peer's old physical page.
+    let grow = match portal.root(mm, 1).unwrap().brk(0x3000).unwrap() {
+        Decision::Work(grow) => grow,
+        _ => panic!("regrowth proposal"),
+    };
+    tables.words[1538].fetch_or(1, Ordering::AcqRel);
+    portal
+        .root(mm, 1)
+        .unwrap()
+        .complete(unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                grow,
+                ReservationBackingReceipt {
+                    receipt: 3,
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+            .unwrap()
+        })
+        .unwrap();
+    assert_eq!(fork_translate(&words, ROOT, 0x2000), grant.physical_ipa);
+    assert_eq!(private_bytes[..4096], [0; 4096]);
+    let retirement = match portal.root(mm, 1).unwrap().brk(0x2000).unwrap() {
+        Decision::Work(request) => request,
+        _ => panic!("second retirement"),
+    };
+    access.raise(index);
+    assert!(
+        portal.begin_backing_maintenance(maintenance, 0).is_err(),
+        "same VA after regrowth must not accept the predecessor's request"
+    );
+    portal.root(mm, 1).unwrap().refuse(retirement).unwrap();
+    access.lower(index);
+}

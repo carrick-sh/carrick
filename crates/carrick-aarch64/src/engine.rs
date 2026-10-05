@@ -4076,9 +4076,23 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     /// Scrub the physical backing of `[address, address+len)`, BYPASSING the
     /// PROT_NONE check — used to clear a reused/`munmap`'d region whose stale bytes
     /// must never resurface after a later `mprotect` makes it readable.
+    fn zero_pending_backing(
+        &mut self,
+        pending: carrick_el1_abi::ReservationRequest,
+    ) -> Result<(), MemoryError> {
+        let handle = self.protections.owner().ok_or(MemoryError::Unsupported)?;
+        if handle.mm().raw() != self.mm_generation {
+            return Err(MemoryError::Unsupported);
+        }
+        crate::user_transfer::scrub_pending_backing(self, handle, pending)
+            .map_err(|error| MemoryError::HostMap(error.to_string()))
+    }
+
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         if self.protections.owner().is_some() {
-            return self.write_owner_bytes(address, &vec![0; len]);
+            // Pending owner maintenance requires its exact reservation request;
+            // ordinary user-copy authority cannot replace it.
+            return Err(MemoryError::Unsupported);
         }
         self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::BackingMaintenance)?;
         self.vm.zero_backing(address, len)
