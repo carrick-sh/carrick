@@ -2096,4 +2096,43 @@ mod tests {
             out_of_line_modules: Vec::new(),
         }
     }
+    #[test]
+    fn grant_pool_and_capacity_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let old_pool =
+            fs::read_to_string(repo.join("crates/carrick-el1-abi/src/cow_grants.rs")).unwrap();
+        assert!(
+            !old_pool.contains("pub struct CowGrantPool"),
+            "grant protocol must move, not be wrapped"
+        );
+        let old_capacity =
+            fs::read_to_string(repo.join("crates/carrick-el1/src/alloc.rs")).unwrap();
+        assert!(
+            !old_capacity.contains("pub struct MetadataAllocatorCore"),
+            "capacity must have one neutral owner"
+        );
+        let pool =
+            fs::read_to_string(repo.join("crates/carrick-core-abi/src/mm/cow_pool.rs")).unwrap();
+        assert!(pool.contains("pub struct CowGrantPool"));
+        let capacity =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/capacity.rs")).unwrap();
+        assert!(capacity.contains("pub struct MetadataAllocatorCore"));
+        assert!(!capacity.contains("carrick_el1"));
+    }
+    #[test]
+    fn moved_grant_capacity_witnesses_are_in_the_host_gate() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let recipes = fs::read_to_string(repo.join("justfile")).unwrap();
+        let owner = recipes
+            .split("test-mm-owner *ARGS:")
+            .nth(1)
+            .unwrap()
+            .split("\ntest *ARGS:")
+            .next()
+            .unwrap();
+        assert!(
+            owner.contains("-p carrick-core -p carrick-core-abi --lib"),
+            "moved grant and capacity tests must run in the host gate"
+        );
+    }
 }
