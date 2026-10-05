@@ -16502,7 +16502,7 @@
       "macos-runtime-default"
     ],
     "rationale": "At crates/carrick-kernel/src/el1_delegation/owned_recall.rs:46 in `driver`, `std::thread::Builder::new` creates exactly two carrier-owned storage workers for owned inode recall jobs. The inode owner retains each job; no guest identity selects a host thread, and these workers carry no guest executor lease.",
-    "review_id": "HA-000716",
+    "review_id": "HA-000757",
     "source": {
       "byte_end": 1598,
       "byte_start": 1573,
@@ -17663,7 +17663,7 @@
       "macos-runtime-default"
     ],
     "rationale": "At crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs:72 in `RootHostWait::wait`, `std::thread::sleep` acts only on the current host thread waiting on an EL1 reservation root held by guest EL1, napping between holder-progress checks in `RootHostWait::wait`; no guest identity selects its host target.",
-    "review_id": "HA-000715",
+    "review_id": "HA-000756",
     "source": {
       "byte_end": 3475,
       "byte_start": 3457,
@@ -18297,7 +18297,7 @@
       "macos-runtime-default"
     ],
     "rationale": "At crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs:70 in `RootHostWait::wait`, `std::thread::yield_now` acts only on the current host thread waiting on an EL1 reservation root held by guest EL1 used by `RootHostWait::wait`; no guest identity selects its host target.",
-    "review_id": "HA-000714",
+    "review_id": "HA-000755",
     "source": {
       "byte_end": 3424,
       "byte_start": 3402,
