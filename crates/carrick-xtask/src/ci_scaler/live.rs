@@ -12,6 +12,34 @@ struct Token {
     #[serde(rename = "value")]
     secret: String,
 }
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct GuestExit(i32);
+struct GuestOutput {
+    exit: GuestExit,
+    stdout: String,
+}
+#[derive(Deserialize)]
+struct CloudStatus {
+    status: String,
+    errors: Vec<String>,
+    recoverable_errors: std::collections::BTreeMap<String, Vec<String>>,
+}
+fn cloud_init_complete(output: &GuestOutput) -> Result<bool, ScalerError> {
+    let status: CloudStatus = serde_json::from_str(&output.stdout)?;
+    const PVE_USER_DEPRECATION: &str = "'user' of type string is deprecated in 22.2 and scheduled to be removed in 27.2. Use 'users' list instead.";
+    Ok(matches!(output.exit, GuestExit(0 | 2))
+        && status.status == "done"
+        && status.errors.is_empty()
+        && status
+            .recoverable_errors
+            .iter()
+            .all(|(category, warnings)| {
+                category == "DEPRECATED"
+                    && warnings
+                        .iter()
+                        .all(|warning| warning == PVE_USER_DEPRECATION)
+            }))
+}
 enum PveCall {
     Get,
     Post(Value),
@@ -236,6 +264,13 @@ impl Pve {
         Err(ScalerError::External("PVE task five-minute deadline"))
     }
     fn agent(&self, row: &Record, command: &[&str]) -> Result<String, ScalerError> {
+        let output = self.agent_output(row, command)?;
+        if output.exit != GuestExit(0) {
+            return Err(ScalerError::External("guest qualification"));
+        }
+        Ok(output.stdout)
+    }
+    fn agent_output(&self, row: &Record, command: &[&str]) -> Result<GuestOutput, ScalerError> {
         self.guard(row)?;
         let response = self.request(
             PveCall::Post(json!({"command":command})),
@@ -251,10 +286,14 @@ impl Pve {
                 &format!("{}/agent/exec-status?pid={pid}", base(row.vm)),
             )?;
             if status["exited"].as_bool() == Some(true) || status["exited"].as_u64() == Some(1) {
-                if status["exitcode"].as_u64() != Some(0) {
-                    return Err(ScalerError::External("guest qualification"));
-                }
-                return Ok(status["out-data"].as_str().unwrap_or_default().to_owned());
+                let exit = status["exitcode"]
+                    .as_i64()
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or(ScalerError::External("guest-agent exit status"))?;
+                return Ok(GuestOutput {
+                    exit: GuestExit(exit),
+                    stdout: status["out-data"].as_str().unwrap_or_default().to_owned(),
+                });
             }
             std::thread::sleep(Duration::from_secs(1));
         }
@@ -837,8 +876,49 @@ fn boot_and_register(
     )?;
     let mut ready = false;
     while Instant::now() < deadline {
-        let qualification = pve.agent(row, &["/usr/bin/timeout", "20", "/bin/sh", "-c",
-            "cloud-init status --wait >/dev/null && systemctl is-active carrick-ci-ready >/dev/null && runuser -u runner -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm"]);
+        let qualification = (|| {
+            let cloud = pve.agent_output(
+                row,
+                &[
+                    "/usr/bin/timeout",
+                    "20",
+                    "/usr/bin/cloud-init",
+                    "status",
+                    "--wait",
+                    "--format=json",
+                ],
+            )?;
+            if !cloud_init_complete(&cloud)? {
+                return Err(ScalerError::Guard("cloud-init not completely qualified"));
+            }
+            // cloud-final orders after multi-user.target. Starting this service
+            // explicitly after completed provisioning avoids the target cycle
+            // and makes removal of cloud-init sudo authority mandatory for JIT.
+            pve.agent(
+                row,
+                &["/usr/bin/systemctl", "start", "carrick-ci-ready.service"],
+            )?;
+            pve.agent(
+                row,
+                &[
+                    "/usr/bin/systemctl",
+                    "is-active",
+                    "carrick-ci-ready.service",
+                ],
+            )?;
+            pve.agent(
+                row,
+                &[
+                    "/usr/sbin/runuser",
+                    "-u",
+                    "runner",
+                    "--",
+                    "/usr/local/bin/carrick-xtask",
+                    "ci-scaler",
+                    "verify-kvm",
+                ],
+            )
+        })();
         if qualification.is_ok()
             && let Ok(ip) = pve.guest_ip(row)
         {
@@ -1194,6 +1274,36 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn completed_cloud_init_accepts_only_the_observed_pve_user_deprecation() {
+        let stdout = json!({"status":"done","errors":[],"recoverable_errors":{"DEPRECATED":["'user' of type string is deprecated in 22.2 and scheduled to be removed in 27.2. Use 'users' list instead."]}}).to_string();
+        let output = GuestOutput {
+            exit: GuestExit(2),
+            stdout: stdout.clone(),
+        };
+        assert!(cloud_init_complete(&output).unwrap());
+        for changed in [
+            json!({"status":"running","errors":[],"recoverable_errors":{}}),
+            json!({"status":"done","errors":["module failed"],"recoverable_errors":{}}),
+            json!({"status":"done","errors":[],"recoverable_errors":{"WARNING":["network failed"]}}),
+            json!({"status":"done","errors":[],"recoverable_errors":{"DEPRECATED":["unexpected deprecation"]}}),
+        ] {
+            assert!(
+                !cloud_init_complete(&GuestOutput {
+                    exit: GuestExit(2),
+                    stdout: changed.to_string()
+                })
+                .unwrap()
+            );
+        }
+        assert!(
+            !cloud_init_complete(&GuestOutput {
+                exit: GuestExit(1),
+                stdout
+            })
+            .unwrap()
+        );
+    }
     #[test]
     fn pve_rejection_reports_status_and_field_names_without_echoing_values() {
         let response = b"{\"errors\":{\"sshkeys\":\"invalid secret-value\"},\"message\":\"secret-value\",\"data\":null}\n400";
