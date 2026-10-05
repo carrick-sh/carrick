@@ -35,28 +35,7 @@ pub trait PhysicalForkBuilder<B>: ForkCustody<Retention = Box<dyn Send>> + Send 
     fn settle(self: Box<Self>, committed: bool) -> Result<(), TrapError>;
 }
 
-/// Exact owner completion and the physical lifetimes it selected. A refused
-/// operation cannot produce this receipt or transfer another operation's pins.
-pub struct OwnerForkReceipt<P> {
-    completion: PortalForkCompletion,
-    retained: Vec<P>,
-    host_backing: Vec<(core::num::NonZeroU64, core::num::NonZeroU64)>,
-    selected: Vec<PortalForkCustody>,
-}
-impl<P> OwnerForkReceipt<P> {
-    pub fn completion(&self) -> PortalForkCompletion {
-        self.completion
-    }
-    pub fn inherited_host_backing(&self) -> &[(core::num::NonZeroU64, core::num::NonZeroU64)] {
-        &self.host_backing
-    }
-    pub fn selected(&self) -> &[PortalForkCustody] {
-        &self.selected
-    }
-    pub fn into_parts(self) -> (PortalForkCompletion, Vec<P>) {
-        (self.completion, self.retained)
-    }
-}
+pub use carrick_core::mm::fork::{ForkReceiptError, OwnerForkReceipt, validate_fork_completion};
 
 /// Prepared owner child. The live parent undo remains in EL1 until this exact
 /// pending operation is committed or aborted after task/inventory preparation.
@@ -111,26 +90,14 @@ impl<P> PendingOwnerFork<'_, P> {
         let settled = self.ticket.take_completion().ok_or_else(|| {
             TrapError::Hypervisor("owner Fork returned without exact final settlement".into())
         })?;
-        match settled {
-            Ok(completion)
-                if completion.request == self.completion().request
-                    && completion.child == self.completion().child
-                    && if commit {
-                        completion == self.completion()
-                    } else {
-                        completion.parent_generation.raw()
-                            == self
-                                .completion()
-                                .parent_generation
-                                .raw()
-                                .checked_add(1)
-                                .unwrap_or(0)
-                            && completion.child_tables_used == 0
-                            && (completion.parent_tables_used == 0
-                                || completion.parent_tables_used
-                                    == self.completion().parent_tables_used)
-                    } =>
-            {
+        match validate_fork_completion(
+            self.completion().request,
+            self.completion().child,
+            self.completion(),
+            settled,
+            commit,
+        ) {
+            Ok(completion) => {
                 let Some(mut receipt) = self.receipt.take() else {
                     carrick_fatal::carrick_fatal!(
                         "aarch64::fork_cow",
@@ -140,12 +107,12 @@ impl<P> PendingOwnerFork<'_, P> {
                 receipt.completion = completion;
                 Ok(receipt)
             }
-            Ok(_) => Err(TrapError::Hypervisor(
-                "owner Fork completion does not match final decision".into(),
-            )),
-            Err(errno) => Err(TrapError::Hypervisor(format!(
+            Err(ForkReceiptError::Refused(errno)) => Err(TrapError::Hypervisor(format!(
                 "owner Fork finish refused: errno {errno}"
             ))),
+            Err(_) => Err(TrapError::Hypervisor(
+                "owner Fork completion does not match final decision".into(),
+            )),
         }
     }
 }
