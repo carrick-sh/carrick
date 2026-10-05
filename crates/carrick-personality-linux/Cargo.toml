@@ -1,0 +1,9 @@
+[package]
+name = "carrick-personality-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+carrick-core = { path = "../carrick-core" }
+carrick-core-abi = { path = "../carrick-core-abi" }

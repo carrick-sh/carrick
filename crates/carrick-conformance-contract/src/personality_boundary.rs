@@ -35,6 +35,8 @@ use thiserror::Error;
 
 /// Default allowlist of substrate crates subject to boundary verification.
 pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
+    "carrick-core",
+    "carrick-core-abi",
     "carrick-sched-core",
     "carrick-mmu-core",
     "carrick-signal-core",
@@ -46,6 +48,7 @@ pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
 
 /// Designated Linux personality or ABI crates forbidden in substrate dependency closures.
 pub const FORBIDDEN_PERSONALITY_CRATES: &[&str] = &[
+    "carrick-personality-linux",
     "carrick-abi",
     "carrick-el1-abi",
     "carrick-signal-linux",
@@ -1471,6 +1474,49 @@ mod tests {
         let manifest = fs::read_to_string(repo.join("crates/carrick-core-abi/Cargo.toml")).unwrap();
         assert!(!manifest.contains("carrick-el1-abi"));
         assert!(!source.contains("TrapFrame"));
+    }
+
+    #[test]
+    fn mm_prepared_custody_and_linux_policy_have_one_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let old = fs::read_to_string(
+            repo.join("crates/carrick-el1/src/personality/reservations/prepared.rs"),
+        )
+        .unwrap();
+        assert!(
+            !old.contains("pub struct ClaimedPreparedCopy"),
+            "prepared-copy claim custody must move out of the ARM personality"
+        );
+        let old =
+            fs::read_to_string(repo.join("crates/carrick-el1/src/personality/reservations.rs"))
+                .unwrap();
+        assert!(
+            !old.contains("struct Node {"),
+            "the original node store must use neutral records"
+        );
+        let neutral =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/reservation/prepared.rs"))
+                .unwrap();
+        assert!(neutral.contains("pub struct ClaimedPreparedCopy"));
+        assert!(!neutral.contains("carrick_el1"));
+        let policy =
+            fs::read_to_string(repo.join("crates/carrick-personality-linux/src/mm.rs")).unwrap();
+        assert!(policy.contains("impl NodeDataPolicy"));
+        let neutral_abi =
+            fs::read_to_string(repo.join("crates/carrick-core-abi/src/mm/reservation.rs")).unwrap();
+        assert!(!neutral_abi.contains("fn root_editable"));
+        assert!(!neutral_abi.contains("fn charges_data"));
+    }
+
+    #[test]
+    fn neutral_mm_crates_are_subject_to_the_personality_boundary() {
+        for name in ["carrick-core", "carrick-core-abi"] {
+            assert!(
+                DEFAULT_SUBSTRATE_ALLOWLIST.contains(&name),
+                "{name} must be audited"
+            );
+        }
+        assert!(FORBIDDEN_PERSONALITY_CRATES.contains(&"carrick-personality-linux"));
     }
 
     use serde_json::{Value, json};
