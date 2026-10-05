@@ -3154,7 +3154,9 @@ impl HvfVmState {
             let mut inventory = ledger.lock();
             if inventory.extents.is_empty() {
                 if task.mappings.is_empty() {
-                    return Ok(None);
+                    drop(inventory);
+                    return Self::retire_task_table_capacity(task, custody, expected_root_slot)
+                        .map(|root| root.map(|root| root.proof));
                 }
                 return Err(TrapError::Hypervisor(
                     "HVPatch process retirement has mappings without frame inventory authority"
@@ -3430,9 +3432,7 @@ impl HvfVmState {
                 }
             }
         }
-        let retired_root = expected_root_slot
-            .map(|root_slot| task.mm_access.retire_mm_root_stage2_in(custody, root_slot))
-            .transpose()?;
+        let retired_root = Self::retire_task_table_capacity(task, custody, expected_root_slot)?;
         if let Some(root) = &retired_root {
             extents.insert(root.physical_extent);
         }
@@ -3503,6 +3503,30 @@ impl HvfVmState {
 
         ledger.lock().retirement_commit = Some(retirement_commit);
         Ok(retired_root.map(|root| root.proof))
+    }
+
+    fn retire_task_table_capacity(
+        task: &HvfTaskState,
+        custody: &CarrierVmCustody,
+        expected_root_slot: Option<(u64, u64)>,
+    ) -> Result<Option<RetiredMmRootStage2>, TrapError> {
+        if let Some(root_slot) = expected_root_slot {
+            return task
+                .mm_access
+                .retire_mm_root_stage2_in(custody, root_slot)
+                .map(Some);
+        }
+        // Bootstrap relocation owns its primary through the arena source,
+        // rather than a separately prepared child root-slot receipt. Even an
+        // MM without data mappings must retire this physical table capacity.
+        task.page_tables_authority()
+            .retire_table_capacity(
+                None,
+                carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal,
+                |_| Ok(()),
+            )
+            .map_err(TrapError::Hypervisor)?;
+        Ok(None)
     }
 
     pub(crate) fn retire_task_state_mm_root_only(

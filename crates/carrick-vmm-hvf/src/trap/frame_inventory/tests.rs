@@ -7591,6 +7591,31 @@ fn carries_conditional_retire_of(task: &mut HvfTaskState, frame: carrick_hal::Fr
 
 #[derive(Debug)]
 struct BootstrapRetirementArenaSource(Option<carrick_mmu_core::aarch64::SubstrateGpa>);
+
+struct BootstrapRetirementPoolFixture {
+    custody: std::sync::Arc<CarrierVmCustody>,
+    previous: CarrierRootSlotPoolState,
+}
+impl BootstrapRetirementPoolFixture {
+    fn install(
+        custody: &std::sync::Arc<CarrierVmCustody>,
+        pool: std::sync::Arc<crate::frame_pool::PreMappedRootSlotPool>,
+    ) -> Self {
+        let previous = std::mem::replace(
+            &mut *custody.root_slot_pool.lock(),
+            CarrierRootSlotPoolState::Active(pool),
+        );
+        Self {
+            custody: custody.clone(),
+            previous,
+        }
+    }
+}
+impl Drop for BootstrapRetirementPoolFixture {
+    fn drop(&mut self) {
+        *self.custody.root_slot_pool.lock() = std::mem::take(&mut self.previous);
+    }
+}
 impl carrick_mmu_core::aarch64::TableArenaSource for BootstrapRetirementArenaSource {
     fn id(&self) -> carrick_mmu_core::aarch64::TableArenaSourceId {
         carrick_mmu_core::aarch64::TableArenaSourceId(carrick_mmu_core::aarch64::SubstrateGpa(
@@ -7640,7 +7665,7 @@ fn two_live_mm_bootstrap_retirement_releases_only_its_published_root_slot() {
     let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
         2,
     ));
-    custody.install_root_slot_pool(pool.clone());
+    let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let (mut first, _, _, _) =
@@ -7693,7 +7718,7 @@ fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
     let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
         2,
     ));
-    custody.install_root_slot_pool(pool.clone());
+    let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
     let kernel = std::sync::Arc::new(PerFrameKernel::default());
     let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
     let (mut first, key, generation, _) =

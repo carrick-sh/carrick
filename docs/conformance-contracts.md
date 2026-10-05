@@ -325,6 +325,17 @@ or owner admission invalidates preparation. VM-free bindings:
 `relocated_boot_root_custody_survives_exec_and_reuse_rejects_old_lease`.
 Signed multi-container and exec acceptance remains required.
 
+Physical retirement covers every arena this exact authority published,
+including a relocated bootstrap primary outside the inventory's mapping rows.
+Source capacity cannot be returned while its exact stage-2 record is pinned;
+terminal retirement revokes the software image under the same exclusion before
+reuse. Work visits each owned published arena once, with no carrier-wide scan.
+The two-live-MM VM-free bindings are
+`two_live_mm_bootstrap_retirement_releases_only_its_published_root_slot` and
+`two_live_mm_pinned_table_retirement_cannot_return_physical_capacity`: retirement
+releases one slot, retains the other MM's bytes and identity, and a pin allows
+zero capacity returns. These do not qualify full-crate parallel host fixtures.
+
 `kernel.mm.delegated-root-reader-cost` covers the host readers of a delegated
 root: proposal charging (`RLIMIT_AS`/`RLIMIT_DATA`), `mincore`, fault plans,
 `madvise` range metadata, lock accounting, the arena high water and the host
@@ -386,6 +397,18 @@ same-image Docker. The existing tests remain until the contract has demonstrated
 equivalent or stronger failure detection.
 
 ## Fork stage-1 image example
+
+`kernel.fork.stage1-image` also requires owner-selected physical custody to
+authenticate the selected IPA through the carrier's exact extent record, VM
+generation and logical-owner generation. A carrier-MM alias index is not the
+extent authority; guest VAs cannot substitute for physical selections. The
+VM-free binding
+`owner_fork_retains_live_structural_capacity_without_carrier_mm_alias_index`
+retains two real structural records for a bounded copy with an empty legacy
+index. `owner_selected_same_va_in_two_mms_retains_exact_physical_frames` guards
+same-VA isolation. Lookup work follows the physical extent index and selected
+records, without scanning other MM populations. Signed fork acceptance remains
+required.
 
 `kernel.fork.stage1-image` is the first contract whose structural budget lives
 entirely in the VMM layer. Every forked child owns a private stage-1

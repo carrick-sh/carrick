@@ -179,6 +179,20 @@ impl PendingExecStage2Cleanup {
             }
         }
         let mut root_proof = None;
+        if let Some(mm_access) = self
+            .mm_access
+            .as_ref()
+            .filter(|_| self.mm_root_slot.is_none())
+        {
+            mm_access
+                .page_tables_authority()
+                .retire_table_capacity(
+                    None,
+                    carrick_aarch64::stage1_authority::TableArenaRetirement::ExecHandoff,
+                    |_| Ok(()),
+                )
+                .map_err(TrapError::Hypervisor)?;
+        }
         if let (Some(mm_access), Some(root_slot)) = (&self.mm_access, self.mm_root_slot) {
             let retired_root = mm_access.retire_exec_mm_root_stage2_in(custody, root_slot)?;
             let (ipa, size) = retired_root.physical_extent;
