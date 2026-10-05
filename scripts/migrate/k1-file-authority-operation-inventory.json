@@ -7559,7 +7559,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 382,
+      "line": 383,
       "categories": [
         "mapping"
       ],
@@ -7568,7 +7568,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 958,
+      "line": 959,
       "categories": [
         "mapping"
       ],
@@ -7577,7 +7577,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 1043,
+      "line": 1044,
       "categories": [
         "mapping"
       ],
@@ -7586,7 +7586,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 1052,
+      "line": 1053,
       "categories": [
         "mapping"
       ],
@@ -7595,7 +7595,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 1069,
+      "line": 1070,
       "categories": [
         "mapping"
       ],
@@ -7604,7 +7604,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 1071,
+      "line": 1072,
       "categories": [
         "mapping"
       ],
@@ -7613,7 +7613,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations.rs",
-      "line": 1074,
+      "line": 1075,
       "categories": [
         "mapping"
       ],
