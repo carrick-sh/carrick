@@ -223,7 +223,8 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   exact-HEAD fixture bundle with unrelated dirty host sources: verification
   checks the fixtures' resolved Cargo path-dependency inputs and records
   `input_identity` in the receipt. Changed fixture inputs still require their
-  own committed variant and rebuilt bundle. Acceptance remains clean-tree,
+  own committed variant and rebuilt bundle. Acceptance independently requires
+  no tracked or untracked changes (gitignored outputs excluded), and remains
   exact-SHA; see [`docs/signed-fixtures.md`](docs/signed-fixtures.md#scoped-tests-and-red-first-work).
 - **Report errno NUMBERS** (`seek_data_negative_errno = errno`) — Linux said
   ENXIO where EINVAL was assumed; ESPIPE for `pwrite` on either pipe end, not
