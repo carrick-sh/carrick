@@ -1776,8 +1776,8 @@ fn owner_fork_refuses_outstanding_copy_and_keeps_peer_same_va_separate() {
 /// one transaction; none of those steps may consult the peer's translation.
 #[test]
 fn owner_fork_publishes_child_with_two_live_same_va_mms() {
-    let parent_root = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE;
     let pool_root = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+    let parent_root = pool_root;
     let region = Region::new();
     let spaces = AddressSpaces::new();
     let parent = admit(&region, &spaces, 2, parent_root, 2, 0);
@@ -1803,9 +1803,13 @@ fn owner_fork_publishes_child_with_two_live_same_va_mms() {
     parent_tables.words[512 + indices[1]].store((parent_root + 0x4000) | 3, Ordering::Release);
     parent_tables.words[2048 + indices[2]].store(0xb000_0000 | (RW & !3) | 1, Ordering::Release);
     let request = fork_request(&region, &spaces, parent, 3, &child, &supply);
-    // The fixed boot primary was an admitted HVF root before N1's pool
-    // relocation; BIND accepts it on the carrier maintenance root. Fork must
-    // use the same authenticated window while both MM identities are live.
+    // Before bootstrap relocation, BIND admitted the fixed primary and Fork
+    // stage 3 refused it with EINVAL. All live owner roots must now be pool
+    // roots while the child and peer remain separate MM identities.
+    assert_eq!(
+        fork::fork_table_window(request, carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE).err(),
+        Some(3)
+    );
     let primary = fork::fork_table_window(request, parent_root).unwrap();
     assert_eq!(primary.physical_base, parent_root);
     assert_eq!(primary.words as u64, parent_root);
