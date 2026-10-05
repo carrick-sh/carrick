@@ -168,8 +168,9 @@ pub(crate) fn run_with_carrier_budget(
     // between containers). Its window is a multiple of the budget so a guest
     // that legitimately sleeps through a whole run — `mtidlesleep` sleeps 20 s
     // with no syscalls — never trips it.
+    let identity = builder.capture_identity();
     if let Some(window) = DeadlockWindow::new(budget * CARRIER_STALL_MULTIPLE) {
-        deadlock_watchdog::arm(window);
+        deadlock_watchdog::arm(window, carrick_runtime::carrier::active_carrier_scope);
     }
 
     let (sender, receiver) = mpsc::channel();
@@ -213,7 +214,7 @@ pub(crate) fn run_with_carrier_budget(
                 // thread is instead described from outside, by a debugger, and
                 // the carrier is reaped behind the returned error.
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    Err(wedged(label, budget, started.elapsed()))
+                    Err(wedged(label, budget, started.elapsed(), &identity))
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => Err(EmbedError::ExecutePanicked(
                     "the budget-bounded run thread ended without a result".to_owned(),
@@ -226,12 +227,17 @@ pub(crate) fn run_with_carrier_budget(
 /// The abort latch was never consumed: capture the carrier from outside and
 /// report where the artifacts are. Both outcomes are named failures; neither
 /// is ever an empty pass.
-fn wedged(label: &str, budget: Duration, elapsed: Duration) -> EmbedError {
+fn wedged(
+    label: &str,
+    budget: Duration,
+    elapsed: Duration,
+    identity: &carrick_kernel::wedge_capture::CarrierCaptureIdentity,
+) -> EmbedError {
     let pid = i32::try_from(std::process::id()).unwrap_or(-1);
     let request = WedgeCaptureRequest {
         label: label.to_owned(),
         pid,
-        run_id: std::env::var("CARRICK_RUN_ID").ok(),
+        run_id: identity.run_id(),
         budget_ms: millis(budget),
         elapsed_ms: millis(elapsed),
         out_root: wedge_capture_root(),
