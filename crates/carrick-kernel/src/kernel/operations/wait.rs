@@ -376,7 +376,12 @@ impl Kernel {
                             .tasks
                             .get(&child_key.id)
                             .map(|record| &record.task)
-                            .or_else(|| state.retiring_tasks.get(&child_key.id));
+                            .or_else(|| {
+                                state
+                                    .retiring_tasks
+                                    .get(&child_key.id)
+                                    .map(|record| &record.task)
+                            });
                         task.is_some_and(|task| {
                             task.key() == *child_key
                                 && task.parent() == Some(parent)
@@ -440,7 +445,12 @@ impl Kernel {
                                 .tasks
                                 .get(&child_key.id)
                                 .map(|record| &record.task)
-                                .or_else(|| state.retiring_tasks.get(&child_key.id));
+                                .or_else(|| {
+                                    state
+                                        .retiring_tasks
+                                        .get(&child_key.id)
+                                        .map(|record| &record.task)
+                                });
                             task.is_some_and(|task| {
                                 task.key() == *child_key
                                     && task.parent() == Some(parent)
@@ -621,7 +631,12 @@ impl Kernel {
                     .tasks
                     .get(&child_key.id)
                     .map(|record| &record.task)
-                    .or_else(|| state.retiring_tasks.get(&child_key.id));
+                    .or_else(|| {
+                        state
+                            .retiring_tasks
+                            .get(&child_key.id)
+                            .map(|record| &record.task)
+                    });
                 task.is_some_and(|task| {
                     task.key() == *child_key
                         && task.parent() == Some(parent)

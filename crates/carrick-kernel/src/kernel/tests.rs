@@ -865,7 +865,7 @@ fn container_retirement_uses_task_exit_settlement_before_reaping() {
     assert!(
         kernel
             .registry()
-            .zombies_for_container(container.id())
+            .exited_processes_for_container(container.id())
             .is_empty()
     );
 }

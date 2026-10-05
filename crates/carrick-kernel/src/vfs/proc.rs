@@ -1733,7 +1733,7 @@ pub(crate) fn synthetic_task_dir(
             return Some(tids);
         }
         if registry
-            .zombies_for_container(container_id)
+            .exited_processes_for_container(container_id)
             .into_iter()
             .any(|z| z.key.id == task_id)
         {
