@@ -694,7 +694,7 @@ fn guest_cow_kernel_grant_refusal_releases_backend_inventory_and_owner() {
     assert!(!ScopedStage2MapTestStub::is_mapped(gpa, length as usize));
 }
 
-fn replacement(base: u64, generation: u64) -> super::PendingEl1GrantReplacement {
+fn replacement(base: u64, generation: u64) -> super::PendingEl1GrantPublication {
     use super::*;
     let ready = carrick_hal::El1FrameGrantReady {
         physical_ipa: 0x80_0000_0000 + base,
@@ -703,7 +703,8 @@ fn replacement(base: u64, generation: u64) -> super::PendingEl1GrantReplacement 
         owner_generation: generation,
         inventory_revision: 8,
     };
-    PendingEl1GrantReplacement {
+    PendingEl1GrantPublication {
+        completion: global_frame::PhysicalGrantCompletion::new(),
         grant: carrick_hal::threaded::El1FrameGrantRollback {
             mm_key: 41,
             semantic_base: base,
@@ -738,9 +739,9 @@ fn replacement(base: u64, generation: u64) -> super::PendingEl1GrantReplacement 
 /// A guest-lane replacement is named to its completion or rollback by its
 /// exact incarnation, and one span never holds two pending replacements.
 #[test]
-fn pending_el1_grant_replacements_match_only_the_exact_grant() {
+fn pending_el1_grant_publications_match_only_the_exact_grant() {
     use super::*;
-    let mut ledger = PendingEl1GrantReplacements::default();
+    let mut ledger = PendingEl1GrantPublications::default();
     let first = replacement(0x10_0000, 3);
     assert!(ledger.insert(first.clone()));
     assert!(ledger.overlaps(0x10_3000, 0x1000));
@@ -802,8 +803,8 @@ fn guest_lane_replacement_grant_defers_retirement_and_registration() {
             "publish_frame_grant(",
             "if let Some(retirement) = retirement.take()",
             "commit_preapplied_process_alias_retirement(",
-            "None => register_shared_alias(published.alias)",
-            "self.el1_grant_replacements.lock().insert(pending)",
+            "if predecessor_leases.is_none()",
+            "self.el1_grant_publications.lock().insert(pending)",
             "transition.commit()",
         ],
     );
@@ -826,7 +827,7 @@ fn replacement_completion_and_rollback_touch_the_right_owner() {
     in_order(
         complete,
         &[
-            "el1_grant_replacements.lock().take(&grant)",
+            "el1_grant_publications.lock().take(&grant)",
             "prepare_process_alias_retirement(",
             "retirement.planned_leases != pending.predecessor_leases",
             "FrameRegistryGuard::acquire(",
@@ -843,7 +844,7 @@ fn replacement_completion_and_rollback_touch_the_right_owner() {
     in_order(
         pending,
         &[
-            "el1_grant_replacements.lock().take(&grant)",
+            "el1_grant_publications.lock().take(&grant)",
             "retire_unregistered_el1_frame_grant(",
             "restore_pristine(",
             "return Ok(true)",
