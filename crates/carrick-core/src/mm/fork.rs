@@ -664,16 +664,6 @@ pub struct ForkCensus {
     pub custody: usize,
 }
 
-/// The identity page is the only private data in the bootstrap control hole.
-/// The carrier owns code, maintenance and mailbox outputs for its entire VM
-/// lifetime; a coarse bootstrap descriptor also covers stage-2 gaps. Neither
-/// those shared outputs nor the gaps authorize a physical fork copy.
-fn private_control_page(va: u64) -> bool {
-    (carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE
-        ..carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE + carrick_el1_abi::CARRICK_IDENTITY_PAGE_SIZE)
-        .contains(&va)
-}
-
 pub fn census_table<
     B: OwnerForkMmu,
     P: MappingInheritancePolicy,
@@ -737,8 +727,8 @@ pub fn census_entry<
         return Ok(());
     }
     let span = 1u64 << SHIFTS[level];
-    const CONTROL: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE - 0x2_0000;
-    let structural = B::PRIVATE_CONTROL_WINDOW && va < CONTROL + 0x20_0000 && va + span > CONTROL;
+    let structural = B::control_window()
+        .is_some_and(|(start, end)| va < end.raw() && va.saturating_add(span) > start.raw());
     let selected = policy::<B, P>(policy_provider, mappings, va, span, descriptor)?;
     if (structural || selected == Policy::Mixed) && level < 3 {
         count.child = count.child.checked_add(512).ok_or(ForkError::NoMemory)?;
@@ -757,7 +747,7 @@ pub fn census_entry<
             )?;
         }
     } else if structural {
-        if private_control_page(va) {
+        if B::control_needs_copy(UserVa::new(va), descriptor) {
             count.custody = count.custody.checked_add(1).ok_or(ForkError::NoMemory)?;
         }
     } else if (selected == Policy::Private || (selected == Policy::Keep && B::is_user(descriptor)))
@@ -866,8 +856,8 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
         return Ok((descriptor, 0));
     }
     let span = 1u64 << SHIFTS[level];
-    const CONTROL: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE - 0x2_0000;
-    let structural = B::PRIVATE_CONTROL_WINDOW && va < CONTROL + 0x20_0000 && va + span > CONTROL;
+    let structural = B::control_window()
+        .is_some_and(|(start, end)| va < end.raw() && va.saturating_add(span) > start.raw());
     if structural && level < 3 {
         let child = scratch.allocate_child()?;
         for index in 0..512 {
@@ -892,18 +882,26 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
         ));
     }
     if structural {
-        let table_start = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE;
-        let table_end = table_start + carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE;
-        if (table_start..table_end).contains(&va) {
-            let output = request.child_tables.base + (va - table_start);
+        if B::is_control_alias(UserVa::new(va)) {
+            let output = B::control_alias_destination(
+                UserVa::new(va),
+                FrameGpa::new(request.child_tables.base),
+            )
+            .map_err(|_| ForkError::Core)?
+            .raw();
             if !request.child_tables.contains(output) {
                 return Err(ForkError::NoMemory);
             }
             return Ok((descriptor, (descriptor & !B::ADDRESS_MASK) | output));
         }
-        if private_control_page(va) {
+        if B::control_needs_copy(UserVa::new(va), descriptor) {
             let source_ipa = descriptor & B::ADDRESS_MASK;
-            let destination_ipa = request.kernel_control_ipa + (va - CONTROL);
+            let destination_ipa = B::control_copy_destination(
+                UserVa::new(va),
+                FrameGpa::new(request.kernel_control_ipa),
+            )
+            .map_err(|_| ForkError::Core)?
+            .raw();
             scratch.custody(PortalForkCustody::StructuralCopy {
                 source_ipa,
                 destination_ipa,
