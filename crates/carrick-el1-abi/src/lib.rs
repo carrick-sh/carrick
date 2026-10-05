@@ -30,12 +30,11 @@ mod mm_portal;
 mod mm_portal_executable;
 mod mm_portal_fork;
 mod mm_portal_grant;
+pub use carrick_core_abi::*;
 pub use mm_portal::*;
 pub use mm_portal_executable::*;
 pub use mm_portal_fork::*;
 pub use mm_portal_grant::*;
-mod metadata_extent;
-pub use metadata_extent::*;
 
 mod reservations;
 pub use reservations::*;
