@@ -34,7 +34,7 @@ pub enum ExecStage1Replacement {
     /// detached cleanup. Adopt this exact authority without editing the old one.
     Authority(crate::stage1_authority::Stage1Authority),
     /// The engine owns table retirement for this backend's rebuilt image.
-    Image(Option<PageTableManager>),
+    Image(Option<Box<PageTableManager>>),
 }
 
 /// COW-inherit vs eager full-RAM copy at `fork(2)`. Re-exported from
