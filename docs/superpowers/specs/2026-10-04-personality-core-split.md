@@ -1,5 +1,7 @@
 # Personality-neutral core with Linux and NT clients
 
+Status: approved by the owner 2026-10-05 (see Owner decisions).
+
 Design proposal, 2026-10-04. Documentation only; no implementation, runtime
 acceptance, or compatibility claim. Inspected Carrick `0250e7f2a834e8bd1b080780bd0f5b8e67bc30ad`.
 
@@ -567,24 +569,20 @@ HVF adds CDHash, LC_UUID, entitlement and DOF. Rebuild after integration.
 
 ## Owner decisions
 
-- Approve the proposed package names and migration destination map. The key
-  decision is ownership, not renaming every crate with “core” in its name.
-- Confirm separate carriers and immutable per-process personality for the first
-  release target, and whether any cross-personality sharing is wanted later.
-- Choose the initial NT build/API profile, x86_64 versus AArch64 delivery order,
-  first real console workload and licensed native Windows oracle machines.
-- Set the clean-room ntdll export/workload denominator and the support boundary
-  for direct numeric syscalls. The no-Wine decision is already settled; there
-  is no Wine code, design, test, userland or oracle integration option.
-- Schedule x86/WHP work relative to N1–N4 without diluting current Linux
-  acceptance. Approve the minimum WHP host builds after capability qualification;
-  do not promise AArch64 bhyve/NVMM merely from the overall architecture goal.
-- Approve NT namespace/security and filesystem scope, including case-sensitive
-  directories, share/delete behavior, registry, jobs, debugger and IOCP needs.
-  Missing host primitives require a faithful guest model or an explicit
-  unsupported contract, not host-dependent NT semantics.
-- Approve the NT workload timing denominator and <=2x objective proposed above.
-  Linux's existing acceptance objective and budgets stay unchanged.
+- Package names and migration map: APPROVED as proposed.
+- Separate carriers and IMMUTABLE per-process personality for the first release
+  target: APPROVED. Cross-personality sharing stays a later, explicit decision.
+- Delivery order: x86_64 FIRST for NT (AArch64 NT later).
+- First real workload: a CONSOLE (CUI) program. The black-box oracle runs on
+  real Windows under Docker on Windows (Windows containers), mirroring the Linux
+  Docker oracle. Use the licensed Windows oracle machine (willow VM 106 is the
+  existing Windows host; never touch other protected VMs). No Wine, ever
+  (already settled).
+- Remaining items (ntdll export/workload denominator and direct-syscall support
+  boundary; x86/WHP scheduling relative to N1-N4 without diluting Linux
+  acceptance; NT namespace/security/filesystem scope; the NT timing denominator
+  and <=2x objective): APPROVED AS PROPOSED in this document, to be refined at
+  their milestones. Implementation still requires each milestone's stated gates.
 
 ## Verification of this design change
 
