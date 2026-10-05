@@ -944,18 +944,8 @@ mod tests {
                 |source, destination| self.memory.copy_through(self.arena, source, destination),
                 || {},
             );
-            match outcome {
-                Ok(GuestCowOutcome::Resolved(_) | GuestCowOutcome::AlreadyWritable) => true,
-                Ok(GuestCowOutcome::Declined(_)) => false,
-                Err(CowError::Indeterminate) => {
-                    panic!(
-                        "EL1 COW translation state indeterminate: failed rollback or alias restore"
-                    )
-                }
-                Err(CowError::Corrupt) => panic!("EL1 COW descriptor state corrupt"),
-                Err(CowError::Internal) => panic!("EL1 COW internal invariant violation"),
-                Err(CowError::Refused) => false,
-            }
+            crate::fault::handle_cow_outcome(outcome, &mut None)
+                == crate::fault::CowResolution::Resolved
         }
         fn editor_busy(&mut self) {
             self.pool.note_declined(CowDecline::EditorBusy);
@@ -1116,31 +1106,12 @@ mod tests {
                     },
                     || {},
                 );
-                // The resolver implementation under test: previously this was
-                // matches!(outcome, Ok(GuestCowOutcome::Resolved(_) | ...)) which
-                // treated Indeterminate as a non-fatal refusal (returning false),
-                // allowing execution to continue via Action::Forward!
-                self.handle_outcome(outcome)
+                assert_eq!(outcome, Err(CowError::Indeterminate));
+                crate::fault::handle_cow_outcome(outcome, &mut None)
+                    == crate::fault::CowResolution::Resolved
             }
             fn editor_busy(&mut self) {
                 self.pool.note_declined(CowDecline::EditorBusy);
-            }
-        }
-
-        impl CorruptingResolver<'_> {
-            fn handle_outcome(&self, outcome: Result<GuestCowOutcome, CowError>) -> bool {
-                match outcome {
-                    Ok(GuestCowOutcome::Resolved(_) | GuestCowOutcome::AlreadyWritable) => true,
-                    Ok(GuestCowOutcome::Declined(_)) => false,
-                    Err(CowError::Indeterminate) => {
-                        panic!(
-                            "EL1 COW translation state indeterminate: failed rollback or alias restore"
-                        )
-                    }
-                    Err(CowError::Corrupt) => panic!("EL1 COW descriptor state corrupt"),
-                    Err(CowError::Internal) => panic!("EL1 COW internal invariant violation"),
-                    Err(CowError::Refused) => false,
-                }
             }
         }
 
