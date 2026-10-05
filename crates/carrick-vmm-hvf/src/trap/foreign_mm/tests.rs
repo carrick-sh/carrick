@@ -12982,6 +12982,67 @@ mod guest_cow {
         assert!(pool.finish(&excluded, &completion.grant));
     }
 
+    /// Owner fork arms the live leaves without creating host semantic COW
+    /// ranges. The same physical settlement must accept its exact MM grant,
+    /// while refusing a different MM or a replacement not in the live graph.
+    #[test]
+    fn an_owner_fork_cow_settles_without_host_arm_ranges() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external = ExternalAliasStateRestore::capture();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (mut child, pool) =
+            forked_guest_child_with(810, 0x9a01_3800_0000, 0x9b01_3800_0000, true);
+        child.state.cow_armed.lock().restore(Vec::new());
+        let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let mm = child.snapshot.mm.get();
+        provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+        let grant = pool.ready(mm).next().unwrap();
+        child
+            .owners
+            .0
+            .push((grant.physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+        assert!(matches!(
+            el1_write_fault(&child, pool, TEST_VA + 8),
+            GuestCowOutcome::Resolved(_)
+        ));
+        let spaces = AddressSpaces::new();
+        let excluded = spaces.unpublished(mm).unwrap();
+        let completion = pool.completions(&excluded).next().unwrap();
+        let runtime = child.state.cow_runtime.read().clone().unwrap();
+        let mut wrong_mm = completion;
+        wrong_mm.grant.mm_key += 1;
+        assert!(
+            crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &wrong_mm)
+                .is_err()
+        );
+        let mut wrong_output = completion;
+        wrong_output.new_ipa += 4096;
+        assert!(
+            crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &wrong_output)
+                .is_err()
+        );
+        crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion)
+            .expect("owner COW completion needs no host semantic arm map");
+        let replacement = alias_registry()
+            .lock()
+            .newest_matching_for_process(
+                Some(old_key_root(&child)),
+                ContainerRootToken::ROOT,
+                |alias| alias.start == TEST_VA,
+            )
+            .expect("replacement alias");
+        assert_eq!(replacement.physical_ipa, grant.physical_ipa);
+        assert!(replacement.guest_writable);
+        assert!(child.state.cow_armed.lock().ranges.is_empty());
+        assert_eq!(child.state.host_cow_stats.host_cow_resolutions(), 0);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(model_owner_host(grant.physical_ipa), 4) },
+            b"old!",
+            "the private grant preserves the source bytes"
+        );
+        assert!(pool.finish(&excluded, &completion.grant));
+    }
+
     /// The initial process carves its sparse mmap arena and apertures with
     /// host edits on the owned page-table copy. Binding its live backing at
     /// construction made that manager live on a resolver that cannot yet
