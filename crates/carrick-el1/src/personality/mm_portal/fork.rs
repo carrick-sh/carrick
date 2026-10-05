@@ -19,6 +19,33 @@ use std::vec::Vec;
 const PA: u64 = 0x0000_ffff_ffff_f000;
 const SHIFTS: [u32; 4] = [39, 30, 21, 12];
 
+/// Check the supplied table arenas and choose the primary window that the
+/// maintenance service can address. The ordinal is returned to the host only
+/// on a stage-3 refusal.
+#[cfg(any(test, target_os = "none"))]
+pub(super) fn fork_table_window(
+    request: PortalForkRequest,
+    parent_ttbr0: u64,
+) -> Result<carrick_mmu_core::aarch64::descriptor_txn::TableWindow, u64> {
+    let pool = carrick_el1_abi::stage1_table_pool_window();
+    for (check, arena) in [(1, request.child_tables), (2, request.parent_tables)] {
+        if arena.base < pool.physical_base
+            || arena.base + arena.len > pool.physical_base + pool.byte_len as u64
+        {
+            return Err(check);
+        }
+    }
+    let base = parent_ttbr0 & PA;
+    if base < pool.physical_base || base + 4096 > pool.physical_base + pool.byte_len as u64 {
+        return Err(3);
+    }
+    Ok(carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
+        words: base as *mut core::sync::atomic::AtomicU64,
+        physical_base: base,
+        byte_len: 4096,
+    })
+}
+
 /// All allocation occurs before borrowing either owner. Unlinked table words
 /// and parent undo storage stay owned across physical custody suspension.
 pub struct ForkScratch {
@@ -1102,28 +1129,19 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             .spaces
             .grant(index, request.operation.mm.raw())
             .ok_or(MmError::Busy)?;
-        let base = grant.ttbr0 & PA;
         frame.x[1] = 3; // Physical table pool and live word access.
         frame.x[3] = grant.ttbr0; // Failure-only host diagnostic.
         let pool = carrick_el1_abi::stage1_table_pool_window();
-        for (check, arena) in [(1, request.child_tables), (2, request.parent_tables)] {
-            if arena.base < pool.physical_base
-                || arena.base + arena.len > pool.physical_base + pool.byte_len as u64
-            {
-                frame.x[2] = check;
-                return Err(MmError::Invalid);
-            }
-        }
-        if base < pool.physical_base || base + 4096 > pool.physical_base + pool.byte_len as u64 {
-            frame.x[2] = 3;
-            return Err(MmError::Invalid);
-        }
+        let primary = fork_table_window(request, grant.ttbr0).map_err(|check| {
+            frame.x[2] = check;
+            MmError::Invalid
+        })?;
         let maintenance = CallerInvalidatesAsid;
         let words = unsafe {
             PrimaryTableWords::new(
-                base as *mut core::sync::atomic::AtomicU64,
-                base,
-                4096,
+                primary.words,
+                primary.physical_base,
+                primary.byte_len,
                 &maintenance,
             )
             .and_then(|words| words.with_window(pool))
