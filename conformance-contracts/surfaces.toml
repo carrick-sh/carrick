@@ -714,3 +714,8 @@ contracts = ["kernel.net.connect-wake-scope"]
 [[surfaces]]
 path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs"
 contracts = ["x86.run-elf.poll"]
+
+# Fixture-only injection ownership for executor activation and rollback tests.
+[[surfaces]]
+path = "crates/carrick-runtime/src/test_hooks.rs"
+contracts = ["kernel.vcpu.vm-lifetime"]
