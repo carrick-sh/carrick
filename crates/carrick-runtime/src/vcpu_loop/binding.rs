@@ -200,6 +200,11 @@ impl DeferredResumeBlocked {
     }
 }
 
+pub(super) enum OwnerSupplyWait {
+    Owner(carrick_el1_abi::PortalOwnerWait),
+    Physical(carrick_guest_mem::OwnedMemoryWait),
+}
+
 pub(super) enum HvpatchProductionPhase {
     Resident,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -263,6 +268,12 @@ pub(super) enum HvpatchProductionPhase {
     /// remains live while the job, not a pool worker, is blocked.
     ResumeOwnerPhysical {
         frame: carrick_hal::RawSyscall,
+        wait: carrick_guest_mem::OwnedMemoryWait,
+        _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
+    },
+    /// The exact unpublished physical grant must settle before EL0 can
+    /// reselect this fault. No syscall completion belongs to this wait.
+    ResumeFaultPhysical {
         wait: carrick_guest_mem::OwnedMemoryWait,
         _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
     },
@@ -424,6 +435,7 @@ impl HvpatchProductionPhase {
             Self::ResumeTerminalOwner { .. } => 19,
             Self::ResumeTerminalPhysical { .. } => 20,
             Self::TerminalMemoryRetry { .. } => 21,
+            Self::ResumeFaultPhysical { .. } => 22,
         }
     }
 }
@@ -1505,7 +1517,11 @@ where
             }
             MemoryPrepareError::Supply(request) => {
                 if let Some(wait) = self.supply_owner_memory(engine, request)? {
-                    return self.park_retained_terminal_owner(engine, control, wait);
+                    let wait = match wait {
+                        OwnerSupplyWait::Owner(wait) => MemoryPrepareError::OwnerWait(wait),
+                        OwnerSupplyWait::Physical(wait) => MemoryPrepareError::Physical(wait),
+                    };
+                    return self.wait_for_retained_terminal_memory(engine, control, wait);
                 }
                 let action = self.take_terminal_memory_action()?;
                 self.drive_terminal_memory(engine, control, action)
@@ -3035,7 +3051,7 @@ where
         &mut self,
         engine: &mut E,
         request: carrick_guest_mem::MemorySupplyRequest,
-    ) -> Result<Option<carrick_el1_abi::PortalOwnerWait>, RuntimeError> {
+    ) -> Result<Option<OwnerSupplyWait>, RuntimeError> {
         let (grant_va, grant_len) = match request {
             carrick_guest_mem::MemorySupplyRequest::Grant(window)
             | carrick_guest_mem::MemorySupplyRequest::Cow(window) => {
@@ -3090,7 +3106,12 @@ where
             // The grant service takes its own EL1 editor after the host
             // predecessor settlement releases its mutation exclusion.
             let supplied = match engine.supply_memory(request) {
-                Err(carrick_guest_mem::MemoryError::OwnerWait(wait)) => return Ok(Some(wait)),
+                Err(carrick_guest_mem::MemoryError::OwnerWait(wait)) => {
+                    return Ok(Some(OwnerSupplyWait::Owner(wait)));
+                }
+                Err(carrick_guest_mem::MemoryError::Physical(wait)) => {
+                    return Ok(Some(OwnerSupplyWait::Physical(wait)));
+                }
                 result => result.map_err(|error| {
                     RuntimeError::Configuration(format!("owner supply failed: {error}"))
                 })?,
@@ -3130,7 +3151,15 @@ where
                 })?;
             let result = self.supply_owner_memory(engine, request);
             if let Some(wait) = result? {
-                return self.owner_memory_park(engine, control, frame, wait);
+                let outcome = match wait {
+                    OwnerSupplyWait::Owner(wait) => {
+                        DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }
+                    }
+                    OwnerSupplyWait::Physical(wait) => {
+                        DispatchOutcome::OwnerPhysicalWait { wait, committed: 0 }
+                    }
+                };
+                return self.service_outcome(engine, control, frame, outcome);
             }
             let outcome = self.state.redispatch_threaded_syscall(
                 &self.kernel,
@@ -4218,6 +4247,25 @@ where
                     )?;
                     return self.service_outcome(engine, control, frame, outcome);
                 }
+                HvpatchProductionPhase::ResumeFaultPhysical {
+                    wait,
+                    _subscription,
+                } => {
+                    if !wait.0.is_ready() {
+                        self.phase = HvpatchProductionPhase::ResumeFaultPhysical {
+                            wait,
+                            _subscription,
+                        };
+                        return Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::Blocked(
+                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                            ),
+                        ));
+                    }
+                    drop(_subscription);
+                    return Ok(executor::ExecutorExit::Syscall);
+                }
                 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
                 HvpatchProductionPhase::BootstrapProcessChild(bootstrap) => {
                     bootstrap_hvpatch_process_child(
@@ -4890,6 +4938,30 @@ where
                     }
                     None => None,
                 };
+                if let Some(carrick_hal::OwnerFileFaultOutcome::Pending(wait)) = &owner_file_fault {
+                    let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                        RuntimeError::Configuration("physical fault wait lost context".to_owned())
+                    })?;
+                    let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+                        RuntimeError::Configuration("physical fault wait lost scheduler".to_owned())
+                    })?;
+                    let scheduler = runtime.continuation_services(context.kernel()).0;
+                    let wake = registration_wake_callback(scheduler, context.thread().key(), false);
+                    let (subscription, ready) = wait.0.enroll(wake);
+                    if ready || wait.0.is_ready() {
+                        return Ok(executor::ExecutorExit::Syscall);
+                    }
+                    self.phase = HvpatchProductionPhase::ResumeFaultPhysical {
+                        wait: wait.clone(),
+                        _subscription: subscription,
+                    };
+                    return Ok(self.suspend(
+                        HvpatchLoopSuspension::BlockedContinuation,
+                        executor::ExecutorExit::Blocked(
+                            carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                        ),
+                    ));
+                }
                 if owner_file_fault == Some(carrick_hal::OwnerFileFaultOutcome::Resolved) {
                     return Ok(executor::ExecutorExit::Syscall);
                 }
