@@ -43,6 +43,19 @@ def reviewed_row(finding: GATE.Finding, **kwargs) -> dict:
 
 
 class RuntimeGlobalStateTests(unittest.TestCase):
+    def test_moved_neutral_counters_remain_in_the_default_census(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            expected = set()
+            for crate in ("carrick-core", "carrick-core-abi"):
+                relative = Path("crates") / crate / "src/lib.rs"
+                source = root / relative
+                source.parent.mkdir(parents=True)
+                source.write_text("static COUNTER: AtomicU64 = AtomicU64::new(1);\n")
+                expected.add(relative.as_posix())
+            self.assertEqual({row.file for row in GATE.discover(root)}, expected)
+
+
     def test_discovers_multiline_static_and_env_sources(self):
         source = r'''static mut RAW: u64 = 0;
 static CELL: OnceLock<u64> = OnceLock::new();
