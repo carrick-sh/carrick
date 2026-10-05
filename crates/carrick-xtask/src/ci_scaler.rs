@@ -221,6 +221,7 @@ pub enum TaskState {
 pub enum Recovery {
     Wait,
     ResumeClone,
+    ResumeReaping,
     Inspect,
     FinishAbsent,
     Quarantine,
@@ -230,6 +231,9 @@ pub fn recovery_decision(row: &Record, present: bool, task: TaskState, now: u64)
         return Recovery::Wait;
     }
     if present {
+        if row.state == State::Reaping {
+            return Recovery::ResumeReaping;
+        }
         if row.state == State::Cloning && task == TaskState::Succeeded {
             return Recovery::ResumeClone;
         }
@@ -237,7 +241,7 @@ pub fn recovery_decision(row: &Record, present: bool, task: TaskState, now: u64)
     }
     if task == TaskState::Failed
         || row.state == State::Destroyed
-        || (row.state == State::Reaping && task == TaskState::Succeeded)
+        || row.state == State::Reaping
         || (row.state == State::Reserved
             && task == TaskState::Absent
             && now.saturating_sub(row.created) >= 900)
@@ -306,6 +310,9 @@ pub fn mark_job_started(dir: &Path) -> Result<(), ScalerError> {
     Ok(())
 }
 pub fn reap_decision(row: &Record, now: u64, assignment: Assignment) -> Reap {
+    if row.state == State::Reaping {
+        return Reap::Destroy;
+    }
     match assignment {
         Assignment::Completed => Reap::Destroy,
         Assignment::Unassigned if now.saturating_sub(row.created) >= 900 => Reap::Destroy,
