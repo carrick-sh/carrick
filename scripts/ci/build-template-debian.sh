@@ -61,7 +61,7 @@ disable_root: true
 ssh_deletekeys: true
 ssh_genkeytypes: [ed25519, rsa]
 package_update: true
-packages: [build-essential, clang, git, curl, jq, just, qemu-guest-agent, openssh-server, nftables, libicu76, libssl3t64, libkrb5-3, zlib1g]
+packages: [build-essential, clang, git, curl, jq, just, util-linux, procps, qemu-guest-agent, openssh-server, nftables, libicu76, libssl3t64, libkrb5-3, zlib1g]
 runcmd:
   - [bash, -c, 'mkdir -p /mnt/carrick-seed; mount -o ro /dev/disk/by-label/cidata /mnt/carrick-seed; bash /mnt/carrick-seed/provision.sh']
 DATA

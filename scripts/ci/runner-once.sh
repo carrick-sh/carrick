@@ -19,7 +19,9 @@ rm -f /home/runner/.ssh/authorized_keys
   export RUSTC_WRAPPER=/usr/local/bin/sccache
   export ACTIONS_RUNNER_HOOK_JOB_STARTED=/usr/local/bin/carrick-ci-admit-job.sh
   set +e
-  ./run.sh --jitconfig "$jit"
+  # The hook must be able to kill listener and worker without reaching this
+  # SSH launch wrapper. No workflow-controlled step precedes that hook.
+  /usr/bin/setsid --wait ./run.sh --jitconfig "$jit"
   result=$?
   printf '%s\n' "$result" > /home/runner/runner.exit
 ) </dev/null > /home/runner/runner.log 2>&1 &
