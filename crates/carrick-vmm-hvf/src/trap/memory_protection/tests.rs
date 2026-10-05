@@ -2785,83 +2785,101 @@ mod alias_registry_tests {
 
     #[test]
     fn unmap_single_row_in_5000_row_registry_is_fast() {
-        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-        for population in [16_u64, 256, 5000] {
-            let mut registry = AliasRegistry::default();
-            let scope = AliasOwnershipScope::MmRootSlot {
-                base: 0x5000_0000,
-                size: 0x4000,
-            };
-            // Descending insertion puts the target near the tail of the scope
-            // vector but at the front of the VA tree. A population scan cannot
-            // accidentally find it early; unrelated rows share its scope.
-            for i in (0..population).rev() {
-                let va = 0x1000_0000 + i * 0x8000;
-                let physical_ipa = 0x8000_0000 + i * 0x8000;
-                registry.push(make_test_alias(va, 0x1000, physical_ipa, 0x1000, scope));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+            for population in [16_u64, 256, 5000] {
+                let mut registry = AliasRegistry::default();
+                let scope = AliasOwnershipScope::MmRootSlot {
+                    base: 0x5000_0000,
+                    size: 0x4000,
+                };
+                // Descending insertion puts the target near the tail of the scope
+                // vector but at the front of the VA tree. A population scan cannot
+                // accidentally find it early; unrelated rows share its scope.
+                for i in (0..population).rev() {
+                    let va = 0x1000_0000 + i * 0x8000;
+                    let physical_ipa = 0x8000_0000 + i * 0x8000;
+                    registry.push(make_test_alias(va, 0x1000, physical_ipa, 0x1000, scope));
+                }
+                assert_eq!(registry.len(), population as usize);
+
+                let target_va = 0x1000_0000 + 0x8000;
+                let before_scanned = alias_state_rows_scanned();
+                let before_moved = alias_rows_moved();
+                let (planned, registry_before) = registry.plan_unregister_process_alias(
+                    target_va,
+                    0x1000,
+                    Some((0x5000_0000, 0x4000)),
+                    ContainerRootToken::ROOT,
+                );
+                let after_plan = alias_state_rows_scanned();
+                assert_eq!(
+                    registry_before.len(),
+                    1,
+                    "planning must retain only the queried row"
+                );
+                let spans = retired_alias_disarm_spans(
+                    &registry_before,
+                    target_va,
+                    0x1000,
+                    Some((0x5000_0000, 0x4000)),
+                    ContainerRootToken::ROOT,
+                    &planned,
+                );
+                let after_disarm = alias_state_rows_scanned();
+                let actual = unregister_alias_entries(
+                    &mut registry,
+                    target_va,
+                    0x1000,
+                    Some((0x5000_0000, 0x4000)),
+                    ContainerRootToken::ROOT,
+                );
+                let after_remove = alias_state_rows_scanned();
+                let height = u64::from(population.ilog2()) + 1;
+                assert!(
+                    after_plan - before_scanned <= height + 12,
+                    "planning visited {} rows at population {population}",
+                    after_plan - before_scanned
+                );
+                assert_eq!(
+                    after_disarm - after_plan,
+                    1,
+                    "disarm must visit only the planned row"
+                );
+                assert!(
+                    after_remove - after_disarm <= height + 8,
+                    "removal visited {} rows at population {population}",
+                    after_remove - after_disarm
+                );
+                let moved = alias_rows_moved().saturating_sub(before_moved);
+
+                assert_eq!(planned, actual);
+                assert_eq!(actual.len(), 1);
+                assert_eq!(spans.len(), 1);
+                assert_eq!(spans[0].va, target_va);
+                assert_eq!(spans[0].len, 0x1000);
+                assert_eq!(registry.len(), population as usize - 1);
+                assert!(
+                    moved <= population,
+                    "unmapping 1 row at population {population} moved {moved} rows, expected <= {population}"
+                );
             }
-            assert_eq!(registry.len(), population as usize);
-
-            let target_va = 0x1000_0000 + 0x8000;
-            let before_scanned = alias_state_rows_scanned();
-            let before_moved = alias_rows_moved();
-            let (planned, registry_before) = registry.plan_unregister_process_alias(
-                target_va,
-                0x1000,
-                Some((0x5000_0000, 0x4000)),
-                ContainerRootToken::ROOT,
-            );
-            let after_plan = alias_state_rows_scanned();
-            assert_eq!(
-                registry_before.len(),
-                1,
-                "planning must retain only the queried row"
-            );
-            let spans = retired_alias_disarm_spans(
-                &registry_before,
-                target_va,
-                0x1000,
-                Some((0x5000_0000, 0x4000)),
-                ContainerRootToken::ROOT,
-                &planned,
-            );
-            let after_disarm = alias_state_rows_scanned();
-            let actual = unregister_alias_entries(
-                &mut registry,
-                target_va,
-                0x1000,
-                Some((0x5000_0000, 0x4000)),
-                ContainerRootToken::ROOT,
-            );
-            let after_remove = alias_state_rows_scanned();
-            let height = u64::from(population.ilog2()) + 1;
-            assert!(
-                after_plan - before_scanned <= height + 12,
-                "planning visited {} rows at population {population}",
-                after_plan - before_scanned
-            );
-            assert_eq!(
-                after_disarm - after_plan,
-                1,
-                "disarm must visit only the planned row"
-            );
-            assert!(
-                after_remove - after_disarm <= height + 8,
-                "removal visited {} rows at population {population}",
-                after_remove - after_disarm
-            );
-            let moved = alias_rows_moved().saturating_sub(before_moved);
-
-            assert_eq!(planned, actual);
-            assert_eq!(actual.len(), 1);
-            assert_eq!(spans.len(), 1);
-            assert_eq!(spans[0].va, target_va);
-            assert_eq!(spans[0].len, 0x1000);
-            assert_eq!(registry.len(), population as usize - 1);
-            assert!(
-                moved <= population,
-                "unmapping 1 row at population {population} moved {moved} rows, expected <= {population}"
-            );
+            drop(_global_state_guard);
+            done_tx.send(()).unwrap();
+        });
+        match done_rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(()) => worker.join().unwrap(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                worker.join().unwrap();
+                panic!("unmap worker exited without completing fixture");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // A stuck worker may hold the global lock needed by other tests.
+                // Fail the test process so it cannot strand the rest of the suite.
+                eprintln!("FAIL: unmap fixture independent watchdog expired");
+                std::process::exit(101);
+            }
         }
     }
 
