@@ -24576,7 +24576,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 695,
+      "line": 690,
       "categories": [
         "mapping"
       ],
@@ -24585,7 +24585,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 1124,
+      "line": 1119,
       "categories": [
         "mapping"
       ],
@@ -24594,7 +24594,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 3494,
+      "line": 3489,
       "categories": [
         "mapping"
       ],
