@@ -1,4 +1,5 @@
 //! The production reservation/permit owner, exercised over x86 descriptors.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #[path = "x86_acceleration/mm_owner.rs"]
 mod mm_owner;
 use carrick_core::mm::transaction::{admit_service_root, serve_transfer};
@@ -64,10 +65,12 @@ fn transfer_fixture(pages: usize, unrelated: usize) {
                 .select(
                     &transfer,
                     &words,
-                    &mut NoopPreparedResolver,
-                    &mut NoopCowResolver,
-                    &residency(),
-                    0,
+                    carrick_core::mm::transaction::SelectionVenues {
+                        prepared: &mut NoopPreparedResolver,
+                        cow: &mut NoopCowResolver,
+                        residency: &residency(),
+                        slot: 0,
+                    },
                 )
                 .unwrap();
             let TransferStep::Selected(selected) = step else {
@@ -181,10 +184,12 @@ fn x86_wrong_output_pin_refuses_before_preparing_copy() {
         .select(
             &transfer,
             &words,
-            &mut NoopPreparedResolver,
-            &mut NoopCowResolver,
-            &residency(),
-            0,
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency(),
+                slot: 0,
+            },
         )
         .unwrap()
     else {

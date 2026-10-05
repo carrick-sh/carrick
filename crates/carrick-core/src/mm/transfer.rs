@@ -213,28 +213,23 @@ impl SelectedChunk {
     }
     /// # Safety
     /// The caller must hold the exact MM editor and authenticate the selected mapping.
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn from_owner_selection(
         handle: El1MmHandle,
         sequence: NonZeroU64,
-        generation: u64,
-        offset: u64,
-        va: GuestVa,
-        ipa: u64,
-        executable: bool,
-        len: u64,
+        selected: carrick_core_abi::PortalSelectedData,
+        range: carrick_core_abi::PortalByteRange,
         fork_sequence: Option<NonZeroU64>,
         retry: Option<carrick_core_abi::PortalOwnerWait>,
     ) -> Self {
         Self {
             handle,
             sequence,
-            generation,
-            offset,
-            va,
-            ipa,
-            executable,
-            len,
+            generation: selected.root_generation.get(),
+            offset: selected.offset,
+            va: GuestVa::new(range.address()),
+            ipa: selected.ipa,
+            executable: selected.executable,
+            len: range.len(),
             fork_sequence,
             retry,
         }
