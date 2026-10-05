@@ -300,8 +300,10 @@ fn runner_death_preserves_exclusion(
         assert_eq!(count, 0, "test fork inherited the raw lease descriptor");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let release = libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
-            let alive = libc::kill(pid, 0) == 0;
+            let (alive, release) = observe_exclusion(
+                || libc::kill(pid, 0) == 0,
+                || libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
+            );
             assert!(
                 release != 0 || !alive,
                 "exclusion released while admitted {}workload PID {pid} survives runner death",
@@ -636,4 +638,23 @@ fn fake_ps_refuses_load_and_override_records_parent_command() {
         output.stdout.is_empty(),
         "accept must refuse before starting host work"
     );
+}
+
+// This seam models a release between observations without scheduler sleeps.
+fn observe_exclusion(alive: impl FnOnce() -> bool, flock: impl FnOnce() -> i32) -> (bool, i32) {
+    let live = alive();
+    (live, flock())
+}
+
+#[test]
+fn release_between_observations_is_detected() {
+    let released = std::cell::Cell::new(false);
+    let (alive, release) = observe_exclusion(
+        || {
+            released.set(true);
+            true
+        },
+        || if released.get() { 0 } else { -1 },
+    );
+    assert!(alive && release == 0, "missed release while workload alive");
 }
