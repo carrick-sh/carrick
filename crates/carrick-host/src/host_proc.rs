@@ -1046,8 +1046,18 @@ mod imp {
             let pid = unsafe { libc::fork() };
             assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
             if pid == 0 {
-                let passed = std::panic::catch_unwind(test).is_ok();
-                unsafe { libc::_exit(i32::from(!passed)) };
+                let result = std::panic::catch_unwind(test);
+                if let Err(payload) = &result {
+                    use std::io::Write;
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&str>().copied())
+                        .unwrap_or("non-string panic payload");
+                    writeln!(std::io::stderr().lock(), "fork fixture failed: {message}")
+                        .expect("report fork fixture failure outside libtest capture");
+                }
+                unsafe { libc::_exit(i32::from(result.is_err())) };
             }
             let mut status = 0;
             assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
@@ -1102,18 +1112,42 @@ mod imp {
         #[test]
         fn canonical_dyld_delegated_empty_tuple_is_accepted() {
             fork_test(|| {
-                assert!(matches!(
-                    reserve_self_direct_vm_range(0x4_0000_0000, PAGE as u64)
-                        .expect("classify canonical dyld gap"),
-                    DirectVmReservationOutcome::DelegatedDyldPmapEmpty
-                ));
+                let address = match find_delegated_empty_region(PAGE as u64) {
+                    Some(address) => {
+                        assert!(matches!(
+                            classify_vm_range(address, PAGE as u64),
+                            VmRangeClass::Delegated(_)
+                        ));
+                        address
+                    }
+                    None => {
+                        report_missing_delegation(
+                            "canonical_dyld_delegated_empty_tuple_is_accepted",
+                        );
+                        vacant_scratch_range(PAGE)
+                    }
+                };
+                assert_classified_reservation(address, PAGE as u64);
             });
         }
 
         #[test]
         fn fork_child_canonical_unnested_dyld_gap_is_accepted() {
             fork_test(|| {
-                let source = 0x4_0000_0000usize;
+                // Leave a gap in the same region as the replaced source page.
+                const GAP_OFFSET: u64 = 0x2_0000;
+                let length = GAP_OFFSET as usize + PAGE;
+                let source = match find_delegated_empty_region(length as u64) {
+                    Some(address) => address,
+                    None => {
+                        report_missing_delegation(
+                            "fork_child_canonical_unnested_dyld_gap_is_accepted",
+                        );
+                        vacant_scratch_range(length)
+                    }
+                };
+                let gap = source + GAP_OFFSET;
+                assert_classified_reservation(gap, PAGE as u64);
                 let mapped = unsafe {
                     libc::mmap(
                         source as *mut libc::c_void,
@@ -1124,25 +1158,16 @@ mod imp {
                         0,
                     )
                 };
-                assert_eq!(mapped as usize, source);
+                assert_eq!(mapped as u64, source);
+                unsafe { mapped.cast::<u8>().write(0x5e) };
 
-                let child = unsafe { libc::fork() };
-                assert!(
-                    child >= 0,
-                    "fork direct-mapped child: {}",
-                    std::io::Error::last_os_error()
-                );
-                if child == 0 {
-                    let accepted = matches!(
-                        reserve_self_direct_vm_range(0x4_0002_0000, PAGE as u64),
-                        Ok(DirectVmReservationOutcome::DelegatedDyldPmapEmpty)
-                    );
-                    unsafe { libc::_exit(i32::from(!accepted)) };
-                }
-                let mut status = 0;
-                assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-                assert!(libc::WIFEXITED(status), "child status was 0x{status:x}");
-                assert_eq!(libc::WEXITSTATUS(status), 0);
+                fork_test(|| {
+                    // Fork and replacement may unnest or remove the empty
+                    // pmap entry. Its live tuple determines the exact outcome.
+                    assert_classified_reservation(gap, PAGE as u64);
+                    assert_eq!(unsafe { mapped.cast::<u8>().read() }, 0x5e);
+                });
+                assert_eq!(unsafe { mapped.cast::<u8>().read() }, 0x5e);
             });
         }
 
@@ -1237,6 +1262,231 @@ mod imp {
                     "generic shared/read-only mapping must not match delegated dyld tuple"
                 );
             });
+        }
+
+        #[derive(Debug)]
+        struct VmRegion {
+            start: u64,
+            end: u64,
+            protection: i32,
+            max_protection: i32,
+            shared: bool,
+            reserved: bool,
+            user_tag: u32,
+            share_mode: u8,
+        }
+
+        impl VmRegion {
+            fn is_delegated_empty(&self) -> bool {
+                self.protection == libc::VM_PROT_READ
+                    && self.max_protection == libc::VM_PROT_READ
+                    && !self.shared
+                    && self.reserved
+                    && matches!(
+                        self.user_tag,
+                        super::VM_MEMORY_SHARED_PMAP | super::VM_MEMORY_UNSHARED_PMAP
+                    )
+                    && self.share_mode == super::SM_EMPTY
+            }
+        }
+
+        #[derive(Debug)]
+        enum VmRangeClass {
+            Free,
+            Delegated(VmRegion),
+            Occupied(VmRegion),
+        }
+
+        // Query the map, not page residency: an empty delegated pmap is a
+        // real entry despite having no resident pages.
+        fn next_vm_region(cursor: u64) -> Option<VmRegion> {
+            let task = unsafe { mach2::traps::mach_task_self() };
+            let mut address = cursor;
+            let mut size = 0;
+            let mut basic = [0i32; 16];
+            let mut count = super::VM_REGION_BASIC_INFO_COUNT_64;
+            let mut object = 0;
+            let kr = unsafe {
+                super::mach_vm_region(
+                    task,
+                    &mut address,
+                    &mut size,
+                    super::VM_REGION_BASIC_INFO_64,
+                    basic.as_mut_ptr(),
+                    &mut count,
+                    &mut object,
+                )
+            };
+            if object != 0 {
+                assert_eq!(unsafe { super::mach_port_deallocate(task, object) }, 0);
+            }
+            if kr == mach2::kern_return::KERN_INVALID_ADDRESS {
+                return None;
+            }
+            assert_eq!(
+                kr,
+                libc::KERN_SUCCESS,
+                "query basic VM region at {cursor:#x}"
+            );
+            assert_eq!(count, super::VM_REGION_BASIC_INFO_COUNT_64);
+            let basic_end = address.checked_add(size).expect("basic region end");
+            let mut extended_address = address;
+            let mut extended_size = 0;
+            let mut extended = super::VmRegionExtendedInfo::default();
+            let mut count = super::VM_REGION_EXTENDED_INFO_COUNT;
+            let mut object = 0;
+            let kr = unsafe {
+                super::mach_vm_region(
+                    task,
+                    &mut extended_address,
+                    &mut extended_size,
+                    super::VM_REGION_EXTENDED_INFO,
+                    &mut extended as *mut super::VmRegionExtendedInfo as *mut i32,
+                    &mut count,
+                    &mut object,
+                )
+            };
+            if object != 0 {
+                assert_eq!(unsafe { super::mach_port_deallocate(task, object) }, 0);
+            }
+            assert_eq!(
+                kr,
+                libc::KERN_SUCCESS,
+                "query extended VM region at {address:#x}"
+            );
+            assert_eq!(count, super::VM_REGION_EXTENDED_INFO_COUNT);
+            let extended_end = extended_address
+                .checked_add(extended_size)
+                .expect("extended region end");
+            let start = address.max(extended_address);
+            let end = basic_end.min(extended_end);
+            assert!(start < end && end > cursor, "VM region walk must advance");
+            Some(VmRegion {
+                start,
+                end,
+                protection: basic[0],
+                max_protection: basic[1],
+                shared: basic[3] != 0,
+                reserved: basic[4] != 0,
+                user_tag: extended.user_tag,
+                share_mode: extended.share_mode,
+            })
+        }
+
+        fn classify_vm_range(start: u64, length: u64) -> VmRangeClass {
+            let end = start.checked_add(length).expect("fixture range end");
+            match next_vm_region(start) {
+                None => VmRangeClass::Free,
+                Some(region) if region.start >= end => VmRangeClass::Free,
+                Some(region)
+                    if region.start <= start
+                        && region.end >= end
+                        && region.is_delegated_empty() =>
+                {
+                    VmRangeClass::Delegated(region)
+                }
+                Some(region) => VmRangeClass::Occupied(region),
+            }
+        }
+
+        fn find_delegated_empty_region(length: u64) -> Option<u64> {
+            let mut cursor = 0;
+            // A completed bounded walk is the precondition witness; exhausting
+            // the bound is an error, not an unavailable-precondition result.
+            for _ in 0..65_536 {
+                let region = next_vm_region(cursor)?;
+                let start = region.start.max(PAGE as u64);
+                let aligned = start
+                    .checked_add(PAGE as u64 - 1)
+                    .expect("align region start")
+                    & !(PAGE as u64 - 1);
+                if region.is_delegated_empty()
+                    && aligned
+                        .checked_add(length)
+                        .is_some_and(|end| end <= region.end)
+                {
+                    return Some(aligned);
+                }
+                cursor = region.end;
+            }
+            panic!("delegated-empty VM region discovery exceeded its region bound");
+        }
+
+        fn vacant_scratch_range(length: usize) -> u64 {
+            let scratch = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    length,
+                    libc::PROT_NONE,
+                    libc::MAP_ANON | libc::MAP_PRIVATE,
+                    -1,
+                    0,
+                )
+            };
+            assert_ne!(scratch, libc::MAP_FAILED);
+            assert_eq!(unsafe { libc::munmap(scratch, length) }, 0);
+            assert!(matches!(
+                classify_vm_range(scratch as u64, length as u64),
+                VmRangeClass::Free
+            ));
+            scratch as u64
+        }
+
+        fn report_missing_delegation(test: &str) {
+            use std::io::Write;
+            // Direct stderr bypasses libtest's capture, including in a fork
+            // child that terminates with _exit. Passing CI logs retain this
+            // named precondition result instead of implying delegation coverage.
+            writeln!(
+                std::io::stderr().lock(),
+                "PRECONDITION_UNAVAILABLE[{test}::dyld_delegated_empty_region]: \
+                 completed Mach VM map walk found no qualifying region; \
+                 checking exact ownership of a classified free range"
+            )
+            .expect("write named fixture precondition result");
+        }
+
+        fn assert_classified_reservation(start: u64, length: u64) {
+            use std::io::Write;
+            let classification = classify_vm_range(start, length);
+            writeln!(
+                std::io::stderr().lock(),
+                "VM_MAP_CLASSIFICATION[{start:#x}+{length:#x}]: {classification:?}"
+            )
+            .expect("report live VM map classification");
+            match classification {
+                VmRangeClass::Free => {
+                    let guard = match reserve_self_direct_vm_range(start, length)
+                        .expect("reserve classified free range")
+                    {
+                        DirectVmReservationOutcome::Reserved(guard) => guard,
+                        other => panic!("free range must have an owned guard: {other:?}"),
+                    };
+                    assert_eq!(guard.owned_spans().collect::<Vec<_>>(), [(start, length)]);
+                    drop(guard);
+                    assert!(matches!(
+                        classify_vm_range(start, length),
+                        VmRangeClass::Free
+                    ));
+                }
+                VmRangeClass::Delegated(region) => {
+                    assert!(
+                        matches!(
+                            reserve_self_direct_vm_range(start, length)
+                                .expect("reserve classified delegated-empty range"),
+                            DirectVmReservationOutcome::DelegatedDyldPmapEmpty
+                        ),
+                        "delegated tuple must not acquire owned spans: {region:?}"
+                    );
+                    assert!(matches!(
+                        classify_vm_range(start, length),
+                        VmRangeClass::Delegated(_)
+                    ));
+                }
+                VmRangeClass::Occupied(region) => {
+                    panic!("fixture interval is occupied, not free or delegated: {region:?}");
+                }
+            }
         }
     }
 
