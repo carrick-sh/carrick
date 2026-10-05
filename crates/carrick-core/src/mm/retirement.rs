@@ -386,3 +386,343 @@ impl<V: ResidencyVenue, G: Copy + Eq> ResidencyRetirement<V, G> {
         root.settle(receipt)
     }
 }
+
+pub use carrick_core_abi::mm::custody::*;
+
+pub fn record_identity_mismatch(
+    record: &CarrierStage2Record,
+    identity: CarrierStage2RecordIdentity,
+) -> Option<CarrierStage2RetireOutcome> {
+    if record.snapshot.record_id != identity.record_id {
+        return Some(CarrierStage2RetireOutcome::NotFound);
+    }
+    if record.snapshot.vm_generation != identity.vm_generation {
+        return Some(CarrierStage2RetireOutcome::VmGenerationMismatch);
+    }
+    match (record.snapshot.logical_owner, identity.logical_owner) {
+        (Some(expected), Some(actual)) if expected.id != actual.id => {
+            Some(CarrierStage2RetireOutcome::OwnerIdentityMismatch)
+        }
+        (Some(expected), Some(actual)) if expected.generation != actual.generation => {
+            Some(CarrierStage2RetireOutcome::OwnerGenerationMismatch)
+        }
+        (None, None) | (Some(_), Some(_)) => None,
+        (None, Some(_)) | (Some(_), None) => {
+            Some(CarrierStage2RetireOutcome::OwnerIdentityMismatch)
+        }
+    }
+}
+
+/// Supplies lookup/exclusion over the backend's one physical custody ledger.
+pub trait RecordPinVenue: fmt::Debug {
+    fn release_pin(&self, identity: CarrierStage2RecordIdentity);
+}
+#[derive(Debug)]
+pub struct RecordPin<V: RecordPinVenue> {
+    venue: V,
+    identity: CarrierStage2RecordIdentity,
+    active: bool,
+}
+impl<V: RecordPinVenue> RecordPin<V> {
+    pub fn into_transferred_identity(mut self) -> CarrierStage2RecordIdentity {
+        self.active = false;
+        self.identity
+    }
+}
+impl<V: RecordPinVenue> Drop for RecordPin<V> {
+    fn drop(&mut self) {
+        if self.active {
+            self.venue.release_pin(self.identity);
+        }
+    }
+}
+
+pub fn pin_record<V: RecordPinVenue>(
+    record: &mut CarrierStage2Record,
+    identity: CarrierStage2RecordIdentity,
+    venue: V,
+) -> Result<RecordPin<V>, CarrierStage2PinError> {
+    if let Some(mismatch) = record_identity_mismatch(record, identity) {
+        return Err(match mismatch {
+            CarrierStage2RetireOutcome::VmGenerationMismatch => {
+                CarrierStage2PinError::VmGenerationMismatch
+            }
+            CarrierStage2RetireOutcome::OwnerIdentityMismatch => {
+                CarrierStage2PinError::OwnerIdentityMismatch
+            }
+            CarrierStage2RetireOutcome::OwnerGenerationMismatch => {
+                CarrierStage2PinError::OwnerGenerationMismatch
+            }
+            _ => CarrierStage2PinError::NotFound,
+        });
+    }
+    if record.snapshot.terminalized_by_vm_destroy {
+        return Err(CarrierStage2PinError::TerminalizedByVmDestroy);
+    }
+    if record.snapshot.retirement_requested || record.unmap_in_flight {
+        return Err(CarrierStage2PinError::RetirementRequested);
+    }
+    if !record.snapshot.mapped {
+        return Err(CarrierStage2PinError::NotMapped);
+    }
+    record.snapshot.pin_count = record
+        .snapshot
+        .pin_count
+        .checked_add(1)
+        .ok_or(CarrierStage2PinError::PinCountExhausted)?;
+    Ok(RecordPin {
+        venue,
+        identity,
+        active: true,
+    })
+}
+
+pub fn request_record_retirement(
+    record: &mut CarrierStage2Record,
+    identity: CarrierStage2RecordIdentity,
+) -> CarrierStage2RetireOutcome {
+    if let Some(mismatch) = record_identity_mismatch(record, identity) {
+        return mismatch;
+    }
+    if record.snapshot.terminalized_by_vm_destroy {
+        return CarrierStage2RetireOutcome::TerminalizedByVmDestroy;
+    }
+    record.snapshot.retirement_requested = true;
+    record.snapshot.retry_eligible = record.snapshot.pin_count == 0;
+    CarrierStage2RetireOutcome::DeferredActivePins
+}
+#[derive(Debug, Eq, PartialEq)]
+pub enum RecordRetirement {
+    Complete(CarrierStage2RetireOutcome),
+    Unmap { ipa: u64, len: usize },
+}
+pub fn prepare_record_retirement(
+    record: &mut CarrierStage2Record,
+    identity: CarrierStage2RecordIdentity,
+) -> RecordRetirement {
+    if let Some(mismatch) = record_identity_mismatch(record, identity) {
+        return RecordRetirement::Complete(mismatch);
+    }
+    if record.snapshot.terminalized_by_vm_destroy {
+        return RecordRetirement::Complete(CarrierStage2RetireOutcome::TerminalizedByVmDestroy);
+    }
+    record.snapshot.retirement_requested = true;
+    if record.snapshot.pin_count != 0 {
+        record.snapshot.retry_eligible = false;
+        return RecordRetirement::Complete(CarrierStage2RetireOutcome::DeferredActivePins);
+    }
+    if !record.snapshot.mapped {
+        record.snapshot.retry_eligible = false;
+        record.snapshot.retry_pending = None;
+        return RecordRetirement::Complete(CarrierStage2RetireOutcome::RetiredUnmapped);
+    }
+    if record.unmap_in_flight {
+        return RecordRetirement::Complete(CarrierStage2RetireOutcome::RetryPending(
+            CarrierStage2BackendError::ConcurrentRetirement,
+        ));
+    }
+    if !record.snapshot.backend_map_installed {
+        record.snapshot.mapped = false;
+        record.snapshot.retry_eligible = false;
+        record.snapshot.retry_pending = None;
+        return RecordRetirement::Complete(CarrierStage2RetireOutcome::RetiredUnmapped);
+    }
+    record.unmap_in_flight = true;
+    record.snapshot.retry_eligible = false;
+    RecordRetirement::Unmap {
+        ipa: record.snapshot.ipa,
+        len: record.snapshot.len,
+    }
+}
+pub fn settle_record_retirement(
+    record: &mut CarrierStage2Record,
+    identity: CarrierStage2RecordIdentity,
+    backend_result: Result<(), CarrierStage2BackendError>,
+) -> CarrierStage2RetireOutcome {
+    if let Some(mismatch) = record_identity_mismatch(record, identity) {
+        return mismatch;
+    }
+    record.unmap_in_flight = false;
+    if record.snapshot.terminalized_by_vm_destroy {
+        return CarrierStage2RetireOutcome::TerminalizedByVmDestroy;
+    }
+    match backend_result {
+        Ok(()) => {
+            record.snapshot.mapped = false;
+            record.snapshot.backend_map_installed = false;
+            record.snapshot.retry_eligible = false;
+            record.snapshot.retry_pending = None;
+            CarrierStage2RetireOutcome::RetiredUnmapped
+        }
+        Err(error) => {
+            record.snapshot.retry_eligible = true;
+            record.snapshot.retry_pending = Some(error);
+            CarrierStage2RetireOutcome::RetryPending(error)
+        }
+    }
+}
+/// Whether the physical ledger can discard a terminal superseded predecessor.
+pub fn release_record_pin(
+    record: &mut CarrierStage2Record,
+    identity: CarrierStage2RecordIdentity,
+) -> bool {
+    if record_identity_mismatch(record, identity).is_some() {
+        return false;
+    }
+    record.snapshot.pin_count = record.snapshot.pin_count.saturating_sub(1);
+    if record.snapshot.pin_count == 0
+        && record.snapshot.retirement_requested
+        && record.snapshot.mapped
+        && !record.snapshot.terminalized_by_vm_destroy
+    {
+        record.snapshot.retry_eligible = true;
+    }
+    record.snapshot.pin_count == 0
+        && record.snapshot.terminalized_by_vm_destroy
+        && record.snapshot.superseded_by_rebind
+}
+pub fn terminalize_record(record: &mut CarrierStage2Record) {
+    record.snapshot.mapped = false;
+    record.snapshot.backend_map_installed = false;
+    record.snapshot.retirement_requested = true;
+    record.snapshot.retry_eligible = false;
+    record.snapshot.retry_pending = None;
+    record.snapshot.terminalized_by_vm_destroy = true;
+    record.unmap_in_flight = false;
+}
+
+/// Retire the owner's published extensions before removing them from its one
+/// capacity list. A refused physical unmap leaves remaining capacity charged.
+pub fn retire_table_arenas<E>(
+    published: &mut alloc::vec::Vec<u64>,
+    root: Option<u64>,
+    mut retire: impl FnMut(u64) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut index = 0;
+    while index < published.len() {
+        let base = published[index];
+        if Some(base) == root {
+            index += 1;
+            continue;
+        }
+        retire(base)?;
+        published.swap_remove(index);
+    }
+    Ok(())
+}
+
+/// Borrowed outstanding inheritance, with physical/probe fields left native.
+pub trait PendingRetirementReference {
+    fn child_mapping(&self) -> carrick_core_abi::MappingId;
+    fn frame(&self) -> carrick_core_abi::FrameId;
+}
+/// Why a retirement receipt did or did not authenticate, clause by clause.
+///
+/// The abort this feeds is unrecoverable, so it must name the failing clause: a
+/// receipt that leaves the mm non-empty, one that covers a different number of
+/// mappings, and one that omits a pending fork frame call for entirely different
+/// fixes, and a bare "malformed" verdict cannot tell them apart.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingRetirementAudit {
+    mm_empty_at_revision: bool,
+    expected_non_empty: bool,
+    cardinality_matches: bool,
+    expected_authorized: bool,
+    pending_authorized: bool,
+}
+
+impl PendingRetirementAudit {
+    pub const fn ok(self) -> bool {
+        self.mm_empty_at_revision
+            && self.expected_non_empty
+            && self.cardinality_matches
+            && self.expected_authorized
+            && self.pending_authorized
+    }
+}
+
+pub fn authenticate_pending_retirement<P: PendingRetirementReference>(
+    expected: &[(carrick_core_abi::MappingId, carrick_core_abi::FrameId)],
+    pending: &[P],
+    receipt: &carrick_core_abi::FrameInventoryRetirementReceipt,
+) -> PendingRetirementAudit {
+    // O((n + p) log n): `authorizes` is a binary search over the receipt's
+    // sorted set, and pending receipts are matched against sorted expected
+    // mapping ids. Both were linear scans per element (O(n^2) and O(p*n)).
+    let mut expected_mappings: alloc::vec::Vec<carrick_core_abi::MappingId> =
+        expected.iter().map(|&(mapping, _)| mapping).collect();
+    expected_mappings.sort_unstable();
+    PendingRetirementAudit {
+        mm_empty_at_revision: receipt.mm_empty_at_revision(),
+        expected_non_empty: !expected.is_empty(),
+        cardinality_matches: expected.len() == receipt.mapping_set().len(),
+        expected_authorized: expected
+            .iter()
+            .all(|&(mapping, frame)| receipt.authorizes(mapping, frame)),
+        // Only OUTSTANDING inheritances. A pending receipt records an
+        // obligation created at fork publication: "this child mapping holds a
+        // frame inherited from the parent". It is discharged either here, by the
+        // retirement unmapping that mapping with that frame, or EARLIER, when
+        // the mapping was superseded — `stage_cow_inventory_split` pushes its
+        // own `UnmapMapping` and `RetireFrame` for the old mapping and
+        // `commit_cow_inventory_split` drops the extent, all inside that
+        // transaction. Demanding that retirement account for an already-settled
+        // obligation is a category error, and it failed every forked child that
+        // wrote to an inherited page: the superseded mapping id is simply absent
+        // from the retirement's set. A mapping still live in `expected` must
+        // still retire under the frame it inherited.
+        pending_authorized: pending
+            .iter()
+            .filter(|pending| {
+                expected_mappings
+                    .binary_search(&pending.child_mapping())
+                    .is_ok()
+            })
+            .all(|pending| receipt.authorizes(pending.child_mapping(), pending.frame())),
+    }
+}
+
+/// The existing lease publication gate, now neutral. It is separate from
+/// hardware residency: an uninstalled root still must close publication.
+#[derive(Debug, Default)]
+pub struct LeaseGate {
+    lifecycle: ResidencyLifecycle,
+}
+impl LeaseGate {
+    pub fn is_live(&self) -> bool {
+        self.lifecycle == ResidencyLifecycle::Live
+    }
+    pub fn prepare(&mut self) -> bool {
+        if !self.is_live() {
+            return false;
+        }
+        self.lifecycle = ResidencyLifecycle::RetirementPrepared;
+        true
+    }
+    /// Called by the existing non-cloneable prepared retirement's commit.
+    pub fn commit(&mut self) {
+        self.lifecycle = ResidencyLifecycle::Retired;
+    }
+    /// Reopen only after physical allocation and residency rollback settle.
+    pub fn rollback(&mut self) {
+        if self.lifecycle == ResidencyLifecycle::RetirementPrepared {
+            self.lifecycle = ResidencyLifecycle::Live;
+        }
+    }
+}
+/// Existing sched-core publication, owned by the kernel's placement adapter.
+pub trait AddressPublication {
+    fn retire_reservations(&self);
+}
+/// Drop the closed publication (draining sched-core occupants) before waiting
+/// for admitted host loads and deciding which hardware invalidation is owed.
+pub fn drain_publication<V: ResidencyVenue, G: Copy + Eq, P: AddressPublication>(
+    publication: Option<P>,
+    residency: &ResidencyRetirement<V, G>,
+) {
+    if let Some(publication) = publication.as_ref() {
+        publication.retire_reservations();
+    }
+    drop(publication);
+    residency.wait_for_admitted_loads();
+}
