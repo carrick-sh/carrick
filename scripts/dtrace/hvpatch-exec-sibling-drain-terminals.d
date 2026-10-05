@@ -35,13 +35,20 @@
  *   region count u64, mapped bytes u64.
  * - carrick*:::hvpatch-syscall-service-begin / hvpatch-syscall-service args:
  *   pid i32, tid i32, asid u32, nr u32 (+ duration ns on the completion).
+ * - carrick*:::hvpatch-executor-load-failure args: thread serial u64,
+ *   execution generation u64, executor u32, error C string. Source-qualified;
+ *   a capture must see this row before attributing a backend load refusal.
  *
  * PERTURBATION: LOW — only the selected syscalls and lifecycle edges print;
  * the sched_yield storm the reproducer generates is not instrumented.
- * Zero lifecycle events makes the capture fail closed (exit 1).
+ * A reason-6 settlement also captures its host stack, so an unexpected
+ * executor-failure retirement can be attributed to its actual caller.
+ * Zero lifecycle events makes the capture fail closed (exit 1). A target
+ * still alive at 120 seconds makes the capture fail closed (exit 2).
  */
 
 #pragma D option quiet
+#pragma D option strsize=1024
 
 dtrace:::BEGIN
 {
@@ -62,6 +69,20 @@ carrick*:::hvpatch-thread-terminal
 {
     printf("%12d host_tid=%d thread-terminal pid=%d linux_tid=%d registry_tid=%d reason=%d detail=%d\n",
         timestamp - started, tid, arg0, arg1, arg2, arg3, arg4);
+}
+
+carrick*:::hvpatch-thread-terminal
+/(pid == $target || progenyof($target)) && arg3 == 6/
+{
+    ustack(32);
+}
+
+carrick*:::hvpatch-executor-load-failure
+/pid == $target || progenyof($target)/
+{
+    printf("%12d host_tid=%d load-failure thread_serial=%d generation=%d executor=%d error=%s\n",
+        timestamp - started, tid, arg0, arg1, arg2, copyinstr(arg3));
+    ustack(32);
 }
 
 carrick*:::hvpatch-exec-runtime-stage
@@ -90,4 +111,11 @@ proc:::exit
 {
     printf("%12d target-exit\n", timestamp - started);
     exit(lifecycle == 0 ? 1 : 0);
+}
+
+tick-1s
+/timestamp - started >= 120 * 1000000000/
+{
+    printf("terminal-trace timeout\n");
+    exit(2);
 }
