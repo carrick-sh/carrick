@@ -12,7 +12,10 @@
  * arg3 reason), read(page, length, phase, descriptor), syscall(nr,name,retval).
  * hvpatch-el1-owner-bind-result arg0 is the owner errno; live-qualified by
  * el1-root-admission.d on the same 1dfba1500 artifact. This profile itself
- * still requires live qualification; zero controls, errors or drops fail.
+ * was live-qualified on 1dfba1500: owner_bind_controls=1, errors=0,
+ * drops=0. Zero controls, errors or drops fail. Grant-supply phases use
+ * the ABI qualified in el1-host-read-progress.d; only overlaps/refusals
+ * and their physical identity are printed, not successful publications.
  *
  * Perturbation: no el1-mapping-leaf probe is armed, so publication performs
  * no diagnostic descriptor walks. Stack collection occurs only at refusals.
@@ -55,6 +58,15 @@ carrick*:::guest-internal-write-fault
         pid, tid, arg0, arg1, arg2, copyinstr(arg3));
     ustack();
     @refused[arg2, copyinstr(arg3)] = count();
+}
+
+carrick*:::hvpatch-el1-owner-grant-supply
+/(pid == $target || progenyof($target)) &&
+ (arg2 == 4 || arg2 == 8 || arg2 == 9 || arg2 == 10 || arg2 == 11 ||
+  (arg2 == 7 && arg3 == 0))/
+{
+    printf("GRANTREFUSAL ns=%d pid=%d tid=%d va=0x%x len=0x%x phase=%d detail=0x%x\n",
+        timestamp, pid, tid, arg0, arg1, arg2, arg3);
 }
 
 carrick*:::hvpatch-el1-owner-bind-result
