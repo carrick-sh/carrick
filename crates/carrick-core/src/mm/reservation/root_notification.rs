@@ -5,14 +5,15 @@ use carrick_sched_core::spaces::notification::{
     SpaceWaitCause,
 };
 use core::num::NonZeroU64;
-#[derive(Clone, Copy)]
-pub(super) enum RootAuthority<'a> {
-    Bound(RootReleaseVenue<'a>),
+pub(super) enum RootAuthority<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry> {
+    Bound(RootReleaseVenue<'a, Policy, Geometry>),
     #[cfg(any(test, feature = "host-test"))]
-    SourceFree(SourceFreeReservations<'a>),
+    SourceFree(SourceFreeReservations<'a, Policy, Geometry>),
 }
-impl<'a> RootAuthority<'a> {
-    pub fn release(self) -> Option<RootReleaseVenue<'a>> {
+impl<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry>
+    RootAuthority<'a, Policy, Geometry>
+{
+    pub fn release(self) -> Option<RootReleaseVenue<'a, Policy, Geometry>> {
         match self {
             Self::Bound(venue) => Some(venue),
             #[cfg(any(test, feature = "host-test"))]
@@ -24,22 +25,27 @@ impl<'a> RootAuthority<'a> {
     }
 }
 #[cfg(any(test, feature = "host-test"))]
-#[derive(Clone, Copy)]
-pub struct SourceFreeReservations<'a>(&'a SharedReservations);
+pub struct SourceFreeReservations<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry>(
+    &'a SharedReservations<Policy, Geometry>,
+);
 #[cfg(any(test, feature = "host-test"))]
-impl SharedReservations {
-    pub fn source_free(&self) -> SourceFreeReservations<'_> {
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
+    SharedReservations<Policy, Geometry>
+{
+    pub fn source_free(&self) -> SourceFreeReservations<'_, Policy, Geometry> {
         SourceFreeReservations(self)
     }
 }
-impl SharedReservations {
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
+    SharedReservations<Policy, Geometry>
+{
     pub fn lock_in<'a>(
         &'a self,
         spaces: carrick_sched_core::spaces::notification::SpaceAccess<'a>,
         index: usize,
         mm: ReservationMm,
         slot: u32,
-    ) -> Result<Reservations<'a>, Refusal> {
+    ) -> Result<Reservations<'a, Policy, Geometry>, Refusal> {
         if let Some(venue) = spaces.venue() {
             return RootReleaseVenue::new(self, venue)?.lock_el1(index, mm, slot);
         }
@@ -51,19 +57,19 @@ impl SharedReservations {
         Err(Refusal::Stale)
     }
 }
-#[derive(Clone, Copy)]
-pub struct RootReleaseVenue<'a> {
-    pub(super) table: &'a SharedReservations,
+pub struct RootReleaseVenue<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry> {
+    pub(super) table: &'a SharedReservations<Policy, Geometry>,
     pub(crate) release: SpaceReleaseVenue<'a>,
 }
-impl<'a> RootReleaseVenue<'a> {
+impl<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry>
+    RootReleaseVenue<'a, Policy, Geometry>
+{
     pub fn new(
-        table: &'a SharedReservations,
+        table: &'a SharedReservations<Policy, Geometry>,
         release: SpaceReleaseVenue<'a>,
     ) -> Result<Self, Refusal> {
-        let root_region =
-            (table as *const _ as usize).checked_sub(EL1_RESERVATIONS_OFFSET as usize);
-        let zone_region = (release.zone as *const _ as usize).checked_sub(EL1_ZONE_OFFSET as usize);
+        let root_region = (table as *const _ as usize).checked_sub(Geometry::RESERVATIONS_OFFSET);
+        let zone_region = (release.zone as *const _ as usize).checked_sub(Geometry::ZONE_OFFSET);
         if root_region.is_none() || root_region != zone_region {
             return Err(Refusal::Stale);
         }
@@ -74,7 +80,7 @@ impl<'a> RootReleaseVenue<'a> {
         index: usize,
         mm: ReservationMm,
         wait: &dyn RootWait,
-    ) -> Result<Reservations<'a>, Refusal> {
+    ) -> Result<Reservations<'a, Policy, Geometry>, Refusal> {
         self.table.lock_using(
             index,
             mm,
@@ -90,7 +96,7 @@ impl<'a> RootReleaseVenue<'a> {
         index: usize,
         mm: ReservationMm,
         slot: u32,
-    ) -> Result<Reservations<'a>, Refusal> {
+    ) -> Result<Reservations<'a, Policy, Geometry>, Refusal> {
         self.table.lock_using(
             index,
             mm,
@@ -105,9 +111,9 @@ impl<'a> RootReleaseVenue<'a> {
         self,
         index: usize,
         mm: ReservationMm,
-        nodes: &'a ResolvedReservationNodes<P>,
+        nodes: &'a ResolvedReservationNodes<P, Policy, Geometry>,
         wait: &dyn RootWait,
-    ) -> Result<Reservations<'a>, Refusal> {
+    ) -> Result<Reservations<'a, Policy, Geometry>, Refusal> {
         if !core::ptr::eq(nodes.table, self.table) {
             return Err(Refusal::Stale);
         }
@@ -125,9 +131,9 @@ impl<'a> RootReleaseVenue<'a> {
         self,
         index: usize,
         mm: ReservationMm,
-        nodes: &'a ResolvedReservationNodes<P>,
+        nodes: &'a ResolvedReservationNodes<P, Policy, Geometry>,
         slot: u32,
-    ) -> Result<Reservations<'a>, Refusal> {
+    ) -> Result<Reservations<'a, Policy, Geometry>, Refusal> {
         if !core::ptr::eq(nodes.table, self.table) {
             return Err(Refusal::Stale);
         }
@@ -142,7 +148,9 @@ impl<'a> RootReleaseVenue<'a> {
         )
     }
 }
-impl<'a> Reservations<'a> {
+impl<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry>
+    Reservations<'a, Policy, Geometry>
+{
     pub(super) fn notification_identity(&self) -> Result<SpaceNotificationIdentity, Refusal> {
         Ok(SpaceNotificationIdentity {
             mm: NonZeroU64::new(self.mm.raw()).ok_or(Refusal::Stale)?,
@@ -191,10 +199,48 @@ impl<'a> Reservations<'a> {
             .fetch_or(ROOT_NOTIFICATION_REQUIRED, Ordering::Release);
         Ok(())
     }
-    pub(crate) fn notification_ticket(
+    pub fn notification_ticket(
         &self,
         cause: SpaceWaitCause,
     ) -> Option<carrick_sched_core::object_wait::ObjectNotificationTicket<'a>> {
         self.notification.as_ref().map(|lease| lease.reserve(cause))
+    }
+}
+
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Copy
+    for RootReleaseVenue<'_, Policy, Geometry>
+{
+}
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Clone
+    for RootReleaseVenue<'_, Policy, Geometry>
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Copy
+    for RootAuthority<'_, Policy, Geometry>
+{
+}
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Clone
+    for RootAuthority<'_, Policy, Geometry>
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+#[cfg(any(test, feature = "host-test"))]
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Copy
+    for SourceFreeReservations<'_, Policy, Geometry>
+{
+}
+#[cfg(any(test, feature = "host-test"))]
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Clone
+    for SourceFreeReservations<'_, Policy, Geometry>
+{
+    fn clone(&self) -> Self {
+        *self
     }
 }
