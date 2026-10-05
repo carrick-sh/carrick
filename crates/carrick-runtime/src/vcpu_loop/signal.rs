@@ -445,7 +445,9 @@ pub(super) fn resolve_owner_file_fault(
     let completed = engine
         .service_owner_file_fault(mm_key, generation)?
         .ok_or_else(|| TrapError::Hypervisor("owner file fault selection was displaced".into()))?;
-    if completed == carrick_hal::OwnerFileFaultOutcome::Resolved {
+    if completed == carrick_hal::OwnerFileFaultOutcome::Resolved
+        || matches!(completed, carrick_hal::OwnerFileFaultOutcome::Pending(_))
+    {
         crate::probes::hvpatch_el1_file_fault_handoff(
             address,
             mailbox.state.load(std::sync::atomic::Ordering::Acquire),
