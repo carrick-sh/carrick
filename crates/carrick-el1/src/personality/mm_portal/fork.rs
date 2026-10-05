@@ -1,8 +1,9 @@
 //! Owner-selected fork over live descriptors and the production reservation root.
 use super::{El1MmHandle, MmError, MmPortal};
-use crate::memory::reservations::Reservations;
+use crate::memory::reservations::{Refusal, Reservations};
 #[cfg(target_os = "none")]
 use crate::rust_alloc::vec::Vec;
+use carrick_core::mm::fork::{ForkChildRoot, ForkError, ForkParentRoot};
 use carrick_el1_abi::{
     PinnedMetadataExtent, PortalForkCompletion, PortalForkCustody, PortalForkRequest,
     ReservationNodeFlags,
@@ -64,6 +65,100 @@ impl carrick_core::mm::fork::MappingInheritancePolicy for LinuxForkPolicy {
     }
 }
 
+fn refusal_to_fork_error(e: Refusal) -> ForkError {
+    match e {
+        Refusal::Stale => ForkError::Stale,
+        Refusal::Busy | Refusal::PreparedConflict => ForkError::Busy,
+        _ => ForkError::Core,
+    }
+}
+
+impl ForkChildRoot for Reservations<'_> {
+    fn incarnation(&self) -> u64 {
+        self.incarnation().raw()
+    }
+
+    fn is_admitted(&self) -> bool {
+        self.is_admitted()
+    }
+
+    fn fork_write_authorized(&mut self, sequence: Option<core::num::NonZeroU64>) -> bool {
+        self.fork_write_authorized(sequence)
+    }
+
+    fn authenticate_fork_origin(&mut self, request: PortalForkRequest) -> bool {
+        self.authenticate_fork_origin(request)
+    }
+
+    fn set_fork_origin(&mut self, request: PortalForkRequest) -> Result<(), ForkError> {
+        self.set_fork_origin(request).map_err(refusal_to_fork_error)
+    }
+
+    fn clear_fork_origin(&mut self) {
+        self.clear_fork_origin();
+    }
+
+    fn publish_fork_child(&mut self, request: PortalForkRequest) {
+        self.publish_fork_child(request);
+    }
+
+    fn finish_fork_publication(
+        &mut self,
+        operation: carrick_el1_abi::PortalOperation,
+    ) -> Result<(), ForkError> {
+        self.finish_fork_publication(operation).map_err(refusal_to_fork_error)
+    }
+
+    fn retire(self) -> Result<(), ForkError> {
+        self.retire().map_err(refusal_to_fork_error)
+    }
+}
+
+impl<'b> ForkParentRoot<Reservations<'b>> for Reservations<'_> {
+    fn incarnation(&self) -> u64 {
+        self.incarnation().raw()
+    }
+
+    fn generation(&self) -> carrick_el1_abi::ReservationGeneration {
+        self.generation()
+    }
+
+    fn operation_sequence(&self) -> u64 {
+        self.operation_sequence()
+    }
+
+    fn fork_ready(&mut self) -> bool {
+        self.fork_ready()
+    }
+
+    fn fork_write_authorized(&mut self, sequence: Option<core::num::NonZeroU64>) -> bool {
+        self.fork_write_authorized(sequence)
+    }
+
+    fn reserve_fork_certificate(&mut self, request: PortalForkRequest) -> Result<(), ForkError> {
+        self.reserve_fork_certificate(request).map_err(refusal_to_fork_error)
+    }
+
+    fn clone_into(&mut self, child: &mut Reservations<'b>) -> Result<(), ForkError> {
+        self.clone_into(child).map_err(refusal_to_fork_error)
+    }
+
+    fn publish_fork_parent(&mut self, request: PortalForkRequest) -> carrick_el1_abi::ReservationGeneration {
+        self.publish_fork_parent(request)
+    }
+
+    fn finish_fork_publication(
+        &mut self,
+        operation: carrick_el1_abi::PortalOperation,
+    ) -> Result<(), ForkError> {
+        self.finish_fork_publication(operation).map_err(refusal_to_fork_error)
+    }
+
+    fn commit_fork_generation(&mut self) -> Result<carrick_el1_abi::ReservationGeneration, ForkError> {
+        self.commit_fork_generation().map_err(refusal_to_fork_error)
+    }
+}
+
 /// An unpublished memory result. Task admission chooses commit or rollback;
 /// the child gate is closed throughout, and its exact parent undo remains owned.
 pub struct UnpublishedEl1Child {
@@ -91,19 +186,9 @@ impl UnpublishedEl1Child {
         worker: u32,
     ) -> Result<PortalForkCompletion, MmError> {
         let request = self.inner.completion.request;
-        let mut parent = portal.root(request.operation.mm, worker)?;
-        let mut child = portal.child_root(request.child_mm, worker)?;
-        if parent.incarnation().raw() != request.operation.incarnation.get()
-            || parent.generation() != self.inner.completion.parent_generation
-            || !child.authenticate_fork_origin(request)
-            || !parent.fork_write_authorized(Some(request.operation.sequence))
-            || !child.fork_write_authorized(Some(request.operation.sequence))
-        {
-            return Err(MmError::Stale);
-        }
-        parent.finish_fork_publication(request.operation)?;
-        child.finish_fork_publication(request.operation)?;
-        Ok(self.inner.completion)
+        let parent = portal.root(request.operation.mm, worker)?;
+        let child = portal.child_root(request.child_mm, worker)?;
+        self.inner.commit(parent, child).map_err(Into::into)
     }
 
     pub fn abort<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
@@ -125,44 +210,9 @@ impl UnpublishedEl1Child {
             .space_access(worker)?
             .try_begin_closed_child_edit(child_index, child.raw(), owner)
             .ok_or(MmError::Busy)?;
-        let mut root = portal.root(parent, worker)?;
-        if root.incarnation().raw() != self.inner.completion.request.operation.incarnation.get()
-            || root.generation() != self.inner.completion.parent_generation
-        {
-            return Err(MmError::Stale);
-        }
-        let mut child_root = portal.child_root(child, worker)?;
-        if !root.fork_write_authorized(Some(self.inner.completion.request.operation.sequence))
-            || !child_root
-                .fork_write_authorized(Some(self.inner.completion.request.operation.sequence))
-            || !child_root.authenticate_fork_origin(self.inner.completion.request)
-        {
-            return Err(MmError::Stale);
-        }
-        rollback(words, &self.inner.scratch.edits)?;
-        words.publish_barrier();
-        words.invalidate_range(0, 1 << 48);
-        root.finish_fork_publication(self.inner.completion.request.operation)?;
-        self.inner.completion.parent_generation = root.commit_fork_generation()?;
-        if !self.inner.scratch.edits.iter().any(|edit| {
-            edit.before & 3 == 3
-                && self
-                    .inner
-                    .completion
-                    .request
-                    .parent_tables
-                    .contains(edit.before & PA)
-        }) {
-            self.inner.completion.parent_tables_used = 0;
-        }
-        self.inner.completion.child_tables_used = 0;
-        drop(root);
-        child_root.finish_fork_publication(self.inner.completion.request.operation)?;
-        child_root.retire()?;
-        // The child's words are unreachable. Physical table/grant custody is
-        // returned by the exact operation's host settlement after this receipt.
-        let _ = self.inner.parent_root;
-        Ok(())
+        let root = portal.root(parent, worker)?;
+        let child_root = portal.child_root(child, worker)?;
+        self.inner.abort(words, root, child_root).map_err(Into::into)
     }
 }
 
@@ -393,120 +443,18 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
         if child_editor.grant().ttbr0 & PA != request.child_tables.base {
             return Err(MmError::Stale);
         }
-        let mut root = self.root(request.operation.mm, worker)?;
-        if root.incarnation().raw() != request.operation.incarnation.get()
-            || root.generation() != request.parent_generation
-            || root.operation_sequence() != request.operation.sequence.get()
-        {
-            return Err(MmError::Stale);
-        }
-        if !root.fork_ready() {
-            return Err(MmError::Busy);
-        }
-        let mut child = self.child_root(request.child_mm, worker)?;
-        if child.is_admitted() {
-            return Err(MmError::Stale);
-        }
+        let root = self.root(request.operation.mm, worker)?;
+        let child = self.child_root(request.child_mm, worker)?;
         let child_incarnation = NonZeroU64::new(child.incarnation().raw()).ok_or(MmError::Stale)?;
-        for (pa, before) in &plan.scratch.reads {
-            if words.load(*pa).map_err(|_| MmError::Core)? != *before {
-                return Err(MmError::Stale);
-            }
-        }
-        if request.parent_generation.raw() >= u64::MAX - 1 {
-            return Err(MmError::Stale);
-        }
-        root.reserve_fork_certificate(request)?;
-        for (index, word) in plan.scratch.child[..plan.scratch.child_used]
-            .iter()
-            .enumerate()
-        {
-            words
-                .store_unlinked(request.child_tables.base + index as u64 * 8, *word)
-                .map_err(|_| MmError::Core)?;
-        }
-        for (index, word) in plan.scratch.parent[..plan.scratch.parent_used]
-            .iter()
-            .enumerate()
-        {
-            words
-                .store_unlinked(request.parent_tables.base + index as u64 * 8, *word)
-                .map_err(|_| MmError::Core)?;
-        }
-        words.publish_barrier();
-        for (applied, edit) in plan.scratch.edits.iter().enumerate() {
-            let changed = if edit.bbm_len != 0 {
-                match words.compare_exchange(edit.pa, edit.before, 0) {
-                    Ok(true) => {
-                        words.publish_barrier();
-                        words.invalidate_range(edit.bbm_va, edit.bbm_len);
-                        match words.compare_exchange(edit.pa, 0, edit.after) {
-                            Ok(true) => Ok(()),
-                            result => {
-                                if !words
-                                    .compare_exchange(edit.pa, 0, edit.before)
-                                    .map_err(|_| MmError::Core)?
-                                {
-                                    return Err(MmError::Core);
-                                }
-                                words.publish_barrier();
-                                words.invalidate_range(edit.bbm_va, edit.bbm_len);
-                                Err(if result.is_err() {
-                                    MmError::Core
-                                } else {
-                                    MmError::Stale
-                                })
-                            }
-                        }
-                    }
-                    Ok(false) => Err(MmError::Stale),
-                    Err(_) => Err(MmError::Core),
-                }
-            } else {
-                match words.compare_exchange(edit.pa, edit.before, edit.after) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => Err(MmError::Stale),
-                    Err(_) => Err(MmError::Core),
-                }
-            };
-            if let Err(error) = changed {
-                rollback(words, &plan.scratch.edits[..applied])?;
-                return Err(error);
-            }
-        }
-        if let Err(error) = child.set_fork_origin(request) {
-            rollback(words, &plan.scratch.edits)?;
-            return Err(error.into());
-        }
-        if let Err(error) = root.clone_into(&mut child) {
-            child.clear_fork_origin();
-            rollback(words, &plan.scratch.edits)?;
-            return Err(error.into());
-        }
-        // Root/editor exclusion proves these metadata transitions cannot
-        // change between preflight and this publication. Advance only once.
-        let parent_generation = root.publish_fork_parent(request);
-        child.publish_fork_child(request);
         let child_handle = unsafe {
             El1MmHandle::from_admitted_owner(self.carrier, request.child_mm, child_incarnation)
         };
-        child_editor.set_mmap_next(editor.mmap_next());
-        child_editor.set_brk_current(root.layout().brk);
-        words.publish_barrier();
-        words.invalidate_range(0, 1 << 48);
-        Ok(UnpublishedEl1Child {
-            inner: carrick_core::mm::fork::UnpublishedChild::new(
-                PortalForkCompletion {
-                    request,
-                    child: child_handle,
-                    parent_generation,
-                    child_tables_used: plan.scratch.child_used as u64 * 8,
-                    parent_tables_used: plan.scratch.parent_used as u64 * 8,
-                },
-                plan.parent_root,
-                plan.scratch,
-            ),
-        })
+        let mmap_next = editor.mmap_next();
+        let brk = root.layout().brk;
+        let inner = plan.publish(words, root, child, child_handle)?;
+        child_editor.set_mmap_next(mmap_next);
+        child_editor.set_brk_current(brk);
+        Ok(UnpublishedEl1Child { inner })
     }
 }
 
