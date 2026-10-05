@@ -837,7 +837,7 @@ mod serial_host {
         std::io::stdin().read_line(&mut path).unwrap();
         let lease = HostLease::acquire_path(std::path::Path::new(path.trim()), HostLeaseMode::Gate)
             .unwrap();
-        let child = Command::new("/bin/true").spawn().unwrap();
+        let mut child = Command::new("/bin/true").spawn().unwrap();
         let pid = child.id() as libc::pid_t;
         let exit = ExitEvents::pidfd(pid).unwrap();
         let mut poll = libc::pollfd {
@@ -862,6 +862,9 @@ mod serial_host {
             io::Error::last_os_error().raw_os_error(),
             Some(libc::ECHILD)
         );
+        // POSIX subreaping already consumed this exact child. Confirm through
+        // Child as well; never leave its reaping responsibility implicit.
+        assert_eq!(child.wait().unwrap_err().raw_os_error(), Some(libc::ECHILD));
         drop(lease);
     }
 
