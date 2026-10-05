@@ -2670,6 +2670,35 @@ fn el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation_on_any_thread() {
     );
 }
 
+/// A missed command acknowledgement must end the witness before another edit.
+#[test]
+fn el1_tlb_first_missed_ack_is_terminal() {
+    let _guard = common::guest_lock();
+    let carrier = carrier_or_fail();
+    let measured = run_fixture(
+        &carrier,
+        &["tlb-stale-threads", "3", "2", "omit-first-write-ack"],
+        Duration::from_secs(120),
+    );
+    let stdout = measured.result.stdout_utf8();
+    println!("{stdout}");
+    assert!(
+        !measured.result.success(),
+        "a missed acknowledgement passed"
+    );
+    assert!(
+        stdout.contains(
+            "tlb-command-timeout command=0x202 op=write-probe phase=read-only round=0 worker=1 "
+        ),
+        "missing the first unacknowledged command: {stdout:?}"
+    );
+    assert!(stdout.contains(" vcpu=2 "), "missing vCPU: {stdout:?}");
+    assert!(
+        !stdout.contains("expected_faults="),
+        "continued page edits and aggregated contaminated evidence: {stdout:?}"
+    );
+}
+
 /// Fork and exec around required invalidations: a writable translation a
 /// worker on CPU 1 holds must not survive the fork's copy-on-write arming
 /// (its post-fork write must not reach the child), and a page unmapped just
