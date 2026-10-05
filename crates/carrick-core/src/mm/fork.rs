@@ -13,12 +13,26 @@ use crate::mm::reservation::{Refusal, ReservationGeometry, ReservationPolicy, Re
 
 const SHIFTS: [u32; 4] = [39, 30, 21, 12];
 
+/// Typed owner refusals preserved across the neutral fork transaction. The
+/// personality adapter decides their guest-visible error representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkOwnerRefusal {
+    Invalid,
+    Collision,
+    Hole,
+    ForeignMapping,
+    Limit,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForkError {
     Invalid,
     NoMemory,
     Busy,
     Stale,
+    /// Owner metadata backing must be supplied before publication can finish.
+    MetadataRequired,
+    OwnerRefusal(ForkOwnerRefusal),
     Core,
 }
 
@@ -183,7 +197,12 @@ fn refusal_to_fork_error(e: Refusal) -> ForkError {
     match e {
         Refusal::Stale => ForkError::Stale,
         Refusal::Busy | Refusal::PreparedConflict => ForkError::Busy,
-        _ => ForkError::Core,
+        Refusal::MetadataRequired => ForkError::MetadataRequired,
+        Refusal::Invalid => ForkError::OwnerRefusal(ForkOwnerRefusal::Invalid),
+        Refusal::Collision => ForkError::OwnerRefusal(ForkOwnerRefusal::Collision),
+        Refusal::Hole => ForkError::OwnerRefusal(ForkOwnerRefusal::Hole),
+        Refusal::ForeignMapping => ForkError::OwnerRefusal(ForkOwnerRefusal::ForeignMapping),
+        Refusal::Limit => ForkError::OwnerRefusal(ForkOwnerRefusal::Limit),
     }
 }
 
