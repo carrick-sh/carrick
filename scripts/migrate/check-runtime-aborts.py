@@ -43,6 +43,31 @@ class Token:
     pos: int
 
 
+def opaque_macro_inputs(tokens: Sequence[Token]) -> list[bool]:
+    """Attributes inside arbitrary macro inputs cannot establish test scope."""
+    opaque: list[bool] = []
+    delimiters: list[bool] = []
+    for index, token in enumerate(tokens):
+        inherited = bool(delimiters and delimiters[-1])
+        if token.text in {"(", "[", "{"}:
+            invocation = (
+                index >= 2
+                and tokens[index - 1].text == "!"
+                and tokens[index - 2].text != "#"
+            )
+            definition = (
+                index >= 3
+                and tokens[index - 2].text == "!"
+                and tokens[index - 3].text == "macro_rules"
+            )
+            inherited = inherited or invocation or definition
+            delimiters.append(inherited)
+        opaque.append(inherited)
+        if token.text in {")", "]", "}"} and delimiters:
+            delimiters.pop()
+    return opaque
+
+
 @dataclass
 class Scope:
     kind: str  # "root", "mod", "impl", "trait", "fn", "block"
@@ -186,6 +211,15 @@ def lex_rust(source: str) -> list[Token]:
                     break
                 i += 1
             tokens.append(Token("number", source[start_pos:i], line, start_pos))
+            continue
+
+        # Raw identifiers name the same operation as their ordinary spelling.
+        if source.startswith("r#", i) and i + 2 < n and (source[i + 2].isalpha() or source[i + 2] == "_"):
+            start_pos = i
+            i += 2
+            while i < n and (source[i].isalnum() or source[i] == "_"):
+                i += 1
+            tokens.append(Token("ident", source[start_pos + 2:i], line, start_pos))
             continue
 
         if c.isalpha() or c == "_":
@@ -740,6 +774,7 @@ def scan_abort_source(
 ) -> Sequence[AbortFinding]:
     posix_path = PurePosixPath(Path(path).as_posix()).as_posix()
     tokens = lex_rust(source)
+    opaque = opaque_macro_inputs(tokens)
 
     scopes: list[Scope] = [Scope("root", "<root>", False, 0, 0, 0)]
     pending_test = False
@@ -800,7 +835,7 @@ def scan_abort_source(
                         attr_toks.append(tokens[attr_idx])
                     attr_idx += 1
 
-                is_test = is_test_only_attribute(attr_toks)
+                is_test = not opaque[i] and is_test_only_attribute(attr_toks)
                 if is_inner:
                     if is_test:
                         scopes[-1].is_test = True

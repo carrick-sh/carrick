@@ -1786,6 +1786,248 @@ fn test(table: &Table) { table.read_open_files(); }
     );
 }
 
+#[test]
+fn review_fail_closed_macro_attributes_cannot_exclude_module_references() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        r#"
+macro_rules! production { (#[cfg(test)] $item:item) => { $item }; }
+production! { #[cfg(test)] pub mod hidden; }
+#[cfg(test)] #[path="hidden.rs"] mod test_copy;
+pub fn poll(table: &Table) { table.read_open_files(); }
+"#,
+    )
+    .unwrap();
+    write_source(
+        src.join("hidden.rs"),
+        "fn hidden(table: &Table) { table.read_open_files(); }",
+    )
+    .unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert!(!census.is_test_file("crates/carrick-kernel/src/hidden.rs"));
+    assert_eq!(census.k1.len(), 2);
+    assert!(
+        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+            .is_err()
+    );
+}
+
+#[test]
+fn review_fail_closed_macro_attributes_cannot_exclude_inline_authority() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        r#"
+macro_rules! production { (#[cfg(test)] $item:item) => { $item }; }
+production! { #[cfg(test)] fn hidden(table: &Table) { table.read_open_files(); } }
+pub fn poll(table: &Table) { table.read_open_files(); }
+"#,
+    )
+    .unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert_eq!(census.k1.len(), 2);
+    assert!(
+        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+            .is_err()
+    );
+}
+
+#[test]
+fn review_fail_closed_raw_identifier_methods_and_ufcs_are_counted() {
+    for call in [
+        "table.r#read_open_files()",
+        "Table::r#read_open_files(table)",
+        "<Table as Access>::r#read_open_files(table)",
+    ] {
+        let root = source_fixture();
+        write_source(
+            root.path().join("crates/carrick-kernel/src/lib.rs"),
+            format!("pub fn r#poll(table: &Table) {{ {call}; }}"),
+        )
+        .unwrap();
+        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        assert_eq!(census.k1.len(), 1, "{call}");
+        assert_eq!(census.k1[0].operation, "read_open_files");
+        assert_eq!(census.k1[0].owner, "carrick_kernel::poll");
+    }
+}
+
+#[test]
+fn review_fail_closed_raw_identifier_macro_definition_is_guarded() {
+    let root = source_fixture();
+    write_source(
+        root.path().join("crates/carrick-kernel/src/lib.rs"),
+        r#"
+macro_rules! access { ($table:expr) => { $table.r#read_open_files() }; }
+pub fn poll(table: &Table) { table.read_open_files(); }
+"#,
+    )
+    .unwrap();
+    assert!(carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err());
+}
+
+#[test]
+fn review_fail_closed_raw_identifiers_reach_retained_lock_scanner() {
+    for call in ["this.proc.r#lock()", "this.r#proc.r#lock()"] {
+        let root = source_fixture();
+        write_source(root.path().join("crates/carrick-kernel/src/dispatch/mod.rs"), format!("mod sysv; mod mm_authority; mod mm_quiesce; fn r#hidden(this: &Dispatcher) {{ {call}; }}")).unwrap();
+        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        assert!(!census.is_test_file("crates/carrick-kernel/src/dispatch/mod.rs"));
+        assert!(
+            carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+                .is_err(),
+            "{call}"
+        );
+    }
+}
+
+#[test]
+fn review_fail_closed_raw_identifiers_reach_global_and_termination_scanners() {
+    for call in [
+        r#"std::r#env::r#var("CARRICK_GUEST_STATE")"#,
+        "std::r#process::r#abort()",
+    ] {
+        let root = source_fixture();
+        write_source(
+            root.path()
+                .join("crates/carrick-kernel/src/dispatch/mod.rs"),
+            format!("mod sysv; mod mm_authority; mod mm_quiesce; fn hidden() {{ {call}; }}"),
+        )
+        .unwrap();
+        carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        assert!(
+            carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+                .is_err(),
+            "{call}"
+        );
+    }
+}
+
+#[test]
+fn review_fail_closed_test_include_cycle_does_not_seed_production() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        "#[cfg(test)] mod a; pub fn poll(table: &Table) { table.read_open_files(); }",
+    )
+    .unwrap();
+    write_source(
+        src.join("a.rs"),
+        "include!(\"b.rs\"); fn helper(table: &Table) { table.read_open_files(); }",
+    )
+    .unwrap();
+    write_source(
+        src.join("b.rs"),
+        "const SOURCE: &str = include_str!(\"a.rs\");",
+    )
+    .unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert!(census.is_test_file("crates/carrick-kernel/src/a.rs"));
+    assert!(census.is_test_file("crates/carrick-kernel/src/b.rs"));
+    assert_eq!(census.k1.len(), 1);
+    carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1)).unwrap();
+    // A production macro literal wins over the entire test-only cycle.
+    write_source(src.join("lib.rs"), "#[cfg(test)] mod a; pass! { @ \"b.rs\" } pub fn poll(table: &Table) { table.read_open_files(); }").unwrap();
+    write_source(src.join("a.rs"), "include!(\"b.rs\"); fn helper() {}").unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert!(!census.is_test_file("crates/carrick-kernel/src/a.rs"));
+    assert!(!census.is_test_file("crates/carrick-kernel/src/b.rs"));
+    // Production promotion cannot manufacture a logical authority owner.
+    write_source(
+        src.join("a.rs"),
+        "include!(\"b.rs\"); fn helper(table: &Table) { table.read_open_files(); }",
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+            .is_err()
+    );
+}
+
+#[test]
+fn review_fail_closed_macro_attributes_cannot_hide_retained_authorities() {
+    for call in [
+        "this.proc.lock()",
+        "std::env::var(\"CARRICK_GUEST_STATE\")",
+        "std::process::abort()",
+    ] {
+        let root = source_fixture();
+        write_source(
+            root.path()
+                .join("crates/carrick-kernel/src/dispatch/mod.rs"),
+            format!(
+                r#"
+mod sysv; mod mm_authority; mod mm_quiesce;
+macro_rules! production {{ (#[cfg(test)] $item:item) => {{ $item }}; }}
+production! {{ #[cfg(test)] fn hidden(this: &Dispatcher) {{ {call}; }} }}
+"#
+            ),
+        )
+        .unwrap();
+        carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        assert!(
+            carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+                .is_err(),
+            "{call}"
+        );
+    }
+}
+
+#[test]
+fn review_fail_closed_opaque_path_attributes_cannot_exclude_default_modules() {
+    for (declaration, default_file, selected_file) in [
+        (
+            r#"#[path="decoy.rs"] pub mod hidden;"#,
+            "hidden.rs",
+            "decoy.rs",
+        ),
+        (
+            r#"#[path="decoy"] pub mod hidden { pub mod child; }"#,
+            "hidden/child.rs",
+            "decoy/child.rs",
+        ),
+    ] {
+        let root = source_fixture();
+        let src = root.path().join("crates/carrick-kernel/src");
+        write_source(
+            src.join("lib.rs"),
+            format!(
+                r#"
+macro_rules! production {{ (#[path=$path:literal] $item:item) => {{ $item }}; }}
+production! {{ {declaration} }}
+#[cfg(test)] #[path="{default_file}"] mod test_copy;
+pub fn poll(table: &Table) {{ table.read_open_files(); }}
+"#
+            ),
+        )
+        .unwrap();
+        for file in [default_file, selected_file] {
+            let path = src.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            write_source(path, "fn data() {}").unwrap();
+        }
+        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        assert!(
+            !census.is_test_file(&format!("crates/carrick-kernel/src/{default_file}")),
+            "{declaration}"
+        );
+        write_source(
+            src.join(default_file),
+            "fn hidden(table: &Table) { table.read_open_files(); }",
+        )
+        .unwrap();
+        assert!(
+            carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+                .is_err(),
+            "{declaration}"
+        );
+    }
+}
+
 fn git_fixture(root: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args(args)
