@@ -24,6 +24,28 @@ struct CloudStatus {
     errors: Vec<String>,
     recoverable_errors: std::collections::BTreeMap<String, Vec<String>>,
 }
+struct GuestScript {
+    path: &'static str,
+    source: &'static str,
+}
+const GUEST_SCRIPTS: [GuestScript; 2] = [
+    GuestScript {
+        path: "/usr/local/bin/carrick-ci-run-once",
+        source: include_str!("../../../../scripts/ci/runner-once.sh"),
+    },
+    GuestScript {
+        path: "/usr/local/bin/carrick-ci-admit-job.sh",
+        source: include_str!("../../../../scripts/ci/admit-job.sh"),
+    },
+];
+fn script_install_command(path: &str, source: &str) -> String {
+    format!(
+        "umask 077; printf '%s' {} > {} && chmod 755 {}",
+        crate::remote_accept::shell_quote(source),
+        crate::remote_accept::shell_quote(path),
+        crate::remote_accept::shell_quote(path)
+    )
+}
 fn cloud_init_complete(output: &GuestOutput) -> Result<bool, ScalerError> {
     let status: CloudStatus = serde_json::from_str(&output.stdout)?;
     const PVE_USER_DEPRECATION: &str = "'user' of type string is deprecated in 22.2 and scheduled to be removed in 27.2. Use 'users' list instead.";
@@ -949,9 +971,25 @@ fn boot_and_register(
             "guest five-minute readiness deadline",
         ));
     }
-    drop(shared_deadline);
+    // Public launch payloads are bound to the exact controller artifact. A
+    // cached template must not select a stale job-start guard or launch path.
+    for script in &GUEST_SCRIPTS {
+        pve.agent(
+            row,
+            &[
+                "/bin/sh",
+                "-c",
+                &script_install_command(script.path, script.source),
+            ],
+        )?;
+    }
+    pve.agent(
+        row,
+        &["/bin/sh", "-c", "rm -f /usr/local/bin/carrick-ci-admit-job"],
+    )?;
     pve.agent(row, &["/bin/sh", "-c", &format!("install -d -m 755 /etc/carrick-ci; printf '%s\\n' {sha} > /etc/carrick-ci/approved-sha; chmod 644 /etc/carrick-ci/approved-sha")])?;
     println!("vm={} ready; non-root KVM API 12 verified", row.vm.get());
+    drop(shared_deadline);
     // Write registration intent before asking GitHub. No JIT material in ledger.
     row.state = State::Registered;
     update(ledger, row, path)?;
@@ -1274,6 +1312,39 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    #[test]
+    fn serial_host_guest_payload_installs_exact_bytes_without_expansion() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, script) in GUEST_SCRIPTS.iter().enumerate() {
+            let path = dir.path().join(format!("payload-{i}"));
+            let status = Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    &script_install_command(path.to_str().unwrap(), script.source),
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), script.source);
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+        }
+    }
+    #[test]
+    fn official_runner_hook_has_a_supported_script_extension() {
+        let launch = include_str!("../../../../scripts/ci/runner-once.sh");
+        let hook = launch
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("export ACTIONS_RUNNER_HOOK_JOB_STARTED=")
+            })
+            .unwrap();
+        // The live runner rejected its extensionless hook before executing it.
+        assert!(hook.ends_with(".sh") || hook.ends_with(".ps1") || hook.ends_with(".js"));
+    }
     #[test]
     fn completed_cloud_init_accepts_only_the_observed_pve_user_deprecation() {
         let stdout = json!({"status":"done","errors":[],"recoverable_errors":{"DEPRECATED":["'user' of type string is deprecated in 22.2 and scheduled to be removed in 27.2. Use 'users' list instead."]}}).to_string();
