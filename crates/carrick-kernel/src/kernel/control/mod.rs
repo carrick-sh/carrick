@@ -1400,6 +1400,9 @@ mod tests {
             notifying_runtime,
         )
         .expect("server");
+        // Move ownership after server creation: unwind releases the gate,
+        // completes held work, then joins handlers in server Drop.
+        let held_work = work;
         let state = server.state();
         let wait_endpoint = endpoint.clone();
         let wait_state = state.clone();
@@ -1429,7 +1432,7 @@ mod tests {
             waiter.join().expect("waiter").expect("wait response"),
             ControlOutcome::ExecRunning,
         );
-        drop(work);
+        drop(held_work);
         server.shutdown();
     }
 
