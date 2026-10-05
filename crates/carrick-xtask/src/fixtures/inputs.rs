@@ -1,9 +1,10 @@
 //! Resolve fixture inputs independently of the host workspace's crate population.
+use super::environment::{BuildEnvironment, checkout_configs};
 use super::{ContentHash, GuestTarget, Result, fail, git, hash_source, safe_path};
-use crate::command;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const FIXTURES: &[&str] = &[
     "conformance-probes",
@@ -27,6 +28,7 @@ const BUILD_INPUTS: &[&str] = &[
     // The publisher itself constructs the Cargo commands and probe selection.
     "crates/carrick-xtask/src/fixtures.rs",
     "crates/carrick-xtask/src/fixtures/inputs.rs",
+    "crates/carrick-xtask/src/fixtures/environment.rs",
     "crates/carrick-xtask/src/probe_inventory.rs",
     "crates/carrick-xtask/src/provision.rs",
 ];
@@ -80,6 +82,7 @@ fn relative(root: &Path, path: &Path) -> Result<String> {
 
 fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
     let root = root.canonicalize()?;
+    let environment = BuildEnvironment::new(&root)?;
     let mut inputs: BTreeSet<_> = BUILD_INPUTS.iter().map(|s| (*s).to_owned()).collect();
     for fixture in FIXTURES {
         let directory = safe_path(&root, fixture)?;
@@ -98,9 +101,16 @@ fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
             // Resolve the same default features and target as the locked build.
             // Offline prevents validation from silently relying on registry access;
             // a cold/incomplete Cargo cache is an explicit preparation failure.
-            let output = command::run_checked(
-                "cargo",
-                [
+            let configs = checkout_configs(&root, &directory)?;
+            let mut command = Command::new("cargo");
+            environment
+                .configure(&mut command)
+                .current_dir(environment.scratch_root());
+            for config in configs {
+                command.arg("--config").arg(config);
+            }
+            command
+                .args([
                     "metadata",
                     "--locked",
                     "--offline",
@@ -109,11 +119,10 @@ fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
                     "--filter-platform",
                     target.triple(),
                     "--manifest-path",
-                    "Cargo.toml",
-                ],
-                Some(&directory),
-            )?;
-            let metadata: Metadata = serde_json::from_str(&output.stdout)?;
+                ])
+                .arg(&manifest);
+            let output = environment.output(&mut command)?;
+            let metadata: Metadata = serde_json::from_str(&output)?;
             inputs.insert(relative(
                 &root,
                 &metadata.workspace_root.join("Cargo.toml"),
@@ -187,7 +196,8 @@ fn resolved_inputs(root: &Path) -> Result<BTreeSet<String>> {
     Ok(inputs)
 }
 
-pub(super) fn source_hashes(root: &Path) -> Result<BTreeMap<String, ContentHash>> {
+/// Compute the same scoped input inventory used by the bundle publisher.
+pub fn source_hashes(root: &Path) -> Result<BTreeMap<String, ContentHash>> {
     let inputs = resolved_inputs(root)?;
     let mut args = vec!["status", "--porcelain", "--untracked-files=all", "--"];
     args.extend(inputs.iter().map(String::as_str));
