@@ -5475,16 +5475,23 @@ fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
 
 #[test]
 fn production_fork_plan_retains_structural_vvar_semantic_authority() {
-    production_fork_vvar_refresh(false);
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    production_fork_vvar_refresh(None);
 }
 
 #[test]
 fn owner_fork_refreshes_readonly_vvar_without_host_arm_ranges() {
-    production_fork_vvar_refresh(true);
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    production_fork_vvar_refresh(Some(4));
 }
 
-fn production_fork_vvar_refresh(guest_lane: bool) {
+#[test]
+fn owner_vvar_refresh_preserves_neighbors_outside_the_live_cow_arm() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    production_fork_vvar_refresh(Some(1));
+}
+
+fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
     let _external_alias_restore = ExternalAliasStateRestore::capture();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let transport = Arc::new(CarrierForeignMmTransport::new());
@@ -5680,7 +5687,15 @@ fn production_fork_vvar_refresh(guest_lane: bool) {
         cow_rollback_scratch: None,
         registration: None,
     };
-    let root_slot_base = crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + 0x40_0000;
+    // Each fixture owns its root slots; pooled custody from another test
+    // must never choose this test's child or grandchild address.
+    let root_slot_offset = match owner_cow_pages {
+        None => 0x40_0000,
+        Some(4) => 0x80_0000,
+        Some(1) => 0xc0_0000,
+        _ => panic!("unsupported vvar fixture shape"),
+    };
+    let root_slot_base = crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + root_slot_offset;
     let root_slot_size = 0x20_0000_u64;
     let make_request = || carrick_hal::ProcessForkRequest {
         entry: carrick_hal::GuestEntryRegs::default(),
@@ -6035,14 +6050,31 @@ fn production_fork_vvar_refresh(guest_lane: bool) {
             .is_some_and(|mapping| !mapping.guest_writable),
         "production mapping resolution must find the read-only prepared child vvar",
     );
-    if guest_lane {
+    if let Some(pages) = owner_cow_pages {
         child_page_tables_authority
             .edit(
                 || panic!("prepared child tables"),
                 |editor| {
+                    for page in 0..4 {
+                        let va = vvar_ipa + page * 4096;
+                        editor
+                            .manager
+                            .publish_private_pages(
+                                carrick_mmu_core::aarch64::GuestLeafPublication {
+                                    va,
+                                    ipa: va,
+                                    len: 4096,
+                                    writable: false,
+                                    executable: true,
+                                },
+                                va,
+                                None,
+                            )
+                            .expect("bootstrap-sealed private vvar page");
+                    }
                     editor
                         .manager
-                        .set_fork_readonly_adopting(vvar_ipa, vvar_len as usize, None)?;
+                        .set_fork_readonly_adopting(vvar_ipa, pages * 4096, None)?;
                     // SAFETY: the prepared child owns this exact table arena.
                     unsafe {
                         editor.sync_to_host(super::TestPageTableArena(
@@ -6063,6 +6095,19 @@ fn production_fork_vvar_refresh(guest_lane: bool) {
         assert_eq!(
             child_page_tables_authority.live_descriptor_owner(),
             carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest,
+        );
+        let leaf = child_page_tables_authority
+            .with_manager(|manager| {
+                carrick_mmu_core::aarch64::terminal_descriptor(manager.debug_walk(vvar_ipa))
+            })
+            .unwrap();
+        assert!(
+            carrick_mmu_core::aarch64::terminal_descriptor_is_fork_cow(leaf),
+            "fixture must carry actual private COW authority: {leaf:#x}"
+        );
+        assert!(
+            !carrick_mmu_core::aarch64::terminal_descriptor_may_write(leaf),
+            "read-only vvar must carry no Linux write intent: {leaf:#x}"
         );
         child_task.cow_armed.lock().ranges.clear();
         let published = std::cell::RefCell::new(Vec::new());
@@ -6127,6 +6172,17 @@ fn production_fork_vvar_refresh(guest_lane: bool) {
             .refresh_fork_process_state_in(&transport.custody, &mut service)
             .expect("owner refresh must use live private COW leaves, not host arms");
         assert_eq!(published.borrow().len(), 1, "one owner COW publication");
+        assert!(matches!(published.borrow()[0].op,
+            carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint { len, .. }
+            if len == pages as u64 * 4096));
+        if pages == 1 {
+            assert_eq!(
+                child_page_tables_authority
+                    .with_manager(|manager| manager.translate(vvar_ipa + 4096)),
+                Some(Some(vvar_ipa + 4096)),
+                "the unarmed neighbor keeps the old owner"
+            );
+        }
         assert!(child_task.cow_armed.lock().ranges.is_empty());
         assert_eq!(child_task.host_cow_stats.host_cow_resolutions(), 0);
     } else {
@@ -13190,7 +13246,6 @@ mod guest_cow {
             DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants, TerminalEdit,
             execute_descriptor_op,
         };
-        let _guard = FOREIGN_MM_TEST_LOCK.lock();
         let _external = ExternalAliasStateRestore::capture();
         let _stub = ScopedStage2MapTestStub::enable();
         let (mut child, pool) = forked_guest_child(ordinal, root, data);
@@ -13270,11 +13325,13 @@ mod guest_cow {
 
     #[test]
     fn settlement_preserves_later_owner_retirement() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
         settle_after_owner_edit(811, 0x9a01_3900_0000, 0x9b01_3900_0000, false);
     }
 
     #[test]
     fn settlement_preserves_later_owner_fork_arm() {
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
         settle_after_owner_edit(812, 0x9a01_3a00_0000, 0x9b01_3a00_0000, true);
     }
 
