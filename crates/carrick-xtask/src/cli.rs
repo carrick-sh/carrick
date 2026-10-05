@@ -28,6 +28,12 @@ pub enum Commands {
     #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
     WorktreeGc(crate::worktree_gc::WorktreeGcArgs),
 
+    #[command(
+        hide = true,
+        about = "Descriptor-anchored prebuilt remote pruning helper"
+    )]
+    TargetPrune(crate::target_prune::TargetPruneArgs),
+
     #[command(about = "Hold checkout admission through a foreground command")]
     WorktreeRun(crate::worktree_admission::WorktreeRunArgs),
 
@@ -285,6 +291,10 @@ where
     match cli.command {
         Commands::CiScaler(args) => {
             crate::ci_scaler::run(args)?;
+            Ok(())
+        }
+        Commands::TargetPrune(args) => {
+            crate::target_prune::run_helper(args, writer)?;
             Ok(())
         }
         Commands::WorktreeRun(args) => {
