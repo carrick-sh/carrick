@@ -1428,6 +1428,43 @@ impl<'ast, 'a> Visit<'ast> for SourceCheckerVisitor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mm_transfer_records_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let neutral = repo.join("crates/carrick-core-abi/src/mm/transfer.rs");
+        let source = fs::read_to_string(&neutral)
+            .expect("MM transport must move into core-abi before either ISA consumes it");
+        let items = syn::parse_file(&source).unwrap();
+        for name in [
+            "El1MmHandle",
+            "PortalTransferRequest",
+            "PortalPreparedPermit",
+            "PortalTransferSlot",
+            "PortalTransferService",
+        ] {
+            assert_eq!(
+                items
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item,
+                syn::Item::Struct(record) if record.ident == name))
+                    .count(),
+                1,
+                "neutral ABI must own {name} exactly once"
+            );
+            let old =
+                fs::read_to_string(repo.join("crates/carrick-el1-abi/src/mm_portal.rs")).unwrap();
+            assert!(
+                !old.contains(&format!("pub struct {name} {{")),
+                "ARM transport must not retain displaced {name}"
+            );
+        }
+        let manifest = fs::read_to_string(repo.join("crates/carrick-core-abi/Cargo.toml")).unwrap();
+        assert!(!manifest.contains("carrick-el1-abi"));
+        assert!(!source.contains("TrapFrame"));
+    }
+
     use serde_json::{Value, json};
 
     struct Fixture {
