@@ -5334,11 +5334,11 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         self.vm.bind_frame_cow(authority, identity);
     }
 
-    fn service_owner_file_fault(
+    fn service_owner_fault(
         &mut self,
         mm_key: u64,
         request_generation: u64,
-    ) -> Result<Option<carrick_hal::OwnerFileFaultOutcome>, TrapError> {
+    ) -> Result<Option<carrick_hal::OwnerFaultOutcome>, TrapError> {
         let Some(slot_index) = self.vcpu.get_mut().mailbox_slot() else {
             return Ok(None);
         };
@@ -5358,9 +5358,9 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let Some(window) = slot.fault_selection(mm_key, request_generation) else {
             return Ok(None);
         };
-        if mm_key != self.mm_generation || window.host_backing.is_none() {
+        if mm_key != self.mm_generation {
             return Err(TrapError::Hypervisor(
-                "owner file fault selection names another MM or source".into(),
+                "owner fault selection names another MM".into(),
             ));
         }
         let ttbr0 = self.vcpu.get_mut().get_sys_reg(SysReg::Ttbr0)?;
@@ -5384,7 +5384,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 if !slot.cancel_fault_selection(window, request_generation) {
                     return Err(TrapError::Hypervisor("owner EOF selection is stale".into()));
                 }
-                return Ok(Some(carrick_hal::OwnerFileFaultOutcome::BusFault));
+                return Ok(Some(carrick_hal::OwnerFaultOutcome::BusFault));
             }
             other => other?,
         };
@@ -5398,10 +5398,10 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 );
                 if !slot.cancel_fault_selection(window, request_generation) {
                     return Err(TrapError::Hypervisor(
-                        "owner file fault cancellation is stale".into(),
+                        "owner fault cancellation is stale".into(),
                     ));
                 }
-                return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Resolved));
+                return Ok(Some(carrick_hal::OwnerFaultOutcome::Resolved));
             }
             crate::user_transfer::TransferPreparation::Pending(wait) => {
                 if !slot.cancel_fault_selection(window, request_generation) {
@@ -5409,7 +5409,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                         "owner pending fault selection is stale".into(),
                     ));
                 }
-                return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Pending(wait)));
+                return Ok(Some(carrick_hal::OwnerFaultOutcome::Pending(wait)));
             }
             crate::user_transfer::TransferPreparation::Declined => {
                 carrick_observability::probes::hvpatch_el1_file_fault_handoff(
@@ -5419,15 +5419,15 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                 );
                 if !slot.cancel_fault_selection(window, request_generation) {
                     return Err(TrapError::Hypervisor(
-                        "owner file fault cancellation is stale".into(),
+                        "owner fault cancellation is stale".into(),
                     ));
                 }
-                return Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused));
+                return Ok(Some(carrick_hal::OwnerFaultOutcome::Refused));
             }
         };
         if !slot.submit(window, grant.transaction()) {
             return Err(TrapError::Hypervisor(
-                "owner file fault grant selection was displaced".into(),
+                "owner fault grant selection was displaced".into(),
             ));
         }
         carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 6);
@@ -5454,18 +5454,18 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             );
             outcome?;
             Ok(Some(if settled {
-                carrick_hal::OwnerFileFaultOutcome::Resolved
+                carrick_hal::OwnerFaultOutcome::Resolved
             } else {
-                carrick_hal::OwnerFileFaultOutcome::Refused
+                carrick_hal::OwnerFaultOutcome::Refused
             }))
         } else if slot.withdraw(window, grant.transaction()) {
             carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 8);
             outcome?;
-            Ok(Some(carrick_hal::OwnerFileFaultOutcome::Refused))
+            Ok(Some(carrick_hal::OwnerFaultOutcome::Refused))
         } else {
             carrick_fatal::carrick_fatal!(
                 "aarch64::user_transfer",
-                "unsettled owner file fault retains physical custody"
+                "unsettled owner fault retains physical custody"
             );
         }
     }

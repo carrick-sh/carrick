@@ -6,13 +6,19 @@ use carrick_core_abi::PortalTransferIntent;
 use carrick_el1::personality::mm_portal::NativeOwnerVenue;
 use carrick_el1::personality::mm_portal::test_support::*;
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
-use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerMmu};
+use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerForkMmu};
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 use carrick_sched_core::AddressSpaces;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
-fn first_touch_window<B: OwnerMmu>(backend: B, table_flags: u64, resident: u64, prepared: u64) {
+fn first_touch_window<B: OwnerForkMmu + Copy>(
+    backend: B,
+    table_flags: u64,
+    resident: u64,
+    prepared: u64,
+    neighbors: bool,
+) {
     let region = Region::new();
     let spaces = AddressSpaces::new();
     let mm = admit(&region, &spaces, 78, ROOT, 4, 0);
@@ -29,8 +35,10 @@ fn first_touch_window<B: OwnerMmu>(backend: B, table_flags: u64, resident: u64, 
     for (entry, offset) in [(0, 4096), (513, 8192), (1024, 12288)] {
         tables.words[entry].store((ROOT + offset) | table_flags, Ordering::Release);
     }
-    tables.words[1536].store(IPA | resident, Ordering::Release);
-    tables.words[1538].store((IPA + 8192) | prepared, Ordering::Release);
+    if neighbors {
+        tables.words[1536].store(IPA | resident, Ordering::Release);
+        tables.words[1538].store((IPA + 8192) | prepared, Ordering::Release);
+    }
     let inherited: Vec<_> = tables
         .words
         .iter()
@@ -81,17 +89,50 @@ fn first_touch_window<B: OwnerMmu>(backend: B, table_flags: u64, resident: u64, 
     };
     assert_eq!(
         window.range.start(),
-        VA + 4096,
+        if neighbors { VA + 4096 } else { VA },
         "owner supply must exclude the inherited resident predecessor"
     );
     assert_eq!(
         window.range.end(),
-        VA + 8192,
+        if neighbors { VA + 8192 } else { VA + 16384 },
         "owner supply must exclude the inherited prepared successor"
     );
     assert_eq!(window.operation.mm, mm);
     assert_eq!(window.generation, owner_identity.2.generation);
     assert_eq!(window.host_backing, None);
+    let slots = Box::new(carrick_el1_abi::MmPortalSlots::new());
+    assert!(slots.bind_carrier(NonZeroU64::new(1).unwrap()));
+    let mailbox = carrick_core_abi::FrameGrantMailbox::new();
+    let venue = carrick_core::mm::fault::OwnerFaultVenue {
+        roots: region.table(),
+        spaces: carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+        slots: &*slots,
+        worker: 0,
+        mailbox: &mailbox,
+    };
+    assert!(venue.publish(backend, &words, mm.raw(), VA + 4096, 1));
+    let request = mailbox.claim_request().unwrap();
+    let fault_window = slots
+        .grant(0)
+        .unwrap()
+        .fault_selection(mm.raw(), request.request_generation)
+        .unwrap();
+    assert_eq!(fault_window.range, window.range);
+    assert_eq!(fault_window.generation, window.generation);
+    assert_eq!(fault_window.operation.mm, mm);
+    assert_eq!(
+        fault_window.operation.incarnation,
+        window.operation.incarnation
+    );
+    assert_ne!(fault_window.operation.sequence, window.operation.sequence);
+    assert_eq!(fault_window.host_backing, None);
+    assert_eq!(request.requested_len, window.range.len());
+    assert!(
+        slots
+            .grant(0)
+            .unwrap()
+            .cancel_fault_selection(fault_window, request.request_generation)
+    );
     assert_eq!(
         identity(parent),
         parent_identity,
@@ -107,7 +148,7 @@ fn first_touch_window<B: OwnerMmu>(backend: B, table_flags: u64, resident: u64, 
         inherited
     );
     assert!(
-        words.loads.get() <= 4 * 4 * 4,
+        words.loads.get() <= 4 * (2 * 4 + 1),
         "selection work must be bounded by the reservation window"
     );
 }
@@ -119,6 +160,7 @@ fn aarch64_owner_fault_window_excludes_inherited_backing() {
         3,
         RW | (1 << 56) | (1 << 57),
         (RW | (1 << 56) | (1 << 57)) & !1,
+        true,
     );
 }
 
@@ -130,5 +172,17 @@ fn x86_owner_fault_window_excludes_inherited_backing() {
         PRESENT | USER | WRITE,
         PRESENT | USER | WRITE | NX | MAY_WRITE,
         PREPARED | USER | WRITE | NX | MAY_WRITE,
+        true,
     );
+}
+
+#[test]
+fn aarch64_owner_fault_batches_unbacked_reservation() {
+    first_touch_window(Aarch64Mmu, 3, 0, 0, false);
+}
+
+#[test]
+fn x86_owner_fault_batches_unbacked_reservation() {
+    use carrick_mmu_core::x86::descriptor_txn::{PRESENT, USER, WRITE};
+    first_touch_window(X86Mmu, PRESENT | USER | WRITE, 0, 0, false);
 }

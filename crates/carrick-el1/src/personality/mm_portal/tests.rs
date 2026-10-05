@@ -2225,14 +2225,14 @@ fn owner_fork_anonymous_first_touch_excludes_inherited_prepared_neighbors() {
     assert!(slots.bind_carrier(NonZeroU64::new(1).unwrap()));
     let mailbox = FrameGrantMailbox::new();
     assert!(
-        (crate::fault::FileFaultVenue {
+        (crate::fault::OwnerFaultVenue {
             roots: region.table(),
             spaces: carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
             slots: &slots,
             worker: 0,
             mailbox: &mailbox,
         })
-        .publish(78, VA, 1),
+        .publish(carrick_mmu_core::owner_mmu::Aarch64Mmu, &words, 78, VA, 1),
         "anonymous first-touch must use the admitted owner handoff"
     );
     let fault = mailbox.claim_request().unwrap();
@@ -2336,14 +2336,14 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
     assert!(fault_slots.bind_carrier(NonZeroU64::new(1).unwrap()));
     let fault_mailbox = FrameGrantMailbox::new();
     assert!(
-        (crate::fault::FileFaultVenue {
+        (crate::fault::OwnerFaultVenue {
             roots: region.table(),
             spaces: carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
             slots: &fault_slots,
             worker: 0,
             mailbox: &fault_mailbox
         })
-        .publish(78, VA, 1)
+        .publish(carrick_mmu_core::owner_mmu::Aarch64Mmu, &words, 78, VA, 1)
     );
     let fault_request = fault_mailbox.claim_request().unwrap();
     let fault_window = fault_slots

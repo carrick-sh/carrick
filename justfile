@@ -488,6 +488,7 @@ test-kernel-semantics *ARGS:
 test-mm-owner *ARGS:
     {{_admit}} {{_cargo}} test --locked -p carrick-core -p carrick-core-abi --lib
     {{_admit}} {{_cargo}} test --locked -p carrick-core --doc
+    {{_admit}} {{_cargo}} test --locked -p carrick-core --test owner_fault {{ARGS}}
     {{_admit}} {{_cargo}} test --locked -p carrick-core --test x86_acceleration {{ARGS}}
 
 test *ARGS:

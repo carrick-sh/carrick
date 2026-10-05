@@ -390,12 +390,12 @@ fn claim_frame_grant_request(
 
 /// Service a source selected by the owner before any host page-table pause.
 /// Absence leaves the scheduler request untouched for other fault venues.
-pub(super) fn resolve_owner_file_fault(
+pub(super) fn resolve_owner_fault(
     engine: &mut impl carrick_hal::threaded::ThreadedEngine,
     mm_key: u64,
     address: u64,
     access: Option<carrick_mmu_core::aarch64::LeafAccess>,
-) -> Result<Option<carrick_hal::OwnerFileFaultOutcome>, TrapError> {
+) -> Result<Option<carrick_hal::OwnerFaultOutcome>, TrapError> {
     let Some(index) = engine.mailbox_slot() else {
         return Ok(None);
     };
@@ -412,7 +412,7 @@ pub(super) fn resolve_owner_file_fault(
     let Some(slot) = slots.grant(index) else {
         return Ok(None);
     };
-    let Some((generation, window)) = slot.pending_fault_selection(mm_key, address) else {
+    let Some((generation, _window)) = slot.pending_fault_selection(mm_key, address) else {
         crate::probes::hvpatch_el1_file_fault_handoff(
             address,
             carrick_el1_abi::frame_grant_mailbox_host_for_slot(index).map_or(u32::MAX, |mailbox| {
@@ -423,7 +423,7 @@ pub(super) fn resolve_owner_file_fault(
         return Ok(None);
     };
     let mailbox = carrick_el1_abi::frame_grant_mailbox_host_for_slot(index)
-        .ok_or_else(|| TrapError::Hypervisor("owner file fault has no frame mailbox".into()))?;
+        .ok_or_else(|| TrapError::Hypervisor("owner fault has no frame mailbox".into()))?;
     crate::probes::hvpatch_el1_file_fault_handoff(
         address,
         mailbox.state.load(std::sync::atomic::Ordering::Acquire),
@@ -433,20 +433,15 @@ pub(super) fn resolve_owner_file_fault(
         FrameGrantClaim::Accepted(request) if request.request_generation == generation => request,
         _ => {
             return Err(TrapError::Hypervisor(
-                "owner file fault scheduler request is stale".into(),
+                "owner fault scheduler request is stale".into(),
             ));
         }
     };
-    if window.host_backing.is_none() {
-        return Err(TrapError::Hypervisor(
-            "owner file fault lost source identity".into(),
-        ));
-    }
     let completed = engine
-        .service_owner_file_fault(mm_key, generation)?
-        .ok_or_else(|| TrapError::Hypervisor("owner file fault selection was displaced".into()))?;
-    if completed == carrick_hal::OwnerFileFaultOutcome::Resolved
-        || matches!(completed, carrick_hal::OwnerFileFaultOutcome::Pending(_))
+        .service_owner_fault(mm_key, generation)?
+        .ok_or_else(|| TrapError::Hypervisor("owner fault selection was displaced".into()))?;
+    if completed == carrick_hal::OwnerFaultOutcome::Resolved
+        || matches!(completed, carrick_hal::OwnerFaultOutcome::Pending(_))
     {
         crate::probes::hvpatch_el1_file_fault_handoff(
             address,
@@ -455,8 +450,8 @@ pub(super) fn resolve_owner_file_fault(
         );
         if !mailbox.complete_resolved_owner_fault(request) {
             carrick_fatal::carrick_fatal!(
-                "hvpatch::owner_file_fault",
-                "resolved owner file grant lost exact mailbox claim: mm={} generation={} fault=0x{:x}",
+                "hvpatch::owner_fault",
+                "resolved owner grant lost exact mailbox claim: mm={} generation={} fault=0x{:x}",
                 request.mm_key,
                 request.request_generation,
                 request.fault_va,
@@ -466,7 +461,7 @@ pub(super) fn resolve_owner_file_fault(
         crate::probes::hvpatch_el1_file_fault_handoff(
             address,
             mailbox.state.load(std::sync::atomic::Ordering::Acquire),
-            if completed == carrick_hal::OwnerFileFaultOutcome::BusFault {
+            if completed == carrick_hal::OwnerFaultOutcome::BusFault {
                 4
             } else {
                 3

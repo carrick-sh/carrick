@@ -1,6 +1,9 @@
 //! Shared lazy-supply generations and exact reservation fault admission.
 use carrick_core_abi::{EL1_FRAME_GRANT_TARGET_SIZE, FrameGrantMailbox, FrameGrantRequest};
+use carrick_guest_arch::{RootGpa, UserVa};
 use carrick_mmu_core::aarch64::LeafAccess;
+use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
+use carrick_mmu_core::owner_mmu::OwnerForkMmu;
 use carrick_sched_core::spaces::notification::SpaceAccess;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -67,7 +70,64 @@ pub fn root_admits_commit<
 
 use core::num::NonZeroU64;
 
-pub struct FileFaultVenue<
+/// Select a bounded contiguous unbacked neighborhood inside the exact live
+/// reservation. The caller holds this MM's editor and reservation root.
+/// Prepared stock is physical ownership even though hardware VALID is clear.
+pub fn owner_fault_plan<
+    Policy: crate::mm::reservation::ReservationPolicy,
+    Geometry: crate::mm::reservation::ReservationGeometry,
+    B: OwnerForkMmu,
+    W: LiveDescriptorWords + ?Sized,
+>(
+    root: &mut crate::mm::reservation::Reservations<'_, Policy, Geometry>,
+    words: &W,
+    hardware_root: RootGpa,
+    address: UserVa,
+    access: carrick_core_abi::ReservationProtection,
+    fork_sequence: Option<NonZeroU64>,
+) -> Result<crate::mm::reservation::ReservationFaultPlan, crate::mm::reservation::Refusal> {
+    use crate::mm::reservation::Refusal;
+    let mapping = root.mapping(address.raw()).ok_or(Refusal::Hole)?;
+    let target = if mapping.host_backing.is_some() {
+        4096
+    } else {
+        EL1_FRAME_GRANT_TARGET_SIZE
+    };
+    let mut plan = root.fork_transfer_fault_plan(address.raw(), target, access, fork_sequence)?;
+    let table = hardware_root.address().raw();
+    let unbacked = |va: u64| -> Result<bool, Refusal> {
+        let mut table = table;
+        for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
+            let word = words
+                .load(table + ((va >> shift) & 511) * 8)
+                .map_err(|_| Refusal::Stale)?;
+            if word == 0 {
+                return Ok(true);
+            }
+            if B::is_table(word, level) {
+                table = word & B::ADDRESS_MASK;
+            } else {
+                return Ok(B::is_retired(word) || B::is_absent_unowned(word));
+            }
+        }
+        Err(Refusal::Stale)
+    };
+    if !unbacked(plan.fault_page)? {
+        return Err(Refusal::Busy);
+    }
+    let mut start = plan.fault_page;
+    while start > plan.range.start() && unbacked(start - 4096)? {
+        start -= 4096;
+    }
+    let mut end = plan.fault_page + 4096;
+    while end < plan.range.end() && unbacked(end)? {
+        end += 4096;
+    }
+    plan.range = carrick_core_abi::ReservationRange::new(start, end).ok_or(Refusal::Invalid)?;
+    Ok(plan)
+}
+
+pub struct OwnerFaultVenue<
     'a,
     Policy: crate::mm::reservation::ReservationPolicy,
     Geometry: crate::mm::reservation::ReservationGeometry,
@@ -83,30 +143,51 @@ impl<
     Policy: crate::mm::reservation::ReservationPolicy,
     Geometry: crate::mm::reservation::ReservationGeometry,
     Slots: carrick_core_abi::GrantSlotVenue,
-> FileFaultVenue<'_, Policy, Geometry, Slots>
+> OwnerFaultVenue<'_, Policy, Geometry, Slots>
 {
-    pub fn publish(&self, mm_key: u64, va: u64, access: u64) -> bool {
-        let owner_source = core::cell::Cell::new(false);
+    pub fn publish<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
+        &self,
+        _: B,
+        words: &W,
+        mm_key: u64,
+        va: u64,
+        access: u64,
+    ) -> bool {
+        let owner_admitted = core::cell::Cell::new(false);
         let run = || -> Option<bool> {
             let mm = carrick_core_abi::ReservationMm::new(mm_key)?;
             let index = self.spaces.find(mm_key)?;
             if !self.roots.admitted(index.index(), mm) {
                 return None;
             }
+            owner_admitted.set(true);
+            let _editor = self.spaces.try_begin_edit(
+                index,
+                mm_key,
+                NonZeroU64::new(u64::from(self.worker) + 1)?,
+            )?;
+            let grant = self.spaces.table().grant(index, mm_key)?;
             let mut root = self
                 .roots
                 .lock_in(self.spaces, index.index(), mm, self.worker)
                 .ok()?;
-            root.mapping(va)?.host_backing?;
-            owner_source.set(true);
             let protection = carrick_core_abi::ReservationProtection::from_bits(access)?;
-            let plan = root
-                .transfer_fault_plan(va & !4095, 4096, protection)
-                .ok()?;
+            let plan = owner_fault_plan::<_, _, B, _>(
+                &mut root,
+                words,
+                B::root(grant.ttbr0).ok()?,
+                UserVa::new(va),
+                protection,
+                None,
+            )
+            .ok()?;
             let mapping = root.mapping(plan.range.start())?;
-            let source = mapping
-                .host_backing?
-                .advance(plan.range.start().checked_sub(mapping.range.start())?)?;
+            let source = match mapping.host_backing {
+                Some(source) => {
+                    Some(source.advance(plan.range.start().checked_sub(mapping.range.start())?)?)
+                }
+                None => None,
+            };
             let sequence = root.next_transfer_sequence().ok()?;
             let carrier = self.slots.carrier()?;
             let operation = carrick_core_abi::PortalOperation {
@@ -121,7 +202,7 @@ impl<
                 range: plan.range,
                 protection: plan.protection,
                 fault_page: plan.fault_page,
-                host_backing: Some(source),
+                host_backing: source,
                 fork_sequence: None,
             };
             drop(root);
@@ -141,7 +222,7 @@ impl<
             }
             Some(true)
         };
-        run().unwrap_or(owner_source.get())
+        run().unwrap_or(owner_admitted.get())
     }
 }
 
