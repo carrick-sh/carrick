@@ -1360,7 +1360,7 @@ fn imported_private_empty_cow_pool_returns_owned_exact_target_supply() {
             );
             assert_eq!(
                 result,
-                crate::cow::GuestCowOutcome::Declined(carrick_el1_abi::CowDecline::PoolEmpty)
+                Ok(crate::cow::GuestCowOutcome::Declined(carrick_el1_abi::CowDecline::PoolEmpty))
             );
             crate::fault::CowResolution::NeedsSupply
         }
@@ -2271,7 +2271,7 @@ fn owner_fork_resident_child_cow_copies_with_production_classifier() {
         || {},
     );
     assert!(
-        matches!(outcome, crate::cow::GuestCowOutcome::Resolved(_)),
+        matches!(outcome, Ok(crate::cow::GuestCowOutcome::Resolved(_))),
         "{outcome:?}"
     );
     replacement.borrow_mut()[..4].copy_from_slice(b"fork");
@@ -2497,11 +2497,11 @@ fn owner_parent_copyout_rollback(mixed_block: bool) {
         || {},
     );
     assert!(
-        matches!(outcome, crate::cow::GuestCowOutcome::Resolved(_)),
+        matches!(outcome, Ok(crate::cow::GuestCowOutcome::Resolved(_))),
         "{outcome:?}"
     );
     drop(_editor);
-    let crate::cow::GuestCowOutcome::Resolved(completion) = outcome else {
+    let Ok(crate::cow::GuestCowOutcome::Resolved(completion)) = outcome else {
         panic!("owner COW receipt missing")
     };
     pending.reconcile_parent_write(&words, completion).unwrap();
