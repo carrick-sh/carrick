@@ -299,7 +299,7 @@ fn is_exactly_el1_frame_grant(
     )
 }
 
-/// One guest-lane EL1 frame grant that replaces a private predecessor,
+/// One guest-lane EL1 frame grant, fresh or replacing a private predecessor,
 /// between its preparation and the settlement of EL1's receipt for it.
 ///
 /// The grant's backing, inventory mapping and stage-2 owner are published at
@@ -309,7 +309,8 @@ fn is_exactly_el1_frame_grant(
 /// one owner per span, and retiring the predecessor by span must not take the
 /// replacement with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PendingEl1GrantReplacement {
+pub(crate) struct PendingEl1GrantPublication {
+    pub(crate) completion: global_frame::PhysicalGrantCompletion,
     /// The exact grant, as settlement names it to completion or rollback.
     pub(crate) grant: carrick_hal::threaded::El1FrameGrantRollback,
     /// The predecessor's physical leases, planned at preparation. Completion
@@ -319,16 +320,16 @@ pub(crate) struct PendingEl1GrantReplacement {
     pub(crate) alias: AliasBacking,
 }
 
-/// MM-owned ledger of [`PendingEl1GrantReplacement`]s. Settlement may run on
+/// MM-owned ledger of [`PendingEl1GrantPublication`]s. Settlement may run on
 /// any vCPU bound to the MM, so this lives in the MM's access state, not in
 /// an engine. A leaf lock: never held while taking another.
 #[derive(Debug, Default)]
-pub(crate) struct PendingEl1GrantReplacements {
-    entries: Vec<PendingEl1GrantReplacement>,
+pub(crate) struct PendingEl1GrantPublications {
+    entries: Vec<PendingEl1GrantPublication>,
 }
 
-impl PendingEl1GrantReplacements {
-    /// Whether any pending replacement overlaps `[va, va + len)`.
+impl PendingEl1GrantPublications {
+    /// Whether any pending publication overlaps `[va, va + len)`.
     pub(crate) fn overlaps(&self, va: u64, len: u64) -> bool {
         let end = va.saturating_add(len);
         self.entries.iter().any(|entry| {
@@ -337,10 +338,10 @@ impl PendingEl1GrantReplacements {
         })
     }
 
-    /// Record a prepared replacement. `false`: its span overlaps one already
+    /// Record a prepared publication. `false`: its span overlaps one already
     /// pending (the caller declines before publishing, so this never holds
     /// two owners for one span).
-    pub(crate) fn insert(&mut self, entry: PendingEl1GrantReplacement) -> bool {
+    pub(crate) fn insert(&mut self, entry: PendingEl1GrantPublication) -> bool {
         if self.overlaps(entry.grant.semantic_base, entry.grant.len) {
             return false;
         }
@@ -354,7 +355,7 @@ impl PendingEl1GrantReplacements {
     pub(crate) fn take(
         &mut self,
         grant: &carrick_hal::threaded::El1FrameGrantRollback,
-    ) -> Option<PendingEl1GrantReplacement> {
+    ) -> Option<PendingEl1GrantPublication> {
         let index = self
             .entries
             .iter()
@@ -1475,7 +1476,7 @@ impl HvfVmState {
             == carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest;
         if guest_lane
             && self
-                .el1_grant_replacements
+                .el1_grant_publications
                 .lock()
                 .overlaps(request.semantic_base, request.len)
         {
@@ -1582,34 +1583,27 @@ impl HvfVmState {
                 );
             });
         }
-        match predecessor_leases {
-            None => register_shared_alias(published.alias),
-            Some(predecessor_leases) => {
-                let pending = PendingEl1GrantReplacement {
-                    grant: carrick_hal::threaded::El1FrameGrantRollback {
-                        mm_key: request.mm_key,
-                        semantic_base: request.semantic_base,
-                        len: request.len,
-                        ready: published.ready,
-                    },
-                    predecessor_leases,
-                    alias: published.alias,
-                };
-                // The overlap check above ran under this MM's mutation
-                // authority, which every writer of this ledger holds.
-                let recorded = self.el1_grant_replacements.lock().insert(pending);
-                if !recorded {
-                    // Should the check ever be bypassed, nothing exposed the
-                    // grant and its transition is uncommitted: retire exactly
-                    // its own publication and decline.
-                    self.retire_unregistered_el1_frame_grant(
-                        request.semantic_base,
-                        semantic_len,
-                        published.alias,
-                        &registry,
-                    )?;
-                    return decline("frame grant replacement ledger overlaps");
-                }
+        if predecessor_leases.is_none() {
+            register_shared_alias(published.alias);
+        }
+        if guest_lane {
+            let pending = PendingEl1GrantPublication {
+                completion: published.completion.clone(),
+                grant: carrick_hal::threaded::El1FrameGrantRollback {
+                    mm_key: request.mm_key,
+                    semantic_base: request.semantic_base,
+                    len: request.len,
+                    ready: published.ready,
+                },
+                predecessor_leases: predecessor_leases.unwrap_or_default(),
+                alias: published.alias,
+            };
+            let recorded = self.el1_grant_publications.lock().insert(pending);
+            if !recorded {
+                carrick_fatal!(
+                    "hvpatch::physical_grant",
+                    "publication escaped prior overlap check"
+                );
             }
         }
         drop(registry);
@@ -1674,8 +1668,11 @@ impl HvfVmState {
             )));
         }
         let len = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
-        let pending = self.el1_grant_replacements.lock().take(&grant);
-        if let Some(pending) = pending {
+        let pending = self.el1_grant_publications.lock().take(&grant);
+        if let Some(pending) = pending
+            .as_ref()
+            .filter(|pending| !pending.predecessor_leases.is_empty())
+        {
             // A replacement EL1 never exposed: its predecessor was never
             // touched and stays exactly as it was. Retire only the grant's
             // own (unregistered) publication.
@@ -1746,9 +1743,12 @@ impl HvfVmState {
                 grant.mm_key, identity.mm
             )));
         }
-        let Some(pending) = self.el1_grant_replacements.lock().take(&grant) else {
+        let Some(pending) = self.el1_grant_publications.lock().take(&grant) else {
             return Ok(());
         };
+        if pending.predecessor_leases.is_empty() {
+            return Ok(()); // Fresh alias is already installed; receipt proves publication.
+        }
         let len = usize::try_from(grant.len).map_err(|_| TrapError::MappingTooLarge(grant.len))?;
         let retirement = self.prepare_process_alias_retirement(grant.semantic_base, len)?;
         if retirement.planned_leases != pending.predecessor_leases {
