@@ -140,6 +140,7 @@ pub struct CleanupCount {
 pub struct FixtureBundleReceipt {
     pub source: String,
     pub path: String,
+    pub captured_path: String,
     pub identity: String,
     pub archive_sha256: String,
 }
@@ -1675,7 +1676,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
     }
 
     let json_bytes = serde_json::to_vec_pretty(&receipt)?;
-    fs::write(&receipt_path, json_bytes).map_err(|e| AcceptError::Io {
+    crate::atomic_file::write(&receipt_path, &json_bytes).map_err(|e| AcceptError::Io {
         path: receipt_path.clone(),
         source: e,
     })?;

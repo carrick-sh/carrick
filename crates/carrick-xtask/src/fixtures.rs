@@ -60,6 +60,15 @@ pub enum FixturesAction {
         #[arg(long, help = "Expected commit (default: checkout HEAD)")]
         sha: Option<String>,
     },
+    /// Capture, verify and restore a bundle with durable remote-run provenance.
+    Prepare {
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        run_dir: PathBuf,
+        #[arg(long, value_enum)]
+        source: crate::remote_accept::FixtureBundleSource,
+    },
     /// Check a bundle or, by default, every installed signed-tier fixture.
     Verify {
         #[arg(long, conflicts_with = "bundle")]
@@ -283,7 +292,7 @@ fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {
 fn git(root: &Path, args: &[&str]) -> Result<String> {
     Ok(command::run_checked("git", args, Some(root))?.stdout)
 }
-fn expected_head(root: &Path, sha: Option<&str>) -> Result<CommitSha> {
+pub(crate) fn expected_head(root: &Path, sha: Option<&str>) -> Result<CommitSha> {
     let head = CommitSha::try_from(git(root, &["rev-parse", "HEAD"])?.trim().to_owned())?;
     if let Some(sha) = sha {
         let requested = CommitSha::try_from(sha.to_owned())?;
@@ -557,6 +566,10 @@ enum PublicationKind {
 fn publish_file(path: &Path, bytes: &[u8], kind: PublicationKind) -> Result<usize> {
     let parent = path.parent().ok_or_else(|| fail("output has no parent"))?;
     fs::create_dir_all(parent)?;
+    if kind == PublicationKind::Receipt {
+        crate::atomic_file::write(path, bytes)?;
+        return Ok(1);
+    }
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
     temp.write_all(bytes)?;
     #[cfg(unix)]
@@ -565,18 +578,8 @@ fn publish_file(path: &Path, bytes: &[u8], kind: PublicationKind) -> Result<usiz
         temp.as_file()
             .set_permissions(fs::Permissions::from_mode(0o755))?;
     }
-    // A receipt alone never authorizes fixture use: acceptance rehashes all
-    // files, including after interruption or power loss. Atomic renames make
-    // complete bytes visible; per-executable full storage flushes add no
-    // validation authority and amplify restore cost on Darwin.
-    let flushes = if kind == PublicationKind::Receipt {
-        temp.as_file().sync_all()?;
-        1
-    } else {
-        0
-    };
     temp.persist(path).map_err(|e| e.error)?;
-    Ok(flushes)
+    Ok(0)
 }
 
 pub fn restore(root: &Path, path: &Path, sha: Option<&str>) -> Result<RestoreWork> {
@@ -818,6 +821,20 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
                 "fixtures: restored and verified {} executables; durability_flushes={}",
                 work.executable_publications, work.durability_flushes
             )?;
+        }
+        FixturesAction::Prepare {
+            bundle,
+            run_dir,
+            source,
+        } => {
+            let provenance =
+                crate::remote_accept::capture_fixture_bundle(root, &bundle, &run_dir, source)?;
+            writeln!(
+                writer,
+                "fixtures: verified captured bundle {}; identity={} archive_sha256={}",
+                provenance.captured_path, provenance.identity, provenance.archive_sha256
+            )?;
+            archive::restore(root, Path::new(&provenance.captured_path), None)?;
         }
         FixturesAction::Verify {
             manifest,
