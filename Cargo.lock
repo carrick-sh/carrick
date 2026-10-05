@@ -834,6 +834,7 @@ dependencies = [
  "goblin",
  "hickory-proto",
  "libc",
+ "loom",
  "mach2",
  "native-syscall-slice",
  "oci-client",
