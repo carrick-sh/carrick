@@ -649,6 +649,7 @@ pub fn census_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescrip
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn copy_table<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescriptorWords + ?Sized>(
     policy_provider: &P,
     words: &W,
