@@ -149,7 +149,7 @@ busy=$(awk -v a="${before[*]}" -v b="${after[*]}" -v n="$(nproc)" -v load="$(cut
   idle=y[5]-x[5]+y[6]-x[6]; u=(t>0?1-idle/t:1); if(load/n>u) u=load/n;
   printf "%.6f",u+2/n;
 }')
-awk -v projected="$busy" 'BEGIN { print "template projected CPU=" projected; exit !(projected<0.85) }'
+awk -v projected="$busy" 'BEGIN { print "template projected CPU=" projected; exit !(projected<=0.80) }'
 awk '/MemAvailable:/ {exit !($2 >= 10485760)}' /proc/meminfo
 pve_call POST /nodes/willow/qemu/300/status/start
 # Provisioning is bounded; the clone readiness deadline is separately five minutes.
