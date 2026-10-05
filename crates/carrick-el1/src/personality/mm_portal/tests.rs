@@ -132,10 +132,12 @@ fn owner_lazy_selection_keeps_supply_owned_when_fault_mailbox_is_occupied() {
         .select(
             &transfer,
             &tables.live(&CallerInvalidatesAsid),
-            &mut NoopPreparedResolver,
-            &mut NoopCowResolver,
-            &residency(),
-            0,
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency(),
+                slot: 0,
+            },
         )
         .unwrap();
     assert!(
@@ -261,10 +263,12 @@ fn prepared_bulk_leaf_and_live_residency_select_existing_owner_page() {
             .select(
                 &transfer,
                 &words,
-                &mut prepared,
-                &mut NoopCowResolver,
-                &residency,
-                0,
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut prepared,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency,
+                    slot: 0,
+                },
             )
             .unwrap();
         assert_eq!(
@@ -371,10 +375,12 @@ fn stopped_lazy_transfer_reuses_fault_grant_mailbox() {
             .select(
                 &transfer,
                 &tables.live(&maintenance),
-                &mut NoopPreparedResolver,
-                &mut NoopCowResolver,
-                &residency(),
-                0
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency(),
+                    slot: 0
+                }
             )
             .unwrap(),
         TransferStep::Supply(_)
@@ -450,10 +456,12 @@ fn internal_reads_cannot_name_arbitrary_user_windows() {
             portal.select(
                 &transfer,
                 &tables.live(&maintenance),
-                &mut NoopPreparedResolver,
-                &mut NoopCowResolver,
-                &residency(),
-                0
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency(),
+                    slot: 0
+                }
             ),
             Err(MmError::Fault)
         ));
@@ -504,10 +512,12 @@ fn kernel_only_leaf_does_not_trigger_anonymous_supply() {
         portal.select(
             &transfer,
             &tables.live(&maintenance),
-            &mut NoopPreparedResolver,
-            &mut NoopCowResolver,
-            &residency(),
-            0
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency(),
+                slot: 0
+            }
         ),
         Err(MmError::Fault)
     ));
@@ -763,10 +773,12 @@ fn stopped_target_untouched_transfer_prepares_only_exact_owner_window() {
         .select(
             &transfer,
             &words,
-            &mut NoopPreparedResolver,
-            &mut NoopCowResolver,
-            &residency,
-            0,
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency,
+                slot: 0,
+            },
         )
         .unwrap()
     else {
@@ -868,10 +880,12 @@ fn stopped_target_untouched_transfer_prepares_only_exact_owner_window() {
             .select(
                 &transfer,
                 &words,
-                &mut NoopPreparedResolver,
-                &mut NoopCowResolver,
-                &residency,
-                0,
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency,
+                    slot: 0,
+                },
             )
             .unwrap(),
     );
@@ -991,10 +1005,12 @@ fn partial_retired_compound_replacement_preserves_live_neighbor() {
         .select(
             &transfer,
             &words,
-            &mut NoopPreparedResolver,
-            &mut NoopCowResolver,
-            &residency,
-            0,
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency,
+                slot: 0,
+            },
         )
         .unwrap()
     else {
@@ -1044,10 +1060,12 @@ fn partial_retired_compound_replacement_preserves_live_neighbor() {
             .select(
                 &transfer,
                 &words,
-                &mut NoopPreparedResolver,
-                &mut NoopCowResolver,
-                &residency,
-                0,
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency,
+                    slot: 0,
+                },
             )
             .unwrap(),
     );
@@ -1105,10 +1123,12 @@ fn kernel_only_write_denial_is_a_fault_without_supply() {
     let result = portal.select(
         &transfer,
         &tables.live(&CallerInvalidatesAsid),
-        &mut NoopPreparedResolver,
-        &mut NoopCowResolver,
-        &residency(),
-        0,
+        carrick_core::mm::transaction::SelectionVenues {
+            prepared: &mut NoopPreparedResolver,
+            cow: &mut NoopCowResolver,
+            residency: &residency(),
+            slot: 0,
+        },
     );
     assert!(matches!(result, Err(MmError::Fault)), "{result:?}");
 }
@@ -1275,10 +1295,12 @@ fn cow_without_publication_capability_refuses_exec_and_instruction_reads_work() 
         portal.select(
             &write,
             &tables.live(&CallerInvalidatesAsid),
-            &mut NoopPreparedResolver,
-            &mut NoopCowResolver,
-            &residency(),
-            0
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency(),
+                slot: 0
+            }
         ),
         Err(MmError::UnsupportedExecutableCow)
     );
@@ -1296,14 +1318,7 @@ fn cow_without_publication_capability_refuses_exec_and_instruction_reads_work() 
     tables.words[1536].store(0, Ordering::Release);
     assert!(matches!(
         portal
-            .select(
-                &instruction,
-                &tables.live(&CallerInvalidatesAsid),
-                &mut NoopPreparedResolver,
-                &mut NoopCowResolver,
-                &residency(),
-                0
-            )
+            .select(&instruction, &tables.live(&CallerInvalidatesAsid), carrick_core::mm::transaction::SelectionVenues { prepared: &mut NoopPreparedResolver, cow: &mut NoopCowResolver, residency: &residency(), slot: 0 })
             .unwrap(),
         TransferStep::Supply(window) if window.protection.permits(ReservationProtection::from_bits(4).unwrap())
     ));
@@ -1375,10 +1390,12 @@ fn imported_private_empty_cow_pool_returns_owned_exact_target_supply() {
         .select(
             &transfer,
             &tables.live(&CallerInvalidatesAsid),
-            &mut NoopPreparedResolver,
-            &mut EmptyCow(&tables, &pool, &resident),
-            &resident,
-            0,
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut EmptyCow(&tables, &pool, &resident),
+                residency: &resident,
+                slot: 0,
+            },
         )
         .unwrap()
     else {
@@ -1434,10 +1451,12 @@ fn reservation_policy_readonly_none_and_retire_refuse_exact_mm() {
                 let result = portal.select(
                     &transfer,
                     &tables.live(&CallerInvalidatesAsid),
-                    &mut NoopPreparedResolver,
-                    &mut NoopCowResolver,
-                    &residency(),
-                    0,
+                    carrick_core::mm::transaction::SelectionVenues {
+                        prepared: &mut NoopPreparedResolver,
+                        cow: &mut NoopCowResolver,
+                        residency: &residency(),
+                        slot: 0,
+                    },
                 );
                 let allowed = mm == b
                     || (intent == TransferIntent::UserRead
@@ -1912,10 +1931,12 @@ fn owner_fork_publishes_child_with_two_live_same_va_mms() {
             .select(
                 &transfer,
                 &words,
-                &mut NoopPreparedResolver,
-                &mut NoopCowResolver,
-                &residency(),
-                0,
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency(),
+                    slot: 0,
+                },
             )
             .unwrap()
         {
@@ -2029,10 +2050,12 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
         .select(
             &transfer,
             &words,
-            &mut NoopPreparedResolver,
-            &mut NoopCowResolver,
-            &residency,
-            0,
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency,
+                slot: 0,
+            },
         )
         .unwrap()
     else {
@@ -2078,10 +2101,12 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
             .select(
                 &transfer,
                 &words,
-                &mut NoopPreparedResolver,
-                &mut NoopCowResolver,
-                &residency,
-                0,
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency,
+                    slot: 0,
+                },
             )
             .unwrap(),
     );
@@ -2103,10 +2128,12 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
             .select(
                 &write,
                 &words,
-                &mut NoopPreparedResolver,
-                &mut NoopCowResolver,
-                &residency,
-                0,
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency,
+                    slot: 0,
+                },
             )
             .unwrap(),
     );
@@ -3856,10 +3883,12 @@ fn grant_resume_reselects_generation_range_protection_and_source_changed_while_p
             .select(
                 &transfer,
                 &words,
-                &mut NoopPreparedResolver,
-                &mut NoopCowResolver,
-                &residency,
-                0,
+                carrick_core::mm::transaction::SelectionVenues {
+                    prepared: &mut NoopPreparedResolver,
+                    cow: &mut NoopCowResolver,
+                    residency: &residency,
+                    slot: 0,
+                },
             )
             .unwrap()
         else {
@@ -3928,10 +3957,12 @@ fn grant_resume_reselects_generation_range_protection_and_source_changed_while_p
         let current = portal.select(
             &transfer,
             &words,
-            &mut NoopPreparedResolver,
-            &mut NoopCowResolver,
-            &residency,
-            0,
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency,
+                slot: 0,
+            },
         );
         if change == "range" || change == "protection" {
             assert_eq!(current, Err(MmError::Fault), "{change}");
