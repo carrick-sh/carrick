@@ -1,4 +1,5 @@
 //! Conformance and defect witnesses for the neutral MM / fork / COW substrate.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use carrick_core::mm::fork::{
     ForkReceiptError, ForkScratch, Mapping, copy_table, rollback, validate_fork_completion,
