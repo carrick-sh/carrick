@@ -105,6 +105,31 @@ fn cpu_admission_enforces_director_eighty_percent_ceiling_and_headroom() {
 }
 
 #[test]
+fn serial_host_template_cpu_admission_uses_same_eighty_percent_ceiling() {
+    let source = include_str!("../../../scripts/ci/build-template-debian.sh");
+    let policy = source
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("awk -v projected=\"$busy\" '")?
+                .strip_suffix('\'')
+        })
+        .unwrap();
+    for (projected, expected) in [
+        ("0.79", true),
+        ("0.80", true),
+        ("0.801", false),
+        ("0.84", false),
+    ] {
+        let status = std::process::Command::new("awk")
+            .args(["-v", &format!("projected={projected}"), policy])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert_eq!(status.success(), expected, "projected={projected}");
+    }
+}
+
+#[test]
 fn cached_template_flag_cannot_exempt_a_clone_id_from_the_budget() {
     let member = PoolMember {
         id: 308,
