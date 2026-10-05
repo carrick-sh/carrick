@@ -864,6 +864,7 @@ pub struct Thread {
     runner_gate: Arc<RunnerGate>,
     start_gate_open: AtomicBool,
     start_gate_proof_generation: AtomicU64,
+    pub(in crate::kernel) child_tid_cleared_in_zone: AtomicBool,
     execution: Mutex<ThreadExecutionRecord>,
     /// Guest USER time charged directly to this exact logical thread across
     /// every host execution interval. Executor slots are never identities.
@@ -975,6 +976,12 @@ impl OpenedStartGate {
 }
 
 impl Thread {
+    /// Durable receipt copied from this exact birth entry's ExitedInZone
+    /// transition before the reusable ABI entry is reaped.
+    pub fn child_tid_cleared_in_zone(&self) -> bool {
+        self.child_tid_cleared_in_zone.load(Ordering::Acquire)
+    }
+
     pub fn last_cpu(&self) -> Option<carrick_hal::GuestCpuId> {
         let raw = self.last_cpu.load(Ordering::Relaxed);
         if raw == u32::MAX {
@@ -2957,6 +2964,7 @@ impl Thread {
             runner_gate: Arc::new(RunnerGate::new(key)),
             start_gate_open: AtomicBool::new(true),
             start_gate_proof_generation: AtomicU64::new(0),
+            child_tid_cleared_in_zone: AtomicBool::new(false),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
@@ -3000,6 +3008,7 @@ impl Thread {
             runner_gate: Arc::new(RunnerGate::new(key)),
             start_gate_open: AtomicBool::new(false),
             start_gate_proof_generation: AtomicU64::new(0),
+            child_tid_cleared_in_zone: AtomicBool::new(false),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
@@ -3033,6 +3042,7 @@ impl Thread {
             runner_gate: Arc::new(RunnerGate::new(key)),
             start_gate_open: AtomicBool::new(false),
             start_gate_proof_generation: AtomicU64::new(0),
+            child_tid_cleared_in_zone: AtomicBool::new(false),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_accounting: Arc::new(ThreadCpuAccounting::default()),
             crash_vote: Mutex::new(None),
@@ -3065,6 +3075,7 @@ impl Thread {
             runner_gate: Arc::clone(&caller.runner_gate),
             start_gate_open: AtomicBool::new(true),
             start_gate_proof_generation: AtomicU64::new(0),
+            child_tid_cleared_in_zone: AtomicBool::new(false),
             execution: Mutex::new(ThreadExecutionRecord::uninitialized()),
             cpu_accounting: Arc::clone(&caller.cpu_accounting),
             crash_vote: Mutex::new(None),

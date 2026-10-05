@@ -1380,10 +1380,9 @@ impl BlockedContinuation {
                         let kernel = kernel
                             .as_ref()
                             .ok_or(ContinuationBuildError::StaleChildSelector)?;
-                        // A child may finish exiting and transition from `state.tasks` to
-                        // `state.zombies` in the race window between wait4 returning StillRunning
-                        // and continuation enrollment; checking `zombies` prevents a spurious
-                        // StaleChildSelector error when building WaitOnHvpatchChild.
+                        // A child can retire while wait4 captures its continuation.
+                        // Retained terminal-clear custody and published zombies both
+                        // preserve the exact child selector through this interval.
                         // For live tasks, the waiting process may be either the parent or an
                         // attached ptrace tracer. For zombies, ptrace has already detached at exit
                         // so only the parent may reap.
@@ -1396,6 +1395,11 @@ impl BlockedContinuation {
                                 return Err(ContinuationBuildError::StaleChildSelector);
                             }
                             child_key
+                        } else if let Some(task) = state.retiring_tasks.get(&id) {
+                            if task.parent() != Some(parent_task) {
+                                return Err(ContinuationBuildError::StaleChildSelector);
+                            }
+                            task.key()
                         } else if let Some(record) = state.zombies.get(&id) {
                             if record.zombie.parent != Some(parent_task) {
                                 return Err(ContinuationBuildError::StaleChildSelector);

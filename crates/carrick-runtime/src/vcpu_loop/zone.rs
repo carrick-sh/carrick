@@ -29,6 +29,11 @@ use carrick_el1_abi::{
 use carrick_hal::threaded::GuestCpuState;
 use carrick_kernel::el1_zone::HostLockWait;
 
+pub(super) enum OwnerMemoryAction {
+    Syscall(carrick_hal::RawSyscall),
+    Terminal,
+}
+
 thread_local! {
     /// The zone thread this executor thread took off its vCPU at the last
     /// exit (EL1 plan 1d): it claims that thread itself next, rather than
@@ -608,6 +613,25 @@ where
         frame: carrick_hal::RawSyscall,
         wait: carrick_el1_abi::PortalOwnerWait,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        self.park_owner_memory_action(engine, control, OwnerMemoryAction::Syscall(frame), wait)
+    }
+
+    pub(super) fn park_retained_terminal_owner(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        wait: carrick_el1_abi::PortalOwnerWait,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        self.park_owner_memory_action(engine, control, OwnerMemoryAction::Terminal, wait)
+    }
+
+    pub(super) fn park_owner_memory_action(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        action: OwnerMemoryAction,
+        wait: carrick_el1_abi::PortalOwnerWait,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
         let Some((zone, mm)) = zone_for(self.state.zone_mm) else {
             return Err(RuntimeError::Configuration(
@@ -628,14 +652,20 @@ where
             &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
                 as *const carrick_el1_abi::MmPortalSlots)
         };
-        let state = engine.snapshot_guest_state_for_publication()?;
-        let ctx = zone_ctx_from_state(&state, ZoneExit::Syscall { completed: true })?;
-        let request = self
-            .state
-            .syscall_completion
-            .guest("owner wait lost its prepared completion token")?
-            .syscall()
-            .request;
+        let syscall_state = match &action {
+            OwnerMemoryAction::Syscall(_) => {
+                let state = engine.snapshot_guest_state_for_publication()?;
+                let ctx = zone_ctx_from_state(&state, ZoneExit::Syscall { completed: true })?;
+                let request = self
+                    .state
+                    .syscall_completion
+                    .guest("owner wait lost its prepared completion token")?
+                    .syscall()
+                    .request;
+                Some((state, ctx, request))
+            }
+            OwnerMemoryAction::Terminal => None,
+        };
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("owner wait lost its Kernel context".to_owned())
         })?;
@@ -655,14 +685,16 @@ where
         let enrollment = slots.authenticate_wait(zone, wait).map_err(|error| {
             RuntimeError::Configuration(format!("owner wait receipt rejected: {error:?}"))
         })?;
+        let token = OperationToken::metadata_request(context.thread().key().serial.raw())
+            .ok_or_else(|| RuntimeError::Configuration("owner wait serial is zero".to_owned()))?;
         let record = zone.alloc_record(identity).map_err(|error| {
             RuntimeError::Configuration(format!("owner wait record unavailable: {error:?}"))
         })?;
         // SAFETY: this freshly allocated record has not been published.
-        unsafe { *zone.record(record).ctx_mut() = ctx };
+        if let Some((_, ctx, _)) = &syscall_state {
+            unsafe { *zone.record(record).ctx_mut() = *ctx };
+        }
         let seq = zone.next_seq(record);
-        let token = OperationToken::metadata_request(context.thread().key().serial.raw())
-            .ok_or_else(|| RuntimeError::Configuration("owner wait serial is zero".to_owned()))?;
         let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
             carrick_sched_core::LockWait::complete_object_wake(&HostLockWait, zone, effects)
         };
@@ -671,25 +703,68 @@ where
                 zone.counters
                     .host_parks
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let exit = self.settle_into_zone(
-                    control,
-                    state,
-                    zone.record_ref(record),
-                    seq,
-                    None,
-                    request,
-                )?;
-                self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame };
-                Ok(exit)
+                match (action, syscall_state) {
+                    (OwnerMemoryAction::Syscall(frame), Some((state, _, request))) => {
+                        let exit = self.settle_into_zone(
+                            control,
+                            state,
+                            zone.record_ref(record),
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame };
+                        Ok(exit)
+                    }
+                    (OwnerMemoryAction::Terminal, None) => {
+                        let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
+                            zone.record_ref(record),
+                            seq,
+                        );
+                        let continuation = carrick_kernel::kernel::continuation::BlockedContinuation::from_terminal_zone_park(
+                            context,
+                            control.execution_lease_mut().map_err(RuntimeError::Trap)?,
+                            wait,
+                        ).map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                        // The ordinary CPU save remains authoritative. A terminal
+                        // action has no syscall continuation for ZoneSave to fold.
+                        let action = self.take_terminal_memory_action()?;
+                        self.phase = HvpatchProductionPhase::ResumeTerminalOwner {
+                            action: Box::new(action),
+                        };
+                        Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::BlockedContinuation {
+                                continuation: Box::new(continuation),
+                                vfork_activation: None,
+                            },
+                        ))
+                    }
+                    _ => {
+                        carrick_kernel::el1_zone::cancel(zone.record_ref(record));
+                        Err(RuntimeError::Configuration(
+                            "owner wait capture changed action".to_owned(),
+                        )
+                        .into())
+                    }
+                }
             }
             Err((ObjectWaitError::Changed | ObjectWaitError::Stale, _token)) => {
                 zone.free_record(record);
-                let outcome = self.state.redispatch_threaded_syscall(
-                    &self.kernel,
-                    engine,
-                    control.submission.host_wait_context(),
-                )?;
-                self.service_outcome(engine, control, frame, outcome)
+                match action {
+                    OwnerMemoryAction::Syscall(frame) => {
+                        let outcome = self.state.redispatch_threaded_syscall(
+                            &self.kernel,
+                            engine,
+                            control.submission.host_wait_context(),
+                        )?;
+                        self.service_outcome(engine, control, frame, outcome)
+                    }
+                    OwnerMemoryAction::Terminal => {
+                        let action = self.take_terminal_memory_action()?;
+                        self.drive_terminal_memory(engine, control, action)
+                    }
+                }
             }
             Err((error, _token)) => {
                 zone.free_record(record);
@@ -709,6 +784,31 @@ where
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
         frame: carrick_hal::RawSyscall,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let mut result = self.consume_owner_zone(control)?;
+        let reserved = result.take_reserved_signal();
+        let interruption = owner_wait_interruption(&result.completion);
+        // The restored CPU still owns the pending syscall's EL1 trap frame.
+        // Carry the reservation to common completion, which publishes the
+        // actual return value before signal delivery at the EL0 boundary.
+        // Dropping any later reservation requeues it through its authority.
+        self.state.reserved_signal = self.state.reserved_signal.take().or(reserved);
+        self.state.continuation_restart = None;
+        let outcome = match interruption {
+            Some(outcome) => outcome,
+            None => self.state.redispatch_threaded_syscall(
+                &self.kernel,
+                engine,
+                control.submission.host_wait_context(),
+            )?,
+        };
+        self.service_outcome(engine, control, frame, outcome)
+    }
+
+    pub(super) fn consume_owner_zone(
+        &mut self,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+    ) -> Result<carrick_kernel::kernel::continuation::ContinuationResult, ProductionHvpatchPollError>
+    {
         let context = self
             .kernel
             .dispatcher
@@ -733,55 +833,32 @@ where
             .task_binding()
             .capture(self.state.linux_tid)
             .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-        let mut result =
+        let result =
             carrick_kernel::kernel::continuation::resume_continuation(lease, event, &fresh)
                 .map_err(|error| {
                     RuntimeError::Configuration(format!("owner wait resume: {error:?}"))
                 })?;
-        let reserved = result.take_reserved_signal();
         let zone = carrick_kernel::el1_zone::zone().ok_or_else(|| {
             RuntimeError::Configuration("owner wait resume without zone".to_owned())
         })?;
         let rec = zone.live(record).ok_or_else(|| {
             RuntimeError::Configuration(format!("owner wait record {record:?} is gone"))
         })?;
-        if !rec.has_object_operation() {
-            return Err(RuntimeError::Configuration(
-                "owner wait wake lost its host operation".to_owned(),
-            )
-            .into());
-        }
         // SAFETY: the host owns this handed-back record and has consumed its
         // exact completion event. The token is the metadata-form receipt
         // installed by owner_memory_park, not an IPC operation.
         let token = unsafe { rec.take_object_operation() };
-        if token
-            .and_then(|token| token.metadata_generation())
-            .is_none()
+        zone.free_record(record.id);
+        if token.and_then(|token| token.metadata_generation())
+            != Some(context.thread().key().serial.raw())
         {
             return Err(RuntimeError::Configuration(
                 "owner wait wake returned another operation".to_owned(),
             )
             .into());
         }
-        zone.free_record(record.id);
         self.state.service_kernel_context = Some(context.retain_exact());
-        let interruption = owner_wait_interruption(&result.completion);
-        // The restored CPU still owns the pending syscall's EL1 trap frame.
-        // Carry the reservation to common completion, which publishes the
-        // actual return value before signal delivery at the EL0 boundary.
-        // Dropping any later reservation requeues it through its authority.
-        self.state.reserved_signal = self.state.reserved_signal.take().or(reserved);
-        self.state.continuation_restart = None;
-        let outcome = match interruption {
-            Some(outcome) => outcome,
-            None => self.state.redispatch_threaded_syscall(
-                &self.kernel,
-                engine,
-                control.submission.host_wait_context(),
-            )?,
-        };
-        self.service_outcome(engine, control, frame, outcome)
+        Ok(result)
     }
 
     /// A zone-parked thread was loaded from its record: apply how its wait

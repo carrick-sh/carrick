@@ -985,6 +985,8 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// `handle_persistent_thread_exit` Busy retries (see
     /// `PersistentThreadExitDisposition`).
     pub(super) thread_exit_withdrawn: bool,
+    pub(super) child_tid_clear: Option<threads::PendingChildTidClear>,
+    pub(super) drained_child_tid_clears: Option<Vec<threads::PendingChildTidClear>>,
     /// Live reservation-change subscription while a thread exit is parked
     /// on `PersistentThreadExitDisposition::Busy`; dropped when the retry
     /// runs.
@@ -1053,6 +1055,8 @@ where
             crash_lease_drain_budget: CrashLeaseDrainBudget::DEFAULT,
             vfork_release_fd: None,
             thread_exit_withdrawn: false,
+            child_tid_clear: None,
+            drained_child_tid_clears: None,
             thread_exit_retry_subscription: None,
             _engine: std::marker::PhantomData,
         }
@@ -3124,9 +3128,71 @@ pub(crate) mod tests {
         pub(crate) fail_execve_into: Option<String>,
         pub(crate) terminal_continuation_discards: usize,
         pub(crate) mailbox_slot: Option<usize>,
+        pub(crate) prepare_dependency: Option<carrick_guest_mem::OwnedMemoryWait>,
+        pub(crate) prepared_write_context: Option<carrick_kernel::kernel::KernelContext>,
+        pub(crate) prepared_cancels: usize,
+        pub(crate) prepared_commits: usize,
+    }
+
+    struct TestPreparedClear<'a> {
+        engine: &'a mut CrashCaptureTestEngine,
+        address: u64,
+        committed: bool,
+    }
+    impl carrick_guest_mem::PreparedGuestWrite for TestPreparedClear<'_> {
+        fn commit(mut self: Box<Self>, outputs: &[&[u8]]) {
+            let context = self.engine.prepared_write_context.as_ref().unwrap();
+            assert!(
+                !context.kernel().task_key_is_live(context.task().key())
+                    || !context.exact_thread_is_live(),
+                "prepared clear committed before exact signal-visible retirement"
+            );
+            assert_eq!(outputs, &[&[0_u8; 4][..]]);
+            self.engine
+                .guest_memory
+                .insert(self.address, outputs[0].to_vec());
+            self.engine.prepared_commits += 1;
+            self.committed = true;
+        }
+    }
+    impl Drop for TestPreparedClear<'_> {
+        fn drop(&mut self) {
+            if !self.committed {
+                self.engine.prepared_cancels += 1;
+            }
+        }
     }
 
     impl carrick_guest_mem::GuestMemory for CrashCaptureTestEngine {
+        fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+            if self.prepare_dependency.is_some() {
+                carrick_guest_mem::UserMemoryVenue::Owner
+            } else {
+                carrick_guest_mem::UserMemoryVenue::Legacy
+            }
+        }
+        fn prepare_write(
+            &mut self,
+            ranges: &[carrick_guest_mem::GuestWriteRange],
+        ) -> Result<
+            Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
+            carrick_guest_mem::MemoryPrepareError,
+        > {
+            let wait = self.prepare_dependency.as_ref().unwrap();
+            if !wait.0.is_ready() {
+                return Err(carrick_guest_mem::MemoryPrepareError::Physical(
+                    wait.clone(),
+                ));
+            }
+            assert_eq!(ranges.len(), 1);
+            assert_eq!(ranges[0].len(), 4);
+            Ok(Box::new(TestPreparedClear {
+                engine: self,
+                address: ranges[0].address().raw(),
+                committed: false,
+            }))
+        }
+
         fn read_bytes_raw(
             &self,
             address: u64,

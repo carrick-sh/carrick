@@ -10,6 +10,8 @@ pub(crate) struct PreparedCorePublication {
     pub(crate) payload: carrick_kernel::core_dump::CorePayload,
     pub(crate) generation: u64,
     pub(crate) fatal_tid: i32,
+    pub(crate) publication:
+        Option<Option<carrick_kernel::dispatch::core_publication::CorePublication>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -753,6 +755,7 @@ where
                 payload,
                 generation: generation.get(),
                 fatal_tid: fatal.tid.raw(),
+                publication: None,
             }))
         })();
         if result.is_err() || matches!(&result, Ok(None)) {
