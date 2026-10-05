@@ -2483,9 +2483,11 @@ pub type PendingOwnerForkReceipt = (
 );
 
 /// Result of servicing an owner-selected retained file page.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnerFileFaultOutcome {
     Resolved,
+    /// Reselect only after the exact predecessor publishes or rolls back.
+    Pending(carrick_guest_mem::OwnedMemoryWait),
     Refused,
     BusFault,
 }
