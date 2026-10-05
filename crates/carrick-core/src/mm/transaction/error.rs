@@ -11,6 +11,18 @@ impl From<crate::mm::transfer::TransferError> for MmError {
     }
 }
 
+impl From<crate::mm::fork::ForkError> for MmError {
+    fn from(e: crate::mm::fork::ForkError) -> Self {
+        match e {
+            crate::mm::fork::ForkError::Invalid => Self::Invalid,
+            crate::mm::fork::ForkError::NoMemory => Self::NoMemory,
+            crate::mm::fork::ForkError::Busy => Self::Busy,
+            crate::mm::fork::ForkError::Stale => Self::Stale,
+            crate::mm::fork::ForkError::Core => Self::Core,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MmError {
     Fault,
