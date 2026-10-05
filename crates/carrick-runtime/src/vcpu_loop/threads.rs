@@ -1294,10 +1294,12 @@ mod child_tid_owner_tests {
             let result = self.portal.select(
                 &transfer,
                 &self.tables.live(&CallerInvalidatesAsid),
-                &mut carrick_el1::fault::NoopPreparedResolver,
-                &mut carrick_el1::fault::NoopCowResolver,
-                &residency(),
-                0,
+                carrick_el1::personality::mm_portal::SelectionVenues {
+                    prepared: &mut carrick_el1::fault::NoopPreparedResolver,
+                    cow: &mut carrick_el1::fault::NoopCowResolver,
+                    residency: &residency(),
+                    slot: 0,
+                },
             );
             match result {
                 Err(MmError::Wait(wait)) => {
