@@ -1,7 +1,7 @@
 schema_version = 1
 id = "kernel.scheduler.runnable-progress"
 title = "Runnable scheduler preemption progress"
-guest_surfaces = ["scheduler:preemption", "scheduler:rotation"]
+guest_surfaces = ["scheduler:preemption", "scheduler:rotation", "scheduler:executor-pool"]
 semantic_authority = [
   "man 7 sched",
   "man 2 sched_yield",
@@ -9,10 +9,10 @@ semantic_authority = [
 ]
 fixture = "fixture:scheduler_preemption"
 scale_points = [1, 8, 32, 128]
-rationale = "Eligible syscall-free tasks rotate under a finite execution budget; affinity and thread identity remain exact."
+rationale = "Eligible syscall-free tasks rotate under a finite execution budget; affinity and thread identity remain exact. Pool admission must reject bound-worker capacity below the scheduler CPU count before publishing any preemption driver, resolver or worker; spare workers cannot cover missing bound CPUs and the policy must not be silently clamped."
 
 [bindings]
-vm_free = "carrick-kernel-example::scheduler_progress_contract; carrick-kernel::kernel::scheduler::tests::{a_deferred_zone_handback_does_not_audit_a_reaped_target,zone_handback_authenticates_the_registered_continuation,zone_handback_before_registration_kicks_the_running_owner_once} (zone delivery target authentication, retired no-op, and one kick/zero queue rows before enrollment; no new preemption-policy or runtime-cost acceptance); carrick-kernel::kernel::scheduler::tests::serial_host::failed_zone_load_settlement_retires_only_its_owned_continuation (test-only extension: exact continuation transfer and failed-load retirement, zero queued rows after failure/stale delivery; no new preemption, scaling or runtime-ratio acceptance)"
+vm_free = "carrick-runtime::vcpu_loop::executor::tests::{insufficient_bound_workers_cannot_strand_a_pinned_task,pool_admission_covers_overrides_ceilings_reserves_and_small_hosts} (pool admission: zero worker creations and no driver/resolver publication on refusal; bounded CPU-3 strand witness with two workers/four CPUs; highest-CPU execution on valid and corrected topologies); carrick-kernel-example::scheduler_progress_contract; carrick-kernel::kernel::scheduler::tests::{a_deferred_zone_handback_does_not_audit_a_reaped_target,zone_handback_authenticates_the_registered_continuation,zone_handback_before_registration_kicks_the_running_owner_once} (zone delivery target authentication, retired no-op, and one kick/zero queue rows before enrollment; no new preemption-policy or runtime-cost acceptance); carrick-kernel::kernel::scheduler::tests::serial_host::failed_zone_load_settlement_retires_only_its_owned_continuation (test-only extension: exact continuation transfer and failed-load retirement, zero queued rows after failure/stale delivery; no new preemption, scaling or runtime-ratio acceptance)"
 embed = "carrick-embed::scheduler_progress_contract"
 docker = "fixture:scheduler_preemption"
 ecosystem = ["go:runtime", "cpython:threading"]

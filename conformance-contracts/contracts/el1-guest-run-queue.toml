@@ -1,4 +1,11 @@
 schema_version = 1
+# Pool admission audit (2026-10-04): preserve the policy's CPU/affinity domain
+# and require one bound executor per CPU before startup. Runtime executor
+# tests insufficient_bound_workers_cannot_strand_a_pinned_task and
+# pool_admission_covers_overrides_ceilings_reserves_and_small_hosts prove the
+# VM-free admission invariant, including the env and backend-cap paths.
+# They do not execute EL1; the existing guest queue/steal paths are unchanged
+# and their signed bindings below remain required for integration acceptance.
 id = "kernel.el1.guest-run-queue"
 title = "Where the guest schedules its threads, a thread the host makes runnable goes to an EL1 run queue and no host executor schedules it: host executors are per-vCPU drivers that wait in the guest"
 guest_surfaces = [

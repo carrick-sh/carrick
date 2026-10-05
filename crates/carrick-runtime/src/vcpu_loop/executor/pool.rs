@@ -50,7 +50,9 @@ use carrick_kernel::kernel::{
 /// one `M`. The spares and the handoff that exists stay, to keep `P` vCPUs in
 /// the guest while one executor blocks.
 ///
-/// `CARRICK_BOUND_EXECUTORS=<n>` is the exact bisection hatch.
+/// `CARRICK_BOUND_EXECUTORS=<n>` is the exact bisection hatch. The effective
+/// bound count must cover every scheduler CPU or pool startup fails; spares
+/// cannot supply a CPU that has no bound executor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExecutorPoolConfig {
     /// `M`s bound to a guest CPU, round-robin. Several may share one `P`.
@@ -65,6 +67,13 @@ pub struct ExecutorPoolConfig {
 pub enum ExecutorPoolConfigError {
     #[error("the backend reports zero available vCPUs")]
     ZeroVcpuCeiling,
+    #[error(
+        "{bound_workers} bound executors cannot serve {guest_cpus} guest CPUs; increase CARRICK_BOUND_EXECUTORS and the backend vCPU budget or select a smaller scheduling policy"
+    )]
+    InsufficientBoundWorkers {
+        bound_workers: usize,
+        guest_cpus: usize,
+    },
 }
 
 impl ExecutorPoolConfig {
@@ -75,10 +84,23 @@ impl ExecutorPoolConfig {
         Ok(self.vcpu_ceiling.saturating_sub(self.reserve))
     }
 
-    /// `M`s bound to a guest CPU. At least one: a carrier with no `M` runs
-    /// nothing.
+    /// `M`s bound to a guest CPU, limited by the available backend budget.
+    /// Pool admission rejects a count that cannot serve every scheduler CPU.
     pub fn bound_worker_count(self) -> Result<usize, ExecutorPoolConfigError> {
-        Ok(self.bound_workers.min(self.available()?).max(1))
+        Ok(self.bound_workers.max(1).min(self.available()?))
+    }
+
+    /// Preserve the policy's CPU surface: reject an unservable topology rather
+    /// than silently changing `nproc` or the meaning of an affinity mask.
+    fn validate_guest_cpus(self, guest_cpus: usize) -> Result<(), ExecutorPoolConfigError> {
+        let bound_workers = self.bound_worker_count()?;
+        if bound_workers < guest_cpus {
+            return Err(ExecutorPoolConfigError::InsufficientBoundWorkers {
+                bound_workers,
+                guest_cpus,
+            });
+        }
+        Ok(())
     }
 
     /// Spare `M`s, after the bound set has taken its share of the vCPU
@@ -96,12 +118,20 @@ impl ExecutorPoolConfig {
 /// `M`s bound to a guest CPU: one per guest CPU (see [`ExecutorPoolConfig`]),
 /// with `CARRICK_BOUND_EXECUTORS=<n>` as the exact bisection hatch. The
 /// backend's vCPU ceiling is the real bound; this is only the request.
+/// Startup rejects a capped count below the installed policy's CPU count.
 pub fn configured_bound_executors(guest_cpus: usize) -> usize {
+    bound_executors_from_value(
+        guest_cpus,
+        std::env::var("CARRICK_BOUND_EXECUTORS").ok().as_deref(),
+    )
+}
+
+pub(super) fn bound_executors_from_value(guest_cpus: usize, value: Option<&str>) -> usize {
     let default = guest_cpus.max(1);
-    match std::env::var("CARRICK_BOUND_EXECUTORS") {
-        Ok(raw) => raw.trim().parse::<usize>().unwrap_or(default).max(1),
-        Err(_) => default,
-    }
+    value
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+        .max(1)
 }
 
 /// Spare `M`s to start beyond the bound set.
@@ -866,11 +896,16 @@ pub struct ExecutorPoolStartError {
     configured_workers: usize,
     message: String,
     driver_error: Option<carrick_kernel::kernel::PreemptionDriverError>,
+    config_error: Option<ExecutorPoolConfigError>,
 }
 
 impl ExecutorPoolStartError {
     pub const fn configured_workers(&self) -> usize {
         self.configured_workers
+    }
+
+    pub const fn config_error(&self) -> Option<&ExecutorPoolConfigError> {
+        self.config_error.as_ref()
     }
 
     pub fn driver_error(&self) -> Option<&carrick_kernel::kernel::PreemptionDriverError> {
@@ -941,6 +976,14 @@ where
         resolver: Arc<R>,
         _audit: ExecutorBoundaryAudit,
     ) -> Result<Self, ExecutorPoolStartError> {
+        config
+            .validate_guest_cpus(scheduler.cpu_count())
+            .map_err(|error| ExecutorPoolStartError {
+                configured_workers: 0,
+                message: error.to_string(),
+                driver_error: None,
+                config_error: Some(error),
+            })?;
         let bound_workers =
             config
                 .bound_worker_count()
@@ -948,6 +991,7 @@ where
                     configured_workers: 0,
                     message: error.to_string(),
                     driver_error: None,
+                    config_error: Some(error),
                 })?;
         let spare_workers =
             config
@@ -956,6 +1000,7 @@ where
                     configured_workers: 0,
                     message: error.to_string(),
                     driver_error: None,
+                    config_error: Some(error),
                 })?;
         let configured_workers = bound_workers + spare_workers;
         // The scheduler's one preemption driver is claimed before anything
@@ -968,6 +1013,7 @@ where
                 configured_workers,
                 message: format!("preemption driver start failed: {error}"),
                 driver_error: Some(error),
+                config_error: None,
             },
         )?;
         resolver
@@ -976,6 +1022,7 @@ where
                 configured_workers,
                 message: format!("install combined task resolver: {error}"),
                 driver_error: None,
+                config_error: None,
             })?;
         let receipts = Arc::new(ReceiptLog::default());
         let debug_aux_provider: Arc<dyn carrick_kernel::kernel::debug::KernelDebugAuxProvider> =
@@ -992,6 +1039,7 @@ where
                     configured_workers,
                     message: format!("publish carrier debug provider: {error}"),
                     driver_error: None,
+                    config_error: None,
                 })?,
         );
         let control = Arc::new(PoolControl::new(configured_workers, Arc::clone(&scheduler)));
@@ -1033,6 +1081,7 @@ where
                         configured_workers,
                         message,
                         driver_error: None,
+                        config_error: None,
                     });
                 }
             };
@@ -1085,6 +1134,7 @@ where
                 configured_workers,
                 message,
                 driver_error: None,
+                config_error: None,
             });
         }
 
@@ -1099,6 +1149,7 @@ where
                     configured_workers,
                     message,
                     driver_error: None,
+                    config_error: None,
                 });
             }
         }

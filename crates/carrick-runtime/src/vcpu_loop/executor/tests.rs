@@ -3022,12 +3022,151 @@ fn enqueue_root(
     authority
 }
 
+// Pool tests choose their CPU topology independently of the host and env.
+fn single_cpu_scheduler(kernel: Arc<Kernel>) -> Scheduler {
+    Scheduler::new_with_policy(kernel, Arc::new(GuestCpuPolicy::new(1)))
+}
+
 fn config(workers: usize) -> ExecutorPoolConfig {
     ExecutorPoolConfig {
         bound_workers: workers,
         spare_executors: 0,
         vcpu_ceiling: workers + 1,
         reserve: 1,
+    }
+}
+
+/// kernel.scheduler.runnable-progress: affinity must never name an unserved CPU.
+#[test]
+fn insufficient_bound_workers_cannot_strand_a_pinned_task() {
+    let (kernel, root) = bootstrap(14_006);
+    let scheduler = Arc::new(Scheduler::new_with_policy(
+        kernel,
+        Arc::new(GuestCpuPolicy::new(4)),
+    ));
+    root.thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(3)));
+    let factory = Arc::new(FakeFactory::default());
+    let binding = FakeBinding::new(303, [Step::Exit]);
+    let (settled_tx, settled_rx) = std::sync::mpsc::channel();
+    binding.notify_on_terminal_settlement(settled_tx);
+    factory.install(&root, Arc::clone(&binding));
+    let generation = publish(&root, 303);
+    match ExecutorPool::start(
+        config(2),
+        Arc::clone(&scheduler),
+        Arc::clone(&factory),
+        Arc::clone(&factory),
+        ExecutorBoundaryAudit::production(),
+    ) {
+        Err(error) => {
+            assert_eq!(
+                error.config_error(),
+                Some(&super::ExecutorPoolConfigError::InsufficientBoundWorkers {
+                    bound_workers: 2,
+                    guest_cpus: 4,
+                })
+            );
+            assert_eq!(factory.create_calls.load(Ordering::SeqCst), 0);
+            assert!(!scheduler.is_preemption_driver_attached());
+            assert!(factory.scheduler.lock().upgrade().is_none());
+        }
+        Ok(pool) => {
+            let authority = enqueue_root(&scheduler, &root, generation);
+            let settled = settled_rx.recv_timeout(Duration::from_secs(5));
+            if settled.is_err() {
+                scheduler
+                    .fail_runnable_exact(
+                        root.thread().key(),
+                        generation,
+                        ExecutionFailure::SnapshotRestoreFailed,
+                    )
+                    .expect("cancel the stranded generation before shutdown");
+            }
+            drop(authority);
+            pool.shutdown()
+                .expect("clean shutdown after bounded observation");
+            assert!(
+                settled.is_ok(),
+                "CPU 3 task stranded: four scheduler CPUs but only two bound workers; progress={}",
+                binding.progress.load(Ordering::SeqCst)
+            );
+            panic!("an insufficient pool must be rejected before startup");
+        }
+    }
+}
+
+#[test]
+fn pool_admission_covers_overrides_ceilings_reserves_and_small_hosts() {
+    // guest CPUs, env value, backend ceiling, reserve, spares, effective bound count
+    for (cpus, value, ceiling, reserve, spares, bound) in [
+        (4, Some("2"), 16, 0, 8, 2), // spares cannot serve missing CPUs
+        (4, None, 2, 0, 8, 2),       // backend caps the default request
+        (4, Some("8"), 5, 2, 0, 3),  // reserve caps an explicit request
+        (1, None, 1, 1, 0, 0),       // reserve consumes the entire budget
+        (4, Some("0"), 16, 0, 0, 1),
+        (1, None, 1, 0, 0, 1),
+        (2, None, 2, 0, 4, 2), // two-performance-core hosted runner
+        (2, Some("invalid"), 6, 0, 0, 2),
+        (2, Some(" 2 "), 6, 0, 0, 2),
+        (2, Some("4"), 6, 0, 0, 4), // several workers may share a CPU
+        (4, None, 12, 0, 8, 4),
+    ] {
+        let (kernel, root) = bootstrap(14_007);
+        let scheduler = Arc::new(Scheduler::new_with_policy(
+            kernel,
+            Arc::new(GuestCpuPolicy::new(cpus)),
+        ));
+        root.thread()
+            .set_affinity(CpuAffinity::single(GuestCpuId::new((cpus - 1) as u32)));
+        let factory = Arc::new(FakeFactory::default());
+        let binding = FakeBinding::new(304, [Step::Exit]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        binding.notify_on_terminal_settlement(tx);
+        factory.install(&root, binding);
+        let generation = publish(&root, 304);
+        let config = ExecutorPoolConfig {
+            bound_workers: super::pool::bound_executors_from_value(cpus, value),
+            spare_executors: spares,
+            vcpu_ceiling: ceiling,
+            reserve,
+        };
+        assert_eq!(config.bound_worker_count().unwrap(), bound);
+        let started = ExecutorPool::start(
+            config,
+            Arc::clone(&scheduler),
+            Arc::clone(&factory),
+            Arc::clone(&factory),
+            ExecutorBoundaryAudit::production(),
+        );
+        if bound < cpus {
+            let error = started.expect_err("every guest CPU needs a bound worker");
+            assert_eq!(
+                error.config_error(),
+                Some(&super::ExecutorPoolConfigError::InsufficientBoundWorkers {
+                    bound_workers: bound,
+                    guest_cpus: cpus,
+                })
+            );
+            assert_eq!(factory.create_calls.load(Ordering::SeqCst), 0);
+            assert!(!scheduler.is_preemption_driver_attached());
+            assert!(factory.scheduler.lock().upgrade().is_none());
+            // Rejection leaves the scheduler usable, with the original policy.
+            let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), cpus);
+            let authority = enqueue_root(&scheduler, &root, generation);
+            let settled = rx.recv_timeout(Duration::from_secs(5));
+            drop(authority);
+            pool.shutdown().unwrap();
+            settled.expect("highest policy CPU runs after correcting the pool");
+        } else {
+            let pool = started.expect("servable topology starts");
+            let authority = enqueue_root(&scheduler, &root, generation);
+            let settled = rx.recv_timeout(Duration::from_secs(5));
+            drop(authority);
+            pool.shutdown().unwrap();
+            settled.expect("highest policy CPU is served");
+        }
+        assert_eq!(scheduler.cpu_count(), cpus, "never clamp the policy");
     }
 }
 
@@ -3212,11 +3351,11 @@ fn saved_host_wait_slot_release_rejects_live_and_foreign_execution_claims() {
 #[test]
 fn a_second_pool_on_one_kernel_cannot_replace_the_debug_owner() {
     let (kernel, _root) = bootstrap(14_005);
-    let first_scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+    let first_scheduler = Arc::new(single_cpu_scheduler(Arc::clone(&kernel)));
     let first_factory = Arc::new(FakeFactory::default());
     let first_pool = start_pool(first_scheduler, first_factory, 1);
 
-    let second_scheduler = Arc::new(Scheduler::new(kernel));
+    let second_scheduler = Arc::new(single_cpu_scheduler(kernel));
     let second_factory = Arc::new(FakeFactory::default());
     let error = ExecutorPool::start(
         config(1),
@@ -3257,7 +3396,7 @@ fn pool_size_is_bounded_and_zero_host_capacity_fails_before_creation() {
         }
         .bound_worker_count()
         .unwrap(),
-        1
+        0
     );
     assert!(
         ExecutorPoolConfig {
@@ -3306,7 +3445,7 @@ fn spares_take_only_what_the_vcpu_budget_leaves_after_the_guest_cpus() {
 fn creation_is_transactional_and_every_created_vcpu_dies_on_its_owner_worker() {
     let caller = thread::current().id();
     let (kernel, _) = bootstrap(14_001);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     factory.fail_create_call.store(3, Ordering::SeqCst);
     let error = ExecutorPool::start(
@@ -3343,7 +3482,7 @@ fn creation_is_transactional_and_every_created_vcpu_dies_on_its_owner_worker() {
 fn multi_worker_initial_audit_panic_returns_transactionally_and_destroys_every_created_backend() {
     let caller = thread::current().id();
     let (kernel, _) = bootstrap(14_005);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     factory.panic_initial_audit_call.store(2, Ordering::SeqCst);
     let gate = Arc::new(Barrier::new(2));
@@ -3395,7 +3534,7 @@ fn multi_worker_initial_audit_panic_returns_transactionally_and_destroys_every_c
 fn sequential_generations_reuse_one_executor_and_migration_follows_save() {
     let (kernel, first) = bootstrap(14_010);
     let second = sibling(&kernel, &first, 24_010);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     let first_binding = FakeBinding::new(10, [Step::Yield, Step::Exit]);
     let second_binding = FakeBinding::new(20, [Step::Exit]);
@@ -3898,7 +4037,7 @@ fn worker_hardware_identity_is_create_owned_across_idle_load_save_and_shutdown()
 #[test]
 fn a_reaped_yield_publishes_the_process_job_it_would_have_stranded() {
     let (kernel, context) = bootstrap(14_610);
-    let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+    let scheduler = Arc::new(single_cpu_scheduler(Arc::clone(&kernel)));
     let factory = Arc::new(FakeFactory::default());
     let binding = FakeBinding::new(170, [Step::Yield, Step::Exit]);
     let entered = Arc::new(Barrier::new(2));
@@ -3942,7 +4081,7 @@ fn a_reaped_yield_publishes_the_process_job_it_would_have_stranded() {
 #[test]
 fn terminal_settlement_retires_the_exact_binding_before_worker_destroy() {
     let (kernel, context) = bootstrap(14_013);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     factory.install(&context, FakeBinding::new(13, [Step::Exit]));
     let generation = publish(&context, 13);
@@ -4079,7 +4218,7 @@ fn task_migrates_between_workers_only_after_complete_save_and_unbind() {
 #[test]
 fn resident_task_crosses_ten_thousand_syscalls_without_snapshot_or_tick() {
     let (kernel, context) = bootstrap(14_020);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     let binding = FakeBinding::new(30, [Step::Syscalls(10_000), Step::Exit]);
     factory.install(&context, Arc::clone(&binding));
@@ -4105,7 +4244,7 @@ fn resident_task_crosses_ten_thousand_syscalls_without_snapshot_or_tick() {
 fn queued_task_preempts_resident_syscall_loop_at_boundary() {
     let (kernel, first) = bootstrap(14_025);
     let second = sibling(&kernel, &first, 24_025);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
 
     let first_entered = Arc::new(Barrier::new(2));
@@ -4153,7 +4292,7 @@ fn queued_task_preempts_resident_syscall_loop_at_boundary() {
 fn queued_task_never_preempts_a_task_stopped_mid_el1() {
     let (kernel, first) = bootstrap(14_026);
     let second = sibling(&kernel, &first, 24_026);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
 
     let first_entered = Arc::new(Barrier::new(2));
@@ -4191,7 +4330,7 @@ fn queued_task_never_preempts_a_task_stopped_mid_el1() {
 fn demand_preemption_and_exact_signal_kick_advance_two_compute_tasks_without_stale_leak() {
     let (kernel, first) = bootstrap(14_030);
     let second = sibling(&kernel, &first, 24_030);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     let first_gate = Arc::new(Barrier::new(2));
     let second_gate = Arc::new(Barrier::new(2));
@@ -4397,7 +4536,7 @@ fn rebind_in_delivery_validation_to_mutation_window_cannot_flag_or_receipt_succe
 fn blocked_task_releases_the_only_worker_immediately() {
     let (kernel, blocked) = bootstrap(14_040);
     let runnable = sibling(&kernel, &blocked, 24_040);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     factory.install(&blocked, FakeBinding::new(60, [Step::Block]));
     factory.install(&runnable, FakeBinding::new(70, [Step::Exit]));
@@ -4424,7 +4563,7 @@ fn pool_drives_owned_blocked_continuation_into_kernel_state() {
 
     let (kernel, blocked) = bootstrap(14_045);
     let runnable = sibling(&kernel, &blocked, 24_045);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     let blocked_generation = publish(&blocked, 61);
     let continuation = BlockedContinuation::from_dispatch_outcome(
@@ -4479,7 +4618,7 @@ fn load_save_run_panic_audit_and_invalid_state_fail_exact_task_and_retire_worker
         ("invalid", Step::Invalid),
     ] {
         let (kernel, context) = bootstrap(14_100 + i32::try_from(case.len()).unwrap());
-        let scheduler = Arc::new(Scheduler::new(kernel));
+        let scheduler = Arc::new(single_cpu_scheduler(kernel));
         let factory = Arc::new(FakeFactory::default());
         let binding = FakeBinding::new(80, [step]);
         factory.install(&context, binding);
@@ -4508,7 +4647,7 @@ fn load_save_run_panic_audit_and_invalid_state_fail_exact_task_and_retire_worker
 
     for (case, inject) in [("load", 0_u8), ("save", 1_u8), ("audit", 2_u8)] {
         let (kernel, context) = bootstrap(14_200 + i32::from(inject));
-        let scheduler = Arc::new(Scheduler::new(kernel));
+        let scheduler = Arc::new(single_cpu_scheduler(kernel));
         let factory = Arc::new(FakeFactory::default());
         let binding = FakeBinding::new(90, [Step::Yield]);
         binding.load_fails.store(inject == 0, Ordering::SeqCst);
@@ -4542,7 +4681,7 @@ fn load_save_run_panic_audit_and_invalid_state_fail_exact_task_and_retire_worker
 #[test]
 fn controller_close_failing_audit_worker_retires_across_census_race() {
     let (kernel, context) = bootstrap(14_290);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     let binding = FakeBinding::new(90, [Step::Yield]);
     binding.audit_fails.store(true, Ordering::SeqCst);
@@ -4621,7 +4760,7 @@ fn controller_close_failing_audit_worker_retires_across_census_race() {
 fn last_worker_failure_fails_queued_exact_generation_and_shutdown_returns() {
     let (kernel, first) = bootstrap(14_240);
     let second = sibling(&kernel, &first, 24_240);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     let run_gate = Arc::new(Barrier::new(2));
     let first_binding = FakeBinding::new(91, [Step::FailRun]);
@@ -4676,7 +4815,7 @@ fn last_worker_failure_fails_queued_exact_generation_and_shutdown_returns() {
 fn malicious_backend_retained_binding_cannot_receive_authority_or_hold_terminal_drain_open() {
     let (kernel, first) = bootstrap(14_242);
     let second = sibling(&kernel, &first, 24_242);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(MaliciousFactory::default());
     let entered = Arc::new(Barrier::new(2));
     let resume = Arc::new(Barrier::new(2));
@@ -4732,7 +4871,7 @@ fn malicious_backend_retained_binding_cannot_receive_authority_or_hold_terminal_
 fn run_error_and_panic_charge_exact_cpu_receipt_once_before_failure() {
     for (offset, step) in [Step::FailRun, Step::PanicRun].into_iter().enumerate() {
         let (kernel, context) = bootstrap(14_245 + i32::try_from(offset).unwrap());
-        let scheduler = Arc::new(Scheduler::new(kernel));
+        let scheduler = Arc::new(single_cpu_scheduler(kernel));
         let factory = Arc::new(FakeFactory::default());
         factory.install(&context, FakeBinding::new(93, [step]));
         let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
@@ -4753,7 +4892,7 @@ fn run_error_and_panic_charge_exact_cpu_receipt_once_before_failure() {
 #[test]
 fn missing_scoped_lease_return_fails_and_retires_exact_claim() {
     let (kernel, context) = bootstrap(14_247);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     factory.install(&context, FakeBinding::new(95, [Step::LoseLease]));
     let generation = publish(&context, 95);
@@ -4776,7 +4915,7 @@ fn missing_scoped_lease_return_fails_and_retires_exact_claim() {
 #[test]
 fn missing_exact_hardware_identity_fails_pool_start_before_any_task_claim() {
     let (kernel, context) = bootstrap(14_248);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     factory.fail_hardware_kick.store(true, Ordering::SeqCst);
     factory.install(&context, FakeBinding::new(96, [Step::Exit]));
@@ -4816,7 +4955,7 @@ fn missing_exact_hardware_identity_fails_pool_start_before_any_task_claim() {
 #[test]
 fn mismatched_hardware_identity_fails_exact_loaded_claim() {
     let (kernel, context) = bootstrap(14_250);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     factory.drift_hardware_on_load.store(true, Ordering::SeqCst);
     factory.install(&context, FakeBinding::new(98, [Step::Exit]));
@@ -4845,7 +4984,7 @@ fn invalid_migration_authority_and_invalidation_failure_never_load_or_run_backen
         configure: impl FnOnce(&Arc<Kernel>, &KernelContext, &Arc<FakeBinding>, &Arc<FakeFactory>),
     ) {
         let (kernel, context) = bootstrap(pid);
-        let scheduler = Arc::new(Scheduler::new(Arc::clone(&kernel)));
+        let scheduler = Arc::new(single_cpu_scheduler(Arc::clone(&kernel)));
         let factory = Arc::new(FakeFactory::default());
         let binding = FakeBinding::new(94, [Step::Exit]);
         factory.install(&context, Arc::clone(&binding));
@@ -4922,7 +5061,7 @@ fn invalid_migration_authority_and_invalidation_failure_never_load_or_run_backen
 #[test]
 fn ordinary_task_load_never_performs_an_asid_invalidation() {
     let (kernel, context) = bootstrap(14_255);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     factory.install(&context, FakeBinding::new(97, [Step::Exit]));
     let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
@@ -4944,7 +5083,7 @@ fn ordinary_task_load_never_performs_an_asid_invalidation() {
 fn destroy_error_and_panic_are_terminal_and_reported_after_join() {
     for destroy_mode in [1, 2] {
         let (kernel, context) = bootstrap(14_250 + destroy_mode as i32);
-        let scheduler = Arc::new(Scheduler::new(kernel));
+        let scheduler = Arc::new(single_cpu_scheduler(kernel));
         let factory = Arc::new(FakeFactory::default());
         factory.destroy_mode.store(destroy_mode, Ordering::SeqCst);
         factory.install(&context, FakeBinding::new(95, [Step::Exit]));
@@ -4965,7 +5104,7 @@ fn destroy_error_and_panic_are_terminal_and_reported_after_join() {
 fn authority_rolls_across_yield_and_preempt_before_normal_descendant_publication() {
     let (kernel, root) = bootstrap(14_290);
     let child = process_child(&kernel, &root, 24_290, "child");
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     let root_binding = FakeBinding::new(98, [Step::Yield, Step::Preempt, Step::Yield, Step::Exit]);
     let child_binding = FakeBinding::new(99, [Step::Exit]);
@@ -5006,7 +5145,7 @@ fn shutdown_drains_recursive_child_and_grandchild_before_destroy_and_join() {
     let (kernel, root) = bootstrap(14_300);
     let child = process_child(&kernel, &root, 24_300, "child");
     let grandchild = process_child(&kernel, &child, 34_300, "grandchild");
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     let root_binding = FakeBinding::new(100, [Step::Yield, Step::Preempt, Step::Yield, Step::Exit]);
     let root_entered = Arc::new(Barrier::new(2));
@@ -5082,7 +5221,7 @@ fn shutdown_drains_recursive_child_and_grandchild_before_destroy_and_join() {
 fn alternating_tasks_never_inherit_cpu_mailbox_restart_or_tls_state() {
     let (kernel, first) = bootstrap(14_400);
     let second = sibling(&kernel, &first, 24_400);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     factory.install(&first, FakeBinding::new(130, [Step::Yield, Step::Exit]));
     factory.install(&second, FakeBinding::new(140, [Step::Yield, Step::Exit]));
@@ -5133,7 +5272,7 @@ fn boundary_inventory_is_typed_exhaustive_and_receipts_are_totally_ordered() {
     );
 
     let (kernel, context) = bootstrap(14_500);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     factory.install(&context, FakeBinding::new(150, [Step::Exit]));
     let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);
@@ -5314,7 +5453,7 @@ fn real_owner_boundary_state_fails_or_resets_and_successor_observes_clean_state(
 fn prohibited_real_owner_state_retires_worker_and_cleanup_leaves_no_inherited_state() {
     for mode in [1, 3, 4, 5, 6] {
         let (kernel, context) = bootstrap(14_560 + mode as i32);
-        let scheduler = Arc::new(Scheduler::new(kernel));
+        let scheduler = Arc::new(single_cpu_scheduler(kernel));
         let factory = Arc::new(FakeFactory::default());
         factory.owner_dirty_mode.store(mode, Ordering::SeqCst);
         factory.install(&context, FakeBinding::new(156, [Step::Yield]));
@@ -5343,7 +5482,7 @@ fn prohibited_real_owner_state_retires_worker_and_cleanup_leaves_no_inherited_st
 #[test]
 fn save_error_retains_exact_lease_authority_until_failure_settlement() {
     let (kernel, context) = bootstrap(14_600);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     let binding = FakeBinding::new(160, [Step::Yield]);
     binding.save_fails.store(true, Ordering::SeqCst);
@@ -5487,7 +5626,7 @@ impl VforkTestFixture {
             job_completion.clone(),
         );
 
-        let scheduler = Arc::new(Scheduler::new(kernel.clone()));
+        let scheduler = Arc::new(single_cpu_scheduler(kernel.clone()));
         let factory = Arc::new(FakeFactory::default());
         let parent_binding = FakeBinding::new(10, [Step::Block, Step::Exit]);
         let fake_child_binding = FakeBinding::new(20, [Step::Exit]);
@@ -5909,7 +6048,7 @@ impl Drop for TerminalRetirementTestCleanup {
 #[test]
 fn terminal_retirement_does_not_hold_topology_lock_across_detached_cleanup() {
     let (process, context) = crate::hvpatch::process_context_for_tests(14_990);
-    let scheduler = Arc::new(Scheduler::new(Arc::clone(context.kernel())));
+    let scheduler = Arc::new(single_cpu_scheduler(Arc::clone(context.kernel())));
     let factory = Arc::new(FakeFactory::default());
     let binding = FakeBinding::new(99, [Step::Exit]);
     let (gate_tx, gate_rx) = std::sync::mpsc::channel();
@@ -5967,7 +6106,7 @@ fn terminal_retirement_does_not_hold_topology_lock_across_detached_cleanup() {
 #[test]
 fn test_lazy_vcpu_same_executor_reclaim_skips_snapshot_and_overlay() {
     let (kernel, context) = bootstrap(15_001);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     let binding = FakeBinding::new(201, [Step::Block, Step::Exit]);
     factory.install(&context, Arc::clone(&binding));
@@ -6017,7 +6156,7 @@ fn test_lazy_vcpu_same_executor_reclaim_skips_snapshot_and_overlay() {
 fn test_lazy_vcpu_intervening_load_materializes_resident_task() {
     let (kernel, first) = bootstrap(15_002);
     let second = sibling(&kernel, &first, 25_002);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
 
     let first_binding = FakeBinding::new(202, [Step::Block, Step::Exit]);
@@ -6434,7 +6573,10 @@ fn test_lazy_vcpu_cross_executor_claim_waits_for_idle_flush_and_overlays_materia
 #[test]
 fn test_lazy_vcpu_cross_executor_pool_execution() {
     let (kernel, context) = bootstrap(15_007);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(Scheduler::new_with_policy(
+        kernel,
+        Arc::new(GuestCpuPolicy::new(2)),
+    ));
     let factory = Arc::new(FakeFactory::default());
     let binding = FakeBinding::new(208, [Step::Block, Step::Exit]);
     factory.install(&context, Arc::clone(&binding));
@@ -6560,7 +6702,7 @@ fn test_lazy_vcpu_targeted_flush_request_wakes_owner_and_avoids_broadcast() {
 fn test_lazy_vcpu_same_executor_reclaim_after_block_with_empty_queue_has_zero_snapshots_and_overlays()
  {
     let (kernel, context) = bootstrap(15_009);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     let binding = FakeBinding::new(210, [Step::Block, Step::Exit]);
     factory.install(&context, Arc::clone(&binding));
@@ -6837,7 +6979,11 @@ fn run_production_exec_failure_pool_case(boundary: InjectedExecFailureBoundary, 
         Arc::new(EndpointTestSignalPump),
         Arc::new(EndpointTestSignalArrival),
         Some(process.clone()),
-        None,
+        Some(Arc::new(
+            crate::vcpu_loop::HvpatchRuntimeDirectory::with_scheduling_policy(Some(Arc::new(
+                GuestCpuPolicy::new(1),
+            ))),
+        )),
     ));
     let runtime = Arc::clone(kernel.hvpatch_runtime.as_ref().unwrap());
     let (scheduler, _) = runtime.continuation_services(context.kernel());
@@ -7124,7 +7270,7 @@ fn test_production_exec_failure_at_identity_publication_settles_in_executor_pool
 #[test]
 fn preemption_driver_duplicate_attachment_fails_with_typed_error() {
     let (kernel, _root) = bootstrap(68_100);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
 
     let mut driver =
@@ -7216,7 +7362,7 @@ fn preemption_driver_shutdown_with_future_deadline() {
 #[test]
 fn preemption_driver_disabled_via_env_var() {
     let (kernel, root) = bootstrap(68_104);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     let binding = FakeBinding::new(401, [Step::Exit]);
     let (settled_tx, settled_rx) = std::sync::mpsc::channel();
@@ -7248,7 +7394,7 @@ fn preemption_driver_disabled_via_env_var() {
 #[test]
 fn preemption_driver_worker_failure_allows_clean_shutdown() {
     let (kernel, context) = bootstrap(68_105);
-    let scheduler = Arc::new(Scheduler::new(kernel));
+    let scheduler = Arc::new(single_cpu_scheduler(kernel));
     let factory = Arc::new(FakeFactory::default());
     factory.install(&context, FakeBinding::new(96, [Step::PanicRun]));
     let pool = start_pool(Arc::clone(&scheduler), Arc::clone(&factory), 1);

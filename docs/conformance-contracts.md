@@ -217,6 +217,40 @@ host lookup errors intact rather than manufacturing a shared authority.
 
 ## Executor empty host queue
 
+`kernel.scheduler.runnable-progress` also covers pool admission and guest CPU affinity.
+Linux authority: `sched_setaffinity(2)` restricts a runnable thread to the
+allowed CPUs; `sched_getaffinity(2)` and `nproc` must describe CPUs that can
+execute it. Every scheduler CPU requires at least one bound executor; spares
+do not cover CPUs without a bound executor to lend them its slot. Invalid
+configuration must create zero workers and publish no preemption driver or
+resolver. The VM-free binding
+`insufficient_bound_workers_cannot_strand_a_pinned_task` explicitly requests
+two workers for four CPUs and pins a runnable task to CPU 3. Before the fix,
+the task makes no progress within five seconds; exact-generation cancellation
+keeps teardown bounded. Signed execution and full promotion remain
+director-owned; no Docker phase is authorized on cloudmac.
+
+Admission preserves the installed policy and rejects insufficient bound capacity
+with `ExecutorPoolConfigError::InsufficientBoundWorkers` before starting the
+preemption driver, installing the resolver, or publishing any worker. Silently
+clamping a custom policy would change the CPU IDs and affinity topology it
+promises. The count includes the backend ceiling and reserve; spare executors
+cannot substitute for bound workers. Even a one-CPU policy is rejected when
+reserve consumes the entire budget.
+
+Configuration audit: `carrier_scheduler` publishes the installed policy count;
+the default uses `default_guest_cpu_count`, hence `CARRICK_EXPOSED_CPUS` or the
+host's logical/performance-core count, clamped to `MAX_GUEST_CPUS`.
+`configured_bound_executors` defaults to that same count; its explicit env
+request is validated after the backend cap. Invalid text falls back to the
+policy count and zero requests one worker, as before. HVF supplies
+`vcpu_budget()` from its hypervisor ceiling (already reserving its overhead),
+not its physical-core count; the production pool adds no reserve.
+`pool_admission_covers_overrides_ceilings_reserves_and_small_hosts` checks these
+admission combinations, including a two-CPU policy with two workers, execution
+on the highest CPU, and corrected startup after refusal. CPU publication and
+`sched_setaffinity` validation retain their existing single policy authority.
+
 `kernel.executor.empty-host-steal` covers an executor seeking host-runnable
 work while runnable tasks are held by the in-guest scheduler. Linux blocking
 and wakeup semantics remain the authority: a guest wait releases executor
