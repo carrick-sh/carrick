@@ -352,6 +352,28 @@ mod tests {
 
     #[test]
     fn active_command_excludes_retirement_for_its_entire_lifetime() {
+        // Other parallel tests fork while holding arbitrary file descriptors.
+        // CLOEXEC closes our guard at exec, but the immediate-release assertion
+        // must not depend on when an unrelated child crosses that boundary.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "worktree_admission::tests::active_command_lifetime_fixture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated file-lifetime fixture invoked by the admission regression"]
+    fn active_command_lifetime_fixture() {
         let repo = repository();
         let root = repo.path();
         let common = common(root).unwrap();

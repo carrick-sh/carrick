@@ -215,6 +215,11 @@ impl Fixture {
         );
         write(
             root,
+            "scripts/lib/build-env.sh",
+            include_bytes!("../../../scripts/lib/build-env.sh"),
+        );
+        write(
+            root,
             "fixtures/linux-aarch64-hello/src/main.rs",
             b"raw fixture\n",
         );
@@ -309,10 +314,11 @@ impl Fixture {
         git(root, &["commit", "-qm", "fixture inputs"]);
         let sha = git(root, &["rev-parse", "HEAD"]);
         let mut sources = BTreeMap::new();
-        for path in git(root, &["ls-files"])
-            .lines()
-            .filter(|p| *p != ".gitignore" && !p.starts_with("crates/carrick-runtime/"))
-        {
+        for path in git(root, &["ls-files"]).lines().filter(|p| {
+            *p != ".gitignore"
+                && *p != "scripts/lib/build-env.sh"
+                && !p.starts_with("crates/carrick-runtime/")
+        }) {
             let source = root.join(path);
             let digest = if fs::symlink_metadata(&source)
                 .unwrap()
@@ -903,6 +909,7 @@ impl Preparation {
             &bin,
             "cargo",
             br#"#!/bin/sh
+if [ "$1" = --config ]; then shift 2; fi
 if [ "$1" = metadata ]; then exec "$FIXTURE_TEST_CARGO" "$@"; fi
 while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
 [ "$#" -gt 0 ] || exit 91
