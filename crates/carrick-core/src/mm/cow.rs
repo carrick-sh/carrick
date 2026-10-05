@@ -101,6 +101,7 @@ pub struct GuestCowVenue<'a, W: ?Sized> {
 /// When a store sequence can neither complete nor roll back (the live graph
 /// is no longer the one this editor validated): continuing would run the MM
 /// on unknown translations.
+#[allow(clippy::panic, clippy::expect_used)]
 pub fn resolve_guest_cow<W, C, I>(
     venue: &GuestCowVenue<'_, W>,
     mm_key: u64,
