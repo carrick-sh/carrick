@@ -5,7 +5,7 @@
     "table_guard": 172,
     "description_guard": 200,
     "description_backing": 24,
-    "epoll": 511,
+    "epoll": 522,
     "stream": 176,
     "mapping": 1512,
     "lifecycle": 34
@@ -14,7 +14,7 @@
     "table_guard": 66,
     "description_guard": 172,
     "description_backing": 9,
-    "epoll": 221,
+    "epoll": 223,
     "stream": 120,
     "mapping": 966,
     "lifecycle": 16
@@ -23,7 +23,7 @@
     "table_guard": 27,
     "description_guard": 38,
     "description_backing": 8,
-    "epoll": 49,
+    "epoll": 51,
     "stream": 21,
     "mapping": 114,
     "lifecycle": 10
@@ -12123,8 +12123,107 @@
       "scope_kind": "production_callsite"
     },
     {
+      "file": "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests/loom_models.rs",
+      "line": 3,
+      "categories": [
+        "epoll"
+      ],
+      "text": "//! The mutex-owned listener queue and per-description epoll owner lists model",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests/loom_models.rs",
+      "line": 54,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// may now register an epoll before connect finishes notifying.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests.rs",
+      "line": 42,
+      "categories": [
+        "epoll"
+      ],
+      "text": "fn epoll(&mut self, fd: u64, events: u32) -> u64 {",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests.rs",
+      "line": 55,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// Linux authority: man 2 connect, man 2 shutdown, man 7 epoll. Connection",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests.rs",
+      "line": 84,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let client_epfd = parent.epoll(client_fd, LINUX_EPOLLOUT);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests.rs",
+      "line": 138,
+      "categories": [
+        "epoll"
+      ],
+      "text": "let epfd = peer.epoll(accepted, LINUX_EPOLLRDHUP);",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests.rs",
+      "line": 145,
+      "categories": [
+        "epoll"
+      ],
+      "text": "// epoll has drained its ctl wake, checked RDHUP, and built its wait.",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests.rs",
+      "line": 160,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll { kqueue, .. } => Some(Arc::clone(kqueue)),",
+      "scope_kind": "test_or_definition"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests.rs",
+      "line": 178,
+      "categories": [
+        "epoll"
+      ],
+      "text": "\"client's pre-connect epoll registration must still become writable\"",
+      "scope_kind": "test_or_definition"
+    },
+    {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 469,
+      "line": 35,
+      "categories": [
+        "epoll"
+      ],
+      "text": "/// A broadcast after enqueue can reach an epoll the acceptor has already armed",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
+      "line": 41,
+      "categories": [
+        "epoll"
+      ],
+      "text": "OpenDescription::Epoll { kqueue, .. } => Some(Arc::clone(kqueue)),",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
+      "line": 493,
       "categories": [
         "stream"
       ],
@@ -12133,7 +12232,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 511,
+      "line": 535,
       "categories": [
         "mapping"
       ],
@@ -12142,7 +12241,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 522,
+      "line": 546,
       "categories": [
         "description_guard"
       ],
@@ -12151,7 +12250,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 661,
+      "line": 685,
       "categories": [
         "description_guard"
       ],
@@ -12160,7 +12259,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 687,
+      "line": 711,
       "categories": [
         "description_guard"
       ],
@@ -12169,7 +12268,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 699,
+      "line": 723,
       "categories": [
         "description_guard"
       ],
@@ -12178,7 +12277,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 713,
+      "line": 737,
       "categories": [
         "description_guard"
       ],
@@ -12187,7 +12286,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 726,
+      "line": 750,
       "categories": [
         "description_guard"
       ],
@@ -12196,7 +12295,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 738,
+      "line": 762,
       "categories": [
         "description_guard"
       ],
@@ -12205,7 +12304,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 747,
+      "line": 771,
       "categories": [
         "description_guard"
       ],
@@ -12214,7 +12313,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 758,
+      "line": 782,
       "categories": [
         "description_guard"
       ],
@@ -12223,7 +12322,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 994,
+      "line": 1018,
       "categories": [
         "description_guard"
       ],
@@ -12232,7 +12331,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 1085,
+      "line": 1109,
       "categories": [
         "description_guard"
       ],
@@ -12241,7 +12340,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 1131,
+      "line": 1155,
       "categories": [
         "description_guard"
       ],
@@ -12250,7 +12349,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 1142,
+      "line": 1166,
       "categories": [
         "description_guard"
       ],
@@ -12259,7 +12358,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 1164,
+      "line": 1188,
       "categories": [
         "description_guard"
       ],
@@ -12268,7 +12367,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 1236,
+      "line": 1260,
       "categories": [
         "epoll"
       ],
@@ -12277,7 +12376,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 1249,
+      "line": 1273,
       "categories": [
         "description_guard"
       ],
@@ -12286,7 +12385,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 1266,
+      "line": 1290,
       "categories": [
         "description_guard"
       ],
@@ -12295,7 +12394,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 1313,
+      "line": 1337,
       "categories": [
         "description_guard"
       ],
@@ -12304,7 +12403,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 1643,
+      "line": 1667,
       "categories": [
         "mapping"
       ],
@@ -12313,7 +12412,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 2046,
+      "line": 2070,
       "categories": [
         "table_guard"
       ],
@@ -12322,7 +12421,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 2070,
+      "line": 2094,
       "categories": [
         "description_guard"
       ],
@@ -12331,7 +12430,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 2978,
+      "line": 3002,
       "categories": [
         "description_guard"
       ],
@@ -12340,7 +12439,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 3113,
+      "line": 3137,
       "categories": [
         "description_guard"
       ],
@@ -12349,7 +12448,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 3147,
+      "line": 3171,
       "categories": [
         "description_guard"
       ],
@@ -12358,7 +12457,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 3756,
+      "line": 3780,
       "categories": [
         "description_guard"
       ],
@@ -12367,7 +12466,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 3765,
+      "line": 3789,
       "categories": [
         "description_guard"
       ],
@@ -12376,7 +12475,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 3855,
+      "line": 3879,
       "categories": [
         "description_guard"
       ],
@@ -12385,7 +12484,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/net/lifecycle.rs",
-      "line": 3960,
+      "line": 3984,
       "categories": [
         "description_guard"
       ],

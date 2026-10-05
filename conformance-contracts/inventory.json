@@ -317,6 +317,7 @@
       "contracts": [
         "kernel.el1.epoll-zone",
         "kernel.el1.poll-select-owner",
+        "kernel.net.connect-wake-scope",
         "kernel.signal.job-control-wait-interruption"
       ],
       "claims": [],
@@ -2879,7 +2880,8 @@
       "handler": "network",
       "authority": "host",
       "contracts": [
-        "kernel.el1.unix-owner"
+        "kernel.el1.unix-owner",
+        "kernel.net.connect-wake-scope"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -2894,7 +2896,8 @@
       "handler": "network",
       "authority": "host",
       "contracts": [
-        "kernel.el1.unix-owner"
+        "kernel.el1.unix-owner",
+        "kernel.net.connect-wake-scope"
       ],
       "claims": [],
       "uncovered_behaviors": [
@@ -2992,7 +2995,8 @@
       "handler": "network",
       "authority": "host",
       "contracts": [
-        "kernel.el1.unix-owner"
+        "kernel.el1.unix-owner",
+        "kernel.net.connect-wake-scope"
       ],
       "claims": [],
       "uncovered_behaviors": [

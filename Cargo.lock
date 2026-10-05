@@ -683,6 +683,7 @@ dependencies = [
  "goblin",
  "hickory-proto",
  "libc",
+ "loom",
  "parking_lot",
  "parking_lot_core",
  "proptest",
