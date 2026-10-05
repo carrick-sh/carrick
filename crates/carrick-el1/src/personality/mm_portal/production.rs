@@ -1,6 +1,9 @@
 //! Transfers borrow the admitted production owner. No table or frame ledger
 //! is constructed here. Physical pinning happens after selection, on host.
-use super::{El1MmHandle, GuestVa, MmError, TransferIntent};
+use super::{
+    El1MmHandle, GuestVa, MmError, SelectedChunk, TransferContinuation, TransferIntent,
+    ValidatedChunk,
+};
 use crate::fault::{CowResolver, PreparedPageResolver};
 use crate::memory::reservations::{Reservations, ResolvedReservationNodes, SharedReservations};
 use carrick_el1_abi::{
@@ -54,81 +57,6 @@ impl PreparedDelivery<'_> {
     }
 }
 
-/// Owned request position. Suspension never discards already copied bytes.
-pub struct TransferContinuation {
-    pub handle: El1MmHandle,
-    pub intent: TransferIntent,
-    address: GuestVa,
-    len: u64,
-    offset: u64,
-    sequence: NonZeroU64,
-    fork_sequence: Option<NonZeroU64>,
-}
-
-impl TransferContinuation {
-    fn new(
-        handle: El1MmHandle,
-        address: GuestVa,
-        len: u64,
-        intent: TransferIntent,
-        sequence: NonZeroU64,
-    ) -> Result<Self, MmError> {
-        address.raw().checked_add(len).ok_or(MmError::Invalid)?;
-        Ok(Self {
-            handle,
-            intent,
-            address,
-            len,
-            offset: 0,
-            sequence,
-            fork_sequence: None,
-        })
-    }
-    pub fn settle(
-        &mut self,
-        request: carrick_el1_abi::PortalTransferRequest,
-        receipt: carrick_el1_abi::PortalTransferCompletion,
-    ) -> Result<(), MmError> {
-        if receipt.operation != request.operation
-            || receipt.retained != request.retained
-            || request.operation.carrier != self.handle.carrier()
-            || request.operation.mm != self.handle.mm()
-            || request.operation.incarnation != self.handle.incarnation()
-            || request.operation.sequence != self.sequence
-            || request.selected.offset != self.offset
-            || request.range.address() != self.address.raw() + self.offset
-            || receipt.completed > request.range.len()
-            || receipt.completed > self.len - self.offset
-        {
-            return Err(MmError::Stale);
-        }
-        self.offset += receipt.completed;
-        Ok(())
-    }
-    pub fn offset(&self) -> u64 {
-        self.offset
-    }
-    pub fn is_complete(&self) -> bool {
-        self.offset == self.len
-    }
-}
-
-/// EL1-selected data, not metadata storage. Host enriches this with its exact
-/// physical record identity and retains the matching stage-2 pin.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SelectedChunk {
-    pub(super) retry: Option<carrick_el1_abi::PortalOwnerWait>,
-    fork_sequence: Option<NonZeroU64>,
-    handle: El1MmHandle,
-    sequence: NonZeroU64,
-    pub(super) generation: u64,
-    offset: u64,
-    pub va: GuestVa,
-    pub ipa: u64,
-    pub executable: bool,
-    pub len: u64,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransferStep {
     Selected(SelectedChunk),
@@ -138,29 +66,6 @@ pub enum TransferStep {
     /// root lock, editor, or physical pin survives this return.
     Suspended,
     Complete,
-}
-
-/// Exact-MM authorization for one bounded copy. A host custodian must retain
-/// the selected physical identities before obtaining this fence. Drop before
-/// any host I/O, lazy supply, suspension, or selection of the next chunk.
-pub struct ValidatedChunk<'a> {
-    selected: SelectedChunk,
-    _editor: SpaceEditor<'a>,
-}
-impl ValidatedChunk<'_> {
-    pub fn selected(&self) -> SelectedChunk {
-        self.selected
-    }
-    pub fn complete(self, continuation: &mut TransferContinuation) -> Result<(), MmError> {
-        if continuation.handle != self.selected.handle
-            || continuation.sequence != self.selected.sequence
-            || continuation.offset != self.selected.offset
-        {
-            return Err(MmError::Stale);
-        }
-        continuation.offset += self.selected.len;
-        Ok(())
-    }
 }
 
 impl<'a, P: PinnedMetadataExtent> MmPortal<'a, P> {
@@ -332,7 +237,8 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
             return Err(MmError::Stale);
         }
         let sequence = root.next_transfer_sequence()?;
-        TransferContinuation::new(handle, address, len, intent, sequence)
+        unsafe { TransferContinuation::from_owner_sequence(handle, address, len, intent, sequence) }
+            .map_err(MmError::from)
     }
     pub fn begin_fork_parent_write(
         &self,
@@ -353,9 +259,11 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
             return Err(MmError::Stale);
         }
         let sequence = root.next_fork_write_sequence(fork_sequence)?;
-        let mut continuation = TransferContinuation::new(handle, address, len, intent, sequence)?;
-        continuation.fork_sequence = Some(fork_sequence);
-        Ok(continuation)
+        let continuation = unsafe {
+            TransferContinuation::from_owner_sequence(handle, address, len, intent, sequence)
+        }
+        .map_err(MmError::from)?;
+        Ok(unsafe { continuation.with_fork_sequence(fork_sequence) })
     }
     fn observe_wait(
         &self,
@@ -442,7 +350,7 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
             carrick_el1_abi::PortalWaitCause::PendingEdit,
         )?;
         let mut root = self.root_for(continuation.handle, slot)?;
-        if root.fork_pending() && !root.fork_write_authorized(continuation.fork_sequence) {
+        if root.fork_pending() && !root.fork_write_authorized(continuation.fork_sequence()) {
             return Err(pending.map_or(MmError::Busy, MmError::Wait));
         }
         if root.incarnation().raw() != continuation.handle.incarnation().get() {
@@ -455,8 +363,8 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
             // Only named Carrick control windows bypass user-VMA permission
             // selection. Live translation and exact owner validation still apply.
             if !carrick_el1_abi::CarrickInternalReadRange::authorizes(
-                continuation.address.raw(),
-                continuation.len,
+                continuation.address().raw(),
+                continuation.len(),
             ) {
                 return Err(MmError::Fault);
             }
@@ -509,8 +417,8 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
                 None => Ok(TransferStep::Suspended),
             };
         };
-        let va = continuation.address.raw() + continuation.offset;
-        let len = (continuation.len - continuation.offset).min(4096 - (va & 4095));
+        let va = continuation.address().raw() + continuation.offset();
+        let len = (continuation.len() - continuation.offset()).min(4096 - (va & 4095));
         let generation = match self.authorize(continuation, va, len, slot) {
             Err(MmError::Busy) => return Ok(TransferStep::Suspended),
             result => result?,
@@ -529,7 +437,7 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
                     crate::fault::CowResolution::Resolved => {
                         #[cfg(target_os = "none")]
                         if let (Some(sequence), Some(completion)) =
-                            (continuation.fork_sequence, cow.take_cow_completion())
+                            (continuation.fork_sequence(), cow.take_cow_completion())
                         {
                             super::fork::reconcile_pending_parent_write(
                                 slot as usize,
@@ -544,7 +452,7 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
                     crate::fault::CowResolution::NeedsSupply => {
                         let mut root = self.root(continuation.handle.mm(), slot)?;
                         if root.fork_pending()
-                            && !root.fork_write_authorized(continuation.fork_sequence)
+                            && !root.fork_write_authorized(continuation.fork_sequence())
                         {
                             return Err(MmError::Busy);
                         }
@@ -573,14 +481,14 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
                                     carrier: continuation.handle.carrier(),
                                     mm: continuation.handle.mm(),
                                     incarnation: continuation.handle.incarnation(),
-                                    sequence: continuation.sequence,
+                                    sequence: continuation.sequence(),
                                 },
                                 generation: plan.generation,
                                 range: plan.range,
                                 protection: plan.protection,
                                 fault_page: plan.fault_page,
                                 host_backing: None,
-                                fork_sequence: continuation.fork_sequence,
+                                fork_sequence: continuation.fork_sequence(),
                             },
                         ));
                     }
@@ -614,7 +522,7 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
                 LeafAccess::Execute => 4,
             };
             let mut root = self.root(continuation.handle.mm(), slot)?;
-            if root.fork_pending() && !root.fork_write_authorized(continuation.fork_sequence) {
+            if root.fork_pending() && !root.fork_write_authorized(continuation.fork_sequence()) {
                 return Err(MmError::Busy);
             }
             let target = if root
@@ -629,7 +537,7 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
                 va,
                 target,
                 ReservationProtection::from_bits(bits).ok_or(MmError::Invalid)?,
-                continuation.fork_sequence,
+                continuation.fork_sequence(),
             )?;
             let host_backing = root.mapping(plan.range.start()).and_then(|mapping| {
                 mapping
@@ -642,27 +550,31 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
                     carrier: continuation.handle.carrier(),
                     mm: continuation.handle.mm(),
                     incarnation: continuation.handle.incarnation(),
-                    sequence: continuation.sequence,
+                    sequence: continuation.sequence(),
                 },
                 generation: plan.generation,
                 range: plan.range,
                 protection: plan.protection,
                 fault_page: plan.fault_page,
                 host_backing,
-                fork_sequence: continuation.fork_sequence,
+                fork_sequence: continuation.fork_sequence(),
             }));
         };
-        Ok(TransferStep::Selected(SelectedChunk {
-            retry,
-            fork_sequence: continuation.fork_sequence,
-            handle: continuation.handle,
-            sequence: continuation.sequence,
-            generation,
-            offset: continuation.offset,
-            va: GuestVa::new(va),
-            ipa,
-            executable: continuation.intent == TransferIntent::UserWrite && executable,
-            len,
+        // SAFETY: the exact editor, admitted MM, reservation and translation
+        // license this selection. Copy still requires physical custody and revalidation.
+        Ok(TransferStep::Selected(unsafe {
+            SelectedChunk::from_owner_selection(
+                continuation.handle,
+                continuation.sequence(),
+                generation,
+                continuation.offset(),
+                GuestVa::new(va),
+                ipa,
+                continuation.intent == TransferIntent::UserWrite && executable,
+                len,
+                continuation.fork_sequence(),
+                retry,
+            )
         }))
     }
 
@@ -676,20 +588,16 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
         words: &W,
         slot: u32,
     ) -> Result<Option<ValidatedChunk<'_>>, MmError> {
-        if selected.fork_sequence != continuation.fork_sequence
-            || selected.handle != continuation.handle
-            || selected.sequence != continuation.sequence
-            || selected.offset != continuation.offset
-        {
+        if !selected.matches(continuation) {
             return Err(MmError::Stale);
         }
-        let mm = selected.handle.mm().raw();
+        let mm = selected.handle().mm().raw();
         let index = self.spaces.find(mm).ok_or(MmError::Stale)?;
-        let editor = match self.editor_for(selected.handle, slot) {
+        let editor = match self.editor_for(selected.handle(), slot) {
             Err(MmError::Busy) => return Ok(None),
             result => result?,
         };
-        let gate = self.observe_wait(selected.handle, carrick_el1_abi::PortalWaitCause::Gate)?;
+        let gate = self.observe_wait(selected.handle(), carrick_el1_abi::PortalWaitCause::Gate)?;
         let Some(grant) = self.spaces.grant(index, mm) else {
             return match gate {
                 Some(wait) => Err(MmError::Wait(wait)),
@@ -715,20 +623,18 @@ impl<'a, P: PinnedMetadataExtent, B: OwnerMmu> MmPortal<'a, P, B> {
             Err(MmError::Fault) => return Ok(None),
             result => result?,
         };
-        let expected = (selected.ipa, selected.executable);
-        let current = current.map(|(ipa, executable)| {
-            (
-                ipa,
-                continuation.intent == TransferIntent::UserWrite && executable,
+        // SAFETY: exact-MM editor, reservation generation and live output
+        // were authenticated above; core publishes the sole bounded fence.
+        unsafe {
+            carrick_core::mm::transaction::validate_selection(
+                continuation,
+                selected,
+                editor,
+                generation,
+                current,
             )
-        });
-        if generation != selected.generation || current != Some(expected) {
-            return Ok(None);
         }
-        Ok(Some(ValidatedChunk {
-            selected,
-            _editor: editor,
-        }))
+        .map_err(MmError::from)
     }
 }
 
@@ -757,40 +663,6 @@ fn translated<B: OwnerMmu, W: LiveDescriptorWords + ?Sized>(
     .map_err(mmu_error)
 }
 
-impl SelectedChunk {
-    pub fn request(
-        self,
-        intent: TransferIntent,
-        retained: carrick_el1_abi::PortalRetainedData,
-    ) -> Result<carrick_el1_abi::PortalTransferRequest, MmError> {
-        use carrick_el1_abi::{
-            PortalByteRange, PortalOperation, PortalSelectedData, PortalTransferRequest,
-        };
-        PortalTransferRequest::new(
-            PortalOperation {
-                carrier: self.handle.carrier(),
-                mm: self.handle.mm(),
-                incarnation: self.handle.incarnation(),
-                sequence: self.sequence,
-            },
-            PortalByteRange::new(self.va.raw(), self.len).ok_or(MmError::Invalid)?,
-            intent,
-            PortalSelectedData {
-                ipa: self.ipa,
-                executable: self.executable,
-                root_generation: NonZeroU64::new(self.generation).ok_or(MmError::Stale)?,
-                offset: self.offset,
-            },
-            retained,
-        )
-        .map(|mut request| {
-            request.fork_sequence = self.fork_sequence;
-            request
-        })
-        .ok_or(MmError::Invalid)
-    }
-}
-
 /// PREPARE finishes all fault/supply work and authenticates physical custody
 /// before publishing semantic admission. A refusal occurs before consumption.
 pub fn prepare_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized, B: OwnerMmu>(
@@ -807,32 +679,9 @@ pub fn prepare_transfer<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized
             request.operation.incarnation,
         )
     };
-    let address = request
-        .range
-        .address()
-        .checked_sub(request.selected.offset)
-        .ok_or(MmError::Invalid)?;
-    let continuation = TransferContinuation {
-        handle,
-        intent: request.intent,
-        address: GuestVa::new(address),
-        len: request.selected.offset + request.range.len(),
-        offset: request.selected.offset,
-        sequence: request.operation.sequence,
-        fork_sequence: request.fork_sequence,
-    };
-    let selected = SelectedChunk {
-        retry: None,
-        fork_sequence: request.fork_sequence,
-        handle,
-        sequence: request.operation.sequence,
-        generation: request.selected.root_generation.get(),
-        offset: request.selected.offset,
-        va: GuestVa::new(request.range.address()),
-        ipa: request.selected.ipa,
-        executable: request.selected.executable,
-        len: request.range.len(),
-    };
+    // SAFETY: candidate only; live owner revalidation below precedes effects.
+    let continuation = unsafe { TransferContinuation::from_request(request) }?;
+    let selected = unsafe { SelectedChunk::from_request(request) };
     let Some(fence) = portal.revalidate(&continuation, selected, words, slot)? else {
         return Ok(None);
     };
@@ -1231,11 +1080,11 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             frame.slot as u32,
         )? {
             TransferStep::Selected(selected) => {
-                frame.x[8] = selected.sequence.get();
-                frame.x[9] = selected.generation;
+                frame.x[8] = selected.sequence().get();
+                frame.x[9] = selected.generation();
                 frame.x[10] = selected.ipa;
                 frame.x[15] = u64::from(selected.executable);
-                let retry = selected.retry.ok_or(MmError::Stale)?;
+                let retry = selected.retry().ok_or(MmError::Stale)?;
                 frame.x[16] = retry.cause().encode();
                 frame.x[17] = retry.revision();
                 Ok(())

@@ -15,15 +15,15 @@ pub mod production;
 pub use fork::*;
 pub use production::*;
 
-/// Guest address, never a physical extent or a host pointer.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GuestVa(u64);
-impl GuestVa {
-    pub const fn new(value: u64) -> Self {
-        Self(value)
-    }
-    pub const fn raw(self) -> u64 {
-        self.0
+pub use carrick_core::mm::transfer::{
+    GuestVa, SelectedChunk, TransferContinuation, ValidatedChunk,
+};
+impl From<carrick_core::mm::transfer::TransferError> for MmError {
+    fn from(error: carrick_core::mm::transfer::TransferError) -> Self {
+        match error {
+            carrick_core::mm::transfer::TransferError::Stale => Self::Stale,
+            carrick_core::mm::transfer::TransferError::Invalid => Self::Invalid,
+        }
     }
 }
 
@@ -80,6 +80,3 @@ pub use carrick_el1_abi::PortalTransferIntent as TransferIntent;
 pub mod test_support;
 #[cfg(test)]
 pub(crate) mod tests;
-
-#[cfg(test)]
-mod x86_tests;
