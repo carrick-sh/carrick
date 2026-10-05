@@ -13643,6 +13643,33 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         panic!("uncommitted replacement must retain a completion wait");
     };
     assert!(!wait.0.is_ready());
+    let alias = alias_registry().lock().overlapping_process_aliases(
+        TEST_VA,
+        4096,
+        Some(root),
+        ContainerRootToken::ROOT,
+    )[0]
+    .1;
+    let owner = custody
+        .global_frame_host_owners
+        .lock()
+        .get(&(alias.physical_ipa, alias.physical_size as u64))
+        .unwrap()
+        .owner()
+        .clone();
+    let pins_at_wake = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let observed = pins_at_wake.clone();
+    let observed_custody = custody.clone();
+    let (_subscription, ready) = wait.0.enroll(Arc::new(move || {
+        observed.store(
+            observed_custody
+                .stage2_record_snapshot(owner.record_identity.record_id)
+                .unwrap()
+                .pin_count,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }));
+    assert!(!ready);
     let txn = *pending.transaction();
     let DescriptorOp::Prepare { publication, .. } = txn.op else {
         panic!()
@@ -13662,6 +13689,11 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         "{receipt:?}"
     );
     assert!(pending.settle(&receipt).unwrap());
+    assert_eq!(
+        pins_at_wake.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "applied grant must release its temporary physical pin before waking a contender"
+    );
     assert!(
         wait.0.is_ready(),
         "exact applied receipt completes publication"
@@ -14334,9 +14366,33 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
     };
     assert!(!wait.0.is_ready());
     let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let first_alias = alias_registry().lock().overlapping_process_aliases(
+        start,
+        4096,
+        Some(installed.owners.0[0]),
+        ContainerRootToken::ROOT,
+    )[0]
+    .1;
+    let owner = custody
+        .global_frame_host_owners
+        .lock()
+        .get(&(first_alias.physical_ipa, first_alias.physical_size as u64))
+        .unwrap()
+        .owner()
+        .clone();
+    let pins_at_wake = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+    let observed_pins = pins_at_wake.clone();
+    let observed_custody = custody.clone();
     let observed = wakes.clone();
     let (subscription, ready) = wait.0.enroll(Arc::new(move || {
         observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        observed_pins.store(
+            observed_custody
+                .stage2_record_snapshot(owner.record_identity.record_id)
+                .unwrap()
+                .pin_count,
+            std::sync::atomic::Ordering::SeqCst,
+        );
         // Completion must release inventory and alias guards before callbacks.
         assert!(alias_registry().try_lock().is_some());
     }));
@@ -14346,14 +14402,12 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
         before,
         "the contender must not allocate a second physical frame"
     );
-    let first_alias = alias_registry().lock().overlapping_process_aliases(
-        start,
-        4096,
-        Some(installed.owners.0[0]),
-        ContainerRootToken::ROOT,
-    )[0]
-    .1;
     drop(pending);
+    assert_eq!(
+        pins_at_wake.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "rolled-back grant must release its temporary physical pin before waking a contender"
+    );
     let _ = retire_global_frame_host_owner_if_generation_in(
         &custody,
         first_alias.physical_ipa,
