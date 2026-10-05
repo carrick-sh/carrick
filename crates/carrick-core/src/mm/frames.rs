@@ -202,3 +202,53 @@ pub fn apply_grant<B: OwnerGrantMmu, W: LiveDescriptorWords + ?Sized>(
     drop(editor);
     Some(receipt)
 }
+
+/// Logical leaf references for one physical backing. The backend owns storage
+/// and the inventory's one journal; this value is the journaled logical state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FrameReferences {
+    mapping_count: u32,
+    retire_on_last_unmap: bool,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceError {
+    Exhausted,
+    Underflow,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReferenceRetirement {
+    Ready,
+    AlreadyPending,
+    Deferred,
+}
+impl FrameReferences {
+    pub const fn count(self) -> u32 {
+        self.mapping_count
+    }
+    pub fn retain(&mut self) -> Result<(), ReferenceError> {
+        self.mapping_count = self
+            .mapping_count
+            .checked_add(1)
+            .ok_or(ReferenceError::Exhausted)?;
+        // A new holder takes responsibility for retirement.
+        self.retire_on_last_unmap = false;
+        Ok(())
+    }
+    pub fn unmap(&mut self) -> Result<bool, ReferenceError> {
+        self.mapping_count = self
+            .mapping_count
+            .checked_sub(1)
+            .ok_or(ReferenceError::Underflow)?;
+        Ok(self.mapping_count == 0 && self.retire_on_last_unmap)
+    }
+    pub fn request_retirement(&mut self) -> ReferenceRetirement {
+        if self.mapping_count == 0 {
+            ReferenceRetirement::Ready
+        } else if self.retire_on_last_unmap {
+            ReferenceRetirement::AlreadyPending
+        } else {
+            self.retire_on_last_unmap = true;
+            ReferenceRetirement::Deferred
+        }
+    }
+}

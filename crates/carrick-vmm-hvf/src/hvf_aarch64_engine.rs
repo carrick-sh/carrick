@@ -3497,7 +3497,10 @@ mod task_only_materializer_tests {
         assert!(task_authority_shape.contains("retirement_expected"));
         assert!(task_authority_shape.contains("let mut expected_mappings"));
         assert!(task_authority_shape.contains("committed_unmaps != expected_ids"));
-        assert!(include_str!("trap.rs").contains("mm_empty_at_revision"));
+        assert!(
+            include_str!("../../carrick-core/src/mm/retirement.rs")
+                .contains("mm_empty_at_revision")
+        );
         assert!(task_authority_shape.contains("apply(retirement.commit)"));
         assert!(task_authority_shape.contains("authenticate_pending_retirement"));
         assert!(task_authority_shape.contains("malformed successful HVPatch retirement receipt"));
