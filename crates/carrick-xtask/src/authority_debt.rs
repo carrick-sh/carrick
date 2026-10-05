@@ -59,22 +59,23 @@ pub enum Lane {
 }
 
 impl Lane {
-    pub fn source(file: &str) -> Self {
-        if file.contains("carrick-vmm-hvf/") {
+    pub fn module(krate: &str, modules: &[String]) -> Self {
+        if krate == "carrick_vmm_hvf" {
             Self::Hvf
-        } else if file.contains("carrick-vmm-kvm/") {
+        } else if krate == "carrick_vmm_kvm" {
             Self::Kvm
-        } else if file.contains("carrick-vmm-bhyve/") {
+        } else if krate == "carrick_vmm_bhyve" {
             Self::Bhyve
-        } else if file.contains("carrick-vmm-nvmm/") {
+        } else if krate == "carrick_vmm_nvmm" {
             Self::Nvmm
-        } else if file.contains("carrick-x86/") || file.contains("/x86_") {
+        } else if krate == "carrick_x86" || modules.iter().any(|module| module.starts_with("x86_"))
+        {
             Self::X86
-        } else if file.contains("carrick-host-linux/") {
+        } else if krate == "carrick_host_linux" {
             Self::Linux
-        } else if file.contains("carrick-host-bsd/") {
+        } else if krate == "carrick_host_bsd" {
             Self::Bsd
-        } else if file.contains("carrick-host-darwin/") {
+        } else if krate == "carrick_host_darwin" {
             Self::Darwin
         } else {
             Self::Shared
@@ -281,12 +282,24 @@ fn unsalt(symbol: &str) -> String {
         .collect::<Vec<_>>()
         .join("::")
 }
-fn symbol_owner(file: &str, symbol: &str) -> Result<String, DebtError> {
-    let krate = file
-        .split('/')
-        .nth(1)
-        .ok_or_else(|| DebtError::Policy("missing crate owner".into()))?;
-    Ok(format!("{}::{}", krate.replace('-', "_"), unsalt(symbol)))
+fn finding_owner(source: &SourceCensus, row: &Value) -> Result<String, DebtError> {
+    let line = row["line"]
+        .as_u64()
+        .ok_or_else(|| DebtError::Policy("missing ephemeral symbol diagnostic line".into()))?
+        as usize;
+    let mut owner = source.owner_at(
+        text(row, "file")?,
+        line,
+        row["column"]
+            .as_u64()
+            .ok_or_else(|| DebtError::Policy("missing ephemeral symbol diagnostic column".into()))?
+            as usize,
+    )?;
+    if let Some(argument) = row["argument"].as_str() {
+        owner.push_str("::");
+        owner.push_str(argument);
+    }
+    Ok(owner)
 }
 fn add(actual: &mut BTreeMap<Key, u64>, family: Family, operation: &str, owner: &str, lane: Lane) {
     *actual
@@ -344,16 +357,31 @@ fn source_counts(
     policy: &AuthorityDebtCeilings,
     source: &SourceCensus,
 ) -> Result<BTreeMap<Key, u64>, DebtError> {
+    source.verify_task_rules()?;
     let mut actual = BTreeMap::new();
     for row in rows(&discover(root, "check-dispatch-lock-authority", tools)?)? {
         let file = text(row, "file")?;
+        if source.is_test_at(
+            file,
+            row["line"].as_u64().unwrap_or(0) as usize,
+            row["column"].as_u64().unwrap_or(0) as usize,
+        ) {
+            continue;
+        }
         let line = row["line"]
             .as_u64()
             .ok_or_else(|| DebtError::Policy("missing lock diagnostic line".into()))?
             as usize;
-        let owner = source.owner_at(file, line, 0)?;
+        let owner = source.owner_at(
+            file,
+            line,
+            row["column"]
+                .as_u64()
+                .ok_or_else(|| DebtError::Policy("missing lock diagnostic column".into()))?
+                as usize,
+        )?;
         let operation = text(row, "category")?;
-        let lane = Lane::source(file);
+        let lane = source.lane(&owner)?;
         policy.assign(&[Family::RawLock], operation, &owner, lane)?;
         add(&mut actual, Family::RawLock, operation, &owner, lane);
     }
@@ -363,20 +391,23 @@ fn source_counts(
     }
     for row in rows(&discover(root, "check-runtime-global-state", tools)?)? {
         let file = text(row, "file")?;
-        if source.is_test_file(file) {
+        if source.is_test_at(
+            file,
+            row["line"].as_u64().unwrap_or(0) as usize,
+            row["column"].as_u64().unwrap_or(0) as usize,
+        ) {
             continue;
         }
-        let owner = symbol_owner(file, text(row, "symbol")?)?;
+        let owner = finding_owner(source, row)?;
         let operation = format!("global:{}", text(row, "kind")?);
-        let lane = Lane::source(file);
+        let lane = source.lane(&owner)?;
         let family = policy.assign(GLOBAL_FAMILIES, &operation, &owner, lane)?;
         add(&mut actual, family, &operation, &owner, lane);
     }
     for row in rows(&discover(root, "check-runtime-aborts", tools)?)? {
-        let file = text(row, "file")?;
-        let owner = symbol_owner(file, text(row, "function")?)?;
+        let owner = finding_owner(source, row)?;
         let operation = format!("fatal:{}", text(row, "domain")?);
-        let lane = Lane::source(file);
+        let lane = source.lane(&owner)?;
         let family = policy.assign(FATAL_FAMILIES, &operation, &owner, lane)?;
         add(&mut actual, family, &operation, &owner, lane);
     }
@@ -465,16 +496,30 @@ fn legacy_policy_with_tools(root: &Path, tools: &Path) -> Result<AuthorityDebtCe
     let mut counters = BTreeMap::<Key, u64>::new();
     for row in rows(&discover(root, "check-dispatch-lock-authority", tools)?)? {
         let file = text(row, "file")?;
+        if source.is_test_at(
+            file,
+            row["line"].as_u64().unwrap_or(0) as usize,
+            row["column"].as_u64().unwrap_or(0) as usize,
+        ) {
+            continue;
+        }
         let line = row["line"]
             .as_u64()
             .ok_or_else(|| DebtError::Policy("invalid historical lock diagnostic".into()))?
             as usize;
+        let owner = source.owner_at(
+            file,
+            line,
+            row["column"].as_u64().ok_or_else(|| {
+                DebtError::Policy("invalid historical lock diagnostic column".into())
+            })? as usize,
+        )?;
         add(
             &mut counters,
             Family::RawLock,
             text(row, "category")?,
-            &source.owner_at(file, line, 0)?,
-            Lane::source(file),
+            &owner,
+            source.lane(&owner)?,
         );
     }
     let taxonomy =
@@ -496,7 +541,7 @@ fn legacy_policy_with_tools(root: &Path, tools: &Path) -> Result<AuthorityDebtCe
             .filter(|r| {
                 r["line"].as_u64().is_some_and(|line| {
                     source
-                        .owner_at(&site.file, line as usize, 0)
+                        .owner_on_line(&site.file, line as usize)
                         .is_ok_and(|owner| owner == site.owner)
                 })
             })
@@ -568,7 +613,7 @@ fn legacy_policy_with_tools(root: &Path, tools: &Path) -> Result<AuthorityDebtCe
         [
             std::ffi::OsStr::new("-c"),
             std::ffi::OsStr::new(
-                "import importlib.util,json,pathlib,sys; s=importlib.util.spec_from_file_location('globals',sys.argv[1]); m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); print(json.dumps([{'file':f.file,'kind':f.kind,'symbol':f.symbol} for f in m.discover(pathlib.Path(sys.argv[2]))]))",
+                "import importlib.util,json,pathlib,sys; s=importlib.util.spec_from_file_location('globals',sys.argv[1]); m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); print(json.dumps([{'file':f.file,'kind':f.kind,'symbol':f.symbol,'line':f.line,'argument':f.argument,'column':f.column} for f in m.discover(pathlib.Path(sys.argv[2]))]))",
             ),
             tools
                 .join("scripts/migrate/check-runtime-global-state.py")
@@ -578,54 +623,80 @@ fn legacy_policy_with_tools(root: &Path, tools: &Path) -> Result<AuthorityDebtCe
         Some(root),
     )?;
     let production: Value = serde_json::from_str(&output.stdout)?;
-    let production: BTreeSet<_> = rows(&production)?
-        .iter()
-        .map(|row| {
-            Ok((
-                text(row, "file")?.to_owned(),
-                text(row, "kind")?.to_owned(),
-                unsalt(text(row, "symbol")?),
-            ))
-        })
-        .collect::<Result<_, DebtError>>()?;
+    let mut global_classes = BTreeMap::new();
     for row in rows(&read_json(&root.join("scripts/migrate/runtime-global-state.json"))?["rows"])? {
-        if source.is_test_file(text(row, "file")?)
-            || !production.contains(&(
-                text(row, "file")?.to_owned(),
-                text(row, "kind")?.to_owned(),
-                unsalt(text(row, "symbol")?),
-            ))
-        {
-            continue;
-        }
-        let file = text(row, "file")?;
         let family: Family = serde_json::from_value(Value::String(format!(
             "global_{}",
             text(row, "classification")?
         )))?;
+        let key = (
+            text(row, "file")?.to_owned(),
+            text(row, "kind")?.to_owned(),
+            unsalt(text(row, "symbol")?),
+        );
+        let entry = global_classes.entry(key).or_insert(family);
+        *entry = (*entry).max(family);
+    }
+    for row in rows(&production)? {
+        let file = text(row, "file")?;
+        if source.is_test_at(
+            file,
+            row["line"].as_u64().unwrap_or(0) as usize,
+            row["column"].as_u64().unwrap_or(0) as usize,
+        ) {
+            continue;
+        }
+        let key = (
+            file.to_owned(),
+            text(row, "kind")?.to_owned(),
+            unsalt(text(row, "symbol")?),
+        );
+        let family = global_classes.get(&key).ok_or_else(|| {
+            DebtError::Policy(format!("base global lacks reviewed family: {key:?}"))
+        })?;
+        let owner = finding_owner(&source, row)?;
         add(
             &mut counters,
-            family,
+            *family,
             &format!("global:{}", text(row, "kind")?),
-            &symbol_owner(file, text(row, "symbol")?)?,
-            Lane::source(file),
+            &owner,
+            source.lane(&owner)?,
         );
     }
+    let mut fatal_classes = BTreeMap::new();
     for shard in ["hvf", "runtime", "vcpu-loop", "other"] {
         for row in rows(
             &read_json(&root.join(format!("scripts/migrate/runtime-aborts/{shard}.json")))?["rows"],
         )? {
-            let file = text(row, "file")?;
             let family: Family =
                 serde_json::from_value(Value::String(format!("fatal_{}", text(row, "verdict")?)))?;
-            add(
-                &mut counters,
-                family,
-                &format!("fatal:{}", text(row, "domain")?),
-                &symbol_owner(file, text(row, "function")?)?,
-                Lane::source(file),
+            let key = (
+                text(row, "file")?.to_owned(),
+                unsalt(text(row, "function")?),
+                text(row, "domain")?.to_owned(),
             );
+            let entry = fatal_classes.entry(key).or_insert(family);
+            *entry = (*entry).max(family);
         }
+    }
+    for row in rows(&discover(root, "check-runtime-aborts", tools)?)? {
+        let file = text(row, "file")?;
+        let key = (
+            file.to_owned(),
+            unsalt(text(row, "function")?),
+            text(row, "domain")?.to_owned(),
+        );
+        let family = fatal_classes.get(&key).ok_or_else(|| {
+            DebtError::Policy(format!("base fatal lacks reviewed family: {key:?}"))
+        })?;
+        let owner = finding_owner(&source, row)?;
+        add(
+            &mut counters,
+            *family,
+            &format!("fatal:{}", text(row, "domain")?),
+            &owner,
+            source.lane(&owner)?,
+        );
     }
     for row in rows(&read_json(
         &root.join("scripts/migrate/host-authority-transition-inventory.json"),

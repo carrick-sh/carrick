@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -27,6 +27,8 @@ class AbortFinding:
     fingerprint: str
     sink: str = "raw"
     domain: str | None = None
+    line: int = field(default=0, compare=False)
+    column: int = field(default=0, compare=False)
 
 
 class LedgerError(Exception):
@@ -1417,6 +1419,8 @@ def scan_abort_source(
                     fingerprint=fp,
                     sink=site_sink,
                     domain=site_domain,
+                    line=tokens[i].line,
+                    column=tokens[i].pos - source.rfind("\n", 0, tokens[i].pos) - 1,
                 )
                 if finding in finding_identities:
                     raise LedgerError(
@@ -1481,7 +1485,7 @@ def main():
     if raw:
         print(f"raw termination forbidden: {raw[0].file}::{raw[0].function}", file=sys.stderr)
         return 1
-    print(json.dumps([{"file": f.file, "function": f.function, "domain": f.domain} for f in findings]))
+    print(json.dumps([{"file": f.file, "function": f.function, "domain": f.domain, "line": f.line, "column": f.column} for f in findings]))
     return 0
 
 

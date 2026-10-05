@@ -279,12 +279,16 @@ impl ProcessGraphLiveness {
         let kernel = self.kernel.as_ref().and_then(Weak::upgrade);
         let run_id = kernel.as_ref().and_then(|kernel| {
             let ids = kernel.container_ids();
-            let [id] = ids.as_slice() else {
-                return None;
-            };
-            kernel
-                .container(*id)
-                .map(|container| container.launch().carrier_scope_id.as_str().to_owned())
+            let mut common = None;
+            for id in ids {
+                let container = kernel.container(id)?;
+                let scope = &container.launch().carrier_scope_id;
+                if common.as_ref().is_some_and(|previous| previous != scope) {
+                    return None;
+                }
+                common = Some(scope.clone());
+            }
+            common.map(|scope| scope.as_str().to_owned())
         });
         let mut post_mortem =
             carrick_kernel::kernel::debug::PostMortem::capture(kernel.as_ref(), reason, run_id);
@@ -1038,5 +1042,49 @@ mod tests {
             liveness.census().is_none(),
             "an unobservable graph is not a dead graph"
         );
+    }
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn two_container_abort_keeps_scope_across_successive_carriers() {
+        use carrick_kernel::kernel::{
+            CarrierScopeId, Container, LaunchContext, RootBootstrap, RunId,
+        };
+        for generation in ["capture-generation-alpha", "capture-generation-beta"] {
+            let scope = CarrierScopeId::new(generation).expect("scope");
+            let mut first = LaunchContext::unmanaged(RunId::new("first"));
+            first.carrier_scope_id = scope.clone();
+            let bootstrap = RootBootstrap::for_reference_model(
+                81209,
+                ThreadId::synthetic_for_tests(81209),
+                "first".into(),
+            )
+            .expect("bootstrap")
+            .with_container(Arc::new(Container::new(first)));
+            let (kernel, first_context) =
+                carrick_kernel::kernel::Kernel::bootstrap_root(bootstrap).expect("kernel");
+            let mut second = LaunchContext::unmanaged(RunId::new("second"));
+            second.carrier_scope_id = scope.clone();
+            let second_context = kernel
+                .prepare_container_root(
+                    ThreadId::synthetic_for_tests(81210),
+                    None,
+                    "second".into(),
+                    Arc::new(Container::new(second)),
+                    None,
+                )
+                .expect("second prepared root")
+                .commit()
+                .expect("second root");
+            assert_eq!(kernel.container_count(), 2);
+            let liveness = ProcessGraphLiveness::for_tests(Some(&kernel), None, LIVENESS_CONFIRM);
+            let RuntimeError::KernelAborted { post_mortem, .. } =
+                liveness.liveness_abort(dead_census(), 2)
+            else {
+                panic!("expected post-mortem");
+            };
+            assert_eq!(post_mortem.run_id.as_deref(), Some(generation));
+            assert_eq!(first_context.container().launch().carrier_scope_id, scope);
+            assert_eq!(second_context.container().launch().carrier_scope_id, scope);
+        }
     }
 }

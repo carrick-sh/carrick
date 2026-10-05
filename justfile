@@ -242,6 +242,8 @@ lint-domains-source:
     ./scripts/check-fixture-lockfiles.sh
     {{_admit}} {{_cargo}} run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
     python3 -m unittest scripts/tests/test_check_contract_change.py
+    # Generic scalar rules here; symbol-bound task rules and mandatory owner
+    # discovery run in authority-debt --source-only below.
     python3 scripts/migrate/check-task-participant-witnesses.py --check
     python3 scripts/migrate/check-mm-authority.py --check
     python3 scripts/migrate/check-host-authority-transitions.py --static

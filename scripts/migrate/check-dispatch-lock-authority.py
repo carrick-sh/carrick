@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check and enforce dispatch lock authority across production runtime sources.
 
-This gate inventories raw lock acquisitions in `crates/carrick-kernel/src`:
+This gate inventories raw lock acquisitions in production crate sources:
 - `proc` dispatcher state
 - `pty_table` state
 - `sysv_process` and `sysv_namespace` state
@@ -20,7 +20,7 @@ It enforces that:
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import sys
@@ -28,7 +28,6 @@ from typing import Any, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCAN_PATHS = [REPO_ROOT / "crates" / "carrick-kernel" / "src"]
 
 CATEGORIES = {
     "proc": "raw acquisition of dispatcher `proc` lock",
@@ -76,6 +75,7 @@ class Token:
     text: str
     line: int
     pos: int
+    column: int = field(default=0, compare=False)
 
 
 @dataclass(frozen=True)
@@ -87,6 +87,7 @@ class RawLockSite:
     category: str
     expression: str
     ordinal: int
+    column: int = field(default=0, compare=False)
 
 
 def lex_rust(source: str) -> list[Token]:
@@ -223,7 +224,11 @@ def lex_rust(source: str) -> list[Token]:
         tokens.append(Token("punct", char, line, i))
         i += 1
 
-    return tokens
+    return [
+        Token(token.kind, token.text, token.line, token.pos,
+              token.pos - source.rfind("\n", 0, token.pos) - 1)
+        for token in tokens
+    ]
 
 
 def _matching_delimiter(tokens: Sequence[Token], start: int, opening: str, closing: str) -> int:
@@ -361,7 +366,7 @@ def find_enclosing_item(tokens: Sequence[Token], target_idx: int) -> str:
 def scan_tokens(tokens: Sequence[Token], relative_path: str) -> list[RawLockSite]:
     """Scan a tokenized Rust file for raw lock acquisition sites."""
     prod_mask = production_mask(tokens)
-    raw_occurrences: list[tuple[int, str, str, str]] = []  # (line, item, category, expression)
+    raw_occurrences: list[tuple[int, str, str, str, int]] = []  # (line, item, category, expression, column)
 
     # Track local variable bindings inside functions for local lock alias detection
     fn_aliases: dict[str, str] = {}
@@ -490,14 +495,14 @@ def scan_tokens(tokens: Sequence[Token], relative_path: str) -> list[RawLockSite
                     expr = f"{prev_ident}.{lock_method}()"
 
             if category is not None and expr is not None:
-                raw_occurrences.append((tokens[i].line, enclosing, category, expr))
+                raw_occurrences.append((tokens[i].line, enclosing, category, expr, tokens[i].column))
 
         i += 1
 
     # Assign stable ordinals and unique IDs per (file, item, category)
     ordinal_counters: dict[tuple[str, str], int] = {}
     sites: list[RawLockSite] = []
-    for line, item, category, expr in raw_occurrences:
+    for line, item, category, expr, column in raw_occurrences:
         key = (item, category)
         ordinal = ordinal_counters.get(key, 0) + 1
         ordinal_counters[key] = ordinal
@@ -511,6 +516,7 @@ def scan_tokens(tokens: Sequence[Token], relative_path: str) -> list[RawLockSite
                 category=category,
                 expression=expr,
                 ordinal=ordinal,
+                column=column,
             )
         )
 
@@ -518,10 +524,13 @@ def scan_tokens(tokens: Sequence[Token], relative_path: str) -> list[RawLockSite
 
 
 def scan_sources(repo_root: Path) -> list[RawLockSite]:
-    """Scan all configured production sources under carrick-runtime."""
+    """Scan crate source trees; the Rust census resolves production owners."""
     all_sites: list[RawLockSite] = []
-    for old_target in SCAN_PATHS:
-        target = repo_root / old_target.relative_to(REPO_ROOT)
+    # A declared kernel module can use #[path] outside its physical crate.
+    # The Rust census binds these diagnostics to the declaring module owner.
+    for target in sorted((repo_root / "crates").glob("*/src")):
+        if target.parent.name == "carrick-xtask":
+            continue
         if target.is_file():
             files = [target]
         elif target.is_dir():
@@ -906,7 +915,7 @@ def main():
         print("\n".join(errors), file=sys.stderr)
         return 1
     sites = scan_sources(args.root)
-    print(json.dumps([{"file": s.file, "line": s.line, "category": s.category} for s in sites]))
+    print(json.dumps([{"file": s.file, "line": s.line, "column": s.column, "category": s.category} for s in sites]))
     return 0
 
 

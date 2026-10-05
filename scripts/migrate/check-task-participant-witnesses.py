@@ -53,21 +53,9 @@ NUMERIC_RETURN_TYPES = frozenset(
 )
 ALLOWED_NUMERIC_METHOD_SUFFIX = "_for_probe"
 
-CRASH_MUTATION_OWNERS = frozenset(
-    {
-        "crates/carrick-kernel/src/dispatch/mm_authority.rs",
-        "crates/carrick-kernel/src/kernel/objects.rs",
-    }
-)
-# The exact-mm stage-1 quiesce protocol (`dispatch/mm_quiesce.rs`) and the
-# carrier fork path that consumes it: a scalar `census.live()` read there is
-# a census witness bypass, not a diagnostic.
-EXACT_MM_QUIESCE_OWNERS = frozenset(
-    {
-        "crates/carrick-kernel/src/dispatch/mm_quiesce.rs",
-        "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-    }
-)
+# Owner-specific projection, census and crash-mutation rules are bound to
+# complete production symbols by authority_source.rs, with mandatory owner
+# discovery. This lexical gate retains the host-independent scalar rules.
 
 
 @dataclass(frozen=True)
@@ -442,30 +430,8 @@ def scan_source(source: str, relative_path: str) -> list[Finding]:
                     RAW_TASK_MEMBERSHIP,
                     f"threads() scalar method {method}()",
                 )
-        if (
-            relative_path == "crates/carrick-kernel/src/kernel/crash_capture.rs"
-            and _sequence_at(tokens, index, [".", "threads", "(", ")"])
-        ):
-            add(index, RAW_TASK_PROJECTION, "CrashQuorum generic Task::threads()")
         if token.kind == "ident" and token.text == "live_thread_count":
             add(index, RAW_TASK_CARDINALITY, "live_thread_count")
-        if (
-            relative_path in EXACT_MM_QUIESCE_OWNERS
-            and _sequence_at(tokens, index, [".", "live", "(", ")"])
-        ):
-            add(index, SCALAR_CENSUS_API, "GuestExecutorCensus::live() call")
-
-        if (
-            token.kind == "ident"
-            and token.text
-            in {
-                "enter_crash_safe_point_participation",
-                "leave_crash_safe_point_participation",
-            }
-            and relative_path not in CRASH_MUTATION_OWNERS
-        ):
-            add(index, RAW_CRASH_PARTICIPATION, token.text)
-
         if _sequence_at(tokens, index, ["struct", "GuestExecutorCensus"]):
             block = _find_block(tokens, index + 2)
             if block is not None:
@@ -619,10 +585,7 @@ def self_test() -> None:
             SCALAR_CENSUS_API,
             "impl GuestExecutorCensus { pub fn live(&self) -> u64 { 1 } }",
         ),
-        "raw_crash.rs": (
-            RAW_CRASH_PARTICIPATION,
-            "fn f(thread: &Thread) { thread.enter_crash_safe_point_participation(); }",
-        ),
+
     }
     positive = {
         "comment.rs": "fn f() { /* task.threads().len() */ let _ = 1; }",
@@ -678,34 +641,10 @@ def self_test() -> None:
             if findings:
                 raise AssertionError(f"{name}: unexpected findings {findings!r}")
 
-        crash_projection = scan_source(
-            "fn poll(&self) { for thread in self.task.threads() {} }\n",
-            "crates/carrick-kernel/src/kernel/crash_capture.rs",
-        )
-        if [
-            (finding.category, finding.path, finding.line)
-            for finding in crash_projection
-        ] != [(RAW_TASK_PROJECTION, "crates/carrick-kernel/src/kernel/crash_capture.rs", 1)]:
-            raise AssertionError(
-                "crash projection: expected generic task membership finding, "
-                f"got {crash_projection!r}"
-            )
-
-        census_call = scan_source(
-            "fn pause(census: &GuestExecutorCensus) { probe(census.live()); }\n",
-            "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-        )
-        if [
-            (finding.category, finding.path, finding.line) for finding in census_call
-        ] != [(SCALAR_CENSUS_API, "crates/carrick-runtime/src/vcpu_loop/quiesce.rs", 1)]:
-            raise AssertionError(
-                "census call: expected scalar executor census finding, "
-                f"got {census_call!r}"
-            )
 
     print(
         "task participant witness self-test: "
-        f"{len(negative) + 2} negative and {len(positive)} positive fixtures passed"
+        f"{len(negative)} negative and {len(positive)} positive fixtures passed"
     )
 
 
