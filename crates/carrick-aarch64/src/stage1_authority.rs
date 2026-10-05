@@ -1000,10 +1000,10 @@ impl Stage1Authority {
         // No host I/O: the caller only updates this unpublished task's staged
         // register image. There is no guest that can observe the old/new pair.
         switch(root)?;
-        // SAFETY: the physical allocation remains in this exact MM's custody.
-        unsafe {
-            image.make_live(resolver);
-        }
+        // Preserve deferred bootstrap editing: carving the initial apertures
+        // may still allocate extension tables before they are physically
+        // published. Owner admission promotes this synced image on the
+        // retained resolver after all bootstrap edits have been published.
         *inner.manager = Some(image);
         inner.published_arenas.push(root);
         capacity.base = None;
@@ -3277,6 +3277,11 @@ mod tests {
             assert_eq!(root, pool + index as u64 * 0x20_0000);
             assert_eq!(switched.get(), Some(root));
             assert_eq!(authority.root_base(), Some(root));
+            assert_eq!(
+                authority.with_manager(PageTableManager::is_live),
+                Some(false),
+                "bootstrap carving must retain its deferred owned image until owner admission"
+            );
             let image = authority.snapshot_image().unwrap();
             assert_eq!(original.translate(LINUX_MMAP_BASE), Some(0x9c_1234_5000));
             assert_eq!(image.translate(LINUX_MMAP_BASE), Some(0x9c_1234_5000));
