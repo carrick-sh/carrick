@@ -51,7 +51,9 @@ impl CowGrantCompletion {
             && self.span_va.is_multiple_of(PAGE)
             && self.old_ipa.is_multiple_of(PAGE)
             && self.new_ipa >= self.grant.physical_ipa
-            && offset + self.span_len <= COW_GRANT_SIZE
+            && offset
+                .checked_add(self.span_len)
+                .is_some_and(|end| end <= COW_GRANT_SIZE)
             && (self.old_ipa & (COW_GRANT_SIZE - 1)) == offset
             && self.span_va.checked_add(self.span_len).is_some()
     }
