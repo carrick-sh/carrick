@@ -71,6 +71,17 @@ impl From<PageTableError> for MmError {
         Self::Table(e)
     }
 }
+impl From<carrick_core::mm::fork::ForkError> for MmError {
+    fn from(e: carrick_core::mm::fork::ForkError) -> Self {
+        match e {
+            carrick_core::mm::fork::ForkError::Invalid => Self::Invalid,
+            carrick_core::mm::fork::ForkError::NoMemory => Self::NoMemory,
+            carrick_core::mm::fork::ForkError::Busy => Self::Busy,
+            carrick_core::mm::fork::ForkError::Stale => Self::Stale,
+            carrick_core::mm::fork::ForkError::Core => Self::Core,
+        }
+    }
+}
 
 /// Internal reads are confined to the immutable boot control page. They are
 /// not a privileged user-copy bypass, and cannot write or name other windows.

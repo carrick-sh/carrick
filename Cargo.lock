@@ -312,6 +312,7 @@ dependencies = [
  "bitflags 2.11.1",
  "carrick-abi",
  "carrick-conformance-contract",
+ "carrick-core",
  "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-mem",
@@ -447,10 +448,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-core"
+version = "0.1.0"
+dependencies = [
+ "carrick-el1-abi",
+ "carrick-guest-arch",
+ "carrick-mmu-core",
+]
+
+[[package]]
 name = "carrick-el1"
 version = "0.1.0"
 dependencies = [
  "carrick-aarch64",
+ "carrick-core",
  "carrick-el1-abi",
  "carrick-guest-arch",
  "carrick-hal",
