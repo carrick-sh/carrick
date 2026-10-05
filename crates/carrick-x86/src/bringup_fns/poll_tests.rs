@@ -229,3 +229,201 @@ fn normalized_poll_validates_memory_but_ignores_pointer_for_empty_set() {
     run_elf_service_loop(&mut bad).unwrap();
     assert_eq!(bad.results, [LINUX_EFAULT.guest_retval()]);
 }
+
+#[test]
+fn poll_normalizes_every_negative_timeout_at_the_native_boundary() {
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    writer.write_all(b"ready").unwrap();
+    for timeout in [-2, i32::MIN] {
+        let mut guest = PollGuest::new(
+            &[LinuxPollFd {
+                fd: reader.as_raw_fd(),
+                events: LINUX_POLLIN,
+                revents: -1,
+            }],
+            0,
+        );
+        let result = sys_poll(
+            StandaloneHostFds,
+            &mut guest,
+            carrick_guest_mem::GuestVa(0),
+            1,
+            timeout,
+            |fds, native_timeout| {
+                // FreeBSD rejects values below -1 even when a fd is ready.
+                assert_eq!(native_timeout, -1);
+                poll_host_fds(fds, native_timeout)
+            },
+        );
+        assert_eq!(result, 1);
+        let revents = LinuxPollFd::read_from_bytes(&guest.memory).unwrap().revents;
+        assert_eq!(revents, LINUX_POLLIN);
+    }
+}
+
+#[test]
+fn poll_invalid_descriptor_overrides_an_infinite_timeout() {
+    let mut guest = PollGuest::new(
+        &[LinuxPollFd {
+            fd: i32::MAX,
+            events: 0,
+            revents: -1,
+        }],
+        0,
+    );
+    let result = sys_poll(
+        StandaloneHostFds,
+        &mut guest,
+        carrick_guest_mem::GuestVa(0),
+        1,
+        i32::MIN,
+        |fds, timeout| {
+            assert_eq!(timeout, 0);
+            poll_host_fds(fds, timeout)
+        },
+    );
+    assert_eq!(result, 1);
+    let revents = LinuxPollFd::read_from_bytes(&guest.memory).unwrap().revents;
+    assert_eq!(revents, LINUX_POLLNVAL);
+}
+
+#[test]
+fn normalized_poll_broken_pipe_writer_reports_error_for_every_zero_interest_entry() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let fds = [LinuxPollFd {
+        fd: writer.as_raw_fd(),
+        events: 0,
+        revents: -1,
+    }; 2];
+    let mut guest = PollGuest::new(&fds, 0);
+    run_elf_service_loop(&mut guest).unwrap();
+    assert_eq!(guest.results, [2]);
+    for bytes in guest.memory.chunks_exact(8) {
+        let revents = LinuxPollFd::read_from_bytes(bytes).unwrap().revents;
+        assert_eq!(revents, carrick_abi::LINUX_POLLERR);
+    }
+    assert_eq!(guest.read_bytes.get(), 16);
+    assert_eq!(guest.written_bytes, 4);
+}
+
+#[test]
+fn normalized_poll_pipe_reader_keeps_unrequested_hangup() {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(writer);
+    let mut guest = PollGuest::new(
+        &[LinuxPollFd {
+            fd: reader.as_raw_fd(),
+            events: 0,
+            revents: -1,
+        }],
+        0,
+    );
+    run_elf_service_loop(&mut guest).unwrap();
+    assert_eq!(guest.results, [1]);
+    let revents = LinuxPollFd::read_from_bytes(&guest.memory).unwrap().revents;
+    assert_eq!(revents, LINUX_POLLHUP);
+}
+
+#[test]
+fn poll_positive_wait_completes_when_a_producer_makes_the_fd_ready() {
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    let (start, receive) = std::sync::mpsc::channel();
+    let producer = std::thread::spawn(move || {
+        receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        writer.write_all(b"ready").unwrap();
+        writer
+    });
+    let mut guest = PollGuest::new(
+        &[LinuxPollFd {
+            fd: reader.as_raw_fd(),
+            events: LINUX_POLLIN,
+            revents: -1,
+        }],
+        0,
+    );
+    let result = sys_poll(
+        StandaloneHostFds,
+        &mut guest,
+        carrick_guest_mem::GuestVa(0),
+        1,
+        5_000,
+        |fds, timeout| {
+            assert_eq!(timeout, 5_000);
+            // The fd is initially unready. Release the producer at the native
+            // wait boundary; either scheduler order must complete correctly.
+            start.send(()).unwrap();
+            poll_host_fds(fds, timeout)
+        },
+    );
+    let _writer = producer.join().unwrap();
+    assert_eq!(result, 1);
+    let revents = LinuxPollFd::read_from_bytes(&guest.memory).unwrap().revents;
+    assert_eq!(revents, LINUX_POLLIN);
+}
+
+#[test]
+fn poll_native_interruption_returns_linux_eintr_without_copyout_or_retry() {
+    let (reader, _writer) = UnixStream::pair().unwrap();
+    let mut guest = PollGuest::new(
+        &[LinuxPollFd {
+            fd: reader.as_raw_fd(),
+            events: LINUX_POLLIN,
+            revents: -1,
+        }],
+        0,
+    );
+    let original = guest.memory.clone();
+    let mut calls = 0;
+    let result = sys_poll(
+        StandaloneHostFds,
+        &mut guest,
+        carrick_guest_mem::GuestVa(0),
+        1,
+        5_000,
+        |_, _| {
+            // Inject at the native boundary, avoiding process-wide signal
+            // disposition changes and timing-dependent signal delivery.
+            calls += 1;
+            Err(std::io::Error::from_raw_os_error(libc::EINTR))
+        },
+    );
+    assert_eq!(result, carrick_abi::LINUX_EINTR.guest_retval());
+    assert_eq!(calls, 1);
+    assert_eq!(guest.memory, original);
+    assert_eq!(guest.written_bytes, 0);
+}
+
+#[test]
+fn poll_rejects_nfds_above_the_limit_before_guest_access_or_native_wait() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: limit points to writable storage for the returned host limit.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    let limit = u32::try_from(limit.rlim_cur).unwrap();
+    assert!(limit > 0);
+    let mut guest = PollGuest::new(&[], 0);
+    for (count, errno) in [
+        (limit, LINUX_EFAULT),
+        (limit.checked_add(1).unwrap(), carrick_abi::LINUX_EINVAL),
+    ] {
+        let result = sys_poll(
+            StandaloneHostFds,
+            &mut guest,
+            carrick_guest_mem::GuestVa(0),
+            count,
+            0,
+            |_, _| panic!("invalid request must not reach the native wait"),
+        );
+        assert_eq!(result, errno.guest_retval());
+        assert_eq!(guest.read_bytes.get(), 0);
+        assert_eq!(guest.written_bytes, 0);
+    }
+}

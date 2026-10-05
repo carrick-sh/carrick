@@ -3,7 +3,7 @@ id = "x86.run-elf.poll"
 title = "Standalone x86 startup serves the normalized poll ABI"
 guest_surfaces = ["syscall:poll", "vmm:kvm", "vmm:bhyve", "vmm:nvmm"]
 semantic_authority = [
-  "Linux poll(2): integer millisecond timeout, readiness count, per-entry revents, negative descriptors ignored, invalid descriptors report POLLNVAL, invalid array reports EFAULT",
+  "Linux poll(2): integer millisecond timeout, readiness count, per-entry revents, negative descriptors ignored, invalid descriptors report POLLNVAL, invalid array reports EFAULT; every negative timeout means infinite; a pipe write end with no readers reports POLLERR even without requested events",
   "Committed hello-x86_64/oracle.expected: musl startup reaches main, writes the exact hello line, and exits zero",
 ]
 fixture = "carrick-x86::bringup_fns::poll_tests; carrick-vmm-kvm::live_vcpu_x86::test_m2_musl_static_hello"
@@ -22,7 +22,14 @@ poll, including entries with no requested events. Host interests are combined
 per descriptor, then readiness is copied to and counted for each original
 entry. Duplicate and distinct ready descriptor populations both retain the
 same exact guest-copy budgets. Invalid descriptors make the batch immediately
-ready; hangups are reported even with no requested events. This does not cover
+ready; hangups are reported even with no requested events. Every negative
+Linux timeout becomes native -1 unless invalid entries require immediate return.
+Pipe hangups are classified by fstat FIFO type and access mode once per distinct
+hung-up descriptor: broken write ends report ERR, read ends retain HUP.
+A bounded producer exercises positive waits; native-boundary EINTR injection
+checks errno translation, no retry and no copyout. The nfds limit is checked
+before memory access or a host wait, without changing process-wide limits.
+This does not cover
 the full kernel's virtual descriptor graph,
 signal delivery, or the standalone loop's pre-existing ppoll approximation.
 """
