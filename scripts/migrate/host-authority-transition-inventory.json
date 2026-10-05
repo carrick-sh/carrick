@@ -5064,18 +5064,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-host/src/host_proc.rs:1642 in `pid_info`, the host result from `std::fs::metadata` of host `/proc/<pid>` (its owner) determines the guest /proc process uid and gid returned on Linux hosts.",
+    "rationale": "At crates/carrick-host/src/host_proc.rs:1892 in `pid_info`, the host result from `std::fs::metadata` of host `/proc/<pid>` (its owner) determines the guest /proc process uid and gid returned on Linux hosts.",
     "review_id": "HA-000726",
     "source": {
-      "byte_end": 68964,
-      "byte_start": 68947,
+      "byte_end": 79295,
+      "byte_start": 79278,
       "column": 26,
       "column_end": 43,
       "column_start": 26,
       "file": "crates/carrick-host/src/host_proc.rs",
-      "line": 1642,
-      "line_end": 1642,
-      "line_start": 1642
+      "line": 1892,
+      "line_end": 1892,
+      "line_start": 1892
     }
   },
   {
@@ -6702,18 +6702,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-host/src/host_proc.rs:1621 in `aggregate_state`, the host result from `std::fs::read_dir` of host `/proc/<pid>/task` determines the guest /proc process run state that `pid_info` reports on Linux hosts.",
+    "rationale": "At crates/carrick-host/src/host_proc.rs:1871 in `aggregate_state`, the host result from `std::fs::read_dir` of host `/proc/<pid>/task` determines the guest /proc process run state that `pid_info` reports on Linux hosts.",
     "review_id": "HA-000729",
     "source": {
-      "byte_end": 68146,
-      "byte_start": 68129,
+      "byte_end": 78477,
+      "byte_start": 78460,
       "column": 23,
       "column_end": 40,
       "column_start": 23,
       "file": "crates/carrick-host/src/host_proc.rs",
-      "line": 1621,
-      "line_end": 1621,
-      "line_start": 1621
+      "line": 1871,
+      "line_end": 1871,
+      "line_start": 1871
     }
   },
   {
@@ -7975,18 +7975,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-host/src/host_proc.rs:1606 in `read_stat`, the host result from `std::fs::read_to_string` of host `/proc/<pid>/stat` determines the guest /proc process stat fields (comm, state, ppid, pgrp) that `pid_info` and `parent_pid` return on Linux hosts.",
+    "rationale": "At crates/carrick-host/src/host_proc.rs:1856 in `read_stat`, the host result from `std::fs::read_to_string` of host `/proc/<pid>/stat` determines the guest /proc process stat fields (comm, state, ppid, pgrp) that `pid_info` and `parent_pid` return on Linux hosts.",
     "review_id": "HA-000733",
     "source": {
-      "byte_end": 67365,
-      "byte_start": 67342,
+      "byte_end": 77696,
+      "byte_start": 77673,
       "column": 21,
       "column_end": 44,
       "column_start": 21,
       "file": "crates/carrick-host/src/host_proc.rs",
-      "line": 1606,
-      "line_end": 1606,
-      "line_start": 1606
+      "line": 1856,
+      "line_end": 1856,
+      "line_start": 1856
     }
   },
   {
@@ -8002,18 +8002,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-host/src/host_proc.rs:1788 in the Linux `self_resource_usage`, the host result from `std::fs::read_to_string` of the carrier's `/proc/self/statm` determines the guest process resource-usage result (VSZ/RSS).",
+    "rationale": "At crates/carrick-host/src/host_proc.rs:2038 in the Linux `self_resource_usage`, the host result from `std::fs::read_to_string` of the carrier's `/proc/self/statm` determines the guest process resource-usage result (VSZ/RSS).",
     "review_id": "HA-000734",
     "source": {
-      "byte_end": 74868,
-      "byte_start": 74845,
+      "byte_end": 85199,
+      "byte_start": 85176,
       "column": 32,
       "column_end": 55,
       "column_start": 32,
       "file": "crates/carrick-host/src/host_proc.rs",
-      "line": 1788,
-      "line_end": 1788,
-      "line_start": 1788
+      "line": 2038,
+      "line_end": 2038,
+      "line_start": 2038
     }
   },
   {
@@ -12801,18 +12801,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-host/src/host_proc.rs:1725 in the non-macOS `is_guest_process`, the host result from `std::process::id` anchors the host ppid-chain walk that determines the guest /proc process-membership result.",
+    "rationale": "At crates/carrick-host/src/host_proc.rs:1975 in the non-macOS `is_guest_process`, the host result from `std::process::id` anchors the host ppid-chain walk that determines the guest /proc process-membership result.",
     "review_id": "HA-000746",
     "source": {
-      "byte_end": 72211,
-      "byte_start": 72195,
+      "byte_end": 82542,
+      "byte_start": 82526,
       "column": 18,
       "column_end": 34,
       "column_start": 18,
       "file": "crates/carrick-host/src/host_proc.rs",
-      "line": 1725,
-      "line_end": 1725,
-      "line_start": 1725
+      "line": 1975,
+      "line_end": 1975,
+      "line_start": 1975
     }
   },
   {
