@@ -2878,72 +2878,15 @@ fn authenticate_pending_fork_receipts(
     })
 }
 
-/// Why a retirement receipt did or did not authenticate, clause by clause.
-///
-/// The abort this feeds is unrecoverable, so it must name the failing clause: a
-/// receipt that leaves the mm non-empty, one that covers a different number of
-/// mappings, and one that omits a pending fork frame call for entirely different
-/// fixes, and a bare "malformed" verdict cannot tell them apart.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
-struct PendingRetirementAudit {
-    mm_empty_at_revision: bool,
-    expected_non_empty: bool,
-    cardinality_matches: bool,
-    expected_authorized: bool,
-    pending_authorized: bool,
-}
-
+use carrick_core::mm::retirement::authenticate_pending_retirement;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl PendingRetirementAudit {
-    const fn ok(self) -> bool {
-        self.mm_empty_at_revision
-            && self.expected_non_empty
-            && self.cardinality_matches
-            && self.expected_authorized
-            && self.pending_authorized
+impl carrick_core::mm::retirement::PendingRetirementReference for PendingForkFrameReceipt {
+    fn child_mapping(&self) -> carrick_core_abi::MappingId {
+        self.child_mapping
     }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-fn authenticate_pending_retirement(
-    expected: &[(carrick_hal::MappingId, carrick_hal::FrameId)],
-    pending: &[PendingForkFrameReceipt],
-    receipt: &carrick_hal::FrameInventoryRetirementReceipt,
-) -> PendingRetirementAudit {
-    // O((n + p) log n): `authorizes` is a binary search over the receipt's
-    // sorted set, and pending receipts are matched against sorted expected
-    // mapping ids. Both were linear scans per element (O(n^2) and O(p*n)).
-    let mut expected_mappings: Vec<carrick_hal::MappingId> =
-        expected.iter().map(|&(mapping, _)| mapping).collect();
-    expected_mappings.sort_unstable();
-    PendingRetirementAudit {
-        mm_empty_at_revision: receipt.mm_empty_at_revision(),
-        expected_non_empty: !expected.is_empty(),
-        cardinality_matches: expected.len() == receipt.mapping_set().len(),
-        expected_authorized: expected
-            .iter()
-            .all(|&(mapping, frame)| receipt.authorizes(mapping, frame)),
-        // Only OUTSTANDING inheritances. A pending receipt records an
-        // obligation created at fork publication: "this child mapping holds a
-        // frame inherited from the parent". It is discharged either here, by the
-        // retirement unmapping that mapping with that frame, or EARLIER, when
-        // the mapping was superseded — `stage_cow_inventory_split` pushes its
-        // own `UnmapMapping` and `RetireFrame` for the old mapping and
-        // `commit_cow_inventory_split` drops the extent, all inside that
-        // transaction. Demanding that retirement account for an already-settled
-        // obligation is a category error, and it failed every forked child that
-        // wrote to an inherited page: the superseded mapping id is simply absent
-        // from the retirement's set. A mapping still live in `expected` must
-        // still retire under the frame it inherited.
-        pending_authorized: pending
-            .iter()
-            .filter(|pending| {
-                expected_mappings
-                    .binary_search(&pending.child_mapping)
-                    .is_ok()
-            })
-            .all(|pending| receipt.authorizes(pending.child_mapping, pending.frame)),
+    fn frame(&self) -> carrick_core_abi::FrameId {
+        self.frame
     }
 }
 
