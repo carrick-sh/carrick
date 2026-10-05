@@ -848,8 +848,62 @@ fn stopped_target_untouched_transfer_prepares_only_exact_owner_window() {
         tables: TableGrants::new(&[]).unwrap(),
     };
     let slot = carrick_el1_abi::PortalGrantSlot::new();
+    // Selection released its exclusion before host supply. Every changed
+    // determinant must refuse without publishing even one descriptor.
+    let bad_generation =
+        carrick_el1_abi::ReservationGeneration::new(window.generation.raw() + 1).unwrap();
+    let bad_source = carrick_el1_abi::HostBackingIdentity::new(nz(17), nz(3), 0);
+    for stale in [
+        carrick_el1_abi::PortalGrantWindow {
+            generation: bad_generation,
+            ..window
+        },
+        carrick_el1_abi::PortalGrantWindow {
+            range: ReservationRange::new(window.range.start(), window.range.end() + 4096).unwrap(),
+            ..window
+        },
+        carrick_el1_abi::PortalGrantWindow {
+            protection: ReservationProtection::from_bits(1).unwrap(),
+            ..window
+        },
+        carrick_el1_abi::PortalGrantWindow {
+            host_backing: Some(bad_source),
+            ..window
+        },
+        carrick_el1_abi::PortalGrantWindow {
+            operation: carrick_el1_abi::PortalOperation {
+                incarnation: nz(window.operation.incarnation.get() + 1),
+                ..window.operation
+            },
+            ..window
+        },
+    ] {
+        assert!(slot.submit(stale, &txn));
+        if stale.operation.incarnation != window.operation.incarnation {
+            assert_eq!(
+                serve_grant(&portal, &slot, &words, &residency, 0, || {}),
+                Err(MmError::Stale)
+            );
+            assert!(slot.withdraw(stale, &txn));
+        } else {
+            let receipt = serve_grant(&portal, &slot, &words, &residency, 0, || {})
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                receipt.outcome,
+                DescriptorOutcome::Refused(
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot
+                )
+            );
+            assert!(slot.take_receipt(stale, &txn).is_some());
+        }
+        assert!(residency.lookup(mm.raw(), VA).is_none());
+        assert_eq!(tables.words[1536].load(Ordering::Acquire), 0);
+    }
     assert!(slot.submit(window, &txn));
-    let receipt = serve_grant(&portal, &slot, &words, &residency, 0, || {}).unwrap();
+    let receipt = serve_grant(&portal, &slot, &words, &residency, 0, || {})
+        .unwrap()
+        .unwrap();
     assert!(
         matches!(receipt.outcome, DescriptorOutcome::Applied(_)),
         "{receipt:?}"
@@ -887,7 +941,9 @@ fn stopped_target_untouched_transfer_prepares_only_exact_owner_window() {
     assert_eq!(&bytes[7..11], b"lazy");
     // A fresh receipt cannot replace an already committed predecessor.
     assert!(slot.submit(window, &txn));
-    let refused = serve_grant(&portal, &slot, &words, &residency, 0, || {}).unwrap();
+    let refused = serve_grant(&portal, &slot, &words, &residency, 0, || {})
+        .unwrap()
+        .unwrap();
     assert!(matches!(refused.outcome, DescriptorOutcome::Refused(_)));
 }
 
@@ -1021,7 +1077,9 @@ fn partial_retired_compound_replacement_preserves_live_neighbor() {
     };
     let slot = carrick_el1_abi::PortalGrantSlot::new();
     assert!(slot.submit(window, &txn));
-    let receipt = serve_grant(&portal, &slot, &words, &residency, 0, || {}).unwrap();
+    let receipt = serve_grant(&portal, &slot, &words, &residency, 0, || {})
+        .unwrap()
+        .unwrap();
     assert!(
         matches!(receipt.outcome, DescriptorOutcome::Applied(_)),
         "{receipt:?}"
@@ -1067,7 +1125,9 @@ fn partial_retired_compound_replacement_preserves_live_neighbor() {
     );
     // A fresh receipt cannot replace an already committed predecessor.
     assert!(slot.submit(window, &txn));
-    let refused = serve_grant(&portal, &slot, &words, &residency, 0, || {}).unwrap();
+    let refused = serve_grant(&portal, &slot, &words, &residency, 0, || {})
+        .unwrap()
+        .unwrap();
     assert!(matches!(refused.outcome, DescriptorOutcome::Refused(_)));
 }
 
@@ -1852,7 +1912,9 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
     };
     let grant_slot = carrick_el1_abi::PortalGrantSlot::new();
     assert!(grant_slot.submit(window, &txn));
-    let receipt = serve_grant(&portal, &grant_slot, &words, &residency, 0, || {}).unwrap();
+    let receipt = serve_grant(&portal, &grant_slot, &words, &residency, 0, || {})
+        .unwrap()
+        .unwrap();
     assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
     assert!(grant_slot.take_receipt(window, &txn).is_some());
     let chunk = selected(
@@ -3618,4 +3680,190 @@ fn selected_data_retains_exact_pre_selection_reservation_observation() {
         source.observe(SpaceWaitCause::Reservations).revision(),
         revision
     );
+}
+
+#[test]
+fn grant_gate_closed_after_selection_preserves_exact_owner_wait() {
+    use carrick_el1_abi::PortalWaitCause;
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(
+        NonZeroU64::new(1).unwrap(),
+        region.table(),
+        &zone.spaces,
+        &view,
+    )
+    .with_zone(zone)
+    .unwrap();
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let transfer = portal
+        .begin(handle, GuestVa::new(VA), 4, TransferIntent::UserWrite, 0)
+        .unwrap();
+    let tables = Tables::new(ROOT, IPA, 0);
+    let TransferStep::Supply(window) = select(&portal, &transfer, &tables) else {
+        panic!("must select untouched owner window");
+    };
+    let index = zone.spaces.find(mm.raw()).unwrap();
+    let access = portal.space_access(1).unwrap();
+    access.raise(index);
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, TableGrants,
+    };
+    let txn = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: NonZeroU64::new(mm.raw()).unwrap(),
+            generation: NonZeroU64::new(1).unwrap(),
+        },
+        root: carrick_mmu_core::aarch64::SubstrateGpa(ROOT),
+        op: DescriptorOp::Retire(PageSpan::new(VA, 4096)),
+        tables: TableGrants::NONE,
+    };
+    let wire = carrick_el1_abi::PortalGrantSlot::new();
+    assert!(wire.submit(window, &txn));
+    let result = serve_grant(
+        &portal,
+        &wire,
+        &tables.live(&CallerInvalidatesAsid),
+        &residency(),
+        0,
+        || panic!("gate refusal must not complete a descriptor transaction"),
+    );
+    assert!(
+        wire.withdraw(window, &txn),
+        "the physical transaction must remain unclaimed"
+    );
+    assert!(!wire.has_outstanding_for(mm.raw()));
+    access.lower(index);
+    let Err(MmError::Wait(wait)) = result else {
+        panic!("gate after selection must retain owner wait, got {result:?}");
+    };
+    assert_eq!(wait.handle(), handle);
+    assert_eq!(wait.cause(), PortalWaitCause::Gate);
+    assert_eq!(transfer.offset(), 0);
+}
+
+#[test]
+fn grant_resume_reselects_generation_range_protection_and_source_changed_while_parked() {
+    use crate::memory::reservations::{Decision, Placement};
+    for change in ["generation", "range", "protection", "source"] {
+        let region = Region::new();
+        let zone = region.zone();
+        let mm = admit_notified(&region, 77, ROOT, 1, 0);
+        let view = nodes(&region);
+        let portal = MmPortal::new(
+            NonZeroU64::new(1).unwrap(),
+            region.table(),
+            &zone.spaces,
+            &view,
+        )
+        .with_zone(zone)
+        .unwrap();
+        let handle = portal.admitted_handle(mm, 0).unwrap();
+        let transfer = portal
+            .begin(handle, GuestVa::new(VA), 4, TransferIntent::UserWrite, 0)
+            .unwrap();
+        let tables = Tables::new(ROOT, IPA, 0);
+        let residency = residency();
+        let words = tables.live(&CallerInvalidatesAsid);
+        let TransferStep::Supply(window) = portal
+            .select(
+                &transfer,
+                &words,
+                &mut NoopPreparedResolver,
+                &mut NoopCowResolver,
+                &residency,
+                0,
+            )
+            .unwrap()
+        else {
+            panic!("missing initial supply");
+        };
+        let index = zone.spaces.find(mm.raw()).unwrap();
+        let access = portal.space_access(1).unwrap();
+        access.raise(index);
+        assert!(matches!(
+            grant_target(&portal, window, 0),
+            Err(MmError::Wait(_))
+        ));
+        let source = carrick_el1_abi::HostBackingIdentity::new(
+            NonZeroU64::new(73).unwrap(),
+            NonZeroU64::new(9).unwrap(),
+            8192,
+        );
+        {
+            let mut owner = portal.root(mm, 1).unwrap();
+            let range = ReservationRange::new(VA, VA + 4096).unwrap();
+            if change == "source" {
+                owner.retire_opaque(range).unwrap();
+                owner
+                    .insert_opaque_backed(
+                        range,
+                        ReservationProtection::READ_WRITE,
+                        carrick_el1_abi::ReservationNodeFlags::PRIVATE,
+                        Some(source),
+                    )
+                    .unwrap();
+            } else {
+                let decision = match change {
+                    "generation" => owner
+                        .mmap(
+                            Placement::Fixed(VA + 8192),
+                            4096,
+                            ReservationProtection::READ_WRITE,
+                        )
+                        .unwrap(),
+                    "range" => owner.munmap(range).unwrap(),
+                    "protection" => owner
+                        .mprotect(range, ReservationProtection::from_bits(1).unwrap())
+                        .unwrap(),
+                    _ => unreachable!(),
+                };
+                let Decision::Work(request) = decision else {
+                    panic!("missing owner edit");
+                };
+                // SAFETY: this isolated fixture has no resident descriptors or
+                // backing. The edit completes with exactly zero physical work.
+                let receipt = unsafe {
+                    carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
+                        request,
+                        carrick_el1_abi::ReservationBackingReceipt {
+                            receipt: request.sequence.raw(),
+                            granted_bytes: 0,
+                            returned_bytes: 0,
+                        },
+                    )
+                }
+                .unwrap();
+                owner.complete(receipt).unwrap();
+            }
+        }
+        access.lower(index);
+        let current = portal.select(
+            &transfer,
+            &words,
+            &mut NoopPreparedResolver,
+            &mut NoopCowResolver,
+            &residency,
+            0,
+        );
+        if change == "range" || change == "protection" {
+            assert_eq!(current, Err(MmError::Fault), "{change}");
+        } else {
+            let Ok(TransferStep::Supply(fresh)) = current else {
+                panic!("{change}: {current:?}");
+            };
+            assert_ne!(fresh.generation, window.generation, "{change}");
+            assert_eq!(fresh.operation.incarnation, window.operation.incarnation);
+            assert_eq!(fresh.host_backing, (change == "source").then_some(source));
+        }
+        assert_eq!(
+            transfer.offset(),
+            0,
+            "no source bytes consumed before admission"
+        );
+        assert!(residency.lookup(mm.raw(), VA).is_none());
+        assert_eq!(tables.words[1536].load(Ordering::Acquire), 0);
+    }
 }
