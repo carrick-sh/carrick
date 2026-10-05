@@ -35,6 +35,9 @@ Permission to signal is independent of permission to reap an adopted child.
   Exit watches register on the selected
   process and are authenticated again after registration. Reaping compares the
   same incarnation; it never waits on a replacement using `kill(pid, 0)`.
+  Queries request zombie entries explicitly: NOTE_EXIT certifies exit, and
+  `exited_child_is_not_reaped_until_waitpid` requires a child's identity to stay
+  present until its parent's actual wait/reap.
   Deterministic model tests cover exit, reap and reuse before each signal check.
   There is still a window **after the final successful proc_pidinfo comparison
   and before PID-only kill acquires the kernel process reference**. A process
