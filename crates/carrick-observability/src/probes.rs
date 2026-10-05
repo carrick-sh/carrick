@@ -5521,6 +5521,11 @@ mod real {
         /// 9=cumulative total enclosing phases 0..=8), parent PID, child PID
         /// (zero before allocation), forking TID, elapsed nanoseconds.
         fn hvpatch__fork__runtime__stage(_: u32, _: i32, _: i32, _: i32, _: u64) {}
+        /// Owner Fork refused before task publication. Args: raw Linux errno,
+        /// service stage (0 slot, 1 operation, 2 parent space, 3 table pool,
+        /// 4 census, 5 prepare, 6 custody, 7 owner publication, 8 receipt),
+        /// parent MM, child MM, and parent reservation generation.
+        fn hvpatch__owner__fork__refusal(_: u32, _: u64, _: u64, _: u64, _: u64) {}
         /// Mutually exclusive process-spec construction stages. Args: phase
         /// (0=parent tables load, 1=vCPU snapshot, 2=parent table clone,
         /// 3=rebase, 4=alias union, 5=private snapshot, 6=validation,
@@ -7432,6 +7437,19 @@ mod real {
     }
 
     #[inline(never)]
+    pub fn hvpatch_owner_fork_refusal(
+        errno: u32,
+        stage: u64,
+        parent_mm: u64,
+        child_mm: u64,
+        generation: u64,
+    ) {
+        carrick_usdt::hvpatch__owner__fork__refusal!(|| (
+            errno, stage, parent_mm, child_mm, generation
+        ));
+    }
+
+    #[inline(never)]
     pub fn hvpatch_fork_process_spec_stage(event: super::HvpatchForkProcessSpecStage) {
         carrick_usdt::hvpatch__fork__process__spec__stage!(|| (
             event.phase().raw(),
@@ -9252,6 +9270,7 @@ mod stub {
     stub!(hvpatch_exec_runtime_stage(event: super::HvpatchExecRuntimeStage));
     stub!(hvpatch_topology_lock(event: super::HvpatchTopologyLock));
     stub!(hvpatch_fork_runtime_stage(event: super::HvpatchForkRuntimeStage));
+    stub!(hvpatch_owner_fork_refusal(errno: u32, stage: u64, parent_mm: u64, child_mm: u64, generation: u64));
     stub!(hvpatch_fork_process_spec_stage(event: super::HvpatchForkProcessSpecStage));
     stub!(hvpatch_fork_private_snapshot(event: super::HvpatchForkPrivateSnapshot));
     stub!(hvpatch_fork_private_snapshot_outcome(event: super::HvpatchForkPrivateSnapshotOutcome));

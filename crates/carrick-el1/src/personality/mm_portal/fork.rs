@@ -1058,6 +1058,7 @@ pub(super) fn reconcile_pending_parent_write<W: LiveDescriptorWords + ?Sized>(
 #[cfg(target_os = "none")]
 pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     use carrick_mmu_core::aarch64::descriptor_txn::{CallerInvalidatesAsid, PrimaryTableWords};
+    frame.x[1] = 0; // Slot claim.
     let slots =
         unsafe { &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots) };
     let Some(slot) = slots.fork(frame.slot as usize) else {
@@ -1069,7 +1070,8 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         return;
     };
     let request = service.request();
-    let run = || -> Result<PortalForkCompletion, MmError> {
+    let mut run = || -> Result<PortalForkCompletion, MmError> {
+        frame.x[1] = 1; // Exact operation and outstanding work.
         if slots.carrier() != Some(request.operation.carrier) {
             return Err(MmError::Stale);
         }
@@ -1091,6 +1093,7 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             nodes: None,
             zone: Some(zone),
         };
+        frame.x[1] = 2; // Parent space and grant.
         let index = zone
             .spaces
             .find(request.operation.mm.raw())
@@ -1100,6 +1103,7 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             .grant(index, request.operation.mm.raw())
             .ok_or(MmError::Busy)?;
         let base = grant.ttbr0 & PA;
+        frame.x[1] = 3; // Physical table pool and live word access.
         let pool = carrick_el1_abi::stage1_table_pool_window();
         for arena in [request.child_tables, request.parent_tables] {
             if arena.base < pool.physical_base
@@ -1122,17 +1126,22 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             .and_then(|words| words.with_window(pool))
         }
         .map_err(|_| MmError::Core)?;
+        frame.x[1] = 4; // Reachable graph census.
         let scratch = portal.census_fork(request, &words, frame.slot as u32)?;
+        frame.x[1] = 5; // Owner fork preparation.
         let plan = portal.prepare_fork(request, scratch, &words, frame.slot as u32)?;
+        frame.x[1] = 6; // Exact physical custody.
         for (index, custody) in plan.custody().iter().copied().enumerate() {
             if !service.retain(index as u64, custody, super::production::yield_host_effect) {
                 return Err(MmError::Busy);
             }
         }
+        frame.x[1] = 7; // Parent and closed child publication.
         let child = portal.publish_fork(plan, &words, frame.slot as u32)?;
         crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, grant.ttbr0);
         let completion = child.completion();
         *pending.lock() = Some(child);
+        frame.x[1] = 8; // Detached receipt publication.
         service.publish_detached(completion).ok_or(MmError::Stale)?;
         Ok(completion)
     };
