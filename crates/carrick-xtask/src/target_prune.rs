@@ -1,13 +1,21 @@
-//! One portable, Rust-generated pruning body, shared by local and SSH execution.
+//! Target cleanup with lifetime-held directory and native Cargo authorities.
 use crate::host_lease::{DEFAULT_LOCK_PATH, HostLease};
+use crate::prune_fs as at;
 use crate::remote_accept::shell_quote;
 use crate::worktree_gc::{GcError, WorktreeGcArgs};
-use std::fs;
-use std::io::Write;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, Metadata};
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+type CensusHandles = BTreeMap<i32, PathBuf>;
 struct CheckoutGuard(PathBuf);
-
 impl CheckoutGuard {
     fn claim(path: &Path) -> std::io::Result<Option<Self>> {
         match fs::create_dir(path) {
@@ -24,7 +32,6 @@ impl CheckoutGuard {
         }
     }
 }
-
 impl Drop for CheckoutGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(self.0.join("run_id"));
@@ -32,250 +39,461 @@ impl Drop for CheckoutGuard {
     }
 }
 
-// An empty census or complete records for exclusively held native locks prove
-// idle. A file query and +D both retain warnings as unknown visibility.
-const LOCK_FIELD_PARSER: &str = r#"
-    /^p[1-9][0-9]*$/ {
-        if (pid && (!file || !name)) bad=1;
-        pid=substr($0,2); file=0; name=0; next
-    }
-    /^f[0-9]+$/ {
-        if (!pid || (file && !name) || descriptors[pid SUBSEP $0]++) bad=1;
-        file=1; name=0; next
-    }
-    /^n/ {
-        if (!pid || !file || name || (substr($0,2)!=debug && substr($0,2)!=release)) bad=1;
-        name=1; seen=1; next
-    }
-    { bad=1 }
-    END { exit (bad || !seen || !file || !name) ? 1 : 0 }
-"#;
-
-const IDLE_CENSUS: &str = r#"
-idle() {
-    if [ -d "$1" ]; then set -- -F pfn +D "$1"; else set -- -F pfn "$1"; fi
-    if [ "$uid" = 0 ]; then
-        if "$lsof_bin" "$@" > "$state/use.out" 2> "$state/use.err"; then code=0; else code=$?; fi
-    else
-        if sudo -n -u root "$lsof_bin" "$@" > "$state/use.out" 2> "$state/use.err"; then code=0; else code=$?; fi
-    fi
-    [ ! -s "$state/use.err" ] || return 1
-    if [ ! -s "$state/use.out" ]; then [ "$code" = 1 ]; return; fi
-    case "$code" in 0|1) ;; *) return 1;; esac
-    # Inherited guardians appear in the target census. Exempt only the two
-    # exact native lock paths held exclusively; keep every artifact visible.
-    awk -v debug="${CARRICK_PRUNE_TARGET:-}/debug/.cargo-lock" -v release="${CARRICK_PRUNE_TARGET:-}/release/.cargo-lock" '
-        LOCK_FIELD_PARSER
-    ' "$state/use.out"
-}
-"#;
-
-// find rounds mtime down to full days: +1 means at least two full days old.
-// Checking every descendant also preserves new contents inside an old parent.
-const AGE_QUERY: &str =
-    r#"find "$entry" \( ! -mtime "$age" -o -type l -o \( -type f -links +1 \) \) -print"#;
-
-const TARGET_IDENTITY_CHECK: &str = r#"use Fcntl qw(:mode);
-my ($target, $device, $inode) = @ARGV;
-my @current = lstat($target);
-die "target identity changed before pruning\n"
-    unless @current && S_ISDIR($current[2]) && $current[0] == $device && $current[1] == $inode;
-"#;
-
-const CANDIDATES: &str = r#"
-for entry do
-    if ! AGE_QUERY > "$state/age"; then exit 1; fi
-    [ ! -s "$state/age" ] || continue
-    if ! du -sk "$entry" > "$state/du"; then exit 1; fi
-    allocated=$(awk '{printf "%.0f", $1 * 1024}' "$state/du") || exit 1
-    case "$allocated" in ''|*[!0-9]*) printf 'target pruning: invalid byte accounting\n' >&2; exit 1;; esac
-    if [ "$apply" = 1 ]; then
-        idle "$entry" || continue
-        # Recheck the descendant age proof after the census.
-        if ! AGE_QUERY > "$state/age"; then exit 1; fi
-        [ ! -s "$state/age" ] || continue
-        TARGET_IDENTITY_CHECK || exit 1
-        printf '%s\n' "$allocated" >> "$state/bytes" || exit 1
-        rm -rf -- "$entry" || exit 1
-        action=pruned
-    else
-        printf '%s\n' "$allocated" >> "$state/bytes" || exit 1
-        action=eligible
-    fi
-    printf '%s %s allocated bytes | %s\n' "$action" "$allocated" "$entry" || exit 1
-done
-"#;
-
-// Cargo holds the profile's .cargo-lock while using artifacts. An exclusive
-// lock excludes both older exclusive Cargo locks and newer shared Cargo locks.
-// Inherit the handles through exec so parent death cannot release exclusion
-// while the deletion shell or one of its utilities remains alive.
-const CARGO_TARGET_LOCKS: &str = r#"use Fcntl qw(:flock :DEFAULT :mode F_GETFD F_SETFD FD_CLOEXEC);
-use File::Path qw(make_path);
-use Cwd qw(abs_path);
-my $input = shift @ARGV;
-my $target = abs_path($input) // die "target canonicalization: $!\n";
-sysopen(my $root, $target, O_RDONLY | O_NOFOLLOW) or die "target identity open: $!\n";
-my @identity = stat($root);
-my @source = stat($input);
-die "target identity changed during canonicalization\n"
-    unless @identity && @source && S_ISDIR($identity[2])
-        && $identity[0] == $source[0] && $identity[1] == $source[1];
-close($root) or die "target identity close: $!\n";
-my @locks;
-for my $profile ('debug', 'release') {
-    my $directory = "$target/$profile";
-    next if -l $directory;
-    make_path($directory);
-    sysopen(my $lock, "$directory/.cargo-lock", O_RDWR | O_CREAT | O_NOFOLLOW, 0666)
-        or die "Cargo target lock open: $!\n";
-    unless (flock($lock, LOCK_EX | LOCK_NB)) {
-        print "keep target (Cargo lock is held) | $target\n";
-        exit 0;
-    }
-    my $flags = fcntl($lock, F_GETFD, 0);
-    die "Cargo lock descriptor flags: $!\n" unless defined $flags;
-    fcntl($lock, F_SETFD, $flags & ~FD_CLOEXEC) or die "Cargo lock inheritance: $!\n";
-    push @locks, $lock;
-}
-my @current = lstat($target);
-die "target identity changed during lock acquisition\n"
-    unless @current && S_ISDIR($current[2]) && $current[0] == $identity[0] && $current[1] == $identity[1];
-$ENV{CARRICK_PRUNE_TARGET} = $target;
-$ENV{CARRICK_PRUNE_DEVICE} = $identity[0];
-$ENV{CARRICK_PRUNE_INODE} = $identity[1];
-system(@ARGV);
-die "target prune spawn: $!\n" if $? == -1;
-exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
-"#;
-
-fn pruning_body(targets: &[PathBuf], days: u64, apply: bool) -> Result<String, GcError> {
-    pruning_body_with_census(targets, days, apply, IDLE_CENSUS)
+#[derive(clap::Args, Debug)]
+pub struct TargetPruneArgs {
+    /// Require the descriptor-anchored helper protocol; old helpers fail closed.
+    #[arg(long, value_enum)]
+    pub protocol: PruneProtocol,
+    #[arg(long)]
+    pub dev_root: PathBuf,
+    #[arg(long)]
+    pub target_dir: PathBuf,
+    #[arg(long, default_value_t = 2)]
+    pub days: u64,
+    #[arg(long)]
+    pub apply: bool,
 }
 
-fn pruning_body_with_census(
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+pub enum PruneProtocol {
+    #[value(name = "fd-v1")]
+    DirectoryDescriptors,
+}
+
+fn cutoff(days: u64) -> Result<i128, GcError> {
+    if days == 0 || days > i32::MAX as u64 {
+        return Err(GcError::Census(
+            "artifact age must be 1..=2147483647 days".into(),
+        ));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| GcError::Census(e.to_string()))?;
+    Ok(now.as_nanos() as i128 - i128::from(days) * 86_400 * 1_000_000_000)
+}
+fn identity(a: &Metadata, b: &Metadata) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino() && a.file_type() == b.file_type()
+}
+fn unchanged(a: &Metadata, b: &Metadata) -> bool {
+    identity(a, b)
+        && a.mtime() == b.mtime()
+        && a.mtime_nsec() == b.mtime_nsec()
+        && a.len() == b.len()
+        && a.nlink() == b.nlink()
+        && a.blocks() == b.blocks()
+}
+fn allocated(total: u64, blocks: u64) -> Result<u64, GcError> {
+    blocks
+        .checked_mul(512)
+        .and_then(|bytes| total.checked_add(bytes))
+        .ok_or_else(|| GcError::Census("allocated byte accounting overflow".into()))
+}
+fn keepable(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::ENOENT | libc::ELOOP | libc::ENOTDIR)
+    )
+}
+
+struct Tree {
+    file: File,
+    metadata: Metadata,
+    children: Vec<(OsString, Tree)>,
+    bytes: u64,
+}
+impl Tree {
+    fn capture(
+        parent: &File,
+        name: &OsStr,
+        device: u64,
+        cutoff: i128,
+    ) -> Result<Option<Self>, GcError> {
+        let file = match at::open(parent, name, false) {
+            Ok(file) => file,
+            Err(error) if keepable(&error) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = file.metadata()?;
+        let modified =
+            i128::from(metadata.mtime()) * 1_000_000_000 + i128::from(metadata.mtime_nsec());
+        if metadata.dev() != device
+            || modified > cutoff
+            || (!metadata.is_dir() && (!metadata.is_file() || metadata.nlink() != 1))
+        {
+            return Ok(None);
+        }
+        let mut bytes = allocated(0, metadata.blocks())?;
+        let mut children = Vec::new();
+        if metadata.is_dir() {
+            for name in at::entries(&file)? {
+                let Some(child) = Self::capture(&file, &name, device, cutoff)? else {
+                    return Ok(None);
+                };
+                bytes = bytes
+                    .checked_add(child.bytes)
+                    .ok_or_else(|| GcError::Census("allocated byte accounting overflow".into()))?;
+                children.push((name, child));
+            }
+        }
+        if !unchanged(&metadata, &file.metadata()?) || !at::same(parent, name, &metadata)? {
+            return Err(GcError::Census(
+                "artifact changed during descriptor traversal".into(),
+            ));
+        }
+        Ok(Some(Self {
+            file,
+            metadata,
+            children,
+            bytes,
+        }))
+    }
+    fn register(&self, path: &Path, handles: &mut CensusHandles) {
+        handles.insert(self.file.as_raw_fd(), path.to_owned());
+        for (name, child) in &self.children {
+            child.register(&path.join(name), handles);
+        }
+    }
+    fn valid(&self, parent: &File, name: &OsStr) -> Result<bool, GcError> {
+        if !at::same(parent, name, &self.metadata)?
+            || !unchanged(&self.metadata, &self.file.metadata()?)
+        {
+            return Ok(false);
+        }
+        if self.metadata.is_dir() {
+            if at::entries(&self.file)?
+                != self
+                    .children
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>()
+            {
+                return Ok(false);
+            }
+            for (name, child) in &self.children {
+                if !child.valid(&self.file, name)? {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+    fn remove(&self, parent: &File, name: &OsStr) -> Result<(), GcError> {
+        if !at::same(parent, name, &self.metadata)? {
+            return Err(GcError::Census(
+                "staged entry changed; preserved for recovery".into(),
+            ));
+        }
+        if self.metadata.is_dir() {
+            self.file
+                .set_permissions(fs::Permissions::from_mode(self.metadata.mode() | 0o700))?;
+        }
+        for (name, child) in &self.children {
+            child.remove(&self.file, name)?;
+        }
+        at::unlink(parent, name, self.metadata.is_dir())?;
+        Ok(())
+    }
+}
+
+// Require complete owned records AND every anchored object in the queried
+// subtree. An empty census cannot conceal a path swapped during lsof's walk.
+fn idle_fields(code: Option<i32>, stdout: &[u8], stderr: &[u8], handles: &CensusHandles) -> bool {
+    if !matches!(code, Some(0 | 1)) || !stderr.is_empty() || stdout.is_empty() || handles.is_empty()
+    {
+        return false;
+    }
+    let mut processes = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut pid = None;
+    let mut descriptor = None;
+    let mut named = false;
+    let Some(records) = stdout.strip_suffix(b"\n") else {
+        return false;
+    };
+    for field in records.split(|b| *b == b'\n') {
+        let Some((&tag, value)) = field.split_first() else {
+            return false;
+        };
+        match tag {
+            b'p' => {
+                if pid.is_some() && (descriptor.is_none() || !named) {
+                    return false;
+                }
+                let Ok(value) = std::str::from_utf8(value) else {
+                    return false;
+                };
+                let Ok(process) = value.parse::<u32>() else {
+                    return false;
+                };
+                if process != std::process::id()
+                    || value != process.to_string()
+                    || !processes.insert(process)
+                {
+                    return false;
+                }
+                pid = Some(process);
+                descriptor = None;
+                named = false;
+            }
+            b'f' => {
+                if pid.is_none() || (descriptor.is_some() && !named) {
+                    return false;
+                }
+                let Ok(value) = std::str::from_utf8(value) else {
+                    return false;
+                };
+                let Ok(fd) = value.parse::<i32>() else {
+                    return false;
+                };
+                if value != fd.to_string() || !handles.contains_key(&fd) || !seen.insert(fd) {
+                    return false;
+                }
+                descriptor = Some(fd);
+                named = false;
+            }
+            b'n' => {
+                let Some(fd) = descriptor else {
+                    return false;
+                };
+                if named
+                    || handles
+                        .get(&fd)
+                        .is_none_or(|path| path.as_os_str().as_bytes() != value)
+                {
+                    return false;
+                }
+                named = true;
+            }
+            _ => return false,
+        }
+    }
+    named && seen.len() == handles.len()
+}
+fn census_output(path: &Path, directory: bool) -> Option<std::process::Output> {
+    let lsof = std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join("lsof"))
+            .find(|file| {
+                fs::metadata(file)
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            })
+            .and_then(|file| fs::canonicalize(file).ok())
+    })?;
+    // SAFETY: geteuid has no preconditions and observes the invoking user.
+    let mut command = if unsafe { libc::geteuid() } == 0 {
+        Command::new(lsof)
+    } else {
+        let mut command = Command::new("sudo");
+        command.args(["-n", "-u", "root"]).arg(lsof);
+        command
+    };
+    command.args(["-F", "pfn"]);
+    if directory {
+        command.arg("+D");
+    }
+    command.arg(path).output().ok()
+}
+fn census(path: &Path, directory: bool, handles: &CensusHandles) -> bool {
+    census_output(path, directory)
+        .is_some_and(|out| idle_fields(out.status.code(), &out.stdout, &out.stderr, handles))
+}
+
+fn stage(root: &File) -> Result<(OsString, File), GcError> {
+    let mut random = [0; 16];
+    File::open("/dev/urandom")?.read_exact(&mut random)?;
+    let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let name = OsString::from(format!(".carrick-prune-{token}"));
+    at::mkdir(root, &name)?;
+    let directory = at::open(root, &name, true)?;
+    Ok((name, directory))
+}
+
+fn prune_target(
+    target: &Path,
+    cutoff: i128,
+    apply: bool,
+    writer: &mut impl Write,
+    before_delete: &mut impl FnMut(),
+) -> Result<u64, GcError> {
+    let source = match fs::symlink_metadata(target) {
+        Ok(meta) if meta.is_dir() => meta,
+        Ok(_) => {
+            writeln!(
+                writer,
+                "keep target (symlink or non-directory) | {}",
+                target.display()
+            )?;
+            return Ok(0);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    let canonical = fs::canonicalize(target)?;
+    let root = at::root(&canonical)?;
+    let root_meta = root.metadata()?;
+    if !identity(&source, &root_meta) {
+        return Err(GcError::Census(
+            "target changed during authentication".into(),
+        ));
+    }
+    let mut handles = CensusHandles::from([(root.as_raw_fd(), canonical.clone())]);
+    let mut profiles = Vec::new();
+    for name in ["debug", "release"] {
+        let directory = match at::open(&root, OsStr::new(name), true) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                at::mkdir(&root, OsStr::new(name))?;
+                at::open(&root, OsStr::new(name), true)?
+            }
+            Err(error) if keepable(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if directory.metadata()?.dev() != root_meta.dev() {
+            return Err(GcError::Census("profile crosses target filesystem".into()));
+        }
+        let lock = at::lock(&directory)?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => {
+                writeln!(
+                    writer,
+                    "keep target (Cargo lock is held) | {}",
+                    canonical.display()
+                )?;
+                return Ok(0);
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        handles.insert(directory.as_raw_fd(), canonical.join(name));
+        handles.insert(lock.as_raw_fd(), canonical.join(name).join(".cargo-lock"));
+        profiles.push((name, directory, lock));
+    }
+    if !identity(&root_meta, &fs::symlink_metadata(&canonical)?) {
+        return Err(GcError::Census(
+            "target changed during lock acquisition".into(),
+        ));
+    }
+    if !census(&canonical, true, &handles) {
+        writeln!(
+            writer,
+            "keep target (in use or unknown visibility) | {}",
+            canonical.display()
+        )?;
+        return Ok(0);
+    }
+    let mut total: u64 = 0;
+    for (profile, directory, _lock) in &profiles {
+        for kind in ["deps", "build", ".fingerprint"] {
+            let parent = match at::open(directory, OsStr::new(kind), true) {
+                Ok(parent) => parent,
+                Err(error) if keepable(&error) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let kind_path = canonical.join(profile).join(kind);
+            for name in at::entries(&parent)? {
+                let Some(tree) = Tree::capture(&parent, &name, root_meta.dev(), cutoff)? else {
+                    continue;
+                };
+                let path = kind_path.join(&name);
+                let mut candidate_handles = CensusHandles::new();
+                tree.register(&path, &mut candidate_handles);
+                if !census(&path, tree.metadata.is_dir(), &candidate_handles) {
+                    continue;
+                }
+                if !tree.valid(&parent, &name)?
+                    || !identity(&root_meta, &fs::symlink_metadata(&canonical)?)
+                {
+                    return Err(GcError::Census(
+                        "target or artifact changed before pruning".into(),
+                    ));
+                }
+                let next_total = total
+                    .checked_add(tree.bytes)
+                    .ok_or_else(|| GcError::Census("allocated byte accounting overflow".into()))?;
+                if apply {
+                    // The regression pauses here, AFTER the final path identity check.
+                    // Everything below addresses retained directory descriptors only.
+                    before_delete();
+                    root.set_permissions(fs::Permissions::from_mode(root_meta.mode() | 0o700))?;
+                    parent.set_permissions(fs::Permissions::from_mode(
+                        parent.metadata()?.mode() | 0o700,
+                    ))?;
+                    let (stage_name, staged) = stage(&root)?;
+                    at::rename(&parent, &name, &staged, OsStr::new("artifact"))?;
+                    if !tree.valid(&staged, OsStr::new("artifact"))? {
+                        return Err(GcError::Census(format!(
+                            "changed candidate preserved in {}/{}",
+                            canonical.display(),
+                            stage_name.to_string_lossy()
+                        )));
+                    }
+                    tree.remove(&staged, OsStr::new("artifact"))?;
+                    at::unlink(&root, &stage_name, true)?;
+                }
+                total = next_total;
+                writeln!(
+                    writer,
+                    "{} {} allocated bytes | {}",
+                    if apply { "pruned" } else { "eligible" },
+                    tree.bytes,
+                    path.display()
+                )?;
+            }
+        }
+    }
+    Ok(total)
+}
+fn prune_targets(
     targets: &[PathBuf],
     days: u64,
     apply: bool,
-    idle_census: &str,
-) -> Result<String, GcError> {
-    let idle_census = idle_census.replace("LOCK_FIELD_PARSER", LOCK_FIELD_PARSER);
-    let identity_check = format!(
-        "/usr/bin/perl -e {} \"$CARRICK_PRUNE_TARGET\" \"$CARRICK_PRUNE_DEVICE\" \"$CARRICK_PRUNE_INODE\"",
-        shell_quote(TARGET_IDENTITY_CHECK)
-    );
-    let older_than = days
-        .checked_sub(1)
-        .filter(|_| days <= i32::MAX as u64)
-        .ok_or_else(|| GcError::Census("artifact age must be 1..=2147483647 days".into()))?;
-    let candidate = format!(
-        "set -u\napply=$1; age=$2; state=$3; lsof_bin=$4; uid=$5; shift 5\n{idle_census}\n{}",
-        CANDIDATES
-            .replace("AGE_QUERY", AGE_QUERY)
-            .replace("TARGET_IDENTITY_CHECK", &identity_check)
-    );
-    let paths = targets
-        .iter()
-        .map(|path| {
-            path.to_str()
-                .map(shell_quote)
-                .ok_or_else(|| GcError::Census("target path is not UTF-8".into()))
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .join(" ");
-    let candidate = shell_quote(&candidate);
-    let target_body = shell_quote(&format!(
-        r#"set -u
-target=$CARRICK_PRUNE_TARGET; apply=$2; age=$3; state=$4; lsof_bin=$5; uid=$6
-{identity_check} || exit 1
-{idle_census}
-if [ ! -x "$lsof_bin" ] || ! idle "$target"; then
-    printf 'keep target (in use or unknown visibility) | %s\n' "$target"
-    exit 0
-fi
-for profile in debug release; do
-    [ ! -L "$target/$profile" ] || continue
-    for kind in deps build .fingerprint; do
-        directory="$target/$profile/$kind"
-        [ -d "$directory" ] && [ ! -L "$directory" ] || continue
-        find "$directory" -mindepth 1 -maxdepth 1 -exec /bin/sh -c {candidate} sh "$apply" "$age" "$state" "$lsof_bin" "$uid" {{}} + || exit 1
-    done
-done
-"#
-    ));
-    let locks = shell_quote(CARGO_TARGET_LOCKS);
-    let apply = u8::from(apply);
-    Ok(format!(
-        r#"set -u
-apply={apply}
-age=+{older_than}
-for tool in find du awk mktemp rm id /bin/sh /usr/bin/perl; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        printf 'target pruning: missing required utility: %s\n' "$tool" >&2
-        exit 1
-    fi
-done
-state=$(mktemp -d "${{TMPDIR:-/tmp}}/carrick-target-prune.XXXXXX") || exit 1
-trap 'rm -rf -- "$state"' EXIT
-: > "$state/bytes" || exit 1
-lsof_bin=$(command -v lsof) || lsof_bin=
-uid=$(id -u) || exit 1
-set -- {paths}
-for target do
-    [ -d "$target" ] || continue
-    if [ -L "$target" ]; then
-        printf 'keep target (symlink) | %s\n' "$target"
-        continue
-    fi
-    /usr/bin/perl -e {locks} "$target" /bin/sh -c {target_body} sh "$target" "$apply" "$age" "$state" "$lsof_bin" "$uid" || exit 1
-done
-if [ "$apply" = 1 ]; then action=freed; else action='would free'; fi
-bytes=$(awk '{{total += $1}} END {{printf "%.0f", total}}' "$state/bytes") || exit 1
-case "$bytes" in ''|*[!0-9]*) printf 'target pruning: invalid total accounting\n' >&2; exit 1;; esac
-printf 'target pruning: %s %s allocated bytes (age >= {days} days)\n' "$action" "$bytes"
-"#
-    ))
+    writer: &mut impl Write,
+) -> Result<(), GcError> {
+    let cutoff = cutoff(days)?;
+    let mut total: u64 = 0;
+    for target in targets {
+        total = total
+            .checked_add(prune_target(target, cutoff, apply, writer, &mut || {})?)
+            .ok_or_else(|| GcError::Census("allocated byte accounting overflow".into()))?;
+    }
+    writeln!(
+        writer,
+        "target pruning: {} {} allocated bytes (age >= {days} days)",
+        if apply { "freed" } else { "would free" },
+        total
+    )?;
+    Ok(())
 }
-
-/// Stock Perl supplies BSD flock on macOS, which ships no flock executable.
-/// Inherit its descriptor into deletion children; never unlink a live lease.
-const REMOTE_LEASE: &str = r#"use Fcntl qw(:flock F_GETFD F_SETFD FD_CLOEXEC);
-my $path = shift @ARGV;
-open(my $lock, '>>', $path) or die "host lease open: $!\n";
-chmod 0666, $path;
-unless (flock($lock, LOCK_EX | LOCK_NB)) {
-    print "target pruning skipped: host lease is held\n";
-    exit 0;
+fn guarded(
+    dev: &Path,
+    targets: &[PathBuf],
+    days: u64,
+    apply: bool,
+    writer: &mut impl Write,
+) -> Result<(), GcError> {
+    cutoff(days)?;
+    let Some(_checkout) = CheckoutGuard::claim(&dev.join("gate-worktree.lock"))? else {
+        writeln!(writer, "target pruning skipped: gate checkout lock is held")?;
+        return Ok(());
+    };
+    let path = std::env::var_os("CARRICK_HOST_LEASE_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_PATH));
+    let Some(_lease) = HostLease::try_exclusive(&path)? else {
+        writeln!(writer, "target pruning skipped: host lease is held")?;
+        return Ok(());
+    };
+    prune_targets(targets, days, apply, writer)
 }
-my $flags = fcntl($lock, F_GETFD, 0);
-die "host lease descriptor flags: $!\n" unless defined $flags;
-fcntl($lock, F_SETFD, $flags & ~FD_CLOEXEC) or die "host lease inheritance: $!\n";
-system(@ARGV);
-die "target pruning spawn: $!\n" if $? == -1;
-exit(($? & 127) ? 128 + ($? & 127) : $? >> 8);
-"#;
-
-pub(crate) fn remote_script(remote_root: &str) -> Result<String, GcError> {
-    let lock = shell_quote(&format!("{remote_root}/gate-worktree.lock"));
-    let env = shell_quote(&format!("{remote_root}/env.sh"));
-    let target = PathBuf::from(format!("{remote_root}/gate-worktree/target"));
-    let body = shell_quote(&pruning_body(&[target], 2, true)?);
-    let perl = shell_quote(REMOTE_LEASE);
-    Ok(format!(
-        r#"set -u
-if [ -f {env} ]; then . {env}; fi
-lock={lock}
-if ! mkdir "$lock"; then
-    printf 'target pruning skipped: gate checkout lock is held\n'
-    exit 0
-fi
-trap 'rm -f "$lock/run_id"; rmdir "$lock"' EXIT
-printf 'target-prune-%s\n' "$$" > "$lock/run_id" || exit 1
-/usr/bin/perl -e {perl} "${{CARRICK_HOST_LEASE_PATH:-{DEFAULT_LOCK_PATH}}}" /bin/sh -c {body}
-"#
-    ))
+pub(crate) fn run_helper(args: TargetPruneArgs, writer: &mut impl Write) -> Result<(), GcError> {
+    guarded(
+        &args.dev_root,
+        &[args.target_dir],
+        args.days,
+        args.apply,
+        writer,
+    )
 }
-
 pub(crate) fn run(
     root: &Path,
     args: WorktreeGcArgs,
@@ -284,17 +502,6 @@ pub(crate) fn run(
     let dev = root
         .parent()
         .ok_or_else(|| GcError::Census("checkout has no parent directory".into()))?;
-    let Some(_checkout) = CheckoutGuard::claim(&dev.join("gate-worktree.lock"))? else {
-        writeln!(writer, "target pruning skipped: gate checkout lock is held")?;
-        return Ok(());
-    };
-    let lease_path = std::env::var_os("CARRICK_HOST_LEASE_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_LOCK_PATH));
-    let Some(lease) = HostLease::try_exclusive(&lease_path)? else {
-        writeln!(writer, "target pruning skipped: host lease is held")?;
-        return Ok(());
-    };
     let targets = if let Some(target) = args.target_dir {
         vec![target]
     } else {
@@ -310,446 +517,598 @@ pub(crate) fn run(
             .map(|path| Path::new(path).join("target"))
             .collect()
     };
-    let body = pruning_body(&targets, args.days, args.apply)?;
-    let mut command = std::process::Command::new("/bin/sh");
-    command.args(["-c", &body]);
-    lease.configure_command(&mut command)?;
-    let output = command.output()?;
-    if !output.status.success() {
-        return Err(crate::command::CommandError::NonZeroExit {
-            program: "/bin/sh".into(),
-            status: output.status,
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        }
-        .into());
-    }
-    writer.write_all(&output.stdout)?;
-    Ok(())
+    guarded(dev, &targets, args.days, args.apply, writer)
+}
+pub(crate) fn remote_script(remote_root: &str) -> Result<String, GcError> {
+    let env = shell_quote(&format!("{remote_root}/env.sh"));
+    let helper = shell_quote(&format!("{remote_root}/build-tools/carrick-xtask"));
+    let dev = shell_quote(remote_root);
+    let target = shell_quote(&format!("{remote_root}/gate-worktree/target"));
+    Ok(format!(
+        "set -eu\nif [ -f {env} ]; then . {env}; fi\npruner=${{CARRICK_TARGET_PRUNER:-{helper}}}\nexec \"$pruner\" target-prune --protocol fd-v1 --dev-root {dev} --target-dir {target} --days 2 --apply\n"
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host_lease::HostLeaseMode;
-    use std::os::unix::fs::{PermissionsExt, symlink};
-    use std::process::Command;
-    use std::time::{Duration, SystemTime};
-
-    fn utility_fixture(root: &Path, omit: &str) -> PathBuf {
-        let bin = root.join("bin");
-        fs::create_dir(&bin).unwrap();
-        for tool in [
-            "find", "du", "awk", "mktemp", "rm", "id", "mkdir", "rmdir", "chmod",
-        ] {
-            if tool == omit {
-                continue;
-            }
-            let output = Command::new("/bin/sh")
-                .args(["-c", &format!("command -v {tool}")])
-                .output()
-                .unwrap();
-            assert!(output.status.success());
-            symlink(
-                String::from_utf8(output.stdout).unwrap().trim(),
-                bin.join(tool),
-            )
-            .unwrap();
-        }
-        fs::write(bin.join("lsof"), "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(bin.join("lsof"), fs::Permissions::from_mode(0o755)).unwrap();
-        bin
-    }
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::process::{Child, Stdio};
+    use std::time::Duration;
 
     fn old_artifact(root: &Path) -> (PathBuf, PathBuf) {
         let target = root.join("target");
-        let file = target.join("debug/deps/old-output");
-        fs::create_dir_all(file.parent().unwrap()).unwrap();
-        fs::write(&file, "keep on failed accounting").unwrap();
-        fs::File::open(&file)
+        let artifact = target.join("debug/deps/old-output");
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, "original aged artifact").unwrap();
+        age(&artifact);
+        (target, artifact)
+    }
+    fn age(path: &Path) {
+        File::open(path)
             .unwrap()
             .set_times(
                 fs::FileTimes::new()
                     .set_modified(SystemTime::now() - Duration::from_secs(4 * 86_400)),
             )
             .unwrap();
-        (target, file)
     }
-
-    fn real_lock_census(target: &Path) -> String {
-        let shell = format!(
-            "lsof_bin=$(command -v lsof) || exit 1; if [ \"$(id -u)\" = 0 ]; then \"$lsof_bin\" -F pfn +D {target}; else sudo -n -u root \"$lsof_bin\" -F pfn +D {target}; fi",
-            target = shell_quote(target.to_str().unwrap())
-        );
-        let output = Command::new("/usr/bin/perl")
-            .args(["-e", CARGO_TARGET_LOCKS])
-            .arg(target)
-            .args(["/bin/sh", "-c", &shell])
-            .output()
-            .unwrap();
-        assert!(
-            matches!(output.status.code(), Some(0 | 1)),
-            "real lsof failed: {output:?}"
-        );
-        assert!(output.stderr.is_empty(), "real lsof warnings: {output:?}");
-        let census = String::from_utf8(output.stdout).unwrap();
-        for field in ['p', 'f', 'n'] {
-            assert!(
-                census.lines().any(|line| line.starts_with(field)),
-                "missing {field} in real census: {census}"
-            );
+    fn spawn(target: &Path, apply: bool, socket: Option<&Path>) -> Child {
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--ignored",
+                "--exact",
+                "target_prune::tests::prune_child_fixture",
+                "--nocapture",
+            ])
+            .env("PRUNE_FIXTURE_TARGET", target)
+            .env("PRUNE_FIXTURE_APPLY", if apply { "1" } else { "0" })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(socket) = socket {
+            child.env("PRUNE_FIXTURE_SOCKET", socket);
         }
-        census
+        child.spawn().unwrap()
     }
-
-    fn assert_real_idle_target_pruned(alias: bool) {
-        let temp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
-        let checkout = root.join("checkout");
-        fs::create_dir(&checkout).unwrap();
-        let (target, artifact) = old_artifact(&checkout);
-        let census = real_lock_census(&target);
-        let input = if alias {
-            let link = root.join("worktree-alias");
-            symlink(&checkout, &link).unwrap();
-            link.join("target")
-        } else {
-            target
-        };
-        let body = pruning_body(&[input], 2, true).unwrap();
-        let output = Command::new("/bin/sh")
-            .args(["-c", &body])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success() && !artifact.exists(),
-            "real lsof must permit idle pruning (alias={alias}): artifact_exists={}, stdout={}, stderr={}, actual lock census:\n{census}",
-            artifact.exists(),
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
     #[test]
-    fn real_lsof_descriptor_protocol_prunes_idle_target() {
-        assert_real_idle_target_pruned(false);
-    }
-
-    #[test]
-    fn real_lsof_canonical_names_prune_symlinked_ancestor_target() {
-        assert_real_idle_target_pruned(true);
-    }
-
-    #[test]
-    fn authenticated_canonical_target_rejects_replacement_and_symlink() {
-        use std::os::unix::fs::MetadataExt;
-        let temp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
-        let (target, artifact) = old_artifact(&root);
-        let identity = fs::metadata(&target).unwrap();
-        let check = || {
-            Command::new("/usr/bin/perl")
-                .args(["-e", TARGET_IDENTITY_CHECK])
-                .arg(&target)
-                .args([identity.dev().to_string(), identity.ino().to_string()])
-                .output()
-                .unwrap()
-        };
-        assert!(check().status.success());
-        let retired = root.join("original-target");
-        fs::rename(&target, &retired).unwrap();
-        fs::create_dir(&target).unwrap();
-        assert!(
-            !check().status.success(),
-            "replacement must fail identity authentication"
-        );
-        fs::remove_dir(&target).unwrap();
-        symlink(&retired, &target).unwrap();
-        assert!(
-            !check().status.success(),
-            "symlink must fail even when pointing to the original inode"
-        );
-        assert!(artifact.exists());
-    }
-
-    #[test]
-    fn real_lsof_unrelated_open_artifact_keeps_target() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
-        let (target, artifact) = old_artifact(&root);
-        let _open_artifact = fs::File::open(&artifact).unwrap();
-        let census = real_lock_census(&target);
-        assert!(census.contains(artifact.to_str().unwrap()), "{census}");
-        let body = pruning_body(&[target], 2, true).unwrap();
-        let output = Command::new("/bin/sh")
-            .args(["-c", &body])
-            .output()
-            .unwrap();
-        assert!(output.status.success() && artifact.exists(), "{output:?}");
-        assert!(String::from_utf8_lossy(&output.stdout).contains("in use or unknown visibility"));
-    }
-
-    #[test]
-    fn real_lsof_records_reject_malformed_descriptor_boundaries() {
-        use std::process::Stdio;
-        let temp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
-        let (target, _) = old_artifact(&root);
-        let census = real_lock_census(&target);
-        let debug = format!("debug={}/debug/.cargo-lock", target.display());
-        let release = format!("release={}/release/.cargo-lock", target.display());
-        let parse = |records: &str| {
-            let mut child = Command::new("awk")
-                .args(["-v", &debug, "-v", &release, LOCK_FIELD_PARSER])
-                .stdin(Stdio::piped())
-                .spawn()
-                .unwrap();
-            child
-                .stdin
-                .take()
-                .unwrap()
-                .write_all(records.as_bytes())
-                .unwrap();
-            child.wait().unwrap().success()
-        };
-        assert!(parse(&census));
-        let lines: Vec<_> = census.lines().collect();
-        let without_descriptors = lines
-            .iter()
-            .filter(|line| !line.starts_with('f'))
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        let without_names = lines
-            .iter()
-            .filter(|line| !line.starts_with('n'))
-            .copied()
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        for malformed in [
-            without_descriptors,
-            without_names,
-            format!("{census}f99\n"),
-            format!("{census}p0\nf9\nn{}/debug/.cargo-lock\n", target.display()),
-            format!("{census}n{}/debug/.cargo-lock\n", target.display()),
-            format!("{census}fcwd\nn{}\n", target.display()),
-            format!("{census}xunexpected\n"),
-            format!("{census}{}\n", lines[1]),
-        ] {
-            assert!(
-                !parse(&malformed),
-                "accepted malformed real census: {malformed}"
-            );
+    #[ignore = "isolated native pruning process invoked by concurrent fixtures"]
+    fn prune_child_fixture() {
+        let target = PathBuf::from(std::env::var_os("PRUNE_FIXTURE_TARGET").unwrap());
+        let apply = std::env::var("PRUNE_FIXTURE_APPLY").unwrap() == "1";
+        let case = std::env::var("PRUNE_FIXTURE_CASE").unwrap_or_default();
+        if case == "host" {
+            let dev = target.parent().unwrap();
+            let path = dev.join("host.lock");
+            for mode in [
+                crate::host_lease::HostLeaseMode::Carrick,
+                crate::host_lease::HostLeaseMode::Gate,
+            ] {
+                let _lease = HostLease::acquire_path(&path, mode).unwrap();
+                let mut output = Vec::new();
+                guarded(dev, std::slice::from_ref(&target), 2, true, &mut output).unwrap();
+                assert!(
+                    String::from_utf8(output)
+                        .unwrap()
+                        .contains("host lease is held")
+                );
+                assert!(!dev.join("gate-worktree.lock").exists());
+            }
+            return;
         }
+        if case == "fields" {
+            let root = at::root(&target).unwrap();
+            let lock = at::lock(&root).unwrap();
+            let handles = CensusHandles::from([
+                (root.as_raw_fd(), target.clone()),
+                (lock.as_raw_fd(), target.join(".cargo-lock")),
+            ]);
+            let output = census_output(&target, true).unwrap();
+            assert!(
+                idle_fields(
+                    output.status.code(),
+                    &output.stdout,
+                    &output.stderr,
+                    &handles
+                ),
+                "{output:?}"
+            );
+            let real = String::from_utf8(output.stdout).unwrap();
+            let missing_f = real
+                .lines()
+                .filter(|line| !line.starts_with('f'))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            let missing_n = real
+                .lines()
+                .filter(|line| !line.starts_with('n'))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            for malformed in [
+                missing_f,
+                missing_n,
+                format!("{real}fcwd\nn{}\n", target.display()),
+                format!("{real}p{}\nf0\nn{}\n", std::process::id(), target.display()),
+                format!("{real}n{}\n", target.display()),
+                format!("{real}xunknown\n"),
+            ] {
+                assert!(
+                    !idle_fields(Some(0), malformed.as_bytes(), b"", &handles),
+                    "{malformed}"
+                );
+            }
+            let _unrelated = File::open(target.join("debug/deps/old-output")).unwrap();
+            let unrelated = census_output(&target, true).unwrap();
+            assert!(
+                !idle_fields(
+                    unrelated.status.code(),
+                    &unrelated.stdout,
+                    &unrelated.stderr,
+                    &handles
+                ),
+                "{unrelated:?}"
+            );
+            return;
+        }
+        let _own_artifact =
+            (case == "own-open").then(|| File::open(target.join("debug/deps/old-output")).unwrap());
+        let socket = std::env::var_os("PRUNE_FIXTURE_SOCKET");
+        let mut hook = || {
+            if let Some(socket) = &socket {
+                let mut peer = UnixStream::connect(socket).unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                peer.write_all(b"ready\n").unwrap();
+                let mut reply = [0];
+                peer.read_exact(&mut reply).unwrap();
+            }
+        };
+        let mut output = Vec::new();
+        let result = prune_target(&target, cutoff(2).unwrap(), apply, &mut output, &mut hook);
+        std::io::stdout().write_all(&output).unwrap();
+        result.unwrap();
     }
-
-    fn parent_death_keeps_child_lock(remote: bool) {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixListener;
-        use std::process::Stdio;
-        let temp = tempfile::tempdir().unwrap();
-        let (target, artifact) = old_artifact(temp.path());
-        let socket = temp.path().join("child.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
+    fn prune(target: &Path, apply: bool) -> String {
+        let output = spawn(target, apply, None).wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout).unwrap()
+    }
+    fn barrier(listener: UnixListener) -> UnixStream {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || sender.send(listener.accept()).unwrap());
-        let handshake = temp.path().join("child.pl");
-        fs::write(&handshake, r#"use IO::Socket::UNIX; my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $ARGV[0]) or die $!; print $s "ready\n"; $s->flush; my $reply = <$s>; die "lost controller" unless defined $reply;"#).unwrap();
-        // The shell survives its Perl lock parent and stays at the barrier
-        // immediately before deletion. Its inherited stdout bounds its exit.
-        let shell = format!(
-            "/usr/bin/perl {} {} && rm -f {}",
-            shell_quote(handshake.to_str().unwrap()),
-            shell_quote(socket.to_str().unwrap()),
-            shell_quote(artifact.to_str().unwrap())
-        );
-        let lock_path = if remote {
-            temp.path().join("host.lock")
-        } else {
-            target.join("debug/.cargo-lock")
-        };
-        let mut parent = Command::new("/usr/bin/perl")
-            .args([
-                "-e",
-                if remote {
-                    REMOTE_LEASE
-                } else {
-                    CARGO_TARGET_LOCKS
-                },
-            ])
-            .arg(if remote { &lock_path } else { &target })
-            .args(["/bin/sh", "-c", &shell])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
         let (mut peer, _) = receiver
-            .recv_timeout(Duration::from_secs(10))
-            .expect("deletion child must reach barrier")
+            .recv_timeout(Duration::from_secs(15))
+            .expect("pruner must reach final pre-unlink boundary")
             .unwrap();
         peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let mut ready = [0; 6];
         peer.read_exact(&mut ready).unwrap();
         assert_eq!(&ready, b"ready\n");
-        let lock = fs::File::options()
+        peer
+    }
+    #[test]
+    fn replacement_after_final_check_is_never_deleted() {
+        for link in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = fs::canonicalize(temp.path()).unwrap();
+            let (target, _) = old_artifact(&root);
+            let socket = root.join("before-delete.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let child = spawn(&target, true, Some(&socket));
+            let mut peer = barrier(listener);
+            let retired = root.join("target.old");
+            fs::rename(&target, &retired).unwrap();
+            let replacement = if link {
+                root.join("replacement")
+            } else {
+                target.clone()
+            };
+            fs::create_dir_all(replacement.join("debug/deps")).unwrap();
+            let untouched = replacement.join("debug/deps/old-output");
+            fs::write(&untouched, "never aged or censused replacement").unwrap();
+            if link {
+                symlink(&replacement, &target).unwrap();
+            }
+            peer.write_all(b"delete\n").unwrap();
+            drop(peer);
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                untouched.exists(),
+                "replacement artifact deleted after final identity check (symlink={link}): {output:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(&untouched).unwrap(),
+                "never aged or censused replacement"
+            );
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                !retired.join("debug/deps/old-output").exists(),
+                "held directory should address the original artifact"
+            );
+            assert!(
+                !replacement.join("debug/.cargo-lock").exists(),
+                "must not acquire locks in replacement"
+            );
+        }
+    }
+    #[test]
+    fn candidate_replaced_at_final_boundary_is_preserved_in_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (target, artifact) = old_artifact(&root);
+        let socket = root.join("before-delete.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let child = spawn(&target, true, Some(&socket));
+        let mut peer = barrier(listener);
+        let original = root.join("original-output");
+        fs::rename(&artifact, &original).unwrap();
+        fs::write(&artifact, "new unchecked candidate").unwrap();
+        peer.write_all(b"delete\n").unwrap();
+        drop(peer);
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !output.status.success(),
+            "changed candidate must stop pruning"
+        );
+        let recovery = fs::read_dir(&target)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|entry| entry.file_name().as_bytes().starts_with(b".carrick-prune-"))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(recovery.path().join("artifact")).unwrap(),
+            "new unchecked candidate"
+        );
+        assert!(original.exists());
+    }
+    #[test]
+    fn real_lsof_descriptor_protocol_prunes_idle_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (target, artifact) = old_artifact(&root);
+        let output = prune(&target, true);
+        assert!(
+            !artifact.exists(),
+            "real lsof must permit idle pruning: {output}"
+        );
+        assert!(output.contains("pruned"));
+    }
+    #[test]
+    fn real_lsof_canonical_names_prune_symlinked_ancestor_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let checkout = root.join("checkout");
+        fs::create_dir(&checkout).unwrap();
+        let (_, artifact) = old_artifact(&checkout);
+        let alias = root.join("worktree-alias");
+        symlink(&checkout, &alias).unwrap();
+        let output = prune(&alias.join("target"), true);
+        assert!(
+            !artifact.exists(),
+            "real alias census must permit pruning: {output}"
+        );
+    }
+    #[test]
+    fn real_lsof_unrelated_open_artifact_keeps_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, artifact) = old_artifact(temp.path());
+        let _opened = File::open(&artifact).unwrap();
+        let output = prune(&target, true);
+        assert!(
+            artifact.exists() && output.contains("in use or unknown visibility"),
+            "{output}"
+        );
+    }
+    #[test]
+    fn native_cargo_lock_preserves_old_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, artifact) = old_artifact(temp.path());
+        let lock = File::create(target.join("debug/.cargo-lock")).unwrap();
+        lock.lock().unwrap();
+        let output = prune(&target, true);
+        assert!(
+            artifact.exists() && output.contains("Cargo lock is held"),
+            "{output}"
+        );
+    }
+    #[test]
+    fn concurrent_cargo_admission_is_excluded_through_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (target, artifact) = old_artifact(&root);
+        let socket = root.join("before-delete.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let child = spawn(&target, true, Some(&socket));
+        let mut peer = barrier(listener);
+        let lock = File::options()
             .read(true)
             .write(true)
-            .open(&lock_path)
+            .open(target.join("debug/.cargo-lock"))
             .unwrap();
         assert!(matches!(
             lock.try_lock(),
             Err(std::fs::TryLockError::WouldBlock)
         ));
-        // Kill only the guardian, never the deletion child or process group.
-        assert_eq!(unsafe { libc::kill(parent.id() as i32, libc::SIGTERM) }, 0);
-        parent.wait().unwrap();
-        let acquisition = lock.try_lock();
-        let blocked = matches!(acquisition, Err(std::fs::TryLockError::WouldBlock));
-        if acquisition.is_ok() {
-            lock.unlock().unwrap();
-        }
-        assert!(artifact.exists());
         peer.write_all(b"delete\n").unwrap();
         drop(peer);
-        // Reading to EOF waits for every inheriting shell/utility to exit,
-        // even though wait() has already reaped the killed parent.
-        let mut stdout = Vec::new();
-        parent
-            .stdout
-            .take()
-            .unwrap()
-            .read_to_end(&mut stdout)
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success() && !artifact.exists(), "{output:?}");
+        lock.try_lock().unwrap();
+    }
+    #[test]
+    fn killed_native_pruner_has_no_surviving_deletion_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let (target, artifact) = old_artifact(&root);
+        let socket = root.join("before-delete.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut child = spawn(&target, true, Some(&socket));
+        let _peer = barrier(listener);
+        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGTERM) }, 0);
+        child.wait().unwrap();
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .open(target.join("debug/.cargo-lock"))
             .unwrap();
-        assert!(!artifact.exists(), "surviving child must complete deletion");
+        lock.try_lock().unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success() && artifact.exists(), "{output:?}");
+    }
+    #[test]
+    fn dry_run_and_age_policy_keep_recent_future_symlinks_hardlinks_and_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, old) = old_artifact(temp.path());
+        let deps = old.parent().unwrap();
+        let recent = deps.join("recent");
+        fs::write(&recent, "recent").unwrap();
+        let future = deps.join("future");
+        fs::write(&future, "future").unwrap();
+        File::open(&future)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(86_400)),
+            )
+            .unwrap();
+        let hard = deps.join("hard");
+        fs::write(&hard, "hard").unwrap();
+        age(&hard);
+        fs::hard_link(&hard, temp.path().join("hard-alias")).unwrap();
+        let link = deps.join("symlink");
+        symlink(&old, &link).unwrap();
+        let directory = deps.join("tree");
+        fs::create_dir(&directory).unwrap();
+        fs::write(directory.join("recent"), "recent").unwrap();
+        age(&directory);
+        let binary = target.join("debug/carrick");
+        fs::write(&binary, "preserve binary").unwrap();
+        age(&binary);
+        let output = prune(&target, false);
+        assert!(old.exists() && output.contains("eligible"), "{output}");
+        let output = prune(&target, true);
+        assert!(!old.exists(), "{output}");
+        for preserved in [recent, future, hard, link, directory, binary] {
+            assert!(fs::symlink_metadata(preserved).is_ok());
+        }
         assert!(
-            lock.try_lock().is_ok(),
-            "lock must release after child exit"
+            target.join("debug/.cargo-lock").exists()
+                && target.join("release/.cargo-lock").exists()
         );
+    }
+    #[test]
+    fn nested_descriptor_tree_is_removed_without_following_replaced_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let target = root.join("target");
+        let directory = target.join("debug/build/old-build");
+        fs::create_dir_all(directory.join("nested")).unwrap();
+        fs::write(directory.join("nested/output"), "old nested output").unwrap();
+        for path in [
+            directory.join("nested/output"),
+            directory.join("nested"),
+            directory.clone(),
+        ] {
+            age(&path);
+        }
+        let socket = root.join("before-delete.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let child = spawn(&target, true, Some(&socket));
+        let mut peer = barrier(listener);
+        let retired = root.join("build.old");
+        fs::rename(target.join("debug/build"), &retired).unwrap();
+        fs::create_dir_all(target.join("debug/build/old-build/nested")).unwrap();
+        let untouched = target.join("debug/build/old-build/nested/output");
+        fs::write(&untouched, "new").unwrap();
+        peer.write_all(b"delete\n").unwrap();
+        drop(peer);
+        let output = child.wait_with_output().unwrap();
         assert!(
-            blocked,
-            "{} lock released after parent death while deletion child lived",
-            if remote { "host" } else { "Cargo" }
+            output.status.success() && untouched.exists() && !retired.join("old-build").exists(),
+            "{output:?}"
         );
     }
-
     #[test]
-    fn cargo_lock_survives_parent_death_until_deletion_child_exits() {
-        parent_death_keeps_child_lock(false);
+    fn strict_fields_reject_unrelated_malformed_duplicates_cwd_and_missing_owned_objects() {
+        let pid = std::process::id();
+        let handles = CensusHandles::from([
+            (3, PathBuf::from("/target")),
+            (4, PathBuf::from("/target/.cargo-lock")),
+        ]);
+        let valid = format!("p{pid}\nf3\nn/target\nf4\nn/target/.cargo-lock\n");
+        assert!(idle_fields(Some(0), valid.as_bytes(), b"", &handles));
+        assert!(idle_fields(Some(1), valid.as_bytes(), b"", &handles));
+        for invalid in [
+            valid.replace("f3\n", ""),
+            valid.replace("n/target\n", ""),
+            valid.replace("/target/.cargo-lock", "/unrelated"),
+            format!("{valid}fcwd\nn/target\n"),
+            format!("{valid}f4\nn/target/.cargo-lock\n"),
+            format!("{valid}p{pid}\nf9\nn/target\n"),
+            format!("{valid}xunknown\n"),
+            format!("p{pid}\nf3\nn/target\n"),
+            valid.trim_end().into(),
+        ] {
+            assert!(
+                !idle_fields(Some(0), invalid.as_bytes(), b"", &handles),
+                "{invalid}"
+            );
+        }
+        assert!(!idle_fields(Some(1), b"", b"", &handles));
+        assert!(!idle_fields(
+            Some(0),
+            valid.as_bytes(),
+            b"warning",
+            &handles
+        ));
+        assert!(!idle_fields(Some(2), valid.as_bytes(), b"", &handles));
     }
-
     #[test]
-    fn remote_host_lock_survives_parent_death_until_deletion_child_exits() {
-        parent_death_keeps_child_lock(true);
+    fn invalid_ages_and_accounting_overflow_fail_closed() {
+        assert!(cutoff(0).is_err() && cutoff(u64::MAX).is_err());
+        assert!(allocated(u64::MAX, 1).is_err() && allocated(0, u64::MAX).is_err());
+        assert_eq!(allocated(100, 8).unwrap(), 4196);
     }
-
     #[test]
-    fn native_cargo_lock_preserves_old_artifacts_despite_idle_census() {
+    fn descriptor_staging_never_overwrites_an_existing_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("source"), "aged source").unwrap();
+        fs::write(temp.path().join("destination"), "unchecked destination").unwrap();
+        let root = at::root(temp.path()).unwrap();
+        assert!(
+            at::rename(
+                &root,
+                OsStr::new("source"),
+                &root,
+                OsStr::new("destination")
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("source")).unwrap(),
+            "aged source"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("destination")).unwrap(),
+            "unchecked destination"
+        );
+    }
+    #[test]
+    fn held_checkout_guard_skips_before_host_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = CheckoutGuard::claim(&temp.path().join("gate-worktree.lock"))
+            .unwrap()
+            .unwrap();
+        let mut output = Vec::new();
+        guarded(temp.path(), &[], 2, true, &mut output).unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("checkout lock is held")
+        );
+    }
+    #[test]
+    fn missing_remote_helper_fails_closed_without_legacy_removal() {
         let temp = tempfile::tempdir().unwrap();
         let (target, artifact) = old_artifact(temp.path());
-        let bin = utility_fixture(temp.path(), "");
-        let lock = fs::File::create(target.join("debug/.cargo-lock")).unwrap();
-        lock.lock().unwrap();
-        let body =
-            pruning_body_with_census(&[target], 2, true, "\nidle() { return 0; }\n").unwrap();
         let output = Command::new("/bin/sh")
-            .args(["-c", &body])
-            .env("PATH", bin)
+            .args(["-c", &remote_script(temp.path().to_str().unwrap()).unwrap()])
+            .env("CARRICK_TARGET_PRUNER", "/nonexistent/carrick-fd-pruner")
+            .output()
+            .unwrap();
+        assert!(!output.status.success() && artifact.exists() && target.exists());
+    }
+    #[test]
+    fn remote_wrapper_requires_native_protocol_and_no_cargo_or_rm_fallback() {
+        let script = remote_script("/dev/with spaces").unwrap();
+        assert!(
+            script.contains("--protocol fd-v1") && script.contains("build-tools/carrick-xtask")
+        );
+        assert!(
+            !script.contains("cargo run")
+                && !script.contains("rm -rf")
+                && !script.contains("/usr/bin/perl")
+        );
+    }
+    fn fixture_case(target: &Path, case: &str) -> std::process::Output {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "target_prune::tests::prune_child_fixture",
+                "--nocapture",
+            ])
+            .env("PRUNE_FIXTURE_TARGET", target)
+            .env("PRUNE_FIXTURE_APPLY", "1")
+            .env("PRUNE_FIXTURE_CASE", case)
+            .env(
+                "CARRICK_HOST_LEASE_PATH",
+                target.parent().unwrap().join("host.lock"),
+            )
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        output
+    }
+    #[test]
+    fn either_shared_or_exclusive_host_lease_prevents_pruning() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, artifact) = old_artifact(temp.path());
+        fixture_case(&target, "host");
+        assert!(artifact.exists());
+    }
+    #[test]
+    fn real_lsof_records_reject_malformed_boundaries_and_unrelated_own_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, _) = old_artifact(temp.path());
+        fixture_case(&fs::canonicalize(target).unwrap(), "fields");
+    }
+    #[test]
+    fn unrelated_own_descriptor_remains_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, artifact) = old_artifact(temp.path());
+        let output = fixture_case(&target, "own-open");
+        assert!(
+            artifact.exists()
+                && String::from_utf8_lossy(&output.stdout).contains("in use or unknown visibility")
+        );
+    }
+    #[test]
+    fn missing_lsof_keeps_artifacts_without_fake_census() {
+        let temp = tempfile::tempdir().unwrap();
+        let (target, artifact) = old_artifact(temp.path());
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        let output = child
+            .args([
+                "--ignored",
+                "--exact",
+                "target_prune::tests::prune_child_fixture",
+                "--nocapture",
+            ])
+            .env("PRUNE_FIXTURE_TARGET", &target)
+            .env("PRUNE_FIXTURE_APPLY", "1")
+            .env("PATH", temp.path())
             .output()
             .unwrap();
         assert!(
-            output.status.success() && artifact.exists(),
-            "native Cargo lock must exclude pruning: exit={:?}, artifact_exists={}, stdout={}",
-            output.status.code(),
-            artifact.exists(),
-            String::from_utf8_lossy(&output.stdout)
+            output.status.success()
+                && artifact.exists()
+                && String::from_utf8_lossy(&output.stdout).contains("unknown visibility"),
+            "{output:?}"
         );
     }
-
-    #[test]
-    fn concurrent_cargo_admission_is_excluded_through_deletion() {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixListener;
-        use std::process::Stdio;
-        let temp = tempfile::tempdir().unwrap();
-        let (target, artifact) = old_artifact(temp.path());
-        let bin = utility_fixture(temp.path(), "");
-        let socket = temp.path().join("census.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            sender.send(listener.accept()).unwrap();
-        });
-        let handshake = temp.path().join("census.pl");
-        fs::write(&handshake, r#"use IO::Socket::UNIX; my $s = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $ARGV[0]) or die $!; print $s "ready\n"; $s->flush; my $reply = <$s>; die "lost controller" unless defined $reply;"#).unwrap();
-        let idle = format!(
-            "\nidle() {{\nif [ ! -f \"{marker}\" ]; then\n: > \"{marker}\"\n/usr/bin/perl \"{handshake}\" \"{socket}\" || exit 1\nfi\nreturn 0\n}}\n",
-            marker = temp.path().join("census.once").display(),
-            handshake = handshake.display(),
-            socket = socket.display()
-        );
-        let body = pruning_body_with_census(std::slice::from_ref(&target), 2, true, &idle).unwrap();
-        let child = Command::new("/bin/sh")
-            .args(["-c", &body])
-            .env("PATH", bin)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let (mut peer, _) = receiver
-            .recv_timeout(Duration::from_secs(10))
-            .expect("pruning must reach its idle census")
-            .unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut ready = [0; 6];
-        peer.read_exact(&mut ready).unwrap();
-        assert_eq!(&ready, b"ready\n");
-        let lock = fs::File::options()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(target.join("debug/.cargo-lock"))
-            .unwrap();
-        let admission = lock.try_lock();
-        // Always release the fixture so the regression fails without hanging.
-        peer.write_all(b"continue\n").unwrap();
-        let output = child.wait_with_output().unwrap();
-        assert!(
-            matches!(admission, Err(std::fs::TryLockError::WouldBlock)),
-            "Cargo admitted after idle census: {admission:?}; artifact_exists={}",
-            artifact.exists()
-        );
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(!artifact.exists());
-        assert!(
-            lock.try_lock().is_ok(),
-            "Cargo must be admitted after deletion finishes"
-        );
-    }
-
     #[test]
     fn real_cargo_build_and_pruning_share_the_native_lock() {
-        use std::io::{Read, Write};
-        use std::os::unix::net::UnixListener;
-        use std::process::Stdio;
         let temp = tempfile::tempdir().unwrap();
         let (target, artifact) = old_artifact(temp.path());
-        let bin = utility_fixture(temp.path(), "");
-        fs::write(temp.path().join("Cargo.toml"), "[package]\nname=\"native-lock-proof\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n").unwrap();
+        fs::write(temp.path().join("Cargo.toml"),"[package]\nname=\"native-lock-proof\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[workspace]\n").unwrap();
         fs::create_dir(temp.path().join("src")).unwrap();
         fs::write(temp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
-        fs::write(temp.path().join("build.rs"), r#"use std::io::{Read, Write}; fn main() { let mut s = std::os::unix::net::UnixStream::connect(std::env::var_os("BUILD_CENSUS_SOCKET").unwrap()).unwrap(); s.write_all(b"ready\n").unwrap(); let mut reply = [0]; s.read_exact(&mut reply).unwrap(); }"#).unwrap();
+        fs::write(temp.path().join("build.rs"),r#"use std::io::{Read,Write}; fn main() { let mut s = std::os::unix::net::UnixStream::connect(std::env::var_os("BUILD_CENSUS_SOCKET").unwrap()).unwrap(); s.write_all(b"ready\n").unwrap(); let mut reply=[0]; s.read_exact(&mut reply).unwrap(); }"#).unwrap();
         let socket = temp.path().join("cargo.sock");
         let listener = UnixListener::bind(&socket).unwrap();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            sender.send(listener.accept()).unwrap();
-        });
         let cargo = Command::new("cargo")
             .arg("build")
             .current_dir(temp.path())
@@ -760,257 +1119,14 @@ mod tests {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let (mut peer, _) = receiver
-            .recv_timeout(Duration::from_secs(30))
-            .expect("Cargo build script must reach the barrier")
-            .unwrap();
-        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut ready = [0; 6];
-        peer.read_exact(&mut ready).unwrap();
-        assert_eq!(&ready, b"ready\n");
-        let body =
-            pruning_body_with_census(&[target], 2, true, "\nidle() { return 0; }\n").unwrap();
-        let output = Command::new("/bin/sh")
-            .args(["-c", &body])
-            .env("PATH", bin)
-            .output()
-            .unwrap();
+        let mut peer = barrier(listener);
+        let output = prune(&target, true);
         peer.write_all(b"c").unwrap();
+        drop(peer);
         let built = cargo.wait_with_output().unwrap();
         assert!(
-            built.status.success(),
-            "{}",
-            String::from_utf8_lossy(&built.stderr)
+            built.status.success() && artifact.exists() && output.contains("Cargo lock is held"),
+            "{built:?}; {output}"
         );
-        assert!(
-            output.status.success() && artifact.exists(),
-            "live Cargo build must exclude deletion: artifact_exists={}, stdout={}",
-            artifact.exists(),
-            String::from_utf8_lossy(&output.stdout)
-        );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("Cargo lock is held"));
-    }
-
-    #[test]
-    fn missing_awk_fails_before_deleting_an_artifact() {
-        let temp = tempfile::tempdir().unwrap();
-        let (target, file) = old_artifact(temp.path());
-        let bin = utility_fixture(temp.path(), "awk");
-        // Pin the external OS census to idle; exercise real find/du/deletion
-        // and shell accounting with the reviewed missing-utility PATH.
-        let body =
-            pruning_body_with_census(&[target], 2, true, "\nidle() { return 0; }\n").unwrap();
-        let output = Command::new("/bin/sh")
-            .args(["-c", &body])
-            .env("PATH", bin)
-            .output()
-            .unwrap();
-        assert!(
-            !output.status.success() && file.exists(),
-            "missing awk must fail before deletion: exit={:?}, artifact_exists={}, stderr={}, stdout={}",
-            output.status.code(),
-            file.exists(),
-            String::from_utf8_lossy(&output.stderr),
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
-
-    #[test]
-    fn failed_awk_accounting_preserves_the_artifact() {
-        let temp = tempfile::tempdir().unwrap();
-        let (target, file) = old_artifact(temp.path());
-        let bin = utility_fixture(temp.path(), "awk");
-        fs::write(bin.join("awk"), "#!/bin/sh\nexit 75\n").unwrap();
-        fs::set_permissions(bin.join("awk"), fs::Permissions::from_mode(0o755)).unwrap();
-        let body =
-            pruning_body_with_census(&[target], 2, true, "\nidle() { return 0; }\n").unwrap();
-        let output = Command::new("/bin/sh")
-            .args(["-c", &body])
-            .env("PATH", bin)
-            .output()
-            .unwrap();
-        assert!(
-            !output.status.success() && file.exists(),
-            "failed accounting must preserve the artifact: exit={:?}, artifact_exists={}",
-            output.status.code(),
-            file.exists()
-        );
-    }
-
-    #[test]
-    fn held_checkout_lock_skips_local_and_remote_pruning() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("main");
-        fs::create_dir(&root).unwrap();
-        let _guard = CheckoutGuard::claim(&temp.path().join("gate-worktree.lock"))
-            .unwrap()
-            .unwrap();
-        assert!(
-            CheckoutGuard::claim(&temp.path().join("gate-worktree.lock"))
-                .unwrap()
-                .is_none()
-        );
-        let mut output = Vec::new();
-        run(
-            &root,
-            WorktreeGcArgs {
-                apply: true,
-                prune_targets: true,
-                days: 2,
-                target_dir: None,
-            },
-            &mut output,
-        )
-        .unwrap();
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains("checkout lock is held")
-        );
-        let remote = Command::new("/bin/sh")
-            .args(["-c", &remote_script(temp.path().to_str().unwrap()).unwrap()])
-            .output()
-            .unwrap();
-        assert!(remote.status.success());
-        assert!(
-            String::from_utf8(remote.stdout)
-                .unwrap()
-                .contains("checkout lock is held")
-        );
-        assert!(temp.path().join("gate-worktree.lock/run_id").exists());
-    }
-
-    #[test]
-    fn either_shared_or_exclusive_host_lease_prevents_local_and_remote_pruning() {
-        // Isolate owned descriptors from concurrent fork-based tests: a fork
-        // temporarily inherits their open descriptions even before exec.
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--ignored",
-                "--exact",
-                "target_prune::tests::lock_guard_child_fixture",
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
-
-    #[test]
-    #[ignore = "isolated process fixture invoked by the lock guard test"]
-    fn lock_guard_child_fixture() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("host.lock");
-        for mode in [HostLeaseMode::Carrick, HostLeaseMode::Gate] {
-            let lease = HostLease::acquire_path(&path, mode).unwrap();
-            assert!(HostLease::try_exclusive(&path).unwrap().is_none());
-            let remote = Command::new("/bin/sh")
-                .args(["-c", &remote_script(temp.path().to_str().unwrap()).unwrap()])
-                .env("CARRICK_HOST_LEASE_PATH", &path)
-                .output()
-                .unwrap();
-            assert!(
-                remote.status.success(),
-                "{}",
-                String::from_utf8_lossy(&remote.stderr)
-            );
-            assert!(
-                String::from_utf8(remote.stdout)
-                    .unwrap()
-                    .contains("host lease is held")
-            );
-            assert!(!temp.path().join("gate-worktree.lock").exists());
-            drop(lease);
-            assert!(HostLease::try_exclusive(&path).unwrap().is_some());
-        }
-    }
-
-    fn rejected_by_find(entry: &Path) -> bool {
-        let query = format!(
-            "entry={}; age=+1; {AGE_QUERY}",
-            shell_quote(entry.to_str().unwrap())
-        );
-        let output = Command::new("/bin/sh")
-            .args(["-c", &query])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        !output.stdout.is_empty()
-    }
-
-    #[test]
-    fn generated_age_query_keeps_recent_future_descendants_symlinks_and_hardlinks() {
-        use std::os::unix::fs::symlink;
-        let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("artifact");
-        fs::create_dir(&directory).unwrap();
-        let file = directory.join("output");
-        fs::write(&file, "recent").unwrap();
-        let old = SystemTime::now() - Duration::from_secs(4 * 86_400);
-        let set_time = |path: &Path, time| {
-            fs::File::open(path)
-                .unwrap()
-                .set_times(fs::FileTimes::new().set_modified(time))
-                .unwrap()
-        };
-        set_time(&directory, old);
-        assert!(rejected_by_find(&directory));
-        set_time(&file, SystemTime::now() + Duration::from_secs(86_400));
-        assert!(rejected_by_find(&file));
-        set_time(&file, old);
-        assert!(!rejected_by_find(&directory));
-        fs::hard_link(&file, temp.path().join("other")).unwrap();
-        assert!(rejected_by_find(&file));
-        fs::remove_file(temp.path().join("other")).unwrap();
-        symlink(&file, directory.join("link")).unwrap();
-        set_time(&directory, old);
-        assert!(rejected_by_find(&directory));
-    }
-
-    #[test]
-    fn invalid_ages_fail_before_generating_a_prune_command() {
-        assert!(pruning_body(&[], 0, true).is_err());
-        assert!(pruning_body(&[], u64::MAX, true).is_err());
-        assert!(pruning_body(&[], 2, false).is_ok());
-    }
-
-    #[test]
-    fn remote_wrapper_uses_the_authoritative_host_lock_path_and_nonblocking_flock() {
-        let script = remote_script("/dev/with spaces").unwrap();
-        assert!(script.contains(&format!(
-            "${{CARRICK_HOST_LEASE_PATH:-{DEFAULT_LOCK_PATH}}}"
-        )));
-        assert!(script.contains("LOCK_EX | LOCK_NB"));
-        assert!(script.contains("/usr/bin/perl -e"));
-        assert!(!script.contains("cargo run"));
-    }
-
-    #[test]
-    fn missing_remote_perl_never_prunes_without_a_lease() {
-        let temp = tempfile::tempdir().unwrap();
-        let deps = temp.path().join("gate-worktree/target/debug/deps");
-        fs::create_dir_all(&deps).unwrap();
-        let file = deps.join("old-output");
-        fs::write(&file, "keep").unwrap();
-        fs::File::open(&file)
-            .unwrap()
-            .set_times(
-                fs::FileTimes::new()
-                    .set_modified(SystemTime::now() - Duration::from_secs(4 * 86_400)),
-            )
-            .unwrap();
-        let script = remote_script(temp.path().to_str().unwrap())
-            .unwrap()
-            .replace("/usr/bin/perl", "/nonexistent/carrick-perl");
-        let output = Command::new("/bin/sh")
-            .args(["-c", &script])
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(file.exists());
-        assert!(!temp.path().join("gate-worktree.lock").exists());
     }
 }
