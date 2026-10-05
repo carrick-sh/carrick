@@ -161,6 +161,26 @@ struct Pve {
     token: Token,
     deadline: std::cell::Cell<Option<Instant>>,
 }
+fn pve_curl(call: &PveCall, url: &str) -> Command {
+    let mut command = Command::new("curl");
+    command.args([
+        "--disable",
+        "--silent",
+        "--show-error",
+        "--write-out",
+        "\n%{http_code}",
+        "--max-time",
+        "40",
+        "--resolve",
+        "willow.atxconsulting.com:8006:127.0.0.1",
+        "--config",
+        "-",
+        "--request",
+        call.method(),
+        url,
+    ]);
+    command
+}
 impl Pve {
     fn local() -> Result<Self, ScalerError> {
         if std::fs::read_to_string("/etc/hostname")?.trim() != "willow" {
@@ -191,21 +211,10 @@ impl Pve {
         let limit = remaining(self.deadline.get(), Duration::from_secs(45))?;
         let config = request_config(&self.token, &call)?;
         let bytes = execute(
-            Command::new("curl").args([
-                "--silent",
-                "--show-error",
-                "--write-out",
-                "\n%{http_code}",
-                "--max-time",
-                "40",
-                "--resolve",
-                "willow.atxconsulting.com:8006:127.0.0.1",
-                "--config",
-                "-",
-                "--request",
-                call.method(),
+            &mut pve_curl(
+                &call,
                 &format!("https://willow.atxconsulting.com:8006/api2/json{path}"),
-            ]),
+            ),
             config.as_bytes(),
             limit,
         )?;
@@ -1312,6 +1321,10 @@ pub(super) fn pilot(sha: &str, dir: &Path, group: u64, one_job: bool) -> Result<
         std::thread::sleep(Duration::from_secs(30));
     }
 }
+
+#[cfg(test)]
+#[path = "security_tests.rs"]
+mod security_tests;
 
 #[cfg(test)]
 mod tests {
