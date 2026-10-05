@@ -62,8 +62,10 @@ pub enum FixturesAction {
     },
     /// Check a bundle or, by default, every installed signed-tier fixture.
     Verify {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "bundle")]
         manifest: Option<PathBuf>,
+        #[arg(long, conflicts_with = "manifest")]
+        bundle: Option<PathBuf>,
         #[arg(long, help = "Expected commit (default: checkout HEAD)")]
         sha: Option<String>,
         #[arg(
@@ -819,13 +821,28 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
         }
         FixturesAction::Verify {
             manifest,
+            bundle,
             sha,
             receipt,
         } => {
-            expected_head(root, sha.as_deref())?;
-            let manifest = match manifest {
-                Some(path) => verify_bundle(root, &path, sha.as_deref())?,
-                None => verify_installed(root)?,
+            let expected = expected_head(root, sha.as_deref())?;
+            let manifest = if let Some(bundle_path) = bundle {
+                let (manifest, identity) = archive::verify(&bundle_path, &expected.0)?;
+                let archive_sha256 = provision::compute_sha256(&bundle_path)?;
+                writeln!(
+                    writer,
+                    "fixtures: verified {} executables for {}; identity={} archive_sha256={}",
+                    manifest.executables.len(),
+                    manifest.source_head.0,
+                    identity,
+                    archive_sha256,
+                )?;
+                manifest
+            } else {
+                match manifest {
+                    Some(path) => verify_bundle(root, &path, sha.as_deref())?,
+                    None => verify_installed(root)?,
+                }
             };
             if let Some(path) = receipt {
                 fs::write(

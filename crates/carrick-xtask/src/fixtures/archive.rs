@@ -46,7 +46,7 @@ pub fn pack(manifest: &Path, output: &Path) -> Result<PathBuf> {
         }
         archive.into_inner()?.finish()?;
     }
-    verify(temp.path(), &String::from(identity.source_head))?;
+    let _ = verify(temp.path(), &String::from(identity.source_head))?;
     let artifact = destination.join(format!("{}.tar.gz", String::from(digest)));
     if artifact.exists() {
         if hash_file(&artifact)? != hash_file(temp.path())? {
@@ -129,9 +129,16 @@ pub fn restore(root: &Path, bundle: &Path, sha: Option<&str>) -> Result<RestoreW
 }
 
 /// Verify transport identity without borrowing the sender checkout's HEAD.
-pub fn verify(bundle: &Path, sha: &str) -> Result<()> {
+pub fn verify(bundle: &Path, sha: &str) -> Result<(super::Manifest, String)> {
     let expected = CommitSha::try_from(sha.to_owned())?;
     let unpacked = unpack(bundle)?;
-    inspect_bundle(&unpacked.manifest, Some(&expected))?;
-    Ok(())
+    let manifest = inspect_bundle(&unpacked.manifest, Some(&expected))?;
+    let identity = unpacked
+        .manifest
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| fail("manifest has no parent directory"))?
+        .to_string();
+    Ok((manifest, identity))
 }

@@ -967,6 +967,15 @@ fi
     }
 
     fn remote_job(&self) -> (String, String) {
+        self.remote_job_with_bundle(Some(carrick_xtask::remote_accept::FixtureBundle::local(
+            self.archive.to_str().unwrap(),
+        )))
+    }
+
+    fn remote_job_with_bundle(
+        &self,
+        bundle: Option<carrick_xtask::remote_accept::FixtureBundle>,
+    ) -> (String, String) {
         let log = self.scratch.path().join("accept.log");
         let exit = self.scratch.path().join("exit");
         let script = carrick_xtask::remote_accept::build_accept_job_script(
@@ -975,7 +984,7 @@ fi
             log.to_str().unwrap(),
             exit.to_str().unwrap(),
             self.lock.to_str().unwrap(),
-            Some(self.archive.to_str().unwrap()),
+            bundle,
         )
         .unwrap();
         let out = self.command("sh").args(["-c", &script]).output().unwrap();
@@ -999,6 +1008,19 @@ fn remote_preparation_restores_empty_checkout_before_signed_preflight() {
     let (exit, log) = p.remote_job();
     assert_eq!(exit, "0", "empty checkout preparation failed:\n{log}");
     carrick_xtask::accept::verify_signed_fixtures(&p.checkout).unwrap();
+}
+
+#[test]
+fn remote_preparation_restores_empty_checkout_with_remote_bundle() {
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    let (exit, log) = p.remote_job_with_bundle(Some(
+        carrick_xtask::remote_accept::FixtureBundle::remote(p.archive.to_str().unwrap()),
+    ));
+    assert_eq!(exit, "0", "empty checkout preparation failed:\n{log}");
+    carrick_xtask::accept::verify_signed_fixtures(&p.checkout).unwrap();
+    assert!(log.contains("fixtures: verified"));
 }
 
 #[test]
