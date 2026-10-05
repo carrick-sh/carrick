@@ -222,3 +222,47 @@ fn remote_accept_cli_help() {
     assert!(combined.contains("--attach"));
     assert!(!combined.contains("--keep-worktree"));
 }
+
+fn worktree_command_status(script: &str, leased: bool) -> std::process::ExitStatus {
+    let repo = tempfile::tempdir().unwrap();
+    init_git_repo(repo.path());
+    let lock = tempfile::NamedTempFile::new().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+    command
+        .arg("--root")
+        .arg(repo.path())
+        .args(["worktree-run", "--"]);
+    if leased {
+        command
+            .arg(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .args(["host-lease", "--mode", "gate", "--"])
+            .env("CARRICK_HOST_LEASE_PATH", lock.path())
+            .env_remove("CARRICK_HOST_LEASE_SOCKET")
+            .env_remove("CARRICK_HOST_LEASE_FD");
+    }
+    command.args(["/bin/sh", "-c", script]).status().unwrap()
+}
+
+#[test]
+fn worktree_run_preserves_exit_code() {
+    for leased in [false, true] {
+        assert_eq!(worktree_command_status("exit 37", leased).code(), Some(37));
+    }
+}
+
+#[test]
+fn worktree_run_preserves_signal_status() {
+    for leased in [false, true] {
+        let status = worktree_command_status("kill -TERM $$", leased);
+        assert_eq!(
+            carrick_xtask::host_lease::extract_exit_code(&status),
+            128 + libc::SIGTERM
+        );
+        if leased {
+            assert_eq!(status.code(), Some(128 + libc::SIGTERM));
+        } else {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(libc::SIGTERM));
+        }
+    }
+}

@@ -11,8 +11,8 @@ just build-cache
 CARRICK_SCCACHE=0 just build
 ```
 
-Only the exact value `0` disables caching (and unsets `RUSTC_WRAPPER`).
-An explicitly supplied nonempty `RUSTC_WRAPPER` is respected when enabled.
+Only the exact value `0` disables automatic caching. An explicitly supplied
+`RUSTC_WRAPPER` retains Cargo's normal precedence, including with cache opt-out.
 The automatic wrapper is a Cargo option, so it does not enter test or fixture
 admission environments. Explicit ambient wrappers still fail fixture policy;
 controlled fixture builds retain their declared environment and configuration.
@@ -70,7 +70,12 @@ deletion.
 
 Repo Cargo recipes and the direct signed entry points acquire a shared Rust
 `worktree-run` lifetime guard. Signed entry points retain it through linking,
-signing, tests and scoped EXIT cleanup. Each Git worktree administrative
+signing, tests and scoped EXIT cleanup. `worktree-run` replaces itself with the
+command, preserving its PID and exact exit/signal status. Only the checkout
+guard is inherited through exec, so the existing lease supervisor observes
+public runner death and retains admission through cancellation and reaping;
+the host lease descriptor remains exclusive to that supervisor.
+Each Git worktree administrative
 directory atomically records a random checkout-generation token authenticated
 with the root device/inode. The persistent authority is keyed by that token
 under the Git common directory, outside removable checkouts. Replacing a

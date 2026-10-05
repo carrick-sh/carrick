@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -129,7 +130,8 @@ fn live(mut file: &File) -> std::io::Result<bool> {
     Ok(state.is_empty())
 }
 
-/// A foreground command retains this shared guard until its child has exited.
+/// Shared checkout lifetime authority; explicit exec handoff retains it in the
+/// command tree, including the lease supervisor through scoped cleanup.
 pub(crate) struct Admission {
     _file: File,
 }
@@ -242,21 +244,27 @@ impl CargoLocks {
 }
 
 pub fn run(root: &Path, args: WorktreeRunArgs) -> Result<(), GcError> {
-    let _admission = Admission::acquire(root)?;
+    let admission = Admission::acquire(root)?;
     let (program, argv) = args
         .command
         .split_first()
         .ok_or_else(|| GcError::Census("missing command".into()))?;
-    let status = Command::new(program)
-        .args(argv)
-        .current_dir(root)
-        .status()?;
-    if !status.success() {
-        return Err(GcError::Census(format!(
-            "foreground command failed: {status}"
-        )));
+    let mut command = Command::new(program);
+    command.args(argv).current_dir(root);
+    // Replace this runner so the lease supervisor watches the public runner's
+    // PID, and exit/signal status remains the command's own. Only checkout
+    // admission is inherited: the supervisor still exclusively owns host flock.
+    // SAFETY: the guard owns this descriptor; fcntl is async-signal-safe. Keep
+    // the handoff inside exec so ordinary Admission guards remain CLOEXEC.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(admission._file.as_raw_fd(), libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
-    Ok(())
+    Err(command.exec().into())
 }
 
 #[cfg(test)]

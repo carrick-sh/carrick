@@ -115,6 +115,22 @@ fn runner_death_cancels_detached_nested_workload_before_releasing_exclusion() {
 }
 
 #[test]
+fn worktree_runner_death_cancels_nested_workload_before_releasing_exclusion() {
+    runner_death_with_admission(true, true, false, false, None);
+}
+
+#[test]
+fn worktree_runner_death_cancels_detached_workload_before_releasing_exclusion() {
+    runner_death_with_admission(true, true, true, false, None);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn worktree_runner_death_cancels_detached_closed_scope_workload() {
+    runner_death_with_admission(true, true, true, true, None);
+}
+
+#[test]
 fn supervisor_sigterm_cancels_before_releasing_exclusion() {
     runner_death_preserves_exclusion(true, false, false, Some(libc::SIGTERM));
 }
@@ -146,6 +162,17 @@ fn detached_closed_scope_descendant_is_cancelled() {
 
 #[cfg(test)]
 fn runner_death_preserves_exclusion(
+    nested: bool,
+    detached: bool,
+    close_scope: bool,
+    supervisor_signal: Option<libc::c_int>,
+) {
+    runner_death_with_admission(false, nested, detached, close_scope, supervisor_signal);
+}
+
+#[cfg(test)]
+fn runner_death_with_admission(
+    admitted: bool,
     nested: bool,
     detached: bool,
     close_scope: bool,
@@ -219,7 +246,38 @@ fn runner_death_preserves_exclusion(
     }
     let lock = tempfile::NamedTempFile::new().unwrap();
     let ready = tempfile::NamedTempFile::new().unwrap();
+    let repository = tempfile::tempdir().unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+    if admitted {
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "base",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(repository.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        command
+            .arg("--root")
+            .arg(repository.path())
+            .args(["worktree-run", "--"])
+            .arg(env!("CARGO_BIN_EXE_carrick-xtask"));
+    }
     command.args(["host-lease", "--mode", "gate", "--"]);
     if nested {
         command.arg(env!("CARGO_BIN_EXE_carrick-xtask")).args([
@@ -274,6 +332,17 @@ fn runner_death_preserves_exclusion(
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     holder.fork = Some(pid);
+    let checkout_lock = admitted.then(|| {
+        let generation: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(repository.path().join(".git/carrick-checkout-generation")).unwrap(),
+        )
+        .unwrap();
+        let path = repository
+            .path()
+            .join(".git/carrick-worktree-admission")
+            .join(generation["token"].as_str().unwrap());
+        std::fs::File::open(path).unwrap()
+    });
     // SAFETY: independent flock and existence checks do not modify the child.
     unsafe {
         if detached {
@@ -287,6 +356,13 @@ fn runner_death_preserves_exclusion(
             libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
             -1
         );
+        if let Some(checkout) = &checkout_lock {
+            assert_eq!(
+                libc::flock(checkout.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB),
+                -1,
+                "worktree admission missing before runner death"
+            );
+        }
         if let Some(signal) = supervisor_signal {
             // Readiness records the actual flock owner's PID, not the proxy.
             assert_eq!(libc::kill(*holder.parents.last().unwrap(), signal), 0);
@@ -309,7 +385,16 @@ fn runner_death_preserves_exclusion(
                 "exclusion released while admitted {}workload PID {pid} survives runner death",
                 if nested { "nested " } else { "" }
             );
-            if release == 0 {
+            if let Some(checkout) = &checkout_lock {
+                let released = libc::flock(checkout.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB);
+                assert!(
+                    released != 0 || !alive,
+                    "checkout admission released while workload survives runner death"
+                );
+                if release == 0 && released == 0 {
+                    break;
+                }
+            } else if release == 0 {
                 break;
             }
             assert!(
