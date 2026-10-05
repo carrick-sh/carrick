@@ -8,8 +8,14 @@
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
+use carrick_sched_core::{SlotId, ThreadIdentity, ZoneTables};
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::OBSERVE_NATIVE;
+use carrick_x86::cpl0_scheduler::{
+    ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context,
+};
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 
 fn image() -> PathBuf {
@@ -211,4 +217,141 @@ fn entry_and_return_kicks_never_republish_or_recomplete() {
     let observation_count = entries[0] + entries[1];
     assert_eq!(observation_count, 4);
     assert_eq!(forwards, 0, "kicks cannot forward a served call");
+}
+
+#[test]
+fn x1_boot_shared_substrate() {
+    let p = program(&[(0xa000, 24), (0xdead, 23)]);
+    let dummy = &[0x0f, 0x0b];
+    let mut carrier = Cpl0Carrier::boot(&image(), [&p, dummy]).expect("real KVM + CPL0 image");
+
+    // Shared substrate ZoneTables and AddressSpaces claims
+    let layout = std::alloc::Layout::new::<ZoneTables>();
+    let zone = unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+        assert!(!ptr.is_null());
+        Box::from_raw(ptr)
+    };
+    let slot = SlotId::new(0);
+    zone.drive(slot, 1);
+    zone.publish_slot(slot, 11, Some(0), 0);
+    zone.enter_guest(slot);
+
+    let mm = 11u64;
+    let root = RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap();
+    let space = zone
+        .spaces
+        .publish_closed(mm, root.address().raw(), 0)
+        .unwrap();
+    zone.spaces.open(space);
+
+    let record = zone
+        .alloc_record(ThreadIdentity {
+            mm,
+            tid: 41,
+            serial: 101,
+            generation: 5,
+            ..Default::default()
+        })
+        .unwrap();
+    zone.requeue_preempted(slot, record);
+    let on_cpu = zone.switch_in(slot).unwrap();
+    assert_eq!(on_cpu, record);
+
+    let binding = ContextBinding {
+        record: zone.record_ref(record),
+        context: NativeContext {
+            frame: InterruptFrame {
+                gpr: [0; 15],
+                rip: carrick_vmm_kvm::cpl0_boot::USER_CODE,
+                cs: 0x23,
+                flags: 0x202,
+                rsp: 0x3_1ff0,
+                ss: 0x1b,
+            },
+            address: AddressContext {
+                root,
+                mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
+                generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+            },
+            fs_base: 0x1000,
+            gs_base: 0x2000,
+            xsave: XsaveArea::ZERO,
+        },
+    };
+
+    // 1. Admit context under shared ZoneTables and AddressSpaces claims
+    assert!(admit_context(&zone, slot, &binding));
+    assert_eq!(zone.installed_space(slot), mm);
+
+    // 2. Execute CPL3 bytes and verify shared robust-list serving
+    // Call 1: valid length 24
+    let obs1 = carrier.observe(0).expect("bounded native entry/return");
+    assert_eq!(obs1.result, 0, "set_robust_list(24) should return 0");
+    assert_eq!(obs1.heads[0], (0xa000, 24));
+    assert_eq!(obs1.forwarded, 0);
+    assert_eq!(obs1.semantic_host_exits, 0);
+
+    // Call 2: invalid length 23
+    let obs2 = carrier.observe(0).expect("bounded native entry/return");
+    assert_eq!(
+        obs2.result, -22,
+        "set_robust_list(23) should return -EINVAL (-22)"
+    );
+    assert_eq!(obs2.heads[0], (0xa000, 24), "previous head preserved");
+
+    // 3. Preserve native context / TLS / XSAVE
+    assert_eq!(obs1.captured_stack, 0x3_1fe8);
+    assert_eq!(obs1.returned_stack, 0x3_1fe8);
+    assert_eq!(obs1.preserved_rbx, 0xa000);
+    assert_eq!(obs2.preserved_rbx, 0xdead);
+    assert_eq!(binding.context.fs_base, 0x1000);
+    assert_eq!(binding.context.gs_base, 0x2000);
+
+    // 4. Reject recycled record / root identity (zone-record reuse/admission error detection)
+    // Recycled record incarnation defect
+    let mut stale = ContextBinding {
+        record: binding.record,
+        context: binding.context.clone(),
+    };
+    stale.record.incarnation += 1;
+    assert!(
+        !admit_context(&zone, slot, &stale),
+        "stale incarnation must be rejected"
+    );
+
+    // Wrong root identity defect
+    let mut wrong_root = ContextBinding {
+        record: binding.record,
+        context: binding.context.clone(),
+    };
+    wrong_root.context.address.root = RootGpa::page_aligned(FrameGpa::new(0x70_0000)).unwrap();
+    assert!(
+        !admit_context(&zone, slot, &wrong_root),
+        "mismatched root must be rejected"
+    );
+    assert_eq!(zone.installed_space(slot), 0, "refusal vacates occupancy");
+
+    // Wrong MM identity defect
+    let mut wrong_mm = ContextBinding {
+        record: binding.record,
+        context: binding.context.clone(),
+    };
+    wrong_mm.context.address.mm = MmGeneration::new(NonZeroU64::new(99).unwrap());
+    assert!(
+        !admit_context(&zone, slot, &wrong_mm),
+        "wrong MM must be rejected"
+    );
+
+    // Re-admitting with valid binding restores space
+    assert!(admit_context(&zone, slot, &binding));
+    assert_eq!(zone.installed_space(slot), mm);
+
+    // Closed space defect
+    zone.release_space(slot);
+    zone.spaces.close(space);
+    assert!(
+        !admit_context(&zone, slot, &binding),
+        "closed space must be rejected"
+    );
 }
