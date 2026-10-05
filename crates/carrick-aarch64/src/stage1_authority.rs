@@ -256,6 +256,13 @@ impl Stage1Authority {
         }
     }
 
+    /// The exact physical backing bound to this table authority. A caller
+    /// with a bound resolver must not fall back to a VM-wide IPA lookup when
+    /// that resolver refuses an arena.
+    pub(crate) fn live_host_resolver(&self) -> Option<Arc<dyn HostArenaResolver + Send + Sync>> {
+        self.inner.lock().host_resolver.clone()
+    }
+
     /// Bind a live host arena resolver, making hardware-visible backing authoritative.
     ///
     /// # Safety
@@ -1920,7 +1927,7 @@ impl<'a> Stage1Editor<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Raw `(base, host)` arenas for a VM-free test whose edits publish
@@ -3184,7 +3191,7 @@ mod tests {
         }
     }
 
-    struct BootTablePublisher {
+    pub(crate) struct BootTablePublisher {
         resolver: Arc<MultiBufferResolver>,
         fail: std::sync::atomic::AtomicBool,
         retired: Mutex<Vec<u64>>,
@@ -3212,7 +3219,10 @@ mod tests {
         }
     }
 
-    fn boot_root_fixture(old: u64, capacity: u64) -> (Stage1Authority, Arc<BootTablePublisher>) {
+    pub(crate) fn boot_root_fixture(
+        old: u64,
+        capacity: u64,
+    ) -> (Stage1Authority, Arc<BootTablePublisher>) {
         let mut image = test_manager();
         image
             .map_private_aliased(
