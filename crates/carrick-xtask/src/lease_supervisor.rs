@@ -8,7 +8,8 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 #[derive(clap::Args, Debug)]
 pub struct SupervisorArgs {
@@ -120,24 +121,28 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
 
     // On owner death AND normal command exit, terminate remaining run-scoped
     // descendants. Retain exclusion across this whole operation and EOF.
-    complete_cleanup("cancel workload", || workload.cancel());
-    let status = complete_cleanup("reap worker", || workload.child.wait());
+    let mut cleanup = Cleanup::new().map_err(HostLeaseError::ChildWait)?;
+    complete_cleanup("cancel workload", || workload.cancel(&cleanup.deadline))?;
+    let status = complete_cleanup("reap worker", || cleanup.wait_child(&mut workload.child))?;
     workload.reaped = true;
     #[cfg(target_os = "linux")]
-    complete_cleanup("reap descendants", reap_descendants);
+    complete_cleanup("reap descendants", || reap_descendants(&mut cleanup))?;
     let mut bytes = [0; 256];
-    loop {
-        match lifetime.read(&mut bytes) {
-            Ok(0) => break,
-            Ok(_) => continue,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => {
-                complete_cleanup("workload lifetime EOF", || lifetime.read(&mut bytes));
+    complete_cleanup("workload lifetime EOF", || {
+        loop {
+            cleanup.deadline.wait_fd(lifetime.as_raw_fd())?;
+            match lifetime.read(&mut bytes) {
+                Ok(0) => return Ok(()),
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
             }
         }
-    }
+    })?;
     #[cfg(not(target_os = "linux"))]
-    complete_cleanup("descendant reaping", || workload.wait_for_reaping());
+    complete_cleanup("descendant reaping", || {
+        workload.wait_for_reaping(&cleanup.deadline)
+    })?;
     supervision.map_err(HostLeaseError::ChildWait)?;
     drop(lease);
     Ok(extract_exit_code(&status))
@@ -176,50 +181,153 @@ mod registration_tests {
     }
 }
 
-fn complete_cleanup<T>(operation: &str, mut attempt: impl FnMut() -> io::Result<T>) -> T {
-    let mut reported = None;
-    loop {
-        match attempt() {
-            Ok(result) => return result,
-            Err(error) => {
-                let message = error.to_string();
-                if reported.as_ref() != Some(&message) {
-                    eprintln!(
-                        "host-lease: {operation} failed: {error}; retaining exclusion and continuing cleanup"
-                    );
-                    reported = Some(message);
+// One cleanup deadline covers every phase, including privileged work that
+// cannot be killed. Expiry is an explicit failed run, never an accepted gate.
+const CLEANUP_LIMIT: Duration = Duration::from_secs(5);
+
+struct CleanupDeadline(Instant);
+
+impl CleanupDeadline {
+    fn remaining(&self) -> io::Result<Duration> {
+        self.0
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "cleanup deadline expired"))
+    }
+
+    fn wait_fd(&self, fd: libc::c_int) -> io::Result<()> {
+        loop {
+            let remaining = self.remaining()?;
+            let mut event = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one live descriptor, bounded by the single cleanup deadline.
+            let ready = unsafe {
+                libc::poll(
+                    &mut event,
+                    1,
+                    remaining.as_millis().max(1).min(i32::MAX as u128) as i32,
+                )
+            };
+            if ready > 0 {
+                if event.revents & libc::POLLNVAL != 0 {
+                    return Err(io::Error::from_raw_os_error(libc::EBADF));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                return Ok(());
+            }
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
             }
         }
     }
+
+    #[cfg(not(target_os = "linux"))]
+    fn next_observation(&self, interval: Duration) -> io::Result<()> {
+        std::thread::sleep(self.remaining()?.min(interval));
+        Ok(())
+    }
+}
+
+struct Cleanup {
+    deadline: CleanupDeadline,
+    children: CancellationSignals,
+}
+
+impl Cleanup {
+    fn new() -> io::Result<Self> {
+        let children = CancellationSignals::for_signals(&[libc::SIGCHLD])?;
+        children.reader.set_nonblocking(true)?;
+        Ok(Self {
+            deadline: CleanupDeadline(Instant::now() + CLEANUP_LIMIT),
+            children,
+        })
+    }
+
+    fn child_changed(&mut self) -> io::Result<()> {
+        self.deadline.wait_fd(self.children.reader.as_raw_fd())?;
+        let mut bytes = [0; 256];
+        loop {
+            match self.children.reader.read(&mut bytes) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "child exit signal channel closed",
+                    ));
+                }
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn wait_child(&mut self, child: &mut Child) -> io::Result<ExitStatus> {
+        loop {
+            self.deadline.remaining()?;
+            if let Some(status) = child.try_wait()? {
+                return Ok(status);
+            }
+            self.child_changed()?;
+        }
+    }
+}
+
+fn complete_cleanup<T>(
+    operation: &'static str,
+    attempt: impl FnOnce() -> io::Result<T>,
+) -> Result<T, HostLeaseError> {
+    attempt().map_err(|source| HostLeaseError::Cleanup { operation, source })
 }
 
 #[cfg(test)]
 mod cleanup_tests {
     #[test]
-    fn permission_error_keeps_observing_workload_exit() {
+    fn permanent_cleanup_error_returns_instead_of_retaining_forever() {
         let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut attempts = 0;
-            super::complete_cleanup("permission fixture", || {
-                attempts += 1;
-                if attempts == 1 {
-                    Err(std::io::Error::from_raw_os_error(libc::EPERM))
-                } else {
-                    // Privileged work finishes naturally after cancellation was
-                    // refused. The next observation must permit cleanup/release.
-                    Ok(())
-                }
+            let _ = super::complete_cleanup::<()>("missing children", || {
+                Err(std::io::Error::from_raw_os_error(libc::ENOENT))
             });
-            send.send(attempts).unwrap();
+            send.send(()).unwrap();
         });
-        assert_eq!(
+        assert!(
             receive
                 .recv_timeout(std::time::Duration::from_millis(500))
-                .ok(),
-            Some(2),
-            "permission error prevented the next exit observation"
+                .is_ok(),
+            "permanent cleanup failure retained the lease indefinitely"
+        );
+    }
+
+    #[test]
+    fn permission_error_is_reported_without_retry() {
+        let mut attempts = 0;
+        let result = super::complete_cleanup::<()>("permission fixture", || {
+            attempts += 1;
+            Err(std::io::Error::from_raw_os_error(libc::EPERM))
+        });
+        assert!(matches!(
+            result,
+            Err(crate::host_lease::HostLeaseError::Cleanup { .. })
+        ));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn expired_cleanup_deadline_cannot_block_on_lifetime_writer() {
+        let (reader, _writer) = super::scope_pipe().unwrap();
+        let deadline = super::CleanupDeadline(std::time::Instant::now());
+        assert_eq!(
+            deadline
+                .wait_fd(std::os::fd::AsRawFd::as_raw_fd(&reader))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
         );
     }
 }
@@ -252,11 +360,12 @@ struct Workload {
 }
 
 impl Workload {
-    fn cancel(&mut self) -> io::Result<()> {
+    fn cancel(&mut self, deadline: &CleanupDeadline) -> io::Result<()> {
+        deadline.remaining()?;
         let group = self.child.id() as libc::pid_t;
         #[cfg(target_os = "macos")]
         {
-            self.scope.cancel(group, &mut self.cancelled)?;
+            self.scope.cancel(group, &mut self.cancelled, deadline)?;
         }
         // SAFETY: child created its own session/group before exec. The zombie
         // leader remains unreaped here, pinning its identity during cancellation.
@@ -276,14 +385,14 @@ impl Workload {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn wait_for_reaping(&self) -> io::Result<()> {
+    fn wait_for_reaping(&self, deadline: &CleanupDeadline) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         for process in self.cancelled.values() {
             loop {
                 if process.reaped()? {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                deadline.next_observation(Duration::from_millis(1))?;
             }
         }
         #[cfg(target_os = "macos")]
@@ -302,7 +411,7 @@ impl Workload {
                 }
                 // Darwin reparents indirect descendants to launchd, which reaps
                 // them. Keep exclusion until that reaping has removed the group.
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                deadline.next_observation(Duration::from_millis(1))?;
             }
         }
     }
@@ -425,60 +534,77 @@ mod incarnation_tests {
 impl Drop for Workload {
     fn drop(&mut self) {
         if !self.reaped {
-            let _ = self.cancel();
-            let _ = self.child.wait();
+            // Error unwinding must not restart or block the bounded cleanup.
+            let _ = self.child.kill();
+            let _ = self.child.try_wait();
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-fn reap_descendants() -> io::Result<()> {
+fn reap_descendants(cleanup: &mut Cleanup) -> io::Result<()> {
+    reap_descendants_with(cleanup, || {
+        std::fs::read_to_string("/proc/thread-self/children")
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn reap_descendants_with(
+    cleanup: &mut Cleanup,
+    mut read_children: impl FnMut() -> io::Result<String>,
+) -> io::Result<()> {
     loop {
-        // The direct worker is dead: every remaining descendant is either an
-        // adopted child here, or below one. Kill roots, reap, repeat to ECHILD;
-        // this also catches children that created another group/session.
-        let children =
-            std::fs::read_to_string(format!("/proc/self/task/{}/children", std::process::id()))?;
-        for pid in children.split_whitespace() {
-            let pid: libc::pid_t = pid
-                .parse()
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            // Exit/reaping authority is independent of signal permission. A
-            // privileged adopted child that exited must not be stuck at EPERM.
-            let reaped = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
-            if reaped == pid {
-                continue;
-            }
-            if reaped < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ECHILD) {
+        cleanup.deadline.remaining()?;
+        // Optional cancellation optimisation only. Procfs may be absent, lack
+        // CONFIG_PROC_CHILDREN, or belong to an ancestor PID namespace.
+        if let Ok(children) = read_children() {
+            for pid in children.split_whitespace() {
+                let pid: libc::pid_t = pid
+                    .parse()
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                // A waitable adopted child pins the PID until we reap it.
+                let reaped = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+                if reaped == pid {
                     continue;
                 }
-                return Err(error);
-            }
-            // SAFETY: exact unreaped adopted child, cannot be a reused PID.
-            if unsafe { libc::kill(pid, libc::SIGKILL) } < 0
-                && io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-            {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EPERM) {
+                if reaped < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ECHILD) {
+                        continue;
+                    }
+                    if error.raw_os_error() == Some(libc::EINTR) {
+                        continue;
+                    }
                     return Err(error);
                 }
-                eprintln!(
-                    "host-lease: privileged descendant {pid} refused cancellation; awaiting its exit with exclusion held"
-                );
+                if unsafe { libc::kill(pid, libc::SIGKILL) } < 0 {
+                    let error = io::Error::last_os_error();
+                    match error.raw_os_error() {
+                        Some(libc::ESRCH) => (),
+                        Some(libc::EPERM) => eprintln!(
+                            "host-lease: privileged descendant {pid} refused cancellation; awaiting exit within cleanup deadline"
+                        ),
+                        _ => return Err(error),
+                    }
+                }
             }
         }
-        // SAFETY: this process runs no unrelated work; all children are scoped.
-        if unsafe { libc::waitpid(-1, std::ptr::null_mut(), 0) } >= 0 {
+        // POSIX subreaper wait is release authority, independent of procfs.
+        // WNOHANG plus SIGCHLD readiness permits a bounded failure state even
+        // when live descendants cannot be discovered or cannot be killed.
+        let reaped = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+        if reaped > 0 {
             continue;
         }
-        let error = io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::ECHILD) => return Ok(()),
-            Some(libc::EINTR) => continue,
-            _ => return Err(error),
+        if reaped < 0 {
+            let error = io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ECHILD) => return Ok(()),
+                Some(libc::EINTR) => continue,
+                _ => return Err(error),
+            }
         }
+        cleanup.child_changed()?;
     }
 }
 
@@ -653,12 +779,16 @@ struct CancellationSignals {
 
 impl CancellationSignals {
     fn new() -> io::Result<Self> {
+        Self::for_signals(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP])
+    }
+
+    fn for_signals(signals: &[libc::c_int]) -> io::Result<Self> {
         let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
         let mut result = Self {
             reader,
             registrations: Vec::new(),
         };
-        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        for &signal in signals {
             result
                 .registrations
                 .push(signal_hook::low_level::pipe::register(
@@ -675,5 +805,79 @@ impl Drop for CancellationSignals {
         for &registration in &self.registrations {
             signal_hook::low_level::unregister(registration);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod serial_host {
+    use super::*;
+
+    #[test]
+    #[ignore = "isolated subreaper fixture invoked by missing-children regression"]
+    fn missing_children_cleanup_fixture() {
+        let mut path = String::new();
+        std::io::stdin().read_line(&mut path).unwrap();
+        let lease = HostLease::acquire_path(std::path::Path::new(path.trim()), HostLeaseMode::Gate)
+            .unwrap();
+        let child = Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        let exit = ExitEvents::pidfd(pid).unwrap();
+        let mut poll = libc::pollfd {
+            fd: exit.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Exit readiness preserves the zombie for waitpid(-1) to reap.
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+        let mut cleanup = super::Cleanup::new().unwrap();
+        super::complete_cleanup("missing children", || {
+            super::reap_descendants_with(&mut cleanup, || {
+                Err(io::Error::from_raw_os_error(libc::ENOENT))
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        drop(lease);
+    }
+
+    #[test]
+    fn missing_children_file_still_reaps_and_releases() {
+        use std::io::Write;
+        let lock = tempfile::NamedTempFile::new().unwrap();
+        let mut fixture = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "lease_supervisor::serial_host::missing_children_cleanup_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(fixture.stdin.take().unwrap(), "{}", lock.path().display()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = fixture.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                fixture.kill().unwrap();
+                fixture.wait().unwrap();
+                panic!("missing children file wedged cleanup before lease release");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(status.success(), "missing children cleanup failed");
+        assert!(
+            HostLease::try_exclusive(lock.path()).unwrap().is_some(),
+            "cleanup retained exclusion"
+        );
     }
 }

@@ -87,7 +87,8 @@ carrier-topology-gate *ARGS: build
 xtask *ARGS:
     cargo run --locked -p carrick-xtask -- {{ARGS}}
 
-# Host flock; cancels on runner death or TERM/INT/HUP. Owner SIGKILL releases it.
+# Host flock; cancels on runner death or TERM/INT/HUP; cleanup failure releases with error.
+# One five-second cleanup deadline; owner SIGKILL releases immediately.
 # Darwin cannot contain detached descendants closing every scope fd; see docs/host-lease-containment-follow-up.md.
 lease MODE +CMD:
     cargo run --locked -p carrick-xtask -- host-lease --mode {{MODE}} -- {{CMD}}

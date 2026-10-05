@@ -108,8 +108,10 @@ impl PipeWriter {
         &self,
         session: libc::pid_t,
         members: &mut BTreeMap<ProcessIncarnation, ProcessWatch>,
+        deadline: &super::CleanupDeadline,
     ) -> io::Result<()> {
         loop {
+            deadline.remaining()?;
             let mut changed = false;
             for pid in all_pids()? {
                 if pid <= 0 || (unsafe { libc::getsid(pid) } != session && !self.owns_writer(pid)) {
@@ -144,7 +146,7 @@ impl PipeWriter {
             if !changed && !pending {
                 return Ok(());
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            deadline.next_observation(std::time::Duration::from_millis(10))?;
         }
     }
 }

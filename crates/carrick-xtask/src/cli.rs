@@ -60,7 +60,7 @@ pub enum Commands {
     #[command(
         name = "host-lease",
         about = "Run command under machine-global host lease flock (carrick shared, gate/docker exclusive)",
-        long_about = "Run command under machine-global host lease flock. Runner death and supervisor SIGTERM/SIGINT/SIGHUP cancel supervised work before release. SIGKILL of the sole supervisor releases flock immediately. On Darwin, detached descendants closing all inherited scope descriptors escape; the final process-start-time check to kill also has a PID reuse window. See docs/host-lease-containment-follow-up.md."
+        long_about = "Run command under machine-global host lease flock. Runner death and supervisor SIGTERM/SIGINT/SIGHUP cancel supervised work before successful release. Cleanup errors or the single five-second cleanup deadline fail the run explicitly and release the lease. SIGKILL of the sole supervisor releases flock immediately. On Darwin, detached descendants closing all inherited scope descriptors escape; the final process-start-time check to kill also has a PID reuse window. See docs/host-lease-containment-follow-up.md."
     )]
     HostLease(HostLeaseArgs),
 

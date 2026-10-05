@@ -3,14 +3,15 @@
 The lease supervisor owns flock; arbitrary commands, tests and guests own zero
 flock descriptors. Caller exit and supervisor SIGTERM/SIGINT/SIGHUP request
 cancellation. The supervisor cancels and observes supervised work exiting,
-reaps its children, observes lifetime EOF, and only then releases exclusion.
+reaps its children, observes lifetime EOF, and only then releases exclusion on success. Cleanup failure releases with a
+reported failed-run error under the bounded policy below.
 The existing direct `try_exclusive` still performs a zero-wait flock attempt.
 
-Linux uses a dedicated child subreaper. Detached descendants remain owned even
+Linux uses a dedicated child subreaper. With child-list support, detached descendants remain owned even
 after `setsid` and closing every inherited descriptor. Darwin selects members
 by the workload session or the exact kernel scope-pipe identity. Cancellation
 issues SIGKILL without first stopping processes. An EPERM helper keeps running
-while exit observation and cleanup remain active and exclusion stays held.
+while exit observation and cleanup remain active within the single deadline.
 Permission to signal is independent of permission to reap an adopted child.
 
 ## Explicit limits
@@ -47,6 +48,19 @@ Permission to signal is independent of permission to reap an adopted child.
 These limits are part of the CLI/recipe help and the native contract. This PR
 does not claim to contain arbitrary host process trees or survive flock-owner
 SIGKILL. Ignored failures document missing guarantees; they confer no acceptance.
+
+## Bounded cleanup failure
+
+Cleanup has one five-second deadline across cancellation, worker and descendant
+reaping, and scope EOF. Permanent I/O errors return immediately; pending exit
+and reaping observations must finish within that deadline. A typed
+`HostLeaseError::Cleanup` reports the operation and cause, explicitly marks the
+run failed, and releases the lease. Failure is not acceptance or a promise that
+unkillable work has stopped. The supervisor must not wedge the host indefinitely.
+Linux subreaper `waitpid(-1)` through `ECHILD` is release authority; procfs child
+lists only help cancel live adopted roots and are optional. Without those lists,
+an undiscoverable live detached child may cause the bounded failed-run state.
+The containment follow-up below remains necessary for stronger guarantees.
 
 ## Follow-up design
 
