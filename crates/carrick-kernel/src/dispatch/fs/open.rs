@@ -1553,7 +1553,7 @@ impl<'a> FsView<'a> {
                     .map(carrick_vfs::SyntheticProcRecord::Live);
             }
             registry
-                .zombie(task_id)
+                .exited_process(task_id)
                 .filter(|zombie| zombie.container == context.container().id())
                 .and_then(|zombie| {
                     let to_ns = |raw: i32| {
@@ -1589,7 +1589,7 @@ impl<'a> FsView<'a> {
                     process
                         .kernel_graph()
                         .registry()
-                        .zombies_for_container(context.container().id())
+                        .exited_processes_for_container(context.container().id())
                         .into_iter()
                         .filter_map(|zombie| {
                             let to_ns = |raw: i32| {

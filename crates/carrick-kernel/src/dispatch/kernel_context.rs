@@ -452,7 +452,7 @@ impl SyscallDispatcher {
                 }
             });
         }
-        Some(match kernel.registry().zombie(task) {
+        Some(match kernel.registry().exited_process(task) {
             Some(zombie) if zombie.container == context.container().id() => {
                 GuestProcessTarget::Zombie { euid: zombie.euid }
             }
