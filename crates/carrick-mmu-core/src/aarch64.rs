@@ -17,6 +17,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 pub mod descriptor_txn;
+pub mod owner_fork;
 
 /// Why the host could not build a guest descriptor transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
