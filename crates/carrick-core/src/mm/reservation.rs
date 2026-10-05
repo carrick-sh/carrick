@@ -1,4 +1,17 @@
 //! Neutral reservation storage records and prepared-copy custody.
+//!
+//! Raw selections cannot mint copy permits outside the revalidating owner.
+//! Even a request naming the right MM and VA cannot authorize a peer IPA:
+//! ```compile_fail
+//! use carrick_core::mm::reservation::Reservations;
+//! use carrick_core_abi::{ReservationGeometry, ReservationPolicy, PortalTransferRequest};
+//! fn forge<P: ReservationPolicy, G: ReservationGeometry>(
+//!     root: &mut Reservations<'_, P, G>, mut request: PortalTransferRequest,
+//! ) {
+//!     request.selected.ipa += 0x10000; // same-VA peer's output
+//!     let _ = root.prepare_copy(request, None);
+//! }
+//! ```
 use core::cell::UnsafeCell;
 use core::sync::atomic::AtomicU64;
 
