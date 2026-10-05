@@ -84,8 +84,10 @@ impl<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.table.lock_using(
             index,
             mm,
-            None,
-            cfg!(target_os = "none"),
+            RootStorageAccess {
+                banks: None,
+                identity: cfg!(target_os = "none"),
+            },
             wait,
             RootHolder::Host.word(),
             RootAuthority::Bound(self),
@@ -100,8 +102,10 @@ impl<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.table.lock_using(
             index,
             mm,
-            None,
-            cfg!(target_os = "none"),
+            RootStorageAccess {
+                banks: None,
+                identity: cfg!(target_os = "none"),
+            },
             &NoRootWait,
             RootHolder::El1Slot(slot).word(),
             RootAuthority::Bound(self),
@@ -120,8 +124,10 @@ impl<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.table.lock_using(
             index,
             mm,
-            Some(nodes),
-            false,
+            RootStorageAccess {
+                banks: Some(nodes),
+                identity: false,
+            },
             wait,
             RootHolder::Host.word(),
             RootAuthority::Bound(self),
@@ -140,8 +146,10 @@ impl<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.table.lock_using(
             index,
             mm,
-            Some(nodes),
-            false,
+            RootStorageAccess {
+                banks: Some(nodes),
+                identity: false,
+            },
             &NoRootWait,
             RootHolder::El1Slot(slot).word(),
             RootAuthority::Bound(self),
