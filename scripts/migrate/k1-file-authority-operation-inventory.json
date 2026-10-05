@@ -23568,7 +23568,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
-      "line": 1458,
+      "line": 1482,
       "categories": [
         "mapping"
       ],
