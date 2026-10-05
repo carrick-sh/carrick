@@ -272,6 +272,40 @@ fn validate_entry(entry: u64, level: usize) -> Result<(), DescriptorRefusal> {
     }
     Ok(())
 }
+
+/// Split one coarse terminal without changing PAT or prepared/COW state.
+pub fn split_terminal_descriptor(
+    entry: u64,
+    level: usize,
+    index: usize,
+) -> Result<u64, DescriptorRefusal> {
+    if !matches!(level, 1 | 2) || index >= 512 || entry & HUGE == 0 {
+        return Err(DescriptorRefusal::Malformed);
+    }
+    validate_entry(entry, level)?;
+    let mut flags = (entry & !ADDRESS) & !HUGE;
+    let pat = entry & PAT_LARGE != 0;
+    if level + 1 < 3 {
+        flags |= HUGE;
+        if pat {
+            flags |= PAT_LARGE;
+        }
+    } else if pat {
+        flags |= HUGE;
+    }
+    Ok((leaf_output(entry, level) + index as u64 * level_bytes(level + 1)) | flags)
+}
+
+pub fn arm_cow_terminal(entry: u64) -> Result<u64, DescriptorRefusal> {
+    if entry & (PRESENT | PREPARED) == 0 {
+        return Err(DescriptorRefusal::MissingTable);
+    }
+    Ok(if entry & WRITE != 0 {
+        (entry & !WRITE) | COW | MAY_WRITE
+    } else {
+        entry
+    })
+}
 struct Planner<'a, 't, W: LiveDescriptorWords + ?Sized> {
     words: &'a W,
     txn: &'a DescriptorTxn<'t>,
@@ -319,22 +353,10 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
     }
     fn split(&mut self, entry: u64, level: usize) -> Result<u64, DescriptorRefusal> {
         let child = self.grant()?;
-        let output = leaf_output(entry, level);
-        let mut flags = entry & !ADDRESS;
-        let pat = entry & PAT_LARGE != 0;
-        flags &= !HUGE;
-        if level + 1 < 3 {
-            flags |= HUGE;
-            if pat {
-                flags |= PAT_LARGE;
-            }
-        } else if pat {
-            flags |= HUGE;
-        }
         for index in 0..512 {
             self.set(
                 child + index * 8,
-                (output + index * level_bytes(level + 1)) | flags,
+                split_terminal_descriptor(entry, level, index as usize)?,
             )?;
         }
         Ok(child)
@@ -453,16 +475,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 }
                 entry & !(WRITE | USER | NX | MAY_WRITE) | permissions(p)
             }
-            DescriptorOp::ArmCow(_) => {
-                if entry & (PRESENT | PREPARED) == 0 {
-                    return Err(DescriptorRefusal::MissingTable);
-                }
-                if entry & WRITE != 0 {
-                    (entry & !WRITE) | COW | MAY_WRITE
-                } else {
-                    entry
-                }
-            }
+            DescriptorOp::ArmCow(_) => arm_cow_terminal(entry)?,
             DescriptorOp::CowRepoint { old, new, .. } => {
                 if entry & COW == 0 || entry & MAY_WRITE == 0 {
                     return Err(DescriptorRefusal::NotCowArmed);
@@ -696,10 +709,30 @@ pub fn translate<W: LiveDescriptorWords + ?Sized>(
     access: Access,
     user: bool,
 ) -> Result<FrameGpa, FaultClass> {
+    translate_leaf(words, root, va, access, user).map(|leaf| leaf.output)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TranslatedLeaf {
+    pub output: FrameGpa,
+    pub executable: bool,
+    pub ancestors_writable: bool,
+    pub descriptor: u64,
+    pub size: u64,
+}
+pub fn translate_leaf<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: RootGpa,
+    va: UserVa,
+    access: Access,
+    user: bool,
+) -> Result<TranslatedLeaf, FaultClass> {
     if !canonical(va.raw()) {
         return Err(FaultClass::Reserved);
     }
     let mut table = root.address().raw();
+    let mut executable = true;
+    let mut ancestors_writable = true;
     for level in 0..4 {
         let entry = words
             .load(table + ((va.raw() >> (39 - level * 9)) & 511) * 8)
@@ -708,6 +741,7 @@ pub fn translate<W: LiveDescriptorWords + ?Sized>(
         if entry & PRESENT == 0 {
             return Err(FaultClass::NotPresent);
         }
+        executable &= entry & NX == 0;
         if user && entry & USER == 0 {
             return Err(FaultClass::Protection);
         }
@@ -722,10 +756,17 @@ pub fn translate<W: LiveDescriptorWords + ?Sized>(
             });
         }
         if level == 3 || entry & HUGE != 0 {
-            return Ok(FrameGpa::new(
-                leaf_output(entry, level) + (va.raw() & (level_bytes(level) - 1)),
-            ));
+            return Ok(TranslatedLeaf {
+                output: FrameGpa::new(
+                    leaf_output(entry, level) + (va.raw() & (level_bytes(level) - 1)),
+                ),
+                executable,
+                ancestors_writable,
+                descriptor: entry,
+                size: level_bytes(level),
+            });
         }
+        ancestors_writable &= entry & WRITE != 0;
         table = entry & ADDRESS;
     }
     Err(FaultClass::Reserved)
