@@ -2285,25 +2285,25 @@
       "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/executor/binding.rs",
       "symbol": "VFORK_ACTIVATION_HOOK",
-      "fingerprint": "fbba5cbdfd1fe6923542b013fe8828c2b3a6774ecdf07765037c1b61e2c8a642",
+      "fingerprint": "0212d8d089fed12b1c4fb34f25923fe8cde0aa174a71d8669abc186eca516623",
       "classification": "test_only",
-      "rationale": "Test-only fixture or lock VFORK_ACTIVATION_HOOK in crates/carrick-runtime/src/vcpu_loop/executor.rs scoped strictly to test harness execution."
+      "rationale": "Test-only registry of owned fixture injections. Admission requires the exact retained Task allocation and TaskKey (including TaskSerial); an RAII guard uninstalls only its own entry. Numeric task keys may repeat across independent Kernel fixtures. Absent from production builds."
     },
     {
       "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs",
       "symbol": "HVPATCH_CLONE_FAILPOINT",
-      "fingerprint": "caba41a511d201e06b2a61a9355203b4d243401d256fba1fb280c6807818e097",
-      "classification": "config_debug",
-      "rationale": "Process-global configuration or failpoint cache HVPATCH_CLONE_FAILPOINT in crates/carrick-runtime/src/vcpu_loop/lifecycle.rs initialized from environment flags."
+      "fingerprint": "6f97b556eeb1bdbfc50ad7da71690a7a9d9b3cc497917ad323af4d0cfc1fea53",
+      "classification": "test_only",
+      "rationale": "Test-only registry of owned fixture injections. Admission requires the exact retained Task allocation and TaskKey (including TaskSerial); an RAII guard uninstalls only its own entry. Numeric task keys may repeat across independent Kernel fixtures. Absent from production builds."
     },
     {
       "kind": "static",
       "file": "crates/carrick-runtime/src/vcpu_loop/lifecycle.rs",
       "symbol": "HVPATCH_PROCESS_FAILPOINT",
-      "fingerprint": "268cd2aeca841ba69d180fdcc2194cfd95b18c69679f0671006d2c6fe04fb6bd",
+      "fingerprint": "125e5fafecdb15579efea364e569364de10a9df558c3767a8748ad0be2e0a234",
       "classification": "test_only",
-      "rationale": "Test-only atomic failure injection for HVPatch process activation; installed and consumed only under cfg(test), including the portable vfork rollback test. Absent from production builds."
+      "rationale": "Test-only registry of owned fixture injections. Admission requires the exact retained Task allocation and TaskKey (including TaskSerial); an RAII guard uninstalls only its own entry. Numeric task keys may repeat across independent Kernel fixtures. Absent from production builds."
     },
     {
       "kind": "static",

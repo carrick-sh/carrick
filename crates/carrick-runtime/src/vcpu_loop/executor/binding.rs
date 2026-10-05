@@ -21,7 +21,7 @@ use crate::vcpu_loop::{
     ContainerJobReservation, HvpatchLoopResult, PersistentProcessMemberPublication,
     ProcessPhysicalRetirement,
 };
-#[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(test)]
 use crate::vcpu_loop::{HvpatchProcessFailpoint, check_hvpatch_process_failpoint};
 #[cfg(test)]
 use carrick_kernel::kernel::SchedulerError;
@@ -933,18 +933,8 @@ impl Drop for PreparedHvpatchSubmission {
 }
 
 #[cfg(test)]
-static VFORK_ACTIVATION_HOOK: parking_lot::Mutex<Option<Box<dyn Fn() + Send + Sync>>> =
-    parking_lot::Mutex::new(None);
-
-#[cfg(test)]
-pub(crate) struct TestHookGuard;
-
-#[cfg(test)]
-impl Drop for TestHookGuard {
-    fn drop(&mut self) {
-        *VFORK_ACTIVATION_HOOK.lock() = None;
-    }
-}
+static VFORK_ACTIVATION_HOOK: crate::test_hooks::TaskHookRegistry<Box<dyn Fn() + Send + Sync>> =
+    crate::test_hooks::TaskHookRegistry::new();
 
 pub(crate) struct PreparedVforkChildActivation {
     dormant: PreparedHvpatchSubmission,
@@ -1017,8 +1007,11 @@ impl PreparedVforkChildActivation {
             error
         };
 
-        #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
-        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::Activation) {
+        #[cfg(test)]
+        if let Err(error) = check_hvpatch_process_failpoint(
+            &child_thread.task().expect("retained child task"),
+            HvpatchProcessFailpoint::Activation,
+        ) {
             return Err(fail_unpublished_child(TrapError::Hypervisor(
                 error.to_string(),
             )));
@@ -1033,18 +1026,25 @@ impl PreparedVforkChildActivation {
             .map_err(|error| fail_unpublished_child(TrapError::Hypervisor(error.to_string())))?;
 
         #[cfg(test)]
-        if let Some(hook) = VFORK_ACTIVATION_HOOK.lock().as_ref() {
-            hook();
-        }
+        VFORK_ACTIVATION_HOOK.with_task(
+            &child_thread.task().expect("retained child task"),
+            |hook| {
+                if let Some(hook) = hook.as_ref() {
+                    hook();
+                }
+            },
+        );
 
         member_publication.commit();
         Ok(())
     }
 
     #[cfg(test)]
-    pub(crate) fn set_test_hook(hook: impl Fn() + Send + Sync + 'static) -> TestHookGuard {
-        *VFORK_ACTIVATION_HOOK.lock() = Some(Box::new(hook));
-        TestHookGuard
+    pub(crate) fn set_test_hook(
+        task: &carrick_kernel::kernel::TaskRef,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> crate::test_hooks::TaskHookGuard<Box<dyn Fn() + Send + Sync>> {
+        VFORK_ACTIVATION_HOOK.install(task, Box::new(hook))
     }
 }
 
