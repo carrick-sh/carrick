@@ -100,6 +100,13 @@ impl SyscallFrame {
     }
 }
 
+/// The boundary that owns a wait. Terminal work has no guest return frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContinuationOrigin {
+    Syscall(SyscallFrame),
+    ChildTidClear,
+}
+
 #[derive(Debug)]
 pub struct ContinuationCapture {
     kernel: Weak<Kernel>,
@@ -118,7 +125,7 @@ pub struct ContinuationCapture {
     persistent_signal_mask: SigSet,
     restore_after_signal: Option<SigSet>,
     execution: ExecutionGeneration,
-    syscall: SyscallFrame,
+    origin: ContinuationOrigin,
     restart: RestartClass,
 }
 
@@ -127,6 +134,20 @@ impl ContinuationCapture {
         context: &KernelContext,
         lease: &crate::kernel::objects::ThreadExecutionLease,
         request: SyscallRequest,
+        restart: RestartClass,
+    ) -> Result<Self, ContinuationBuildError> {
+        Self::capture_lease(
+            context,
+            lease,
+            ContinuationOrigin::Syscall(SyscallFrame { request }),
+            restart,
+        )
+    }
+
+    fn capture_lease(
+        context: &KernelContext,
+        lease: &crate::kernel::objects::ThreadExecutionLease,
+        origin: ContinuationOrigin,
         restart: RestartClass,
     ) -> Result<Self, ContinuationBuildError> {
         if !context.exact_thread_is_live()
@@ -159,7 +180,7 @@ impl ContinuationCapture {
             persistent_signal_mask: signal_authority.blocked(),
             restore_after_signal: signal_authority.armed_restore_mask(),
             execution: lease.generation(),
-            syscall: SyscallFrame { request },
+            origin,
             restart,
         })
     }
@@ -202,7 +223,7 @@ impl ContinuationCapture {
             persistent_signal_mask: signal_authority.blocked(),
             restore_after_signal: signal_authority.armed_restore_mask(),
             execution,
-            syscall: SyscallFrame { request },
+            origin: ContinuationOrigin::Syscall(SyscallFrame { request }),
             restart,
         })
     }
@@ -224,7 +245,7 @@ pub struct ContinuationAuthority {
     pub(crate) task_wake_generation: u64,
     pub(crate) task_event_generation: u64,
     pub(crate) execution: ExecutionGeneration,
-    pub(crate) syscall: SyscallFrame,
+    origin: ContinuationOrigin,
     pub(crate) restart: RestartClass,
     pub(crate) mm: MmId,
     pub(crate) asid_generation: u64,
@@ -245,7 +266,7 @@ impl ContinuationAuthority {
             task_wake_generation: capture.task_wake_generation,
             task_event_generation: capture.task_event_generation,
             execution: capture.execution,
-            syscall: capture.syscall,
+            origin: capture.origin,
             restart: capture.restart,
             mm: capture.mm,
             asid_generation: capture.asid_generation,
@@ -299,8 +320,15 @@ impl ContinuationAuthority {
         self.asid_generation
     }
 
-    pub const fn syscall(&self) -> SyscallFrame {
-        self.syscall
+    pub const fn syscall(&self) -> Option<SyscallFrame> {
+        match self.origin {
+            ContinuationOrigin::Syscall(frame) => Some(frame),
+            ContinuationOrigin::ChildTidClear => None,
+        }
+    }
+
+    pub const fn is_terminal_action(&self) -> bool {
+        matches!(self.origin, ContinuationOrigin::ChildTidClear)
     }
 
     pub const fn restart_class(&self) -> RestartClass {
@@ -1536,6 +1564,22 @@ impl BlockedContinuation {
         })
     }
 
+    /// Retain a non-returning clear-child-tid action on the same exact zone
+    /// wait service. No syscall request, guest output, or restart is invented.
+    pub fn from_terminal_zone_park(
+        context: &KernelContext,
+        lease: &crate::kernel::objects::ThreadExecutionLease,
+        wait: ZoneWait,
+    ) -> Result<Self, ContinuationBuildError> {
+        let capture = ContinuationCapture::capture_lease(
+            context,
+            lease,
+            ContinuationOrigin::ChildTidClear,
+            RestartClass::Never,
+        )?;
+        Ok(Self::from_zone_park(capture, wait, None))
+    }
+
     /// The zone record a zone wait parks on.
     pub fn zone_wait(&self) -> Option<&ZoneWait> {
         match &self.state().detail {
@@ -1721,7 +1765,10 @@ impl BlockedContinuation {
     /// pipe, futex, poll/select, and sleep waits across a group stop.
     fn interrupts_on_group_stop(&self) -> bool {
         use carrick_abi::syscall::nr;
-        let nr = self.authority().syscall.request().number;
+        let Some(frame) = self.authority().syscall() else {
+            return false;
+        };
+        let nr = frame.request().number;
         if matches!(nr, value if value == nr::EPOLL_PWAIT
             || value == nr::EPOLL_PWAIT2
             || value == nr::RT_SIGTIMEDWAIT
@@ -2129,7 +2176,11 @@ impl BlockedContinuation {
         } else {
             event
         };
-        let outcome = if !completed && self.interrupted_by_group_stop(context.task()) {
+        let outcome = if self.authority().is_terminal_action() {
+            // A notification makes the retained action eligible to prepare
+            // again. Even a raced signal cannot synthesize an exit return.
+            ContinuationCompletion::ResumeTerminalAction
+        } else if !completed && self.interrupted_by_group_stop(context.task()) {
             ContinuationCompletion::Errno(LINUX_EINTR)
         } else {
             match event {
@@ -2553,6 +2604,7 @@ impl ContinuationEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContinuationCompletion {
+    ResumeTerminalAction,
     Return(i64),
     Errno(LinuxErrno),
     Redispatch,
@@ -2676,6 +2728,7 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
     memory: &mut M,
 ) -> Result<Option<DispatchOutcome>, MemoryError> {
     Ok(match completion {
+        ContinuationCompletion::ResumeTerminalAction => return Err(MemoryError::Unsupported),
         ContinuationCompletion::Return(value) => Some(DispatchOutcome::Returned { value }),
         ContinuationCompletion::Errno(errno) => Some(DispatchOutcome::Errno { errno }),
         ContinuationCompletion::Redispatch => None,
