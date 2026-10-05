@@ -1409,6 +1409,8 @@ fn grant_fixture<B: carrick_mmu_core::owner_mmu::OwnerGrantMmu>(
 
 #[test]
 fn x3_shared_protocol() {
+    retirement_fixture(12);
+    retirement_fixture(14);
     for pages in [16, 64, 256] {
         grant_fixture::<carrick_mmu_core::owner_mmu::Aarch64Mmu>(
             pages,
@@ -1421,4 +1423,146 @@ fn x3_shared_protocol() {
             carrick_mmu_core::x86::owner_mmu::X86Mmu,
         );
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct RetirementVenue {
+    state: std::sync::Arc<parking_lot::Mutex<carrick_core::mm::retirement::ResidencyState>>,
+    settled: std::sync::Arc<parking_lot::Condvar>,
+}
+// SAFETY: every clone uses the same mutex and condition variable.
+unsafe impl carrick_core::mm::retirement::ResidencyVenue for RetirementVenue {
+    type Guard<'a> = parking_lot::MutexGuard<'a, carrick_core::mm::retirement::ResidencyState>;
+    fn lock(&self) -> Self::Guard<'_> {
+        self.state.lock()
+    }
+    fn wait(&self, guard: &mut Self::Guard<'_>) {
+        self.settled.wait(guard);
+    }
+    fn notify_all(&self) {
+        self.settled.notify_all();
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FixtureRoot {
+    base: u64,
+    size: u64,
+}
+impl carrick_core::mm::retirement::RootSlot for FixtureRoot {
+    fn base(self) -> u64 {
+        self.base
+    }
+    fn size(self) -> u64 {
+        self.size
+    }
+}
+struct Invalidation(u64);
+// SAFETY: fixture CPU translations are invalidated by this exact generation.
+unsafe impl carrick_core::mm::retirement::InvalidationProof<u64> for Invalidation {
+    fn generation(&self) -> u64 {
+        self.0
+    }
+}
+struct TerminalRoot(FixtureRoot);
+// SAFETY: fixture backing has no host mappings or pins at terminal completion.
+unsafe impl carrick_core::mm::retirement::TerminalRootProof for TerminalRoot {
+    fn base(&self) -> u64 {
+        self.0.base
+    }
+    fn size(&self) -> u64 {
+        self.0.size
+    }
+}
+
+fn retirement_fixture(page_shift: u32) {
+    use carrick_core::mm::retirement::{
+        AddressResidency, ResidencyError, RootQuarantine, RootRetirementError,
+    };
+    let root = FixtureRoot {
+        base: 0x200000,
+        size: 1 << page_shift,
+    };
+    let current = AddressResidency::<RetirementVenue, u64>::new(11);
+    let peer = AddressResidency::<RetirementVenue, u64>::new(12);
+    let peer_load = peer.begin_load().unwrap();
+    let prepared = current.prepare_retirement().unwrap();
+    assert!(matches!(
+        current.begin_load(),
+        Err(ResidencyError::Retiring)
+    ));
+    drop(prepared);
+    let mut load = current.begin_load().unwrap();
+    load.arm_hardware_dirty().unwrap();
+    let retired = current.begin_retirement().unwrap();
+    assert!(matches!(
+        current.begin_load(),
+        Err(ResidencyError::Retiring)
+    ));
+    assert_eq!(
+        retired.acknowledge(Invalidation(12)),
+        Err(ResidencyError::StaleGeneration)
+    );
+    assert_eq!(
+        retired.acknowledge(Invalidation(11)),
+        Err(ResidencyError::ExecutorStillLoading)
+    );
+    assert!(!retired.is_complete());
+    drop(load);
+    retired.wait_for_admitted_loads();
+    // A cancelled dirty install still owes all-venue invalidation.
+    assert!(retired.needs_invalidation());
+    let mut gate = RootQuarantine::reserve(Some(root)).unwrap();
+    let ticket = gate.take_ticket().unwrap().unwrap();
+    assert!(matches!(
+        gate.take_ticket(),
+        Err(RootRetirementError::TicketAlreadyIssued)
+    ));
+    let receipt = ticket.redeem(TerminalRoot(root)).unwrap();
+    assert_eq!(
+        retired.complete_root(gate, Some(receipt)),
+        Err(RootRetirementError::Incomplete)
+    );
+    retired.acknowledge(Invalidation(11)).unwrap();
+
+    // The same coordinates in a later admission cannot accept an old nonce.
+    let mut stale_gate = RootQuarantine::reserve(Some(root)).unwrap();
+    let stale = stale_gate
+        .take_ticket()
+        .unwrap()
+        .unwrap()
+        .redeem(TerminalRoot(root))
+        .unwrap();
+    let gate = RootQuarantine::reserve(Some(root)).unwrap();
+    assert!(matches!(
+        retired.complete_root(gate, Some(stale)),
+        Err(RootRetirementError::Mismatch { .. })
+    ));
+    let mut gate = RootQuarantine::reserve(Some(root)).unwrap();
+    let ticket = gate.take_ticket().unwrap().unwrap();
+    let wrong = FixtureRoot {
+        base: root.base + root.size,
+        size: root.size,
+    };
+    assert!(matches!(
+        ticket.redeem(TerminalRoot(wrong)),
+        Err(RootRetirementError::Mismatch { .. })
+    ));
+    let gate = RootQuarantine::reserve(Some(root)).unwrap();
+    assert_eq!(
+        retired.complete_root(gate, None),
+        Err(RootRetirementError::ReceiptMissing)
+    );
+    let mut gate = RootQuarantine::reserve(Some(root)).unwrap();
+    let receipt = gate
+        .take_ticket()
+        .unwrap()
+        .unwrap()
+        .redeem(TerminalRoot(root))
+        .unwrap();
+    assert_eq!(
+        retired.complete_root(gate, Some(receipt)).unwrap(),
+        Some(root)
+    );
+    assert!(!peer.is_retiring());
+    peer_load.mark_resident().unwrap();
 }
