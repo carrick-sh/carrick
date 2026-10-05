@@ -13,6 +13,8 @@ workspace = true
 
 [features]
 default = ["platform-macos"]
+# Bounded terminal-clear models, compiled only into unit tests.
+loom = []
 # Guest-side syscall shim (docs/syscall-shim-design.md). NO default here on
 # purpose: the binary (carrick-cli) is the single control point. carrick-cli's
 # default enables it for normal builds; dependents that use carrick-runtime as a
@@ -147,6 +149,7 @@ applevisor-sys.workspace = true
 mach2.workspace = true
 
 [dev-dependencies]
+loom = "=0.7.2"
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 # Self dev-dependency: enables `test-support` on this crate's own lib when it
