@@ -193,14 +193,22 @@ pub fn witness(
         }
         let tag = 0x31 + index as u8;
         let mut xsave = XsaveArea::ZERO;
-        xsave.0[0..2].copy_from_slice(&0x37fu16.to_le_bytes());
-        xsave.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        // Distinct legal round-down/round-up controls, all exceptions masked.
+        let rounding = index as u16 + 1;
+        xsave.0[0..2].copy_from_slice(&(0x37fu16 | (rounding << 10)).to_le_bytes());
+        xsave.0[24..28].copy_from_slice(&(0x1f80u32 | (u32::from(rounding) << 13)).to_le_bytes());
         xsave.0[512..520].copy_from_slice(&XSTATE_MASK.to_le_bytes());
         xsave.0[400..416].fill(tag); // XMM15
         xsave.0[816..832].fill(tag); // YMM15 upper
         let fs = PROGRESS_DATA + 0x100 + index * 0x40;
         let gs = PROGRESS_DATA + 0x200 + index * 0x40;
         let gpa = data_map(index).gpa;
+        // User compute accumulates AND/OR of every executed control store.
+        // Initialize only the AND identities; stores and OR words start zero.
+        for offset in [72, 80] {
+            ram.write_gpa(gpa + offset, &u32::MAX.to_le_bytes())
+                .map_err(|e| fail(e.to_string()))?;
+        }
         ram.write_gpa(
             gpa + fs - PROGRESS_DATA + 8,
             &(0xf500 + index).to_le_bytes(),

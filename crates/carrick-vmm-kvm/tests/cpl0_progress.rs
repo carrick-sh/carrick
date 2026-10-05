@@ -8,15 +8,41 @@ use carrick_vmm_kvm::carrier_interrupts::{KickBoundary, SECOND_ROOT, witness};
 use carrick_x86::cpl0_scheduler::*;
 use std::path::PathBuf;
 
-// inc [rax]; inc rbx; read distinct FS/GS words; store YMM15; jmp back.
+// inc [rax]; inc rbx; read distinct FS/GS words; store YMM15 and FP controls.
+// AND/OR every control sample so a transient switch leak survives readback.
+// Only RCX (already the GS scratch) is additionally clobbered.
 // Contains neither SYSCALL nor a control/semantic doorbell.
 const COMPUTE: &[u8] = &[
     0x48, 0xff, 0x00, 0x48, 0xff, 0xc3, 0x64, 0x48, 0x8b, 0x14, 0x25, 0x08, 0, 0, 0, 0x48, 0x89,
     0x50, 0x08, 0x65, 0x48, 0x8b, 0x0c, 0x25, 0x10, 0, 0, 0, 0x48, 0x89, 0x48, 0x10, 0xc5, 0x7e,
-    0x7f, 0x78, 0x20, 0xeb, 0xd9,
+    0x7f, 0x78, 0x20, 0xd9, 0x78, 0x40, // fnstcw [rax + 64]
+    0x0f, 0xae, 0x58, 0x44, // stmxcsr [rax + 68]
+    0x0f, 0xb7, 0x48, 0x40, // movzx ecx, word [rax + 64]
+    0x21, 0x48, 0x48, // and [rax + 72], ecx
+    0x09, 0x48, 0x4c, // or [rax + 76], ecx
+    0x8b, 0x48, 0x44, // mov ecx, [rax + 68]
+    0x21, 0x48, 0x50, // and [rax + 80], ecx
+    0x09, 0x48, 0x54, // or [rax + 84], ecx
+    0xeb, 0xbf, // jmp back to inc [rax]
 ];
 fn word(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+}
+
+fn control_word(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+}
+
+fn control_dword(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct FpControls {
+    executed: (u16, u32),
+    every_sample_and: (u32, u32),
+    every_sample_or: (u32, u32),
+    saved: (u16, u32),
 }
 
 fn progress(boundary: KickBoundary) {
@@ -117,6 +143,29 @@ fn progress(boundary: KickBoundary) {
     );
     assert_eq!(observed.semantic_host_forwards, 0);
     assert_eq!(observed.interrupt_host_exits, 0);
+
+    // Check after every original progress/isolation/budget assertion: the
+    // negative control must complete all 16 turns, not merely fail boot.
+    let controls: [FpControls; 2] = core::array::from_fn(|index| {
+        let data = &observed.data[index];
+        let xsave = &observed.xsave[index];
+        FpControls {
+            executed: (control_word(data, 64), control_dword(data, 68)),
+            every_sample_and: (control_dword(data, 72), control_dword(data, 80)),
+            every_sample_or: (control_dword(data, 76), control_dword(data, 84)),
+            saved: (control_word(xsave, 0), control_dword(xsave, 24)),
+        }
+    });
+    let expected = [(0x077f, 0x3f80), (0x0b7f, 0x5f80)].map(|(x87, mxcsr)| FpControls {
+        executed: (x87, mxcsr),
+        every_sample_and: (u32::from(x87), mxcsr),
+        every_sample_or: (u32::from(x87), mxcsr),
+        saved: (x87, mxcsr),
+    });
+    assert_eq!(
+        controls, expected,
+        "executed and saved x87/MXCSR isolation across all 16 turns"
+    );
 }
 
 #[test]
