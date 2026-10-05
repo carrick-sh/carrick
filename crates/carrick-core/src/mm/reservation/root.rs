@@ -87,7 +87,7 @@ pub struct ReservationFaultPlan {
 struct Pending {
     request: ReservationRequest,
     result: u64,
-    new_brk: u64,
+    policy_value: u64,
     /// Node attributes of a created (`Prepare`/`Move`) node: plain for
     /// `mmap`/`brk`, the source's for an `mremap` extension or destination.
     flags: u32,
@@ -371,7 +371,13 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
 {
     /// Install in the slot of the matching closed AddressSpaces entry. The
     /// region must initially be zeroed. A published MM key is never reused.
-    pub fn publish(&self, index: usize, mm: ReservationMm, layout: Layout) -> Result<(), Refusal> {
+    pub fn publish(
+        &self,
+        index: usize,
+        mm: ReservationMm,
+        layout: impl Into<Layout>,
+    ) -> Result<(), Refusal> {
+        let layout = layout.into();
         match self.layout_hash.compare_exchange(
             0,
             Self::LAYOUT_HASH,
@@ -393,7 +399,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             .map_err(|_| Refusal::Busy)?;
         let result = if root.key.load(Ordering::Acquire) != 0 {
             Err(Refusal::Collision)
-        } else if !layout.heap.contains(layout.brk) && layout.brk != layout.heap.end() {
+        } else if !Policy::validates_layout(layout) {
             Err(Refusal::Invalid)
         } else if root.epoch.load(Ordering::Relaxed) == u64::MAX {
             Err(Refusal::Stale)
@@ -1139,7 +1145,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         ReservationGeneration::new(self.state().generation).expect("published generation")
     }
     pub fn brk_current(&self) -> u64 {
-        self.state().layout.brk
+        Policy::active_value(self.state().layout.policy)
     }
     pub fn pending(&self) -> Option<ReservationRequest> {
         self.state().pending.map(|p| p.request)
@@ -1151,14 +1157,11 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             && !self.state().fork_pending
             && self.state().pending.is_some_and(|pending| {
                 pending.request == request
-                    && request.operation == ReservationOperation::Retire
-                    && request.protection == ReservationProtection::NONE
-                    && request.source.is_none()
-                    && pending.new_brk < self.brk_current()
-                    && pending.new_brk.checked_add(4095).map(|end| end & !4095)
-                        == Some(request.range.start())
-                    && self.brk_current().checked_add(4095).map(|end| end & !4095)
-                        == Some(request.range.end())
+                    && Policy::authenticates_maintenance(
+                        self.state().layout,
+                        request,
+                        pending.policy_value,
+                    )
             })
     }
 
@@ -1596,7 +1599,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         prot: ReservationProtection,
         operation: ReservationOperation,
         result: u64,
-        new_brk: u64,
+        policy_value: u64,
         require_coverage: bool,
         source: Option<ReservationRange>,
         flags: ReservationNodeFlags,
@@ -1670,23 +1673,24 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             0
         };
         let tree = self.read(self.state().tree);
-        let layout = self.state().layout;
-        let total = tree.bytes - bytes;
-        let total_data = tree.data - data;
-        if total
-            .checked_add(added)
-            .and_then(|n| n.checked_add(layout.external_address_bytes))
-            .is_none_or(|n| n > layout.address_limit)
-            || total_data
-                .checked_add(added_data)
-                .and_then(|n| n.checked_add(layout.external_data_bytes))
-                .is_none_or(|n| n > layout.data_limit)
-        {
-            // Retire/shrink must be possible even after a limit was lowered.
-            if added > bytes || added_data > data {
-                return Err(Refusal::Limit);
-            }
-        }
+        Policy::admits_charges(
+            self.state().layout.policy,
+            Charges {
+                bytes: tree.bytes,
+                data: tree.data,
+                locked: tree.locked,
+            },
+            Charges {
+                bytes,
+                data,
+                locked: 0,
+            },
+            Charges {
+                bytes: added,
+                data: added_data,
+                locked: 0,
+            },
+        )?;
         let sequence = self.state().sequence.checked_add(1).ok_or(Refusal::Stale)?;
         self.state()
             .generation
@@ -1713,7 +1717,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         self.state_mut().pending = Some(Pending {
             request,
             result,
-            new_brk,
+            policy_value,
             flags: flags.bits(),
             nodes,
         });
@@ -2146,7 +2150,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             self.insert_coalescing(id);
         }
         self.release_spares(spares.0);
-        self.state_mut().layout.brk = pending.new_brk;
+        Policy::apply_value(&mut self.state_mut().layout.policy, pending.policy_value);
         self.state_mut().generation += 1;
         self.state_mut().pending = None;
         Ok(pending.result)
@@ -2333,17 +2337,21 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     /// `Limit` (ENOMEM; brk keeps the old break); shrinking stays possible.
     /// Existing mappings and fault grants are unaffected, so no new generation.
     pub fn set_limits(&mut self, address_limit: u64, data_limit: u64) {
-        let layout = &mut self.state_mut().layout;
-        layout.address_limit = address_limit;
-        layout.data_limit = data_limit;
+        Policy::update_limits(
+            &mut self.state_mut().layout.policy,
+            address_limit,
+            data_limit,
+        );
     }
     /// Push the current charges of mappings this root does not model (the
     /// host-owned VMAs), so `set_limits` compares the whole mm against its
     /// limits. Like `set_limits`, no mapping changes and no new generation.
     pub fn set_external_charges(&mut self, address_bytes: u64, data_bytes: u64) {
-        let layout = &mut self.state_mut().layout;
-        layout.external_address_bytes = address_bytes;
-        layout.external_data_bytes = data_bytes;
+        Policy::update_external_charges(
+            &mut self.state_mut().layout.policy,
+            address_bytes,
+            data_bytes,
+        );
     }
     /// Host admission of an existing mapping, before the guest lane is opened.
     /// The caller supplies the complete current snapshot and exact limits.
@@ -2514,9 +2522,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         let generation = self.host_edit_admitted()?;
         let mut cursor = range.start();
         while let Some(n) = self.next(cursor).filter(|n| n.start < range.end()) {
-            if set.contains(ReservationNodeFlags::WIPEONFORK)
-                && !Policy::flags(&n).contains(ReservationNodeFlags::ANONYMOUS_PRIVATE)
-            {
+            if !Policy::validates_attributes(&n, set) {
                 return Err(Refusal::Invalid);
             }
             if n.start > cursor {
@@ -2635,7 +2641,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         }
         let n = self.read(id);
         self.copy_in_order(n.left, list, child)?;
-        if !Policy::flags(&n).contains(ReservationNodeFlags::DONTFORK) {
+        if Policy::inherits(&n) {
             let copy = self.pool_node()?;
             let mut data = n;
             data.left = 0;
@@ -2721,11 +2727,11 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
     pub fn layout(&self) -> Layout {
         self.state().layout
     }
-    pub fn configure_import(&mut self, layout: Layout) -> Result<(), Refusal> {
+    pub fn configure_import(&mut self, layout: impl Into<Layout>) -> Result<(), Refusal> {
         if self.state().admitted || self.state().tree != 0 {
             return Err(Refusal::Stale);
         }
-        self.state_mut().layout = layout;
+        self.state_mut().layout = layout.into();
         Ok(())
     }
     pub fn abort_import(&mut self) -> Result<(), Refusal> {
@@ -2870,7 +2876,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             .generation
             .checked_add(1)
             .ok_or(Refusal::Stale)?;
-        self.state_mut().layout.brk = requested.raw();
+        Policy::apply_value(&mut self.state_mut().layout.policy, requested.raw());
         self.state_mut().generation = generation;
         Ok(())
     }
@@ -2924,8 +2930,8 @@ mod tests {
         assert!(!ptr.is_null());
         unsafe { Box::from_raw(ptr.cast()) }
     }
-    fn layout() -> Layout {
-        Layout {
+    fn layout() -> carrick_personality_linux::mm::LinuxReservationLayout {
+        carrick_personality_linux::mm::LinuxReservationLayout {
             heap: ReservationRange::new(0x1000, 0x100000).unwrap(),
             arena: ReservationRange::new(0x100000, 0x1000000).unwrap(),
             brk: 0x1000,

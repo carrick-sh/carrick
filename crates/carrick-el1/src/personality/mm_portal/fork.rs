@@ -666,7 +666,7 @@ impl<P: PinnedMetadataExtent> NativeForkPortal<P> for MmPortal<'_, P> {
             El1MmHandle::from_admitted_owner(self.carrier, request.child_mm, child_incarnation)
         };
         child_editor.set_mmap_next(editor.mmap_next());
-        child_editor.set_brk_current(root.layout().brk);
+        child_editor.set_brk_current(root.brk_current());
         words.publish_barrier();
         words.invalidate_range(0, 1 << 48);
         Ok(UnpublishedEl1Child {

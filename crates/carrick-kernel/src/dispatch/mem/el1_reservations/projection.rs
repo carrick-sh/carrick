@@ -53,7 +53,7 @@ impl ReservationProcMaps {
         if host.mm != model.mm() {
             return Err(Refusal::Stale);
         }
-        let layout = model.layout();
+        let layout = carrick_personality_linux::mm::LinuxReservationLayout::from(model.layout());
         let mut anonymous = Vec::new();
         model.observe_mappings(&mut |mapping| {
             if mapping.anonymous {
