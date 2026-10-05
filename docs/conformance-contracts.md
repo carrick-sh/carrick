@@ -262,6 +262,21 @@ bindings: `delegated_guest_venue_munmap_then_mmap_retires_host_residency` and
 `delegated_residency_of_two_adjacent_mappings_survives_only_where_unretired`
 (delegated MM against a host-setup twin).
 
+`kernel.mm.bootstrap-table-custody` covers initial roots created after the
+carrier's first container. Every root must be physically accessible to the
+maintenance lane before owner admission, using this MM's exact table-slot
+lease and authenticated stage-2 backing. Relocation is one cold publication
+of one primary table arena; it preserves user leaves and never expands the
+maintenance window to arbitrary global frames. Publication/switch failures
+retire backing before returning capacity; a same-address image replacement
+or owner admission invalidates preparation. VM-free bindings:
+`later_bootstrap_roots_use_distinct_maintenance_accessible_table_custody`,
+`bootstrap_root_publication_failure_returns_capacity_without_switching`,
+`bootstrap_root_same_address_replacement_cannot_commit_stale_preparation`,
+`bootstrap_root_admission_during_publication_refuses_host_commit`, and
+`relocated_boot_root_custody_survives_exec_and_reuse_rejects_old_lease`.
+Signed multi-container and exec acceptance remains required.
+
 `kernel.mm.delegated-root-reader-cost` covers the host readers of a delegated
 root: proposal charging (`RLIMIT_AS`/`RLIMIT_DATA`), `mincore`, fault plans,
 `madvise` range metadata, lock accounting, the arena high water and the host

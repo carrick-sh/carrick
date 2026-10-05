@@ -2390,6 +2390,54 @@ mod tests {
     }
 
     #[test]
+    fn relocated_boot_root_custody_survives_exec_and_reuse_rejects_old_lease() {
+        let (pool, boot) =
+            Stage1MmPool::new_root_for_tests(0x9b_4000_0000, 3).expect("bootstrap lease");
+        let mut source = boot.table_arena_source(pool.clone());
+        let physical = source.take_arena().expect("bootstrap table custody");
+        let initial = boot
+            .publish_stage1_root(physical.0)
+            .expect("bind relocated root");
+        let generation = boot.asid_generation();
+        boot.begin_asid_load().unwrap().mark_resident().unwrap();
+
+        let exec = pool
+            .prepare_child()
+            .expect("successful replacement preparation")
+            .commit();
+        exec.begin_asid_load().unwrap().mark_resident().unwrap();
+        assert_ne!(exec.binding().stage1_root, initial.stage1_root);
+        assert_eq!(
+            boot.binding(),
+            initial,
+            "exec cannot retarget a retained old-MM observer"
+        );
+        assert_eq!(boot.extension_slots().len(), 1);
+        let retirement = pool.retire(&boot).unwrap();
+        assert!(retirement.needs_invalidation());
+        assert_eq!(
+            boot.publish_stage1_root(physical.0),
+            Err(Stage1MmError::Retired)
+        );
+        retirement
+            .acknowledge(BroadcastInvalidation::completed(generation))
+            .unwrap();
+        retirement.complete_for_test().unwrap();
+
+        let reused = pool
+            .prepare_child()
+            .expect("exact retired table address is reusable");
+        assert_eq!(reused.binding().stage1_root, initial.stage1_root);
+        assert_ne!(reused.asid_generation(), generation);
+        assert_eq!(
+            boot.publish_stage1_root(physical.0),
+            Err(Stage1MmError::Retired)
+        );
+        assert_eq!(exec.extension_slots().len(), 0);
+        assert_ne!(exec.binding().stage1_root, reused.binding().stage1_root);
+    }
+
+    #[test]
     fn extension_slots_return_to_free_root_slots_on_retirement() {
         let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 64).expect("root slot pool");
         let initial_free = pool.inner.lock().free_root_slots.len();
