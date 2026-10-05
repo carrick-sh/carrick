@@ -54,7 +54,11 @@ pub enum InventoryError {
     InvalidRow { probe: String, details: String },
 }
 
+/// The authoritative topology-specific bindings used by coverage validation and
+/// the closure harness. Every probe not listed here must use `generic`.
 pub const DEDICATED_PROBE_RUNNERS: &[(&str, &str)] = &[
+    // This probe needs signed execution of warm ptrace-patched text; the
+    // `carrick-conformance-next` ptrace suite owns it instead of generic shards.
     (
         "ptracepoketext",
         "production_rx_poketext_executes_warm_patched_instruction",
@@ -120,12 +124,11 @@ pub const DEDICATED_PROBE_RUNNERS: &[(&str, &str)] = &[
 ];
 
 pub fn is_authorized_runner(probe: &str, runner: &str) -> bool {
-    if runner == "generic" {
-        return true;
-    }
-    DEDICATED_PROBE_RUNNERS
+    let expected = DEDICATED_PROBE_RUNNERS
         .iter()
-        .any(|(p, r)| *p == probe && *r == runner)
+        .find_map(|(name, binding)| (*name == probe).then_some(*binding))
+        .unwrap_or("generic");
+    runner == expected
 }
 
 struct UniqueMapVisitor;

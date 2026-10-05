@@ -7,11 +7,10 @@
 //! or `github.event.merge_group.base_sha` via the `CARRICK_PROBE_COVERAGE_BASE` environment
 //! variable or `--base` flag).
 //!
-//! In local execution, the base is resolved against candidate main branches
-//! (`refs/remotes/github/main`, `refs/remotes/origin/main`, `refs/heads/main`, `main`)
-//! via `git merge-base`. If the resolved merge-base is identical to HEAD (e.g. on main
-//! or a clean branch without commits), execution fails clearly rather than silently
-//! comparing HEAD to itself.
+//! An absent or empty base means there is no change range: absolute checks still
+//! run, but the delta ratchet is skipped with one log line. Local developers must
+//! provide an explicit base to run the delta. Explicit bases resolve through
+//! `git merge-base`; a HEAD-to-HEAD range is rejected rather than reported as a pass.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -300,34 +299,6 @@ pub fn validate_coverage(
     Ok(())
 }
 
-pub fn resolve_local_base_target(repo_root: &Path) -> Result<String, CoverageError> {
-    let candidates = [
-        "refs/remotes/github/main",
-        "refs/remotes/origin/main",
-        "refs/heads/main",
-        "main",
-    ];
-    let mut tried = Vec::new();
-    for candidate in candidates {
-        if command::run_checked("git", ["rev-parse", "--verify", candidate], Some(repo_root))
-            .is_ok()
-        {
-            if command::run_checked("git", ["merge-base", "HEAD", candidate], Some(repo_root))
-                .is_ok()
-            {
-                return Ok(candidate.to_string());
-            }
-            tried.push(format!("{candidate} (no common merge-base with HEAD)"));
-        } else {
-            tried.push(format!("{candidate} (ref not found)"));
-        }
-    }
-    Err(CoverageError::BaseResolution(format!(
-        "no candidate base ref could resolve a merge-base with HEAD (tried: {}); specify an explicit --base <commit>",
-        tried.join(", ")
-    )))
-}
-
 pub fn validate_inventory_classes_and_runners(
     inventory: &BTreeMap<String, ProbeInventoryRow>,
 ) -> Result<(), CoverageError> {
@@ -374,15 +345,11 @@ pub fn resolve_base_commit_with_env(
     env_base: Option<&str>,
     current_head: &str,
 ) -> Result<Option<String>, CoverageError> {
-    let target = match explicit_base.filter(|s| !s.trim().is_empty()) {
-        Some(b) => Some(b.trim().to_string()),
-        None => match env_base.filter(|s| !s.trim().is_empty()) {
-            Some(b) => Some(b.trim().to_string()),
-            None => resolve_local_base_target(repo_root).ok(),
-        },
-    };
-
-    let Some(target) = target else {
+    let Some(target) = explicit_base
+        .filter(|base| !base.trim().is_empty())
+        .or_else(|| env_base.filter(|base| !base.trim().is_empty()))
+        .map(str::trim)
+    else {
         return Ok(None);
     };
 
@@ -392,7 +359,7 @@ pub fn resolve_base_commit_with_env(
         )));
     }
 
-    let mb_out = command::run_checked("git", ["merge-base", "HEAD", &target], Some(repo_root))
+    let mb_out = command::run_checked("git", ["merge-base", "HEAD", target], Some(repo_root))
         .map_err(|e| {
             CoverageError::BaseResolution(format!(
                 "could not compute merge-base between HEAD and '{target}': {e}"
@@ -406,7 +373,9 @@ pub fn resolve_base_commit_with_env(
     }
 
     if resolved_sha == current_head {
-        return Ok(None);
+        return Err(CoverageError::CannotCompareHeadToItself {
+            head: current_head.to_string(),
+        });
     }
 
     Ok(Some(resolved_sha))
@@ -461,16 +430,8 @@ pub fn run_probe_coverage_with_env(
 
     match resolved_base {
         None => {
-            let reason = if base_commit.is_none() && env_base.is_none() {
-                "local run whose resolved base equals HEAD or no base provided"
-            } else {
-                "resolved base equals HEAD"
-            };
             println!(
-                "probe coverage delta: no change range ({reason}); delta ratchet not applicable"
-            );
-            eprintln!(
-                "probe coverage delta: no change range ({reason}); delta ratchet not applicable"
+                "probe coverage delta: no change range (no base provided); delta ratchet not applicable"
             );
             Ok(())
         }
@@ -539,17 +500,8 @@ pub fn validate_closure_coverage(
 
     match resolved_base {
         None => {
-            let reason =
-                if base_commit.is_none() && std::env::var("CARRICK_PROBE_COVERAGE_BASE").is_err() {
-                    "local run whose resolved base equals HEAD or no base provided"
-                } else {
-                    "resolved base equals HEAD"
-                };
             println!(
-                "probe coverage delta: no change range ({reason}); delta ratchet not applicable"
-            );
-            eprintln!(
-                "probe coverage delta: no change range ({reason}); delta ratchet not applicable"
+                "probe coverage delta: no change range (no base provided); delta ratchet not applicable"
             );
             Ok(())
         }
