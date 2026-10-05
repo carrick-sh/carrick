@@ -1,5 +1,10 @@
 # forkexecstorm shard-load investigation (2026-10-04)
 
+This is a **probe-harness fix**, not a Carrick kernel-wait fix. Independent
+review confirmed readiness-first ordering is correct at all eight calls to
+the probe's `bounded_reap_pid`. The original loaded-gate attribution remains
+unproven.
+
 ## Fault and classification
 
 The signed gate reported one `forkexecstorm` child unreaped after 183
@@ -232,3 +237,59 @@ the final branch head. Their results and receipt paths are recorded in
 [PR #20](https://github.com/carrick-sh/carrick/pull/20), with fixed local
 receipt paths `target/fes-load2/host-receipt.json` and
 `target/fes-load2/signed-receipt.json`.
+
+## Review follow-up: make the deterministic witness a signed gate
+
+The original Rust test lived only in the probe crate's `cfg(test)` module.
+Normal probe gates ran its production binary and could miss a reverted
+deadline-first helper whenever the storm happened to finish promptly.
+
+`carrick-conformance-next/tests/forkexecstorm_witness.rs` now owns
+`case_forkexecstorm_ready_child_at_expired_deadline`. The existing signed
+acceptance `case_` step selects it. Before signed conformance-next tests,
+`scripts/test-signed.sh` explicitly cross-builds the probe's Linux musl Rust
+test executable with `cargo test --locked --release --no-run`. Cargo's JSON
+must identify exactly one test executable. The runner records its SHA-256
+and fingerprints of the probe source, shared library, manifest, and lockfile.
+The case checks these identities against its compiled-in sources, mounts the
+exact checked ELF bytes through `InMemoryFileVfs`, and runs the exact Rust
+test in-process through `carrick-embed`. Both the named test's success line
+and a one-test passing summary are required; missing/stale artifacts and
+zero selected guest tests fail closed.
+
+Readiness synchronization now uses `waitid(WEXITED|WNOWAIT|WNOHANG)` under a
+five-second deadline. Zeroed siginfo distinguishes not-ready from an exit;
+the exact child PID, `CLD_EXITED`, and exit status zero must match before the
+helper is called with `Duration::ZERO`. The original child guard still kills
+and boundedly reaps the child on assertion failure.
+
+Fresh red/green commands (full signed acceptance remains held):
+
+```sh
+CARRICK_RUN_ID=fes3-red ./scripts/test-signed.sh carrick-conformance-next \
+  case_forkexecstorm_ready_child_at_expired_deadline --nocapture
+CARRICK_RUN_ID=fes3-green ./scripts/test-signed.sh carrick-conformance-next \
+  case_forkexecstorm_ready_child_at_expired_deadline --nocapture
+```
+
+Only the helper's main deadline-first ordering was restored for red. The
+new case failed with guest exit 101, `ready child must be checked before
+timeout`, left 0/right 17; signed-runner exit 1. Restoring readiness-first
+made the case pass (1 passed, 0 failed; signed-runner exit 0). Both runs'
+unsigned negative controls passed, and both scoped cleanup counts were zero.
+Logs: `target/fes-review/{red,green}.log`; green host-artifact receipt:
+`target/fes-review/green-signed-artifacts.jsonl`. Witness ELF SHA-256:
+
+- red: `c2a2fc1b2f2c019aeaa05b5efbd361267bd72bab531591609b165847375813ad`
+- green: `0d3804b9eda3a44bf9b1f52baaa99689017d389fbca3bf94e178458ba20ae44e`
+
+The lifecycle script now maintains independent syscall and lifecycle
+counters. Both terminal paths require a nonzero lifecycle count, so syscall
+entries alone cannot qualify the capture. `sudo dtrace -Z -e -s
+scripts/dtrace/hvpatch-forkexecstorm-lifecycle.d` passed the compile-only
+check. No new live trace or stress campaign was run.
+
+The two oracle headers were rebound to the changed test-containing source;
+their bodies are unchanged and their native-Linux authority remains
+provisional. Earlier host/shard receipts above belong to their recorded
+revisions; the new focused witness does not confer full signed acceptance.

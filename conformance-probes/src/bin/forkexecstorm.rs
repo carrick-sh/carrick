@@ -1404,19 +1404,36 @@ mod tests {
         }
         assert!(child > 1, "fork must return a child PID");
         let mut guard = TestProcessGuard::new(child);
-        let mut info = core::mem::MaybeUninit::<libc::siginfo_t>::uninit();
-        assert_eq!(
-            unsafe {
-                libc::waitid(
-                    libc::P_PID,
-                    child as libc::id_t,
-                    info.as_mut_ptr(),
-                    libc::WEXITED | libc::WNOWAIT,
-                )
-            },
-            0,
-            "child must have exited and remain unreaped"
-        );
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            // Zero initialization also covers WNOHANG implementations that
+            // leave siginfo untouched when no child is ready.
+            let mut info = unsafe { core::mem::zeroed::<libc::siginfo_t>() };
+            assert_eq!(
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child as libc::id_t,
+                        &mut info,
+                        libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                    )
+                },
+                0,
+                "nonblocking readiness observation must succeed"
+            );
+            let observed_child = unsafe { info.si_pid() };
+            if observed_child != 0 {
+                assert_eq!(observed_child, child, "must observe the exact child");
+                assert_eq!(info.si_code, libc::CLD_EXITED);
+                assert_eq!(unsafe { info.si_status() }, 0);
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "child did not exit within the readiness bound"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
 
         let (reaped, status, timed_out) = unsafe { bounded_reap_pid(child, Duration::ZERO) };
         assert_eq!(reaped, child, "ready child must be checked before timeout");
