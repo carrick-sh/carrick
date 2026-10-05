@@ -3061,7 +3061,7 @@ impl SyscallDispatcher {
             process
                 .kernel_graph()
                 .registry()
-                .zombies_for_container(context.container().id())
+                .exited_processes_for_container(context.container().id())
                 .into_iter()
                 .filter_map(|zombie| {
                     let to_ns = |raw: i32| {
