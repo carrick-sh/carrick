@@ -19,3 +19,6 @@ carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
 
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
+
+[lints]
+workspace = true
