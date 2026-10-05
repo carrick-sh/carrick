@@ -4824,20 +4824,25 @@ fn delegated_admission_releases_host_marks_over_the_roots_holes() {
 
 #[test]
 fn delegated_published_grant_settles_after_backing_leaves_pristine() {
-    published_grant_settlement(None);
+    published_grant_settlement(None, true);
 }
 
 #[test]
 fn delegated_published_grant_settles_after_guest_retirement_without_reviving_residency() {
-    published_grant_settlement(Some(0));
+    published_grant_settlement(Some(0), true);
 }
 
 #[test]
 fn delegated_published_grant_does_not_republish_stock_retired_beside_the_fault() {
-    published_grant_settlement(Some(1));
+    published_grant_settlement(Some(1), true);
 }
 
-fn published_grant_settlement(retired_page: Option<u64>) {
+#[test]
+fn delegated_partial_retirement_settlement_preserves_the_unretired_fault() {
+    published_grant_settlement(Some(1), false);
+}
+
+fn published_grant_settlement(retired_page: Option<u64>, precommit: bool) {
     use carrick_guest_mem::GuestVa;
     let dispatcher = SyscallDispatcher::new();
     let root = Root::admit(&dispatcher);
@@ -4999,9 +5004,11 @@ fn published_grant_settlement(retired_page: Option<u64>) {
         },
     );
     root.guest_mprotect(fault, PAGE, ReservationProtection::READ_WRITE);
-    dispatcher
-        .with_resident_fault_plan_for_test(fault, |plan| dispatcher.commit_resident_fault(plan))
-        .expect("EL1's live-page reconciliation can precede receipt settlement");
+    if precommit {
+        dispatcher
+            .with_resident_fault_plan_for_test(fault, |plan| dispatcher.commit_resident_fault(plan))
+            .expect("EL1's live-page reconciliation can precede receipt settlement");
+    }
     if let Some(page) = retired_page {
         let retired = fault + page * PAGE;
         let range = ReservationRange::new(retired, retired + PAGE).unwrap();
@@ -5037,13 +5044,36 @@ fn published_grant_settlement(retired_page: Option<u64>) {
                 assert_eq!((resident.start(), resident.len()), (start, len));
             }
             let residency_before = dispatcher.mem().lock().resident.ranges();
-            dispatcher.commit_published_frame_grant(plan, grant);
+            let publication = dispatcher.mem_view().commit_published_frame_grant(plan);
+            let table = Box::new(carrick_el1_abi::FrameGrantResidencyTable::new());
+            publication.publish(&table, grant);
+            assert_eq!(
+                table.is_guest_committed(grant.mm_key, fault),
+                retired_page != Some(0),
+                "the exact authenticated resident page must retain its commit evidence"
+            );
+            for page in (start..start + len).step_by(PAGE as usize) {
+                if retired_page.is_some_and(|retired| page == fault + retired * PAGE) {
+                    assert!(
+                        table.lookup(grant.mm_key, page).is_none(),
+                        "retired page regained authority"
+                    );
+                } else {
+                    let retained = table
+                        .lookup(grant.mm_key, page)
+                        .expect("surviving prepared page lost authority");
+                    assert_eq!(retained.expected_ipa, grant.physical_ipa + page - start);
+                    assert_eq!(retained.identity.owner_generation, grant.owner_generation);
+                }
+            }
             if let Some(page) = retired_page {
-                assert_eq!(
-                    dispatcher.mem().lock().resident.ranges(),
-                    residency_before,
-                    "receipt settlement must not revive retired residency"
-                );
+                if precommit || page == 0 {
+                    assert_eq!(
+                        dispatcher.mem().lock().resident.ranges(),
+                        residency_before,
+                        "receipt settlement must not revive retired residency"
+                    );
+                }
                 assert!(root.lock().mapping(fault + page * PAGE).is_none());
                 let mut returns = Vec::new();
                 root.lock()
