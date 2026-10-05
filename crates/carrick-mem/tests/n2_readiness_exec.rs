@@ -98,7 +98,7 @@ fn oversized_load_file_cannot_prepare_an_exec_image() {
 fn unterminated_interp_cannot_select_a_different_interpreter() {
     let mut bytes = executable(Some(b"/ld.so\0"));
     let valid = plan_elf_load_bytes_for(&bytes, EM_AARCH64).expect("valid interpreter control");
-    assert_eq!(valid.interpreter.as_deref(), Some("/ld.so"));
+    assert_eq!(valid.interpreter.as_deref(), Some(b"/ld.so".as_slice()));
     // Leave the NUL in the file, but outside the declared PT_INTERP extent.
     // A parser must not read the following byte to repair a malformed extent.
     bytes[PHOFF + 32..PHOFF + 40].copy_from_slice(&6_u64.to_le_bytes());
@@ -115,24 +115,52 @@ fn unterminated_interp_cannot_select_a_different_interpreter() {
 fn embedded_nul_interp_uses_first_pathname_terminator() {
     let bytes = executable(Some(b"/ld.so\0\0"));
     let plan = plan_elf_load_bytes_for(&bytes, EM_AARCH64).expect("terminated pathname");
-    assert_eq!(plan.interpreter.as_deref(), Some("/ld.so"));
+    assert_eq!(plan.interpreter.as_deref(), Some(b"/ld.so".as_slice()));
     assert_eq!(
         inspect_elf_bytes(&bytes)
             .expect("inspection")
             .interpreter
             .as_deref(),
-        Some("/ld.so")
+        Some(b"/ld.so".as_slice())
     );
 }
 
 #[test]
-fn non_utf8_interp_is_explicitly_rejected() {
+fn non_utf8_main_interp_is_explicitly_rejected_at_lookup() {
+    use carrick_mem::{
+        elf::ElfInspectError,
+        memory::{AddressSpace, AddressSpaceError},
+    };
     let bytes = executable(Some(b"/ld.\xff\0"));
-    assert!(
-        plan_elf_load_bytes_for(&bytes, EM_AARCH64).is_err(),
-        "unrepresentable interpreter must not silently become a static image"
+    assert_eq!(
+        plan_elf_load_bytes_for(&bytes, EM_AARCH64)
+            .expect("byte-valued load metadata")
+            .interpreter
+            .as_deref(),
+        Some(b"/ld.\xff".as_slice())
     );
-    assert!(inspect_elf_bytes(&bytes).is_err());
+    assert_eq!(
+        inspect_elf_bytes(&bytes)
+            .expect("byte-valued inspection")
+            .interpreter
+            .as_deref(),
+        Some(b"/ld.\xff".as_slice())
+    );
+    let lookups = std::cell::Cell::new(0);
+    let error = AddressSpace::load_elf_bytes_with_reader_for(
+        &bytes,
+        &|_| {
+            lookups.set(lookups.get() + 1);
+            None
+        },
+        EM_AARCH64,
+    )
+    .expect_err("unrepresentable main interpreter must not silently become a static image");
+    assert!(matches!(
+        error,
+        AddressSpaceError::Elf(ElfInspectError::InterpreterPathEncoding(_))
+    ));
+    assert_eq!(lookups.get(), 0);
 }
 
 #[test]
@@ -152,4 +180,32 @@ fn interpreter_format_failure_retains_its_role() {
             if matches!(cause.as_ref(), carrick_mem::memory::AddressSpaceError::Elf(_))),
         "lost interpreter provenance: {error}"
     );
+}
+
+#[test]
+fn dyn_interpreter_ignores_its_own_non_utf8_interp() {
+    use carrick_mem::memory::{AddressSpace, LINUX_INTERPRETER_BASE};
+    let main = executable(Some(b"/ld.so\0"));
+    let mut control = executable(None);
+    control[16..18].copy_from_slice(&goblin::elf::header::ET_DYN.to_le_bytes());
+    let image =
+        AddressSpace::load_elf_bytes_with_reader_for(&main, &|_| Some(control.clone()), EM_AARCH64)
+            .expect("self-contained ET_DYN interpreter control");
+    assert_eq!(image.entry(), LINUX_INTERPRETER_BASE + ENTRY);
+
+    let mut interpreter = executable(Some(b"/unused.\xff\0"));
+    interpreter[16..18].copy_from_slice(&goblin::elf::header::ET_DYN.to_le_bytes());
+    let lookups = std::cell::Cell::new(0);
+    let image = AddressSpace::load_elf_bytes_with_reader_for(
+        &main,
+        &|path| {
+            lookups.set(lookups.get() + 1);
+            assert_eq!(path, "/ld.so", "only the main interpreter is resolved");
+            Some(interpreter.clone())
+        },
+        EM_AARCH64,
+    )
+    .expect("ET_DYN interpreter's own PT_INTERP is unused byte metadata");
+    assert_eq!(image.entry(), LINUX_INTERPRETER_BASE + ENTRY);
+    assert_eq!(lookups.get(), 1);
 }

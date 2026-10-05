@@ -40,3 +40,9 @@ than silently running the main image. Native Linux accepts pathname bytes;
 this absent non-UTF-8 pathname is expected to return ENOENT (2). The oracle
 stores native output; the host test names and checks this single representation
 limit separately. This is a disclosed divergence, not a parity claim.
+
+The ASCII-named, self-contained ET_DYN interpreter case has its own valid,
+terminated PT_INTERP containing non-UTF-8 bytes. That metadata is never resolved:
+loading this interpreter must still succeed and execute exit(42). Only a main
+image's PT_INTERP lookup needs Carrick's string-path representation check.
+Shared inspection/load-plan metadata retains pathname bytes losslessly.

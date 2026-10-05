@@ -138,6 +138,15 @@ fn main() {
     // This is a documented Carrick representation limit, not Linux parity:
     // Linux pathname bytes accept non-UTF-8; Carrick must reject explicitly.
     observe("non_utf8_interp", &elf(Some(b"/tmp/elf-ld.\xff\0")));
+    // A loader's own PT_INTERP is metadata, not a second interpreter lookup.
+    let mut nested = elf(Some(b"/unused.\xff\0"));
+    nested[16..18].copy_from_slice(&3_u16.to_le_bytes()); // ET_DYN
+    nested[0x1000..0x1004].copy_from_slice(&0xd2800540_u32.to_le_bytes()); // exit(42)
+    std::fs::write("/tmp/elf-ld.so", &nested).unwrap();
+    observe(
+        "interpreter_own_non_utf8_interp",
+        &elf(Some(b"/tmp/elf-ld.so\0")),
+    );
     std::fs::write("/tmp/elf-ld.so", &relocatable).unwrap();
     observe("interpreter_et_rel", &elf(Some(b"/tmp/elf-ld.so\0")));
     std::fs::write("/tmp/elf-ld.so", b"not an ELF interpreter").unwrap();
