@@ -504,3 +504,6 @@ mod rosetta_detection_tests {
         assert_eq!(parse_binfmt_interpreter(""), None);
     }
 }
+
+#[cfg(test)]
+mod test_hooks;

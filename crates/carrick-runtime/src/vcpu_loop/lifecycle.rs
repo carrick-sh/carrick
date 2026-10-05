@@ -613,64 +613,74 @@ pub(crate) enum HvpatchProcessFailpoint {
 }
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-static HVPATCH_CLONE_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static HVPATCH_CLONE_FAILPOINT: crate::test_hooks::TaskHookRegistry<HvpatchCloneFailpoint> =
+    crate::test_hooks::TaskHookRegistry::new();
 
 #[cfg(test)]
-static HVPATCH_PROCESS_FAILPOINT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static HVPATCH_PROCESS_FAILPOINT: crate::test_hooks::TaskHookRegistry<HvpatchProcessFailpoint> =
+    crate::test_hooks::TaskHookRegistry::new();
 
 #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
-pub(crate) fn install_hvpatch_clone_failpoint(phase: HvpatchCloneFailpoint) {
-    HVPATCH_CLONE_FAILPOINT.store(phase as u8, std::sync::atomic::Ordering::Release);
+pub(crate) fn install_hvpatch_clone_failpoint(
+    task: &carrick_kernel::kernel::TaskRef,
+    phase: HvpatchCloneFailpoint,
+) -> crate::test_hooks::TaskHookGuard<HvpatchCloneFailpoint> {
+    HVPATCH_CLONE_FAILPOINT.install(task, phase)
 }
 
 #[cfg(test)]
-pub(crate) fn install_hvpatch_process_failpoint(phase: HvpatchProcessFailpoint) {
-    HVPATCH_PROCESS_FAILPOINT.store(phase as u8, std::sync::atomic::Ordering::Release);
+pub(crate) fn install_hvpatch_process_failpoint(
+    task: &carrick_kernel::kernel::TaskRef,
+    phase: HvpatchProcessFailpoint,
+) -> crate::test_hooks::TaskHookGuard<HvpatchProcessFailpoint> {
+    HVPATCH_PROCESS_FAILPOINT.install(task, phase)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn check_hvpatch_clone_failpoint(
+    task: &carrick_kernel::kernel::TaskRef,
     phase: HvpatchCloneFailpoint,
 ) -> Result<(), RuntimeError> {
     #[cfg(test)]
-    if HVPATCH_CLONE_FAILPOINT
-        .compare_exchange(
-            phase as u8,
-            0,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
+    if HVPATCH_CLONE_FAILPOINT.with_task(task, |value| {
+        if *value == Some(phase) {
+            value.take();
+            true
+        } else {
+            false
+        }
+    }) == Some(true)
     {
         return Err(RuntimeError::Configuration(format!(
             "injected production HVPatch clone failpoint: {phase:?}"
         )));
     }
     #[cfg(not(test))]
-    let _ = phase;
+    let _ = (task, phase);
     Ok(())
 }
 
 #[cfg(any(test, all(target_os = "macos", target_arch = "aarch64")))]
 pub(crate) fn check_hvpatch_process_failpoint(
+    task: &carrick_kernel::kernel::TaskRef,
     phase: HvpatchProcessFailpoint,
 ) -> Result<(), RuntimeError> {
     #[cfg(test)]
-    if HVPATCH_PROCESS_FAILPOINT
-        .compare_exchange(
-            phase as u8,
-            0,
-            std::sync::atomic::Ordering::AcqRel,
-            std::sync::atomic::Ordering::Acquire,
-        )
-        .is_ok()
+    if HVPATCH_PROCESS_FAILPOINT.with_task(task, |value| {
+        if *value == Some(phase) {
+            value.take();
+            true
+        } else {
+            false
+        }
+    }) == Some(true)
     {
         return Err(RuntimeError::Configuration(format!(
             "injected production HVPatch process failpoint: {phase:?}"
         )));
     }
     #[cfg(not(test))]
-    let _ = phase;
+    let _ = (task, phase);
     Ok(())
 }
 
@@ -700,7 +710,7 @@ where
     stamp_ns_visible_guest_tid(engine, context).map_err(RuntimeError::Trap)?;
     if let ProcessChildBootstrap::GuestFork { child_settid, .. } = bootstrap {
         if let Some((address, tid)) = child_settid {
-            bootstrap_hvpatch_process_child_tid(engine, address, tid)?;
+            bootstrap_hvpatch_process_child_tid(context.task(), engine, address, tid)?;
         }
         state.complete_precompleted_child(&kernel.reporter, 0)?;
     }
@@ -763,11 +773,12 @@ pub(crate) fn bootstrap_hvpatch_process_child_identity_with(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn bootstrap_hvpatch_process_child_tid(
+    task: &carrick_kernel::kernel::TaskRef,
     memory: &mut impl CurrentMmMemory,
     address: u64,
     tid: i32,
 ) -> Result<(), RuntimeError> {
-    check_hvpatch_process_failpoint(HvpatchProcessFailpoint::ChildSettidBootstrap)?;
+    check_hvpatch_process_failpoint(task, HvpatchProcessFailpoint::ChildSettidBootstrap)?;
     memory
         .write_bytes(address, &tid.to_le_bytes())
         .map_err(|error| {
@@ -994,6 +1005,72 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(read_state(&child_memory), (child_pid, 1, 0));
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn clone_failpoints_ignore_other_fixtures_and_uninstall_on_drop() {
+        let (_, owner) = crate::hvpatch::process_context_for_tests(90_001);
+        let (_, other) = crate::hvpatch::process_context_for_tests(90_001);
+        assert_eq!(owner.task().key(), other.task().key());
+        let guard =
+            install_hvpatch_clone_failpoint(owner.task(), HvpatchCloneFailpoint::TidCopyout);
+        let other_guard =
+            install_hvpatch_clone_failpoint(other.task(), HvpatchCloneFailpoint::StartProof);
+        let task = Arc::clone(other.task());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send((
+                check_hvpatch_clone_failpoint(&task, HvpatchCloneFailpoint::TidCopyout),
+                check_hvpatch_clone_failpoint(&task, HvpatchCloneFailpoint::StartProof),
+                check_hvpatch_clone_failpoint(&task, HvpatchCloneFailpoint::StartProof),
+            ))
+            .unwrap();
+        });
+        let (unowned, owned, consumed) = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert!(unowned.is_ok());
+        assert!(owned.is_err());
+        assert!(consumed.is_ok());
+        drop(other_guard);
+        assert!(
+            check_hvpatch_clone_failpoint(owner.task(), HvpatchCloneFailpoint::TidCopyout).is_err()
+        );
+        drop(guard);
+        let guard =
+            install_hvpatch_clone_failpoint(owner.task(), HvpatchCloneFailpoint::Activation);
+        drop(guard);
+        assert!(
+            check_hvpatch_clone_failpoint(owner.task(), HvpatchCloneFailpoint::Activation).is_ok()
+        );
+    }
+
+    #[test]
+    fn process_failpoints_uninstall_during_unwind_without_removing_another_fixture() {
+        let (_, owner) = crate::hvpatch::process_context_for_tests(90_002);
+        let (_, other) = crate::hvpatch::process_context_for_tests(90_002);
+        let _other_guard =
+            install_hvpatch_process_failpoint(other.task(), HvpatchProcessFailpoint::Activation);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = install_hvpatch_process_failpoint(
+                owner.task(),
+                HvpatchProcessFailpoint::Activation,
+            );
+            panic!("fixture teardown");
+        }));
+        assert!(unwind.is_err());
+        assert!(
+            check_hvpatch_process_failpoint(owner.task(), HvpatchProcessFailpoint::Activation)
+                .is_ok()
+        );
+        assert!(
+            check_hvpatch_process_failpoint(other.task(), HvpatchProcessFailpoint::Activation)
+                .is_err()
+        );
+        assert!(
+            check_hvpatch_process_failpoint(other.task(), HvpatchProcessFailpoint::Activation)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1322,7 +1399,7 @@ pub(crate) mod tests {
             };
             let mut control =
                 executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
-            install_hvpatch_clone_failpoint(phase);
+            let _failpoint = install_hvpatch_clone_failpoint(root.task(), phase);
             assert!(
                 job.spawn_persistent_hvpatch_clone_thread(
                     &mut memory,
@@ -1334,7 +1411,7 @@ pub(crate) mod tests {
                 )
                 .is_err()
             );
-            assert!(check_hvpatch_clone_failpoint(phase).is_ok());
+            assert!(check_hvpatch_clone_failpoint(root.task(), phase).is_ok());
             assert_eq!(memory.0[&0x1000], 11_i32.to_le_bytes());
             assert_eq!(memory.0[&0x2000], 22_i32.to_le_bytes());
             assert_eq!(root.task().threads().len(), 1);
@@ -1798,9 +1875,8 @@ pub(crate) mod tests {
             let mut control =
                 executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
             let mut ops = FakeBackendOps::default();
-            if let Some(phase) = phase {
-                install_hvpatch_process_failpoint(phase);
-            }
+            let _failpoint =
+                phase.map(|phase| install_hvpatch_process_failpoint(root.task(), phase));
             let result = state.prepare_in_process_fork(
                 &kernel,
                 &root,
@@ -1836,7 +1912,7 @@ pub(crate) mod tests {
                 continue;
             };
             assert!(result.is_err());
-            assert!(check_hvpatch_process_failpoint(phase).is_ok());
+            assert!(check_hvpatch_process_failpoint(root.task(), phase).is_ok());
             assert_eq!(ops.copied_preparations, 1);
             assert_eq!(ops.shared_preparations, 0);
             if matches!(
@@ -1858,10 +1934,23 @@ pub(crate) mod tests {
 
         let mut bootstrap = Memory::default();
         bootstrap.0.insert(0x3000, 33_i32.to_le_bytes().to_vec());
-        install_hvpatch_process_failpoint(HvpatchProcessFailpoint::ChildSettidBootstrap);
-        assert!(bootstrap_hvpatch_process_child_tid(&mut bootstrap, 0x3000, 44).is_err());
+        let (_, bootstrap_context) = crate::hvpatch::process_context_for_tests(43);
+        let _failpoint = install_hvpatch_process_failpoint(
+            bootstrap_context.task(),
+            HvpatchProcessFailpoint::ChildSettidBootstrap,
+        );
+        assert!(
+            bootstrap_hvpatch_process_child_tid(
+                bootstrap_context.task(),
+                &mut bootstrap,
+                0x3000,
+                44
+            )
+            .is_err()
+        );
         assert_eq!(bootstrap.0[&0x3000], 33_i32.to_le_bytes());
-        bootstrap_hvpatch_process_child_tid(&mut bootstrap, 0x3000, 44).unwrap();
+        bootstrap_hvpatch_process_child_tid(bootstrap_context.task(), &mut bootstrap, 0x3000, 44)
+            .unwrap();
         assert_eq!(bootstrap.0[&0x3000], 44_i32.to_le_bytes());
     }
 

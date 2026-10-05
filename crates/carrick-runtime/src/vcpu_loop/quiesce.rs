@@ -1342,8 +1342,10 @@ where
                 "parent fork copyout diverged from preflight after child process was materialized: parent_pid={parent_pid}, child_pid={child_pid}"
             );
         }
-        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::ParentCopyout)
-        {
+        if let Err(error) = check_hvpatch_process_failpoint(
+            parent_context.task(),
+            HvpatchProcessFailpoint::ParentCopyout,
+        ) {
             if let (Some(address), Some(bytes)) =
                 (request.parent_tid_addr, parent_tid_original.as_ref())
             {
@@ -1372,8 +1374,10 @@ where
             rollback_pidfd(installed_pidfd);
             return Err(error);
         }
-        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::BackendCommit)
-        {
+        if let Err(error) = check_hvpatch_process_failpoint(
+            parent_context.task(),
+            HvpatchProcessFailpoint::BackendCommit,
+        ) {
             if let (Some(address), Some(bytes)) =
                 (request.parent_tid_addr, parent_tid_original.as_ref())
             {
@@ -1402,7 +1406,10 @@ where
             rollback_pidfd(installed_pidfd);
             return Err(error);
         }
-        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::KernelCommit) {
+        if let Err(error) = check_hvpatch_process_failpoint(
+            parent_context.task(),
+            HvpatchProcessFailpoint::KernelCommit,
+        ) {
             if let (Some(address), Some(bytes)) =
                 (request.parent_tid_addr, parent_tid_original.as_ref())
             {
@@ -1582,7 +1589,10 @@ where
                     "failed to bind COW child token to task backend: child_pid={child_pid}, error={error}"
                 );
             });
-        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::TokenBind) {
+        if let Err(error) = check_hvpatch_process_failpoint(
+            parent_context.task(),
+            HvpatchProcessFailpoint::TokenBind,
+        ) {
             return Err(ops.fail_stop(error));
         }
         if !shares_mm {
@@ -1728,8 +1738,10 @@ where
         if let Err(error) = child_kernel.admit_external_exec(child_context.task().key()) {
             return Err(ops.fail_stop(error));
         }
-        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::DormantHandle)
-        {
+        if let Err(error) = check_hvpatch_process_failpoint(
+            parent_context.task(),
+            HvpatchProcessFailpoint::DormantHandle,
+        ) {
             return Err(ops.fail_stop(error));
         }
         let started = published.start_child().unwrap_or_else(|error| {
@@ -1765,7 +1777,10 @@ where
                 "validate process child activation proof failed: child_pid={child_pid}, error={error}"
             );
         });
-        if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::StartProof) {
+        if let Err(error) = check_hvpatch_process_failpoint(
+            parent_context.task(),
+            HvpatchProcessFailpoint::StartProof,
+        ) {
             return Err(ops.fail_stop(error));
         }
         let member_publication = PersistentProcessMemberPublication::new(
@@ -1813,8 +1828,10 @@ where
                 logical.completion.clone(),
                 logical.process_retirement.clone(),
             )?;
-            if let Err(error) = check_hvpatch_process_failpoint(HvpatchProcessFailpoint::Activation)
-            {
+            if let Err(error) = check_hvpatch_process_failpoint(
+                parent_context.task(),
+                HvpatchProcessFailpoint::Activation,
+            ) {
                 return Err(ops.fail_stop(error));
             }
             None

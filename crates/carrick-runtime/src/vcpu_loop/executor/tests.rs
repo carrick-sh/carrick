@@ -5937,6 +5937,79 @@ impl VforkTestFixture {
 }
 
 #[test]
+fn vfork_activation_hook_ignores_another_live_fixture() {
+    // Deliberately reuse numeric identities: a TaskKey alone cannot separate
+    // two independent Kernel fixtures.
+    let mut owner = VforkTestFixture::new(14_506, 24_506);
+    let mut other = VforkTestFixture::new(14_506, 24_506);
+    assert_eq!(owner.child.task().key(), other.child.task().key());
+    let observed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&observed);
+    let _guard =
+        super::PreparedVforkChildActivation::set_test_hook(owner.child.task(), move || {
+            flag.store(true, Ordering::SeqCst);
+        });
+    let activation = other.make_activation(None);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send(activation.activate()).unwrap();
+    });
+    rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+    worker.join().unwrap();
+    assert!(
+        !observed.load(Ordering::SeqCst),
+        "another fixture fired the owner's hook"
+    );
+    owner.make_activation(None).activate().unwrap();
+    assert!(observed.load(Ordering::SeqCst));
+}
+
+#[test]
+fn vfork_activation_failpoint_ignores_another_live_fixture() {
+    let mut owner = VforkTestFixture::new(14_507, 24_507);
+    let mut other = VforkTestFixture::new(14_507, 24_507);
+    let _failpoint = super::super::install_hvpatch_process_failpoint(
+        owner.child.task(),
+        super::super::HvpatchProcessFailpoint::Activation,
+    );
+    let activation = other.make_activation(None);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        tx.send(activation.activate()).unwrap();
+    });
+    let result = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    worker.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "another fixture consumed the owner's failpoint: {result:?}"
+    );
+    assert!(owner.make_activation(None).activate().is_err());
+}
+
+#[test]
+fn vfork_hook_drop_uninstalls_only_its_own_fixture() {
+    let mut owner = VforkTestFixture::new(14_508, 24_508);
+    let mut other = VforkTestFixture::new(14_508, 24_508);
+    let owner_observed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&owner_observed);
+    let guard = super::PreparedVforkChildActivation::set_test_hook(owner.child.task(), move || {
+        flag.store(true, Ordering::SeqCst);
+    });
+    let other_observed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&other_observed);
+    let _other_guard =
+        super::PreparedVforkChildActivation::set_test_hook(other.child.task(), move || {
+            flag.store(true, Ordering::SeqCst);
+        });
+    drop(guard);
+    owner.make_activation(None).activate().unwrap();
+    assert!(!owner_observed.load(Ordering::SeqCst));
+    assert!(!other_observed.load(Ordering::SeqCst));
+    other.make_activation(None).activate().unwrap();
+    assert!(other_observed.load(Ordering::SeqCst));
+}
+
+#[test]
 fn dropped_vfork_activation_releases_unpublished_job_reservation() {
     let mut fixture = VforkTestFixture::new(14_500, 24_500);
     let activation = fixture.make_activation(None);
@@ -5967,20 +6040,21 @@ fn vfork_deferred_child_activation_runs_after_parent_backend_saved() {
         .parent_binding
         .notify_on_terminal_settlement(terminal_tx);
 
-    let _guard = super::PreparedVforkChildActivation::set_test_hook(move || {
-        let events = factory_events.lock().clone();
-        let parent_saved = events.iter().any(|e| {
-            e.kind == BackendEventKind::Save && e.task.is_some_and(|(k, _)| k == parent_key)
+    let _guard =
+        super::PreparedVforkChildActivation::set_test_hook(fixture.child.task(), move || {
+            let events = factory_events.lock().clone();
+            let parent_saved = events.iter().any(|e| {
+                e.kind == BackendEventKind::Save && e.task.is_some_and(|(k, _)| k == parent_key)
+            });
+            observed_flag.store(parent_saved, Ordering::SeqCst);
+            kernel
+                .exit_task(
+                    child.task().key().id,
+                    carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                    None,
+                )
+                .unwrap();
         });
-        observed_flag.store(parent_saved, Ordering::SeqCst);
-        kernel
-            .exit_task(
-                child.task().key().id,
-                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
-                None,
-            )
-            .unwrap();
-    });
 
     fixture
         .parent_binding
@@ -6069,15 +6143,16 @@ fn vfork_release_during_child_activation_preserves_wake_edge_through_parent_sett
         .notify_on_terminal_settlement(terminal_tx);
 
     // Release vfork during activation (after dormant.activate succeeds, before parent blocked settlement)
-    let _guard = super::PreparedVforkChildActivation::set_test_hook(move || {
-        kernel
-            .exit_task(
-                child.task().key().id,
-                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
-                None,
-            )
-            .unwrap();
-    });
+    let _guard =
+        super::PreparedVforkChildActivation::set_test_hook(fixture.child.task(), move || {
+            kernel
+                .exit_task(
+                    child.task().key().id,
+                    carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                    None,
+                )
+                .unwrap();
+        });
 
     fixture
         .parent_binding
@@ -6175,7 +6250,8 @@ fn vfork_child_activation_failpoint_rolls_back_and_fails_parent_claim() {
     let continuation = fixture.make_continuation();
     let activation = fixture.make_activation(None);
 
-    super::super::install_hvpatch_process_failpoint(
+    let _failpoint = super::super::install_hvpatch_process_failpoint(
+        fixture.child.task(),
         super::super::HvpatchProcessFailpoint::Activation,
     );
 

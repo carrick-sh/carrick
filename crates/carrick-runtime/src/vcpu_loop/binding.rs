@@ -2065,7 +2065,9 @@ where
                 threads::CloneThreadSpawn::Errno(crate::linux_abi::LINUX_EFAULT),
             ));
         }
-        if let Err(error) = check_hvpatch_clone_failpoint(HvpatchCloneFailpoint::TidCopyout) {
+        if let Err(error) =
+            check_hvpatch_clone_failpoint(parent_context.task(), HvpatchCloneFailpoint::TidCopyout)
+        {
             tid_outputs.rollback(memory).map_err(|rollback| {
                 RuntimeError::Configuration(format!(
                     "restore failpoint HVPatch clone TID outputs: {rollback}"
@@ -2229,7 +2231,10 @@ where
                 return Err(error);
             }
         };
-        if let Err(error) = check_hvpatch_clone_failpoint(HvpatchCloneFailpoint::BackendCommit) {
+        if let Err(error) = check_hvpatch_clone_failpoint(
+            parent_context.task(),
+            HvpatchCloneFailpoint::BackendCommit,
+        ) {
             drop(task_backend);
             self.rollback_published_hvpatch_clone(
                 memory,
@@ -2277,7 +2282,10 @@ where
         };
         if let Err(error) =
             lifecycle::bind_activate_child::<M, _>(ops, &mut task_backend, child_token, || {
-                check_hvpatch_clone_failpoint(HvpatchCloneFailpoint::TokenBind)
+                check_hvpatch_clone_failpoint(
+                    parent_context.task(),
+                    HvpatchCloneFailpoint::TokenBind,
+                )
             })
         {
             drop(task_backend);
@@ -2363,7 +2371,10 @@ where
             .registry
             .register_child_with_tid(tid, clear_child_tid_addr);
         enroll_persistent_process_member(&self.state.threads, &logical.terminal_settlement);
-        if let Err(error) = check_hvpatch_clone_failpoint(HvpatchCloneFailpoint::RegistryHandle) {
+        if let Err(error) = check_hvpatch_clone_failpoint(
+            parent_context.task(),
+            HvpatchCloneFailpoint::RegistryHandle,
+        ) {
             drop(dormant);
             self.rollback_published_hvpatch_clone(
                 memory,
@@ -2445,7 +2456,9 @@ where
                 return Err(RuntimeError::Trap(error));
             }
         };
-        if let Err(error) = check_hvpatch_clone_failpoint(HvpatchCloneFailpoint::StartProof) {
+        if let Err(error) =
+            check_hvpatch_clone_failpoint(parent_context.task(), HvpatchCloneFailpoint::StartProof)
+        {
             drop(dormant);
             self.rollback_published_hvpatch_clone(
                 memory,
@@ -2474,7 +2487,9 @@ where
             );
             return Err(RuntimeError::Trap(error));
         }
-        if let Err(error) = check_hvpatch_clone_failpoint(HvpatchCloneFailpoint::Activation) {
+        if let Err(error) =
+            check_hvpatch_clone_failpoint(parent_context.task(), HvpatchCloneFailpoint::Activation)
+        {
             self.rollback_published_hvpatch_clone(
                 memory,
                 &child_context,
