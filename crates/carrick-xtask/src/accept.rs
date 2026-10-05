@@ -151,6 +151,8 @@ pub struct AcceptReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<ArtifactIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture_validation: Option<crate::fixtures::ValidationReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub el1: Option<El1Comparison>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub probe_diffs: Vec<ProbeDiff>,
@@ -772,13 +774,14 @@ fn run_command_redirect(
     Ok((extract_exit_code(&status).into(), duration_s))
 }
 
-pub fn verify_signed_fixtures(root: &Path) -> Result<(), AcceptError> {
-    crate::fixtures::verify_installed(root).map_err(|error| {
+pub fn verify_signed_fixtures(
+    root: &Path,
+) -> Result<crate::fixtures::ValidationReceipt, AcceptError> {
+    crate::fixtures::verify_installed_receipt(root).map_err(|error| {
         AcceptError::Failed(format!(
             "signed fixture provenance: {error}; restore an exact-HEAD bundle with xtask fixtures restore --manifest <path>"
         ))
-    })?;
-    Ok(())
+    })
 }
 
 pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptError> {
@@ -905,6 +908,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
     // Fail before signing or guest execution, while preserving a FAIL receipt.
     let signed_requested = matches!(args.phase, AcceptPhase::Signed | AcceptPhase::All);
     let mut fixtures_valid = false;
+    let mut fixture_validation = None;
     if signed_requested {
         if std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64" {
             return Err(AcceptError::UnsupportedPlatform(format!(
@@ -916,7 +920,13 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
         let start = Instant::now();
         let result = verify_signed_fixtures(&root);
         fixtures_valid = result.is_ok();
-        let error = result.err().map(|error| error.to_string());
+        let error = match result {
+            Ok(validation) => {
+                fixture_validation = Some(validation);
+                None
+            }
+            Err(error) => Some(error.to_string()),
+        };
         let log_path = run_dir.join("signed-00-fixtures.log");
         let message = if let Some(error) = &error {
             failures.push(error.clone());
@@ -929,7 +939,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
                     source,
                 })?;
             format!(
-                "all signed-tier fixture hashes verified for {head}; installed receipt sha256={receipt_hash}"
+                "all signed-tier fixture hashes verified by input_identity for {head}; installed receipt sha256={receipt_hash}"
             )
         };
         fs::write(&log_path, &message).map_err(|source| AcceptError::Io {
@@ -1619,6 +1629,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
         steps: step_results,
         skipped_steps: skipped_steps.clone(),
         artifact: artifact_identity,
+        fixture_validation,
         el1: el1_summary,
         probe_diffs,
         cleanup_counts,
@@ -1939,6 +1950,7 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
             }],
             skipped_steps: vec!["ltp".to_string()],
             artifact: None,
+            fixture_validation: None,
             el1: None,
             probe_diffs: vec![],
             cleanup_counts: vec![],
