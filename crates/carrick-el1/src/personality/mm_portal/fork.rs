@@ -19,6 +19,16 @@ use std::vec::Vec;
 const PA: u64 = 0x0000_ffff_ffff_f000;
 const SHIFTS: [u32; 4] = [39, 30, 21, 12];
 
+/// The identity page is the only private data in the bootstrap control hole.
+/// The carrier owns code, maintenance and mailbox outputs for its entire VM
+/// lifetime; a coarse bootstrap descriptor also covers stage-2 gaps. Neither
+/// those shared outputs nor the gaps authorize a physical fork copy.
+fn private_control_page(va: u64) -> bool {
+    (carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE
+        ..carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE + carrick_el1_abi::CARRICK_IDENTITY_PAGE_SIZE)
+        .contains(&va)
+}
+
 /// Check the supplied table arenas and choose the primary window that the
 /// maintenance service can address. The ordinal is returned to the host only
 /// on a stage-3 refusal.
@@ -821,10 +831,7 @@ fn census_entry<W: LiveDescriptorWords + ?Sized>(
             )?;
         }
     } else if structural {
-        let alias = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE;
-        if !(alias..alias + carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE).contains(&va)
-            && descriptor & PA != 0
-        {
+        if private_control_page(va) {
             count.custody = count.custody.checked_add(1).ok_or(MmError::NoMemory)?;
         }
     } else if (selected == Policy::Private
@@ -943,7 +950,7 @@ fn copy_entry<W: LiveDescriptorWords + ?Sized>(
             }
             return Ok((descriptor, (descriptor & !PA) | output));
         }
-        if descriptor & (1 << 7) == 0 {
+        if private_control_page(va) {
             let source_ipa = descriptor & PA;
             let destination_ipa = request.kernel_control_ipa + (va - CONTROL);
             scratch.custody(PortalForkCustody::StructuralCopy {
@@ -953,15 +960,6 @@ fn copy_entry<W: LiveDescriptorWords + ?Sized>(
                 executable: descriptor & (1 << 53) == 0,
             })?;
             return Ok((descriptor, (descriptor & !PA) | destination_ipa));
-        }
-        let ipa = descriptor & PA;
-        if ipa != 0 {
-            scratch.custody(PortalForkCustody::Frame {
-                va,
-                ipa,
-                len: span,
-                shared: false,
-            })?;
         }
         return Ok((descriptor, descriptor));
     }
