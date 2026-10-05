@@ -62,6 +62,38 @@ pub struct PreparedTaskExit {
     pub(super) result_zombie: Zombie,
 }
 
+/// Signal-visible retirement has committed, while completion remains reserved.
+/// The caller must finish its already-prepared clear/wake outside graph locks,
+/// then consume this token. No suspension or recoverable operation is allowed
+/// between retirement and publication; abandonment fails closed.
+#[must_use = "retired task completion must be published after terminal memory work"]
+pub struct RetiredTaskExit<F: FnOnce() -> Result<Zombie, KernelOperationError>> {
+    publish: Option<F>,
+}
+
+impl<F: FnOnce() -> Result<Zombie, KernelOperationError>> RetiredTaskExit<F> {
+    pub fn publish(mut self) -> Result<Zombie, KernelOperationError> {
+        let publish = self.publish.take().unwrap_or_else(|| {
+            carrick_fatal!(
+                "kernel::task_exit_publication",
+                "retired task publication was consumed twice"
+            )
+        });
+        publish()
+    }
+}
+
+impl<F: FnOnce() -> Result<Zombie, KernelOperationError>> Drop for RetiredTaskExit<F> {
+    fn drop(&mut self) {
+        if self.publish.is_some() {
+            carrick_fatal!(
+                "kernel::task_exit_publication",
+                "retired task publication was abandoned"
+            );
+        }
+    }
+}
+
 impl PreparedTaskExit {
     pub const fn task(&self) -> TaskKey {
         self.task
@@ -86,6 +118,19 @@ impl PreparedTaskExit {
                 _ => crate::observe::ZombieReaper::ContainerRetirement,
             },
         }
+    }
+
+    /// Retire signal-visible membership, retaining the entire completion
+    /// transaction until the caller finishes its prepared clear and wake.
+    pub fn retire_notifying<F: FnOnce(Option<TaskKey>)>(
+        self,
+        notify_parent: F,
+    ) -> Result<
+        RetiredTaskExit<impl FnOnce() -> Result<Zombie, KernelOperationError> + use<F>>,
+        KernelOperationError,
+    > {
+        let kernel = Arc::clone(&self.reservation.kernel);
+        kernel.retire_task_exit_notifying(self, notify_parent)
     }
 
     pub fn commit(self) -> Result<Zombie, KernelOperationError> {
@@ -254,6 +299,10 @@ impl Kernel {
             self.exit_subscribers.register(task, subscriber);
             return Some(task);
         }
+        if let Some(task) = state.retiring_tasks.get(&task_id) {
+            self.exit_subscribers.register(task.key(), subscriber);
+            return Some(task.key());
+        }
         let exited = state
             .zombies
             .get(&task_id)
@@ -353,7 +402,11 @@ impl Kernel {
             .task
             .retire_thread(context.thread.key())
             .ok_or(KernelOperationError::UnknownThread(tid))?;
-        if !matches!(lane, ThreadRetirementLane::ExitedInZone { .. }) {
+        if matches!(lane, ThreadRetirementLane::ExitedInZone { .. }) {
+            thread
+                .child_tid_cleared_in_zone
+                .store(true, std::sync::atomic::Ordering::Release);
+        } else {
             thread
                 .control_lease()
                 .lifecycle()
@@ -595,6 +648,7 @@ impl Kernel {
         let mut reserved_ids = BTreeSet::from([task_id]);
         let mut affected_revisions = BTreeMap::new();
         for child_key in &children {
+            ensure_task_unreserved(&state, child_key.id)?;
             reserved_ids.insert(child_key.id);
             if let Some(child) = state.tasks.get(&child_key.id) {
                 if child.task.key() != *child_key {
@@ -719,17 +773,29 @@ impl Kernel {
     /// `prepare_task_exit`; errors here denote an internal breach of the
     /// reservation contract, not a guest-visible retry condition.
     pub(crate) fn commit_task_exit(
-        &self,
+        self: &Arc<Self>,
         prepared: PreparedTaskExit,
     ) -> Result<Zombie, KernelOperationError> {
         self.commit_task_exit_notifying(prepared, |_| {})
     }
 
     pub(crate) fn commit_task_exit_notifying(
-        &self,
-        mut prepared: PreparedTaskExit,
+        self: &Arc<Self>,
+        prepared: PreparedTaskExit,
         notify_parent: impl FnOnce(Option<TaskKey>),
     ) -> Result<Zombie, KernelOperationError> {
+        self.retire_task_exit_notifying(prepared, notify_parent)?
+            .publish()
+    }
+
+    fn retire_task_exit_notifying<F: FnOnce(Option<TaskKey>)>(
+        self: &Arc<Self>,
+        mut prepared: PreparedTaskExit,
+        notify_parent: F,
+    ) -> Result<
+        RetiredTaskExit<impl FnOnce() -> Result<Zombie, KernelOperationError> + use<F>>,
+        KernelOperationError,
+    > {
         // Read before the zombie is moved into the registry below: the auditor
         // is told who will consume it, and that judgement belongs to the same
         // reserved snapshot that chose the adopter.
@@ -881,119 +947,145 @@ impl Kernel {
             }
         }
 
-        let process_group = task.process_group();
-        let session = task.session();
-        if prepared.autoreap_parent.is_some() {
-            remove_group_member(&mut state, process_group, session, prepared.task);
-        } else {
-            state.zombies.insert(
-                prepared.task.id,
-                ZombieRecord {
-                    zombie: prepared.registry_zombie,
-                    _task_claim: task_claim,
-                },
-            );
-        }
-
-        // Detach this exact task generation's watchers before the zombie can
-        // be consumed and its numeric claim eventually reused. Callbacks stay
-        // outside the registry lock, but a later generation can no longer be
-        // mistaken for this exit.
-        let subscribers = self.exit_subscribers.take(prepared.task);
-        let pending_publication = prepared.reservation.commit(&mut state)?;
+        state
+            .retiring_tasks
+            .insert(prepared.task.id, Arc::clone(&task));
         drop(state);
-        pending_publication.publish();
+        let kernel = Arc::clone(self);
+        Ok(RetiredTaskExit {
+            publish: Some(move || {
+                let mut state = kernel.registry().settled().write();
+                // Include observers registered during the prepared clear;
+                // detach this exact generation before the zombie is visible.
+                let subscribers = kernel.exit_subscribers.take(prepared.task);
+                if state
+                    .retiring_tasks
+                    .remove(&prepared.task.id)
+                    .is_none_or(|task| task.key() != prepared.task)
+                {
+                    carrick_fatal!(
+                        "kernel::task_exit_publication",
+                        "retired task publication lost its exact incarnation"
+                    );
+                }
+                let process_group = task.process_group();
+                let session = task.session();
+                if prepared.autoreap_parent.is_some() {
+                    remove_group_member(&mut state, process_group, session, prepared.task);
+                } else {
+                    state.zombies.insert(
+                        prepared.task.id,
+                        ZombieRecord {
+                            zombie: prepared.registry_zombie,
+                            _task_claim: task_claim,
+                        },
+                    );
+                }
 
-        if let Some(parent_key) = prepared.autoreap_parent {
-            self.auditors().reaped(parent_key, prepared.task);
-        } else {
-            self.auditors().zombie_created(prepared.task, zombie_reaper);
-        }
-        if self.registry().settled().read().tasks.is_empty() {
-            self.auditors().process_graph_empty(self.unpublished_jobs());
-        }
-        if let Some(region) = pid_region {
-            for tid in retired_secondary_namespace_tids {
-                if !region.unregister_reaped(tid) {
-                    carrick_fatal!(
-                        "kernel::task_exit_identity",
-                        "failed to unregister reaped secondary thread"
-                    );
+                let pending_publication = prepared.reservation.commit(&mut state)?;
+                drop(state);
+                pending_publication.publish();
+
+                if let Some(parent_key) = prepared.autoreap_parent {
+                    kernel.auditors().reaped(parent_key, prepared.task);
+                } else {
+                    kernel
+                        .auditors()
+                        .zombie_created(prepared.task, zombie_reaper);
                 }
-            }
-            if prepared.autoreap_parent.is_some() {
-                let leader_tid = u32::try_from(prepared.task.id.raw()).unwrap_or_else(|_| {
-                    carrick_fatal!(
-                        "kernel::task_exit_identity",
-                        "leader tid exceeds u32 in commit_task_exit_notifying"
-                    );
-                });
-                if !region.unregister_reaped(leader_tid) {
-                    carrick_fatal!(
-                        "kernel::task_exit_identity",
-                        "failed to unregister reaped leader thread"
-                    );
+                if {
+                    let state = kernel.registry().settled().read();
+                    state.tasks.is_empty() && state.retiring_tasks.is_empty()
+                } {
+                    kernel
+                        .auditors()
+                        .process_graph_empty(kernel.unpublished_jobs());
                 }
-            }
-        }
-        // Cancellation can wake a host waiter, whose callback may re-enter the
-        // registry. Never invoke it while holding the topology write lock.
-        for thread in exiting_threads {
-            let _ = thread.cancel_kernel_owned_continuation(
-                crate::kernel::continuation::CancellationCause::ProcessExit,
-            );
-        }
-        // Queue the parent's exit notification after the exit reservation is
-        // committed. If notify_parent ran before commit, a parent that woke
-        // immediately would see TaskBusy in wait_child_matching and park in
-        // BlockedContinuation having already consumed this exit's wake edge,
-        // wedging forever.
-        if let Some(parent_key) = prepared.result_zombie.parent {
-            let parent_task = {
-                let state = self.registry().settled().read();
-                state
-                    .tasks
-                    .get(&parent_key.id)
-                    .filter(|record| record.task.key() == parent_key)
-                    .map(|record| Arc::clone(&record.task))
-            };
-            if let Some(parent_task) = parent_task {
-                let posted = match prepared.result_zombie.exit_signal {
-                    crate::kernel::ids::ChildExitSignal::Signal(signal) => {
-                        if child_exit_signal_needs_notification(&parent_task, signal) {
-                            let siginfo = exit_siginfo_for_zombie(&prepared.result_zombie);
-                            self.post_signal_to_task_key(parent_key, signal, siginfo)
-                        } else {
-                            false
+                if let Some(region) = pid_region {
+                    for tid in retired_secondary_namespace_tids {
+                        if !region.unregister_reaped(tid) {
+                            carrick_fatal!(
+                                "kernel::task_exit_identity",
+                                "failed to unregister reaped secondary thread"
+                            );
                         }
                     }
-                    crate::kernel::ids::ChildExitSignal::None => false,
-                };
-                if !posted {
-                    parent_task.wake();
+                    if prepared.autoreap_parent.is_some() {
+                        let leader_tid =
+                            u32::try_from(prepared.task.id.raw()).unwrap_or_else(|_| {
+                                carrick_fatal!(
+                                    "kernel::task_exit_identity",
+                                    "leader tid exceeds u32 in commit_task_exit_notifying"
+                                );
+                            });
+                        if !region.unregister_reaped(leader_tid) {
+                            carrick_fatal!(
+                                "kernel::task_exit_identity",
+                                "failed to unregister reaped leader thread"
+                            );
+                        }
+                    }
                 }
-            }
-        }
-        notify_parent(prepared.result_zombie.parent);
-        for tracee in released_tracees {
-            tracee.wake();
-        }
-        if let Some(tracer) = own_tracer {
-            tracer.wake();
-        }
-        for files in &exiting_file_tables {
-            self.retire_file_table_if_unreferenced(files);
-        }
-        if let Some(release) = vfork_release {
-            release.release(VforkReleaseReason::Exit);
-        }
-        for subscriber in subscribers
-            .into_iter()
-            .filter_map(|subscriber| subscriber.upgrade())
-        {
-            subscriber.publish_exit(prepared.result_zombie.status);
-        }
-        Ok(prepared.result_zombie)
+                // Cancellation can wake a host waiter, whose callback may re-enter the
+                // registry. Never invoke it while holding the topology write lock.
+                for thread in exiting_threads {
+                    let _ = thread.cancel_kernel_owned_continuation(
+                        crate::kernel::continuation::CancellationCause::ProcessExit,
+                    );
+                }
+                // Queue the parent's exit notification after the exit reservation is
+                // committed. If notify_parent ran before commit, a parent that woke
+                // immediately would see TaskBusy in wait_child_matching and park in
+                // BlockedContinuation having already consumed this exit's wake edge,
+                // wedging forever.
+                if let Some(parent_key) = prepared.result_zombie.parent {
+                    let parent_task = {
+                        let state = kernel.registry().settled().read();
+                        state
+                            .tasks
+                            .get(&parent_key.id)
+                            .filter(|record| record.task.key() == parent_key)
+                            .map(|record| Arc::clone(&record.task))
+                    };
+                    if let Some(parent_task) = parent_task {
+                        let posted = match prepared.result_zombie.exit_signal {
+                            crate::kernel::ids::ChildExitSignal::Signal(signal) => {
+                                if child_exit_signal_needs_notification(&parent_task, signal) {
+                                    let siginfo = exit_siginfo_for_zombie(&prepared.result_zombie);
+                                    kernel.post_signal_to_task_key(parent_key, signal, siginfo)
+                                } else {
+                                    false
+                                }
+                            }
+                            crate::kernel::ids::ChildExitSignal::None => false,
+                        };
+                        if !posted {
+                            parent_task.wake();
+                        }
+                    }
+                }
+                notify_parent(prepared.result_zombie.parent);
+                for tracee in released_tracees {
+                    tracee.wake();
+                }
+                if let Some(tracer) = own_tracer {
+                    tracer.wake();
+                }
+                for files in &exiting_file_tables {
+                    kernel.retire_file_table_if_unreferenced(files);
+                }
+                if let Some(release) = vfork_release {
+                    release.release(VforkReleaseReason::Exit);
+                }
+                for subscriber in subscribers
+                    .into_iter()
+                    .filter_map(|subscriber| subscriber.upgrade())
+                {
+                    subscriber.publish_exit(prepared.result_zombie.status);
+                }
+                Ok(prepared.result_zombie)
+            }),
+        })
     }
 
     /// Convenience path for model callers without an external backend teardown.
@@ -1166,6 +1258,110 @@ mod tests {
                 None,
             )
             .expect("clone sibling")
+    }
+
+    #[test]
+    fn retired_task_holds_wait_vfork_and_subscribers_until_terminal_clear_publication() {
+        use std::sync::atomic::AtomicBool;
+        let (kernel, root) = bootstrap(19_401);
+        let published = kernel
+            .reserve_fork(
+                &root,
+                ClonePlan::from_flags(LinuxCloneFlags::VM | LinuxCloneFlags::VFORK).unwrap(),
+                "unpublished terminal clear".to_owned(),
+                None,
+            )
+            .unwrap()
+            .prepare_reference(ThreadId::synthetic_for_tests(19_402))
+            .unwrap()
+            .commit()
+            .unwrap();
+        let (child, vfork) = published.into_parts().unwrap();
+        let vfork = vfork.unwrap();
+        assert!(Arc::ptr_eq(&root.shared().mm(), &child.shared().mm()));
+        let subscriber = Arc::new(CountingExitSubscriber::default());
+        kernel.register_task_exit_subscriber(child.task().key().id, &subscriber);
+        let cleared = AtomicBool::new(false);
+        let notified = AtomicBool::new(false);
+        let retired = kernel
+            .prepare_task_exit_key(
+                child.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap()
+            .retire_notifying(|_| {
+                assert!(
+                    cleared.load(Ordering::Acquire),
+                    "parent observed exit before clear-child-tid committed"
+                );
+                notified.store(true, Ordering::Release);
+            })
+            .unwrap();
+        assert!(!kernel.task_key_is_live(child.task().key()));
+        assert_eq!(vfork.released_reason(), None);
+        assert_eq!(subscriber.0.load(Ordering::Acquire), 0);
+        assert!(!notified.load(Ordering::Acquire));
+        let late_subscriber = Arc::new(CountingExitSubscriber::default());
+        assert_eq!(
+            kernel.register_task_exit_subscriber(child.task().key().id, &late_subscriber),
+            Some(child.task().key())
+        );
+        assert_eq!(late_subscriber.0.load(Ordering::Acquire), 0);
+        assert!(kernel.task_exists(child.task().key().id));
+        assert_eq!(
+            kernel
+                .process_identity(child.task().key().id)
+                .unwrap()
+                .state,
+            crate::kernel::ProcessState::Zombie
+        );
+        kernel.validate_invariants().unwrap();
+        assert!(matches!(
+            kernel.prepare_task_exit_key(
+                root.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                None
+            ),
+            Err(KernelOperationError::TaskBusy(_))
+        ));
+        assert!(matches!(
+            kernel.retire_container_root(root.task().container().id(), None),
+            Err(crate::kernel::KernelError::ContainerBusy(_))
+        ));
+        for mode in [WaitMode::Observe, WaitMode::Consume] {
+            assert!(
+                matches!(
+                    kernel.wait_child(root.task().key().id, Some(child.task().key().id), mode),
+                    Ok(WaitOutcome::StillRunning(_))
+                ),
+                "wait must retain the unpublished child until clear publication"
+            );
+        }
+        cleared.store(true, Ordering::Release);
+        retired.publish().unwrap();
+        assert!(notified.load(Ordering::Acquire));
+        assert_eq!(vfork.released_reason(), Some(VforkReleaseReason::Exit));
+        assert_eq!(subscriber.0.load(Ordering::Acquire), 1);
+        assert_eq!(late_subscriber.0.load(Ordering::Acquire), 1);
+        drop(
+            kernel
+                .prepare_task_exit_key(
+                    root.task().key(),
+                    LinuxWaitStatus::from_wait_encoding(0),
+                    None,
+                )
+                .unwrap(),
+        );
+        assert!(matches!(
+            kernel.wait_child(
+                root.task().key().id,
+                Some(child.task().key().id),
+                WaitMode::Consume
+            ),
+            Ok(WaitOutcome::Exited(_))
+        ));
+        kernel.validate_invariants().unwrap();
     }
 
     #[test]
