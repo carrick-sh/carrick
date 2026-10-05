@@ -28,6 +28,21 @@ pub trait CowResolver {
     fn take_cow_completion(&mut self) -> Option<carrick_core_abi::CowGrantCompletion> {
         None
     }
+    /// Drain a resolved COW completion once, including outside fork.
+    fn finish_resolution<
+        W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    >(
+        &mut self,
+        slot: u32,
+        handle: carrick_core_abi::El1MmHandle,
+        sequence: Option<NonZeroU64>,
+        words: &W,
+    ) -> Result<(), crate::mm::transaction::MmError> {
+        if let (Some(sequence), Some(completion)) = (sequence, self.take_cow_completion()) {
+            self.reconcile_parent_write(slot, handle, sequence, completion, words)?;
+        }
+        Ok(())
+    }
     fn reconcile_parent_write<
         W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
     >(
@@ -35,6 +50,7 @@ pub trait CowResolver {
         _slot: u32,
         _handle: carrick_core_abi::El1MmHandle,
         _sequence: NonZeroU64,
+        _completion: carrick_core_abi::CowGrantCompletion,
         _words: &W,
     ) -> Result<(), crate::mm::transaction::MmError> {
         Ok(())
@@ -74,5 +90,40 @@ impl PreparedPageResolver for NoopPreparedResolver {
         _access: LeafAccess,
     ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
         Err(GuestPreparedCommitError::NotPrepared)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn resolved_non_fork_cow_consumes_completion_once() {
+        struct CountingCow(u32);
+        impl CowResolver for CountingCow {
+            fn resolve_cow(&mut self, _: u64, _: u64, _: u64) -> bool {
+                false
+            }
+            fn take_cow_completion(&mut self) -> Option<carrick_core_abi::CowGrantCompletion> {
+                self.0 += 1;
+                None
+            }
+        }
+        let mut cow = CountingCow(0);
+        let tables =
+            carrick_el1::personality::mm_portal::test_support::Tables::new(0x10000, 0x40000, 1);
+        let maintenance = carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
+        let handle = unsafe {
+            carrick_core_abi::El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                carrick_core_abi::ReservationMm::new(1).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            )
+        };
+        cow.finish_resolution(0, handle, None, &tables.live(&maintenance))
+            .unwrap();
+        assert_eq!(
+            cow.0, 1,
+            "resolved COW drains the mailbox even outside fork"
+        );
     }
 }
