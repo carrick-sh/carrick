@@ -1,6 +1,6 @@
 # N1 pending-brk backing maintenance handoff
 
-Status: diagnosed, VM-free red captured, production correction unimplemented.
+Status: typed production correction implemented; fresh signed qualification pending.
 The tested source is `77b7d5e7151e142b95dacbca376aebbab607ced0`, on exact
 batch-5 main `51bfe67f4`. Do not rebase to batch 6 or integrate helper PRs
 14/11/21/16 as part of this repair. The director approved this correction via
@@ -92,3 +92,27 @@ signed artifact and the anonymous case plus exact 10/10 copyout and hello
 under one exclusive lease. Compare all six regressions by failure mode.
 Record new provenance and cleanup; the 77b7d5e71 receipts cannot transfer.
 Only post review-ready after the remaining functional regressions close.
+
+## Implemented owner operation
+
+`PortalBackingMaintenance` carries the complete pending Retire proposal and
+admitted incarnation through a distinct service entry. The owner borrows its
+paused editor, authenticates the actual heap contraction, and walks the live
+invalid leaf. It uses the existing physical COW grant pool and slot-scoped
+copy aliases to zero a private replacement, then repoints while preserving
+inaccessibility. It never writes the predecessor, even when a live fork peer
+shares it. Missing subtrees advance the cursor without page-by-page service
+calls. Host physical supply and exact inventory settlement happen after the
+service releases both root/editor and driving-vCPU loans. Generic
+`zero_backing` refuses admitted roots; only the pending brk binding can issue
+this operation.
+
+The saved witness reproduced its Gate assertion on the integrated fork tree.
+Its green form additionally checks corrupt identities/request fields, the
+ordinary UserWrite Gate, aliased replacement refusal, a live COW peer's bytes,
+adjacent bytes, stale physical generation rejection, regrowth/VA reuse, and a
+96-word descriptor budget with hundreds of unrelated terminal leaves. The
+278 EL1 tests, 134 ABI tests and eight focused brk tests passed; workspace
+clippy passed. Clean-tree inventory capture, full CI/Loom and exact signed
+qualification follow this source checkpoint. No signed or N1 acceptance is
+claimed by these VM-free results.

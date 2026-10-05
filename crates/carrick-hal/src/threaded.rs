@@ -2577,6 +2577,14 @@ pub trait FrameCowAuthority: Send + Sync {
         None
     }
 
+    /// Settle completed owner backing replacements after the service returned
+    /// its editor. No execution loan may span this physical-inventory work.
+    fn settle_backing_maintenance(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(std::io::Error::other(
+            "owner maintenance settlement unavailable",
+        )))
+    }
+
     fn quiesce(&self)
     -> Result<Box<dyn FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>;
 

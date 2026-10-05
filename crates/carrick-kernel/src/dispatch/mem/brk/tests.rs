@@ -70,6 +70,17 @@ impl HeapVmaTrackingMemory {
 }
 
 impl GuestMemory for HeapVmaTrackingMemory {
+    fn zero_pending_backing(
+        &mut self,
+        pending: carrick_el1_abi::ReservationRequest,
+    ) -> Result<(), MemoryError> {
+        assert_eq!(
+            pending.operation,
+            carrick_el1_abi::ReservationOperation::Retire
+        );
+        self.zero_backing(pending.range.start(), pending.range.len() as usize)
+    }
+
     fn protections(&self) -> Option<carrick_guest_mem::LegacyProtectionRead<'_>> {
         Some(carrick_guest_mem::LegacyProtectionRead::borrowed(
             &self.protections,
