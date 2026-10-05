@@ -13,6 +13,16 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::dispatch::fd_table::{HostFdRef, make_readiness_pipe};
 
+/// Remaining monotonic time; equality is already expired. Keep the arithmetic
+/// independent of host scheduling so boundary cases can use explicit instants.
+fn remaining_until(deadline: Instant, now: Instant) -> Option<Duration> {
+    if now >= deadline {
+        None
+    } else {
+        Some(deadline - now)
+    }
+}
+
 /// An enrolled waiter's reference in a [`WaitQueue`].
 ///
 /// When dropped, this automatically unregisters the waiter from the target queue.
@@ -466,11 +476,9 @@ impl WaitSet {
                             }
                             break WaitSetOutcome::Woken;
                         }
-                        let now = Instant::now();
-                        if now >= deadline {
+                        let Some(remaining) = remaining_until(deadline, Instant::now()) else {
                             break WaitSetOutcome::Timeout;
-                        }
-                        let remaining = deadline - now;
+                        };
                         let result = self.inner.condvar.wait_for(&mut guard, remaining);
                         if self.inner.notified.swap(false, Ordering::SeqCst) {
                             if is_interrupted() {
@@ -478,7 +486,8 @@ impl WaitSet {
                             }
                             break WaitSetOutcome::Woken;
                         }
-                        if result.timed_out() || Instant::now() >= deadline {
+                        if result.timed_out() || remaining_until(deadline, Instant::now()).is_none()
+                        {
                             break WaitSetOutcome::Timeout;
                         }
                     }
@@ -620,15 +629,31 @@ mod tests {
 
     #[test]
     fn deadline_arithmetic() {
-        let wait_set = WaitSet::new();
-        let t0 = Instant::now();
-        let outcome = wait_set.wait(&[], Some(Duration::from_millis(30)), || false);
-        let elapsed = t0.elapsed();
-        assert_eq!(outcome, WaitSetOutcome::Timeout);
-        assert!(
-            elapsed >= Duration::from_millis(28) && elapsed <= Duration::from_millis(45),
-            "expected ~30ms, got {:?}",
-            elapsed
+        let start = Instant::now();
+        let duration = Duration::from_millis(30);
+        let deadline = start + duration;
+        assert_eq!(remaining_until(deadline, start), Some(duration));
+        assert_eq!(
+            remaining_until(deadline, start + Duration::from_millis(7)),
+            Some(Duration::from_millis(23)),
+        );
+        assert_eq!(
+            remaining_until(deadline, deadline - Duration::from_nanos(1)),
+            Some(Duration::from_nanos(1)),
+        );
+        assert_eq!(remaining_until(deadline, deadline), None);
+        assert_eq!(
+            remaining_until(deadline, start + Duration::from_millis(49)),
+            None,
+        );
+        assert_eq!(remaining_until(start, start), None);
+    }
+
+    #[test]
+    fn zero_deadline_returns_timeout() {
+        assert_eq!(
+            WaitSet::new().wait(&[], Some(Duration::ZERO), || false),
+            WaitSetOutcome::Timeout,
         );
     }
 
