@@ -1,4 +1,5 @@
 //! Exact range and proposal identities, independent of syscall lowering.
+pub use carrick_guest_arch::{GuestLen, UserVa};
 pub use carrick_mmu_core::HostBackingIdentity;
 
 macro_rules! identity {
@@ -338,6 +339,27 @@ pub trait ReservationGeometry {
 
 /// The Linux client interprets the neutral node; core owns its storage and work.
 pub trait ReservationPolicy {
+    fn place<M: ReservationPolicyAccess>(
+        root: &mut M,
+        placement: Placement,
+        len: GuestLen,
+    ) -> Result<ReservationRange, Refusal>;
+    fn mmap<M: ReservationPolicyAccess>(
+        root: &mut M,
+        placement: Placement,
+        len: GuestLen,
+        protection: ReservationProtection,
+    ) -> Result<Decision, Refusal>;
+    fn mremap<M: ReservationPolicyAccess>(
+        root: &mut M,
+        source: ReservationRange,
+        new_len: GuestLen,
+        target: MoveTarget,
+    ) -> Result<Decision, Refusal>;
+    fn brk<M: ReservationPolicyAccess>(
+        root: &mut M,
+        requested: UserVa,
+    ) -> Result<Decision, Refusal>;
     fn root_editable(node: &ReservationNodeData) -> bool;
     fn flags(node: &ReservationNodeData) -> ReservationNodeFlags;
     fn protection(node: &ReservationNodeData) -> ReservationProtection;
@@ -347,6 +369,36 @@ pub trait ReservationPolicy {
     fn mapping(node: &ReservationNodeData, generation: ReservationGeneration) -> Mapping;
     fn same_mapping(node: &ReservationNodeData, other: &ReservationNodeData) -> bool;
     fn charges_data(flags: ReservationNodeFlags, protection: ReservationProtection) -> bool;
+}
+
+/// Borrowed policy access to the existing guarded store. This carries no MM
+/// state, permit or cursor; proposals remain uncommitted owner transactions.
+pub trait ReservationPolicyAccess {
+    fn is_admitted(&self) -> bool;
+    fn has_pending_edit(&self) -> bool;
+    fn fork_pending(&self) -> bool;
+    fn layout(&self) -> Layout;
+    fn next_range(&mut self, address: UserVa) -> Option<ReservationRange>;
+    fn first_fit(&mut self, len: GuestLen) -> Option<UserVa>;
+    fn in_layout(&self, range: ReservationRange) -> bool;
+    fn mapping(&mut self, address: UserVa) -> Option<Mapping>;
+    fn run_covering(&mut self, range: ReservationRange) -> Option<ReservationNodeData>;
+    fn pending_result(&self) -> Option<UserVa>;
+    fn write_pending_backing(&mut self, backing: HostBackingIdentity) -> Result<(), Refusal>;
+    fn set_byte_break(&mut self, requested: UserVa) -> Result<(), Refusal>;
+    fn refuse(&mut self, request: ReservationRequest) -> Result<(), Refusal>;
+    #[allow(clippy::too_many_arguments)]
+    fn propose(
+        &mut self,
+        range: ReservationRange,
+        protection: ReservationProtection,
+        operation: ReservationOperation,
+        result: UserVa,
+        byte_break: UserVa,
+        preserve: bool,
+        source: Option<ReservationRange>,
+        flags: ReservationNodeFlags,
+    ) -> Result<Decision, Refusal>;
 }
 
 /// Native allocator adapter, called only after the root guard is consumed.
@@ -360,4 +412,61 @@ pub unsafe trait ReservationMetadataAllocator {
         layout: core::alloc::Layout,
     ) -> Option<(*mut u8, crate::ExtentGrantReceipt)>;
     fn deallocate(&self, ptr: *mut u8, layout: core::alloc::Layout);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    Busy,
+    PreparedConflict,
+    Stale,
+    Invalid,
+    Collision,
+    Hole,
+    ForeignMapping,
+    Limit,
+    MetadataRequired,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct Layout {
+    pub heap: ReservationRange,
+    pub arena: ReservationRange,
+    pub brk: u64,
+    pub address_limit: u64,
+    pub data_limit: u64,
+    /// Charges outside this admitted anonymous arena/heap.
+    pub external_address_bytes: u64,
+    pub external_data_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    Anywhere,
+    Hint(u64),
+    Fixed(u64),
+    NoReplace(u64),
+}
+
+/// Destination intent interpreted by the selected reservation client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveTarget {
+    /// No `MREMAP_MAYMOVE`: resize in place or fail with ENOMEM.
+    InPlace,
+    /// `MREMAP_MAYMOVE`: resize in place when the following range is free,
+    /// otherwise relocate to a first-fit arena range.
+    MayMove,
+    /// `MREMAP_MAYMOVE | MREMAP_FIXED`: relocate to exactly this address,
+    /// replacing root-editable anonymous nodes there.
+    Fixed(u64),
+    /// `MREMAP_MAYMOVE | MREMAP_DONTUNMAP` (with `MREMAP_FIXED` when
+    /// `Some`): the source mapping stays, and a same-size destination is
+    /// prepared with the source's protection and attributes.
+    KeepSource(Option<u64>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Complete(u64),
+    Work(ReservationRequest),
 }
