@@ -44,6 +44,9 @@ static ERRORS: AtomicU64 = AtomicU64::new(0);
 // Deterministic witness: omit exactly one worker's acknowledgement of the
 // first read-only write probe. Its work still finishes; only the ack is lost.
 static OMIT_ACK: AtomicUsize = AtomicUsize::new(usize::MAX);
+static WORKER_TIDS: [AtomicU32; MAX_WORKERS] = [const { AtomicU32::new(0) }; MAX_WORKERS];
+static WORKER_COMMANDS: [AtomicU32; MAX_WORKERS] = [const { AtomicU32::new(0) }; MAX_WORKERS];
+static WORKER_ACKS: [AtomicU32; MAX_WORKERS] = [const { AtomicU32::new(0) }; MAX_WORKERS];
 
 thread_local! {
     static WORKER: Cell<usize> = const { Cell::new(usize::MAX) };
@@ -108,22 +111,89 @@ fn probe_read(ptr: *const u64) -> u64 {
 }
 
 /// Post `op` to every worker and wait (bounded) until each acknowledged.
-fn command(op: u32, workers: u32) -> bool {
+fn command(op: u32, workers: u32, phase: &str, round: usize) {
     let target = ACKS.load(Ordering::SeqCst).wrapping_add(workers);
     let seq = (CMD.load(Ordering::SeqCst) >> 8).wrapping_add(1);
-    CMD.store((seq << 8) | op, Ordering::SeqCst);
+    let cmd = (seq << 8) | op;
+    CMD.store(cmd, Ordering::SeqCst);
     let _ = futex_wake(&CMD, u32::MAX >> 1);
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let acks = ACKS.load(Ordering::SeqCst);
         if acks == target {
-            return true;
+            return;
         }
         let now = std::time::Instant::now();
         if now >= deadline {
-            return false;
+            command_timeout(cmd, workers, phase, round, acks, target);
         }
         let _ = wait_until_changed(&ACKS, acks, deadline - now);
+    }
+}
+
+/// This is terminal for the entire guest, not just the coordinator thread:
+/// no later command, page edit, join, or aggregate verdict is admissible.
+fn command_timeout(cmd: u32, workers: u32, phase: &str, round: usize, acks: u32, target: u32) -> ! {
+    let op = match cmd & 0xff {
+        OP_WARM => "warm",
+        OP_WRITE_PROBE => "write-probe",
+        OP_READ_PROBE => "read-probe",
+        OP_STOP => "stop",
+        OP_WRITE_NEW => "write-new",
+        OP_READ_VALUE => "read-value",
+        _ => "unknown",
+    };
+    // Snapshot all peers before output: printing a line must not move which
+    // worker is reported if a late acknowledgement arrives during the report.
+    let peers: [_; MAX_WORKERS] = std::array::from_fn(|worker| {
+        (
+            worker,
+            WORKER_TIDS[worker].load(Ordering::SeqCst),
+            WORKER_COMMANDS[worker].load(Ordering::SeqCst),
+            WORKER_ACKS[worker].load(Ordering::SeqCst),
+        )
+    });
+    for (worker, tid, seen, acknowledged) in peers.into_iter().take(workers as usize) {
+        // Stack-only formatting and direct output: even the failure report
+        // must not allocate or remap memory after the missed acknowledgement.
+        use std::fmt::Write;
+        let mut line = TimeoutLine {
+            bytes: [0; 512],
+            len: 0,
+        };
+        if writeln!(
+            line,
+            "tlb-command-timeout command={cmd:#x} op={op} phase={phase} round={round} \
+             worker={worker} tid={tid} vcpu={} seen={seen:#x} acknowledged={acknowledged:#x} \
+             missing={} acks={acks} target={target} terminal=true",
+            worker + 1,
+            acknowledged != cmd,
+        )
+        .is_err()
+        {
+            unsafe { libc::_exit(74) };
+        }
+        if unsafe { libc::write(1, line.bytes.as_ptr().cast(), line.len) } != line.len as isize {
+            unsafe { libc::_exit(74) };
+        }
+    }
+    unsafe { libc::_exit(1) };
+}
+
+struct TimeoutLine {
+    bytes: [u8; 512],
+    len: usize,
+}
+
+impl std::fmt::Write for TimeoutLine {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let end = self.len + text.len();
+        self.bytes
+            .get_mut(self.len..end)
+            .ok_or(std::fmt::Error)?
+            .copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
     }
 }
 
@@ -134,6 +204,10 @@ fn spawn_worker(index: usize, cpu: u32) -> std::thread::JoinHandle<()> {
     let first_seen = CMD.load(Ordering::SeqCst);
     std::thread::spawn(move || {
         WORKER.with(|worker| worker.set(index));
+        WORKER_TIDS[index].store(
+            unsafe { libc::syscall(libc::SYS_gettid) } as u32,
+            Ordering::SeqCst,
+        );
         if pin(cpu) != 0 {
             ERRORS.fetch_add(1, Ordering::SeqCst);
         }
@@ -144,6 +218,7 @@ fn spawn_worker(index: usize, cpu: u32) -> std::thread::JoinHandle<()> {
             }
             let cmd = CMD.load(Ordering::SeqCst);
             seen = cmd;
+            WORKER_COMMANDS[index].store(cmd, Ordering::SeqCst);
             let ptr = PROBE_PAGE.load(Ordering::SeqCst) as *mut u64;
             let before = FAULTS[index].load(Ordering::SeqCst);
             match cmd & 0xff {
@@ -172,6 +247,7 @@ fn spawn_worker(index: usize, cpu: u32) -> std::thread::JoinHandle<()> {
                     WORKER_SEEN.store(unsafe { std::ptr::read_volatile(ptr) }, Ordering::SeqCst);
                 }
                 _ => {
+                    WORKER_ACKS[index].store(cmd, Ordering::SeqCst);
                     ACKS.fetch_add(1, Ordering::SeqCst);
                     let _ = futex_wake(&ACKS, 1);
                     return;
@@ -184,6 +260,7 @@ fn spawn_worker(index: usize, cpu: u32) -> std::thread::JoinHandle<()> {
             {
                 continue;
             }
+            WORKER_ACKS[index].store(cmd, Ordering::SeqCst);
             ACKS.fetch_add(1, Ordering::SeqCst);
             let _ = futex_wake(&ACKS, 1);
         }
@@ -421,23 +498,22 @@ pub(crate) fn stale_threads(rounds: usize, workers: usize, omit_ack: bool) -> i3
         .map(|index| spawn_worker(index, index as u32 + 1))
         .collect();
     let count = workers as u32;
-    let mut timeouts = 0u64;
     let mut zero_failures = 0u64;
-    for _ in 0..rounds {
+    for round in 0..rounds {
         let region = base as *mut libc::c_void;
-        timeouts += u64::from(!command(OP_WARM, count));
+        command(OP_WARM, count, "writable-before-restrict", round);
         if unsafe { libc::mprotect(region, PAGE, libc::PROT_READ) } != 0 {
             ERRORS.fetch_add(1, Ordering::SeqCst);
         }
-        timeouts += u64::from(!command(OP_WRITE_PROBE, count));
+        command(OP_WRITE_PROBE, count, "read-only", round);
         if unsafe { libc::mprotect(region, PAGE, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
             ERRORS.fetch_add(1, Ordering::SeqCst);
         }
-        timeouts += u64::from(!command(OP_WARM, count));
+        command(OP_WARM, count, "writable-before-unmap", round);
         if unsafe { libc::munmap(region, PAGE) } != 0 {
             ERRORS.fetch_add(1, Ordering::SeqCst);
         }
-        timeouts += u64::from(!command(OP_READ_PROBE, count));
+        command(OP_READ_PROBE, count, "unmapped", round);
         if map_page(base) != base {
             ERRORS.fetch_add(1, Ordering::SeqCst);
             break;
@@ -449,7 +525,7 @@ pub(crate) fn stale_threads(rounds: usize, workers: usize, omit_ack: bool) -> i3
             }
         }
     }
-    timeouts += u64::from(!command(OP_STOP, count));
+    command(OP_STOP, count, "stop", rounds);
     for handle in handles {
         let _ = handle.join();
     }
@@ -460,10 +536,10 @@ pub(crate) fn stale_threads(rounds: usize, workers: usize, omit_ack: bool) -> i3
         .collect();
     let stale = STALE.load(Ordering::SeqCst);
     let errors = ERRORS.load(Ordering::SeqCst) + zero_failures;
-    let ok = faults.iter().all(|&f| f == expected) && stale == 0 && errors == 0 && timeouts == 0;
+    let ok = faults.iter().all(|&f| f == expected) && stale == 0 && errors == 0;
     println!(
         "tlb-stale-threads rounds={rounds} workers={workers} expected_faults={expected} \
-         faults={faults:?} stale={stale} errors={errors} timeouts={timeouts} ok={ok}"
+         faults={faults:?} stale={stale} errors={errors} timeouts=0 ok={ok}"
     );
     i32::from(!ok)
 }
@@ -489,12 +565,11 @@ pub(crate) fn fork_stale(rounds: usize) -> i32 {
     let ptr = base as *mut u64;
     let mut child_failures = 0u64;
     let mut parent_failures = 0u64;
-    let mut timeouts = 0u64;
     for round in 0..rounds as u64 {
         let old = 0x01D0_0000 + round;
         unsafe { std::ptr::write_volatile(ptr, old) };
         // The worker's TLB now holds a writable translation of the page.
-        timeouts += u64::from(!command(OP_WARM, 1));
+        command(OP_WARM, 1, "before-fork", round as usize);
         let mut go = [0i32; 2];
         if unsafe { libc::pipe(go.as_mut_ptr()) } != 0 {
             ERRORS.fetch_add(1, Ordering::SeqCst);
@@ -520,7 +595,7 @@ pub(crate) fn fork_stale(rounds: usize) -> i32 {
         // After fork returned: the worker writes through whatever
         // translation its vCPU holds. A stale writable one would land in the
         // frame the child shares.
-        timeouts += u64::from(!command(OP_WRITE_NEW, 1));
+        command(OP_WRITE_NEW, 1, "after-fork", round as usize);
         if unsafe { std::ptr::read_volatile(ptr) } != 0x4E45_5700 {
             parent_failures += 1;
         }
@@ -536,13 +611,13 @@ pub(crate) fn fork_stale(rounds: usize) -> i32 {
             child_failures += 1;
         }
     }
-    timeouts += u64::from(!command(OP_STOP, 1));
+    command(OP_STOP, 1, "stop", rounds);
     let _ = worker.join();
     let errors = ERRORS.load(Ordering::SeqCst);
-    let ok = child_failures == 0 && parent_failures == 0 && errors == 0 && timeouts == 0;
+    let ok = child_failures == 0 && parent_failures == 0 && errors == 0;
     println!(
         "tlb-fork-stale rounds={rounds} child_failures={child_failures} \
-         parent_failures={parent_failures} errors={errors} timeouts={timeouts} ok={ok}"
+         parent_failures={parent_failures} errors={errors} timeouts=0 ok={ok}"
     );
     i32::from(!ok)
 }
@@ -562,10 +637,7 @@ pub(crate) fn exec_stale(argv0: &str) -> i32 {
     PROBE_PAGE.store(base, Ordering::SeqCst);
     unsafe { std::ptr::write_volatile(base as *mut u64, 0xE1E1_E1E1) };
     let worker = spawn_worker(0, 1);
-    if !command(OP_WARM, 1) {
-        println!("tlb-exec-stale warm timed out");
-        return 1;
-    }
+    command(OP_WARM, 1, "before-exec", 0);
     // The worker stays alive (parked) on CPU 1 until execve ends it.
     drop(worker);
     if unsafe { libc::munmap(base as *mut libc::c_void, PAGE) } != 0 {
@@ -602,7 +674,7 @@ pub(crate) fn exec_stale_child(address: Option<&str>) -> i32 {
     PROBE_PAGE.store(base, Ordering::SeqCst);
     let worker = spawn_worker(0, 1);
     let mut stale_reads = 0u64;
-    let mut timeouts = u64::from(!command(OP_READ_PROBE, 1));
+    command(OP_READ_PROBE, 1, "after-exec-unmapped", 0);
     stale_reads += STALE.swap(0, Ordering::SeqCst);
     // The probe faulted, so nothing of the new image lives there: map it
     // back with MAP_FIXED.
@@ -625,17 +697,17 @@ pub(crate) fn exec_stale_child(address: Option<&str>) -> i32 {
         return 1;
     }
     // Mapped fresh: CPU 1 must see zero, never the old image's value.
-    timeouts += u64::from(!command(OP_READ_VALUE, 1));
+    command(OP_READ_VALUE, 1, "after-exec-remapped", 0);
     let seen = WORKER_SEEN.load(Ordering::SeqCst);
     let zero = seen == 0;
-    timeouts += u64::from(!command(OP_STOP, 1));
+    command(OP_STOP, 1, "stop", 0);
     let _ = worker.join();
     let faults = FAULTS[0].load(Ordering::SeqCst);
     let errors = ERRORS.load(Ordering::SeqCst);
-    let ok = faults == 1 && stale_reads == 0 && zero && errors == 0 && timeouts == 0;
+    let ok = faults == 1 && stale_reads == 0 && zero && errors == 0;
     println!(
         "tlb-exec-stale faults={faults} stale_reads={stale_reads} seen={seen:#x} errors={errors} \
-         timeouts={timeouts} ok={ok}"
+         timeouts=0 ok={ok}"
     );
     i32::from(!ok)
 }
