@@ -709,7 +709,7 @@ fn exhaustive_real_dispatch_shapes_become_owned_send_static_continuations() {
             authority.asid_generation(),
             context.shared().mm().id().raw()
         );
-        assert_eq!(authority.syscall().request(), request(73));
+        assert_eq!(authority.syscall().unwrap().request(), request(73));
         assert_eq!(authority.restart_class(), RestartClass::RestartSyscall);
         let masks = continuation.signal_masks();
         assert_eq!(masks.persistent(), SigSet::EMPTY);
@@ -7176,4 +7176,84 @@ fn group_stop_preserves_published_terminal_results() {
             "{family:?}"
         );
     }
+}
+
+#[test]
+fn terminal_zone_capture_has_no_syscall_and_keeps_signals_pending() {
+    let (_kernel, context) = bootstrap(15_399);
+    publish(&context, 0x704);
+    let executor =
+        crate::kernel::objects::ExecutorId::for_transitional_thread(context.thread().registry_id())
+            .unwrap();
+    let lease = context.thread().claim_runnable(executor).unwrap();
+    // This test exercises capture and completion, not zone enrollment. No
+    // global carrier region is installed and the record is never published.
+    let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+    wait.mark_consumed();
+    let continuation =
+        BlockedContinuation::from_terminal_zone_park(&context, &lease, wait).unwrap();
+    assert!(continuation.authority().is_terminal_action());
+    assert_eq!(continuation.authority().syscall(), None);
+    assert_eq!(continuation.authority().mm(), context.shared().mm().id());
+    assert_eq!(
+        continuation.authority().execution_generation(),
+        lease.generation()
+    );
+    assert_eq!(
+        continuation.authority().restart_class(),
+        RestartClass::Never
+    );
+    assert!(!continuation.accepts_generic_scheduler_wake());
+    let signal = crate::kernel::LinuxSignal::for_signal_number(10).unwrap();
+    context
+        .signal_authority()
+        .enqueue_thread_standard(signal, None);
+    let signal_probe = SignalReadinessProbe::from_continuation(&continuation);
+    assert_eq!(signal_probe.event(), None);
+    assert_eq!(signal_probe.event_after_task_wake(), None);
+    assert!(context.signal_authority().thread_pending().contains(10));
+    let result = continuation
+        .resume(ContinuationEvent::Signal, &context)
+        .unwrap();
+    assert_eq!(
+        result.completion,
+        ContinuationCompletion::ResumeTerminalAction
+    );
+    assert_eq!(result.restart(), RestartDecision::NoRestart);
+    assert!(result.reserved_signal().is_none());
+    assert!(context.signal_authority().thread_pending().contains(10));
+}
+
+#[test]
+fn terminal_zone_capture_rejects_another_threads_execution_lease() {
+    let (_kernel, context) = bootstrap(15_400);
+    let (_other_kernel, other) = bootstrap(15_401);
+    publish(&context, 0x705);
+    let executor =
+        crate::kernel::objects::ExecutorId::for_transitional_thread(context.thread().registry_id())
+            .unwrap();
+    let lease = context.thread().claim_runnable(executor).unwrap();
+    let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+    wait.mark_consumed();
+    assert!(matches!(
+        BlockedContinuation::from_terminal_zone_park(&other, &lease, wait),
+        Err(ContinuationBuildError::StaleExecutionAuthority),
+    ));
+}
+
+#[test]
+fn terminal_action_cannot_be_folded_into_a_guest_syscall_result() {
+    let (_kernel, context) = bootstrap(15_402);
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0; 16]);
+    assert_eq!(
+        fold_continuation_completion(
+            ContinuationCompletion::ResumeTerminalAction,
+            &dispatcher,
+            &context,
+            &mut memory,
+        )
+        .unwrap_err(),
+        MemoryError::Unsupported,
+    );
 }
