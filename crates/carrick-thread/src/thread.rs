@@ -84,9 +84,62 @@ pub use carrick_hal::ThreadId;
 /// IS `u32`). Callers on other platforms store `0` (no port available).
 pub type ThreadPort = u32;
 
+/// A single clear address incarnation inside one runtime registry.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ChildTidClearId(u64);
+
+const CLEAR_AVAILABLE: u8 = 0;
+const CLEAR_CLAIMED: u8 = 1;
+const CLEAR_SETTLED: u8 = 2;
+
+struct ChildTidClearState {
+    id: ChildTidClearId,
+    tid: ThreadId,
+    address: carrick_guest_mem::GuestVa,
+    custody: AtomicU8,
+}
+
+/// Move-only execution custody of a clear-child-tid obligation. Claiming it
+/// does not change futex routing. The runtime adds exact Kernel thread/MM
+/// authority before performing the clear; a numeric registry tid is not that
+/// authority. Dropping an unfinished claim returns it to the same registry.
+pub struct ChildTidClear {
+    state: Arc<ChildTidClearState>,
+    registry: Arc<ParkingMutex<RegistryInner>>,
+}
+
+impl ChildTidClear {
+    pub fn tid(&self) -> ThreadId {
+        self.state.tid
+    }
+
+    pub fn address(&self) -> carrick_guest_mem::GuestVa {
+        self.state.address
+    }
+
+    /// Consume routing membership only after the runtime has completed its
+    /// clear AND wake (or its explicit invalid-address terminal disposition).
+    pub fn settle(self) {
+        let mut registry = self.registry.lock();
+        self.state.custody.store(CLEAR_SETTLED, Ordering::Release);
+        registry.retiring_clears.remove(&self.state.id);
+    }
+}
+
+impl Drop for ChildTidClear {
+    fn drop(&mut self) {
+        let _ = self.state.custody.compare_exchange(
+            CLEAR_CLAIMED,
+            CLEAR_AVAILABLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
+
 struct ThreadEntry {
     /// Guest address to zero + FUTEX_WAKE on thread exit (CLONE_CHILD_CLEARTID).
-    clear_child_tid: u64,
+    clear_child_tid: Option<Arc<ChildTidClearState>>,
     /// Mach port of the host thread backing this guest tid, recorded once when
     /// the vCPU thread starts. `/proc/<tid>/stat`'s state char is read from the
     /// KERNEL via `thread_info` on this port (no hand-tracked "sleeping" flag —
@@ -157,6 +210,9 @@ pub enum VcpuParkClass {
 /// veto-neutered release for the cluster-B investigation).
 struct RegistryInner {
     map: HashMap<ThreadId, ThreadEntry>,
+    next_clear: u64,
+    // Keyed by clear incarnation, never by a reusable numeric tid.
+    retiring_clears: BTreeMap<ChildTidClearId, Arc<ChildTidClearState>>,
     /// Set by whichever thread RELEASES the VM — a single-threaded park
     /// (the park path's unconditional release) or an MT slicing thread's
     /// slice-tick upgrade (`try_release_vm_mt`, only after the engine
@@ -165,10 +221,36 @@ struct RegistryInner {
     vm_released: bool,
 }
 
+impl RegistryInner {
+    fn new_clear(&mut self, tid: ThreadId, address: u64) -> Option<Arc<ChildTidClearState>> {
+        if address == 0 {
+            return None;
+        }
+        let id = ChildTidClearId(self.next_clear);
+        self.next_clear = self.next_clear.checked_add(1).unwrap_or_else(|| {
+            carrick_fatal::carrick_fatal!("thread::clear_child_tid", "clear incarnation overflow")
+        });
+        Some(Arc::new(ChildTidClearState {
+            id,
+            tid,
+            address: carrick_guest_mem::GuestVa::from(address),
+            custody: AtomicU8::new(CLEAR_AVAILABLE),
+        }))
+    }
+
+    fn retain_clear(&mut self, entry: ThreadEntry) {
+        if let Some(clear) = entry.clear_child_tid
+            && clear.custody.load(Ordering::Acquire) != CLEAR_SETTLED
+        {
+            self.retiring_clears.insert(clear.id, clear);
+        }
+    }
+}
+
 pub struct ThreadRegistry {
     main_tid: ThreadId,
     next_tid: AtomicI32,
-    inner: ParkingMutex<RegistryInner>,
+    inner: Arc<ParkingMutex<RegistryInner>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +258,7 @@ pub enum ExecSurvivorRekeyError {
     UnknownSurvivor(ThreadId),
     SiblingsRemain(usize),
     MainTidOccupied(ThreadId),
+    PendingChildTidClears,
 }
 
 /// Proof that the sole exec survivor was atomically moved onto the permanent
@@ -324,7 +407,7 @@ impl ThreadRegistry {
         map.insert(
             main_tid,
             ThreadEntry {
-                clear_child_tid: 0,
+                clear_child_tid: None,
                 mach_port: 0,
                 name: None,
                 proc_state: 'R',
@@ -334,10 +417,12 @@ impl ThreadRegistry {
         Self {
             main_tid,
             next_tid: AtomicI32::new(main_tid.raw() + 1),
-            inner: ParkingMutex::new(RegistryInner {
+            inner: Arc::new(ParkingMutex::new(RegistryInner {
                 map,
+                next_clear: 1,
+                retiring_clears: BTreeMap::new(),
                 vm_released: false,
-            }),
+            })),
         }
     }
 
@@ -354,7 +439,9 @@ impl ThreadRegistry {
     /// Register a child whose tid was allocated by an external process-wide
     /// task-id namespace (hvpatch's one-VM process table).
     pub fn register_child_with_tid(&self, tid: ThreadId, clear_child_tid: u64) {
-        self.inner.lock().map.insert(
+        let mut inner = self.inner.lock();
+        let clear_child_tid = inner.new_clear(tid, clear_child_tid);
+        if let Some(previous) = inner.map.insert(
             tid,
             ThreadEntry {
                 clear_child_tid,
@@ -363,17 +450,86 @@ impl ThreadRegistry {
                 proc_state: 'R',
                 vcpu_parked: None,
             },
-        );
+        ) {
+            inner.retain_clear(previous);
+        }
     }
 
     pub fn clear_child_tid(&self, tid: ThreadId) -> Option<u64> {
-        self.inner.lock().map.get(&tid).map(|e| e.clear_child_tid)
+        self.inner.lock().map.get(&tid).map(|entry| {
+            entry
+                .clear_child_tid
+                .as_ref()
+                .filter(|clear| clear.custody.load(Ordering::Acquire) != CLEAR_SETTLED)
+                .map_or(0, |clear| clear.address.raw())
+        })
     }
 
     pub fn set_clear_child_tid(&self, tid: ThreadId, addr: u64) {
-        if let Some(e) = self.inner.lock().map.get_mut(&tid) {
-            e.clear_child_tid = addr;
+        let mut inner = self.inner.lock();
+        if inner.map.contains_key(&tid) {
+            let clear = inner.new_clear(tid, addr);
+            let previous = inner
+                .map
+                .get_mut(&tid)
+                .and_then(|entry| std::mem::replace(&mut entry.clear_child_tid, clear));
+            // A suspended exit owns the previous address, even if a new
+            // incarnation is published. An unclaimed registration is reset.
+            if let Some(previous) = previous
+                && previous.custody.load(Ordering::Acquire) == CLEAR_CLAIMED
+            {
+                inner.retiring_clears.insert(previous.id, previous);
+            }
         }
+    }
+
+    /// A terminal owner adopts a clear for a stopped EL1 birth which never
+    /// acquired runtime membership. The caller retains exact Kernel identity;
+    /// this registry owns only one-shot custody and futex routing.
+    pub fn claim_detached_child_tid(&self, tid: ThreadId, address: u64) -> Option<ChildTidClear> {
+        let mut registry = self.inner.lock();
+        let clear = registry.new_clear(tid, address)?;
+        clear.custody.store(CLEAR_CLAIMED, Ordering::Release);
+        registry
+            .retiring_clears
+            .insert(clear.id, Arc::clone(&clear));
+        Some(ChildTidClear {
+            state: clear,
+            registry: Arc::clone(&self.inner),
+        })
+    }
+
+    pub fn claim_clear_child_tid(&self, tid: ThreadId) -> Option<ChildTidClear> {
+        let inner = self.inner.lock();
+        self.claim_clear(inner.map.get(&tid)?.clear_child_tid.as_ref()?)
+    }
+
+    fn claim_clear(&self, state: &Arc<ChildTidClearState>) -> Option<ChildTidClear> {
+        state
+            .custody
+            .compare_exchange(
+                CLEAR_AVAILABLE,
+                CLEAR_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        Some(ChildTidClear {
+            state: Arc::clone(state),
+            registry: Arc::clone(&self.inner),
+        })
+    }
+
+    /// Registry-only custody probe. Production drains transfer claims already
+    /// bound to exact Kernel contexts instead of recapturing numeric tids.
+    #[cfg(test)]
+    fn claim_retiring_child_tids(&self) -> Vec<ChildTidClear> {
+        self.inner
+            .lock()
+            .retiring_clears
+            .values()
+            .filter_map(|clear| self.claim_clear(clear))
+            .collect()
     }
 
     /// True iff `addr` is the live (nonzero) `CLONE_CHILD_CLEARTID` address of ANY
@@ -384,19 +540,27 @@ impl ThreadRegistry {
     /// so a mirror wait would never be woken (the bhyve immediate-`pthread_join`
     /// hang; a no-op on HVF/KVM, where such a private word never had a mirror).
     pub fn is_clear_child_tid_addr(&self, addr: u64) -> bool {
-        addr != 0
-            && self
-                .inner
-                .lock()
-                .map
-                .values()
-                .any(|e| e.clear_child_tid == addr)
+        if addr == 0 {
+            return false;
+        }
+        let inner = self.inner.lock();
+        inner
+            .map
+            .values()
+            .filter_map(|entry| entry.clear_child_tid.as_ref())
+            .chain(inner.retiring_clears.values())
+            .any(|clear| {
+                clear.address.raw() == addr
+                    && clear.custody.load(Ordering::Acquire) != CLEAR_SETTLED
+            })
     }
 
     /// Returns true if this was the last live thread (process should exit).
     pub fn exit(&self, tid: ThreadId) -> bool {
         let mut inner = self.inner.lock();
-        inner.map.remove(&tid);
+        if let Some(entry) = inner.map.remove(&tid) {
+            inner.retain_clear(entry);
+        }
         inner.map.is_empty()
     }
 
@@ -426,7 +590,9 @@ impl ThreadRegistry {
             .filter(|tid| *tid != keep_tid)
             .collect();
         for tid in &removed {
-            inner.map.remove(tid);
+            if let Some(entry) = inner.map.remove(tid) {
+                inner.retain_clear(entry);
+            }
         }
         removed
     }
@@ -447,6 +613,15 @@ impl ThreadRegistry {
         if !inner.map.contains_key(&survivor) {
             return Err(ExecSurvivorRekeyError::UnknownSurvivor(survivor));
         }
+        if !inner.retiring_clears.is_empty()
+            || inner
+                .map
+                .get(&survivor)
+                .and_then(|entry| entry.clear_child_tid.as_ref())
+                .is_some_and(|clear| clear.custody.load(Ordering::Acquire) == CLEAR_CLAIMED)
+        {
+            return Err(ExecSurvivorRekeyError::PendingChildTidClears);
+        }
         if survivor != self.main_tid && inner.map.contains_key(&self.main_tid) {
             return Err(ExecSurvivorRekeyError::MainTidOccupied(self.main_tid));
         }
@@ -456,7 +631,7 @@ impl ThreadRegistry {
             .ok_or(ExecSurvivorRekeyError::UnknownSurvivor(survivor))?;
         // Kernel-owned clone-exit and old-image presentation state do not
         // survive exec. The backing host pthread/port does, so preserve it.
-        entry.clear_child_tid = 0;
+        entry.clear_child_tid = None;
         entry.name = None;
         entry.proc_state = 'R';
         entry.vcpu_parked = None;
@@ -2211,6 +2386,121 @@ mod tests {
             registry.is_clear_child_tid_addr(0x4000),
             "runtime removal cannot discard the pending clear or reroute its joiners",
         );
+    }
+
+    #[test]
+    fn claimed_clear_survives_removal_and_returns_to_the_drain() {
+        let owner = ThreadId::synthetic_for_tests(1_021);
+        let registry = ThreadRegistry::new(owner);
+        let sibling = registry.register_child(0x5000);
+        let clear = registry.claim_clear_child_tid(sibling).unwrap();
+        assert!(registry.claim_clear_child_tid(sibling).is_none());
+        assert!(registry.is_clear_child_tid_addr(0x5000));
+        registry.remove_all_except(owner);
+        assert!(registry.claim_retiring_child_tids().is_empty());
+        assert!(registry.is_clear_child_tid_addr(0x5000));
+        // A terminal loser returns custody before its member completion.
+        drop(clear);
+        let mut pending = registry.claim_retiring_child_tids();
+        assert_eq!(pending.len(), 1);
+        let clear = pending.pop().unwrap();
+        assert_eq!(clear.tid(), sibling);
+        assert_eq!(clear.address().raw(), 0x5000);
+        assert!(registry.is_clear_child_tid_addr(0x5000));
+        clear.settle();
+        assert!(!registry.is_clear_child_tid_addr(0x5000));
+        assert!(registry.claim_retiring_child_tids().is_empty());
+    }
+
+    #[test]
+    fn stop_before_exit_claim_transfers_one_clear_to_the_drain() {
+        let owner = ThreadId::synthetic_for_tests(1_022);
+        let registry = ThreadRegistry::new(owner);
+        let sibling = registry.register_child(0x6000);
+        registry.remove_all_except(owner);
+        assert!(registry.claim_clear_child_tid(sibling).is_none());
+        let mut pending = registry.claim_retiring_child_tids();
+        assert_eq!(pending.len(), 1);
+        assert!(registry.claim_retiring_child_tids().is_empty());
+        pending.pop().unwrap().settle();
+        assert!(!registry.is_clear_child_tid_addr(0x6000));
+    }
+
+    #[test]
+    fn stale_clear_settlement_cannot_erase_reused_tid_address_incarnation() {
+        let owner = ThreadId::synthetic_for_tests(1_023);
+        let registry = ThreadRegistry::new(owner);
+        let sibling = registry.register_child(0x7000);
+        let old = registry.claim_clear_child_tid(sibling).unwrap();
+        registry.remove_all_except(owner);
+        registry.register_child_with_tid(sibling, 0x7000);
+        registry.remove_all_except(owner);
+        old.settle();
+        assert!(registry.is_clear_child_tid_addr(0x7000));
+        let mut pending = registry.claim_retiring_child_tids();
+        assert_eq!(pending.len(), 1);
+        pending.pop().unwrap().settle();
+        assert!(!registry.is_clear_child_tid_addr(0x7000));
+    }
+
+    #[test]
+    fn concurrent_exit_claim_and_stop_have_one_clear_owner() {
+        let owner = ThreadId::synthetic_for_tests(1_024);
+        let registry = Arc::new(ThreadRegistry::new(owner));
+        let sibling = registry.register_child(0x8000);
+        let barrier = Arc::new(Barrier::new(2));
+        let exit_registry = Arc::clone(&registry);
+        let exit_barrier = Arc::clone(&barrier);
+        let exiting = std::thread::spawn(move || {
+            exit_barrier.wait();
+            exit_registry.claim_clear_child_tid(sibling)
+        });
+        barrier.wait();
+        registry.remove_all_except(owner);
+        let mut claims = registry.claim_retiring_child_tids();
+        claims.extend(exiting.join().unwrap());
+        assert_eq!(claims.len(), 1);
+        assert!(registry.is_clear_child_tid_addr(0x8000));
+        claims.pop().unwrap().settle();
+        assert!(!registry.is_clear_child_tid_addr(0x8000));
+    }
+
+    #[test]
+    fn completed_clear_does_not_accumulate_retired_routing_membership() {
+        let owner = ThreadId::synthetic_for_tests(1_025);
+        let registry = ThreadRegistry::new(owner);
+        let sibling = registry.register_child(0x9000);
+        registry.claim_clear_child_tid(sibling).unwrap().settle();
+        registry.exit(sibling);
+        assert!(!registry.is_clear_child_tid_addr(0x9000));
+        assert!(registry.claim_retiring_child_tids().is_empty());
+    }
+
+    #[test]
+    fn exec_rekey_refuses_pending_sibling_or_survivor_clear_custody() {
+        let owner = ThreadId::synthetic_for_tests(1_026);
+        let registry = ThreadRegistry::new(owner);
+        registry.set_clear_child_tid(owner, 0xa000);
+        let sibling = registry.register_child(0xb000);
+        let own = registry.claim_clear_child_tid(owner).unwrap();
+        registry.remove_all_except(owner);
+        assert_eq!(
+            registry.rekey_exec_survivor(owner),
+            Err(ExecSurvivorRekeyError::PendingChildTidClears)
+        );
+        let mut pending = registry.claim_retiring_child_tids();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].tid(), sibling);
+        pending.pop().unwrap().settle();
+        assert_eq!(
+            registry.rekey_exec_survivor(owner),
+            Err(ExecSurvivorRekeyError::PendingChildTidClears)
+        );
+        // The successful exec survivor resets an unclaimed registration;
+        // it does not execute an exiting-thread clear on its own old stack.
+        drop(own);
+        registry.rekey_exec_survivor(owner).unwrap();
+        assert!(!registry.is_clear_child_tid_addr(0xa000));
     }
 
     #[test]

@@ -129,6 +129,23 @@ pub trait CarrierProcess: Send + Sync {
                 ));
             }
         };
+        self.exit_exact_thread(&context)
+    }
+
+    /// Retire the captured thread incarnation, including when a terminal
+    /// drain retained it before removing runtime membership. Never resolve a
+    /// numeric tid again after a memory suspension or an exec replacement.
+    fn exit_exact_thread(
+        &self,
+        context: &crate::kernel::KernelContext,
+    ) -> Result<ProcessThreadExit, crate::kernel::KernelOperationError> {
+        if context.task().key() != self.task_key()
+            || !Arc::ptr_eq(context.kernel(), self.kernel_graph())
+        {
+            return Err(crate::kernel::KernelOperationError::UnknownTask(
+                context.task().key().id,
+            ));
+        }
         // Capture the retiring thread's exact owner/table generation before
         // Kernel publication removes the thread from the authoritative graph.
         // Callers use this receipt to consume only that generation's close
@@ -136,7 +153,7 @@ pub trait CarrierProcess: Send + Sync {
         let retired =
             RetiredThreadResources::new(context.task().key(), context.resources().files());
         let observed = self.kernel_graph().reservation_epoch();
-        match self.kernel_graph().exit_thread(&context, None) {
+        match self.kernel_graph().exit_thread(context, None) {
             Ok(_) => Ok(ProcessThreadExit::Retired(retired)),
             Err(crate::kernel::KernelOperationError::TaskBusy(_)) => {
                 // NEVER park the executor host thread on the reservation

@@ -847,6 +847,72 @@ fn hvpatch_resolves_child_selectors_in_kernel_domain() {
 }
 
 #[test]
+fn hvpatch_child_selector_survives_unpublished_terminal_clear() {
+    let (kernel, context) = bootstrap(15_425);
+    let generation = publish(&context, 0x710);
+    let child = kernel
+        .fork_task(
+            &context,
+            crate::kernel::ClonePlan::from_flags(LinuxCloneFlags::empty()).unwrap(),
+            ThreadId::synthetic_for_tests(15_426),
+            "unpublished child clear".into(),
+            None,
+        )
+        .unwrap();
+    let retired = kernel
+        .prepare_task_exit_key(
+            child.task().key(),
+            crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
+            None,
+        )
+        .unwrap()
+        .retire_notifying(|_| {})
+        .unwrap();
+    let wait = kernel.wait_child(
+        context.task().key().id,
+        Some(child.task().key().id),
+        crate::kernel::WaitMode::Observe,
+    );
+    let continuation = match wait {
+        Ok(crate::kernel::WaitOutcome::StillRunning(precheck)) => {
+            BlockedContinuation::from_dispatch_outcome(
+                DispatchOutcome::WaitOnHvpatchChild {
+                    target: Some(child.task().key().id.raw()),
+                    sig_mask: WaitSigMask::NONE,
+                    precheck,
+                },
+                capture(&context, generation),
+            )
+        }
+        other => {
+            retired.publish().unwrap();
+            panic!("unpublished child must stay waitable: {other:?}");
+        }
+    };
+    retired.publish().unwrap();
+    let continuation = continuation.expect("staged child keeps exact selector through enrollment");
+    assert_eq!(
+        continuation.child_selector(),
+        Some(ChildSelector::Exact(child.task().key()))
+    );
+    let service = CarrierWaitService::new(Arc::new(Scheduler::new(Arc::clone(&kernel))));
+    let mut registration = service.prepare_registration(&continuation);
+    let token = registration.wake_token();
+    service.enroll(&mut registration).unwrap();
+    assert_eq!(
+        service
+            .inner
+            .state
+            .lock()
+            .entries
+            .get(&token.continuation)
+            .unwrap()
+            .state,
+        RegistrationState::Ready
+    );
+}
+
+#[test]
 fn hvpatch_child_enrollment_requires_a_real_task_event() {
     let (kernel, context) = bootstrap(15_021);
     let generation = publish(&context, 0x301);

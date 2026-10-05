@@ -903,6 +903,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-abi",
  "carrick-fatal",
+ "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
  "carrick-observability",

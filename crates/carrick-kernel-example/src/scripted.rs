@@ -1538,11 +1538,11 @@ impl Task {
                 }
             }
         }
-        if let Some(clear_addr) = self.thread_registry.clear_child_tid(thread_id)
-            && clear_addr != 0
-        {
-            let _ = self.memory.lock().write(clear_addr, &[0u8; 4]);
-            self.futex_table.wake(clear_addr, 1);
+        if let Some(clear) = self.thread_registry.claim_clear_child_tid(thread_id) {
+            let address = clear.address().raw();
+            let _ = self.memory.lock().write(address, &[0u8; 4]);
+            self.futex_table.wake(address, 1);
+            clear.settle();
         }
         self.thread_registry.exit(thread_id);
         Ok(())

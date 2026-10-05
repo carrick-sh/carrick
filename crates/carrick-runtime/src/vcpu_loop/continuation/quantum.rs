@@ -1508,7 +1508,9 @@ mod tests {
         for required in [
             "begin_persistent_process_terminal",
             "finalize_persistent_process_terminal",
-            "publish_exit_status",
+            "graph_exit",
+            "retire_notifying",
+            "publication.publish()",
             "notify_hvpatch_parent_exit",
             "unregister_hvpatch_runtime_endpoint",
             "publish_process_terminal(terminal_publication)",
@@ -1573,9 +1575,17 @@ mod tests {
             "persistent thread exit must route from the atomic withdrawal result"
         );
         assert!(
-            thread_exit.contains("settle_persistent_thread_exit"),
-            "the ThreadExit arm must route through the shared settle seam"
+            thread_exit.contains("drive_thread_exit"),
+            "the ThreadExit arm must route through the terminal memory driver"
         );
+        let thread_exit_driver = production
+            .split_once("fn drive_thread_exit(")
+            .unwrap()
+            .1
+            .split_once("fn take_terminal_memory_action(")
+            .unwrap()
+            .0;
+        assert!(thread_exit_driver.contains("settle_persistent_thread_exit"));
         let settle_seam = production
             .split_once("fn settle_persistent_thread_exit")
             .expect("thread-exit settle seam")

@@ -248,6 +248,17 @@ pub(super) enum HvpatchProductionPhase {
     ResumeOwnerZone {
         frame: carrick_hal::RawSyscall,
     },
+    ResumeTerminalOwner {
+        action: Box<TerminalMemoryAction>,
+    },
+    TerminalMemoryRetry {
+        action: Box<TerminalMemoryAction>,
+    },
+    ResumeTerminalPhysical {
+        action: Box<TerminalMemoryAction>,
+        wait: carrick_guest_mem::OwnedMemoryWait,
+        _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
+    },
     /// A retained physical writer owns this dependency. Its subscription
     /// remains live while the job, not a pool worker, is blocked.
     ResumeOwnerPhysical {
@@ -275,6 +286,26 @@ pub(super) enum HvpatchProductionPhase {
         _subscription: TerminalRetireSubscription,
     },
     Complete,
+}
+
+pub(super) enum TerminalMemoryAction {
+    ThreadExit {
+        code: i32,
+    },
+    ExecDrain {
+        context: carrick_kernel::kernel::KernelContext,
+        owner: Box<exec::PreparedExecveDrain>,
+    },
+    ProcessFinish {
+        context: carrick_kernel::kernel::KernelContext,
+        terminal: PersistentTerminal,
+    },
+}
+
+impl TerminalMemoryAction {
+    fn is_drain_owner(&self) -> bool {
+        !matches!(self, Self::ThreadExit { .. })
+    }
 }
 
 /// What a parked process terminal waits on before retrying its retirement.
@@ -351,6 +382,12 @@ pub(crate) fn registration_wake_callback(
 
 impl HvpatchProductionPhase {
     fn is_terminal_transition(&self) -> bool {
+        if let Self::ResumeTerminalOwner { action }
+        | Self::ResumeTerminalPhysical { action, .. }
+        | Self::TerminalMemoryRetry { action } = self
+        {
+            return action.is_drain_owner();
+        }
         matches!(
             self,
             Self::ExecSiblingDrain { .. }
@@ -384,6 +421,9 @@ impl HvpatchProductionPhase {
             Self::BootstrapThreadChild => 13,
             Self::ResumeZone | Self::ResumeOwnerZone { .. } => 14,
             Self::ResumeOwnerPhysical { .. } => 18,
+            Self::ResumeTerminalOwner { .. } => 19,
+            Self::ResumeTerminalPhysical { .. } => 20,
+            Self::TerminalMemoryRetry { .. } => 21,
         }
     }
 }
@@ -629,18 +669,14 @@ where
                     }
                 };
                 if owner.is_ready() {
-                    let finished = match self.state.finish_prepared_execve_drain(
-                        &self.kernel,
+                    self.drive_terminal_memory(
                         engine,
-                        &self.completion,
-                        owner,
-                    ) {
-                        Ok(finished) => finished,
-                        Err(failure) => {
-                            return Err(ProductionHvpatchPollError::from_exec_failure(failure));
-                        }
-                    };
-                    self.finish_exec_suffix(engine, control, finished)
+                        control,
+                        TerminalMemoryAction::ExecDrain {
+                            context,
+                            owner: Box::new(owner),
+                        },
+                    )
                 } else {
                     self.phase = HvpatchProductionPhase::ExecSiblingDrain {
                         context,
@@ -903,9 +939,10 @@ where
     fn finalize_persistent_process_terminal(
         &mut self,
         engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
         terminal_context: carrick_kernel::kernel::KernelContext,
-        terminal: PersistentTerminal,
-    ) -> executor::ExecutorExit {
+        mut terminal: PersistentTerminal,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         let process = self.kernel.hvpatch_process.as_ref().unwrap_or_else(|| {
             carrick_fatal!(
                 "kernel::terminal_settlement",
@@ -933,6 +970,89 @@ where
         self.kernel
             .dispatcher
             .retire_hvpatch_process_fds(&terminal_context);
+        let prepared_core = match &mut terminal {
+            PersistentTerminal::Outcome { prepared_core, .. } => prepared_core.as_deref_mut(),
+            _ => None,
+        };
+        let core_publication = match prepared_core {
+            Some(prepared) => prepared
+                .publication
+                .get_or_insert_with(|| {
+                    match self.kernel.dispatcher.publish_core_atomic(
+                        &prepared.snapshot,
+                        prepared.generation,
+                        prepared.payload.clone(),
+                    ) {
+                        Ok(publ) => {
+                            crate::probes::hvpatch_core_lifecycle(
+                                4,
+                                process.pid(),
+                                prepared.fatal_tid,
+                                publ.generation,
+                                0,
+                            );
+                            tracing::debug!(
+                                path = %publ.path,
+                                bytes = publ.bytes,
+                                "published guest core file"
+                            );
+                            Some(publ)
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "publish core atomic");
+                            crate::probes::hvpatch_core_lifecycle(
+                                6,
+                                process.pid(),
+                                prepared.fatal_tid,
+                                prepared.generation,
+                                1,
+                            );
+                            None
+                        }
+                    }
+                })
+                .clone(),
+            None => None,
+        };
+        let prepared_core = match &terminal {
+            PersistentTerminal::Outcome { prepared_core, .. } => prepared_core.as_deref(),
+            _ => None,
+        };
+        let core_dumped = core_publication.is_some();
+        let (exit_code, wait_encoding, terminal_publication) = match &terminal {
+            PersistentTerminal::Outcome {
+                outcome: VcpuLoopOutcome::ProcessExit(run) | VcpuLoopOutcome::TrapLimit(run),
+                ..
+            } => (
+                run.exit_code,
+                run.wait_status_encoding(core_dumped),
+                Ok((**run).clone()),
+            ),
+            PersistentTerminal::Error(error) => {
+                // The owner's failure would otherwise vanish: its sibling job
+                // result is not the launch result, so this arm's Err(()) was
+                // the only externally visible trace ("sibling-owned process
+                // termination failed" with no cause). Name the cause here.
+                //
+                // The guest pid belongs in the line for the same reason: a
+                // `cpython-importlib` wedge left one zombie at `127 << 8` and
+                // an unattributable error on stderr, so which Linux process
+                // carrick killed had to be inferred from the wait status.
+                tracing::error!(
+                    guest_pid = process.pid(),
+                    %error,
+                    "HVPatch terminal owner publishes failure"
+                );
+                (127, 127 << 8, Err(()))
+            }
+            PersistentTerminal::Outcome {
+                outcome: VcpuLoopOutcome::ThreadDone,
+                ..
+            } => carrick_fatal!(
+                "kernel::terminal_settlement",
+                "Unexpected terminal settlement disposition encountered during process teardown"
+            ),
+        };
         // Retiring this process's MM edge is an owner-set edit on its
         // generation. A vfork sibling mid-exec has that generation reserved
         // and its owner set frozen; admit the edit against the reservation
@@ -970,12 +1090,12 @@ where
                                     _subscription: subscription,
                                 },
                             };
-                            return self.suspend(
+                            return Ok(self.suspend(
                                 HvpatchLoopSuspension::TerminalSiblingDrain,
                                 executor::ExecutorExit::Blocked(
                                     carrick_kernel::kernel::objects::BlockedReason::HostWait,
                                 ),
-                            );
+                            ));
                         }
                     }
                 }
@@ -1005,6 +1125,103 @@ where
                     "classify persistent terminal MM ownership failed: {failure}"
                 );
             });
+        let status = carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(wait_encoding);
+        let orphan_adopter = self.kernel.dispatcher.hvpatch_orphan_adopter();
+        let epoch = terminal_context.kernel().reservation_epoch();
+        let graph_exit = match orphan_adopter {
+            Some(adopter) => terminal_context
+                .kernel()
+                .prepare_task_exit_key_with_adopter(
+                    terminal_context.task().key(),
+                    status,
+                    adopter,
+                    None,
+                ),
+            None => terminal_context.kernel().prepare_task_exit_key(
+                terminal_context.task().key(),
+                status,
+                None,
+            ),
+        };
+        let graph_exit = match graph_exit {
+            Ok(prepared) => prepared,
+            Err(carrick_kernel::kernel::KernelOperationError::TaskBusy(_)) => {
+                drop(topology);
+                drop(owner_set_edit);
+                let action = TerminalMemoryAction::ProcessFinish {
+                    context: terminal_context.retain_exact(),
+                    terminal,
+                };
+                return Ok(self.park_thread_exit_retry(
+                    &terminal_context,
+                    epoch,
+                    HvpatchProductionPhase::TerminalMemoryRetry {
+                        action: Box::new(action),
+                    },
+                ));
+            }
+            Err(error) => {
+                return Err(RuntimeError::Configuration(format!(
+                    "prepare terminal graph exit: {error}"
+                ))
+                .into());
+            }
+        };
+        let notification_kernel = Arc::clone(&self.kernel);
+        let publish_result =
+            match self
+                .state
+                .commit_terminal_child_tid(&self.kernel, engine, || {
+                    graph_exit.retire_notifying(move |parent| {
+                        notification_kernel.notify_hvpatch_parent_exit(parent)
+                    })
+                }) {
+                Ok(result) => result,
+                Err(error) => {
+                    // The failed attempt owns no permit and drops graph admission
+                    // before parking. Keep only exact clear/terminal custody.
+                    drop(topology);
+                    drop(owner_set_edit);
+                    return self.wait_for_terminal_memory(
+                        engine,
+                        control,
+                        TerminalMemoryAction::ProcessFinish {
+                            context: terminal_context,
+                            terminal,
+                        },
+                        error,
+                    );
+                }
+            };
+        let publish_result = publish_result.and_then(|publication| publication.publish());
+        if publish_result.is_ok() {
+            if let Some(chain) = self.kernel.dispatcher.observers() {
+                let p = carrick_kernel::observe::ProcessInfo::new(&terminal_context);
+                chain.on_process_exit(
+                    &p,
+                    carrick_kernel::observe::ExitStatus::from_wait_status(status),
+                );
+            }
+        }
+        if let Err(failure) = publish_result {
+            if let Some(publ) = &core_publication {
+                let _ = self.kernel.dispatcher.rollback_core_publication(publ);
+            }
+            if let Some(prepared) = prepared_core {
+                crate::probes::hvpatch_core_lifecycle(
+                    6,
+                    process.pid(),
+                    prepared.fatal_tid,
+                    prepared.generation,
+                    1,
+                );
+            }
+            tracing::error!(%failure, "publish persistent failure Kernel exit");
+            carrick_fatal!(
+                "kernel::terminal_settlement",
+                "publish persistent failure Kernel exit failed: {failure}"
+            );
+        }
         if owns_final_mm {
             if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
                 table.retire_overlapping(terminal_mm.raw(), 0, u64::MAX);
@@ -1050,82 +1267,6 @@ where
                 });
             drop(registry);
         }
-        let prepared_core = match &terminal {
-            PersistentTerminal::Outcome { prepared_core, .. } => prepared_core.as_deref(),
-            _ => None,
-        };
-        let core_publication = match prepared_core {
-            Some(prepared) => {
-                match self.kernel.dispatcher.publish_core_atomic(
-                    &prepared.snapshot,
-                    prepared.generation,
-                    prepared.payload.clone(),
-                ) {
-                    Ok(publ) => {
-                        crate::probes::hvpatch_core_lifecycle(
-                            4,
-                            process.pid(),
-                            prepared.fatal_tid,
-                            publ.generation,
-                            0,
-                        );
-                        tracing::debug!(
-                            path = %publ.path,
-                            bytes = publ.bytes,
-                            "published guest core file"
-                        );
-                        Some(publ)
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "publish core atomic");
-                        crate::probes::hvpatch_core_lifecycle(
-                            6,
-                            process.pid(),
-                            prepared.fatal_tid,
-                            prepared.generation,
-                            1,
-                        );
-                        None
-                    }
-                }
-            }
-            None => None,
-        };
-        let core_dumped = core_publication.is_some();
-        let (exit_code, wait_encoding, terminal_publication) = match &terminal {
-            PersistentTerminal::Outcome {
-                outcome: VcpuLoopOutcome::ProcessExit(run) | VcpuLoopOutcome::TrapLimit(run),
-                ..
-            } => (
-                run.exit_code,
-                run.wait_status_encoding(core_dumped),
-                Ok((**run).clone()),
-            ),
-            PersistentTerminal::Error(error) => {
-                // The owner's failure would otherwise vanish: its sibling job
-                // result is not the launch result, so this arm's Err(()) was
-                // the only externally visible trace ("sibling-owned process
-                // termination failed" with no cause). Name the cause here.
-                //
-                // The guest pid belongs in the line for the same reason: a
-                // `cpython-importlib` wedge left one zombie at `127 << 8` and
-                // an unattributable error on stderr, so which Linux process
-                // carrick killed had to be inferred from the wait status.
-                tracing::error!(
-                    guest_pid = process.pid(),
-                    %error,
-                    "HVPatch terminal owner publishes failure"
-                );
-                (127, 127 << 8, Err(()))
-            }
-            PersistentTerminal::Outcome {
-                outcome: VcpuLoopOutcome::ThreadDone,
-                ..
-            } => carrick_fatal!(
-                "kernel::terminal_settlement",
-                "Unexpected terminal settlement disposition encountered during process teardown"
-            ),
-        };
         let process_exit_event = process.record_process_exit_begin(exit_code, self.state.this_tid);
         if let Some(work) = self.external_exec.take() {
             let out = self.kernel.dispatcher.stdout();
@@ -1154,42 +1295,6 @@ where
                     "publish logical exec terminal result failed: {error}"
                 );
             }
-        }
-        let status = carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(wait_encoding);
-        let orphan_adopter = self.kernel.dispatcher.hvpatch_orphan_adopter();
-        let publish_result = process.publish_exit_status(status, orphan_adopter, |parent| {
-            // The exit transaction's exact parent key is authoritative. A
-            // pre-commit parent snapshot cannot decide current parentage after
-            // reparenting or an overlapping parent exit.
-            self.kernel.notify_hvpatch_parent_exit(parent);
-        });
-        if publish_result.is_ok() {
-            if let Some(chain) = self.kernel.dispatcher.observers() {
-                let p = carrick_kernel::observe::ProcessInfo::new(&terminal_context);
-                chain.on_process_exit(
-                    &p,
-                    carrick_kernel::observe::ExitStatus::from_wait_status(status),
-                );
-            }
-        }
-        if let Err(failure) = publish_result {
-            if let Some(publ) = &core_publication {
-                let _ = self.kernel.dispatcher.rollback_core_publication(publ);
-            }
-            if let Some(prepared) = prepared_core {
-                crate::probes::hvpatch_core_lifecycle(
-                    6,
-                    process.pid(),
-                    prepared.fatal_tid,
-                    prepared.generation,
-                    1,
-                );
-            }
-            tracing::error!(%failure, "publish persistent failure Kernel exit");
-            carrick_fatal!(
-                "kernel::terminal_settlement",
-                "publish persistent failure Kernel exit failed: {failure}"
-            );
         }
         // The logical process is no longer runnable. Drop its carrier-wide
         // run-state publication now; run-state-only records are reclaimed here,
@@ -1234,7 +1339,212 @@ where
         drop(owner_set_edit);
         drop(topology);
         self.kernel.publish_process_terminal(terminal_publication);
-        self.finish(terminal.into_result())
+        Ok(self.finish(terminal.into_result()))
+    }
+
+    pub(super) fn drive_thread_exit(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        code: i32,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let context = self
+            .state
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration("thread exit lost exact context".to_owned())
+            })?
+            .retain_exact();
+        let disposition =
+            self.state
+                .handle_persistent_thread_exit(&self.kernel, engine, code, self.traps);
+        self.settle_persistent_thread_exit(engine, control, code, context, disposition)
+    }
+
+    pub(super) fn take_terminal_memory_action(
+        &mut self,
+    ) -> Result<TerminalMemoryAction, RuntimeError> {
+        match std::mem::replace(&mut self.phase, HvpatchProductionPhase::Resident) {
+            HvpatchProductionPhase::TerminalMemoryRetry { action } => Ok(*action),
+            other => {
+                self.phase = other;
+                Err(RuntimeError::Configuration(
+                    "terminal memory action lost custody".to_owned(),
+                ))
+            }
+        }
+    }
+
+    pub(super) fn drive_terminal_memory(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        action: TerminalMemoryAction,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        if let TerminalMemoryAction::ThreadExit { code } = action {
+            return self.drive_thread_exit(engine, control, code);
+        }
+        self.phase = HvpatchProductionPhase::TerminalMemoryRetry {
+            action: Box::new(action),
+        };
+        let result = self.drive_retained_terminal_memory(engine, control);
+        self.route_poll_result(result)
+    }
+
+    fn drive_retained_terminal_memory(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let HvpatchProductionPhase::TerminalMemoryRetry { action } = &self.phase else {
+            return Err(RuntimeError::Configuration(
+                "terminal memory driver lost action".to_owned(),
+            )
+            .into());
+        };
+        let saved = match action.as_ref() {
+            TerminalMemoryAction::ExecDrain { context, .. }
+            | TerminalMemoryAction::ProcessFinish { context, .. } => context,
+            TerminalMemoryAction::ThreadExit { .. } => {
+                return Err(RuntimeError::Configuration(
+                    "terminal memory driver received thread exit".to_owned(),
+                )
+                .into());
+            }
+        };
+        let current = self
+            .state
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration("terminal clear drain lost context".to_owned())
+            })?
+            .retain_exact();
+        if current.thread().key() != saved.thread().key()
+            || current.task().key() != saved.task().key()
+            || current.shared().mm().id() != saved.shared().mm().id()
+        {
+            return Err(RuntimeError::Configuration(
+                "terminal clear drain changed incarnation".to_owned(),
+            )
+            .into());
+        }
+        if let Err(disposition) = self.state.drain_child_tid_clears(&self.kernel, engine) {
+            return match disposition {
+                threads::PersistentThreadExitDisposition::Memory(error) => {
+                    let action = self.take_terminal_memory_action()?;
+                    self.wait_for_terminal_memory(engine, control, action, error)
+                }
+                threads::PersistentThreadExitDisposition::Busy { observed_epoch } => {
+                    let context = current.retain_exact();
+                    let action = self.take_terminal_memory_action()?;
+                    Ok(self.park_thread_exit_retry(
+                        &context,
+                        observed_epoch,
+                        HvpatchProductionPhase::TerminalMemoryRetry {
+                            action: Box::new(action),
+                        },
+                    ))
+                }
+                threads::PersistentThreadExitDisposition::Failed(error) => Err(error.into()),
+                threads::PersistentThreadExitDisposition::Done(_) => Err(
+                    RuntimeError::Configuration("clear drain returned guest completion".to_owned())
+                        .into(),
+                ),
+            };
+        }
+        match self.take_terminal_memory_action()? {
+            TerminalMemoryAction::ExecDrain { context: _, owner } => {
+                let finished = self
+                    .state
+                    .finish_prepared_execve_drain(&self.kernel, engine, &self.completion, *owner)
+                    .map_err(ProductionHvpatchPollError::from_exec_failure)?;
+                self.state.finish_child_tid_drain();
+                self.finish_exec_suffix(engine, control, finished)
+            }
+            TerminalMemoryAction::ProcessFinish { context, terminal } => self
+                .finalize_persistent_process_terminal(engine, control, context, terminal)
+                .map_err(|error| match error {
+                    ProductionHvpatchPollError::Runtime(error) => {
+                        ProductionHvpatchPollError::TerminalOwner(error)
+                    }
+                    other => other,
+                }),
+            TerminalMemoryAction::ThreadExit { .. } => Err(RuntimeError::Configuration(
+                "drain changed into a thread exit".to_owned(),
+            )
+            .into()),
+        }
+    }
+
+    fn wait_for_terminal_memory(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        action: TerminalMemoryAction,
+        error: carrick_guest_mem::MemoryPrepareError,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        self.phase = HvpatchProductionPhase::TerminalMemoryRetry {
+            action: Box::new(action),
+        };
+        let result = self.wait_for_retained_terminal_memory(engine, control, error);
+        self.route_poll_result(result)
+    }
+
+    fn wait_for_retained_terminal_memory(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        error: carrick_guest_mem::MemoryPrepareError,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        use carrick_guest_mem::MemoryPrepareError;
+        match error {
+            MemoryPrepareError::OwnerWait(wait) => {
+                self.park_retained_terminal_owner(engine, control, wait)
+            }
+            MemoryPrepareError::Supply(request) => {
+                if let Some(wait) = self.supply_owner_memory(engine, request)? {
+                    return self.park_retained_terminal_owner(engine, control, wait);
+                }
+                let action = self.take_terminal_memory_action()?;
+                self.drive_terminal_memory(engine, control, action)
+            }
+            MemoryPrepareError::Physical(wait) => {
+                let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration("clear wait lost context".to_owned())
+                })?;
+                let runtime = self.kernel.hvpatch_runtime.as_ref().ok_or_else(|| {
+                    RuntimeError::Configuration("clear wait lost runtime".to_owned())
+                })?;
+                let scheduler = runtime.continuation_services(context.kernel()).0;
+                let (subscription, ready) = wait.0.enroll(registration_wake_callback(
+                    scheduler,
+                    context.thread().key(),
+                    false,
+                ));
+                let action = self.take_terminal_memory_action()?;
+                if ready || wait.0.is_ready() {
+                    drop(subscription);
+                    return self.drive_terminal_memory(engine, control, action);
+                }
+                self.phase = HvpatchProductionPhase::ResumeTerminalPhysical {
+                    action: Box::new(action),
+                    wait,
+                    _subscription: subscription,
+                };
+                Ok(self.suspend(
+                    HvpatchLoopSuspension::BlockedContinuation,
+                    executor::ExecutorExit::Blocked(
+                        carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                    ),
+                ))
+            }
+            other => Err(RuntimeError::Configuration(format!(
+                "prepare clear-child-tid: {other:?}"
+            ))
+            .into()),
+        }
     }
 
     /// Complete or park a guest thread's logical exit. `Busy` parks the
@@ -1246,11 +1556,21 @@ where
     fn settle_persistent_thread_exit(
         &mut self,
         engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
         code: i32,
         context: carrick_kernel::kernel::KernelContext,
         disposition: threads::PersistentThreadExitDisposition,
-    ) -> executor::ExecutorExit {
-        match disposition {
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        Ok(match disposition {
+            threads::PersistentThreadExitDisposition::Failed(error) => return Err(error.into()),
+            threads::PersistentThreadExitDisposition::Memory(error) => {
+                return self.wait_for_terminal_memory(
+                    engine,
+                    control,
+                    TerminalMemoryAction::ThreadExit { code },
+                    error,
+                );
+            }
             threads::PersistentThreadExitDisposition::Done(VcpuLoopOutcome::ThreadDone) => {
                 self.finish(Ok(VcpuLoopOutcome::ThreadDone))
             }
@@ -1290,7 +1610,8 @@ where
                             .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
                         self.state.thread_exit_withdrawn = true;
                     }
-                    return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
+                    self.state.handoff_child_tid_clear();
+                    return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
                 }
                 self.park_thread_exit_retry(
                     &context,
@@ -1298,7 +1619,7 @@ where
                     HvpatchProductionPhase::RetryThreadExit { code },
                 )
             }
-        }
+        })
     }
 
     /// Park a Busy thread exit as a Blocked job subscribed to the kernel
@@ -1412,12 +1733,9 @@ where
                     2,
                 );
                 if self.terminal_runtime == PersistentTerminalRuntimeState::Resident {
-                    let _ = self.state.handle_persistent_thread_exit(
-                        &self.kernel,
-                        engine,
-                        127,
-                        self.traps,
-                    );
+                    if let Err(error) = self.state.capture_child_tid_clear() {
+                        return self.finish(Err(error));
+                    }
                     if !self.state.thread_exit_withdrawn {
                         let _ = self
                             .state
@@ -1426,6 +1744,7 @@ where
                     }
                     self.terminal_runtime = PersistentTerminalRuntimeState::Withdrawn;
                 }
+                self.state.handoff_child_tid_clear();
                 return self.finish(Ok(VcpuLoopOutcome::ThreadDone));
             }
             ProcessExitClaim::Pending => {
@@ -1501,6 +1820,9 @@ where
                     };
             }
         }
+        if let Err(error) = self.state.capture_child_tid_clear() {
+            return self.finish(Err(error));
+        }
         // Withdraw runtime execution immediately, but retain the exact Kernel
         // thread/generation through drain and topology retries. Their callbacks
         // wake this owner by that key; retiring it here loses the only wake.
@@ -1541,7 +1863,13 @@ where
                         "publish persistent process physical retirement failed: {failure}"
                     );
                 });
-            return self.finalize_persistent_process_terminal(engine, context, terminal);
+            self.phase = HvpatchProductionPhase::TerminalMemoryRetry {
+                action: Box::new(TerminalMemoryAction::ProcessFinish { context, terminal }),
+            };
+            return self.suspend(
+                HvpatchLoopSuspension::TerminalSiblingDrain,
+                executor::ExecutorExit::Yielded,
+            );
         }
         self.phase = HvpatchProductionPhase::TerminalProcessDrain {
             terminal,
@@ -2584,6 +2912,21 @@ where
     /// the sole owner of its publication instead of a member list this job may
     /// already have left.
     fn publish_lost_claim_terminal_result(&mut self) {
+        if self.phase.is_terminal_transition() {
+            carrick_fatal!(
+                "kernel::terminal_settlement",
+                "terminal owner cannot publish a losing member completion"
+            );
+        }
+        self.state
+            .capture_child_tid_clear()
+            .unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "kernel::terminal_settlement",
+                    "losing member could not retain clear-child-tid: {error}"
+                );
+            });
+        self.state.handoff_child_tid_clear();
         if self.terminal_result.is_none() {
             self.terminal_result = Some(Ok(VcpuLoopOutcome::ThreadDone));
         }
@@ -2673,6 +3016,88 @@ where
         })
     }
 
+    pub(super) fn supply_owner_memory(
+        &mut self,
+        engine: &mut E,
+        request: carrick_guest_mem::MemorySupplyRequest,
+    ) -> Result<Option<carrick_el1_abi::PortalOwnerWait>, RuntimeError> {
+        let (grant_va, grant_len) = match request {
+            carrick_guest_mem::MemorySupplyRequest::Grant(window)
+            | carrick_guest_mem::MemorySupplyRequest::Cow(window) => {
+                (window.range.start(), window.range.len())
+            }
+            carrick_guest_mem::MemorySupplyRequest::Metadata { .. } => (0, 0),
+        };
+        let context = self
+            .state
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration("owner supply lost its exact Kernel context".to_owned())
+            })?
+            .retain_exact();
+        let mut executor = self.state.guest_execution.take().ok_or_else(|| {
+            RuntimeError::Configuration("owner supply lost MM executor participation".to_owned())
+        })?;
+        let result = (|| {
+            let reconciled = {
+                let mutation = carrick_kernel::dispatch::mm_mutation::from_executor(&mut executor)
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "owner supply could not exclude an EL1 edit: {error:?}"
+                        ))
+                    })?;
+                let permit = mutation.host_alias_permit();
+                if context.shared().mm().id() != permit.mm() {
+                    return Err(RuntimeError::Configuration(
+                        "owner supply MM differs from saved syscall".to_owned(),
+                    ));
+                }
+                self.kernel
+                    .dispatcher
+                    .with_kernel_resources(&context, || {
+                        self.kernel
+                            .dispatcher
+                            .reconcile_el1_deferred_returns(&permit, engine)
+                    })
+                    .map_err(|error| {
+                        RuntimeError::Configuration(format!(
+                            "owner supply could not settle EL1 predecessor: {error:?}"
+                        ))
+                    })?
+            };
+            carrick_observability::probes::hvpatch_el1_owner_grant_supply(
+                grant_va,
+                grant_len,
+                6,
+                reconciled as u64,
+            );
+            // The grant service takes its own EL1 editor after the host
+            // predecessor settlement releases its mutation exclusion.
+            let supplied = match engine.supply_memory(request) {
+                Err(carrick_guest_mem::MemoryError::OwnerWait(wait)) => return Ok(Some(wait)),
+                result => result.map_err(|error| {
+                    RuntimeError::Configuration(format!("owner supply failed: {error}"))
+                })?,
+            };
+            carrick_observability::probes::hvpatch_el1_owner_grant_supply(
+                grant_va,
+                grant_len,
+                7,
+                u64::from(supplied),
+            );
+            if !supplied {
+                return Err(RuntimeError::Configuration(
+                    "owner supply declined an exact grant after predecessor reconciliation"
+                        .to_owned(),
+                ));
+            }
+            Ok(None)
+        })();
+        self.state.guest_execution = Some(executor);
+        result
+    }
+
     pub(super) fn service_outcome(
         &mut self,
         engine: &mut E,
@@ -2688,85 +3113,7 @@ where
                 .ok_or_else(|| {
                     RuntimeError::Configuration("owner read progress overflow".to_owned())
                 })?;
-            let (grant_va, grant_len) = match request {
-                carrick_guest_mem::MemorySupplyRequest::Grant(window)
-                | carrick_guest_mem::MemorySupplyRequest::Cow(window) => {
-                    (window.range.start(), window.range.len())
-                }
-                carrick_guest_mem::MemorySupplyRequest::Metadata { .. } => (0, 0),
-            };
-            let context = self
-                .state
-                .service_kernel_context
-                .as_ref()
-                .ok_or_else(|| {
-                    RuntimeError::Configuration(
-                        "owner supply lost its exact Kernel context".to_owned(),
-                    )
-                })?
-                .retain_exact();
-            let mut executor = self.state.guest_execution.take().ok_or_else(|| {
-                RuntimeError::Configuration(
-                    "owner supply lost MM executor participation".to_owned(),
-                )
-            })?;
-            let result = (|| {
-                let reconciled = {
-                    let mutation =
-                        carrick_kernel::dispatch::mm_mutation::from_executor(&mut executor)
-                            .map_err(|error| {
-                                RuntimeError::Configuration(format!(
-                                    "owner supply could not exclude an EL1 edit: {error:?}"
-                                ))
-                            })?;
-                    let permit = mutation.host_alias_permit();
-                    if context.shared().mm().id() != permit.mm() {
-                        return Err(RuntimeError::Configuration(
-                            "owner supply MM differs from saved syscall".to_owned(),
-                        ));
-                    }
-                    self.kernel
-                        .dispatcher
-                        .with_kernel_resources(&context, || {
-                            self.kernel
-                                .dispatcher
-                                .reconcile_el1_deferred_returns(&permit, engine)
-                        })
-                        .map_err(|error| {
-                            RuntimeError::Configuration(format!(
-                                "owner supply could not settle EL1 predecessor: {error:?}"
-                            ))
-                        })?
-                };
-                carrick_observability::probes::hvpatch_el1_owner_grant_supply(
-                    grant_va,
-                    grant_len,
-                    6,
-                    reconciled as u64,
-                );
-                // The grant service takes its own EL1 editor after the host
-                // predecessor settlement releases its mutation exclusion.
-                let supplied = match engine.supply_memory(request) {
-                    Err(carrick_guest_mem::MemoryError::OwnerWait(wait)) => return Ok(Some(wait)),
-                    result => result.map_err(|error| {
-                        RuntimeError::Configuration(format!("owner supply failed: {error}"))
-                    })?,
-                };
-                carrick_observability::probes::hvpatch_el1_owner_grant_supply(
-                    grant_va,
-                    grant_len,
-                    7,
-                    u64::from(supplied),
-                );
-                if !supplied {
-                    return Err(RuntimeError::Configuration(
-                        "owner supply declined an exact grant after predecessor reconciliation"
-                            .to_owned(),
-                    ));
-                }
-                Ok(None)
-            })();
-            self.state.guest_execution = Some(executor);
+            let result = self.supply_owner_memory(engine, request);
             if let Some(wait) = result? {
                 return self.owner_memory_park(engine, control, frame, wait);
             }
@@ -2981,19 +3328,7 @@ where
             }
             DispatchOutcome::ThreadExit { code } => {
                 self.state.retire_syscall()?;
-                let context = self
-                    .state
-                    .service_kernel_context
-                    .as_ref()
-                    .unwrap_or_else(|| carrick_fatal!("vcpu_loop::service_context", "ThreadRuntimeState missing service_kernel_context during run-loop outcome servicing"))
-                    .retain_exact();
-                let disposition = self.state.handle_persistent_thread_exit(
-                    &self.kernel,
-                    engine,
-                    code,
-                    self.traps,
-                );
-                self.settle_persistent_thread_exit(engine, code, context, disposition)
+                return self.drive_thread_exit(engine, control, code);
             }
             DispatchOutcome::Exit { code } => {
                 self.state.retire_syscall()?;
@@ -3059,20 +3394,14 @@ where
                             }
                         };
                         if owner.is_ready() {
-                            let finished = match self.state.finish_prepared_execve_drain(
-                                &self.kernel,
+                            return self.drive_terminal_memory(
                                 engine,
-                                &self.completion,
-                                owner,
-                            ) {
-                                Ok(finished) => finished,
-                                Err(failure) => {
-                                    return Err(ProductionHvpatchPollError::from_exec_failure(
-                                        failure,
-                                    ));
-                                }
-                            };
-                            return self.finish_exec_suffix(engine, control, finished);
+                                control,
+                                TerminalMemoryAction::ExecDrain {
+                                    context,
+                                    owner: Box::new(owner),
+                                },
+                            );
                         }
                         self.phase = HvpatchProductionPhase::ExecSiblingDrain {
                             context,
@@ -3635,38 +3964,17 @@ where
                     carrick_observability::probes::HvpatchThreadTerminalReason::ExecRegistryGoneAtLoopTop,
                     i32::from(self.kernel.process_exiting()),
                 );
-                match self
-                    .state
-                    .handle_persistent_thread_exit(&self.kernel, engine, 0, self.traps)
-                {
-                    // The drain path always finishes ThreadDone: the terminal
-                    // owner or exec survivor owns the task's end, so a
-                    // registry-derived process-exit claim is discarded here
-                    // exactly as it always was.
-                    threads::PersistentThreadExitDisposition::Done(_) => {
-                        return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
-                    }
-                    threads::PersistentThreadExitDisposition::Busy { observed_epoch } => {
-                        // Ownership passed: on this drain path the thread is
-                        // here BECAUSE an exec replacement or the process
-                        // terminal is retiring it — the Busy holder is (or is
-                        // superseded by) the very transaction that retires this
-                        // thread's kernel row. Its own exit_thread is redundant,
-                        // and parking for the holder STRANDS: the retirement
-                        // makes every registry-addressed wake UnknownThread
-                        // (measured live — parks at observed_epoch with three
-                        // later publishes, final wake Err(UnknownThread), 10/12
-                        // teardown hangs). Finish; the owner retires the row.
-                        let _ = observed_epoch;
-                        if !self.state.thread_exit_withdrawn {
-                            let _ = self
-                                .state
-                                .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
-                            self.state.thread_exit_withdrawn = true;
-                        }
-                        return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
-                    }
+                // This loser has no admitted execution/MM lane. Transfer
+                // its intent before publishing member completion; the live
+                // drain owner performs preparation and exact graph retirement.
+                self.state.capture_child_tid_clear()?;
+                self.state.handoff_child_tid_clear();
+                if !self.state.thread_exit_withdrawn {
+                    self.state
+                        .withdraw_persistent_terminal_owner_runtime(&self.kernel, engine);
+                    self.state.thread_exit_withdrawn = true;
                 }
+                return Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)));
             }
 
             if self.state.guest_execution.is_none() {
@@ -4034,31 +4342,42 @@ where
                     };
                 }
                 HvpatchProductionPhase::RetryThreadExit { code } => {
-                    // Drop the reservation subscription for this attempt; a
-                    // fresh one is installed if the retry parks again.
                     self.state.thread_exit_retry_subscription = None;
-                    let context = self
-                        .state
-                        .service_kernel_context
-                        .as_ref()
-                        .ok_or_else(|| {
-                            RuntimeError::Configuration(
-                                "persistent thread-exit retry lost exact Kernel context".to_owned(),
-                            )
-                        })?
-                        .retain_exact();
-                    let disposition = self.state.handle_persistent_thread_exit(
-                        &self.kernel,
-                        engine,
-                        code,
-                        self.traps,
-                    );
-                    return Ok(self.settle_persistent_thread_exit(
-                        engine,
-                        code,
-                        context,
-                        disposition,
-                    ));
+                    return self.drive_thread_exit(engine, control, code);
+                }
+                HvpatchProductionPhase::TerminalMemoryRetry { action } => {
+                    self.state.thread_exit_retry_subscription = None;
+                    return self.drive_terminal_memory(engine, control, *action);
+                }
+                HvpatchProductionPhase::ResumeTerminalOwner { action } => {
+                    self.phase = HvpatchProductionPhase::TerminalMemoryRetry { action };
+                    let result = self.consume_owner_zone(control)?;
+                    if !matches!(result.completion, carrick_kernel::kernel::continuation::ContinuationCompletion::ResumeTerminalAction) {
+                        return Err(RuntimeError::Configuration("clear-child-tid resumed as a syscall".to_owned()).into());
+                    }
+                    let action = self.take_terminal_memory_action()?;
+                    return self.drive_terminal_memory(engine, control, action);
+                }
+                HvpatchProductionPhase::ResumeTerminalPhysical {
+                    action,
+                    wait,
+                    _subscription,
+                } => {
+                    if !wait.0.is_ready() {
+                        self.phase = HvpatchProductionPhase::ResumeTerminalPhysical {
+                            action,
+                            wait,
+                            _subscription,
+                        };
+                        return Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::Blocked(
+                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                            ),
+                        ));
+                    }
+                    drop(_subscription);
+                    return self.drive_terminal_memory(engine, control, *action);
                 }
                 HvpatchProductionPhase::ResumeBlocked {
                     frame,
@@ -4128,18 +4447,11 @@ where
                             ),
                         ));
                     }
-                    let finished = match self.state.finish_prepared_execve_drain(
-                        &self.kernel,
+                    return self.drive_terminal_memory(
                         engine,
-                        &self.completion,
-                        *owner,
-                    ) {
-                        Ok(finished) => finished,
-                        Err(failure) => {
-                            return Err(ProductionHvpatchPollError::from_exec_failure(failure));
-                        }
-                    };
-                    return self.finish_exec_suffix(engine, control, finished);
+                        control,
+                        TerminalMemoryAction::ExecDrain { context, owner },
+                    );
                 }
                 HvpatchProductionPhase::TerminalProcessDrain {
                     terminal,
@@ -4165,7 +4477,11 @@ where
                     self.kernel
                         .process_physical_retirement
                         .publish(completions)?;
-                    return Ok(self.finalize_persistent_process_terminal(engine, context, terminal));
+                    return self.drive_terminal_memory(
+                        engine,
+                        control,
+                        TerminalMemoryAction::ProcessFinish { context, terminal },
+                    );
                 }
                 HvpatchProductionPhase::TerminalClaimRetry {
                     terminal,
@@ -4181,7 +4497,11 @@ where
                     _subscription,
                 } => {
                     drop(_subscription);
-                    return Ok(self.finalize_persistent_process_terminal(engine, context, terminal));
+                    return self.drive_terminal_memory(
+                        engine,
+                        control,
+                        TerminalMemoryAction::ProcessFinish { context, terminal },
+                    );
                 }
                 HvpatchProductionPhase::Resident => {}
                 HvpatchProductionPhase::Complete => return Ok(executor::ExecutorExit::Exited),
@@ -4786,16 +5106,18 @@ where
         self.route_poll_result(result)
     }
 
-    fn route_poll_result(
+    pub(super) fn route_poll_result(
         &mut self,
         result: Result<executor::ExecutorExit, ProductionHvpatchPollError>,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
         match result {
             Err(ProductionHvpatchPollError::Runtime(RuntimeError::Dispatch(
                 carrick_kernel::dispatch::DispatchError::HostWaitRetired,
-            ))) => {
+            ))) if !self.phase.is_terminal_transition() => {
                 // A peer already removed this exact thread. Do not publish a
                 // syscall return, touch guest registers, or claim process exit.
+                self.state.capture_child_tid_clear()?;
+                self.state.handoff_child_tid_clear();
                 Ok(self.finish(Ok(VcpuLoopOutcome::ThreadDone)))
             }
             Err(ProductionHvpatchPollError::Runtime(error)) => {
@@ -4803,6 +5125,18 @@ where
                     Some(pending) => Err(ProductionHvpatchPollError::Exec(Box::new(
                         PendingExecTerminalError { error, pending },
                     ))),
+                    None if matches!(
+                        &self.phase,
+                        HvpatchProductionPhase::TerminalProcessDrain { .. }
+                            | HvpatchProductionPhase::TerminalRetireRetry { .. }
+                    ) || matches!(&self.phase,
+                            HvpatchProductionPhase::TerminalMemoryRetry { action }
+                            | HvpatchProductionPhase::ResumeTerminalOwner { action }
+                            | HvpatchProductionPhase::ResumeTerminalPhysical { action, .. }
+                            if matches!(action.as_ref(), TerminalMemoryAction::ProcessFinish { .. })) =>
+                    {
+                        Err(ProductionHvpatchPollError::TerminalOwner(error))
+                    }
                     None => Err(ProductionHvpatchPollError::Runtime(error)),
                 }
             }
@@ -4824,6 +5158,17 @@ where
                     context: terminal_context,
                     handoff,
                 })
+            }
+            HvpatchProductionPhase::TerminalMemoryRetry { action }
+            | HvpatchProductionPhase::ResumeTerminalOwner { action }
+            | HvpatchProductionPhase::ResumeTerminalPhysical { action, .. }
+                if matches!(action.as_ref(), TerminalMemoryAction::ExecDrain { .. }) =>
+            {
+                let TerminalMemoryAction::ExecDrain { owner, .. } = *action else {
+                    return None;
+                };
+                let (context, handoff) = (*owner).into_terminal_authority();
+                Some(PendingExecTerminal { context, handoff })
             }
             other => {
                 self.phase = other;
@@ -4862,6 +5207,12 @@ where
                     PersistentTerminal::Error(error),
                     pending,
                 )
+            }
+            Err(ProductionHvpatchPollError::TerminalOwner(error)) => {
+                carrick_fatal!(
+                    "kernel::terminal_settlement",
+                    "terminal owner failed while retaining clear-child-tid custody: {error}"
+                );
             }
             Err(ProductionHvpatchPollError::Runtime(error)) => {
                 let context = self
@@ -7295,7 +7646,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_terminal_owner_withdrawal_clears_child_tid_and_wakes_joiner() {
+    fn persistent_terminal_commit_clears_child_tid_and_wakes_joiner() {
         let owner = ThreadId::synthetic_for_tests(70_302);
         let clear_address = 0x2_000;
         let registry = ThreadRegistry::new(owner);
@@ -7315,14 +7666,18 @@ mod tests {
             owner.raw().to_le_bytes().to_vec(),
         );
 
-        threads::clear_persistent_child_tid_and_wake(
+        let clear = registry.claim_clear_child_tid(owner).unwrap();
+        threads::retire_with_child_tid_clear(
             &mut memory,
-            &registry,
-            &futex,
-            owner,
-            None,
-            |_| {},
-        );
+            &clear,
+            || Ok::<(), ()>(()),
+            || {
+                futex.wake(clear_address, 1);
+            },
+        )
+        .unwrap()
+        .unwrap();
+        clear.settle();
 
         assert_eq!(
             memory.read_bytes(clear_address, std::mem::size_of::<i32>()),
@@ -7372,7 +7727,7 @@ mod tests {
             "exit must not elect a stage-1 pause: sibling executors are beyond kicking after exit_group"
         );
         let publish_at = finalize
-            .find(".publish_exit_status(")
+            .find("graph_exit.retire_notifying(")
             .expect("exit publishes into the kernel graph");
         let retire_at = finalize
             .find(".begin_address_space_retirement(")

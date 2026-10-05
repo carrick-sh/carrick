@@ -76,6 +76,7 @@ pub(crate) struct PendingExecTerminalError {
 pub(crate) enum ProductionHvpatchPollError {
     Runtime(RuntimeError),
     Exec(Box<PendingExecTerminalError>),
+    TerminalOwner(RuntimeError),
 }
 
 impl ProductionHvpatchPollError {
@@ -97,7 +98,7 @@ impl ProductionHvpatchPollError {
     #[cfg(test)]
     pub(crate) fn into_runtime_error(self) -> RuntimeError {
         match self {
-            Self::Runtime(error) => error,
+            Self::Runtime(error) | Self::TerminalOwner(error) => error,
             Self::Exec(pending) => pending.error,
         }
     }
@@ -119,6 +120,9 @@ impl std::fmt::Debug for ProductionHvpatchPollError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Runtime(error) => formatter.debug_tuple("Runtime").field(error).finish(),
+            Self::TerminalOwner(error) => {
+                formatter.debug_tuple("TerminalOwner").field(error).finish()
+            }
             Self::Exec(pending) => formatter.debug_tuple("Exec").field(&pending.error).finish(),
         }
     }
@@ -4528,6 +4532,28 @@ pub(crate) mod tests {
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn finish_terminal_memory_quantum(
+        job: &mut ProductionHvpatchLoopJob<CrashCaptureTestEngine>,
+        engine: &mut CrashCaptureTestEngine,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+        exit: executor::ExecutorExit,
+    ) -> executor::ExecutorExit {
+        use super::super::binding::TerminalMemoryAction;
+        if !matches!(exit, executor::ExecutorExit::Yielded) {
+            return exit;
+        }
+        assert!(
+            matches!(&job.phase,
+                HvpatchProductionPhase::TerminalMemoryRetry { action }
+                    if matches!(action.as_ref(), TerminalMemoryAction::ProcessFinish { .. })
+            ),
+            "only exact terminal memory admission adds a quantum"
+        );
+        assert!(job.terminal_result.is_none());
+        ProductionHvpatchLoopPoll::poll(job, engine, control)
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn assert_production_exec_terminal_failure(
         job: &mut ProductionHvpatchLoopJob<CrashCaptureTestEngine>,
         engine: &mut CrashCaptureTestEngine,
@@ -4540,6 +4566,7 @@ pub(crate) mod tests {
             install_exec_terminal_handoff_contender(&job.kernel.clone_admission, contender);
 
         let exit = ProductionHvpatchLoopPoll::poll(job, engine, control);
+        let exit = finish_terminal_memory_quantum(job, engine, control, exit);
 
         assert!(
             matches!(exit, executor::ExecutorExit::Exited),
@@ -4591,6 +4618,7 @@ pub(crate) mod tests {
             install_exec_terminal_handoff_contender(&job.kernel.clone_admission, contender);
 
         let exit = ProductionHvpatchLoopPoll::poll(job, engine, control);
+        let exit = finish_terminal_memory_quantum(job, engine, control, exit);
 
         assert!(
             matches!(exit, executor::ExecutorExit::Exited),
@@ -5059,6 +5087,66 @@ pub(crate) mod tests {
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
+    fn terminal_memory_error_keeps_exec_and_process_owner_custody() {
+        use super::super::binding::{PersistentTerminal, TerminalMemoryAction};
+        for (pid, parked) in [(72_551, false), (72_552, true)] {
+            let mut case = pending_exec_drain_test_case(pid, ExecCompletionOrigin::GuestSyscall);
+            let HvpatchProductionPhase::ExecSiblingDrain { context, owner } =
+                std::mem::replace(&mut case.job.phase, HvpatchProductionPhase::Resident)
+            else {
+                panic!("prepared exec must own the drain");
+            };
+            let action = Box::new(TerminalMemoryAction::ExecDrain { context, owner });
+            case.job.phase = if parked {
+                HvpatchProductionPhase::ResumeTerminalOwner { action }
+            } else {
+                HvpatchProductionPhase::TerminalMemoryRetry { action }
+            };
+            let error = || {
+                ProductionHvpatchPollError::Runtime(RuntimeError::Dispatch(
+                    carrick_kernel::dispatch::DispatchError::HostWaitRetired,
+                ))
+            };
+            let Err(ProductionHvpatchPollError::Exec(pending)) =
+                case.job.route_poll_result(Err(error()))
+            else {
+                panic!("retired wait must retain exec ownership, not complete a member");
+            };
+            assert!(case.job.terminal_result.is_none());
+            assert_eq!(
+                pending.pending.context.thread().key(),
+                case.context.thread().key()
+            );
+            let PendingExecTerminal { context, handoff } = pending.pending;
+            assert_eq!(
+                handoff.claim_process_exit().unwrap().claim,
+                ProcessExitClaim::Owner
+            );
+            case.job.phase = HvpatchProductionPhase::TerminalMemoryRetry {
+                action: Box::new(TerminalMemoryAction::ProcessFinish {
+                    context,
+                    terminal: PersistentTerminal::Error(RuntimeError::Configuration(
+                        "retained owner".into(),
+                    )),
+                }),
+            };
+            assert!(matches!(
+                case.job.route_poll_result(Err(error())),
+                Err(ProductionHvpatchPollError::TerminalOwner(_))
+            ));
+            assert!(matches!(
+                case.job.phase,
+                HvpatchProductionPhase::TerminalMemoryRetry { .. }
+            ));
+            assert!(case.job.terminal_result.is_none());
+            case.sibling
+                .publish_member(Ok(VcpuLoopOutcome::ThreadDone))
+                .unwrap();
+        }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
     fn pending_exec_completion_ownership_survives_mm_readmission_failure_without_masking_error() {
         for (pid, origin) in [
             (72_429, ExecCompletionOrigin::GuestSyscall),
@@ -5107,6 +5195,8 @@ pub(crate) mod tests {
                 ProductionHvpatchLoopPoll::poll(&mut case.job, &mut case.engine, &mut control);
 
             drop(blocker);
+            let exit =
+                finish_terminal_memory_quantum(&mut case.job, &mut case.engine, &mut control, exit);
             assert!(matches!(exit, executor::ExecutorExit::Exited));
             assert_pending_exec_terminal_error(&case.job, &expected);
             assert!(case.job.state.syscall_completion.is_idle());
@@ -5664,6 +5754,8 @@ pub(crate) mod tests {
                 executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
             let exit =
                 ProductionHvpatchLoopPoll::poll(&mut case.job, &mut case.engine, &mut control);
+            let exit =
+                finish_terminal_memory_quantum(&mut case.job, &mut case.engine, &mut control, exit);
             assert!(
                 matches!(exit, executor::ExecutorExit::Exited),
                 "exec failure past no return must exit, got {exit:?}"
@@ -5885,7 +5977,9 @@ pub(crate) mod tests {
             let exit = {
                 let mut control =
                     executor::HvpatchQuantumControl::for_test(&need_resched, &mut submission);
-                ProductionHvpatchLoopPoll::poll(&mut case.job, &mut case.engine, &mut control)
+                let exit =
+                    ProductionHvpatchLoopPoll::poll(&mut case.job, &mut case.engine, &mut control);
+                finish_terminal_memory_quantum(&mut case.job, &mut case.engine, &mut control, exit)
             };
 
             assert!(matches!(exit, executor::ExecutorExit::Exited));
