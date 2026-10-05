@@ -1392,7 +1392,9 @@ fn imported_private_empty_cow_pool_returns_owned_exact_target_supply() {
             );
             assert_eq!(
                 result,
-                Ok(crate::cow::GuestCowOutcome::Declined(carrick_el1_abi::CowDecline::PoolEmpty))
+                Ok(crate::cow::GuestCowOutcome::Declined(
+                    carrick_el1_abi::CowDecline::PoolEmpty
+                ))
             );
             crate::fault::CowResolution::NeedsSupply
         }

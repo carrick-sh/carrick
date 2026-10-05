@@ -48,7 +48,10 @@ pub use carrick_core::mm::fork::{ForkScratch, PreparedOwnerFork};
 pub struct LinuxForkPolicy;
 
 impl carrick_core::mm::fork::MappingInheritancePolicy for LinuxForkPolicy {
-    fn inheritance_policy(&self, mapping: &carrick_core::mm::fork::Mapping) -> carrick_core::mm::fork::Policy {
+    fn inheritance_policy(
+        &self,
+        mapping: &carrick_core::mm::fork::Mapping,
+    ) -> carrick_core::mm::fork::Policy {
         if mapping.flags.contains(ReservationNodeFlags::DONTFORK) {
             carrick_core::mm::fork::Policy::Omit
         } else if mapping.flags.contains(ReservationNodeFlags::WIPEONFORK) {
@@ -106,7 +109,8 @@ impl ForkChildRoot for Reservations<'_> {
         &mut self,
         operation: carrick_el1_abi::PortalOperation,
     ) -> Result<(), ForkError> {
-        self.finish_fork_publication(operation).map_err(refusal_to_fork_error)
+        self.finish_fork_publication(operation)
+            .map_err(refusal_to_fork_error)
     }
 
     fn retire(self) -> Result<(), ForkError> {
@@ -136,14 +140,18 @@ impl<'b> ForkParentRoot<Reservations<'b>> for Reservations<'_> {
     }
 
     fn reserve_fork_certificate(&mut self, request: PortalForkRequest) -> Result<(), ForkError> {
-        self.reserve_fork_certificate(request).map_err(refusal_to_fork_error)
+        self.reserve_fork_certificate(request)
+            .map_err(refusal_to_fork_error)
     }
 
     fn clone_into(&mut self, child: &mut Reservations<'b>) -> Result<(), ForkError> {
         self.clone_into(child).map_err(refusal_to_fork_error)
     }
 
-    fn publish_fork_parent(&mut self, request: PortalForkRequest) -> carrick_el1_abi::ReservationGeneration {
+    fn publish_fork_parent(
+        &mut self,
+        request: PortalForkRequest,
+    ) -> carrick_el1_abi::ReservationGeneration {
         self.publish_fork_parent(request)
     }
 
@@ -151,10 +159,13 @@ impl<'b> ForkParentRoot<Reservations<'b>> for Reservations<'_> {
         &mut self,
         operation: carrick_el1_abi::PortalOperation,
     ) -> Result<(), ForkError> {
-        self.finish_fork_publication(operation).map_err(refusal_to_fork_error)
+        self.finish_fork_publication(operation)
+            .map_err(refusal_to_fork_error)
     }
 
-    fn commit_fork_generation(&mut self) -> Result<carrick_el1_abi::ReservationGeneration, ForkError> {
+    fn commit_fork_generation(
+        &mut self,
+    ) -> Result<carrick_el1_abi::ReservationGeneration, ForkError> {
         self.commit_fork_generation().map_err(refusal_to_fork_error)
     }
 }
@@ -212,7 +223,9 @@ impl UnpublishedEl1Child {
             .ok_or(MmError::Busy)?;
         let root = portal.root(parent, worker)?;
         let child_root = portal.child_root(child, worker)?;
-        self.inner.abort(words, root, child_root).map_err(Into::into)
+        self.inner
+            .abort(words, root, child_root)
+            .map_err(Into::into)
     }
 }
 
