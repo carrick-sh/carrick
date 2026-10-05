@@ -1169,9 +1169,57 @@ unsafe impl Send for GlobalFrameSharedMapping {}
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 unsafe impl Sync for GlobalFrameSharedMapping {}
 
+/// Completion of one unpublished physical incarnation. Consumers retain only
+/// the wait; producer leases finish after exact descriptor settlement/rollback.
+#[derive(Debug, Default)]
+struct PhysicalGrantWait {
+    ready: std::sync::atomic::AtomicBool,
+    callbacks: carrick_thread::completion::CompletionCallbacks,
+}
+impl carrick_guest_mem::PhysicalMemoryWait for PhysicalGrantWait {
+    fn is_ready(&self) -> bool {
+        self.ready.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn enroll(
+        &self,
+        wake: std::sync::Arc<dyn Fn() + Send + Sync>,
+    ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+        let enrollment = self.callbacks.enroll(move |_| wake());
+        (Box::new(enrollment), self.is_ready())
+    }
+}
+#[derive(Debug)]
+struct PhysicalGrantProducer(std::sync::Arc<PhysicalGrantWait>);
+impl Drop for PhysicalGrantProducer {
+    fn drop(&mut self) {
+        self.0
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.0.callbacks.publish(0);
+    }
+}
+/// Last producer release signals completion. Keep it beyond rollback and all
+/// inventory/alias guards; callbacks may reenter physical preparation.
+#[derive(Clone, Debug)]
+pub(crate) struct PhysicalGrantCompletion(std::sync::Arc<PhysicalGrantProducer>);
+impl PhysicalGrantCompletion {
+    pub(crate) fn new() -> Self {
+        Self(std::sync::Arc::new(PhysicalGrantProducer(
+            std::sync::Arc::new(PhysicalGrantWait::default()),
+        )))
+    }
+}
+impl PartialEq for PhysicalGrantCompletion {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for PhysicalGrantCompletion {}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[derive(Debug)]
 pub(crate) struct GlobalFrameHostOwner {
+    grant_publication: std::sync::OnceLock<std::sync::Weak<PhysicalGrantWait>>,
     pub(crate) mapping: std::sync::Arc<GlobalFrameSharedMapping>,
     pub(crate) custody: std::sync::Weak<CarrierVmCustody>,
     pub(crate) record_identity: CarrierStage2RecordIdentity,
@@ -1179,12 +1227,32 @@ pub(crate) struct GlobalFrameHostOwner {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl GlobalFrameHostOwner {
+    pub(crate) fn begin_grant_publication(&self) -> PhysicalGrantCompletion {
+        let completion = PhysicalGrantCompletion::new();
+        if self
+            .grant_publication
+            .set(std::sync::Arc::downgrade(&completion.0.0))
+            .is_err()
+        {
+            carrick_fatal!(
+                "hvpatch::physical_grant",
+                "physical incarnation published twice"
+            );
+        }
+        completion
+    }
+    pub(crate) fn pending_grant(&self) -> Option<carrick_guest_mem::OwnedMemoryWait> {
+        use carrick_guest_mem::PhysicalMemoryWait;
+        let wait = self.grant_publication.get()?.upgrade()?;
+        (!wait.is_ready()).then_some(carrick_guest_mem::OwnedMemoryWait(wait))
+    }
     pub(crate) fn from_record(
         mapping: std::sync::Arc<GlobalFrameSharedMapping>,
         custody: std::sync::Arc<CarrierVmCustody>,
         record_identity: CarrierStage2RecordIdentity,
     ) -> Self {
         Self {
+            grant_publication: std::sync::OnceLock::new(),
             mapping,
             custody: std::sync::Arc::downgrade(&custody),
             record_identity,
