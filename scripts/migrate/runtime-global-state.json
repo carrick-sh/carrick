@@ -2323,11 +2323,11 @@
     },
     {
       "kind": "static",
-      "file": "crates/carrick-runtime/src/hvpatch/stage1_mm.rs",
+      "file": "crates/carrick-core/src/mm/retirement.rs",
       "symbol": "NEXT_ROOT_RETIREMENT_NONCE",
       "fingerprint": "c73210fbc89a24fcfaa66dc2721fc4849d50029ea61803558ef70f4ea8f3c24e",
       "classification": "monotonic_allocator",
-      "rationale": "Carrier-wide monotonic allocator for one-shot stage-1 root retirement proof nonces; it carries no current-container identity and aborts before wrap can permit proof replay."
+      "rationale": "The same carrier-wide root retirement nonce allocator moved into Core. It carries no container identity; checked admission refuses exhaustion before irreversible retirement and never wraps."
     },
     {
       "kind": "static",
@@ -3976,6 +3976,22 @@
       "fingerprint": "9801e0e967649c49aa50f58434e118519eb8f76e908043ff8c5e3ae13e58163a",
       "classification": "test_only",
       "rationale": "Test-only parent-death regression readiness path reports exact worker/supervisor PIDs to the isolated outer fixture for cancellation and reaping assertions; no production state."
+    },
+    {
+      "kind": "static",
+      "file": "crates/carrick-core/src/mm/fault.rs",
+      "symbol": "NEXT_FRAME_GRANT_GENERATION",
+      "fingerprint": "b6aeadce6873b2d880a5a6a0fdbc8d823844f0e42a16be82d21ad6ed13bb8736",
+      "classification": "monotonic_allocator",
+      "rationale": "Existing N1 slot-local lazy-frame request identity allocator moved from EL1 fault into Core. Checked exhaustion refuses with invalid zero instead of replaying incarnation one. It carries no current task or container identity."
+    },
+    {
+      "kind": "thread_local",
+      "file": "crates/carrick-core/src/mm/reservation/root.rs",
+      "symbol": "tests::LOSE_POPS",
+      "fingerprint": "95346c9c7415092a89b75662b0838984879c7ce557c21b99db7ae088d98c09d2",
+      "classification": "test_only",
+      "rationale": "Existing reservation-root test-only thread-local metadata-allocation failure injection moved with the root owner from EL1 into Core; excluded from production by cfg(test)."
     }
   ]
 }

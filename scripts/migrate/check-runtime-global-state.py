@@ -22,6 +22,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 LEDGER_PATH = REPO_ROOT / "scripts" / "migrate" / "runtime-global-state.json"
 
 DEFAULT_SCAN_ROOTS = (
+    # Neutral owner moves retain the same runtime-global census.
+    "crates/carrick-core/src",
+    "crates/carrick-core-abi/src",
     "crates/carrick-runtime/src",
     # The filesystem model moved out of carrick-runtime (plan
     # 2026-09-13-extract-carrick-vfs-and-carrick-kernel); its reviewed global
