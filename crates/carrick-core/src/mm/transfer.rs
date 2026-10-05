@@ -279,3 +279,5 @@ impl SelectedChunk {
         .ok_or(TransferError::Invalid)
     }
 }
+
+pub mod resolver;
