@@ -650,15 +650,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 367944,
-        "byte_start": 367932,
+        "byte_end": 365140,
+        "byte_start": 365128,
         "column": 21,
         "column_end": 33,
         "column_start": 21,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 8215,
-        "line_end": 8215,
-        "line_start": 8215
+        "line": 8158,
+        "line_end": 8158,
+        "line_start": 8158
       }
     },
     {
@@ -671,15 +671,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 372246,
-        "byte_start": 372234,
+        "byte_end": 369442,
+        "byte_start": 369430,
         "column": 36,
         "column_end": 48,
         "column_start": 36,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 8294,
-        "line_end": 8294,
-        "line_start": 8294
+        "line": 8237,
+        "line_end": 8237,
+        "line_start": 8237
       }
     },
     {
@@ -692,15 +692,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 378540,
-        "byte_start": 378528,
+        "byte_end": 375736,
+        "byte_start": 375724,
         "column": 29,
         "column_end": 41,
         "column_start": 29,
         "file": "crates/carrick-vmm-hvf/src/trap.rs",
-        "line": 8400,
-        "line_end": 8400,
-        "line_start": 8400
+        "line": 8343,
+        "line_end": 8343,
+        "line_start": 8343
       }
     },
     {
@@ -4182,8 +4182,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 55074,
-        "byte_start": 55061,
+        "byte_end": 55100,
+        "byte_start": 55087,
         "column": 16,
         "column_end": 29,
         "column_start": 16,
@@ -4202,8 +4202,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 55553,
-        "byte_start": 55540,
+        "byte_end": 55579,
+        "byte_start": 55566,
         "column": 29,
         "column_end": 42,
         "column_start": 29,
@@ -9295,15 +9295,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 42221,
-        "byte_start": 42205,
+        "byte_end": 42137,
+        "byte_start": 42121,
         "column": 48,
         "column_end": 64,
         "column_start": 48,
         "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-        "line": 1143,
-        "line_end": 1143,
-        "line_start": 1143
+        "line": 1142,
+        "line_end": 1142,
+        "line_start": 1142
       }
     },
     {
@@ -10483,8 +10483,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 38863,
-        "byte_start": 38847,
+        "byte_end": 38889,
+        "byte_start": 38873,
         "column": 44,
         "column_end": 60,
         "column_start": 44,
@@ -12399,9 +12399,9 @@
       }
     }
   ],
-  "rows_sha256": "29af6c27467f663c4cd683f84b8e024560224b659cf19951e8200ca301bf9b95",
+  "rows_sha256": "42b65e28add6f4f373d36be2274f5e9a96a4c91f8b71c48bc99b3667e3515f23",
   "schema": 1,
-  "source_head": "99a7ef64fdee3ed96c5dbf03af40c3734bea8b99",
+  "source_head": "28e6fd8a6ad8e608425f218683ac0a5dfc4f9eaa",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
