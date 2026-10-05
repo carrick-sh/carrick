@@ -7772,6 +7772,51 @@ fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
     );
 }
 
+#[test]
+fn two_live_mm_empty_inventory_releases_already_terminal_table_capacity() {
+    let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        2,
+    ));
+    let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
+    let kernel = std::sync::Arc::new(PerFrameKernel::default());
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let (mut first, key, generation, _) =
+        exit_task_holding_owned_lease(709, 0x4000, 709, 710, &kernel, &frames);
+    let (mut second, _, _, _) =
+        exit_task_holding_owned_lease(711, 0x8000, 711, 712, &kernel, &frames);
+    let base = pool.base_ipa();
+    let record = relocate_exit_fixture_root(&mut first, base);
+    let peer = relocate_exit_fixture_root(&mut second, base + 0x20_0000);
+    // An earlier exact physical retirement may finish before MM metadata drops.
+    retire_carrier_stage2_record_at_safe_point(custody, record).unwrap();
+    assert!(pool.allocate_slot_at(base).is_none());
+    assert!(
+        retire_global_frame_host_owner_if_generation_in(custody, key.0, key.1, generation)
+            .is_retired()
+    );
+    first.frame_inventory.lock().extents.clear();
+    first.mappings = TaskMappingIndex::default();
+    HvfVmState::retire_task_state_process_mappings(&mut first)
+        .expect("terminal exact record still permits its owned capacity release");
+    let reused = pool
+        .allocate_slot_at(base)
+        .expect("release empty MM's table slot");
+    assert!(first.page_tables_authority().is_none());
+    assert!(
+        custody
+            .stage2_record_snapshot(peer.record_id)
+            .unwrap()
+            .mapped
+    );
+    assert!(pool.allocate_slot_at(base + 0x20_0000).is_none());
+    HvfVmState::retire_task_state_process_mappings(&mut second).unwrap();
+    drop(reused);
+    assert_eq!(pool.allocated_count(), 0);
+}
+
 /// A fork parent and child map one grant frame and both exit. Each
 /// retirement decides before its Kernel unmap is applied, so neither can
 /// know whose unmap is last (signed `el1_anonymous_discard_and_exit_return_frames`
