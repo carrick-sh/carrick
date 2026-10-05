@@ -1901,6 +1901,14 @@ mod tests {
         )
         .unwrap();
         let tid = LinuxTid::from_abi_positive(identity.tid as i32).unwrap();
+        let census = root.task_binding().capture_threads().unwrap();
+        let born = census
+            .iter()
+            .find(|context| context.thread().key().tid == tid)
+            .unwrap();
+        assert_eq!(born.thread().key().serial.raw(), identity.thread_serial);
+        assert!(born.thread().execution_state().generation().is_none());
+        assert_eq!(born.thread().control_slot().clear_child_tid(), 0x8000);
         assert_eq!(
             peer.kernel().live_task_for_thread(None, tid),
             Some(root.task().key().id),
@@ -2050,6 +2058,14 @@ mod tests {
         assert!(
             kernel.ids().is_reserved_number(tid.raw()),
             "captured identity was released early"
+        );
+        assert!(
+            held.thread().child_tid_cleared_in_zone(),
+            "the exact EL1 clear receipt must survive its ABI entry being reaped"
+        );
+        assert!(
+            !peer_sibling.thread().child_tid_cleared_in_zone(),
+            "a host graph retirement is not an EL1 clear receipt"
         );
         drop(held);
         kernel.sweep_retired_threads();
