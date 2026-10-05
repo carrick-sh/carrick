@@ -233,8 +233,8 @@ fn x1_shared_mm_owner() {
 
 mod fork_cow {
     use carrick_core::mm::fork::{
-        ForkChildRoot, ForkError, ForkParentRoot, ForkReceiptError, ForkScratch, Mapping,
-        PreparedOwnerFork, copy_table, validate_fork_completion,
+        ForkChildRoot, ForkError, ForkParentRoot, ForkReceiptError, ForkScratch, ForkTableCursor,
+        Mapping, PreparedOwnerFork, copy_table, validate_fork_completion,
     };
     use carrick_el1_abi::{
         CowGrant, CowGrantCompletion, CowGrantPurpose, El1MmHandle, PortalForkCompletion,
@@ -559,9 +559,19 @@ mod fork_cow {
         let mut scratch = ForkScratch::bounded(req, 1, 512 * 4, 512 * 4, 512 * 4, 512).unwrap();
         scratch.mappings = mappings;
 
-        // Run copy_table with X86Mmu
-        copy_table::<X86Mmu, _, _>(&LinuxForkPolicy, &mem, req, &mut scratch, root_pa, 0, 0, 0)
-            .unwrap();
+        copy_table::<X86Mmu, _, _>(
+            &LinuxForkPolicy,
+            &mem,
+            req,
+            &mut scratch,
+            ForkTableCursor {
+                table: root_pa,
+                level: 0,
+                base: 0,
+                child_offset: 0,
+            },
+        )
+        .unwrap();
 
         // Check that parent leaf was armed for COW: WRITE removed, COW | MAY_WRITE added
         let (parent_edit_before, parent_edit_after) = {
@@ -733,10 +743,12 @@ mod fork_cow {
             &arm_mem,
             req,
             &mut arm_scratch,
-            arm_root,
-            0,
-            0,
-            0,
+            ForkTableCursor {
+                table: arm_root,
+                level: 0,
+                base: 0,
+                child_offset: 0,
+            },
         )
         .unwrap();
         assert!(
@@ -777,10 +789,12 @@ mod fork_cow {
             &perms_mem,
             req,
             &mut perms_scratch,
-            root_pa,
-            0,
-            0,
-            0,
+            ForkTableCursor {
+                table: root_pa,
+                level: 0,
+                base: 0,
+                child_offset: 0,
+            },
         )
         .unwrap();
 
