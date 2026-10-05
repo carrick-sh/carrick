@@ -5719,6 +5719,9 @@ mod real {
         /// TaskSerial joins the earlier guest-lifecycle identity without
         /// assuming TaskSerial == ThreadSerial for a process leader.
         fn hvpatch__executor__claim(_: u64, _: u64, _: u32, _: u64, _: u64) {}
+
+        /// Failed backend load: exact thread, generation, executor and error.
+        fn hvpatch__executor__load__failure(_: u64, _: u64, _: u32, _: &str) {}
         /// One scheduler wake edge against a kernel thread. Args: ThreadSerial,
         /// wake kind (`HvpatchSchedulerWakeKind`), the execution state the
         /// wake found (`HvpatchThreadExecutionStateKind`), that state's
@@ -6535,6 +6538,22 @@ mod real {
             executor,
             execution_generation,
             asid_generation
+        ));
+    }
+
+    /// Preserve the backend load refusal before terminal settlement replaces
+    /// it with the process-level failure. Emitted only on a failed load.
+    pub fn hvpatch_executor_load_failure(
+        thread_serial: u64,
+        execution_generation: u64,
+        executor: u32,
+        error: &str,
+    ) {
+        carrick_usdt::hvpatch__executor__load__failure!(|| (
+            thread_serial,
+            execution_generation,
+            executor,
+            error
         ));
     }
 
@@ -9109,6 +9128,12 @@ mod stub {
         executor: u32,
         execution_generation: u64,
         asid_generation: u64
+    ));
+    stub!(hvpatch_executor_load_failure(
+        thread_serial: u64,
+        execution_generation: u64,
+        executor: u32,
+        error: &str
     ));
     stub!(hvpatch_scheduler_wake(
         thread_serial: u64,
