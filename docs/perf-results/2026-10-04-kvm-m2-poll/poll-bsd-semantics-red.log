@@ -1,0 +1,46 @@
+2bf9c418af392ff78d31b1986db67dfc6f289bec01e539c41c8b45ec83e090a3  crates/carrick-x86/src/bringup_fns.rs
+5826789c9fc9dfedd79c55e117ac82cba72c413a2bfa86e3212b1bce9ea6d1cb  crates/carrick-x86/src/bringup_fns/poll_tests.rs
+host-lease: acquired carrick at /tmp/carrick-host-lease.lock
+   Compiling carrick-x86 v0.1.0 (/Volumes/carrick/dev/m2-poll-focused/crates/carrick-x86)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.71s
+     Running unittests src/lib.rs (target/debug/deps/carrick_x86-db45fcb0c8412803)
+
+running 12 tests
+test bringup_fns::poll_tests::normalized_poll_validates_memory_but_ignores_pointer_for_empty_set ... ok
+test bringup_fns::poll_tests::poll_native_interruption_returns_linux_eintr_without_copyout_or_retry ... ok
+test bringup_fns::poll_tests::normalized_poll_clears_stale_events_and_reports_invalid_descriptors ... ok
+test bringup_fns::poll_tests::normalized_poll_pipe_reader_keeps_unrequested_hangup ... ok
+test bringup_fns::poll_tests::normalized_poll_preserves_each_duplicate_interest_and_unrequested_hangup ... ok
+test bringup_fns::poll_tests::poll_invalid_descriptor_overrides_an_infinite_timeout ... ok
+test bringup_fns::poll_tests::normalized_poll_reports_readiness_and_linear_guest_copy_work ... ok
+test bringup_fns::poll_tests::poll_rejects_nfds_above_the_limit_before_guest_access_or_native_wait ... ok
+test bringup_fns::poll_tests::normalized_poll_broken_pipe_writer_reports_error_for_every_zero_interest_entry ... FAILED
+test bringup_fns::poll_tests::poll_normalizes_every_negative_timeout_at_the_native_boundary ... FAILED
+test bringup_fns::poll_tests::poll_positive_wait_completes_when_a_producer_makes_the_fd_ready ... ok
+test bringup_fns::poll_tests::normalized_poll_keeps_distinct_ready_descriptors ... ok
+
+failures:
+
+---- bringup_fns::poll_tests::normalized_poll_broken_pipe_writer_reports_error_for_every_zero_interest_entry stdout ----
+
+thread 'bringup_fns::poll_tests::normalized_poll_broken_pipe_writer_reports_error_for_every_zero_interest_entry' (8674544) panicked at crates/carrick-x86/src/bringup_fns/poll_tests.rs:304:9:
+assertion `left == right` failed
+  left: 16
+ right: 8
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- bringup_fns::poll_tests::poll_normalizes_every_negative_timeout_at_the_native_boundary stdout ----
+
+thread 'bringup_fns::poll_tests::poll_normalizes_every_negative_timeout_at_the_native_boundary' (8674553) panicked at crates/carrick-x86/src/bringup_fns/poll_tests.rs:254:17:
+assertion `left == right` failed
+  left: -2
+ right: -1
+
+
+failures:
+    bringup_fns::poll_tests::normalized_poll_broken_pipe_writer_reports_error_for_every_zero_interest_entry
+    bringup_fns::poll_tests::poll_normalizes_every_negative_timeout_at_the_native_boundary
+
+test result: FAILED. 10 passed; 2 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p carrick-x86 --lib`

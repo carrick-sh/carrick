@@ -732,6 +732,7 @@ where
                 carrick_guest_mem::GuestVa(args[0]),
                 args[1] as u32,
                 args[2] as i32,
+                poll_host_fds,
             ),
             SYS_TKILL => {
                 let sig = args[1];
@@ -1186,6 +1187,7 @@ fn sys_poll<E: carrick_guest_mem::GuestMemory>(
     fds: carrick_guest_mem::GuestVa,
     count: u32,
     timeout_ms: i32,
+    host_poll: impl FnOnce(&mut [libc::pollfd], i32) -> std::io::Result<()>,
 ) -> i64 {
     use carrick_abi::{LINUX_EFAULT, LINUX_EINVAL, LINUX_ENOMEM, LinuxPollFd};
     use zerocopy::FromBytes;
@@ -1269,19 +1271,31 @@ fn sys_poll<E: carrick_guest_mem::GuestMemory>(
     }
     // POLLHUP is reported even without an input interest. Asking for it also
     // makes Darwin observe hangups on valid descriptors with events == 0.
-    let timeout_ms = if has_invalid { 0 } else { timeout_ms };
-    // SAFETY: host_fds owns its initialized pollfd values for this one call.
-    // No guest pointer crosses the host boundary; negative timeouts keep their
-    // poll meaning. Do not retry EINTR or replace this with a sampling loop.
-    if unsafe {
-        libc::poll(
-            host_fds.as_mut_ptr(),
-            host_fds.len() as libc::nfds_t,
-            timeout_ms,
-        )
-    } < 0
-    {
-        return poll_host_error().guest_retval();
+    let timeout_ms = if has_invalid {
+        0
+    } else if timeout_ms < 0 {
+        // Linux accepts every negative value as infinite; FreeBSD accepts -1.
+        -1
+    } else {
+        timeout_ms
+    };
+    if let Err(error) = host_poll(&mut host_fds, timeout_ms) {
+        return poll_error(error).guest_retval();
+    }
+    // Classify hangups once per distinct descriptor, before duplicate copyout.
+    // BSD pipe write ends report HUP when their readers close; Linux reports
+    // ERR. Read ends and sockets must retain HUP, including events == 0.
+    for host in &mut host_fds {
+        if host.fd >= 0 && host.revents & libc::POLLHUP != 0 {
+            match poll_pipe_writer(StandaloneHostFd(host.fd)) {
+                Ok(true) => host.revents = (host.revents & !libc::POLLHUP) | libc::POLLERR,
+                Ok(false) => {}
+                Err(error) if error.raw_os_error() == Some(libc::EBADF) => {
+                    host.revents = libc::POLLNVAL;
+                }
+                Err(error) => return poll_error(error).guest_retval(),
+            }
+        }
     }
     let mut ready = 0;
     for (index, original) in bytes.chunks_exact(8).enumerate() {
@@ -1318,12 +1332,55 @@ fn sys_poll<E: carrick_guest_mem::GuestMemory>(
     ready
 }
 
+/// Classify the inherited endpoint, not just its host readiness bit pattern.
+fn poll_pipe_writer(fd: StandaloneHostFd) -> std::io::Result<bool> {
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: metadata provides writable storage for the complete host stat.
+    if unsafe { libc::fstat(fd.0, metadata.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful fstat initialized metadata.
+    let metadata = unsafe { metadata.assume_init() };
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return Ok(false);
+    }
+    // SAFETY: F_GETFL inspects the inherited descriptor without ownership.
+    let flags = unsafe { libc::fcntl(fd.0, libc::F_GETFL) };
+    if flags < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(flags & libc::O_ACCMODE == libc::O_WRONLY)
+    }
+}
+
+/// A single native wait; the caller owns all descriptors and pollfd storage.
+fn poll_host_fds(host_fds: &mut [libc::pollfd], timeout_ms: i32) -> std::io::Result<()> {
+    // SAFETY: host_fds owns initialized pollfd values for this call. No guest
+    // pointer crosses this boundary. Never retry EINTR or sample in a loop.
+    if unsafe {
+        libc::poll(
+            host_fds.as_mut_ptr(),
+            host_fds.len() as libc::nfds_t,
+            timeout_ms,
+        )
+    } < 0
+    {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Poll's documented errors have different numbers on BSD and Linux.
 fn poll_host_error() -> carrick_abi::LinuxErrno {
+    poll_error(std::io::Error::last_os_error())
+}
+
+fn poll_error(error: std::io::Error) -> carrick_abi::LinuxErrno {
     use carrick_abi::{
         LINUX_EAGAIN, LINUX_EFAULT, LINUX_EINTR, LINUX_EINVAL, LINUX_EIO, LINUX_ENOMEM,
     };
-    match std::io::Error::last_os_error().raw_os_error() {
+    match error.raw_os_error() {
         Some(libc::EINTR) => LINUX_EINTR,
         Some(libc::EINVAL) => LINUX_EINVAL,
         Some(libc::ENOMEM) => LINUX_ENOMEM,

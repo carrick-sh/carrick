@@ -122,3 +122,38 @@ descriptor populations at 1/8/32, duplicate entries with different interests,
 and an unrequested hangup. Both repeated and distinct populations retain the
 exact 8*n guest bytes read and 2*n bytes written. Final-head results and the
 superseding Linux/cloudmac receipts are reported in the PR.
+
+## Negative timeouts and pipe endpoint semantics
+
+Review of `4bb670667` found two remaining BSD translation gaps. The
+[native-boundary timeout test](poll-timeout-red.log) failed before the fix:
+`left: -2, right: -1`. Linux interprets every negative timeout as infinite,
+whereas FreeBSD requires -1. The bridge now normalizes negative values to -1,
+retaining the zero-timeout override when an invalid descriptor is ready.
+Tests use a ready descriptor with both -2 and INT_MIN, so neither can hang.
+
+The [macOS regression run](poll-bsd-semantics-red.log) also failed the new
+closed-reader pipe test: `left: 16, right: 8`. Native BSD pipe write endpoints
+report HUP after all readers close; Linux requires ERR, even for `events = 0`.
+After the native wait, each distinct descriptor reporting HUP is classified
+with `fstat` (FIFO type) and `F_GETFL` (write-only access mode). Only pipe write
+endpoints have HUP replaced by ERR. Duplicate guest entries receive and count
+the corrected result independently; read endpoints and sockets retain HUP.
+Normal readiness needs no additional metadata queries. The tests retain exact
+guest-copy budgets and cover two zero-interest entries for the broken writer.
+
+The native-call boundary accepts a one-shot callable, with the production
+callable issuing exactly one libc poll. This permits deterministic timeout
+and EINTR assertions without process-wide signal-handler mutation. The EINTR
+test injects a native error and verifies Linux errno translation, no retry and
+no copyout; it does not claim asynchronous signal-delivery coverage. A bounded
+producer makes an initially unready socket readable during a positive wait.
+The nfds test reads the current limit without changing it: count at the limit
+reaches memory validation, while limit+1 returns EINVAL before native polling.
+No sleeps, widened production timeout, retry or weakened assertion was added.
+
+Both red logs use the previous behavior plus the new tests and a behavior-
+preserving extraction of the native call. The pipe failure is a live macOS
+observation; FreeBSD's timeout boundary is asserted portably, not represented
+as a live FreeBSD execution. Final focused results are recorded in PR #34.
+Full acceptance remains with the director's batch-5 gate.
