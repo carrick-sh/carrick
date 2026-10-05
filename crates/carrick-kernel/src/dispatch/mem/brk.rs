@@ -103,7 +103,11 @@ impl<'a> MemView<'a> {
                     );
                 }
                 cx.memory.set_unmapped(shrink_start, shrink_len, true);
-                if cx.memory.zero_backing(shrink_start, shrink_len).is_err() {
+                let scrub = match &pending {
+                    Some((_, request)) => cx.memory.zero_pending_backing(*request),
+                    None => cx.memory.zero_backing(shrink_start, shrink_len),
+                };
+                if scrub.is_err() {
                     carrick_fatal!(
                         "dispatch::brk",
                         "zero_backing failed during brk heap contraction"

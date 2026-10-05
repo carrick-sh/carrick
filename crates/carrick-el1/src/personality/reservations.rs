@@ -1333,6 +1333,24 @@ impl Reservations<'_> {
     pub fn pending(&self) -> Option<ReservationRequest> {
         self.state().pending.map(|p| p.request)
     }
+    /// Only the exact pending heap contraction may scrub retired backing.
+    /// A munmap at the same VA or a later reuse never substitutes for it.
+    pub fn authenticates_brk_maintenance(&self, request: ReservationRequest) -> bool {
+        self.is_admitted()
+            && !self.state().fork_pending
+            && self.state().pending.is_some_and(|pending| {
+                pending.request == request
+                    && request.operation == ReservationOperation::Retire
+                    && request.protection == ReservationProtection::NONE
+                    && request.source.is_none()
+                    && pending.new_brk < self.brk_current()
+                    && pending.new_brk.checked_add(4095).map(|end| end & !4095)
+                        == Some(request.range.start())
+                    && self.brk_current().checked_add(4095).map(|end| end & !4095)
+                        == Some(request.range.end())
+            })
+    }
+
     fn read(&mut self, id: u32) -> NodeData {
         self.work += 1;
         if id == 0 {

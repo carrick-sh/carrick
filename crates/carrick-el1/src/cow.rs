@@ -71,6 +71,22 @@ impl<'a> CowCopyWindow<'a> {
         })
     }
 
+    pub(crate) fn with_page(
+        &self,
+        source: u64,
+        destination: u64,
+        effect: &mut impl FnMut(u64, u64),
+    ) -> Result<(), DescriptorOutcome> {
+        with_cow_copy_aliases(
+            self.words,
+            self.root,
+            self.base(),
+            SubstrateGpa(source),
+            SubstrateGpa(destination),
+            effect,
+        )
+    }
+
     fn base(&self) -> u64 {
         self.slot
             .map_or(carrick_el1_abi::EL1_COW_COPY_BASE, |slot| slot.base())
@@ -218,6 +234,7 @@ where
                 }
             }
             let completion = CowGrantCompletion {
+                purpose: carrick_el1_abi::CowGrantPurpose::UserWrite,
                 grant,
                 span_va: run.va,
                 span_len: run.len,
@@ -797,6 +814,7 @@ mod tests {
         let outcome = resolve(&arena, &memory, &pool, VA + 0x1abc, &invalidations);
 
         let expected = CowGrantCompletion {
+            purpose: carrick_el1_abi::CowGrantPurpose::UserWrite,
             grant,
             span_va: VA,
             span_len: 4 * 4096,
@@ -860,6 +878,7 @@ mod tests {
         assert_eq!(
             outcome,
             GuestCowOutcome::Resolved(CowGrantCompletion {
+                purpose: carrick_el1_abi::CowGrantPurpose::UserWrite,
                 grant,
                 span_va: VA + 4096,
                 span_len: 3 * 4096,
