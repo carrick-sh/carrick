@@ -19,7 +19,6 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
