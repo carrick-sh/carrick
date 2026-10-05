@@ -12,3 +12,5 @@ pub mod cow_pool;
 pub use cow_pool::*;
 pub mod grant_slot;
 pub use grant_slot::*;
+pub mod frame_mailbox;
+pub use frame_mailbox::*;
