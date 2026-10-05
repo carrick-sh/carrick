@@ -304,7 +304,7 @@ pub fn rollback<W: LiveDescriptorWords + ?Sized>(
     Ok(())
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Policy {
     Keep,
     Private,
@@ -313,7 +313,13 @@ pub enum Policy {
     Mixed,
 }
 
-pub fn policy(
+pub trait MappingInheritancePolicy {
+    fn inheritance_policy(&self, mapping: &Mapping) -> Policy;
+    fn is_shared(&self, mapping: &Mapping) -> bool;
+}
+
+pub fn policy<B: OwnerForkMmu, P: MappingInheritancePolicy>(
+    policy_provider: &P,
     mappings: &[Mapping],
     base: u64,
     span: u64,
@@ -333,15 +339,7 @@ pub fn policy(
         if start > cursor {
             mixed = true;
         }
-        let value = if mapping.flags.contains(ReservationNodeFlags::DONTFORK) {
-            Policy::Omit
-        } else if mapping.flags.contains(ReservationNodeFlags::WIPEONFORK) {
-            Policy::Wipe
-        } else if mapping.flags.contains(ReservationNodeFlags::PRIVATE) {
-            Policy::Private
-        } else {
-            Policy::Keep
-        };
+        let value = policy_provider.inheritance_policy(mapping);
         if result.is_some_and(|prior| prior != value) {
             mixed = true;
         }
@@ -355,10 +353,10 @@ pub fn policy(
             result
         })
     } else {
-        Ok(if descriptor & (1 << 6) == 0 {
-            Policy::Keep
-        } else {
+        Ok(if B::is_user(descriptor) {
             Policy::Omit
+        } else {
+            Policy::Keep
         })
     }
 }
@@ -370,7 +368,8 @@ pub struct ForkCensus {
     pub custody: usize,
 }
 
-pub fn census_table<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
+pub fn census_table<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescriptorWords + ?Sized>(
+    policy_provider: &P,
     words: &W,
     mappings: &[Mapping],
     table: u64,
@@ -381,7 +380,8 @@ pub fn census_table<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
     count.child = count.child.checked_add(512).ok_or(ForkError::NoMemory)?;
     count.live = count.live.checked_add(512).ok_or(ForkError::NoMemory)?;
     for index in 0..512 {
-        census_entry::<B, W>(
+        census_entry::<B, P, W>(
+            policy_provider,
             words,
             mappings,
             words.load(table + index * 8).map_err(|_| ForkError::Core)?,
@@ -393,7 +393,8 @@ pub fn census_table<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
     Ok(())
 }
 
-pub fn census_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
+pub fn census_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescriptorWords + ?Sized>(
+    policy_provider: &P,
     words: &W,
     mappings: &[Mapping],
     descriptor: u64,
@@ -405,7 +406,8 @@ pub fn census_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
         return Ok(());
     }
     if level < 3 && B::is_table(descriptor, level) {
-        return census_table::<B, W>(
+        return census_table::<B, P, W>(
+            policy_provider,
             words,
             mappings,
             descriptor & B::ADDRESS_MASK,
@@ -423,14 +425,15 @@ pub fn census_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
     let span = 1u64 << SHIFTS[level];
     const CONTROL: u64 = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE - 0x2_0000;
     let structural = B::PRIVATE_CONTROL_WINDOW && va < CONTROL + 0x20_0000 && va + span > CONTROL;
-    let selected = policy(mappings, va, span, descriptor)?;
+    let selected = policy::<B, P>(policy_provider, mappings, va, span, descriptor)?;
     if (structural || selected == Policy::Mixed) && level < 3 {
         count.child = count.child.checked_add(512).ok_or(ForkError::NoMemory)?;
         if !structural {
             count.parent = count.parent.checked_add(512).ok_or(ForkError::NoMemory)?;
         }
         for index in 0..512 {
-            census_entry::<B, W>(
+            census_entry::<B, P, W>(
+                policy_provider,
                 words,
                 mappings,
                 B::split(descriptor, level, index).map_err(|_| ForkError::Core)?,
@@ -455,7 +458,8 @@ pub fn census_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
     Ok(())
 }
 
-pub fn copy_table<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
+pub fn copy_table<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescriptorWords + ?Sized>(
+    policy_provider: &P,
     words: &W,
     request: PortalForkRequest,
     scratch: &mut ForkScratch,
@@ -472,7 +476,8 @@ pub fn copy_table<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
         }
         scratch.reads.push((address, descriptor));
         let va = base + ((index as u64) << SHIFTS[level]);
-        let (parent, child) = copy_entry::<B, W>(words, request, scratch, descriptor, level, va)?;
+        let (parent, child) =
+            copy_entry::<B, P, W>(policy_provider, words, request, scratch, descriptor, level, va)?;
         scratch.child[child_offset + index] = child;
         if parent != descriptor {
             if scratch.edits.len() == scratch.edits.capacity() {
@@ -494,7 +499,8 @@ pub fn copy_table<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
     Ok(())
 }
 
-pub fn copy_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
+pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescriptorWords + ?Sized>(
+    policy_provider: &P,
     words: &W,
     request: PortalForkRequest,
     scratch: &mut ForkScratch,
@@ -507,7 +513,8 @@ pub fn copy_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
     }
     if level < 3 && B::is_table(descriptor, level) {
         let child = scratch.allocate_child()?;
-        copy_table::<B, W>(
+        copy_table::<B, P, W>(
+            policy_provider,
             words,
             request,
             scratch,
@@ -540,7 +547,8 @@ pub fn copy_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
         let child = scratch.allocate_child()?;
         for index in 0..512 {
             let original = B::split(descriptor, level, index).map_err(|_| ForkError::Core)?;
-            let (_, inherited) = copy_entry::<B, W>(
+            let (_, inherited) = copy_entry::<B, P, W>(
+                policy_provider,
                 words,
                 request,
                 scratch,
@@ -593,7 +601,7 @@ pub fn copy_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
         }
         return Ok((descriptor, descriptor));
     }
-    let policy = policy(&scratch.mappings, va, span, descriptor)?;
+    let policy = policy::<B, P>(policy_provider, &scratch.mappings, va, span, descriptor)?;
     if policy == Policy::Mixed {
         if level == 3 {
             return Err(ForkError::Core);
@@ -603,7 +611,8 @@ pub fn copy_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
         let mut parent_changed = false;
         for index in 0..512 {
             let original = B::split(descriptor, level, index).map_err(|_| ForkError::Core)?;
-            let (updated, inherited) = copy_entry::<B, W>(
+            let (updated, inherited) = copy_entry::<B, P, W>(
+                policy_provider,
                 words,
                 request,
                 scratch,
@@ -661,7 +670,7 @@ pub fn copy_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
                     shared: {
                         let index = scratch.mappings.partition_point(|m| m.range.end() <= va);
                         scratch.mappings.get(index).is_some_and(|m| {
-                            m.range.contains(va) && !m.flags.contains(ReservationNodeFlags::PRIVATE)
+                            m.range.contains(va) && policy_provider.is_shared(m)
                         })
                     },
                 })?;
