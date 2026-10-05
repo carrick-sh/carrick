@@ -92,7 +92,7 @@ use super::{
 };
 
 /// Wire protocol revision of [`DescriptorTxnSlot`]. Both venues must agree.
-pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 10;
+pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 11;
 
 /// Maximum host-reserved table pages carried by one transaction. A 2 MiB
 /// grant needs at most one L1, one L2 and two L3 tables when it straddles a
@@ -280,14 +280,19 @@ impl AliasAccess {
 /// decisions already established by the exact-MM protection authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CowRepointAccess {
+    /// Owner maintenance replaces backing without making a retired leaf valid.
+    Retired,
     RecordedPrivate,
-    User { writable_pages: u8 },
+    User {
+        writable_pages: u8,
+    },
     Kernel,
 }
 
 impl CowRepointAccess {
     fn wire(self) -> u64 {
         match self {
+            Self::Retired => 3,
             Self::RecordedPrivate => 0,
             Self::Kernel => 1,
             Self::User { writable_pages } => 2 | (u64::from(writable_pages) << 8),
@@ -296,6 +301,7 @@ impl CowRepointAccess {
 
     fn from_wire(word: u64) -> Option<Self> {
         match word {
+            3 => Some(Self::Retired),
             0 => Some(Self::RecordedPrivate),
             1 => Some(Self::Kernel),
             value if value & !0xf00 == 2 => Some(Self::User {
@@ -2345,6 +2351,12 @@ impl<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized> Executor<'_
                 }
                 let output = new_ipa.raw() + (base - va);
                 match access {
+                    CowRepointAccess::Retired => {
+                        if descriptor & VALID != 0 || descriptor & PA_MASK_4KIB == 0 {
+                            return Err(DescriptorRefusal::PermissionDenied);
+                        }
+                        return Ok((descriptor & !PA_MASK_4KIB) | output);
+                    }
                     CowRepointAccess::Kernel => {
                         if descriptor & VALID == 0 || descriptor & (1 << 6) != 0 {
                             return Err(DescriptorRefusal::PermissionDenied);

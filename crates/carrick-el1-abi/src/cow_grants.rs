@@ -45,7 +45,7 @@ pub const COW_GRANT_PROBES: usize = 64;
 /// Bytes of one grant: the host COW compound.
 pub const COW_GRANT_SIZE: u64 = 16 * 1024;
 /// Protocol revision, folded into [`crate::EL1_ABI_LAYOUT_HASH`].
-pub const COW_GRANT_PROTOCOL_VERSION: u64 = 1;
+pub const COW_GRANT_PROTOCOL_VERSION: u64 = 2;
 
 const EMPTY: u64 = 0;
 const WRITING: u64 = 1;
@@ -100,11 +100,22 @@ pub struct CowGrant {
     pub backing: BackingIdentity,
 }
 
+/// Which owner operation licensed the physical replacement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum CowGrantPurpose {
+    UserWrite = 0,
+    RetiredBacking = 1,
+    /// Malformed wire receipt; never accepted for publication or settlement.
+    Invalid = 2,
+}
+
 /// One guest COW EL1 completed with a grant: `[span_va, span_va + span_len)`
 /// moved from `old_ipa` (the span's first page) to `new_ipa`, both inside
 /// their 16 KiB compounds at the same offset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CowGrantCompletion {
+    pub purpose: CowGrantPurpose,
     pub grant: CowGrant,
     pub span_va: u64,
     pub span_len: u64,
@@ -118,7 +129,8 @@ impl CowGrantCompletion {
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         let offset = self.new_ipa.wrapping_sub(self.grant.physical_ipa);
-        self.span_len != 0
+        self.purpose != CowGrantPurpose::Invalid
+            && self.span_len != 0
             && self.span_len.is_multiple_of(PAGE)
             && self.span_va.is_multiple_of(PAGE)
             && self.old_ipa.is_multiple_of(PAGE)
@@ -145,6 +157,7 @@ pub struct CowGrantRecord {
     span_len: AtomicU64,
     old_ipa: AtomicU64,
     new_ipa: AtomicU64,
+    purpose: AtomicU64,
 }
 
 impl CowGrantRecord {
@@ -161,6 +174,7 @@ impl CowGrantRecord {
             span_len: AtomicU64::new(0),
             old_ipa: AtomicU64::new(0),
             new_ipa: AtomicU64::new(0),
+            purpose: AtomicU64::new(0),
         }
     }
 
@@ -350,6 +364,9 @@ impl CowGrantPool {
         {
             return false;
         }
+        record
+            .purpose
+            .store(completion.purpose as u64, Ordering::Relaxed);
         record.span_va.store(completion.span_va, Ordering::Relaxed);
         record
             .span_len
@@ -420,6 +437,11 @@ impl CowGrantPool {
                             continue;
                         };
                         return Some(CowGrantCompletion {
+                            purpose: match record.purpose.load(Ordering::Relaxed) {
+                                0 => CowGrantPurpose::UserWrite,
+                                1 => CowGrantPurpose::RetiredBacking,
+                                _ => CowGrantPurpose::Invalid,
+                            },
                             grant,
                             span_va: record.span_va.load(Ordering::Relaxed),
                             span_len: record.span_len.load(Ordering::Relaxed),
@@ -636,6 +658,7 @@ mod tests {
 
     fn completion(grant: CowGrant) -> CowGrantCompletion {
         CowGrantCompletion {
+            purpose: CowGrantPurpose::UserWrite,
             grant,
             span_va: 0x4000_1000,
             span_len: 0x3000,
