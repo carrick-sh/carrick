@@ -3332,21 +3332,23 @@ impl HvfTaskState {
         })?;
         super::guest_cow::require_guest_cow_settled(identity.mm, "host frame COW");
 
-        // Another vCPU of this mm may have won while we waited for topology.
-        // Take only what the fault path needs. This used to CLONE the whole
-        // armed-range vector on EVERY COW fault — a heap allocation and copy
-        // proportional to the mm's armed range count — to serve one boolean
-        // and two diagnostics. A fork arms every private writable range, so
-        // the clone grew with the very thing the faults are resolving.
-        let (candidate, armed_is_empty, armed_len) = {
+        // Another vCPU of this MM may have won while we waited for topology.
+        // Owner MMs authenticate the arm from their live descriptors. Host
+        // MMs select one candidate without cloning the whole arm population.
+        let (span, armed_is_empty, armed_len) = if guest_lane {
+            (self.guest_private_cow_span(fault_va), true, 0)
+        } else {
             let cow_armed = self.cow_armed.lock();
+            let candidate = cow_armed.span_for(fault_va);
+            let empty = cow_armed.ranges.is_empty();
+            let len = cow_armed.ranges.len();
+            drop(cow_armed);
             (
-                cow_armed.span_for(fault_va),
-                cow_armed.ranges.is_empty(),
-                cow_armed.ranges.len(),
+                candidate.map(|candidate| self.live_cow_span(candidate, fault_va)),
+                empty,
+                len,
             )
         };
-        let span = candidate.map(|candidate| self.live_cow_span(candidate, fault_va));
         let Some(span) = span else {
             let mapping = self.mapping_for_range_in(custody, fault_va, 1);
             let write_denied = self
@@ -4012,55 +4014,6 @@ impl HvfTaskState {
                 let tables = self.page_tables_authority();
                 let mm_key = std::num::NonZeroU64::new(identity.mm)
                     .ok_or_else(|| TrapError::Hypervisor("zero COW MM".to_owned()))?;
-                // The host record says the span shares its frame, but a page
-                // the host published from a prepared leaf (a copyout or
-                // signal frame into untouched memory) became a plain
-                // resident private leaf without EL1's COW arm. Re-arm the
-                // span in EL1 first, so the repoint below copies exactly as
-                // the record requires.
-                let unarmed_resident = tables
-                    .with_manager(|manager| {
-                        (0..(span.len as u64 / PAGE_SIZE)).any(|index| {
-                            let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
-                                manager.debug_walk(span.va + index * PAGE_SIZE),
-                            );
-                            carrick_mmu_core::aarch64::el1_private_leaf_state(leaf)
-                                == carrick_mmu_core::aarch64::El1PrivateLeafState::Resident
-                                && !carrick_mmu_core::aarch64::terminal_descriptor_is_fork_cow(leaf)
-                        })
-                    })
-                    .unwrap_or(false);
-                if unarmed_resident && !span.kernel_only {
-                    let arm = tables
-                        .with_manager(|manager| {
-                            manager.fork_arm_op(
-                                span.va,
-                                span.len as u64,
-                                false,
-                                span.executable,
-                                false,
-                            )
-                        })
-                        .ok_or_else(|| {
-                            TrapError::Hypervisor("guest COW re-arm lost its tables".to_owned())
-                        })?;
-                    let arm_txn =
-                        tables
-                            .prepare_guest_descriptor_txn(mm_key, arm)
-                            .map_err(|error| {
-                                TrapError::Hypervisor(format!(
-                                    "prepare guest COW re-arm: {error:?}"
-                                ))
-                            })?;
-                    flush_stage1.publish(&arm_txn).map_err(|error| {
-                        error.into_clean_refusal().unwrap_or_else(|error| {
-                            carrick_fatal!(
-                                "hvpatch::cow",
-                                "guest COW re-arm lacks a verified completion: {error}"
-                            )
-                        })
-                    })?;
-                }
                 let txn = tables
                     .prepare_guest_descriptor_txn(
                         mm_key,
@@ -4606,11 +4559,6 @@ impl HvfTaskState {
     ) -> Result<(), TrapError> {
         let generation_address =
             crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_RNG_GENERATION as u64;
-        if self.cow_armed.lock().span_for(generation_address).is_none() {
-            return Err(TrapError::Hypervisor(
-                "HVPatch child vvar generation has no COW arm".to_owned(),
-            ));
-        }
         if !self.perform_frame_cow(
             custody,
             generation_address,
@@ -7390,6 +7338,62 @@ impl HvfTaskState {
                 candidate.live(va, |page| manager.translate_retained_output(page))
             })
             .unwrap_or_else(|| candidate.live(va, |_| None))
+    }
+
+    /// Physical backing service for an owner MM. EL1's live private COW
+    /// leaves are the authority; host arm ranges are not a semantic shadow.
+    /// Inspect at most one 16 KiB compound, retaining only the contiguous
+    /// affine-output run that still belongs to this fork arm. A replacement
+    /// or a later COW completion in a neighboring Linux page ends the run.
+    fn guest_private_cow_span(&self, va: u64) -> Option<CowArmedSpan> {
+        use carrick_mmu_core::aarch64::{
+            El1PrivateLeafState, el1_private_leaf_state, terminal_descriptor,
+            terminal_descriptor_is_fork_cow,
+        };
+        const PAGE: u64 = CowArmedRanges::PAGE_SIZE;
+        self.page_tables_authority()
+            .with_manager(|manager| {
+                let output = |page| {
+                    let leaf = terminal_descriptor(manager.debug_walk(page));
+                    if !matches!(
+                        el1_private_leaf_state(leaf),
+                        El1PrivateLeafState::Prepared
+                            | El1PrivateLeafState::Resident
+                            | El1PrivateLeafState::Retired
+                    ) || !terminal_descriptor_is_fork_cow(leaf)
+                    {
+                        return None;
+                    }
+                    Some((manager.translate_retained_output(page)?, leaf))
+                };
+                let page = align_down(va, PAGE);
+                let (anchor, leaf) = output(page)?;
+                let first = page.checked_sub(anchor % CowArmedRanges::COMPOUND_SIZE)?;
+                let limit = first.checked_add(CowArmedRanges::COMPOUND_SIZE)?;
+                let same_frame = |candidate| {
+                    let expected = if candidate >= page {
+                        anchor.checked_add(candidate - page)
+                    } else {
+                        anchor.checked_sub(page - candidate)
+                    };
+                    output(candidate).is_some_and(|(ipa, _)| Some(ipa) == expected)
+                };
+                let mut start = page;
+                while start > first && same_frame(start - PAGE) {
+                    start -= PAGE;
+                }
+                let mut end = page + PAGE;
+                while end < limit && same_frame(end) {
+                    end += PAGE;
+                }
+                Some(CowArmedSpan {
+                    va: start,
+                    len: (end - start) as usize,
+                    executable: leaf & (1 << 54) == 0,
+                    kernel_only: false,
+                })
+            })
+            .flatten()
     }
 
     pub(crate) fn translate_va_for_cow(&self, va: u64) -> Option<u64> {
