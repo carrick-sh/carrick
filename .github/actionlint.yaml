@@ -1,0 +1,14 @@
+# Existing hardware/pilot routing labels only; this does not register runners.
+# Carried forward from PR #2 without its deferred cloudmac acceptance labels.
+self-hosted-runner:
+  labels:
+    - carrick-hvf
+    - carrick-kvm
+    - kvm
+    - willow-kvm
+paths:
+  .github/workflows/kernel-runtime.yml:
+    ignore:
+      # The existing `just lease gate bash -c '...'` deliberately defers
+      # expansion to the child shell. Keep the hardware workflow unchanged.
+      - 'shellcheck reported issue in this script: SC2016:'
