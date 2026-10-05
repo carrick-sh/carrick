@@ -810,6 +810,8 @@ mod tests {
     mod native_buffers;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     mod native_floor;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    mod native_jit;
     use super::*;
 
     #[test]
@@ -1563,6 +1565,9 @@ mod tests {
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn native_carrier_elf_memory_control_round_trip() {
+        if !native_jit::available_for("native_carrier_elf_memory_control_round_trip") {
+            return;
+        }
         use carrick_kernel::{
             compat::{CompatReporter, SyscallArgs},
             dispatch::{

@@ -70,8 +70,30 @@ unsafe extern "C" {
     fn slice_enter(state: *mut State, entry: usize);
     fn slice_gateway();
     fn pthread_jit_write_protect_np(enabled: libc::c_int);
-    fn pthread_jit_write_protect_supported_np() -> libc::c_int;
     fn sys_icache_invalidate(address: *mut c_void, length: usize);
+}
+
+/// The host cannot enforce this transport's per-thread JIT W^X contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JitWriteProtectUnsupported;
+
+impl std::fmt::Display for JitWriteProtectUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JIT W^X unsupported")
+    }
+}
+
+impl std::error::Error for JitWriteProtectUnsupported {}
+
+/// Query the capability itself, independently of OS version or virtualization.
+/// Unsupported hosts must refuse publication, never fall back to writable code.
+pub fn require_jit_write_protect() -> Result<(), JitWriteProtectUnsupported> {
+    // SAFETY: this argument-free capability query does not change protection.
+    if unsafe { libc::pthread_jit_write_protect_supported_np() } != 0 {
+        Ok(())
+    } else {
+        Err(JitWriteProtectUnsupported)
+    }
 }
 
 mod compact;
@@ -357,10 +379,7 @@ impl Code {
             }
             (words, (0..image.words.len()).map(|i| i * SLOT).collect())
         };
-        ensure!(
-            unsafe { pthread_jit_write_protect_supported_np() } != 0,
-            "JIT W^X unsupported"
-        );
+        require_jit_write_protect()?;
         let length = (words.len() * 4 + 16383) & !16383;
         let ptr = unsafe {
             libc::mmap(
