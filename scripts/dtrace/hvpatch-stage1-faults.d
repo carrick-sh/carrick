@@ -5,6 +5,12 @@
  * protection bits, arg2 formatted backend error C string. This failure-only
  * addition identifies first-touch refusals otherwise lowered to SIGSEGV;
  * live-qualified on macOS/arm64 in eco-resident-error-1788721196681925000.
+ * 2026-10-05 anonymous-scale attribution: source-qualified
+ * hvpatch-el1-frame-grant-plan args are fault VA, semantic base/length,
+ * Linux protection and request generation; hvpatch-first-touch-deliver args
+ * are fault VA, reason ordinal and Linux TID; hvpatch-first-touch-refused
+ * args are page VA, access, site and formatted backend error. The added
+ * actions fire on grant plans or failed first touches, not on every syscall.
  *
  * WHAT: records the hardware ESR/FAR/instruction, the live serialized stage-1
  * walk, TTBR0, typed COW-trigger identity, and the sparse stage-2 lifecycle for
@@ -203,4 +209,25 @@ carrick*:::resident-fault-protection-error
 {
     printf("HVPATCHFAULT1|resident_error|ts=%llu|host_pid=%d|page=%llx|prot=%llx|error=%s\n",
         timestamp, pid, arg0, arg1, copyinstr(arg2));
+}
+
+carrick*:::hvpatch-el1-frame-grant-plan
+/(pid == $target || progenyof($target))/
+{
+    printf("HVPATCHFAULT1|grant_plan|ts=%llu|host_pid=%d|fault=%llx|base=%llx|length=%llx|prot=%llx|generation=%llu\n",
+        timestamp, pid, arg0, arg1, arg2, arg3, (uint64_t)arg4);
+}
+
+carrick*:::hvpatch-first-touch-deliver
+/(pid == $target || progenyof($target))/
+{
+    printf("HVPATCHFAULT1|first_touch_deliver|ts=%llu|host_pid=%d|fault=%llx|reason=%u|linux_tid=%d\n",
+        timestamp, pid, arg0, (uint32_t)arg1, (int32_t)arg2);
+}
+
+carrick*:::hvpatch-first-touch-refused
+/(pid == $target || progenyof($target))/
+{
+    printf("HVPATCHFAULT1|first_touch_refused|ts=%llu|host_pid=%d|page=%llx|access=%u|site=%u|error=%s\n",
+        timestamp, pid, arg0, (uint32_t)arg1, (uint32_t)arg2, copyinstr(arg3));
 }
