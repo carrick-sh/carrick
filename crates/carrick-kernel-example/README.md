@@ -112,31 +112,40 @@ feature unification into the shipped binary.
 actor at a time at the typed `schedule_point!` seams. The run owns its
 coordinator; child identities are registered before their host threads start.
 `Schedule::receipt(result, work_snapshot)` records the exact actor generation,
-point, visit number, runnable set and decision, plus source/fixture hashes.
-`Schedule::replay(receipt)` rejects drift and an unconsumed suffix. Source
-comparison across the known-bad and fixed fd-pin revisions requires an
-explicit `allow_source_pair`.
+point, visit number, runnable set, authority and selection, plus the scenario's
+fixture hash, backend and scale. Kernel source text is not replay identity.
+`Schedule::replay(receipt, ReplayExpectation::Exact)` checks schema/generator,
+fixture identity, every decision, fully consumed decisions and drained actors.
+It always compares the completed result and work snapshot. `run_operations`
+takes an observation closure so its receipt contains the actual completed
+result and work, rather than a result overwritten after comparison.
+
+`ReplayExpectation::Regression { result, work_snapshot }` keeps a historical
+trace intact while requiring an explicit current observation. The expectation
+must differ from the historical observation; schedule and fixture checks are
+identical to exact replay. It cannot upgrade a generator, remap an actor or
+insert transitions introduced by a correction.
 
 `just lint-domains` checks the product closure; `just test-vmfree-schedule`
 also runs the replay controls. The default schedule test asserts fd-pin
-semantics and work on its fresh seeded run, then replays that run exactly.
-The Linux x86_64 retained `tests/fixtures/fdpin-seed5.json` witnesses the
-pre-fix `fork(2)`/`close(2)`/`exit_group(2)` ordering. Those version-2,
-host-labelled receipts remain historical evidence; the portable version-3
-replayer rejects them. `VMFREE_REPLAY` accepts portable receipts only.
+semantics and work on seed 5, then replays that run exactly. The two retained
+fd-pin receipts use generator 2 and a Linux x86_64 backend identity. They
+preserve their 22 decisions and the pre-fix continuation fd-pin error;
+today's generator 3 deliberately rejects them. `VMFREE_REPLAY` accepts only
+current portable receipts, with exact result/work expectations.
+
 On a pre-fix scratch checkout, use the ignored
 `record_fd_pin_schedule_on_historical_revision` test with `VMFREE_TRACE` to
-record a receipt while the default conformance test fails. After applying the
-separately owned fd-pin correction, declare the exact source pair with
-`VMFREE_ALLOW_FIXED_SOURCE` to prove the same ordering passes. The pre-fix
-code borrows a raw host fd; host fd-number reuse can change its outcome on
-macOS even with identical guest decisions. Ordinary kernel semantics tests
-remain unscheduled.
+record a receipt while the default conformance test fails. The pre-fix code
+borrows a raw host fd; host fd-number reuse can change its outcome on macOS
+even with identical guest decisions. Ordinary kernel semantics tests remain
+unscheduled.
 
-`tests/fixtures/fdpin-seed5-main-prefx.json` records the same scenario with
-the newer task serials from main after reversing only the fd-pin correction.
-The historical source pair describes that comparison; ordinary replay refuses
-to remap exact task identities across revisions.
+The retained setid seed-0 receipts preserve the errno-11 historical result and
+the required return 0. The correction adds credential admission/publication
+events, so their four- and six-decision traces are paired evidence. The fixed
+receipt replays exactly; attempting to replay the historical trace with a
+regression expectation still rejects the changed transitions.
 
 Portable receipts name `kernel-example/portable` and replay the same actor
 decisions on Linux and macOS. The retained futex wake/exit receipt records the
