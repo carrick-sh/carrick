@@ -230,13 +230,14 @@ at line 1831. That file is unchanged from base main `0250e7f2a`.
 repairs; it was not folded into this probe-only investigation.
 
 The failed CI result remains red. Its later `test` and `test-integration`
-stages did not execute in that invocation. Host acceptance includes `just
-test`; the skipped integration stage is also run separately. Final host and
-signed acceptance run after this note is committed, so their receipts name
-the final branch head. Their results and receipt paths are recorded in
-[PR #20](https://github.com/carrick-sh/carrick/pull/20), with fixed local
-receipt paths `target/fes-load2/host-receipt.json` and
-`target/fes-load2/signed-receipt.json`.
+stages did not execute in that invocation. Host acceptance subsequently
+passed on `fb47a1781`; its receipt is
+`target/fes-load2/host-receipt.json`. The supplemental integration run failed
+the unchanged-main help snapshot because the required environment supplies
+`CARRICK_HOME` while the fixture expects an empty value. The queued full
+signed acceptance was canceled at the director's request for batch 5; no
+signed acceptance receipt was produced. Results are also recorded in
+[PR #20](https://github.com/carrick-sh/carrick/pull/20).
 
 ## Review follow-up: make the deterministic witness a signed gate
 
@@ -293,3 +294,22 @@ The two oracle headers were rebound to the changed test-containing source;
 their bodies are unchanged and their native-Linux authority remains
 provisional. Earlier host/shard receipts above belong to their recorded
 revisions; the new focused witness does not confer full signed acceptance.
+
+## Review follow-up: host verification and coordination
+
+On `087a98d87`, all under exclusive host leases:
+
+| Command | Result | Full log |
+| --- | --- | --- |
+| `just fmt-check` | PASS, exit 0 | `target/fes-review/fmt-check.log` |
+| `just clippy` | PASS, exit 0 | `target/fes-review/clippy.log` |
+| `just lint-domains` | PASS, exit 0 | `target/fes-review/lint-domains.log` |
+| `just ci` | Interrupted by SIGTERM during workspace build | `target/fes-review/ci.log` |
+
+The director confirmed stopping CI to give the waiting batch-5 cloudmac
+host gate priority. This invocation passed its preceding checks but did not
+reach rustdoc or tests, and confers no CI pass. Re-running CI is held until
+the director relays that batch 5's host gate has exited. Full signed
+acceptance remains held until batch 5 lands. The earlier inherited rustdoc
+failure and PR #3 repair remain disclosed above. No gate timeout, retry, or
+concurrency setting was changed.
