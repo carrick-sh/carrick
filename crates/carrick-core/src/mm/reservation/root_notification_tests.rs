@@ -1,5 +1,21 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
+use carrick_el1_abi::{EL1_REGION_SIZE, EL1_RESERVATIONS_OFFSET, EL1_ZONE_OFFSET};
+type SharedReservations = super::SharedReservations<
+    carrick_personality_linux::mm::LinuxReservationPolicy,
+    carrick_el1::memory::reservations::NativeReservationGeometry,
+>;
+type Reservations<'a> = super::Reservations<
+    'a,
+    carrick_personality_linux::mm::LinuxReservationPolicy,
+    carrick_el1::memory::reservations::NativeReservationGeometry,
+>;
+type RootReleaseVenue<'a> = super::RootReleaseVenue<
+    'a,
+    carrick_personality_linux::mm::LinuxReservationPolicy,
+    carrick_el1::memory::reservations::NativeReservationGeometry,
+>;
+use fixture::{Region, admit_notified};
 
 use carrick_sched_core::spaces::notification::SpaceWaitCause;
 #[test]
@@ -108,7 +124,6 @@ fn actual_root_release_publishes_blocked_probe() {
 
 #[test]
 fn wrong_region_notification_venue_is_rejected() {
-    use crate::personality::mm_portal::test_support::Region;
     let a = Region::new();
     let b = Region::new();
     fn deliver(
@@ -133,7 +148,7 @@ fn wrong_region_notification_venue_is_rejected() {
 
 #[test]
 fn delayed_old_root_admission_cannot_demote_reused_notification_word() {
-    use crate::personality::mm_portal::test_support::{ROOT, Region, admit_notified};
+    use carrick_el1::personality::mm_portal::test_support::ROOT;
     use carrick_sched_core::spaces::notification::SpaceReleaseVenue;
     use core::cell::{Cell, RefCell};
     let region = Region::new();
@@ -255,4 +270,33 @@ fn delayed_old_root_admission_cannot_demote_reused_notification_word() {
         .unwrap()
         .retire()
         .unwrap();
+}
+
+mod fixture {
+    use super::*;
+    pub struct Region(carrick_el1::personality::mm_portal::test_support::Region);
+    impl Region {
+        pub fn new() -> Self {
+            Self(carrick_el1::personality::mm_portal::test_support::Region::new())
+        }
+        pub fn table(&self) -> &SharedReservations {
+            // SAFETY: unit and production owners use the same repr(C) store,
+            // real client and geometry; this retained region is aligned and zeroed.
+            unsafe { &*(self.0.table() as *const _ as *const SharedReservations) }
+        }
+        pub fn zone(&self) -> &carrick_sched_core::ZoneTables {
+            self.0.zone()
+        }
+    }
+    pub fn admit_notified(
+        region: &Region,
+        mm: u64,
+        root: u64,
+        pages: usize,
+        unrelated: usize,
+    ) -> ReservationMm {
+        carrick_el1::personality::mm_portal::test_support::admit_notified(
+            &region.0, mm, root, pages, unrelated,
+        )
+    }
 }

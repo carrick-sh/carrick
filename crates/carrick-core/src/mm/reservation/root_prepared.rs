@@ -2,19 +2,31 @@
 //! Copy settlement touches only permanent atomic node headers. Reclamation
 //! belongs to the next root guard, never the consuming host's critical path.
 use super::*;
-use carrick_core::mm::reservation::prepared::{self as owner, PreparedCopyNodes};
+use crate::mm::reservation::prepared::{self as owner, PreparedCopyNodes};
 use core::num::NonZeroU64;
 use owner::{GENERATION, LIVE, SETTLED};
 
 /// Retains the existing table and its authenticated metadata-bank view.
-#[derive(Clone, Copy)]
-pub struct BorrowedReservationNodes<'a> {
-    table: &'a SharedReservations,
+pub struct BorrowedReservationNodes<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry> {
+    table: &'a SharedReservations<Policy, Geometry>,
     banks: Option<&'a dyn storage::NodeBanks>,
+}
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Copy
+    for BorrowedReservationNodes<'_, Policy, Geometry>
+{
+}
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Clone
+    for BorrowedReservationNodes<'_, Policy, Geometry>
+{
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 // SAFETY: constructed only from the production table and its borrowed pinned
 // view. The original root list prevents reuse until the neutral claim settles.
-unsafe impl<'a> PreparedCopyNodes<'a> for BorrowedReservationNodes<'a> {
+unsafe impl<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry> PreparedCopyNodes<'a>
+    for BorrowedReservationNodes<'a, Policy, Geometry>
+{
     fn allocated(self) -> u32 {
         self.table.allocated.load(Ordering::Acquire)
     }
@@ -22,36 +34,39 @@ unsafe impl<'a> PreparedCopyNodes<'a> for BorrowedReservationNodes<'a> {
         self.table.node(index, self.banks)
     }
 }
-pub type ClaimedPreparedCopy<'a> = owner::ClaimedPreparedCopy<'a, BorrowedReservationNodes<'a>>;
+pub type ClaimedPreparedCopy<'a, Policy, Geometry> =
+    owner::ClaimedPreparedCopy<'a, BorrowedReservationNodes<'a, Policy, Geometry>>;
 
-impl SharedReservations {
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
+    SharedReservations<Policy, Geometry>
+{
     /// No root lock or editor acquisition. Metadata-bank pins must outlive
     /// this claim, exactly as they outlive the borrowed production portal.
     pub fn claim_prepared<'a, P: PinnedMetadataExtent>(
         &'a self,
-        nodes: Option<&'a ResolvedReservationNodes<P>>,
+        nodes: Option<&'a ResolvedReservationNodes<P, Policy, Geometry>>,
         permit: PortalPreparedPermit,
         request: PortalTransferRequest,
-    ) -> Result<ClaimedPreparedCopy<'a>, Refusal> {
+    ) -> Result<ClaimedPreparedCopy<'a, Policy, Geometry>, Refusal> {
         self.claim_prepared_inner(nodes, permit, request, || {})
     }
-    #[cfg(test)]
-    pub(crate) fn claim_prepared_with_rejection<'a, P: PinnedMetadataExtent>(
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn claim_prepared_with_rejection<'a, P: PinnedMetadataExtent>(
         &'a self,
-        nodes: Option<&'a ResolvedReservationNodes<P>>,
+        nodes: Option<&'a ResolvedReservationNodes<P, Policy, Geometry>>,
         permit: PortalPreparedPermit,
         request: PortalTransferRequest,
         before_rollback: impl FnOnce(),
-    ) -> Result<ClaimedPreparedCopy<'a>, Refusal> {
+    ) -> Result<ClaimedPreparedCopy<'a, Policy, Geometry>, Refusal> {
         self.claim_prepared_inner(nodes, permit, request, before_rollback)
     }
     fn claim_prepared_inner<'a, P: PinnedMetadataExtent>(
         &'a self,
-        nodes: Option<&'a ResolvedReservationNodes<P>>,
+        nodes: Option<&'a ResolvedReservationNodes<P, Policy, Geometry>>,
         permit: PortalPreparedPermit,
         request: PortalTransferRequest,
         before_rollback: impl FnOnce(),
-    ) -> Result<ClaimedPreparedCopy<'a>, Refusal> {
+    ) -> Result<ClaimedPreparedCopy<'a, Policy, Geometry>, Refusal> {
         let banks: Option<&dyn storage::NodeBanks> =
             nodes.map(|nodes| nodes as &dyn storage::NodeBanks);
         owner::claim_prepared(
@@ -63,7 +78,7 @@ impl SharedReservations {
         .map_err(|_| Refusal::Stale)
     }
 }
-impl Reservations<'_> {
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, Policy, Geometry> {
     pub fn prepared_wait_key(&self) -> Option<carrick_sched_core::object_wait::ObjectWaitKey> {
         carrick_sched_core::object_wait::ObjectWaitKey::address_space(
             self.index(),
@@ -169,7 +184,7 @@ impl Reservations<'_> {
             self.free_node(id);
         }
     }
-    pub(crate) fn prepare_copy(
+    pub fn prepare_copy(
         &mut self,
         request: PortalTransferRequest,
         notification: Option<carrick_sched_core::object_wait::ObjectWaitKey>,
