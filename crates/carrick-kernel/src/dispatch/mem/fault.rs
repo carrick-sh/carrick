@@ -394,16 +394,20 @@ impl RootPiece {
 impl MemState {
     /// Who answers `page`'s first-touch facts (see [`FirstTouchOwner`]).
     pub(in crate::dispatch) fn first_touch_owner(&self, page: u64) -> FirstTouchOwner {
+        self.try_first_touch_owner(page)
+            .unwrap_or_else(|refusal| broken_root("a first-touch observation", refusal))
+    }
+
+    /// A pre-exclusion reader must preserve contention as an admission result.
+    fn try_first_touch_owner(&self, page: u64) -> Result<FirstTouchOwner, Refusal> {
         let Some(root) = self.delegated_root() else {
-            return FirstTouchOwner::Host;
+            return Ok(FirstTouchOwner::Host);
         };
         if self.venue_owns(page, page.saturating_add(1)) {
-            return FirstTouchOwner::Host;
+            return Ok(FirstTouchOwner::Host);
         }
-        let node = root
-            .with_root(|model| Ok(model.node(page)))
-            .unwrap_or_else(|refusal| broken_root("a first-touch observation", refusal));
-        match node {
+        let node = root.with_root(|model| Ok(model.node(page)))?;
+        Ok(match node {
             None => FirstTouchOwner::Unmapped,
             Some((mapping, incarnation))
                 if mapping.anonymous
@@ -416,7 +420,7 @@ impl MemState {
                 FirstTouchOwner::Root(mapping, incarnation)
             }
             Some(_) => FirstTouchOwner::Host,
-        }
+        })
     }
 
     /// Record `range` resident, each piece under the owner that holds it
@@ -1076,10 +1080,15 @@ impl<'a> MemView<'a> {
         // fault and `resident_tracked_ranges` is one entry per live anonymous
         // extent. `growdown_ranges` stays a scan — there is one entry per
         // MAP_GROWSDOWN VMA and a process has a handful.
-        let tracked = match mem.first_touch_owner(page) {
-            FirstTouchOwner::Host => ranges_contain_page(&mem.resident_tracked_ranges, page),
-            FirstTouchOwner::Root(..) => true,
-            FirstTouchOwner::Unmapped => false,
+        let tracked = match mem.try_first_touch_owner(page) {
+            Ok(FirstTouchOwner::Host) => ranges_contain_page(&mem.resident_tracked_ranges, page),
+            Ok(FirstTouchOwner::Root(..)) => true,
+            Ok(FirstTouchOwner::Unmapped) => false,
+            // This classifier runs before editor exclusion. Route contention
+            // to the exact-MM mutation authority, which excludes EL1 edits
+            // before asking the live owner again. No mapping is inferred here.
+            Err(Refusal::Busy) => true,
+            Err(refusal) => broken_root("a first-touch observation", refusal),
         } || mem
             .growdown_ranges
             .iter()
