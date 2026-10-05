@@ -1,6 +1,8 @@
 //! Standalone x86 poll contract: normalize the real ABI, then serve it.
 use super::*;
-use carrick_abi::{LINUX_EFAULT, LINUX_POLLIN, LINUX_POLLNVAL, LinuxPollFd};
+use carrick_abi::{
+    LINUX_EFAULT, LINUX_POLLHUP, LINUX_POLLIN, LINUX_POLLNVAL, LINUX_POLLOUT, LinuxPollFd,
+};
 use carrick_guest_mem::X8664SyscallFrame;
 use carrick_guest_mem::{GuestMemory, MemoryError};
 use carrick_hal::x8664_arch::SyscallNorm;
@@ -116,6 +118,36 @@ fn normalized_poll_reports_readiness_and_linear_guest_copy_work() {
 }
 
 #[test]
+fn normalized_poll_keeps_distinct_ready_descriptors() {
+    for count in [1, 8, 32] {
+        let pairs: Vec<_> = (0..count)
+            .map(|_| {
+                let (reader, mut writer) = UnixStream::pair().unwrap();
+                writer.write_all(b"ready").unwrap();
+                (reader, writer)
+            })
+            .collect();
+        let fds: Vec<_> = pairs
+            .iter()
+            .map(|(reader, _)| LinuxPollFd {
+                fd: reader.as_raw_fd(),
+                events: LINUX_POLLIN,
+                revents: -1,
+            })
+            .collect();
+        let mut guest = PollGuest::new(&fds, 0);
+        run_elf_service_loop(&mut guest).unwrap();
+        assert_eq!(guest.results, [count as i64]);
+        for bytes in guest.memory.chunks_exact(8) {
+            let revents = LinuxPollFd::read_from_bytes(bytes).unwrap().revents;
+            assert_eq!(revents, LINUX_POLLIN);
+        }
+        assert_eq!(guest.read_bytes.get(), count * size_of::<LinuxPollFd>());
+        assert_eq!(guest.written_bytes, count * size_of::<i16>());
+    }
+}
+
+#[test]
 fn normalized_poll_clears_stale_events_and_reports_invalid_descriptors() {
     let (reader, _writer) = UnixStream::pair().unwrap();
     let fds = [
@@ -144,6 +176,38 @@ fn normalized_poll_clears_stale_events_and_reports_invalid_descriptors() {
         .map(|bytes| LinuxPollFd::read_from_bytes(bytes).unwrap().revents)
         .collect();
     assert_eq!(revents, [0, 0, LINUX_POLLNVAL]);
+}
+
+#[test]
+fn normalized_poll_preserves_each_duplicate_interest_and_unrequested_hangup() {
+    let (reader, mut writer) = UnixStream::pair().unwrap();
+    writer.write_all(b"ready").unwrap();
+    let fds: Vec<_> = [LINUX_POLLIN, 0, LINUX_POLLOUT, LINUX_POLLIN]
+        .into_iter()
+        .map(|events| LinuxPollFd {
+            fd: reader.as_raw_fd(),
+            events,
+            revents: -1,
+        })
+        .collect();
+    let mut guest = PollGuest::new(&fds, 0);
+    run_elf_service_loop(&mut guest).unwrap();
+    assert_eq!(guest.results, [3]);
+    let revents: Vec<_> = guest
+        .memory
+        .chunks_exact(8)
+        .map(|bytes| LinuxPollFd::read_from_bytes(bytes).unwrap().revents)
+        .collect();
+    assert_eq!(revents, [LINUX_POLLIN, 0, LINUX_POLLOUT, LINUX_POLLIN]);
+
+    drop(writer);
+    let mut hung_up = PollGuest::new(&[fds[1]], 0);
+    run_elf_service_loop(&mut hung_up).unwrap();
+    assert_eq!(hung_up.results, [1]);
+    let revents = LinuxPollFd::read_from_bytes(&hung_up.memory)
+        .unwrap()
+        .revents;
+    assert_eq!(revents, LINUX_POLLHUP);
 }
 
 #[test]
