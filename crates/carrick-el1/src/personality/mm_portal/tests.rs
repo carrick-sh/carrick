@@ -1615,6 +1615,161 @@ fn fork_request(
     }
 }
 
+// Exhaust the real shared pool with unrelated, unpublished imports. Keep the
+// parent's certificate and optional child's reserve live so each case reaches
+// the intended publication allocation, rather than a setup refusal.
+fn fork_publication_metadata_pressure(reserve_child: bool, copy_nodes_available: u64) {
+    use crate::memory::reservations::{HOST_RESERVE, Refusal};
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let parent = admit(&region, &spaces, 77, ROOT, 2, 1);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let parent_tables = Tables::new(ROOT, IPA, 2);
+    let child = Tables::new(ROOT + 0x100000, 0, 0);
+    let supply = Tables::new(ROOT + 0x200000, 0, 0);
+    let request = fork_request(&region, &spaces, parent, 78, &child, &supply);
+    let arenas = [&parent_tables, &child, &supply];
+    let words = ForkWords {
+        arenas: &arenas,
+        loads: core::cell::Cell::new(0),
+    };
+    let plan = portal.census_fork(request, &words, 0).unwrap();
+    let plan = portal.prepare_fork(request, plan, &words, 0).unwrap();
+    let before: Vec<_> = parent_tables
+        .words
+        .iter()
+        .map(|word| word.load(Ordering::Acquire))
+        .collect();
+    let layout = {
+        let mut root = portal.root(parent, 0).unwrap();
+        root.reserve_fork_certificate(request).unwrap();
+        root.layout()
+    };
+    if reserve_child {
+        portal
+            .root_any(request.child_mm, 0)
+            .unwrap()
+            .secure_host_nodes(HOST_RESERVE)
+            .unwrap();
+    }
+    let spare_mm = ReservationMm::new(80).unwrap();
+    let spare_index = spaces
+        .publish_closed(spare_mm.raw(), ROOT + 0x300000, ROOT + 0x300000)
+        .unwrap();
+    region
+        .table()
+        .publish(spare_index.index(), spare_mm, layout)
+        .unwrap();
+    let mut spare = region
+        .table()
+        .lock_el1_resolved(spare_index.index(), spare_mm, &view, 0)
+        .unwrap();
+    // One node for the child's certificate, then zero or one copied node.
+    for index in 0..=copy_nodes_available {
+        let va = VA + index * 8192;
+        spare
+            .import(
+                ReservationRange::new(va, va + 4096).unwrap(),
+                ReservationProtection::READ_WRITE,
+                true,
+            )
+            .unwrap();
+    }
+    let filler_mm = ReservationMm::new(81).unwrap();
+    let filler_index = spaces
+        .publish_closed(filler_mm.raw(), ROOT + 0x400000, ROOT + 0x400000)
+        .unwrap();
+    region
+        .table()
+        .publish(filler_index.index(), filler_mm, layout)
+        .unwrap();
+    let mut filler = region
+        .table()
+        .lock_el1_resolved(filler_index.index(), filler_mm, &view, 0)
+        .unwrap();
+    let mut imported = 0u64;
+    loop {
+        let va = VA + imported * 8192;
+        match filler.import(
+            ReservationRange::new(va, va + 4096).unwrap(),
+            ReservationProtection::READ_WRITE,
+            true,
+        ) {
+            Ok(()) => imported += 1,
+            Err(Refusal::MetadataRequired) => break,
+            other => panic!("unexpected metadata-pressure setup result {other:?}"),
+        }
+    }
+    assert!(imported > 512, "exhaust the actual bootstrap metadata pool");
+    spare.abort_import().unwrap();
+    drop(spare);
+    drop(filler);
+
+    let error = match portal.publish_fork(plan, &words, 0) {
+        Err(error) => error,
+        Ok(_) => panic!("exhausted publication must refuse before child admission"),
+    };
+    assert_eq!(error.errno(), 11);
+    assert_eq!(error, MmError::MetadataRequired);
+    assert_eq!(
+        portal.root(parent, 0).unwrap().generation(),
+        request.parent_generation
+    );
+    assert!(!portal.root(parent, 0).unwrap().fork_pending());
+    assert!(!portal.root_any(request.child_mm, 0).unwrap().is_admitted());
+    assert!(
+        portal
+            .root_any(request.child_mm, 0)
+            .unwrap()
+            .mapping(VA)
+            .is_none()
+    );
+    assert!(
+        portal
+            .root_any(request.child_mm, 0)
+            .unwrap()
+            .mapping(VA + 0x0100_0000)
+            .is_none()
+    );
+    for (word, original) in parent_tables.words.iter().zip(&before) {
+        assert_eq!(
+            word.load(Ordering::Acquire),
+            *original,
+            "refusal restores every parent descriptor"
+        );
+    }
+    assert!(spaces.grant(spaces.find(78).unwrap(), 78).is_none());
+
+    // Returning actual shared metadata permits the same exact fork to finish;
+    // no retry loop, fresh generation, or widened capacity hides the refusal.
+    region
+        .table()
+        .lock_el1_resolved(filler_index.index(), filler_mm, &view, 0)
+        .unwrap()
+        .abort_import()
+        .unwrap();
+    let scratch = portal.census_fork(request, &words, 0).unwrap();
+    let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
+    let mut pending = portal.publish_fork(plan, &words, 0).unwrap();
+    pending.abort(&portal, &words, 0).unwrap();
+}
+
+#[test]
+fn owner_fork_metadata_child_reserve_preserves_original_refusal() {
+    fork_publication_metadata_pressure(false, 0);
+}
+
+#[test]
+fn owner_fork_metadata_copy_node_preserves_original_refusal() {
+    fork_publication_metadata_pressure(true, 0);
+}
+
+#[test]
+fn owner_fork_metadata_partial_copy_preserves_original_refusal() {
+    fork_publication_metadata_pressure(true, 1);
+}
+
 #[test]
 pub(crate) fn owner_fork_child_has_live_private_cow_and_parent_stays_unchanged_on_abort() {
     let region = Region::new();

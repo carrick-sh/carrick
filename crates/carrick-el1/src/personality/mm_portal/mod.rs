@@ -73,12 +73,21 @@ impl From<PageTableError> for MmError {
 }
 impl From<carrick_core::mm::fork::ForkError> for MmError {
     fn from(e: carrick_core::mm::fork::ForkError) -> Self {
+        use carrick_core::mm::fork::{ForkError, ForkOwnerRefusal};
         match e {
-            carrick_core::mm::fork::ForkError::Invalid => Self::Invalid,
-            carrick_core::mm::fork::ForkError::NoMemory => Self::NoMemory,
-            carrick_core::mm::fork::ForkError::Busy => Self::Busy,
-            carrick_core::mm::fork::ForkError::Stale => Self::Stale,
-            carrick_core::mm::fork::ForkError::Core => Self::Core,
+            ForkError::Invalid => Self::Invalid,
+            ForkError::NoMemory => Self::NoMemory,
+            ForkError::Busy => Self::Busy,
+            ForkError::Stale => Self::Stale,
+            ForkError::MetadataRequired => Self::MetadataRequired,
+            ForkError::OwnerRefusal(refusal) => Self::from(match refusal {
+                ForkOwnerRefusal::Invalid => Refusal::Invalid,
+                ForkOwnerRefusal::Collision => Refusal::Collision,
+                ForkOwnerRefusal::Hole => Refusal::Hole,
+                ForkOwnerRefusal::ForeignMapping => Refusal::ForeignMapping,
+                ForkOwnerRefusal::Limit => Refusal::Limit,
+            }),
+            ForkError::Core => Self::Core,
         }
     }
 }
