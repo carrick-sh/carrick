@@ -1,5 +1,4 @@
 //! Linux reservation ownership, VMA interpretation and charges.
-use carrick_core::mm::reservation::{Charges, Mapping, ReservationNodeData};
 use carrick_core_abi::*;
 
 /// Linux edit authority and rlimit charging for the neutral flag record.
@@ -23,80 +22,83 @@ impl NodeFlagsPolicy for ReservationNodeFlags {
             && protection.bits() & 2 != 0
     }
 }
-/// Linux reservation interpretation. The backing tree and storage stay neutral.
-pub trait NodeDataPolicy {
-    fn root_editable(&self) -> bool;
-    fn flags(&self) -> ReservationNodeFlags;
-    fn protection(&self) -> ReservationProtection;
-    fn charged_data(&self) -> u64;
-    fn charged_locked(&self) -> u64;
-    fn charges_within(&self, start: u64, end: u64) -> Charges;
-    fn mapping(&self, generation: ReservationGeneration) -> Mapping;
-    fn same_mapping(&self, other: &ReservationNodeData) -> bool;
-}
-impl NodeDataPolicy for ReservationNodeData {
-    fn root_editable(&self) -> bool {
-        self.flags().root_editable()
-            && (!self.flags().contains(ReservationNodeFlags::FILE) || self.host_backing.is_some())
+/// Linux interpretation of the one neutral root store.
+pub struct LinuxReservationPolicy;
+impl carrick_core_abi::ReservationPolicy for LinuxReservationPolicy {
+    fn root_editable(node: &ReservationNodeData) -> bool {
+        Self::flags(node).root_editable()
+            && (!Self::flags(node).contains(ReservationNodeFlags::FILE)
+                || node.host_backing.is_some())
     }
-    fn flags(&self) -> ReservationNodeFlags {
+    fn flags(node: &ReservationNodeData) -> ReservationNodeFlags {
         // Nodes are only written from validated flags.
-        ReservationNodeFlags::from_bits(u32::from(self.flags))
+        ReservationNodeFlags::from_bits(u32::from(node.flags))
             .unwrap_or(ReservationNodeFlags::EMPTY)
     }
-    fn protection(&self) -> ReservationProtection {
-        ReservationProtection::from_bits(u64::from(self.prot))
+    fn protection(node: &ReservationNodeData) -> ReservationProtection {
+        ReservationProtection::from_bits(u64::from(node.prot))
             .unwrap_or(ReservationProtection::NONE)
     }
-    fn charged_data(&self) -> u64 {
-        if self.flags().charges_data(self.protection()) {
-            self.end - self.start
+    fn charged_data(node: &ReservationNodeData) -> u64 {
+        if Self::charges_data(Self::flags(node), Self::protection(node)) {
+            node.end - node.start
         } else {
             0
         }
     }
-    fn charged_locked(&self) -> u64 {
-        if self.flags().contains(ReservationNodeFlags::ANONYMOUS)
-            && self.flags().contains(ReservationNodeFlags::LOCKED)
+    fn charged_locked(node: &ReservationNodeData) -> u64 {
+        if Self::flags(node).contains(ReservationNodeFlags::ANONYMOUS)
+            && Self::flags(node).contains(ReservationNodeFlags::LOCKED)
         {
-            self.end - self.start
+            node.end - node.start
         } else {
             0
         }
     }
     /// Charges of the part of this one node inside `[start, end)`.
-    fn charges_within(&self, start: u64, end: u64) -> Charges {
-        let bytes = self.end.min(end).saturating_sub(self.start.max(start));
+    fn charges_within(node: &ReservationNodeData, start: u64, end: u64) -> Charges {
+        let bytes = node.end.min(end).saturating_sub(node.start.max(start));
         Charges {
             bytes,
-            data: if self.charged_data() != 0 { bytes } else { 0 },
-            locked: if self.charged_locked() != 0 { bytes } else { 0 },
+            data: if Self::charged_data(node) != 0 {
+                bytes
+            } else {
+                0
+            },
+            locked: if Self::charged_locked(node) != 0 {
+                bytes
+            } else {
+                0
+            },
         }
     }
-    fn mapping(&self, generation: ReservationGeneration) -> Mapping {
+    fn mapping(node: &ReservationNodeData, generation: ReservationGeneration) -> Mapping {
         // Nodes are only constructed from validated ABI ranges/protections.
         Mapping {
-            range: ReservationRange::new(self.start, self.end).expect("reservation range"),
-            protection: self.protection(),
-            anonymous: self.flags().contains(ReservationNodeFlags::ANONYMOUS),
-            flags: self.flags(),
+            range: ReservationRange::new(node.start, node.end).expect("reservation range"),
+            protection: Self::protection(node),
+            anonymous: Self::flags(node).contains(ReservationNodeFlags::ANONYMOUS),
+            flags: Self::flags(node),
             generation,
-            host_backing: self.host_backing,
+            host_backing: node.host_backing,
         }
     }
     /// Whether an adjacent node is the same Linux mapping (a VMA boundary
     /// the tree keeps only to separate incarnations).
-    fn same_mapping(&self, other: &ReservationNodeData) -> bool {
-        self.prot == other.prot
-            && self.flags == other.flags
-            && match (self.host_backing, other.host_backing) {
+    fn same_mapping(node: &ReservationNodeData, other: &ReservationNodeData) -> bool {
+        node.prot == other.prot
+            && node.flags == other.flags
+            && match (node.host_backing, other.host_backing) {
                 (None, None) => true,
-                (Some(a), Some(b)) if self.start <= other.start => {
-                    a.advance(other.start - self.start) == Some(b)
+                (Some(a), Some(b)) if node.start <= other.start => {
+                    a.advance(other.start - node.start) == Some(b)
                 }
-                (Some(a), Some(b)) => b.advance(self.start - other.start) == Some(a),
+                (Some(a), Some(b)) => b.advance(node.start - other.start) == Some(a),
                 _ => false,
             }
+    }
+    fn charges_data(flags: ReservationNodeFlags, protection: ReservationProtection) -> bool {
+        flags.charges_data(protection)
     }
 }
 
