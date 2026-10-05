@@ -42,6 +42,11 @@ fn driver() -> &'static Driver {
         changed: parking_lot::Condvar::new(),
     });
     START.call_once(|| {
+        // These workers cross to host storage: execute_recall withdraws the
+        // exact inode's guest mutation authority, then InodeWriteback::apply
+        // writes retained bytes to its host file. A pending guest recall is
+        // an owned request on the zone continuation's WaitQueue; it carries
+        // no guest execution lease into this fixed carrier storage pool.
         for index in 0..STORAGE_WORKERS {
             std::thread::Builder::new()
                 .name(format!("carrick-recall-{index}"))

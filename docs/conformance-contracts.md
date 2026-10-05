@@ -296,6 +296,14 @@ bindings: `delegated_guest_venue_munmap_then_mmap_retires_host_residency` and
 `delegated_residency_of_two_adjacent_mappings_survives_only_where_unretired`
 (delegated MM against a host-setup twin).
 
+Pre-exclusion fault classification probes the reservation root once. A busy
+guest editor routes the fault to the existing exact-MM mutation authority;
+it supplies neither a mapping answer nor a polling wait. The mutation route
+excludes EL1 edits before reading the live owner again. VM-free binding:
+`delegated_fault_classifier_routes_busy_root_to_mutation_without_waiting`
+holds an EL1 root through classification of both a mapped page and a hole,
+then verifies that the hole remains unmapped after release.
+
 `kernel.mm.copyout-owner-gate` covers a peer closing the MM gate between
 SELECT and PREPARE. The hardware preamble must observe the exact Gate
 producer before probing and return its owned suspension, never a raw

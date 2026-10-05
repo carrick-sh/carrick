@@ -425,17 +425,6 @@
       "domain": "dispatch::el1_reservations"
     },
     {
-      "file": "crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs",
-      "function": "<RootHostWait as carrick_el1::memory::reservations::RootWait>::wait",
-      "ordinal_in_function": 1,
-      "fingerprint": "0881b22e0d038671818abceaa4cb09d6c160dbe7266a60bf9f389a7c40ba8ef8",
-      "verdict": "carrier_fault",
-      "failure_domain": "dispatch::el1_reservations",
-      "rationale": "A reservation root still names a guest EL1 slot whose run sequence stayed even and unchanged across a whole failed attempt: that vCPU executed nothing while holding the root, so EL1 left a critical section holding it and nothing can ever release it. Waiting would park a host thread holding the MM's MemState forever; the contradiction is proven, so the carrier fails loud.",
-      "sink": "fatal",
-      "domain": "dispatch::el1_reservations"
-    },
-    {
       "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
       "function": "MemView<'a>::commit_mmap_growdown",
       "ordinal_in_function": 1,
