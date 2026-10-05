@@ -5475,6 +5475,15 @@ fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
 
 #[test]
 fn production_fork_plan_retains_structural_vvar_semantic_authority() {
+    production_fork_vvar_refresh(false);
+}
+
+#[test]
+fn owner_fork_refreshes_readonly_vvar_without_host_arm_ranges() {
+    production_fork_vvar_refresh(true);
+}
+
+fn production_fork_vvar_refresh(guest_lane: bool) {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let _external_alias_restore = ExternalAliasStateRestore::capture();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
@@ -5726,6 +5735,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         parent_generation_ptr
             .cast::<u64>()
             .write_unaligned(parent_generation_seed);
+        vvar_owner.ptr().add(128).write(0x5a);
     }
 
     let parent_vvar = parent
@@ -6002,7 +6012,7 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
         last_syscall_orig_x0: 0,
         live_vcpu: crate::vcpu_kick::LiveVcpuSlot::new(),
         persistent_vm_lifecycle: true,
-        cow_authority: Some(cow_authority),
+        cow_authority: Some(cow_authority.clone()),
         cow_identity: Some(carrick_hal::FrameCowIdentity {
             linux_pid: 871,
             linux_tid: 871,
@@ -6025,14 +6035,110 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
             .is_some_and(|mapping| !mapping.guest_writable),
         "production mapping resolution must find the read-only prepared child vvar",
     );
-    let mut flushes = 0;
-    child_task
-        .refresh_fork_process_state_in(&transport.custody, &mut || {
-            flushes += 1;
-            Ok(())
-        })
-        .expect("production privileged child vvar refresh");
-    assert_eq!(flushes, 1, "child vvar refresh must publish stage-1 once");
+    if guest_lane {
+        child_page_tables_authority
+            .edit(
+                || panic!("prepared child tables"),
+                |editor| {
+                    editor
+                        .manager
+                        .set_fork_readonly_adopting(vvar_ipa, vvar_len as usize, None)?;
+                    // SAFETY: the prepared child owns this exact table arena.
+                    unsafe {
+                        editor.sync_to_host(super::TestPageTableArena(
+                            editor.base(),
+                            child_page_table_host,
+                        ))
+                    }
+                },
+            )
+            .expect("model owner fork's private COW leaves");
+        child_state.set_live_resolver(MmAccessLiveResolver::new(
+            &child_state,
+            transport.custody.clone(),
+        ));
+        child_page_tables_authority
+            .select_guest_descriptor_owner()
+            .expect("select the live owner lane");
+        assert_eq!(
+            child_page_tables_authority.live_descriptor_owner(),
+            carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest,
+        );
+        child_task.cow_armed.lock().ranges.clear();
+        let published = std::cell::RefCell::new(Vec::new());
+        struct VvarService<'a> {
+            inner: RetainedReuseGuestService<'a>,
+            source: *const u8,
+            source_ipa: u64,
+            source_len: u64,
+        }
+        impl carrick_aarch64::vmm::Stage1Services for VvarService<'_> {
+            fn flush(&mut self) -> Result<(), TrapError> {
+                panic!("owner vvar refresh must publish through EL1")
+            }
+            fn guest_publication_available(&self) -> bool {
+                true
+            }
+            fn publish(
+                &mut self,
+                txn: &carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+            ) -> Result<
+                carrick_mmu_core::aarch64::descriptor_txn::VerifiedDescriptorReceipt,
+                carrick_aarch64::vmm::GuestPublishError,
+            > {
+                if let carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
+                    old_ipa,
+                    new_ipa,
+                    len,
+                    ..
+                } = txn.op
+                {
+                    let offset = old_ipa.raw().checked_sub(self.source_ipa).unwrap();
+                    assert!(offset + len <= self.source_len);
+                    // Model EL1's authenticated copy window before its journal.
+                    // SAFETY: the parent structural owner and new grant are pinned.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.source.add(offset as usize),
+                            model_owner_host(new_ipa.raw()),
+                            len as usize,
+                        );
+                    }
+                }
+                self.inner.publish(txn)
+            }
+        }
+        let mut service = VvarService {
+            inner: RetainedReuseGuestService {
+                tables: child_page_tables_authority.clone(),
+                authority: cow_authority,
+                root: (root_slot_base, root_slot_size),
+                host: child_page_table_host as usize,
+                available: true,
+                published: &published,
+                maintenance: RetainedReuseMaintenance(std::cell::Cell::new(0)),
+                not_applied: None,
+            },
+            source: vvar_owner.ptr(),
+            source_ipa: vvar_ipa,
+            source_len: vvar_len,
+        };
+        child_task
+            .refresh_fork_process_state_in(&transport.custody, &mut service)
+            .expect("owner refresh must use live private COW leaves, not host arms");
+        assert_eq!(published.borrow().len(), 1, "one owner COW publication");
+        assert!(child_task.cow_armed.lock().ranges.is_empty());
+        assert_eq!(child_task.host_cow_stats.host_cow_resolutions(), 0);
+    } else {
+        let mut flushes = 0;
+        child_task
+            .refresh_fork_process_state_in(&transport.custody, &mut || {
+                flushes += 1;
+                Ok(())
+            })
+            .expect("production privileged child vvar refresh");
+        assert_eq!(flushes, 1, "child vvar refresh must publish stage-1 once");
+    }
     let parent_generation = unsafe { parent_generation_ptr.cast::<u64>().read_unaligned() };
     assert_eq!(
         parent_generation, parent_generation_seed,
@@ -6048,6 +6154,11 @@ fn production_fork_plan_retains_structural_vvar_semantic_authority() {
     assert!(
         !refreshed.guest_writable,
         "vvar semantic mapping must stay read-only"
+    );
+    assert_eq!(
+        unsafe { refreshed.host_addr.add(128).read() },
+        0x5a,
+        "refresh must copy the parent bytes outside the generation word"
     );
     assert_eq!(
         child_page_tables_authority
