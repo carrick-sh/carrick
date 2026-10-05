@@ -674,3 +674,15 @@ contracts = ["kernel.fork.filetable", "kernel.el1.ipc-fd-authority"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/kernel/objects/ipc.rs"
 contracts = ["kernel.el1.fd-single-owner", "kernel.el1.ipc-fd-authority"]
+
+[[surfaces]]
+path = "crates/carrick-x86/src/bringup_fns.rs"
+contracts = ["x86.run-elf.poll"]
+
+[[surfaces]]
+path = "crates/carrick-x86/src/bringup_fns/poll_tests.rs"
+contracts = ["x86.run-elf.poll"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs"
+contracts = ["x86.run-elf.poll"]
