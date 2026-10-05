@@ -468,6 +468,7 @@ dependencies = [
 name = "carrick-core-abi"
 version = "0.1.0"
 dependencies = [
+ "carrick-guest-arch",
  "carrick-mmu-core",
  "carrick-sched-core",
 ]
