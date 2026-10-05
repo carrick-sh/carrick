@@ -259,7 +259,7 @@ impl HvpatchTaskEngineBindingState {
                             ticket.base(),
                             ticket.size(),
                         )?;
-                        let receipt = ticket.redeem_vmm(proof).map_err(|error| {
+                        let receipt = ticket.redeem(proof).map_err(|error| {
                             TrapError::Hypervisor(format!(
                                 "authenticate detached resident root retirement: {error}"
                             ))
@@ -309,7 +309,7 @@ impl HvpatchTaskEngineBindingState {
                                 ticket.base(),
                                 ticket.size(),
                             )?;
-                            ticket.redeem_vmm(proof).map(Some).map_err(|error| {
+                            ticket.redeem(proof).map(Some).map_err(|error| {
                                 TrapError::Hypervisor(format!(
                                     "authenticate detached shared-inventory root retirement: {error}"
                                 ))
@@ -325,7 +325,7 @@ impl HvpatchTaskEngineBindingState {
                             ticket.base(),
                             ticket.size(),
                         )?;
-                        let receipt = ticket.redeem_vmm(proof).map_err(|error| {
+                        let receipt = ticket.redeem(proof).map_err(|error| {
                             TrapError::Hypervisor(format!(
                                 "authenticate detached task-only root retirement: {error}"
                             ))
@@ -348,7 +348,7 @@ impl HvpatchTaskEngineBindingState {
             }
             #[cfg(test)]
             HvpatchTaskEngineBindingPayload::Test => {
-                Ok(root_ticket.map(crate::hvpatch::Stage1RootRetirementTicket::complete_for_test))
+                Ok(root_ticket.map(crate::hvpatch::complete_root_for_test))
             }
         }
     }
@@ -365,7 +365,7 @@ impl HvpatchTaskEngineBindingState {
                             ticket.base(),
                             ticket.size(),
                         )?;
-                    ticket.redeem_vmm(proof).map(Some).map_err(|error| {
+                    ticket.redeem(proof).map(Some).map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "authenticate resident exec predecessor root retirement: {error}"
                         ))
@@ -383,7 +383,7 @@ impl HvpatchTaskEngineBindingState {
                             ticket.base(),
                             ticket.size(),
                         )?;
-                    ticket.redeem_vmm(proof).map(Some).map_err(|error| {
+                    ticket.redeem(proof).map(Some).map_err(|error| {
                         TrapError::Hypervisor(format!(
                             "authenticate task-only exec predecessor root retirement: {error}"
                         ))
@@ -396,7 +396,7 @@ impl HvpatchTaskEngineBindingState {
             },
             #[cfg(test)]
             HvpatchTaskEngineBindingPayload::Test => {
-                Ok(root_ticket.map(crate::hvpatch::Stage1RootRetirementTicket::complete_for_test))
+                Ok(root_ticket.map(crate::hvpatch::complete_root_for_test))
             }
         }
     }
