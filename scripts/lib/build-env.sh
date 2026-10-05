@@ -4,12 +4,10 @@
 # inject it into fixture admission and test processes. Their environment
 # policy deliberately rejects ambient compiler wrappers.
 if [ "${CARRICK_SCCACHE:-1}" = 0 ]; then
-    unset RUSTC_WRAPPER
+    # Disable only our automatic Cargo option. Ambient wrapper variables must
+    # remain visible to fixture policy, which rejects even an empty value.
     CARRICK_CARGO_CACHE_CONFIG='build.rustc-wrapper=""'
 else
-    if [ -z "${RUSTC_WRAPPER:-}" ]; then
-        unset RUSTC_WRAPPER
-    fi
     # Escape the default executable path as a TOML basic string. An explicit
     # RUSTC_WRAPPER still takes precedence under Cargo's normal rules.
     carrick_cache_wrapper=$(printf '%s' "$HOME/.cargo/bin/sccache" | sed 's/\\/\\\\/g; s/"/\\"/g')

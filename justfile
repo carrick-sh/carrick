@@ -13,8 +13,7 @@ export SCCACHE_DIR := `sh -c '. scripts/lib/build-env.sh; printf "%s" "$SCCACHE_
 export SCCACHE_CACHE_SIZE := `sh -c '. scripts/lib/build-env.sh; printf "%s" "$SCCACHE_CACHE_SIZE"'`
 
 # Shared checkout admission spans each foreground Cargo command.
-_cargo_environment := if env("CARRICK_SCCACHE", "1") == "0" { "env -u RUSTC_WRAPPER " } else if env("RUSTC_WRAPPER", "") == "" { "env -u RUSTC_WRAPPER " } else { "" }
-_cargo := _cargo_environment + "cargo --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
+_cargo := "cargo --config " + quote(CARRICK_CARGO_CACHE_CONFIG)
 _admit := _cargo + " run --locked -p carrick-xtask -- worktree-run --"
 
 # Per-host backend feature flags for `cargo build`/`cargo test` of carrick-cli.
