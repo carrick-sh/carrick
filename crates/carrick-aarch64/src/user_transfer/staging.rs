@@ -213,6 +213,14 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
             MemorySupplyRequest::Grant(window)
         }));
     }
+    if frame.x[0] != 0 && intent == PortalTransferIntent::UserWrite {
+        carrick_observability::probes::guest_internal_write_fault(
+            va,
+            len as u64,
+            25,
+            &format!("owner SELECT errno={} tag={}", frame.x[0], frame.x[14]),
+        );
+    }
     if frame.x[0] == 3 {
         return Err(MemoryPrepareError::Fault(
             carrick_guest_mem::MemoryError::OwnerRetired(target.handle),
