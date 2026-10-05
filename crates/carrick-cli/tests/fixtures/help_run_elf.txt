@@ -1,4 +1,4 @@
-`run-elf` drives a freestanding ELF straight through the HVF run loop (`run_static_elf_with_hvf_…`), macOS-only. On Linux use `carrick run <oci>`, or the `carrick-kvm run-elf` dev driver for a bare ELF
+`run-elf` drives a freestanding ELF straight through the HVF run loop (`run_static_elf_with_hvf_…`), macOS-only
 
 Usage: carrick run-elf [OPTIONS] <PATH> [-- <ARGS>...]
 
