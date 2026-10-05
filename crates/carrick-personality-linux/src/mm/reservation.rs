@@ -1,5 +1,5 @@
 //! Linux placement, remap and byte-brk interpretation over one borrowed owner guard.
-use super::LinuxReservationPolicy;
+use super::{LinuxReservationLayout, LinuxReservationPolicy, LinuxReservationState};
 use carrick_core_abi::*;
 
 pub(super) fn place<M: ReservationPolicyAccess>(
@@ -80,7 +80,7 @@ pub(super) fn mmap<M: ReservationPolicyAccess>(
         prot,
         ReservationOperation::Prepare,
         UserVa::new(address),
-        UserVa::new(root.layout().brk),
+        UserVa::new(LinuxReservationLayout::from(root.layout()).brk),
         false,
         None,
         ReservationNodeFlags::ANONYMOUS_PRIVATE,
@@ -156,7 +156,7 @@ fn mremap_inner<M: ReservationPolicyAccess>(
     }
     let prot = LinuxReservationPolicy::protection(&node);
     let flags = LinuxReservationPolicy::flags(&node);
-    let brk = root.layout().brk;
+    let brk = LinuxReservationLayout::from(root.layout()).brk;
     let (operation, moved) = if keep_source {
         (ReservationOperation::Prepare, None)
     } else {
@@ -252,7 +252,7 @@ pub(super) fn brk<M: ReservationPolicyAccess>(
     if root.has_pending_edit() || root.fork_pending() {
         return Err(Refusal::Busy);
     }
-    let old = root.layout().brk;
+    let old = LinuxReservationLayout::from(root.layout()).brk;
     let heap = root.layout().heap;
     if requested == 0 || requested < heap.start() || requested > heap.end() {
         return Ok(Decision::Complete(old));
@@ -295,4 +295,31 @@ pub(super) fn brk<M: ReservationPolicyAccess>(
         Err(Refusal::Limit | Refusal::ForeignMapping) => Ok(Decision::Complete(old)),
         result => result,
     }
+}
+
+/// Linux limit admission: shrinking remains possible after lowering a limit.
+pub(super) fn admits_charges(
+    layout: LinuxReservationState,
+    total: Charges,
+    removed: Charges,
+    added: Charges,
+) -> Result<(), Refusal> {
+    let bytes = total
+        .bytes
+        .checked_sub(removed.bytes)
+        .ok_or(Refusal::Stale)?;
+    let data = total.data.checked_sub(removed.data).ok_or(Refusal::Stale)?;
+    if (bytes
+        .checked_add(added.bytes)
+        .and_then(|n| n.checked_add(layout.external_address_bytes))
+        .is_none_or(|n| n > layout.address_limit)
+        || data
+            .checked_add(added.data)
+            .and_then(|n| n.checked_add(layout.external_data_bytes))
+            .is_none_or(|n| n > layout.data_limit))
+        && (added.bytes > removed.bytes || added.data > removed.data)
+    {
+        return Err(Refusal::Limit);
+    }
+    Ok(())
 }

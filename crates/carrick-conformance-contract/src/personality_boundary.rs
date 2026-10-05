@@ -1516,6 +1516,23 @@ mod tests {
         let neutral_abi =
             fs::read_to_string(repo.join("crates/carrick-core-abi/src/mm/reservation.rs")).unwrap();
         for item in syn::parse_file(&neutral_abi).unwrap().items {
+            if let syn::Item::Struct(record) = &item
+                && record.ident == "Layout"
+            {
+                for field in &record.fields {
+                    assert!(
+                        !matches!(
+                            field.ident.as_ref().unwrap().to_string().as_str(),
+                            "brk"
+                                | "address_limit"
+                                | "data_limit"
+                                | "external_address_bytes"
+                                | "external_data_bytes"
+                        ),
+                        "Linux state belongs to the selected client's opaque payload"
+                    );
+                }
+            }
             if let syn::Item::Impl(implementation) = item {
                 for item in implementation.items {
                     if let syn::ImplItem::Fn(method) = item {
@@ -1530,6 +1547,9 @@ mod tests {
         }
         let owner = fs::read_to_string(repo.join("crates/carrick-core/src/mm/reservation/root.rs"))
             .unwrap();
+        let production = owner.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(!production.contains("ReservationNodeFlags::DONTFORK"));
+        assert!(!production.contains("ReservationNodeFlags::WIPEONFORK"));
         let owner = syn::parse_file(&owner).unwrap();
         for item in owner.items {
             if let syn::Item::Impl(implementation) = item {

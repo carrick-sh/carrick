@@ -1,9 +1,10 @@
 //! Native projection of the sole neutral reservation owner.
 use carrick_core::mm::reservation as owner;
 use carrick_el1_abi::*;
+pub use carrick_personality_linux::mm::LinuxReservationLayout as Layout;
 use carrick_personality_linux::mm::LinuxReservationPolicy;
 pub use owner::{
-    Charges, DEFERRED_RETURNS, Decision, DeferredReturn, HOST_RESERVE, Layout, Mapping, MoveTarget,
+    Charges, DEFERRED_RETURNS, Decision, DeferredReturn, HOST_RESERVE, Mapping, MoveTarget,
     NoRootWait, Placement, Refusal, ReservationFaultPlan, ReturnSlot, RootHolder, RootWait,
 };
 pub struct NativeReservationGeometry;

@@ -339,6 +339,24 @@ pub trait ReservationGeometry {
 
 /// The Linux client interprets the neutral node; core owns its storage and work.
 pub trait ReservationPolicy {
+    fn validates_layout(layout: Layout) -> bool;
+    fn active_value(policy: ReservationPolicyPayload) -> u64;
+    fn apply_value(policy: &mut ReservationPolicyPayload, value: u64);
+    fn admits_charges(
+        policy: ReservationPolicyPayload,
+        total: Charges,
+        removed: Charges,
+        added: Charges,
+    ) -> Result<(), Refusal>;
+    fn update_limits(policy: &mut ReservationPolicyPayload, address: u64, data: u64);
+    fn update_external_charges(policy: &mut ReservationPolicyPayload, address: u64, data: u64);
+    fn authenticates_maintenance(
+        layout: Layout,
+        request: ReservationRequest,
+        pending_value: u64,
+    ) -> bool;
+    fn validates_attributes(node: &ReservationNodeData, set: ReservationNodeFlags) -> bool;
+    fn inherits(node: &ReservationNodeData) -> bool;
     fn place<M: ReservationPolicyAccess>(
         root: &mut M,
         placement: Placement,
@@ -432,12 +450,20 @@ pub enum Refusal {
 pub struct Layout {
     pub heap: ReservationRange,
     pub arena: ReservationRange,
-    pub brk: u64,
-    pub address_limit: u64,
-    pub data_limit: u64,
-    /// Charges outside this admitted anonymous arena/heap.
-    pub external_address_bytes: u64,
-    pub external_data_bytes: u64,
+    /// Personality-owned wire payload. Core never interprets its words.
+    pub policy: ReservationPolicyPayload,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub struct ReservationPolicyPayload([u64; 5]);
+impl ReservationPolicyPayload {
+    pub const fn new(words: [u64; 5]) -> Self {
+        Self(words)
+    }
+    pub const fn words(self) -> [u64; 5] {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
