@@ -262,6 +262,20 @@ bindings: `delegated_guest_venue_munmap_then_mmap_retires_host_residency` and
 `delegated_residency_of_two_adjacent_mappings_survives_only_where_unretired`
 (delegated MM against a host-setup twin).
 
+`kernel.mm.copyout-owner-gate` covers a peer closing the MM gate between
+SELECT and PREPARE. The hardware preamble must observe the exact Gate
+producer before probing and return its owned suspension, never a raw
+EAGAIN completion that the host lowers to EFAULT. No source byte may be
+consumed before a semantic permit. The production-entry VM-free bindings
+are `owner_wait_release_before_enrollment_never_parks_a_lost_edge`,
+`owner_wait_unrelated_release_cannot_reschedule_and_real_release_delivers_once`,
+and `prepare_entry_refuses_another_incarnation_before_gate_wait`.
+They cover both release/enrollment orders, unrelated release isolation,
+exactly one handback, and resumed admission of the original operation.
+Work is bounded by one gate probe/enrollment per owner release; no polling,
+timeout, or retry budget is a substitute. Signed binding:
+`el1_host_copyout_into_and_out_of_untouched_reserved_memory` (300 rounds).
+
 `kernel.mm.bootstrap-table-custody` covers initial roots created after the
 carrier's first container. Every root must be physically accessible to the
 maintenance lane before owner admission, using this MM's exact table-slot
