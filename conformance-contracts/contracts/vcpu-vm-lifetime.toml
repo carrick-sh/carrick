@@ -1,4 +1,12 @@
 schema_version = 1
+# Pool admission audit (2026-10-04): reject unservable scheduler CPU counts
+# before driver/resolver publication or vCPU creation. Runtime executor tests
+# insufficient_bound_workers_cannot_strand_a_pinned_task and
+# pool_admission_covers_overrides_ceilings_reserves_and_small_hosts assert zero
+# creations on refusal and successful corrected startup. The existing
+# creation_is_transactional_and_every_created_vcpu_dies_on_its_owner_worker
+# test now declares its one-CPU policy and passes in the serial runtime suite.
+# No post-start creation/destruction or signed topology claim changes.
 # Executor handback adapter audit (2026-09-29): next_runnable now carries the
 # core's pre-publication RecordRef. This changes no vCPU creation/destruction
 # path. Retain the topology and signed two-root bindings below as regressions;

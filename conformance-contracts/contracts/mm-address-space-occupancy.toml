@@ -1,4 +1,11 @@
 schema_version = 1
+# Pool admission audit (2026-10-04): the new configuration guard precedes
+# resolver installation and every worker, so rejection cannot load an MM or
+# publish occupancy. The runtime pool-admission matrix proves zero creations,
+# absent resolver/driver publication and successful corrected startup.
+# MM load/unload, drain and ASID retirement paths are unchanged. Their
+# existing VM-free bindings below pass under just test-kernel / just test;
+# this admission change provides no new signed MM-occupancy acceptance.
 # Executor handback adapter audit (2026-09-29): carrying the core's RecordRef
 # through adoption changes neither occupancy publication nor MM draining.
 # Retain the existing switched-slot and signed two-process bindings below;
