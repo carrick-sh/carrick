@@ -1006,7 +1006,7 @@
     },
     {
       "file": "crates/carrick-aarch64/src/user_transfer.rs",
-      "function": "supply",
+      "function": "finish_supply",
       "ordinal_in_function": 1,
       "fingerprint": "2dd799f0332ac3375f173e653e98b34cefd378716c069ae1303285c5609e06ed",
       "sink": "fatal",
