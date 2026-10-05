@@ -13133,6 +13133,18 @@ mod guest_cow {
         let runtime = child.state.cow_runtime.read().clone().unwrap();
         crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion)
             .expect("physical settlement preserves later owner edits");
+        let alias = alias_registry()
+            .lock()
+            .newest_matching_for_process(
+                Some(old_key_root(&child)),
+                ContainerRootToken::ROOT,
+                |alias| alias.start == TEST_VA,
+            )
+            .expect("settled physical alias");
+        assert_eq!(
+            alias.guest_writable, rearm,
+            "retirement revokes write access"
+        );
         for (page, leaf) in leaves.iter().enumerate() {
             assert_eq!(
                 unsafe { leaf_word(root, TEST_VA + page as u64 * 4096).read_volatile() },
