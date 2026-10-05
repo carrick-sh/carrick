@@ -3379,9 +3379,9 @@ fn committed_child_requires_fresh_exact_kernel_cow_binding() {
 /// Kernel built the receipt with a `contains` per unmap event.
 #[test]
 fn retirement_receipt_authentication_has_no_per_element_scans() {
-    let trap = include_str!("../trap.rs");
-    let authenticate = trap
-        .split("fn authenticate_pending_retirement(")
+    let owner = include_str!("../../../carrick-core/src/mm/retirement.rs");
+    let authenticate = owner
+        .split("fn authenticate_pending_retirement<")
         .nth(1)
         .and_then(|tail| tail.split("\n}\n").next())
         .expect("authenticate_pending_retirement body");
