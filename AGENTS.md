@@ -219,7 +219,12 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   (in `lint-domains`) enforces it.
 - **Red-first:** `git checkout <pre-fix> -- <file>`, rebuild signed, DIFF;
   restore, MATCH; record false lines in the commit. Passing immediately proves
-  nothing.
+  nothing. Scoped `just test-embed <filter>` / `test-signed.sh` runs may use an
+  exact-HEAD fixture bundle with unrelated dirty host sources: verification
+  checks the fixtures' resolved Cargo path-dependency inputs and records
+  `input_identity` in the receipt. Changed fixture inputs still require their
+  own committed variant and rebuilt bundle. Acceptance remains clean-tree,
+  exact-SHA; see [`docs/signed-fixtures.md`](docs/signed-fixtures.md#scoped-tests-and-red-first-work).
 - **Report errno NUMBERS** (`seek_data_negative_errno = errno`) — Linux said
   ENXIO where EINVAL was assumed; ESPIPE for `pwrite` on either pipe end, not
   EBADF.
