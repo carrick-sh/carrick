@@ -247,6 +247,9 @@ fn dispatch_invalid(
 
 #[test]
 fn native_data_demand_contract() {
+    if !native_jit::available_for("native_data_demand_contract") {
+        return;
+    }
     use carrick_conformance_contract::{
         Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
         SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
@@ -476,6 +479,9 @@ fn native_data_demand_contract() {
 
 #[test]
 fn native_code_density_contract() {
+    if !native_jit::available_for("native_code_density_contract") {
+        return;
+    }
     use carrick_conformance_contract::{
         Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
         SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
