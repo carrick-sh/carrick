@@ -13027,7 +13027,10 @@ mod guest_cow {
                 .is_err()
         );
         let mut wrong_output = completion;
+        wrong_output.span_len = 4096;
+        wrong_output.old_ipa += 4096;
         wrong_output.new_ipa += 4096;
+        assert!(wrong_output.is_well_formed());
         assert!(
             crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &wrong_output)
                 .is_err()
