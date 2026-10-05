@@ -1239,6 +1239,64 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     };
 }
 
+/// An editor retained from target admission through descriptor completion.
+pub(super) struct GrantTarget<'a> {
+    window: carrick_el1_abi::PortalGrantWindow,
+    grant: carrick_sched_core::SpaceGrant,
+    _editor: SpaceEditor<'a>,
+    authenticated: bool,
+}
+
+pub(super) fn grant_target<'a, P: PinnedMetadataExtent>(
+    portal: &'a MmPortal<'_, P>,
+    window: carrick_el1_abi::PortalGrantWindow,
+    worker: u32,
+) -> Result<GrantTarget<'a>, MmError> {
+    if window.operation.carrier != portal.carrier {
+        return Err(MmError::Stale);
+    }
+    // SAFETY: this is only a candidate identity. editor_for authenticates its
+    // exact notification source before admitting it; root_for and the fault
+    // plan below validate incarnation, generation, range, protection and source.
+    let handle = unsafe {
+        El1MmHandle::from_admitted_owner(
+            window.operation.carrier,
+            window.operation.mm,
+            window.operation.incarnation,
+        )
+    };
+    let gate = portal.observe_wait(handle, carrick_el1_abi::PortalWaitCause::Gate)?;
+    let editor = portal.editor_for(handle, worker)?;
+    let index = portal
+        .spaces
+        .find(window.operation.mm.raw())
+        .ok_or(MmError::Stale)?;
+    // A host can raise the gate after admission, then wait for this editor.
+    // Observe before probing and release the editor before parking that wait.
+    let grant = portal
+        .spaces
+        .grant(index, window.operation.mm.raw())
+        .ok_or_else(|| gate.map_or(MmError::Busy, MmError::Wait))?;
+    let mut root = portal.root_for(handle, worker)?;
+    let authenticated = root.authenticate_fork_transfer_fault(
+        crate::memory::reservations::ReservationFaultPlan {
+            mm: window.operation.mm,
+            generation: window.generation,
+            range: window.range,
+            protection: window.protection,
+            fault_page: window.fault_page,
+        },
+        window.host_backing,
+        window.fork_sequence,
+    );
+    Ok(GrantTarget {
+        window,
+        grant,
+        _editor: editor,
+        authenticated,
+    })
+}
+
 /// Revalidate an owner-selected lazy window and apply its isolated submission
 /// through the existing descriptor executor. Normal descriptor drains cannot
 /// see the submission before this exact-generation check.
@@ -1249,60 +1307,39 @@ pub fn serve_grant<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
     residency: &FrameGrantResidencyTable,
     worker: u32,
     invalidate: impl FnOnce(),
+) -> Result<Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt>, MmError> {
+    let Some(window) = slot.window() else {
+        return Ok(None);
+    };
+    let target = grant_target(portal, window, worker)?;
+    Ok(apply_grant(slot, words, residency, target, invalidate))
+}
+
+fn apply_grant<W: LiveDescriptorWords + ?Sized>(
+    slot: &carrick_el1_abi::PortalGrantSlot,
+    words: &W,
+    residency: &FrameGrantResidencyTable,
+    target: GrantTarget<'_>,
+    invalidate: impl FnOnce(),
 ) -> Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt> {
     use carrick_mmu_core::aarch64::descriptor_txn::{
         DescriptorOp, DescriptorOutcome, DescriptorRefusal, InlineJournal, execute_descriptor_txn,
     };
-    let window = slot.window()?;
+    let GrantTarget {
+        window,
+        grant,
+        _editor: editor,
+        authenticated,
+    } = target;
     let mm = window.operation.mm;
     let claimed = slot.descriptor().claim_for_mm(mm.raw())?;
-    let editor = portal.spaces.find(mm.raw()).and_then(|index| {
-        portal.space_access(worker).ok()?.try_begin_edit(
-            index,
-            mm.raw(),
-            NonZeroU64::new(u64::from(worker) + 1)?,
-        )
-    });
     let outcome = (|| {
-        if editor.is_none() {
-            return DescriptorOutcome::Refused(DescriptorRefusal::Contended);
-        }
         let Ok(txn) = claimed.txn() else {
             return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
         };
-        let authenticated = (|| -> Result<(), MmError> {
-            if window.operation.carrier != portal.carrier {
-                return Err(MmError::Stale);
-            }
-            let mut root = portal.root(mm, worker)?;
-            let plan = crate::memory::reservations::ReservationFaultPlan {
-                mm,
-                generation: window.generation,
-                range: window.range,
-                protection: window.protection,
-                fault_page: window.fault_page,
-            };
-            if root.incarnation().raw() != window.operation.incarnation.get()
-                || !root.authenticate_fork_transfer_fault(
-                    plan,
-                    window.host_backing,
-                    window.fork_sequence,
-                )
-            {
-                return Err(MmError::Stale);
-            }
-            Ok(())
-        })();
-        if authenticated.is_err() {
+        if !authenticated {
             return DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot);
         }
-        let Some(grant) = portal
-            .spaces
-            .find(mm.raw())
-            .and_then(|index| portal.spaces.grant(index, mm.raw()))
-        else {
-            return DescriptorOutcome::Refused(DescriptorRefusal::Contended);
-        };
         let DescriptorOp::Prepare {
             publication,
             resident,
@@ -1380,15 +1417,16 @@ pub fn serve_grant<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
 
 #[cfg(target_os = "none")]
 pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
+    use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
+    // Every pre-claim failure is explicit; only a typed owner wait suspends.
+    frame.x[0] = 22;
+    frame.x[14] = 0;
     let Some(executor_slot) = carrick_el1_abi::service_slot_from_stack(
         crate::substrate::sched::hw::read_current_sp(),
         frame.slot,
     ) else {
-        frame.x[0] = 3;
         return;
     };
-    let _ = executor_slot;
-    use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
     let slots =
         unsafe { &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots) };
     let Some(slot) = slots.grant(frame.slot as usize) else {
@@ -1397,22 +1435,41 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let Some(window) = slot.window() else {
         return;
     };
+    let Some(carrier) = slots.carrier() else {
+        return;
+    };
     let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
+    let portal = MmPortal::<GuestMetadataPin> {
+        carrier,
+        roots: crate::memory::reservations::shared_guest(),
+        spaces: &zone.spaces,
+        nodes: None,
+        zone: Some(zone),
+    };
+    let target = match grant_target(&portal, window, u32::from(executor_slot.raw())) {
+        Ok(target) => target,
+        Err(MmError::Wait(wait)) => {
+            frame.x[0] = 11;
+            frame.x[14] = 3;
+            frame.x[16] = wait.cause().encode();
+            frame.x[17] = wait.revision();
+            return;
+        }
+        Err(error) => {
+            frame.x[0] = u64::from(error.errno());
+            return;
+        }
+    };
     let ttbr: u64;
     unsafe {
         core::arch::asm!("mrs {}, ttbr0_el1",out(reg)ttbr,options(nomem,nostack));
     }
-    let Some(grant) = zone
-        .spaces
-        .find(window.operation.mm.raw())
-        .and_then(|index| zone.spaces.grant(index, window.operation.mm.raw()))
-    else {
+    let Some(table) = carrick_el1_abi::service_target_table_window(ttbr, target.grant.ttbr0) else {
         return;
     };
-    let Some(table) = carrick_el1_abi::service_target_table_window(ttbr, grant.ttbr0) else {
-        return;
+    let maintenance = crate::fault::El1TableMaintenance {
+        ttbr0: target.grant.ttbr0,
     };
-    let maintenance = crate::fault::El1TableMaintenance { ttbr0: grant.ttbr0 };
     let Ok(words) = (unsafe {
         PrimaryTableWords::new(
             table.words,
@@ -1424,34 +1481,20 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     }) else {
         return;
     };
-    let Some(carrier) = slots.carrier() else {
-        return;
-    };
-    let portal = MmPortal::<GuestMetadataPin> {
-        carrier,
-        roots: crate::memory::reservations::shared_guest(),
-        spaces: &zone.spaces,
-        nodes: None,
-        zone: Some(zone),
-    };
-    if zone
-        .spaces
-        .find(window.operation.mm.raw())
-        .and_then(|index| zone.spaces.grant(index, window.operation.mm.raw()))
-        .is_none_or(|current| current.ttbr0 != grant.ttbr0)
-    {
-        return;
-    }
-    serve_grant(
-        &portal,
+    let root = target.grant.ttbr0;
+    if apply_grant(
         slot,
         &words,
         carrick_el1_abi::frame_grant_residency_guest(),
-        frame.slot as u32,
+        target,
         || {
-            crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, grant.ttbr0);
+            crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, root);
         },
-    );
+    )
+    .is_some()
+    {
+        frame.x[0] = 0;
+    }
 }
 
 #[cfg(any(test, target_os = "none"))]

@@ -3391,7 +3391,20 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     )));
                 }
                 TransferProgress::Supply(supply) => {
-                    if !self.supply_memory(supply)? {
+                    let supplied = match self.supply_memory(supply) {
+                        Err(MemoryError::OwnerWait(wait)) => {
+                            return Err(MemoryError::ReadSuspended(Box::new(
+                                carrick_guest_mem::MemoryReadSuspension {
+                                    wait: carrick_guest_mem::MemoryReadWait::Owner(wait),
+                                    continuation: carrick_guest_mem::OwnedReadContinuation::new(
+                                        transfer,
+                                    ),
+                                },
+                            )));
+                        }
+                        result => result?,
+                    };
+                    if !supplied {
                         return Err(MemoryError::ReadSuspended(Box::new(
                             carrick_guest_mem::MemoryReadSuspension {
                                 wait: carrick_guest_mem::MemoryReadWait::Supply(supply),
@@ -3581,6 +3594,13 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             request,
         )
         .map_err(|error| MemoryError::HostMap(error.to_string()))
+        .and_then(|progress| match progress {
+            crate::user_transfer::SupplyProgress::Ready => Ok(true),
+            crate::user_transfer::SupplyProgress::Declined => Ok(false),
+            crate::user_transfer::SupplyProgress::OwnerWait(wait) => {
+                Err(MemoryError::OwnerWait(wait))
+            }
+        })
     }
 
     fn read_carrick_internal(
