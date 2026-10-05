@@ -1495,6 +1495,7 @@ impl ZoneTables {
         record.next.store(NIL, Ordering::Relaxed);
         record.host_wanted.clear();
         record.deadline.store(0, Ordering::Relaxed);
+        record.object.reset_completion_flags();
         record.claim.store(Claim::Free.encode(), Ordering::Release);
         Ok(id)
     }
