@@ -512,6 +512,10 @@ path = "crates/carrick-vmm-hvf/src/trap/vcpu_admission.rs"
 contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.gic"]
 
 [[surfaces]]
+path = "crates/carrick-vmm-hvf/src/trap/admission_retry.rs"
+contracts = ["kernel.vcpu.vm-lifetime", "kernel.el1.gic"]
+
+[[surfaces]]
 path = "crates/carrick-vmm-hvf/src/trap/mapping_plan.rs"
 contracts = ["kernel.vcpu.vm-lifetime"]
 
