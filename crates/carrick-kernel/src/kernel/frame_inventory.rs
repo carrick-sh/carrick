@@ -137,13 +137,7 @@ struct ReservationRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FrameEntry {
     length: FrameLength,
-    /// `u32` keeps the entry at 16 bytes with the flag below
-    /// (`high_alias_frame_keeps_constant_size_apply_state`); exhausting it
-    /// is `MappingCountExhausted`, as it was for `usize`.
-    mapping_count: u32,
-    /// A `RetireFrameIfLastUnmap` found mappings remaining: the batch that
-    /// applies the last unmap retires the frame.
-    retire_on_last_unmap: bool,
+    references: carrick_core::mm::frames::FrameReferences,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -422,7 +416,7 @@ impl FrameInventoryAuthority {
                 .frames
                 .get(&frame)
                 .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
-            if frame_entry.mapping_count == 0 {
+            if frame_entry.references.count() == 0 {
                 return Err(FrameInventoryError::MappingCountUnderflow(frame));
             }
         }
@@ -438,11 +432,11 @@ impl FrameInventoryAuthority {
                     .frames
                     .get_mut(&frame)
                     .ok_or(FrameInventoryError::RollbackReceiptMismatch(mapping))?;
-                frame_entry.mapping_count = frame_entry
-                    .mapping_count
-                    .checked_sub(1)
-                    .ok_or(FrameInventoryError::MappingCountUnderflow(frame))?;
-                frame_entry.mapping_count == 0
+                frame_entry
+                    .references
+                    .unmap()
+                    .map_err(|_| FrameInventoryError::MappingCountUnderflow(frame))?;
+                frame_entry.references.count() == 0
             };
             if retire_frame {
                 state.frames.remove(&frame);
@@ -697,7 +691,7 @@ impl FrameInventoryAuthority {
         state
             .frames
             .get(&frame)
-            .map(|entry| entry.mapping_count as usize)
+            .map(|entry| entry.references.count() as usize)
     }
 
     /// Query extent liveness for a batch of candidate extents and reference
@@ -727,7 +721,7 @@ impl FrameInventoryAuthority {
                 state
                     .frames
                     .get(&frame)
-                    .map(|entry| entry.mapping_count as usize)
+                    .map(|entry| entry.references.count() as usize)
             })
             .collect();
         (extent_liveness, frame_counts)
@@ -830,8 +824,7 @@ fn apply_event(
                     frame,
                     FrameEntry {
                         length,
-                        mapping_count: 0,
-                        retire_on_last_unmap: false,
+                        references: carrick_core::mm::frames::FrameReferences::default(),
                     },
                 );
             }
@@ -848,12 +841,10 @@ fn apply_event(
                     actual: length,
                 });
             }
-            frame_entry.mapping_count = frame_entry
-                .mapping_count
-                .checked_add(1)
-                .ok_or(FrameInventoryError::MappingCountExhausted(frame))?;
-            // A new holder owns the frame's retirement from here on.
-            frame_entry.retire_on_last_unmap = false;
+            frame_entry
+                .references
+                .retain()
+                .map_err(|_| FrameInventoryError::MappingCountExhausted(frame))?;
             state.insert_mapping(
                 mapping,
                 MappingEntry {
@@ -921,11 +912,10 @@ fn apply_event(
             let frame = state
                 .frame_mut(frame_id)
                 .ok_or(FrameInventoryError::RetiredFrame(frame_id))?;
-            frame.mapping_count = frame
-                .mapping_count
-                .checked_sub(1)
-                .ok_or(FrameInventoryError::MappingCountUnderflow(frame_id))?;
-            let retire = frame.mapping_count == 0 && frame.retire_on_last_unmap;
+            let retire = frame
+                .references
+                .unmap()
+                .map_err(|_| FrameInventoryError::MappingCountUnderflow(frame_id))?;
             state.unmap_mapping(mapping, frame_id, generation);
             if retire {
                 tracing::debug!(
@@ -943,7 +933,7 @@ fn apply_event(
             let entry = state
                 .frame(frame)
                 .ok_or(FrameInventoryError::RetiredFrame(frame))?;
-            if entry.mapping_count != 0 {
+            if entry.references.count() != 0 {
                 return Err(FrameInventoryError::FrameStillMapped(frame));
             }
             let expected = state
@@ -967,7 +957,7 @@ fn apply_event(
                 // An earlier holder's pending retirement already ran in this
                 // batch's last unmap, or another holder's batch retired it.
                 None => ConditionalRetirement::AlreadyRetired,
-                Some(entry) if entry.mapping_count == 0 => {
+                Some(entry) if entry.references.count() == 0 => {
                     let expected = state
                         .last_unmapped
                         .get(&frame)
@@ -983,13 +973,22 @@ fn apply_event(
                     state.retire_frame(frame);
                     ConditionalRetirement::Retired
                 }
-                Some(entry) if entry.retire_on_last_unmap => ConditionalRetirement::AlreadyPending,
                 Some(_) => {
                     let entry = state
                         .frame_mut(frame)
                         .ok_or(FrameInventoryError::RetiredFrame(frame))?;
-                    entry.retire_on_last_unmap = true;
-                    ConditionalRetirement::Deferred
+                    match entry.references.request_retirement() {
+                        carrick_core::mm::frames::ReferenceRetirement::AlreadyPending => {
+                            ConditionalRetirement::AlreadyPending
+                        }
+                        carrick_core::mm::frames::ReferenceRetirement::Deferred => {
+                            ConditionalRetirement::Deferred
+                        }
+                        // The zero-reference arm above already handled this case.
+                        carrick_core::mm::frames::ReferenceRetirement::Ready => {
+                            ConditionalRetirement::AlreadyRetired
+                        }
+                    }
                 }
             };
             tracing::debug!(

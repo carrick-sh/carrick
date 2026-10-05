@@ -30,7 +30,7 @@ const STAGE1_ROOT_SLOT_SIZE: u64 = 2 * 1024 * 1024;
 const STAGE1_ROOT_SLOT_COUNT: u32 =
     (carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE / STAGE1_ROOT_SLOT_SIZE) as u32;
 
-use carrick_core::mm::retirement::{RootQuarantine, RootRetirementError, RootSlot};
+use carrick_core::mm::retirement::{LeaseGate, RootQuarantine, RootRetirementError, RootSlot};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Stage1RootSlot(u32);
@@ -108,7 +108,7 @@ pub(crate) struct Stage1MmLease {
     residency: AsidResidency,
     root_slot: Option<Stage1RootSlot>,
     extension_slots: Mutex<Vec<Stage1RootSlot>>,
-    lifecycle: Mutex<Stage1MmLeaseLifecycle>,
+    lifecycle: Mutex<LeaseGate>,
     /// The last foreign-COW invalidation generation published for this MM.
     cow_invalidation_published: Arc<AtomicU64>,
     /// The last generation a broadcast invalidation covered (on any vCPU).
@@ -182,13 +182,6 @@ impl CowInvalidationTicket {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Stage1MmLeaseLifecycle {
-    Live,
-    RetirementPrepared,
-    Retired,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum Stage1RetirementPreparationFailpoint {
     Disabled,
@@ -219,7 +212,7 @@ impl Stage1MmLease {
             residency: AsidResidency::new(asid),
             root_slot,
             extension_slots: Mutex::new(Vec::new()),
-            lifecycle: Mutex::new(Stage1MmLeaseLifecycle::Live),
+            lifecycle: Mutex::new(LeaseGate::default()),
             cow_invalidation_published: Arc::new(AtomicU64::new(0)),
             cow_invalidation_serviced: Arc::new(AtomicU64::new(0)),
             cow_invalidation: Mutex::new(0),
@@ -258,7 +251,7 @@ impl Stage1MmLease {
             self.binding().ttbr0.raw(),
             0,
         );
-        *space = if *lifecycle == Stage1MmLeaseLifecycle::Live {
+        *space = if lifecycle.is_live() {
             publish(self.binding().ttbr0.raw())
                 .map_or(AddressSpaceState::Never, AddressSpaceState::Published)
         } else {
@@ -317,12 +310,12 @@ impl Stage1MmLease {
     /// Whether this lease has stopped admitting executor loads, for either
     /// reason: the lease itself is retiring, or its ASID generation is.
     pub(crate) fn is_retiring(&self) -> bool {
-        *self.lifecycle.lock() != Stage1MmLeaseLifecycle::Live || self.residency.is_retiring()
+        !self.lifecycle.lock().is_live() || self.residency.is_retiring()
     }
 
     pub(crate) fn begin_asid_load(&self) -> Result<AsidLoad, AsidResidencyError> {
         let lifecycle = self.lifecycle.lock();
-        if *lifecycle != Stage1MmLeaseLifecycle::Live {
+        if !lifecycle.is_live() {
             return Err(AsidResidencyError::Retiring);
         }
         self.residency.begin_load()
@@ -409,7 +402,7 @@ impl Stage1MmLease {
 
     pub(crate) fn publish_stage1_root(&self, stage1_root: u64) -> Result<MmBinding, Stage1MmError> {
         let lifecycle = self.lifecycle.lock();
-        if *lifecycle != Stage1MmLeaseLifecycle::Live {
+        if !lifecycle.is_live() {
             return Err(Stage1MmError::Retired);
         }
         let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
@@ -704,25 +697,24 @@ impl Stage1MmPool {
     ) -> Result<PreparedStage1MmRetirement, Stage1MmError> {
         let root_quarantine = RootQuarantine::reserve(lease.root_slot)?;
         let mut lifecycle = lease.lifecycle.lock();
-        if *lifecycle != Stage1MmLeaseLifecycle::Live {
+        if !lifecycle.prepare() {
             return Err(Stage1MmError::Retired);
         }
-        *lifecycle = Stage1MmLeaseLifecycle::RetirementPrepared;
         if failpoint == Stage1RetirementPreparationFailpoint::AfterLeaseGate {
-            *lifecycle = Stage1MmLeaseLifecycle::Live;
+            lifecycle.rollback();
             return Err(Stage1MmError::Retired);
         }
 
         let residency = match lease.residency.prepare_retirement() {
             Ok(residency) => residency,
             Err(error) => {
-                *lifecycle = Stage1MmLeaseLifecycle::Live;
+                lifecycle.rollback();
                 return Err(error.into());
             }
         };
         if failpoint == Stage1RetirementPreparationFailpoint::AfterResidency {
             drop(residency);
-            *lifecycle = Stage1MmLeaseLifecycle::Live;
+            lifecycle.rollback();
             return Err(Stage1MmError::Retired);
         }
         let asid = {
@@ -733,14 +725,14 @@ impl Stage1MmPool {
             Ok(asid) => asid,
             Err(error) => {
                 drop(residency);
-                *lifecycle = Stage1MmLeaseLifecycle::Live;
+                lifecycle.rollback();
                 return Err(error.into());
             }
         };
         if failpoint == Stage1RetirementPreparationFailpoint::AfterAllocator {
             drop(asid);
             drop(residency);
-            *lifecycle = Stage1MmLeaseLifecycle::Live;
+            lifecycle.rollback();
             return Err(Stage1MmError::Retired);
         }
         drop(lifecycle);
@@ -807,11 +799,7 @@ impl PreparedStage1MmRetirement {
 
     pub(crate) fn commit(mut self) -> Stage1MmRetirement {
         let mut lifecycle = self.lease.lifecycle.lock();
-        assert_eq!(
-            *lifecycle,
-            Stage1MmLeaseLifecycle::RetirementPrepared,
-            "prepared stage-1 retirement lost its lease-gate reservation"
-        );
+
         let Some(residency) = self.residency.take() else {
             carrick_fatal!(
                 "hvpatch::stage1_retirement",
@@ -826,7 +814,7 @@ impl PreparedStage1MmRetirement {
             );
         };
         let asid = asid.commit();
-        *lifecycle = Stage1MmLeaseLifecycle::Retired;
+        lifecycle.commit();
         drop(lifecycle);
         self.finished = true;
         // The ASID is retiring: guest EL1 may not install the address space
@@ -867,11 +855,7 @@ impl Drop for PreparedStage1MmRetirement {
             return;
         }
         let mut lifecycle = self.lease.lifecycle.lock();
-        assert_eq!(
-            *lifecycle,
-            Stage1MmLeaseLifecycle::RetirementPrepared,
-            "prepared stage-1 retirement lost its lease-gate reservation"
-        );
+
         drop(self.asid.take());
         #[cfg(test)]
         if let Some(hook) = self.rollback_hook.as_ref() {
@@ -884,7 +868,7 @@ impl Drop for PreparedStage1MmRetirement {
             hook.after_residency.wait();
             hook.resume_after_residency.wait();
         }
-        *lifecycle = Stage1MmLeaseLifecycle::Live;
+        lifecycle.rollback();
     }
 }
 
@@ -1052,13 +1036,7 @@ impl Stage1MmRetirement {
     /// entry is freed.
     pub(crate) fn retire_address_space(&self) {
         let space = self.space.lock().take();
-        if let Some(space) = space.as_ref() {
-            space.retire_reservations();
-        }
-        drop(space);
-        // A foreign drain may still borrow this generation's TTBR0 on another
-        // MM's vCPU: its window ends before the invalidation is decided.
-        self.residency.wait_for_admitted_loads();
+        carrick_core::mm::retirement::drain_publication(space, &self.residency);
     }
 
     pub(crate) fn asid_generation(&self) -> AsidGeneration {
