@@ -2229,18 +2229,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-mem/src/memory.rs:2950 in `fill_random_bytes`, `std::fs::File::open` accesses only the fixed host entropy source used for guest stack randomization used by `fill_random_bytes`.",
+    "rationale": "At crates/carrick-mem/src/memory.rs:2952 in `fill_random_bytes`, `std::fs::File::open` accesses only the fixed host entropy source used for guest stack randomization used by `fill_random_bytes`.",
     "review_id": "HA-000090",
     "source": {
-      "byte_end": 127507,
-      "byte_start": 127493,
+      "byte_end": 127753,
+      "byte_start": 127739,
       "column": 20,
       "column_end": 34,
       "column_start": 20,
       "file": "crates/carrick-mem/src/memory.rs",
-      "line": 2950,
-      "line_end": 2950,
-      "line_start": 2950
+      "line": 2952,
+      "line_end": 2952,
+      "line_start": 2952
     }
   },
   {
@@ -2319,8 +2319,8 @@
     "rationale": "At crates/carrick-runtime/src/runtime/exec.rs:124 in `load_execve_image`, `std::fs::File::open` accesses only the selected absolute executable in the explicitly enabled bare RunElf host-filesystem fallback; container execution keeps this fallback disabled.",
     "review_id": "HA-000654",
     "source": {
-      "byte_end": 5027,
-      "byte_start": 5008,
+      "byte_end": 5010,
+      "byte_start": 4991,
       "column": 28,
       "column_end": 47,
       "column_start": 28,
@@ -6126,18 +6126,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-mem/src/memory.rs:1392 in `load_elf_for`, `std::fs::read` accesses only the selected guest executable image used by `load_elf_for`.",
+    "rationale": "At crates/carrick-mem/src/memory.rs:1394 in `load_elf_for`, `std::fs::read` accesses only the selected guest executable image used by `load_elf_for`.",
     "review_id": "HA-000227",
     "source": {
-      "byte_end": 67636,
-      "byte_start": 67628,
+      "byte_end": 67739,
+      "byte_start": 67731,
       "column": 20,
       "column_end": 28,
       "column_start": 20,
       "file": "crates/carrick-mem/src/memory.rs",
-      "line": 1392,
-      "line_end": 1392,
-      "line_start": 1392
+      "line": 1394,
+      "line_end": 1394,
+      "line_start": 1394
     }
   },
   {
@@ -6156,18 +6156,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-mem/src/memory.rs:1394 in `load_elf_for`, `std::fs::read` accesses only the selected guest interpreter image used by `load_elf_for`.",
+    "rationale": "At crates/carrick-mem/src/memory.rs:1396 in `load_elf_for`, `std::fs::read` accesses only the selected guest interpreter image used by `load_elf_for`.",
     "review_id": "HA-000228",
     "source": {
-      "byte_end": 67745,
-      "byte_start": 67737,
+      "byte_end": 67848,
+      "byte_start": 67840,
       "column": 81,
       "column_end": 89,
       "column_start": 81,
       "file": "crates/carrick-mem/src/memory.rs",
-      "line": 1394,
-      "line_end": 1394,
-      "line_start": 1394
+      "line": 1396,
+      "line_end": 1396,
+      "line_start": 1396
     }
   },
   {
@@ -6321,8 +6321,8 @@
     "rationale": "At crates/carrick-runtime/src/runtime/exec.rs:196 in `load_execve_image`, `std::fs::read` accesses only the selected guest exec target used by `load_execve_image`.",
     "review_id": "HA-000241",
     "source": {
-      "byte_end": 8458,
-      "byte_start": 8445,
+      "byte_end": 8441,
+      "byte_start": 8428,
       "column": 13,
       "column_end": 26,
       "column_start": 13,
@@ -11561,18 +11561,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:293 in `forked_child_die_by_signal`, the host result from `std::fs::write` determines the guest child signal wait status published by `forked_child_die_by_signal`.",
+    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:313 in `forked_child_die_by_signal`, the host result from `std::fs::write` determines the guest child signal wait status published by `forked_child_die_by_signal`.",
     "review_id": "HA-000415",
     "source": {
-      "byte_end": 11675,
-      "byte_start": 11661,
+      "byte_end": 12493,
+      "byte_start": 12479,
       "column": 17,
       "column_end": 31,
       "column_start": 17,
       "file": "crates/carrick-kernel/src/exec_helpers.rs",
-      "line": 293,
-      "line_end": 293,
-      "line_start": 293
+      "line": 313,
+      "line_end": 313,
+      "line_start": 313
     }
   },
   {
@@ -11588,18 +11588,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:311 in `forked_child_die_by_signal`, the host result from `std::fs::write` determines the guest child signal wait status published by `forked_child_die_by_signal`.",
+    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:331 in `forked_child_die_by_signal`, the host result from `std::fs::write` determines the guest child signal wait status published by `forked_child_die_by_signal`.",
     "review_id": "HA-000416",
     "source": {
-      "byte_end": 12708,
-      "byte_start": 12694,
+      "byte_end": 13526,
+      "byte_start": 13512,
       "column": 17,
       "column_end": 31,
       "column_start": 17,
       "file": "crates/carrick-kernel/src/exec_helpers.rs",
-      "line": 311,
-      "line_end": 311,
-      "line_start": 311
+      "line": 331,
+      "line_end": 331,
+      "line_start": 331
     }
   },
   {
@@ -13613,18 +13613,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:263 in `forked_child_exit`, the host result from `std::process::id` determines the guest child-exit and SIGCHLD publication identity used by `forked_child_exit`.",
+    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:283 in `forked_child_exit`, the host result from `std::process::id` determines the guest child-exit and SIGCHLD publication identity used by `forked_child_exit`.",
     "review_id": "HA-000514",
     "source": {
-      "byte_end": 10629,
-      "byte_start": 10613,
+      "byte_end": 11447,
+      "byte_start": 11431,
       "column": 15,
       "column_end": 31,
       "column_start": 15,
       "file": "crates/carrick-kernel/src/exec_helpers.rs",
-      "line": 263,
-      "line_end": 263,
-      "line_start": 263
+      "line": 283,
+      "line_end": 283,
+      "line_start": 283
     }
   },
   {
@@ -13640,18 +13640,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:293 in `forked_child_die_by_signal`, the host result from `std::process::id` determines the guest signal-death and SIGCHLD publication identity used by `forked_child_die_by_signal`.",
+    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:313 in `forked_child_die_by_signal`, the host result from `std::process::id` determines the guest signal-death and SIGCHLD publication identity used by `forked_child_die_by_signal`.",
     "review_id": "HA-000515",
     "source": {
-      "byte_end": 11713,
-      "byte_start": 11697,
+      "byte_end": 12531,
+      "byte_start": 12515,
       "column": 53,
       "column_end": 69,
       "column_start": 53,
       "file": "crates/carrick-kernel/src/exec_helpers.rs",
-      "line": 293,
-      "line_end": 293,
-      "line_start": 293
+      "line": 313,
+      "line_end": 313,
+      "line_start": 313
     }
   },
   {
@@ -13667,18 +13667,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:311 in `forked_child_die_by_signal`, the host result from `std::process::id` determines the guest child signal wait status published by `forked_child_die_by_signal`.",
+    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:331 in `forked_child_die_by_signal`, the host result from `std::process::id` determines the guest child signal wait status published by `forked_child_die_by_signal`.",
     "review_id": "HA-000516",
     "source": {
-      "byte_end": 12746,
-      "byte_start": 12730,
+      "byte_end": 13564,
+      "byte_start": 13548,
       "column": 53,
       "column_end": 69,
       "column_start": 53,
       "file": "crates/carrick-kernel/src/exec_helpers.rs",
-      "line": 311,
-      "line_end": 311,
-      "line_start": 311
+      "line": 331,
+      "line_end": 331,
+      "line_start": 331
     }
   },
   {
@@ -13696,18 +13696,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:444 in `stop_for_ptrace_signal`, the host result from `std::process::id` determines the guest ptrace child-exit result used by `stop_for_ptrace_signal`.",
+    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:464 in `stop_for_ptrace_signal`, the host result from `std::process::id` determines the guest ptrace child-exit result used by `stop_for_ptrace_signal`.",
     "review_id": "HA-000517",
     "source": {
-      "byte_end": 17612,
-      "byte_start": 17596,
+      "byte_end": 18430,
+      "byte_start": 18414,
       "column": 49,
       "column_end": 65,
       "column_start": 49,
       "file": "crates/carrick-kernel/src/exec_helpers.rs",
-      "line": 444,
-      "line_end": 444,
-      "line_start": 444
+      "line": 464,
+      "line_end": 464,
+      "line_start": 464
     }
   },
   {
@@ -18449,18 +18449,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:389 in `await_virtual_ptrace_stop_request`, `std::thread::yield_now` acts only on the current ptrace-stop retry worker used by `await_virtual_ptrace_stop_request`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/exec_helpers.rs:409 in `await_virtual_ptrace_stop_request`, `std::thread::yield_now` acts only on the current ptrace-stop retry worker used by `await_virtual_ptrace_stop_request`; no guest identity selects its host target.",
     "review_id": "HA-000633",
     "source": {
-      "byte_end": 15132,
-      "byte_start": 15110,
+      "byte_end": 15950,
+      "byte_start": 15928,
       "column": 65,
       "column_end": 87,
       "column_start": 65,
       "file": "crates/carrick-kernel/src/exec_helpers.rs",
-      "line": 389,
-      "line_end": 389,
-      "line_start": 389
+      "line": 409,
+      "line_end": 409,
+      "line_start": 409
     }
   },
   {
