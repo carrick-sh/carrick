@@ -2759,6 +2759,9 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
                     "applied grant failed exact settlement; physical ownership retained: {error:?}"
                 )
             });
+            // Completion callbacks may immediately retire this exact owner.
+            // Release the publisher's temporary pin before publishing readiness.
+            drop(self.pin.take());
             self.publication.take();
         } else if let Err(error) = result {
             if let carrick_aarch64::descriptor_drain::GuestPublishError::Unsettled(error) =
@@ -2901,8 +2904,11 @@ impl Drop for PendingTransferGrant {
             alias_registry()
                 .lock()
                 .remove_exact_values_in_batch(&[publication.alias]);
+            drop(inventory);
         }
-        let _ = &self.pin;
+        // The local publication retains completion through rollback, physical
+        // pin release and every registry/inventory guard. It drops last.
+        drop(self.pin.take());
     }
 }
 
@@ -3058,6 +3064,7 @@ impl PendingImport<'_> {
             )
         });
         self.descriptor_undo.commit();
+        drop(self.pending.pin.take());
         Ok(publication.ready)
     }
 }
