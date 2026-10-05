@@ -412,7 +412,7 @@ pub(crate) struct MmArenaPublisher {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher {
-    fn publish_raw_fork_arena(&self, base: u64) -> Result<(), String> {
+    fn publish_raw_table_arena(&self, base: u64) -> Result<(), String> {
         let state = self
             .state
             .upgrade()
@@ -427,7 +427,7 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
             )
             .map_err(|error| error.to_string())
     }
-    fn retire_raw_fork_arena(&self, base: u64) -> Result<(), String> {
+    fn retire_raw_table_arena(&self, base: u64) -> Result<(), String> {
         let state = self
             .state
             .upgrade()

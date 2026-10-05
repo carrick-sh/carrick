@@ -3379,6 +3379,19 @@ pub trait ThreadedEngine: SyscallTrap + RegAccess + CurrentMmMemory + Send {
             "threaded backend has no stage-1 manager to install arena source".to_owned(),
         ))
     }
+    /// Before first execution, publish a root reachable by the maintenance
+    /// lane, then bind the exact MM lease. The callback only updates staged
+    /// metadata; it must leave that metadata unchanged on error.
+    fn publish_initial_stage1_root(
+        &mut self,
+        publish: &mut dyn FnMut(u64) -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        let root = self
+            .get_sys_reg(crate::SysReg::Ttbr0)
+            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+        publish(root & 0x0000_ffff_ffff_f000)
+    }
+
     /// The guest CPU ISA this engine runs. Fixed per process (the guest ISA
     /// equals the host ISA), so it is an associated type — monomorphized per
     /// ISA, no syscall-hot-path vtable. Aarch64 today; x86_64 in Phase 2.
