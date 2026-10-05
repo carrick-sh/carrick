@@ -1770,6 +1770,139 @@ fn owner_fork_refuses_outstanding_copy_and_keeps_peer_same_va_separate() {
     );
 }
 
+/// A closed child is built from the live parent's owner graph while another
+/// admitted MM uses the same guest VA. Exercise the census, preparation,
+/// physical-selection receipt, descriptor publication and final admission in
+/// one transaction; none of those steps may consult the peer's translation.
+#[test]
+fn owner_fork_publishes_child_with_two_live_same_va_mms() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let parent = admit(&region, &spaces, 2, ROOT, 2, 0);
+    let peer_root = ROOT + 0xc00000;
+    let peer = admit(&region, &spaces, 4, peer_root, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let parent_tables = Tables::new(ROOT, IPA, 2);
+    let peer_tables = Tables::new(peer_root, IPA + 0x300000, 1);
+    let child = Tables {
+        base: ROOT + 0x400000,
+        words: (0..(2 * 1024 * 1024 / 8))
+            .map(|_| core::sync::atomic::AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    };
+    let supply = Tables::new(ROOT + 0x800000, 0, 0);
+    // The production bootstrap has an EL1-only control window followed by
+    // its table alias. Model the full 2 MiB structural block so Fork must
+    // request control-copy custody and rebind every child table alias.
+    let control = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE - 0x20000;
+    let indices = carrick_mmu_core::aarch64::indices(control);
+    parent_tables.words[512 + indices[1]].store((ROOT + 0x4000) | 3, Ordering::Release);
+    parent_tables.words[2048 + indices[2]].store(0xb000_0000 | (RW & !3) | 1, Ordering::Release);
+    let request = fork_request(&region, &spaces, parent, 3, &child, &supply);
+    let arenas = [&parent_tables, &child, &supply, &peer_tables];
+    let words = ForkWords {
+        arenas: &arenas,
+        loads: core::cell::Cell::new(0),
+    };
+
+    let scratch = portal.census_fork(request, &words, 0).unwrap();
+    struct ExactParentFrames;
+    impl carrick_aarch64::fork::ForkCustody for ExactParentFrames {
+        type Retention = ();
+        fn retain(
+            &self,
+            _: carrick_el1_abi::PortalForkRequest,
+            selected: carrick_el1_abi::PortalForkCustody,
+        ) -> Result<Option<()>, carrick_hal::TrapError> {
+            Ok(match selected {
+                carrick_el1_abi::PortalForkCustody::Frame { ipa, .. } => {
+                    ipa == IPA || ipa == IPA + 4096
+                }
+                carrick_el1_abi::PortalForkCustody::StructuralCopy {
+                    source_ipa,
+                    destination_ipa,
+                    len,
+                    ..
+                } => {
+                    (0xb000_0000..0xb020_0000).contains(&source_ipa)
+                        && destination_ipa == 0xa000_0000 + (source_ipa - 0xb000_0000)
+                        && len == 4096
+                }
+                _ => false,
+            }
+            .then_some(()))
+        }
+    }
+    let slot = carrick_el1_abi::PortalForkSlot::new();
+    let unpublished = core::cell::RefCell::new(None);
+    let pending =
+        carrick_aarch64::fork::prepare(request, &slot, &ExactParentFrames, |frame, effect| {
+            let service = slot.claim().unwrap();
+            let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
+            assert_eq!(plan.custody().len(), 66);
+            for (index, selected) in plan.custody().iter().copied().enumerate() {
+                assert!(service.retain(index as u64, selected, || {
+                    assert!(effect());
+                }));
+            }
+            let child = portal.publish_fork(plan, &words, 0).unwrap();
+            service.publish_detached(child.completion()).unwrap();
+            *unpublished.borrow_mut() = Some(child);
+            Ok(frame)
+        })
+        .unwrap()
+        .unwrap();
+    let receipt = pending
+        .finish(true, |frame, _| {
+            assert_eq!(slot.finish_request(), Some((request, true)));
+            let receipt = unpublished
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .commit(&portal, 0)
+                .unwrap();
+            assert!(slot.complete_finish_receipt(receipt));
+            Ok(frame)
+        })
+        .unwrap()
+        .completion();
+    assert_eq!(receipt.child.mm(), request.child_mm);
+    spaces.open(spaces.find(3).unwrap());
+
+    for (mm, expected_ipa) in [
+        (parent, IPA),
+        (request.child_mm, IPA),
+        (peer, IPA + 0x300000),
+    ] {
+        let transfer = portal
+            .begin(
+                portal.admitted_handle(mm, 0).unwrap(),
+                GuestVa::new(VA),
+                1,
+                TransferIntent::UserRead,
+                0,
+            )
+            .unwrap();
+        let selection = match portal
+            .select(
+                &transfer,
+                &words,
+                &mut NoopPreparedResolver,
+                &mut NoopCowResolver,
+                &residency(),
+                0,
+            )
+            .unwrap()
+        {
+            TransferStep::Selected(selection) => selection,
+            other => panic!("owner fork transfer did not select resident frame: {other:?}"),
+        };
+        assert_eq!(selection.ipa, expected_ipa);
+    }
+}
+
 #[test]
 fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private() {
     use carrick_mmu_core::aarch64::descriptor_txn::{

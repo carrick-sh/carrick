@@ -449,8 +449,10 @@ dependencies = [
 name = "carrick-el1"
 version = "0.1.0"
 dependencies = [
+ "carrick-aarch64",
  "carrick-el1-abi",
  "carrick-guest-arch",
+ "carrick-hal",
  "carrick-inotify-core",
  "carrick-mem",
  "carrick-mmu-core",
