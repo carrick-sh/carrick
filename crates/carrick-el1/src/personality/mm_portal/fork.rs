@@ -35,15 +35,15 @@ pub(super) fn fork_table_window(
             return Err(check);
         }
     }
-    let base = parent_ttbr0 & PA;
-    if base < pool.physical_base || base + 4096 > pool.physical_base + pool.byte_len as u64 {
-        return Err(3);
-    }
-    Ok(carrick_mmu_core::aarch64::descriptor_txn::TableWindow {
-        words: base as *mut core::sync::atomic::AtomicU64,
-        physical_base: base,
-        byte_len: 4096,
-    })
+    // BIND authenticates this same root on the carrier maintenance lane.
+    // The fixed boot primary is outside the table pool but remains mapped
+    // there until its MM retires; only child/extension capacity must be in
+    // the pool. Keep Fork's root admission identical to BIND's.
+    carrick_el1_abi::service_target_table_window(
+        carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
+        parent_ttbr0,
+    )
+    .ok_or(3)
 }
 
 /// All allocation occurs before borrowing either owner. Unlinked table words
