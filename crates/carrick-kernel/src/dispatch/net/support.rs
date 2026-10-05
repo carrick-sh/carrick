@@ -566,7 +566,7 @@ pub(super) fn canonical_socket_errno(
 }
 
 const HOST_STREAM_BUF_TARGET: libc::c_int = 16 * 1024 * 1024;
-const HOST_STREAM_BUF_REQUIRED: libc::c_int = 8 * 1024 * 1024;
+const HOST_STREAM_BUF_FALLBACK: libc::c_int = 8 * 1024 * 1024;
 
 // Only referenced from the macOS-gated widening test now that widening reads
 // back nothing in the hot path (best-effort). Keep it for that coverage. The
@@ -625,13 +625,13 @@ fn set_host_socket_buffer_size(
 /// semantics differ.
 ///
 /// The host may reject or silently clamp a large `setsockopt(SO_*BUF)` request,
-/// so this function retries at the required floor and then reads back the actual
-/// kernel value. Widening is a BEST-EFFORT host-backing optimization: Linux
-/// `socket(2)` never fails for buffer-sizing reasons, so a host that caps the
-/// send/recv buffer below the desired floor (e.g. FreeBSD's default
-/// `kern.ipc.maxsockbuf`, which is smaller than 8 MiB) must NOT turn a valid
-/// socket creation into `ENOBUFS`. We set the largest value the host accepts and
-/// proceed with whatever backing capacity results.
+/// so this function tries the target and then a smaller fallback. Neither is a
+/// guaranteed floor, and there is no readback on the hot path. Widening is a
+/// BEST-EFFORT host-backing optimization: a host that caps the send/recv buffer
+/// below the fallback request (e.g. FreeBSD's default `kern.ipc.maxsockbuf`,
+/// which is smaller than 8 MiB) must NOT turn an otherwise valid
+/// socket creation into `ENOBUFS`. If both requests fail, the existing buffer
+/// remains; otherwise the host may clamp the accepted request.
 pub(super) fn widen_stream_socket_buffers(
     host_fd: i32,
     family: i32,
@@ -644,11 +644,10 @@ pub(super) fn widen_stream_socket_buffers(
         return Ok(());
     }
     for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-        // Prefer the target; if the host rejects it, drop to the required floor.
-        // Both are best-effort — a host that caps below either value keeps its
-        // own maximum rather than failing the socket.
+        // Prefer the target; if the host rejects it, try the smaller fallback.
+        // Both are best-effort; rejection preserves the existing buffer.
         if set_host_socket_buffer_size(host_fd, opt, HOST_STREAM_BUF_TARGET).is_err() {
-            let _ = set_host_socket_buffer_size(host_fd, opt, HOST_STREAM_BUF_REQUIRED);
+            let _ = set_host_socket_buffer_size(host_fd, opt, HOST_STREAM_BUF_FALLBACK);
         }
     }
     Ok(())
@@ -3489,19 +3488,53 @@ mod tests {
         assert_eq!(pollevent_to_epoll(&ev(Readiness::empty(), false, None)), 0);
     }
 
+    /// Snapshot the result BEFORE probing the host's effective cap on this
+    /// socket. Using the same socket preserves protocol/connected-state limits;
+    /// it cannot hide a missing widening call because `actual` is already saved.
+    /// macOS releases differ in how much of maxsockbuf is usable payload, so
+    /// measure that cap instead of baking a kernel-version formula into tests.
+    #[cfg(target_os = "macos")]
+    fn assert_host_stream_buffer_target(fd: i32) {
+        let mut maxsockbuf: u32 = 0;
+        let mut len = std::mem::size_of_val(&maxsockbuf);
+        // SAFETY: the name is NUL-terminated and output has the declared size.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"kern.ipc.maxsockbuf".as_ptr(),
+                (&mut maxsockbuf as *mut u32).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "read kern.ipc.maxsockbuf");
+        assert_eq!(len, std::mem::size_of_val(&maxsockbuf));
+        let maximum = i32::try_from(maxsockbuf).expect("maxsockbuf fits SO_*BUF");
+        assert!(maximum > 0);
+        for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+            let actual = host_socket_buffer_size(fd, opt).expect("read widened buffer");
+            // This direct host request is the oracle, independent of Carrick's
+            // target/fallback requests. No machine-wide sysctl is changed.
+            set_host_socket_buffer_size(fd, opt, maximum).expect("probe host buffer cap");
+            let cap = host_socket_buffer_size(fd, opt).expect("read effective host cap");
+            assert!(cap > 0 && cap <= maximum);
+            assert_eq!(
+                actual,
+                HOST_STREAM_BUF_TARGET.min(cap),
+                "fd {fd} opt {opt}: maxsockbuf={maximum}, effective cap={cap}",
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn stream_buffer_widening_covers_inet_stream_sockets() {
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
         assert!(fd >= 0);
         let result = widen_stream_socket_buffers(fd, LINUX_AF_INET, LINUX_SOCK_STREAM);
-        let sndbuf = host_socket_buffer_size(fd, libc::SO_SNDBUF);
-        let rcvbuf = host_socket_buffer_size(fd, libc::SO_RCVBUF);
+        result.expect("best-effort widening must not reject socket creation");
+        assert_host_stream_buffer_target(fd);
         unsafe { libc::close(fd) };
-
-        result.expect("stream buffer widening should meet required floor");
-        assert!(sndbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
-        assert!(rcvbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
     }
 
     #[cfg(target_os = "macos")]
@@ -3516,12 +3549,8 @@ mod tests {
 
         let result =
             widen_stream_socket_buffers(server.as_raw_fd(), LINUX_AF_INET, LINUX_SOCK_STREAM);
-        let sndbuf = host_socket_buffer_size(server.as_raw_fd(), libc::SO_SNDBUF);
-        let rcvbuf = host_socket_buffer_size(server.as_raw_fd(), libc::SO_RCVBUF);
-
-        result.expect("accepted stream buffer widening should meet required floor");
-        assert!(sndbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
-        assert!(rcvbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
+        result.expect("best-effort widening must not reject socket acceptance");
+        assert_host_stream_buffer_target(server.as_raw_fd());
         drop(client);
     }
 
@@ -3533,16 +3562,12 @@ mod tests {
         assert_eq!(rc, 0);
 
         let result = widen_stream_socket_buffers(fds[0], LINUX_AF_UNIX, LINUX_SOCK_STREAM);
-        let sndbuf = host_socket_buffer_size(fds[0], libc::SO_SNDBUF);
-        let rcvbuf = host_socket_buffer_size(fds[0], libc::SO_RCVBUF);
+        result.expect("best-effort widening must not reject socket creation");
+        assert_host_stream_buffer_target(fds[0]);
         unsafe {
             libc::close(fds[0]);
             libc::close(fds[1]);
         }
-
-        result.expect("unix stream buffer widening should meet required floor");
-        assert!(sndbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
-        assert!(rcvbuf.unwrap() >= HOST_STREAM_BUF_REQUIRED);
     }
 
     /// The `socketpair(2)` HANDLER - not just the helper - must widen both
@@ -3590,14 +3615,7 @@ mod tests {
             let host_fd = dispatcher
                 .host_fd_for_poll(guest_fd)
                 .expect("socketpair end has a host fd");
-            for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-                let size = host_socket_buffer_size(host_fd.get(), opt)
-                    .expect("read back the host socket buffer size");
-                assert!(
-                    size >= HOST_STREAM_BUF_REQUIRED,
-                    "socketpair end {guest_fd} opt {opt} is {size}, below the Linux-sized floor",
-                );
-            }
+            assert_host_stream_buffer_target(host_fd.get());
         }
     }
 
