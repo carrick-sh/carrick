@@ -17,19 +17,22 @@ macOS, 30 on Linux, and 5 for filtering/aggregation.
 
 | Job | Recipes / evidence |
 | --- | --- |
-| `lint` (Ubuntu) | `fmt-check`, one `deny`, `check-matrix`, `check-layering`, PR `check-contract-change`, `lint-domains-source` (including contract registry on every event) |
+| `lint` (Ubuntu) | `fmt-check`, one `deny`, `check-matrix`, `check-layering`, PR `check-contract-change`, `lint-domains-source` (including contract registry on every event), `check-test-shards` for the portable selection |
 | `portable` (Ubuntu x86_64) | `check-kernel-portable` for aarch64 Linux, native `test-kernel-semantics` |
 | `linux-doc` (Ubuntu) | `doc` for the Linux crate set, including Linux host/KVM documentation hidden from the macOS build |
 | `cross-check-linux` (Ubuntu) | `check-linux`, `test-host-linux` |
 | `kernel-linux-native` (Ubuntu ARM64) | Existing native `test-kernel-semantics`; no hardware virtualization needed |
 | `cross-check-freebsd` (Ubuntu) | Existing `check-freebsd` CLI/runtime/tests closure, permanent-archive sysroot |
 | `cross-check-netbsd` (Ubuntu) | Existing `check-netbsd` NVMM/tests closure |
-| `macos-clippy` (`macos-15`) | `clippy`, `lint-domains-host` live compiler census |
+| `macos-clippy` (`macos-15`) | `clippy`, `lint-domains-host` live compiler census, `check-test-shards` for the full macOS selection |
 | `macos-build` (`macos-15`) | `check --workspace`, `doc`, `check-fuzz` |
-| `macos-unit` (`macos-15`) | `test` with existing fd-limit setup |
+| `macos-unit-a` (`macos-15`) | `test-shard-a`: workspace lib/bin selection, kernel semantics, contract registry |
+| `macos-unit-b` (`macos-15`) | `test-shard-b`: CLI, host, VFS |
+| `macos-unit-c` (`macos-15`) | `test-shard-c`: kernel parallel and serial passes |
+| `macos-unit-d` (`macos-15`) | `test-shard-d`: runtime and HVF |
 | `macos-integration` (`macos-15`) | `test-integration` with existing fd-limit setup |
 
-The four Mac jobs use the same rust-cache `shared-key`, so they can reuse a
+All Mac jobs use the same rust-cache `shared-key`, so they can reuse a
 compatible dependency cache without serial dependencies between jobs. Linux
 jobs retain separate caches: a small cross-check must not populate the only
 cache for the larger lint/doc/semantics jobs. Cold jobs still compile
@@ -45,6 +48,29 @@ spent about 29 minutes in one serial macOS job. The new critical path is the
 longest parallel job plus filter, aggregate and queue/setup time. Hosted run
 links and observed durations belong in the PR verification record, with cold
 cache and unrelated source failures distinguished from a green timing result.
+
+## Unit shard coverage
+
+The four unit shards reuse the private test-group recipes called by `just test`.
+The unsharded recipe retains its original per-host selection and order. All
+shards retain the fd-limit setup; Cargo features, `--skip serial_host`, serial
+passes under `RUST_TEST_THREADS=1`, and the CLI stack budget are unchanged.
+All four jobs are explicit dependencies of `ci-ok`.
+
+`just check-test-shards` executes both recipe paths with a temporary Cargo
+capture executable. It compares the **multiset** of exact arguments, working
+directory, thread count and stack size. Only `cargo tree` passes through to real
+Cargo, preserving the portable package closure. No tests run during capture.
+Identical whole-Cargo selections imply identical discovered test sets, including
+future tests; the gate also preserves any repeated selections in the original
+recipe. Missing/extra invocations, changed filters/features, or lost serial
+settings fail. Its regression suite also parses the workflow to require every
+shard job, shared cache and aggregate dependency. The check runs on both Linux
+and macOS because their unsharded selections differ.
+
+Shard wall times include independent compilation and cache/setup costs. Hosted
+measurements belong in the PR record; the target is about seven minutes per
+unit shard without altering test behavior, deadlines or retries.
 
 ## Events, docs fast path and the one required check
 
