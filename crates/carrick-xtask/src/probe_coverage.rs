@@ -328,17 +328,43 @@ pub fn resolve_local_base_target(repo_root: &Path) -> Result<String, CoverageErr
     )))
 }
 
+pub fn validate_inventory_classes_and_runners(
+    inventory: &BTreeMap<String, ProbeInventoryRow>,
+) -> Result<(), CoverageError> {
+    for (name, row) in inventory {
+        let expected_class = if name.starts_with("perf_") {
+            "performance"
+        } else if name == "probeinit" {
+            "helper"
+        } else {
+            "conformance"
+        };
+        if row.class != expected_class {
+            return Err(CoverageError::InvalidClass {
+                probe: name.clone(),
+                class: row.class.clone(),
+            });
+        }
+        if !is_authorized_runner(name, &row.runner) {
+            return Err(CoverageError::UnauthorizedRunner {
+                probe: name.clone(),
+                runner: row.runner.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn resolve_base_commit(
     repo_root: &Path,
     explicit_base: Option<&str>,
     current_head: &str,
-) -> Result<String, CoverageError> {
+) -> Result<Option<String>, CoverageError> {
     resolve_base_commit_with_env(
         repo_root,
         explicit_base,
         std::env::var("CARRICK_PROBE_COVERAGE_BASE").ok().as_deref(),
         current_head,
-        false,
     )
 }
 
@@ -347,14 +373,17 @@ pub fn resolve_base_commit_with_env(
     explicit_base: Option<&str>,
     env_base: Option<&str>,
     current_head: &str,
-    allow_head: bool,
-) -> Result<String, CoverageError> {
+) -> Result<Option<String>, CoverageError> {
     let target = match explicit_base.filter(|s| !s.trim().is_empty()) {
-        Some(b) => b.trim().to_string(),
+        Some(b) => Some(b.trim().to_string()),
         None => match env_base.filter(|s| !s.trim().is_empty()) {
-            Some(b) => b.trim().to_string(),
-            None => resolve_local_base_target(repo_root)?,
+            Some(b) => Some(b.trim().to_string()),
+            None => resolve_local_base_target(repo_root).ok(),
         },
+    };
+
+    let Some(target) = target else {
+        return Ok(None);
     };
 
     if target.chars().all(|c| c == '0') {
@@ -375,13 +404,12 @@ pub fn resolve_base_commit_with_env(
             "empty merge-base between HEAD and '{target}'"
         )));
     }
-    if !allow_head && resolved_sha == current_head {
-        return Err(CoverageError::CannotCompareHeadToItself {
-            head: current_head.to_string(),
-        });
+
+    if resolved_sha == current_head {
+        return Ok(None);
     }
 
-    Ok(resolved_sha)
+    Ok(Some(resolved_sha))
 }
 
 pub fn run_probe_coverage(
@@ -420,45 +448,67 @@ pub fn run_probe_coverage_with_env(
 
     let inv_names: BTreeSet<String> = current_inventory.keys().cloned().collect();
     validate_source_membership(&inv_names, &sources)?;
+    validate_inventory_classes_and_runners(&current_inventory)?;
 
     let ret_path = repo_root.join("conformance-probes/reviewed-retirements.json");
     let retirements_doc = load_reviewed_retirements(&ret_path)?;
+    for record in retirements_doc.records() {
+        record.validate_not_empty()?;
+    }
 
     let resolved_base =
-        resolve_base_commit_with_env(repo_root, base_commit, env_base, &current_head, false)?;
+        resolve_base_commit_with_env(repo_root, base_commit, env_base, &current_head)?;
 
-    let git_out = command::run_checked(
-        "git",
-        [
-            "show",
-            &format!("{resolved_base}:conformance-probes/probe-inventory.json"),
-        ],
-        Some(repo_root),
-    )?;
-    let base_inventory = load_inventory_from_str(&git_out.stdout)?;
-    let base_probes: BTreeMap<String, ProbeIdentity> = base_inventory
-        .into_iter()
-        .map(|(k, v)| {
-            (
-                k,
-                ProbeIdentity {
-                    class: v.class,
-                    runner: v.runner,
-                    excluded: v.excluded,
-                },
-            )
-        })
-        .collect();
+    match resolved_base {
+        None => {
+            let reason = if base_commit.is_none() && env_base.is_none() {
+                "local run whose resolved base equals HEAD or no base provided"
+            } else {
+                "resolved base equals HEAD"
+            };
+            println!(
+                "probe coverage delta: no change range ({reason}); delta ratchet not applicable"
+            );
+            eprintln!(
+                "probe coverage delta: no change range ({reason}); delta ratchet not applicable"
+            );
+            Ok(())
+        }
+        Some(base_sha) => {
+            let git_out = command::run_checked(
+                "git",
+                [
+                    "show",
+                    &format!("{base_sha}:conformance-probes/probe-inventory.json"),
+                ],
+                Some(repo_root),
+            )?;
+            let base_inventory = load_inventory_from_str(&git_out.stdout)?;
+            let base_probes: BTreeMap<String, ProbeIdentity> = base_inventory
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        ProbeIdentity {
+                            class: v.class,
+                            runner: v.runner,
+                            excluded: v.excluded,
+                        },
+                    )
+                })
+                .collect();
 
-    validate_coverage(
-        &resolved_base,
-        &base_probes,
-        &current_inventory,
-        &sources,
-        retirements_doc.records(),
-    )?;
+            validate_coverage(
+                &base_sha,
+                &base_probes,
+                &current_inventory,
+                &sources,
+                retirements_doc.records(),
+            )?;
 
-    Ok(())
+            Ok(())
+        }
+    }
 }
 
 pub fn validate_closure_coverage(
@@ -470,47 +520,72 @@ pub fn validate_closure_coverage(
     let head_out = command::run_checked("git", ["rev-parse", "HEAD"], Some(repo_root))?;
     let current_head = head_out.stdout.trim().to_string();
 
+    let inv_names: BTreeSet<String> = inventory.keys().cloned().collect();
+    validate_source_membership(&inv_names, sources)?;
+    validate_inventory_classes_and_runners(inventory)?;
+
     let ret_path = repo_root.join("conformance-probes/reviewed-retirements.json");
     let retirements_doc = load_reviewed_retirements(&ret_path)?;
+    for record in retirements_doc.records() {
+        record.validate_not_empty()?;
+    }
 
     let resolved_base = resolve_base_commit_with_env(
         repo_root,
         base_commit,
         std::env::var("CARRICK_PROBE_COVERAGE_BASE").ok().as_deref(),
         &current_head,
-        true,
     )?;
 
-    let git_out = command::run_checked(
-        "git",
-        [
-            "show",
-            &format!("{resolved_base}:conformance-probes/probe-inventory.json"),
-        ],
-        Some(repo_root),
-    )?;
-    let base_inventory = load_inventory_from_str(&git_out.stdout)?;
-    let base_probes: BTreeMap<String, ProbeIdentity> = base_inventory
-        .into_iter()
-        .map(|(k, v)| {
-            (
-                k,
-                ProbeIdentity {
-                    class: v.class,
-                    runner: v.runner,
-                    excluded: v.excluded,
-                },
-            )
-        })
-        .collect();
+    match resolved_base {
+        None => {
+            let reason =
+                if base_commit.is_none() && std::env::var("CARRICK_PROBE_COVERAGE_BASE").is_err() {
+                    "local run whose resolved base equals HEAD or no base provided"
+                } else {
+                    "resolved base equals HEAD"
+                };
+            println!(
+                "probe coverage delta: no change range ({reason}); delta ratchet not applicable"
+            );
+            eprintln!(
+                "probe coverage delta: no change range ({reason}); delta ratchet not applicable"
+            );
+            Ok(())
+        }
+        Some(base_sha) => {
+            let git_out = command::run_checked(
+                "git",
+                [
+                    "show",
+                    &format!("{base_sha}:conformance-probes/probe-inventory.json"),
+                ],
+                Some(repo_root),
+            )?;
+            let base_inventory = load_inventory_from_str(&git_out.stdout)?;
+            let base_probes: BTreeMap<String, ProbeIdentity> = base_inventory
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k,
+                        ProbeIdentity {
+                            class: v.class,
+                            runner: v.runner,
+                            excluded: v.excluded,
+                        },
+                    )
+                })
+                .collect();
 
-    validate_coverage(
-        &resolved_base,
-        &base_probes,
-        inventory,
-        sources,
-        retirements_doc.records(),
-    )?;
+            validate_coverage(
+                &base_sha,
+                &base_probes,
+                inventory,
+                sources,
+                retirements_doc.records(),
+            )?;
 
-    Ok(())
+            Ok(())
+        }
+    }
 }
