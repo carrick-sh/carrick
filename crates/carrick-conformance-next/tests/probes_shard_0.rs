@@ -495,7 +495,7 @@ fn generic_probe_shard_0() {
 /// probeinit fork/exec topology. These are semantic witnesses, not proof of
 /// EL1 frame ownership. No new subprocess or executable probe is introduced.
 #[test]
-fn m5_el0_nested_altstack_and_fault_frame_bindings() {
+fn case_m5_el0_nested_altstack_and_fault_frame_bindings() {
     let _guard = common::guest_lock();
     let root = common::repo_root();
     for (target, libc) in [
