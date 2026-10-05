@@ -343,6 +343,17 @@ impl HvpatchMmRootRetirementProof {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// SAFETY: this sealed proof is minted only after exact stage-2 terminal custody.
+unsafe impl carrick_core::mm::retirement::TerminalRootProof for HvpatchMmRootRetirementProof {
+    fn base(&self) -> u64 {
+        self.root_slot_base()
+    }
+    fn size(&self) -> u64 {
+        self.root_slot_size()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) struct RetiredMmRootStage2 {
     pub(crate) proof: HvpatchMmRootRetirementProof,
     pub(crate) physical_extent: (u64, usize),

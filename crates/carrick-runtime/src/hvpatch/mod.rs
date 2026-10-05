@@ -52,12 +52,12 @@ pub(crate) use mm_resources::{
     ExecMmDispositionKind, ExecMmReservation, ExecSettlementEnrollment, ExecSettlementSubscription,
     MmResourcesError, RetiredStage1Mm,
 };
-#[cfg(test)]
-pub(crate) use stage1_mm::Stage1MmPool;
 pub(crate) use stage1_mm::{
     CowInvalidationObserver, Stage1MmLease, Stage1MmRetirement, Stage1RootRetirementReceipt,
     Stage1RootRetirementTicket,
 };
+#[cfg(test)]
+pub(crate) use stage1_mm::{Stage1MmPool, complete_root_for_test};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use mm_resources::OwnerSetEditHold;
