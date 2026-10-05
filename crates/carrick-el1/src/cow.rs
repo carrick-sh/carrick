@@ -1,8 +1,10 @@
 //! Guest EL1 fork-COW resolution with host-provisioned replacement frames.
 //!
 //! The caller holds the faulting MM's exact page-table editor. EL1 then
-//! classifies the write fault ([`classify_guest_cow_write`]), takes one of
-//! the MM's ready grants from the shared [`CowGrantPool`], copies the run's
+//! classifies the write fault
+//! ([`classify_guest_cow_write`](carrick_mmu_core::aarch64::descriptor_txn::guest_cow::classify_guest_cow_write)),
+//! takes one of
+//! the MM's ready grants from the shared [`carrick_el1_abi::CowGrantPool`], copies the run's
 //! pages from the still-shared compound into the grant through the MM's
 //! two temporary copy-window aliases, repoints the run with the shared
 //! descriptor executor, invalidates the MM's ASID and only then records the
