@@ -413,7 +413,8 @@ mod delegated {
             .expect("prlimit64 dispatch");
         assert_eq!(returned(set), 0);
         assert_eq!(
-            root.lock().layout().data_limit,
+            carrick_personality_linux::mm::LinuxReservationLayout::from(root.lock().layout())
+                .data_limit,
             limit,
             "setrlimit must push RLIMIT_DATA to the root"
         );
