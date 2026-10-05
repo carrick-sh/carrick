@@ -7658,6 +7658,70 @@ fn relocate_exit_fixture_root(task: &mut HvfTaskState, base: u64) -> CarrierStag
 }
 
 #[test]
+fn two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody() {
+    let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        2,
+    ));
+    let _pool_fixture = BootstrapRetirementPoolFixture::install(custody, pool.clone());
+    let kernel = std::sync::Arc::new(PerFrameKernel::default());
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let (mut old, _, _, _) = exit_task_holding_owned_lease(713, 0x4000, 713, 714, &kernel, &frames);
+    let (mut new, _, _, _) = exit_task_holding_owned_lease(715, 0x8000, 715, 716, &kernel, &frames);
+    let base = pool.base_ipa();
+    let predecessor_record = relocate_exit_fixture_root(&mut old, base);
+    let successor_record = relocate_exit_fixture_root(&mut new, base + 0x20_0000);
+    let mut engine = old.page_tables_authority();
+    engine
+        .install_exec_successor(new.page_tables_authority())
+        .unwrap();
+    let successor_owner =
+        new.mm_access.structural_owners.read()[&(base + 0x20_0000, 0x20_0000)].clone();
+    // SAFETY: both MMs are stopped fixtures with separate exact table slots.
+    unsafe { successor_owner.ptr().add(0x1000).write(0x79) };
+    let (predecessor_identity, predecessor_mm) = predecessor_test_identity(&old);
+    let mut cleanup = PendingExecStage2Cleanup {
+        mappings: TaskMappingIndex::default(),
+        extents: std::collections::BTreeMap::new(),
+        predecessor_aliases: Vec::new(),
+        frames: frames.clone(),
+        mm_root_slot: None,
+        mm_access: Some(old.mm_access.clone()),
+        predecessor_identity,
+        predecessor_mm,
+        shared_projection: false,
+        armed: true,
+    };
+    let result = cleanup.retire();
+    cleanup.armed = false; // A failed witness must report rather than abort in Drop.
+    result.expect("detached predecessor cleanup keeps its own physical publisher");
+    assert!(
+        custody
+            .stage2_record_snapshot(predecessor_record.record_id)
+            .is_none()
+    );
+    let reused = pool
+        .allocate_slot_at(base)
+        .expect("predecessor slot retired");
+    assert!(pool.allocate_slot_at(base + 0x20_0000).is_none());
+    assert!(
+        custody
+            .stage2_record_snapshot(successor_record.record_id)
+            .unwrap()
+            .mapped
+    );
+    assert_eq!(unsafe { successor_owner.ptr().add(0x1000).read() }, 0x79);
+    assert!(engine.shares_exact_authority(&new.page_tables_authority()));
+    assert_eq!(old.page_tables_authority().root_base(), Some(base));
+    HvfVmState::retire_task_state_process_mappings(&mut old).unwrap();
+    HvfVmState::retire_task_state_process_mappings(&mut new).unwrap();
+    drop(reused);
+    assert_eq!(pool.allocated_count(), 0);
+}
+
+#[test]
 fn two_live_mm_bootstrap_retirement_releases_only_its_published_root_slot() {
     let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
     let _stage2_stub = ScopedStage2MapTestStub::enable();

@@ -1301,6 +1301,25 @@ impl Stage1Authority {
             .replace(image.take().ok_or(PageTableError::BadAddress)?))
     }
 
+    /// Adopt the backend's exact new-MM authority after exec. Retained old-MM
+    /// cleanup keeps its manager, publisher and capacity until its own proof.
+    /// Only this exec's vfork share is consumed; other sharers remain live.
+    pub fn install_exec_successor(&mut self, successor: Self) -> Result<bool, String> {
+        if self.shares_exact_authority(&successor) {
+            return Err("exec successor reused its predecessor table authority".into());
+        }
+        let was_shared = {
+            let mut predecessor = self.inner.lock();
+            let shared = predecessor.vfork_shares != 0;
+            if shared {
+                predecessor.vfork_shares -= 1;
+            }
+            shared
+        };
+        *self = successor;
+        Ok(was_shared)
+    }
+
     /// Replace the stage-1 authority for `execve`.
     ///
     /// - If `SharedWithVforkChild` (or `predecessor_shared` is true): the shared authority
@@ -2605,6 +2624,44 @@ pub(crate) mod tests {
             },
             "only retired backing may return its arena address"
         );
+    }
+
+    #[test]
+    fn exec_successor_consumes_only_its_share_without_stealing_parent_capacity() {
+        let parent = Stage1Authority::new_with_manager(Some(test_manager()));
+        parent
+            .install_source(Box::new(CountingArenaSource {
+                id: TableArenaSourceId(SubstrateGpa(LINUX_PAGE_TABLES_BASE)),
+                available: Arc::new(Mutex::new(Vec::new())),
+                returned: Arc::new(Mutex::new(Vec::new())),
+            }))
+            .unwrap();
+        parent.share_with_vfork_child();
+        parent.share_with_vfork_child();
+        let mut first = parent.clone();
+        let mut second = parent.clone();
+        let successor = Stage1Authority::new_with_manager(Some(test_manager_at(0x9a_0020_0000)));
+        assert!(first.install_exec_successor(successor.clone()).unwrap());
+        assert!(first.shares_exact_authority(&successor));
+        assert!(parent.is_shared_with_vfork_child());
+        assert!(parent.has_source());
+        assert_eq!(parent.root_base(), Some(LINUX_PAGE_TABLES_BASE));
+        let successor = Stage1Authority::new_with_manager(Some(test_manager_at(0x9a_0040_0000)));
+        assert!(second.install_exec_successor(successor).unwrap());
+        assert!(parent.is_exclusive());
+        assert!(parent.has_source());
+        assert_eq!(parent.root_base(), Some(LINUX_PAGE_TABLES_BASE));
+    }
+
+    #[test]
+    fn exec_successor_refuses_predecessor_authority_without_consuming_its_share() {
+        let mut authority = Stage1Authority::new_with_manager(Some(test_manager()));
+        authority.share_with_vfork_child();
+        let retained = authority.clone();
+        assert!(authority.install_exec_successor(retained.clone()).is_err());
+        assert!(authority.shares_exact_authority(&retained));
+        assert!(retained.is_shared_with_vfork_child());
+        assert_eq!(retained.root_base(), Some(LINUX_PAGE_TABLES_BASE));
     }
 
     #[test]
