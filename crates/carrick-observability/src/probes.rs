@@ -39,6 +39,20 @@ use std::ops::Range;
 
 use carrick_guest_mem::HostVa;
 
+/// Stopped-vCPU observations of one syscall mailbox incarnation.
+#[derive(Clone, Copy)]
+#[repr(u32)]
+pub enum SyscallMailboxPhase {
+    RequestObserved = 1,
+    Capture = 2,
+    Take = 3,
+    Import = 4,
+    Return = 5,
+    RegisterResume = 6,
+    ClockRestart = 7,
+    Rebind = 8,
+}
+
 /// Result of attempting to install a private file view rather than copying it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
@@ -5275,6 +5289,11 @@ mod real {
         /// reason (1 no indexed stage-2 record, 3 missing, 4 unmapped,
         /// 5 retiring). Diagnostic only; it grants no custody.
         fn hvpatch__el1__host__read__retention(_: u64, _: u32) {}
+
+        /// phase, mailbox host address, generation, request sequence, state.
+        fn syscall__mailbox__lifecycle(_: u32, _: u64, _: u64, _: u64, _: u32) {}
+
+        fn el1__zone__capture__missing(_: u64, _: u64) {}
         /// Root mapping observed at synchronous-fault delivery. Args: FAR,
         /// live mapping start/end (zero if absent), retained host-source
         /// handle and offset (zero if the mapping has no owner file source).
@@ -6708,6 +6727,22 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_el1_host_read_retention(ipa: u64, reason: u32) {
         carrick_usdt::hvpatch__el1__host__read__retention!(|| (ipa, reason));
+    }
+
+    /// Read diagnostic payload only when the lifecycle probe is enabled.
+    #[inline(never)]
+    pub fn syscall_mailbox_lifecycle_with(
+        phase: super::SyscallMailboxPhase,
+        snapshot: impl FnOnce() -> (u64, u64, u64, u32),
+    ) {
+        carrick_usdt::syscall__mailbox__lifecycle!(|| {
+            let (address, generation, sequence, state) = snapshot();
+            (phase as u32, address, generation, sequence, state)
+        });
+    }
+
+    pub fn el1_zone_capture_missing(pc: u64, pstate: u64) {
+        carrick_usdt::el1__zone__capture__missing!(|| (pc, pstate));
     }
 
     /// Read the root only while this diagnostic probe is enabled.
@@ -9115,6 +9150,14 @@ mod stub {
     stub!(hvpatch_el1_host_write_prepare(address: u64, length: u64, phase: u32, detail: u64));
     stub!(hvpatch_el1_owner_grant_supply(address: u64, length: u64, phase: u32, detail: u64));
     stub!(hvpatch_el1_host_read_retention(ipa: u64, reason: u32));
+
+    pub fn syscall_mailbox_lifecycle_with(
+        _phase: super::SyscallMailboxPhase,
+        _snapshot: impl FnOnce() -> (u64, u64, u64, u32),
+    ) {
+    }
+
+    stub!(el1_zone_capture_missing(pc: u64, pstate: u64));
     #[allow(dead_code, unused_variables)]
     #[inline(always)]
     pub fn hvpatch_el1_fault_root_mapping_with(
