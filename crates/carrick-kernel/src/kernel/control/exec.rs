@@ -836,11 +836,38 @@ mod tests {
         assert!(work.admit(ControlTaskKey { pid: 4, serial: 1 }));
         assert_eq!(thread.join().expect("submitter"), Ok(capability));
 
-        let started = std::time::Instant::now();
-        assert_eq!(runtime.wait(capability), ExecStatus::Running);
-        assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "WaitExec monopolized the serial control endpoint"
+        let (tx, rx) = std::sync::mpsc::channel();
+        let poll_runtime = runtime.clone();
+        let poller = std::thread::spawn(move || {
+            tx.send(poll_runtime.wait(capability)).expect("poll result");
+        });
+        // `work` belongs to this thread until the result is observed: neither
+        // completion nor dropping it can unblock a wrongly blocking wait.
+        let status = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("consume poll waited for held work");
+        assert_eq!(status, ExecStatus::Running);
+        assert_eq!(runtime.query(capability), ExecStatus::Running);
+        poller.join().expect("poller");
+        assert_eq!(
+            work.complete(ExecResult {
+                exit_code: 0,
+                terminating_signal: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                output_truncated: false,
+            }),
+            Ok(())
+        );
+        assert_eq!(
+            runtime.wait(capability),
+            ExecStatus::Complete(ExecResult {
+                exit_code: 0,
+                terminating_signal: None,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                output_truncated: false,
+            })
         );
     }
 

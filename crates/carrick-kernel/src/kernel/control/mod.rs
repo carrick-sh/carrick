@@ -1351,6 +1351,8 @@ mod tests {
         struct NotifyingExecAdmission {
             inner: Arc<dyn CarrierExecAdmission>,
             entered: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            held: Arc<AtomicBool>,
         }
 
         impl CarrierExecAdmission for NotifyingExecAdmission {
@@ -1367,15 +1369,28 @@ mod tests {
             }
 
             fn wait(&self, capability: ExecCapability) -> ExecStatus {
-                let _ = self.entered.send(());
+                self.held.store(true, Ordering::Release);
+                self.entered.send(()).expect("announce held ExecWait");
+                // Only the test releases this gate. Its bounded Status observer
+                // drops the sender on failure, so expiry cannot grant success.
+                self.release
+                    .lock()
+                    .expect("release gate")
+                    .recv()
+                    .expect("explicit release");
+                self.held.store(false, Ordering::Release);
                 self.inner.wait(capability)
             }
         }
 
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let held = Arc::new(AtomicBool::new(false));
         let notifying_runtime = Arc::new(NotifyingExecAdmission {
             inner: Arc::clone(&runtime) as Arc<dyn CarrierExecAdmission>,
             entered: entered_tx,
+            release: std::sync::Mutex::new(release_rx),
+            held: Arc::clone(&held),
         });
 
         let mut server = CarrierControlServer::start_at_with_exec(
@@ -1395,18 +1410,21 @@ mod tests {
                 ControlOperation::ExecWait { capability },
             )
         });
+        // Drop the release sender before server teardown on any assertion
+        // failure, so the bounded observer cannot deadlock in server Drop.
+        let status_release = release_tx;
         entered_rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("waiter entered exec wait");
-        let started = std::time::Instant::now();
         assert_eq!(
             send_at(&endpoint, &state, ControlOperation::Status).expect("status"),
             ControlOutcome::Alive,
         );
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(200),
-            "a running ExecWait monopolized the serial control endpoint",
+            held.load(Ordering::Acquire),
+            "Status must return while the ExecWait holder is inside its release gate"
         );
+        status_release.send(()).expect("release waiter");
         assert_eq!(
             waiter.join().expect("waiter").expect("wait response"),
             ControlOutcome::ExecRunning,

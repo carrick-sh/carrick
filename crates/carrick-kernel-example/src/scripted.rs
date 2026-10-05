@@ -109,6 +109,48 @@ pub enum ExampleError {
     },
 }
 
+/// Clock and deadline consumer used by the VM-free syscall driver.
+/// The default uses host time and the ordinary wait service. A fixture can
+/// observe the supplied timeout and expire it without a wall-clock race.
+pub trait ScriptedWaitDriver: Send + Sync {
+    fn now(&self) -> Instant;
+    fn await_event(
+        &self,
+        label: &'static str,
+        service: &CarrierWaitService,
+        token: ContinuationWakeToken,
+        timeout: Duration,
+        scope: &carrick_observability::work_meter::WorkScope,
+    ) -> Option<
+        Result<
+            carrick_kernel::kernel::continuation::ContinuationEvent,
+            carrick_kernel::kernel::continuation::WaitServiceError,
+        >,
+    >;
+}
+
+struct HostScriptedWaitDriver;
+impl ScriptedWaitDriver for HostScriptedWaitDriver {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn await_event(
+        &self,
+        _label: &'static str,
+        service: &CarrierWaitService,
+        token: ContinuationWakeToken,
+        timeout: Duration,
+        scope: &carrick_observability::work_meter::WorkScope,
+    ) -> Option<
+        Result<
+            carrick_kernel::kernel::continuation::ContinuationEvent,
+            carrick_kernel::kernel::continuation::WaitServiceError,
+        >,
+    > {
+        crate::driver::block_on_timeout_with_scope(service.event(token), timeout, Some(scope))
+    }
+}
+
 /// The backend: one kernel per run, one host thread per Linux task.
 pub struct ScriptedBackend {
     bridges: CarrierBridges,
@@ -117,6 +159,7 @@ pub struct ScriptedBackend {
     root_exit_checkpoint: Option<crate::operand::ScriptCheckpoint>,
     pauses: Vec<ScriptPause>,
     schedule: Option<crate::schedule::Schedule>,
+    wait_driver: Arc<dyn ScriptedWaitDriver>,
 }
 
 struct ScriptPause {
@@ -146,7 +189,14 @@ impl ScriptedBackend {
             root_exit_checkpoint: None,
             pauses: Vec::new(),
             schedule: None,
+            wait_driver: Arc::new(HostScriptedWaitDriver),
         }
+    }
+
+    /// Inject a clock and deadline observer into the syscall wait boundary.
+    pub fn with_wait_driver(mut self, driver: Arc<dyn ScriptedWaitDriver>) -> Self {
+        self.wait_driver = driver;
+        self
     }
 
     /// Configure a custom filesystem backend (e.g. [`carrick_vfs::fs_backend::HostFsBackend`]).
@@ -248,6 +298,7 @@ impl ScriptedBackend {
             work_scope: work_scope.clone(),
             pauses: Mutex::new(self.pauses),
             schedule: self.schedule,
+            wait_driver: self.wait_driver,
         });
         let process = Arc::new(process);
         let mut dispatcher = SyscallDispatcher::with_bridges(self.bridges);
@@ -403,6 +454,7 @@ pub(crate) struct Shared {
     pub(crate) work_scope: carrick_observability::work_meter::WorkScope,
     pauses: Mutex<Vec<ScriptPause>>,
     pub(crate) schedule: Option<crate::schedule::Schedule>,
+    pub(crate) wait_driver: Arc<dyn ScriptedWaitDriver>,
 }
 
 impl Shared {

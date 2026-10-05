@@ -1741,28 +1741,23 @@ mod tests {
         }
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let start = std::time::Instant::now();
         let handle = std::thread::spawn(move || {
             drain_fd(read_fd);
-            let _ = tx.send(start.elapsed());
+            let _ = tx.send(());
             unsafe { libc::close(read_fd) };
         });
 
-        let elapsed = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(elapsed) => elapsed,
-            Err(err) => {
-                unsafe { libc::close(write_fd) };
-                let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
-                handle
-                    .join()
-                    .expect("drain thread exits after writer close");
-                panic!("drain_fd blocked on an empty internal pipe: {err}");
-            }
-        };
+        // While write_fd remains open, drain_fd returning on an empty pipe proves
+        // it did not block waiting for EOF or data.
+        rx.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("drain_fd did not return while writer was open");
 
+        assert!(
+            unsafe { libc::fcntl(write_fd, libc::F_GETFD) } >= 0,
+            "writer remains held at drain completion"
+        );
         unsafe { libc::close(write_fd) };
         handle.join().expect("drain thread exits");
-        assert!(elapsed < std::time::Duration::from_millis(50));
     }
 
     #[test]

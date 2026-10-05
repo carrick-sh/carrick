@@ -293,7 +293,21 @@ fn timerfd_read_continuation_waits_for_dispatcher_arm_then_completes_read() {
 
 #[test]
 fn timerfd_rearm_wakes_retained_read_before_old_deadline() {
-    let (kernel, context) = bootstrap(15_472);
+    let clock = Arc::new(crate::kernel::ClockDomain::deterministic(
+        std::time::UNIX_EPOCH,
+    ));
+    // An untimed participant prevents auto-advance; only this test moves time.
+    let clock_holder = clock.enroll_waiter(None);
+    let container =
+        Arc::new(crate::kernel::Container::for_reference_model().with_clock(Arc::clone(&clock)));
+    let input = crate::kernel::RootBootstrap::for_reference_model(
+        15_472,
+        ThreadId::synthetic_for_tests(15_472),
+        "controlled timerfd rearm".into(),
+    )
+    .unwrap()
+    .with_container(container);
+    let (kernel, context) = Kernel::bootstrap_root(input).unwrap();
     let generation = publish(&context, 0x917);
     let mut dispatcher = crate::dispatch::SyscallDispatcher::new();
     let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0u8; 0x400]);
@@ -366,7 +380,6 @@ fn timerfd_rearm_wakes_retained_read_before_old_deadline() {
         "the long timer must be enrolled before it is replaced"
     );
 
-    let rearm_started = Instant::now();
     arm_timerfd_through_dispatcher(
         &context,
         &mut dispatcher,
@@ -374,13 +387,43 @@ fn timerfd_rearm_wakes_retained_read_before_old_deadline() {
         fd,
         Duration::from_millis(20),
     );
-    let event = await_event_timeout(&service, token, Duration::from_secs(1))
+    let event = await_event_timeout(&service, token, Duration::from_secs(30))
         .expect("timerfd rearm must wake the retained continuation")
         .expect("timerfd wait service event");
     assert!(
         matches!(event, ContinuationEvent::Ready | ContinuationEvent::Timeout),
         "timerfd rearm produced an unrelated continuation event: {event:?}"
     );
+    let completion = continuation
+        .resume(event, &context)
+        .expect("resume changed timer")
+        .completion;
+    let ContinuationCompletion::TimerFdRead(read) = completion else {
+        panic!("retained read")
+    };
+    let crate::dispatch::format_time::TimerFdReadStep::Wait(read) = read.complete(&mut memory)
+    else {
+        panic!("new deadline must still be held")
+    };
+    assert_eq!(
+        read.plan().virtual_due,
+        Some(Duration::from_millis(20)),
+        "retained read must replace its two-second deadline"
+    );
+    let mut continuation = BlockedContinuation::from_dispatch_outcome(
+        DispatchOutcome::BlockingTimerFdRead(read),
+        capture(&context, generation),
+    )
+    .unwrap();
+    let mut registration = service.prepare_registration(&continuation);
+    let token = registration.wake_token();
+    service.enroll(&mut registration).unwrap();
+    continuation.attach_registration(registration).unwrap();
+    assert_eq!(clock.monotonic_now(), Duration::ZERO);
+    clock.advance(Duration::from_millis(20)).unwrap();
+    let event = await_event_timeout(&service, token, Duration::from_secs(30))
+        .expect("controlled expiry watchdog")
+        .unwrap();
     assert_eq!(
         complete_timerfd_continuation_after_ready(
             continuation,
@@ -392,10 +435,12 @@ fn timerfd_rearm_wakes_retained_read_before_old_deadline() {
         ),
         DispatchOutcome::Returned { value: 8 }
     );
-    assert!(
-        rearm_started.elapsed() < Duration::from_millis(500),
-        "timerfd rearm waited for its replaced two-second deadline"
+    assert_eq!(
+        clock.monotonic_now(),
+        Duration::from_millis(20),
+        "old deadline remains unexpired"
     );
+    clock.remove_waiter(clock_holder);
     assert_eq!(
         u64::from_le_bytes(
             memory

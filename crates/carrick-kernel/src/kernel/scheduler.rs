@@ -3424,6 +3424,8 @@ pub struct Scheduler {
     executors: Arc<ExecutorDirectory>,
     preemption: Arc<Mutex<PreemptionState>>,
     preemption_condvar: Arc<Condvar>,
+    #[cfg(any(test, feature = "test-support"))]
+    preemption_wait_observer: Mutex<Option<std::sync::mpsc::Sender<Option<Instant>>>>,
     snapshot_count: AtomicU64,
     generation_transition: Mutex<()>,
     generation_observer: Mutex<Option<Arc<dyn SchedulerGenerationObserver>>>,
@@ -3489,6 +3491,8 @@ impl Scheduler {
             executors,
             preemption,
             preemption_condvar,
+            #[cfg(any(test, feature = "test-support"))]
+            preemption_wait_observer: Mutex::new(None),
             snapshot_count: AtomicU64::new(0),
             generation_transition: Mutex::new(()),
             generation_observer: Mutex::new(None),
@@ -5477,6 +5481,27 @@ impl Scheduler {
         DeliveryOutcome::Stale
     }
 
+    /// Observe the exact wait predicate before its atomic unlock-and-park.
+    /// Tests acquire the preemption lock through shutdown after receiving this
+    /// notification, so they cannot race ahead of the actual wait.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn observe_preemption_waits(&self, observer: std::sync::mpsc::Sender<Option<Instant>>) {
+        *self.preemption_wait_observer.lock() = Some(observer);
+    }
+
+    /// Advance a fixture's clock under the same mutex as unlock-and-park.
+    /// This prevents a clock notification being lost between observing the
+    /// deadline predicate and actually parking the driver.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn advance_preemption_test_clock(
+        &self,
+        clock: &ManualClock,
+        duration: std::time::Duration,
+    ) {
+        let _preemption = self.preemption.lock();
+        clock.advance(duration);
+    }
+
     /// Wait for preemption work (deadline reached or shutdown).
     pub fn wait_preemption_work(&self) -> PreemptionWork {
         let mut preemption = self.preemption.lock();
@@ -5495,6 +5520,10 @@ impl Scheduler {
                     return PreemptionWork::Due(due);
                 } else {
                     let timeout = deadline.duration_since(now);
+                    #[cfg(any(test, feature = "test-support"))]
+                    if let Some(observer) = self.preemption_wait_observer.lock().as_ref() {
+                        let _ = observer.send(Some(deadline));
+                    }
                     self.preemption_condvar.wait_for(&mut preemption, timeout);
                 }
             } else {

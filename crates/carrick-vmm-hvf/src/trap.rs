@@ -368,6 +368,8 @@ mod task_mapping_index;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) use task_mapping_index::*;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod admission_retry;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vcpu_admission;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vcpu_gate;

@@ -859,8 +859,18 @@ impl std::fmt::Debug for MirrorState {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+struct EntrantTestObserver {
+    park: std::sync::mpsc::Sender<(bool, u64)>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    guard_waiting: std::sync::mpsc::Sender<()>,
+}
+
 #[derive(Debug)]
 pub struct PtQuiesce {
+    #[cfg(test)]
+    test_observer: Option<EntrantTestObserver>,
     coordinator: AtomicBool,
     /// The MM's fence: no vCPU may enter the guest for the MM while set.
     quiescing: AtomicBool,
@@ -912,6 +922,8 @@ impl Default for PtQuiesce {
 impl PtQuiesce {
     pub fn new() -> Self {
         Self {
+            #[cfg(test)]
+            test_observer: None,
             coordinator: AtomicBool::new(false),
             quiescing: AtomicBool::new(false),
             draining: AtomicBool::new(false),
@@ -991,6 +1003,12 @@ impl PtQuiesce {
         let mut seen = self.pauses_ended.load(Ordering::SeqCst);
         let mut refused_wakes = 0u64;
         while self.quiescing.load(Ordering::SeqCst) {
+            #[cfg(test)]
+            #[allow(clippy::unwrap_used)]
+            // test-owned handshake failures fail the fixture
+            if let Some(observer) = &self.test_observer {
+                observer.park.send((false, refused_wakes)).unwrap();
+            }
             #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
             let next = self.cv.wait(g).unwrap();
             g = next;
@@ -1002,6 +1020,17 @@ impl PtQuiesce {
                 }
             }
             seen = ended;
+            #[cfg(test)]
+            #[allow(clippy::unwrap_used)]
+            // test-owned handshake failures fail the fixture
+            if let Some(observer) = &self.test_observer {
+                // The fixture owns when this running entrant can retry entry.
+                // Release the mutex so the coordinator can end/re-elect.
+                drop(g);
+                observer.park.send((true, refused_wakes)).unwrap();
+                observer.release.lock().unwrap().recv().unwrap();
+                g = self.parked_entrants.lock().unwrap();
+            }
         }
         *g -= 1;
         if *g == 0 {
@@ -1025,6 +1054,12 @@ impl PtQuiesce {
         #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
         let mut g = self.parked_entrants.lock().unwrap();
         while *g > 0 {
+            #[cfg(test)]
+            #[allow(clippy::unwrap_used)]
+            // test-owned handshake failures fail the fixture
+            if let Some(observer) = &self.test_observer {
+                observer.guard_waiting.send(()).unwrap();
+            }
             #[allow(clippy::unwrap_used)] // poisoned lock = correct to die
             let next = self.cv.wait(g).unwrap();
             g = next;
@@ -1574,43 +1609,85 @@ mod tests {
     /// editor re-elects.
     #[test]
     fn a_starving_entrant_leaves_before_the_next_fence_is_raised() {
-        for _ in 0..16 {
-            let barrier = Arc::new(PtQuiesce::new());
-            assert!(barrier.try_become_coordinator());
-            barrier.set_quiescing();
-            let left = Arc::new(AtomicBool::new(false));
-            let entrant = {
-                let (barrier, left) = (Arc::clone(&barrier), Arc::clone(&left));
-                std::thread::spawn(move || {
-                    barrier.park();
-                    left.store(true, Ordering::SeqCst);
-                })
-            };
-            while *barrier.parked_entrants.lock().unwrap() == 0 {
-                std::thread::yield_now();
-            }
-            // A hot editor: each edit holds the fence briefly, then the
-            // editor ends the pause and re-elects at once.
-            let parked_at = Instant::now();
-            let give_up = parked_at + Duration::from_secs(2);
-            while !left.load(Ordering::SeqCst) && Instant::now() < give_up {
-                let edit = Instant::now();
-                while edit.elapsed() < Duration::from_micros(50) {
-                    std::hint::spin_loop();
-                }
-                barrier.end();
+        let (park_tx, park_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (guard_tx, guard_rx) = std::sync::mpsc::channel();
+        let mut fixture = PtQuiesce::new();
+        fixture.test_observer = Some(EntrantTestObserver {
+            park: park_tx,
+            release: Mutex::new(release_rx),
+            guard_waiting: guard_tx,
+        });
+        let barrier = Arc::new(fixture);
+        assert!(barrier.try_become_coordinator());
+        barrier.set_quiescing();
+        let (left_tx, left_rx) = std::sync::mpsc::channel();
+        let entrant_barrier = Arc::clone(&barrier);
+        let entrant = std::thread::spawn(move || {
+            entrant_barrier.park();
+            left_tx.send(()).unwrap();
+        });
+        assert_eq!(
+            park_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+            (false, 0)
+        );
+        for refused in 1..=ENTRANT_REFUSAL_LIMIT {
+            {
+                // Model end followed by immediate re-election while owning
+                // the wake mutex. The entrant cannot win a scheduling gap.
+                let _entrants = barrier.parked_entrants.lock().unwrap();
+                barrier.pauses_ended.fetch_add(1, Ordering::SeqCst);
+                barrier.coordinator.store(false, Ordering::SeqCst);
                 assert!(barrier.try_become_coordinator());
-                barrier.await_starving_entrants();
-                barrier.set_quiescing();
+                barrier.cv.notify_all();
             }
-            let waited = parked_at.elapsed();
-            barrier.end();
-            entrant.join().unwrap();
-            assert!(
-                waited < Duration::from_millis(500),
-                "the parked entrant was held behind back-to-back fences for {waited:?}"
+            assert_eq!(
+                park_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+                (true, refused)
             );
+            assert_eq!(
+                barrier.starving.load(Ordering::SeqCst),
+                refused == ENTRANT_REFUSAL_LIMIT,
+                "admission must become mandatory at the refusal budget"
+            );
+            if refused < ENTRANT_REFUSAL_LIMIT {
+                release_tx.send(()).unwrap();
+                assert_eq!(
+                    park_rx.recv_timeout(Duration::from_secs(30)).unwrap(),
+                    (false, refused)
+                );
+            }
         }
+        // The entrant is held outside the mutex. The newly elected editor
+        // must actually wait for it, and cannot raise another fence first.
+        barrier.end();
+        assert!(barrier.try_become_coordinator());
+        let guard_barrier = Arc::clone(&barrier);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let coordinator = std::thread::spawn(move || {
+            guard_barrier.await_starving_entrants();
+            assert_eq!(
+                *guard_barrier.parked_entrants.lock().unwrap(),
+                0,
+                "guard returned with a held entrant"
+            );
+            guard_barrier.set_quiescing();
+            done_tx.send(()).unwrap();
+        });
+        guard_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("guard must wait for explicitly held entrant");
+        assert!(!barrier.is_quiescing());
+        release_tx.send(()).unwrap();
+        left_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("entrant admission watchdog");
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("coordinator watchdog");
+        entrant.join().unwrap();
+        coordinator.join().unwrap();
+        barrier.end();
     }
 
     #[test]
