@@ -2097,6 +2097,187 @@ mod tests {
         }
     }
     #[test]
+    fn grant_pool_and_capacity_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let old_pool =
+            fs::read_to_string(repo.join("crates/carrick-el1-abi/src/cow_grants.rs")).unwrap();
+        assert!(
+            !old_pool.contains("pub struct CowGrantPool"),
+            "grant protocol must move, not be wrapped"
+        );
+        let old_capacity =
+            fs::read_to_string(repo.join("crates/carrick-el1/src/alloc.rs")).unwrap();
+        assert!(
+            !old_capacity.contains("pub struct MetadataAllocatorCore"),
+            "capacity must have one neutral owner"
+        );
+        let pool =
+            fs::read_to_string(repo.join("crates/carrick-core-abi/src/mm/cow_pool.rs")).unwrap();
+        assert!(pool.contains("pub struct CowGrantPool"));
+        let capacity =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/capacity.rs")).unwrap();
+        assert!(capacity.contains("pub struct MetadataAllocatorCore"));
+        assert!(!capacity.contains("carrick_el1"));
+    }
+    #[test]
+    fn moved_grant_capacity_witnesses_are_in_the_host_gate() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let recipes = fs::read_to_string(repo.join("justfile")).unwrap();
+        let owner = recipes
+            .split("test-mm-owner *ARGS:")
+            .nth(1)
+            .unwrap()
+            .split("\ntest *ARGS:")
+            .next()
+            .unwrap();
+        assert!(
+            owner.contains("-p carrick-core -p carrick-core-abi --lib"),
+            "moved grant and capacity tests must run in the host gate"
+        );
+    }
+    #[test]
+    fn grant_publication_and_wire_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let old = fs::read_to_string(
+            repo.join("crates/carrick-el1/src/personality/mm_portal/production.rs"),
+        )
+        .unwrap();
+        assert!(
+            !old.contains("fn apply_grant<"),
+            "grant owner must move, not be wrapped"
+        );
+        let wire =
+            fs::read_to_string(repo.join("crates/carrick-el1-abi/src/mm_portal_grant.rs")).unwrap();
+        assert!(!wire.contains("pub struct PortalGrantSlot"));
+        let owner = fs::read_to_string(repo.join("crates/carrick-core/src/mm/frames.rs")).unwrap();
+        assert!(owner.contains("fn apply_grant<"));
+        assert!(owner.contains("B::execute_grant"));
+        assert!(!owner.contains("carrick_el1"));
+    }
+    #[test]
+    fn frame_fault_admission_and_mailbox_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let old = fs::read_to_string(repo.join("crates/carrick-el1/src/fault.rs")).unwrap();
+        assert!(!old.contains("fn root_admits_commit("));
+        assert!(!old.contains("fn request_lazy_frames("));
+        assert!(!old.contains("pub struct FileFaultVenue"));
+        let wire = fs::read_to_string(repo.join("crates/carrick-el1-abi/src/lib.rs")).unwrap();
+        assert!(!wire.contains("pub struct FrameGrantMailbox"));
+        let owner = fs::read_to_string(repo.join("crates/carrick-core/src/mm/fault.rs")).unwrap();
+        assert!(owner.contains("pub fn root_admits_commit<"));
+        assert!(owner.contains("pub fn request_lazy_frames("));
+        assert!(!owner.contains("carrick_el1"));
+    }
+    #[test]
+    fn residency_retirement_has_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let native =
+            fs::read_to_string(repo.join("crates/carrick-runtime/src/hvpatch/asid.rs")).unwrap();
+        assert!(!native.contains("struct ResidencyState"));
+        assert!(!native.contains("struct AsidResidency {"));
+        assert!(!native.contains("struct AsidLoad {"));
+        let owner =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/retirement.rs")).unwrap();
+        assert!(owner.contains("pub struct AddressResidency"));
+        assert!(owner.contains("pub fn wait_for_admitted_loads"));
+        assert!(!owner.contains("carrick_runtime"));
+        assert!(!owner.contains("carrick_el1"));
+    }
+    #[test]
+    fn root_retirement_receipt_has_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let native =
+            fs::read_to_string(repo.join("crates/carrick-runtime/src/hvpatch/stage1_mm.rs"))
+                .unwrap();
+        assert!(!native.contains("pub struct Stage1RootRetirementTicket"));
+        assert!(!native.contains("root_retirement_nonce:"));
+        assert!(!native.contains("root_ticket_issued:"));
+        let owner =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/retirement.rs")).unwrap();
+        assert!(owner.contains("pub struct RootQuarantine"));
+        assert!(owner.contains("pub fn complete_root"));
+        assert!(owner.contains("!self.is_complete()"));
+    }
+    #[test]
+    fn logical_frame_references_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let native =
+            fs::read_to_string(repo.join("crates/carrick-kernel/src/kernel/frame_inventory.rs"))
+                .unwrap();
+        assert!(!native.contains("mapping_count: u32,"));
+        assert!(!native.contains("retire_on_last_unmap: bool,"));
+        let owner = fs::read_to_string(repo.join("crates/carrick-core/src/mm/frames.rs")).unwrap();
+        assert!(owner.contains("pub struct FrameReferences"));
+        assert!(owner.contains("pub fn request_retirement"));
+    }
+    #[test]
+    fn pin_retirement_has_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let native =
+            fs::read_to_string(repo.join("crates/carrick-vmm-hvf/src/trap/carrier_custody.rs"))
+                .unwrap();
+        assert!(!native.contains("pub(crate) struct CarrierStage2Pin {"));
+        assert!(!native.contains("snapshot.pin_count ="));
+        assert!(!native.contains("record.snapshot.retirement_requested = true;"));
+        let owner =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/retirement.rs")).unwrap();
+        assert!(owner.contains("pub fn pin_record"));
+        assert!(owner.contains("pub fn prepare_record_retirement"));
+        assert!(owner.contains("pub fn settle_record_retirement"));
+    }
+    #[test]
+    fn inventory_receipts_have_one_neutral_definition() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let native = fs::read_to_string(repo.join("crates/carrick-hal/src/kernel.rs")).unwrap();
+        assert!(!native.contains("pub struct FrameInventoryApplyReceipt"));
+        assert!(!native.contains("pub struct FrameInventoryRetirementReceipt"));
+        assert!(!native.contains("hal_id!(FrameId)"));
+        let wire =
+            fs::read_to_string(repo.join("crates/carrick-core-abi/src/mm/inventory.rs")).unwrap();
+        assert!(wire.contains("pub struct FrameInventoryApplyReceipt"));
+        assert!(wire.contains("binary_search"));
+        assert!(!wire.contains("carrick_hal"));
+    }
+
+    #[test]
+    fn table_capacity_retirement_loop_has_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let native =
+            fs::read_to_string(repo.join("crates/carrick-aarch64/src/stage1_authority.rs"))
+                .unwrap();
+        assert!(!native.contains("while index < inner.published_arenas.len()"));
+        assert!(!native.contains("pub enum TableArenaRetirement"));
+        let owner =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/retirement.rs")).unwrap();
+        assert!(owner.contains("pub fn retire_table_arenas"));
+    }
+
+    #[test]
+    fn pending_retirement_validation_has_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let native = fs::read_to_string(repo.join("crates/carrick-vmm-hvf/src/trap.rs")).unwrap();
+        assert!(!native.contains("struct PendingRetirementAudit {"));
+        assert!(!native.contains("fn authenticate_pending_retirement("));
+        let owner =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/retirement.rs")).unwrap();
+        assert!(owner.contains("pub fn authenticate_pending_retirement<"));
+        assert!(owner.contains("binary_search"));
+    }
+
+    #[test]
+    fn lease_closure_and_publication_drain_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let native =
+            fs::read_to_string(repo.join("crates/carrick-runtime/src/hvpatch/stage1_mm.rs"))
+                .unwrap();
+        assert!(!native.contains("enum Stage1MmLeaseLifecycle"));
+        assert!(!native.contains("self.residency.wait_for_admitted_loads();"));
+        let owner =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/retirement.rs")).unwrap();
+        assert!(owner.contains("pub struct LeaseGate"));
+        assert!(owner.contains("pub fn drain_publication"));
+    }
+    #[test]
     fn image_build_tracks_neutral_owner_inputs() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let build = fs::read_to_string(repo.join("crates/carrick-el1-image/build.rs")).unwrap();

@@ -30,10 +30,10 @@ const STAGE1_ROOT_SLOT_SIZE: u64 = 2 * 1024 * 1024;
 const STAGE1_ROOT_SLOT_COUNT: u32 =
     (carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_ARENA_SIZE / STAGE1_ROOT_SLOT_SIZE) as u32;
 
-static NEXT_ROOT_RETIREMENT_NONCE: AtomicU64 = AtomicU64::new(1);
+use carrick_core::mm::retirement::{LeaseGate, RootQuarantine, RootRetirementError, RootSlot};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct Stage1RootSlot(u32);
+pub struct Stage1RootSlot(u32);
 
 impl Stage1RootSlot {
     pub(crate) fn base(self) -> u64 {
@@ -46,61 +46,35 @@ impl Stage1RootSlot {
     }
 }
 
-/// One-shot request proving which reusable stage-1 slot the VMM must retire.
-///
-/// The VMM receives only the coordinates. The nonce stays opaque and is moved
-/// into a receipt only after the backend proves the exact stage-2 custody
-/// record is terminal, so allocator reuse cannot race physical retirement.
-#[derive(Debug)]
-pub struct Stage1RootRetirementTicket {
-    slot: Stage1RootSlot,
-    nonce: u64,
-}
-
-impl Stage1RootRetirementTicket {
-    pub(crate) fn base(&self) -> u64 {
-        self.slot.base()
+impl RootSlot for Stage1RootSlot {
+    fn base(self) -> u64 {
+        self.base()
     }
-
-    pub(crate) fn size(&self) -> u64 {
-        self.slot.size()
-    }
-
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    pub(crate) fn redeem_vmm(
-        self,
-        proof: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchMmRootRetirementProof,
-    ) -> Result<Stage1RootRetirementReceipt, Stage1MmError> {
-        let base = proof.root_slot_base();
-        let size = proof.root_slot_size();
-        if (base, size) != (self.slot.base(), self.slot.size()) {
-            return Err(Stage1MmError::RootRetirementMismatch {
-                expected_base: self.slot.base(),
-                expected_size: self.slot.size(),
-                actual_base: base,
-                actual_size: size,
-            });
-        }
-        Ok(Stage1RootRetirementReceipt {
-            slot: self.slot,
-            nonce: self.nonce,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn complete_for_test(self) -> Stage1RootRetirementReceipt {
-        Stage1RootRetirementReceipt {
-            slot: self.slot,
-            nonce: self.nonce,
-        }
+    fn size(self) -> u64 {
+        self.size()
     }
 }
+pub type Stage1RootRetirementTicket =
+    carrick_core::mm::retirement::RootRetirementTicket<Stage1RootSlot>;
+pub type Stage1RootRetirementReceipt =
+    carrick_core::mm::retirement::RootRetirementReceipt<Stage1RootSlot>;
 
-/// Opaque proof that the VMM terminalized the exact reusable root slot.
-#[derive(Debug)]
-pub struct Stage1RootRetirementReceipt {
-    slot: Stage1RootSlot,
-    nonce: u64,
+#[cfg(test)]
+pub(crate) fn complete_root_for_test(
+    ticket: Stage1RootRetirementTicket,
+) -> Stage1RootRetirementReceipt {
+    struct TestProof(u64, u64);
+    // SAFETY: VM-free fixture terminalizes synthetic backing at these coordinates.
+    unsafe impl carrick_core::mm::retirement::TerminalRootProof for TestProof {
+        fn base(&self) -> u64 {
+            self.0
+        }
+        fn size(&self) -> u64 {
+            self.1
+        }
+    }
+    let proof = TestProof(ticket.base(), ticket.size());
+    ticket.redeem(proof).expect("exact synthetic root receipt")
 }
 
 #[derive(Debug)]
@@ -134,7 +108,7 @@ pub(crate) struct Stage1MmLease {
     residency: AsidResidency,
     root_slot: Option<Stage1RootSlot>,
     extension_slots: Mutex<Vec<Stage1RootSlot>>,
-    lifecycle: Mutex<Stage1MmLeaseLifecycle>,
+    lifecycle: Mutex<LeaseGate>,
     /// The last foreign-COW invalidation generation published for this MM.
     cow_invalidation_published: Arc<AtomicU64>,
     /// The last generation a broadcast invalidation covered (on any vCPU).
@@ -208,13 +182,6 @@ impl CowInvalidationTicket {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Stage1MmLeaseLifecycle {
-    Live,
-    RetirementPrepared,
-    Retired,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg_attr(not(test), allow(dead_code))]
 enum Stage1RetirementPreparationFailpoint {
     Disabled,
@@ -245,7 +212,7 @@ impl Stage1MmLease {
             residency: AsidResidency::new(asid),
             root_slot,
             extension_slots: Mutex::new(Vec::new()),
-            lifecycle: Mutex::new(Stage1MmLeaseLifecycle::Live),
+            lifecycle: Mutex::new(LeaseGate::default()),
             cow_invalidation_published: Arc::new(AtomicU64::new(0)),
             cow_invalidation_serviced: Arc::new(AtomicU64::new(0)),
             cow_invalidation: Mutex::new(0),
@@ -284,7 +251,7 @@ impl Stage1MmLease {
             self.binding().ttbr0.raw(),
             0,
         );
-        *space = if *lifecycle == Stage1MmLeaseLifecycle::Live {
+        *space = if lifecycle.is_live() {
             publish(self.binding().ttbr0.raw())
                 .map_or(AddressSpaceState::Never, AddressSpaceState::Published)
         } else {
@@ -343,12 +310,12 @@ impl Stage1MmLease {
     /// Whether this lease has stopped admitting executor loads, for either
     /// reason: the lease itself is retiring, or its ASID generation is.
     pub(crate) fn is_retiring(&self) -> bool {
-        *self.lifecycle.lock() != Stage1MmLeaseLifecycle::Live || self.residency.is_retiring()
+        !self.lifecycle.lock().is_live() || self.residency.is_retiring()
     }
 
     pub(crate) fn begin_asid_load(&self) -> Result<AsidLoad, AsidResidencyError> {
         let lifecycle = self.lifecycle.lock();
-        if *lifecycle != Stage1MmLeaseLifecycle::Live {
+        if !lifecycle.is_live() {
             return Err(AsidResidencyError::Retiring);
         }
         self.residency.begin_load()
@@ -435,7 +402,7 @@ impl Stage1MmLease {
 
     pub(crate) fn publish_stage1_root(&self, stage1_root: u64) -> Result<MmBinding, Stage1MmError> {
         let lifecycle = self.lifecycle.lock();
-        if *lifecycle != Stage1MmLeaseLifecycle::Live {
+        if !lifecycle.is_live() {
             return Err(Stage1MmError::Retired);
         }
         let stage1_root = Stage1Root::for_aarch64_4k(carrick_guest_mem::Gpa(stage1_root))?;
@@ -458,6 +425,8 @@ pub(crate) struct Stage1MmPool {
 struct Stage1MmPoolInner {
     asids: AsidAllocator,
     free_root_slots: BTreeSet<Stage1RootSlot>,
+    #[cfg(test)]
+    root_nonce_exhausted: bool,
 }
 
 fn carrier_stage1_mm_pool() -> &'static Arc<Mutex<Stage1MmPoolInner>> {
@@ -466,6 +435,8 @@ fn carrier_stage1_mm_pool() -> &'static Arc<Mutex<Stage1MmPoolInner>> {
         Arc::new(Mutex::new(Stage1MmPoolInner {
             asids: AsidAllocator::new(),
             free_root_slots: (0..STAGE1_ROOT_SLOT_COUNT).map(Stage1RootSlot).collect(),
+            #[cfg(test)]
+            root_nonce_exhausted: false,
         }))
     })
 }
@@ -638,6 +609,8 @@ impl Stage1MmPool {
                 inner: Arc::new(Mutex::new(Stage1MmPoolInner {
                     asids,
                     free_root_slots: (0..STAGE1_ROOT_SLOT_COUNT).map(Stage1RootSlot).collect(),
+                    #[cfg(test)]
+                    root_nonce_exhausted: false,
                 })),
             },
             root,
@@ -723,31 +696,41 @@ impl Stage1MmPool {
         self.prepare_retirement_inner(lease, failpoint)
     }
 
+    fn reserve_root_quarantine(
+        &self,
+        slot: Option<Stage1RootSlot>,
+    ) -> Result<RootQuarantine<Stage1RootSlot>, RootRetirementError> {
+        #[cfg(test)]
+        if slot.is_some() && self.inner.lock().root_nonce_exhausted {
+            return Err(RootRetirementError::TicketUnavailable);
+        }
+        RootQuarantine::reserve(slot)
+    }
+
     fn prepare_retirement_inner(
         &self,
         lease: &Arc<Stage1MmLease>,
         failpoint: Stage1RetirementPreparationFailpoint,
     ) -> Result<PreparedStage1MmRetirement, Stage1MmError> {
         let mut lifecycle = lease.lifecycle.lock();
-        if *lifecycle != Stage1MmLeaseLifecycle::Live {
+        if !lifecycle.prepare() {
             return Err(Stage1MmError::Retired);
         }
-        *lifecycle = Stage1MmLeaseLifecycle::RetirementPrepared;
         if failpoint == Stage1RetirementPreparationFailpoint::AfterLeaseGate {
-            *lifecycle = Stage1MmLeaseLifecycle::Live;
+            lifecycle.rollback();
             return Err(Stage1MmError::Retired);
         }
 
         let residency = match lease.residency.prepare_retirement() {
             Ok(residency) => residency,
             Err(error) => {
-                *lifecycle = Stage1MmLeaseLifecycle::Live;
+                lifecycle.rollback();
                 return Err(error.into());
             }
         };
         if failpoint == Stage1RetirementPreparationFailpoint::AfterResidency {
             drop(residency);
-            *lifecycle = Stage1MmLeaseLifecycle::Live;
+            lifecycle.rollback();
             return Err(Stage1MmError::Retired);
         }
         let asid = {
@@ -758,14 +741,14 @@ impl Stage1MmPool {
             Ok(asid) => asid,
             Err(error) => {
                 drop(residency);
-                *lifecycle = Stage1MmLeaseLifecycle::Live;
+                lifecycle.rollback();
                 return Err(error.into());
             }
         };
         if failpoint == Stage1RetirementPreparationFailpoint::AfterAllocator {
             drop(asid);
             drop(residency);
-            *lifecycle = Stage1MmLeaseLifecycle::Live;
+            lifecycle.rollback();
             return Err(Stage1MmError::Retired);
         }
         drop(lifecycle);
@@ -832,11 +815,7 @@ impl PreparedStage1MmRetirement {
 
     pub(crate) fn commit(mut self) -> Stage1MmRetirement {
         let mut lifecycle = self.lease.lifecycle.lock();
-        assert_eq!(
-            *lifecycle,
-            Stage1MmLeaseLifecycle::RetirementPrepared,
-            "prepared stage-1 retirement lost its lease-gate reservation"
-        );
+
         let Some(residency) = self.residency.take() else {
             carrick_fatal!(
                 "hvpatch::stage1_retirement",
@@ -851,7 +830,7 @@ impl PreparedStage1MmRetirement {
             );
         };
         let asid = asid.commit();
-        *lifecycle = Stage1MmLeaseLifecycle::Retired;
+        lifecycle.commit();
         drop(lifecycle);
         self.finished = true;
         // The ASID is retiring: guest EL1 may not install the address space
@@ -871,26 +850,23 @@ impl PreparedStage1MmRetirement {
                 AddressSpaceState::Unpublished | AddressSpaceState::Never => None,
             }
         };
-        let root_retirement_nonce = self.root_slot.map(|_| {
-            NEXT_ROOT_RETIREMENT_NONCE
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    current.checked_add(1)
-                })
-                .unwrap_or_else(|_| {
-                    carrick_fatal!(
-                        "hvpatch::stage1_retirement",
-                        "root retirement nonce overflow in PreparedStage1MmRetirement::commit"
-                    );
-                })
-        });
+        // Unpublished rollback never allocates proof identity. Preserve the
+        // native exhaustion disposition at the committed retirement boundary.
+        let root_quarantine = self
+            .pool
+            .reserve_root_quarantine(self.root_slot)
+            .unwrap_or_else(|_| {
+                carrick_fatal!(
+                    "hvpatch::stage1_retirement",
+                    "root retirement nonce overflow in PreparedStage1MmRetirement::commit"
+                );
+            });
         let extension_slots = self.lease.extension_slots.lock().drain(..).collect();
         Stage1MmRetirement {
             pool: self.pool.clone(),
             asid,
             residency,
-            root_slot: self.root_slot,
-            root_retirement_nonce,
-            root_ticket_issued: false,
+            root_quarantine,
             extension_slots,
             space: Mutex::new(space),
         }
@@ -903,11 +879,7 @@ impl Drop for PreparedStage1MmRetirement {
             return;
         }
         let mut lifecycle = self.lease.lifecycle.lock();
-        assert_eq!(
-            *lifecycle,
-            Stage1MmLeaseLifecycle::RetirementPrepared,
-            "prepared stage-1 retirement lost its lease-gate reservation"
-        );
+
         drop(self.asid.take());
         #[cfg(test)]
         if let Some(hook) = self.rollback_hook.as_ref() {
@@ -920,7 +892,7 @@ impl Drop for PreparedStage1MmRetirement {
             hook.after_residency.wait();
             hook.resume_after_residency.wait();
         }
-        *lifecycle = Stage1MmLeaseLifecycle::Live;
+        lifecycle.rollback();
     }
 }
 
@@ -1076,9 +1048,7 @@ pub(crate) struct Stage1MmRetirement {
     pool: Stage1MmPool,
     asid: RetiredAsid,
     residency: AsidRetirement,
-    root_slot: Option<Stage1RootSlot>,
-    root_retirement_nonce: Option<u64>,
-    root_ticket_issued: bool,
+    root_quarantine: RootQuarantine<Stage1RootSlot>,
     extension_slots: Vec<Stage1RootSlot>,
     /// The closed publication of the retiring address space, if it had one.
     space: Mutex<Option<carrick_kernel::kernel::AddressSpacePublication>>,
@@ -1090,13 +1060,7 @@ impl Stage1MmRetirement {
     /// entry is freed.
     pub(crate) fn retire_address_space(&self) {
         let space = self.space.lock().take();
-        if let Some(space) = space.as_ref() {
-            space.retire_reservations();
-        }
-        drop(space);
-        // A foreign drain may still borrow this generation's TTBR0 on another
-        // MM's vCPU: its window ends before the invalidation is decided.
-        self.residency.wait_for_admitted_loads();
+        carrick_core::mm::retirement::drain_publication(space, &self.residency);
     }
 
     pub(crate) fn asid_generation(&self) -> AsidGeneration {
@@ -1118,42 +1082,16 @@ impl Stage1MmRetirement {
     pub(crate) fn take_root_retirement_ticket(
         &mut self,
     ) -> Result<Option<Stage1RootRetirementTicket>, Stage1MmError> {
-        let Some(slot) = self.root_slot else {
-            return Ok(None);
-        };
-        if self.root_ticket_issued {
-            return Err(Stage1MmError::RootRetirementTicketAlreadyIssued);
-        }
-        let nonce = self
-            .root_retirement_nonce
-            .ok_or(Stage1MmError::RootRetirementTicketUnavailable)?;
-        self.root_ticket_issued = true;
-        Ok(Some(Stage1RootRetirementTicket { slot, nonce }))
+        self.root_quarantine.take_ticket().map_err(Into::into)
     }
 
     pub(crate) fn complete(
         self,
         root_receipt: Option<Stage1RootRetirementReceipt>,
     ) -> Result<(), Stage1MmError> {
-        if !self.residency.is_complete() {
-            return Err(Stage1MmError::RetirementIncomplete);
-        }
-        match (self.root_slot, self.root_retirement_nonce, root_receipt) {
-            (None, None, None) => {}
-            (Some(slot), Some(nonce), Some(receipt))
-                if receipt.slot == slot && receipt.nonce == nonce => {}
-            (Some(slot), _, Some(receipt)) => {
-                return Err(Stage1MmError::RootRetirementMismatch {
-                    expected_base: slot.base(),
-                    expected_size: slot.size(),
-                    actual_base: receipt.slot.base(),
-                    actual_size: receipt.slot.size(),
-                });
-            }
-            (Some(_), _, None) => return Err(Stage1MmError::RootRetirementReceiptMissing),
-            (None, _, Some(_)) => return Err(Stage1MmError::UnexpectedRootRetirementReceipt),
-            (None, Some(_), None) => return Err(Stage1MmError::UnexpectedRootRetirementReceipt),
-        }
+        let root_slot = self
+            .residency
+            .complete_root(self.root_quarantine, root_receipt)?;
         let mut inner = self.pool.inner.lock();
         inner.asids.acknowledge_tlb_flush(self.asid)?;
         let generation = self.residency.generation();
@@ -1161,9 +1099,9 @@ impl Stage1MmRetirement {
             1,
             u32::from(generation.asid().raw()),
             generation.generation(),
-            self.root_slot.map_or(0, |slot| slot.base()),
+            root_slot.map_or(0, |slot| slot.base()),
         );
-        if let Some(root_slot) = self.root_slot {
+        if let Some(root_slot) = root_slot {
             inner.free_root_slots.insert(root_slot);
         }
         for slot in self.extension_slots {
@@ -1176,7 +1114,7 @@ impl Stage1MmRetirement {
     pub(crate) fn complete_for_test(mut self) -> Result<(), Stage1MmError> {
         let receipt = self
             .take_root_retirement_ticket()?
-            .map(Stage1RootRetirementTicket::complete_for_test);
+            .map(complete_root_for_test);
         self.complete(receipt)
     }
 }
@@ -1214,6 +1152,29 @@ pub(crate) enum Stage1MmError {
     },
     #[error(transparent)]
     Residency(#[from] AsidResidencyError),
+}
+
+impl From<RootRetirementError> for Stage1MmError {
+    fn from(error: RootRetirementError) -> Self {
+        match error {
+            RootRetirementError::Incomplete => Self::RetirementIncomplete,
+            RootRetirementError::TicketAlreadyIssued => Self::RootRetirementTicketAlreadyIssued,
+            RootRetirementError::TicketUnavailable => Self::RootRetirementTicketUnavailable,
+            RootRetirementError::ReceiptMissing => Self::RootRetirementReceiptMissing,
+            RootRetirementError::UnexpectedReceipt => Self::UnexpectedRootRetirementReceipt,
+            RootRetirementError::Mismatch {
+                expected_base,
+                expected_size,
+                actual_base,
+                actual_size,
+            } => Self::RootRetirementMismatch {
+                expected_base,
+                expected_size,
+                actual_base,
+                actual_size,
+            },
+        }
+    }
 }
 
 impl From<AsidError> for Stage1MmError {
@@ -1581,6 +1542,81 @@ mod tests {
             .complete_for_test()
             .expect("ack retire");
         assert_eq!(backend.binding(), initial);
+    }
+
+    #[test]
+    fn root_nonce_exhaustion_does_not_retain_unpublished_drop() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let prepared = pool.prepare_child().expect("first preparation");
+        let binding = prepared.binding();
+        let slot = prepared.root_slot();
+        pool.inner.lock().root_nonce_exhausted = true;
+        drop(prepared);
+        let replacement = pool.prepare_child().expect("unpublished ASID returned");
+        assert_eq!(replacement.binding().asid, binding.asid);
+        assert_eq!(replacement.root_slot(), slot, "unpublished root returned");
+    }
+
+    #[test]
+    fn root_nonce_exhaustion_does_not_retain_unpublished_abort() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let prepared = pool.prepare_child().expect("first preparation");
+        let binding = prepared.binding();
+        let slot = prepared.root_slot();
+        pool.inner.lock().root_nonce_exhausted = true;
+        assert!(matches!(
+            prepared.abort().expect("unpublished abort"),
+            PreparedStage1MmAbort::Unpublished { .. }
+        ));
+        let replacement = pool.prepare_child().expect("unpublished ASID returned");
+        assert_eq!(replacement.binding().asid, binding.asid);
+        assert_eq!(replacement.root_slot(), slot, "unpublished root returned");
+    }
+
+    #[test]
+    #[ignore = "invoked by the bounded native-fatal parent witness"]
+    fn serial_host_root_nonce_exhaustion_is_native_fatal_child() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let lease = pool.prepare_child().expect("child").commit();
+        pool.inner.lock().root_nonce_exhausted = true;
+        let _retirement = pool
+            .retire(&lease)
+            .expect("committed retirement is not recoverable");
+        panic!("committed retirement returned after root nonce exhaustion");
+    }
+
+    #[test]
+    fn serial_host_root_nonce_exhaustion_is_native_fatal() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+        use wait_timeout::ChildExt;
+
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "hvpatch::stage1_mm::tests::serial_host_root_nonce_exhaustion_is_native_fatal_child",
+                "--ignored", "--nocapture",
+            ])
+            .stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().expect("native fatal witness child");
+        if child
+            .wait_timeout(Duration::from_secs(5))
+            .expect("bounded child wait")
+            .is_none()
+        {
+            child.kill().expect("kill only witness child");
+            child.wait().expect("reap witness child");
+            panic!("native fatal witness exceeded its five-second bound");
+        }
+        let output = child.wait_with_output().expect("reaped witness output");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.signal(), Some(libc::SIGABRT), "{stderr}");
+        assert!(stderr.contains("hvpatch::stage1_retirement"), "{stderr}");
+        assert!(
+            stderr.contains("root retirement nonce overflow in PreparedStage1MmRetirement::commit"),
+            "{stderr}"
+        );
     }
 
     #[test]

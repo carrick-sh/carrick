@@ -71,14 +71,7 @@ pub trait TableArenaPublisher: Send + Sync {
     }
 }
 
-/// Software-image disposition after exact physical table-capacity retirement.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TableArenaRetirement {
-    /// Revoke the stopped MM's image before released backing is accessible.
-    Terminal,
-    /// Preserve the quiesced image for the existing exec successor handoff.
-    ExecHandoff,
-}
+pub use carrick_core::mm::retirement::TableArenaRetirement;
 
 struct Stage1AuthorityInner {
     manager: TrackedStage1Image,
@@ -816,16 +809,11 @@ impl Stage1Authority {
                 let publisher = inner.arena_publisher.clone().ok_or_else(|| {
                     "published table capacity has no physical retirement authority".to_owned()
                 })?;
-                let mut index = 0;
-                while index < inner.published_arenas.len() {
-                    let base = inner.published_arenas[index];
-                    if Some(base) == root {
-                        index += 1;
-                        continue;
-                    }
-                    publisher.retire_raw_table_arena(base)?;
-                    inner.published_arenas.swap_remove(index);
-                }
+                carrick_core::mm::retirement::retire_table_arenas(
+                    &mut inner.published_arenas,
+                    root,
+                    |base| publisher.retire_raw_table_arena(base),
+                )?;
             }
             let result = retire_root(inner.manager.as_ref())?;
             let (image, source) = if disposition == TableArenaRetirement::Terminal {

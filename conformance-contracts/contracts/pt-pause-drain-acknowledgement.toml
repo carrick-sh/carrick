@@ -9,10 +9,11 @@ rationale = "Before editing stage-1 descriptors the coordinator kicks every exec
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-runtime::vcpu_loop::quiesce::pt_pause_tests::pt_pause_drain_waits_for_late_sibling_acknowledgement; carrick-runtime::vcpu_loop::quiesce::pt_pause_tests::pt_pause_drain_sees_a_sibling_that_reregistered_after_a_block"
+vm_free = "carrick-runtime::vcpu_loop::quiesce::pt_pause_tests::pt_pause_drain_waits_for_late_sibling_acknowledgement; carrick-runtime::vcpu_loop::quiesce::pt_pause_tests::pt_pause_drain_sees_a_sibling_that_reregistered_after_a_block; carrick-core::x86_acceleration::x3_shared_protocol (orders 3a/3b components only: both descriptor ISAs at 16/64/256 pages, exact grant generation and rollback; 4 KiB/16 KiB backing, logical leaf references and pin-before-return; dirty-load closure/drain, stale invalidation refusal, exact root nonce, failed arena retirement quarantine, and 20000-mapping retirement receipt authentication; no signed physical mapping census, production pool-exhaustion, exec/clear-tid or order-4 wait acceptance)"
 embed = "carrick-embed::pt_pause_drain_pressure"
 ecosystem = ["go:testing", "go:time", "go:os_signal", "go:net_http"]
 
 [bindings.unresolved]
+x86_cpl0 = "Order 3 custody components now have a VM-free binding. Exact in-CPL0 X3 remains pending order 4, release-before-enroll, default-pool exhaustion and exec/clear-tid; no KVM or signed acceptance is conferred."
 docker = "Internal quiescence invariant. The Linux-visible obligation is that the faulting instruction or mmap-family call completes; the go ecosystem rows carry the differential."
 embed_structural = "The VM-free binding asserts the coordinator's CPU time stays far below its wait (no spin) as a wall-clock-free ratio, not a deterministic work counter; no WorkObservation metric for drain wake rounds is registered yet."
