@@ -425,6 +425,8 @@ pub(crate) struct Stage1MmPool {
 struct Stage1MmPoolInner {
     asids: AsidAllocator,
     free_root_slots: BTreeSet<Stage1RootSlot>,
+    #[cfg(test)]
+    root_nonce_exhausted: bool,
 }
 
 fn carrier_stage1_mm_pool() -> &'static Arc<Mutex<Stage1MmPoolInner>> {
@@ -433,6 +435,8 @@ fn carrier_stage1_mm_pool() -> &'static Arc<Mutex<Stage1MmPoolInner>> {
         Arc::new(Mutex::new(Stage1MmPoolInner {
             asids: AsidAllocator::new(),
             free_root_slots: (0..STAGE1_ROOT_SLOT_COUNT).map(Stage1RootSlot).collect(),
+            #[cfg(test)]
+            root_nonce_exhausted: false,
         }))
     })
 }
@@ -605,6 +609,8 @@ impl Stage1MmPool {
                 inner: Arc::new(Mutex::new(Stage1MmPoolInner {
                     asids,
                     free_root_slots: (0..STAGE1_ROOT_SLOT_COUNT).map(Stage1RootSlot).collect(),
+                    #[cfg(test)]
+                    root_nonce_exhausted: false,
                 })),
             },
             root,
@@ -690,12 +696,22 @@ impl Stage1MmPool {
         self.prepare_retirement_inner(lease, failpoint)
     }
 
+    fn reserve_root_quarantine(
+        &self,
+        slot: Option<Stage1RootSlot>,
+    ) -> Result<RootQuarantine<Stage1RootSlot>, RootRetirementError> {
+        #[cfg(test)]
+        if slot.is_some() && self.inner.lock().root_nonce_exhausted {
+            return Err(RootRetirementError::TicketUnavailable);
+        }
+        RootQuarantine::reserve(slot)
+    }
+
     fn prepare_retirement_inner(
         &self,
         lease: &Arc<Stage1MmLease>,
         failpoint: Stage1RetirementPreparationFailpoint,
     ) -> Result<PreparedStage1MmRetirement, Stage1MmError> {
-        let root_quarantine = RootQuarantine::reserve(lease.root_slot)?;
         let mut lifecycle = lease.lifecycle.lock();
         if !lifecycle.prepare() {
             return Err(Stage1MmError::Retired);
@@ -742,7 +758,7 @@ impl Stage1MmPool {
             lease: Arc::clone(lease),
             residency: Some(residency),
             asid: Some(asid),
-            root_quarantine,
+            root_slot: lease.root_slot,
             finished: false,
             #[cfg(test)]
             rollback_hook: None,
@@ -758,7 +774,7 @@ pub(crate) struct PreparedStage1MmRetirement {
     lease: Arc<Stage1MmLease>,
     residency: Option<PreparedAsidResidencyRetirement>,
     asid: Option<PreparedAsidAllocatorRetirement>,
-    root_quarantine: RootQuarantine<Stage1RootSlot>,
+    root_slot: Option<Stage1RootSlot>,
     finished: bool,
     #[cfg(test)]
     rollback_hook: Option<RollbackOrderHook>,
@@ -834,15 +850,23 @@ impl PreparedStage1MmRetirement {
                 AddressSpaceState::Unpublished | AddressSpaceState::Never => None,
             }
         };
+        // Unpublished rollback never allocates proof identity. Preserve the
+        // native exhaustion disposition at the committed retirement boundary.
+        let root_quarantine = self
+            .pool
+            .reserve_root_quarantine(self.root_slot)
+            .unwrap_or_else(|_| {
+                carrick_fatal!(
+                    "hvpatch::stage1_retirement",
+                    "root retirement nonce overflow in PreparedStage1MmRetirement::commit"
+                );
+            });
         let extension_slots = self.lease.extension_slots.lock().drain(..).collect();
         Stage1MmRetirement {
             pool: self.pool.clone(),
             asid,
             residency,
-            root_quarantine: std::mem::replace(
-                &mut self.root_quarantine,
-                RootQuarantine::rootless(),
-            ),
+            root_quarantine,
             extension_slots,
             space: Mutex::new(space),
         }
@@ -1518,6 +1542,81 @@ mod tests {
             .complete_for_test()
             .expect("ack retire");
         assert_eq!(backend.binding(), initial);
+    }
+
+    #[test]
+    fn root_nonce_exhaustion_does_not_retain_unpublished_drop() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let prepared = pool.prepare_child().expect("first preparation");
+        let binding = prepared.binding();
+        let slot = prepared.root_slot();
+        pool.inner.lock().root_nonce_exhausted = true;
+        drop(prepared);
+        let replacement = pool.prepare_child().expect("unpublished ASID returned");
+        assert_eq!(replacement.binding().asid, binding.asid);
+        assert_eq!(replacement.root_slot(), slot, "unpublished root returned");
+    }
+
+    #[test]
+    fn root_nonce_exhaustion_does_not_retain_unpublished_abort() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let prepared = pool.prepare_child().expect("first preparation");
+        let binding = prepared.binding();
+        let slot = prepared.root_slot();
+        pool.inner.lock().root_nonce_exhausted = true;
+        assert!(matches!(
+            prepared.abort().expect("unpublished abort"),
+            PreparedStage1MmAbort::Unpublished { .. }
+        ));
+        let replacement = pool.prepare_child().expect("unpublished ASID returned");
+        assert_eq!(replacement.binding().asid, binding.asid);
+        assert_eq!(replacement.root_slot(), slot, "unpublished root returned");
+    }
+
+    #[test]
+    #[ignore = "invoked by the bounded native-fatal parent witness"]
+    fn serial_host_root_nonce_exhaustion_is_native_fatal_child() {
+        let (pool, _root) = Stage1MmPool::new_root_for_tests(0x8000, 2).expect("root pool");
+        let lease = pool.prepare_child().expect("child").commit();
+        pool.inner.lock().root_nonce_exhausted = true;
+        let _retirement = pool
+            .retire(&lease)
+            .expect("committed retirement is not recoverable");
+        panic!("committed retirement returned after root nonce exhaustion");
+    }
+
+    #[test]
+    fn serial_host_root_nonce_exhaustion_is_native_fatal() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+        use wait_timeout::ChildExt;
+
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "hvpatch::stage1_mm::tests::serial_host_root_nonce_exhaustion_is_native_fatal_child",
+                "--ignored", "--nocapture",
+            ])
+            .stdout(Stdio::piped()).stderr(Stdio::piped())
+            .spawn().expect("native fatal witness child");
+        if child
+            .wait_timeout(Duration::from_secs(5))
+            .expect("bounded child wait")
+            .is_none()
+        {
+            child.kill().expect("kill only witness child");
+            child.wait().expect("reap witness child");
+            panic!("native fatal witness exceeded its five-second bound");
+        }
+        let output = child.wait_with_output().expect("reaped witness output");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.signal(), Some(libc::SIGABRT), "{stderr}");
+        assert!(stderr.contains("hvpatch::stage1_retirement"), "{stderr}");
+        assert!(
+            stderr.contains("root retirement nonce overflow in PreparedStage1MmRetirement::commit"),
+            "{stderr}"
+        );
     }
 
     #[test]

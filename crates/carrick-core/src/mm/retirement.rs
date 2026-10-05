@@ -307,7 +307,8 @@ pub struct RootRetirementReceipt<S: RootSlot> {
 }
 
 /// The sole root-reuse gate for one retirement. Neither cloneable nor mintable
-/// from a receipt; aborted admission burns a nonce without authorizing reuse.
+/// from a receipt. Allocate it only when retirement commits; unpublished
+/// preparation and rollback do not need proof identity.
 #[derive(Debug)]
 pub struct RootQuarantine<S: RootSlot> {
     slot: Option<S>,
@@ -323,10 +324,16 @@ impl<S: RootSlot> RootQuarantine<S> {
         }
     }
     pub fn reserve(slot: Option<S>) -> Result<Self, RootRetirementError> {
+        Self::reserve_with_counter(slot, &NEXT_ROOT_RETIREMENT_NONCE)
+    }
+    fn reserve_with_counter(
+        slot: Option<S>,
+        counter: &AtomicU64,
+    ) -> Result<Self, RootRetirementError> {
         let Some(slot) = slot else {
             return Ok(Self::rootless());
         };
-        let nonce = NEXT_ROOT_RETIREMENT_NONCE
+        let nonce = counter
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1)
             })
@@ -729,4 +736,39 @@ pub fn drain_publication<V: ResidencyVenue, G: Copy + Eq, P: AddressPublication>
     }
     drop(publication);
     residency.wait_for_admitted_loads();
+}
+
+#[cfg(test)]
+mod nonce_tests {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct Slot;
+    impl RootSlot for Slot {
+        fn base(self) -> u64 {
+            0x8000
+        }
+        fn size(self) -> u64 {
+            0x4000
+        }
+    }
+
+    #[test]
+    fn root_nonce_exhaustion_never_wraps_and_rootless_needs_no_nonce() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        let mut last = RootQuarantine::reserve_with_counter(Some(Slot), &counter)
+            .expect("last available nonce");
+        assert_eq!(last.take_ticket().unwrap().unwrap().nonce, u64::MAX - 1);
+        for _ in 0..2 {
+            assert!(matches!(
+                RootQuarantine::reserve_with_counter(Some(Slot), &counter),
+                Err(RootRetirementError::TicketUnavailable)
+            ));
+            assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+        }
+        let mut rootless = RootQuarantine::<Slot>::reserve_with_counter(None, &counter)
+            .expect("rootless retirement needs no nonce");
+        assert!(rootless.take_ticket().unwrap().is_none());
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
 }

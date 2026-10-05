@@ -2327,7 +2327,7 @@
       "symbol": "NEXT_ROOT_RETIREMENT_NONCE",
       "fingerprint": "c73210fbc89a24fcfaa66dc2721fc4849d50029ea61803558ef70f4ea8f3c24e",
       "classification": "monotonic_allocator",
-      "rationale": "The same carrier-wide root retirement nonce allocator moved into Core. It carries no container identity; checked admission refuses exhaustion before irreversible retirement and never wraps."
+      "rationale": "The same carrier-wide root retirement nonce allocator moved into Core. It carries no container identity and never wraps. Unpublished rollback does not allocate a nonce. Core reports exhaustion; the committed native retirement preserves its fatal disposition."
     },
     {
       "kind": "static",
