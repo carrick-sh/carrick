@@ -221,17 +221,72 @@ impl Fixture {
             &serde_json::to_vec(&inventory).unwrap(),
         );
         std::os::unix::fs::symlink(
-            "carrick-el1-abi/src/lib.rs",
-            root.join("crates/source-link"),
+            "src/lib.rs",
+            root.join("crates/carrick-el1-abi/source-link"),
         )
         .unwrap();
+        // Real, registry-free Cargo graphs exercise direct and transitive closure.
+        for name in [
+            "carrick-el1-abi",
+            "fixture-transitive",
+            "fixture-builder",
+            "carrick-runtime",
+        ] {
+            let dependency = if name == "carrick-el1-abi" {
+                "[dependencies]\nfixture-transitive = { path = \"../fixture-transitive\" }\n"
+            } else {
+                ""
+            };
+            write(root, &format!("crates/{name}/Cargo.toml"),
+                format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n{dependency}").as_bytes());
+            if name != "carrick-el1-abi" {
+                write(root, &format!("crates/{name}/src/lib.rs"), b"// source\n");
+            }
+        }
+        write(
+            root,
+            "Cargo.toml",
+            b"[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n",
+        );
+        for directory in [
+            "conformance-probes",
+            "fixtures/linux-aarch64-hello",
+            "fixtures/embed-interceptor-probe",
+            "fixtures/embed-zone-readers",
+            "fixtures/embed-icache-reuse",
+            "fixtures/embed-el1-sched",
+        ] {
+            let name = directory.rsplit('/').next().unwrap();
+            let dependency = if name == "embed-el1-sched" {
+                "[dependencies]\ncarrick-el1-abi = { path = \"../../crates/carrick-el1-abi\" }\n[build-dependencies]\nfixture-builder = { path = \"../../crates/fixture-builder\" }\n[dev-dependencies]\ncarrick-runtime = { path = \"../../crates/carrick-runtime\" }\n"
+            } else {
+                ""
+            };
+            write(root, &format!("{directory}/Cargo.toml"),
+                format!("[workspace]\n[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n{dependency}").as_bytes());
+            write(root, &format!("{directory}/src/lib.rs"), b"// source\n");
+            if name == "embed-el1-sched" {
+                write(root, &format!("{directory}/build.rs"), b"fn main() {}\n");
+            }
+            let output = Command::new("cargo")
+                .current_dir(root)
+                .args(["generate-lockfile", "--offline", "--manifest-path"])
+                .arg(format!("{directory}/Cargo.toml"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
         git(root, &["add", "."]);
         git(root, &["commit", "-qm", "fixture inputs"]);
         let sha = git(root, &["rev-parse", "HEAD"]);
         let mut sources = BTreeMap::new();
         for path in git(root, &["ls-files"])
             .lines()
-            .filter(|p| *p != ".gitignore")
+            .filter(|p| *p != ".gitignore" && !p.starts_with("crates/carrick-runtime/"))
         {
             let source = root.join(path);
             let digest = if fs::symlink_metadata(&source)
@@ -444,6 +499,107 @@ fn local_workspace_dependency_sources_are_verified() {
     );
 }
 #[test]
+fn unrelated_workspace_edits_preserve_fixture_identity() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    write(
+        f.repo.path(),
+        "crates/carrick-runtime/src/lib.rs",
+        b"// diagnostic\n",
+    );
+    write(
+        f.repo.path(),
+        "crates/carrick-runtime/src/diagnostic.rs",
+        b"// untracked\n",
+    );
+    fixtures::verify_installed(f.repo.path()).unwrap();
+    fixtures::verify_bundle(f.repo.path(), &f.path, None).unwrap();
+    let receipt = f.store.path().join("verification.json");
+    let result = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .current_dir(f.repo.path())
+        .args(["fixtures", "verify", "--receipt"])
+        .arg(&receipt)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let validation: serde_json::Value =
+        serde_json::from_slice(&fs::read(receipt).unwrap()).unwrap();
+    assert_eq!(validation["validation_method"], "input_identity");
+    assert_eq!(validation["checkout_dirty"], true);
+    assert_eq!(
+        validation["checkout_head"],
+        validation["bundle_source_head"]
+    );
+    assert_eq!(
+        validation["inputs_sha256"],
+        String::from(hash(&serde_json::to_vec(&f.manifest.sources).unwrap()))
+    );
+    let acceptance = carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).unwrap();
+    assert_eq!(serde_json::to_value(acceptance).unwrap(), validation);
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    let installed: serde_json::Value = serde_json::from_slice(
+        &fs::read(f.repo.path().join(fixtures::INSTALLED_MANIFEST)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(installed["validation"], validation);
+}
+
+#[test]
+fn unresolved_fixture_closure_fails_closed() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    write(
+        f.repo.path(),
+        "fixtures/embed-el1-sched/Cargo.toml",
+        b"not a manifest",
+    );
+    assert!(
+        fixtures::verify_installed(f.repo.path())
+            .unwrap_err()
+            .to_string()
+            .contains("command 'cargo' failed")
+    );
+    git(
+        f.repo.path(),
+        &["restore", "fixtures/embed-el1-sched/Cargo.toml"],
+    );
+    fs::remove_file(f.repo.path().join("fixtures/embed-el1-sched/Cargo.lock")).unwrap();
+    assert!(
+        fixtures::verify_installed(f.repo.path())
+            .unwrap_err()
+            .to_string()
+            .contains("missing fixture manifest or lockfile")
+    );
+}
+
+#[test]
+fn transitive_fixture_dependency_edits_are_rejected() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    write(
+        f.repo.path(),
+        "crates/fixture-transitive/src/lib.rs",
+        b"// changed\n",
+    );
+    assert!(fixtures::verify_installed(f.repo.path()).is_err());
+    git(
+        f.repo.path(),
+        &["restore", "crates/fixture-transitive/src/lib.rs"],
+    );
+    fixtures::verify_installed(f.repo.path()).unwrap();
+    write(
+        f.repo.path(),
+        "crates/fixture-builder/src/lib.rs",
+        b"// changed builder\n",
+    );
+    assert!(fixtures::verify_installed(f.repo.path()).is_err());
+}
+
+#[test]
 fn missing_source_hash_and_missing_executable_row_are_rejected() {
     let mut f = Fixture::new();
     f.manifest.sources.remove("rust-toolchain.toml");
@@ -578,6 +734,7 @@ impl Preparation {
             &bin,
             "cargo",
             br#"#!/bin/sh
+if [ "$1" = metadata ]; then exec "$FIXTURE_TEST_CARGO" "$@"; fi
 while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
 [ "$#" -gt 0 ] || exit 91
 shift
@@ -623,6 +780,7 @@ fi
                 format!("{}:{}", self.bin.display(), std::env::var("PATH").unwrap()),
             )
             .env("FIXTURE_TEST_XTASK", env!("CARGO_BIN_EXE_carrick-xtask"))
+            .env("FIXTURE_TEST_CARGO", env!("CARGO"))
             .env(
                 "FIXTURE_TEST_JUST",
                 String::from_utf8(just.stdout).unwrap().trim(),
