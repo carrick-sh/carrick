@@ -519,7 +519,8 @@ test *ARGS:
         # Runtime's test injections are fixture-owned, but carrier/prepare tests
         # still share process-wide VM lifecycle windows. Artifact/preemption
         # tests mutate env, signal tests fork/reap host children, and owner-boundary
-        # tests probe closed fd numbers. Keep the crate serial for these reasons.
+        # tests probe closed fd numbers. Stage-1 rollback tests assert reuse from
+        # the process-wide root-slot pool. Keep the crate serial for these reasons.
         env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
         # carrick-vmm-hvf is serial for a THIRD reason, and it is structural
         # rather than a test-hygiene lapse: the carrier is process-global by
@@ -550,8 +551,8 @@ test *ARGS:
     env RUST_TEST_THREADS=1 cargo test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} serial_host
     env RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-cli {{_platform_features}} --bin carrick {{ARGS}}
     env RUST_TEST_THREADS=1 cargo test -p carrick-host --lib {{ARGS}}
-    # Runtime still has process-wide carrier lifecycle, env and host-fork tests;
-    # fixture-owned injections alone do not make the complete crate parallel-safe.
+    # Runtime still has process-wide carrier lifecycle, root-slot pool, env and
+    # host-fork tests; fixture-owned injections alone do not make it parallel-safe.
     env RUST_TEST_THREADS=1 cargo test -p carrick-runtime {{_platform_features}} --lib {{ARGS}}
     cargo test -p carrick-conformance-contract --tests {{ARGS}}
     cargo test -p carrick-xtask --test probe_coverage {{ARGS}}

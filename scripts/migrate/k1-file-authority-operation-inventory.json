@@ -22533,7 +22533,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5991,
+      "line": 6006,
       "categories": [
         "mapping"
       ],
@@ -22542,7 +22542,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5999,
+      "line": 6014,
       "categories": [
         "mapping"
       ],
@@ -22551,7 +22551,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 6015,
+      "line": 6030,
       "categories": [
         "mapping"
       ],
@@ -23388,7 +23388,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/quiesce.rs",
-      "line": 2393,
+      "line": 2410,
       "categories": [
         "mapping"
       ],
