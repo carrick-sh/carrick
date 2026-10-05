@@ -1597,6 +1597,195 @@ pub fn poll(table: &Table) { table.read_open_files(); }
     );
 }
 
+#[test]
+fn review_production_closure_promotes_the_shared_module_child() {
+    for hidden in [
+        "fn hidden(table: &Table) { table.read_open_files(); }",
+        "fn hidden(this: &Dispatcher) { this.proc.lock(); }",
+    ] {
+        let root = source_fixture();
+        let src = root.path().join("crates/carrick-kernel/src");
+        write_source(
+            src.join("lib.rs"),
+            r#"
+pass! { @ use std::include as x; x!("shared.rs"); }
+#[cfg(test)] #[path="shared.rs"] mod tests_copy;
+pub fn poll(table: &Table) { table.read_open_files(); }
+"#,
+        )
+        .unwrap();
+        write_source(
+            src.join("shared.rs"),
+            "#[path=\"census_child.rs\"] pub mod child;",
+        )
+        .unwrap();
+        write_source(src.join("census_child.rs"), "fn data() {}").unwrap();
+        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        assert!(!census.is_test_file("crates/carrick-kernel/src/census_child.rs"));
+        write_source(src.join("census_child.rs"), hidden).unwrap();
+        assert!(
+            carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+                .is_err(),
+            "a promoted production file cannot confer a test-only exemption on its child: {hidden}"
+        );
+    }
+}
+
+#[test]
+fn review_production_closure_promotes_two_level_descendants() {
+    for hidden in [
+        "fn hidden(table: &Table) { table.read_open_files(); }",
+        "fn hidden(this: &Dispatcher) { this.proc.lock(); }",
+    ] {
+        let root = source_fixture();
+        let src = root.path().join("crates/carrick-kernel/src");
+        write_source(
+            src.join("lib.rs"),
+            r#"
+pass! { @ "shared.rs"; }
+#[cfg(test)] #[path="shared.rs"] mod tests_copy;
+pub fn poll(table: &Table) { table.read_open_files(); }
+"#,
+        )
+        .unwrap();
+        write_source(
+            src.join("shared.rs"),
+            "#[path=\"census_child.rs\"] pub mod child;",
+        )
+        .unwrap();
+        write_source(
+            src.join("census_child.rs"),
+            "#[path=\"census_grandchild.rs\"] pub mod grandchild;",
+        )
+        .unwrap();
+        write_source(src.join("census_grandchild.rs"), "fn data() {}").unwrap();
+        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        assert!(!census.is_test_file("crates/carrick-kernel/src/census_child.rs"));
+        assert!(!census.is_test_file("crates/carrick-kernel/src/census_grandchild.rs"));
+        write_source(src.join("census_grandchild.rs"), hidden).unwrap();
+        assert!(
+            carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+                .is_err(),
+            "production reachability must continue beyond one child: {hidden}"
+        );
+    }
+}
+
+#[test]
+fn review_production_closure_follows_plain_modules_and_macro_edges() {
+    for (shared_file, shared, child_file) in [
+        ("shared.rs", "pub mod census_child;", "census_child.rs"),
+        (
+            "shared.rs",
+            "pass! { @ \"census_child.rs\"; }",
+            "census_child.rs",
+        ),
+        (
+            "shared.rs",
+            "fn launch() { #[path=\"census_child.rs\"] mod child; }",
+            "census_child.rs",
+        ),
+        (
+            "shared.rs",
+            "items! { #[path=\"census_child.rs\"] mod child; }",
+            "census_child.rs",
+        ),
+        (
+            "shared.rs",
+            "#[path=\"inline_sources\"] mod inline { pub mod census_child; }",
+            "inline_sources/census_child.rs",
+        ),
+        (
+            "nested/entry.rs",
+            "pub mod census_child;",
+            "nested/entry/census_child.rs",
+        ),
+    ] {
+        let root = source_fixture();
+        let src = root.path().join("crates/carrick-kernel/src");
+        let child = src.join(child_file);
+        let grandchild = child.with_extension("").join("grandchild.rs");
+        let grandchild_file = grandchild.strip_prefix(&src).unwrap().to_string_lossy();
+        write_source(
+            src.join("lib.rs"),
+            format!(
+                r#"
+pass! {{ @ "{shared_file}"; }}
+#[cfg(test)] #[path="{shared_file}"] mod tests_copy;
+#[cfg(test)] #[path="{child_file}"] mod child_tests_copy;
+#[cfg(test)] #[path="{grandchild_file}"] mod grandchild_tests_copy;
+pub fn poll(table: &Table) {{ table.read_open_files(); }}
+"#
+            ),
+        )
+        .unwrap();
+        let shared_path = src.join(shared_file);
+        std::fs::create_dir_all(shared_path.parent().unwrap()).unwrap();
+        write_source(shared_path, shared).unwrap();
+        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+        write_source(child, "pub mod grandchild;").unwrap();
+        std::fs::create_dir_all(grandchild.parent().unwrap()).unwrap();
+        write_source(&grandchild, "fn data() {}").unwrap();
+        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        let relative = format!("crates/carrick-kernel/src/{grandchild_file}");
+        assert!(!census.is_test_file(&relative), "descendant of {shared}");
+        write_source(
+            &grandchild,
+            "fn hidden(table: &Table) { table.read_open_files(); }",
+        )
+        .unwrap();
+        assert!(
+            carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+                .is_err(),
+            "ordinary, inline, local, macro-input and literal edges must continue to production descendants: {shared_file}: {shared}"
+        );
+    }
+}
+
+#[test]
+fn review_production_closure_converges_without_promoting_test_modules() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        r#"
+pass! { @ "shared.rs"; }
+#[cfg(test)] #[path="shared.rs"] mod tests_copy;
+pub fn poll(table: &Table) { table.read_open_files(); }
+"#,
+    )
+    .unwrap();
+    write_source(
+        src.join("shared.rs"),
+        r#"
+#[path="census_child.rs"] pub mod child;
+#[cfg(test)] #[path="only_tests.rs"] mod tests;
+"#,
+    )
+    .unwrap();
+    write_source(
+        src.join("census_child.rs"),
+        "#[path=\"shared.rs\"] pub mod back;",
+    )
+    .unwrap();
+    write_source(
+        src.join("only_tests.rs"),
+        r#"
+pass! { @ "only_tests.rs"; }
+fn test(table: &Table) { table.read_open_files(); }
+"#,
+    )
+    .unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert!(!census.is_test_file("crates/carrick-kernel/src/census_child.rs"));
+    assert!(census.is_test_file("crates/carrick-kernel/src/only_tests.rs"));
+    assert!(
+        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+            .is_ok(),
+        "cyclic physical references converge while cfg(test) descendants stay excluded"
+    );
+}
+
 fn git_fixture(root: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args(args)
