@@ -1,0 +1,35 @@
+   Compiling carrick-x86 v0.1.0 (/home/carrick/dev/wt-m2-kvm/crates/carrick-x86)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.12s
+     Running unittests src/lib.rs (target/debug/deps/carrick_x86-9021914d64a80c84)
+
+running 12 tests
+test bringup_fns::poll_tests::normalized_poll_pipe_reader_keeps_unrequested_hangup ... ok
+test bringup_fns::poll_tests::normalized_poll_broken_pipe_writer_reports_error_for_every_zero_interest_entry ... ok
+test bringup_fns::poll_tests::normalized_poll_clears_stale_events_and_reports_invalid_descriptors ... ok
+test bringup_fns::poll_tests::normalized_poll_validates_memory_but_ignores_pointer_for_empty_set ... ok
+test bringup_fns::poll_tests::normalized_poll_reports_readiness_and_linear_guest_copy_work ... ok
+test bringup_fns::poll_tests::normalized_poll_preserves_each_duplicate_interest_and_unrequested_hangup ... ok
+test bringup_fns::poll_tests::poll_invalid_descriptor_overrides_an_infinite_timeout ... ok
+test bringup_fns::poll_tests::poll_native_interruption_returns_linux_eintr_without_copyout_or_retry ... ok
+test bringup_fns::poll_tests::poll_normalizes_every_negative_timeout_at_the_native_boundary ... FAILED
+test bringup_fns::poll_tests::poll_rejects_nfds_above_the_limit_before_guest_access_or_native_wait ... ok
+test bringup_fns::poll_tests::poll_positive_wait_completes_when_a_producer_makes_the_fd_ready ... ok
+test bringup_fns::poll_tests::normalized_poll_keeps_distinct_ready_descriptors ... ok
+
+failures:
+
+---- bringup_fns::poll_tests::poll_normalizes_every_negative_timeout_at_the_native_boundary stdout ----
+
+thread 'bringup_fns::poll_tests::poll_normalizes_every_negative_timeout_at_the_native_boundary' (539750) panicked at crates/carrick-x86/src/bringup_fns/poll_tests.rs:254:17:
+assertion `left == right` failed
+  left: -2
+ right: -1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    bringup_fns::poll_tests::poll_normalizes_every_negative_timeout_at_the_native_boundary
+
+test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p carrick-x86 --lib`
