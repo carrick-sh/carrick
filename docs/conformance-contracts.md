@@ -335,6 +335,9 @@ The two-live-MM VM-free bindings are
 `two_live_mm_pinned_table_retirement_cannot_return_physical_capacity`: retirement
 releases one slot, retains the other MM's bytes and identity, and a pin allows
 zero capacity returns. These do not qualify full-crate parallel host fixtures.
+`two_live_mm_empty_inventory_releases_already_terminal_table_capacity` covers
+an earlier exact physical retirement followed by MM teardown without data rows:
+the old record permits release of only its still-retained capacity.
 
 `kernel.mm.delegated-root-reader-cost` covers the host readers of a delegated
 root: proposal charging (`RLIMIT_AS`/`RLIMIT_DATA`), `mincore`, fault plans,
