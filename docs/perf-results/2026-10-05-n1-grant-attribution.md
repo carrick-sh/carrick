@@ -69,3 +69,19 @@ rollback wake, late enrollment, distinct completion at the same VA, and an
 applied descriptor receipt. The full HVF non-serial library run passes
 713 tests (3 ignored, 18 serial-host tests excluded); runtime compile-check
 passes. Full CI, loom and exact signed acceptance remain pending.
+
+## Clear-child-tid identity correction
+
+The exact captured-thread refusal is reproduced by a real VM-free nonleader
+exec in `serial_host_child_tid_clear_survives_nonleader_exec_identity_change`.
+Exec promotes the survivor's Linux TID while preserving its runtime registry
+ID. The previous guard compared these separate domains. The red checkpoint
+is `ef2f1ab23`; `/tmp/n1g2-child-tid-red.log` contains the same refusal as the
+signed anonymous/fork-COW failures.
+
+Capture and sibling drain now use the Kernel thread's typed `registry_id()`;
+exact thread and MM custody still govern retirement. The green witness
+rejects a different registry runner and the old MM, then completes clear,
+wake and exit publication exactly once. All six `child_tid_owner_tests`
+pass serially (`/tmp/n1g2-child-tid-green.log`). Signed attribution remains
+pending the final exact-artifact gate.
