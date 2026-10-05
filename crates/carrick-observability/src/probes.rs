@@ -5526,6 +5526,10 @@ mod real {
         /// 4 census, 5 prepare, 6 custody, 7 owner publication, 8 receipt),
         /// parent MM, child MM, and parent reservation generation.
         fn hvpatch__owner__fork__refusal(_: u32, _: u64, _: u64, _: u64, _: u64) {}
+        /// Stage-3 EINVAL details: check (1 child arena, 2 parent arena,
+        /// 3 parent root), parent TTBR0, child base, parent base, and
+        /// child/parent lengths packed into the high/low 32 bits.
+        fn hvpatch__owner__fork__stage3__refusal(_: u64, _: u64, _: u64, _: u64, _: u64) {}
         /// Mutually exclusive process-spec construction stages. Args: phase
         /// (0=parent tables load, 1=vCPU snapshot, 2=parent table clone,
         /// 3=rebase, 4=alias union, 5=private snapshot, 6=validation,
@@ -7450,6 +7454,23 @@ mod real {
     }
 
     #[inline(never)]
+    pub fn hvpatch_owner_fork_stage3_refusal(
+        check: u64,
+        parent_ttbr0: u64,
+        child_base: u64,
+        parent_base: u64,
+        packed_lengths: u64,
+    ) {
+        carrick_usdt::hvpatch__owner__fork__stage3__refusal!(|| (
+            check,
+            parent_ttbr0,
+            child_base,
+            parent_base,
+            packed_lengths
+        ));
+    }
+
+    #[inline(never)]
     pub fn hvpatch_fork_process_spec_stage(event: super::HvpatchForkProcessSpecStage) {
         carrick_usdt::hvpatch__fork__process__spec__stage!(|| (
             event.phase().raw(),
@@ -9271,6 +9292,7 @@ mod stub {
     stub!(hvpatch_topology_lock(event: super::HvpatchTopologyLock));
     stub!(hvpatch_fork_runtime_stage(event: super::HvpatchForkRuntimeStage));
     stub!(hvpatch_owner_fork_refusal(errno: u32, stage: u64, parent_mm: u64, child_mm: u64, generation: u64));
+    stub!(hvpatch_owner_fork_stage3_refusal(check: u64, parent_ttbr0: u64, child_base: u64, parent_base: u64, packed_lengths: u64));
     stub!(hvpatch_fork_process_spec_stage(event: super::HvpatchForkProcessSpecStage));
     stub!(hvpatch_fork_private_snapshot(event: super::HvpatchForkPrivateSnapshot));
     stub!(hvpatch_fork_private_snapshot_outcome(event: super::HvpatchForkPrivateSnapshotOutcome));
