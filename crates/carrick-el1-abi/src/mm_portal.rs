@@ -237,3 +237,15 @@ const _: () =
 const _: () = assert!(
     EL1_MM_PORTAL_OFFSET + core::mem::size_of::<MmPortalSlots>() as u64 <= crate::EL1_STACKS_OFFSET
 );
+
+impl carrick_core_abi::ForkRequestRecord for crate::PortalForkRequest {
+    fn operation(self) -> PortalOperation {
+        self.operation
+    }
+    fn parent_generation(self) -> ReservationGeneration {
+        self.parent_generation
+    }
+    fn child_mm(self) -> ReservationMm {
+        self.child_mm
+    }
+}

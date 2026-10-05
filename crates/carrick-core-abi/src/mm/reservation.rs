@@ -280,3 +280,83 @@ impl ReservationNodeFlags {
         Self(self.0 & !other.0)
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mapping {
+    pub range: ReservationRange,
+    pub protection: ReservationProtection,
+    /// Non-anonymous mappings participate in placement but cannot be edited.
+    pub anonymous: bool,
+    /// Insertion-time attributes; anything but plain private anonymous is
+    /// host-owned and every EL1 edit touching it forwards.
+    pub flags: ReservationNodeFlags,
+    pub generation: ReservationGeneration,
+    pub host_backing: Option<crate::HostBackingIdentity>,
+}
+
+/// Byte charges of committed nodes, whole-root or within one range: every
+/// node (`RLIMIT_AS`), `RLIMIT_DATA` nodes, and `LOCKED` anonymous nodes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Charges {
+    pub bytes: u64,
+    pub data: u64,
+    pub locked: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct ReservationNodeData {
+    pub start: u64,
+    pub end: u64,
+    pub first: u64,
+    pub last: u64,
+    pub gap: u64,
+    pub bytes: u64,
+    pub data: u64,
+    /// Subtree bytes of `LOCKED` anonymous nodes.
+    pub locked: u64,
+    /// This node's [`ReservationIncarnation`]; zero never names one.
+    pub incarnation: u64,
+    pub left: u32,
+    pub right: u32,
+    pub height: u32,
+    /// [`ReservationProtection`] bits (three) and [`ReservationNodeFlags`]
+    /// bits (seven), packed so the bootstrap table fits its region.
+    pub prot: u16,
+    pub flags: u16,
+    pub host_backing: Option<crate::HostBackingIdentity>,
+}
+/// ISA binding of the existing shared region. No owner logic belongs here.
+pub trait ReservationGeometry {
+    const RESERVATIONS_OFFSET: usize;
+    const ZONE_OFFSET: usize;
+    const REGION_BASE: u64;
+    const BOOTSTRAP_BASE: u64;
+    const BOOTSTRAP_SIZE: u64;
+}
+
+/// The Linux client interprets the neutral node; core owns its storage and work.
+pub trait ReservationPolicy {
+    fn root_editable(node: &ReservationNodeData) -> bool;
+    fn flags(node: &ReservationNodeData) -> ReservationNodeFlags;
+    fn protection(node: &ReservationNodeData) -> ReservationProtection;
+    fn charged_data(node: &ReservationNodeData) -> u64;
+    fn charged_locked(node: &ReservationNodeData) -> u64;
+    fn charges_within(node: &ReservationNodeData, start: u64, end: u64) -> Charges;
+    fn mapping(node: &ReservationNodeData, generation: ReservationGeneration) -> Mapping;
+    fn same_mapping(node: &ReservationNodeData, other: &ReservationNodeData) -> bool;
+    fn charges_data(flags: ReservationNodeFlags, protection: ReservationProtection) -> bool;
+}
+
+/// Native allocator adapter, called only after the root guard is consumed.
+///
+/// # Safety
+/// Allocations must cover the returned receipt and remain live until freed.
+/// Published allocations belong to the carrier store until carrier teardown.
+pub unsafe trait ReservationMetadataAllocator {
+    fn allocate_with_extent(
+        &self,
+        layout: core::alloc::Layout,
+    ) -> Option<(*mut u8, crate::ExtentGrantReceipt)>;
+    fn deallocate(&self, ptr: *mut u8, layout: core::alloc::Layout);
+}
