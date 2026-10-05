@@ -1271,6 +1271,7 @@ fn replace_page_tables_authority(
             .install_exec_successor(successor)
             .map_err(TrapError::Hypervisor),
         ExecStage1Replacement::Image(manager) => {
+            let manager = manager.map(|image| *image);
             let (successor, shared) =
                 page_tables.replace_for_exec_internal(|| Ok(manager), |old| retire_old(old))?;
             *page_tables = successor;
@@ -1288,7 +1289,7 @@ fn replace_and_bind_page_tables_authority(
 ) -> Result<(), TrapError> {
     replace_page_tables_authority(
         page_tables,
-        ExecStage1Replacement::Image(manager),
+        ExecStage1Replacement::Image(manager.map(Box::new)),
         retire_old,
     )?;
     bind_new(page_tables.clone());
