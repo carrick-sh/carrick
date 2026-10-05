@@ -6,7 +6,7 @@
 //! zero semantic host forwards. Control observation/kicks are separate.
 //! Missing KVM or an image is a failure; no Docker, retries or timing claims.
 #![cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::needless_range_loop)]
 
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
 use carrick_sched_core::{SlotId, ThreadIdentity, ZoneTables};
