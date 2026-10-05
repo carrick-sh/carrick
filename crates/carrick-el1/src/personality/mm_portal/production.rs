@@ -4,13 +4,13 @@ use super::{El1MmHandle, GuestVa, TransferIntent};
 use super::{MmError, MmErrorLinux};
 use crate::memory::reservations::NativeReservationGeometry;
 pub use carrick_core::mm::transaction::{
-    GrantTarget, SelectionVenues, TRANSFER_CHUNK_BYTES, TransferStep, admit_service_root,
-    bind_service_root, grant_target, prepare_transfer, serve_transfer, settle_prepared_service,
+    SelectionVenues, TRANSFER_CHUNK_BYTES, TransferStep, admit_service_root, bind_service_root,
+    grant_target, prepare_transfer, serve_transfer, settle_prepared_service,
 };
+#[cfg(target_os = "none")]
+use carrick_el1_abi::PinnedMetadataExtent;
 #[cfg(any(test, target_os = "none"))]
 use carrick_el1_abi::ReservationMm;
-use carrick_el1_abi::{FrameGrantResidencyTable, PinnedMetadataExtent};
-use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
 use carrick_mmu_core::owner_mmu::Aarch64Mmu;
 use carrick_personality_linux::mm::LinuxReservationPolicy;
 #[cfg(target_os = "none")]
@@ -46,7 +46,9 @@ pub type MmPortal<'a, P, B = Aarch64Mmu> = carrick_core::mm::transaction::MmPort
     NativeOwnerVenue,
     B,
 >;
-const PA: u64 = 0x0000_ffff_ffff_f000;
+#[cfg(target_os = "none")]
+use carrick_core::mm::frames::apply_grant;
+pub use carrick_core::mm::frames::{GrantTarget, serve_grant};
 
 #[cfg(target_os = "none")]
 pub enum GuestMetadataPin {}
@@ -304,119 +306,6 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     };
 }
 
-/// Revalidate an owner-selected lazy window and apply its isolated submission
-/// through the existing descriptor executor. Normal descriptor drains cannot
-/// see the submission before this exact-generation check.
-pub fn serve_grant<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
-    portal: &MmPortal<'_, P>,
-    slot: &carrick_el1_abi::PortalGrantSlot,
-    words: &W,
-    residency: &FrameGrantResidencyTable,
-    worker: u32,
-    invalidate: impl FnOnce(),
-) -> Result<Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt>, MmError> {
-    let Some(window) = slot.window() else {
-        return Ok(None);
-    };
-    let target = grant_target(portal, window, worker)?;
-    Ok(apply_grant(slot, words, residency, target, invalidate))
-}
-
-fn apply_grant<W: LiveDescriptorWords + ?Sized>(
-    slot: &carrick_el1_abi::PortalGrantSlot,
-    words: &W,
-    residency: &FrameGrantResidencyTable,
-    target: GrantTarget<'_>,
-    invalidate: impl FnOnce(),
-) -> Option<carrick_mmu_core::aarch64::descriptor_txn::DescriptorReceipt> {
-    use carrick_mmu_core::aarch64::descriptor_txn::{
-        DescriptorOp, DescriptorOutcome, DescriptorRefusal, InlineJournal, execute_descriptor_txn,
-    };
-    let (window, grant, editor, authenticated) = target.into_parts();
-    let mm = window.operation.mm;
-    let claimed = slot.descriptor().claim_for_mm(mm.raw())?;
-    let outcome = (|| {
-        let Ok(txn) = claimed.txn() else {
-            return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
-        };
-        if !authenticated {
-            return DescriptorOutcome::Refused(DescriptorRefusal::StaleRoot);
-        }
-        let DescriptorOp::Prepare {
-            publication,
-            resident,
-            backing,
-        } = txn.op
-        else {
-            return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
-        };
-        if publication.va != window.range.start()
-            || publication.len != window.range.len()
-            || publication.writable != (window.protection.bits() & 2 != 0)
-            || publication.executable != (window.protection.bits() & 4 != 0)
-            || resident.va != window.fault_page
-            || resident.len != 4096
-        {
-            return DescriptorOutcome::Refused(DescriptorRefusal::BadEncoding);
-        }
-        // The authenticated remapped root may replace a core-typed retired
-        // terminal with fresh backing. Never revive its output, or replace a
-        // prepared/live predecessor. The window is at most 512 pages.
-        for va in (publication.va..publication.va + publication.len).step_by(4096) {
-            let mut table = grant.ttbr0 & PA;
-            for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
-                let Ok(word) = words.load(table + ((va >> shift) & 511) * 8) else {
-                    return DescriptorOutcome::Refused(DescriptorRefusal::TableOutsidePrimary);
-                };
-                if word == 0 {
-                    break;
-                }
-                if word & 3 != 3 || level == 3 {
-                    if level != 0
-                        && carrick_mmu_core::aarch64::el1_private_leaf_state(word)
-                            == carrick_mmu_core::aarch64::El1PrivateLeafState::Retired
-                    {
-                        break;
-                    }
-                    return DescriptorOutcome::Refused(DescriptorRefusal::Occupied);
-                }
-                table = word & PA;
-            }
-        }
-        let identity = carrick_el1_abi::FrameGrantResidencyIdentity {
-            mm_key: mm.raw(),
-            semantic_base: publication.va,
-            physical_ipa: publication.ipa,
-            len: publication.len,
-            mapping_id: backing.mapping_id.get(),
-            frame_id: backing.frame_id.get(),
-            owner_generation: backing.owner_generation.get(),
-            inventory_revision: backing.inventory_revision.get(),
-        };
-        let Some(residency_slot) = residency.publish(identity) else {
-            return DescriptorOutcome::Refused(DescriptorRefusal::JournalCapacity);
-        };
-        let outcome = execute_descriptor_txn(
-            words,
-            carrick_mmu_core::aarch64::SubstrateGpa(grant.ttbr0 & PA),
-            txn,
-            &mut InlineJournal::new(),
-        )
-        .outcome;
-        if let DescriptorOutcome::Applied(_) = outcome {
-            if let Some(page) = residency.lookup(mm.raw(), window.fault_page) {
-                residency.record_commit(page);
-            }
-        } else {
-            residency.retire(residency_slot, identity);
-        }
-        outcome
-    })();
-    let receipt = claimed.complete(outcome, invalidate);
-    drop(editor);
-    Some(receipt)
-}
-
 #[cfg(target_os = "none")]
 pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
@@ -486,7 +375,7 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         return;
     };
     let root = target.grant().ttbr0;
-    if apply_grant(
+    if apply_grant::<Aarch64Mmu, _>(
         slot,
         &words,
         carrick_el1_abi::frame_grant_residency_guest(),
