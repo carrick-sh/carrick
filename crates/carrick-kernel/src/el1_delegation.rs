@@ -1734,6 +1734,20 @@ pub(crate) fn owner_prepare_refusal_after(
     committed: u64,
 ) -> crate::dispatch::DispatchOutcome {
     use carrick_guest_mem::MemoryPrepareError;
+    if let MemoryPrepareError::Fault(fault) = &error {
+        let (address, length) = match fault {
+            carrick_guest_mem::MemoryError::OutOfBounds { address, length } => {
+                (*address, *length as u64)
+            }
+            _ => (0, 0),
+        };
+        carrick_observability::probes::guest_internal_write_fault(
+            address,
+            length,
+            27,
+            &format!("owner copyout after {committed} bytes: {fault}"),
+        );
+    }
     match error {
         MemoryPrepareError::OwnerWait(wait) => {
             crate::dispatch::DispatchOutcome::OwnerMemoryWait { wait, committed }
