@@ -33,3 +33,5 @@ mod error;
 pub use error::MmError;
 pub mod owner;
 pub use owner::*;
+
+pub use crate::mm::frames::{GrantTarget, grant_target};

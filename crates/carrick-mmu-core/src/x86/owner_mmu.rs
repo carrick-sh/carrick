@@ -114,3 +114,79 @@ impl OwnerMmu for X86Mmu {
         Ok(())
     }
 }
+
+impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
+    fn execute_grant<W: LiveDescriptorWords + ?Sized>(
+        words: &W,
+        register: u64,
+        txn: &crate::aarch64::descriptor_txn::DescriptorTxn,
+    ) -> crate::aarch64::descriptor_txn::DescriptorOutcome {
+        use crate::aarch64::descriptor_txn::{
+            DescriptorApplied, DescriptorOp as WireOp, DescriptorOutcome as WireOutcome,
+            ReclaimedTables,
+        };
+        let WireOp::Prepare {
+            publication,
+            resident,
+            backing,
+        } = txn.op
+        else {
+            return WireOutcome::Refused(DescriptorRefusal::BadEncoding);
+        };
+        let Ok(root) = Self::root(register) else {
+            return WireOutcome::Refused(DescriptorRefusal::StaleRoot);
+        };
+        if root.address().raw() != txn.root.raw() {
+            return WireOutcome::Refused(DescriptorRefusal::StaleRoot);
+        }
+        let tables: alloc::vec::Vec<_> = txn
+            .tables
+            .as_slice()
+            .iter()
+            .map(|&pa| RootGpa::page_aligned(FrameGpa::new(pa)))
+            .collect();
+        let Some(tables) = tables.into_iter().collect::<Option<alloc::vec::Vec<_>>>() else {
+            return WireOutcome::Refused(DescriptorRefusal::BadTableGrant);
+        };
+        let native = DescriptorTxn {
+            id: txn.id,
+            root,
+            op: DescriptorOp::Prepare {
+                span: PageSpan::new(publication.va, publication.len),
+                output: FrameGpa::new(publication.ipa),
+                permissions: Permissions {
+                    writable: publication.writable,
+                    executable: publication.executable,
+                    user: true,
+                },
+                resident,
+                backing,
+            },
+            tables: &tables,
+        };
+        let receipt = execute_descriptor_txn(words, &native, root, &mut InlineJournal::new());
+        match receipt.outcome {
+            DescriptorOutcome::Applied {
+                stores,
+                tables_linked,
+            } => {
+                let (Ok(live_stores), Ok(tables_linked)) =
+                    (u32::try_from(stores), u8::try_from(tables_linked))
+                else {
+                    return WireOutcome::Indeterminate(DescriptorRefusal::BadEncoding);
+                };
+                WireOutcome::Applied(DescriptorApplied {
+                    pages: publication.len / PAGE,
+                    resident,
+                    tables_linked,
+                    reclaimed: ReclaimedTables::NONE,
+                    live_stores,
+                    flush_required: stores != 0,
+                })
+            }
+            DescriptorOutcome::Refused(reason) => WireOutcome::Refused(reason),
+            DescriptorOutcome::RolledBack(reason) => WireOutcome::RolledBack(reason),
+            DescriptorOutcome::Indeterminate(reason) => WireOutcome::Indeterminate(reason),
+        }
+    }
+}
