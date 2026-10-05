@@ -1395,7 +1395,8 @@ impl BlockedContinuation {
                                 return Err(ContinuationBuildError::StaleChildSelector);
                             }
                             child_key
-                        } else if let Some(task) = state.retiring_tasks.get(&id) {
+                        } else if let Some(record) = state.retiring_tasks.get(&id) {
+                            let task = &record.task;
                             if task.parent() != Some(parent_task) {
                                 return Err(ContinuationBuildError::StaleChildSelector);
                             }
