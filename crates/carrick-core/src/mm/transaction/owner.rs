@@ -512,9 +512,12 @@ impl<
                 match cow.resolve_cow_outcome(grant.ttbr0, mm, va) {
                     CowResolution::Resolved => {
                         #[cfg(target_os = "none")]
-                        if let Some(sequence) = continuation.fork_sequence() {
-                            cow.reconcile_parent_write(slot, continuation.handle, sequence, words)?;
-                        }
+                        cow.finish_resolution(
+                            slot,
+                            continuation.handle,
+                            continuation.fork_sequence(),
+                            words,
+                        )?;
                     }
                     CowResolution::Refused => return Err(MmError::Core),
                     CowResolution::NeedsSupply => {
