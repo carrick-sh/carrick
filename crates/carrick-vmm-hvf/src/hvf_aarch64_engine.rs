@@ -2814,8 +2814,8 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         Ok(())
     }
 
-    fn exec_page_tables(&self) -> Option<carrick_mmu_core::aarch64::PageTableManager> {
-        self.state.page_tables_snapshot()
+    fn exec_stage1_replacement(&self) -> carrick_aarch64::vmm::ExecStage1Replacement {
+        carrick_aarch64::vmm::ExecStage1Replacement::Authority(self.state.page_tables_authority())
     }
 
     fn install_user_memory_authority(
