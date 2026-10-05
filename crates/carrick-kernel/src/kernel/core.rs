@@ -1784,7 +1784,7 @@ impl Kernel {
             if state
                 .retiring_tasks
                 .values()
-                .any(|task| task.container().id() == container_id)
+                .any(|record| record.task.container().id() == container_id)
                 || (!selected.contains(&init.id)
                     && state
                         .zombies
@@ -1854,7 +1854,7 @@ impl Kernel {
                 || state
                     .retiring_tasks
                     .values()
-                    .any(|task| task.container().id() == container_id)
+                    .any(|record| record.task.container().id() == container_id)
                 || state.reservations.keys().any(|task| {
                     state
                         .tasks
@@ -2216,7 +2216,7 @@ impl Kernel {
                 && state
                     .retiring_tasks
                     .get(&root.id)
-                    .is_none_or(|task| task.key() != *root)
+                    .is_none_or(|record| record.task.key() != *root)
         }) {
             return Err(RegistryInvariantError::RootNotLive);
         }
@@ -2300,7 +2300,8 @@ impl Kernel {
                         return Err(RegistryInvariantError::ProcessGroupBacklink);
                     }
                     (task.task.process_group(), task.task.container().id())
-                } else if let Some(task) = state.retiring_tasks.get(&member.id) {
+                } else if let Some(record) = state.retiring_tasks.get(&member.id) {
+                    let task = &record.task;
                     if task.key() != *member {
                         return Err(RegistryInvariantError::ProcessGroupBacklink);
                     }
@@ -2392,8 +2393,8 @@ impl Kernel {
                     .zombies
                     .get(&child.id)
                     .is_some_and(|record| record.zombie.parent == Some(parent.task.key()));
-                let retiring_matches = state.retiring_tasks.get(&child.id).is_some_and(|task| {
-                    task.key() == child && task.parent() == Some(parent.task.key())
+                let retiring_matches = state.retiring_tasks.get(&child.id).is_some_and(|record| {
+                    record.task.key() == child && record.task.parent() == Some(parent.task.key())
                 });
                 if !live_matches && !zombie_matches && !retiring_matches {
                     return Err(RegistryInvariantError::ChildBacklink);
@@ -2450,26 +2451,42 @@ impl Registry {
             .map(|record| Arc::clone(&record.task))
     }
 
-    pub fn zombie(&self, id: TaskId) -> Option<Zombie> {
-        self.settled()
-            .read()
+    /// Observe exited identity without exposing its wait completion. A staged
+    /// clear keeps this identity addressable; wait reads only `state.zombies`.
+    pub fn exited_process(&self, id: TaskId) -> Option<Zombie> {
+        let state = self.settled().read();
+        state
             .zombies
             .get(&id)
-            .map(|record| record.zombie.clone())
+            .map(|record| &record.zombie)
+            .or_else(|| {
+                state
+                    .retiring_tasks
+                    .get(&id)
+                    .map(|record| &record.observation)
+            })
+            .cloned()
     }
 
-    pub(crate) fn zombies_for_container(&self, container: ContainerId) -> Vec<Zombie> {
-        self.settled()
-            .read()
+    pub(crate) fn exited_processes_for_container(&self, container: ContainerId) -> Vec<Zombie> {
+        let state = self.settled().read();
+        state
             .zombies
             .values()
-            .filter(|record| record.zombie.container == container)
-            .map(|record| record.zombie.clone())
+            .map(|record| &record.zombie)
+            .chain(
+                state
+                    .retiring_tasks
+                    .values()
+                    .map(|record| &record.observation),
+            )
+            .filter(|zombie| zombie.container == container)
+            .cloned()
             .collect()
     }
 
     /// Every LIVE process's Linux identity, for the `/proc/<pid>/{stat,status,
-    /// comm,cmdline}` renderers. The sibling of [`Registry::zombies_for_container`]: that one
+    /// comm,cmdline}` renderers. The sibling of [`Registry::exited_processes_for_container`]: that one
     /// describes the exited-but-unreaped interval, this one the interval before
     /// it, and together they are the whole set of processes a guest can name.
     ///
@@ -2777,13 +2794,21 @@ impl Registry {
     }
 }
 
+/// Exited identity retained while its prepared terminal memory work completes.
+/// `observation` is not installed in the waitable zombie table until publish.
+#[derive(Debug)]
+pub(super) struct RetiringTaskRecord {
+    pub(super) task: TaskRef,
+    pub(super) observation: Zombie,
+}
+
 #[derive(Debug)]
 pub(super) struct RegistryState {
     pub(super) epoch: u64,
     pub(super) container_inits: BTreeMap<ContainerId, TaskKey>,
     pub(super) tasks: BTreeMap<TaskId, TaskRecord>,
     pub(super) zombies: BTreeMap<TaskId, ZombieRecord>,
-    pub(super) retiring_tasks: BTreeMap<TaskId, TaskRef>,
+    pub(super) retiring_tasks: BTreeMap<TaskId, RetiringTaskRecord>,
     pub(super) process_groups: BTreeMap<ProcessGroupId, ProcessGroupRecord>,
     pub(super) process_group_by_namespace: BTreeMap<(ContainerId, u32), ProcessGroupId>,
     pub(super) reservations: BTreeMap<TaskId, carrick_hal::KernelTransactionId>,

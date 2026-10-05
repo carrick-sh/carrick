@@ -98,7 +98,7 @@ impl Kernel {
                 state
                     .retiring_tasks
                     .get(&task_id)
-                    .map(|task| (task, ProcessState::Zombie))
+                    .map(|record| (&record.task, ProcessState::Zombie))
             });
         if let Some((task, process_state)) = visible {
             let container = task.container().id();

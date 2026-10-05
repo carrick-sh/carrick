@@ -3447,7 +3447,7 @@ fn hvpatch_signal_observes_zombie(context: &crate::kernel::KernelContext, pid: i
         .and_then(|pid| crate::namespace::pid::ns_to_kernel_for(context, pid))
         .and_then(|pid| i32::try_from(pid).ok())
         .and_then(|pid| crate::kernel::TaskId::from_abi_positive(pid).ok())
-        .and_then(|target| context.kernel().registry().zombie(target))
+        .and_then(|target| context.kernel().registry().exited_process(target))
         .is_some_and(|zombie| zombie.container == context.container().id())
 }
 
@@ -3915,14 +3915,27 @@ mod tests {
         let child_id = child.task().key().id;
         let child_pid = child_id.raw();
 
-        parent
+        let retired = parent
             .kernel()
-            .exit_task(
-                child_id,
+            .prepare_task_exit_key(
+                child.task().key(),
                 crate::kernel::LinuxWaitStatus::from_wait_encoding(0),
                 None,
             )
-            .expect("child exit");
+            .unwrap()
+            .retire_notifying(|_| {})
+            .unwrap();
+        let staged_addressable = hvpatch_signal_observes_zombie(&parent, child_pid);
+        let staged_signal_target = hvpatch_process_signal_target(&parent, child_pid);
+        retired.publish().unwrap();
+        assert!(
+            staged_addressable,
+            "terminal clear retains process identity"
+        );
+        assert!(
+            staged_signal_target.is_none(),
+            "staged identity is not a live signal target"
+        );
 
         assert!(hvpatch_process_signal_target(&parent, child_pid).is_none());
         // Addressable until reaped, for EVERY signal — not just the signum-0

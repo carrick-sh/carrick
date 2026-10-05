@@ -17,8 +17,8 @@ use super::{
 };
 use crate::kernel::core::{
     FileCloseDisposition, FileCloseEvent, Kernel, KernelContext, RegistryState,
-    RetiredThreadRecord, TaskExitSubscriber, TaskRecord, TaskRevision, VforkReleaseReason,
-    ZombieRecord,
+    RetiredThreadRecord, RetiringTaskRecord, TaskExitSubscriber, TaskRecord, TaskRevision,
+    VforkReleaseReason, ZombieRecord,
 };
 use crate::kernel::ids::{FileTableId, LinuxTid, TaskId};
 use crate::kernel::objects::{
@@ -299,9 +299,10 @@ impl Kernel {
             self.exit_subscribers.register(task, subscriber);
             return Some(task);
         }
-        if let Some(task) = state.retiring_tasks.get(&task_id) {
-            self.exit_subscribers.register(task.key(), subscriber);
-            return Some(task.key());
+        if let Some(record) = state.retiring_tasks.get(&task_id) {
+            self.exit_subscribers
+                .register(record.task.key(), subscriber);
+            return Some(record.task.key());
         }
         let exited = state
             .zombies
@@ -947,9 +948,13 @@ impl Kernel {
             }
         }
 
-        state
-            .retiring_tasks
-            .insert(prepared.task.id, Arc::clone(&task));
+        state.retiring_tasks.insert(
+            prepared.task.id,
+            RetiringTaskRecord {
+                task: Arc::clone(&task),
+                observation: prepared.registry_zombie.clone(),
+            },
+        );
         drop(state);
         let kernel = Arc::clone(self);
         Ok(RetiredTaskExit {
@@ -961,7 +966,7 @@ impl Kernel {
                 if state
                     .retiring_tasks
                     .remove(&prepared.task.id)
-                    .is_none_or(|task| task.key() != prepared.task)
+                    .is_none_or(|record| record.task.key() != prepared.task)
                 {
                     carrick_fatal!(
                         "kernel::task_exit_publication",
@@ -993,10 +998,11 @@ impl Kernel {
                         .auditors()
                         .zombie_created(prepared.task, zombie_reaper);
                 }
-                if {
+                let graph_empty = {
                     let state = kernel.registry().settled().read();
                     state.tasks.is_empty() && state.retiring_tasks.is_empty()
-                } {
+                };
+                if graph_empty {
                     kernel
                         .auditors()
                         .process_graph_empty(kernel.unpublished_jobs());
@@ -1309,6 +1315,21 @@ mod tests {
         );
         assert_eq!(late_subscriber.0.load(Ordering::Acquire), 0);
         assert!(kernel.task_exists(child.task().key().id));
+        assert_eq!(
+            kernel
+                .registry()
+                .exited_process(child.task().key().id)
+                .unwrap()
+                .key,
+            child.task().key()
+        );
+        assert!(
+            kernel
+                .registry()
+                .exited_processes_for_container(child.task().container().id())
+                .iter()
+                .any(|exit| exit.key == child.task().key())
+        );
         assert_eq!(
             kernel
                 .process_identity(child.task().key().id)
@@ -2010,7 +2031,7 @@ mod tests {
 
         let zombie = kernel
             .registry()
-            .zombie(grandchild_id)
+            .exited_process(grandchild_id)
             .expect("reparented zombie");
         assert_eq!(zombie.parent, Some(root.task.key()));
         assert_eq!(live_grandchild.task.parent(), Some(root.task.key()));

@@ -1392,18 +1392,22 @@ where
                 if matches!(event, ExecutorPoolEvent::SettledExited { .. }) {
                     binding.after_terminal_settlement();
                     let task_key = settlement_thread.task_key();
-                    let (status, owner) =
-                        if let Some(zombie) = scheduler.kernel().registry().zombie(task_key.id) {
-                            (
-                                zombie.status,
-                                carrick_kernel::observe::ExitOwner::from(zombie.parent),
-                            )
-                        } else {
-                            (
-                                carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
-                                carrick_kernel::observe::ExitOwner::Nobody,
-                            )
-                        };
+                    let (status, owner) = if let Some(zombie) = scheduler
+                        .kernel()
+                        .registry()
+                        .exited_process(task_key.id)
+                        .filter(|exited| exited.key == task_key)
+                    {
+                        (
+                            zombie.status,
+                            carrick_kernel::observe::ExitOwner::from(zombie.parent),
+                        )
+                    } else {
+                        (
+                            carrick_kernel::kernel::LinuxWaitStatus::from_wait_encoding(0),
+                            carrick_kernel::observe::ExitOwner::Nobody,
+                        )
+                    };
                     scheduler
                         .kernel()
                         .auditors()
