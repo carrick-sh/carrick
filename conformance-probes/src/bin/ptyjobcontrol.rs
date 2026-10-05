@@ -141,18 +141,32 @@ unsafe fn poll_write_ready(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
 }
 
 unsafe fn read_exact_timeout(fd: libc::c_int, buf: &mut [u8], timeout_ms: libc::c_int) -> bool {
+    read_exact_timeout_with(fd, buf, timeout_ms, Instant::now, |fd, remaining| {
+        poll_read_ready(fd, remaining)
+    })
+}
+
+// Observe clock and poll work without changing the real syscall path or any
+// printed oracle report. The empty-pipe fixture expires the chosen poll budget.
+unsafe fn read_exact_timeout_with(
+    fd: libc::c_int,
+    buf: &mut [u8],
+    timeout_ms: libc::c_int,
+    mut now: impl FnMut() -> Instant,
+    mut poll: impl FnMut(libc::c_int, libc::c_int) -> bool,
+) -> bool {
     if fd < 0 {
         return false;
     }
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    let deadline = now() + Duration::from_millis(timeout_ms as u64);
     let mut off = 0;
     while off < buf.len() {
-        let now = Instant::now();
+        let now = now();
         if now >= deadline {
             return false;
         }
         let remaining_ms = (deadline - now).as_millis().max(1) as libc::c_int;
-        if !poll_read_ready(fd, remaining_ms) {
+        if !poll(fd, remaining_ms) {
             return false;
         }
         let n = libc::read(fd, buf[off..].as_mut_ptr().cast(), buf.len() - off);
@@ -1184,15 +1198,43 @@ mod tests {
     fn test_pipe_read_timeout_on_blocked_empty_pipe() {
         unsafe {
             let (r, w) = conformance_probes::pipe2();
-            let mut buf = [0u8; 4];
-            let start = Instant::now();
-            let ok = read_exact_timeout(r, &mut buf, 50);
-            let elapsed = start.elapsed();
-            assert!(!ok);
-            assert!(elapsed >= Duration::from_millis(40));
-            assert!(elapsed < Duration::from_millis(500));
-            libc::close(r);
+            // Only this thread owns the writer. Completion must precede close.
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut buf = [0u8; 4];
+                let start = Instant::now();
+                let mut poll_budgets = Vec::new();
+                let ok = read_exact_timeout_with(
+                    r,
+                    &mut buf,
+                    50,
+                    || start,
+                    |fd, remaining| {
+                        assert_eq!(fd, r);
+                        poll_budgets.push(remaining);
+                        false // The empty pipe has no readiness at this deadline.
+                    },
+                );
+                assert!(!ok);
+                assert_eq!(
+                    poll_budgets,
+                    vec![50],
+                    "one poll consumes the supplied deadline"
+                );
+                // Also exercise real poll/read with an independently held pipe.
+                assert!(!read_exact_timeout(r, &mut buf, 50));
+                done_tx.send(()).unwrap();
+                libc::close(r);
+            });
+            done_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("pipe timeout waited for held writer");
+            assert!(
+                libc::fcntl(w, libc::F_GETFD) >= 0,
+                "writer is still held at completion"
+            );
             libc::close(w);
+            worker.join().unwrap();
         }
     }
 

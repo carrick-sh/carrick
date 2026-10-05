@@ -3761,6 +3761,8 @@ pub(crate) fn retired_alias_disarm_spans(
     container_root: ContainerRootToken,
     retired_leases: &std::collections::BTreeSet<(u64, u64)>,
 ) -> Vec<CowArmedSpan> {
+    #[cfg(test)]
+    note_alias_state_rows_scanned(registry.len());
     let end = va.saturating_add(len as u64);
     registry
         .iter()

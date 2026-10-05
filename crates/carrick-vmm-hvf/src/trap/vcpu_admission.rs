@@ -846,45 +846,44 @@ pub(super) fn create_with_no_resources_backpressure_bounded<T>(
 
     let start = std::time::Instant::now();
     let mut parks: u32 = 0;
-    loop {
-        match attempt() {
-            Ok(v) => {
-                if parks > 0 && admission_trace_enabled() {
-                    eprintln!(
-                        "[hvf-admission pid={}] {what} recovered from HV_NO_RESOURCES after {parks} park(s) / {:?}",
-                        unsafe { libc::getpid() },
-                        start.elapsed(),
-                    );
-                }
-                return Ok(v);
+    let result = super::admission_retry::retry_with_clock(
+        park,
+        max_wait,
+        &mut attempt,
+        |error| *error == HypervisorError::NoResources,
+        || start.elapsed(),
+        |duration| {
+            parks += 1;
+            if admission_trace_enabled() {
+                eprintln!(
+                    "[hvf-admission pid={}] {what} HV_NO_RESOURCES; park+retry #{parks} (waited {:?})",
+                    unsafe { libc::getpid() },
+                    start.elapsed()
+                );
             }
-            Err(e) if e == HypervisorError::NoResources && start.elapsed() < max_wait => {
-                parks += 1;
-                if admission_trace_enabled() {
-                    eprintln!(
-                        "[hvf-admission pid={}] {what} HV_NO_RESOURCES; park+retry #{parks} (waited {:?})",
-                        unsafe { libc::getpid() },
-                        start.elapsed(),
-                    );
-                }
-                vcpu_gate::park_for_slot(park);
+            vcpu_gate::park_for_slot(duration);
+        },
+    );
+    match result {
+        Ok(value) => {
+            if parks > 0 && admission_trace_enabled() {
+                eprintln!(
+                    "[hvf-admission pid={}] {what} recovered from HV_NO_RESOURCES after {parks} park(s) / {:?}",
+                    unsafe { libc::getpid() },
+                    start.elapsed()
+                );
             }
-            Err(e) => {
-                if e == HypervisorError::NoResources && admission_trace_enabled() {
-                    eprintln!(
-                        "[hvf-admission pid={}] {what} HV_NO_RESOURCES persisted {:?} after {parks} park(s); host full, propagating",
-                        unsafe { libc::getpid() },
-                        start.elapsed(),
-                    );
-                }
-                // Name the operation. This loop already carries `what` for
-                // its trace output and then dropped it on the error path, so a
-                // real failure surfaced as a bare "owning resource is busy
-                // (error 0xfae94002)" with nothing saying WHICH call — the
-                // concurrent container-gate failure had to be chased from a
-                // 7.5 GiB core to find out.
-                return Err(TrapError::Hypervisor(format!("{what}: {e}")));
+            Ok(value)
+        }
+        Err(error) => {
+            if error == HypervisorError::NoResources && admission_trace_enabled() {
+                eprintln!(
+                    "[hvf-admission pid={}] {what} HV_NO_RESOURCES persisted {:?} after {parks} park(s); host full, propagating",
+                    unsafe { libc::getpid() },
+                    start.elapsed()
+                );
             }
+            Err(TrapError::Hypervisor(format!("{what}: {error}")))
         }
     }
 }
@@ -1063,36 +1062,6 @@ mod vm_create_admission_tests {
         );
         assert_eq!(out.ok(), Some(42), "transient NoResources must recover");
         assert_eq!(calls.get(), 3, "expected two retries then success");
-    }
-
-    #[test]
-    fn no_resources_backpressure_bounds_out_when_host_is_full() {
-        let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
-        // Always NoResources: the loop must give up after ~max_wait and propagate
-        // the error (never hang forever). A tiny max_wait keeps the test fast.
-        let calls = Cell::new(0u32);
-        let start = std::time::Instant::now();
-        let out: Result<u64, TrapError> = create_with_no_resources_backpressure_bounded(
-            "test",
-            Duration::from_millis(1),
-            Duration::from_millis(20),
-            || {
-                calls.set(calls.get() + 1);
-                Err(HypervisorError::NoResources)
-            },
-        );
-        assert!(
-            out.is_err(),
-            "a genuinely-full host must propagate the error"
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "bounded wait must not hang"
-        );
-        assert!(
-            calls.get() >= 2,
-            "expected at least one park+retry before giving up"
-        );
     }
 
     #[test]

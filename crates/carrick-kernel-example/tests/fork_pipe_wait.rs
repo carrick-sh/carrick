@@ -89,10 +89,44 @@ fn a_forked_task_can_fork_again() {
 
 /// A lost wake is a failed run, not a hang: the child reads a pipe nobody
 /// writes (`WaitOnFds`, re-dispatched) and the parent waits for a child that
-/// never exits (`WaitOnHvpatchChild`, re-dispatched). Both must stop at the
-/// bound. This test costs `WAIT_BOUND` (5 s) by construction.
+/// never exits (`WaitOnHvpatchChild`, re-dispatched). Both must supply exactly
+/// WAIT_BOUND to the deadline consumer, which expires without host time.
 #[test]
 fn a_lost_wake_fails_inside_the_bound() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    struct DeadlineObserver {
+        start: Instant,
+        waits: Mutex<Vec<(&'static str, Duration)>>,
+        both_parked: std::sync::Barrier,
+    }
+    impl carrick_kernel_example::ScriptedWaitDriver for DeadlineObserver {
+        fn now(&self) -> Instant {
+            self.start
+        }
+        fn await_event(
+            &self,
+            label: &'static str,
+            _service: &carrick_kernel::kernel::continuation::CarrierWaitService,
+            _token: carrick_kernel::kernel::continuation::ContinuationWakeToken,
+            timeout: Duration,
+            _scope: &carrick_observability::work_meter::WorkScope,
+        ) -> Option<
+            Result<
+                carrick_kernel::kernel::continuation::ContinuationEvent,
+                carrick_kernel::kernel::continuation::WaitServiceError,
+            >,
+        > {
+            self.waits.lock().unwrap().push((label, timeout));
+            self.both_parked.wait(); // Keep both tasks live until both waits enrolled.
+            None // The supplied deadline expires with no producer wake.
+        }
+    }
+    let observer = Arc::new(DeadlineObserver {
+        start: Instant::now(),
+        waits: Mutex::new(Vec::new()),
+        both_parked: std::sync::Barrier::new(2),
+    });
     let script = vec![
         Step::Sys(
             sys::pipe2(0)
@@ -108,11 +142,19 @@ fn a_lost_wake_fails_inside_the_bound() {
         Step::Sys(sys::wait4(last_child(), 0)),
         Step::Sys(sys::exit_group(0)),
     ];
-    let started = Instant::now();
-    let error = ScriptedBackend::new()
-        .run_root(script)
-        .expect_err("a lost wake must fail the run");
-    let elapsed = started.elapsed();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let wait_driver = observer.clone();
+    let worker = std::thread::spawn(move || {
+        let error = ScriptedBackend::new()
+            .with_wait_driver(wait_driver)
+            .run_root(script)
+            .expect_err("a lost wake must fail the run");
+        done_tx.send(error).unwrap();
+    });
+    let error = done_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("lost-wake independent watchdog");
+    worker.join().unwrap();
     assert!(
         matches!(
             &error,
@@ -124,9 +166,12 @@ fn a_lost_wake_fails_inside_the_bound() {
         ),
         "expected child task 2 read to time out, got: {error}"
     );
-    assert!(
-        elapsed >= WAIT_BOUND && elapsed < WAIT_BOUND * 3,
-        "the bound fired at {elapsed:?}"
+    let mut waits = observer.waits.lock().unwrap().clone();
+    waits.sort_unstable_by_key(|(label, _)| *label);
+    assert_eq!(
+        waits,
+        vec![("read", WAIT_BOUND), ("wait4", WAIT_BOUND)],
+        "each retained wait consumes the exact operation deadline once"
     );
 }
 

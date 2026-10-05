@@ -189,7 +189,7 @@ pub(crate) fn drive(
         &crate::operand::ScriptCheckpoint,
     )>,
 ) -> Result<InternalCompletion, ExampleError> {
-    let deadline = Instant::now() + WAIT_BOUND;
+    let deadline = shared.wait_driver.now() + WAIT_BOUND;
     loop {
         if !task.is_live() {
             return Ok(InternalCompletion::Cancelled(
@@ -473,7 +473,7 @@ pub(crate) fn drive(
                     // Notify listeners that this task thread is now parked/enrolled.
                     shared.notify_parked(task.tid, syscall.label);
 
-                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let remaining = deadline.saturating_duration_since(shared.wait_driver.now());
                     if remaining.is_zero() {
                         shared.unregister_active_token(token);
                         let _ = continuation.cancel(CancellationCause::ServiceShutdown);
@@ -508,17 +508,21 @@ pub(crate) fn drive(
                             Some(&shared.work_scope),
                         )
                     } else {
-                        block_on_timeout_with_scope(
-                            shared.wait_service.event(token),
+                        shared.wait_driver.await_event(
+                            syscall.label,
+                            &shared.wait_service,
+                            token,
                             remaining,
-                            Some(&shared.work_scope),
+                            &shared.work_scope,
                         )
                     };
                     #[cfg(not(debug_assertions))]
-                    let event_result = block_on_timeout_with_scope(
-                        shared.wait_service.event(token),
+                    let event_result = shared.wait_driver.await_event(
+                        syscall.label,
+                        &shared.wait_service,
+                        token,
                         remaining,
-                        Some(&shared.work_scope),
+                        &shared.work_scope,
                     );
                     shared.unregister_active_token(token);
                     #[cfg(debug_assertions)]

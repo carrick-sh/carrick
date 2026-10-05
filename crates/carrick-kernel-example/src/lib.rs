@@ -69,6 +69,6 @@ pub use process::{
 };
 pub use report::{Completion, Output, RunReport};
 pub use schedule::{Decision, Point, Schedule, ScheduleReceipt};
-pub use scripted::{ExampleError, ScriptedBackend, WAIT_BOUND};
+pub use scripted::{ExampleError, ScriptedBackend, ScriptedWaitDriver, WAIT_BOUND};
 
 pub use carrick_kernel::schedule_point;

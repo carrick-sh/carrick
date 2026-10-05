@@ -7175,42 +7175,93 @@ fn preemption_driver_close_before_start_shuts_down_cleanly() {
     assert!(!scheduler.is_preemption_driver_attached());
 }
 
-#[test]
-fn preemption_driver_close_during_expiry_wakes_and_terminates() {
-    let (kernel, _root) = bootstrap(68_102);
-    let scheduler = Arc::new(Scheduler::new(kernel));
-
-    let mut driver =
-        PreemptionDriver::start(Arc::clone(&scheduler)).expect("preemption driver starts");
-
+// The running task remains owned by this test until shutdown is observed.
+// A stopped driver must not depend on task settlement or advancing its clock.
+fn preemption_driver_shutdown_under_held_deadline(close_at_expiry: bool) {
+    use carrick_kernel::kernel::scheduler::preemption::{ManualClock, MonotonicClock};
+    #[derive(Clone, Debug)]
+    struct NotifyKick(std::sync::mpsc::Sender<()>);
+    impl carrick_hal::VcpuKick for NotifyKick {
+        fn kick(&self) {
+            let _ = self.0.send(());
+        }
+    }
+    let (kernel, root) = bootstrap(if close_at_expiry { 68_102 } else { 68_103 });
+    root.thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    let peer = sibling(&kernel, &root, 78_103);
+    publish(&root, 102);
+    publish(&peer, 103);
     let start = Instant::now();
-    scheduler.close();
-
-    driver.shutdown();
+    let clock = Arc::new(ManualClock::new(start));
+    let scheduler = Arc::new(Scheduler::new_with_policy_and_clock(
+        kernel,
+        Arc::new(GuestCpuPolicy::new(1)),
+        clock.clone(),
+    ));
+    clock.attach_condvar(scheduler.preemption_condvar());
+    let (kick_tx, kick_rx) = std::sync::mpsc::channel();
+    let worker = Arc::new(WorkerKick::new(Arc::new(ReceiptLog::default())));
+    let executor = scheduler.register_executor(worker.clone()).unwrap();
+    scheduler.make_runnable(root.thread().key()).unwrap();
+    let running = scheduler.take(&executor).unwrap();
     assert!(
-        start.elapsed() < Duration::from_millis(500),
-        "shutdown after close took too long: {:?}",
-        start.elapsed()
+        worker.publish_hardware(
+            super::ExactHardwareKick::new(
+                Box::new(NotifyKick(kick_tx)),
+                102,
+                super::current_owner_thread_port()
+            )
+            .unwrap()
+        )
+    );
+    scheduler.make_runnable(peer.thread().key()).unwrap();
+    let _ = kick_rx.try_iter().count();
+    let (wait_tx, wait_rx) = std::sync::mpsc::channel();
+    scheduler.observe_preemption_waits(wait_tx);
+    let mut driver = PreemptionDriver::start(Arc::clone(&scheduler)).unwrap();
+    assert!(driver.is_enabled());
+    let deadline = wait_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("driver reached deadline wait")
+        .expect("installed future deadline");
+    assert!(deadline > clock.now());
+    if close_at_expiry {
+        scheduler.advance_preemption_test_clock(&clock, deadline.duration_since(start));
+        kick_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("expiry delivered a kick");
+        scheduler.close();
+    }
+    let held_time = clock.now();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let shutdown = std::thread::spawn(move || {
+        driver.shutdown();
+        done_tx.send(()).expect("shutdown result");
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("shutdown waited for held task/deadline");
+    assert_eq!(clock.now(), held_time, "test still owns clock progression");
+    assert_eq!(
+        running.thread().key(),
+        root.thread().key(),
+        "test still owns the running task"
     );
     assert!(!scheduler.is_preemption_driver_attached());
+    shutdown.join().unwrap();
+    scheduler.settle_exited(running).unwrap();
+    scheduler.unregister_executor(&executor).unwrap();
+}
+
+#[test]
+fn preemption_driver_close_during_expiry_wakes_and_terminates() {
+    preemption_driver_shutdown_under_held_deadline(true);
 }
 
 #[test]
 fn preemption_driver_shutdown_with_future_deadline() {
-    let (kernel, _root) = bootstrap(68_103);
-    let scheduler = Arc::new(Scheduler::new(kernel));
-
-    let mut driver =
-        PreemptionDriver::start(Arc::clone(&scheduler)).expect("preemption driver starts");
-
-    let start = Instant::now();
-    driver.shutdown();
-    assert!(
-        start.elapsed() < Duration::from_millis(500),
-        "shutdown took too long: {:?}",
-        start.elapsed()
-    );
-    assert!(!scheduler.is_preemption_driver_attached());
+    preemption_driver_shutdown_under_held_deadline(false);
 }
 
 #[test]
