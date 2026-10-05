@@ -281,7 +281,7 @@ impl PersistentTaskBinding for FakeBinding {
         if let Some(resume) = self.retire_detached_address_space_resume.lock().take() {
             let _ = resume.recv_timeout(std::time::Duration::from_secs(5));
         }
-        Ok(root_ticket.map(|ticket| ticket.complete_for_test()))
+        Ok(root_ticket.map(crate::hvpatch::complete_root_for_test))
     }
 
     fn cpu_residency(&self) -> Option<super::residency::TaskCpuResidency> {

@@ -463,6 +463,7 @@ dependencies = [
  "carrick-mmu-core",
  "carrick-personality-linux",
  "carrick-sched-core",
+ "parking_lot",
 ]
 
 [[package]]
@@ -846,6 +847,7 @@ dependencies = [
  "carrick-aarch64",
  "carrick-abi",
  "carrick-conformance-contract",
+ "carrick-core",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",
@@ -1015,6 +1017,7 @@ dependencies = [
  "carrick-aarch64",
  "carrick-abi",
  "carrick-conformance-contract",
+ "carrick-core",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-fatal",
