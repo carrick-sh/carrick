@@ -156,6 +156,37 @@ impl ForkScratch {
     }
 }
 
+pub trait ForkChildRoot {
+    fn incarnation(&self) -> u64;
+    fn is_admitted(&self) -> bool;
+    fn fork_write_authorized(&mut self, sequence: Option<core::num::NonZeroU64>) -> bool;
+    fn authenticate_fork_origin(&mut self, request: PortalForkRequest) -> bool;
+    fn set_fork_origin(&mut self, request: PortalForkRequest) -> Result<(), ForkError>;
+    fn clear_fork_origin(&mut self);
+    fn publish_fork_child(&mut self, request: PortalForkRequest);
+    fn finish_fork_publication(
+        &mut self,
+        operation: carrick_el1_abi::PortalOperation,
+    ) -> Result<(), ForkError>;
+    fn retire(self) -> Result<(), ForkError>;
+}
+
+pub trait ForkParentRoot<C: ForkChildRoot> {
+    fn incarnation(&self) -> u64;
+    fn generation(&self) -> ReservationGeneration;
+    fn operation_sequence(&self) -> u64;
+    fn fork_ready(&mut self) -> bool;
+    fn fork_write_authorized(&mut self, sequence: Option<core::num::NonZeroU64>) -> bool;
+    fn reserve_fork_certificate(&mut self, request: PortalForkRequest) -> Result<(), ForkError>;
+    fn clone_into(&mut self, child: &mut C) -> Result<(), ForkError>;
+    fn publish_fork_parent(&mut self, request: PortalForkRequest) -> ReservationGeneration;
+    fn finish_fork_publication(
+        &mut self,
+        operation: carrick_el1_abi::PortalOperation,
+    ) -> Result<(), ForkError>;
+    fn commit_fork_generation(&mut self) -> Result<ReservationGeneration, ForkError>;
+}
+
 pub struct PreparedOwnerFork<B: OwnerForkMmu = Aarch64Mmu> {
     pub request: PortalForkRequest,
     pub parent_root: u64,
@@ -180,6 +211,114 @@ impl<B: OwnerForkMmu> PreparedOwnerFork<B> {
     pub fn request(&self) -> PortalForkRequest {
         self.request
     }
+
+    pub fn publish<W: LiveDescriptorWords + ?Sized, C: ForkChildRoot, P: ForkParentRoot<C>>(
+        self,
+        words: &W,
+        mut parent: P,
+        mut child: C,
+        child_handle: El1MmHandle,
+    ) -> Result<UnpublishedChild<B>, ForkError> {
+        for (pa, before) in &self.scratch.reads {
+            if words.load(*pa).map_err(|_| ForkError::Core)? != *before {
+                return Err(ForkError::Stale);
+            }
+        }
+        if self.request.parent_generation.raw() >= u64::MAX - 1 {
+            return Err(ForkError::Stale);
+        }
+        if parent.incarnation() != self.request.operation.incarnation.get()
+            || parent.generation() != self.request.parent_generation
+            || parent.operation_sequence() != self.request.operation.sequence.get()
+        {
+            return Err(ForkError::Stale);
+        }
+        if !parent.fork_ready() || child.is_admitted() {
+            return Err(ForkError::Busy);
+        }
+        parent.reserve_fork_certificate(self.request)?;
+        for (index, word) in self.scratch.child[..self.scratch.child_used]
+            .iter()
+            .enumerate()
+        {
+            words
+                .store_unlinked(self.request.child_tables.base + index as u64 * 8, *word)
+                .map_err(|_| ForkError::Core)?;
+        }
+        for (index, word) in self.scratch.parent[..self.scratch.parent_used]
+            .iter()
+            .enumerate()
+        {
+            words
+                .store_unlinked(self.request.parent_tables.base + index as u64 * 8, *word)
+                .map_err(|_| ForkError::Core)?;
+        }
+        words.publish_barrier();
+        for (applied, edit) in self.scratch.edits.iter().enumerate() {
+            let changed = if edit.bbm_len != 0 {
+                match words.compare_exchange(edit.pa, edit.before, 0) {
+                    Ok(true) => {
+                        words.publish_barrier();
+                        words.invalidate_range(edit.bbm_va, edit.bbm_len);
+                        match words.compare_exchange(edit.pa, 0, edit.after) {
+                            Ok(true) => Ok(()),
+                            result => {
+                                if !words
+                                    .compare_exchange(edit.pa, 0, edit.before)
+                                    .map_err(|_| ForkError::Core)?
+                                {
+                                    return Err(ForkError::Core);
+                                }
+                                words.publish_barrier();
+                                words.invalidate_range(edit.bbm_va, edit.bbm_len);
+                                Err(if result.is_err() {
+                                    ForkError::Core
+                                } else {
+                                    ForkError::Stale
+                                })
+                            }
+                        }
+                    }
+                    Ok(false) => Err(ForkError::Stale),
+                    Err(_) => Err(ForkError::Core),
+                }
+            } else {
+                match words.compare_exchange(edit.pa, edit.before, edit.after) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => Err(ForkError::Stale),
+                    Err(_) => Err(ForkError::Core),
+                }
+            };
+            if let Err(error) = changed {
+                rollback(words, &self.scratch.edits[..applied])?;
+                return Err(error);
+            }
+        }
+        if let Err(error) = child.set_fork_origin(self.request) {
+            rollback(words, &self.scratch.edits)?;
+            return Err(error);
+        }
+        if let Err(error) = parent.clone_into(&mut child) {
+            child.clear_fork_origin();
+            rollback(words, &self.scratch.edits)?;
+            return Err(error);
+        }
+        let parent_generation = parent.publish_fork_parent(self.request);
+        child.publish_fork_child(self.request);
+        words.publish_barrier();
+        words.invalidate_range(0, 1 << 48);
+        Ok(UnpublishedChild::new(
+            PortalForkCompletion {
+                request: self.request,
+                child: child_handle,
+                parent_generation,
+                child_tables_used: self.scratch.child_used as u64 * 8,
+                parent_tables_used: self.scratch.parent_used as u64 * 8,
+            },
+            self.parent_root,
+            self.scratch,
+        ))
+    }
 }
 
 pub struct UnpublishedChild<B: OwnerForkMmu = Aarch64Mmu> {
@@ -201,6 +340,58 @@ impl<B: OwnerForkMmu> UnpublishedChild<B> {
 
     pub fn completion(&self) -> PortalForkCompletion {
         self.completion
+    }
+
+    pub fn commit<C: ForkChildRoot, P: ForkParentRoot<C>>(
+        &mut self,
+        mut parent: P,
+        mut child: C,
+    ) -> Result<PortalForkCompletion, ForkError> {
+        let request = self.completion.request;
+        if parent.incarnation() != request.operation.incarnation.get()
+            || parent.generation() != self.completion.parent_generation
+            || !child.authenticate_fork_origin(request)
+            || !parent.fork_write_authorized(Some(request.operation.sequence))
+            || !child.fork_write_authorized(Some(request.operation.sequence))
+        {
+            return Err(ForkError::Stale);
+        }
+        parent.finish_fork_publication(request.operation)?;
+        child.finish_fork_publication(request.operation)?;
+        Ok(self.completion)
+    }
+
+    pub fn abort<W: LiveDescriptorWords + ?Sized, C: ForkChildRoot, P: ForkParentRoot<C>>(
+        &mut self,
+        words: &W,
+        mut parent: P,
+        mut child: C,
+    ) -> Result<(), ForkError> {
+        let request = self.completion.request;
+        if parent.incarnation() != request.operation.incarnation.get()
+            || parent.generation() != self.completion.parent_generation
+            || !child.authenticate_fork_origin(request)
+            || !parent.fork_write_authorized(Some(request.operation.sequence))
+            || !child.fork_write_authorized(Some(request.operation.sequence))
+        {
+            return Err(ForkError::Stale);
+        }
+        rollback(words, &self.scratch.edits)?;
+        words.publish_barrier();
+        words.invalidate_range(0, 1 << 48);
+        parent.finish_fork_publication(request.operation)?;
+        self.completion.parent_generation = parent.commit_fork_generation()?;
+        if !self.scratch.edits.iter().any(|edit| {
+            B::is_table(edit.before, 0)
+                && request.parent_tables.contains(edit.before & B::ADDRESS_MASK)
+        }) {
+            self.completion.parent_tables_used = 0;
+        }
+        self.completion.child_tables_used = 0;
+        drop(parent);
+        child.finish_fork_publication(request.operation)?;
+        child.retire()?;
+        Ok(())
     }
 
     pub fn reconcile_parent_write<W: LiveDescriptorWords + ?Sized>(
