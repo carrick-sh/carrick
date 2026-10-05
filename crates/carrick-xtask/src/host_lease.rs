@@ -54,6 +54,14 @@ pub enum HostLeaseError {
     },
     #[error("child process error: {0}")]
     ChildWait(#[source] io::Error),
+    #[error(
+        "host-lease cleanup incomplete during {operation}: {source}; lease released; run failed"
+    )]
+    Cleanup {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
     #[error("no command specified to run under host-lease")]
     EmptyCommand,
     #[error(
@@ -72,7 +80,8 @@ pub enum HostLeaseError {
 
 pub struct HostLease {
     // Production workloads run below lease_supervisor, which alone owns this
-    // holder and retains it through cancellation, descendant exit and reaping.
+    // holder through successful cancellation, exit and reaping; cleanup failures
+    // release with a typed failed-run error rather than retaining forever.
     _holder: Option<LeaseHolder>,
     _scope: Option<OwnedFd>,
     socket: PathBuf,

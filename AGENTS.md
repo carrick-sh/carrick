@@ -147,7 +147,9 @@ carrick's bug. Skills: [`.agents/skills/ltp-conformance`](.agents/skills/ltp-con
   tests inherit a scope pipe, never the flock; nested runners
   never downgrade or reacquire it. Never upgrade a shared lease into a
   gate/Docker lease. Runner death and supervisor TERM/INT/HUP cancel supervised
-  work before release. SIGKILL of the sole supervisor releases flock immediately;
+  work before successful release. Cleanup errors or its single five-second
+  deadline fail the run explicitly and release, rather than wedge the host.
+  SIGKILL of the sole supervisor releases flock immediately;
   Darwin descendants that detach and close every scope fd escape. Darwin checks
   process start time before each signal, with a residual query-to-kill reuse
   window. These limits and the containment follow-up are explicit in
