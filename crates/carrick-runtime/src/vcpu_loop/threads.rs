@@ -1294,7 +1294,7 @@ mod child_tid_owner_tests {
             let result = self.portal.select(
                 &transfer,
                 &self.tables.live(&CallerInvalidatesAsid),
-                carrick_el1::personality::mm_portal::SelectionVenues {
+                carrick_core::mm::transaction::SelectionVenues {
                     prepared: &mut carrick_el1::fault::NoopPreparedResolver,
                     cow: &mut carrick_el1::fault::NoopCowResolver,
                     residency: &residency(),
