@@ -457,7 +457,9 @@ version = "0.1.0"
 dependencies = [
  "carrick-core-abi",
  "carrick-el1",
+ "carrick-el1-abi",
  "carrick-mmu-core",
+ "carrick-personality-linux",
  "carrick-sched-core",
 ]
 
