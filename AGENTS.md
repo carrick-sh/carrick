@@ -363,6 +363,9 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
   exposed non-unwinding misaligned-pointer failures hidden by macOS allocation.
   Fixtures use `carrick_test_support::TestEl1Region`, whose typed allocation
   and compile-time ABI alignment checks preserve the storage contract.
+- **Scheduler fixtures own their CPU topology.** Set task affinity to the
+  fixture's policy before cloning; inheriting host CPU counts can strand a
+  bound executor on small hosted runners. Bound actor coordination waits.
 - Next frontier: **ownership, scope, lifetime.** Five defects on 2026-09-05
   came from one `Arc<Mutex<Option<PageTableManager>>>` whose comment-only rules
   (arena source belongs to the mm; vfork child shares until exec; rollback
