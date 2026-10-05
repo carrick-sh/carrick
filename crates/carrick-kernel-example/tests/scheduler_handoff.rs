@@ -1370,6 +1370,120 @@ fn self_affinity_change_requires_migration_before_return() {
     );
 }
 
+/// A local queue placement predates the mask change. Claiming that row must
+/// reroute it rather than grant an excluded CPU its next guest entry.
+#[test]
+fn queued_affinity_change_requires_migration_before_claim() {
+    let (kernel, root, _asids) = bootstrap_kernel(59_310);
+    root.thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    let sibling = create_sibling_thread(&kernel, &root, 59_311);
+    publish_task(&root, 1510);
+    publish_task(&sibling, 1511);
+    let scheduler = Scheduler::new_with_policy(kernel, Arc::new(GuestCpuPolicy::new(2)));
+    let executors: Vec<_> = (0..2)
+        .map(|cpu| {
+            scheduler
+                .register_executor_bound(
+                    Arc::new(TestKick::default()),
+                    Some(GuestCpuId::new(cpu)),
+                    false,
+                )
+                .unwrap()
+        })
+        .collect();
+    scheduler.make_runnable(root.thread().key()).unwrap();
+    scheduler.make_runnable(sibling.thread().key()).unwrap();
+    let running = scheduler.take(&executors[0]).unwrap();
+    scheduler.settle_exited(running).unwrap();
+    sibling
+        .thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+    let illegal = scheduler.try_take(&executors[0]).unwrap();
+    let entered_excluded = illegal.is_some();
+    if let Some(illegal) = illegal {
+        scheduler.settle_exited(illegal).unwrap();
+    } else {
+        let migrated = scheduler
+            .try_take(&executors[1])
+            .unwrap()
+            .expect("eligible CPU finds moved row");
+        assert_eq!(migrated.thread_key(), sibling.thread().key());
+        scheduler.settle_exited(migrated).unwrap();
+    }
+    scheduler.close();
+    for executor in &executors {
+        scheduler.unregister_executor(executor).unwrap();
+    }
+    assert!(
+        !entered_excluded,
+        "queued sibling was claimed on now-excluded CPU 0"
+    );
+}
+
+/// With no queue demand or clock advance, a changed remote residency must
+/// receive its exact kick. Widening and the unrelated caller cost no kicks.
+#[test]
+fn remote_affinity_exclusion_kicks_the_exact_running_thread() {
+    let (kernel, root, asids) = bootstrap_kernel(59_320);
+    root.thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    let (peer, _process) = create_forked_child(&kernel, &root, &asids, "remote affinity peer");
+    peer.thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+    publish_task(&root, 1520);
+    publish_task(&peer, 1521);
+    let scheduler = Scheduler::new_with_policy(kernel, Arc::new(GuestCpuPolicy::new(2)));
+    let kicks = [Arc::new(TestKick::default()), Arc::new(TestKick::default())];
+    let executors: Vec<_> = (0..2)
+        .map(|cpu| {
+            scheduler
+                .register_executor_bound(
+                    kicks[cpu].clone(),
+                    Some(GuestCpuId::new(cpu as u32)),
+                    false,
+                )
+                .unwrap()
+        })
+        .collect();
+    scheduler.make_runnable(root.thread().key()).unwrap();
+    scheduler.make_runnable(peer.thread().key()).unwrap();
+    let running = scheduler.take(&executors[0]).unwrap();
+    let remote = scheduler.take(&executors[1]).unwrap();
+    peer.thread().set_affinity(CpuAffinity::all(2));
+    assert!(
+        kicks[1].tokens.lock().is_empty(),
+        "allowed residency needs no kick"
+    );
+    peer.thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    let tokens = kicks[1].tokens.lock().clone();
+    let caller_tokens = kicks[0].tokens.lock().clone();
+    let expected = kicks[1].current_binding().unwrap();
+    scheduler.settle_exited(running).unwrap();
+    scheduler.settle_runnable(remote).unwrap();
+    let migrated = scheduler.take(&executors[0]).unwrap();
+    assert_eq!(migrated.thread_key(), peer.thread().key());
+    scheduler.settle_exited(migrated).unwrap();
+    scheduler.close();
+    for executor in &executors {
+        scheduler.unregister_executor(executor).unwrap();
+    }
+    assert!(
+        caller_tokens.is_empty(),
+        "another process owns the changed affinity"
+    );
+    assert_eq!(
+        tokens.len(),
+        1,
+        "remote exclusion must kick without a timer or syscall"
+    );
+    assert_eq!(tokens[0].thread(), expected.thread());
+    assert_eq!(tokens[0].generation(), expected.generation());
+    assert_eq!(tokens[0].executor(), expected.executor());
+    assert_eq!(tokens[0].executor_epoch(), expected.executor_epoch());
+}
+
 /// A return reason belongs to the surviving handoff, not to the executor's
 /// next residency after that handoff has completely drained.
 #[test]

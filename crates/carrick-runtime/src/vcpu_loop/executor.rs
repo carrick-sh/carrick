@@ -462,7 +462,16 @@ where
 
         let mut pending_exec_retirement = None;
         let mut pending_exec_cleanup = false;
+        let mut first_guest_entry = true;
         let (exit, settlement_authority) = 'quantum: loop {
+            // A remote mask change may land after the queue claim, including
+            // during backend load. Do not enter that excluded residency even
+            // once. Subsequent mid-EL1 exits still resume their owned operation;
+            // ordinary boundaries below discharge later migration requests.
+            if first_guest_entry && !running.thread().affinity().is_allowed(guest_cpu) {
+                break 'quantum (ExecutorExit::Preempted, SettlementAuthority::Live);
+            }
+            first_guest_entry = false;
             let lease = running.take_lease();
             #[cfg(test)]
             let publish_test_descendant = |child, child_generation| {
