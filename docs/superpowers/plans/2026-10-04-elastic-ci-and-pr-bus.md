@@ -1,6 +1,8 @@
 # Runner-first CI and a reactive PR bus
 
-Status: **plan of record; direction approved by the owner on 2026-10-04**.
+Status: **plan of record; approved by the owner on 2026-10-05, with the
+modification to bring elastic FreeBSD and NetBSD vetting onto willow**.
+The runner-first direction was approved on 2026-10-04.
 This is a docs-only revision, not a deployment or acceptance claim. Infrastructure
 activation remains subject to the decisions below. Reported operational evidence
 is dated 2026-10-04; capabilities without a live qualification are **UNVERIFIED**.
@@ -39,6 +41,7 @@ The owner's 2026-10-04 operational evidence explains the change:
 | --- | --- |
 | fmt, clippy, doc, test, cross-check, BSD builds | GitHub-hosted Ubuntu and **`macos-15` pinned**: the `hv_gic` APIs require SDK 15. Hosted macOS cannot run Hypervisor.framework guests. Hosted BSD builds/cross-checks do not prove bhyve/NVMM runtime behavior. |
 | `linux-portable`, x86 KVM/CPL0 | willow Proxmox clones (additional provider TBD) |
+| FreeBSD/bhyve and NetBSD/NVMM vetting | Ephemeral BSD targets on willow, driven by one-job JIT Linux proxy runners in the same `carrick-ci` pool; `merge_group` and owner dispatch first. Advisory pilots, then required merge-group inputs to `ci-ok` after qualification. Hosted cross-checks remain required. |
 | aarch64 Linux with KVM | provider TBD (owner's biggest gap) |
 | Signed HVF | **cloudmac self-hosted runner — OWNER APPROVED 2026-10-04.** JIT ephemeral registration; only `merge_group` and owner-triggered `workflow_dispatch`, never untrusted `pull_request` events. Workers stop using cloudmac directly for gates. |
 | Docker oracle | Dedicated director-controlled job/host, never sharing a host with Carrick runs. Native ARM Linux for the canonical ARM oracle; x86 results prove only x86. No Docker on cloudmac or VM 210. |
@@ -68,7 +71,9 @@ The owner's 2026-10-04 operational evidence explains the change:
    ruleset requirements aligned (`host-linux-arm64`, `host-linux-x86-kvm`,
    `macos-host`, `signed`, `merge-queue`); signed checks are required at the merge
    group stage, not an impossible untrusted-PR prerequisite.
-4. Register runners: willow pilot first.
+4. Register runners: willow Linux pilot first, then a template-build milestone
+   and single-job pilot for each BSD OS before shared-pool elastic admission
+   (see BSD vetting below).
 5. Enable PR-bus phase 2, then switch every worker brief to **push-and-react**.
    Update conflicting full-gate requirements in AGENTS.md, skills and hooks in
    that cutover PR. Do not describe workers as switched while briefs still demand
@@ -96,9 +101,18 @@ not a claim that the pilot has delivered the fleet.
 Owner-supplied capacity snapshot: 16 threads, about 75% busy; 62 GB RAM, about
 12 GB free; VM 210 uses 40 GB/12 vCPU and VM 106 uses 8 GB. Free storage was
 local-lvm 815 GB and external ZFS 440 GB. These measurements are **UNVERIFIED in
-this revision** and need recapture before expansion. Never mutate VMs 105/106 or
-objects outside the CI pool; 200–203/211 are reference evidence only. Resizing
-VM 210 is an owner operation outside the scaler.
+this revision** and need recapture before expansion. Protected VMs **105, 106,
+200–203, 210 and 211 must never be touched by template builders, runners, the
+scaler or its janitor**; objects outside the CI pool are also excluded. Any owner
+decision to resize VM 210 is a separate operation outside this rollout.
+
+The landed pilot is implemented in `crates/carrick-xtask/src/ci_scaler.rs` and
+`crates/carrick-xtask/src/ci_scaler/live.rs`, with
+`scripts/ci/build-template-debian.sh` and `.github/workflows/willow-pilot.yml`.
+It currently accepts only the approved pilot workflow's owner dispatch and SHA,
+uses template 300, allows one clone and delivers JIT material over authenticated
+SSH. BSD OS/template selection, proxy/target reservations and merge-group
+admission extend this controller and ledger; they are not already implemented.
 
 Extend the existing pilot with a small Rust controller under `carrick-xtask`,
 running as an unprivileged service on willow, with a durable job/VM ledger
@@ -123,6 +137,16 @@ describe the ACL model; [VM documentation](https://pve.proxmox.com/pve-docs/chap
 describes templates, clones and resource controls. A pool is an authorization
 group, not a resource quota or a numeric VMID fence: the controller must enforce
 budgets and reservation rules as well.
+
+Preserve the pilot's root-local token boundary for every OS: the PVE secret is
+stored **only on willow as root-owned, root-only
+`root:/root/carrick-ci-token.json`**, never copied to this worker, a proxy, BSD
+target, template, seed disk, checkout, artifact or log. The existing transport
+reads it locally and passes authorization through stdin, never command-line
+arguments. Any unprivileged supervisor extension must use that local credential
+broker rather than relocating or widening access to the token. GitHub
+administration credentials likewise stay controller-side; proxies receive only
+short-lived one-use JIT configuration, and BSD targets receive neither.
 
 ### Demand, JIT and cleanup
 
@@ -165,7 +189,7 @@ and **4 CPU-thread equivalents for host/Windows demand**; do not resize VM 106.
 | --- | --- |
 | Pilot | Leave VM 210 unchanged; one **2-vCPU/4-GiB/64-GiB** clone, Cargo jobs=2, lightweight work only. |
 | After owner drains/resizes VM 210 | Candidate: 210 at **24 GiB/6 vCPU**, CPU limit **4**. Pool max **8 CPU equivalents/20 GiB**, at most **3 clones**. Two **4-vCPU/8-GiB** runners or one **8-vCPU/20-GiB** heavy runner, never both. |
-| Future BSD runtime pair | **2-vCPU/2-GiB** Linux proxy plus **4-vCPU/8-GiB** BSD target, both charged to the pool; heavy mode excludes pairs. |
+| Approved BSD vetting pair (after capacity qualification) | **2-vCPU/2-GiB** Linux proxy plus **4-vCPU/8-GiB** BSD target: **2 clones, 6 CPU equivalents/10 GiB** total, charged to the same pool. Heavy mode excludes pairs. The current one-clone pilot cannot admit a pair. |
 
 At the supplied 75% CPU utilization, reserving two additional busy threads would
 project 87.5%, above the admission limit: the pilot initially waits for a quieter
@@ -229,21 +253,140 @@ supervisor restart recovery without rebooting the host. Measure queue/gate/clean
 p50/p95 before setting capacity expectations; JIT registration does not make one
 physical HVF host parallel.
 
-## BSD runtime extension
+## Elastic BSD vetting on willow
 
-Keep BSD builds in hosted CI. Future bhyve/NVMM runtime coverage can use official
-one-job Linux proxy runners driving disposable FreeBSD/NetBSD clones; BSD runtime
-qualification is **UNVERIFIED**. Send an exact-SHA source archive with hashes,
-preserve target exit codes, pin one-use SSH host keys, disable forwarding, and
-export target logs. Give the BSD target no GitHub/PVE credentials. Cancellation
-reaps only the ledger-owned proxy/target pair.
+**OWNER APPROVED 2026-10-05** as the modification to this runner-first plan:
+ephemeral FreeBSD/bhyve and NetBSD/NVMM lanes run alongside the Linux KVM lane
+on willow Proxmox. Deployment and runtime qualification remain **UNVERIFIED**.
+Keep the existing hosted BSD cross-checks; extend the same controller, pool,
+VMID fence, ledger, admission rules and cleanup rather than introducing another
+scaler. An official one-job Linux JIT runner drives one disposable BSD target;
+do not assume a native GitHub runner distribution for BSD.
 
-Proposed checksum-pinned FreeBSD 15 and NetBSD 11 (or explicitly pinned prerelease)
-templates must prove exposed SVM, non-root device access and live bhyve/NVMM vCPU
-execution, not merely compilation. Follow [HAL](../../hal.md) and the
-[bhyve memory contract](../../bhyve-shared-memory.md). Existing reference VMs stay
-untouched. Unsupported nesting remains visibly blocked; add required runtime
-checks only after qualification and an aggregate-policy review.
+### Per-OS templates and capability
+
+Use separate checksum-pinned FreeBSD and NetBSD templates within **300–307**,
+preserving Debian template 300 and at most two generations per variant. Allocate
+both proxy and target clones from **308–349**, always in **`carrick-ci`**. Reserve
+unused template IDs after inventory inspection; do not repurpose protected VMs
+**105, 106, 200–203, 210 or 211**. Follow the Debian builder's input manifests,
+pinned toolchain/package inventory, credential-free image and regenerated
+machine/SSH identities, with OS-specific unattended provisioning and readiness.
+BSD builders are new milestones, not existing scripts or deployed templates.
+
+| Template | Qualification and vetting surface |
+| --- | --- |
+| FreeBSD/bhyve | Pin a FreeBSD release/image and package repository; the earlier FreeBSD 15 proposal must be qualified separately from hosted CI's **14.3-RELEASE** sysroot. Install the native Rust/C toolchain, just and dependencies; provision `vmm.ko`, `/dev/vmm` access and narrowly scoped backend cleanup before job admission. Build the `platform-freebsd` CLI/runtime and bhyve closure; prove live nested vCPU execution. |
+| NetBSD/NVMM | Pin a NetBSD release/image and matching kernel/module sources; the earlier NetBSD 11 (or explicitly pinned prerelease) proposal is not a qualification claim. Install the native toolchain/dependencies, load NVMM and provision `/dev/nvmm` access. Build the NVMM backend and `platform-netbsd` CLI/runtime closure; prove live nested vCPU execution. Record any required eager-GPA-fault module preparation from `scripts/netbsd/load-nvmm-eager-gpa-fault.sh` and its patch in the template manifest; do not silently treat patched and stock kernels as equivalent. |
+
+Willow is Ryzen/x86_64: start with **amd64 BSD hosts and x86_64 Linux guests**.
+Require host `kvm_amd nested=1`, `cpu: host` with exposed SVM/NPT and actual
+bhyve/NVMM machine creation, vCPU run and teardown inside each BSD clone.
+Aarch64 is an option only on a future willow capability that is separately
+qualified for that ISA and backend; emulated aarch64 builds do not prove nested
+bhyve/NVMM. Read [HAL](../../hal.md) and the
+[bhyve memory contract](../../bhyve-shared-memory.md); device presence or a
+cross-compile is insufficient. Qualify non-root backend access or a reviewed,
+fixed privileged test helper where existing live tests require root; never give
+workflow code general sudo. Unsupported nesting blocks the runtime milestone
+with explicit evidence.
+
+### Jobs, triggers and aggregate result
+
+The existing `cross-check-freebsd` and `cross-check-netbsd` jobs in
+`.github/workflows/ci.yml` run on hosted Ubuntu and already feed `ci-ok`.
+Their `justfile` recipes are the compile baseline: `just check-freebsd` checks
+the x86_64 FreeBSD CLI/runtime with `platform-freebsd`, including all targets;
+`just check-netbsd` checks all targets of `carrick-vmm-nvmm`, without claiming
+the broader CLI/runtime closure. Willow adds native linking and execution:
+
+- FreeBSD: locked native build of `carrick-cli` and `carrick-runtime` with
+  `--no-default-features --features platform-freebsd`, including the bhyve
+  backend, then the qualified kernel-semantics subset.
+- NetBSD: locked native build of `carrick-vmm-nvmm`, plus the CLI/runtime with
+  `--no-default-features --features platform-netbsd`, then the qualified
+  kernel-semantics subset. Broader portability gaps remain visible failures,
+  not evidence inferred from the narrower hosted cross-check.
+- Start VM-free semantics with `just test-kernel-semantics` from
+  `crates/carrick-kernel-example`; commit an explicit nonempty per-OS case
+  manifest and expected counts during qualification. Add live backend smoke
+  and reviewed conformance selections for `bhyve-local` and `nvmm-local` from
+  `docs/conformance-testing.md` and `scripts/conformance/suites.toml`. Preserve
+  OS-specific results and overlays in `scripts/conformance/baseline.bhyve.jsonl`
+  and `scripts/conformance/baseline.nvmm.jsonl`; this is bring-up coverage, not
+  full Linux or HVF closure. No retries or weakened work budgets to make green.
+
+No Docker on willow CI clones or VM 210. Differential selections require the
+director's separate native x86 Linux oracle host and exact-input fixture/image
+and oracle identities. The current harness runs a Docker phase; splitting or
+replaying that evidence must be implemented and qualified before enabling such
+jobs. Until then use kernel-semantics plus live backend smoke, never invoke the
+unchanged differential harness as a Docker-free shortcut. x86 evidence does not
+substitute for the canonical native ARM oracle.
+
+Initially admit only **`merge_group` and owner-triggered `workflow_dispatch`**,
+like cloudmac's signed runner; no `pull_request` jobs. Authenticate actor,
+repository, event, reviewed workflow revision and exact event SHA both before
+provisioning and in the proxy's job-start admission hook. Extend the pilot's
+allowlist deliberately. Use full Linux/X64 label sets with separate allowlisted
+tiers (proposed `willow-bhyve` and `willow-nvmm`) to select OS templates; labels
+alone do not authorize work. Obtain fresh JIT configuration per job on the
+controller, reconcile the actual assignment, and consume it only once.
+
+Single-job pilots publish **advisory** OS-specific checks and logs; they confer
+no required coverage and do not relax today's hosted inputs to `ci-ok`.
+After each OS qualifies build, selected case counts, live backend capability
+and lifecycle, promote its check independently to a **required merge-group
+input to `ci-ok`**, with a reviewed aggregate/ruleset change. Expected checks
+missing, cancelled, failed or unexpectedly skipped must fail the aggregate;
+missing capacity leaves work queued, never green. PRs retain hosted checks;
+owner dispatch produces evidence but cannot satisfy a different merge-group
+SHA. This phase-in changes no workflows or aggregate policy in this revision.
+
+### Shared capacity, staging and teardown
+
+The current **one-clone total** cap applies across OSes; it cannot fit a
+proxy/target pair. Build/qualify templates serially under resource admission,
+then admit each single-job BSD pilot only after recaptured host capacity permits
+an explicitly configured **two-clone** pair budget. Under the proposed expanded
+pool's **three-clone, 8-CPU-equivalent/20-GiB** ceiling, one BSD pair can coexist
+with at most one lightweight **2-vCPU/4-GiB** Linux clone: **8 CPU/14 GiB** total.
+Two BSD pairs or a pair plus a heavy runner cannot fit. These are shared totals,
+not per-OS entitlements or authorization to resize VM 210.
+
+Reserve proxy and target VM slots, CPU, memory and storage atomically, including
+booting/idle reservations. Retain the **80% projected CPU** ceiling, **6-GiB
+host reserve**, storage headroom and pressure rules above. If a whole pair
+cannot fit, keep the job queued with its capacity reason and queue age; launch
+neither half. Prioritize merge groups with aging across Linux and both BSD OSes;
+freeze new admission on API/pressure/cleanup failure and preserve active gates.
+Nested performance measurements additionally need quiet-host admission.
+
+| Milestone | Required evidence before proceeding |
+| --- | --- |
+| FreeBSD template build | Pinned image/packages/toolchain manifest, isolated bootstrap, fresh identities, authorized bhyve device access and live nested execution/cleanup; preserved template 300 and protected VMs. |
+| NetBSD template build | Same evidence for NVMM, plus kernel/module/patch identity and nested GPA-fault qualification; no changes to reference VMs. |
+| One FreeBSD job, then one NetBSD job | Separate owner-dispatched pilots: exact-SHA native build, nonempty semantics selection, backend smoke, actual JIT assignment, exported logs and one-job proxy/target teardown. Qualify cancellation and restart recovery per OS. |
+| Elastic admission | Extend the existing ledger to owned pairs and OS tiers; prove shared-budget back-pressure, missed-event reconciliation, API outage and idle cleanup, then a complete merge-group run per OS before required `ci-ok` promotion. |
+
+Send an exact-SHA source archive with hashes to the target, preserve its exit
+codes, pin one-use SSH host keys and disable forwarding. Allow the proxy to
+reach only its assigned BSD target through the approved job transport, never
+PVE management or other VMs. Targets have no GitHub/PVE credentials. Export job,
+runner and target logs, case counts, receipts and image/capability identities
+outside both disks before teardown. Cancellation and the external janitor reap
+only the recorded pair after live pool/range/ledger-generation checks, remove
+stale runner registration and erase one-use transport material. Unknown objects
+are quarantined; failed cleanup blocks further admission.
+
+Risks remain **UNVERIFIED**: BSD unattended provisioning, guest-agent/readiness
+and first-boot identity support differ from Debian cloud-init; nested SVM/NPT
+and NVMM module behavior may prevent runtime qualification; native packages or
+toolchains may lag. Record image, package and runner license/redistribution
+terms and required notices before publishing templates, and distinguish stock
+from locally patched kernels. Failed milestones preserve evidence and block
+that OS's activation; they never authorize touching protected VMs or weakening
+required checks.
 
 ## PR bus: failures return to the driver
 
