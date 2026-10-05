@@ -450,7 +450,7 @@
       "file": "crates/carrick-kernel/src/dispatch/mem/fault.rs",
       "function": "MemView<'a>::commit_published_frame_grant",
       "ordinal_in_function": 1,
-      "fingerprint": "0455600fbfc5b5800e8f18f81243f2a79a61ffb2a3a3eb295ac718896d259176",
+      "fingerprint": "a8b92005295bda2f368742110b0e64ebb4c384796fbc7eb0425177a45cae9710",
       "verdict": "carrier_fault",
       "failure_domain": "dispatch::resident_frame_grant",
       "rationale": "A retired grant settlement is licensed by the originating exact-MM host-alias exclusion. Committing its return-accounting span through another dispatcher would attach backing to the wrong MM and permit reuse before its owed return. This is contradictory kernel authority, not a guest errno; stop before mutating the stock list.",
