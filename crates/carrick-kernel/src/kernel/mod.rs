@@ -132,7 +132,7 @@ pub use objects::{
 pub use operations::{
     ChildStartOutcome, ChildStartWait, ChildWaitPrecheck, ForkReservation, KernelFailpoint,
     KernelOperationError, PreparedFork, PreparedTaskExit, PreparedThreadClone, ProcessIdentity,
-    ProcessState, PublishedFork, PublishedThreadClone, ReservedPidfdSubscription,
+    ProcessState, PublishedFork, PublishedThreadClone, ReservedPidfdSubscription, RetiredTaskExit,
     SignalTargetAuthorization, StartedFork, StartedThreadClone, TaskIdentity,
     TaskOperationReservation, ThreadCloneReservation, ThreadPublicationReservationAttempt,
     WaitChildClass, WaitMode, WaitOutcome,
