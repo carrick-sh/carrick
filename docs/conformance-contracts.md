@@ -281,6 +281,14 @@ park per blocking episode, no redispatch while parked, and queue work
 proportional to affected waiters rather than historical population. It runs at
 1, 8, 32, and 128 waiters.
 
+`recycled_owner_wait_record_resumes_a_completed_futex_without_an_owner_continuation`
+adds an incarnation-reuse witness at the runtime residency boundary. An
+owner-memory wait and a subsequent futex wait reuse the same zone record,
+but only the owner wait retains a syscall continuation. Exactly one host
+wake restores the futex's completed EL0 context without replay or refusal.
+Allocation resets completion flags in constant work; previous owner flags
+must not change the next Linux futex wait's result or require another wake.
+
 Carrier shared-word keys compare the full `(st_dev, st_ino, file offset)` for
 file mappings, or the exact host word address for direct and mirror mappings.
 A hash may select a shard but cannot decide queue equality. The VM-free

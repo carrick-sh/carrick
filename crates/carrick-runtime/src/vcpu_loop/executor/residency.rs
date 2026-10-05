@@ -185,7 +185,7 @@ mod tests {
     use super::*;
     use carrick_hal::threaded::Aarch64SyscallContinuationV1;
     use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken, OwnedObjectWakeEffects};
-    use carrick_sched_core::{BoundedSpin, ThreadIdentity, Waker, ZoneTables};
+    use carrick_sched_core::{BoundedSpin, RecordRef, ThreadIdentity, Waker, ZoneTables};
     use std::cell::RefCell;
 
     fn zone() -> Box<ZoneTables> {
@@ -242,7 +242,7 @@ mod tests {
         exercise_zone_wakes(false);
     }
 
-    fn exercise_zone_wakes(host_owned: bool) {
+    fn exercise_zone_wakes(host_owned: bool) -> (Box<ZoneTables>, RecordRef) {
         let zone = zone();
         let key = ObjectWaitKey::metadata_request(17).unwrap();
         let delivered = RefCell::new(Vec::new());
@@ -255,6 +255,7 @@ mod tests {
             .unwrap();
         let original = pending_read();
         let mut saved = original.clone();
+        let mut retired = None;
         for round in 0..if host_owned { 2 } else { 1 } {
             let source = zone
                 .admit_object_notification(key, &BoundedSpin(0), &complete)
@@ -330,7 +331,80 @@ mod tests {
             assert!(unsafe { rec.take_object_operation() }.is_none());
             zone.free_record(record);
             assert!(materialize_zone_in(&zone, &saved, reference).is_err());
+            retired = Some(reference);
         }
+        (zone, retired.unwrap())
+    }
+
+    #[test]
+    fn recycled_owner_wait_record_resumes_a_completed_futex_without_an_owner_continuation() {
+        let (zone, retired) = exercise_zone_wakes(true);
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 102,
+                serial: 102,
+                mm: 1,
+                file_table: 1,
+                generation: 1,
+                affinity: 0,
+                lifecycle_page: 0,
+                control_slot: 0,
+            })
+            .unwrap();
+        let reference = zone.record_ref(record);
+        assert_eq!(reference.id, retired.id, "exercise actual slot reuse");
+        assert_ne!(reference, retired, "the allocation has a fresh incarnation");
+        let mut saved = pending_read();
+        let ctx = crate::vcpu_loop::zone::zone_ctx_from_state(
+            &saved,
+            crate::vcpu_loop::zone::ZoneExit::Syscall { completed: true },
+        )
+        .unwrap();
+        // SAFETY: the freshly allocated record has not been published.
+        unsafe { *zone.record(record).ctx_mut() = ctx };
+        let GuestCpuState::Aarch64V1(cpu) = &mut saved else {
+            panic!("AArch64 fixture");
+        };
+        // zone_park retires the completed futex syscall before saving its CPU.
+        std::sync::Arc::make_mut(cpu).syscall_continuation = None;
+        let guard = zone
+            .lock(ZoneTables::bucket_of(1, 0x6000), &BoundedSpin(0))
+            .unwrap();
+        let seq = zone.next_seq(record);
+        zone.enqueue(&guard, record, seq, 1, 0x6000, u32::MAX, 0)
+            .unwrap();
+        zone.publish_park(record, seq);
+        let mut transfers = Vec::new();
+        assert_eq!(
+            zone.wake_host(
+                &guard,
+                1,
+                0x6000,
+                u32::MAX,
+                1,
+                false,
+                &mut |transfer| transfers.push(transfer),
+                &mut |_| panic!("host wake must return this record"),
+            ),
+            1
+        );
+        drop(guard);
+        assert_eq!(transfers.len(), 1);
+        assert_eq!(
+            transfers.pop().unwrap().finish(&BoundedSpin(0)),
+            Some(reference)
+        );
+        let restored = materialize_zone_in(&zone, &saved, reference)
+            .expect("a completed futex must not inherit a previous owner's continuation");
+        let GuestCpuState::Aarch64V1(cpu) = restored else {
+            panic!("AArch64 fixture");
+        };
+        assert!(cpu.syscall_continuation.is_none());
+        assert_eq!((cpu.trap_pc, cpu.trap_pstate), (ctx.pc, ctx.pstate));
+        assert_eq!(cpu.gprs, ctx.x);
+        assert!(!zone.record(record).has_object_operation());
+        zone.free_record(record);
+        assert!(zone.live(reference).is_none());
     }
 
     #[derive(Default)]
