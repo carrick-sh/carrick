@@ -7962,6 +7962,20 @@
     },
     {
       "family": "host_substrate",
+      "operation": "libc::syscall",
+      "owner": "carrick_portable::process_exit_fd",
+      "lane": "linux_cli",
+      "ceiling": 1
+    },
+    {
+      "family": "host_substrate",
+      "operation": "libc::syscall",
+      "owner": "carrick_portable::process_exit_fd",
+      "lane": "linux_runtime",
+      "ceiling": 1
+    },
+    {
+      "family": "host_substrate",
       "operation": "libc::waitpid",
       "owner": "carrick_cli::lifecycle::await_detached_ready",
       "lane": "macos_cli_default",

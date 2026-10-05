@@ -477,7 +477,7 @@ fn base_policy(root: &Path, base: &str) -> Result<AuthorityDebtCeilings, DebtErr
         return Ok(serde_json::from_str(&output.stdout)?);
     }
     let output = std::process::Command::new("git")
-        .args(["archive", base, "crates", "scripts/migrate"])
+        .args(["archive", base, "crates", "scripts"])
         .current_dir(root)
         .output()?;
     if !output.status.success() {
