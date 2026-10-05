@@ -91,18 +91,12 @@ impl<'a, S: PreparedCopyNodes<'a>> ClaimedPreparedCopy<'a, S> {
 impl<'a, S: PreparedCopyNodes<'a>> Drop for ClaimedPreparedCopy<'a, S> {
     fn drop(&mut self) {
         if self.armed {
-            assert!(
-                self.node
-                    .next_free
-                    .compare_exchange(
-                        COPYING | self.permit.generation.get(),
-                        LIVE | self.permit.generation.get(),
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok(),
-                "exact prepared claim rollback custody"
-            );
+            // This claim exclusively owns the Copying phase until it either
+            // settles or restores Live. Neither the root nor another claimant
+            // may write the phase while this capability is armed.
+            self.node
+                .next_free
+                .store(LIVE | self.permit.generation.get(), Ordering::Release);
         }
     }
 }

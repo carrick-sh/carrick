@@ -555,7 +555,7 @@ impl MemState {
         let retired = root
             .with_root(|model| {
                 let mut retired = Vec::new();
-                while let Some(identity) = model.take_retired_host_backing() {
+                while let Some(identity) = model.take_retired_host_backing()? {
                     retired.push(identity);
                 }
                 Ok(retired)

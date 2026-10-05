@@ -234,7 +234,10 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
                     .get()
                     .cast::<carrick_sched_core::completion_queue::CompletionQueue>()
             };
-            assert!(queue.initialize());
+            if !queue.initialize() {
+                self.free_node(queue_id);
+                return Err(Refusal::Stale);
+            }
             self.state_mut().prepared_head = queue_id;
         }
         let id = self.pool_node()?;

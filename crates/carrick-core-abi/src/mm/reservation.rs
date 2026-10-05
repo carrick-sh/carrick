@@ -21,6 +21,12 @@ macro_rules! identity {
 
 identity!(ReservationMm);
 identity!(ReservationGeneration);
+impl ReservationGeneration {
+    pub const INITIAL: Self = Self(1);
+    pub fn checked_next(self) -> Option<Self> {
+        self.raw().checked_add(1).and_then(Self::new)
+    }
+}
 identity!(ReservationSequence);
 identity!(
     /// One incarnation of anonymous memory in one root: minted when a node is
@@ -69,6 +75,9 @@ impl ReservationRange {
 pub struct ReservationProtection(u64);
 impl ReservationProtection {
     pub const NONE: Self = Self(0);
+    pub const READ: Self = Self(1);
+    pub const WRITE: Self = Self(2);
+    pub const EXECUTE: Self = Self(4);
     pub const READ_WRITE: Self = Self(3);
     pub const fn from_bits(bits: u64) -> Option<Self> {
         if bits & !7 == 0 {
@@ -384,7 +393,10 @@ pub trait ReservationPolicy {
     fn charged_data(node: &ReservationNodeData) -> u64;
     fn charged_locked(node: &ReservationNodeData) -> u64;
     fn charges_within(node: &ReservationNodeData, start: u64, end: u64) -> Charges;
-    fn mapping(node: &ReservationNodeData, generation: ReservationGeneration) -> Mapping;
+    fn mapping(
+        node: &ReservationNodeData,
+        generation: ReservationGeneration,
+    ) -> Result<Mapping, Refusal>;
     fn same_mapping(node: &ReservationNodeData, other: &ReservationNodeData) -> bool;
     fn charges_data(flags: ReservationNodeFlags, protection: ReservationProtection) -> bool;
 }
@@ -405,18 +417,7 @@ pub trait ReservationPolicyAccess {
     fn write_pending_backing(&mut self, backing: HostBackingIdentity) -> Result<(), Refusal>;
     fn set_byte_break(&mut self, requested: UserVa) -> Result<(), Refusal>;
     fn refuse(&mut self, request: ReservationRequest) -> Result<(), Refusal>;
-    #[allow(clippy::too_many_arguments)]
-    fn propose(
-        &mut self,
-        range: ReservationRange,
-        protection: ReservationProtection,
-        operation: ReservationOperation,
-        result: UserVa,
-        byte_break: UserVa,
-        preserve: bool,
-        source: Option<ReservationRange>,
-        flags: ReservationNodeFlags,
-    ) -> Result<Decision, Refusal>;
+    fn propose(&mut self, proposal: ReservationProposal) -> Result<Decision, Refusal>;
 }
 
 /// Native allocator adapter, called only after the root guard is consumed.
@@ -495,4 +496,17 @@ pub enum MoveTarget {
 pub enum Decision {
     Complete(u64),
     Work(ReservationRequest),
+}
+
+/// Inputs to one uncommitted reservation edit; this record grants no authority.
+#[derive(Clone, Copy, Debug)]
+pub struct ReservationProposal {
+    pub range: ReservationRange,
+    pub protection: ReservationProtection,
+    pub operation: ReservationOperation,
+    pub result: UserVa,
+    pub policy_value: UserVa,
+    pub require_coverage: bool,
+    pub source: Option<ReservationRange>,
+    pub flags: ReservationNodeFlags,
 }

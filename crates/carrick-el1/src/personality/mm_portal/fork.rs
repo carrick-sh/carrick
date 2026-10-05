@@ -660,8 +660,8 @@ impl<P: PinnedMetadataExtent> NativeForkPortal<P> for MmPortal<'_, P> {
         }
         // Root/editor exclusion proves these metadata transitions cannot
         // change between preflight and this publication. Advance only once.
-        let parent_generation = root.publish_fork_parent(request);
-        child.publish_fork_child(request);
+        let parent_generation = root.publish_fork_parent(request)?;
+        child.publish_fork_child(request)?;
         let child_handle = unsafe {
             El1MmHandle::from_admitted_owner(self.carrier, request.child_mm, child_incarnation)
         };

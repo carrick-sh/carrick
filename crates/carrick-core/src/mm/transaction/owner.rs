@@ -30,6 +30,14 @@ pub trait OwnerVenue {
     fn cancelled_copy_code() -> u32;
 }
 
+/// Independently borrowed venues; no owner state or permit is created here.
+pub struct SelectionVenues<'a, R, C> {
+    pub prepared: &'a mut R,
+    pub cow: &'a mut C,
+    pub residency: &'a FrameGrantResidencyTable,
+    pub slot: u32,
+}
+
 /// At most one Linux page is fenced through a host memcpy. Bigger transfers
 /// retain their byte offset and select/revalidate each next page separately.
 pub const TRANSFER_CHUNK_BYTES: u64 = 4096;
@@ -437,9 +445,9 @@ impl<
         } else {
             let mapping = root.mapping(va).ok_or(MmError::Fault)?;
             let access = match continuation.intent {
-                TransferIntent::UserWrite => ReservationProtection::from_bits(2).unwrap(),
-                TransferIntent::ReadInstruction => ReservationProtection::from_bits(4).unwrap(),
-                _ => ReservationProtection::from_bits(1).unwrap(),
+                TransferIntent::UserWrite => ReservationProtection::WRITE,
+                TransferIntent::ReadInstruction => ReservationProtection::EXECUTE,
+                _ => ReservationProtection::READ,
             };
             if !mapping.protection.permits(access) || va + len > mapping.range.end() {
                 return Err(MmError::Fault);
@@ -452,16 +460,18 @@ impl<
     }
 
     // These are independently borrowed production owner venues, not portal state.
-    #[allow(clippy::too_many_arguments)]
     pub fn select<W: LiveDescriptorWords + ?Sized, R: PreparedPageResolver, C: CowResolver>(
         &self,
         continuation: &TransferContinuation,
         words: &W,
-        prepared: &mut R,
-        cow: &mut C,
-        residency: &FrameGrantResidencyTable,
-        slot: u32,
+        venues: SelectionVenues<'_, R, C>,
     ) -> Result<TransferStep, MmError> {
+        let SelectionVenues {
+            prepared,
+            cow,
+            residency,
+            slot,
+        } = venues;
         if continuation.is_complete() {
             return Ok(TransferStep::Complete);
         }
@@ -624,12 +634,13 @@ impl<
             SelectedChunk::from_owner_selection(
                 continuation.handle,
                 continuation.sequence(),
-                generation,
-                continuation.offset(),
-                GuestVa::new(va),
-                ipa,
-                continuation.intent == TransferIntent::UserWrite && executable,
-                len,
+                PortalSelectedData {
+                    root_generation: NonZeroU64::new(generation).ok_or(MmError::Stale)?,
+                    offset: continuation.offset(),
+                    ipa,
+                    executable: continuation.intent == TransferIntent::UserWrite && executable,
+                },
+                PortalByteRange::new(va, len).ok_or(MmError::Invalid)?,
                 continuation.fork_sequence(),
                 retry,
             )

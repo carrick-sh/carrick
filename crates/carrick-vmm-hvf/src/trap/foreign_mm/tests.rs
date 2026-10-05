@@ -14625,10 +14625,12 @@ fn exercise_retained_import(journal_case: u8) {
             .select(
                 &transfer,
                 &words,
-                &mut carrick_el1::fault::NoopPreparedResolver,
-                &mut carrick_el1::fault::NoopCowResolver,
-                &carrick_el1::personality::mm_portal::test_support::residency(),
-                0,
+                carrick_el1::personality::mm_portal::SelectionVenues {
+                    prepared: &mut carrick_el1::fault::NoopPreparedResolver,
+                    cow: &mut carrick_el1::fault::NoopCowResolver,
+                    residency: &carrick_el1::personality::mm_portal::test_support::residency(),
+                    slot: 0,
+                },
             )
             .unwrap(),
     );
