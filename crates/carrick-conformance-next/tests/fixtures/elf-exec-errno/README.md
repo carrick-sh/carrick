@@ -7,7 +7,11 @@ AArch64 exit(0) control must execute first. All child waits are bounded.
 
 `oracle.json` is **provisional, pending the director's native arm64 Linux
 bless**. Its current assumptions are ENOEXEC (8), no signal, and child exit 0
-for ET_REL, p_filesz > p_memsz, and unterminated PT_INTERP. A passing
+for main ET_REL, p_filesz > p_memsz, and unterminated PT_INTERP;
+ELIBBAD (80) for existing ET_REL/non-ELF interpreters; ENOENT (2) for
+a missing interpreter. Valid and embedded-NUL interpreters exit 42. Both
+the full and formerly truncated interpreter paths exist, preventing an
+accidental missing-file pass. A passing
 provisional comparison establishes Carrick's behavior, not Linux parity.
 Do not copy these assumptions into the generic blessed oracle cache.
 
@@ -29,3 +33,10 @@ binary SHA-256. The signed runner records executable identity and cleanup.
 Run the **same guest binary** on native arm64 Linux to bless: retain its stdout,
 binary hash, image digest and kernel identity, then update `stdout` and change
 `status` to `blessed` with that provenance. Do not normalize a death into errno.
+
+Carrick cannot currently represent a non-UTF-8 interpreter pathname in its
+string-based filesystem API. The probe explicitly checks ENOEXEC (8) rather
+than silently running the main image. Native Linux accepts pathname bytes;
+this absent non-UTF-8 pathname is expected to return ENOENT (2). The oracle
+stores native output; the host test names and checks this single representation
+limit separately. This is a disclosed divergence, not a parity claim.

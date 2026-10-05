@@ -3306,6 +3306,7 @@ pub const LINUX_E2BIG: LinuxErrno = LinuxErrno::new(7);
 // canonical home for the `linux_errno` re-export table in dispatch/mod.rs.
 pub const LINUX_EIO: LinuxErrno = LinuxErrno::new(5);
 pub const LINUX_ENOEXEC: LinuxErrno = LinuxErrno::new(8);
+pub const LINUX_ELIBBAD: LinuxErrno = LinuxErrno::new(80);
 pub const LINUX_ENOTBLK: LinuxErrno = LinuxErrno::new(15);
 pub const LINUX_EBUSY: LinuxErrno = LinuxErrno::new(16);
 pub const LINUX_EXDEV: LinuxErrno = LinuxErrno::new(18);
@@ -3377,6 +3378,7 @@ const ERRNO_NAMES: &[(LinuxErrno, &str)] = &[
     (LINUX_ENXIO, "ENXIO"),
     (LINUX_E2BIG, "E2BIG"),
     (LINUX_ENOEXEC, "ENOEXEC"),
+    (LINUX_ELIBBAD, "ELIBBAD"),
     (LINUX_EBADF, "EBADF"),
     (LINUX_ECHILD, "ECHILD"),
     (LINUX_EAGAIN, "EAGAIN"),

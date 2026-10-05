@@ -20,6 +20,26 @@
 use crate::dispatch::SyscallDispatcher;
 use crate::linux_abi::LinuxErrno;
 
+/// Translate an executable-image load failure at the Linux execve boundary.
+pub fn exec_image_errno(error: carrick_mem::memory::AddressSpaceError) -> LinuxErrno {
+    use crate::linux_abi::{LINUX_EIO, LINUX_ELIBBAD, LINUX_ENOENT, LINUX_ENOEXEC};
+    use carrick_mem::{elf::ElfInspectError, memory::AddressSpaceError};
+    match error {
+        AddressSpaceError::Interpreter(_) => LINUX_ELIBBAD,
+        AddressSpaceError::Io(error) | AddressSpaceError::Elf(ElfInspectError::Io(error)) => {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                LINUX_ENOENT
+            } else {
+                error
+                    .raw_os_error()
+                    .map(crate::host_to_linux_errno)
+                    .unwrap_or(LINUX_EIO)
+            }
+        }
+        _ => LINUX_ENOEXEC,
+    }
+}
+
 /// Resolve `#!` shebang scripts the way the Linux kernel does: if `path` names
 /// a file starting with `#!`, re-target at the interpreter with the script path
 /// spliced into argv, repeating up to BINPRM_MAX_RECURSION (4) levels. A
@@ -481,6 +501,36 @@ pub fn stop_after_traced_exec(dispatcher: &SyscallDispatcher) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_image_format_and_missing_file_have_distinct_errno() {
+        use carrick_mem::{elf::ElfInspectError, memory::AddressSpaceError};
+        assert_eq!(
+            exec_image_errno(AddressSpaceError::Io(std::io::ErrorKind::NotFound.into())),
+            crate::linux_abi::LINUX_ENOENT
+        );
+        assert_eq!(
+            exec_image_errno(AddressSpaceError::Elf(ElfInspectError::NotElf)),
+            crate::linux_abi::LINUX_ENOEXEC
+        );
+        assert_eq!(
+            exec_image_errno(AddressSpaceError::Elf(ElfInspectError::Io(
+                std::io::ErrorKind::NotFound.into()
+            ))),
+            crate::linux_abi::LINUX_ENOENT
+        );
+        assert_eq!(
+            exec_image_errno(AddressSpaceError::Interpreter(Box::new(
+                AddressSpaceError::Elf(ElfInspectError::NotElf)
+            ))),
+            crate::linux_abi::LINUX_ELIBBAD
+        );
+        assert_eq!(crate::linux_abi::LINUX_ELIBBAD.get(), 80);
+        assert_eq!(
+            crate::linux_abi::errno_name(crate::linux_abi::LINUX_ELIBBAD),
+            Some("ELIBBAD")
+        );
+    }
 
     const EM_X86_64: u16 = 62;
 

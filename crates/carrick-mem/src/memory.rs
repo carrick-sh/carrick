@@ -1313,6 +1313,8 @@ impl MemoryRegion {
 pub enum AddressSpaceError {
     #[error("failed to inspect ELF load plan: {0}")]
     Elf(#[from] ElfInspectError),
+    #[error("failed to load ELF interpreter: {0}")]
+    Interpreter(#[source] Box<AddressSpaceError>),
     #[error("stage-1 image cannot express the permission of 0x{start:x}..0x{end:x}: {reason}")]
     Stage1Protection {
         start: u64,
@@ -1547,7 +1549,8 @@ impl AddressSpace {
         if let Some(interpreter_path) = plan.interpreter.as_deref() {
             let interpreter = read_interp(interpreter_path)
                 .ok_or_else(|| AddressSpaceError::Io(std::io::ErrorKind::NotFound.into()))?;
-            let interpreter_plan = plan_elf_load_bytes_for(&interpreter, machine)?
+            let interpreter_plan = plan_elf_load_bytes_for(&interpreter, machine)
+                .map_err(|error| AddressSpaceError::Interpreter(Box::new(error.into())))?
                 .with_load_bias(LINUX_INTERPRETER_BASE);
             file_mappings.extend(file_mappings_from_load_plan(
                 &interpreter_plan,
@@ -1555,11 +1558,10 @@ impl AddressSpace {
             ));
             ro_spans.extend(crate::elf::ro_page_spans(&interpreter_plan));
             rw_spans.extend(crate::elf::rw_page_spans(&interpreter_plan));
-            regions.extend(regions_from_load_plan_with_shape(
-                &interpreter,
-                &interpreter_plan,
-                shape,
-            )?);
+            regions.extend(
+                regions_from_load_plan_with_shape(&interpreter, &interpreter_plan, shape)
+                    .map_err(|error| AddressSpaceError::Interpreter(Box::new(error)))?,
+            );
             entry = interpreter_plan.entry;
             interpreter_base = Some(LINUX_INTERPRETER_BASE);
         }

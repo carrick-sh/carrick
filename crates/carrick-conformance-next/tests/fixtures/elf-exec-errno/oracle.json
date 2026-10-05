@@ -1,6 +1,7 @@
 {
   "status": "pending-director-bless",
-  "source_sha256": "055501760e40d5af4f56330a2859b3475618782a3aea86ec161b3c627c7aed1d",
+  "source_sha256": "60bf58f1a920b7096f565759b55db72e6c19eeeefdb3795f64e862944df0ab0a",
   "authority": "Linux elf(5), execve(2); exact per-case oracle pending native arm64 director run",
-  "stdout": "fixture_source_sha256=055501760e40d5af4f56330a2859b3475618782a3aea86ec161b3c627c7aed1d\nvalid_errno=-1\nvalid_signal=0\nvalid_exit=0\net_rel_errno=8\net_rel_signal=0\net_rel_exit=0\nfilesz_gt_memsz_errno=8\nfilesz_gt_memsz_signal=0\nfilesz_gt_memsz_exit=0\nunterminated_interp_errno=8\nunterminated_interp_signal=0\nunterminated_interp_exit=0\n"
+  "stdout": "fixture_source_sha256=60bf58f1a920b7096f565759b55db72e6c19eeeefdb3795f64e862944df0ab0a\nvalid_errno=-1\nvalid_signal=0\nvalid_exit=0\net_rel_errno=8\net_rel_signal=0\net_rel_exit=0\nfilesz_gt_memsz_errno=8\nfilesz_gt_memsz_signal=0\nfilesz_gt_memsz_exit=0\nvalid_interp_errno=-1\nvalid_interp_signal=0\nvalid_interp_exit=42\nembedded_nul_interp_errno=-1\nembedded_nul_interp_signal=0\nembedded_nul_interp_exit=42\nunterminated_interp_errno=8\nunterminated_interp_signal=0\nunterminated_interp_exit=0\nnon_utf8_interp_errno=2\nnon_utf8_interp_signal=0\nnon_utf8_interp_exit=0\ninterpreter_et_rel_errno=80\ninterpreter_et_rel_signal=0\ninterpreter_et_rel_exit=0\ninterpreter_not_elf_errno=80\ninterpreter_not_elf_signal=0\ninterpreter_not_elf_exit=0\nmissing_interp_errno=2\nmissing_interp_signal=0\nmissing_interp_exit=0\n",
+  "representation_limit": "non_utf8_interp: Carrick rejects with ENOEXEC (8); Linux accepts pathname bytes and this absent pathname should yield ENOENT (2). Exclude this Carrick limitation from parity claims."
 }

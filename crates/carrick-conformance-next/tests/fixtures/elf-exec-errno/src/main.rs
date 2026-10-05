@@ -4,7 +4,7 @@ use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
-fn elf(interpreter: bool) -> Vec<u8> {
+fn elf(interpreter: Option<&[u8]>) -> Vec<u8> {
     let mut bytes = vec![0; 0x1000 + 12];
     bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
     bytes[16..18].copy_from_slice(&2_u16.to_le_bytes()); // ET_EXEC
@@ -14,12 +14,12 @@ fn elf(interpreter: bool) -> Vec<u8> {
     bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
     bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
     bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
-    bytes[56..58].copy_from_slice(&(if interpreter { 2_u16 } else { 1 }).to_le_bytes());
-    let load = if interpreter {
+    bytes[56..58].copy_from_slice(&(if interpreter.is_some() { 2_u16 } else { 1 }).to_le_bytes());
+    let load = if let Some(path) = interpreter {
         bytes[64..68].copy_from_slice(&3_u32.to_le_bytes()); // PT_INTERP
         bytes[72..80].copy_from_slice(&176_u64.to_le_bytes());
-        bytes[96..104].copy_from_slice(&6_u64.to_le_bytes()); // excludes NUL
-        bytes[176..183].copy_from_slice(b"/ld.so\0");
+        bytes[96..104].copy_from_slice(&(path.len() as u64).to_le_bytes());
+        bytes[176..176 + path.len()].copy_from_slice(path);
         120
     } else {
         64
@@ -117,12 +117,33 @@ fn main() {
         };
         assert_eq!(libc::setrlimit(libc::RLIMIT_CORE, &limit), 0);
     }
-    observe("valid", &elf(false));
-    let mut relocatable = elf(false);
+    observe("valid", &elf(None));
+    let mut relocatable = elf(None);
     relocatable[16..18].copy_from_slice(&1_u16.to_le_bytes()); // ET_REL
     observe("et_rel", &relocatable);
-    let mut oversized = elf(false);
+    let mut oversized = elf(None);
     oversized[104..112].copy_from_slice(&11_u64.to_le_bytes()); // p_memsz < p_filesz
     observe("filesz_gt_memsz", &oversized);
-    observe("unterminated_interp", &elf(true));
+    // Both the declared pathname and Goblin's old truncated pathname exist.
+    // A removed terminator check must execute exit(42), rather than fail lookup.
+    let mut loader = elf(None);
+    loader[0x1000..0x1004].copy_from_slice(&0xd2800540_u32.to_le_bytes()); // mov x0, #42
+    for path in ["/tmp/elf-ld.so", "/tmp/elf-ld.s"] {
+        std::fs::write(path, &loader).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    observe("valid_interp", &elf(Some(b"/tmp/elf-ld.so\0")));
+    observe("embedded_nul_interp", &elf(Some(b"/tmp/elf-ld.so\0\0")));
+    observe("unterminated_interp", &elf(Some(b"/tmp/elf-ld.so")));
+    // This is a documented Carrick representation limit, not Linux parity:
+    // Linux pathname bytes accept non-UTF-8; Carrick must reject explicitly.
+    observe("non_utf8_interp", &elf(Some(b"/tmp/elf-ld.\xff\0")));
+    std::fs::write("/tmp/elf-ld.so", &relocatable).unwrap();
+    observe("interpreter_et_rel", &elf(Some(b"/tmp/elf-ld.so\0")));
+    std::fs::write("/tmp/elf-ld.so", b"not an ELF interpreter").unwrap();
+    observe("interpreter_not_elf", &elf(Some(b"/tmp/elf-ld.so\0")));
+    for path in ["/tmp/elf-ld.so", "/tmp/elf-ld.s"] {
+        std::fs::remove_file(path).unwrap();
+    }
+    observe("missing_interp", &elf(Some(b"/tmp/elf-ld.so\0")));
 }

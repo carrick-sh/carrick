@@ -110,3 +110,46 @@ fn unterminated_interp_cannot_select_a_different_interpreter() {
         "row 11: unterminated PT_INTERP produced a load plan: {result:?}"
     );
 }
+
+#[test]
+fn embedded_nul_interp_uses_first_pathname_terminator() {
+    let bytes = executable(Some(b"/ld.so\0\0"));
+    let plan = plan_elf_load_bytes_for(&bytes, EM_AARCH64).expect("terminated pathname");
+    assert_eq!(plan.interpreter.as_deref(), Some("/ld.so"));
+    assert_eq!(
+        inspect_elf_bytes(&bytes)
+            .expect("inspection")
+            .interpreter
+            .as_deref(),
+        Some("/ld.so")
+    );
+}
+
+#[test]
+fn non_utf8_interp_is_explicitly_rejected() {
+    let bytes = executable(Some(b"/ld.\xff\0"));
+    assert!(
+        plan_elf_load_bytes_for(&bytes, EM_AARCH64).is_err(),
+        "unrepresentable interpreter must not silently become a static image"
+    );
+    assert!(inspect_elf_bytes(&bytes).is_err());
+}
+
+#[test]
+fn interpreter_format_failure_retains_its_role() {
+    use carrick_mem::memory::AddressSpace;
+    let main = executable(Some(b"/ld.so\0"));
+    let mut interpreter = executable(None);
+    interpreter[16..18].copy_from_slice(&ET_REL.to_le_bytes());
+    let error = AddressSpace::load_elf_bytes_with_reader_for(
+        &main,
+        &|_| Some(interpreter.clone()),
+        EM_AARCH64,
+    )
+    .expect_err("ET_REL interpreter");
+    assert!(
+        matches!(error, carrick_mem::memory::AddressSpaceError::Interpreter(ref cause)
+            if matches!(cause.as_ref(), carrick_mem::memory::AddressSpaceError::Elf(_))),
+        "lost interpreter provenance: {error}"
+    );
+}

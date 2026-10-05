@@ -54,7 +54,10 @@ pub(crate) fn is_entrypoint_not_executable(e: &RuntimeError) -> bool {
     match e {
         // A file that isn't a loadable AArch64 ELF (wrong magic, truncated,
         // wrong machine, parse error): docker's "exec format error".
-        RuntimeError::AddressSpace(crate::memory::AddressSpaceError::Elf(_)) => true,
+        RuntimeError::AddressSpace(
+            crate::memory::AddressSpaceError::Elf(_)
+            | crate::memory::AddressSpaceError::Interpreter(_),
+        ) => true,
         // The file exists but we lack execute/read permission: "permission denied".
         RuntimeError::AddressSpace(crate::memory::AddressSpaceError::Io(io)) => {
             io.kind() == std::io::ErrorKind::PermissionDenied
@@ -529,6 +532,11 @@ mod exit_code_tests {
         // "exec format error", or EACCES "permission denied") is 126 — not 127,
         // not the generic 1.
         assert!(is_entrypoint_not_executable(&rt_not_elf()));
+        assert!(is_entrypoint_not_executable(&RuntimeError::AddressSpace(
+            AddressSpaceError::Interpreter(Box::new(AddressSpaceError::Elf(
+                ElfInspectError::NotElf
+            ))),
+        )));
         assert!(is_entrypoint_not_executable(&rt_io(
             ErrorKind::PermissionDenied
         )));
