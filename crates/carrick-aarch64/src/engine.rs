@@ -328,6 +328,7 @@ pub(crate) fn memory_error_to_trap_error(error: MemoryError, context: &str) -> T
 
 struct EngineHostResolver<'a, V> {
     vm: &'a V,
+    retained: Option<Arc<dyn carrick_mmu_core::aarch64::HostArenaResolver + Send + Sync>>,
     pt_base: u64,
     host: *mut u8,
     size: usize,
@@ -338,8 +339,12 @@ unsafe impl<V: Aarch64Vmm> carrick_mmu_core::aarch64::HostArenaResolver
 {
     fn host_ptr_for_range(&self, base: u64, len: usize) -> Option<*mut u8> {
         let needed = len.max(self.size);
-        self.vm
-            .host_ptr(base, needed)
+        self.retained
+            .as_ref()
+            .map_or_else(
+                || self.vm.host_ptr(base, needed),
+                |resolver| resolver.host_ptr_for_range(base, needed),
+            )
             .or_else(|| (base == self.pt_base && len <= self.size).then_some(self.host))
     }
 
@@ -1551,6 +1556,13 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
     /// TTBR0 root — the same construction `pt_edit_locked` performs lazily on
     /// the first edit. Fails (rather than guessing) when the root or its
     /// backing is not readable yet.
+    fn page_table_host_ptr(&self, base: u64, len: usize) -> Option<*mut u8> {
+        match self.page_tables.live_host_resolver() {
+            Some(resolver) => resolver.host_ptr_for_range(base, len),
+            None => self.vm.host_ptr(base, len),
+        }
+    }
+
     fn build_page_tables_manager_from_live(&self) -> Result<PageTableManager, MemoryError> {
         const TTBR_ROOT_MASK: u64 = (1_u64 << 48) - 1;
         let pt_base = self
@@ -1566,8 +1578,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
         let host = self
-            .vm
-            .host_ptr(pt_base, size)
+            .page_table_host_ptr(pt_base, size)
             .ok_or_else(|| MemoryError::HostMap("read live page tables".to_string()))?;
         // SAFETY: `host_ptr` resolved the complete live page-table mapping at
         // `pt_base` for `size` bytes, and the engine retains that mapping for
@@ -1623,10 +1634,10 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
         let host = self
-            .vm
-            .host_ptr(pt_base, size)
+            .page_table_host_ptr(pt_base, size)
             .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
         let page_tables = self.page_tables.clone();
+        let retained = page_tables.live_host_resolver();
         let engines = page_tables.engines();
         let unsafe_to_coalesce = page_tables.is_shared_with_vfork_child() || engines > 1;
         let stage1_exclusive = carrick_hal::stage1_exclusive::current_thread_edits_exclusively();
@@ -1651,6 +1662,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 if let Some((address, len)) = live_range {
                     let resolver = EngineHostResolver {
                         vm: &self.vm,
+                        retained: retained.clone(),
                         pt_base,
                         host,
                         size,
@@ -1678,6 +1690,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                             // within `[host, host + size)`.
                             let resolver = EngineHostResolver {
                                 vm: &self.vm,
+                                retained: retained.clone(),
                                 pt_base,
                                 host,
                                 size,
@@ -1961,11 +1974,11 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             & TTBR_ROOT_MASK;
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
         let host = self
-            .vm
-            .host_ptr(pt_base, size)
+            .page_table_host_ptr(pt_base, size)
             .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_string()))?;
         let resolver = EngineHostResolver {
             vm: &self.vm,
+            retained: self.page_tables.live_host_resolver(),
             pt_base,
             host,
             size,
@@ -2000,8 +2013,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             & TTBR_ROOT_MASK;
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
         let host = self
-            .vm
-            .host_ptr(pt_base, size)
+            .page_table_host_ptr(pt_base, size)
             .ok_or_else(|| MemoryError::HostMap("page-table region not mapped".to_owned()))?;
         Ok((pt_base, host))
     }
@@ -2013,6 +2025,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         host: *mut u8,
     ) -> Result<[u64; 4], MemoryError> {
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+        let retained = self.page_tables.live_host_resolver();
         self.page_tables
             .with_manager(|manager| {
                 if manager.base() != pt_base {
@@ -2025,6 +2038,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 // `pt_base`, and the manager's base/length were checked above.
                 let resolver = EngineHostResolver {
                     vm: &self.vm,
+                    retained,
                     pt_base,
                     host,
                     size,
@@ -5696,12 +5710,14 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             return;
         };
         let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
+        let retained = self.page_tables.live_host_resolver();
         self.page_tables.with_manager(|manager| {
             if manager.base() != pt_base {
                 return;
             }
             let resolver = EngineHostResolver {
                 vm: &self.vm,
+                retained,
                 pt_base,
                 host,
                 size,
@@ -5774,8 +5790,16 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         source: Box<dyn carrick_mmu_core::aarch64::TableArenaSource>,
     ) -> Result<(), TrapError> {
         let page_tables = self.page_tables.clone();
+        // The authority calls its eager builder while holding its own lock.
+        // Resolve the current live image first, while the retained resolver
+        // can still be consulted without recursively taking that lock.
+        let eager = (!page_tables.is_present()).then(|| self.build_page_tables_manager_from_live());
         page_tables.install_source_with_eager_builder(source, || {
-            self.build_page_tables_manager_from_live()
+            eager.unwrap_or_else(|| {
+                Err(MemoryError::HostMap(
+                    "eager table builder was not required".to_owned(),
+                ))
+            })
         })?;
         // Deferred backends could not bind a resolver to the empty placeholder.
         // Revisit that exact authority now that the bootstrap image exists,
@@ -5999,7 +6023,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         // cycle for a diagnostic probe. It still reads the HARDWARE-visible
         // bytes rather than the software model, which is the whole point of
         // this walk.
-        let host = self.vm.host_ptr(root, size)?;
+        let host = self.page_table_host_ptr(root, size)?;
         // SAFETY: `host_ptr` resolved a complete live mapping of `size` bytes
         // whose byte offset 0 is the PA `root`, and this frame holds the engine
         // borrow for the duration of the walk.
@@ -6416,7 +6440,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                             })?
                             & TTBR_ROOT_MASK;
                     let size = carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize;
-                    let host = self.vm.host_ptr(pt_base, size).ok_or_else(|| {
+                    let host = self.page_table_host_ptr(pt_base, size).ok_or_else(|| {
                         TrapError::Hypervisor("page-table region not mapped".to_owned())
                     })?;
 
@@ -9035,6 +9059,73 @@ mod transfer_service_tests {
             0,
         )
     }
+    #[test]
+    fn relocated_bootstrap_edits_use_retained_physical_table_custody() {
+        use carrick_mem::memory::{LINUX_MMAP_BASE, LINUX_PAGE_TABLES_SIZE};
+        let pool = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+        let mut engines = Vec::new();
+        for (old, root) in [(0x9b_4000_0000, pool), (0x9b_8000_0000, pool + 0x20_0000)] {
+            let mut engine = engine_fixture();
+            let (authority, _publisher) =
+                crate::stage1_authority::tests::boot_root_fixture(old, root);
+            engine.page_tables = authority;
+            engine.vcpu.get_mut().ttbr0 = old;
+            engine.publish_initial_stage1_root(&mut |_| Ok(())).unwrap();
+            assert!(
+                engine
+                    .vm
+                    .host_ptr(root, LINUX_PAGE_TABLES_SIZE as usize)
+                    .is_none()
+            );
+            assert_eq!(engine.page_tables.root_base(), Some(root));
+            engines.push(engine);
+        }
+        let leaf = |engine: &Aarch64EngineCore<Vm>| {
+            carrick_mmu_core::aarch64::terminal_descriptor(
+                engine.live_pt_debug_walk(LINUX_MMAP_BASE).unwrap(),
+            )
+        };
+        assert_ne!(leaf(&engines[0]) & 1, 0);
+        assert_ne!(leaf(&engines[1]) & 1, 0);
+        engines[0]
+            .pt_edit_locked(|editor| editor.set_prot_none(LINUX_MMAP_BASE, 4096))
+            .expect("first relocated root must resolve its retained table custody");
+        assert_eq!(leaf(&engines[0]) & 1, 0);
+        assert_ne!(
+            leaf(&engines[1]) & 1,
+            0,
+            "a peer MM at the same VA stays mapped"
+        );
+        engines[1]
+            .pt_edit_locked(|editor| editor.set_prot_none(LINUX_MMAP_BASE, 4096))
+            .expect("second relocated root must resolve its own retained table custody");
+        assert_eq!(leaf(&engines[1]) & 1, 0);
+    }
+
+    #[test]
+    fn bound_table_custody_refusal_cannot_fall_back_to_vm_mapping() {
+        use carrick_mem::memory::{LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE};
+        let mut engine = engine_fixture();
+        engine.vm.bootstrap = Some(vec![0; LINUX_PAGE_TABLES_SIZE as usize]);
+        assert!(
+            engine
+                .vm
+                .host_ptr(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize)
+                .is_some()
+        );
+        // SAFETY: this resolver deliberately authenticates no table arena.
+        unsafe {
+            engine
+                .page_tables
+                .record_live_backing_without_promotion(Arc::new(UnmappedResolver));
+        }
+        assert!(
+            engine
+                .page_table_host_ptr(LINUX_PAGE_TABLES_BASE, LINUX_PAGE_TABLES_SIZE as usize)
+                .is_none()
+        );
+    }
+
     #[test]
     fn source_installation_binds_populated_bootstrap_authority_to_backend() {
         use carrick_mem::memory::{LINUX_PAGE_TABLES_BASE, stage1_hvpatch_page_tables};
