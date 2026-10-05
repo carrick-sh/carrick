@@ -13664,8 +13664,7 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         observed.store(
             observed_custody
                 .stage2_record_snapshot(owner.record_identity.record_id)
-                .unwrap()
-                .pin_count,
+                .map_or(0, |record| record.pin_count),
             std::sync::atomic::Ordering::SeqCst,
         );
     }));
@@ -14389,8 +14388,7 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
         observed_pins.store(
             observed_custody
                 .stage2_record_snapshot(owner.record_identity.record_id)
-                .unwrap()
-                .pin_count,
+                .map_or(0, |record| record.pin_count),
             std::sync::atomic::Ordering::SeqCst,
         );
         // Completion must release inventory and alias guards before callbacks.
