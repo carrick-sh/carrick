@@ -383,8 +383,8 @@ pub(crate) struct MmAccessState {
     pub(crate) mm_root_stage2: parking_lot::Mutex<Option<MmRootStage2Authority>>,
     pub(crate) mutation_coordinator: parking_lot::Mutex<()>,
     /// Guest-lane EL1 frame grants that replace a predecessor, awaiting the
-    /// settlement of EL1's receipt (see `PendingEl1GrantReplacement`).
-    pub(crate) el1_grant_replacements: parking_lot::Mutex<PendingEl1GrantReplacements>,
+    /// settlement of EL1's receipt (see `PendingEl1GrantPublication`).
+    pub(crate) el1_grant_publications: parking_lot::Mutex<PendingEl1GrantPublications>,
     pub(crate) cow_runtime: parking_lot::RwLock<Option<MmCowRuntimeBinding>>,
     pub(crate) cow_rollback_scratch:
         parking_lot::Mutex<Option<carrick_mmu_core::aarch64::PageTableManager>>,
@@ -855,7 +855,7 @@ impl MmAccessState {
             structural_owners: parking_lot::RwLock::new(std::collections::BTreeMap::new()),
             mm_root_stage2: parking_lot::Mutex::new(None),
             mutation_coordinator: parking_lot::Mutex::new(()),
-            el1_grant_replacements: parking_lot::Mutex::new(PendingEl1GrantReplacements::default()),
+            el1_grant_publications: parking_lot::Mutex::new(PendingEl1GrantPublications::default()),
             cow_runtime: parking_lot::RwLock::new(None),
             deferred_anonymous: parking_lot::RwLock::new(None),
             cow_rollback_scratch: parking_lot::Mutex::new(None),

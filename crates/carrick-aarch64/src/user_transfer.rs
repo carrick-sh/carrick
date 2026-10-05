@@ -13,6 +13,7 @@ use core::num::NonZeroU64;
 pub use staging::prepare_write;
 
 pub enum SupplyProgress {
+    Physical(carrick_guest_mem::OwnedMemoryWait),
     Ready,
     Declined,
     OwnerWait(carrick_el1_abi::PortalOwnerWait),
@@ -52,6 +53,7 @@ pub fn supply<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
     }
     let grant = match custody.prepare(target, window)? {
         TransferPreparation::Grant(grant) => grant,
+        TransferPreparation::Pending(wait) => return Ok(SupplyProgress::Physical(wait)),
         // A peer installed the exact fault page while this physical request
         // was in flight. No host bytes were delivered; select again under
         // the owner's current root and source authority.
@@ -194,6 +196,7 @@ pub trait TransferGrant {
     ) -> Result<bool, TrapError>;
 }
 pub enum TransferPreparation {
+    Pending(carrick_guest_mem::OwnedMemoryWait),
     Grant(Box<dyn TransferGrant>),
     PeerResident,
     Declined,
