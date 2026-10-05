@@ -19,12 +19,14 @@ pub fn panic_publication_detail() -> u64 {
 }
 
 fn next_frame_grant_generation() -> u64 {
-    loop {
-        let generation = NEXT_FRAME_GRANT_GENERATION.fetch_add(1, Ordering::Relaxed);
-        if generation != 0 {
-            return generation;
-        }
-    }
+    frame_grant_generation(&NEXT_FRAME_GRANT_GENERATION)
+}
+fn frame_grant_generation(counter: &AtomicU64) -> u64 {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .unwrap_or(0)
 }
 
 /// The one lazy-supply protocol, shared by faults and stopped-target transfers.
@@ -2716,5 +2718,17 @@ mod tests {
             assert_eq!(frames.destination, frames.source);
             assert_eq!(copy.grant(), grant);
         }
+    }
+    #[test]
+    fn exhausted_frame_request_generation_refuses_without_reusing_one() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        let last = frame_grant_generation(&counter);
+        let exhausted = frame_grant_generation(&counter);
+        let repeated = frame_grant_generation(&counter);
+        assert_ne!(repeated, 1, "exhaustion reused request incarnation one");
+        assert_eq!(last, u64::MAX - 1);
+        assert_eq!(exhausted, 0);
+        assert_eq!(repeated, 0);
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }
