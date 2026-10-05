@@ -218,6 +218,15 @@ impl std::fmt::Debug for Stage1Authority {
     }
 }
 
+fn stage1_primary_in_pool(base: u64) -> bool {
+    let pool_base = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+    let pool_end = pool_base + carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_SIZE;
+    base >= pool_base
+        && base
+            .checked_add(carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE)
+            .is_some_and(|end| end <= pool_end)
+}
+
 impl Stage1Authority {
     /// Create a new, unpopulated stage-1 authority in the `Exclusive` state.
     pub fn new() -> Self {
@@ -938,12 +947,10 @@ impl Stage1Authority {
                 .manager
                 .as_ref()
                 .ok_or("bootstrap has no table image")?;
-            if carrick_el1_abi::service_target_table_window(
-                carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
-                manager.base(),
-            )
-            .is_some()
-            {
+            // The fixed boot primary is service-accessible, but an owner
+            // Fork requires its published parent root inside this pool.
+            // Accessibility alone must not skip the initial relocation.
+            if stage1_primary_in_pool(manager.base()) {
                 return Ok(manager.base());
             }
             let generation = inner
@@ -961,13 +968,8 @@ impl Stage1Authority {
         };
         let mut capacity = self.reserve_table_arena()?;
         let root = capacity.base.ok_or("bootstrap lost table capacity")?.0;
-        if carrick_el1_abi::service_target_table_window(
-            carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
-            root,
-        )
-        .is_none()
-        {
-            return Err("bootstrap capacity is outside the maintenance table window".into());
+        if !stage1_primary_in_pool(root) {
+            return Err("bootstrap capacity is outside the stage-1 table pool".into());
         }
         // Bootstrap images have only the primary arena. A malformed/expanded
         // image fails before publication rather than borrowing another MM's
