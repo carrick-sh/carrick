@@ -44,7 +44,9 @@ fn restore_command(f: &Fixture, lock: &Path) -> Command {
         .arg(&f.path)
         .env("CARRICK_HOST_LEASE_PATH", lock)
         .env_remove("CARRICK_HOST_LEASE_FD")
-        .env_remove("CARRICK_HOST_LEASE_MODE");
+        .env_remove("CARRICK_HOST_LEASE_MODE")
+        .env_remove("CARRICK_HOST_LEASE_SOCKET")
+        .env_remove("CARRICK_HOST_LEASE_SCOPE_FD");
     command
 }
 
@@ -539,6 +541,8 @@ fn acceptance_rejects_untracked_host_test_even_with_valid_fixtures() {
         .env("CARRICK_HOST_LEASE_PATH", f.store.path().join("host.lock"))
         .env_remove("CARRICK_HOST_LEASE_FD")
         .env_remove("CARRICK_HOST_LEASE_MODE")
+        .env_remove("CARRICK_HOST_LEASE_SOCKET")
+        .env_remove("CARRICK_HOST_LEASE_SCOPE_FD")
         .output()
         .unwrap();
     assert!(!output.status.success());
@@ -886,7 +890,7 @@ exec "$FIXTURE_TEST_XTASK" "$@"
         write(&bin, "just", br#"#!/bin/sh
 if [ "$1" = accept ]; then
     "$FIXTURE_TEST_XTASK" fixtures verify || exit $?
-    [ "$CARRICK_HOST_LEASE_MODE" = gate ] || exit 92
+    "$FIXTURE_TEST_XTASK" host-lease --mode gate -- /bin/true || exit $?
     [ -d "$FIXTURE_TEST_CHECKOUT_LOCK" ] || exit 93
     touch "$FIXTURE_TEST_ACCEPTED"
     receipt_dir="target/el1-gate/$(git rev-parse --short HEAD)"
@@ -941,7 +945,9 @@ fi
                 self.scratch.path().join("host.lock"),
             )
             .env_remove("CARRICK_HOST_LEASE_FD")
-            .env_remove("CARRICK_HOST_LEASE_MODE");
+            .env_remove("CARRICK_HOST_LEASE_MODE")
+            .env_remove("CARRICK_HOST_LEASE_SOCKET")
+            .env_remove("CARRICK_HOST_LEASE_SCOPE_FD");
         command
     }
 
@@ -1073,7 +1079,7 @@ fn trusted_hardware_workflow_prepares_exact_sha_fixtures_before_signed_execution
         "scripts/sudo/kill.sh",
         br#"#!/bin/sh
 [ "$1" = "$CARRICK_RUN_ID" ] || exit 95
-[ "$CARRICK_HOST_LEASE_MODE" = gate ] || exit 92
+"$FIXTURE_TEST_XTASK" host-lease --mode gate -- /bin/true || exit $?
 printf '%s\n' "$1" > "$FIXTURE_TEST_CLEANED"
 "#,
     );
@@ -1107,7 +1113,7 @@ case "$1" in
     ci) : ;;
     build|test-embed|conformance-probes)
         "$FIXTURE_TEST_XTASK" fixtures verify || exit $?
-        [ "$CARRICK_HOST_LEASE_MODE" = gate ] || exit 92
+        "$FIXTURE_TEST_XTASK" host-lease --mode gate -- /bin/true || exit $?
         printf '%s\n' "$1" >> "$FIXTURE_TEST_EXECUTIONS"
         ;;
     *) exec "$FIXTURE_TEST_JUST" --justfile "$FIXTURE_TEST_JUSTFILE" --working-directory "$PWD" "$@" ;;
