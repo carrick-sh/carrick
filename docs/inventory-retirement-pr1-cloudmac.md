@@ -57,6 +57,8 @@ run_inv_pr1_check two-container-scope cargo test --locked -p carrick-runtime --l
     two_container_abort_keeps_scope_across_successive_carriers || exit "$?"
 run_inv_pr1_check census-scope cargo test --locked -p carrick-runtime --lib \
     snapshot_uses_the_supplied_launch_identity || exit "$?"
+run_inv_pr1_check host-lease-subprocesses cargo test --locked -p carrick-xtask --lib \
+    host_lease::tests:: -- --test-threads=1 || exit "$?"
 
 # Build and sign once. Subsequent test-embed invocations retain this CLI binary.
 run_inv_pr1_check signed-build just build || exit "$?"
