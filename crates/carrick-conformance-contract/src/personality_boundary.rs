@@ -2172,4 +2172,18 @@ mod tests {
         assert!(owner.contains("B::execute_grant"));
         assert!(!owner.contains("carrick_el1"));
     }
+    #[test]
+    fn frame_fault_admission_and_mailbox_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let old = fs::read_to_string(repo.join("crates/carrick-el1/src/fault.rs")).unwrap();
+        assert!(!old.contains("fn root_admits_commit("));
+        assert!(!old.contains("fn request_lazy_frames("));
+        assert!(!old.contains("pub struct FileFaultVenue"));
+        let wire = fs::read_to_string(repo.join("crates/carrick-el1-abi/src/lib.rs")).unwrap();
+        assert!(!wire.contains("pub struct FrameGrantMailbox"));
+        let owner = fs::read_to_string(repo.join("crates/carrick-core/src/mm/fault.rs")).unwrap();
+        assert!(owner.contains("pub fn root_admits_commit<"));
+        assert!(owner.contains("pub fn request_lazy_frames("));
+        assert!(!owner.contains("carrick_el1"));
+    }
 }
