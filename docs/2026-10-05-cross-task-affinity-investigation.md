@@ -92,9 +92,71 @@ leader from the sibling, and checks that the caller mask is unchanged. It
 prints stable boolean lines and errno numbers. The generic shards separately
 compare the same probe with the director's source-validated Docker oracle.
 
-Signed red/green receipts, exact fixture bundle and executable identities,
-five full `el1_` population receipts, and the final fmt/domain receipts are
-recorded in the PR's Verified section and under the same investigation output
-directory. Docker blessing and fixture publication run on the director's
-publisher; cloudmac uses no Docker. The six N1 failures are inventoried by
-name, and their presence is never reported as a raw full-filter green.
+The director rebuilt and blessed both probe libcs on native-arm64 Docker;
+the cached-oracle generic shards pass. Cloudmac uses no Docker. Signed
+red/green receipts and final static-check receipts are in the PR's Verified
+section and under the same investigation directory.
+
+## Fixed five-run signed population
+
+All five scheduled runs use clean host sources at `af1240c4c` and its exact
+fixture bundle: 1,132 executables, manifest
+`71cb5dc303f9a56029631c4f5ab4411efad03edfc80f5e1b9a16ed10ea11f159`, tar SHA-256
+`7961ee23db125673f442662e8678d725f60cf4c129a14fd2f076f3e4f805e423`.
+Each `cross-affinity-full-01/` through `cross-affinity-full-05/` retains the
+source identity, complete log and all ten signed executables, with SHA-256,
+CDHash, LC_UUID, entitlement and DOF identities. The documentation update
+afterward changes neither production sources nor fixture inputs.
+
+| Full run | Passing selected tests | Failures |
+| --- | ---: | --- |
+| 1 | 77 | Six documented N1 cases |
+| 2 | 76 | Six N1 cases plus the cross-vCPU TLB witness |
+| 3 | 77 | Six documented N1 cases |
+| 4 | 77 | Six documented N1 cases |
+| 5 | 77 | Six documented N1 cases |
+
+All 25 handoff samples have zero cross-vCPU wakes and at least 5,000 switches;
+all five fork-storm cases, entitlement negative controls and scoped cleanup
+checks pass. Every raw full-filter command exits **1**. These are focused
+affinity results, not full EL1 acceptance. Run 2 is retained red and was not
+retried or added to the six-case N1 inventory.
+
+## Run-2 TLB failure: ordering audit and separate capture
+
+The additional failure is
+`el1_tlb_cross_vcpu_mm_edits_leave_no_stale_translation_on_any_thread`:
+`faults=[598, 728] stale=2 errors=0 timeouts=3 ok=false`, with 600 faults
+expected per worker. Five isolated samples on each of `af1240c4c` and
+`805eada21` pass; that comparison is inconclusive, so sampling stopped.
+
+The existing host migration protocol does not bypass invalidation:
+
+- `executor/backend.rs::load` waits for a cross-executor resident task to
+  become Materialized. `flush_resident_task` issues the resident task's owed
+  invalidation before snapshot and publication. Its ticket completes only
+  after `invalidate_worker_asid` succeeds, before the residency mutex
+  publication and notification let the destination proceed.
+- Scoped ASID maintenance accepts only `MaintenanceDone` and absorbs kicks.
+  The maintenance and mailbox-return instruction images execute
+  DSB / TLBI ASIDE1IS / DSB / ISB before completion or return. The invalidation
+  is broadcast, rather than local to the source CPU.
+- Same-executor resume retains its debt when stopped inside the invalidation
+  entry. Saving to a zone record settles the debt before zone publication.
+
+The existing residency-wait, instruction-image, absorbed-kick and
+invalidation-debt tests pass: ten tests in five invocations. Their complete
+logs and the source audit are in `tlb-ordering-proof/`. This establishes the
+host migration ordering; it is not a proof of every permission-edit path.
+
+The fixture pins workers only at startup. Its aggregate-ACK timeout path
+continues editing permissions and posting new commands without the preceding
+command's acknowledgment. A late `OP_WARM` can therefore store while the page
+is read-only or unmapped in a later phase. The excess faults do not identify
+stale read-only permissions; skipped commands can also alter expected fault
+counts. The timeouts and their cause remain real failures.
+
+The director accepted the ordering evidence and queued this as a separate
+capture item, including the fixture's timeout/acknowledgment flaw. Capture
+must identify the first command, permission and vCPU divergence. No retry,
+timeout increase, added load or expected-failure expansion was used as closure.
