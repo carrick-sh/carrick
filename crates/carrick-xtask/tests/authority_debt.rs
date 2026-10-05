@@ -1482,6 +1482,96 @@ fn review_macro_input_inclusion_alias_rejects_nonliteral_paths() {
     assert!(error.contains("nonliteral source inclusion"), "{error}");
 }
 
+#[test]
+fn review_dsl_inclusion_alias_cannot_hide_authority() {
+    for hidden in [
+        "fn hidden(table: &Table) { table.read_open_files(); }",
+        "fn hidden(this: &Dispatcher) { this.proc.lock(); }",
+    ] {
+        let root = source_fixture();
+        let src = root.path().join("crates/carrick-kernel/src");
+        write_source(
+            src.join("lib.rs"),
+            r#"
+pass! { @ use std::include as x; x!("shared.rs"); }
+#[cfg(test)] #[path="shared.rs"] mod tests_copy;
+pub fn poll(table: &Table) { table.read_open_files(); }
+"#,
+        )
+        .unwrap();
+        write_source(src.join("shared.rs"), hidden).unwrap();
+        assert!(
+            carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+                .is_err(),
+            "an arbitrary DSL cannot confer a test-only authority exemption: {hidden}"
+        );
+    }
+}
+
+#[test]
+fn review_dsl_source_literals_mark_production_in_every_token_position() {
+    for invocation in [
+        r#"pass! { @ "shared.rs" => marker; }"#,
+        r##"pass! { @ [(key => { r#"./shared.rs"# })] }"##,
+        r#"pass! { @ "shared\u{2e}rs"; }"#,
+        r#"#[cfg(test)] pass! { @ "shared.rs"; }"#,
+        r#"macro_rules! data { () => { @ "shared.rs"; }; }"#,
+        r#"fn data() { pass! { @ "shared.rs"; } }"#,
+        r#"#[doc = pass! { @ "shared.rs" }] fn data() {}"#,
+        r#"#[pass(@ "shared.rs")] fn data() {}"#,
+    ] {
+        let root = source_fixture();
+        let src = root.path().join("crates/carrick-kernel/src");
+        write_source(
+            src.join("lib.rs"),
+            format!("{invocation}\n#[cfg(test)] #[path=\"shared.rs\"] mod tests_copy;"),
+        )
+        .unwrap();
+        write_source(src.join("shared.rs"), "fn data() {}").unwrap();
+        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        assert!(
+            !census.is_test_file("crates/carrick-kernel/src/shared.rs")
+                && !census.is_test_at("crates/carrick-kernel/src/shared.rs", 1, 0),
+            "every source literal in macro tokens is a production reference: {invocation}"
+        );
+    }
+}
+
+#[test]
+fn review_dsl_source_literals_resolve_from_each_invoking_file() {
+    for (invoking_file, literal, shared_file) in [
+        ("nested/caller.rs", "../shared.rs", "shared.rs"),
+        ("caller.rs", "../shared.rs", "../shared.rs"),
+        ("caller.rs", "bin/shared.rs", "bin/shared.rs"),
+    ] {
+        let root = source_fixture();
+        let src = root.path().join("crates/carrick-kernel/src");
+        write_source(
+            src.join("lib.rs"),
+            format!(
+                "#[cfg(test)] #[path=\"{shared_file}\"] mod tests_copy;\n\
+                 pub fn poll(table: &Table) {{ table.read_open_files(); }}"
+            ),
+        )
+        .unwrap();
+        let invoking = src.join(invoking_file);
+        std::fs::create_dir_all(invoking.parent().unwrap()).unwrap();
+        write_source(invoking, format!("pass! {{ @ [\"{literal}\"] }}")).unwrap();
+        let shared = src.join(shared_file);
+        std::fs::create_dir_all(shared.parent().unwrap()).unwrap();
+        write_source(
+            shared,
+            "fn hidden(table: &Table) { table.read_open_files(); }",
+        )
+        .unwrap();
+        assert!(
+            carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+                .is_err(),
+            "source references resolve relative to {invoking_file}, including files under crates outside src"
+        );
+    }
+}
+
 fn git_fixture(root: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args(args)
