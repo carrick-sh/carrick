@@ -1114,6 +1114,15 @@ pub(crate) fn initialize_root_process<E: ThreadedEngine>(
                         "install HVPatch root table arena source: {error}"
                     ))
                 })?;
+            let root_lease = table
+                .lease(root_context.task().key())
+                .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+            engine.publish_initial_stage1_root(&mut |root| {
+                root_lease
+                    .publish_stage1_root(root)
+                    .map(|_| ())
+                    .map_err(|error| crate::trap::TrapError::Hypervisor(error.to_string()))
+            })?;
             let prepared = ProcessContext::new(
                 Arc::clone(&table),
                 root_context.task_binding(),

@@ -62,11 +62,11 @@ pub trait TableArenaPublisher: Send + Sync {
     /// yet. An error leaves the arenas unpublished.
     fn publish_extension_arenas(&self, manager: &PageTableManager) -> Result<(), String>;
     /// Publish physical capacity before the owner chooses any descriptors.
-    fn publish_raw_fork_arena(&self, _base: u64) -> Result<(), String> {
+    fn publish_raw_table_arena(&self, _base: u64) -> Result<(), String> {
         Err("raw Fork table capacity is unavailable".into())
     }
     /// Release unused capacity after the owner's exact abort/unused receipt.
-    fn retire_raw_fork_arena(&self, _base: u64) -> Result<(), String> {
+    fn retire_raw_table_arena(&self, _base: u64) -> Result<(), String> {
         Err("raw Fork table capacity retirement is unavailable".into())
     }
 }
@@ -909,29 +909,134 @@ impl Stage1Authority {
         f(&mut editor)
     }
 
+    /// Publish a bootstrap image into maintenance-accessible physical custody.
+    /// The caller must still hold the task before its first execution. `switch`
+    /// updates only its staged CPU roots and must leave them unchanged on error.
+    /// Already admitted/shared images are refused, including a same-root ABA
+    /// while physical capacity is being published outside the authority lock.
+    pub fn publish_initial_table_root(
+        &self,
+        switch: impl FnOnce(u64) -> Result<(), String>,
+    ) -> Result<u64, String> {
+        let (mut image, generation, resolver) = {
+            let inner = self.inner.lock();
+            if inner.live_owner != LiveDescriptorOwner::Host
+                || inner.guest_lane_pending
+                || inner.engines > 1
+                || inner.vfork_shares != 0
+            {
+                return Err("bootstrap table publication requires an unadmitted root".into());
+            }
+            let manager = inner
+                .manager
+                .as_ref()
+                .ok_or("bootstrap has no table image")?;
+            if carrick_el1_abi::service_target_table_window(
+                carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
+                manager.base(),
+            )
+            .is_some()
+            {
+                return Ok(manager.base());
+            }
+            let generation = inner
+                .manager
+                .generation
+                .ok_or("bootstrap generation exhausted")?;
+            let resolver = inner
+                .host_resolver
+                .clone()
+                .ok_or("bootstrap has no physical resolver")?;
+            let image = manager
+                .snapshot_image()
+                .map_err(|error| error.to_string())?;
+            (image, generation, resolver)
+        };
+        let mut capacity = self.reserve_table_arena()?;
+        let root = capacity.base.ok_or("bootstrap lost table capacity")?.0;
+        if carrick_el1_abi::service_target_table_window(
+            carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
+            root,
+        )
+        .is_none()
+        {
+            return Err("bootstrap capacity is outside the maintenance table window".into());
+        }
+        // Bootstrap images have only the primary arena. A malformed/expanded
+        // image fails before publication rather than borrowing another MM's
+        // extension source during relocation.
+        image
+            .rebase(root, None)
+            .map_err(|error| error.to_string())?;
+        image
+            .map_kernel_aliased(
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE,
+                root,
+                carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        let bytes = image.as_bytes();
+        let target = resolver
+            .host_ptr_for_range(root, bytes.len())
+            .ok_or("bootstrap table backing is not authenticated")?;
+        // SAFETY: capacity owns the unpublished physical allocation, and this
+        // authority's authenticated resolver pins its complete writable extent.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len());
+            image
+                .sync_to_host(&resolver)
+                .map_err(|error| error.to_string())?;
+        }
+        let mut inner = self.inner.lock();
+        if inner.manager.generation != Some(generation)
+            || inner.live_owner != LiveDescriptorOwner::Host
+            || inner.guest_lane_pending
+            || inner.engines > 1
+            || inner.vfork_shares != 0
+        {
+            return Err("bootstrap table authority changed during physical publication".into());
+        }
+        // No host I/O: the caller only updates this unpublished task's staged
+        // register image. There is no guest that can observe the old/new pair.
+        switch(root)?;
+        // SAFETY: the physical allocation remains in this exact MM's custody.
+        unsafe {
+            image.make_live(resolver);
+        }
+        *inner.manager = Some(image);
+        inner.published_arenas.push(root);
+        capacity.base = None;
+        Ok(root)
+    }
+
     /// Reserve physically published, unlinked table capacity for owner Fork.
     /// This method neither observes nor edits the MM's descriptor graph.
-    pub fn reserve_owner_fork_arena(&self) -> Result<OwnerForkTableArena, String> {
+    pub fn reserve_owner_fork_arena(&self) -> Result<ReservedTableArena, String> {
+        self.reserve_table_arena()
+    }
+
+    fn reserve_table_arena(&self) -> Result<ReservedTableArena, String> {
         let (base, publisher) = {
             let mut inner = self.inner.lock();
             let publisher = inner
                 .arena_publisher
                 .clone()
-                .ok_or_else(|| "Fork table capacity has no physical publisher".to_owned())?;
+                .ok_or_else(|| "table capacity has no physical publisher".to_owned())?;
             let base = inner
                 .arena_source
                 .as_mut()
                 .and_then(|source| source.take_arena())
-                .ok_or_else(|| "Fork table capacity is exhausted".to_owned())?;
+                .ok_or_else(|| "table capacity is exhausted".to_owned())?;
             (base, publisher)
         };
-        if let Err(error) = publisher.publish_raw_fork_arena(base.0) {
+        if let Err(error) = publisher.publish_raw_table_arena(base.0) {
             if let Some(source) = self.inner.lock().arena_source.as_mut() {
                 source.return_arena(base);
             }
             return Err(error);
         }
-        Ok(OwnerForkTableArena {
+        Ok(ReservedTableArena {
             authority: self.clone(),
             publisher,
             base: Some(base),
@@ -1440,14 +1545,14 @@ impl HostLaneCause {
     pub const COUNT: usize = 6;
 }
 
-/// Physical source lifetime for one owner-selected parent split-table extent.
-#[must_use = "Fork table capacity must settle from an exact owner receipt"]
-pub struct OwnerForkTableArena {
+/// Physical source lifetime for one unpublished table extent.
+#[must_use = "table capacity must be committed or retired before reuse"]
+pub struct ReservedTableArena {
     authority: Stage1Authority,
     publisher: Arc<dyn TableArenaPublisher>,
     base: Option<carrick_mmu_core::aarch64::SubstrateGpa>,
 }
-impl OwnerForkTableArena {
+impl ReservedTableArena {
     pub fn arena(&self) -> Option<carrick_el1_abi::PortalForkTableArena> {
         self.base
             .and_then(|base| carrick_el1_abi::PortalForkTableArena::new(base.0, 2 * 1024 * 1024))
@@ -1465,10 +1570,10 @@ impl OwnerForkTableArena {
         Ok(())
     }
 }
-impl Drop for OwnerForkTableArena {
+impl Drop for ReservedTableArena {
     fn drop(&mut self) {
         if let Some(base) = self.base.take() {
-            if self.publisher.retire_raw_fork_arena(base.0).is_err() {
+            if self.publisher.retire_raw_table_arena(base.0).is_err() {
                 // The physical publisher still holds this exact allocation;
                 // quarantine it rather than recycle capacity that remains live.
                 return;
@@ -3077,6 +3182,193 @@ mod tests {
                 unsafe { System.dealloc(ptr, layout) }
             }
         }
+    }
+
+    struct BootTablePublisher {
+        resolver: Arc<MultiBufferResolver>,
+        fail: std::sync::atomic::AtomicBool,
+        retired: Mutex<Vec<u64>>,
+        returned: Arc<Mutex<Vec<Gpa>>>,
+        during_publish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+    impl TableArenaPublisher for BootTablePublisher {
+        fn publish_extension_arenas(&self, _: &PageTableManager) -> Result<(), String> {
+            Ok(())
+        }
+        fn publish_raw_table_arena(&self, base: u64) -> Result<(), String> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err("physical publication refused".into());
+            }
+            self.resolver.register(base, 2 * 1024 * 1024);
+            if let Some(hook) = self.during_publish.lock().unwrap().take() {
+                hook();
+            }
+            Ok(())
+        }
+        fn retire_raw_table_arena(&self, base: u64) -> Result<(), String> {
+            self.resolver.arenas.lock().unwrap().remove(&base);
+            self.retired.lock().unwrap().push(base);
+            Ok(())
+        }
+    }
+
+    fn boot_root_fixture(old: u64, capacity: u64) -> (Stage1Authority, Arc<BootTablePublisher>) {
+        let mut image = test_manager();
+        image.rebase(old, None).unwrap();
+        let authority = Stage1Authority::new_with_manager(Some(image));
+        let returned = Arc::new(Mutex::new(Vec::new()));
+        authority
+            .install_source(Box::new(CountingArenaSource {
+                id: TableArenaSourceId(SubstrateGpa(old)),
+                available: Arc::new(Mutex::new(vec![Gpa(capacity)])),
+                returned: returned.clone(),
+            }))
+            .unwrap();
+        let resolver = Arc::new(MultiBufferResolver::new());
+        // SAFETY: this resolver retains every table allocation for this fixture.
+        unsafe {
+            authority.record_live_backing_without_promotion(resolver.clone());
+        }
+        let publisher = Arc::new(BootTablePublisher {
+            resolver,
+            fail: std::sync::atomic::AtomicBool::new(false),
+            retired: Mutex::new(Vec::new()),
+            returned,
+            during_publish: Mutex::new(None),
+        });
+        authority.set_arena_publisher(publisher.clone());
+        (authority, publisher)
+    }
+
+    #[test]
+    fn later_bootstrap_roots_use_distinct_maintenance_accessible_table_custody() {
+        let pool = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+        let first = boot_root_fixture(0x9b_4000_0000, pool);
+        let second = boot_root_fixture(0x9b_8000_0000, pool + 0x20_0000);
+        for (index, (authority, publisher)) in [&first, &second].into_iter().enumerate() {
+            let original = authority.snapshot_image().unwrap();
+            let switched = std::cell::Cell::new(None);
+            let root = authority
+                .publish_initial_table_root(|root| {
+                    switched.set(Some(root));
+                    Ok(())
+                })
+                .unwrap();
+            assert!(
+                carrick_el1_abi::service_target_table_window(
+                    carrick_el1_abi::EL1_CARRIER_MAINT_ROOT_BASE,
+                    root,
+                )
+                .is_some(),
+                "later bootstrap root {root:#x} must have maintenance-accessible table custody"
+            );
+            assert_eq!(root, pool + index as u64 * 0x20_0000);
+            assert_eq!(switched.get(), Some(root));
+            assert_eq!(authority.root_base(), Some(root));
+            let image = authority.snapshot_image().unwrap();
+            assert_eq!(
+                image.translate(LINUX_MMAP_BASE),
+                original.translate(LINUX_MMAP_BASE)
+            );
+            assert_eq!(
+                image.translate(carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE),
+                Some(root),
+            );
+            let bytes = publisher.resolver.arenas.lock().unwrap();
+            let backing = bytes.get(&root).unwrap();
+            assert_eq!(&backing[..image.as_bytes().len()], image.as_bytes());
+            assert!(publisher.retired.lock().unwrap().is_empty());
+        }
+        assert_ne!(first.0.root_base(), second.0.root_base());
+    }
+
+    #[test]
+    fn bootstrap_root_publication_failure_returns_capacity_without_switching() {
+        let pool = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+        for physical_failure in [true, false] {
+            let (authority, publisher) = boot_root_fixture(0x9b_4000_0000, pool);
+            let original = authority.snapshot_image().unwrap();
+            publisher.fail.store(physical_failure, Ordering::Release);
+            let switched = std::cell::Cell::new(false);
+            let result = authority.publish_initial_table_root(|_| {
+                switched.set(true);
+                Err("staged root switch refused".into())
+            });
+            assert!(result.unwrap_err().contains(if physical_failure {
+                "physical publication refused"
+            } else {
+                "staged root switch refused"
+            }));
+            assert_eq!(switched.get(), !physical_failure);
+            assert_eq!(authority.root_base(), Some(original.base()));
+            assert_eq!(
+                authority.snapshot_image().unwrap().as_bytes(),
+                original.as_bytes()
+            );
+            assert_eq!(*publisher.returned.lock().unwrap(), vec![Gpa(pool)]);
+            assert!(publisher.resolver.arenas.lock().unwrap().is_empty());
+            assert_eq!(
+                publisher.retired.lock().unwrap().len(),
+                usize::from(!physical_failure)
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_root_same_address_replacement_cannot_commit_stale_preparation() {
+        let pool = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+        let (authority, publisher) = boot_root_fixture(0x9b_4000_0000, pool);
+        let replacement = authority.snapshot_image().unwrap();
+        let changed = authority.clone();
+        *publisher.during_publish.lock().unwrap() = Some(Box::new(move || {
+            changed.set_manager(replacement);
+        }));
+        let error = authority
+            .publish_initial_table_root(|_| {
+                panic!("same-address replacement must refuse before switching");
+            })
+            .unwrap_err();
+        assert!(error.contains("authority changed"));
+        assert_eq!(authority.root_base(), Some(0x9b_4000_0000));
+        assert_eq!(*publisher.retired.lock().unwrap(), vec![pool]);
+        assert_eq!(*publisher.returned.lock().unwrap(), vec![Gpa(pool)]);
+    }
+
+    #[test]
+    fn bootstrap_root_admission_during_publication_refuses_host_commit() {
+        let pool = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+        let (authority, publisher) = boot_root_fixture(0x9b_4000_0000, pool);
+        let changed = authority.clone();
+        *publisher.during_publish.lock().unwrap() = Some(Box::new(move || {
+            changed.inner.lock().guest_lane_pending = true;
+        }));
+        let error = authority
+            .publish_initial_table_root(|_| {
+                panic!("admitted root must refuse before switching");
+            })
+            .unwrap_err();
+        assert!(error.contains("authority changed"));
+        assert_eq!(authority.root_base(), Some(0x9b_4000_0000));
+        assert_eq!(*publisher.retired.lock().unwrap(), vec![pool]);
+    }
+
+    #[test]
+    fn exec_pool_root_preserves_existing_maintenance_custody() {
+        let pool = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+        let (authority, publisher) = boot_root_fixture(pool, pool + 0x20_0000);
+        let before = authority.snapshot_image().unwrap();
+        let root = authority
+            .publish_initial_table_root(|_| {
+                panic!("an existing exec pool root must not be relocated");
+            })
+            .unwrap();
+        assert_eq!(root, pool);
+        assert_eq!(
+            authority.snapshot_image().unwrap().as_bytes(),
+            before.as_bytes()
+        );
+        assert!(publisher.resolver.arenas.lock().unwrap().is_empty());
+        assert!(publisher.returned.lock().unwrap().is_empty());
     }
 
     struct MultiBufferResolver {
