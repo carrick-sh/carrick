@@ -116,3 +116,19 @@ adjacent bytes, stale physical generation rejection, regrowth/VA reuse, and a
 clippy passed. Clean-tree inventory capture, full CI/Loom and exact signed
 qualification follow this source checkpoint. No signed or N1 acceptance is
 claimed by these VM-free results.
+
+## Signed checkpoint after integration
+
+The exact `e1435e4e0` gate is recorded in
+`docs/perf-results/2026-10-05-n1-maintenance-gate.md`. Full CI and five Loom
+tests passed. The anonymous guest now reports its complete zero/regrowth
+assertions `ok=true`, then fails at the separate captured-thread clear-child-tid
+check. All six comparison tests remain red. Copyout is 8/10: two exact-grant
+supply refusals; hello and entitlement negative control pass. All 21 scoped
+cleanup records are zero and the one exclusive gate has ended.
+
+VMA and ptrace each live-qualified `OWNERFORKREFUSAL1` at errno 22/stage 3
+(table pool/live words), with closed-child controls, no script errors, no
+bound expiry and successful consumer receipts. Forward these lines to n1-fork.
+Keep the retained artifact for driver diagnosis of clear-child-tid identity
+and exact grant refusal. This is a committed handoff, not N1 acceptance.
