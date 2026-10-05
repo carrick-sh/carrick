@@ -4,7 +4,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use carrick_kernel::kernel::objects::ExecutionGeneration;
@@ -73,13 +72,24 @@ pub struct Decision {
     pub authority: Option<carrick_kernel::kernel::schedule::AuthorityStamp>,
 }
 
+/// An exact trace compares its recorded result and work. A historical
+/// regression keeps that trace intact but names the required current result
+/// and work explicitly. Neither mode relaxes schedule or fixture identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReplayExpectation {
+    Exact,
+    Regression {
+        result: String,
+        work_snapshot: Option<WorkSnapshot>,
+    },
+}
+
 /// Portable receipt for strict replay and retained regression fixtures.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScheduleReceipt {
     pub schema_version: u32,
     pub generator_version: u32,
     pub seed: u64,
-    pub source_hash: String,
     pub fixture_hash: String,
     pub backend: String,
     pub scale: usize,
@@ -103,13 +113,11 @@ struct State {
     current: Option<Actor>,
     decisions: Vec<Decision>,
     visits: BTreeMap<(Actor, Point), usize>,
-    replay: Option<ScheduleReceipt>,
-    source_hash: String,
+    replay: Option<(ScheduleReceipt, ReplayExpectation)>,
     fixture_hash: String,
     scale: usize,
     started: bool,
     failure: Option<String>,
-    allowed_source_pair: Option<(String, String)>,
 }
 
 impl Schedule {
@@ -128,20 +136,18 @@ impl Schedule {
                 decisions: Vec::new(),
                 visits: BTreeMap::new(),
                 replay: None,
-                source_hash: String::new(),
                 fixture_hash: String::new(),
                 scale: 1,
                 started: false,
                 failure: None,
-                allowed_source_pair: None,
             }),
             Condvar::new(),
         )))
     }
 
-    pub fn replay(receipt: ScheduleReceipt) -> Self {
+    pub fn replay(receipt: ScheduleReceipt, expectation: ReplayExpectation) -> Self {
         let schedule = Self::explore(receipt.seed);
-        schedule.0.0.lock().replay = Some(receipt);
+        schedule.0.0.lock().replay = Some((receipt, expectation));
         schedule
     }
 
@@ -160,6 +166,7 @@ impl Schedule {
         scale: usize,
         contexts: &[carrick_kernel::kernel::KernelContext],
         operation: impl Fn(usize, &OperationActor<'_>) + Sync,
+        observation: impl FnOnce() -> (String, Option<WorkSnapshot>),
     ) -> Result<ScheduleReceipt, String> {
         use carrick_kernel::kernel::schedule::{Authority, Point as KPoint};
         let actors: Vec<_> = contexts
@@ -263,7 +270,8 @@ impl Schedule {
             }
         });
         kernel.schedule_hooks().set(None);
-        self.receipt("operations drained", None)
+        let (result, work_snapshot) = observation();
+        self.receipt(result, work_snapshot)
     }
 
     #[cfg(debug_assertions)]
@@ -297,12 +305,6 @@ impl Schedule {
         self.enter(actor)
     }
 
-    /// Explicitly allow exactly one known-bad -> fixed source comparison.
-    pub fn allow_source_pair(self, bad: &str, fixed: &str) -> Self {
-        self.0.0.lock().allowed_source_pair = Some((bad.into(), fixed.into()));
-        self
-    }
-
     pub(crate) fn start(&self, script: &[Step], root: Actor) -> Result<(), String> {
         if script.iter().any(has_uncontrolled_step) {
             return Err(
@@ -318,10 +320,9 @@ impl Schedule {
         if state.started {
             return Err("schedule already started".into());
         }
-        state.source_hash = source_hash()?;
         state.fixture_hash = fixture_hash;
         state.scale = scale;
-        if let Some(replay) = &state.replay {
+        if let Some((replay, expectation)) = &state.replay {
             if replay.schema_version != SCHEMA_VERSION
                 || replay.generator_version != GENERATOR_VERSION
                 || replay.backend != backend_id()
@@ -330,11 +331,17 @@ impl Schedule {
             {
                 return Err("replay schema, backend, scale or fixture mismatch".into());
             }
-            if replay.source_hash != state.source_hash
-                && state.allowed_source_pair.as_ref()
-                    != Some(&(replay.source_hash.clone(), state.source_hash.clone()))
+            if let ReplayExpectation::Regression {
+                result,
+                work_snapshot,
+            } = expectation
+                && replay.result == *result
+                && replay.work_snapshot == *work_snapshot
             {
-                return Err("replay source hash mismatch".into());
+                return Err(
+                    "replay regression expectation must differ from the historical observation"
+                        .into(),
+                );
             }
         }
         state.actors.insert(root);
@@ -420,7 +427,7 @@ impl Schedule {
         let visits = state.visits.entry((actor, point)).or_default();
         let visit = *visits;
         *visits += 1;
-        let next = if let Some(replay) = &state.replay {
+        let next = if let Some((replay, _)) = &state.replay {
             let expected = replay
                 .decisions
                 .get(state.decisions.len())
@@ -655,26 +662,31 @@ impl Schedule {
                 state.decisions.last(),
             ));
         }
-        if let Some(replay) = &state.replay
+        if let Some((replay, _)) = &state.replay
             && replay.decisions.len() != state.decisions.len()
         {
             return Err("unconsumed replay suffix".into());
         }
         let result = result.into();
-        if let Some(replay) = &state.replay
-            && replay.source_hash == state.source_hash
-            && (replay.result != result || replay.work_snapshot != work_snapshot)
-        {
-            return Err(format!(
-                "replay result or work snapshot drift: expected result {:?}, observed {:?}; expected work {:?}, observed work {:?}",
-                replay.result, result, replay.work_snapshot, work_snapshot
-            ));
+        if let Some((replay, expectation)) = &state.replay {
+            let (expected_result, expected_work) = match expectation {
+                ReplayExpectation::Exact => (&replay.result, &replay.work_snapshot),
+                ReplayExpectation::Regression {
+                    result,
+                    work_snapshot,
+                } => (result, work_snapshot),
+            };
+            if *expected_result != result || *expected_work != work_snapshot {
+                return Err(format!(
+                    "replay result or work snapshot drift: expected result {:?}, observed {:?}; expected work {:?}, observed work {:?}",
+                    expected_result, result, expected_work, work_snapshot
+                ));
+            }
         }
         Ok(ScheduleReceipt {
             schema_version: SCHEMA_VERSION,
             generator_version: GENERATOR_VERSION,
             seed: state.seed,
-            source_hash: state.source_hash.clone(),
             fixture_hash: state.fixture_hash.clone(),
             backend: backend_id(),
             scale: state.scale,
@@ -752,53 +764,6 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 fn backend_id() -> String {
     "kernel-example/portable".into()
-}
-
-fn source_hash() -> Result<String, String> {
-    static SOURCE_HASH: OnceLock<Result<String, String>> = OnceLock::new();
-    SOURCE_HASH.get_or_init(compute_source_hash).clone()
-}
-
-fn compute_source_hash() -> Result<String, String> {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut paths = Vec::new();
-    collect_rust_sources(&root.join("crates/carrick-kernel/src"), &mut paths)?;
-    collect_rust_sources(&root.join("crates/carrick-kernel-example/src"), &mut paths)?;
-    for name in ["carrick-sched-core", "carrick-fd-core", "carrick-pipe-core"] {
-        collect_rust_sources(&root.join("crates").join(name).join("src"), &mut paths)?;
-    }
-    paths.push(root.join("crates/carrick-kernel-example/tests/admission_interleavings.rs"));
-    paths.push(root.join("crates/carrick-kernel-example/tests/schedule_replay.rs"));
-    paths.sort();
-    let mut hash = Sha256::new();
-    for path in paths {
-        let relative = path.strip_prefix(&root).map_err(|e| e.to_string())?;
-        hash.update(relative.to_string_lossy().as_bytes());
-        hash.update([0]);
-        hash.update(std::fs::read(&path).map_err(|e| format!("hash {}: {e}", relative.display()))?);
-    }
-    Ok(format!("{:x}", hash.finalize()))
-}
-
-fn collect_rust_sources(
-    dir: &std::path::Path,
-    paths: &mut Vec<std::path::PathBuf>,
-) -> Result<(), String> {
-    for entry in std::fs::read_dir(dir).map_err(|e| format!("list {}: {e}", dir.display()))? {
-        let entry = entry.map_err(|e| format!("list {}: {e}", dir.display()))?;
-        let kind = entry.file_type().map_err(|e| format!("source type: {e}"))?;
-        if kind.is_dir() {
-            collect_rust_sources(&entry.path(), paths)?;
-        } else if kind.is_file()
-            && entry
-                .path()
-                .extension()
-                .is_some_and(|extension| extension == "rs")
-        {
-            paths.push(entry.path());
-        }
-    }
-    Ok(())
 }
 
 pub use carrick_kernel::schedule_point;

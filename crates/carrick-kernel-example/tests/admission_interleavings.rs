@@ -17,7 +17,7 @@ use carrick_kernel::{
     },
 };
 use carrick_kernel_example::{
-    Point, Schedule,
+    Point, ReplayExpectation, Schedule, ScheduleReceipt,
     process::{AddressSpace, AsidAllocator, ExampleProcess},
     schedule::Actor,
 };
@@ -59,6 +59,7 @@ fn thread_publication_receipt_names_creator_and_child_once() {
                     assert_eq!(context.thread().key(), child);
                 }
             },
+            || ("operations drained".into(), None),
         )
         .unwrap();
     let publications: Vec<_> = receipt
@@ -150,6 +151,7 @@ fn admitted_credential_wait_releases_permit_without_redispatch() {
                             lane.release_admission(&contexts[0]);
                         }
                     },
+                    || ("operations drained".into(), None),
                 )
                 .unwrap();
             assert!(
@@ -234,11 +236,19 @@ fn operation_receipt_rejects_authority_and_scale_drift() {
             |_, lane| {
                 lane.authority_point(KPoint::BeforeLock, Authority::Object(key));
             },
+            || ("operations drained".into(), None),
         )
     };
     let recorded = run(&Schedule::explore(5)).unwrap();
     assert_eq!(recorded.scale, 8);
-    assert_eq!(run(&Schedule::replay(recorded.clone())).unwrap(), recorded);
+    assert_eq!(
+        run(&Schedule::replay(
+            recorded.clone(),
+            ReplayExpectation::Exact
+        ))
+        .unwrap(),
+        recorded
+    );
     let mut wrong_authority = recorded.clone();
     wrong_authority.decisions[0].authority =
         Some(carrick_kernel::kernel::schedule::AuthorityStamp::Object {
@@ -246,14 +256,14 @@ fn operation_receipt_rejects_authority_and_scale_drift() {
             generation: 8,
         });
     assert!(
-        run(&Schedule::replay(wrong_authority))
+        run(&Schedule::replay(wrong_authority, ReplayExpectation::Exact))
             .unwrap_err()
             .contains("authority")
     );
     let mut wrong_scale = recorded;
     wrong_scale.scale = 32;
     assert!(
-        run(&Schedule::replay(wrong_scale))
+        run(&Schedule::replay(wrong_scale, ReplayExpectation::Exact))
             .unwrap_err()
             .contains("scale")
     );
@@ -380,6 +390,7 @@ fn wait_service_keeps_a_wake_published_before_enrollment() {
                         lane.point(KPoint::AfterUnlock);
                     }
                 },
+                || ("operations drained".into(), None),
             )
             .unwrap();
         service.schedule_hooks().set(None);
@@ -415,139 +426,182 @@ fn wait_service_keeps_a_wake_published_before_enrollment() {
 fn setresuid_during_sibling_birth_completes_once() {
     for scale in [1, 8, 32] {
         for seed in 0..16 {
-            let (process, contexts) = pair();
-            let kernel = contexts[0].kernel().clone();
-            let page = contexts[0].thread().control_lease().lifecycle().clone();
-            // The exact Phase-B claimant that made BirthAdmissionGuard reject
-            // credentials before 800247419. It belongs to this live process.
-            let claimed = Mutex::new(Some(page.claim_any().unwrap()));
-            assert_eq!(page.claimed_count(), 1);
-            let pending = kernel
-                .reserve_thread_clone(&contexts[1], thread_plan(), None)
-                .unwrap()
-                .prepare(ThreadId::from_guest_supplied_tid(3))
-                .unwrap();
-            let born_key = pending.prepared_execution_identity().1;
-            let pending = Mutex::new(Some(pending));
-            let sibling_credentials = contexts[1].resources().credentials();
-            let process = Arc::new(process) as Arc<dyn CarrierProcess>;
-            let outcomes = Mutex::new(Vec::new());
-            let reporter = CompatReporter::default();
-            let root_actor = actor(&contexts[0]);
-            let schedule = Schedule::explore(seed).max_transitions(512);
-            let mut receipt = schedule
-                .run_operations(
-                    &kernel,
-                    &format!("setresuid-held-birth/{scale}"),
-                    scale as usize,
-                    &contexts,
-                    |index, lane| {
-                        if index == 0 {
-                            let mut dispatcher = SyscallDispatcher::with_bridges(CarrierBridges {
-                                host_signal: Arc::new(NullHostSignalBridge::default()),
-                                timers: Arc::new(NullGuestTimerBridge::default()),
-                            });
-                            dispatcher.bind_hvpatch_process(process.clone());
-                            let mut memory = LinearMemory::new(0, vec![0; 1024]);
-                            for iteration in 0..scale {
-                                let current = kernel
-                                    .context(
-                                        contexts[0].task().key().id,
-                                        contexts[0].thread().key().tid,
-                                    )
-                                    .unwrap();
-                                outcomes.lock().push(
-                                    dispatcher
-                                        .dispatch(
-                                            &current,
-                                            SyscallRequest::new(
-                                                nr::SETRESUID.raw(),
-                                                SyscallArgs::new([
-                                                    10 + iteration,
-                                                    0,
-                                                    100 + iteration,
-                                                    0,
-                                                    0,
-                                                    0,
-                                                ]),
-                                            ),
-                                            &mut memory,
-                                            &reporter,
-                                        )
-                                        .unwrap(),
-                                );
-                            }
-                        } else {
-                            lane.after(root_actor, Point::Finish).unwrap();
-                            page.unclaim(claimed.lock().take().unwrap()).unwrap();
-                            // One real ledger birth; its inherited resources came
-                            // from the unaffected sibling, not the setid caller.
-                            let pending = pending.lock().take().unwrap();
-                            assert_eq!(pending.record_birth(), born_key);
-                            lane.point(KPoint::AdmissionReleased);
-                        }
-                    },
-                )
-                .unwrap();
-            // Retain the smallest source-qualified historical witness before
-            // its semantic assertion fails. This is an explicit recorder,
-            // following schedule_replay's VMFREE_TRACE convention.
-            if seed == 0 && scale == 1 {
-                receipt.result = format!("setresuid outcomes: {:?}", *outcomes.lock());
-                if let Ok(path) = std::env::var("VMFREE_TRACE") {
-                    std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
-                }
-            }
-            for outcome in outcomes.lock().iter() {
-                assert_eq!(
-                    *outcome,
-                    DispatchOutcome::Returned { value: 0 },
-                    "seed {seed}, scale {scale}: guest EAGAIN is not admission"
-                );
-            }
-            assert_eq!(reporter.snapshot().summary.syscall_invocations, scale);
-            let born = kernel
-                .context(contexts[0].task().key().id, born_key.tid)
-                .unwrap();
-            assert_eq!(born.thread().key(), born_key);
-            let inherited = born.resources().credentials();
-            assert_eq!(inherited.ruid(), sibling_credentials.ruid());
-            assert_eq!(inherited.euid(), sibling_credentials.euid());
-            assert_eq!(inherited.suid(), sibling_credentials.suid());
-            assert_eq!(page.claimed_count(), 0);
-            assert_eq!(
-                receipt
-                    .decisions
-                    .iter()
-                    .filter(|d| d.point == Point::Kernel(KPoint::BirthRecorded))
-                    .count(),
-                1
-            );
-            assert_eq!(
-                receipt
-                    .decisions
-                    .iter()
-                    .filter(|d| d.point == Point::Kernel(KPoint::CredentialPublished))
-                    .count(),
-                scale as usize
-            );
-            assert!(
-                !receipt
-                    .decisions
-                    .iter()
-                    .any(|d| matches!(d.point, Point::WaitEnrolled | Point::WaitResumed))
-            );
-            assert_eq!(
-                receipt
-                    .decisions
-                    .iter()
-                    .filter(|d| d.point == Point::Kernel(KPoint::AdmissionReleased))
-                    .count(),
-                1
-            );
-            kernel.validate_invariants().unwrap();
+            run_setresuid(&Schedule::explore(seed).max_transitions(512), scale).unwrap();
         }
     }
+}
+
+fn run_setresuid(schedule: &Schedule, scale: u64) -> Result<ScheduleReceipt, String> {
+    let (process, contexts) = pair();
+    let kernel = contexts[0].kernel().clone();
+    let page = contexts[0].thread().control_lease().lifecycle().clone();
+    // The exact Phase-B claimant that made BirthAdmissionGuard reject
+    // credentials before 800247419. It belongs to this live process.
+    let claimed = Mutex::new(Some(page.claim_any().unwrap()));
+    assert_eq!(page.claimed_count(), 1);
+    let pending = kernel
+        .reserve_thread_clone(&contexts[1], thread_plan(), None)
+        .unwrap()
+        .prepare(ThreadId::from_guest_supplied_tid(3))
+        .unwrap();
+    let born_key = pending.prepared_execution_identity().1;
+    let pending = Mutex::new(Some(pending));
+    let sibling_credentials = contexts[1].resources().credentials();
+    let process = Arc::new(process) as Arc<dyn CarrierProcess>;
+    let outcomes = Mutex::new(Vec::new());
+    let reporter = CompatReporter::default();
+    let root_actor = actor(&contexts[0]);
+    let receipt = schedule.run_operations(
+        &kernel,
+        &format!("setresuid-held-birth/{scale}"),
+        scale as usize,
+        &contexts,
+        |index, lane| {
+            if index == 0 {
+                let mut dispatcher = SyscallDispatcher::with_bridges(CarrierBridges {
+                    host_signal: Arc::new(NullHostSignalBridge::default()),
+                    timers: Arc::new(NullGuestTimerBridge::default()),
+                });
+                dispatcher.bind_hvpatch_process(process.clone());
+                let mut memory = LinearMemory::new(0, vec![0; 1024]);
+                for iteration in 0..scale {
+                    let current = kernel
+                        .context(contexts[0].task().key().id, contexts[0].thread().key().tid)
+                        .unwrap();
+                    outcomes.lock().push(
+                        dispatcher
+                            .dispatch(
+                                &current,
+                                SyscallRequest::new(
+                                    nr::SETRESUID.raw(),
+                                    SyscallArgs::new([10 + iteration, 0, 100 + iteration, 0, 0, 0]),
+                                ),
+                                &mut memory,
+                                &reporter,
+                            )
+                            .unwrap(),
+                    );
+                }
+            } else {
+                lane.after(root_actor, Point::Finish).unwrap();
+                page.unclaim(claimed.lock().take().unwrap()).unwrap();
+                // One real ledger birth; its inherited resources came
+                // from the unaffected sibling, not the setid caller.
+                let pending = pending.lock().take().unwrap();
+                assert_eq!(pending.record_birth(), born_key);
+                lane.point(KPoint::AdmissionReleased);
+            }
+        },
+        || (format!("setresuid outcomes: {:?}", *outcomes.lock()), None),
+    )?;
+    // Retain the smallest historical witness before
+    // its semantic assertion fails. This is an explicit recorder,
+    // following schedule_replay's VMFREE_TRACE convention.
+    if receipt.seed == 0 && scale == 1 {
+        if let Ok(path) = std::env::var("VMFREE_TRACE") {
+            std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+        }
+    }
+    for outcome in outcomes.lock().iter() {
+        assert_eq!(
+            *outcome,
+            DispatchOutcome::Returned { value: 0 },
+            "seed {}, scale {scale}: guest EAGAIN is not admission",
+            receipt.seed
+        );
+    }
+    assert_eq!(reporter.snapshot().summary.syscall_invocations, scale);
+    let born = kernel
+        .context(contexts[0].task().key().id, born_key.tid)
+        .unwrap();
+    assert_eq!(born.thread().key(), born_key);
+    let inherited = born.resources().credentials();
+    assert_eq!(inherited.ruid(), sibling_credentials.ruid());
+    assert_eq!(inherited.euid(), sibling_credentials.euid());
+    assert_eq!(inherited.suid(), sibling_credentials.suid());
+    assert_eq!(page.claimed_count(), 0);
+    assert_eq!(
+        receipt
+            .decisions
+            .iter()
+            .filter(|d| d.point == Point::Kernel(KPoint::BirthRecorded))
+            .count(),
+        1
+    );
+    assert_eq!(
+        receipt
+            .decisions
+            .iter()
+            .filter(|d| d.point == Point::Kernel(KPoint::CredentialPublished))
+            .count(),
+        scale as usize
+    );
+    assert!(
+        !receipt
+            .decisions
+            .iter()
+            .any(|d| matches!(d.point, Point::WaitEnrolled | Point::WaitResumed))
+    );
+    assert_eq!(
+        receipt
+            .decisions
+            .iter()
+            .filter(|d| d.point == Point::Kernel(KPoint::AdmissionReleased))
+            .count(),
+        1
+    );
+    kernel.validate_invariants().unwrap();
+    Ok(receipt)
+}
+
+#[test]
+fn retained_setid_birth_seed0_replays_fixed_and_preserves_historical_drift() {
+    let fixed: ScheduleReceipt =
+        serde_json::from_str(include_str!("fixtures/setid-birth-seed0-fixed.json")).unwrap();
+    let historical: ScheduleReceipt =
+        serde_json::from_str(include_str!("fixtures/setid-birth-seed0-prefx.json")).unwrap();
+    assert_eq!(historical.seed, 0);
+    assert_eq!(historical.decisions.len(), 4);
+    assert!(historical.result.contains("LinuxErrno(11)"));
+    assert_eq!(fixed.decisions.len(), 6);
+    assert_eq!(fixed.result, "setresuid outcomes: [Returned { value: 0 }]");
+    assert_eq!(
+        run_setresuid(
+            &Schedule::replay(fixed.clone(), ReplayExpectation::Exact),
+            1
+        )
+        .unwrap(),
+        fixed
+    );
+    // The correction added credential admission/publication events. Regression
+    // expectations cannot splice them into the four-decision historical trace.
+    let expectation = ReplayExpectation::Regression {
+        result: fixed.result.clone(),
+        work_snapshot: fixed.work_snapshot.clone(),
+    };
+    assert!(
+        run_setresuid(&Schedule::replay(historical, expectation), 1)
+            .unwrap_err()
+            .contains("point")
+    );
+    let mut wrong_result = fixed.clone();
+    wrong_result.result = "setresuid outcomes: [Errno { errno: LinuxErrno(11) }]".into();
+    assert!(
+        run_setresuid(&Schedule::replay(wrong_result, ReplayExpectation::Exact), 1)
+            .unwrap_err()
+            .contains("result")
+    );
+    let mut wrong_work = fixed;
+    wrong_work.work_snapshot = Some(carrick_observability::work_meter::WorkSnapshot {
+        values: Default::default(),
+        dropped_events: 1,
+        unknown_metrics: Default::default(),
+    });
+    assert!(
+        run_setresuid(&Schedule::replay(wrong_work, ReplayExpectation::Exact), 1)
+            .unwrap_err()
+            .contains("work snapshot")
+    );
 }
 
 #[test]
@@ -625,6 +679,7 @@ fn exec_publication_retires_late_ledger_entry() {
                         );
                     }
                 },
+                || ("operations drained".into(), None),
             )
             .unwrap();
         assert_eq!(*late_entries.lock(), [false]);
@@ -736,6 +791,7 @@ fn check_enroll_wake_interleaving_preserves_epoch() {
                         lane.authority_point(KPoint::WakePublished, Authority::Object(key));
                     }
                 },
+                || ("operations drained".into(), None),
             )
             .unwrap();
         assert_eq!(*refused.lock(), Some(ObjectWaitError::Changed));
@@ -826,6 +882,7 @@ fn claim_reuse_removes_queue_entries_and_stale_completions() {
                             lane.authority_point(KPoint::WakePublished, Authority::Object(new));
                         }
                     },
+                    || ("operations drained".into(), None),
                 )
                 .unwrap();
             assert!(matches!(
