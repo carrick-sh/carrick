@@ -319,7 +319,7 @@ fn test_modules(
 // cfg-gated macros, definitions, attributes, or nested DSL groups.
 fn macro_source_references(
     root: &Path,
-    parsed: &mut BTreeMap<PathBuf, syn::File>,
+    parsed: &BTreeMap<PathBuf, syn::File>,
 ) -> Result<BTreeSet<PathBuf>, DebtError> {
     struct References<'a> {
         directory: &'a Path,
@@ -361,9 +361,8 @@ fn macro_source_references(
         }
     }
     let crates = root.join("crates");
-    let mut pending: Vec<_> = parsed.keys().cloned().collect();
     let mut references = BTreeSet::new();
-    while let Some(source) = pending.pop() {
+    for (source, syntax) in parsed {
         let directory = source
             .parent()
             .ok_or_else(|| DebtError::Policy("missing source parent".into()))?;
@@ -372,15 +371,18 @@ fn macro_source_references(
             crates: &crates,
             files: BTreeSet::new(),
         };
-        visitor.visit_file(&parsed[&source]);
+        visitor.visit_file(syntax);
         for path in visitor.files {
-            references.insert(path.clone());
-            if let std::collections::btree_map::Entry::Vacant(entry) = parsed.entry(path.clone()) {
-                let syntax = syn::parse_file(&std::fs::read_to_string(&path)?)
-                    .map_err(|error| DebtError::Policy(format!("{}: {error}", path.display())))?;
-                entry.insert(syntax);
-                pending.push(path);
+            if !parsed.contains_key(&path) {
+                // All retained lexical/zero scanners must cover production
+                // source. Classifying it without that coverage would silently
+                // lose raw locks or global-state operations outside src.
+                return Err(DebtError::Policy(format!(
+                    "production macro source reference outside discoverable Rust files: {}",
+                    path.display()
+                )));
             }
+            references.insert(path);
         }
     }
     Ok(references)
@@ -923,11 +925,9 @@ impl SourceCensus {
                 )?;
             }
         }
-        // Preserve the existing closed rules for known include! invocations
-        // before discovering additional files from arbitrary macro literals.
-        // Such additional references are production, but cannot invent a
-        // compiler-resolved owner for authority calls.
-        let macro_references = macro_source_references(root, &mut parsed)?;
+        // Macro literals force production scope without inventing a logical
+        // owner or extending the retained scanners' source discovery domain.
+        let macro_references = macro_source_references(root, &parsed)?;
         // Parse aliases before any methods: a later type alias or renamed
         // lock import cannot make a raw storage accessor opaque to the census.
         for (path, syntax) in &parsed {

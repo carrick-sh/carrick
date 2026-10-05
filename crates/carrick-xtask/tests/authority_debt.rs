@@ -1572,6 +1572,31 @@ fn review_dsl_source_literals_resolve_from_each_invoking_file() {
     }
 }
 
+#[test]
+fn review_dsl_reference_outside_scanner_scope_cannot_hide_raw_locks() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        r#"
+pass! { @ "../shared.rs"; }
+#[cfg(test)] #[path="../shared.rs"] mod tests_copy;
+pub fn poll(table: &Table) { table.read_open_files(); }
+"#,
+    )
+    .unwrap();
+    write_source(
+        src.join("../shared.rs"),
+        "fn hidden(this: &Dispatcher) { this.proc.lock(); }",
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+            .is_err(),
+        "an undiscoverable production reference cannot bypass retained raw-lock checks"
+    );
+}
+
 fn git_fixture(root: &std::path::Path, args: &[&str]) -> String {
     let output = std::process::Command::new("git")
         .args(args)
