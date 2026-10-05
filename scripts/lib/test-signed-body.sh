@@ -55,7 +55,7 @@ if [ "$(uname -s)" != "Darwin" ]; then
     exit 1
 fi
 if [ -z "${CARRICK_HOST_LEASE_SOCKET:-}" ]; then
-    exec cargo run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- ./scripts/test-signed.sh "$@"
+    exec cargo --config "$CARRICK_CARGO_CACHE_CONFIG" run --locked -p carrick-xtask -- host-lease --mode carrick --check-load -- ./scripts/test-signed.sh "$@"
 fi
 # Validate the supervised lease and check host load before any work. The runner
 # logs detected PIDs and parent commands even with CARRICK_ALLOW_LOAD=1.

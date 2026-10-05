@@ -2,7 +2,8 @@
 
 All `just` recipes and direct `scripts/build-signed.sh` and
 `scripts/test-signed.sh` invocations load `scripts/lib/build-env.sh`.
-Builds use sccache through `RUSTC_WRAPPER` by default. Install it per user:
+Builds use sccache through Cargo's `--config build.rustc-wrapper` by default.
+Install it per user:
 
 ```sh
 cargo install sccache --locked --root "$HOME/.cargo"
@@ -10,8 +11,11 @@ just build-cache
 CARRICK_SCCACHE=0 just build
 ```
 
-Only the exact value `0` disables caching (and clears `RUSTC_WRAPPER`).
+Only the exact value `0` disables caching (and unsets `RUSTC_WRAPPER`).
 An explicitly supplied nonempty `RUSTC_WRAPPER` is respected when enabled.
+The automatic wrapper is a Cargo option, so it does not enter test or fixture
+admission environments. Explicit ambient wrappers still fail fixture policy;
+controlled fixture builds retain their declared environment and configuration.
 A missing sccache executable fails the build; install it or use the hatch.
 Hosted and trusted-hardware CI install it per user after restoring Rust caches.
 No linker, Rust flags, entitlement, DOF processing, or signing steps change:
