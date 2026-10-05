@@ -372,13 +372,17 @@ impl Kernel {
                 });
                 let live_child = live_tracee
                     || children.iter().any(|child_key| {
-                        let Some(record) = state.tasks.get(&child_key.id) else {
-                            return false;
-                        };
-                        record.task.key() == *child_key
-                            && record.task.parent() == Some(parent)
-                            && class.admits(record.task.exit_signal())
-                            && target.admits(*child_key, record.task.process_group())
+                        let task = state
+                            .tasks
+                            .get(&child_key.id)
+                            .map(|record| &record.task)
+                            .or_else(|| state.retiring_tasks.get(&child_key.id));
+                        task.is_some_and(|task| {
+                            task.key() == *child_key
+                                && task.parent() == Some(parent)
+                                && class.admits(task.exit_signal())
+                                && target.admits(*child_key, task.process_group())
+                        })
                     });
                 return Ok(if live_child {
                     WaitOutcome::StillRunning(sample_precheck(&state, parent_id))
@@ -432,13 +436,17 @@ impl Kernel {
                     });
                     let live_child = live_tracee
                         || children.iter().any(|child_key| {
-                            let Some(record) = state.tasks.get(&child_key.id) else {
-                                return false;
-                            };
-                            record.task.key() == *child_key
-                                && record.task.parent() == Some(parent)
-                                && class.admits(record.task.exit_signal())
-                                && target.admits(*child_key, record.task.process_group())
+                            let task = state
+                                .tasks
+                                .get(&child_key.id)
+                                .map(|record| &record.task)
+                                .or_else(|| state.retiring_tasks.get(&child_key.id));
+                            task.is_some_and(|task| {
+                                task.key() == *child_key
+                                    && task.parent() == Some(parent)
+                                    && class.admits(task.exit_signal())
+                                    && target.admits(*child_key, task.process_group())
+                            })
                         });
                     return Ok(if live_child {
                         WaitOutcome::StillRunning(sample_precheck(&state, parent_id))
@@ -609,13 +617,17 @@ impl Kernel {
         });
         let live_child = live_tracee
             || children.iter().any(|child_key| {
-                let Some(record) = state.tasks.get(&child_key.id) else {
-                    return false;
-                };
-                record.task.key() == *child_key
-                    && record.task.parent() == Some(parent)
-                    && class.admits(record.task.exit_signal())
-                    && target.admits(*child_key, record.task.process_group())
+                let task = state
+                    .tasks
+                    .get(&child_key.id)
+                    .map(|record| &record.task)
+                    .or_else(|| state.retiring_tasks.get(&child_key.id));
+                task.is_some_and(|task| {
+                    task.key() == *child_key
+                        && task.parent() == Some(parent)
+                        && class.admits(task.exit_signal())
+                        && target.admits(*child_key, task.process_group())
+                })
             });
         Ok(if live_child {
             WaitOutcome::StillRunning(sample_precheck(&state, parent_id))
