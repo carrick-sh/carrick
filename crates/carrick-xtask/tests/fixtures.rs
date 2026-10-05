@@ -328,9 +328,10 @@ impl Fixture {
             });
         }
         let manifest = Manifest {
-            schema: "carrick.fixtures.v1".into(),
+            schema: "carrick.fixtures.v2".into(),
             source_head: sha.try_into().unwrap(),
             sources,
+            build_policy: fixtures::BuildPolicy::default(),
             toolchain: Toolchain {
                 rustc: "release: 1.96.0\nhost: aarch64-unknown-linux-gnu\n".into(),
                 cargo: "cargo 1.96.0".into(),
@@ -499,6 +500,143 @@ fn local_workspace_dependency_sources_are_verified() {
     );
 }
 #[test]
+fn clean_restore_then_unrelated_edit_preserves_fixtures() {
+    let mut f = Fixture::new();
+    // Use the publisher's inventory for this behavioral witness. The other
+    // tests retain their independent expected inventory to check scope.
+    f.manifest.sources = fixtures::source_hashes(f.repo.path()).unwrap();
+    f.republish();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    println!("clean restore succeeded before unrelated edit");
+    write(
+        f.repo.path(),
+        "crates/carrick-runtime/src/lib.rs",
+        b"// temporary diagnostic\n",
+    );
+    println!("introduced only crates/carrick-runtime/src/lib.rs edit");
+    fixtures::verify_installed(f.repo.path()).unwrap();
+}
+
+#[test]
+fn acceptance_rejects_untracked_host_test_even_with_valid_fixtures() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).unwrap();
+    write(
+        f.repo.path(),
+        "crates/carrick-embed/tests/local_icache.rs",
+        b"#[test] fn extra() {}\n",
+    );
+    git(
+        f.repo.path(),
+        &["config", "status.showUntrackedFiles", "no"],
+    );
+    fixtures::verify_installed(f.repo.path()).unwrap();
+    assert!(carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).is_err());
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .current_dir(f.repo.path())
+        .args(["accept", "--phase", "signed"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("fully clean checkout"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn fixture_verification_rejects_ambient_profile_override() {
+    let f = Fixture::new();
+    fixtures::restore(f.repo.path(), &f.path, None).unwrap();
+    for (name, value) in [
+        ("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0"),
+        ("CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS", "true"),
+        (
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS",
+            "-C opt-level=0",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+            .current_dir(f.repo.path())
+            .args(["fixtures", "verify"])
+            .env(name, value)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "old bundle accepted changed {name}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("build policy"));
+    }
+}
+
+#[test]
+fn fixture_policy_identity_rejects_changed_policy() {
+    let mut f = Fixture::new();
+    f.manifest
+        .build_policy
+        .fixed_environment
+        .insert("CARGO_PROFILE_RELEASE_OPT_LEVEL".into(), "0".into());
+    f.republish();
+    f.rejected("build policy mismatch");
+}
+
+#[test]
+fn cargo_home_and_parent_config_are_isolated() {
+    let f = Fixture::new();
+    let outside = tempfile::tempdir().unwrap();
+    let checkout = outside.path().join("checkout");
+    git(
+        outside.path(),
+        &[
+            "clone",
+            "--quiet",
+            f.repo.path().to_str().unwrap(),
+            "checkout",
+        ],
+    );
+    fixtures::restore(&checkout, &f.path, None).unwrap();
+    write(
+        outside.path(),
+        ".cargo/config.toml",
+        b"this is invalid TOML\n",
+    );
+    write(
+        outside.path(),
+        "cargo-home/config.toml",
+        b"this is invalid TOML\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .current_dir(&checkout)
+        .args(["fixtures", "verify"])
+        .env("CARGO_HOME", outside.path().join("cargo-home"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The same configuration inside the checkout is an input, not host policy.
+    write(
+        &checkout,
+        ".cargo/config.toml",
+        b"[build]\nrustflags = []\n",
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .current_dir(&checkout)
+        .args(["fixtures", "verify"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("requires tracked Cargo configuration")
+    );
+}
+
+#[test]
 fn unrelated_workspace_edits_preserve_fixture_identity() {
     let f = Fixture::new();
     fixtures::restore(f.repo.path(), &f.path, None).unwrap();
@@ -536,10 +674,11 @@ fn unrelated_workspace_edits_preserve_fixture_identity() {
     );
     assert_eq!(
         validation["inputs_sha256"],
-        String::from(hash(&serde_json::to_vec(&f.manifest.sources).unwrap()))
+        String::from(hash(
+            &serde_json::to_vec(&(&f.manifest.sources, &f.manifest.build_policy)).unwrap()
+        ))
     );
-    let acceptance = carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).unwrap();
-    assert_eq!(serde_json::to_value(acceptance).unwrap(), validation);
+    assert!(carrick_xtask::accept::verify_signed_fixtures(f.repo.path()).is_err());
     fixtures::restore(f.repo.path(), &f.path, None).unwrap();
     let installed: serde_json::Value = serde_json::from_slice(
         &fs::read(f.repo.path().join(fixtures::INSTALLED_MANIFEST)).unwrap(),
@@ -561,7 +700,7 @@ fn unresolved_fixture_closure_fails_closed() {
         fixtures::verify_installed(f.repo.path())
             .unwrap_err()
             .to_string()
-            .contains("command 'cargo' failed")
+            .contains("controlled fixture command failed")
     );
     git(
         f.repo.path(),
@@ -923,7 +1062,32 @@ fn trusted_hardware_workflow_prepares_exact_sha_fixtures_before_signed_execution
             .unwrap_or_else(|| panic!("missing workflow step: {name}"))
             .clone()
     };
-    let f = Fixture::new();
+    let mut f = Fixture::new();
+    // The fake cleanup helper is still a build input: commit it before creating
+    // the exact-SHA bundle/checkout instead of relying on untracked admission.
+    write(
+        f.repo.path(),
+        "scripts/sudo/kill.sh",
+        br#"#!/bin/sh
+[ "$1" = "$CARRICK_RUN_ID" ] || exit 95
+[ "$CARRICK_HOST_LEASE_MODE" = gate ] || exit 92
+printf '%s\n' "$1" > "$FIXTURE_TEST_CLEANED"
+"#,
+    );
+    fs::set_permissions(
+        f.repo.path().join("scripts/sudo/kill.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    git(f.repo.path(), &["add", "scripts/sudo/kill.sh"]);
+    git(
+        f.repo.path(),
+        &["commit", "-qm", "track workflow cleanup helper"],
+    );
+    f.manifest.source_head = git(f.repo.path(), &["rev-parse", "HEAD"])
+        .try_into()
+        .unwrap();
+    f.republish();
     let p = Preparation::new(&f);
     p.setup(&f);
     // Only Linux compilation, signing and HVF execution are replaced here.
@@ -952,23 +1116,9 @@ esac
         b"#!/bin/sh\nprintf 'com.apple.security.hypervisor\\n'\n",
     );
     write(&p.bin, "otool", b"#!/bin/sh\nprintf '__dof_carrick\\n'\n");
-    write(
-        &p.checkout,
-        "scripts/sudo/kill.sh",
-        br#"#!/bin/sh
-[ "$1" = "$CARRICK_RUN_ID" ] || exit 95
-[ "$CARRICK_HOST_LEASE_MODE" = gate ] || exit 92
-printf '%s\n' "$1" > "$FIXTURE_TEST_CLEANED"
-"#,
-    );
     for name in ["just", "codesign", "otool"] {
         fs::set_permissions(p.bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
     }
-    fs::set_permissions(
-        p.checkout.join("scripts/sudo/kill.sh"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
     let executions = p.scratch.path().join("executions");
     let cleaned = p.scratch.path().join("cleaned");
     let sha = git(&p.checkout, &["rev-parse", "HEAD"]);
