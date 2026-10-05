@@ -250,6 +250,41 @@ fn files(directory: &Path, result: &mut Vec<std::path::PathBuf>) -> Result<(), D
     }
     Ok(())
 }
+fn module_file(
+    module: &syn::ItemMod,
+    directory: &Path,
+    explicit_directory: &Path,
+    parsed: &BTreeMap<PathBuf, syn::File>,
+) -> (PathBuf, bool) {
+    let explicit = module.attrs.iter().find_map(|attr| {
+        if !attr.path().is_ident("path") {
+            return None;
+        }
+        let syn::Meta::NameValue(value) = &attr.meta else {
+            return None;
+        };
+        let syn::Expr::Lit(value) = &value.value else {
+            return None;
+        };
+        let syn::Lit::Str(value) = &value.lit else {
+            return None;
+        };
+        Some(explicit_directory.join(value.value()))
+    });
+    let explicit_path = explicit.is_some();
+    let path = explicit.unwrap_or_else(|| {
+        if module.content.is_some() {
+            return directory.join(module.ident.to_string());
+        }
+        let flat = directory.join(format!("{}.rs", module.ident));
+        if parsed.contains_key(&flat) {
+            flat
+        } else {
+            directory.join(module.ident.to_string()).join("mod.rs")
+        }
+    });
+    (normalized_path(&path), explicit_path)
+}
 fn test_modules(
     items: &[syn::Item],
     directory: &Path,
@@ -262,22 +297,12 @@ fn test_modules(
         let syn::Item::Mod(module) = item else {
             continue;
         };
-        let explicit = module.attrs.iter().find_map(|attr| {
-            if !attr.path().is_ident("path") {
-                return None;
-            }
-            let syn::Meta::NameValue(value) = &attr.meta else {
-                return None;
-            };
-            let syn::Expr::Lit(value) = &value.value else {
-                return None;
-            };
-            let syn::Lit::Str(value) = &value.lit else {
-                return None;
-            };
-            Some(explicit_directory.join(value.value()))
-        });
-        let child_directory = directory.join(module.ident.to_string());
+        let (path, explicit_path) = module_file(module, directory, explicit_directory, parsed);
+        let child_directory = if module.content.is_some() {
+            path.clone()
+        } else {
+            directory.join(module.ident.to_string())
+        };
         let is_test = inherited_test || test_only(&module.attrs);
         if let Some((_, items)) = &module.content {
             test_modules(
@@ -288,27 +313,17 @@ fn test_modules(
                 parsed,
                 result,
             );
-        } else if is_test {
-            let explicit_path = explicit.is_some();
-            let path = normalized_path(&explicit.unwrap_or_else(|| {
-                let flat = directory.join(format!("{}.rs", module.ident));
-                if parsed.contains_key(&flat) {
-                    flat
-                } else {
-                    child_directory.join("mod.rs")
-                }
-            }));
-            if result.insert(path.clone())
-                && let Some(syntax) = parsed.get(&path)
-                && let Some(parent) = path.parent()
-            {
-                let directory = if explicit_path || path.ends_with("mod.rs") {
-                    parent.to_path_buf()
-                } else {
-                    path.with_extension("")
-                };
-                test_modules(&syntax.items, &directory, parent, true, parsed, result);
-            }
+        } else if is_test
+            && result.insert(path.clone())
+            && let Some(syntax) = parsed.get(&path)
+            && let Some(parent) = path.parent()
+        {
+            let directory = if explicit_path || path.ends_with("mod.rs") {
+                parent.to_path_buf()
+            } else {
+                path.with_extension("")
+            };
+            test_modules(&syntax.items, &directory, parent, true, parsed, result);
         }
     }
 }
@@ -320,7 +335,7 @@ fn test_modules(
 fn macro_source_references(
     root: &Path,
     parsed: &BTreeMap<PathBuf, syn::File>,
-) -> Result<BTreeSet<PathBuf>, DebtError> {
+) -> Result<BTreeMap<PathBuf, BTreeSet<PathBuf>>, DebtError> {
     struct References<'a> {
         directory: &'a Path,
         crates: &'a Path,
@@ -361,7 +376,7 @@ fn macro_source_references(
         }
     }
     let crates = root.join("crates");
-    let mut references = BTreeSet::new();
+    let mut references = BTreeMap::new();
     for (source, syntax) in parsed {
         let directory = source
             .parent()
@@ -372,8 +387,8 @@ fn macro_source_references(
             files: BTreeSet::new(),
         };
         visitor.visit_file(syntax);
-        for path in visitor.files {
-            if !parsed.contains_key(&path) {
+        for path in &visitor.files {
+            if !parsed.contains_key(path) {
                 // All retained lexical/zero scanners must cover production
                 // source. Classifying it without that coverage would silently
                 // lose raw locks or global-state operations outside src.
@@ -382,10 +397,124 @@ fn macro_source_references(
                     path.display()
                 )));
             }
-            references.insert(path);
         }
+        references.insert(source.clone(), visitor.files);
     }
     Ok(references)
+}
+
+// Classification is physical reachability, not logical owner resolution. A
+// literal-promoted file can have no known owner, but all its production
+// descendants must still be counted (and fail closed if their owners are unknown).
+fn production_files(
+    parsed: &BTreeMap<PathBuf, syn::File>,
+    macro_references: &BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+    mut production: BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>, DebtError> {
+    struct Modules<'a> {
+        directory: PathBuf,
+        explicit_directory: PathBuf,
+        parsed: &'a BTreeMap<PathBuf, syn::File>,
+        references: BTreeSet<PathBuf>,
+    }
+    impl<'ast> Visit<'ast> for Modules<'_> {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            let attrs = match item {
+                syn::Item::Const(item) => &item.attrs,
+                syn::Item::Fn(item) => &item.attrs,
+                syn::Item::Impl(item) => &item.attrs,
+                syn::Item::Macro(item) => &item.attrs,
+                syn::Item::Mod(item) => &item.attrs,
+                syn::Item::Static(item) => &item.attrs,
+                syn::Item::Trait(item) => &item.attrs,
+                _ => return visit::visit_item(self, item),
+            };
+            if !test_only(attrs) {
+                visit::visit_item(self, item);
+            }
+        }
+        fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+            if test_only(&module.attrs) {
+                return;
+            }
+            if let Some((_, children)) = &module.content {
+                let (child, _) = module_file(
+                    module,
+                    &self.directory,
+                    &self.explicit_directory,
+                    self.parsed,
+                );
+                let directory = std::mem::replace(&mut self.directory, child.clone());
+                let explicit = std::mem::replace(&mut self.explicit_directory, child);
+                for item in children {
+                    self.visit_item(item);
+                }
+                self.directory = directory;
+                self.explicit_directory = explicit;
+            } else {
+                let (path, _) = module_file(
+                    module,
+                    &self.directory,
+                    &self.explicit_directory,
+                    self.parsed,
+                );
+                if self.parsed.contains_key(&path) || path.is_file() {
+                    self.references.insert(path);
+                }
+            }
+        }
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !test_only(&item.attrs) {
+                visit::visit_impl_item_fn(self, item);
+            }
+        }
+        fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+            if !test_only(&item.attrs) {
+                visit::visit_trait_item_fn(self, item);
+            }
+        }
+        fn visit_expr(&mut self, expression: &'ast syn::Expr) {
+            if !expression_test_only(expression) {
+                visit::visit_expr(self, expression);
+            }
+        }
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            visit_macro_inputs(self, mac.tokens.clone());
+        }
+    }
+    let mut pending = production.clone();
+    while let Some(path) = pending.pop_first() {
+        let syntax = parsed.get(&path).ok_or_else(|| {
+            DebtError::Policy(format!(
+                "production module reference outside discoverable Rust files: {}",
+                path.display()
+            ))
+        })?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| DebtError::Policy("missing source parent".into()))?;
+        let mut references = macro_references.get(&path).cloned().unwrap_or_default();
+        // A literal may instantiate this file through include! or #[path],
+        // rather than its conventional filename. Follow both lookup contexts
+        // conservatively; neither may leave a real descendant test-only.
+        let directories = BTreeSet::from([parent.to_path_buf(), path.with_extension("")]);
+        for directory in directories {
+            let mut visitor = Modules {
+                directory,
+                explicit_directory: parent.to_path_buf(),
+                parsed,
+                references: BTreeSet::new(),
+            };
+            visitor.visit_file(syntax);
+            references.extend(visitor.references);
+        }
+        for child in references {
+            if production.insert(child.clone()) {
+                pending.insert(child);
+            }
+        }
+    }
+    Ok(production)
 }
 fn contains_authority_tokens(
     tokens: TokenStream,
@@ -613,44 +742,20 @@ fn declared_items(
         }
         let mut child_modules = modules.to_vec();
         child_modules.push(module.ident.to_string());
-        let child_directory = directory.join(module.ident.to_string());
+        let (file, explicit_path) = module_file(module, directory, explicit_directory, parsed);
         if let Some((_, children)) = &module.content {
             declared_items(
                 children,
                 source_file,
-                (&child_directory, &child_directory),
+                (&file, &file),
                 &child_modules,
                 parsed,
                 resolved,
                 vocabulary,
             )?;
         } else {
-            let explicit = module.attrs.iter().find_map(|attr| {
-                if !attr.path().is_ident("path") {
-                    return None;
-                }
-                let syn::Meta::NameValue(value) = &attr.meta else {
-                    return None;
-                };
-                let syn::Expr::Lit(value) = &value.value else {
-                    return None;
-                };
-                let syn::Lit::Str(value) = &value.lit else {
-                    return None;
-                };
-                Some(explicit_directory.join(value.value()))
-            });
-            let explicit_path = explicit.is_some();
-            let file = explicit.unwrap_or_else(|| {
-                let flat = directory.join(format!("{}.rs", module.ident));
-                if parsed.contains_key(&flat) {
-                    flat
-                } else {
-                    child_directory.join("mod.rs")
-                }
-            });
             declared_modules(
-                &normalized_path(&file),
+                &file,
                 &child_modules,
                 explicit_path,
                 parsed,
@@ -928,16 +1033,29 @@ impl SourceCensus {
         // Macro literals force production scope without inventing a logical
         // owner or extending the retained scanners' source discovery domain.
         let macro_references = macro_source_references(root, &parsed)?;
+        let mut production = resolved.keys().cloned().collect::<BTreeSet<_>>();
+        // Only production files seed reachability. Their macro inputs remain
+        // conservative even in cfg-gated syntax, but a test-only literal cycle
+        // cannot bootstrap itself into a production incarnation.
+        for path in parsed.keys() {
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| DebtError::Policy(e.to_string()))?
+                .to_string_lossy();
+            let probe =
+                relative.contains("/src/bin/") && !relative.starts_with("crates/carrick-cli/");
+            if !test_files.contains(path) && !probe {
+                production.insert(path.clone());
+            }
+        }
+        let production = production_files(&parsed, &macro_references, production)?;
         // Parse aliases before any methods: a later type alias or renamed
         // lock import cannot make a raw storage accessor opaque to the census.
         for (path, syntax) in &parsed {
             let relative = path
                 .strip_prefix(root)
                 .map_err(|e| DebtError::Policy(e.to_string()))?;
-            if !resolved.contains_key(path)
-                && !macro_references.contains(path)
-                && test_files.contains(path)
-            {
+            if !production.contains(path) && test_files.contains(path) {
                 continue;
             }
             let krate = relative
@@ -982,8 +1100,7 @@ impl SourceCensus {
             // Standalone probe binaries are outside the reviewed product
             // profiles, not test modules. Preserve that scope only when no
             // production declaration or macro literal references the file.
-            if !resolved.contains_key(&path)
-                && !macro_references.contains(&path)
+            if !production.contains(&path)
                 && relative.contains("/src/bin/")
                 && !relative.starts_with("crates/carrick-cli/")
             {
@@ -992,10 +1109,7 @@ impl SourceCensus {
             }
             // Every production declaration takes precedence over every test
             // declaration, including a #[path] into a test directory or bin.
-            if !resolved.contains_key(&path)
-                && !macro_references.contains(&path)
-                && test_files.contains(&path)
-            {
+            if !production.contains(&path) && test_files.contains(&path) {
                 result.test_files.insert(relative);
                 continue;
             }
