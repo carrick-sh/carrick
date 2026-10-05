@@ -439,8 +439,8 @@ mod tests {
         assert!(!ptr.is_null());
         unsafe { Box::from_raw(ptr.cast()) }
     }
-    fn layout() -> Layout {
-        Layout {
+    fn layout() -> carrick_personality_linux::mm::LinuxReservationLayout {
+        carrick_personality_linux::mm::LinuxReservationLayout {
             heap: ReservationRange::new(4096, 0x100000).unwrap(),
             arena: ReservationRange::new(0x100000, 0x10000000).unwrap(),
             brk: 4096,
