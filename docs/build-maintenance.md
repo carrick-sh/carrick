@@ -117,32 +117,51 @@ If either lock is held, it skips without deleting anything. It retains both
 guards through removal. Before any census or deletion it also holds exclusive
 locks on Cargo's native `target/{debug,release}/.cargo-lock` files. Ordinary
 Cargo builds participate in these locks even when bypassing the host lease.
-Before acquiring those locks, pruning resolves the target once and authenticates
-the directory's device/inode against the supplied path. Lock acquisition,
-census exemptions and deletion all use that canonical root, including when
-a worktree ancestor is a symlink. The bound identity is checked after lock
-acquisition and again before deletion; a changed root stops pruning.
-These lock files are never pruned. Their descriptors are explicitly inherited
-by the deletion shell and utilities, so killing the Perl parent cannot release
-exclusion while a deletion child remains alive. The local and remote host
-lease descriptors also follow deletion children. Root-visible lsof exempts
-only the two exact exclusively held Cargo lock paths; every artifact stays
-visible even when opened by a guardian process. The census explicitly requests
-process, descriptor and name fields (`lsof -F pfn`), validating complete file
-records at descriptor and process boundaries. Unrelated files, cwd/mappings,
-unknown fields and incomplete or duplicate records keep the target.
-All accounting utilities are checked before scanning; failed or invalid byte
-accounting stops before unlinking the candidate. It uses the same root-visible
-lsof checks as worktree cleanup. Run from another checkout when pruning a target containing the
-running xtask executable: its mapping correctly makes that target busy.
+Pruning resolves the target once and authenticates its device/inode, including
+through symlinked worktree ancestors. A Rust pass retains that directory handle,
+opens profiles, locks and every candidate descendant with `openat(O_NOFOLLOW)`,
+and measures age and allocated bytes from those retained objects. Traversal and
+deletion use directory-relative operations; display paths never authorize
+unlinking. Replacing or renaming the target after the final identity check cannot
+redirect deletion into its replacement. Native Cargo and host leases live in
+the same process that deletes; there is no shell/Perl deletion child.
+
+Root-visible `lsof -F pfn` validates complete process/descriptor/name records.
+Only exact owned descriptors with authenticated display names are exempt, and
+every retained object in the queried subtree must appear. A namespace change
+during the census cannot turn an empty result into proof of idle. Unrelated
+descriptors, cwd/mappings, warnings, malformed/duplicate records and missing
+objects keep the target. Before unlinking, an eligible candidate is atomically
+moved into a private `.carrick-prune-<token>` directory under the held root and
+its retained tree is verified again. Changed candidates are preserved there
+for recovery rather than deleted. Inspect these directories after interrupted
+or failed pruning; they are excluded from normal artifact cleanup. Owner
+permissions needed for removal are added through held directory handles only.
+
+Age and byte accounting are native Rust operations with checked arithmetic;
+there is no awk/find/du dependency or accounting redirection. Permission/I/O
+errors and descriptor exhaustion fail closed. Very large individual artifact
+trees may exceed the process's descriptor limit; they are preserved. Run from
+another checkout when pruning a target containing the running xtask executable:
+its mapping correctly makes that target busy.
 
 When remote-accept sees less than 40 GiB free, it logs an idle-only pruning
-attempt before refusing. The client's Rust code sends the same find-based
-pruning body over SSH, targeting `gate-worktree/target` with the default
-two-day threshold, then checks free space again. No remote checkout or build
-is needed. macOS has no `flock(1)`; its stock `/usr/bin/perl` holds the existing
-host lease with `LOCK_EX|LOCK_NB` while the generated command runs. The remote
-wrapper claims the checkout lock first and honors `CARRICK_HOST_LEASE_PATH`
-from the host's `env.sh`, just as local pruning does. A busy lock, missing
-utility (including Perl), or insufficient reclaimed space preserves the
-existing refusal; the 40 GiB gate requirement is unchanged.
+attempt before refusing. The client invokes a prebuilt native xtask helper over
+SSH, targeting `gate-worktree/target` with the default two-day threshold, then
+checks free space again. The helper runs the same Rust pass and claims the
+checkout guard before the zero-wait exclusive host lease. Install it on each
+remote gate host from the desired reviewed source in your own checkout:
+
+```sh
+just lease carrick cargo build --locked -p carrick-xtask
+mkdir -p /Volumes/carrick/dev/build-tools
+install -m 755 target/debug/carrick-xtask /Volumes/carrick/dev/build-tools/carrick-xtask
+```
+
+Install/update while the helper is idle. `CARRICK_TARGET_PRUNER` in the host's
+`env.sh` can select another prebuilt native helper. The remote request requires
+the `target-prune --protocol fd-v1` interface; absent or older helpers fail
+closed, with no shell removal fallback. Low-disk recovery needs no Cargo run,
+build or gate checkout mutation. A busy lock, unavailable root lsof or helper,
+or insufficient reclaimed space preserves the 40 GiB refusal. The helper
+honors the existing `CARRICK_HOST_LEASE_PATH` environment plumbing.
