@@ -497,10 +497,11 @@ fn run_setresuid(schedule: &Schedule, scale: u64) -> Result<ScheduleReceipt, Str
     // Retain the smallest historical witness before
     // its semantic assertion fails. This is an explicit recorder,
     // following schedule_replay's VMFREE_TRACE convention.
-    if receipt.seed == 0 && scale == 1 {
-        if let Ok(path) = std::env::var("VMFREE_TRACE") {
-            std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
-        }
+    if receipt.seed == 0
+        && scale == 1
+        && let Ok(path) = std::env::var("VMFREE_TRACE")
+    {
+        std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
     }
     for outcome in outcomes.lock().iter() {
         assert_eq!(
