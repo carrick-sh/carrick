@@ -18,6 +18,7 @@ carrick-sched-core = { path = "../carrick-sched-core" }
 
 [dev-dependencies]
 carrick-el1-abi = { path = "../carrick-el1-abi" }
+parking_lot.workspace = true
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
 
 carrick-personality-linux = { path = "../carrick-personality-linux" }

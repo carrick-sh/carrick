@@ -4,5 +4,6 @@ pub mod fork;
 pub mod fault;
 pub mod frames;
 pub mod reservation;
+pub mod retirement;
 pub mod transaction;
 pub mod transfer;
