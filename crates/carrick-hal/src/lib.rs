@@ -67,7 +67,7 @@ pub use threaded::{
     FrameCowIdentity, FrameCowOwnerInventory, FrameCowOwnerLease, FrameCowQuiesce, FutexOutcome,
     GenericVcpuRegistry, GuestEntryRegs, GuestLeaveWake, GuestLeaveWatch, GuestWaitRegisters,
     HostVa, HvpatchChildKernelToken, HvpatchChildTokenIssuer, HvpatchChildTokenVerifier,
-    HvpatchVerifiedChildKernelBinding, InGuestFlag, OwnerFileFaultOutcome, PlatformFutex,
+    HvpatchVerifiedChildKernelBinding, InGuestFlag, OwnerFaultOutcome, PlatformFutex,
     ProcessForkRequest, RegAccess, SharedFutexFileIdentity, SharedFutexKey, SharedFutexLocation,
     SignalPumpControl, ThreadId, ThreadedEngine, VcpuKick, VcpuKickDyn,
     VcpuLeaseChangeSubscription, VcpuLeaseDrainEnrollment, VcpuLeaseDrainGuard, VcpuLeaseDrainPoll,

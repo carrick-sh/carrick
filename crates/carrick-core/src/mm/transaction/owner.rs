@@ -469,7 +469,10 @@ impl<
         continuation: &TransferContinuation,
         words: &W,
         venues: SelectionVenues<'_, R, C>,
-    ) -> Result<TransferStep, MmError> {
+    ) -> Result<TransferStep, MmError>
+    where
+        B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+    {
         let SelectionVenues {
             prepared,
             cow,
@@ -572,18 +575,18 @@ impl<
             }
             result => result?,
         };
-        if leaf.is_none() {
-            if let Some(page) = residency.lookup(mm, va)
-                && matches!(
-                    prepared.commit_prepared(
-                        grant.ttbr0,
-                        PageSpan::containing(va).va,
-                        page.expected_ipa,
-                        access,
-                    ),
-                    Ok(GuestPreparedCommit::Committed | GuestPreparedCommit::AlreadyResident)
-                )
-            {
+        if leaf.is_none()
+            && let Some(page) = residency.lookup(mm, va)
+        {
+            if matches!(
+                prepared.commit_prepared(
+                    grant.ttbr0,
+                    PageSpan::containing(va).va,
+                    page.expected_ipa,
+                    access,
+                ),
+                Ok(GuestPreparedCommit::Committed | GuestPreparedCommit::AlreadyResident)
+            ) {
                 residency.record_commit(page);
             }
             leaf = translated::<B, W>(words, root, va, access, continuation.intent)?;
@@ -600,17 +603,11 @@ impl<
             if root.fork_pending() && !root.fork_write_authorized(continuation.fork_sequence()) {
                 return Err(MmError::Busy);
             }
-            let target = if root
-                .mapping(va)
-                .is_some_and(|mapping| mapping.host_backing.is_some())
-            {
-                4096
-            } else {
-                carrick_core_abi::EL1_FRAME_GRANT_TARGET_SIZE
-            };
-            let plan = root.fork_transfer_fault_plan(
-                va,
-                target,
+            let plan = crate::mm::fault::owner_fault_plan::<_, _, B, _>(
+                &mut root,
+                words,
+                B::root(grant.ttbr0).map_err(mmu_error)?,
+                UserVa::new(va),
                 ReservationProtection::from_bits(bits).ok_or(MmError::Invalid)?,
                 continuation.fork_sequence(),
             )?;

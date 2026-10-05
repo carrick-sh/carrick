@@ -4931,14 +4931,14 @@ where
                         VcpuLoopOutcome::ProcessExit(Box::new(result)),
                     ));
                 };
-                let owner_file_fault = match self.state.zone_mm {
+                let owner_fault = match self.state.zone_mm {
                     Some(mm_key) => {
-                        signal::resolve_owner_file_fault(engine, mm_key, si_addr, fault_access)
+                        signal::resolve_owner_fault(engine, mm_key, si_addr, fault_access)
                             .map_err(RuntimeError::Trap)?
                     }
                     None => None,
                 };
-                if let Some(carrick_hal::OwnerFileFaultOutcome::Pending(wait)) = &owner_file_fault {
+                if let Some(carrick_hal::OwnerFaultOutcome::Pending(wait)) = &owner_fault {
                     let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
                         RuntimeError::Configuration("physical fault wait lost context".to_owned())
                     })?;
@@ -4962,11 +4962,11 @@ where
                         ),
                     ));
                 }
-                if owner_file_fault == Some(carrick_hal::OwnerFileFaultOutcome::Resolved) {
+                if owner_fault == Some(carrick_hal::OwnerFaultOutcome::Resolved) {
                     return Ok(executor::ExecutorExit::Syscall);
                 }
                 let (signum, si_code) =
-                    if owner_file_fault == Some(carrick_hal::OwnerFileFaultOutcome::BusFault) {
+                    if owner_fault == Some(carrick_hal::OwnerFaultOutcome::BusFault) {
                         (
                             crate::linux_abi::LINUX_SIGBUS,
                             carrick_abi::LINUX_BUS_ADRERR,
@@ -4977,7 +4977,7 @@ where
                 // Raw hardware/host faults can decode as MAPERR even when
                 // Carrick tracks a live VMA denying the access. Upgrade from the
                 // shared protection metadata (LTP mmap05 / roprotect probe).
-                let si_code = if owner_file_fault.is_none() {
+                let si_code = if owner_fault.is_none() {
                     carrick_kernel::kernel::objects::signal::upgrade_protection_si_code(
                         &*engine, signum, si_code, si_addr,
                     )
@@ -4988,7 +4988,7 @@ where
                 let faulting_tid = self.state.linux_tid;
                 let requires_mm_mutation =
                     self.kernel.dispatcher.fault_requires_mm_mutation(si_addr);
-                if owner_file_fault.is_none()
+                if owner_fault.is_none()
                     && requires_mm_mutation
                     && self
                         .state

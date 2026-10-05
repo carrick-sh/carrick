@@ -1085,15 +1085,42 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         let slots = unsafe {
             &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
         };
-        if (FileFaultVenue {
-            roots,
-            spaces,
-            slots,
-            worker: frame.slot as u32,
-            mailbox,
-        })
-        .publish(mm_key, frame.far, access)
-        {
+        let selected = (|| {
+            let grant = spaces.table().grant(spaces.find(mm_key)?, mm_key)?;
+            let table = hardware_target_table_window(grant.ttbr0)?;
+            let maintenance = El1TableMaintenance { ttbr0: grant.ttbr0 };
+            // SAFETY: the current target alias and retained pool expose only
+            // physical table words; the core acquires this MM's editor before
+            // authenticating the root and selecting the live supply window.
+            let words = unsafe {
+                carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords::new(
+                    table.words,
+                    table.physical_base,
+                    carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE as usize,
+                    &maintenance,
+                )
+                .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
+            }
+            .ok()?;
+            Some(
+                (OwnerFaultVenue {
+                    roots,
+                    spaces,
+                    slots,
+                    worker: frame.slot as u32,
+                    mailbox,
+                })
+                .publish(
+                    carrick_mmu_core::owner_mmu::Aarch64Mmu,
+                    &words,
+                    mm_key,
+                    frame.far,
+                    access,
+                ),
+            )
+        })()
+        .unwrap_or(false);
+        if selected {
             return Action::Forward;
         }
     }
@@ -1101,9 +1128,9 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
     Action::Forward
 }
 
-/// File first-touch selects the source and access policy in the admitted root.
-/// The host sees only this exact owner window and retained handle byte service.
-pub type FileFaultVenue<'a> = carrick_core::mm::fault::FileFaultVenue<
+/// First-touch selects its live window and optional byte source in the core.
+/// The host supplies physical custody without deciding reservation policy.
+pub type OwnerFaultVenue<'a> = carrick_core::mm::fault::OwnerFaultVenue<
     'a,
     carrick_personality_linux::mm::LinuxReservationPolicy,
     crate::memory::reservations::NativeReservationGeometry,

@@ -611,13 +611,13 @@
     {
       "verdict": "carrier_fault",
       "failure_domain": "aarch64::user_transfer",
-      "rationale": "Owner-selected file-fault custody cannot be withdrawn or authenticated as settled, leaving an uncommitted physical publication.",
+      "rationale": "Owner-selected anonymous or retained-source fault custody cannot be withdrawn or authenticated as settled, leaving an uncommitted physical publication.",
       "sink": "fatal",
       "domain": "aarch64::user_transfer",
       "file": "crates/carrick-aarch64/src/engine.rs",
-      "function": "<Aarch64EngineCore<V> as ThreadedEngine>::service_owner_file_fault",
+      "function": "<Aarch64EngineCore<V> as ThreadedEngine>::service_owner_fault",
       "ordinal_in_function": 1,
-      "fingerprint": "1fb0e2f2707188366d324afcb323ea0c0ebc9ba1d4a7bd2f31842308b7861559"
+      "fingerprint": "5eca31a6bacd21ebf1a88d4f002f532ced0bda9eaec7033de8ac6d53ef90aef5"
     },
     {
       "verdict": "carrier_fault",

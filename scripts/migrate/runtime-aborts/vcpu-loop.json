@@ -1721,14 +1721,14 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "function": "resolve_owner_file_fault",
+      "function": "resolve_owner_fault",
       "ordinal_in_function": 1,
-      "fingerprint": "62fe702a25cb2be3e99f416d9c3275188192e73d7f2a0f3f765d5e9cb720db73",
+      "fingerprint": "07a9dc4964783efa512473070b124cf154ccfea701aa411198a24bcbe37dc4b5",
       "sink": "fatal",
-      "domain": "hvpatch::owner_file_fault",
+      "domain": "hvpatch::owner_fault",
       "verdict": "carrier_fault",
-      "failure_domain": "hvpatch::owner_file_fault",
-      "rationale": "The owner already resolved the file fault, but its exact generation mailbox claim was lost before completion. Continuing would split committed owner state from scheduler completion authority."
+      "failure_domain": "hvpatch::owner_fault",
+      "rationale": "The owner already resolved the anonymous or retained-source fault, but its exact generation mailbox claim was lost before completion. Continuing would split committed owner state from scheduler completion authority."
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/terminal.rs",
