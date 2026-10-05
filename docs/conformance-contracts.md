@@ -304,6 +304,20 @@ excludes EL1 edits before reading the live owner again. VM-free binding:
 holds an EL1 root through classification of both a mapped page and a hole,
 then verifies that the hole remains unmapped after release.
 
+`kernel.el1.delegated-root-fork` also covers anonymous first-touch after a
+forked child replaces a mapping with `MAP_FIXED`. Linux authority: `fork(2)`
+and `mmap(2)` require fresh private anonymous bytes to start at zero without
+changing the parent. The admitted reservation and live descriptors select the
+supply window; it stays inside that reservation and excludes inherited
+prepared or resident neighbors. Host residency is not an admission authority.
+The VM-free binding
+`owner_fork_anonymous_first_touch_excludes_inherited_prepared_neighbors`
+retains the parent's exact root incarnation, reservation generations and
+descriptor image. Signed bindings remain
+`el1_delegated_root_concurrent_vma_ops` and
+`el1_delegated_root_map_fixed_over_cow_pages`; their serving and exit budgets
+remain part of correctness.
+
 `kernel.mm.copyout-owner-gate` covers a peer closing the MM gate between
 SELECT and PREPARE. The hardware preamble must observe the exact Gate
 producer before probing and return its owned suspension, never a raw
