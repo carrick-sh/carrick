@@ -370,6 +370,14 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         self.deferred_anonymous.clone()
     }
 
+    fn settle_backing_maintenance(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Borrow another count of the existing exact-MM exclusion only after
+        // the owner service returned. Its normal settlement owns the receipt.
+        let _excluded = carrick_kernel::kernel::mm_occupancy::exclude_el1_editor(self.mm)
+            .ok_or_else(|| std::io::Error::other("maintenance MM is no longer published"))?;
+        Ok(())
+    }
+
     fn quiesce(
         &self,
     ) -> Result<Box<dyn carrick_hal::FrameCowQuiesce>, Box<dyn std::error::Error + Send + Sync>>

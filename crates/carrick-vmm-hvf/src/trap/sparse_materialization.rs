@@ -962,6 +962,33 @@ impl<'a> PublicationContext<'a> {
         {
             return Err(invalid("window or owner identity"));
         }
+        Self::for_transfer_target(state, custody, target)
+    }
+
+    pub(super) fn for_maintenance(
+        state: std::sync::Arc<MmAccessState>,
+        custody: std::sync::Arc<CarrierVmCustody>,
+        target: carrick_aarch64::user_transfer::TransferTarget,
+        request: carrick_el1_abi::PortalBackingMaintenance,
+    ) -> Result<Self, TrapError> {
+        if request.handle() != target.handle()
+            || target.handle().carrier() != custody.transfer_carrier
+        {
+            return Err(TrapError::Hypervisor(
+                "maintenance target identity mismatch".into(),
+            ));
+        }
+        Self::for_transfer_target(state, custody, target)
+    }
+
+    fn for_transfer_target(
+        state: std::sync::Arc<MmAccessState>,
+        custody: std::sync::Arc<CarrierVmCustody>,
+        target: carrick_aarch64::user_transfer::TransferTarget,
+    ) -> Result<Self, TrapError> {
+        let invalid = |reason: &'static str| {
+            TrapError::Hypervisor(format!("owner physical target mismatch: {reason}"))
+        };
         let binding = state
             .cow_runtime
             .read()
@@ -2404,6 +2431,13 @@ pub(super) struct PendingTransferGrant {
     descriptor_settled: bool,
 }
 impl PublicationContext<'static> {
+    pub(super) fn finish_maintenance(&self) -> Result<(), TrapError> {
+        self.authority
+            .settle_backing_maintenance()
+            .map_err(|error| {
+                TrapError::Hypervisor(format!("owner maintenance settlement: {error}"))
+            })
+    }
     pub(super) fn refill_transfer_cow(&self) -> Result<bool, TrapError> {
         let Some(pool) = carrick_el1_abi::cow_grant_pool_host() else {
             return Ok(false);

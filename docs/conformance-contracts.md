@@ -462,6 +462,10 @@ not carrier-wide mappings; no lock spans host I/O or a scheduler wait.
 The signed red is `el1_anonymous_reservations_stay_in_guest` on `77b7d5e71`:
 4 KiB heap contraction reaches PREPARE and receives its own Gate wait before
 aborting. A VM-free reproduction and its failing assertion are preserved in
-the 2026-10-05 backing-maintenance handoff. The new typed production binding,
-its negative and deterministic-work witnesses, and signed green are pending;
-this contract is not accepted.
+the 2026-10-05 backing-maintenance handoff. The typed production binding now
+uses `PortalBackingMaintenance` and the existing retained physical grant pool:
+EL1 authenticates the pending heap retirement, replaces each backed invalid
+leaf with private zero backing, and leaves it invalid until regrowth. The
+VM-free witness checks the original Gate red, ordinary user-copy exclusion,
+request corruption and VA reuse, a live COW peer, adjacent bytes, and bounded
+descriptor work. Signed green remains pending; this contract is not accepted.

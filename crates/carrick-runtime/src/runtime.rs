@@ -2469,6 +2469,13 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn finish_host_write(&mut self, ranges: &[carrick_guest_mem::HostWriteRange]) {
         self.mem.finish_host_write(ranges);
     }
+    fn zero_pending_backing(
+        &mut self,
+        pending: carrick_el1_abi::ReservationRequest,
+    ) -> Result<(), MemoryError> {
+        self.mem.zero_pending_backing(pending)
+    }
+
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
         self.mem.zero_backing(address, len)
     }

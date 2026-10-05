@@ -303,6 +303,46 @@ impl TransferCustody for UserTransferCustody {
         )?;
         context.refill_transfer_cow()
     }
+    fn finish_maintenance(
+        &self,
+        target: carrick_aarch64::user_transfer::TransferTarget,
+        request: carrick_el1_abi::PortalBackingMaintenance,
+    ) -> Result<(), TrapError> {
+        let state = self
+            .custody
+            .guest_cow_state(target.handle().mm().raw())
+            .ok()
+            .flatten()
+            .ok_or_else(|| TrapError::Hypervisor("maintenance MM disappeared".into()))?;
+        sparse_materialization::PublicationContext::for_maintenance(
+            state,
+            self.custody.clone(),
+            target,
+            request,
+        )?
+        .finish_maintenance()
+    }
+    fn refill_maintenance(
+        &self,
+        target: carrick_aarch64::user_transfer::TransferTarget,
+        request: carrick_el1_abi::PortalBackingMaintenance,
+    ) -> Result<bool, TrapError> {
+        let Some(state) = self
+            .custody
+            .guest_cow_state(target.handle().mm().raw())
+            .ok()
+            .flatten()
+        else {
+            return Ok(false);
+        };
+        sparse_materialization::PublicationContext::for_maintenance(
+            state,
+            self.custody.clone(),
+            target,
+            request,
+        )?
+        .refill_transfer_cow()
+    }
     fn retain(
         &self,
         selected: PortalSelectedData,
