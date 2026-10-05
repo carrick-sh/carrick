@@ -361,7 +361,7 @@ fn source_counts(
     let mut actual = BTreeMap::new();
     for row in rows(&discover(root, "check-dispatch-lock-authority", tools)?)? {
         let file = text(row, "file")?;
-        if source.is_test_at(
+        if source.is_outside_production_at(
             file,
             row["line"].as_u64().unwrap_or(0) as usize,
             row["column"].as_u64().unwrap_or(0) as usize,
@@ -391,7 +391,7 @@ fn source_counts(
     }
     for row in rows(&discover(root, "check-runtime-global-state", tools)?)? {
         let file = text(row, "file")?;
-        if source.is_test_at(
+        if source.is_outside_production_at(
             file,
             row["line"].as_u64().unwrap_or(0) as usize,
             row["column"].as_u64().unwrap_or(0) as usize,
@@ -504,7 +504,7 @@ fn legacy_policy_with_tools(root: &Path, tools: &Path) -> Result<AuthorityDebtCe
     let mut counters = BTreeMap::<Key, u64>::new();
     for row in rows(&discover(root, "check-dispatch-lock-authority", tools)?)? {
         let file = text(row, "file")?;
-        if source.is_test_at(
+        if source.is_outside_production_at(
             file,
             row["line"].as_u64().unwrap_or(0) as usize,
             row["column"].as_u64().unwrap_or(0) as usize,
@@ -647,7 +647,7 @@ fn legacy_policy_with_tools(root: &Path, tools: &Path) -> Result<AuthorityDebtCe
     }
     for row in rows(&production)? {
         let file = text(row, "file")?;
-        if source.is_test_at(
+        if source.is_outside_production_at(
             file,
             row["line"].as_u64().unwrap_or(0) as usize,
             row["column"].as_u64().unwrap_or(0) as usize,
