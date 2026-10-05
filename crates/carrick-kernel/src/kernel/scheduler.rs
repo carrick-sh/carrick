@@ -5394,8 +5394,15 @@ impl Scheduler {
         self.snapshot_count.load(Ordering::Relaxed)
     }
 
-    /// Demand-driven check: should this running thread yield now?
+    /// Whether this residency may continue after a guest boundary.
     pub fn should_preempt(&self, running: &RunnableThread) -> bool {
+        // sched_setaffinity changes the live thread's mask during a syscall.
+        // An excluded residency must settle even with an empty run queue:
+        // queue demand is a fairness concern, not permission to return to an
+        // excluded CPU. The next claim uses the ordinary affinity admission.
+        if !running.thread().affinity().is_allowed(running.guest_cpu()) {
+            return true;
+        }
         self.preemption
             .lock()
             .should_preempt(&running.binding, self.queue.len())

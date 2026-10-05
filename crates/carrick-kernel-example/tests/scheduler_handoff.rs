@@ -1302,6 +1302,74 @@ fn uncontended_host_wait_return_has_zero_spurious_preemptions() {
     }
 }
 
+/// kernel.scheduler.runnable-progress / kernel.el1.futex-handoff:
+/// a successful self-affinity change must not return to guest instructions on
+/// an excluded CPU, even with an empty host run queue. A second live process
+/// retains its own allowed residency; widening a mask costs no migration.
+#[test]
+fn self_affinity_change_requires_migration_before_return() {
+    let (kernel, root, asids) = bootstrap_kernel(59_300);
+    root.thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(0)));
+    let (peer, _process) = create_forked_child(&kernel, &root, &asids, "affinity peer");
+    peer.thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+    publish_task(&root, 1500);
+    publish_task(&peer, 1501);
+    let scheduler = Scheduler::new_with_policy(kernel, Arc::new(GuestCpuPolicy::new(2)));
+    let executors: Vec<_> = (0..2)
+        .map(|cpu| {
+            scheduler
+                .register_executor_bound(
+                    Arc::new(TestKick::default()),
+                    Some(GuestCpuId::new(cpu)),
+                    false,
+                )
+                .unwrap()
+        })
+        .collect();
+    scheduler.make_runnable(root.thread().key()).unwrap();
+    scheduler.make_runnable(peer.thread().key()).unwrap();
+    let running = scheduler.take(&executors[0]).unwrap();
+    let peer_running = scheduler.take(&executors[1]).unwrap();
+    assert_eq!(scheduler.queued_len(), 0);
+    assert_eq!(running.guest_cpu(), GuestCpuId::new(0));
+
+    // Same mutation used by sched_setaffinity: keeping the current CPU in the
+    // mask is a zero-migration control, independent of a timer or host load.
+    root.thread().set_affinity(CpuAffinity::all(2));
+    scheduler.note_syscall_boundary(&running);
+    let widening_preempted = scheduler.should_preempt(&running);
+    root.thread()
+        .set_affinity(CpuAffinity::single(GuestCpuId::new(1)));
+    scheduler.note_syscall_boundary(&running);
+    let migration_required = scheduler.should_preempt(&running);
+    let peer_preempted = scheduler.should_preempt(&peer_running);
+
+    // Exactly one settlement moves the excluded residency to its legal CPU.
+    scheduler.settle_exited(peer_running).unwrap();
+    scheduler.settle_runnable(running).unwrap();
+    let migrated = scheduler.take(&executors[1]).unwrap();
+    assert_eq!(migrated.thread_key(), root.thread().key());
+    assert_eq!(migrated.guest_cpu(), GuestCpuId::new(1));
+    let still_preempted = scheduler.should_preempt(&migrated);
+    scheduler.settle_exited(migrated).unwrap();
+    scheduler.close();
+    for executor in &executors {
+        scheduler.unregister_executor(executor).unwrap();
+    }
+    assert!(!widening_preempted, "an allowed CPU needs no migration");
+    assert!(!peer_preempted, "affinity belongs to the changed thread");
+    assert!(
+        !still_preempted,
+        "one migration must discharge the requirement"
+    );
+    assert!(
+        migration_required,
+        "self-affinity excluded CPU 0, but the syscall boundary permits guest re-entry there"
+    );
+}
+
 /// A return reason belongs to the surviving handoff, not to the executor's
 /// next residency after that handoff has completely drained.
 #[test]
