@@ -12,6 +12,12 @@ use carrick_hal::TrapError;
 use core::num::NonZeroU64;
 pub use staging::prepare_write;
 
+pub enum SupplyProgress {
+    Ready,
+    Declined,
+    OwnerWait(carrick_el1_abi::PortalOwnerWait),
+}
+
 /// Fulfil one exact owner-issued physical request before retrying the same
 /// transfer. The request carries the MM incarnation and grant generation;
 /// the guest validates both again while applying the descriptor transaction.
@@ -21,12 +27,20 @@ pub fn supply<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
     slots: &MmPortalSlots,
     target: TransferTarget,
     request: carrick_guest_mem::MemorySupplyRequest,
-) -> Result<bool, TrapError> {
+) -> Result<SupplyProgress, TrapError> {
     use carrick_guest_mem::MemorySupplyRequest;
     let window = match request {
         MemorySupplyRequest::Grant(window) => window,
-        MemorySupplyRequest::Cow(window) => return custody.refill_cow(target, window),
-        MemorySupplyRequest::Metadata { .. } => return Ok(false),
+        MemorySupplyRequest::Cow(window) => {
+            return custody.refill_cow(target, window).map(|ready| {
+                if ready {
+                    SupplyProgress::Ready
+                } else {
+                    SupplyProgress::Declined
+                }
+            });
+        }
+        MemorySupplyRequest::Metadata { .. } => return Ok(SupplyProgress::Declined),
     };
     if window.operation.carrier != target.handle.carrier()
         || window.operation.mm != target.handle.mm()
@@ -36,13 +50,16 @@ pub fn supply<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
             "owner grant request differs from selected root".into(),
         ));
     }
-    let mut grant = match custody.prepare(target, window)? {
+    let grant = match custody.prepare(target, window)? {
         TransferPreparation::Grant(grant) => grant,
         // A peer installed the exact fault page while this physical request
         // was in flight. No host bytes were delivered; select again under
         // the owner's current root and source authority.
-        TransferPreparation::PeerResident => return Ok(true),
-        TransferPreparation::Declined => return Ok(false),
+        TransferPreparation::PeerResident => return Ok(SupplyProgress::Ready),
+        TransferPreparation::Declined => {
+            trace_grant_refusal(window, 1);
+            return Ok(SupplyProgress::Declined);
+        }
     };
     let mut service = engine.transfer_service_loan()?;
     let slot = slots
@@ -63,19 +80,82 @@ pub fn supply<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
         None,
         &mut || false,
     );
+    drop(service);
+    finish_supply(grant, slot, window, target, result)
+}
+
+fn finish_supply(
+    mut grant: Box<dyn TransferGrant>,
+    slot: &carrick_el1_abi::PortalGrantSlot,
+    window: carrick_el1_abi::PortalGrantWindow,
+    target: TransferTarget,
+    result: Result<TrapFrame, TrapError>,
+) -> Result<SupplyProgress, TrapError> {
     if let Some(receipt) = slot.take_receipt(window, grant.transaction()) {
         let settled = grant.settle(&receipt)?;
         result?;
-        Ok(settled)
+        Ok(if settled {
+            SupplyProgress::Ready
+        } else {
+            SupplyProgress::Declined
+        })
     } else if slot.withdraw(window, grant.transaction()) {
-        result?;
-        Ok(false)
+        trace_grant_refusal(window, 2);
+        let frame = result?;
+        carrick_observability::probes::el1_grant_refusal(
+            24,
+            frame.x[0],
+            frame.slot,
+            frame.x[16],
+            frame.x[17],
+        );
+        // Withdrawal proves no descriptor was claimed. Release the speculative
+        // physical grant before handing a generation-exact wait to the caller.
+        drop(grant);
+        if frame.x[0] == 11 && frame.x[14] == 3 {
+            let cause = carrick_el1_abi::PortalWaitCause::decode(frame.x[16])
+                .ok_or_else(|| TrapError::Hypervisor("grant returned invalid owner wait".into()))?;
+            // SAFETY: the exact carrier service authenticated this target's
+            // notification source before testing its admission condition.
+            let wait = unsafe {
+                carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, cause, frame.x[17])
+            };
+            Ok(SupplyProgress::OwnerWait(wait))
+        } else {
+            Ok(SupplyProgress::Declined)
+        }
     } else {
         carrick_fatal::carrick_fatal!(
             "aarch64::user_transfer",
             "unsettled owner grant retains physical custody"
         );
     }
+}
+
+/// Capture only the refused immutable selection, never a host policy answer.
+fn trace_grant_refusal(window: carrick_el1_abi::PortalGrantWindow, reason: u32) {
+    use carrick_observability::probes::el1_grant_refusal;
+    el1_grant_refusal(
+        reason * 10 + 1,
+        window.operation.carrier.get(),
+        window.operation.mm.raw(),
+        window.operation.incarnation.get(),
+        window.generation.raw(),
+    );
+    el1_grant_refusal(
+        reason * 10 + 2,
+        window.range.start(),
+        window.range.len(),
+        window.protection.bits(),
+        window.fault_page,
+    );
+    el1_grant_refusal(
+        reason * 10 + 3,
+        window.host_backing.map_or(0, |s| s.handle().get()),
+        window.host_backing.map_or(0, |s| s.generation().get()),
+        window.host_backing.map_or(0, |s| s.offset()),
+        window.operation.sequence.get(),
+    );
 }
 
 /// Host physical custody, with no permission or VA-translation authority.
@@ -560,5 +640,107 @@ mod fork_parent_tests {
         let mut pending_input = OwnedUserTransfer::new(target, input()).unwrap();
         assert!(pending_input.authorize_fork_parent_write(operation));
         assert_eq!(pending_input.fork_sequence, Some(operation.sequence));
+    }
+}
+
+#[cfg(test)]
+mod grant_wait_tests {
+    use super::*;
+    use carrick_el1_abi::{PortalGrantSlot, PortalGrantWindow, PortalWaitCause};
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        DescriptorOp, DescriptorReceipt, DescriptorTxn, DescriptorTxnId, PageSpan, TableGrants,
+    };
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    struct PhysicalGrant {
+        txn: DescriptorTxn,
+        retained: Arc<AtomicBool>,
+    }
+    impl Drop for PhysicalGrant {
+        fn drop(&mut self) {
+            self.retained.store(false, Ordering::Release);
+        }
+    }
+    impl TransferGrant for PhysicalGrant {
+        fn transaction(&self) -> &DescriptorTxn {
+            &self.txn
+        }
+        fn settle(&mut self, _: &DescriptorReceipt) -> Result<bool, TrapError> {
+            panic!("an admission wait must not invent a descriptor receipt");
+        }
+    }
+
+    #[test]
+    fn unclaimed_owner_wait_releases_physical_custody_before_parking() {
+        let nz = |n| NonZeroU64::new(n).unwrap();
+        let operation = PortalOperation {
+            carrier: nz(1),
+            mm: ReservationMm::new(2).unwrap(),
+            incarnation: nz(3),
+            sequence: nz(4),
+        };
+        // SAFETY: isolated test authority, never handed to a running carrier.
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                operation.carrier,
+                operation.mm,
+                operation.incarnation,
+            )
+        };
+        let window = PortalGrantWindow {
+            operation,
+            generation: carrick_el1_abi::ReservationGeneration::new(5).unwrap(),
+            range: carrick_el1_abi::ReservationRange::new(0x6000, 0x7000).unwrap(),
+            protection: carrick_el1_abi::ReservationProtection::READ_WRITE,
+            fault_page: 0x6000,
+            host_backing: None,
+            fork_sequence: None,
+        };
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: nz(2),
+                generation: nz(1),
+            },
+            root: carrick_mmu_core::aarch64::SubstrateGpa(0x4000),
+            op: DescriptorOp::Retire(PageSpan::new(0x6000, 4096)),
+            tables: TableGrants::NONE,
+        };
+        let slot = PortalGrantSlot::new();
+        for cause in [PortalWaitCause::Gate, PortalWaitCause::Editor] {
+            assert!(slot.submit(window, &txn));
+            let retained = Arc::new(AtomicBool::new(true));
+            let grant = Box::new(PhysicalGrant {
+                txn,
+                retained: retained.clone(),
+            });
+            let mut frame = TrapFrame::default();
+            frame.x[0] = 11;
+            frame.x[14] = 3;
+            frame.x[16] = cause.encode();
+            frame.x[17] = 19;
+            let result = finish_supply(
+                grant,
+                &slot,
+                window,
+                TransferTarget::from_handle(handle, 0x4000),
+                Ok(frame),
+            )
+            .unwrap();
+            let SupplyProgress::OwnerWait(wait) = result else {
+                panic!("lost typed wait");
+            };
+            assert_eq!(wait.handle(), handle);
+            assert_eq!(wait.cause(), cause);
+            assert_eq!(wait.revision(), 19);
+            assert!(
+                !retained.load(Ordering::Acquire),
+                "no speculative physical custody may cross park"
+            );
+            assert!(!slot.has_outstanding_for(operation.mm.raw()));
+            assert!(!slot.withdraw(window, &txn), "withdrawal is one-shot");
+        }
     }
 }
