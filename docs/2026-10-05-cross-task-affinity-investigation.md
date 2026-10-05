@@ -4,7 +4,7 @@ PR #49 extends the self-affinity correction with exact target resolution,
 affinity-respecting host queue claims, and remote executor kicks. Linux
 `sched_setaffinity(2)` names a thread, including a thread-group leader when
 a sibling supplies `getpid()`. Only pid zero unconditionally names the caller.
-The existing root/same-owner permission rule remains in place.
+The existing root/same-owner permission rule remains in place and reads the exact target thread's current credentials rather than a group projection.
 
 ## Scope and ownership
 
@@ -26,6 +26,7 @@ All paths below are relative to `target/storm-investigation/` on cloudmac.
 | `cross-affinity-scheduler-red.log` | An excluded queued sibling is claimed on CPU 0; changing the remote process's running mask delivers zero exact kicks rather than one. |
 | `cross-affinity-runtime-red.log` | The compute-only target, with no queue demand, fails because it was never kicked. No timer or syscall closes the witness. |
 | `cross-affinity-claim-entry-red.log` | Changing affinity during backend load leaves the first guest entry on the same executor as the excluded claim. |
+| `cross-affinity-credentials-red.log` | A sibling with raw uid 200 cannot change its own mask because the group leader projection has uid 100; the exact target credentials must authorize it. |
 | `cross-affinity-exec-successor-red.log` | A running exec successor has no affinity kick capability after the exact binding transfer. A retired predecessor is the negative control. |
 
 Kernel witnesses use two live kernel processes or threads. Coordination waits
@@ -57,7 +58,7 @@ the successor; an old predecessor cannot nudge the replacement.
 ## VM-free and static verification
 
 - `cross-affinity-kernel-population.log`: `just test-kernel-semantics` passes
-  315 tests in 30 suites: the original 309 plus six new tests.
+  316 tests in 30 suites: the original 309 plus seven new tests.
 - `cross-affinity-executor-population.log`: `RUST_TEST_THREADS=1 cargo test -p
   carrick-runtime --lib vcpu_loop::executor::tests -- --nocapture` passes 95
   tests: the original 93 plus two new executor witnesses. The existing exec

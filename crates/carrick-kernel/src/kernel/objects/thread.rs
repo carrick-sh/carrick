@@ -1039,6 +1039,12 @@ impl Thread {
         *self.affinity.read()
     }
 
+    /// Scheduling permission belongs to the exact target thread's current
+    /// resource generation, not the thread group's leader projection.
+    pub(crate) fn scheduling_credentials(&self) -> Arc<super::Credentials> {
+        self.resources().credentials()
+    }
+
     pub fn set_affinity(&self, affinity: carrick_hal::CpuAffinity) {
         // Claim publication and mask changes serialize on the execution
         // record. Either this change sees a published residency and kicks it,

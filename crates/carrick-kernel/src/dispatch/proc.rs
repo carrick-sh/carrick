@@ -2073,10 +2073,10 @@ impl<'a> ProcView<'a> {
             let Some(target) = resolve_affinity_thread(cx, pid) else {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
             };
-            let Some(task) = target.task() else {
+            if target.task().is_none() {
                 return Ok(DispatchOutcome::errno(LINUX_ESRCH));
-            };
-            if !sched_cross_owner_ok(task.process_credentials().euid(), this.cred_snapshot().euid) {
+            }
+            if !sched_cross_owner_ok(target.scheduling_credentials().euid(), this.cred_snapshot().euid) {
                 return Ok(DispatchOutcome::errno(LINUX_EPERM));
             }
             let ncpu = crate::kernel::scheduler::guest_cpu_count();
