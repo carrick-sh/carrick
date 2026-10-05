@@ -1,2 +1,16 @@
-2d9b0d315c020183
+663e6358220bcb82
 sibling_affinity_ok=true
+distinct_masks_exercised=true
+caller_mask_unchanged=true
+sibling_mask_from_caller=true
+sibling_mask_from_sibling=true
+leader_mask_from_sibling=true
+caller_get_errno=0
+sibling_get_errno=0
+same_mask_set_errno=0
+changed_set_errno=0
+caller_after_errno=0
+sibling_after_errno=0
+worker_get_errno=0
+worker_initial_errno=0
+leader_get_errno=0
