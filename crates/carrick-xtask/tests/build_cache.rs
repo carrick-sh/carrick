@@ -1,5 +1,6 @@
 //! Real Cargo recipes with an isolated PATH and no installed compiler cache.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -8,6 +9,7 @@ use std::process::{Command, Output};
 struct Build {
     root: tempfile::TempDir,
     just: PathBuf,
+    path: OsString,
 }
 
 fn find(program: &str) -> PathBuf {
@@ -37,13 +39,47 @@ impl Build {
         fs::write(root.path().join("Cargo.toml"), "[workspace]\n[package]\nname = \"cache-recipe-witness\"\nversion = \"0.0.0\"\nedition = \"2021\"\n").unwrap();
         fs::write(root.path().join("src/lib.rs"), "pub fn witness() {}\n").unwrap();
         symlink(env!("CARGO"), root.path().join("bin/cargo")).unwrap();
-        for name in ["rustc", "rustup"] {
+        // Link individual utilities instead of admitting their system/cache
+        // directories to PATH. Only the exact Rust toolchain bins are shared.
+        for name in ["sh", "sed", "rustup"] {
             symlink(find(name), root.path().join("bin").join(name)).unwrap();
         }
-        Self {
+        let rustc = Command::new(find("rustup"))
+            .args(["which", "rustc"])
+            .output()
+            .unwrap();
+        assert!(rustc.status.success());
+        let rustc = PathBuf::from(String::from_utf8(rustc.stdout).unwrap().trim());
+        let cargo = fs::canonicalize(env!("CARGO")).unwrap();
+        let mut bins = vec![root.path().join("bin"), cargo.parent().unwrap().to_owned()];
+        let rustc_bin = fs::canonicalize(rustc)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        if !bins.contains(&rustc_bin) {
+            bins.push(rustc_bin);
+        }
+        let build = Self {
             root,
             just: find("just"),
-        }
+            path: std::env::join_paths(bins).unwrap(),
+        };
+        build.assert_no_sccache();
+        build
+    }
+
+    fn assert_no_sccache(&self) {
+        let out = Command::new(self.root.path().join("bin/sh"))
+            .args(["-c", "! command -v sccache"])
+            .env("PATH", &self.path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "sccache resolved in witness PATH: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 
     fn command(&self, recipe: &str) -> Command {
@@ -51,10 +87,7 @@ impl Build {
         command
             .current_dir(self.root.path())
             .arg(recipe)
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", self.root.path().join("bin").display()),
-            )
+            .env("PATH", &self.path)
             .env(
                 "CARGO_HOME",
                 std::env::var_os("CARGO_HOME").unwrap_or_else(|| {
@@ -278,10 +311,7 @@ fn explicit_binary_change_replaces_inherited_cache_selection() {
                 "build.rustc-wrapper=\"/missing/inherited/sccache\"",
             )
             .env("CARRICK_SCCACHE_REQUEST", "sccache")
-            .env(
-                "CARRICK_SCCACHE_SEARCH_PATH",
-                format!("{}:/usr/bin:/bin", build.root.path().join("bin").display()),
-            )
+            .env("CARRICK_SCCACHE_SEARCH_PATH", &build.path)
             .env("CARRICK_SCCACHE_BIN", &wrapper)
             .env("CACHE_WITNESS_TRACE", build.trace())
             .output()
