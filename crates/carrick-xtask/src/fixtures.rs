@@ -12,10 +12,13 @@ use thiserror::Error;
 use crate::{command, probe_inventory, provision};
 
 pub mod archive;
+mod environment;
 mod inputs;
-use inputs::source_hashes;
+use environment::BuildEnvironment;
+pub use environment::BuildPolicy;
+pub use inputs::source_hashes;
 
-const SCHEMA: &str = "carrick.fixtures.v1";
+const SCHEMA: &str = "carrick.fixtures.v2";
 pub const INSTALLED_MANIFEST: &str = "target/fixtures/installed.json";
 const EMBED: &[(&str, &str)] = &[
     ("embed-interceptor-probe", "interceptor-probe"),
@@ -171,6 +174,7 @@ pub struct Manifest {
     pub schema: String,
     pub source_head: CommitSha,
     pub sources: BTreeMap<String, ContentHash>,
+    pub build_policy: BuildPolicy,
     pub toolchain: Toolchain,
     pub executables: Vec<Executable>,
 }
@@ -209,7 +213,10 @@ fn validation_receipt(root: &Path, manifest: &Manifest) -> Result<ValidationRece
             .trim()
             .is_empty(),
         manifest_sha256: hash_bytes(&manifest_bytes(manifest)?),
-        inputs_sha256: hash_bytes(&serde_json::to_vec(&manifest.sources)?),
+        inputs_sha256: hash_bytes(&serde_json::to_vec(&(
+            &manifest.sources,
+            &manifest.build_policy,
+        ))?),
     })
 }
 
@@ -406,6 +413,9 @@ fn validate_manifest(root: &Path, manifest: &Manifest, expected: &CommitSha) -> 
             "wrong SHA: manifest {}, expected {}",
             manifest.source_head.0, expected.0
         )));
+    }
+    if manifest.build_policy != BuildPolicy::default() {
+        return Err(fail("fixture build policy mismatch"));
     }
     if manifest.sources != source_hashes(root)? {
         return Err(fail("fixture source hashes or inventory mismatch"));
@@ -629,11 +639,12 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     }
     let expected = expected_head(root, Some(sha))?;
     source_hashes(root)?;
-    let snapshot = tempfile::tempdir()?;
+    let environment = BuildEnvironment::new(root)?;
+    let snapshot = tempfile::tempdir_in(environment.scratch_root())?;
     let archive = snapshot.path().join("source.tar");
     run_build(
-        Command::new("git")
-            .current_dir(root)
+        environment
+            .configure(Command::new("git").current_dir(root))
             .args(["archive", "--format=tar", "--output"])
             .arg(&archive)
             .arg(&expected.0),
@@ -641,7 +652,8 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     let source = snapshot.path().join("source");
     fs::create_dir(&source)?;
     run_build(
-        Command::new("tar")
+        environment
+            .configure(&mut Command::new("tar"))
             .args(["-xf"])
             .arg(&archive)
             .arg("-C")
@@ -649,13 +661,21 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     )?;
     // Git metadata is deliberately separate; source_hashes is captured from
     // the original clean checkout again after builds to reject source races.
-    let rustc = command::run_checked("rustc", ["-vV"], Some(root))?.stdout;
-    let cargo = command::run_checked("cargo", ["--version"], Some(root))?.stdout;
+    let rustc = environment
+        .output(environment.configure(Command::new("rustc").current_dir(root).arg("-vV")))?;
+    let cargo = environment
+        .output(environment.configure(Command::new("cargo").current_dir(root).arg("--version")))?;
     let host = rustc
         .lines()
         .find_map(|l| l.strip_prefix("host: "))
         .ok_or_else(|| fail("missing compiler host"))?;
-    let sysroot = command::run_checked("rustc", ["--print", "sysroot"], Some(root))?.stdout;
+    let sysroot = environment.output(
+        environment.configure(
+            Command::new("rustc")
+                .current_dir(root)
+                .args(["--print", "sysroot"]),
+        ),
+    )?;
     let lld = Path::new(sysroot.trim())
         .join("lib/rustlib")
         .join(host)
@@ -665,7 +685,8 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     } else {
         "aarch64-linux-gnu-gcc"
     };
-    let gnu_linker = command::run_checked(linker, ["--version"], Some(root))?.stdout;
+    let gnu_linker = environment
+        .output(environment.configure(Command::new(linker).current_dir(root).arg("--version")))?;
     let toolchain = Toolchain {
         rustc,
         cargo,
@@ -674,7 +695,8 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
     let names = probe_names(&source)?;
     for target in [GuestTarget::Musl, GuestTarget::Gnu] {
         let mut command = Command::new("cargo");
-        command
+        environment
+            .configure(&mut command)
             .current_dir(source.join("conformance-probes"))
             .args([
                 "build",
@@ -682,10 +704,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
                 "--release",
                 "--target",
                 target.triple(),
-            ])
-            .env_remove("CARGO_TARGET_DIR")
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS");
+            ]);
         match target {
             GuestTarget::Musl => {
                 command.env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER", &lld);
@@ -707,12 +726,8 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
         "scripts/build-embed-el1-sched.sh",
     ] {
         run_build(
-            Command::new("bash")
-                .current_dir(&source)
-                .arg(script)
-                .env_remove("CARGO_TARGET_DIR")
-                .env_remove("RUSTFLAGS")
-                .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            environment
+                .configure(Command::new("bash").current_dir(&source).arg(script))
                 .env("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER", &lld),
         )?;
     }
@@ -740,6 +755,7 @@ pub fn build(root: &Path, sha: &str, output: Option<&Path>) -> Result<PathBuf> {
         schema: SCHEMA.into(),
         source_head: expected.clone(),
         sources,
+        build_policy: BuildPolicy::default(),
         toolchain,
         executables,
     };

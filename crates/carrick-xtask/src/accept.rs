@@ -774,9 +774,30 @@ fn run_command_redirect(
     Ok((extract_exit_code(&status).into(), duration_s))
 }
 
+/// Acceptance binds all discoverable build inputs to HEAD, including new files.
+/// Focused signed tests deliberately do not use this admission check.
+pub fn verify_clean_checkout(root: &Path) -> Result<(), AcceptError> {
+    let status = command::run_checked(
+        "git",
+        [
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+        Some(root),
+    )
+    .map_err(|error| AcceptError::Git(error.to_string()))?;
+    if !check_git_status(&status.stdout).0 {
+        return Err(AcceptError::Failed("acceptance requires a fully clean checkout (tracked and untracked inputs; gitignored outputs excluded)".into()));
+    }
+    Ok(())
+}
+
 pub fn verify_signed_fixtures(
     root: &Path,
 ) -> Result<crate::fixtures::ValidationReceipt, AcceptError> {
+    verify_clean_checkout(root)?;
     crate::fixtures::verify_installed_receipt(root).map_err(|error| {
         AcceptError::Failed(format!(
             "signed fixture provenance: {error}; restore an exact-HEAD bundle with xtask fixtures restore --manifest <path>"
@@ -796,6 +817,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
         crate::cli::resolve_repo_info(root_arg).map_err(|e| AcceptError::Git(e.to_string()))?;
     let root = repo_info.repository_root;
     let head = repo_info.head;
+    verify_clean_checkout(&root)?;
 
     let short_head_out = command::run_checked("git", ["rev-parse", "--short", "HEAD"], Some(&root))
         .map_err(|e| AcceptError::Git(e.to_string()))?;
@@ -812,15 +834,8 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
 
     let receipt_path = args.receipt.unwrap_or_else(|| run_dir.join("receipt.json"));
 
-    // Check git tree cleanliness
-    let git_status_out = command::run_checked("git", ["status", "--porcelain"], Some(&root))
-        .map_err(|e| AcceptError::Git(e.to_string()))?;
-    let (clean_tree, has_tracked_modifications) = check_git_status(&git_status_out.stdout);
-
+    let mut clean_tree = true;
     let mut failures = Vec::new();
-    if has_tracked_modifications {
-        failures.push("dirty tracked working tree (receipts belong to a commit)".to_string());
-    }
 
     let mut step_results = Vec::new();
     let mut skipped_steps = Vec::new();
@@ -1616,6 +1631,10 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
         }
     }
 
+    if let Err(error) = verify_clean_checkout(&root) {
+        clean_tree = false;
+        failures.push(error.to_string());
+    }
     let overall = if failures.is_empty() { "PASS" } else { "FAIL" };
 
     let receipt = AcceptReceipt {
