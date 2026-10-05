@@ -11,6 +11,7 @@ use carrick_aarch64::mailbox::{
 };
 use carrick_guest_mem::Aarch64SyscallFrame;
 use carrick_hal::threaded::Aarch64SyscallContinuationV1;
+use carrick_observability::probes::SyscallMailboxPhase;
 
 pub use carrick_mem::memory::{
     LINUX_SYSCALL_MAILBOX_ARENA_SIZE, LINUX_SYSCALL_MAILBOX_BASE,
@@ -608,6 +609,7 @@ impl MailboxBinding {
             };
             self.state()
                 .store(MailboxState::Idle.raw(), Ordering::Release);
+            self.trace_lifecycle(SyscallMailboxPhase::ClockRestart);
             Ok(Some(ClockKickRestart {
                 pc: resume_pc.wrapping_sub(4),
                 pstate,
@@ -637,6 +639,18 @@ impl MailboxBinding {
                 )),
             }
         }
+    }
+
+    fn trace_lifecycle(&self, phase: SyscallMailboxPhase) {
+        carrick_observability::probes::syscall_mailbox_lifecycle_with(phase, || {
+            let snapshot = self.diagnostics();
+            (
+                self.host.as_ptr() as u64,
+                snapshot.generation,
+                snapshot.sequence,
+                snapshot.state,
+            )
+        });
     }
     /// Bind a Carrick-owned slot to its fixed host mapping.
     ///
@@ -809,6 +823,7 @@ impl MailboxBinding {
         if self.lease.is_none() {
             return Err(MailboxConsumeError::AlreadyParked);
         }
+        self.trace_lifecycle(SyscallMailboxPhase::Capture);
         let state = self.state().load(Ordering::Acquire);
         if state == MailboxState::Idle.raw() {
             return Ok(None);
@@ -852,6 +867,7 @@ impl MailboxBinding {
         }
         self.last_sequence = continuation.sequence;
         self.restore_outstanding(continuation);
+        self.trace_lifecycle(SyscallMailboxPhase::Import);
         Ok(())
     }
 
@@ -865,6 +881,7 @@ impl MailboxBinding {
         self.state()
             .store(MailboxState::Idle.raw(), Ordering::Release);
         self.last_sequence = 0;
+        self.trace_lifecycle(SyscallMailboxPhase::Take);
         Ok(continuation)
     }
 
@@ -918,6 +935,7 @@ impl MailboxBinding {
             self.state()
                 .store(MailboxState::Idle.raw(), Ordering::Release);
         }
+        self.trace_lifecycle(SyscallMailboxPhase::Rebind);
     }
 
     /// Follow a stage-1 COW relocation of this slot without modifying the
@@ -975,6 +993,7 @@ impl MailboxBinding {
         validate_request_metadata(metadata, self.generation, self.last_sequence)
             .map_err(MailboxConsumeError::Protocol)?;
         self.last_sequence = metadata.sequence;
+        self.trace_lifecycle(SyscallMailboxPhase::RequestObserved);
         // Reaching validated host dispatch satisfies the latched boundary.
         unsafe {
             let flags = core::ptr::read_volatile(core::ptr::addr_of!((*self.host.as_ptr()).flags));
@@ -1021,6 +1040,7 @@ impl MailboxBinding {
         }
         self.state()
             .store(MailboxState::ResponseReady.raw(), Ordering::Release);
+        self.trace_lifecycle(SyscallMailboxPhase::Return);
         Ok(())
     }
 
@@ -1115,6 +1135,7 @@ impl MailboxBinding {
         }
         self.state()
             .store(MailboxState::ResponseReady.raw(), Ordering::Release);
+        self.trace_lifecycle(SyscallMailboxPhase::RegisterResume);
         Ok(())
     }
 
@@ -1136,6 +1157,7 @@ impl MailboxBinding {
                 }
                 self.state()
                     .store(MailboxState::ResponseReady.raw(), Ordering::Release);
+                self.trace_lifecycle(SyscallMailboxPhase::RegisterResume);
                 Ok(())
             }
             Ok(MailboxState::Idle) => Ok(()),
