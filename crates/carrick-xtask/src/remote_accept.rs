@@ -48,9 +48,39 @@ pub struct RemoteAcceptArgs {
 
     #[arg(
         long,
-        help = "Exact-SHA fixture manifest (default: unique local target/fixtures/bundles/<sha> bundle)"
+        help = "Exact-SHA fixture manifest (default: unique local target/fixtures/bundles/<sha> bundle)",
+        conflicts_with = "remote_bundle"
     )]
     pub fixture_manifest: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Path to exact-SHA fixture bundle already present on gate host",
+        conflicts_with = "fixture_manifest"
+    )]
+    pub remote_bundle: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FixtureBundle {
+    Local(String),
+    Remote(String),
+}
+
+impl FixtureBundle {
+    pub fn local(path: impl Into<String>) -> Self {
+        Self::Local(path.into())
+    }
+
+    pub fn remote(path: impl Into<String>) -> Self {
+        Self::Remote(path.into())
+    }
+
+    pub fn path(&self) -> &str {
+        match self {
+            Self::Local(p) | Self::Remote(p) => p,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -87,6 +117,8 @@ pub enum RemoteAcceptError {
     Fixtures(#[from] crate::fixtures::FixturesError),
     #[error("signed/all remote acceptance requires an exact-SHA fixture bundle")]
     MissingFixtureBundle,
+    #[error("receipt error: {0}")]
+    Receipt(String),
 }
 
 pub fn shell_quote(s: &str) -> String {
@@ -238,7 +270,7 @@ pub fn build_accept_job_script(
     log_file: &str,
     exit_file: &str,
     lock_dir: &str,
-    fixture_bundle: Option<&str>,
+    fixture_bundle: Option<FixtureBundle>,
 ) -> Result<String, RemoteAcceptError> {
     let env_file = Path::new(worktree_dir)
         .parent()
@@ -254,12 +286,22 @@ pub fn build_accept_job_script(
         format!("just accept --phase {phase}")
     } else {
         let bundle = fixture_bundle.ok_or(RemoteAcceptError::MissingFixtureBundle)?;
-        // One gate lease spans restoration, accept and scoped guest cleanup.
+        // One gate lease spans restoration/verification, accept and scoped guest cleanup.
         // The checkout lock is already held and remains held until job exit.
-        let preparation = format!(
-            "test -d {q_lock} && just fixtures-restore {} && just accept --phase {phase}",
-            shell_quote(bundle)
-        );
+        let preparation = match bundle {
+            FixtureBundle::Local(b) => {
+                format!(
+                    "test -d {q_lock} && just fixtures-restore {} && just accept --phase {phase}",
+                    shell_quote(&b)
+                )
+            }
+            FixtureBundle::Remote(b) => {
+                let q_bundle = shell_quote(&b);
+                format!(
+                    "test -d {q_lock} && just fixtures-verify {q_bundle} && just fixtures-restore {q_bundle} && just accept --phase {phase}"
+                )
+            }
+        };
         format!("just lease gate sh -c {}", shell_quote(&preparation))
     };
     Ok(format!(
@@ -274,7 +316,7 @@ pub fn build_detached_start_cmd(
     log_file: &str,
     exit_file: &str,
     lock_dir: &str,
-    fixture_bundle: Option<&str>,
+    fixture_bundle: Option<FixtureBundle>,
 ) -> Result<String, RemoteAcceptError> {
     let script = build_accept_job_script(
         worktree_dir,
@@ -284,6 +326,7 @@ pub fn build_detached_start_cmd(
         lock_dir,
         fixture_bundle,
     )?;
+
     Ok(format!(
         "mkdir -p {} && nohup sh -c {} >/dev/null 2>&1 </dev/null &",
         shell_quote(run_dir),
@@ -542,11 +585,16 @@ fn copy_fixture_bundle(
     run_dir: &str,
     sha: &str,
     manifest: Option<&Path>,
-) -> Result<String, RemoteAcceptError> {
+) -> Result<(String, String, String), RemoteAcceptError> {
     let manifest = crate::fixtures::resolve_bundle(local_root, sha, manifest)?;
     let artifact =
         crate::fixtures::archive::pack(&manifest, &local_root.join("target/fixtures/published"))?;
-    crate::fixtures::archive::verify(&artifact, sha)?;
+    let (_verified_manifest, identity) = crate::fixtures::archive::verify(&artifact, sha)?;
+    let archive_sha256 =
+        crate::provision::compute_sha256(&artifact).map_err(|e| RemoteAcceptError::Io {
+            path: artifact.clone(),
+            source: e,
+        })?;
     let destination = format!("{run_dir}/fixtures");
     run_ssh_command(host, &format!("mkdir -p {}", shell_quote(&destination)))?;
     let filename = artifact
@@ -560,7 +608,56 @@ fn copy_fixture_bundle(
         rsync_args(&artifact.to_string_lossy(), &remote_spec),
         None,
     )?;
-    Ok(remote_artifact)
+    Ok((remote_artifact, identity, archive_sha256))
+}
+
+pub fn parse_remote_bundle_verification(log: &str) -> Option<(String, String)> {
+    for line in log.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("fixtures: verified ") {
+            let identity_part = trimmed.split("identity=").nth(1)?;
+            let mut parts = identity_part.split_whitespace();
+            let identity = parts.next()?;
+            let sha_part = trimmed.split("archive_sha256=").nth(1)?;
+            let archive_sha256 = sha_part.split_whitespace().next()?;
+            if !identity.is_empty() && !archive_sha256.is_empty() {
+                return Some((identity.to_string(), archive_sha256.to_string()));
+            }
+        }
+    }
+    None
+}
+
+pub fn record_bundle_in_receipt(
+    receipt_path: &Path,
+    bundle_receipt: &crate::accept::FixtureBundleReceipt,
+) -> Result<(), RemoteAcceptError> {
+    let bytes = fs::read(receipt_path).map_err(|e| RemoteAcceptError::Io {
+        path: receipt_path.to_path_buf(),
+        source: e,
+    })?;
+    let mut receipt: crate::accept::AcceptReceipt =
+        serde_json::from_slice(&bytes).map_err(|e| RemoteAcceptError::Receipt(e.to_string()))?;
+    receipt.fixture_bundle = Some(bundle_receipt.clone());
+    let serialized = serde_json::to_vec_pretty(&receipt)
+        .map_err(|e| RemoteAcceptError::Receipt(e.to_string()))?;
+    fs::write(receipt_path, serialized).map_err(|e| RemoteAcceptError::Io {
+        path: receipt_path.to_path_buf(),
+        source: e,
+    })?;
+    Ok(())
+}
+
+fn record_bundle_if_receipt_present(
+    local_receipt: &Path,
+    receipt_entry: &crate::accept::FixtureBundleReceipt,
+) {
+    if !local_receipt.is_file() {
+        return;
+    }
+    if let Err(e) = record_bundle_in_receipt(local_receipt, receipt_entry) {
+        eprintln!("Warning: failed to record fixture bundle in receipt: {e}");
+    }
 }
 
 pub(crate) fn check_remote_disk_space(
@@ -651,6 +748,17 @@ pub(crate) fn build_worktree_clean_check_cmd(worktree: &str) -> String {
     format!("if [ -d {q_wt} ]; then git -C {q_wt} status --porcelain --untracked-files=all; fi")
 }
 
+enum BundleTracking {
+    Local {
+        remote_artifact: String,
+        identity: String,
+        archive_sha256: String,
+    },
+    Remote {
+        path: String,
+    },
+}
+
 pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, RemoteAcceptError> {
     let local_root = match root_opt {
         Some(r) => r.to_path_buf(),
@@ -671,10 +779,14 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         .to_string_lossy()
         .to_string();
 
-    let (run_id, sha12) = if let Some(existing_run_id) = &args.attach {
+    let (run_id, sha12, bundle_tracking) = if let Some(existing_run_id) = &args.attach {
         let (parsed_sha, _) = parse_run_id(existing_run_id)?;
         println!("Attaching to remote run: {existing_run_id}");
-        (existing_run_id.clone(), parsed_sha.to_string())
+        let tracking = args
+            .remote_bundle
+            .as_ref()
+            .map(|path| BundleTracking::Remote { path: path.clone() });
+        (existing_run_id.clone(), parsed_sha.to_string(), tracking)
     } else {
         // Step 1: Resolve the ref to a full SHA locally. Refuse if local tracked tree is dirty AND ref is HEAD.
         let full_sha_out =
@@ -715,17 +827,33 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         )?;
 
         let run_dir = format!("{remote_root}/gate-runs/{run_id}");
-        let bundle = if args.phase == AcceptPhase::Host {
-            None
+        let (bundle, bundle_tracking) = if args.phase == AcceptPhase::Host {
+            (None, None)
+        } else if let Some(remote_bundle_path) = &args.remote_bundle {
+            println!("Using remote fixture bundle on {host}: {remote_bundle_path}...");
+            (
+                Some(FixtureBundle::Remote(remote_bundle_path.clone())),
+                Some(BundleTracking::Remote {
+                    path: remote_bundle_path.clone(),
+                }),
+            )
         } else {
             println!("Transferring exact-SHA fixture bundle...");
-            Some(copy_fixture_bundle(
+            let (remote_artifact, identity, archive_sha256) = copy_fixture_bundle(
                 &local_root,
                 &host,
                 &run_dir,
                 &full_sha,
                 args.fixture_manifest.as_deref(),
-            )?)
+            )?;
+            (
+                Some(FixtureBundle::Local(remote_artifact.clone())),
+                Some(BundleTracking::Local {
+                    remote_artifact,
+                    identity,
+                    archive_sha256,
+                }),
+            )
         };
 
         // Step 4: Start detached accept gate on remote
@@ -740,7 +868,7 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
             &log_file,
             &exit_file,
             &lock_dir,
-            bundle.as_deref(),
+            bundle,
         )?;
 
         println!("Starting detached accept gate on {host}...");
@@ -750,7 +878,7 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
         // Disarm the local guard so it never removes the lock on drop.
         lock_guard.disarm();
 
-        (run_id, sha12)
+        (run_id, sha12, bundle_tracking)
     };
 
     let gate_runs_dir = format!("{remote_root}/gate-runs");
@@ -840,8 +968,9 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
     }
 
     let mut exit_code = exit_code;
-    if let Ok(log_content) = fs::read_to_string(&local_log_dest) {
-        if let Some(summary) = extract_summary(&log_content) {
+    let log_read_result = fs::read_to_string(&local_log_dest);
+    if let Ok(log_content) = &log_read_result {
+        if let Some(summary) = extract_summary(log_content) {
             println!("\n{summary}");
         } else {
             eprintln!("Warning: no ACCEPT GATE SUMMARY block found in accept.log");
@@ -870,6 +999,48 @@ pub fn run(root_opt: Option<&Path>, args: RemoteAcceptArgs) -> Result<i32, Remot
     } else {
         eprintln!("Warning: receipt missing at {}", local_receipt.display());
         exit_code = 1;
+    }
+
+    if let Some(tracking) = bundle_tracking {
+        match tracking {
+            BundleTracking::Local {
+                remote_artifact,
+                identity,
+                archive_sha256,
+            } => {
+                let receipt_entry = crate::accept::FixtureBundleReceipt {
+                    source: "local".to_string(),
+                    path: remote_artifact,
+                    identity,
+                    archive_sha256,
+                };
+                record_bundle_if_receipt_present(&local_receipt, &receipt_entry);
+            }
+            BundleTracking::Remote { path } => {
+                if let Ok(log) = &log_read_result {
+                    if let Some((identity, archive_sha256)) = parse_remote_bundle_verification(log)
+                    {
+                        let receipt_entry = crate::accept::FixtureBundleReceipt {
+                            source: "remote".to_string(),
+                            path,
+                            identity,
+                            archive_sha256,
+                        };
+                        record_bundle_if_receipt_present(&local_receipt, &receipt_entry);
+                    } else {
+                        eprintln!("Error: remote bundle verification missing in accept.log");
+                        if exit_code == 0 {
+                            exit_code = 1;
+                        }
+                    }
+                } else {
+                    eprintln!("Error: could not read accept.log to verify remote bundle");
+                    if exit_code == 0 {
+                        exit_code = 1;
+                    }
+                }
+            }
+        }
     }
 
     let prune_cmd = build_prune_runs_cmd(&gate_runs_dir, MAX_RECENT_GATE_RUNS);
@@ -1285,5 +1456,149 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
         ));
         assert!(cmd.contains("echo RECOVERED"));
         assert!(cmd.contains("echo ACTIVE"));
+    }
+
+    #[test]
+    fn test_remote_bundle_command_construction() {
+        let worktree = "/Volumes/carrick/work tree with spaces";
+        let log_file = "/Volumes/carrick/gate runs/123/accept.log";
+        let exit_file = "/Volumes/carrick/gate runs/123/exit";
+        let lock_dir = "/Volumes/carrick/gate-worktree.lock";
+        let remote_bundle_path =
+            "/Volumes/carrick-build/fixtures/published/sha with spaces/identity.tar.gz";
+
+        let script = build_accept_job_script(
+            worktree,
+            AcceptPhase::Signed,
+            log_file,
+            exit_file,
+            lock_dir,
+            Some(FixtureBundle::remote(remote_bundle_path)),
+        )
+        .unwrap();
+
+        let q_bundle_escaped = shell_quote(remote_bundle_path).replace('\'', "'\\''");
+        let expected_verify = format!("just fixtures-verify {q_bundle_escaped}");
+        let expected_restore = format!("just fixtures-restore {q_bundle_escaped}");
+
+        assert!(script.contains(&expected_verify));
+        assert!(script.contains(&expected_restore));
+        assert!(script.contains("just accept --phase signed"));
+
+        let verify_idx = script.find(&expected_verify).expect("verify in script");
+        let restore_idx = script.find(&expected_restore).expect("restore in script");
+        assert!(
+            verify_idx < restore_idx,
+            "fixtures-verify must occur before fixtures-restore"
+        );
+
+        // Local bundle must NOT run fixtures-verify on the remote host
+        let local_script = build_accept_job_script(
+            worktree,
+            AcceptPhase::Signed,
+            log_file,
+            exit_file,
+            lock_dir,
+            Some(FixtureBundle::local("/Volumes/carrick/local.tar.gz")),
+        )
+        .unwrap();
+
+        assert!(!local_script.contains("just fixtures-verify"));
+        let local_escaped = shell_quote("/Volumes/carrick/local.tar.gz").replace('\'', "'\\''");
+        assert!(local_script.contains(&format!("just fixtures-restore {local_escaped}")));
+    }
+
+    #[test]
+    fn test_parse_remote_bundle_verification() {
+        let sample_log = r#"
+just fixtures-verify '/Volumes/carrick-build/fixtures/published/sha/identity.tar.gz'
+fixtures: verified 14 executables for 51bfe67f40123456789abcdef0123456789abcdef; identity=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 archive_sha256=ca978112ca1bbdccafac231b39a23dc4da786eff8147c4e72b9807785afee48b
+just fixtures-restore '/Volumes/carrick-build/fixtures/published/sha/identity.tar.gz'
+just accept --phase signed
+"#;
+        let (identity, archive_sha) =
+            parse_remote_bundle_verification(sample_log).expect("parse remote bundle verification");
+        assert_eq!(
+            identity,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            archive_sha,
+            "ca978112ca1bbdccafac231b39a23dc4da786eff8147c4e72b9807785afee48b"
+        );
+
+        assert!(parse_remote_bundle_verification("no fixtures line here").is_none());
+    }
+
+    #[test]
+    fn test_record_bundle_in_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let receipt_path = tmp.path().join("receipt.json");
+        let initial_receipt = crate::accept::AcceptReceipt {
+            schema_version: 1,
+            timestamp: "20261005-120000".to_string(),
+            head: "0123456789abcdef".to_string(),
+            clean_tree: true,
+            phase: "signed".to_string(),
+            profile: "no-docker".to_string(),
+            overall: "PASS".to_string(),
+            steps: vec![],
+            skipped_steps: vec![],
+            artifact: None,
+            el1: None,
+            probe_diffs: vec![],
+            cleanup_counts: vec![],
+            host_load: Default::default(),
+            failures: vec![],
+            fixture_bundle: None,
+        };
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&initial_receipt).unwrap(),
+        )
+        .unwrap();
+
+        let remote_bundle_receipt = crate::accept::FixtureBundleReceipt {
+            source: "remote".to_string(),
+            path: "/Volumes/carrick-build/fixtures/published/sha/identity.tar.gz".to_string(),
+            identity: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
+            archive_sha256: "ca978112ca1bbdccafac231b39a23dc4da786eff8147c4e72b9807785afee48b"
+                .to_string(),
+        };
+
+        record_bundle_in_receipt(&receipt_path, &remote_bundle_receipt).unwrap();
+
+        let updated_bytes = fs::read(&receipt_path).unwrap();
+        let updated: crate::accept::AcceptReceipt = serde_json::from_slice(&updated_bytes).unwrap();
+        assert_eq!(updated.fixture_bundle, Some(remote_bundle_receipt));
+
+        // Test with local bundle
+        let local_bundle_receipt = crate::accept::FixtureBundleReceipt {
+            source: "local".to_string(),
+            path: "/Volumes/carrick/dev/gate-runs/123/fixtures/identity.tar.gz".to_string(),
+            identity: "1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            archive_sha256: "2222222222222222222222222222222222222222222222222222222222222222"
+                .to_string(),
+        };
+        record_bundle_in_receipt(&receipt_path, &local_bundle_receipt).unwrap();
+        let updated2: crate::accept::AcceptReceipt =
+            serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+        assert_eq!(updated2.fixture_bundle, Some(local_bundle_receipt));
+    }
+
+    #[test]
+    fn test_remote_bundle_failure_mapping() {
+        let err = build_accept_job_script(
+            "/worktree",
+            AcceptPhase::Signed,
+            "/log",
+            "/exit",
+            "/lock",
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, RemoteAcceptError::MissingFixtureBundle));
     }
 }

@@ -114,6 +114,11 @@ fixtures-publish SHA:
 fixtures-restore BUNDLE:
     cargo run --locked -p carrick-xtask -- fixtures restore --bundle {{quote(BUNDLE)}}
 
+# Verify the exact-SHA fixture archive before restoration on the gate host.
+fixtures-verify BUNDLE:
+    cargo run --locked -p carrick-xtask -- fixtures verify --bundle {{quote(BUNDLE)}}
+
+
 # Return a reviewed-position-only patch from the same locked cloudmac worktree.
 # Apply and commit locally; this command never applies the patch for you.
 remote-recapture *ARGS:

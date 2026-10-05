@@ -136,6 +136,14 @@ pub struct CleanupCount {
     pub remaining_count: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FixtureBundleReceipt {
+    pub source: String,
+    pub path: String,
+    pub identity: String,
+    pub archive_sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AcceptReceipt {
     pub schema_version: u32,
@@ -158,6 +166,8 @@ pub struct AcceptReceipt {
     pub probe_diffs: Vec<ProbeDiff>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cleanup_counts: Vec<CleanupCount>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixture_bundle: Option<FixtureBundleReceipt>,
     #[serde(default)]
     pub host_load: crate::host_load::HostLoadReport,
     pub failures: Vec<String>,
@@ -1652,6 +1662,7 @@ pub fn run(root_arg: Option<&Path>, mut args: AcceptArgs) -> Result<(), AcceptEr
         el1: el1_summary,
         probe_diffs,
         cleanup_counts,
+        fixture_bundle: None,
         host_load,
         failures: failures.clone(),
     };
@@ -1973,6 +1984,7 @@ thread 'test_probe_futex' panicked at 'explicit panic', tests/foo.rs:12:5
             el1: None,
             probe_diffs: vec![],
             cleanup_counts: vec![],
+            fixture_bundle: None,
             host_load: crate::host_load::HostLoadReport::default(),
             failures: vec![],
         };
