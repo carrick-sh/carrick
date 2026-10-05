@@ -18,6 +18,7 @@ workspace = true
 test-support = []
 
 [dependencies]
+carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-abi = { path = "../carrick-abi" }
 # Neutral sealed owner receipts carry Fork across task/backend publication.
