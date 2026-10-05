@@ -85,13 +85,7 @@ pub struct ExtentToReturn {
     pub slot_idx: usize,
 }
 
-/// Receipt for a granted host extent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExtentGrantReceipt {
-    pub base_va: u64,
-    pub size: usize,
-    pub token: u64,
-}
+pub use carrick_el1_abi::ExtentGrantReceipt;
 
 /// Errors occurring during extent admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1258,6 +1252,16 @@ pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
             0
         }
         _ => 1,
+    }
+}
+
+// SAFETY: MetadataStorage owns its granted extents through carrier teardown.
+unsafe impl carrick_core::mm::reservation::ReservationMetadataAllocator for MetadataStorage {
+    fn allocate_with_extent(&self, layout: Layout) -> Option<(*mut u8, ExtentGrantReceipt)> {
+        MetadataStorage::allocate_with_extent(self, layout)
+    }
+    fn deallocate(&self, ptr: *mut u8, layout: Layout) {
+        MetadataStorage::deallocate(self, ptr, layout)
     }
 }
 

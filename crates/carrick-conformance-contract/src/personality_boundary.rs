@@ -35,6 +35,8 @@ use thiserror::Error;
 
 /// Default allowlist of substrate crates subject to boundary verification.
 pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
+    "carrick-core",
+    "carrick-core-abi",
     "carrick-sched-core",
     "carrick-mmu-core",
     "carrick-signal-core",
@@ -46,6 +48,7 @@ pub const DEFAULT_SUBSTRATE_ALLOWLIST: &[&str] = &[
 
 /// Designated Linux personality or ABI crates forbidden in substrate dependency closures.
 pub const FORBIDDEN_PERSONALITY_CRATES: &[&str] = &[
+    "carrick-personality-linux",
     "carrick-abi",
     "carrick-el1-abi",
     "carrick-signal-linux",
@@ -381,7 +384,15 @@ pub fn check_substrate_boundary(
         let mixed_el1 = crate_name == "carrick-el1";
         let el1_forbidden = forbidden_crates
             .iter()
-            .filter(|name| name.as_str() != "carrick-el1-abi")
+            // The image binds both the neutral owner and its Linux client.
+            // Its neutral modules are independently checked below; permitting
+            // the image dependency never permits a substrate import of it.
+            .filter(|name| {
+                !matches!(
+                    name.as_str(),
+                    "carrick-el1-abi" | "carrick-personality-linux"
+                )
+            })
             .cloned()
             .collect();
         let substrate_pkg = audit_crate_dependencies_metadata(
@@ -815,6 +826,7 @@ fn audit_el1_modules(
             "dispatch_syscall",
             "serve_futex",
             "carrick_inotify_core",
+            "carrick_personality_linux",
         ]
         .map(str::to_string),
     );
@@ -1145,6 +1157,8 @@ impl<'a> SourceCheckerVisitor<'a> {
                 resolved.pop();
                 rest = &rest[1..];
             }
+        } else if parts[0] == "carrick_personality_linux" {
+            resolved.push("personality".to_string());
         } else {
             return;
         }
@@ -1428,6 +1442,215 @@ impl<'ast, 'a> Visit<'ast> for SourceCheckerVisitor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mm_transfer_records_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let neutral = repo.join("crates/carrick-core-abi/src/mm/transfer.rs");
+        let source = fs::read_to_string(&neutral)
+            .expect("MM transport must move into core-abi before either ISA consumes it");
+        let items = syn::parse_file(&source).unwrap();
+        for name in [
+            "El1MmHandle",
+            "PortalTransferRequest",
+            "PortalPreparedPermit",
+            "PortalTransferSlot",
+            "PortalTransferService",
+        ] {
+            assert_eq!(
+                items
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item,
+                syn::Item::Struct(record) if record.ident == name))
+                    .count(),
+                1,
+                "neutral ABI must own {name} exactly once"
+            );
+            let old =
+                fs::read_to_string(repo.join("crates/carrick-el1-abi/src/mm_portal.rs")).unwrap();
+            assert!(
+                !old.contains(&format!("pub struct {name} {{")),
+                "ARM transport must not retain displaced {name}"
+            );
+        }
+        let old_owner = fs::read_to_string(
+            repo.join("crates/carrick-el1/src/personality/mm_portal/production.rs"),
+        )
+        .unwrap();
+        assert!(
+            !old_owner.contains("pub struct TransferContinuation"),
+            "the old portal must not retain a displaced transfer cursor"
+        );
+        let manifest = fs::read_to_string(repo.join("crates/carrick-core-abi/Cargo.toml")).unwrap();
+        assert!(!manifest.contains("carrick-el1-abi"));
+        assert!(!source.contains("TrapFrame"));
+    }
+
+    #[test]
+    fn mm_prepared_custody_and_linux_policy_have_one_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let old = fs::read_to_string(
+            repo.join("crates/carrick-el1/src/personality/reservations/prepared.rs"),
+        )
+        .unwrap_or_default();
+        assert!(
+            !old.contains("pub struct ClaimedPreparedCopy"),
+            "prepared-copy claim custody must move out of the ARM personality"
+        );
+        let old =
+            fs::read_to_string(repo.join("crates/carrick-el1/src/personality/reservations.rs"))
+                .unwrap();
+        assert!(
+            !old.contains("struct Node {"),
+            "the original node store must use neutral records"
+        );
+        let neutral =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/reservation/prepared.rs"))
+                .unwrap();
+        assert!(neutral.contains("pub struct ClaimedPreparedCopy"));
+        assert!(!neutral.contains("carrick_el1"));
+        let policy =
+            fs::read_to_string(repo.join("crates/carrick-personality-linux/src/mm.rs")).unwrap();
+        assert!(policy.contains("impl carrick_core_abi::ReservationPolicy"));
+        let neutral_abi =
+            fs::read_to_string(repo.join("crates/carrick-core-abi/src/mm/reservation.rs")).unwrap();
+        for item in syn::parse_file(&neutral_abi).unwrap().items {
+            if let syn::Item::Struct(record) = &item
+                && record.ident == "Layout"
+            {
+                for field in &record.fields {
+                    assert!(
+                        !matches!(
+                            field.ident.as_ref().unwrap().to_string().as_str(),
+                            "brk"
+                                | "address_limit"
+                                | "data_limit"
+                                | "external_address_bytes"
+                                | "external_data_bytes"
+                        ),
+                        "Linux state belongs to the selected client's opaque payload"
+                    );
+                }
+            }
+            if let syn::Item::Impl(implementation) = item {
+                for item in implementation.items {
+                    if let syn::ImplItem::Fn(method) = item {
+                        assert!(
+                            method.sig.ident != "root_editable"
+                                && method.sig.ident != "charges_data",
+                            "the neutral ABI may declare policy hooks, but must not interpret Linux ownership or limits"
+                        );
+                    }
+                }
+            }
+        }
+        let owner = fs::read_to_string(repo.join("crates/carrick-core/src/mm/reservation/root.rs"))
+            .unwrap();
+        let production = owner.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(!production.contains("ReservationNodeFlags::DONTFORK"));
+        assert!(!production.contains("ReservationNodeFlags::WIPEONFORK"));
+        let owner = syn::parse_file(&owner).unwrap();
+        for item in owner.items {
+            if let syn::Item::Impl(implementation) = item {
+                for item in implementation.items {
+                    if let syn::ImplItem::Fn(method) = item
+                        && matches!(
+                            method.sig.ident.to_string().as_str(),
+                            "place" | "mmap" | "mremap" | "brk"
+                        )
+                    {
+                        assert_eq!(
+                            method.block.stmts.len(),
+                            1,
+                            "Linux {} decisions must move to the selected client policy",
+                            method.sig.ident
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn neutral_mm_crates_are_subject_to_the_personality_boundary() {
+        for name in ["carrick-core", "carrick-core-abi"] {
+            assert!(
+                DEFAULT_SUBSTRATE_ALLOWLIST.contains(&name),
+                "{name} must be audited"
+            );
+        }
+        assert!(FORBIDDEN_PERSONALITY_CRATES.contains(&"carrick-personality-linux"));
+    }
+
+    #[test]
+    fn mm_reservation_root_storage_and_admission_have_one_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let old =
+            fs::read_to_string(repo.join("crates/carrick-el1/src/personality/reservations.rs"))
+                .unwrap();
+        assert!(
+            !old.contains("pub struct SharedReservations"),
+            "the physical owner table must move, not be wrapped"
+        );
+        assert!(
+            !old.contains("fn lock_using"),
+            "root admission must have one neutral implementation"
+        );
+        let owner = fs::read_to_string(repo.join("crates/carrick-core/src/mm/reservation/root.rs"))
+            .unwrap();
+        assert!(owner.contains("pub struct SharedReservations"));
+        assert!(owner.contains("fn lock_using"));
+        let production = owner.split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(!production.contains("carrick_el1"));
+    }
+
+    #[test]
+    fn mm_selection_and_service_transaction_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let old = fs::read_to_string(
+            repo.join("crates/carrick-el1/src/personality/mm_portal/production.rs"),
+        )
+        .unwrap();
+        for body in [
+            "pub struct MmPortal",
+            "pub fn select<",
+            "pub fn revalidate<",
+            "fn settle_prepared_service<",
+        ] {
+            assert!(
+                !old.contains(body),
+                "move the original {body} body; do not retain an ARM owner"
+            );
+        }
+        let owner =
+            fs::read_to_string(repo.join("crates/carrick-core/src/mm/transaction/owner.rs"))
+                .unwrap();
+        assert!(owner.contains("pub struct MmPortal"));
+        assert!(owner.contains("pub fn select<"));
+        assert!(owner.contains("pub fn revalidate<"));
+        assert!(!owner.contains("carrick_el1"));
+        assert!(!owner.contains("TrapFrame"));
+        let records =
+            fs::read_to_string(repo.join("crates/carrick-core-abi/src/mm/residency.rs")).unwrap();
+        assert!(records.contains("pub struct FrameGrantResidencyTable"));
+        let old_records =
+            fs::read_to_string(repo.join("crates/carrick-el1-abi/src/lib.rs")).unwrap();
+        assert!(!old_records.contains("pub struct FrameGrantResidencyTable"));
+        let old_tests =
+            fs::read_to_string(repo.join("crates/carrick-el1/src/personality/mm_portal/tests.rs"))
+                .unwrap();
+        for witness in [
+            "transfer_revalidates_exact_mm_before_copy",
+            "prepared_copy_commit_and_cancel_never_acquire_held_root_or_editor",
+        ] {
+            assert!(
+                !old_tests.contains(&format!("fn {witness}(")),
+                "move {witness} assertions with their owner"
+            );
+        }
+    }
+
     use serde_json::{Value, json};
 
     struct Fixture {
@@ -1522,6 +1745,7 @@ mod tests {
     fn el1_substrate_rejects_personality_imports_and_root_facades() {
         for code in [
             "use crate::personality::sched as linux;",
+            "use carrick_personality_linux::mm::LinuxReservationPolicy;",
             "use crate::file::read_with;",
             "use crate::*;",
             "use super::super::sched::Sched;",

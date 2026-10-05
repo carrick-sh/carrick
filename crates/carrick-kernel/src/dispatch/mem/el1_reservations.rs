@@ -213,7 +213,8 @@ fn admit_bind(
     let host = HostCharges::at_admission(mem);
     root.with_root_for_import(|model| {
         let result = (|| {
-            let mut import = model.layout();
+            let mut import =
+                carrick_personality_linux::mm::LinuxReservationLayout::from(model.layout());
             import.heap = heap;
             import.arena = arena;
             import.brk = brk;

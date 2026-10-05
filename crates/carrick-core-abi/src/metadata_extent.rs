@@ -65,3 +65,11 @@ pub trait MetadataExtentResolver {
     type Pin: PinnedMetadataExtent;
     fn pin(&self, extent: MetadataExtent) -> Result<Self::Pin, MetadataResolutionError>;
 }
+
+/// Receipt for a granted host extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExtentGrantReceipt {
+    pub base_va: u64,
+    pub size: usize,
+    pub token: u64,
+}

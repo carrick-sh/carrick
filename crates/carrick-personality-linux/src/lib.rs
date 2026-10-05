@@ -1,0 +1,4 @@
+//! Linux interpretation of neutral owner records.
+#![no_std]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+pub mod mm;

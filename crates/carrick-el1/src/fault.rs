@@ -80,57 +80,9 @@ pub fn is_write_permission_fault(esr: u64) -> bool {
     matches!(ec, 0x24 | 0x25) && is_write && matches!(dfsc, 0x0c..=0x0f)
 }
 
-/// Operation needed to resolve a COW fault in EL1. The caller holds the
-/// faulting MM's exact editor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CowResolution {
-    Resolved,
-    NeedsSupply,
-    Refused,
-}
-
-pub trait CowResolver {
-    /// Resolve the write fault at `far` for `mm_key`, whose live root and
-    /// ASID are in `ttbr0`. `true`: retry the faulting instruction.
-    fn resolve_cow(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> bool;
-    fn executable_publication(&self) -> bool {
-        false
-    }
-    fn resolve_cow_outcome(&mut self, ttbr0: u64, mm_key: u64, far: u64) -> CowResolution {
-        if self.resolve_cow(ttbr0, mm_key, far) {
-            CowResolution::Resolved
-        } else {
-            CowResolution::Refused
-        }
-    }
-    fn take_cow_completion(&mut self) -> Option<carrick_el1_abi::CowGrantCompletion> {
-        None
-    }
-    /// The MM's editor could not be taken (another EL1 editor, or a host
-    /// pause closed its gate): the fault goes to the host.
-    fn editor_busy(&mut self) {}
-}
-
-#[derive(Default)]
-pub struct NoopCowResolver;
-
-impl CowResolver for NoopCowResolver {
-    fn resolve_cow(&mut self, _ttbr0: u64, _mm_key: u64, _far: u64) -> bool {
-        false
-    }
-}
-
-pub trait PreparedPageResolver {
-    fn commit_prepared(
-        &mut self,
-        ttbr0: u64,
-        va: u64,
-        expected_ipa: u64,
-        access: LeafAccess,
-    ) -> Result<GuestPreparedCommit, GuestPreparedCommitError>;
-}
-
-pub struct NoopPreparedResolver;
+pub use carrick_core::mm::transfer::resolver::{
+    CowResolution, CowResolver, NoopCowResolver, NoopPreparedResolver, PreparedPageResolver,
+};
 
 pub struct PreparedFaultPath<'a, P: PreparedPageResolver> {
     pub residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
@@ -172,18 +124,6 @@ fn root_admits_commit(
             || carrick_el1_abi::ReservationProtection::from_bits(bits)
                 .is_some_and(|access| mapping.protection.permits(access))
     }))
-}
-
-impl PreparedPageResolver for NoopPreparedResolver {
-    fn commit_prepared(
-        &mut self,
-        _ttbr0: u64,
-        _va: u64,
-        _expected_ipa: u64,
-        _access: LeafAccess,
-    ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
-        Err(GuestPreparedCommitError::NotPrepared)
-    }
 }
 
 #[cfg(target_os = "none")]
@@ -264,6 +204,26 @@ pub struct HardwareCowResolver {
 
 #[cfg(target_os = "none")]
 impl CowResolver for HardwareCowResolver {
+    fn reconcile_parent_write<
+        W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    >(
+        &mut self,
+        slot: u32,
+        handle: carrick_el1_abi::El1MmHandle,
+        sequence: core::num::NonZeroU64,
+        completion: carrick_el1_abi::CowGrantCompletion,
+        words: &W,
+    ) -> Result<(), crate::personality::mm_portal::MmError> {
+        crate::personality::mm_portal::reconcile_pending_parent_write(
+            slot as usize,
+            handle,
+            sequence,
+            completion,
+            words,
+        )?;
+        Ok(())
+    }
+
     fn take_cow_completion(&mut self) -> Option<carrick_el1_abi::CowGrantCompletion> {
         self.completion.take()
     }

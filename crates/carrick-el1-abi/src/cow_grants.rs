@@ -33,6 +33,7 @@
 //! of its key. A full chain only declines the guest fast path (the fault is
 //! forwarded and the host resolves it as before).
 
+pub use carrick_core_abi::{COW_GRANT_SIZE, CowGrant, CowGrantCompletion, CowGrantPurpose};
 use carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity;
 use carrick_sched_core::ExcludedEditor;
 use core::num::NonZeroU64;
@@ -42,8 +43,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const COW_GRANT_POOL_SLOTS: usize = 1024;
 /// Probe chain length for one MM's records.
 pub const COW_GRANT_PROBES: usize = 64;
-/// Bytes of one grant: the host COW compound.
-pub const COW_GRANT_SIZE: u64 = 16 * 1024;
 /// Protocol revision, folded into [`crate::EL1_ABI_LAYOUT_HASH`].
 pub const COW_GRANT_PROTOCOL_VERSION: u64 = 2;
 
@@ -54,7 +53,6 @@ const CLAIMED: u64 = 3;
 const USED: u64 = 4;
 const STATE_MASK: u64 = 7;
 const EPOCH_ONE: u64 = 8;
-const PAGE: u64 = 4096;
 
 /// Why EL1 left a COW write fault to the host. Indexes
 /// [`CowGrantPool::declined`].
@@ -87,59 +85,6 @@ pub enum CowDecline {
 
 /// Number of [`CowDecline`] reasons.
 pub const COW_DECLINE_REASONS: usize = 9;
-
-/// One ready grant as EL1 claimed it, or as the host published it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CowGrant {
-    pub slot: usize,
-    /// The record's state word at publication, without the state bits.
-    pub epoch: u64,
-    pub mm_key: u64,
-    /// 16 KiB-aligned IPA of the replacement compound.
-    pub physical_ipa: u64,
-    pub backing: BackingIdentity,
-}
-
-/// Which owner operation licensed the physical replacement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u64)]
-pub enum CowGrantPurpose {
-    UserWrite = 0,
-    RetiredBacking = 1,
-    /// Malformed wire receipt; never accepted for publication or settlement.
-    Invalid = 2,
-}
-
-/// One guest COW EL1 completed with a grant: `[span_va, span_va + span_len)`
-/// moved from `old_ipa` (the span's first page) to `new_ipa`, both inside
-/// their 16 KiB compounds at the same offset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CowGrantCompletion {
-    pub purpose: CowGrantPurpose,
-    pub grant: CowGrant,
-    pub span_va: u64,
-    pub span_len: u64,
-    pub old_ipa: u64,
-    pub new_ipa: u64,
-}
-
-impl CowGrantCompletion {
-    /// Whether the completion describes a repoint inside one grant compound
-    /// from one old compound at the same offset, page-granular and nonempty.
-    #[must_use]
-    pub fn is_well_formed(&self) -> bool {
-        let offset = self.new_ipa.wrapping_sub(self.grant.physical_ipa);
-        self.purpose != CowGrantPurpose::Invalid
-            && self.span_len != 0
-            && self.span_len.is_multiple_of(PAGE)
-            && self.span_va.is_multiple_of(PAGE)
-            && self.old_ipa.is_multiple_of(PAGE)
-            && self.new_ipa >= self.grant.physical_ipa
-            && offset + self.span_len <= COW_GRANT_SIZE
-            && (self.old_ipa & (COW_GRANT_SIZE - 1)) == offset
-            && self.span_va.checked_add(self.span_len).is_some()
-    }
-}
 
 /// One pool record. The state word is published last (Release) by its
 /// owner and read first (Acquire) by the other venue.
