@@ -48,24 +48,9 @@ FILE_TABLE_INTERNAL_FIELDS = frozenset(
     }
 )
 
+# The Rust census and its macro fail-closed check consume this same vocabulary.
 LOCK_METHODS = frozenset(
-    {
-        "lock",
-        "try_lock",
-        "try_lock_for",
-        "try_lock_until",
-        "lock_arc",
-        "read",
-        "try_read",
-        "try_read_for",
-        "try_read_until",
-        "read_arc",
-        "write",
-        "try_write",
-        "try_write_for",
-        "try_write_until",
-        "write_arc",
-    }
+    json.loads((REPO_ROOT / "scripts/migrate/authority-vocabulary.json").read_text())["raw_lock"]
 )
 
 

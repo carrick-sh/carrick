@@ -1,9 +1,9 @@
 pub mod accept;
 pub mod asm_diff;
 mod atomic_file;
-pub mod ci_scaler;
 pub mod authority_debt;
 pub mod authority_source;
+pub mod ci_scaler;
 pub mod cli;
 pub mod command;
 pub mod fixtures;

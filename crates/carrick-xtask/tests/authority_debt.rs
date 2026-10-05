@@ -1179,3 +1179,222 @@ declare!();
         "unresolved production declarations cannot confer test-only classification"
     );
 }
+
+#[test]
+fn round4_shared_production_includes_cannot_hide_k1() {
+    for inclusion in ["include", "include_str"] {
+        let root = source_fixture();
+        let src = root.path().join("crates/carrick-kernel/src");
+        let declaration = if inclusion == "include" {
+            "include!(\"shared.rs\");"
+        } else {
+            "const SOURCE: &str = include_str!(\"shared.rs\");"
+        };
+        write_source(
+            src.join("lib.rs"),
+            format!("{declaration}\n#[cfg(test)] #[path=\"shared.rs\"] mod tests_copy;"),
+        )
+        .unwrap();
+        write_source(
+            src.join("shared.rs"),
+            "fn access(table: &FileTable) { table.read_open_files(); }",
+        )
+        .unwrap();
+        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        assert_eq!(
+            census.k1.len(),
+            1,
+            "production {inclusion}! incarnation must survive"
+        );
+        assert!(!census.is_test_at("crates/carrick-kernel/src/shared.rs", 1, 0));
+        assert_eq!(
+            census.k1[0].owner,
+            if inclusion == "include" {
+                "carrick_kernel::access"
+            } else {
+                "carrick_kernel::SOURCE::access"
+            }
+        );
+    }
+}
+
+#[test]
+fn round4_shared_production_include_cannot_hide_raw_locks() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(src.join("lib.rs"), "include!(\"shared.rs\");\n#[cfg(test)] #[path=\"shared.rs\"] mod tests_copy;\npub fn poll(table: &Table) { table.read_open_files(); }").unwrap();
+    write_source(
+        src.join("shared.rs"),
+        "fn access(this: &Dispatcher) { this.proc.lock(); }",
+    )
+    .unwrap();
+    assert!(
+        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+            .is_err(),
+        "included production raw lock requires an assigned counter"
+    );
+}
+
+#[test]
+fn round4_nonliteral_source_inclusions_fail_closed() {
+    for inclusion in ["include", "include_str"] {
+        let root = source_fixture();
+        let invocation = format!("{inclusion}!(concat!(env!(\"OUT_DIR\"), \"/shared.rs\"))");
+        let source = if inclusion == "include" {
+            format!("{invocation};")
+        } else {
+            format!("const SOURCE: &str = {invocation};")
+        };
+        write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), source).unwrap();
+        assert!(
+            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            "unresolved {inclusion}! must fail closed"
+        );
+    }
+}
+
+fn check_round4_inspection_macro(operation: &str) {
+    {
+        let root = source_fixture();
+        write_source(root.path().join("crates/carrick-kernel/src/lib.rs"), format!("macro_rules! legacy_access {{ ($slot:expr) => {{ $slot.description.{operation}() }}; }}\nfn unlicensed(slot: &FileSlot) {{ legacy_access!(slot); }}")).unwrap();
+        assert!(
+            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            "description.{operation}() in macro must not escape K1 admission"
+        );
+    }
+}
+
+#[test]
+fn round4_description_inspect_macro_body_fails_closed() {
+    check_round4_inspection_macro("inspect");
+}
+#[test]
+fn round4_description_try_inspect_macro_body_fails_closed() {
+    check_round4_inspection_macro("try_inspect");
+}
+
+#[test]
+fn round4_macro_and_main_scanners_share_the_authority_vocabulary() {
+    let vocabulary: std::collections::BTreeMap<String, Vec<String>> = serde_json::from_str(
+        include_str!("../../../scripts/migrate/authority-vocabulary.json"),
+    )
+    .unwrap();
+    for (kind, operations) in vocabulary {
+        if kind.starts_with("source_") {
+            continue;
+        }
+        for operation in operations {
+            let root = source_fixture();
+            let path = root.path().join("crates/carrick-kernel/src/lib.rs");
+            write_source(&path, format!("macro_rules! hidden {{ ($slot:expr) => {{ $slot.description.{operation}() }}; }}")).unwrap();
+            assert!(
+                carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+                "macro must recognize shared {kind} operation {operation}"
+            );
+            if ["k1", "description_io", "description_guard"].contains(&kind.as_str()) {
+                write_source(
+                    &path,
+                    format!("fn access(slot: &FileSlot) {{ slot.description.{operation}(); }}"),
+                )
+                .unwrap();
+                let census =
+                    carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+                assert_eq!(
+                    census.k1.len(),
+                    1,
+                    "main census must use shared operation {operation}"
+                );
+                assert_eq!(census.k1[0].operation, operation);
+            } else if kind == "raw_lock" {
+                write_source(&path, format!("pub fn poll(table: &Table) {{ table.read_open_files(); }}\nfn access(this: &Dispatcher) {{ this.proc.{operation}(); }}")).unwrap();
+                assert!(
+                    carrick_xtask::authority_debt::verify_source(
+                        root.path(),
+                        tools_root(),
+                        &ceilings(1)
+                    )
+                    .is_err(),
+                    "raw census must use shared operation {operation}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn source_inclusions_keep_physical_lookup_and_logical_owner() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        "mod logical { include!(\"shared.rs\"); }",
+    )
+    .unwrap();
+    write_source(src.join("shared.rs"), "include!(\"leaf.rs\");").unwrap();
+    write_source(
+        src.join("leaf.rs"),
+        "fn access(table: &FileTable) { table.read_open_files(); }",
+    )
+    .unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert_eq!(census.k1.len(), 1);
+    assert_eq!(census.k1[0].owner, "carrick_kernel::logical::access");
+    std::fs::rename(src.join("leaf.rs"), src.join("moved.rs")).unwrap();
+    write_source(src.join("shared.rs"), "include!(\"moved.rs\");").unwrap();
+    let moved = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert_eq!(moved.k1[0].owner, census.k1[0].owner);
+}
+
+#[test]
+fn source_inclusions_in_macro_inputs_cannot_hide_production_files() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(src.join("lib.rs"), "fn access() { concat!(include_str!(\"shared.rs\"), \"suffix\"); }\n#[cfg(test)] #[path=\"shared.rs\"] mod tests_copy;").unwrap();
+    write_source(
+        src.join("shared.rs"),
+        "fn inner(table: &FileTable) { table.read_open_files(); }",
+    )
+    .unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert_eq!(census.k1.len(), 1);
+    assert_eq!(census.k1[0].owner, "carrick_kernel::access::inner");
+}
+
+#[test]
+fn unresolved_inclusion_templates_and_outside_source_files_fail_closed() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    for source in [
+        "macro_rules! hidden { () => { include!(\"shared.rs\"); }; }",
+        "fn access() { include!(\"missing.rs\"); }",
+        "include!(\"../outside.rs\");",
+    ] {
+        write_source(src.join("lib.rs"), source).unwrap();
+        write_source(
+            src.join("../outside.rs"),
+            "fn hidden(table: &FileTable) { table.read_open_files(); }",
+        )
+        .unwrap();
+        assert!(
+            carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err(),
+            "inclusion must resolve to discoverable source: {source}"
+        );
+    }
+}
+
+#[test]
+fn renamed_source_inclusions_cannot_hide_production_files() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(src.join("lib.rs"), "use std::include as compiled; use compiled as indirect; indirect!(\"shared.rs\",);\n#[cfg(test)] #[path=\"shared.rs\"] mod tests_copy;").unwrap();
+    write_source(
+        src.join("shared.rs"),
+        "fn access(table: &FileTable) { table.read_open_files(); }",
+    )
+    .unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert_eq!(census.k1.len(), 1);
+    assert_eq!(census.k1[0].owner, "carrick_kernel::access");
+    write_source(src.join("lib.rs"), "use std::include as compiled; macro_rules! hidden { () => { compiled!(\"shared.rs\"); }; }").unwrap();
+    assert!(carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err());
+}

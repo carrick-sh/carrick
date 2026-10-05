@@ -36,22 +36,35 @@ pub struct SourceCensus {
     test_ranges: BTreeMap<String, Vec<(LineColumn, LineColumn)>>,
     aliases: BTreeMap<String, Vec<syn::Type>>,
     projections: BTreeMap<String, BTreeSet<String>>,
+    vocabulary: BTreeMap<String, AuthorityOperation>,
 }
-const TABLE_APIS: &[&str] = &[
-    "read_open_files",
-    "write_open_files",
-    "lock_next_fd",
-    "lock_stdio_cloexec",
-    "lock_closed_stdio",
-    "read_fd_open_paths",
-    "write_fd_open_paths",
-    "lock_splice_pushback",
-    "read_epoll_fds",
-    "write_epoll_fds",
-    "epoll_wake_registry",
-    "nofile_soft",
-    "set_nofile_soft",
-];
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AuthorityOperation {
+    K1,
+    DescriptionIo,
+    DescriptionGuard,
+    Task,
+    RawLock,
+    SourceInclude,
+    SourceStringInclude,
+}
+fn authority_vocabulary() -> Result<BTreeMap<String, AuthorityOperation>, DebtError> {
+    let groups: BTreeMap<AuthorityOperation, Vec<String>> = serde_json::from_str(include_str!(
+        "../../../scripts/migrate/authority-vocabulary.json"
+    ))?;
+    let mut vocabulary = BTreeMap::new();
+    for (kind, operations) in groups {
+        for operation in operations {
+            if vocabulary.insert(operation.clone(), kind).is_some() {
+                return Err(DebtError::Policy(format!(
+                    "duplicate authority operation: {operation}"
+                )));
+            }
+        }
+    }
+    Ok(vocabulary)
+}
 
 // These are semantic API boundaries: bodies and source locations are not part
 // of the exemption. A trait implementation, another module, wider visibility,
@@ -154,20 +167,6 @@ fn approved_table_guard(owner: &str, method: &syn::ImplItemFn) -> bool {
     }
     signature(method) == signature(&expected)
 }
-
-const TASK_AUTHORITY_TOKENS: &[&str] = &[
-    "threads",
-    "live",
-    "live_thread_count",
-    "enter_crash_safe_point_participation",
-    "leave_crash_safe_point_participation",
-    "ForkBarrierParticipants",
-    "CrashBarrierParticipants",
-    "ThreadExitParticipants",
-    "CrashCaptureParticipants",
-    "CoreNoteParticipants",
-    "GuestExecutorCensus",
-];
 
 // Closed implementation owners, not source paths. Calls made inside these
 // authority primitives are definitions rather than legacy caller debt.
@@ -283,7 +282,10 @@ fn test_modules(
         }
     }
 }
-fn contains_authority_tokens(tokens: TokenStream) -> bool {
+fn contains_authority_tokens(
+    tokens: TokenStream,
+    vocabulary: &BTreeMap<String, AuthorityOperation>,
+) -> bool {
     let tokens: Vec<_> = tokens.into_iter().collect();
     // Inline metadata modules do not select physical files. An unexpanded
     // out-of-line declaration could conceal a production incarnation.
@@ -301,21 +303,70 @@ fn contains_authority_tokens(tokens: TokenStream) -> bool {
         }
     }
     tokens.into_iter().any(|token| match token {
-        TokenTree::Group(group) => contains_authority_tokens(group.stream()),
-        TokenTree::Ident(name) => {
-            TABLE_APIS.contains(&name.to_string().as_str())
-                || TASK_AUTHORITY_TOKENS.contains(&name.to_string().as_str())
-                || [
-                    "OpenDescriptionRef",
-                    "open_description",
-                    "concrete_backing",
-                    "read_for_io",
-                    "write_for_io",
-                ]
-                .contains(&name.to_string().as_str())
-        }
+        TokenTree::Group(group) => contains_authority_tokens(group.stream(), vocabulary),
+        TokenTree::Ident(name) => vocabulary.contains_key(&name.to_string()),
         _ => false,
     })
+}
+// Imported builtin macro names can be re-exported and renamed again. Resolve
+// all such spellings conservatively; conflicting short names fail closed.
+fn collect_source_inclusion_aliases(
+    parsed: &BTreeMap<PathBuf, syn::File>,
+    vocabulary: &mut BTreeMap<String, AuthorityOperation>,
+) -> Result<(), DebtError> {
+    struct Imports(Vec<(String, String)>);
+    impl<'ast> Visit<'ast> for Imports {
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            if test_only(&item.attrs) {
+                return;
+            }
+            fn collect(tree: &syn::UseTree, imports: &mut Vec<(String, String)>) {
+                match tree {
+                    syn::UseTree::Path(path) => collect(&path.tree, imports),
+                    syn::UseTree::Rename(rename) => {
+                        imports.push((rename.ident.to_string(), rename.rename.to_string()))
+                    }
+                    syn::UseTree::Group(group) => {
+                        for tree in &group.items {
+                            collect(tree, imports);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            collect(&item.tree, &mut self.0);
+        }
+    }
+    let mut imports = Imports(Vec::new());
+    for syntax in parsed.values() {
+        imports.visit_file(syntax);
+    }
+    loop {
+        let mut changed = false;
+        for (original, alias) in &imports.0 {
+            if let Some(
+                kind
+                @ (AuthorityOperation::SourceInclude | AuthorityOperation::SourceStringInclude),
+            ) = vocabulary.get(original).copied()
+            {
+                match vocabulary.get(alias) {
+                    Some(previous) if *previous != kind => {
+                        return Err(DebtError::Policy(format!(
+                            "ambiguous source inclusion alias: {alias}"
+                        )));
+                    }
+                    Some(_) => {}
+                    None => {
+                        vocabulary.insert(alias.clone(), kind);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+    }
 }
 fn normalized_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
@@ -338,6 +389,7 @@ fn declared_modules(
     explicit_path: bool,
     parsed: &BTreeMap<PathBuf, syn::File>,
     resolved: &mut BTreeMap<PathBuf, Vec<Vec<String>>>,
+    vocabulary: &BTreeMap<String, AuthorityOperation>,
 ) -> Result<(), DebtError> {
     if resolved
         .get(path)
@@ -370,24 +422,36 @@ fn declared_modules(
     } else {
         path.with_extension("")
     };
-    declared_items(&syntax.items, &directory, parent, modules, parsed, resolved)
+    declared_items(
+        &syntax.items,
+        path,
+        (&directory, parent),
+        modules,
+        parsed,
+        resolved,
+        vocabulary,
+    )
 }
 fn declared_items(
     items: &[syn::Item],
-    directory: &Path,
-    explicit_directory: &Path,
+    source_file: &Path,
+    directories: (&Path, &Path),
     modules: &[String],
     parsed: &BTreeMap<PathBuf, syn::File>,
     resolved: &mut BTreeMap<PathBuf, Vec<Vec<String>>>,
+    vocabulary: &BTreeMap<String, AuthorityOperation>,
 ) -> Result<(), DebtError> {
+    let (directory, explicit_directory) = directories;
     for item in items {
         let syn::Item::Mod(module) = item else {
             let mut bodies = DeclarationBodies {
+                source_file,
                 directory,
                 explicit_directory,
                 modules: modules.to_vec(),
                 parsed,
                 resolved,
+                vocabulary,
                 error: None,
             };
             bodies.visit_item(item);
@@ -405,11 +469,12 @@ fn declared_items(
         if let Some((_, children)) = &module.content {
             declared_items(
                 children,
-                &child_directory,
-                &child_directory,
+                source_file,
+                (&child_directory, &child_directory),
                 &child_modules,
                 parsed,
                 resolved,
+                vocabulary,
             )?;
         } else {
             let explicit = module.attrs.iter().find_map(|attr| {
@@ -442,6 +507,7 @@ fn declared_items(
                 explicit_path,
                 parsed,
                 resolved,
+                vocabulary,
             )?;
         }
     }
@@ -451,23 +517,105 @@ fn declared_items(
 // Local items retain their enclosing function/impl identity. Their physical
 // module lookup directory still belongs to the enclosing module, not the fn.
 struct DeclarationBodies<'a> {
+    source_file: &'a Path,
     directory: &'a Path,
     explicit_directory: &'a Path,
     modules: Vec<String>,
     parsed: &'a BTreeMap<PathBuf, syn::File>,
     resolved: &'a mut BTreeMap<PathBuf, Vec<Vec<String>>>,
     error: Option<DebtError>,
+    vocabulary: &'a BTreeMap<String, AuthorityOperation>,
+}
+impl DeclarationBodies<'_> {
+    fn source_inclusion(&mut self, mac: &syn::Macro, string_data: bool) -> Result<(), DebtError> {
+        use syn::parse::Parser;
+        let arguments =
+            syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated
+                .parse2(mac.tokens.clone())
+                .map_err(|_| {
+                    DebtError::Policy(format!(
+                        "nonliteral source inclusion in {}",
+                        self.source_file.display()
+                    ))
+                })?;
+        let literal = arguments
+            .first()
+            .filter(|_| arguments.len() == 1)
+            .ok_or_else(|| {
+                DebtError::Policy(format!(
+                    "source inclusion requires one literal path in {}",
+                    self.source_file.display()
+                ))
+            })?;
+        let parent = self
+            .source_file
+            .parent()
+            .ok_or_else(|| DebtError::Policy("missing inclusion parent".into()))?;
+        let path = normalized_path(&parent.join(literal.value()));
+        if !self.parsed.contains_key(&path) {
+            // Non-Rust string data (e.g. bundled DTrace scripts) is not executable
+            // source. An executable include outside the discovery domain must
+            // be rejected, rather than silently evade the lexical zero rules.
+            let source = std::fs::read_to_string(&path).map_err(|error| {
+                DebtError::Policy(format!(
+                    "cannot read source inclusion {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if string_data && syn::parse_file(&source).is_err() {
+                return Ok(());
+            }
+            return Err(DebtError::Policy(format!(
+                "source inclusion outside discoverable Rust files: {}",
+                path.display()
+            )));
+        }
+        declared_modules(
+            &path,
+            &self.modules,
+            true,
+            self.parsed,
+            self.resolved,
+            self.vocabulary,
+        )
+    }
+    fn nested_inclusions(&mut self, tokens: TokenStream) {
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            if let TokenTree::Ident(name) = token
+                && matches!(
+                    self.vocabulary.get(&name.to_string()),
+                    Some(
+                        AuthorityOperation::SourceInclude | AuthorityOperation::SourceStringInclude
+                    )
+                )
+                && matches!(tokens.get(index + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                && let Some(TokenTree::Group(group)) = tokens.get(index + 2)
+            {
+                let mac = syn::Macro {
+                    path: syn::Path::from(name.clone()),
+                    bang_token: Default::default(),
+                    delimiter: syn::MacroDelimiter::Paren(Default::default()),
+                    tokens: group.stream(),
+                };
+                self.visit_macro(&mac);
+            } else if let TokenTree::Group(group) = token {
+                self.nested_inclusions(group.stream());
+            }
+        }
+    }
 }
 impl<'ast> Visit<'ast> for DeclarationBodies<'_> {
     fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
         if self.error.is_none() {
             self.error = declared_items(
                 &[syn::Item::Mod(module.clone())],
-                self.directory,
-                self.explicit_directory,
+                self.source_file,
+                (self.directory, self.explicit_directory),
                 &self.modules,
                 self.parsed,
                 self.resolved,
+                self.vocabulary,
             )
             .err();
         }
@@ -527,10 +675,31 @@ impl<'ast> Visit<'ast> for DeclarationBodies<'_> {
         }
     }
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+        let inclusion = mac
+            .path
+            .segments
+            .last()
+            .and_then(|part| self.vocabulary.get(&part.ident.to_string()));
+        if matches!(
+            inclusion,
+            Some(AuthorityOperation::SourceInclude | AuthorityOperation::SourceStringInclude)
+        ) {
+            if self.error.is_none() {
+                self.error = self
+                    .source_inclusion(
+                        mac,
+                        inclusion == Some(&AuthorityOperation::SourceStringInclude),
+                    )
+                    .err();
+            }
+            return;
+        }
         if let Ok(file) = syn::parse2::<syn::File>(mac.tokens.clone()) {
             self.visit_file(&file);
         } else if let Ok(expression) = syn::parse2::<syn::Expr>(mac.tokens.clone()) {
             self.visit_expr(&expression);
+        } else {
+            self.nested_inclusions(mac.tokens.clone());
         }
     }
     fn visit_expr(&mut self, expression: &'ast syn::Expr) {
@@ -554,7 +723,10 @@ fn expression_test_only(expression: &syn::Expr) -> bool {
 }
 impl SourceCensus {
     pub fn load(root: &Path) -> Result<Self, DebtError> {
-        let mut result = Self::default();
+        let mut result = Self {
+            vocabulary: authority_vocabulary()?,
+            ..Self::default()
+        };
         let mut leaves = Vec::new();
         for entry in std::fs::read_dir(root.join("crates"))? {
             let entry = entry?;
@@ -587,6 +759,7 @@ impl SourceCensus {
             test_modules(&syntax.items, &directory, parent, &mut test_roots);
             parsed.insert(path.clone(), syntax);
         }
+        collect_source_inclusion_aliases(&parsed, &mut result.vocabulary)?;
         let mut resolved = BTreeMap::new();
         for path in &leaves {
             let parent = path
@@ -616,7 +789,14 @@ impl SourceCensus {
                         path.file_stem().unwrap_or_default().to_string_lossy()
                     ));
                 }
-                declared_modules(path, &target, false, &parsed, &mut resolved)?;
+                declared_modules(
+                    path,
+                    &target,
+                    false,
+                    &parsed,
+                    &mut resolved,
+                    &result.vocabulary,
+                )?;
             }
         }
         // Parse aliases before any methods: a later type alias or renamed
@@ -1263,16 +1443,12 @@ impl Scanner<'_> {
                 self.task_call(&method_name);
                 let description = index >= 2
                     && matches!(&tokens[index - 2], TokenTree::Ident(i) if i == "description");
-                if TABLE_APIS.contains(&method_name.as_str())
-                    || [
-                        "OpenDescriptionRef",
-                        "open_description",
-                        "concrete_backing",
-                        "read_for_io",
-                        "write_for_io",
-                    ]
-                    .contains(&method_name.as_str())
-                    || (description && ["inspect", "try_inspect"].contains(&method_name.as_str()))
+                if matches!(
+                    self.census.vocabulary.get(&method_name),
+                    Some(AuthorityOperation::K1 | AuthorityOperation::DescriptionIo)
+                ) || (description
+                    && self.census.vocabulary.get(&method_name)
+                        == Some(&AuthorityOperation::DescriptionGuard))
                 {
                     self.call(&method_name, method.span());
                 }
@@ -1303,6 +1479,9 @@ impl Scanner<'_> {
         })
     }
     fn task_call(&mut self, operation: &str) {
+        if self.census.vocabulary.get(operation) != Some(&AuthorityOperation::Task) {
+            return;
+        }
         let Some(owner) = &self.current_owner else {
             return;
         };
@@ -1526,7 +1705,9 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         } else {
             self.owner(&name, item.span())
         };
-        if item.ident.is_some() && contains_authority_tokens(item.mac.tokens.clone()) {
+        if item.ident.is_some()
+            && contains_authority_tokens(item.mac.tokens.clone(), &self.census.vocabulary)
+        {
             self.census.unknown_apis.push(format!(
                 "authority macro {owner} has no compiler-resolved call owner"
             ));
@@ -1550,11 +1731,12 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         } else {
             false
         };
-        if TABLE_APIS.contains(&method.as_str())
-            || ["open_description", "concrete_backing"].contains(&method.as_str())
+        if self.census.vocabulary.get(&method) == Some(&AuthorityOperation::K1)
             || (description
-                && ["read_for_io", "write_for_io", "inspect", "try_inspect"]
-                    .contains(&method.as_str()))
+                && matches!(
+                    self.census.vocabulary.get(&method),
+                    Some(AuthorityOperation::DescriptionIo | AuthorityOperation::DescriptionGuard)
+                ))
         {
             self.call(&method, call.method.span());
         }
@@ -1577,15 +1759,16 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             self.call("OpenDescriptionRef", path.span());
         } else if let Some(segment) = path.path.segments.last() {
             let operation = segment.ident.to_string();
-            if TABLE_APIS.contains(&operation.as_str())
-                || [
-                    "OpenDescriptionRef",
-                    "open_description",
-                    "concrete_backing",
-                    "read_for_io",
-                    "write_for_io",
-                ]
-                .contains(&operation.as_str())
+            if matches!(
+                self.census.vocabulary.get(&operation),
+                Some(AuthorityOperation::K1 | AuthorityOperation::DescriptionIo)
+            ) || (self.census.vocabulary.get(&operation)
+                == Some(&AuthorityOperation::DescriptionGuard)
+                && path
+                    .path
+                    .segments
+                    .iter()
+                    .any(|part| part.ident == "FileDescription"))
             {
                 self.call(&operation, path.span());
             }
