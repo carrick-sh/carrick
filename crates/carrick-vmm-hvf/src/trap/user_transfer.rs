@@ -1404,7 +1404,7 @@ pub(super) mod tests {
                 );
                 assert!(matches!(
                     result,
-                    carrick_el1::cow::GuestCowOutcome::Resolved(_)
+                    Ok(carrick_el1::cow::GuestCowOutcome::Resolved(_))
                 ));
                 arena[(0x3000 / 8) + va[3]].load(Ordering::Acquire) & PA
             } else {
