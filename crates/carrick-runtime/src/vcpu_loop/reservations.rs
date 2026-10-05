@@ -166,7 +166,7 @@ impl PreparedHostReservations for PreparedView {
             index,
             mm,
             &self.0.nodes,
-            &carrick_kernel::dispatch::mem::el1_reservations::RootHostWait::new(),
+            &carrick_el1::memory::reservations::NoRootWait,
         )
     }
 }
