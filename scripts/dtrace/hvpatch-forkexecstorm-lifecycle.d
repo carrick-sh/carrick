@@ -5,7 +5,8 @@
  * fork, exec, process-exit and first wait4 target. The first wait target for
  * each (pid, tid, child) is enough to join a timed-out waiter to its child's
  * lifecycle without printing every WNOHANG poll. The 60 s bound terminates
- * a wedged test; no observed lifecycle event is a failed capture.
+ * a wedged test; no observed lifecycle event is a failed capture. Syscall
+ * entries are counted separately and cannot qualify a lifecycle capture.
  *
  * ABI (qualified live on cloudmac macOS/arm64, 2026-10-04: signed
  * carrick-conformance-next external witness, FES1 trace `fes-trace3-2`;
@@ -42,7 +43,8 @@
 dtrace:::BEGIN
 {
     secs = 0;
-    events = 0;
+    syscall_events = 0;
+    lifecycle_events = 0;
     first_wait[0, 0, 0, 0] = 0;
     printf("FES1|header|bound_s=60\n");
 }
@@ -57,7 +59,7 @@ carrick*:::hvpatch-syscall-service-begin
     self->ltid = (int32_t)arg1;
     self->asid = (uint32_t)arg2;
     self->nr = (uint64_t)arg3;
-    events++;
+    syscall_events++;
 }
 
 carrick*:::hvpatch-syscall-service-begin
@@ -85,7 +87,7 @@ carrick*:::hvpatch-guest-lifecycle
 /(pid == $target || progenyof($target)) &&
     ((int32_t)arg0 == 1 || (int32_t)arg0 == 2 || (int32_t)arg0 == 5)/
 {
-    events++;
+    lifecycle_events++;
     printf("FES1|life|ts=%llu|phase=%d|lpid=%d|lppid=%d|ltid=%d|asid=%u\n",
         timestamp, (int32_t)arg0, (int32_t)arg1, (int32_t)arg2,
         (int32_t)arg3, (uint32_t)arg4);
@@ -94,8 +96,9 @@ carrick*:::hvpatch-guest-lifecycle
 proc:::exit
 /pid == $target/
 {
-    printf("FES1|end|reason=launcher-exit|events=%d\n", events);
-    exit(events == 0 ? 2 : 0);
+    printf("FES1|end|reason=launcher-exit|syscall_events=%d|lifecycle_events=%d\n",
+        syscall_events, lifecycle_events);
+    exit(lifecycle_events == 0 ? 2 : 0);
 }
 
 tick-1s
@@ -106,6 +109,7 @@ tick-1s
 tick-1s
 /secs >= 60/
 {
-    printf("FES1|end|reason=bound|events=%d\n", events);
-    exit(events == 0 ? 2 : 0);
+    printf("FES1|end|reason=bound|syscall_events=%d|lifecycle_events=%d\n",
+        syscall_events, lifecycle_events);
+    exit(lifecycle_events == 0 ? 2 : 0);
 }

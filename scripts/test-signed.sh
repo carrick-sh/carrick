@@ -228,6 +228,31 @@ if [ "$pkg" = "carrick-embed" ]; then
     scripts/build-embed-el1-sched.sh
 fi
 
+# The probe's Rust test is a distinct Linux executable, not its normal storm
+# binary. Build it for every conformance-next signed invocation so case_ gates
+# cannot accidentally run a stale witness after the helper changes.
+if [ "$pkg" = "carrick-conformance-next" ]; then
+    witness_json="$(mktemp "${TMPDIR:-/tmp}/forkexecstorm-witness-build.XXXXXX")"
+    scratch+=("$witness_json")
+    (cd conformance-probes && cargo test --locked --release \
+        --target aarch64-unknown-linux-musl --bin forkexecstorm \
+        --no-run --message-format=json) >"$witness_json"
+    witness_exe="$(jq -ers '[.[] | select(.reason == "compiler-artifact" and .target.name == "forkexecstorm" and .profile.test == true and .executable != null)] | if length == 1 then .[0].executable else error("expected one forkexecstorm test executable") end' "$witness_json")"
+    mkdir -p target/embed-fixtures
+    witness_path=target/embed-fixtures/forkexecstorm-witness-aarch64
+    cp "$witness_exe" "$witness_path"
+    witness_sources='{}'
+    for source in src/bin/forkexecstorm.rs src/lib.rs Cargo.toml Cargo.lock; do
+        digest="$(shasum -a 256 "conformance-probes/$source" | awk '{print $1}')"
+        witness_sources="$(jq -nc --argjson sources "$witness_sources" --arg path "$source" --arg digest "$digest" '$sources + {($path): $digest}')"
+    done
+    jq -nc --arg elf_sha256 "$(shasum -a 256 "$witness_path" | awk '{print $1}')" \
+        --argjson sources "$witness_sources" \
+        '{schema:"forkexecstorm-witness-v1",target:"aarch64-unknown-linux-musl",elf_sha256:$elf_sha256,sources:$sources}' \
+        >"$witness_path.json"
+    echo "test-signed: forkexecstorm witness $(cat "$witness_path.json")"
+fi
+
 # 1. Build (never run) the package's test executables and collect their
 #    paths. Only the package's OWN test-profile artifacts carry
 #    `profile.test == true` plus an `executable`; dependencies compile with
