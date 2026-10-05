@@ -866,6 +866,10 @@ fn logs_unknown_container_errors() {
 fn help_output_snapshots() {
     let check = |subcmd: &str, fixture: &str| {
         let output = command()
+            // Clap renders current values for these env-backed arguments.
+            // Snapshot the CLI definition, independent of the caller's setup.
+            .env_remove("CARRICK_HOME")
+            .env_remove("CARRICK_EXEC_BACKEND")
             .args([subcmd, "--help"])
             .output()
             .expect("run carrick help");
