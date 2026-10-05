@@ -139,6 +139,7 @@ fn apply_zone_exit(
             // The mailbox capture used x16/x17 as scratch after saving them,
             // and holds the EL0 return state.
             let continuation = continuation.ok_or_else(|| {
+                crate::probes::el1_zone_capture_missing(trap.0, trap.1);
                 RuntimeError::Configuration(
                     "EL1 zone capture at a syscall exit without its mailbox request".to_owned(),
                 )
