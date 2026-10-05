@@ -1915,7 +1915,7 @@ mod tests {
             is_dynamic_alias: false,
             sharing: GuestMappingSharing::Private,
             guest_writable: true,
-            shared_key_base: 0,
+            shared_key_base: None,
             shared_key_offset: 0,
             owner_generation: 1,
             structural_owner: None,

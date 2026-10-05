@@ -249,6 +249,12 @@ impl Fixture {
         write(root, "conformance-probes/src/bin/hello.rs", b"probe\n");
         write(
             root,
+            "fixtures/embed-copyout/src/main.rs",
+            b"copyout fixture\n",
+        );
+        write(root, "scripts/build-embed-copyout.sh", b"copyout builder\n");
+        write(
+            root,
             "crates/carrick-el1-abi/src/lib.rs",
             b"local fixture dependency\n",
         );
@@ -445,7 +451,7 @@ fn roundtrip_restores_exact_paths_and_verifies_installed_bytes() {
             .unwrap()
             .executables
             .len(),
-        9
+        10
     );
     for e in &f.manifest.executables {
         assert_eq!(
