@@ -27,6 +27,30 @@ use crate::dispatch::{
 };
 use carrick_spec::PortProtocol;
 
+#[cfg(test)]
+mod connect_tests;
+
+/// The listener enqueue publishes its own readiness wake. Connecting changes
+/// the client description, so notify only epolls that observe that description.
+/// A broadcast after enqueue can reach an epoll the acceptor has already armed
+/// on the new server half, causing a redispatch before its peer sends FIN.
+fn notify_connect_epolls(client: &Arc<crate::kernel::FileDescription>) {
+    for owner in client.epoll_owners() {
+        let kqueue = owner
+            .inspect_kind(|open| match open {
+                OpenDescription::Epoll { kqueue, .. } => Some(Arc::clone(kqueue)),
+                _ => None,
+            })
+            .flatten();
+        if let Some(kqueue) = kqueue {
+            kqueue.wake_parked();
+        }
+        if let Some(queue) = owner.wait_queue() {
+            queue.wake_all();
+        }
+    }
+}
+
 struct InZoneListenerGuard {
     network: Arc<crate::network::RuntimeNetwork>,
     listener: Arc<crate::network::inzone::InZoneListener>,
@@ -985,7 +1009,7 @@ impl<'a> NetView<'a> {
         let _ = base.take_pending_socket_error();
         drop(open);
         admission.enqueue(server);
-        self.notify_inmem_epoll();
+        notify_connect_epolls(&open_file.description);
         Ok(DispatchOutcome::Returned { value: 0 })
     }
 
@@ -3398,7 +3422,7 @@ impl<'a> NetView<'a> {
                         if let Some(hfd) = old_host_fd {
                             this.network.provider.forget_socket_addresses(crate::network::SocketKey::for_host_fd(hfd));
                         }
-                        this.notify_inmem_epoll();
+                        notify_connect_epolls(&file_desc);
                         if this.io_is_nonblocking(fd, 0) {
                             return Ok(DispatchOutcome::errno(LINUX_EINPROGRESS));
                         } else {

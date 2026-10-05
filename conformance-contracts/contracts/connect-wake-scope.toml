@@ -1,0 +1,21 @@
+schema_version = 1
+id = "kernel.net.connect-wake-scope"
+title = "Connection publication wakes only its socket and listener observers"
+guest_surfaces = ["syscall:connect", "syscall:accept", "syscall:shutdown", "syscall:epoll_pwait"]
+semantic_authority = ["man 2 connect", "man 2 shutdown", "man 7 epoll"]
+fixture = "A connector is held in the listener enqueue callback while a second process accepts, registers RDHUP, drains the ctl wake and builds its wait; then connect finishes notifying before peer SHUT_WR"
+scale_points = [1]
+rationale = "The accepted RDHUP wait has zero connect-originated wakeups: its initial dispatch parks and its FIN dispatch completes, exactly two dispatches regardless of host scheduling. Client epolls registered before connect must still observe writable readiness. Listener enqueue owns its own targeted wake. The VM-free witness asserts the exact zero unwanted host poll readiness, and socket_close asserts the exact two-dispatch budget; these are scenario assertions rather than aggregate WorkObservations."
+structural_budgets = []
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::net::lifecycle::connect_tests::connect_publication_does_not_wake_a_newly_accepted_rdhup_wait; carrick-kernel-example::socket_close::tcp_peer_shut_wr_live_peer_handshake; carrick-kernel::dispatch::net::lifecycle::connect_tests::loom_models"
+
+[bindings.unresolved]
+embed_structural = "Signed HVF integration remains director-owned; Linux workers cannot execute this layer."
+docker = "Native arm64 differential remains director-owned; no Docker is authorized in this worktree."
+
+[runtime_ratio]
+maximum = 2.0
+statistic = "p50"
+minimum_samples = 20

@@ -40,6 +40,8 @@ test-support = ["carrick-hal/test-support", "carrick-vfs/test-support"]
 conformance-metrics = ["carrick-observability/conformance-metrics"]
 # Graph-local VM-free instrumentation; even explicit selection excludes release.
 schedule-hooks = []
+# Bounded protocol models; no synchronization substitutions in product code.
+loom = []
 
 # NOTE: no `platform-*` features. This crate selects no VMM and no host
 # backend: the host-OS glue it needs (the kqueue/epoll readiness multiplexer,
@@ -99,6 +101,7 @@ carrick-host-bsd = { path = "../carrick-host-bsd" }
 carrick-host-linux = { path = "../carrick-host-linux" }
 
 [dev-dependencies]
+loom = "=0.7.2"
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
 # Self dev-dependency: enables `test-support` on this crate's own lib when it
 # is built for an integration test (`tests/`), which sees no `cfg(test)`.
