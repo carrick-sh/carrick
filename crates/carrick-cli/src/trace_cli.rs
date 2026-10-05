@@ -283,6 +283,8 @@ pub(crate) fn exec_trace_child(
             .args(&command[2..])
             .status()
             .context("trace child failed to launch external witness")?;
+        use std::os::unix::process::ExitStatusExt;
+        carrick_runtime::probes::trace_witness_exit(status.into_raw());
         if !status.success() {
             bail!("external trace witness exited with {status}");
         }
