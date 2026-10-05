@@ -262,4 +262,10 @@ fn main() {
     println!("cargo:rerun-if-changed=../carrick-mmu-core/Cargo.toml");
     println!("cargo:rerun-if-changed=../carrick-sched-core/src");
     println!("cargo:rerun-if-changed=../carrick-sched-core/Cargo.toml");
+    println!("cargo:rerun-if-changed=../carrick-core/src");
+    println!("cargo:rerun-if-changed=../carrick-core/Cargo.toml");
+    println!("cargo:rerun-if-changed=../carrick-core-abi/src");
+    println!("cargo:rerun-if-changed=../carrick-core-abi/Cargo.toml");
+    println!("cargo:rerun-if-changed=../carrick-personality-linux/src");
+    println!("cargo:rerun-if-changed=../carrick-personality-linux/Cargo.toml");
 }
