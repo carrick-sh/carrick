@@ -1,8 +1,7 @@
 //! In-guest EL1 fault handling and dispatch.
 
 use carrick_el1_abi::{
-    Action, Counters, CurrentTask, EL1_FRAME_GRANT_TARGET_SIZE, FrameGrantMailbox,
-    FrameGrantMailboxes, FrameGrantRequest, TrapFrame,
+    Action, Counters, CurrentTask, FrameGrantMailbox, FrameGrantMailboxes, TrapFrame,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorOutcome, DescriptorReceipt, DescriptorTxnSlot,
@@ -10,36 +9,16 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
 use carrick_mmu_core::aarch64::{GuestPreparedCommit, GuestPreparedCommitError, LeafAccess};
 use carrick_sched_core::spaces::notification::SpaceAccess;
 use core::num::NonZeroU64;
-use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(test, target_os = "none"))]
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::Ordering;
 
-static NEXT_FRAME_GRANT_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// The host now owns frame-grant publication; EL1 has no publication error.
 pub fn panic_publication_detail() -> u64 {
     0
 }
 
-fn next_frame_grant_generation() -> u64 {
-    frame_grant_generation(&NEXT_FRAME_GRANT_GENERATION)
-}
-fn frame_grant_generation(counter: &AtomicU64) -> u64 {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .unwrap_or(0)
-}
-
-/// The one lazy-supply protocol, shared by faults and stopped-target transfers.
-/// Failed mailbox admission leaves the caller's owned continuation resumable.
-pub fn request_lazy_frames(mailbox: &FrameGrantMailbox, mm_key: u64, va: u64, access: u64) -> bool {
-    mailbox.try_publish_request(FrameGrantRequest {
-        mm_key,
-        request_generation: next_frame_grant_generation(),
-        fault_va: va,
-        requested_len: EL1_FRAME_GRANT_TARGET_SIZE,
-        access,
-    })
-}
+pub use carrick_core::mm::fault::{request_lazy_frames, root_admits_commit};
 
 /// Decode an EL0 translation fault that can be satisfied by publishing fresh
 /// anonymous backing. Permission faults name an already-mapped page and must
@@ -127,39 +106,6 @@ pub struct PreparedFaultPath<'a, P: PreparedPageResolver> {
     /// include first-touch stock over root holes: it is committed only where
     /// the root holds a node that permits the access.
     pub roots: Option<&'a crate::memory::reservations::SharedReservations>,
-}
-
-/// Whether a delegated MM's root lets this prepared page be committed:
-/// `None` when the MM has no admitted root (its host arming decided), else
-/// whether a node covers `page` and, for plain anonymous memory, permits
-/// `access`. A busy root answers `Some(false)`: the host decides.
-fn root_admits_commit(
-    roots: Option<&crate::memory::reservations::SharedReservations>,
-    spaces: SpaceAccess<'_>,
-    slot: u32,
-    mm_key: u64,
-    page: u64,
-    access: LeafAccess,
-) -> Option<bool> {
-    let roots = roots?;
-    let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
-    let index = spaces.find(mm_key)?.index();
-    if !roots.admitted(index, mm) {
-        return None;
-    }
-    let Ok(mut model) = roots.lock_in(spaces, index, mm, slot) else {
-        return Some(false);
-    };
-    let bits = match access {
-        LeafAccess::Read => 1,
-        LeafAccess::Write => 2,
-        LeafAccess::Execute => 4,
-    };
-    Some(model.mapping(page).is_some_and(|mapping| {
-        !mapping.anonymous
-            || carrick_el1_abi::ReservationProtection::from_bits(bits)
-                .is_some_and(|access| mapping.protection.permits(access))
-    }))
 }
 
 #[cfg(target_os = "none")]
@@ -1157,73 +1103,12 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
 
 /// File first-touch selects the source and access policy in the admitted root.
 /// The host sees only this exact owner window and retained handle byte service.
-pub struct FileFaultVenue<'a> {
-    pub roots: &'a crate::memory::reservations::SharedReservations,
-    pub spaces: SpaceAccess<'a>,
-    pub slots: &'a carrick_el1_abi::MmPortalSlots,
-    pub worker: u32,
-    pub mailbox: &'a FrameGrantMailbox,
-}
-impl FileFaultVenue<'_> {
-    pub fn publish(&self, mm_key: u64, va: u64, access: u64) -> bool {
-        let owner_source = core::cell::Cell::new(false);
-        let run = || -> Option<bool> {
-            let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
-            let index = self.spaces.find(mm_key)?;
-            if !self.roots.admitted(index.index(), mm) {
-                return None;
-            }
-            let mut root = self
-                .roots
-                .lock_in(self.spaces, index.index(), mm, self.worker)
-                .ok()?;
-            root.mapping(va)?.host_backing?;
-            owner_source.set(true);
-            let protection = carrick_el1_abi::ReservationProtection::from_bits(access)?;
-            let plan = root
-                .transfer_fault_plan(va & !4095, 4096, protection)
-                .ok()?;
-            let mapping = root.mapping(plan.range.start())?;
-            let source = mapping
-                .host_backing?
-                .advance(plan.range.start().checked_sub(mapping.range.start())?)?;
-            let sequence = root.next_transfer_sequence().ok()?;
-            let carrier = self.slots.carrier()?;
-            let operation = carrick_el1_abi::PortalOperation {
-                carrier,
-                mm,
-                incarnation: NonZeroU64::new(root.incarnation().raw())?,
-                sequence,
-            };
-            let window = carrick_el1_abi::PortalGrantWindow {
-                operation,
-                generation: plan.generation,
-                range: plan.range,
-                protection: plan.protection,
-                fault_page: plan.fault_page,
-                host_backing: Some(source),
-                fork_sequence: None,
-            };
-            drop(root);
-            let slot = self.slots.grant(self.worker as usize)?;
-            let generation = next_frame_grant_generation();
-            if !slot.publish_fault_selection(generation, window) {
-                return Some(true);
-            }
-            if !self.mailbox.try_publish_request(FrameGrantRequest {
-                mm_key,
-                request_generation: generation,
-                fault_va: va,
-                requested_len: plan.range.len(),
-                access,
-            }) {
-                slot.cancel_fault_selection(window, generation);
-            }
-            Some(true)
-        };
-        run().unwrap_or(owner_source.get())
-    }
-}
+pub type FileFaultVenue<'a> = carrick_core::mm::fault::FileFaultVenue<
+    'a,
+    carrick_personality_linux::mm::LinuxReservationPolicy,
+    crate::memory::reservations::NativeReservationGeometry,
+    carrick_el1_abi::MmPortalSlots,
+>;
 
 #[cfg(test)]
 mod tests {
@@ -2742,17 +2627,5 @@ mod tests {
             assert_eq!(frames.destination, frames.source);
             assert_eq!(copy.grant(), grant);
         }
-    }
-    #[test]
-    fn exhausted_frame_request_generation_refuses_without_reusing_one() {
-        let counter = AtomicU64::new(u64::MAX - 1);
-        let last = frame_grant_generation(&counter);
-        let exhausted = frame_grant_generation(&counter);
-        let repeated = frame_grant_generation(&counter);
-        assert_ne!(repeated, 1, "exhaustion reused request incarnation one");
-        assert_eq!(last, u64::MAX - 1);
-        assert_eq!(exhausted, 0);
-        assert_eq!(repeated, 0);
-        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
     }
 }
