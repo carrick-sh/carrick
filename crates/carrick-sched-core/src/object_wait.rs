@@ -734,13 +734,22 @@ pub(super) struct ObjectRecord {
     queue: AtomicU32,
     prev: AtomicU32,
     next: AtomicU32,
-    /// 1: the park's deadline ended it ([`ZoneTables::expire_timer`]), not
-    /// a readiness notification. Cleared by every park; read by the adapter
-    /// after it takes the operation token.
+    /// Completion flags: bit 0 means the deadline ended the park; bit 1
+    /// retains a host syscall continuation. Reset for each allocation and
+    /// object park; read by the adapter after it takes the operation token.
     expired: AtomicU32,
     generation: AtomicU64,
     operation: AtomicU64,
     operation_generation: AtomicU64,
+}
+
+impl ObjectRecord {
+    /// A recycled record may next carry a futex park rather than an object
+    /// park. Completion flags describe only the previous incarnation; the
+    /// allocator owns this record before publishing its new claim.
+    pub(super) fn reset_completion_flags(&self) {
+        self.expired.store(0, Ordering::Relaxed);
+    }
 }
 
 /// The queue guard also authenticates its zone, index and incarnation. It
