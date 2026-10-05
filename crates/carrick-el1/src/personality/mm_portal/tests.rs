@@ -3938,7 +3938,7 @@ fn selected_data_retains_exact_pre_selection_reservation_observation() {
     let revision = source.observe(SpaceWaitCause::Reservations).revision();
     let tables = Tables::new(ROOT, IPA, 1);
     let chosen = selected(select(&portal, &transfer, &tables));
-    let wait = chosen.retry.unwrap();
+    let wait = chosen.retry().unwrap();
     assert_eq!(wait.handle(), handle);
     assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Reservations);
     assert_eq!(wait.revision(), revision);
