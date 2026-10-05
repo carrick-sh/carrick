@@ -1,7 +1,8 @@
 # N1 structural custody and table-capacity retirement handoff
 
-**Not review-ready: the signed gate is pending.** The two requested defects
-are repaired red-first in VM-free production-path witnesses. The final code
+**Not review-ready: the signed gate is pending.** The structural lookup
+omission and table-capacity retirement defects are repaired red-first in
+VM-free production-path witnesses. The final code
 and inventory snapshot is `5c8dba4288366b52b02e0e3376ac44ab65175e62` on
 batch-seven main `80bc107de`.
 This document's commit changes documentation only. No signed executable was
@@ -108,6 +109,27 @@ Only this turn's temporary VM worktree and fixture transport ref were
 removed; the cleanup receipt lists no such worktree/ref. No Docker was
 started or used. This bundle is not acceptance evidence for the rebased SHA.
 
+## Director-reported fork diagnostic and ownership split
+
+After the first handoff push, the director reported cloudmac results from
+`n1-cm` on **pre-rebase `299b19ca1`**. VMA, MAP_FIXED-over-COW, ptrace and
+spawn still fail at fork, with a reported `OWNERFORKREFUSAL1` EBUSY errno 16,
+stage 6, parent MM 2, child MM 3, generation 12. That capture has
+`bounded=1`: it is diagnostic only, not qualified acceptance. Fork-COW gets
+past the former root-slot collision but fails fork round 0 at pages=16.
+These are director-reported results; this Mac turn has not inspected the raw
+cloudmac receipts or independently repeated them. The exact-record lookup
+witness repairs one omission and does **not** close the live fork class.
+
+The latest owner direction assigns all five fork-class tests and their
+refusal probe to `n1-cm` on cloudmac. This Mac retains copyout, hello,
+anonymous/brk and clear-child-tid. Do not re-edit the stage-six custodian
+without notifying the director, to avoid overlapping the fork worker.
+Integrate its fixes at a committed boundary before final acceptance. Its
+`299b19ca1` results cannot be combined with this rebased HEAD as same-SHA
+acceptance. The old bundle remains available at the local retained path
+above even though its temporary publisher worktree was removed.
+
 ## Next exact-SHA gate
 
 Publish a new bundle for the final pushed HEAD on the trusted Linux VM,
@@ -118,7 +140,9 @@ standard signed embed hello and its unentitled negative control, CLI hello,
 the six comparisons, ten uninstrumented 300-round copyout runs and the two
 fork refusal captures on unchanged retained signed artifacts. It records
 SHA-256, CDHash, LC_UUID, hypervisor entitlement, DOF and per-run scoped
-cleanup. No signed gate or partial signed retry was consumed in this turn.
+cleanup. It is the original full-gate script; adapt the invoked scope to
+the director's split only after the fork worker covers the **same final
+SHA**. No signed gate or partial signed retry was consumed in this Mac turn.
 
 Report every comparison against the recorded main `51bfe67f4` failure mode
 from the [batch-five receipt](2026-10-04-n1-batch5-gate.md), also summarized in
