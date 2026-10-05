@@ -102,7 +102,9 @@ table inet ci_boundary {
 FIREWALL
 systemctl enable --now nftables
 # Proxmox cloud-init can otherwise grant its selected user passwordless sudo.
-# This unit is inside the guest; no service is installed on Willow.
+# This unit is started by the controller after cloud-final, before JIT.
+# Enabling it under multi-user.target would cycle with cloud-final's After.
+# No service is installed on Willow.
 cat > /etc/systemd/system/carrick-ci-ready.service <<'READY'
 [Unit]
 Description=Remove cloud-init administrative authority from CI runner
@@ -112,8 +114,6 @@ Requires=cloud-final.service
 Type=oneshot
 ExecStart=/usr/local/bin/carrick-ci-ready
 RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
 READY
 cat > /usr/local/bin/carrick-ci-ready <<'GUEST_READY'
 #!/bin/bash
@@ -128,7 +128,7 @@ cat > /usr/local/bin/carrick-ci-admit-job <<'ADMIT'
 exec /usr/local/bin/carrick-xtask ci-scaler admit-job
 ADMIT
 chmod 755 /usr/local/bin/carrick-ci-admit-job
-systemctl enable carrick-ci-ready.service
+systemctl daemon-reload
 runuser -u runner -- /usr/local/bin/carrick-xtask ci-scaler verify-kvm
 mkdir -p /var/lib/carrick-ci
 jq -n --arg kernel "$(uname -r)" --arg rust "$(runuser -u runner -- /home/runner/.cargo/bin/rustc --version)" \
