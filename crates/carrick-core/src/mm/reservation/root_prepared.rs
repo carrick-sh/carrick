@@ -184,7 +184,22 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
             self.free_node(id);
         }
     }
-    pub fn prepare_copy(
+    /// Fixture-only construction for custody and work-budget tests.
+    ///
+    /// # Safety
+    /// The fixture must authenticate the request's exact MM, generation,
+    /// permissions and live output, and retain its metadata and output pins.
+    /// Production callers must use the revalidating owner transaction.
+    #[cfg(feature = "host-test")]
+    pub unsafe fn prepare_copy_for_fixture(
+        &mut self,
+        request: PortalTransferRequest,
+        notification: Option<carrick_sched_core::object_wait::ObjectWaitKey>,
+    ) -> Result<PortalPreparedPermit, Refusal> {
+        self.prepare_copy(request, notification)
+    }
+
+    pub(crate) fn prepare_copy(
         &mut self,
         request: PortalTransferRequest,
         notification: Option<carrick_sched_core::object_wait::ObjectWaitKey>,

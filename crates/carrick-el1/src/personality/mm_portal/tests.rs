@@ -3023,7 +3023,7 @@ fn prepared_copy_elastic_aggregate_prepare_and_settlement_have_linear_work() {
         let mut permits = Vec::with_capacity(count);
         root.work = 0;
         for _ in 0..count {
-            permits.push(root.prepare_copy(request, None).unwrap());
+            permits.push(unsafe { root.prepare_copy_for_fixture(request, None) }.unwrap());
         }
         assert_eq!(
             root.work, count,
@@ -3266,7 +3266,7 @@ fn prepared_copy_metadata_capacity_suspends_before_source_and_recovers_after_can
     {
         let mut root = portal.root(mm, 1).unwrap();
         loop {
-            match root.prepare_copy(request, None) {
+            match unsafe { root.prepare_copy_for_fixture(request, None) } {
                 Ok(permit) => permits.push(permit),
                 Err(crate::memory::reservations::Refusal::MetadataRequired) => break,
                 other => panic!("unexpected admission {other:?}"),
