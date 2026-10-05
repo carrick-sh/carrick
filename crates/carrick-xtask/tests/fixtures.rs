@@ -1124,6 +1124,81 @@ fn actions_restore_entrypoint_preserves_modes_and_passes_fixture_preflight() {
 }
 
 #[test]
+fn cache_opt_out_preserves_ambient_wrapper_rejection_at_fixture_entrypoint() {
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    let out = p
+        .command("just")
+        .current_dir(&p.checkout)
+        .arg("fixtures-restore")
+        .arg(&p.archive)
+        .env("CARRICK_SCCACHE", "0")
+        .env("RUSTC_WRAPPER", "/ambient/compiler-wrapper")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "cache opt-out hid an ambient compiler wrapper"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ambient RUSTC_WRAPPER"), "{stderr}");
+    assert!(carrick_xtask::accept::verify_signed_fixtures(&p.checkout).is_err());
+}
+
+#[test]
+fn cache_opt_out_preserves_ambient_wrapper_rejection_at_fixture_publish() {
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
+    let out = p
+        .command("just")
+        .current_dir(&p.checkout)
+        .arg("fixtures-publish")
+        .arg(sha)
+        .env("CARRICK_SCCACHE", "0")
+        .env("RUSTC_WRAPPER", "/ambient/compiler-wrapper")
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "cache opt-out hid an ambient compiler wrapper"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ambient RUSTC_WRAPPER"), "{stderr}");
+    assert!(!p.checkout.join("target/fixtures/published").exists());
+}
+
+#[test]
+fn signed_build_environment_preserves_ambient_wrapper_when_cache_disabled() {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/build-env.sh");
+    for (cache, wrapper) in [
+        ("0", "/ambient/compiler-wrapper"),
+        ("0", ""),
+        ("1", "/ambient/compiler-wrapper"),
+        ("1", ""),
+    ] {
+        let out = Command::new("sh")
+            .args([
+                "-c",
+                ". \"$1\"; test \"${RUSTC_WRAPPER+x}\" = x && test \"$RUSTC_WRAPPER\" = \"$2\"",
+                "test",
+            ])
+            .arg(&script)
+            .arg(wrapper)
+            .env("CARRICK_SCCACHE", cache)
+            .env("RUSTC_WRAPPER", wrapper)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "build environment erased an ambient wrapper: {wrapper:?}"
+        );
+    }
+}
+
+#[test]
 fn trusted_hardware_workflow_prepares_exact_sha_fixtures_before_signed_execution() {
     use yaml_rust2::{Yaml, YamlLoader};
     let workflow = fs::read_to_string(
