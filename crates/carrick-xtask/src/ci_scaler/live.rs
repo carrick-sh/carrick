@@ -50,6 +50,11 @@ fn cloud_init_complete(output: &GuestOutput) -> Result<bool, ScalerError> {
     let status: CloudStatus = serde_json::from_str(&output.stdout)?;
     const PVE_USER_DEPRECATION: &str = "'user' of type string is deprecated in 22.2 and scheduled to be removed in 27.2. Use 'users' list instead.";
     Ok(matches!(output.exit, GuestExit(0 | 2))
+        && (output.exit == GuestExit(0)
+            || status
+                .recoverable_errors
+                .values()
+                .any(|warnings| !warnings.is_empty()))
         && status.status == "done"
         && status.errors.is_empty()
         && status
@@ -1354,6 +1359,8 @@ mod tests {
         };
         assert!(cloud_init_complete(&output).unwrap());
         for changed in [
+            json!({"status":"done","errors":[],"recoverable_errors":{}}),
+            json!({"status":"done","errors":[],"recoverable_errors":{"DEPRECATED":[]}}),
             json!({"status":"running","errors":[],"recoverable_errors":{}}),
             json!({"status":"done","errors":["module failed"],"recoverable_errors":{}}),
             json!({"status":"done","errors":[],"recoverable_errors":{"WARNING":["network failed"]}}),
@@ -1371,6 +1378,13 @@ mod tests {
             !cloud_init_complete(&GuestOutput {
                 exit: GuestExit(1),
                 stdout
+            })
+            .unwrap()
+        );
+        assert!(
+            cloud_init_complete(&GuestOutput {
+                exit: GuestExit(0),
+                stdout: json!({"status":"done","errors":[],"recoverable_errors":{}}).to_string(),
             })
             .unwrap()
         );
