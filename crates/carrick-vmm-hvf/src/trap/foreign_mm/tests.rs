@@ -13630,6 +13630,19 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
     else {
         panic!("fresh transfer must publish a grant");
     };
+    let peer = sparse_materialization::PublicationContext::for_transfer(
+        installed.state.clone(),
+        custody.clone(),
+        target,
+        window,
+    )
+    .unwrap()
+    .prepare_transfer(window)
+    .unwrap();
+    let carrick_aarch64::user_transfer::TransferPreparation::Pending(wait) = peer else {
+        panic!("uncommitted replacement must retain a completion wait");
+    };
+    assert!(!wait.0.is_ready());
     let txn = *pending.transaction();
     let DescriptorOp::Prepare { publication, .. } = txn.op else {
         panic!()
@@ -13649,6 +13662,10 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         "{receipt:?}"
     );
     assert!(pending.settle(&receipt).unwrap());
+    assert!(
+        wait.0.is_ready(),
+        "exact applied receipt completes publication"
+    );
     drop(pending);
     let new_alias = alias_registry().lock().overlapping_process_aliases(
         TEST_VA,
@@ -14257,7 +14274,7 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
         0x9b00_6100_0000,
         *b"keep",
     );
-    let (authority, _lease, _invalidator) = prepare_foreign_cow(&installed);
+    let (_authority, _lease, _invalidator) = prepare_foreign_cow(&installed);
     installed
         .state
         .page_tables_authority()
@@ -14310,14 +14327,88 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
     .unwrap()
     .prepare_transfer(second)
     .unwrap();
-    assert!(
-        !matches!(peer, TransferPreparation::Declined),
-        "a live unpublished predecessor must own a completion wait, not decline exact supply"
-    );
+    let TransferPreparation::Pending(wait) = peer else {
+        panic!(
+            "a live unpublished predecessor must own a completion wait, not decline exact supply"
+        );
+    };
+    assert!(!wait.0.is_ready());
+    let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = wakes.clone();
+    let (subscription, ready) = wait.0.enroll(Arc::new(move || {
+        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Completion must release inventory and alias guards before callbacks.
+        assert!(alias_registry().try_lock().is_some());
+    }));
+    assert!(!ready);
     assert_eq!(
         installed.state.frame_inventory.ledger.lock().extents.len(),
         before,
         "the contender must not allocate a second physical frame"
     );
+    let first_alias = alias_registry().lock().overlapping_process_aliases(
+        start,
+        4096,
+        Some(installed.owners.0[0]),
+        ContainerRootToken::ROOT,
+    )[0]
+    .1;
     drop(pending);
+    let _ = retire_global_frame_host_owner_if_generation_in(
+        &custody,
+        first_alias.physical_ipa,
+        first_alias.physical_size as u64,
+        first_alias.owner_generation,
+    );
+    assert!(wait.0.is_ready());
+    assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(subscription);
+    let next = sparse_materialization::PublicationContext::for_transfer(
+        installed.state.clone(),
+        custody.clone(),
+        target,
+        second,
+    )
+    .unwrap()
+    .prepare_transfer(second)
+    .unwrap();
+    let TransferPreparation::Grant(next) = next else {
+        panic!("rolled-back predecessor must permit a fresh exact grant");
+    };
+    second.operation.sequence = nonzero(3);
+    let peer = sparse_materialization::PublicationContext::for_transfer(
+        installed.state.clone(),
+        custody.clone(),
+        target,
+        second,
+    )
+    .unwrap()
+    .prepare_transfer(second)
+    .unwrap();
+    let TransferPreparation::Pending(next_wait) = peer else {
+        panic!("new owner must be pending")
+    };
+    assert_ne!(
+        wait, next_wait,
+        "a reused page must not reuse completion identity"
+    );
+    assert!(!next_wait.0.is_ready());
+    // A late enrollment on the completed incarnation reports readiness.
+    let (_late, ready) = wait.0.enroll(Arc::new(|| {}));
+    assert!(ready);
+    let next_alias = alias_registry().lock().overlapping_process_aliases(
+        start,
+        4096,
+        Some(installed.owners.0[0]),
+        ContainerRootToken::ROOT,
+    )[0]
+    .1;
+    drop(next);
+    let _ = retire_global_frame_host_owner_if_generation_in(
+        &custody,
+        next_alias.physical_ipa,
+        next_alias.physical_size as u64,
+        next_alias.owner_generation,
+    );
+    assert!(next_wait.0.is_ready());
 }

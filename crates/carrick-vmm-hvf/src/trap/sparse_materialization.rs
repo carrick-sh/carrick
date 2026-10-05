@@ -20,6 +20,7 @@ pub(super) struct PreparedSparseBacking {
 }
 
 pub(super) struct PublishedFrameGrant {
+    pub(super) completion: global_frame::PhysicalGrantCompletion,
     pub(super) region: HvfMappedRegion,
     pub(super) alias: AliasBacking,
     pub(super) ready: carrick_hal::El1FrameGrantReady,
@@ -506,8 +507,18 @@ fn publish_frame_grant_backing(
         owner_generation,
         inventory_revision: receipt.revision(),
     };
+    let completion = context
+        .custody
+        .global_frame_host_owners
+        .lock()
+        .get(&(physical_ipa, physical_len))
+        .and_then(GlobalFrameOwnerEntry::live_owner)
+        .filter(|owner| owner.generation() == owner_generation)
+        .unwrap_or_else(|| carrick_fatal!("hvpatch::physical_grant", "new grant lost exact owner"))
+        .begin_grant_publication();
     owner_rollback.commit();
     Ok(PublishedFrameGrant {
+        completion,
         region,
         alias,
         ready,
@@ -2499,6 +2510,25 @@ impl PublicationContext<'static> {
             self.container_root,
         );
         if !overlapping.is_empty() {
+            // The alias can precede the guest descriptor receipt. Only the
+            // exact physical owner can supply a completion dependency; never
+            // infer residency or retry authority from an arbitrary overlap.
+            for (_, alias) in &overlapping {
+                let pending = self
+                    .custody
+                    .global_frame_host_owners
+                    .lock()
+                    .get(&(alias.physical_ipa, alias.physical_size as u64))
+                    .and_then(GlobalFrameOwnerEntry::live_owner)
+                    .filter(|owner| {
+                        owner.generation() == alias.owner_generation
+                            && owner.host_addr() == alias.physical_host_addr
+                    })
+                    .and_then(|owner| owner.pending_grant());
+                if let Some(wait) = pending {
+                    return Ok(TransferPreparation::Pending(wait));
+                }
+            }
             let resident = carrick_el1_abi::frame_grant_residency_host()
                 .and_then(|table| table.lookup(window.operation.mm.raw(), window.fault_page));
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
