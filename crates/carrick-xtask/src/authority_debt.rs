@@ -245,7 +245,7 @@ impl AuthorityDebtCeilings {
 }
 #[derive(Debug, clap::Args)]
 pub struct AuthorityDebtArgs {
-    /// Actual PR comparison base, supplied by CI or resolved against github/main.
+    /// Actual change-range base. Absent/empty skips only the delta ratchet.
     #[arg(long)]
     pub base: Option<String>,
     /// Run source and ratchet checks only. Live compiler coverage is still pending.
@@ -448,24 +448,32 @@ fn host_counts(
     }
     Ok(actual)
 }
-fn comparison_base(root: &Path, explicit: Option<&str>) -> Result<String, DebtError> {
+fn comparison_base(root: &Path, explicit: Option<&str>) -> Result<Option<String>, DebtError> {
     let environment = std::env::var("CARRICK_AUTHORITY_BASE").ok();
-    let base = if let Some(base) = explicit.or(environment.as_deref()) {
-        base.to_string()
-    } else {
-        command::run_checked("git", ["merge-base", "HEAD", "github/main"], Some(root))?
-            .stdout
-            .trim()
-            .to_string()
+    let Some(base) = explicit
+        .filter(|base| !base.trim().is_empty())
+        .or_else(|| {
+            environment
+                .as_deref()
+                .filter(|base| !base.trim().is_empty())
+        })
+        .map(str::trim)
+    else {
+        return Ok(None);
     };
-    Ok(command::run_checked(
+    let base = command::run_checked(
         "git",
         ["rev-parse", "--verify", &format!("{base}^{{commit}}")],
         Some(root),
     )?
     .stdout
     .trim()
-    .to_string())
+    .to_string();
+    let head = command::run_checked("git", ["rev-parse", "HEAD"], Some(root))?;
+    if base == head.stdout.trim() {
+        return fail("cannot compare HEAD to itself; provide the actual change-range base");
+    }
+    Ok(Some(base))
 }
 fn base_policy(root: &Path, base: &str) -> Result<AuthorityDebtCeilings, DebtError> {
     let path = format!("{base}:{CEILINGS_PATH}");
@@ -789,7 +797,14 @@ pub fn run(root: &Path, args: &AuthorityDebtArgs) -> Result<(), DebtError> {
     let base = comparison_base(&root, args.base.as_deref())?;
     let policy: AuthorityDebtCeilings =
         serde_json::from_slice(&std::fs::read(root.join(CEILINGS_PATH))?)?;
-    policy.ratchet(&base_policy(&root, &base)?)?;
+    policy.validate()?;
+    if let Some(base) = &base {
+        policy.ratchet(&base_policy(&root, base)?)?;
+    } else {
+        println!(
+            "authority debt delta: no change range (no base provided); delta ratchet not applicable"
+        );
+    }
     let source = SourceCensus::load(&root)?;
     let counts = source_counts(&root, &root, &policy, &source)?;
     policy.check_counts(&counts)?;
@@ -811,8 +826,11 @@ pub fn run(root: &Path, args: &AuthorityDebtArgs) -> Result<(), DebtError> {
             result["executed_profiles"], result["pending_profiles"]
         );
     }
+    if let Some(base) = base {
+        println!("authority debt PR-base ratchet passed ({base})");
+    }
     println!(
-        "authority debt ceilings and PR-base ratchet passed ({base}); source counters: {}",
+        "authority debt ceilings passed; source counters: {}",
         counts.len()
     );
     Ok(())

@@ -485,8 +485,11 @@ verification, acceptance.
 - **Authority debt:** `AuthorityDebtCeilings` stores only operation/owner/lane
   counters. `just lint-domains` checks working source directly and consumes live
   compiler diagnostics ephemerally. Supply the actual PR base with
-  `CARRICK_AUTHORITY_BASE` (CI) or `xtask authority-debt --base COMMIT`; local
-  default is the merge base with `github/main`. Ceilings may only decrease;
+  `CARRICK_AUTHORITY_BASE` (CI) or `xtask authority-debt --base COMMIT`.
+  Absent/empty bases skip only the delta ratchet with one explicit log line;
+  absolute ceilings and live discovery still run. Local range checks must
+  supply their base (e.g. the merge base with `github/main`); HEAD cannot be
+  compared to itself. Ceilings may only decrease;
   removing a nonzero counter or introducing an unknown family/owner fails.
   Keep residual lanes until their own accepted owner cutovers. Zero guest-state
   and raw-termination rules remain unconditional.
