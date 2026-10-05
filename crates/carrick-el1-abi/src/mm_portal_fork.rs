@@ -4,81 +4,9 @@ use crate::{El1MmHandle, PortalOperation, ReservationGeneration, ReservationMm};
 pub const MM_PORTAL_FORK_ESR: u64 = 0x4352_4d4d_464b_0004;
 pub const MM_PORTAL_FORK_FINISH_ESR: u64 = 0x4352_4d4d_4646_0004;
 
-/// An unlinked table extent retained by the physical custodian until settlement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PortalForkTableArena {
-    pub base: u64,
-    pub len: u64,
-}
-impl PortalForkTableArena {
-    pub fn new(base: u64, len: u64) -> Option<Self> {
-        (base != 0
-            && base.is_multiple_of(4096)
-            && len != 0
-            && len.is_multiple_of(4096)
-            && base.checked_add(len).is_some())
-        .then_some(Self { base, len })
-    }
-    pub fn contains(self, address: u64) -> bool {
-        address >= self.base
-            && address
-                .checked_add(8)
-                .is_some_and(|end| end <= self.base + self.len)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PortalForkRequest {
-    pub operation: PortalOperation,
-    pub parent_generation: ReservationGeneration,
-    pub child_mm: ReservationMm,
-    pub child_tables: PortalForkTableArena,
-    pub parent_tables: PortalForkTableArena,
-    pub kernel_control_ipa: u64,
-}
-impl PortalForkRequest {
-    pub fn valid(self) -> bool {
-        self.kernel_control_ipa != 0
-            && self.kernel_control_ipa.is_multiple_of(0x20_0000)
-            && self.kernel_control_ipa.checked_add(0x20_0000).is_some()
-            && self.operation.mm != self.child_mm
-            && PortalForkTableArena::new(self.child_tables.base, self.child_tables.len).is_some()
-            && PortalForkTableArena::new(self.parent_tables.base, self.parent_tables.len).is_some()
-            && (self.child_tables.base + self.child_tables.len <= self.parent_tables.base
-                || self.parent_tables.base + self.parent_tables.len <= self.child_tables.base)
-    }
-}
-
-/// Owner-selected backing. The host authenticates physical custody, never
-/// selects guest mappings or access policy from this receipt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PortalForkCustody {
-    Frame {
-        va: u64,
-        ipa: u64,
-        len: u64,
-        shared: bool,
-    },
-    StructuralCopy {
-        source_ipa: u64,
-        destination_ipa: u64,
-        len: u64,
-        executable: bool,
-    },
-    HostBacking {
-        handle: core::num::NonZeroU64,
-        generation: core::num::NonZeroU64,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PortalForkCompletion {
-    pub request: PortalForkRequest,
-    pub child: El1MmHandle,
-    pub parent_generation: ReservationGeneration,
-    pub child_tables_used: u64,
-    pub parent_tables_used: u64,
-}
+pub use carrick_core_abi::{
+    PortalForkCompletion, PortalForkCustody, PortalForkRequest, PortalForkTableArena,
+};
 
 use core::sync::atomic::{AtomicU64, Ordering};
 const IDLE: u64 = 0;
@@ -92,7 +20,11 @@ const FINISH: u64 = 7;
 const COMPLETED: u64 = 8;
 const READING: u64 = 9;
 const REQUEST_WORDS: usize = 11;
-impl PortalForkRequest {
+trait ForkRequestWire: Sized {
+    fn encode(self) -> [u64; REQUEST_WORDS];
+    fn decode(words: [u64; REQUEST_WORDS], parent_len: u64) -> Option<Self>;
+}
+impl ForkRequestWire for PortalForkRequest {
     fn encode(self) -> [u64; REQUEST_WORDS] {
         [
             crate::MM_PORTAL_PROTOCOL,

@@ -230,3 +230,6 @@ fn x1_shared_mm_owner() {
     transfer_fixture(256, 16);
     x86_wrong_output_pin_refuses_before_preparing_copy();
 }
+
+#[path = "x86_acceleration/fork_cow.rs"]
+mod fork_cow;

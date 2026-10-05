@@ -4,15 +4,28 @@ use crate::aarch64::LeafAccess;
 use crate::owner_mmu::{OwnerForkMmu, OwnerMmu, OwnerMmuRefusal, OwnerTranslation};
 use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct X86Mmu;
 impl OwnerForkMmu for X86Mmu {
     const ADDRESS_MASK: u64 = ADDRESS;
-    const PRIVATE_CONTROL_WINDOW: bool = false;
+    fn control_window() -> Option<(UserVa, UserVa)> {
+        None
+    }
+    fn is_control_alias(_: UserVa) -> bool {
+        false
+    }
+    fn control_alias_destination(_: UserVa, _: FrameGpa) -> Result<FrameGpa, OwnerMmuRefusal> {
+        Err(OwnerMmuRefusal::Unreachable)
+    }
+    fn control_copy_destination(_: UserVa, _: FrameGpa) -> Result<FrameGpa, OwnerMmuRefusal> {
+        Err(OwnerMmuRefusal::Unreachable)
+    }
     fn is_table(word: u64, level: usize) -> bool {
         level < 3 && word & PRESENT != 0 && word & HUGE == 0
     }
     fn table_word(output: FrameGpa, inherited: Option<u64>) -> u64 {
-        output.raw() | inherited.map_or(PRESENT | WRITE | USER, |word| word & !ADDRESS)
+        const TABLE_FLAGS: u64 = PRESENT | WRITE | USER | NX;
+        output.raw() | inherited.map_or(PRESENT, |word| (word & TABLE_FLAGS) | PRESENT)
     }
     fn is_user(word: u64) -> bool {
         word & USER != 0
@@ -32,7 +45,7 @@ impl OwnerForkMmu for X86Mmu {
     fn is_executable_control(word: u64) -> bool {
         word & NX == 0
     }
-    fn control_needs_copy(_: u64) -> bool {
+    fn is_private_control(_: UserVa) -> bool {
         false
     }
     fn split(word: u64, level: usize, index: usize) -> Result<u64, OwnerMmuRefusal> {

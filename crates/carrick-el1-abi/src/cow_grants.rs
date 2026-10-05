@@ -54,37 +54,7 @@ const USED: u64 = 4;
 const STATE_MASK: u64 = 7;
 const EPOCH_ONE: u64 = 8;
 
-/// Why EL1 left a COW write fault to the host. Indexes
-/// [`CowGrantPool::declined`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(usize)]
-pub enum CowDecline {
-    /// No valid L3 page: nothing mapped, an invalid leaf, or a block terminal.
-    Unmapped = 0,
-    /// A valid page that is not COW-armed (untagged backend leaf, or a
-    /// private page `mprotect`ed read-only).
-    NotCowArmed = 1,
-    /// COW-armed but not EL1-private state.
-    NotEl1Private = 2,
-    /// COW-armed and private but Linux never granted write (a real
-    /// protection fault).
-    NoWriteIntent = 3,
-    /// The table walk left the reachable primary arena.
-    Unreachable = 4,
-    /// No grant for this MM was ready.
-    PoolEmpty = 5,
-    /// Another EL1 editor held the MM, or a host pause closed its gate.
-    EditorBusy = 6,
-    /// The copy or the repoint refused (stale leaf, window absent, split
-    /// needed); the grant went back to the pool untouched semantically.
-    Refused = 7,
-    /// An EL0-executable page: its fresh frame's instruction cache is the
-    /// host's to make coherent, so the host resolves the COW.
-    Executable = 8,
-}
-
-/// Number of [`CowDecline`] reasons.
-pub const COW_DECLINE_REASONS: usize = 9;
+pub use carrick_core_abi::{COW_DECLINE_REASONS, CowDecline};
 
 /// One pool record. The state word is published last (Release) by its
 /// owner and read first (Acquire) by the other venue.
@@ -523,6 +493,21 @@ pub trait CowGrantSettlement: Send + Sync {
     /// The excluded MM is retiring: free its pool records (its inventory
     /// retires their frames).
     fn release(&self, excluded: &ExcludedEditor<'_>);
+}
+
+impl carrick_core_abi::CowGrantVenue for CowGrantPool {
+    fn claim(&self, mm_key: u64) -> Option<CowGrant> {
+        self.claim(mm_key)
+    }
+    fn abandon(&self, grant: &CowGrant) -> bool {
+        self.abandon(grant)
+    }
+    fn complete(&self, completion: &CowGrantCompletion) -> bool {
+        self.complete(completion)
+    }
+    fn note_declined(&self, reason: CowDecline) {
+        self.note_declined(reason);
+    }
 }
 
 impl Default for CowGrantPool {
