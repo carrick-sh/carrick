@@ -4022,6 +4022,10 @@ impl Scheduler {
                         .get(&retired._task.id)
                         .is_some_and(|record| record.task.key() == retired._task)
                         || state
+                            .retiring_tasks
+                            .get(&retired._task.id)
+                            .is_some_and(|record| record.task.key() == retired._task)
+                        || state
                             .zombies
                             .get(&retired._task.id)
                             .is_some_and(|record| record.zombie.key == retired._task);
@@ -5873,7 +5877,7 @@ mod tests {
     /// the wake resolves through `state.retired_threads` and the verdict turns
     /// on whether anything still owns `retired._task`.
     #[test]
-    fn a_wake_of_a_zombie_is_classified_exited_not_reaped() {
+    fn a_wake_of_staged_exit_or_zombie_is_classified_exited_not_reaped() {
         let (kernel, root) = bootstrap(12_461);
         let child = process_child(&kernel, &root, 9_461, "wake-audit-target");
         let child_thread = child.thread().key();
@@ -5885,20 +5889,25 @@ mod tests {
         ])));
 
         drop(child);
-        kernel
-            .exit_task_key_eventually(child_task, LinuxWaitStatus::from_wait_encoding(0))
-            .expect("exit the child");
+        let retired = kernel
+            .prepare_task_exit_key(child_task, LinuxWaitStatus::from_wait_encoding(0), None)
+            .unwrap()
+            .retire_notifying(|_| {})
+            .unwrap();
+        let scheduler = Scheduler::new(Arc::clone(&kernel));
+        let staged_wake = scheduler.wake(child_thread);
+        retired.publish().unwrap();
+        assert!(staged_wake.is_err(), "staged exit is no longer runnable");
         assert!(!kernel.task_is_live(child_task.id), "the child is a zombie");
         assert!(kernel.task_exists(child_task.id), "not yet waited for");
 
-        let scheduler = Scheduler::new(Arc::clone(&kernel));
         assert!(
             scheduler.wake(child_thread).is_err(),
             "a zombie's thread cannot be made runnable"
         );
         assert_eq!(
             *recorder.rejections.lock(),
-            vec![(child_task, crate::observe::WakeRejectionReason::Exited)]
+            vec![(child_task, crate::observe::WakeRejectionReason::Exited); 2]
         );
     }
 
