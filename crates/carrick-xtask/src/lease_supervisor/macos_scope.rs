@@ -299,7 +299,8 @@ fn unique_info(pid: libc::pid_t) -> io::Result<Option<UniqueInfo>> {
     let mut info = std::mem::MaybeUninit::<UniqueInfo>::zeroed();
     let size = size_of::<UniqueInfo>() as libc::c_int;
     // SAFETY: matching native PROC_PIDUNIQIDENTIFIERINFO (17) ABI output.
-    let got = unsafe { libc::proc_pidinfo(pid, 17, 0, info.as_mut_ptr().cast(), size) };
+    // arg=1 includes zombies: exit alone must not certify completed reaping.
+    let got = unsafe { libc::proc_pidinfo(pid, 17, 1, info.as_mut_ptr().cast(), size) };
     if got == size {
         return Ok(Some(unsafe { info.assume_init() }));
     }
@@ -324,7 +325,7 @@ fn process_info(pid: libc::pid_t) -> io::Result<Option<NativeProcessInfo>> {
         libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
-            0,
+            1, // Include zombies until their parent's actual wait/reap.
             info.as_mut_ptr().cast(),
             size,
         )
@@ -351,7 +352,7 @@ fn process_info(pid: libc::pid_t) -> io::Result<Option<NativeProcessInfo>> {
             libc::proc_pidinfo(
                 pid,
                 13, // PROC_PIDT_SHORTBSDINFO
-                0,
+                1,  // Include privileged zombies as well as live helpers.
                 info.as_mut_ptr().cast(),
                 size,
             )
@@ -405,6 +406,33 @@ fn all_pids() -> io::Result<Vec<libc::pid_t>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exited_child_is_not_reaped_until_waitpid() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let identity = super::observe(child.id() as libc::pid_t).unwrap().unwrap();
+        let process = super::ProcessWatch::new(identity).unwrap().unwrap();
+        drop(child.stdin.take());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !process.exited().unwrap() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("child exit watch timed out");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let prematurely_reaped = process.reaped().unwrap();
+        // Always reap the fixture before asserting, including on the red path.
+        assert!(child.wait().unwrap().success());
+        assert!(!prematurely_reaped, "unreaped zombie certified as reaped");
+        assert!(process.reaped().unwrap());
+    }
+
     #[test]
     fn privileged_identity_is_observable_without_signal_permission() {
         // Read-only qualification against root-owned launchd. No signal is
