@@ -141,9 +141,32 @@ unsafe fn poll_write_ready(fd: libc::c_int, timeout_ms: libc::c_int) -> bool {
 }
 
 unsafe fn read_exact_timeout(fd: libc::c_int, buf: &mut [u8], timeout_ms: libc::c_int) -> bool {
-    read_exact_timeout_with(fd, buf, timeout_ms, Instant::now, |fd, remaining| {
-        poll_read_ready(fd, remaining)
-    })
+    read_exact_timeout_with(fd, buf, timeout_ms, read_timeout_now, read_timeout_poll)
+}
+
+// Per-thread test observations enter through the production wrapper. Outside
+// tests these helpers delegate directly to the original host clock and poll.
+#[cfg(test)]
+thread_local! {
+    static READ_TIMEOUT_CLOCK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static READ_TIMEOUT_POLLS: std::cell::RefCell<Vec<libc::c_int>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn read_timeout_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = READ_TIMEOUT_CLOCK.with(std::cell::Cell::get) {
+        return now;
+    }
+    Instant::now()
+}
+
+fn read_timeout_poll(fd: libc::c_int, remaining: libc::c_int) -> bool {
+    #[cfg(test)]
+    if READ_TIMEOUT_CLOCK.with(std::cell::Cell::get).is_some() {
+        READ_TIMEOUT_POLLS.with(|polls| polls.borrow_mut().push(remaining));
+        return false;
+    }
+    unsafe { poll_read_ready(fd, remaining) }
 }
 
 // Observe clock and poll work without changing the real syscall path or any
@@ -1203,24 +1226,17 @@ mod tests {
             let worker = std::thread::spawn(move || {
                 let mut buf = [0u8; 4];
                 let start = Instant::now();
-                let mut poll_budgets = Vec::new();
-                let ok = read_exact_timeout_with(
-                    r,
-                    &mut buf,
-                    50,
-                    || start,
-                    |fd, remaining| {
-                        assert_eq!(fd, r);
-                        poll_budgets.push(remaining);
-                        false // The empty pipe has no readiness at this deadline.
-                    },
-                );
+                READ_TIMEOUT_CLOCK.with(|clock| clock.set(Some(start)));
+                let ok = read_exact_timeout(r, &mut buf, 50);
+                READ_TIMEOUT_CLOCK.with(|clock| clock.set(None));
                 assert!(!ok);
-                assert_eq!(
-                    poll_budgets,
-                    vec![50],
-                    "one poll consumes the supplied deadline"
-                );
+                READ_TIMEOUT_POLLS.with(|polls| {
+                    assert_eq!(
+                        *polls.borrow(),
+                        vec![50],
+                        "wrapper must forward the supplied deadline to one poll"
+                    );
+                });
                 // Also exercise real poll/read with an independently held pipe.
                 assert!(!read_exact_timeout(r, &mut buf, 50));
                 done_tx.send(()).unwrap();

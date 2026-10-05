@@ -829,11 +829,29 @@ pub(super) fn create_with_no_resources_backpressure<T>(
     const PARK: std::time::Duration = std::time::Duration::from_millis(25);
     /// Total time to keep parking+retrying before declaring the host genuinely full.
     const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
-    create_with_no_resources_backpressure_bounded(what, PARK, MAX_WAIT, attempt)
+    create_with_no_resources_backpressure_bounded(
+        what,
+        PARK,
+        MAX_WAIT,
+        attempt,
+        &HostRetryClock(std::time::Instant::now()),
+    )
+}
+
+struct HostRetryClock(std::time::Instant);
+
+impl super::admission_retry::RetryClock for HostRetryClock {
+    fn elapsed(&self) -> std::time::Duration {
+        self.0.elapsed()
+    }
+
+    fn park(&self, duration: std::time::Duration) {
+        vcpu_gate::park_for_slot(duration);
+    }
 }
 
 /// The bounded park+retry loop, split out with explicit `park`/`max_wait` so it
-/// is unit-testable in milliseconds instead of the production 10s ceiling. See
+/// accepts a clock/park observer without changing the production policy. See
 /// [`create_with_no_resources_backpressure`] for the semantics.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn create_with_no_resources_backpressure_bounded<T>(
@@ -841,27 +859,26 @@ pub(super) fn create_with_no_resources_backpressure_bounded<T>(
     park: std::time::Duration,
     max_wait: std::time::Duration,
     mut attempt: impl FnMut() -> applevisor::error::Result<T>,
+    clock: &impl super::admission_retry::RetryClock,
 ) -> Result<T, TrapError> {
     use applevisor::error::HypervisorError;
 
-    let start = std::time::Instant::now();
     let mut parks: u32 = 0;
     let result = super::admission_retry::retry_with_clock(
         park,
         max_wait,
         &mut attempt,
         |error| *error == HypervisorError::NoResources,
-        || start.elapsed(),
-        |duration| {
+        clock,
+        || {
             parks += 1;
             if admission_trace_enabled() {
                 eprintln!(
                     "[hvf-admission pid={}] {what} HV_NO_RESOURCES; park+retry #{parks} (waited {:?})",
                     unsafe { libc::getpid() },
-                    start.elapsed()
+                    clock.elapsed()
                 );
             }
-            vcpu_gate::park_for_slot(duration);
         },
     );
     match result {
@@ -870,7 +887,7 @@ pub(super) fn create_with_no_resources_backpressure_bounded<T>(
                 eprintln!(
                     "[hvf-admission pid={}] {what} recovered from HV_NO_RESOURCES after {parks} park(s) / {:?}",
                     unsafe { libc::getpid() },
-                    start.elapsed()
+                    clock.elapsed()
                 );
             }
             Ok(value)
@@ -880,7 +897,7 @@ pub(super) fn create_with_no_resources_backpressure_bounded<T>(
                 eprintln!(
                     "[hvf-admission pid={}] {what} HV_NO_RESOURCES persisted {:?} after {parks} park(s); host full, propagating",
                     unsafe { libc::getpid() },
-                    start.elapsed()
+                    clock.elapsed()
                 );
             }
             Err(TrapError::Hypervisor(format!("{what}: {error}")))
@@ -1041,6 +1058,75 @@ mod vm_create_admission_tests {
     use std::time::Duration;
 
     #[test]
+    fn no_resources_backpressure_bounds_out_when_host_is_full() {
+        use super::super::admission_retry::RetryClock;
+        use std::cell::RefCell;
+
+        struct Clock {
+            elapsed: Cell<Duration>,
+            parks: Cell<u32>,
+            deadlines: RefCell<Vec<Duration>>,
+        }
+        impl RetryClock for Clock {
+            fn elapsed(&self) -> Duration {
+                self.elapsed.get()
+            }
+            fn park(&self, duration: Duration) {
+                assert_eq!(duration, Duration::from_millis(1));
+                self.parks.set(self.parks.get() + 1);
+                self.elapsed.set(self.elapsed.get() + duration);
+            }
+            fn observe_deadline(&self, deadline: Duration) {
+                assert_eq!(
+                    deadline,
+                    Duration::from_millis(20),
+                    "adapter forwarded deadline"
+                );
+                self.deadlines.borrow_mut().push(deadline);
+            }
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let clock = Clock {
+                elapsed: Cell::new(Duration::ZERO),
+                parks: Cell::new(0),
+                deadlines: RefCell::new(Vec::new()),
+            };
+            let calls = Cell::new(0);
+            let max_wait = Duration::from_millis(20);
+            let result: Result<(), TrapError> = create_with_no_resources_backpressure_bounded(
+                "test",
+                Duration::from_millis(1),
+                max_wait,
+                || {
+                    calls.set(calls.get() + 1);
+                    assert!(
+                        calls.get() <= 21,
+                        "retry work exceeded supplied deadline budget"
+                    );
+                    Err(HypervisorError::NoResources)
+                },
+                &clock,
+            );
+            assert_eq!(
+                *clock.deadlines.borrow(),
+                vec![max_wait],
+                "adapter forwarded deadline"
+            );
+            assert!(matches!(result, Err(TrapError::Hypervisor(message))
+                if message == format!("test: {}", HypervisorError::NoResources)));
+            assert_eq!(clock.elapsed.get(), max_wait);
+            assert_eq!(calls.get(), 21);
+            assert_eq!(clock.parks.get(), 20);
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("backpressure independent watchdog");
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn no_resources_backpressure_recovers_after_transient() {
         let _global_state_guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         // NoResources for the first two attempts, then success — the loop must
@@ -1059,6 +1145,7 @@ mod vm_create_admission_tests {
                     Ok(42)
                 }
             },
+            &HostRetryClock(std::time::Instant::now()),
         );
         assert_eq!(out.ok(), Some(42), "transient NoResources must recover");
         assert_eq!(calls.get(), 3, "expected two retries then success");
@@ -1077,6 +1164,7 @@ mod vm_create_admission_tests {
                 calls.set(calls.get() + 1);
                 Err(HypervisorError::Busy)
             },
+            &HostRetryClock(std::time::Instant::now()),
         );
         assert!(out.is_err());
         assert_eq!(
