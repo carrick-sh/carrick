@@ -303,10 +303,10 @@ path), and lets a "landed" change never actually land.
     that blocks the shipped bug shapes (raw wait-set complements, bit=`signum`
     masks, host pids in `NsPid`, hand-numbered private numbers, function-local
     `LINUX_*` consts, inline errno negation). It runs inside `just ci`.
-  - Mechanical migrations go through
+  - Mechanical migrations can use optional one-off codemod tooling outside CI like
     [`scripts/migrate/rewrite.py`](scripts/migrate/rewrite.py) (count-asserted,
-    all-or-nothing rewrite specs) so a repeated-shape pass is a reviewable
-    artifact, not a pile of hand edits.
+    all-or-nothing rewrite specs) so a repeated-shape pass is an auditable
+    artifact, not a pile of hand edits; completed specs are not retained as permanent landing gates.
 - **No pragmatic shortcuts — fix the root cause.** If a backend has a bug, fix the
   backend; don't gate it with a shell hack, swap a real implementation for a
   cheaper approximation, or paper over it. If you catch yourself reaching for a
