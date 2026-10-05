@@ -13,7 +13,11 @@
 
 pub use carrick_core::mm::cow::{CowCopyWindow, CowError, GuestCowOutcome, GuestCowVenue};
 
-pub fn resolve_guest_cow<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized, C: FnMut(u64, u64), I: FnMut()>(
+pub fn resolve_guest_cow<
+    W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    C: FnMut(u64, u64),
+    I: FnMut(),
+>(
     venue: &GuestCowVenue<'_, W>,
     mm_key: u64,
     far: u64,
@@ -780,7 +784,10 @@ mod tests {
                 |source, destination| self.memory.copy_through(self.arena, source, destination),
                 || {},
             );
-            matches!(outcome, Ok(GuestCowOutcome::Resolved(_) | GuestCowOutcome::AlreadyWritable))
+            matches!(
+                outcome,
+                Ok(GuestCowOutcome::Resolved(_) | GuestCowOutcome::AlreadyWritable)
+            )
         }
         fn editor_busy(&mut self) {
             self.pool.note_declined(CowDecline::EditorBusy);
