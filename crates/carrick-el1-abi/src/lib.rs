@@ -1807,12 +1807,9 @@ impl FrameGrantResidencyTable {
             .trailing_zeros()
         {
             let bucket = page / (GRANT_PAGE_SIZE << class);
-            for candidate in [
-                Some(bucket),
-                (class > 0 && bucket > 0).then_some(bucket - 1),
-            ]
-            .into_iter()
-            .flatten()
+            for candidate in [Some(bucket), (class > 0 && bucket > 0).then(|| bucket - 1)]
+                .into_iter()
+                .flatten()
             {
                 for probe in 0..GRANT_PROBES {
                     let slot = Self::probe(mm_key, candidate, class, probe);
@@ -4922,6 +4919,7 @@ mod tests {
     #[test]
     fn disjoint_bulk_grants_share_a_window_without_losing_residency() {
         let table = FrameGrantResidencyTable::new();
+        assert!(table.lookup(41, 0).is_none());
         let base = 0x4000_0000;
         for ordinal in 0..160_u64 {
             let identity = FrameGrantResidencyIdentity {
