@@ -5776,7 +5776,12 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         let page_tables = self.page_tables.clone();
         page_tables.install_source_with_eager_builder(source, || {
             self.build_page_tables_manager_from_live()
-        })
+        })?;
+        // Deferred backends could not bind a resolver to the empty placeholder.
+        // Revisit that exact authority now that the bootstrap image exists,
+        // before publishing a root or admitting any guest descriptor owner.
+        self.vm.bind_stage1_page_tables(page_tables);
+        Ok(())
     }
 
     fn publish_initial_stage1_root(
@@ -8062,7 +8067,7 @@ mod tests {
     }
 
     #[derive(Debug)]
-    struct DummyArenaSource(carrick_mmu_core::aarch64::TableArenaSourceId);
+    pub(super) struct DummyArenaSource(pub(super) carrick_mmu_core::aarch64::TableArenaSourceId);
     impl carrick_mmu_core::aarch64::TableArenaSource for DummyArenaSource {
         fn id(&self) -> carrick_mmu_core::aarch64::TableArenaSourceId {
             self.0
@@ -8882,15 +8887,31 @@ mod transfer_service_tests {
 
     use crate::vmm::*;
     use carrick_hal::*;
-    struct Vm;
+    #[derive(Default)]
+    struct Vm {
+        bound: Option<Stage1Authority>,
+        bootstrap: Option<Vec<u8>>,
+    }
+    struct UnmappedResolver;
+    unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for UnmappedResolver {
+        fn host_ptr_for_base(&self, _: u64) -> Option<*mut u8> {
+            None
+        }
+        fn publish_user_executable(&self, _: u64, _: u64) -> Result<(), PageTableError> {
+            Err(PageTableError::BadAddress)
+        }
+    }
+
     #[derive(Clone)]
     struct Kick;
     impl VcpuKick for Kick {
         fn kick(&self) {}
     }
     impl GuestVmBackend for Vm {
-        fn host_ptr(&self, _: u64, _: usize) -> Option<*mut u8> {
-            None
+        fn host_ptr(&self, base: u64, len: usize) -> Option<*mut u8> {
+            let backing = self.bootstrap.as_ref()?;
+            (base == carrick_mem::memory::LINUX_PAGE_TABLES_BASE && len <= backing.len())
+                .then(|| backing.as_ptr().cast_mut())
         }
         fn write_gpa(&self, _: u64, _: &[u8]) -> Result<(), TrapError> {
             panic!("no frame write expected")
@@ -8901,6 +8922,15 @@ mod transfer_service_tests {
     }
     #[allow(unused_variables)]
     impl Aarch64Vmm for Vm {
+        fn bind_stage1_page_tables(&mut self, authority: Stage1Authority) {
+            // Model the deferred backend: an empty placeholder is not bound.
+            if authority.is_present() {
+                unsafe {
+                    authority.record_live_backing_without_promotion(Arc::new(UnmappedResolver));
+                }
+                self.bound = Some(authority);
+            }
+        }
         type Vcpu = Cpu;
         type AnonymousDiscard = ();
         type KickHandle = Kick;
@@ -8991,7 +9021,7 @@ mod transfer_service_tests {
     }
     fn engine_fixture() -> Aarch64EngineCore<Vm> {
         Aarch64EngineCore::from_injected_task_only_backend(
-            Vm,
+            Vm::default(),
             Cpu {
                 regs: Vec::new(),
                 runs: 0,
@@ -9004,6 +9034,32 @@ mod transfer_service_tests {
             0,
             0,
         )
+    }
+    #[test]
+    fn source_installation_binds_populated_bootstrap_authority_to_backend() {
+        use carrick_mem::memory::{LINUX_PAGE_TABLES_BASE, stage1_hvpatch_page_tables};
+        use carrick_mmu_core::aarch64::{SubstrateGpa, TableArenaSourceId};
+        let mut engine = engine_fixture();
+        engine.vm.bootstrap = Some(stage1_hvpatch_page_tables());
+        engine.vcpu.get_mut().ttbr0 = LINUX_PAGE_TABLES_BASE;
+        assert!(engine.page_tables.is_none());
+        engine
+            .install_stage1_table_arena_source(Box::new(super::tests::DummyArenaSource(
+                TableArenaSourceId(SubstrateGpa(LINUX_PAGE_TABLES_BASE)),
+            )))
+            .unwrap();
+        assert!(
+            engine
+                .vm
+                .bound
+                .as_ref()
+                .is_some_and(|bound| bound.shares_exact_authority(&engine.page_tables)),
+            "the populated bootstrap authority must acquire its backend resolver before root publication"
+        );
+        assert_eq!(
+            engine.page_tables.select_guest_descriptor_owner().unwrap(),
+            crate::stage1_authority::GuestLaneSelection::Selected
+        );
     }
     #[test]
     fn admitted_owner_refuses_legacy_raw_write_preparation() {
