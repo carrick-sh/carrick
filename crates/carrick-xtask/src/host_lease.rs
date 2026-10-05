@@ -1,8 +1,9 @@
+use crate::lock_file::OwnedFileLock;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CString, OsString};
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -129,7 +130,7 @@ impl ScopeIdentity {
 }
 
 struct LeaseHolder {
-    _fd: std::fs::File,
+    _fd: OwnedFileLock,
     directory: tempfile::TempDir,
     stopping: Arc<AtomicBool>,
     server: Option<std::thread::JoinHandle<()>>,
@@ -143,7 +144,90 @@ impl Drop for LeaseHolder {
         if let Some(server) = self.server.take() {
             let _ = server.join();
         }
-        // The owned fd closes after the server stops. Clients never owned it.
+        // The owned guard unlocks after the server stops, then closes its fd.
+        // Unrelated fork copies cannot extend this lease; clients never own it.
+    }
+}
+
+fn read_validation_identity(stream: UnixStream) -> io::Result<LeaseIdentity> {
+    read_validation_identity_until(&stream, Instant::now() + VALIDATION_LIMIT)
+}
+
+fn read_validation_identity_until(
+    stream: &UnixStream,
+    deadline: Instant,
+) -> io::Result<LeaseIdentity> {
+    // Darwin rejects setsockopt after the peer has closed, even with a complete
+    // reply queued. Bound reads without changing socket options. One deadline
+    // covers the entire reply, including EOF; partial progress cannot extend it.
+    let mut bytes = [0; 4097];
+    let mut length = 0;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "lease validation expired"))?;
+        let mut event = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one owned, live socket descriptor, bounded by the deadline.
+        let ready = unsafe {
+            libc::poll(
+                &mut event,
+                1,
+                remaining.as_millis().max(1).min(i32::MAX as u128) as i32,
+            )
+        };
+        if ready == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "lease validation expired",
+            ));
+        }
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if event.revents & libc::POLLNVAL != 0 {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
+        // HUP/ERR may accompany readable final bytes. Receive before deciding
+        // whether EOF completes the identity; never discard a queued reply.
+        // SAFETY: the live socket and writable buffer tail are valid. Per-call
+        // nonblocking I/O prevents a readiness race from blocking past deadline.
+        let count = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                bytes[length..].as_mut_ptr().cast(),
+                bytes.len() - length,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            if matches!(
+                error.kind(),
+                io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+            ) {
+                continue;
+            }
+            return Err(error);
+        }
+        if count == 0 {
+            return Ok(serde_json::from_slice(&bytes[..length])?);
+        }
+        length += count as usize;
+        if length == bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lease validation reply exceeds 4096 bytes",
+            ));
+        }
     }
 }
 
@@ -300,6 +384,7 @@ impl HostLease {
 
         // SAFETY: fd is uniquely owned after successful acquisition.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = OwnedFileLock::from_locked(std::fs::File::from(fd));
         Self::serve(path, mode, fd, scope).map_err(|source| HostLeaseError::Io {
             path: path.to_path_buf(),
             source,
@@ -309,7 +394,7 @@ impl HostLease {
     fn serve(
         path: &Path,
         mode: HostLeaseMode,
-        fd: OwnedFd,
+        fd: OwnedFileLock,
         scope: Option<ScopeIdentity>,
     ) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
@@ -321,7 +406,6 @@ impl HostLease {
             .tempdir_in("/tmp")?;
         let socket = directory.path().join("lease.sock");
         let listener = UnixListener::bind(&socket)?;
-        let fd = std::fs::File::from(fd);
         let metadata = fd.metadata()?;
         let identity = serde_json::to_vec(&LeaseIdentity {
             dev: metadata.dev(),
@@ -394,11 +478,7 @@ impl HostLease {
     ) -> Result<Self, HostLeaseError> {
         use std::os::unix::fs::MetadataExt;
         let validate = || -> io::Result<LeaseIdentity> {
-            let stream = UnixStream::connect(socket)?;
-            stream.set_read_timeout(Some(VALIDATION_LIMIT))?;
-            let mut bytes = Vec::new();
-            stream.take(4096).read_to_end(&mut bytes)?;
-            Ok(serde_json::from_slice(&bytes)?)
+            read_validation_identity(UnixStream::connect(socket)?)
         };
         let identity = validate().map_err(|e| HostLeaseError::Inherited(e.to_string()))?;
         if identity.mode != requested && identity.mode != HostLeaseMode::Gate {
@@ -533,9 +613,164 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    // An unrelated parallel fork can briefly retain even CLOEXEC descriptions
-    // until it execs. Exclusion is immediate; release waits for that exec boundary.
-    const TEST_LEASE_RELEASE_LIMIT: Duration = Duration::from_secs(30);
+    #[test]
+    fn validation_reads_identity_after_peer_closed() {
+        // Run the Linux syscall model in its own process. No process-global
+        // injection or serialization affects the ordinary parallel test suite.
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "host_lease::tests::closed_validation_peer_fixture",
+                "--ignored",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "closed-peer validation failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated closed-peer fixture invoked by its parent regression"]
+    fn closed_validation_peer_fixture() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let reply = LeaseIdentity {
+            dev: 1,
+            ino: 2,
+            mode: HostLeaseMode::Gate,
+            scope: None,
+        };
+        server
+            .write_all(&serde_json::to_vec(&reply).unwrap())
+            .unwrap();
+        drop(server); // Happens before ANY client read or socket configuration.
+        #[cfg(target_os = "linux")]
+        reject_closed_peer_timeout_option(client.as_raw_fd());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(
+            client
+                .set_read_timeout(Some(VALIDATION_LIMIT))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL),
+            "Darwin closed-peer failure must be active before testing validation",
+        );
+        let identity = read_validation_identity(client).unwrap();
+        assert_eq!(identity.dev, reply.dev);
+        assert_eq!(identity.ino, reply.ino);
+        assert_eq!(identity.mode, HostLeaseMode::Gate);
+        assert!(identity.scope.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reject_closed_peer_timeout_option(fd: libc::c_int) {
+        // Darwin's sosetoptlock rejects options after AF_UNIX peer teardown.
+        // Linux permits SO_RCVTIMEO then, so model ONLY that operation on this
+        // already-disconnected fd. This is a syscall witness, not a sandbox.
+        let arg_low = std::mem::offset_of!(libc::seccomp_data, args) as u32
+            + if cfg!(target_endian = "big") { 4 } else { 0 };
+        let mut filter = [
+            (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 0),
+            (
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                0,
+                5,
+                libc::SYS_setsockopt as u32,
+            ),
+            (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, arg_low),
+            (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 0, 3, fd as u32),
+            (
+                libc::BPF_LD | libc::BPF_W | libc::BPF_ABS,
+                0,
+                0,
+                arg_low + 16,
+            ),
+            (
+                libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K,
+                0,
+                1,
+                libc::SO_RCVTIMEO as u32,
+            ),
+            (
+                libc::BPF_RET | libc::BPF_K,
+                0,
+                0,
+                libc::SECCOMP_RET_ERRNO | libc::EINVAL as u32,
+            ),
+            (libc::BPF_RET | libc::BPF_K, 0, 0, libc::SECCOMP_RET_ALLOW),
+        ]
+        .map(|(code, jt, jf, k)| libc::sock_filter {
+            code: code as u16,
+            jt,
+            jf,
+            k,
+        });
+        let program = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_mut_ptr(),
+        };
+        // SAFETY: this isolated test thread owns the filter storage; prctl
+        // copies it synchronously. All other syscalls remain permitted.
+        unsafe {
+            assert_eq!(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), 0);
+            assert_eq!(
+                libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn validation_requires_eof_within_one_deadline() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server
+            .write_all(br#"{"dev":1,"ino":2,"mode":"gate","scope":null}"#)
+            .unwrap();
+        // Keep the peer open with an otherwise complete identity. Validation
+        // must await EOF within the supplied budget, not accept partial framing.
+        let error =
+            read_validation_identity_until(&client, Instant::now() + Duration::from_millis(10))
+                .err()
+                .unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn validation_rejects_incomplete_and_oversized_closed_replies() {
+        for reply in [b"{".to_vec(), vec![b' '; 4097]] {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            server.write_all(&reply).unwrap();
+            drop(server);
+            let error = read_validation_identity(client).err().unwrap();
+            if reply.len() > 4096 {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert!(error.to_string().contains("exceeds 4096 bytes"));
+            } else {
+                assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_fork_exec_cannot_extend_host_lease() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let lease = HostLease::acquire_path(file.path(), HostLeaseMode::Gate).unwrap();
+        let immediate = crate::lock_file::tests::with_unrelated_fork_exec(
+            || {
+                drop(lease);
+                HostLease::try_exclusive(file.path()).unwrap().is_some()
+            },
+            || assert!(HostLease::try_exclusive(file.path()).unwrap().is_some()),
+        );
+        assert!(
+            immediate,
+            "unrelated pre-exec child retained dropped host lease despite CLOEXEC"
+        );
+    }
 
     #[test]
     fn gate_and_docker_exclude_all_other_modes() {
@@ -561,12 +796,7 @@ mod tests {
                     "{holder} must exclude {contender}"
                 );
                 drop(held);
-                HostLease::acquire_path_with_limit(
-                    temp.path(),
-                    contender,
-                    TEST_LEASE_RELEASE_LIMIT,
-                )
-                .unwrap();
+                HostLease::acquire_path_with_limit(temp.path(), contender, Duration::ZERO).unwrap();
             }
         }
     }
@@ -583,12 +813,8 @@ mod tests {
             Err(HostLeaseError::Timeout { .. })
         ));
         drop(gate);
-        HostLease::acquire_path_with_limit(
-            temp.path(),
-            HostLeaseMode::Gate,
-            TEST_LEASE_RELEASE_LIMIT,
-        )
-        .unwrap();
+        HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Gate, Duration::ZERO)
+            .unwrap();
         assert!(
             HostLease::inherit(temp.path(), HostLeaseMode::Carrick, &nested.socket).is_err(),
             "stale capability must fail closed"
@@ -647,13 +873,10 @@ mod tests {
         // Drop the shared lease, releasing the lock
         drop(shared_lease);
 
-        // Release can cross a concurrent fork's exec boundary.
-        let _exclusive = HostLease::acquire_path_with_limit(
-            path,
-            HostLeaseMode::Docker,
-            TEST_LEASE_RELEASE_LIMIT,
-        )
-        .expect("exclusive lock should succeed after shared dropped");
+        // Release is immediate even if an unrelated fork has not executed yet.
+        let _exclusive =
+            HostLease::acquire_path_with_limit(path, HostLeaseMode::Docker, Duration::ZERO)
+                .expect("exclusive lock should succeed after shared dropped");
 
         // SAFETY: fd2 is an open file descriptor.
         unsafe {
@@ -687,13 +910,10 @@ mod tests {
         // Drop the exclusive lease, releasing the lock
         drop(exclusive_lease);
 
-        // Release can cross a concurrent fork's exec boundary.
-        let _shared = HostLease::acquire_path_with_limit(
-            path,
-            HostLeaseMode::Carrick,
-            TEST_LEASE_RELEASE_LIMIT,
-        )
-        .expect("shared lock should succeed after exclusive dropped");
+        // Release is immediate even if an unrelated fork has not executed yet.
+        let _shared =
+            HostLease::acquire_path_with_limit(path, HostLeaseMode::Carrick, Duration::ZERO)
+                .expect("shared lock should succeed after exclusive dropped");
 
         // SAFETY: fd2 is an open file descriptor.
         unsafe {
