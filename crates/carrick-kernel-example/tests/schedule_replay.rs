@@ -1,8 +1,8 @@
 //! Recorded ordering witness for fork/close/exit_group and strict replay.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 use carrick_kernel_example::{
-    ExampleError, Point, Schedule, ScheduleReceipt, ScriptedBackend, Step, alloc_word,
-    await_parked, slot, sys,
+    ExampleError, Point, ReplayExpectation, Schedule, ScheduleReceipt, ScriptedBackend, Step,
+    alloc_word, await_parked, slot, sys,
 };
 
 fn futex_scenario() -> Vec<Step> {
@@ -96,7 +96,7 @@ fn futex_wake_exit_receipt_replays() {
         .expect("futex continuation resume must be recorded");
     assert!(enrolled < published && published < resumed);
     assert_eq!(retained.decisions[published].runnable.len(), 2);
-    let schedule = Schedule::replay(retained.clone());
+    let schedule = Schedule::replay(retained.clone(), ReplayExpectation::Exact);
     let (result, replayed) = run_futex(&schedule);
     assert_eq!(retained.decisions, replayed.decisions);
     let report = result.expect("historical futex pair completes");
@@ -240,7 +240,8 @@ fn seeded_fd_pin_schedule_records_and_replays() {
     }
     // The retained fixtures are historical evidence. Only an explicit
     // VMFREE_REPLAY request uses them; this default check replays its own run.
-    let (replayed, replay_receipt) = run(&Schedule::replay(receipt.clone()));
+    let (replayed, replay_receipt) =
+        run(&Schedule::replay(receipt.clone(), ReplayExpectation::Exact));
     assert_eq!(receipt.decisions, replay_receipt.decisions);
     assert_eq!(format!("{result:?}"), format!("{replayed:?}"));
     assert_fd_pin_conformance(&result);
@@ -249,12 +250,7 @@ fn seeded_fd_pin_schedule_records_and_replays() {
         let retained: ScheduleReceipt =
             serde_json::from_slice(&std::fs::read(path).expect("read replay"))
                 .expect("parse replay");
-        let expected_source = retained.source_hash.clone();
-        let schedule = if let Ok(fixed_source) = std::env::var("VMFREE_ALLOW_FIXED_SOURCE") {
-            Schedule::replay(retained.clone()).allow_source_pair(&expected_source, &fixed_source)
-        } else {
-            Schedule::replay(retained.clone())
-        };
+        let schedule = Schedule::replay(retained.clone(), ReplayExpectation::Exact);
         let (replayed, replay_receipt) = run(&schedule);
         assert_eq!(retained.decisions, replay_receipt.decisions);
         assert_fd_pin_conformance(&replayed);
@@ -273,37 +269,250 @@ fn record_fd_pin_schedule_on_historical_revision() {
     std::fs::write(path, serde_json::to_vec_pretty(&receipt).unwrap()).expect("write trace");
 }
 
-fn expect_replay_rejection(
-    mut receipt: ScheduleReceipt,
-    change: impl FnOnce(&mut ScheduleReceipt),
-) {
-    change(&mut receipt);
-    let schedule = Schedule::replay(receipt);
+fn replay_result(schedule: &Schedule) -> Result<ScheduleReceipt, String> {
     let result = ScriptedBackend::new()
         .with_schedule(schedule.clone())
         .run_root(scenario());
-    let rejection = match result {
-        Err(ExampleError::Schedule(reason)) => reason,
-        Err(ExampleError::Task { error, .. }) => match *error {
-            ExampleError::Schedule(reason) => reason,
-            other => schedule.receipt(other.to_string(), None).unwrap_err(),
-        },
-        other => schedule.receipt(format!("{other:?}"), None).unwrap_err(),
-    };
-    assert!(rejection.contains("replay"), "{rejection}");
+    if let Err(ExampleError::Schedule(reason)) = &result {
+        return Err(reason.clone());
+    }
+    let summary = result
+        .as_ref()
+        .map(|report| {
+            format!(
+                "exit={} tasks={} dispatches={}",
+                report.exit_code(),
+                report.tasks_started(),
+                report.dispatches()
+            )
+        })
+        .unwrap_or_else(|error| error.to_string());
+    let work = result
+        .as_ref()
+        .ok()
+        .map(|report| report.work_snapshot().clone());
+    schedule.receipt(summary, work)
+}
+
+fn expect_replay_rejection(
+    mut receipt: ScheduleReceipt,
+    change: impl FnOnce(&mut ScheduleReceipt),
+    reason: &str,
+) {
+    change(&mut receipt);
+    let rejection =
+        replay_result(&Schedule::replay(receipt, ReplayExpectation::Exact)).unwrap_err();
+    assert!(rejection.contains(reason), "{rejection}");
 }
 
 #[test]
 fn replay_rejects_runnable_actor_generation_fixture_and_suffix_drift() {
     let (_, receipt) = run(&Schedule::explore(5).max_transitions(128));
-    expect_replay_rejection(receipt.clone(), |r| r.decisions[4].runnable.clear());
-    expect_replay_rejection(receipt.clone(), |r| r.decisions[4].next = None);
-    expect_replay_rejection(receipt.clone(), |r| {
-        r.decisions[4].actor.execution_generation += 1
-    });
-    expect_replay_rejection(receipt.clone(), |r| r.fixture_hash.push('0'));
-    expect_replay_rejection(receipt.clone(), |r| r.source_hash.push('0'));
-    expect_replay_rejection(receipt.clone(), |r| {
-        r.decisions.push(r.decisions[0].clone())
-    });
+    // The unmodified control must complete, including its actual result/work.
+    assert_eq!(
+        replay_result(&Schedule::replay(receipt.clone(), ReplayExpectation::Exact)).unwrap(),
+        receipt
+    );
+    expect_replay_rejection(
+        receipt.clone(),
+        |r| r.decisions[4].runnable.clear(),
+        "runnable-set",
+    );
+    expect_replay_rejection(
+        receipt.clone(),
+        |r| r.decisions[4].next = None,
+        "ineligible",
+    );
+    expect_replay_rejection(
+        receipt.clone(),
+        |r| {
+            let decision = &mut r.decisions[4];
+            decision.next = decision
+                .runnable
+                .iter()
+                .copied()
+                .find(|actor| Some(*actor) != decision.next);
+        },
+        "replay",
+    );
+    expect_replay_rejection(
+        receipt.clone(),
+        |r| r.decisions[4].actor.execution_generation += 1,
+        "actor",
+    );
+    expect_replay_rejection(
+        receipt.clone(),
+        |r| r.decisions[4].actor.task_serial += 1,
+        "actor",
+    );
+    expect_replay_rejection(
+        receipt.clone(),
+        |r| r.decisions[4].actor.thread_serial += 1,
+        "actor",
+    );
+    expect_replay_rejection(receipt.clone(), |r| r.decisions[4].visit += 1, "visit");
+    expect_replay_rejection(
+        receipt.clone(),
+        |r| r.decisions[4].point = Point::Finish,
+        "point",
+    );
+    expect_replay_rejection(receipt.clone(), |r| r.fixture_hash.push('0'), "fixture");
+    expect_replay_rejection(receipt.clone(), |r| r.schema_version += 1, "schema");
+    expect_replay_rejection(receipt.clone(), |r| r.generator_version += 1, "schema");
+    expect_replay_rejection(receipt.clone(), |r| r.backend.push('0'), "backend");
+    expect_replay_rejection(receipt.clone(), |r| r.scale += 1, "scale");
+    expect_replay_rejection(
+        receipt.clone(),
+        |r| r.decisions.push(r.decisions[0].clone()),
+        "suffix",
+    );
+    expect_replay_rejection(
+        receipt.clone(),
+        |r| {
+            r.decisions.pop();
+        },
+        "exhausted",
+    );
+    expect_replay_rejection(receipt.clone(), |r| r.result.push('0'), "result");
+    expect_replay_rejection(
+        receipt.clone(),
+        |r| r.work_snapshot.as_mut().unwrap().dropped_events += 1,
+        "work snapshot",
+    );
+    expect_replay_rejection(
+        receipt.clone(),
+        |r| {
+            *r.work_snapshot
+                .as_mut()
+                .unwrap()
+                .values
+                .get_mut(&carrick_observability::work_meter::WorkMetric::KernelDispatches)
+                .unwrap() += 1;
+        },
+        "work snapshot",
+    );
+    expect_replay_rejection(receipt, |r| r.work_snapshot = None, "work snapshot");
+}
+
+#[test]
+fn receipts_bind_scenarios_without_ambient_kernel_sources() {
+    let (_, receipt) = run(&Schedule::explore(5));
+    let json = serde_json::to_value(&receipt).unwrap();
+    assert!(
+        json.get("source_hash").is_none(),
+        "ambient kernel binding must be retired"
+    );
+    assert!(!receipt.fixture_hash.is_empty());
+}
+
+#[test]
+fn regression_replay_checks_explicit_current_result_and_work() {
+    let (_, fixed) = run(&Schedule::explore(5));
+    // A controlled bad observation isolates the expectation mechanism. The
+    // real retained regressions below keep their original trace identities.
+    let mut historical = fixed.clone();
+    historical.result = "continuation build failed: failed to pin an exact fd description".into();
+    historical.work_snapshot = None;
+    assert!(
+        replay_result(&Schedule::replay(
+            historical.clone(),
+            ReplayExpectation::Exact
+        ))
+        .unwrap_err()
+        .contains("result or work")
+    );
+    let expectation = ReplayExpectation::Regression {
+        result: fixed.result.clone(),
+        work_snapshot: fixed.work_snapshot.clone(),
+    };
+    assert_eq!(
+        replay_result(&Schedule::replay(historical.clone(), expectation)).unwrap(),
+        fixed
+    );
+    // A Regression changes only the observation, never actor/transition authority.
+    expect_regression_rejection(
+        &historical,
+        &fixed,
+        |r| r.decisions[4].runnable.clear(),
+        "runnable-set",
+    );
+    for mutate_work in [false, true] {
+        let mut expected = fixed.clone();
+        if mutate_work {
+            expected.work_snapshot.as_mut().unwrap().dropped_events += 1;
+        } else {
+            expected.result.push('0');
+        }
+        let expectation = ReplayExpectation::Regression {
+            result: expected.result,
+            work_snapshot: expected.work_snapshot,
+        };
+        assert!(
+            replay_result(&Schedule::replay(historical.clone(), expectation))
+                .unwrap_err()
+                .contains("result or work")
+        );
+    }
+    assert!(
+        replay_result(&Schedule::replay(
+            fixed.clone(),
+            ReplayExpectation::Regression {
+                result: fixed.result,
+                work_snapshot: fixed.work_snapshot
+            }
+        ))
+        .unwrap_err()
+        .contains("must differ")
+    );
+}
+
+fn expect_regression_rejection(
+    historical: &ScheduleReceipt,
+    fixed: &ScheduleReceipt,
+    change: impl FnOnce(&mut ScheduleReceipt),
+    reason: &str,
+) {
+    let mut receipt = historical.clone();
+    change(&mut receipt);
+    let schedule = Schedule::replay(
+        receipt,
+        ReplayExpectation::Regression {
+            result: fixed.result.clone(),
+            work_snapshot: fixed.work_snapshot.clone(),
+        },
+    );
+    assert!(replay_result(&schedule).unwrap_err().contains(reason));
+}
+
+#[test]
+fn historical_fd_pin_receipts_keep_their_exact_generation_and_bad_result() {
+    for json in [
+        include_str!("fixtures/fdpin-seed5.json"),
+        include_str!("fixtures/fdpin-seed5-main-prefx.json"),
+    ] {
+        let retained: ScheduleReceipt = serde_json::from_str(json).unwrap();
+        assert_eq!(retained.seed, 5);
+        assert_eq!(retained.generator_version, 2);
+        assert_eq!(retained.decisions.len(), 22);
+        assert!(
+            retained
+                .result
+                .contains("failed to pin an exact fd description")
+        );
+        let rejection = replay_result(&Schedule::replay(
+            retained.clone(),
+            ReplayExpectation::Exact,
+        ))
+        .unwrap_err();
+        assert!(rejection.contains("schema"));
+        let expectation = ReplayExpectation::Regression {
+            result: "fixed".into(),
+            work_snapshot: None,
+        };
+        assert!(
+            replay_result(&Schedule::replay(retained, expectation))
+                .unwrap_err()
+                .contains("schema")
+        );
+    }
 }
