@@ -27,6 +27,20 @@
  *     3=parent root. Packed lengths are child high/parent low 32 bits;
  *     TTBR0 includes the ASID in its high bits. Five arguments fit the
  *     Darwin USDT provider limit.
+ *     trace-witness-exit(i32 raw_unix_wait_status)
+ *     fires after the external witness has completed, including its carrier
+ *     cleanup. guest-exit(u32 host_pid, i32 code) records runtime results.
+ *     SIP on cloudmac blocks proc:::exit (qualified 2026-10-05); under -Z
+ *     that absent probe made captures reach their bound. VM-destroy-success
+ *     also does not fire on the retained 299b19ca1 test's exit: the cached
+ *     carrier outlives its guest roots. Use the launcher's witness-exit USDT
+ *     for external tests. The wait-status companion is the witness verdict;
+ *     the trace CLI's successful script receipt qualifies the capture only.
+ *     Inspect both the libtest result and that raw wait status, never infer
+ *     a workload pass from a zero trace CLI status.
+ *     Product invocations keep their proc:::exit control and fail closed if
+ *     that provider is unavailable. Never interpret a bounded trace as zero
+ *     refusals or increase the workload/trace bound to conceal this failure.
  *
  * (c) Perturbation: one failure-only scalar probe per refused owner Fork,
  *     plus one low-frequency publication probe per child. No syscall or
@@ -45,12 +59,15 @@ dtrace:::BEGIN
     children = 0;
     errors = 0;
     bounded = 0;
+    results = 0;
+    witness_closed = 0;
 }
 
 carrick*:::hvpatch-el1-root-prepublish
 /(pid == $target || progenyof($target)) && arg1 == 9/
 {
     children++;
+    carrier_children[pid]++;
     printf("OWNERFORKREFUSAL1|closed-child|mm=%llu|pid=%d\n",
         (uint64_t)arg0, pid);
 }
@@ -78,6 +95,23 @@ dtrace:::ERROR
     errors++;
 }
 
+carrick*:::guest-exit
+/(pid == $target || progenyof($target)) && carrier_children[pid] != 0/
+{
+    results++;
+    printf("OWNERFORKREFUSAL1|guest-result|code=%d|pid=%d\n",
+        (int32_t)arg1, pid);
+}
+
+carrick*:::trace-witness-exit
+/pid == $target/
+{
+    witness_closed++;
+    printf("OWNERFORKREFUSAL1|witness-closed|wait_status=%d|pid=%d\n",
+        (int32_t)arg0, pid);
+    exit(children == 0 || results == 0 || errors != 0 ? 3 : 0);
+}
+
 proc:::exit
 /pid == $target/
 {
@@ -93,6 +127,6 @@ profile:::tick-1sec
 
 dtrace:::END
 {
-    printf("OWNERFORKREFUSAL1|summary|closed_children=%d|refusals=%d|errors=%d|bounded=%d\n",
-        children, refusals, errors, bounded);
+    printf("OWNERFORKREFUSAL1|summary|closed_children=%d|refusals=%d|guest_results=%d|witness_closed=%d|errors=%d|bounded=%d\n",
+        children, refusals, results, witness_closed, errors, bounded);
 }
