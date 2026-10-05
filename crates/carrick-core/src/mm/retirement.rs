@@ -424,6 +424,10 @@ pub struct RecordPin<V: RecordPinVenue> {
     active: bool,
 }
 impl<V: RecordPinVenue> RecordPin<V> {
+    /// Inspect the exact retained identity without releasing or transferring custody.
+    pub const fn identity(&self) -> CarrierStage2RecordIdentity {
+        self.identity
+    }
     pub fn into_transferred_identity(mut self) -> CarrierStage2RecordIdentity {
         self.active = false;
         self.identity
