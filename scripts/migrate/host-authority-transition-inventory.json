@@ -838,18 +838,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8213 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8215 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000048",
     "source": {
-      "byte_end": 367865,
-      "byte_start": 367853,
+      "byte_end": 367944,
+      "byte_start": 367932,
       "column": 21,
       "column_end": 33,
       "column_start": 21,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 8213,
-      "line_end": 8213,
-      "line_start": 8213
+      "line": 8215,
+      "line_end": 8215,
+      "line_start": 8215
     }
   },
   {
@@ -866,18 +866,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8292 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8294 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000049",
     "source": {
-      "byte_end": 372167,
-      "byte_start": 372155,
+      "byte_end": 372246,
+      "byte_start": 372234,
       "column": 36,
       "column_end": 48,
       "column_start": 36,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 8292,
-      "line_end": 8292,
-      "line_start": 8292
+      "line": 8294,
+      "line_end": 8294,
+      "line_start": 8294
     }
   },
   {
@@ -894,18 +894,18 @@
       "macos-hvf-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8398 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-vmm-hvf/src/trap.rs:8400 in `run_to_exit`, `libc::getpid` acts only on the current HVF carrier admission and diagnostic state used by `run_to_exit`; no guest identity selects its host target.",
     "review_id": "HA-000050",
     "source": {
-      "byte_end": 378461,
-      "byte_start": 378449,
+      "byte_end": 378540,
+      "byte_start": 378528,
       "column": 29,
       "column_end": 41,
       "column_start": 29,
       "file": "crates/carrick-vmm-hvf/src/trap.rs",
-      "line": 8398,
-      "line_end": 8398,
-      "line_start": 8398
+      "line": 8400,
+      "line_end": 8400,
+      "line_start": 8400
     }
   },
   {
@@ -13525,8 +13525,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:904 in `is_forked_guest_process`, the host result from `std::process::id` determines the guest fork-child versus bootstrap identity used by `is_forked_guest_process`.",
     "review_id": "HA-000508",
     "source": {
-      "byte_end": 37693,
-      "byte_start": 37677,
+      "byte_end": 38671,
+      "byte_start": 38655,
       "column": 9,
       "column_end": 25,
       "column_start": 9,
@@ -16934,18 +16934,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:5429 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:5444 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 236325,
-      "byte_start": 236300,
+      "byte_end": 236652,
+      "byte_start": 236627,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 5429,
-      "line_end": 5429,
-      "line_start": 5429
+      "line": 5444,
+      "line_end": 5444,
+      "line_start": 5444
     }
   },
   {
@@ -17721,8 +17721,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:2378 in `futex`, `std::thread::sleep` acts only on the current process-dispatch wait worker used by `futex`; no guest identity selects its host target.",
     "review_id": "HA-000605",
     "source": {
-      "byte_end": 107189,
-      "byte_start": 107171,
+      "byte_end": 107879,
+      "byte_start": 107861,
       "column": 29,
       "column_end": 47,
       "column_start": 29,
@@ -18384,8 +18384,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:2044 in `sched_yield`, `std::thread::yield_now` acts only on the current process-dispatch wait worker used by `sched_yield`; no guest identity selects its host target.",
     "review_id": "HA-000630",
     "source": {
-      "byte_end": 90346,
-      "byte_start": 90324,
+      "byte_end": 91324,
+      "byte_start": 91302,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
@@ -18756,18 +18756,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:1447 in `run_executor_loop`, `std::thread::yield_now` acts only on the current persistent executor host thread after one settled quantum used by `run_executor_loop` at line 3931; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:1456 in `run_executor_loop`, `std::thread::yield_now` acts only on the current persistent executor host thread after one settled quantum used by `run_executor_loop` at line 3931; no guest identity selects its host target.",
     "review_id": "HA-000638",
     "source": {
-      "byte_end": 64758,
-      "byte_start": 64736,
+      "byte_end": 65342,
+      "byte_start": 65320,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-      "line": 1447,
-      "line_end": 1447,
-      "line_start": 1447
+      "line": 1456,
+      "line_end": 1456,
+      "line_start": 1456
     }
   }
 ]
