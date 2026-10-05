@@ -64,8 +64,6 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: linux-host
       - name: Install Semgrep
         if: ${{ !cancelled() }}
         run: just ci-install-semgrep
@@ -105,8 +103,6 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: linux-host
       - name: Install Linux C cross toolchain
         if: ${{ !cancelled() }}
         run: just ci-install-linux-cross
@@ -135,8 +131,6 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: linux-host
       - name: Linux crate rustdoc (including Linux host and KVM modules)
         if: ${{ !cancelled() }}
         run: just doc
@@ -249,8 +243,6 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: linux-host
       - name: aarch64 Linux cross-check and no-HVF closure
         if: ${{ !cancelled() }}
         run: just check-linux
@@ -295,8 +287,6 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: linux-host
       - name: Kernel semantics natively on ARM Linux
         if: ${{ !cancelled() }}
         run: just test-kernel-semantics
@@ -320,8 +310,6 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: linux-host
       - name: Install FreeBSD C cross toolchain
         if: ${{ !cancelled() }}
         run: just ci-install-freebsd-cross
@@ -359,8 +347,6 @@ jobs:
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
-        with:
-          shared-key: linux-host
       - name: Cross-check NetBSD NVMM backend (including tests)
         if: ${{ !cancelled() }}
         run: just check-netbsd
