@@ -6328,6 +6328,7 @@ where
                 scheduler: Arc::clone(&prepared.scheduler),
                 wait_service: Arc::clone(&prepared.wait_service),
             },
+            &logical.context.container().launch().carrier_scope_id,
         ) {
             Ok(started) => started,
             Err(error) => {

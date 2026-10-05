@@ -1,79 +1,66 @@
 #!/usr/bin/env python3
-"""Prove lint-domains rejects a new Linux compiler-resolved authority site.
+"""Live Linux direct/alias/macro/cfg breaker using the production profile runner.
 
-Run explicitly on Linux with --ref <reviewed commit>. The product mutation is
-confined to a disposable local clone; the reviewed worktree stays untouched.
-The cheap added/removed/changed projection tests run in lint-domains itself.
+A small dependency-free crate keeps the compiler witness cheap. Rust's count
+consumer checks each resolved operation against an empty approved boundary.
+No stored compiler evidence is read; the JSON is consumed ephemerally.
 """
-
-from __future__ import annotations
-
 import argparse
-import platform
-import subprocess
-import sys
-import tempfile
+import importlib.util
+import json
 from pathlib import Path
-
+import platform
+import shutil
+import sys
 
 ROOT = Path(__file__).resolve().parents[3]
-SITE = "crates/carrick-host-linux/src/lib.rs"
-CHECKER = "scripts/migrate/check-host-authority-transitions.py"
+CHECKER = ROOT / 'scripts/migrate/check-host-authority-transitions.py'
 
 
-def main() -> int:
+def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ref", required=True, help="clean reviewed commit to test")
+    parser.add_argument('--fixture-root', type=Path, required=True)
     args = parser.parse_args()
-    if platform.system() != "Linux":
-        parser.error("the live Linux breaker requires a Linux host")
-    commit = subprocess.check_output(
-        ["git", "rev-parse", "--verify", f"{args.ref}^{{commit}}"], cwd=ROOT, text=True
-    ).strip()
-    with tempfile.TemporaryDirectory(prefix="carrick-ha-linux-breaker-") as directory:
-        clone = Path(directory) / "repo"
-        subprocess.run(
-            ["git", "clone", "--quiet", "--shared", "--no-checkout", str(ROOT), str(clone)],
-            check=True,
-        )
-        subprocess.run(["git", "checkout", "--quiet", "--detach", commit], cwd=clone, check=True)
-        path = clone / SITE
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write(
-                "\n// Disposable Linux host-authority gate breaker.\n"
-                "pub fn carrick_host_authority_linux_breaker() -> u32 {\n"
-                "    std::process::id()\n"
-                "}\n"
-            )
-        subprocess.run(["git", "add", SITE], cwd=clone, check=True)
-        subprocess.run(
-            ["git", "commit", "--quiet", "-m", "test(linux): add disposable authority breaker",
-             "-m", "Verify that a new Linux-only call fails the live compiler census."],
-            cwd=clone,
-            check=True,
-        )
-        # The reviewed macOS projection still agrees. A static-only check
-        # cannot establish Linux coverage; lint must run the fresh census.
-        subprocess.run([sys.executable, CHECKER, "--static"], cwd=clone, check=True)
-        result = subprocess.run(
-            ["just", "lint-domains"], cwd=clone, capture_output=True, text=True
-        )
-        output = result.stdout + result.stderr
-        if (
-            result.returncode == 0
-            or "inventory drift: new=" not in output
-            or SITE not in output
-            or "std::process::id" not in output
-        ):
-            print(output, file=sys.stderr)
-            raise RuntimeError("Linux breaker did not fail at fresh compiler inventory drift")
-        for line in output.splitlines():
-            if "inventory drift:" in line:
-                print(line)
-        print(f"PASS: {commit}: fake Linux std::process::id site failed lint-domains "
-              f"(exit {result.returncode}); disposable clone removed")
-    return 0
+    if platform.system() != 'Linux':
+        parser.error('live Linux breaker requires a Linux host')
+    spec = importlib.util.spec_from_file_location('live_authority_breaker', CHECKER)
+    gate = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = gate
+    spec.loader.exec_module(gate)
+    root = args.fixture_root
+    (root / 'crates/carrick-runtime/src').mkdir(parents=True)
+    (root / '.cargo').mkdir()
+    (root / 'Cargo.toml').write_text('''[workspace]
+members = ["crates/carrick-runtime"]
+resolver = "2"
+''')
+    (root / 'crates/carrick-runtime/Cargo.toml').write_text('''[package]
+name = "carrick-runtime"
+version = "0.1.0"
+edition = "2024"
+[features]
+syscall-shim = []
+platform-linux = []
+''')
+    for path in ['.cargo/config.toml', 'rust-toolchain.toml', 'clippy.toml']:
+        shutil.copyfile(ROOT / path, root / path)
+    (root / 'crates/carrick-runtime/src/lib.rs').write_text('''
+pub fn direct_breaker() -> u32 { std::process::id() }
+use std::process::id as aliased_id;
+pub fn alias_breaker() -> u32 { aliased_id() }
+macro_rules! host_id { () => { std::process::id() }; }
+pub fn macro_breaker() -> u32 { host_id!() }
+#[cfg(target_os = "linux")]
+pub fn cfg_breaker() -> u32 { std::process::id() }
+''')
+    matrix = gate.load_matrix(ROOT / 'scripts/migrate/host-authority-build-matrix.json')
+    catalog = gate.load_catalog_manifest(ROOT / 'scripts/migrate/host-authority-catalog.json')
+    messages = gate.run_profile(matrix.profiles['linux-runtime'], root=root)
+    rows = gate.normalize_messages(messages, 'linux-runtime', root, catalog)
+    if len(rows) != 4 or any(row['operation'] != 'std::process::id' for row in rows):
+        raise RuntimeError(f'compiler did not resolve all four breakers: {rows}')
+    print(json.dumps({'rows': rows}))
 
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__ == '__main__':
+    main()

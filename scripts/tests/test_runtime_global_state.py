@@ -23,23 +23,8 @@ SPEC.loader.exec_module(GATE)
 Finding = GATE.Finding
 LedgerError = GATE.LedgerError
 scan_source = GATE.scan_source
-compare = GATE.compare
 
 
-def reviewed_row(finding: GATE.Finding, **kwargs) -> dict:
-    row = {
-        "kind": finding.kind,
-        "file": finding.file,
-        "symbol": finding.symbol,
-        "fingerprint": finding.fingerprint,
-        "classification": kwargs.get("classification", "carrier_infra"),
-        "rationale": kwargs.get("rationale", "Test rationale."),
-    }
-    if "destination" in kwargs:
-        row["destination"] = kwargs["destination"]
-    elif row["classification"] == "container_debt":
-        row["destination"] = "Container.test_field"
-    return row
 
 
 class RuntimeGlobalStateTests(unittest.TestCase):
@@ -87,24 +72,6 @@ fn borrow(value: &'static str) -> &'static str { value }
             [(row.kind, row.symbol) for row in rows], [("static", "TEST_CELL")]
         )
 
-    def test_exact_ledger_rejects_add_remove_drift_and_bad_rows(self):
-        finding = Finding("static", "crates/x/src/lib.rs", "CELL", "a" * 64)
-        reviewed = reviewed_row(finding, classification="carrier_infra")
-        compare((finding,), (reviewed,))
-        for actual, rows in [((finding,), ()), ((), (reviewed,))]:
-            with self.assertRaises(LedgerError):
-                compare(actual, rows)
-        with self.assertRaises(LedgerError):
-            compare(
-                (dataclasses.replace(finding, fingerprint="b" * 64),),
-                (reviewed,),
-            )
-        with self.assertRaises(LedgerError):
-            compare((finding,), (reviewed, reviewed))
-        with self.assertRaises(LedgerError):
-            compare(
-                (finding,), (reviewed_row(finding, classification="unknown"),)
-            )
 
     def test_line_only_move_keeps_identity(self):
         one = scan_source(
@@ -117,60 +84,8 @@ fn borrow(value: &'static str) -> &'static str { value }
         )
         self.assertEqual(one, two)
 
-    def test_direct_cfg_test_attribute_change_causes_drift(self):
-        with_cfg = scan_source(
-            Path("crates/x/src/lib.rs"),
-            "#[cfg(test)]\nstatic CELL: AtomicU64 = AtomicU64::new(0);",
-        )
-        without_cfg = scan_source(
-            Path("crates/x/src/lib.rs"),
-            "static CELL: AtomicU64 = AtomicU64::new(0);",
-        )
-        self.assertEqual(len(with_cfg), 1)
-        self.assertEqual(len(without_cfg), 1)
-        self.assertEqual(with_cfg[0].symbol, without_cfg[0].symbol)
-        self.assertNotEqual(with_cfg[0].fingerprint, without_cfg[0].fingerprint)
 
-        # Confirm compare rejects with_cfg against without_cfg review
-        with self.assertRaises(LedgerError):
-            compare(with_cfg, (reviewed_row(without_cfg[0]),))
 
-    def test_enclosing_module_cfg_test_change_causes_drift(self):
-        with_mod_cfg = scan_source(
-            Path("crates/x/src/lib.rs"),
-            "#[cfg(test)]\nmod tests {\n    static CELL: AtomicU64 = AtomicU64::new(0);\n}",
-        )
-        without_mod_cfg = scan_source(
-            Path("crates/x/src/lib.rs"),
-            "mod tests {\n    static CELL: AtomicU64 = AtomicU64::new(0);\n}",
-        )
-        self.assertEqual(len(with_mod_cfg), 1)
-        self.assertEqual(len(without_mod_cfg), 1)
-        self.assertEqual(with_mod_cfg[0].symbol, without_mod_cfg[0].symbol)
-        self.assertNotEqual(
-            with_mod_cfg[0].fingerprint, without_mod_cfg[0].fingerprint
-        )
-
-        with self.assertRaises(LedgerError):
-            compare(with_mod_cfg, (reviewed_row(without_mod_cfg[0]),))
-
-    def test_statement_cfg_test_attribute_on_env_read_causes_drift(self):
-        with_cfg = scan_source(
-            Path("crates/x/src/lib.rs"),
-            'fn f() { #[cfg(test)] let _ = std::env::var("X"); }',
-        )
-        without_cfg = scan_source(
-            Path("crates/x/src/lib.rs"),
-            'fn f() { let _ = std::env::var("X"); }',
-        )
-        self.assertEqual(len(with_cfg), 1)
-        self.assertEqual(len(without_cfg), 1)
-        self.assertEqual(with_cfg[0].symbol, without_cfg[0].symbol)
-        self.assertNotEqual(with_cfg[0].fingerprint, without_cfg[0].fingerprint)
-
-        # Confirm compare rejects with_cfg against without_cfg review
-        with self.assertRaises(LedgerError):
-            compare(with_cfg, (reviewed_row(without_cfg[0]),))
 
     def test_statement_cfg_attribute_does_not_leak_to_subsequent_findings(self):
         source = r'''
@@ -262,26 +177,7 @@ const RAW_HASH: &str = r##" std::env::var_os("IGNORED"); "##;
         findings = scan_source(Path("crates/x/src/lib.rs"), source)
         self.assertEqual(findings, ())
 
-    def test_requires_destination_for_container_debt(self):
-        finding = Finding("static", "crates/x/src/lib.rs", "DEBT", "a" * 64)
-        bad_debt = {
-            "kind": "static",
-            "file": "crates/x/src/lib.rs",
-            "symbol": "DEBT",
-            "fingerprint": "a" * 64,
-            "classification": "container_debt",
-            "rationale": "Must move to container.",
-        }
-        with self.assertRaises(LedgerError):
-            compare((finding,), (bad_debt,))
-        good_debt = dict(bad_debt, destination="Container.debt_field")
-        compare((finding,), (good_debt,))
 
-    def test_concurrent_mode_rejects_even_destination_backed_container_debt(self):
-        finding = Finding("static", "crates/x/src/lib.rs", "DEBT", "a" * 64)
-        debt = reviewed_row(finding, classification="container_debt")
-        with self.assertRaises(LedgerError):
-            compare((finding,), (debt,), require_concurrent_embed_clean=True)
 
     def test_concurrent_source_policy_rejects_ambient_runtime_accessors(self):
         source = "fn current_thread_registry() -> &'static Registry { todo!() }"
@@ -306,20 +202,6 @@ const RAW_HASH: &str = r##" std::env::var_os("IGNORED"); "##;
             Path("crates/carrick-thread/src/thread.rs"), source
         )
 
-    def test_requires_rationale_for_all_rows(self):
-        finding = Finding("static", "crates/x/src/lib.rs", "INFRA", "a" * 64)
-        bad_infra = {
-            "kind": "static",
-            "file": "crates/x/src/lib.rs",
-            "symbol": "INFRA",
-            "fingerprint": "a" * 64,
-            "classification": "carrier_infra",
-            "rationale": "",
-        }
-        with self.assertRaises(LedgerError):
-            compare((finding,), (bad_infra,))
-        good_infra = dict(bad_infra, rationale="Host process wide state.")
-        compare((finding,), (good_infra,))
 
     def test_thread_local_multiple_and_visibility(self):
         source = r'''
@@ -334,48 +216,9 @@ thread_local! {
             [("thread_local", "TLS1"), ("thread_local", "TLS2")],
         )
 
-    def test_load_ledger_validates_schema_and_path(self):
-        with self.assertRaises(LedgerError):
-            GATE.load_ledger(Path("nonexistent_file.json"))
 
-    def test_compare_rejects_duplicate_actual_identities(self):
-        f1 = Finding("static", "crates/x/src/lib.rs", "DUP", "a" * 64)
-        f2 = Finding("static", "crates/x/src/lib.rs", "DUP", "a" * 64)
-        reviewed = reviewed_row(f1)
-        with self.assertRaises(LedgerError) as ctx:
-            compare((f1, f2), (reviewed,))
-        self.assertIn("duplicate discovered finding identity", str(ctx.exception))
 
-    def test_bootstrap_emits_unreviewed_and_fails_compare(self):
-        finding = Finding("static", "crates/x/src/lib.rs", "RAW", "a" * 64)
-        unreviewed = {
-            "kind": finding.kind,
-            "file": finding.file,
-            "symbol": finding.symbol,
-            "fingerprint": finding.fingerprint,
-            "classification": "unreviewed",
-            "rationale": "UNREVIEWED: classify scope and state rationale.",
-        }
-        with self.assertRaises(LedgerError) as ctx:
-            compare((finding,), (unreviewed,))
-        self.assertIn("invalid classification: 'unreviewed'", str(ctx.exception))
 
-    def test_cli_ledger_option_with_temporary_ledger(self):
-        import contextlib
-        import io
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tf:
-            tf.write(json.dumps({"schema": 1, "rows": []}))
-            temp_path = Path(tf.name)
-        try:
-            # Running --check against empty ledger on current repo should exit 1 (additions present)
-            stderr_buf = io.StringIO()
-            with contextlib.redirect_stderr(stderr_buf):
-                exit_code = GATE.main(["--check", "--ledger", str(temp_path)])
-            self.assertEqual(exit_code, 1)
-            self.assertIn("error: check-runtime-global-state:", stderr_buf.getvalue())
-        finally:
-            temp_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

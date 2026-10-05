@@ -109,6 +109,7 @@ fn piped_writer(
 /// mount path, a malformed env key).
 pub struct ContainerBuilder {
     carrier: CarrierBinding,
+    capture_identity: carrick_kernel::wedge_capture::CarrierCaptureIdentity,
     image: String,
     platform: Option<Platform>,
     pull: PullPolicy,
@@ -151,9 +152,14 @@ impl ContainerBuilder {
         Self::new(image, CarrierBinding::Explicit(carrier))
     }
 
+    pub(crate) fn capture_identity(&self) -> carrick_kernel::wedge_capture::CarrierCaptureIdentity {
+        self.capture_identity.clone()
+    }
+
     fn new(image: impl Into<String>, carrier: CarrierBinding) -> Self {
         Self {
             carrier,
+            capture_identity: Default::default(),
             image: image.into(),
             platform: None,
             pull: PullPolicy::Missing,
@@ -538,6 +544,7 @@ impl ContainerBuilder {
         self.validate()?;
         Ok(Container {
             carrier: self.carrier,
+            capture_identity: self.capture_identity,
             image: self.image,
             platform: self.platform,
             pull: self.pull,
@@ -623,6 +630,11 @@ impl Container {
         // Reserve identity before image I/O. If resolution fails, the exact
         // prepared lease drops here and removes only this reservation.
         let (carrier, carrier_lease, implicit_carrier) = self.carrier.reserve()?;
+        self.capture_identity
+            .publish(carrier.scope())
+            .map_err(|error| EmbedError::CarrierFailed {
+                reason: error.to_string(),
+            })?;
         let store = self
             .store
             .clone()
@@ -729,6 +741,7 @@ impl Container {
 /// A validated, runnable container configuration.
 pub struct Container {
     carrier: CarrierBinding,
+    capture_identity: carrick_kernel::wedge_capture::CarrierCaptureIdentity,
     image: String,
     platform: Option<Platform>,
     pull: PullPolicy,

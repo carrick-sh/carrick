@@ -152,12 +152,6 @@ fixtures-restore BUNDLE:
 fixtures-verify BUNDLE:
     {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- fixtures verify --bundle {{quote(BUNDLE)}}
 
-
-# Return a reviewed-position-only patch from the same locked cloudmac worktree.
-# Apply and commit locally; this command never applies the patch for you.
-remote-recapture *ARGS:
-    {{_admit}} {{_cargo}} run --locked -p carrick-xtask -- remote-recapture {{ARGS}}
-
 # Provision fresh-worktree guest artifacts before signed execution.
 land-provision *ARGS:
     just --justfile {{justfile()}} xtask provision {{ARGS}}
@@ -207,11 +201,7 @@ clippy *ARGS:
 # checks this host's product profiles and reports all other required profiles
 # pending; a partial local pass is not matrix completeness.
 lint-domains: lint-domains-source
-    just --justfile {{justfile()}} lint-domains-host
-
-# Live compiler capture; hosted CI runs this on macOS beside clippy.
-lint-domains-host:
-    python3 scripts/migrate/check-host-authority-transitions.py --check
+    cargo run --locked -p carrick-xtask -- authority-debt
 
 # Host-independent domain checks; live compiler capture runs separately.
 lint-domains-source:
@@ -232,12 +222,12 @@ lint-domains-source:
     python3 scripts/migrate/check-task-participant-witnesses.py --self-test
     python3 scripts/migrate/check-mm-authority.py --self-test
     python3 scripts/migrate/check-dispatch-lock-authority.py --self-test
-    python3 scripts/migrate/check-k1-burndown.py --self-test
     python3 scripts/migrate/check-serial-host-tests.py --self-test
-    # Inventory rewriters and the compiler-capture checker run their complete
-    # fixture suites here, before their production checks. Keep the list named
+    # Discovery and structural rules run their negative fixture suites
+    # before their production checks. Keep the list named
     # so adding unrelated script tests does not silently change this gate.
-    python3 -m unittest scripts/migrate/tests/test_reconcile_rename.py scripts/tests/test_rehome_line_pinned_inventories.py scripts/tests/test_host_authority_transitions.py
+    python3 -m unittest scripts/tests/test_host_authority_transitions.py scripts/tests/test_runtime_aborts.py scripts/tests/test_runtime_global_state.py scripts/tests/test_authority_debt_retirement.py
+    cargo test --locked -p carrick-xtask --test authority_debt
     python3 -m unittest scripts/tests/test_conformance_contract_policy.py
     {{_admit}} {{_cargo}} run -p carrick-conformance-contract --bin check-contracts -- --root .
     # All-feature metadata includes dependencies for other hosts and optional
@@ -252,140 +242,12 @@ lint-domains-source:
     ./scripts/check-fixture-lockfiles.sh
     {{_admit}} {{_cargo}} run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
     python3 -m unittest scripts/tests/test_check_contract_change.py
-    python3 scripts/migrate/check-runtime-global-state.py --check
-    python3 scripts/migrate/check-runtime-aborts.py --check
     python3 scripts/migrate/check-task-participant-witnesses.py --check
     python3 scripts/migrate/check-mm-authority.py --check
     python3 scripts/migrate/check-host-authority-transitions.py --static
-    python3 scripts/migrate/check-dispatch-lock-authority.py --check
-    python3 scripts/migrate/check-k1-file-authority-inventory.py
-    python3 scripts/migrate/check-k1-file-authority-taxonomy.py
-    python3 scripts/migrate/check-k1-burndown.py
+    cargo run --locked -p carrick-xtask -- authority-debt --source-only
     python3 scripts/migrate/check-serial-host-tests.py
 
-# Re-bind the line-pinned `lint-domains` inventories (runtime-abort
-# fingerprints, host-authority spans, dispatch-lock lines, K1 operation
-# inventory and callsite taxonomy) after an edit that only MOVED reviewed
-# sites. Refuses any change that adds or removes a site — that is a review
-# decision, made by hand in the inventory concerned. Review the resulting
-# `git diff` (positions only), then commit it as
-# `chore: reconcile the line-pinned inventories for <change>`.
-#
-# Rebind the line-pinned lint-domains inventories after a pure code move. Pass
-# `--rehome` to allow reviewed rows to follow functions that move files.
-#
-# It then regenerates the K1 operation inventory and rebinds the K1 call-site
-# taxonomy's moved entries; genuinely new K1 sites, abort sites and global
-# state are listed for review and fail the recipe (never auto-classified).
-reconcile-inventories *args:
-    #!/usr/bin/env bash
-    set -uo pipefail
-    python3 scripts/migrate/reconcile-line-pinned-inventories.py {{args}}
-    status=$?
-    set -e
-    python3 scripts/migrate/check-k1-file-authority-inventory.py --write
-    python3 scripts/migrate/rebind-k1-taxonomy.py
-    python3 scripts/migrate/check-k1-file-authority-taxonomy.py
-    python3 scripts/migrate/check-runtime-aborts.py --check
-    python3 scripts/migrate/check-runtime-global-state.py --check
-    if [ "$status" -ne 0 ]; then
-      echo "reconcile-inventories: the line-pinned reconciler refused part of its work (see above); the K1 steps above ran"
-      exit "$status"
-    fi
-
-# Verify exit status propagation for reconcile-inventories across refusal, success,
-# and followup failure states without executing real Python migrations.
-test-reconcile-exit-status:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    tmp_dir="$(mktemp -d)"
-    trap 'rm -rf "$tmp_dir"' EXIT
-
-    cp "{{justfile()}}" "$tmp_dir/justfile"
-    mkdir -p "$tmp_dir/bin" "$tmp_dir/scripts/migrate"
-
-    printf '%s\n' '#!/usr/bin/env bash' 'script="$1"' 'shift' 'exec bash "$script" "$@"' > "$tmp_dir/bin/python3"
-    chmod +x "$tmp_dir/bin/python3"
-
-    printf '%s\n' '#!/usr/bin/env bash' 'exit "${STUB_RECONCILE_STATUS:-0}"' > "$tmp_dir/scripts/migrate/reconcile-line-pinned-inventories.py"
-
-    printf '%s\n' '#!/usr/bin/env bash' 'exit "${STUB_CHECK_K1_INVENTORY_STATUS:-${STUB_FOLLOWUP_STATUS:-0}}"' > "$tmp_dir/scripts/migrate/check-k1-file-authority-inventory.py"
-
-    printf '%s\n' '#!/usr/bin/env bash' 'exit "${STUB_REBIND_K1_TAXONOMY_STATUS:-${STUB_FOLLOWUP_STATUS:-0}}"' > "$tmp_dir/scripts/migrate/rebind-k1-taxonomy.py"
-
-    printf '%s\n' '#!/usr/bin/env bash' 'exit "${STUB_CHECK_K1_TAXONOMY_STATUS:-${STUB_FOLLOWUP_STATUS:-0}}"' > "$tmp_dir/scripts/migrate/check-k1-file-authority-taxonomy.py"
-
-    printf '%s\n' '#!/usr/bin/env bash' 'exit "${STUB_CHECK_RUNTIME_ABORTS_STATUS:-${STUB_FOLLOWUP_STATUS:-0}}"' > "$tmp_dir/scripts/migrate/check-runtime-aborts.py"
-
-    printf '%s\n' '#!/usr/bin/env bash' 'exit "${STUB_CHECK_RUNTIME_GLOBAL_STATE_STATUS:-${STUB_FOLLOWUP_STATUS:-0}}"' > "$tmp_dir/scripts/migrate/check-runtime-global-state.py"
-
-    chmod +x "$tmp_dir/scripts/migrate"/*.py
-
-    echo "Running case: initial_refusal_survives_successful_followups"
-    for expected_status in 1 2; do
-        set +e
-        out_refusal=$(
-            PATH="$tmp_dir/bin:$PATH" \
-            STUB_RECONCILE_STATUS="$expected_status" \
-            STUB_FOLLOWUP_STATUS=0 \
-            just --justfile "$tmp_dir/justfile" --working-directory "$tmp_dir" reconcile-inventories 2>&1
-        )
-        rc_refusal=$?
-        set -e
-        if [ "$rc_refusal" -ne "$expected_status" ]; then
-            echo "ASSERTION FAILED [initial_refusal_survives_successful_followups]: expected exit status $expected_status, got $rc_refusal" >&2
-            echo "Output was:" >&2
-            echo "$out_refusal" >&2
-            exit 1
-        fi
-        if ! echo "$out_refusal" | grep -q "reconcile-inventories: the line-pinned reconciler refused part of its work"; then
-            echo "ASSERTION FAILED [initial_refusal_survives_successful_followups]: missing review diagnostic" >&2
-            exit 1
-        fi
-    done
-
-    echo "Running case: initial_success_and_followups_succeed"
-    set +e
-    out_success=$(
-        PATH="$tmp_dir/bin:$PATH" \
-        STUB_RECONCILE_STATUS=0 \
-        STUB_FOLLOWUP_STATUS=0 \
-        just --justfile "$tmp_dir/justfile" --working-directory "$tmp_dir" reconcile-inventories 2>&1
-    )
-    rc_success=$?
-    set -e
-    if [ "$rc_success" -ne 0 ]; then
-        echo "ASSERTION FAILED [initial_success_and_followups_succeed]: expected exit status 0, got $rc_success" >&2
-        echo "Output was:" >&2
-        echo "$out_success" >&2
-        exit 1
-    fi
-    if echo "$out_success" | grep -q "reconcile-inventories: the line-pinned reconciler refused part of its work"; then
-        echo "ASSERTION FAILED [initial_success_and_followups_succeed]: unexpected review diagnostic" >&2
-        exit 1
-    fi
-
-    echo "Running case: followup_failure_is_nonzero"
-    for init_status in 0 1; do
-        set +e
-        out_followup=$(
-            PATH="$tmp_dir/bin:$PATH" \
-            STUB_RECONCILE_STATUS="$init_status" \
-            STUB_FOLLOWUP_STATUS=3 \
-            just --justfile "$tmp_dir/justfile" --working-directory "$tmp_dir" reconcile-inventories 2>&1
-        )
-        rc_followup=$?
-        set -e
-        if [ "$rc_followup" -eq 0 ]; then
-            echo "ASSERTION FAILED [followup_failure_is_nonzero]: expected non-zero exit status, got 0" >&2
-            echo "Output was:" >&2
-            echo "$out_followup" >&2
-            exit 1
-        fi
-    done
-
-    echo "test-reconcile-exit-status: all cases passed"
 
 
 # Dependency license / bans / sources gate (matches CI). Enforces the deny.toml

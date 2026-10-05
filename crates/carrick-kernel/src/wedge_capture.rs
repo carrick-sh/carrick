@@ -32,6 +32,31 @@ use std::time::{Duration, Instant};
 
 use crate::deadlock_watchdog::ensure_private_directory;
 
+/// Owned diagnostic identity published when the carrier reservation is made.
+/// Budget/watchdog threads may outlive preparation; this keeps the exact scope
+/// available without rediscovering process environment or guessing a container.
+#[derive(Clone, Default)]
+pub struct CarrierCaptureIdentity(
+    std::sync::Arc<std::sync::OnceLock<crate::kernel::CarrierScopeId>>,
+);
+
+impl CarrierCaptureIdentity {
+    pub fn publish(
+        &self,
+        scope: &crate::kernel::CarrierScopeId,
+    ) -> Result<(), crate::run_result::RuntimeError> {
+        self.0.set(scope.clone()).map_err(|_| {
+            crate::run_result::RuntimeError::Configuration(
+                "carrier capture identity was published twice".to_owned(),
+            )
+        })
+    }
+
+    pub fn run_id(&self) -> Option<String> {
+        self.0.get().map(|scope| scope.as_str().to_owned())
+    }
+}
+
 /// How long one `lldb` invocation may run before it is killed and the capture
 /// reported as timed out. A backtrace of ~26 threads returns in seconds; a
 /// modified-memory core of a multi-GiB carrier is the slow one.
@@ -649,5 +674,27 @@ mod tests {
         assert_eq!(directory_name("../../etc", 7), "------etc-7");
         assert_eq!(directory_name("", 7), "carrier-7");
         assert_eq!(directory_name("generic probe/1", 7), "generic-probe-1-7");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod identity_tests {
+    #[test]
+    fn two_capture_identities_keep_their_exact_published_scope() {
+        use super::CarrierCaptureIdentity;
+        use crate::kernel::CarrierScopeId;
+        let first = CarrierCaptureIdentity::default();
+        let waiting = first.clone();
+        let second = CarrierCaptureIdentity::default();
+        assert_eq!(waiting.run_id(), None);
+        let alpha = CarrierScopeId::new("alpha").expect("valid scope");
+        let beta = CarrierScopeId::new("beta").expect("valid scope");
+        first.publish(&alpha).expect("first publication");
+        second.publish(&beta).expect("independent publication");
+        assert_eq!(waiting.run_id().as_deref(), Some("alpha"));
+        assert_eq!(second.run_id().as_deref(), Some("beta"));
+        assert!(first.publish(&beta).is_err());
+        assert_eq!(waiting.run_id().as_deref(), Some("alpha"));
     }
 }

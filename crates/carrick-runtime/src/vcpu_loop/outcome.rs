@@ -277,9 +277,15 @@ impl ProcessGraphLiveness {
             scheduler.poke_executor_control();
         }
         let kernel = self.kernel.as_ref().and_then(Weak::upgrade);
-        let run_id = std::env::var("CARRICK_RUN_ID")
-            .ok()
-            .filter(|id| !id.is_empty());
+        let run_id = kernel.as_ref().and_then(|kernel| {
+            let ids = kernel.container_ids();
+            let [id] = ids.as_slice() else {
+                return None;
+            };
+            kernel
+                .container(*id)
+                .map(|container| container.launch().carrier_scope_id.as_str().to_owned())
+        });
         let mut post_mortem =
             carrick_kernel::kernel::debug::PostMortem::capture(kernel.as_ref(), reason, run_id);
         post_mortem.enrich_from_capture();

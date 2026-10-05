@@ -11,9 +11,6 @@ from pathlib import Path, PurePosixPath
 import sys
 from typing import Sequence
 
-SHARD_NAMES = ("runtime.json", "hvf.json", "vcpu-loop.json", "other.json")
-REQUIRED_SHARDS = frozenset(SHARD_NAMES)
-
 EXCLUDED_CRATE_PREFIXES = (
     "crates/carrick-conformance",
     "crates/carrick-fatal",  # the sink itself: the one legitimate raw abort
@@ -33,7 +30,7 @@ class AbortFinding:
 
 
 class LedgerError(Exception):
-    """Raised when ledger validation fails."""
+    """Raised when production termination violates the boundary."""
 
 
 @dataclass(frozen=True)
@@ -1473,299 +1470,20 @@ def route_shard(file_path: str) -> str:
     raise LedgerError(f"unknown shard for file: {file_path}")
 
 
-def load_shard(path: Path) -> dict:
-    if not path.is_file():
-        raise LedgerError(f"shard file not found: {path}")
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        raise LedgerError(f"malformed JSON in {path}: {e}") from e
-    return data
-
-
-def validate_required_shards(ledgers: dict[str, dict]) -> None:
-    actual = set(ledgers)
-    if actual != REQUIRED_SHARDS:
-        missing = sorted(REQUIRED_SHARDS - actual)
-        unexpected = sorted(actual - REQUIRED_SHARDS)
-        raise LedgerError(
-            f"required abort shards mismatch: missing={missing}, "
-            f"unexpected={unexpected}"
-        )
-
-
-def validate_shards(
-    findings: Sequence[AbortFinding],
-    ledgers: dict[str, dict],
-    mode: str = "check",
-) -> None:
-    if mode not in ("check", "migrate"):
-        raise ValueError(f"unknown validation mode: {mode}")
-
-    # Explicitly check for duplicate actual identities before constructing index
-    seen_finding_keys: set[tuple[str, str, int]] = set()
-    for f in findings:
-        key = (f.file, f.function, f.ordinal_in_function)
-        if key in seen_finding_keys:
-            raise LedgerError(f"duplicate finding identity: {key}")
-        seen_finding_keys.add(key)
-
-    findings_by_shard: dict[str, list[AbortFinding]] = {s: [] for s in SHARD_NAMES}
-    for f in findings:
-        shard = route_shard(f.file)
-        if shard not in findings_by_shard:
-            raise LedgerError(f"invalid shard route {shard} for {f.file}")
-        findings_by_shard[shard].append(f)
-
-    for shard_name, shard_data in ledgers.items():
-        if shard_name not in SHARD_NAMES:
-            raise LedgerError(f"unknown shard name: {shard_name}")
-
-        if shard_data.get("schema") != 1:
-            raise LedgerError(f"{shard_name}: expected schema 1")
-        if shard_data.get("shard") != shard_name:
-            raise LedgerError(f"{shard_name}: mismatched shard field {shard_data.get('shard')}")
-
-        rows = shard_data.get("rows")
-        if not isinstance(rows, list):
-            raise LedgerError(f"{shard_name}: rows must be a list")
-
-        debt_ceiling = shard_data.get("typed_error_debt_ceiling")
-        if not isinstance(debt_ceiling, int) or debt_ceiling < 0:
-            raise LedgerError(f"{shard_name}: typed_error_debt_ceiling must be non-negative integer")
-
-        # Validate rows
-        seen_row_keys: set[tuple[str, str, int]] = set()
-        debt_count = 0
-        rows_by_key: dict[tuple[str, str, int], dict] = {}
-
-        for row in rows:
-            if not isinstance(row, dict):
-                raise LedgerError(f"{shard_name}: row must be a dict")
-            file_p = row.get("file")
-            func = row.get("function")
-            ord_val = row.get("ordinal_in_function")
-            fp = row.get("fingerprint")
-            verdict = row.get("verdict")
-            rationale = row.get("rationale")
-            failure_domain = row.get("failure_domain")
-            typed_error = row.get("typed_error")
-
-            if not file_p or not isinstance(file_p, str):
-                raise LedgerError(f"{shard_name}: invalid file in row")
-            if not func or not isinstance(func, str):
-                raise LedgerError(f"{shard_name}: invalid function in row")
-            if not isinstance(ord_val, int) or ord_val < 1:
-                raise LedgerError(f"{shard_name}: invalid ordinal_in_function")
-            if not fp or not isinstance(fp, str):
-                raise LedgerError(f"{shard_name}: invalid fingerprint")
-
-            if route_shard(file_p) != shard_name:
-                raise LedgerError(f"{shard_name}: row {file_p} belongs in {route_shard(file_p)}")
-
-            if verdict not in ("carrier_fault", "typed_error_debt"):
-                raise LedgerError(f"{shard_name}: invalid verdict {verdict}")
-
-            if not rationale or not isinstance(rationale, str) or not rationale.strip():
-                raise LedgerError(f"{shard_name}: missing rationale for {file_p} {func} #{ord_val}")
-
-            if not failure_domain or not isinstance(failure_domain, str) or not failure_domain.strip():
-                raise LedgerError(f"{shard_name}: missing failure_domain for {file_p} {func} #{ord_val}")
-
-            if verdict == "typed_error_debt":
-                debt_count += 1
-                if not typed_error or not isinstance(typed_error, str) or not typed_error.strip():
-                    raise LedgerError(f"{shard_name}: typed_error_debt requires typed_error")
-            elif typed_error is not None:
-                raise LedgerError(f"{shard_name}: carrier_fault must not have typed_error")
-
-            sink = row.get("sink")
-            domain = row.get("domain")
-
-            if sink not in ("raw", "fatal"):
-                raise LedgerError(f"{shard_name}: invalid or missing sink {sink} in row {file_p} {func} #{ord_val}")
-
-            if sink == "fatal":
-                if not domain or not isinstance(domain, str) or not domain.strip():
-                    raise LedgerError(f"{shard_name}: fatal sink requires non-empty domain in row {file_p} {func} #{ord_val}")
-            elif domain is not None:
-                raise LedgerError(f"{shard_name}: raw sink must not have domain in row {file_p} {func} #{ord_val}")
-
-            key = (file_p, func, ord_val)
-            if key in seen_row_keys:
-                raise LedgerError(f"{shard_name}: duplicate row for {key}")
-            seen_row_keys.add(key)
-            rows_by_key[key] = row
-
-        if debt_count != debt_ceiling:
-            raise LedgerError(
-                f"{shard_name}: typed_error_debt_ceiling ({debt_ceiling}) does not match exact debt count ({debt_count})"
-            )
-
-        # Compare findings for this shard
-        actual_findings = findings_by_shard[shard_name]
-        actual_keys = {(f.file, f.function, f.ordinal_in_function) for f in actual_findings}
-
-        missing = actual_keys - seen_row_keys
-        if missing:
-            raw_missing = [
-                f for f in actual_findings
-                if (f.file, f.function, f.ordinal_in_function) in missing and f.sink == "raw"
-            ]
-            if raw_missing:
-                raise LedgerError(
-                    f"{shard_name}: new raw abort site forbidden: "
-                    f"{raw_missing[0].file} {raw_missing[0].function} #{raw_missing[0].ordinal_in_function}"
-                )
-            raise LedgerError(f"{shard_name}: missing classifications for {len(missing)} calls: {sorted(missing)[:3]}")
-
-        stale = seen_row_keys - actual_keys
-        if stale:
-            raise LedgerError(f"{shard_name}: stale rows present for {len(stale)} calls: {sorted(stale)[:3]}")
-
-        # Check sink transitions and fingerprints
-        for f in actual_findings:
-            key = (f.file, f.function, f.ordinal_in_function)
-            row = rows_by_key[key]
-
-            # Rule: sink flipped from fatal back to raw is forbidden in both modes
-            if row["sink"] == "fatal" and f.sink == "raw":
-                raise LedgerError(
-                    f"{shard_name}: sink flipped from fatal back to raw for {f.file} {f.function} #{f.ordinal_in_function}"
-                )
-
-            # Rule: raw -> fatal flip
-            if row["sink"] == "raw" and f.sink == "fatal":
-                if mode == "check":
-                    raise LedgerError(
-                        f"{shard_name}: site {f.file} {f.function} #{f.ordinal_in_function} migrated raw→fatal; run --migrate to re-bless"
-                    )
-                if mode == "migrate":
-                    row["sink"] = "fatal"
-                    row["domain"] = f.domain
-                    row["fingerprint"] = f.fingerprint
-                    continue
-
-            # If both are fatal, verify domain matches
-            if row["sink"] == "fatal" and f.sink == "fatal":
-                if row.get("domain") != f.domain:
-                    raise LedgerError(
-                        f"{shard_name}: fatal domain mismatch for {f.file} {f.function} #{f.ordinal_in_function}: ledger={row.get('domain')} vs source={f.domain}"
-                    )
-
-            # If not a raw -> fatal flip, fingerprint must match exactly (refuse fingerprint change on unflipped row)
-            if row["fingerprint"] != f.fingerprint:
-                raise LedgerError(
-                    f"{shard_name}: fingerprint drift for {f.file} {f.function} #{f.ordinal_in_function}"
-                )
-
-
-def main() -> int:
-    root = Path(__file__).resolve().parents[2]
-    shards_dir = root / "scripts/migrate/runtime-aborts"
-
-    args = sys.argv[1:]
-    check_shard: str | None = None
-    if "--check-shard" in args:
-        idx = args.index("--check-shard")
-        if idx + 1 < len(args):
-            check_shard = args[idx + 1]
-            if not check_shard.endswith(".json"):
-                check_shard += ".json"
-        else:
-            print("ERROR: --check-shard requires shard name", file=sys.stderr)
-            return 2
-
-    only_shard: str | None = None
-    if "--only" in args:
-        idx = args.index("--only")
-        if idx + 1 < len(args):
-            only_shard = args[idx + 1]
-            if not only_shard.endswith(".json"):
-                only_shard += ".json"
-        else:
-            print("ERROR: --only requires shard name", file=sys.stderr)
-            return 2
-
-    target_shard = check_shard or only_shard
-    all_findings = discover_runtime_aborts(root)
-
-    if "--migrate" in args:
-        shards_to_migrate = [target_shard] if target_shard else list(SHARD_NAMES)
-        ledgers = {}
-        for s in shards_to_migrate:
-            p = shards_dir / s
-            if not p.is_file():
-                print(f"FAIL: required shard file not found: {p}", file=sys.stderr)
-                return 1
-            ledger = load_shard(p)
-            for row in ledger.get("rows", []):
-                if "sink" not in row:
-                    row["sink"] = "raw"
-            ledgers[s] = ledger
-
-        active_findings = [f for f in all_findings if route_shard(f.file) in ledgers]
-        try:
-            if target_shard is None:
-                validate_required_shards(ledgers)
-            validate_shards(active_findings, ledgers, mode="migrate")
-        except LedgerError as e:
-            print(f"FAIL: {e}", file=sys.stderr)
-            return 1
-
-        for s, l in ledgers.items():
-            p = shards_dir / s
-            p.write_text(json.dumps(l, indent=2) + "\n", encoding="utf-8")
-            print(f"MIGRATED: {s} ({len(l['rows'])} rows)")
-        return 0
-
-    if target_shard and not ("--check" in args and only_shard):
-        shard_path = shards_dir / target_shard
-        if not shard_path.is_file():
-            print(f"ERROR: Shard file {shard_path} does not exist", file=sys.stderr)
-            return 1
-        ledger = load_shard(shard_path)
-        shard_findings = [f for f in all_findings if route_shard(f.file) == target_shard]
-        try:
-            validate_shards(shard_findings, {target_shard: ledger}, mode="check")
-        except LedgerError as e:
-            print(f"FAIL: {e}", file=sys.stderr)
-            return 1
-        cf_count = sum(1 for r in ledger["rows"] if r["verdict"] == "carrier_fault")
-        td_count = sum(1 for r in ledger["rows"] if r["verdict"] == "typed_error_debt")
-        print(f"OK: shard {target_shard} valid ({len(ledger['rows'])} aborts: {cf_count} carrier_fault, {td_count} typed_error_debt)")
-        return 0
-
-    # Validate the exact required shard set, or one explicitly focused shard.
-    ledgers: dict[str, dict] = {}
-    shards_to_inspect = [only_shard] if only_shard else list(SHARD_NAMES)
-
-    for s in shards_to_inspect:
-        p = shards_dir / s
-        if not p.is_file():
-            print(f"FAIL: required shard file not found: {p}", file=sys.stderr)
-            return 1
-        ledgers[s] = load_shard(p)
-
-    if "--check" in args:
-        active_findings = [f for f in all_findings if route_shard(f.file) in ledgers]
-        try:
-            if only_shard is None:
-                validate_required_shards(ledgers)
-            validate_shards(active_findings, ledgers, mode="check")
-        except LedgerError as e:
-            print(f"FAIL: {e}", file=sys.stderr)
-            return 1
-
-        for s, l in ledgers.items():
-            cf = sum(1 for r in l["rows"] if r["verdict"] == "carrier_fault")
-            td = sum(1 for r in l["rows"] if r["verdict"] == "typed_error_debt")
-            print(f"OK: shard {s} valid ({len(l['rows'])} aborts: {cf} carrier_fault, {td} typed_error_debt)")
-        return 0
-
-    print("Usage: check-runtime-aborts.py [--check [--only <shard>] | --check-shard <shard> | --migrate]")
-    return 1
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Discover fatal symbols and unconditionally deny raw termination")
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[2])
+    parser.add_argument("--discover", action="store_true")
+    args = parser.parse_args()
+    findings = discover_runtime_aborts(args.root)
+    raw = [f for f in findings if f.sink == "raw"]
+    if raw:
+        print(f"raw termination forbidden: {raw[0].file}::{raw[0].function}", file=sys.stderr)
+        return 1
+    print(json.dumps([{"file": f.file, "function": f.function, "domain": f.domain} for f in findings]))
+    return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

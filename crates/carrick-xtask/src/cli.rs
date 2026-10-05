@@ -38,6 +38,8 @@ pub enum Commands {
 
     #[command(about = "Hold checkout admission through a foreground command")]
     WorktreeRun(crate::worktree_admission::WorktreeRunArgs),
+    #[command(about = "Live position-free authority debt and PR-base ratchet")]
+    AuthorityDebt(crate::authority_debt::AuthorityDebtArgs),
 
     #[command(about = "Per-landing Carrick vs native Docker receipts")]
     Impact(crate::impact::ImpactArgs),
@@ -88,10 +90,6 @@ pub enum Commands {
         about = "Run accept gate on a remote Mac over ssh and fetch the receipt"
     )]
     RemoteAccept(crate::remote_accept::RemoteAcceptArgs),
-    #[command(
-        about = "Recapture moved host-authority positions on the gate Mac and return a patch"
-    )]
-    RemoteRecapture(crate::remote_recapture::RemoteRecaptureArgs),
 
     #[command(
         name = "test-lanes",
@@ -146,6 +144,8 @@ pub enum CliError {
     CiScaler(#[from] crate::ci_scaler::ScalerError),
     #[error("worktree gc: {0}")]
     WorktreeGc(#[from] crate::worktree_gc::GcError),
+    #[error(transparent)]
+    AuthorityDebt(#[from] crate::authority_debt::DebtError),
     #[error("impact: {0}")]
     Impact(String),
     #[error("{0}")]
@@ -189,8 +189,6 @@ pub enum CliError {
     Accept(#[from] crate::accept::AcceptError),
     #[error("remote accept error: {0}")]
     RemoteAccept(#[from] crate::remote_accept::RemoteAcceptError),
-    #[error("remote recapture error: {0}")]
-    RemoteRecapture(#[from] crate::remote_recapture::RecaptureError),
     #[error("test lanes: {0}")]
     TestLanes(#[from] crate::test_lanes::TestLanesError),
 }
@@ -425,8 +423,9 @@ where
             }
             Ok(())
         }
-        Commands::RemoteRecapture(args) => {
-            crate::remote_recapture::run(cli.root.as_deref(), args)?;
+        Commands::AuthorityDebt(args) => {
+            let root = resolve_repo_info(cli.root.as_deref())?.repository_root;
+            crate::authority_debt::run(&root, &args)?;
             Ok(())
         }
         Commands::TestLanes(args) => {

@@ -28,6 +28,7 @@ env:
   CARGO_NET_RETRY: "10"              # transport retries for registry/download fetches only
   RUST_BACKTRACE: 1
   CARRICK_PROBE_COVERAGE_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+  CARRICK_AUTHORITY_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
 
 jobs:
   changes:
@@ -189,7 +190,7 @@ jobs:
         run: just clippy
       - name: Live host-authority compiler census
         if: ${{ !cancelled() }}
-        run: just lint-domains-host
+        run: cargo run --locked -p carrick-xtask -- authority-debt
 
   macos-build:
     needs: changes

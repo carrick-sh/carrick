@@ -184,6 +184,8 @@ pub(crate) struct HvpatchRuntimeDirectory {
     /// because the directory outlives no kernel: the runner OBSERVES the graph,
     /// it never keeps it alive.
     liveness_kernel: Mutex<Option<Weak<carrick_kernel::kernel::Kernel>>>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    census_scope: Mutex<Option<carrick_kernel::kernel::CarrierScopeId>>,
     /// The one abort this carrier has suffered, if any.
     ///
     /// An abort is CARRIER-terminal, not job-terminal. The kernel graph it
@@ -629,6 +631,8 @@ impl Default for HvpatchRuntimeDirectory {
             continuation_wait_service: Mutex::new(None),
             scheduler: Mutex::new(None),
             liveness_kernel: Mutex::new(None),
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            census_scope: Mutex::new(None),
             kernel_abort: Arc::default(),
             scheduling_policy: Mutex::new(None),
             persistent_bindings: Arc::default(),
@@ -729,6 +733,7 @@ impl HvpatchRuntimeDirectory {
         authority: carrick_vmm_hvf::hvf_aarch64_engine::HvpatchPersistentExecutorFactoryAuthority,
         vcpu_ceiling: usize,
         services: &PreparedPersistentServices,
+        scope: &carrick_kernel::kernel::CarrierScopeId,
     ) -> Result<bool, RuntimeError> {
         let mut pool = self.persistent_pool.lock();
         if pool.is_some() {
@@ -788,6 +793,7 @@ impl HvpatchRuntimeDirectory {
             .map_err(|error| RuntimeError::Configuration(error.to_string()))
         })?;
         *pool = Some(started);
+        *self.census_scope.lock() = Some(scope.clone());
         crate::el1_census::init_from_env();
         Ok(true)
     }
@@ -813,7 +819,7 @@ impl HvpatchRuntimeDirectory {
         // the affected descriptions.
         // The census reads EL1's counters, so it is written before the region
         // pointer is cleared.
-        crate::el1_census::write_at_teardown();
+        crate::el1_census::write_at_teardown(self.census_scope.lock().as_ref());
         carrick_kernel::el1_delegation::recall_all_delegated();
         carrick_kernel::el1_delegation::clear_el1_region_host_ptr();
         result

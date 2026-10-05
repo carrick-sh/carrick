@@ -14,7 +14,7 @@ It enforces that:
 4. Monotone category and total count ceilings cannot be exceeded.
 5. Exact trusted boundaries and their classifications are validated.
 6. Test scopes, comments, and string literals are ignored.
-7. Exact agreement between code and checked-in inventory is required.
+7. Findings are consumed ephemerally by the position-free authority-debt gate.
 """
 
 from __future__ import annotations
@@ -28,13 +28,7 @@ from typing import Any, Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SCAN_PATHS = [
-    # dispatch/ and the kernel graph moved to crates/carrick-kernel; the scope
-    # follows the CODE, not the crate it used to live in.
-    REPO_ROOT / "crates" / "carrick-kernel" / "src" / "dispatch",
-    REPO_ROOT / "crates" / "carrick-kernel" / "src" / "kernel" / "objects.rs",
-]
-DEFAULT_INVENTORY_PATH = REPO_ROOT / "scripts" / "migrate" / "dispatch-lock-authority.json"
+SCAN_PATHS = [REPO_ROOT / "crates" / "carrick-kernel" / "src"]
 
 CATEGORIES = {
     "proc": "raw acquisition of dispatcher `proc` lock",
@@ -42,20 +36,6 @@ CATEGORIES = {
     "sysv_process": "raw acquisition of per-process `sysv_process` lock",
     "sysv_namespace": "raw acquisition of shared SysV `state` lock",
     "file_table_internals": "direct acquisition of FileTable internal mutex/rwlock",
-}
-
-MAX_CATEGORY_CEILINGS: dict[str, int] = {
-    "proc": 60,
-    "pty_table": 10,
-    "sysv_process": 1,
-    "sysv_namespace": 3,
-    "file_table_internals": 33,
-}
-MAX_TOTAL_CEILING: int = 107
-
-EXPECTED_TRUSTED_BOUNDARIES: dict[str, str] = {
-    "crates/carrick-kernel/src/dispatch/sysv.rs::IpcView::lock_sysv_process::sysv_process#1": "trusted_minting_boundary",
-    "crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs::SysvNamespacePermit::lock_paired::sysv_namespace#1": "trusted_paired_boundary",
 }
 
 FILE_TABLE_INTERNAL_FIELDS = frozenset(
@@ -540,7 +520,8 @@ def scan_tokens(tokens: Sequence[Token], relative_path: str) -> list[RawLockSite
 def scan_sources(repo_root: Path) -> list[RawLockSite]:
     """Scan all configured production sources under carrick-runtime."""
     all_sites: list[RawLockSite] = []
-    for target in SCAN_PATHS:
+    for old_target in SCAN_PATHS:
+        target = repo_root / old_target.relative_to(REPO_ROOT)
         if target.is_file():
             files = [target]
         elif target.is_dir():
@@ -565,208 +546,6 @@ def scan_sources(repo_root: Path) -> list[RawLockSite]:
     return sorted(all_sites, key=lambda s: (s.file, s.line, s.id))
 
 
-def build_inventory_dict(sites: Sequence[RawLockSite]) -> dict[str, Any]:
-    counts = {cat: 0 for cat in CATEGORIES}
-    entries = []
-    for site in sites:
-        counts[site.category] = counts.get(site.category, 0) + 1
-        entry: dict[str, Any] = {
-            "id": site.id,
-            "file": site.file,
-            "line": site.line,
-            "item": site.item,
-            "category": site.category,
-            "expression": site.expression,
-            "ordinal": site.ordinal,
-        }
-        if site.item.endswith("lock_sysv_process"):
-            entry["classification"] = "trusted_minting_boundary"
-            entry["rationale"] = "Sole trusted minting boundary for SysvProcessGuard capturing exact namespace reference."
-        elif site.item.endswith("lock_paired"):
-            entry["classification"] = "trusted_paired_boundary"
-            entry["rationale"] = "Sole trusted paired acquisition boundary consuming linearly minted SysvNamespacePermit."
-        entries.append(entry)
-
-    return {
-        "schema_version": 1,
-        "description": "Reviewed inventory of classified production raw lock acquisitions (fail-closed, shrink-only)",
-        "total_count": len(entries),
-        "category_counts": counts,
-        "entries": entries,
-    }
-
-
-ALLOWED_ENTRY_FIELDS = frozenset(
-    {"id", "file", "line", "item", "category", "expression", "ordinal", "classification", "rationale"}
-)
-REQUIRED_ENTRY_FIELDS = frozenset(
-    {"id", "file", "line", "item", "category", "expression", "ordinal"}
-)
-
-
-def validate_inventory(
-    current_sites: Sequence[RawLockSite], inventory_data: dict[str, Any]
-) -> list[str]:
-    """Compare current scanned sites against checked-in inventory data."""
-    errors: list[str] = []
-
-    if inventory_data.get("schema_version") != 1:
-        errors.append(f"Invalid or missing inventory schema_version: {inventory_data.get('schema_version')}")
-        return errors
-
-    entries = inventory_data.get("entries")
-    if not isinstance(entries, list):
-        errors.append("Inventory 'entries' is not a list")
-        return errors
-
-    # Ceiling validation
-    if len(current_sites) > MAX_TOTAL_CEILING:
-        errors.append(
-            f"Total raw lock site count {len(current_sites)} exceeds maximum ceiling {MAX_TOTAL_CEILING}"
-        )
-    if inventory_data.get("total_count", 0) > MAX_TOTAL_CEILING:
-        errors.append(
-            f"Inventory total_count {inventory_data.get('total_count')} exceeds maximum ceiling {MAX_TOTAL_CEILING}"
-        )
-
-    # Check for duplicate IDs and validate entry fields in inventory
-    inv_ids: set[str] = set()
-    inv_entries_by_id: dict[str, dict[str, Any]] = {}
-    for idx, item in enumerate(entries):
-        if not isinstance(item, dict):
-            errors.append(f"Entry #{idx} is not a dictionary")
-            continue
-
-        entry_keys = set(item.keys())
-        missing_keys = REQUIRED_ENTRY_FIELDS - entry_keys
-        if missing_keys:
-            errors.append(f"Entry #{idx} is missing required field(s): {sorted(missing_keys)}")
-
-        extra_keys = entry_keys - ALLOWED_ENTRY_FIELDS
-        if extra_keys:
-            errors.append(f"Entry #{idx} has disallowed extra field(s): {sorted(extra_keys)}")
-
-        entry_id = item.get("id")
-        if not entry_id:
-            continue
-        if entry_id in inv_ids:
-            errors.append(f"Duplicate inventory entry ID: {entry_id}")
-            continue
-        inv_ids.add(entry_id)
-        inv_entries_by_id[entry_id] = item
-
-    # Check header counts
-    expected_total = len(entries)
-    if inventory_data.get("total_count") != expected_total:
-        errors.append(
-            f"Header total_count mismatch: declared {inventory_data.get('total_count')}, but entries list has {expected_total}"
-        )
-
-    category_counts = inventory_data.get("category_counts")
-    if not isinstance(category_counts, dict):
-        errors.append("Header category_counts is missing or not a dictionary")
-    else:
-        actual_counts = {cat: 0 for cat in CATEGORIES}
-        for item in entries:
-            cat = item.get("category")
-            if cat in actual_counts:
-                actual_counts[cat] += 1
-            else:
-                errors.append(f"Entry {item.get('id')} has unknown category: {cat}")
-        for cat in CATEGORIES:
-            declared = category_counts.get(cat, 0)
-            actual = actual_counts.get(cat, 0)
-            if declared != actual:
-                errors.append(
-                    f"Category count mismatch for '{cat}': declared {declared}, actual entries count {actual}"
-                )
-            if actual > MAX_CATEGORY_CEILINGS.get(cat, 999999):
-                errors.append(
-                    f"Category '{cat}' actual site count {actual} exceeds maximum ceiling {MAX_CATEGORY_CEILINGS.get(cat)}"
-                )
-            if declared > MAX_CATEGORY_CEILINGS.get(cat, 999999):
-                errors.append(
-                    f"Category '{cat}' inventory count {declared} exceeds maximum ceiling {MAX_CATEGORY_CEILINGS.get(cat)}"
-                )
-
-    # Validate trusted boundaries
-    for entry in entries:
-        eid = entry.get("id")
-        classification = entry.get("classification")
-        if classification is not None:
-            if eid not in EXPECTED_TRUSTED_BOUNDARIES:
-                errors.append(
-                    f"Entry {eid} has unreviewed/unauthorized classification '{classification}'"
-                )
-            elif classification != EXPECTED_TRUSTED_BOUNDARIES[eid]:
-                errors.append(
-                    f"Entry {eid} has unexpected classification '{classification}' (expected '{EXPECTED_TRUSTED_BOUNDARIES[eid]}')"
-                )
-    for expected_id, expected_cls in EXPECTED_TRUSTED_BOUNDARIES.items():
-        if expected_id in inv_ids:
-            entry = inv_entries_by_id.get(expected_id, {})
-            if entry.get("classification") != expected_cls:
-                errors.append(
-                    f"Expected trusted boundary {expected_id} is missing classification '{expected_cls}' (found '{entry.get('classification')}')"
-                )
-        elif len(entries) > 20:
-            errors.append(f"Expected trusted boundary {expected_id} is missing from production inventory")
-
-    curr_sites_by_id = {site.id: site for site in current_sites}
-    curr_ids = set(curr_sites_by_id.keys())
-
-    # 1. Unclassified additions (in source, but not in inventory) -> FAIL
-    unclassified_ids = curr_ids - inv_ids
-    for uid in sorted(unclassified_ids):
-        site = curr_sites_by_id[uid]
-        errors.append(
-            f"Unclassified raw lock acquisition [{site.category}] at {site.file}:{site.line} "
-            f"in item `{site.item}`: `{site.expression}` (ID: {site.id}). "
-            f"Raw lock additions are forbidden; use encapsulated subsystem authority."
-        )
-
-    # 2. Stale or expanded inventory entries (in inventory, but not in source) -> FAIL
-    stale_ids = inv_ids - curr_ids
-    for sid in sorted(stale_ids):
-        entry = inv_entries_by_id[sid]
-        errors.append(
-            f"Inventory entry not found in production source: {sid} "
-            f"({entry.get('file')}:{entry.get('line')}). "
-            f"If this site was intentionally migrated/removed, update {DEFAULT_INVENTORY_PATH.name} to record the shrink."
-        )
-
-    # 3. Exact metadata agreement for shared IDs
-    for common_id in sorted(curr_ids & inv_ids):
-        site = curr_sites_by_id[common_id]
-        entry = inv_entries_by_id[common_id]
-        if site.category != entry.get("category"):
-            errors.append(
-                f"Metadata mismatch for {common_id}: category in source is '{site.category}', in inventory is '{entry.get('category')}'"
-            )
-        if site.file != entry.get("file"):
-            errors.append(
-                f"Metadata mismatch for {common_id}: file in source is '{site.file}', in inventory is '{entry.get('file')}'"
-            )
-        if site.line != entry.get("line"):
-            errors.append(
-                f"Metadata mismatch for {common_id}: line in source is {site.line}, in inventory is {entry.get('line')}"
-            )
-        if site.item != entry.get("item"):
-            errors.append(
-                f"Metadata mismatch for {common_id}: item in source is '{site.item}', in inventory is '{entry.get('item')}'"
-            )
-        if site.expression != entry.get("expression"):
-            errors.append(
-                f"Metadata mismatch for {common_id}: expression in source is '{site.expression}', in inventory is '{entry.get('expression')}'"
-            )
-        if site.ordinal != entry.get("ordinal"):
-            errors.append(
-                f"Metadata mismatch for {common_id}: ordinal in source is {site.ordinal}, in inventory is {entry.get('ordinal')}"
-            )
-
-    return errors
-
-
 def validate_sysv_lock_authority_rules(
     repo_root: Path,
     override_sources: dict[str, str] | None = None,
@@ -782,6 +561,8 @@ def validate_sysv_lock_authority_rules(
 
     # 1. Check exact visibility tokens in crates/carrick-kernel/src/dispatch/sysv.rs
     sysv_source = get_source("crates/carrick-kernel/src/dispatch/sysv.rs")
+    expected_restricted_fns = {"with_state", "with_state_mut", "lock_sysv_process", "with_sysv_process", "with_sysv_process_mut"}
+    seen_helpers = set()
     if sysv_source:
         sysv_tokens = lex_rust(sysv_source)
         expected_restricted_fns = {
@@ -794,6 +575,7 @@ def validate_sysv_lock_authority_rules(
         for idx, token in enumerate(sysv_tokens):
             if token.text == "fn" and idx + 1 < len(sysv_tokens) and sysv_tokens[idx + 1].text in expected_restricted_fns:
                 fn_name = sysv_tokens[idx + 1].text
+                seen_helpers.add(fn_name)
                 # Look backward from `fn` for visibility starting at `pub`
                 vis_tokens = []
                 k = idx - 1
@@ -810,6 +592,14 @@ def validate_sysv_lock_authority_rules(
                     errors.append(
                         f"crates/carrick-kernel/src/dispatch/sysv.rs: helper '{fn_name}' has unauthorized visibility '{vis_str}' (must be exact 'pub(in crate::dispatch::sysv)')"
                     )
+
+    missing = expected_restricted_fns - seen_helpers
+    if missing:
+        errors.append(f"missing SysV rule owner/helper discovery: {sorted(missing)}")
+    paired_source = get_source("crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs")
+    paired_tokens = lex_rust(paired_source)
+    if not any(t.text == "fn" and i + 1 < len(paired_tokens) and paired_tokens[i + 1].text == "lock_paired" for i, t in enumerate(paired_tokens)):
+        errors.append("missing SysvNamespacePermit::lock_paired rule owner discovery")
 
     # 2. Check strict cross-module caller boundary
     runtime_src = repo_root / "crates/carrick-kernel/src"
@@ -1030,59 +820,6 @@ def run_self_tests() -> bool:
     assert len(sites) == 1, f"cfg(any(...)) production code was falsely ignored: {sites}"
     assert sites[0].category == "proc"
 
-    # Test 13: Validation against valid inventory passes
-    inv = build_inventory_dict(sites)
-    errors = validate_inventory(sites, inv)
-    assert len(errors) == 0, f"Valid inventory failed: {errors}"
-
-    # Test 14: Unclassified raw lock addition must FAIL validation
-    extra_sites = list(sites) + [
-        RawLockSite(
-            id="crates/carrick-kernel/src/dispatch/mod.rs::SyscallDispatcher::new_leak::proc#1",
-            file="crates/carrick-kernel/src/dispatch/mod.rs",
-            line=100,
-            item="SyscallDispatcher::new_leak",
-            category="proc",
-            expression=".proc.lock()",
-            ordinal=1,
-        )
-    ]
-    errors = validate_inventory(extra_sites, inv)
-    assert any("Unclassified raw lock acquisition" in e for e in errors), f"Addition did not fail: {errors}"
-
-    # Test 15: Stale/expanded inventory entry must FAIL validation
-    expanded_inv = dict(inv)
-    expanded_entries = list(inv["entries"]) + [
-        {
-            "id": "crates/carrick-kernel/src/dispatch/mod.rs::SyscallDispatcher::stale::proc#1",
-            "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-            "line": 999,
-            "item": "SyscallDispatcher::stale",
-            "category": "proc",
-            "expression": ".proc.lock()",
-            "ordinal": 1,
-        }
-    ]
-    expanded_inv["entries"] = expanded_entries
-    expanded_inv["total_count"] = len(expanded_entries)
-    expanded_inv["category_counts"]["proc"] = expanded_inv["category_counts"].get("proc", 0) + 1
-    errors = validate_inventory(sites, expanded_inv)
-    assert any("Inventory entry not found in production source" in e for e in errors), f"Stale inventory did not fail: {errors}"
-
-    # Test 16: Category ceiling overflow must FAIL validation
-    overflow_inv = dict(inv)
-    overflow_inv["category_counts"] = dict(inv["category_counts"])
-    overflow_inv["category_counts"]["proc"] = 9999
-    errors = validate_inventory(sites, overflow_inv)
-    assert any("exceeds maximum ceiling" in e for e in errors), f"Category ceiling overflow did not fail: {errors}"
-
-    # Test 17: Trusted boundary tampering must FAIL validation
-    tampered_inv = dict(inv)
-    tampered_entries = [dict(inv["entries"][0], classification="unreviewed_boundary")]
-    tampered_inv["entries"] = tampered_entries
-    errors = validate_inventory(sites, tampered_inv)
-    assert any("unreviewed/unauthorized classification" in e or "missing" in e for e in errors), f"Boundary tampering did not fail: {errors}"
-
     # Test 18: Negative visibility test - pub(crate) on with_state must FAIL
     widened_vis_source = """
     impl SysvIpcNamespace {
@@ -1152,53 +889,26 @@ def run_self_tests() -> bool:
     )
     assert any("unauthorized cross-module reference to SysV lock authority identifier 'SysvNamespacePermit'" in e for e in errs), f"Sibling permit reference did not fail: {errs}"
 
-    print("All check-dispatch-lock-authority self-tests PASSED (22 fixtures).")
+    print("All check-dispatch-lock-authority self-tests PASSED (16 fixtures).")
     return True
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="Validate production source matches inventory")
-    parser.add_argument("--candidate", type=Path, help="Write scanned candidate inventory to specified path")
-    parser.add_argument("--inventory", type=Path, default=DEFAULT_INVENTORY_PATH, help="Path to inventory JSON")
-    parser.add_argument("--self-test", action="store_true", help="Run comprehensive unit tests")
-
+def main():
+    parser = argparse.ArgumentParser(description="Discover raw locks and check structural SysV authority")
+    parser.add_argument("--root", type=Path, default=REPO_ROOT)
+    parser.add_argument("--discover", action="store_true")
+    parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
-
     if args.self_test:
         return 0 if run_self_tests() else 1
-
-    current_sites = scan_sources(REPO_ROOT)
-
-    if args.candidate:
-        candidate_data = build_inventory_dict(current_sites)
-        args.candidate.write_text(json.dumps(candidate_data, indent=2) + "\n", encoding="utf-8")
-        print(f"Wrote candidate inventory ({len(current_sites)} sites) to {args.candidate}")
-        return 0
-
-    if not args.inventory.exists():
-        print(f"Error: Inventory file {args.inventory} not found.", file=sys.stderr)
+    errors = validate_sysv_lock_authority_rules(args.root)
+    if errors:
+        print("\n".join(errors), file=sys.stderr)
         return 1
-
-    try:
-        inventory_data = json.loads(args.inventory.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"Error reading inventory JSON {args.inventory}: {e}", file=sys.stderr)
-        return 1
-
-    errors = validate_inventory(current_sites, inventory_data)
-    rule_errors = validate_sysv_lock_authority_rules(REPO_ROOT)
-    all_errors = errors + rule_errors
-
-    if all_errors:
-        print(f"FAIL: Found {len(all_errors)} dispatch lock authority violation(s):", file=sys.stderr)
-        for err in all_errors:
-            print(f"  - {err}", file=sys.stderr)
-        return 1
-
-    print(f"OK: Verified exact match of {len(current_sites)} production raw lock sites and SysV authority rules against {args.inventory.name}.")
+    sites = scan_sources(args.root)
+    print(json.dumps([{"file": s.file, "line": s.line, "category": s.category} for s in sites]))
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

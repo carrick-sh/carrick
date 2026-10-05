@@ -159,7 +159,7 @@ pub struct Census {
     pub rows: Vec<CensusRow>,
 }
 
-fn snapshot() -> Census {
+fn snapshot(run_id: Option<&carrick_kernel::kernel::CarrierScopeId>) -> Census {
     let counters = crate::read_el1_counters();
     let mut rows = Vec::new();
     for index in 0..SLOTS {
@@ -194,7 +194,7 @@ fn snapshot() -> Census {
     let (process_user_ns, process_sys_ns) = process_cpu_ns();
     Census {
         schema: 1,
-        run_id: std::env::var("CARRICK_RUN_ID").ok(),
+        run_id: run_id.map(|id| id.as_str().to_owned()),
         pid: std::process::id(),
         el1_counters: counters.is_some(),
         process_user_ns,
@@ -208,14 +208,14 @@ fn snapshot() -> Census {
 
 /// Write the census once, at carrier teardown while the EL1 region is still
 /// mapped. A failure to write is reported, never silently dropped.
-pub fn write_at_teardown() {
+pub fn write_at_teardown(run_id: Option<&carrick_kernel::kernel::CarrierScopeId>) {
     let Some(Some(directory)) = DIRECTORY.get() else {
         return;
     };
     if WRITTEN.swap(true, Ordering::AcqRel) {
         return;
     }
-    let census = snapshot();
+    let census = snapshot(run_id);
     let name = format!(
         "{}-{}.json",
         census.run_id.as_deref().unwrap_or("run"),
@@ -464,5 +464,21 @@ mod tests {
         let mut odd = census(vec![row(1, 1, 1)]);
         odd.schema = 2;
         assert!(aggregate(&[odd]).is_err());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod launch_identity_tests {
+    #[test]
+    fn snapshot_uses_the_supplied_launch_identity() {
+        let alpha = carrick_kernel::kernel::CarrierScopeId::new("alpha").expect("alpha scope");
+        let beta = carrick_kernel::kernel::CarrierScopeId::new("beta").expect("beta scope");
+        assert_eq!(
+            super::snapshot(Some(&alpha)).run_id.as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(super::snapshot(Some(&beta)).run_id.as_deref(), Some("beta"));
+        assert_eq!(super::snapshot(None).run_id, None);
     }
 }

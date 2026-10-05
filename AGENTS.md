@@ -88,7 +88,6 @@ with **`HV_DENIED` (`0xfae94007`)**.
 | `just accept [ARGS]` | Run host and/or signed landing gate (no Docker). |
 | `just accept --profile linux-portable` | Linux host gate + receipt; signed phase rejected. |
 | `just remote-accept --ref COMMIT --phase host` | Worker gate on cloudmac + fetched receipt; also run signed for macOS/ARM changes. |
-| `just remote-recapture --ref COMMIT` | Recapture moved host-authority spans on cloudmac; return a guarded patch to apply and commit locally. |
 | `just lease MODE +CMD` | Run command under host flock lease (carrick shared, gate/docker exclusive). |
 
 **Toolchain:** pin, edition, members, `deny`ed lints: [`rust-toolchain.toml`](rust-toolchain.toml) and
@@ -456,8 +455,8 @@ verification, acceptance.
   tests; commit with the worker's trailer. Long conversations die: brief narrowly; start fresh
   conversations on the same worktree.
 - **Never `git merge --ff-only` inside a worktree** (merges its own branch).
-  Rebase there, fast-forward from main, reconcile inventories on the CLEAN
-  merged tree, `just lint-domains`.
+  Rebase there, fast-forward from main, then run `just lint-domains` on
+  the merged tree.
 - **Linux workers run `just accept --profile linux-portable`, then `just remote-accept --ref <their commit> --phase host`** before reporting review-ready; macOS/ARM changes also require `--phase signed` coordinated with the director. Include both verdicts and receipt paths. macOS workers run `just accept`.
 
 ## Commits, hooks & CI
@@ -483,12 +482,14 @@ verification, acceptance.
 - **Trailer:** `Co-Authored-By:` for the agent, after a blank line, e.g.
   `Co-Authored-By: Codex <codex@openai.com>`. Rewording another agent's
   commits: PRESERVE the author.
-- **Inventories: reconcile on a CLEAN tree, post-merge, pre-lint.**
-  `scripts/migrate/reconcile-line-pinned-inventories.py` moves positions only;
-  drop truly retired rows from `host-authority-transition-inventory.json` by
-  hand, reason in the commit. `check-host-authority-transitions.py --check`
-  saying "authoritative compiler capture requires clean tracked snapshot
-  inputs" means a dirty tree.
+- **Authority debt:** `AuthorityDebtCeilings` stores only operation/owner/lane
+  counters. `just lint-domains` checks working source directly and consumes live
+  compiler diagnostics ephemerally. Supply the actual PR base with
+  `CARRICK_AUTHORITY_BASE` (CI) or `xtask authority-debt --base COMMIT`; local
+  default is the merge base with `github/main`. Ceilings may only decrease;
+  removing a nonzero counter or introducing an unknown family/owner fails.
+  Keep residual lanes until their own accepted owner cutovers. Zero guest-state
+  and raw-termination rules remain unconditional.
 - **Hooks:** pre-commit `fmt-check`, pre-push `clippy`. **Never
   `--no-verify`** — `just fmt`. Unrelated fmt churn = toolchain skew:
   `git checkout` it.
