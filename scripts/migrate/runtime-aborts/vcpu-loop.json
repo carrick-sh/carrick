@@ -403,7 +403,7 @@
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
       "function": "ProductionHvpatchLoopJob<E>::poll_with_engine",
       "ordinal_in_function": 4,
-      "fingerprint": "bd3e0ab7b427709a32fdfabce7b6a99083960e13218134c5ba9884be7759e0bc",
+      "fingerprint": "ce568424bf0d23c41e41cfba639e294b74cbbf09a6f331fa4aa1464018ff7082",
       "verdict": "carrier_fault",
       "failure_domain": "vcpu_loop::el1_cow_fault",
       "rationale": "EL1 took a copy-on-write write fault while its vCPU slot still held a reservation root guard. EL1 user copies never run under a root guard, so this is a broken EL1 invariant; resolving the fault in the runtime would leave every host venue waiting on that root (holding the MM's MemState) behind host code on this thread.",
