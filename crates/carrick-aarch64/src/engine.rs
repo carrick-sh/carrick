@@ -1088,7 +1088,7 @@ fn ensure_sparse_page_table_editor(
 struct OwnerForkTransaction<B> {
     pending: crate::fork::PendingOwnerFork<'static, Box<dyn Send>>,
     physical: Box<dyn crate::fork::PhysicalForkBuilder<B>>,
-    parent_tables: crate::stage1_authority::OwnerForkTableArena,
+    parent_tables: crate::stage1_authority::ReservedTableArena,
 }
 
 struct ParentForkCowRollback {
@@ -5777,6 +5777,48 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         page_tables.install_source_with_eager_builder(source, || {
             self.build_page_tables_manager_from_live()
         })
+    }
+
+    fn publish_initial_stage1_root(
+        &mut self,
+        publish: &mut dyn FnMut(u64) -> Result<(), TrapError>,
+    ) -> Result<(), TrapError> {
+        if self.process_asid.is_some() {
+            return Err(TrapError::Hypervisor(
+                "initial root already has an execution ASID".into(),
+            ));
+        }
+        let tables = self.page_tables.clone();
+        let vcpu = self.vcpu.get_mut();
+        let old0 = vcpu.get_sys_reg(SysReg::Ttbr0)?;
+        let old1 = vcpu.get_sys_reg(SysReg::Ttbr1)?;
+        let mut published = false;
+        let root = tables
+            .publish_initial_table_root(|root| {
+                let result = (|| {
+                    vcpu.set_sys_reg(SysReg::Ttbr0, root)?;
+                    vcpu.set_sys_reg(SysReg::Ttbr1, root)?;
+                    publish(root)
+                })();
+                if let Err(error) = result {
+                    // This task has never executed. Even a register-restore error
+                    // aborts bootstrap, so these staged roots cannot become live.
+                    vcpu.set_sys_reg(SysReg::Ttbr0, old0).map_err(|rollback| {
+                        format!("bootstrap root switch failed: {error}; rollback: {rollback}")
+                    })?;
+                    vcpu.set_sys_reg(SysReg::Ttbr1, old1).map_err(|rollback| {
+                        format!("bootstrap root switch failed: {error}; rollback: {rollback}")
+                    })?;
+                    return Err(error.to_string());
+                }
+                published = true;
+                Ok(())
+            })
+            .map_err(TrapError::Hypervisor)?;
+        if !published {
+            publish(root)?;
+        }
+        Ok(())
     }
 
     fn resolve_frame_cow_fault(
