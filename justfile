@@ -166,6 +166,10 @@ clippy *ARGS:
 # checks this host's product profiles and reports all other required profiles
 # pending; a partial local pass is not matrix completeness.
 lint-domains: lint-domains-source
+    just --justfile {{justfile()}} lint-domains-host
+
+# Live compiler capture; hosted CI runs this on macOS beside clippy.
+lint-domains-host:
     python3 scripts/migrate/check-host-authority-transitions.py --check
 
 # Host-independent domain checks; live compiler capture runs separately.
@@ -1028,3 +1032,83 @@ worktree-gc DAYS="14" MODE="dry":
 # Check that changed guest surfaces have matching conformance contract evidence
 check-contract-change base head="HEAD":
     python3 scripts/conformance/check-contract-change.py --root . --base {{base}} --head {{head}}
+
+# Hosted CI setup stays here with the checks it supports. Rustup reads the
+# repository pin, components and targets; no second toolchain version in YAML.
+ci-toolchain:
+    rustup show active-toolchain
+
+ci-install-semgrep:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    python3 -m venv "${RUNNER_TEMP:?}/semgrep"
+    "$RUNNER_TEMP/semgrep/bin/pip" install semgrep
+    echo "$RUNNER_TEMP/semgrep/bin" >> "${GITHUB_PATH:?}"
+
+ci-install-linux-cross:
+    sudo apt-get update
+    sudo apt-get install -y gcc-aarch64-linux-gnu
+
+ci-install-freebsd-cross:
+    sudo apt-get update
+    sudo apt-get install -y clang llvm
+
+# Keep the permanent archive: release mirrors eventually remove old sysroots.
+ci-freebsd-sysroot:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    archive="$(mktemp)"
+    trap 'rm -f "$archive"' EXIT
+    mkdir -p "${FBSD_SYSROOT:?}"
+    curl -fSL "https://archive.freebsd.org/old-releases/amd64/${FBSD_VERSION:?}/base.txz" -o "$archive"
+    tar -xf "$archive" -C "$FBSD_SYSROOT" ./usr/include ./usr/lib ./lib
+
+# These tests use the real host epoll backend but no KVM device or guest.
+test-host-linux:
+    cargo test -p carrick-host-linux
+
+# Limits belong to the shell that starts the tests; a separate setup step
+# cannot raise their soft limit. Preserve the hosted macOS fd headroom.
+ci-macos-test recipe:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    sudo sysctl -w kern.maxfiles=524288 kern.maxfilesperproc=524288 || true
+    ulimit -n 65536 || ulimit -n "$(ulimit -Hn)" || true
+    echo "RLIMIT_NOFILE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
+    exec just --justfile {{justfile()}} {{recipe}}
+
+# Only PRs may skip checks. Null-delimited paths and disabled rename detection
+# ensure deleting/renaming code into docs cannot hide a source change. Empty
+# diffs conservatively run everything; an invalid base fails the filter.
+ci-changes:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    heavy=true
+    if [[ "${CI_EVENT:?}" == pull_request ]]; then
+        paths="$(mktemp)"
+        trap 'rm -f "$paths"' EXIT
+        git diff --no-renames --name-only -z "${CI_BASE:?}...HEAD" > "$paths"
+        if [[ -s "$paths" ]]; then
+            heavy=false
+            while IFS= read -r -d '' path; do
+                case "$path" in docs/*|*.md) ;; *) heavy=true; break ;; esac
+            done < "$paths"
+        fi
+    fi
+    echo "heavy=$heavy" >> "${GITHUB_OUTPUT:?}"
+    echo "Run hosted checks: $heavy"
+
+# Fail closed: GitHub considers skipped required jobs successful on their own.
+# ci-ok depends on every job; only the filter can license a docs-only PR skip.
+ci-results:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    jq -e --arg event "${CI_EVENT:?}" '
+      .changes.result == "success" and
+      (length > 1) and
+      (if .changes.outputs.heavy == "true" then
+         del(.changes) | all(.[]; .result == "success")
+       elif .changes.outputs.heavy == "false" and $event == "pull_request" then
+         del(.changes) | all(.[]; .result == "skipped")
+       else false end)
+    ' <<< "${CI_NEEDS:?}"

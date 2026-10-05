@@ -4,179 +4,259 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
-  # Nightly catches moving @stable toolchain and hosted runner-image drift.
+  # Nightly catches hosted runner-image drift with the repository toolchain.
   schedule:
     - cron: "0 7 * * *"
 
-# Cancel superseded runs on the same ref to save runner minutes.
+# Superseding a PR saves minutes; main and merge-group runs must finish.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  # Source, ABI, kernel-graph, and host-semantic validation on public hosted
-  # Apple Silicon. These steps never launch a guest vCPU; they do not prove
-  # HVPatch runtime or Linux behavioral conformance.
-  check:
-    name: hosted macOS · source + host-only tests
-    runs-on: macos-15 # Apple Silicon; SDK provides the macOS 15 hv_gic_* APIs
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Conformance contract coverage (PR changed surfaces)
-        if: github.event_name == 'pull_request'
-        run: python3 scripts/conformance/check-contract-change.py --root . --base ${{ github.event.pull_request.base.sha }} --head ${{ github.sha }}
-
-      - name: Conformance contract registry validation (push/scheduled/manual)
-        if: github.event_name != 'pull_request'
-        run: cargo run -p carrick-conformance-contract --bin check-contracts -- --root .
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      # The gate commands live in the justfile (single source of truth). CI
-      - name: Install just and cargo-deny
-        uses: taiki-e/install-action@v2
-        with:
-          tool: just, cargo-deny
-
-      - name: Install Semgrep
-        run: brew install semgrep || python3 -m pip install semgrep
-
-      - name: Formatting
-        run: just fmt-check
-
-      - name: Clippy (no-panic gate)
-        run: just clippy
-
-      - name: Typed-domain lints (semgrep gate)
-        run: just lint-domains
-
-      - name: Dependency audit (cargo-deny gate)
-        run: just deny
-
-      - name: Support matrix drift check
-        run: just check-matrix
-
-      # These two sit between `check-matrix` and `check`, the same place they
-      # occupy in the justfile's `ci` recipe. The layering gate walks the
-      # dependency closures with `cargo metadata | jq` — the hosted macos-15
-      # image ships jq (1.8.2 on image 20260831), so no install step is
-      # needed; if a future image drops it the gate fails loudly on the
-      # missing binary rather than passing vacuously. The portable check
-      # cross-compiles carrick-kernel for aarch64-unknown-linux-gnu, a target
-      # rust-toolchain.toml already declares on the pinned 1.96.0 toolchain,
-      # so rustup installs it with the toolchain and this needs no `targets:`
-      # of its own (adding one to dtolnay/rust-toolchain@stable would land it
-      # on the sibling `stable` toolchain the toolchain file then overrides).
-      - name: Layering gate (crate closures + product feature closure)
-        run: just check-layering
-
-      # carrick-kernel -> carrick-spec -> oci-client also compiles ring's C
-      # sources for Linux. A Rust target alone cannot supply its C compiler
-      # and glibc headers on a macOS runner.
-      - name: Install Linux C cross toolchain
-        run: brew install messense/macos-cross-toolchains/aarch64-unknown-linux-gnu
-
-      - name: Portable kernel compile (aarch64-linux, no HVF; lib, tests and semantics suites)
-        env:
-          CC_aarch64_unknown_linux_gnu: aarch64-unknown-linux-gnu-gcc
-          AR_aarch64_unknown_linux_gnu: aarch64-unknown-linux-gnu-ar
-        run: just check-kernel-portable
-
-      - name: Build
-        run: just check --workspace
-
-      # Keep the fuzz harness (separate excluded workspace) compiling so a
-      # carrick-runtime ABI-decode change doesn't silently bit-rot it. Check
-      # only — running the fuzzer needs the nightly sanitizer toolchain.
-      - name: Fuzz harness compile-check
-        run: just check-fuzz
-
-      # Rustdoc gate: broken intra-doc links / unclosed-HTML-tag lints fail the
-      # build, mirroring the clippy gate (--document-private-items because
-      # carrick is internal — most of its substance lives on private items).
-      - name: Docs (rustdoc gate)
-        run: just doc
-
-      # `just test` is `--lib` only; the HVF-dependent integration binaries
-      # (trap_hvf, runtime_loop, interactive_tty, …) need an entitled vCPU and
-      # run only in the trusted hardware workflow. The pure-logic suites run
-      # here via `just test-integration`.
-      #
-      # GitHub-hosted macOS runners default RLIMIT_NOFILE to 256, but carrick
-      # relocates its internal fds above 16384 to stay clear of the guest fd
-      # range — so the test processes need real-host fd headroom. `ulimit`
-      # doesn't persist across steps, so each test step raises the kernel cap
-      # (sysctl) and the soft limit (ulimit) in its own shell before the recipe.
-      - name: Unit tests
-        run: |
-          sudo sysctl -w kern.maxfiles=524288 kern.maxfilesperproc=524288 || true
-          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)" || true
-          echo "RLIMIT_NOFILE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
-          just test
-
-      - name: Host integration tests (no HVF)
-        run: |
-          sudo sysctl -w kern.maxfiles=524288 kern.maxfilesperproc=524288 || true
-          ulimit -n 65536 || ulimit -n "$(ulimit -Hn)" || true
-          echo "RLIMIT_NOFILE: soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
-          just test-integration
-
-
-  # Hosted runners intentionally stop at source, host-semantic, and target
-  # closure evidence. Real guest execution lives in kernel-runtime.yml on
-  # trusted, capability-labeled hardware; a skipped or unsupported nested-virt
-  # attempt is never represented as a kernel pass here.
-
-  # L1 — cross-compile our OWNED crates for aarch64-linux + assert the
-  # platform-linux dependency closure links NO macOS hypervisor (carrick-vmm-hvf /
-  # applevisor). Proves the C4 decouple and the carrick-vmm-hvf/build.rs host-cfg
-  # fix. Cheap on a hosted Linux runner; the full CLI is NOT cross-compiled
-  # here (ring/oci-client need a C cross toolchain) — that real Linux build
-  # happens natively in the local nested-KVM VM (see `just build-linux`).
-  # Real KVM execution is a separate trusted-hardware job; it is not inferred
-  # from this cross-check.
-  cross-check-linux:
-    name: aarch64-linux cross-check · no-hvf closure
+  changes:
+    name: changes
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 5
+    outputs:
+      heavy: ${{ steps.filter.outputs.heavy }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain (+ aarch64-linux target)
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          targets: aarch64-unknown-linux-gnu
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install just
-        uses: taiki-e/install-action@v2
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just
+      - name: Detect docs-only PR
+        id: filter
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_BASE: ${{ github.event.pull_request.base.sha }}
+        run: just ci-changes
 
-      - name: Cross-check carrick-hal + carrick-vmm-kvm + carrick-host-linux for aarch64-linux
+  # Independent checks keep reporting after an earlier check fails. No
+  # continue-on-error: every failure still makes its job (and ci-ok) fail.
+
+  lint:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just,cargo-deny
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: linux-host
+      - name: Install Semgrep
+        if: ${{ !cancelled() }}
+        run: just ci-install-semgrep
+      - name: Formatting
+        if: ${{ !cancelled() }}
+        run: just fmt-check
+      - name: Dependency audit
+        if: ${{ !cancelled() }}
+        run: just deny
+      - name: Support matrix drift
+        if: ${{ !cancelled() }}
+        run: just check-matrix
+      - name: Layering and product feature closure
+        if: ${{ !cancelled() }}
+        run: just check-layering
+      - name: Conformance contract coverage (PR changed surfaces)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          CI_BASE: ${{ github.event.pull_request.base.sha }}
+        run: just check-contract-change "$CI_BASE" "$GITHUB_SHA"
+      - name: Host-independent typed-domain checks and contract registry
+        if: ${{ !cancelled() }}
+        run: just lint-domains-source
+
+  portable:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: linux-host
+      - name: Install Linux C cross toolchain
+        if: ${{ !cancelled() }}
+        run: just ci-install-linux-cross
+      - name: Portable kernel compile (aarch64-linux lib, tests and semantics)
+        if: ${{ !cancelled() }}
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: just check-kernel-portable
+      - name: Kernel semantics on x86_64 Linux
+        if: ${{ !cancelled() }}
+        run: just test-kernel-semantics
+
+  linux-doc:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: linux-host
+      - name: Linux crate rustdoc (including Linux host and KVM modules)
+        if: ${{ !cancelled() }}
+        run: just doc
+
+  macos-clippy:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: macos-host
+      - name: Clippy (no-panic gate)
+        if: ${{ !cancelled() }}
+        run: just clippy
+      - name: Live host-authority compiler census
+        if: ${{ !cancelled() }}
+        run: just lint-domains-host
+
+  macos-build:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: macos-host
+      - name: Workspace build
+        if: ${{ !cancelled() }}
+        run: just check --workspace
+      - name: Workspace rustdoc
+        if: ${{ !cancelled() }}
+        run: just doc
+      - name: Fuzz harness compile-check
+        if: ${{ !cancelled() }}
+        run: just check-fuzz
+
+  macos-unit:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: macos-host
+      - name: Unit tests (host fd headroom)
+        if: ${{ !cancelled() }}
+        run: just ci-macos-test test
+
+  macos-integration:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: macos-host
+      - name: Host integration tests (no HVF)
+        if: ${{ !cancelled() }}
+        run: just ci-macos-test test-integration
+
+  cross-check-linux:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: linux-host
+      - name: aarch64 Linux cross-check and no-HVF closure
+        if: ${{ !cancelled() }}
         run: just check-linux
-
-      # The native-epoll host backend (carrick-host-linux) only runs its real
-      # logic on Linux — cross-compiling it above proves it builds, but its
-      # EV_EOF→EPOLLHUP / IN_IGNORED edge tests need a live kernel. This runner
-      # IS x86_64-linux, so run them natively. No /dev/kvm, no guest needed.
-      - name: Native unit tests for carrick-host-linux
-        run: cargo test -p carrick-host-linux
+      - name: Native Linux host backend tests
+        if: ${{ !cancelled() }}
+        run: just test-host-linux
 
   # Native Linux run of the kernel-semantics suites (crates/carrick-kernel-example):
   # scripted two-process Linux semantics against the public kernel API with no
@@ -199,77 +279,63 @@ jobs:
   #   dispatch::overlay_dispatch_tests::large_nonblocking_host_pipe_write_uses_small_ready_window
   #   dispatch::overlay_dispatch_tests::large_nonblocking_host_socket_write_uses_small_ready_window
   # When those are green, replace `test-kernel-semantics` below with `test-kernel`.
+
   kernel-linux-native:
-    name: aarch64-linux native · kernel semantics suites (no VMM)
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install just
-        uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just
-
-      - name: Kernel semantics suites, natively on Linux
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: linux-host
+      - name: Kernel semantics natively on ARM Linux
+        if: ${{ !cancelled() }}
         run: just test-kernel-semantics
 
-  # Cross-compile the FULL carrick-cli + carrick-runtime closure for
-  # x86_64-unknown-freebsd — INCLUDING the C deps (ring via oci-client), handled
-  # with a FreeBSD base.txz sysroot + clang. Proves the platform-freebsd binary
-  # builds without a FreeBSD machine. `cargo check` does not link, so only the
-  # cross C toolchain (not a FreeBSD linker) is needed; the freebsd std target is
-  # declared in rust-toolchain.toml so it lands on the pinned 1.96.0 toolchain.
   cross-check-freebsd:
-    name: x86_64-freebsd cross-check · cli + runtime
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     env:
-      # Use the permanent release archive so a cold cache survives mirror expiry.
       FBSD_VERSION: 14.3-RELEASE
       FBSD_MAJOR: "14"
       FBSD_SYSROOT: ${{ github.workspace }}/.freebsd-sysroot
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain (+ freebsd target)
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          targets: x86_64-unknown-freebsd
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install just
-        uses: taiki-e/install-action@v2
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just
-
-      - name: Install clang + llvm (cross C toolchain for ring)
-        run: sudo apt-get update && sudo apt-get install -y clang llvm
-
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: linux-host
+      - name: Install FreeBSD C cross toolchain
+        if: ${{ !cancelled() }}
+        run: just ci-install-freebsd-cross
       - name: Cache FreeBSD sysroot
         id: fbsd-sysroot
-        uses: actions/cache@v4
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
           path: ${{ env.FBSD_SYSROOT }}
           key: freebsd-sysroot-${{ env.FBSD_VERSION }}
-
-      - name: Fetch FreeBSD sysroot (headers + libs for ring's C compile)
-        if: steps.fbsd-sysroot.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p "$FBSD_SYSROOT"
-          curl -fSL "https://archive.freebsd.org/old-releases/amd64/${FBSD_VERSION}/base.txz" -o /tmp/base.txz
-          tar -xf /tmp/base.txz -C "$FBSD_SYSROOT" ./usr/include ./usr/lib ./lib
-
-      # Point the cc crate (ring's build.rs) at the cross C toolchain. The
-      # underscore-target env form is required because shells can't export the
-      # dashed target name. No linker var: `cargo check` never links.
-      - name: Cross-check carrick-cli + carrick-runtime for x86_64-freebsd
+      - name: Fetch FreeBSD headers and libraries from permanent archive
+        if: ${{ !cancelled() && steps.fbsd-sysroot.outputs.cache-hit != 'true' }}
+        run: just ci-freebsd-sysroot
+      - name: Cross-check FreeBSD CLI and runtime (including tests)
+        if: ${{ !cancelled() }}
         env:
           CC_x86_64_unknown_freebsd: clang
           CXX_x86_64_unknown_freebsd: clang++
@@ -278,51 +344,56 @@ jobs:
           CXXFLAGS_x86_64_unknown_freebsd: --target=x86_64-unknown-freebsd${{ env.FBSD_MAJOR }} --sysroot=${{ env.FBSD_SYSROOT }}
         run: just check-freebsd
 
-  # Cross-compile the NetBSD/NVMM backend (carrick-vmm-nvmm) for
-  # x86_64-unknown-netbsd. Unlike the FreeBSD job this needs NO sysroot / C
-  # toolchain: carrick-vmm-nvmm depends only on the shared backend/host crates
-  # (NOT carrick-runtime → ring), so `cargo check` builds it from the netbsd std
-  # target alone. Without this job an nvmm trait-signature break is invisible to
-  # CI — exactly the class of break `just check-netbsd --all-targets` surfaced.
   cross-check-netbsd:
-    name: x86_64-netbsd cross-check · nvmm backend
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain (+ netbsd target)
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          targets: x86_64-unknown-netbsd
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install just
-        uses: taiki-e/install-action@v2
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just
-
-      - name: Cross-check carrick-vmm-nvmm for x86_64-netbsd
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: linux-host
+      - name: Cross-check NetBSD NVMM backend (including tests)
+        if: ${{ !cancelled() }}
         run: just check-netbsd
 
-  # Dependency license / bans / sources gate. Enforces the deny.toml permissive
-  # allowlist so a copyleft/unknown-license transitive dependency fails CI rather
-  # than slipping in silently. Cheap; runs on a hosted Linux runner, no hypervisor.
-  deny:
-    name: cargo-deny · licenses
+  # Single ruleset check. Only a successful docs-only PR filter permits skips;
+  # a failed/cancelled filter or an unexpectedly skipped dependency is red.
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs:
+      - changes
+      - lint
+      - portable
+      - linux-doc
+      - macos-clippy
+      - macos-build
+      - macos-unit
+      - macos-integration
+      - cross-check-linux
+      - kernel-linux-native
+      - cross-check-freebsd
+      - cross-check-netbsd
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install just + cargo-deny
-        uses: taiki-e/install-action@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          tool: just,cargo-deny
-
-      - name: cargo-deny (licenses · bans · sources)
-        run: just deny
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Require every applicable job to succeed
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_NEEDS: ${{ toJSON(needs) }}
+        run: just ci-results
