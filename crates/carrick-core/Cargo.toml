@@ -1,0 +1,19 @@
+[package]
+name = "carrick-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Neutral MM, fork, COW, and wait/lifecycle substrate for Carrick."
+
+[lib]
+name = "carrick_core"
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-mmu-core = { path = "../carrick-mmu-core" }

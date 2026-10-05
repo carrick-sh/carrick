@@ -54,18 +54,7 @@ pub enum Refusal {
     MetadataRequired,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Mapping {
-    pub range: ReservationRange,
-    pub protection: ReservationProtection,
-    /// Non-anonymous mappings participate in placement but cannot be edited.
-    pub anonymous: bool,
-    /// Insertion-time attributes; anything but plain private anonymous is
-    /// host-owned and every EL1 edit touching it forwards.
-    pub flags: ReservationNodeFlags,
-    pub generation: ReservationGeneration,
-    pub host_backing: Option<carrick_el1_abi::HostBackingIdentity>,
-}
+pub use carrick_core::mm::fork::Mapping;
 
 /// Byte charges of committed nodes, whole-root or within one range: every
 /// node (`RLIMIT_AS`), `RLIMIT_DATA` nodes, and `LOCKED` anonymous nodes.
