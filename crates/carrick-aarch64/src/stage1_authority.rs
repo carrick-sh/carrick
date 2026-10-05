@@ -3316,6 +3316,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn fixed_boot_primary_is_relocated_before_first_owner_admission() {
+        let fixed = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE;
+        let pool = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
+        let (authority, publisher) = boot_root_fixture(fixed, pool);
+        let switched = std::cell::Cell::new(None);
+        let root = authority
+            .publish_initial_table_root(|root| {
+                switched.set(Some(root));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(root, pool);
+        assert_eq!(switched.get(), Some(pool));
+        assert_eq!(authority.root_base(), Some(pool));
+        assert_eq!(
+            authority
+                .snapshot_image()
+                .unwrap()
+                .translate(carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE),
+            Some(pool)
+        );
+        assert!(
+            publisher
+                .resolver
+                .arenas
+                .lock()
+                .unwrap()
+                .contains_key(&pool)
+        );
+    }
+
+    #[test]
     fn bootstrap_root_publication_failure_returns_capacity_without_switching() {
         let pool = carrick_el1_abi::AARCH64_STAGE1_TABLE_POOL_BASE;
         for physical_failure in [true, false] {
