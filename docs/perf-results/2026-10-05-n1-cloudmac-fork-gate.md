@@ -352,3 +352,35 @@ read-only, a second fork must retain the exact new owner, and publication
 must cost one guest transaction and zero host COW resolutions.
 The first run executes one test and fails at the same missing-host-arm
 check as signed VMA/ptrace/fork-COW (`target/n1-cm/vvar-red.log`).
+
+The vvar core's authoritative ring contains 61/61 records, errors zero.
+The strengthened VM-free input uses real `publish_private_pages` to seal
+read-only resident vvar pages before fork arming. `map_private_aliased`
+alone supplies ASID scope, not EL1 private authority; the earlier adopting
+read-only setup did not establish that tag. Both final owner witnesses
+assert actual private COW tagging and absent Linux write intent before
+calling refresh. Against pre-fix `6bf726f87` `cow_engine.rs`, both fail at
+`child vvar generation has no COW arm`; the existing host and custody
+controls pass (`vvar-authenticated-red.log`: two pass, two fail). A prior
+combined attempt collided because all three fixtures reused one root slot;
+each fixture now owns distinct child/grandchild slots. That attempt is not
+red evidence for the arm diagnosis.
+
+The physical COW service now selects an owner span from live private COW
+leaves and the exact output relation within one 16 KiB compound. It stops
+at a page that is no longer armed or names another output. It does not
+manufacture host arm metadata or re-arm a completed leaf from such metadata.
+Privileged refresh still authenticates physical source/grant/inventory,
+publishes through the driving EL1 vCPU and preserves guest read-only AP.
+The one-page witness proves the unarmed neighbor retains its old backing;
+parent bytes, child generation and the second fork's exact new-owner
+inheritance remain checked. The existing host fixture also passes.
+
+Focused verification: 131 foreign-MM tests pass, one pre-existing test is
+ignored; all 22 COW-engine tests pass. This includes all 13 guest-COW
+settlement witnesses and the lock census. The census exposed helper-held
+locks in the earlier late-edit witnesses; guards now reside at test entry,
+with the same fixture exclusion. Logs: `vvar-foreign-suite.log`,
+`vvar-cow-engine-suite.log`, `vvar-focused-run3.log` in `target/n1-cm/`.
+A new exact signed cycle is still required; clone TID copyout remains open
+in the owner worker's area.
