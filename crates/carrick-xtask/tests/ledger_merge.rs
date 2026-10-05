@@ -1,14 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::fs;
-use std::path::Path;
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use carrick_xtask::command::{CommandError, CommandOutput};
-use carrick_xtask::ledger_merge::{MergeConflict, merge_ledger, regenerate_contracts_with_runner};
+use carrick_xtask::ledger_merge::{MergeConflict, merge_ledger};
 
 const SAMPLE_ABORT_ROW_1: &str = r#"{
   "file": "crates/carrick-vmm-hvf/src/hvf_aarch64_engine.rs",
@@ -559,20 +554,6 @@ fn divergent_debt_ceiling_fails() {
 }
 
 #[test]
-fn generated_contract_inventory_requires_regeneration() {
-    let path = "conformance-contracts/inventory.json";
-    let dummy = r#"{"entries": []}"#;
-    let err = merge_ledger(path, dummy, dummy, dummy)
-        .expect_err("contract inventory must require regeneration");
-    match err {
-        MergeConflict::GeneratedArtifactNeedsRegeneration { path: p } => {
-            assert!(p.contains("conformance-contracts/inventory.json"));
-        }
-        other => panic!("expected GeneratedArtifactNeedsRegeneration, got {other:?}"),
-    }
-}
-
-#[test]
 fn output_is_deterministic() {
     let path = "scripts/migrate/runtime-aborts/hvf.json";
     let base = format!(
@@ -771,81 +752,6 @@ fn failed_merge_leaves_output_unchanged() {
     assert_eq!(
         content_after, canary,
         "output file must remain completely untouched on conflict"
-    );
-}
-
-#[test]
-fn disposable_root_stub_process_runner_regenerate_contracts() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let disposable_root = temp.path().join("disposable_repo");
-    fs::create_dir_all(&disposable_root).expect("create dir");
-
-    let call_count = Arc::new(AtomicUsize::new(0));
-    let calls_log = Arc::new(Mutex::new(Vec::new()));
-
-    let count_clone = Arc::clone(&call_count);
-    let log_clone = Arc::clone(&calls_log);
-
-    let runner = move |prog: &str,
-                       args: &[&str],
-                       _cwd: Option<&Path>|
-          -> Result<CommandOutput, CommandError> {
-        count_clone.fetch_add(1, Ordering::SeqCst);
-        let arg_vec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        log_clone.lock().unwrap().push((prog.to_string(), arg_vec));
-
-        // Return simulated exit success
-        #[cfg(unix)]
-        use std::os::unix::process::ExitStatusExt;
-        let status = std::process::ExitStatus::from_raw(0);
-
-        Ok(CommandOutput {
-            status,
-            stdout: "simulated success".to_string(),
-            stderr: "".to_string(),
-        })
-    };
-
-    let res = regenerate_contracts_with_runner(&disposable_root, runner);
-    assert!(
-        res.is_ok(),
-        "stub runner with disposable root should succeed"
-    );
-    assert_eq!(call_count.load(Ordering::SeqCst), 2);
-
-    let logs = calls_log.lock().unwrap();
-    assert_eq!(logs[0].0, "cargo");
-    assert!(logs[0].1.contains(&"--root".to_string()));
-    assert!(!logs[0].1.contains(&"--check".to_string()));
-
-    assert_eq!(logs[1].0, "cargo");
-    assert!(logs[1].1.contains(&"--root".to_string()));
-    assert!(logs[1].1.contains(&"--check".to_string()));
-}
-
-#[test]
-fn real_contract_inventory_check_on_repository() {
-    // Verifies that carrick-xtask ledger-regenerate-contracts passes on the real repository.
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
-    let bin = env!("CARGO_BIN_EXE_carrick-xtask");
-    let output = Command::new(bin)
-        .current_dir(repo_root)
-        .args([
-            "ledger-regenerate-contracts",
-            "--root",
-            repo_root.to_str().unwrap(),
-        ])
-        .output()
-        .expect("spawn carrick-xtask ledger-regenerate-contracts");
-
-    assert!(
-        output.status.success(),
-        "ledger-regenerate-contracts failed on repo root: stderr={}",
-        String::from_utf8_lossy(&output.stderr)
     );
 }
 

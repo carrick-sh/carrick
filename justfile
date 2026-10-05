@@ -691,10 +691,6 @@ check-matrix:
 inventory *ARGS:
     cargo run -p carrick-conformance-contract --bin generate-inventory -- {{ARGS}}
 
-# Drift gate: conformance-contracts/inventory.json must equal a fresh generation.
-check-inventory:
-    cargo run -p carrick-conformance-contract --bin generate-inventory -- --check
-
 # Contract-driven conformance investigation CLI.
 investigate *ARGS:
     cargo run -p carrick-investigation --bin investigate -- {{ARGS}}

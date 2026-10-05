@@ -40,14 +40,6 @@ pub enum Commands {
         output: PathBuf,
     },
 
-    #[command(
-        about = "Regenerate contract inventory using generate-inventory --root <root>, followed by --check"
-    )]
-    LedgerRegenerateContracts {
-        #[arg(long, help = "Path to repository root")]
-        root: Option<PathBuf>,
-    },
-
     #[command(about = "Provision guest artifacts before signed execution")]
     Provision(crate::provision::ProvisionArgs),
 
@@ -157,8 +149,6 @@ pub enum CliError {
     #[error("ledger merge conflict: {0}")]
     MergeConflict(#[from] crate::ledger_merge::MergeConflict),
 
-    #[error("ledger contract regeneration error: {0}")]
-    RegenerateContracts(#[from] crate::ledger_merge::RegenerateError),
     #[error("provision error: {0}")]
     Provision(#[from] crate::provision::ProvisionError),
     #[error("fixtures error: {0}")]
@@ -309,29 +299,6 @@ where
             }
 
             writeln!(writer, "{}", merged.summary()).map_err(|e| CliError::Io {
-                path: PathBuf::from("stdout"),
-                source: e,
-            })?;
-            Ok(())
-        }
-        Commands::LedgerRegenerateContracts { root } => {
-            let resolved_root = match root {
-                Some(r) => r,
-                None => match &cli.root {
-                    Some(r) => r.clone(),
-                    None => {
-                        let info = resolve_repo_info(None)?;
-                        info.repository_root
-                    }
-                },
-            };
-            crate::ledger_merge::regenerate_contracts(&resolved_root)?;
-            writeln!(
-                writer,
-                "contract inventory regenerated and verified at {}",
-                resolved_root.display()
-            )
-            .map_err(|e| CliError::Io {
                 path: PathBuf::from("stdout"),
                 source: e,
             })?;
