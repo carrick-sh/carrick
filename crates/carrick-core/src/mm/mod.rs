@@ -1,5 +1,6 @@
 //! Architecture-neutral memory management algorithms.
 
+pub mod capacity;
 pub mod cow;
 pub mod fork;
 pub mod reservation;
