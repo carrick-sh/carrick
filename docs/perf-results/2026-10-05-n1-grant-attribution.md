@@ -100,3 +100,15 @@ Re-verified the worker's bootstrap witness before its final fix: at
 `b6e29a6b9`, it returns fixed `0x2d00020000` instead of pool `0x9a00000000`
 (`/tmp/n1g2-fork-primary-red.log`). Integrated green validation and signed
 refusal-probe receipts follow separately.
+
+## Batch-6 rebase
+
+At the director's next-boundary request, rebased onto main `b2e77e2ff`.
+Git dropped already-applied `16041ed47`, `8188bb93d`, and `3e73dd1d2`.
+Kept main's deleted derived syscall inventory and scoped fixture v2 inputs;
+retained both the kernel connect/wake loom suite and terminal-clear models.
+Preserved both kernel dev dependencies. Generated K1 census conflicts were
+rebuilt from the integrated source. The final clean reconciliation passes
+with 663 reviewed authority rows, 621 macOS capture rows, three positional
+rebinding changes and no abort/taxonomy drift. Production changes from this
+turn remain byte-identical across the rebase.
