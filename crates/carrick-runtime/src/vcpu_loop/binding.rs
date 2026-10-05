@@ -2746,9 +2746,12 @@ where
                 );
                 // The grant service takes its own EL1 editor after the host
                 // predecessor settlement releases its mutation exclusion.
-                let supplied = engine.supply_memory(request).map_err(|error| {
-                    RuntimeError::Configuration(format!("owner supply failed: {error}"))
-                })?;
+                let supplied = match engine.supply_memory(request) {
+                    Err(carrick_guest_mem::MemoryError::OwnerWait(wait)) => return Ok(Some(wait)),
+                    result => result.map_err(|error| {
+                        RuntimeError::Configuration(format!("owner supply failed: {error}"))
+                    })?,
+                };
                 carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                     grant_va,
                     grant_len,
@@ -2761,10 +2764,12 @@ where
                             .to_owned(),
                     ));
                 }
-                Ok(())
+                Ok(None)
             })();
             self.state.guest_execution = Some(executor);
-            result?;
+            if let Some(wait) = result? {
+                return self.owner_memory_park(engine, control, frame, wait);
+            }
             let outcome = self.state.redispatch_threaded_syscall(
                 &self.kernel,
                 engine,
