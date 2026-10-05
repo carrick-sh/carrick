@@ -29,6 +29,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-guest-arch"
+version = "0.1.0"
+
+[[package]]
 name = "carrick-inotify-core"
 version = "0.1.0"
 
@@ -36,6 +40,7 @@ version = "0.1.0"
 name = "carrick-mmu-core"
 version = "0.1.0"
 dependencies = [
+ "carrick-guest-arch",
  "hashbrown",
 ]
 
