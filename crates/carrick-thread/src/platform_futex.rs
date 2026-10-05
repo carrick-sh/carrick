@@ -5,7 +5,7 @@
 //! thread of one carrier, so both the private and the `MAP_SHARED` guest futex
 //! are intra-process rendezvous: the private path parks on the per-process
 //! [`crate::thread::FutexTable`], the shared path on the carrier-wide
-//! [`SharedFutexTable`] owned by that kernel. No host futex primitive is involved.
+//! [`SharedFutexTable`](crate::platform_futex::SharedFutexTable) owned by that kernel. No host futex primitive is involved.
 //!
 //! This replaces the per-host `SharedFutexSyscall` shim (macOS
 //! `os_sync_wait_on_address`, Linux bare `SYS_futex`, FreeBSD `_umtx_op`),
