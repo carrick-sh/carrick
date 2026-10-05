@@ -387,8 +387,8 @@
     "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:3971 in `synthetic_proc_pid_file`, the host result from `libc::getpgrp` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000015",
     "source": {
-      "byte_end": 163411,
-      "byte_start": 163398,
+      "byte_end": 163420,
+      "byte_start": 163407,
       "column": 34,
       "column_end": 47,
       "column_start": 34,
@@ -1209,8 +1209,8 @@
     "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:3266 in `synthetic_proc_self_stat`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_self_stat`.",
     "review_id": "HA-000054",
     "source": {
-      "byte_end": 137629,
-      "byte_start": 137616,
+      "byte_end": 137638,
+      "byte_start": 137625,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
@@ -1238,8 +1238,8 @@
     "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:3835 in `synthetic_proc_pid_file`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000055",
     "source": {
-      "byte_end": 157722,
-      "byte_start": 157709,
+      "byte_end": 157731,
+      "byte_start": 157718,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
@@ -1267,8 +1267,8 @@
     "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:3888 in `synthetic_proc_pid_file`, the host result from `libc::getppid` determines the guest-visible /proc process entry used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000056",
     "source": {
-      "byte_end": 159934,
-      "byte_start": 159921,
+      "byte_end": 159943,
+      "byte_start": 159930,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
@@ -1682,8 +1682,8 @@
     "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:2375 in `enumerate_guest_pids`, the host result from `libc::proc_listallpids` determines the guest /proc process enumeration count used by `enumerate_guest_pids`.",
     "review_id": "HA-000072",
     "source": {
-      "byte_end": 102909,
-      "byte_start": 102887,
+      "byte_end": 102918,
+      "byte_start": 102896,
       "column": 26,
       "column_end": 48,
       "column_start": 26,
@@ -1709,8 +1709,8 @@
     "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:2381 in `enumerate_guest_pids`, the host result from `libc::proc_listallpids` determines the guest /proc process enumeration table used by `enumerate_guest_pids`.",
     "review_id": "HA-000073",
     "source": {
-      "byte_end": 103160,
-      "byte_start": 103138,
+      "byte_end": 103169,
+      "byte_start": 103147,
       "column": 24,
       "column_end": 46,
       "column_start": 24,
@@ -6210,18 +6210,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1541 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_hvpatch`.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1477 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest interpreter image used by `run_static_hvpatch`.",
     "review_id": "HA-000231",
     "source": {
-      "byte_end": 56566,
-      "byte_start": 56553,
+      "byte_end": 53513,
+      "byte_start": 53500,
       "column": 16,
       "column_end": 29,
       "column_start": 16,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1541,
-      "line_end": 1541,
-      "line_start": 1541
+      "line": 1477,
+      "line_end": 1477,
+      "line_start": 1477
     }
   },
   {
@@ -6237,18 +6237,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1549 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest executable image used by `run_static_hvpatch`.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1485 in `run_static_hvpatch`, `std::fs::read` accesses only the selected guest executable image used by `run_static_hvpatch`.",
     "review_id": "HA-000232",
     "source": {
-      "byte_end": 57045,
-      "byte_start": 57032,
+      "byte_end": 53992,
+      "byte_start": 53979,
       "column": 29,
       "column_end": 42,
       "column_start": 29,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1549,
-      "line_end": 1549,
-      "line_start": 1549
+      "line": 1485,
+      "line_end": 1485,
+      "line_start": 1485
     }
   },
   {
@@ -13498,8 +13498,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:883 in `is_forked_guest_process`, the host result from `std::process::id` determines the guest fork-child versus bootstrap identity used by `is_forked_guest_process`.",
     "review_id": "HA-000508",
     "source": {
-      "byte_end": 37685,
-      "byte_start": 37669,
+      "byte_end": 37693,
+      "byte_start": 37677,
       "column": 9,
       "column_end": 25,
       "column_start": 9,
@@ -13585,8 +13585,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/signal.rs:3488 in `bootstrap_signal_send_as`, the host result from `std::process::id` determines the guest signal recipient identity used by `bootstrap_signal_send_as`.",
     "review_id": "HA-000512",
     "source": {
-      "byte_end": 145846,
-      "byte_start": 145830,
+      "byte_end": 145854,
+      "byte_start": 145838,
       "column": 20,
       "column_end": 36,
       "column_start": 20,
@@ -14770,8 +14770,8 @@
     "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:1790 in `proc_pid_dir_entries`, the host result from `std::process::id` determines the guest /proc process-directory contents used by `proc_pid_dir_entries`.",
     "review_id": "HA-000563",
     "source": {
-      "byte_end": 80532,
-      "byte_start": 80516,
+      "byte_end": 80541,
+      "byte_start": 80525,
       "column": 21,
       "column_end": 37,
       "column_start": 21,
@@ -14799,8 +14799,8 @@
     "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:2123 in `synthetic_proc_self_stat`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_self_stat`.",
     "review_id": "HA-000564",
     "source": {
-      "byte_end": 92834,
-      "byte_start": 92818,
+      "byte_end": 92843,
+      "byte_start": 92827,
       "column": 62,
       "column_end": 78,
       "column_start": 62,
@@ -14828,8 +14828,8 @@
     "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:3264 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000565",
     "source": {
-      "byte_end": 137531,
-      "byte_start": 137515,
+      "byte_end": 137540,
+      "byte_start": 137524,
       "column": 36,
       "column_end": 52,
       "column_start": 36,
@@ -14857,8 +14857,8 @@
     "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:3836 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc process metadata identity used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000566",
     "source": {
-      "byte_end": 157768,
-      "byte_start": 157752,
+      "byte_end": 157777,
+      "byte_start": 157761,
       "column": 18,
       "column_end": 34,
       "column_start": 18,
@@ -14886,8 +14886,8 @@
     "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:3889 in `synthetic_proc_pid_file`, the host result from `std::process::id` determines the guest /proc parent-process metadata used by `synthetic_proc_pid_file`.",
     "review_id": "HA-000567",
     "source": {
-      "byte_end": 159980,
-      "byte_start": 159964,
+      "byte_end": 159989,
+      "byte_start": 159973,
       "column": 18,
       "column_end": 34,
       "column_start": 18,
@@ -14915,8 +14915,8 @@
     "rationale": "At crates/carrick-kernel/src/vfs/proc.rs:3970 in `parse_proc_pid_path`, the host result from `std::process::id` determines the guest /proc self-directory identity used by `parse_proc_pid_path`.",
     "review_id": "HA-000568",
     "source": {
-      "byte_end": 163361,
-      "byte_start": 163345,
+      "byte_end": 163370,
+      "byte_start": 163354,
       "column": 25,
       "column_end": 41,
       "column_start": 25,
@@ -15798,18 +15798,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1103 in `initialize_root_process`, `std::process::id` acts only on the current carrier identity passed to the deliberately ignored HVPatch bootstrap seam used by `initialize_root_process`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1049 in `initialize_root_process`, `std::process::id` acts only on the current carrier identity passed to the deliberately ignored HVPatch bootstrap seam used by `initialize_root_process`; no guest identity selects its host target.",
     "review_id": "HA-000523",
     "source": {
-      "byte_end": 40800,
-      "byte_start": 40784,
+      "byte_end": 38207,
+      "byte_start": 38191,
       "column": 44,
       "column_end": 60,
       "column_start": 44,
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 1103,
-      "line_end": 1103,
-      "line_start": 1103
+      "line": 1049,
+      "line_end": 1049,
+      "line_start": 1049
     }
   },
   {
@@ -16530,18 +16530,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:548 in `arm_itimer`, `std::thread::Builder::new` acts only on the current HVPatch timer helper and compatibility bootstrap seam used by `arm_itimer`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:565 in `arm_itimer`, `std::thread::Builder::new` acts only on the current HVPatch timer helper and compatibility bootstrap seam used by `arm_itimer`; no guest identity selects its host target.",
     "review_id": "HA-000579",
     "source": {
-      "byte_end": 20565,
-      "byte_start": 20540,
+      "byte_end": 21271,
+      "byte_start": 21246,
       "column": 17,
       "column_end": 42,
       "column_start": 17,
       "file": "crates/carrick-kernel/src/kernel/carrier_process.rs",
-      "line": 548,
-      "line_end": 548,
-      "line_start": 548
+      "line": 565,
+      "line_end": 565,
+      "line_start": 565
     }
   },
   {
@@ -16559,18 +16559,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:612 in `arm_posix`, `std::thread::Builder::new` acts only on the current HVPatch timer helper and compatibility bootstrap seam used by `arm_posix`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:629 in `arm_posix`, `std::thread::Builder::new` acts only on the current HVPatch timer helper and compatibility bootstrap seam used by `arm_posix`; no guest identity selects its host target.",
     "review_id": "HA-000580",
     "source": {
-      "byte_end": 23374,
-      "byte_start": 23349,
+      "byte_end": 24080,
+      "byte_start": 24055,
       "column": 21,
       "column_end": 46,
       "column_start": 21,
       "file": "crates/carrick-kernel/src/kernel/carrier_process.rs",
-      "line": 612,
-      "line_end": 612,
-      "line_start": 612
+      "line": 629,
+      "line_end": 629,
+      "line_start": 629
     }
   },
   {
@@ -16907,18 +16907,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:4984 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/binding.rs:5335 in `after_executor_failure_settlement`, `std::thread::Builder::new` creates only the failure-only process-retirement coordinator owned by the current carrier; exact Carrick kernel receipts, not host identity, determine the process retirement answer.",
     "review_id": "HA-000644",
     "source": {
-      "byte_end": 217627,
-      "byte_start": 217602,
+      "byte_end": 231975,
+      "byte_start": 231950,
       "column": 35,
       "column_end": 60,
       "column_start": 35,
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 4984,
-      "line_end": 4984,
-      "line_start": 4984
+      "line": 5335,
+      "line_end": 5335,
+      "line_start": 5335
     }
   },
   {
@@ -17694,8 +17694,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:2362 in `futex`, `std::thread::sleep` acts only on the current process-dispatch wait worker used by `futex`; no guest identity selects its host target.",
     "review_id": "HA-000605",
     "source": {
-      "byte_end": 107181,
-      "byte_start": 107163,
+      "byte_end": 107189,
+      "byte_start": 107171,
       "column": 29,
       "column_end": 47,
       "column_start": 29,
@@ -17720,18 +17720,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:498 in `drive_itimer`, `std::thread::sleep` acts only on the current HVPatch timer helper delay at line 190; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:515 in `drive_itimer`, `std::thread::sleep` acts only on the current HVPatch timer helper delay at line 190; no guest identity selects its host target.",
     "review_id": "HA-000606",
     "source": {
-      "byte_end": 19188,
-      "byte_start": 19170,
+      "byte_end": 19894,
+      "byte_start": 19876,
       "column": 21,
       "column_end": 39,
       "column_start": 21,
       "file": "crates/carrick-kernel/src/kernel/carrier_process.rs",
-      "line": 498,
-      "line_end": 498,
-      "line_start": 498
+      "line": 515,
+      "line_end": 515,
+      "line_start": 515
     }
   },
   {
@@ -17749,18 +17749,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:503 in `drive_itimer`, `std::thread::sleep` acts only on the current HVPatch timer helper delay at line 195; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:520 in `drive_itimer`, `std::thread::sleep` acts only on the current HVPatch timer helper delay at line 195; no guest identity selects its host target.",
     "review_id": "HA-000607",
     "source": {
-      "byte_end": 19308,
-      "byte_start": 19290,
+      "byte_end": 20014,
+      "byte_start": 19996,
       "column": 9,
       "column_end": 27,
       "column_start": 9,
       "file": "crates/carrick-kernel/src/kernel/carrier_process.rs",
-      "line": 503,
-      "line_end": 503,
-      "line_start": 503
+      "line": 520,
+      "line_end": 520,
+      "line_start": 520
     }
   },
   {
@@ -17778,18 +17778,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:517 in `drive_itimer`, `std::thread::sleep` acts only on the current HVPatch timer helper delay at line 208; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/carrier_process.rs:534 in `drive_itimer`, `std::thread::sleep` acts only on the current HVPatch timer helper delay at line 208; no guest identity selects its host target.",
     "review_id": "HA-000608",
     "source": {
-      "byte_end": 19785,
-      "byte_start": 19767,
+      "byte_end": 20491,
+      "byte_start": 20473,
       "column": 13,
       "column_end": 31,
       "column_start": 13,
       "file": "crates/carrick-kernel/src/kernel/carrier_process.rs",
-      "line": 517,
-      "line_end": 517,
-      "line_start": 517
+      "line": 534,
+      "line_end": 534,
+      "line_start": 534
     }
   },
   {
@@ -17981,18 +17981,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/crash.rs:481 in `capture_core_for_publication`, `std::thread::sleep` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/crash.rs:483 in `capture_core_for_publication`, `std::thread::sleep` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
     "review_id": "HA-000614",
     "source": {
-      "byte_end": 21049,
-      "byte_start": 21031,
+      "byte_end": 21162,
+      "byte_start": 21144,
       "column": 17,
       "column_end": 35,
       "column_start": 17,
       "file": "crates/carrick-runtime/src/vcpu_loop/crash.rs",
-      "line": 481,
-      "line_end": 481,
-      "line_start": 481
+      "line": 483,
+      "line_end": 483,
+      "line_start": 483
     }
   },
   {
@@ -18357,8 +18357,8 @@
     "rationale": "At crates/carrick-kernel/src/dispatch/proc.rs:2023 in `sched_yield`, `std::thread::yield_now` acts only on the current process-dispatch wait worker used by `sched_yield`; no guest identity selects its host target.",
     "review_id": "HA-000630",
     "source": {
-      "byte_end": 90338,
-      "byte_start": 90316,
+      "byte_end": 90346,
+      "byte_start": 90324,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
@@ -18700,18 +18700,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/crash.rs:278 in `capture_core_for_publication`, `std::thread::yield_now` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/crash.rs:280 in `capture_core_for_publication`, `std::thread::yield_now` acts only on the current carrier vCPU worker used by `capture_core_for_publication`; no guest identity selects its host target.",
     "review_id": "HA-000639",
     "source": {
-      "byte_end": 9807,
-      "byte_start": 9785,
+      "byte_end": 9920,
+      "byte_start": 9898,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/vcpu_loop/crash.rs",
-      "line": 278,
-      "line_end": 278,
-      "line_start": 278
+      "line": 280,
+      "line_end": 280,
+      "line_start": 280
     }
   },
   {
@@ -18729,18 +18729,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:1437 in `run_executor_loop`, `std::thread::yield_now` acts only on the current persistent executor host thread after one settled quantum used by `run_executor_loop` at line 3931; no guest identity selects its host target.",
+    "rationale": "At crates/carrick-runtime/src/vcpu_loop/executor.rs:1441 in `run_executor_loop`, `std::thread::yield_now` acts only on the current persistent executor host thread after one settled quantum used by `run_executor_loop` at line 3931; no guest identity selects its host target.",
     "review_id": "HA-000638",
     "source": {
-      "byte_end": 64429,
-      "byte_start": 64407,
+      "byte_end": 64533,
+      "byte_start": 64511,
       "column": 13,
       "column_end": 35,
       "column_start": 13,
       "file": "crates/carrick-runtime/src/vcpu_loop/executor.rs",
-      "line": 1437,
-      "line_end": 1437,
-      "line_start": 1437
+      "line": 1441,
+      "line_end": 1441,
+      "line_start": 1441
     }
   }
 ]
