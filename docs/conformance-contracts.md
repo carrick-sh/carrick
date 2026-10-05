@@ -325,6 +325,15 @@ or owner admission invalidates preparation. VM-free bindings:
 `relocated_boot_root_custody_survives_exec_and_reuse_rejects_old_lease`.
 Signed multi-container and exec acceptance remains required.
 
+Exec adopts the backend's exact successor table authority. A retained
+predecessor keeps its image, publisher and capacity through detached cleanup;
+a snapshot installed into the old authority cannot stand in for the new MM.
+`exec_successor_preserves_retained_predecessor_table_authority` is the
+red-first engine binding; `two_live_mm_exec_successor_keeps_predecessor_table_retirement_custody`
+proves physical retirement releases only the predecessor's pooled slot while
+the successor's exact record and bytes remain live. Signed sibling-exec
+promotion of this repair remains pending.
+
 Physical retirement covers every arena this exact authority published,
 including a relocated bootstrap primary outside the inventory's mapping rows.
 Source capacity cannot be returned while its exact stage-2 record is pinned;

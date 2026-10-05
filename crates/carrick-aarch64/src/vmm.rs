@@ -28,6 +28,15 @@ use carrick_hal::{
 use carrick_mem::memory::AddressSpace;
 use carrick_mmu_core::aarch64::PageTableManager;
 
+/// Stage-1 ownership installed by a completed exec image replacement.
+pub enum ExecStage1Replacement {
+    /// The backend owns the new MM authority and retains the old MM until
+    /// detached cleanup. Adopt this exact authority without editing the old one.
+    Authority(crate::stage1_authority::Stage1Authority),
+    /// The engine owns table retirement for this backend's rebuilt image.
+    Image(Option<PageTableManager>),
+}
+
 /// COW-inherit vs eager full-RAM copy at `fork(2)`. Re-exported from
 /// [`carrick_hal`] (the single canonical definition, shared with the x86 lane) so
 /// existing `crate::vmm::ForkRamStrategy` references keep resolving.
@@ -1303,8 +1312,8 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         new_image: &AddressSpace,
     ) -> Result<(), TrapError>;
 
-    fn exec_page_tables(&self) -> Option<PageTableManager> {
-        None
+    fn exec_stage1_replacement(&self) -> ExecStage1Replacement {
+        ExecStage1Replacement::Image(None)
     }
 
     /// Replacement PROT_NONE authority installed by the just-completed exec.
