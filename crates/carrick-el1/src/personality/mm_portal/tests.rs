@@ -1795,9 +1795,10 @@ fn owner_fork_publishes_child_with_two_live_same_va_mms() {
             .into_boxed_slice(),
     };
     let supply = Tables::new(pool_root + 0x800000, 0, 0);
-    // The production bootstrap has an EL1-only control window followed by
-    // its table alias. Model the full 2 MiB structural block so Fork must
-    // request control-copy custody and rebind every child table alias.
+    // Bootstrap maps the whole EL1-only hole with a coarse descriptor, but
+    // only the identity page is per-MM data. Carrier code/mailboxes and
+    // unmapped stage-2 gaps must keep their inherited output; requesting
+    // physical copies of those pages refuses the first real bootstrap fork.
     let control = carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE - 0x20000;
     let indices = carrick_mmu_core::aarch64::indices(control);
     parent_tables.words[512 + indices[1]].store((parent_root + 0x4000) | 3, Ordering::Release);
@@ -1858,7 +1859,11 @@ fn owner_fork_publishes_child_with_two_live_same_va_mms() {
                     len,
                     ..
                 } => {
-                    (0xb000_0000..0xb020_0000).contains(&source_ipa)
+                    let offset = carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE
+                        - (carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE - 0x20000);
+                    (0xb000_0000 + offset
+                        ..0xb000_0000 + offset + carrick_el1_abi::CARRICK_IDENTITY_PAGE_SIZE)
+                        .contains(&source_ipa)
                         && destination_ipa == 0xa000_0000 + (source_ipa - 0xb000_0000)
                         && len == 4096
                 }
@@ -1873,7 +1878,11 @@ fn owner_fork_publishes_child_with_two_live_same_va_mms() {
         carrick_aarch64::fork::prepare(request, &slot, &ExactParentFrames, |frame, effect| {
             let service = slot.claim().unwrap();
             let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
-            assert_eq!(plan.custody().len(), 66);
+            assert_eq!(
+                plan.custody().len(),
+                6,
+                "two user frames plus four identity pages, no carrier code or gaps"
+            );
             for (index, selected) in plan.custody().iter().copied().enumerate() {
                 assert!(service.retain(index as u64, selected, || {
                     assert!(effect());
@@ -1902,6 +1911,35 @@ fn owner_fork_publishes_child_with_two_live_same_va_mms() {
         .completion();
     assert_eq!(receipt.child.mm(), request.child_mm);
     spaces.open(spaces.find(3).unwrap());
+
+    for offset in [0, 0x4000, 0x10000, 0x1e0000, 0x1e8000, 0x1fc000] {
+        assert_eq!(
+            fork_translate(&words, child.base, control + offset),
+            0xb000_0000 + offset,
+            "carrier code, mailboxes, and stage-2 gaps retain their output"
+        );
+    }
+    for offset in (0..carrick_el1_abi::CARRICK_IDENTITY_PAGE_SIZE).step_by(4096) {
+        let va = carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE + offset;
+        assert_eq!(
+            fork_translate(&words, child.base, va),
+            request.kernel_control_ipa + (va - control),
+            "the child owns its identity bytes"
+        );
+        assert_eq!(
+            fork_translate(&words, parent_root, va),
+            0xb000_0000 + va - control
+        );
+    }
+    assert_eq!(
+        fork_translate(
+            &words,
+            child.base,
+            carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE
+        ),
+        child.base,
+        "the table alias names the child's private root"
+    );
 
     for (mm, expected_ipa) in [
         (parent, IPA),
