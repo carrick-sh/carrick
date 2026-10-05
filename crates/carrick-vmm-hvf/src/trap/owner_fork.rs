@@ -44,6 +44,12 @@ impl ForkPhysicalCustody {
         let Some(end) = ipa.checked_add(len).filter(|_| len != 0) else {
             return Ok(None);
         };
+        // EL1 selected a physical IPA, not a guest VA or a carrier-MM alias.
+        // The extent authority includes structural roots and arenas; pin its
+        // exact VM and logical-owner generation before accessing any bytes.
+        let Some(identity) = self.custody.stage2_record_covering(ipa, 1) else {
+            return Ok(None);
+        };
         let global = self
             .custody
             .global_frame_host_owners
@@ -54,30 +60,18 @@ impl ForkPhysicalCustody {
                 base.checked_add(*length)
                     .is_some_and(|owner_end| end <= owner_end)
             })
-            .and_then(|(_, entry)| entry.live_owner().cloned());
-        let resolved = if let Some(owner) = global {
-            Some((owner.record_identity, Arc::clone(&owner.mapping)))
+            .and_then(|(_, entry)| entry.live_owner().cloned())
+            .filter(|owner| owner.record_identity == identity);
+        let mapping = if let Some(owner) = global {
+            Some(Arc::clone(&owner.mapping))
         } else {
-            let record = self
-                .custody
-                .carrier_stage2_records
+            self.custody
+                .structural_backings
                 .lock()
-                .range(..=(ipa, u64::MAX))
-                .next_back()
-                .filter(|((base, length), _)| {
-                    base.checked_add(*length)
-                        .is_some_and(|owner_end| end <= owner_end)
-                })
-                .map(|(_, identity)| *identity);
-            record.and_then(|identity| {
-                self.custody
-                    .structural_backings
-                    .lock()
-                    .get(&identity.record_id)
-                    .map(|entry| (identity, Arc::clone(&entry.mapping)))
-            })
+                .get(&identity.record_id)
+                .map(|entry| Arc::clone(&entry.mapping))
         };
-        let Some((identity, mapping)) = resolved else {
+        let Some(mapping) = mapping else {
             return Ok(None);
         };
         let pin = self.custody.pin_stage2_record(identity).map_err(|_| {
