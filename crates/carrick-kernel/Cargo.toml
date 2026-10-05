@@ -50,6 +50,7 @@ loom = []
 # backend selection stays above, in carrick-runtime.
 
 [dependencies]
+carrick-core = { path = "../carrick-core" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-fatal.workspace = true
 carrick-abi = { path = "../carrick-abi" }
