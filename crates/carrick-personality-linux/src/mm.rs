@@ -238,16 +238,19 @@ impl carrick_core_abi::ReservationPolicy for LinuxReservationPolicy {
             },
         }
     }
-    fn mapping(node: &ReservationNodeData, generation: ReservationGeneration) -> Mapping {
+    fn mapping(
+        node: &ReservationNodeData,
+        generation: ReservationGeneration,
+    ) -> Result<Mapping, Refusal> {
         // Nodes are only constructed from validated ABI ranges/protections.
-        Mapping {
-            range: ReservationRange::new(node.start, node.end).expect("reservation range"),
+        Ok(Mapping {
+            range: ReservationRange::new(node.start, node.end).ok_or(Refusal::Invalid)?,
             protection: Self::protection(node),
             anonymous: Self::flags(node).contains(ReservationNodeFlags::ANONYMOUS),
             flags: Self::flags(node),
             generation,
             host_backing: node.host_backing,
-        }
+        })
     }
     /// Whether an adjacent node is the same Linux mapping (a VMA boundary
     /// the tree keeps only to separate incarnations).
