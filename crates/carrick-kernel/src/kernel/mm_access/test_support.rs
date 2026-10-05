@@ -119,12 +119,12 @@ pub(crate) struct ChurningBackend {
 }
 
 #[cfg(test)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum MockReadMode {
     RetryOnce,
     AlwaysRetry,
     EmptyOwners,
-    Deadline,
+    Deadline(Arc<parking_lot::Mutex<Vec<Instant>>>),
 }
 
 #[cfg(test)]
@@ -173,11 +173,13 @@ impl ForeignMmReadLease for MockForeignLease {
         _deadline: Instant,
     ) -> Result<Box<dyn ForeignMmReadReceipt>, ForeignMmTransportError> {
         let call = self.calls.fetch_add(1, Ordering::AcqRel);
-        if matches!(self.mode, MockReadMode::Deadline) {
-            while Instant::now() < _deadline {
-                std::hint::spin_loop();
-            }
-            return Err(ForeignMmTransportError::TimedOut);
+        if let MockReadMode::Deadline(deadlines) = &self.mode {
+            deadlines.lock().push(_deadline);
+            return Err(if call == 0 {
+                ForeignMmTransportError::Retry
+            } else {
+                ForeignMmTransportError::TimedOut
+            });
         }
         if matches!(self.mode, MockReadMode::AlwaysRetry) || call == 0 {
             return Err(ForeignMmTransportError::Retry);
@@ -205,7 +207,7 @@ impl ForeignMmTransport for MockForeignTransport {
     ) -> Result<Arc<dyn ForeignMmReadLease>, ForeignMmTransportError> {
         Ok(Arc::new(MockForeignLease {
             calls: Arc::clone(&self.calls),
-            mode: self.mode,
+            mode: self.mode.clone(),
         }))
     }
 }

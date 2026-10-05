@@ -609,6 +609,19 @@ impl MmAccessAuthority {
         range: MmReadRange<'_>,
         dst: &mut [u8],
     ) -> Result<ForeignReadReceipt, MmAccessError> {
+        self.read_mm_with_now(token, range, dst, Instant::now)
+    }
+
+    // One clock source owns creation and expiry of the operation-wide deadline.
+    // Production uses Instant::now; tests can inspect exact deadlines without
+    // letting host scheduling decide whether an attempt was admitted.
+    fn read_mm_with_now(
+        &self,
+        token: &MmToken,
+        range: MmReadRange<'_>,
+        dst: &mut [u8],
+        now: impl Fn() -> Instant,
+    ) -> Result<ForeignReadReceipt, MmAccessError> {
         if !Arc::ptr_eq(&range.token.mm, &token.mm) || range.token.task != token.task {
             return Err(MmAccessError::ForeignRangeAuthorityMismatch);
         }
@@ -619,7 +632,7 @@ impl MmAccessAuthority {
             });
         }
 
-        let deadline = Instant::now() + Self::OVERALL_DEADLINE;
+        let deadline = now() + Self::OVERALL_DEADLINE;
         let token_lease = token
             .foreign_lease
             .read()
@@ -637,7 +650,7 @@ impl MmAccessAuthority {
             mm: Arc::clone(&token.mm),
         };
         for _ in 0..Self::MAX_ATTEMPTS {
-            if Instant::now() >= deadline {
+            if now() >= deadline {
                 return Err(MmAccessError::ForeignReadTimedOut);
             }
             let before_snapshot = snapshot_backend(&token.mm, deadline)?;
@@ -3018,31 +3031,53 @@ mod tests {
 
     #[test]
     fn mm_access_authority_enforces_one_overall_deadline_across_attempts() {
-        let (kernel, root) = bootstrap(31_146);
-        let execution = execution_lease(&root, 147);
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let transport: Arc<dyn ForeignMmTransport> = Arc::new(MockForeignTransport {
-            calls: Arc::clone(&calls),
-            mode: MockReadMode::Deadline,
-        });
-        let child = fork_with_transport(
-            &kernel,
-            &root,
-            31_147,
-            "deadline foreign-read child",
-            transport,
-        );
-        let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
-        let range = foreign.read_range(GuestVa(0x1000), 4).unwrap().unwrap();
-        let mut bytes = [0_u8; 4];
-        let started = Instant::now();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let (kernel, root) = bootstrap(31_146);
+            let execution = execution_lease(&root, 147);
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let deadlines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let transport: Arc<dyn ForeignMmTransport> = Arc::new(MockForeignTransport {
+                calls: Arc::clone(&calls),
+                mode: MockReadMode::Deadline(Arc::clone(&deadlines)),
+            });
+            let child = fork_with_transport(
+                &kernel,
+                &root,
+                31_147,
+                "deadline foreign-read child",
+                transport,
+            );
+            let foreign = foreign_mm(&kernel, &root, &execution, child.task().key());
+            let range = foreign.read_range(GuestVa(0x1000), 4).unwrap().unwrap();
+            let mut bytes = [0_u8; 4];
+            let start = Instant::now();
+            let ticks = std::cell::Cell::new(0_u32);
 
-        assert!(matches!(
-            super::MmAccessAuthority::new().read_foreign(&foreign, range, &mut bytes),
-            Err(MmAccessError::ForeignReadTimedOut)
-        ));
-        assert_eq!(calls.load(Ordering::Acquire), 1);
-        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+            assert!(matches!(
+                super::MmAccessAuthority::new().read_mm_with_now(
+                    &foreign.token,
+                    range,
+                    &mut bytes,
+                    || {
+                        let tick = ticks.get();
+                        ticks.set(tick + 1);
+                        start + std::time::Duration::from_millis(u64::from(tick) * 10)
+                    }
+                ),
+                Err(MmAccessError::ForeignReadTimedOut)
+            ));
+            assert_eq!(calls.load(Ordering::Acquire), 2);
+            assert_eq!(
+                *deadlines.lock(),
+                vec![start + super::MmAccessAuthority::OVERALL_DEADLINE; 2]
+            );
+            done_tx.send(()).expect("deadline assertions completed");
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("foreign read watchdog");
+        worker.join().expect("foreign read worker");
     }
 
     #[test]
