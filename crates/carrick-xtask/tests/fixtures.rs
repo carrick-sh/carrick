@@ -616,7 +616,7 @@ fn fixture_policy_identity_rejects_changed_policy() {
 #[test]
 fn cargo_home_and_parent_config_are_isolated() {
     let f = Fixture::new();
-    let outside = tempfile::tempdir().unwrap();
+    let outside = CanonicalTempDir::new();
     let checkout = outside.path().join("checkout");
     git(
         outside.path(),
@@ -912,8 +912,8 @@ exec "$FIXTURE_TEST_XTASK" "$@"
         );
         write(&bin, "just", br#"#!/bin/sh
 if [ "$1" = accept ]; then
-    "$FIXTURE_TEST_XTASK" fixtures verify || exit $?
-    "$FIXTURE_TEST_XTASK" host-lease --mode gate -- /bin/true || exit $?
+    "$FIXTURE_TEST_XTASK" fixtures verify --receipt "$FIXTURE_TEST_ACCEPTED_DIR/validation.json" || exit $?
+    "$FIXTURE_TEST_XTASK" host-lease --mode gate -- true || exit $?
     [ -d "$FIXTURE_TEST_CHECKOUT_LOCK" ] || exit 93
     if [ "$FIXTURE_TEST_REQUIRE_PROVENANCE" = 1 ]; then
         provenance_dir="$FIXTURE_TEST_ACCEPTED_DIR"
@@ -933,7 +933,7 @@ if [ "$1" = accept ]; then
         fi
         shift
     done
-    printf '{"schema_version":1,"timestamp":"test","head":"%s","clean_tree":true,"phase":"signed","profile":"no-docker","overall":"PASS","steps":[],"skipped_steps":[],"artifact":null,"el1":null,"probe_diffs":[],"cleanup_counts":[],"host_load":{"allow_load":false,"generators":[]},"failures":[],"fixture_bundle":null}\n' "$(git rev-parse HEAD)" > "$receipt_path"
+    printf '{"schema_version":1,"timestamp":"test","head":"%s","clean_tree":true,"phase":"signed","profile":"no-docker","overall":"PASS","steps":[],"skipped_steps":[],"artifact":null,"el1":null,"probe_diffs":[],"cleanup_counts":[],"host_load":{"allow_load":false,"generators":[]},"failures":[],"fixture_bundle":null,"fixture_validation":%s}\n' "$(git rev-parse HEAD)" "$(cat "$FIXTURE_TEST_ACCEPTED_DIR/validation.json")" > "$receipt_path"
     [ "$FIXTURE_TEST_INVALID_RECEIPT" != 1 ] || printf '{}' > "$receipt_path"
     printf '%s\n' '==================== ACCEPT GATE SUMMARY ====================' 'fixture preparation preflight passed (HVF acceptance replaced in this test)' '============================================================='
 else
@@ -1142,7 +1142,7 @@ fn trusted_hardware_workflow_prepares_exact_sha_fixtures_before_signed_execution
         "scripts/sudo/kill.sh",
         br#"#!/bin/sh
 [ "$1" = "$CARRICK_RUN_ID" ] || exit 95
-"$FIXTURE_TEST_XTASK" host-lease --mode gate -- /bin/true || exit $?
+"$FIXTURE_TEST_XTASK" host-lease --mode gate -- true || exit $?
 printf '%s\n' "$1" > "$FIXTURE_TEST_CLEANED"
 "#,
     );
@@ -1176,7 +1176,7 @@ case "$1" in
     ci) : ;;
     build|test-embed|conformance-probes)
         "$FIXTURE_TEST_XTASK" fixtures verify || exit $?
-        "$FIXTURE_TEST_XTASK" host-lease --mode gate -- /bin/true || exit $?
+        "$FIXTURE_TEST_XTASK" host-lease --mode gate -- true || exit $?
         printf '%s\n' "$1" >> "$FIXTURE_TEST_EXECUTIONS"
         ;;
     *) exec "$FIXTURE_TEST_JUST" --justfile "$FIXTURE_TEST_JUSTFILE" --working-directory "$PWD" "$@" ;;
@@ -1468,6 +1468,9 @@ exec "$FIXTURE_TEST_RSYNC" "$@"
         carrick_xtask::remote_accept::local_receipt_path(f.repo.path(), run_id.to_str().unwrap());
     let mut receipt: serde_json::Value =
         serde_json::from_slice(&fs::read(&local_receipt).unwrap()).unwrap();
+    let validation = receipt["fixture_validation"].clone();
+    assert_eq!(validation["validation_method"], "input_identity");
+    assert_eq!(validation["checkout_dirty"], false);
     let provenance = receipt["fixture_bundle"].clone();
     assert!(!provenance.is_null(), "fresh run lacks verified provenance");
     receipt["fixture_bundle"] = serde_json::Value::Null;
@@ -1522,6 +1525,10 @@ exec "$FIXTURE_TEST_RSYNC" "$@"
     );
     let attached: serde_json::Value =
         serde_json::from_slice(&fs::read(&local_receipt).unwrap()).unwrap();
+    assert_eq!(
+        attached["fixture_validation"], validation,
+        "attach lost input validation"
+    );
     assert_eq!(
         attached["fixture_bundle"], provenance,
         "attach lost run provenance"
@@ -1715,7 +1722,7 @@ fn check_gzip_transport(case: &str) {
     }
     fs::write(&p.archive, bytes).unwrap();
     let sha = git(&p.checkout, &["rev-parse", "HEAD"]);
-    let reason = fixtures::archive::verify(&p.archive, &sha)
+    let reason = fixtures::archive::verify(&p.checkout, &p.archive, &sha)
         .unwrap_err()
         .to_string();
     let out = p
@@ -1829,7 +1836,9 @@ fn replacing_shared_archive_after_verification_restores_captured_bytes() {
     let output = CanonicalTempDir::new();
     let second = fixtures::archive::pack(&f.path, output.path()).unwrap();
     assert_ne!(
-        fixtures::archive::verify(&second, &sha).unwrap().1,
+        fixtures::archive::verify(&p.checkout, &second, &sha)
+            .unwrap()
+            .1,
         identity
     );
     fs::rename(second, &p.archive).unwrap();
@@ -1859,4 +1868,116 @@ fn remote_preparation_provenance_write_failure_stops_acceptance() {
     );
     assert!(!p.scratch.path().join("accepted").exists());
     assert!(!p.checkout.join(fixtures::INSTALLED_MANIFEST).exists());
+}
+
+fn check_archive_input_identity(case: &str, expected: &str) {
+    let mut f = Fixture::new();
+    if case == "policy" {
+        f.manifest
+            .build_policy
+            .fixed_environment
+            .insert("CARGO_PROFILE_RELEASE_OPT_LEVEL".into(), "0".into());
+        f.republish();
+    }
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    if case == "source" {
+        write(
+            &p.checkout,
+            "conformance-probes/src/bin/probeinit.rs",
+            b"// changed fixture input\n",
+        );
+    }
+    for action in ["prepare", "verify"] {
+        let run_dir = p.scratch.path().join(action);
+        let mut command = p.command(env!("CARGO_BIN_EXE_carrick-xtask"));
+        command
+            .current_dir(&p.checkout)
+            .args(["fixtures", action, "--bundle"])
+            .arg(&p.archive);
+        if action == "verify" {
+            command
+                .arg("--receipt")
+                .arg(p.scratch.path().join("validation.json"));
+        } else {
+            command
+                .arg("--run-dir")
+                .arg(&run_dir)
+                .args(["--source", "remote"]);
+        }
+        if case == "ambient" {
+            command.env("CARGO_PROFILE_RELEASE_OPT_LEVEL", "0");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            !output.status.success(),
+            "{case} {action} admitted invalid fixture inputs"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected),
+            "{case} {action}: wrong rejection: {stderr}"
+        );
+        assert!(!run_dir.join("fixture-bundle.json").exists());
+        assert!(!p.scratch.path().join("validation.json").exists());
+        assert!(!p.checkout.join(fixtures::INSTALLED_MANIFEST).exists());
+    }
+}
+
+#[test]
+fn archive_verification_rejects_changed_build_policy_before_provenance() {
+    check_archive_input_identity("policy", "build policy mismatch");
+}
+
+#[test]
+fn archive_verification_rejects_changed_scoped_inputs_before_provenance() {
+    check_archive_input_identity("source", "dirty fixture source inputs");
+}
+
+#[test]
+fn archive_verification_rejects_ambient_override_before_provenance() {
+    check_archive_input_identity("ambient", "build policy forbids ambient");
+}
+
+#[test]
+fn archive_verification_records_scoped_evidence_atomically() {
+    let f = Fixture::new();
+    let p = Preparation::new(&f);
+    p.setup(&f);
+    write(
+        &p.checkout,
+        "crates/carrick-runtime/src/lib.rs",
+        b"// unrelated diagnostic\n",
+    );
+    let receipt = p.scratch.path().join("validation.json");
+    fs::write(&receipt, b"previous receipt").unwrap();
+    let mut previous = fs::File::open(&receipt).unwrap();
+    let output = p
+        .command(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .current_dir(&p.checkout)
+        .args(["fixtures", "verify", "--bundle"])
+        .arg(&p.archive)
+        .arg("--receipt")
+        .arg(&receipt)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let validation: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(validation["validation_method"], "input_identity");
+    assert_eq!(validation["checkout_dirty"], true);
+    assert_eq!(
+        validation["checkout_head"],
+        validation["bundle_source_head"]
+    );
+    let mut old_bytes = Vec::new();
+    std::io::Read::read_to_end(&mut previous, &mut old_bytes).unwrap();
+    assert_eq!(
+        old_bytes, b"previous receipt",
+        "verification overwrote a published receipt inode"
+    );
 }

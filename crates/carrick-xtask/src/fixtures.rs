@@ -844,7 +844,7 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
         } => {
             let expected = expected_head(root, sha.as_deref())?;
             let manifest = if let Some(bundle_path) = bundle {
-                let (manifest, identity) = archive::verify(&bundle_path, &expected.0)?;
+                let (manifest, identity) = archive::verify(root, &bundle_path, &expected.0)?;
                 let archive_sha256 = provision::compute_sha256(&bundle_path)?;
                 writeln!(
                     writer,
@@ -862,9 +862,9 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
                 }
             };
             if let Some(path) = receipt {
-                fs::write(
-                    path,
-                    serde_json::to_vec_pretty(&validation_receipt(root, &manifest)?)?,
+                crate::atomic_file::write(
+                    &path,
+                    &serde_json::to_vec_pretty(&validation_receipt(root, &manifest)?)?,
                 )?;
             }
             writeln!(

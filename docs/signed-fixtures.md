@@ -230,6 +230,14 @@ names, and copies the admitted file into the run's private `fixtures`
 directory. Verification, SHA-256 hashing and restoration use only this
 capture. Archive verification reads the gzip stream through EOF, validating
 all member trailers and rejecting trailing garbage for local uploads too.
+It then invokes the same checkout-aware verifier as manifest restoration:
+exact HEAD, v2 schema, scoped source closure, current build policy, toolchain
+and executable inventory must all match before run provenance is published.
+Ambient build overrides are rejected here as well as during restore.
+`fixtures verify --bundle <path> --receipt <path>` writes fresh input-identity
+evidence atomically. Receipt annotation and attach preserve acceptance's
+`fixture_validation` alongside the run's `fixture_bundle` transport provenance.
+The independent fully clean-checkout checks in acceptance still apply.
 
 Admission deliberately rejects symlinks in **every ancestor component** as
 well as the final archive component. This keeps directory aliases from

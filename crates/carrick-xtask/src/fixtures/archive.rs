@@ -1,7 +1,5 @@
 //! Mode-preserving transport; only declared regular bundle files may unpack.
-use super::{
-    CommitSha, ContentHash, RestoreWork, Result, fail, hash_file, inspect_bundle, safe_path,
-};
+use super::{ContentHash, RestoreWork, Result, fail, hash_file, inspect_bundle, safe_path};
 use flate2::{Compression, read::MultiGzDecoder, write::GzEncoder};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -46,7 +44,10 @@ pub fn pack(manifest: &Path, output: &Path) -> Result<PathBuf> {
         }
         archive.into_inner()?.finish()?;
     }
-    let _ = verify(temp.path(), &String::from(identity.source_head))?;
+    // Packing validates transport and object bytes without a receiver checkout.
+    // Admission below additionally validates scoped inputs and build policy.
+    let unpacked = unpack(temp.path())?;
+    inspect_bundle(&unpacked.manifest, Some(&identity.source_head))?;
     let artifact = destination.join(format!("{}.tar.gz", String::from(digest)));
     if artifact.exists() {
         if hash_file(&artifact)? != hash_file(temp.path())? {
@@ -141,11 +142,11 @@ pub fn restore(root: &Path, bundle: &Path, sha: Option<&str>) -> Result<RestoreW
     super::restore(root, &unpacked.manifest, sha)
 }
 
-/// Verify transport identity without borrowing the sender checkout's HEAD.
-pub fn verify(bundle: &Path, sha: &str) -> Result<(super::Manifest, String)> {
-    let expected = CommitSha::try_from(sha.to_owned())?;
+/// Verify complete transport and scoped input identity against the receiver.
+/// The caller must capture shared-store bytes before invoking this admission.
+pub fn verify(root: &Path, bundle: &Path, sha: &str) -> Result<(super::Manifest, String)> {
     let unpacked = unpack(bundle)?;
-    let manifest = inspect_bundle(&unpacked.manifest, Some(&expected))?;
+    let manifest = super::verify_bundle(root, &unpacked.manifest, Some(sha))?;
     let identity = unpacked
         .manifest
         .parent()

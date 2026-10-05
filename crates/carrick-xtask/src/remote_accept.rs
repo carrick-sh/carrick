@@ -676,7 +676,8 @@ pub fn capture_fixture_bundle(
     let mut captured = tempfile::NamedTempFile::new_in(&directory)?;
     io::copy(&mut input, captured.as_file_mut())?;
     let expected = crate::fixtures::expected_head(root, None)?;
-    let (_, identity) = crate::fixtures::archive::verify(captured.path(), &String::from(expected))?;
+    let (_, identity) =
+        crate::fixtures::archive::verify(root, captured.path(), &String::from(expected))?;
     let archive_sha256 = crate::provision::compute_sha256(captured.path())?;
     let captured_path = directory.join("captured.tar.gz");
     captured
@@ -1543,6 +1544,20 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
             steps: vec![],
             skipped_steps: vec![],
             artifact: None,
+            fixture_validation: Some(crate::fixtures::ValidationReceipt {
+                validation_method: crate::fixtures::ValidationMethod::InputIdentity,
+                checkout_head: "0123456789abcdef0123456789abcdef01234567"
+                    .to_string()
+                    .try_into()
+                    .unwrap(),
+                bundle_source_head: "0123456789abcdef0123456789abcdef01234567"
+                    .to_string()
+                    .try_into()
+                    .unwrap(),
+                checkout_dirty: false,
+                manifest_sha256: "1".repeat(64).try_into().unwrap(),
+                inputs_sha256: "2".repeat(64).try_into().unwrap(),
+            }),
             el1: None,
             probe_diffs: vec![],
             cleanup_counts: vec![],
@@ -1578,6 +1593,10 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
         let updated_bytes = fs::read(&receipt_path).unwrap();
         let updated: crate::accept::AcceptReceipt = serde_json::from_slice(&updated_bytes).unwrap();
         assert_eq!(updated.fixture_bundle, Some(remote_bundle_receipt));
+        assert_eq!(
+            updated.fixture_validation,
+            initial_receipt.fixture_validation
+        );
 
         // Test with local bundle
         let local_bundle_receipt = crate::accept::FixtureBundleReceipt {
@@ -1593,6 +1612,10 @@ Filesystem     1024-blocks    Used Available Capacity Mounted on
         let updated2: crate::accept::AcceptReceipt =
             serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
         assert_eq!(updated2.fixture_bundle, Some(local_bundle_receipt));
+        assert_eq!(
+            updated2.fixture_validation,
+            initial_receipt.fixture_validation
+        );
     }
 
     #[test]
