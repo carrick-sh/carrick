@@ -5285,6 +5285,7 @@ mod real {
         /// 4 overlapping retained alias, 5 publication entered), detail
         /// (alias count for phase 4). Does not name guest bytes.
         fn hvpatch__el1__owner__grant__supply(_: u64, _: u64, _: u32, _: u64) {}
+        fn el1__grant__refusal(_: u32, _: u64, _: u64, _: u64, _: u64) {}
         /// Physical retention refusal for an EL1 owner read: selected IPA and
         /// reason (1 no indexed stage-2 record, 3 missing, 4 unmapped,
         /// 5 retiring). Diagnostic only; it grants no custody.
@@ -6722,6 +6723,12 @@ mod real {
     #[inline(never)]
     pub fn hvpatch_el1_owner_grant_supply(address: u64, length: u64, phase: u32, detail: u64) {
         carrick_usdt::hvpatch__el1__owner__grant__supply!(|| (address, length, phase, detail));
+    }
+
+    /// Failure-only grant identity fields; never consulted for authorization.
+    #[inline(never)]
+    pub fn el1_grant_refusal(row: u32, a: u64, b: u64, c: u64, d: u64) {
+        carrick_usdt::el1__grant__refusal!(|| (row, a, b, c, d));
     }
 
     #[inline(never)]
@@ -9149,6 +9156,7 @@ mod stub {
     stub!(hvpatch_el1_host_read_progress(address: u64, length: u64, offset: u64, class: u32, detail: u64));
     stub!(hvpatch_el1_host_write_prepare(address: u64, length: u64, phase: u32, detail: u64));
     stub!(hvpatch_el1_owner_grant_supply(address: u64, length: u64, phase: u32, detail: u64));
+    stub!(el1_grant_refusal(row: u32, a: u64, b: u64, c: u64, d: u64));
     stub!(hvpatch_el1_host_read_retention(ipa: u64, reason: u32));
 
     pub fn syscall_mailbox_lifecycle_with(
