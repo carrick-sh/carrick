@@ -639,7 +639,7 @@
       "file": "crates/carrick-aarch64/src/fork.rs",
       "function": "PendingOwnerFork<'_,P>::finish",
       "ordinal_in_function": 1,
-      "fingerprint": "8c034933301cd8e2e9dc15e94f241441ffc8ff4f2593999f49463a077f5db09f"
+      "fingerprint": "a183808f92478b4638d65437ba237e61fda6dd3d27455a08fb6dc7d40c7c019d"
     },
     {
       "verdict": "carrier_fault",
