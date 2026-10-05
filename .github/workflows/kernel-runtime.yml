@@ -36,6 +36,9 @@ jobs:
         with:
           tool: just
 
+      - name: Install per-user compiler cache
+        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+
       - name: Publish exact-SHA fixture bundle
         run: just fixtures-publish "$GITHUB_SHA"
 
