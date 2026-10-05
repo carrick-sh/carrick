@@ -157,3 +157,9 @@ impl PortalGrantSlot {
         Some(receipt)
     }
 }
+
+/// Borrowed transport views, with no reservation or grant authority of their own.
+pub trait GrantSlotVenue {
+    fn carrier(&self) -> Option<core::num::NonZeroU64>;
+    fn grant(&self, slot: usize) -> Option<&PortalGrantSlot>;
+}
