@@ -20,6 +20,7 @@ It enforces that:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
@@ -183,6 +184,15 @@ def lex_rust(source: str) -> list[Token]:
             tokens.append(Token("char", source[start:i], line, start))
             continue
 
+        # Raw identifiers name the same operation as their ordinary spelling.
+        if source.startswith("r#", i) and i + 2 < length and (source[i + 2].isalpha() or source[i + 2] == "_"):
+            start_pos = i
+            i += 2
+            while i < length and (source[i].isalnum() or source[i] == "_"):
+                i += 1
+            tokens.append(Token("ident", source[start_pos + 2:i], line, start_pos))
+            continue
+
         if char.isalpha() or char == "_":
             start = i
             i += 1
@@ -266,8 +276,19 @@ def _is_test_only_attribute(tokens: Sequence[Token], start: int, end: int) -> bo
     return False
 
 
+def _opaque_macro_inputs(tokens):
+    spec = importlib.util.spec_from_file_location("authority_scope_cfg", Path(__file__).resolve().with_name("check-runtime-aborts.py"))
+    module = sys.modules.get(spec.name)
+    if module is None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    return module.opaque_macro_inputs(tokens)
+
+
 def production_mask(tokens: Sequence[Token]) -> list[bool]:
     """Return True for tokens that can compile when cfg(test) is disabled."""
+    opaque = _opaque_macro_inputs(tokens)
     production = [True] * len(tokens)
     test_scope_stack = [False]
     pending_test_attribute = False
@@ -280,7 +301,7 @@ def production_mask(tokens: Sequence[Token]) -> list[bool]:
 
         if token.text == "#" and index + 1 < len(tokens) and tokens[index + 1].text == "[":
             end = _matching_delimiter(tokens, index + 1, "[", "]")
-            if _is_test_only_attribute(tokens, index + 2, end):
+            if not opaque[index] and _is_test_only_attribute(tokens, index + 2, end):
                 pending_test_attribute = True
             for attr_index in range(index, min(end + 1, len(tokens))):
                 production[attr_index] = not current_test

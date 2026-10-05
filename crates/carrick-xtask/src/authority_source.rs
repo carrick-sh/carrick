@@ -6,9 +6,77 @@ use quote::ToTokens;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use syn::{
+    ext::IdentExt,
+    parse::Parser,
     spanned::Spanned,
     visit::{self, Visit},
 };
+
+fn path_is_ident(path: &syn::Path, expected: &str) -> bool {
+    path.get_ident()
+        .is_some_and(|ident| ident.unraw() == expected)
+}
+
+// Token formatting also participates in type and owner identity. Keep literal
+// contents and source spans intact while canonicalizing identifier spellings.
+fn semantic_tokens(value: &impl ToTokens) -> String {
+    fn normalize(tokens: TokenStream) -> TokenStream {
+        tokens
+            .into_iter()
+            .map(|token| match token {
+                TokenTree::Ident(ident) => TokenTree::Ident(ident.unraw()),
+                TokenTree::Group(group) => {
+                    let mut normalized =
+                        proc_macro2::Group::new(group.delimiter(), normalize(group.stream()));
+                    normalized.set_span(group.span());
+                    TokenTree::Group(normalized)
+                }
+                token => token,
+            })
+            .collect()
+    }
+    normalize(value.to_token_stream()).to_string()
+}
+
+// Attributes in macro inputs describe tokens, not compiler-enforced scope:
+// a macro may remove or rewrite them. No visitor may derive test exclusion
+// from such attributes, even when the rest of the input parses as Rust.
+fn macro_input_tokens(tokens: TokenStream) -> TokenStream {
+    let tokens: Vec<_> = tokens.into_iter().collect();
+    let mut result = TokenStream::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if matches!(&tokens[index], TokenTree::Punct(p) if p.as_char() == '#') {
+            let inner =
+                matches!(tokens.get(index + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!');
+            let end = index + if inner { 3 } else { 2 };
+            if matches!(tokens.get(end - 1), Some(TokenTree::Group(group)) if group.delimiter() == Delimiter::Bracket)
+            {
+                let attribute = tokens[index..end].iter().cloned().collect();
+                let parsed = if inner {
+                    syn::Attribute::parse_inner.parse2(attribute)
+                } else {
+                    syn::Attribute::parse_outer.parse2(attribute)
+                };
+                if parsed.is_ok_and(|attrs| test_only(&attrs)) {
+                    index = end;
+                    continue;
+                }
+            }
+        }
+        result.extend(std::iter::once(match &tokens[index] {
+            TokenTree::Group(group) => {
+                let mut normalized =
+                    proc_macro2::Group::new(group.delimiter(), macro_input_tokens(group.stream()));
+                normalized.set_span(group.span());
+                TokenTree::Group(normalized)
+            }
+            token => token.clone(),
+        }));
+        index += 1;
+    }
+    result
+}
 
 #[derive(Debug)]
 pub struct ApiSite {
@@ -164,7 +232,7 @@ fn approved_table_guard(owner: &str, method: &syn::ImplItemFn) -> bool {
             where_clause.predicates = where_clause.predicates.iter().cloned().collect();
         }
         let visibility = &method.vis;
-        quote::quote!(#visibility #signature).to_string()
+        semantic_tokens(&quote::quote!(#visibility #signature))
     }
     signature(method) == signature(&expected)
 }
@@ -210,17 +278,16 @@ const DEFINITION_OWNERS: &[&str] = &[
 ];
 
 fn test_only(attrs: &[syn::Attribute]) -> bool {
-    attrs
-        .iter()
-        .any(|a| a.path().is_ident("test") || (a.path().is_ident("cfg") && cfg_false(&a.meta)))
+    attrs.iter().any(|a| {
+        path_is_ident(a.path(), "test") || (path_is_ident(a.path(), "cfg") && cfg_false(&a.meta))
+    })
 }
 fn cfg_false(meta: &syn::Meta) -> bool {
     use syn::parse::Parser;
     match meta {
-        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::Path(path) => path_is_ident(path, "test"),
         syn::Meta::NameValue(nv) => {
-            nv.path.is_ident("feature")
-                && nv.value.to_token_stream().to_string() == "\"test-support\""
+            path_is_ident(&nv.path, "feature") && semantic_tokens(&nv.value) == "\"test-support\""
         }
         syn::Meta::List(list) => {
             let Ok(children) =
@@ -229,9 +296,9 @@ fn cfg_false(meta: &syn::Meta) -> bool {
             else {
                 return false;
             };
-            if list.path.is_ident("cfg") || list.path.is_ident("all") {
+            if path_is_ident(&list.path, "cfg") || path_is_ident(&list.path, "all") {
                 children.iter().any(cfg_false)
-            } else if list.path.is_ident("any") {
+            } else if path_is_ident(&list.path, "any") {
                 !children.is_empty() && children.iter().all(cfg_false)
             } else {
                 false
@@ -257,7 +324,7 @@ fn module_file(
     parsed: &BTreeMap<PathBuf, syn::File>,
 ) -> (PathBuf, bool) {
     let explicit = module.attrs.iter().find_map(|attr| {
-        if !attr.path().is_ident("path") {
+        if !path_is_ident(attr.path(), "path") {
             return None;
         }
         let syn::Meta::NameValue(value) = &attr.meta else {
@@ -274,13 +341,15 @@ fn module_file(
     let explicit_path = explicit.is_some();
     let path = explicit.unwrap_or_else(|| {
         if module.content.is_some() {
-            return directory.join(module.ident.to_string());
+            return directory.join(module.ident.unraw().to_string());
         }
-        let flat = directory.join(format!("{}.rs", module.ident));
+        let flat = directory.join(format!("{}.rs", module.ident.unraw()));
         if parsed.contains_key(&flat) {
             flat
         } else {
-            directory.join(module.ident.to_string()).join("mod.rs")
+            directory
+                .join(module.ident.unraw().to_string())
+                .join("mod.rs")
         }
     });
     (normalized_path(&path), explicit_path)
@@ -301,7 +370,7 @@ fn test_modules(
         let child_directory = if module.content.is_some() {
             path.clone()
         } else {
-            directory.join(module.ident.to_string())
+            directory.join(module.ident.unraw().to_string())
         };
         let is_test = inherited_test || test_only(&module.attrs);
         if let Some((_, items)) = &module.content {
@@ -324,6 +393,70 @@ fn test_modules(
                 path.with_extension("")
             };
             test_modules(&syntax.items, &directory, parent, true, parsed, result);
+        }
+    }
+}
+
+// A parsed test module can include other sources. Close these proven include
+// edges before treating otherwise-unbound files as production roots. Opaque
+// macro inputs cannot prove a test-only edge; production closure still wins
+// whenever a file is also referenced by a production source.
+fn test_inclusions(
+    parsed: &BTreeMap<PathBuf, syn::File>,
+    vocabulary: &BTreeMap<String, AuthorityOperation>,
+    test_files: &mut BTreeSet<PathBuf>,
+) {
+    struct Includes<'a> {
+        parent: &'a Path,
+        vocabulary: &'a BTreeMap<String, AuthorityOperation>,
+        references: BTreeSet<PathBuf>,
+    }
+    impl<'ast> Visit<'ast> for Includes<'_> {
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            if mac.path.segments.last().is_some_and(|part| {
+                matches!(
+                    self.vocabulary.get(&part.ident.unraw().to_string()),
+                    Some(
+                        AuthorityOperation::SourceInclude | AuthorityOperation::SourceStringInclude
+                    )
+                )
+            }) && let Ok(arguments) =
+                syn::punctuated::Punctuated::<syn::LitStr, syn::Token![,]>::parse_terminated
+                    .parse2(mac.tokens.clone())
+                && arguments.len() == 1
+                && let Some(literal) = arguments.first()
+            {
+                self.references
+                    .insert(normalized_path(&self.parent.join(literal.value())));
+            }
+            // Never infer test reachability from arbitrary macro token streams.
+        }
+    }
+    let mut pending = test_files.clone();
+    while let Some(path) = pending.pop_first() {
+        let Some(syntax) = parsed.get(&path) else {
+            continue;
+        };
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let mut includes = Includes {
+            parent,
+            vocabulary,
+            references: BTreeSet::new(),
+        };
+        includes.visit_file(syntax);
+        for included in includes.references {
+            if let Some(syntax) = parsed.get(&included)
+                && test_files.insert(included.clone())
+            {
+                pending.insert(included.clone());
+                if let Some(parent) = included.parent() {
+                    let before = test_files.clone();
+                    test_modules(&syntax.items, parent, parent, true, parsed, test_files);
+                    pending.extend(test_files.difference(&before).cloned());
+                }
+            }
         }
     }
 }
@@ -416,6 +549,7 @@ fn production_files(
         explicit_directory: PathBuf,
         parsed: &'a BTreeMap<PathBuf, syn::File>,
         references: BTreeSet<PathBuf>,
+        opaque: bool,
     }
     impl<'ast> Visit<'ast> for Modules<'_> {
         fn visit_item(&mut self, item: &'ast syn::Item) {
@@ -429,57 +563,69 @@ fn production_files(
                 syn::Item::Trait(item) => &item.attrs,
                 _ => return visit::visit_item(self, item),
             };
-            if !test_only(attrs) {
+            if self.opaque || !test_only(attrs) {
                 visit::visit_item(self, item);
             }
         }
         fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
-            if test_only(&module.attrs) {
+            if !self.opaque && test_only(&module.attrs) {
                 return;
             }
-            if let Some((_, children)) = &module.content {
-                let (child, _) = module_file(
-                    module,
-                    &self.directory,
-                    &self.explicit_directory,
-                    self.parsed,
+            let (path, explicit_path) = module_file(
+                module,
+                &self.directory,
+                &self.explicit_directory,
+                self.parsed,
+            );
+            let mut candidates = BTreeSet::from([path]);
+            if self.opaque && explicit_path {
+                // A macro can retain or remove #[path]. Neither candidate is
+                // proof that the other physical incarnation is test-only.
+                let mut plain = module.clone();
+                plain.attrs.clear();
+                candidates.insert(
+                    module_file(
+                        &plain,
+                        &self.directory,
+                        &self.explicit_directory,
+                        self.parsed,
+                    )
+                    .0,
                 );
-                let directory = std::mem::replace(&mut self.directory, child.clone());
-                let explicit = std::mem::replace(&mut self.explicit_directory, child);
-                for item in children {
-                    self.visit_item(item);
-                }
-                self.directory = directory;
-                self.explicit_directory = explicit;
-            } else {
-                let (path, _) = module_file(
-                    module,
-                    &self.directory,
-                    &self.explicit_directory,
-                    self.parsed,
-                );
-                if self.parsed.contains_key(&path) || path.is_file() {
+            }
+            for path in candidates {
+                if let Some((_, children)) = &module.content {
+                    let directory = std::mem::replace(&mut self.directory, path.clone());
+                    let explicit = std::mem::replace(&mut self.explicit_directory, path);
+                    for item in children {
+                        self.visit_item(item);
+                    }
+                    self.directory = directory;
+                    self.explicit_directory = explicit;
+                } else if self.parsed.contains_key(&path) || path.is_file() {
                     self.references.insert(path);
                 }
             }
         }
         fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-            if !test_only(&item.attrs) {
+            if self.opaque || !test_only(&item.attrs) {
                 visit::visit_impl_item_fn(self, item);
             }
         }
         fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
-            if !test_only(&item.attrs) {
+            if self.opaque || !test_only(&item.attrs) {
                 visit::visit_trait_item_fn(self, item);
             }
         }
         fn visit_expr(&mut self, expression: &'ast syn::Expr) {
-            if !expression_test_only(expression) {
+            if self.opaque || !expression_test_only(expression) {
                 visit::visit_expr(self, expression);
             }
         }
         fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            let opaque = std::mem::replace(&mut self.opaque, true);
             visit_macro_inputs(self, mac.tokens.clone());
+            self.opaque = opaque;
         }
     }
     let mut pending = production.clone();
@@ -500,6 +646,7 @@ fn production_files(
         let directories = BTreeSet::from([parent.to_path_buf(), path.with_extension("")]);
         for directory in directories {
             let mut visitor = Modules {
+                opaque: false,
                 directory,
                 explicit_directory: parent.to_path_buf(),
                 parsed,
@@ -524,7 +671,7 @@ fn contains_authority_tokens(
     // Inline metadata modules do not select physical files. An unexpanded
     // out-of-line declaration could conceal a production incarnation.
     for (index, token) in tokens.iter().enumerate() {
-        if matches!(token, TokenTree::Ident(name) if name == "mod") {
+        if matches!(token, TokenTree::Ident(name) if name.unraw() == "mod") {
             for next in &tokens[index + 1..] {
                 if matches!(next, TokenTree::Punct(p) if p.as_char() == ';') {
                     return true;
@@ -538,7 +685,7 @@ fn contains_authority_tokens(
     }
     tokens.into_iter().any(|token| match token {
         TokenTree::Group(group) => contains_authority_tokens(group.stream(), vocabulary),
-        TokenTree::Ident(name) => vocabulary.contains_key(&name.to_string()),
+        TokenTree::Ident(name) => vocabulary.contains_key(&name.unraw().to_string()),
         _ => false,
     })
 }
@@ -546,6 +693,7 @@ fn contains_authority_tokens(
 // inputs with the same parser. File classification uses the independent token
 // literal census above, whether or not these inputs parse as Rust syntax.
 fn visit_macro_inputs(visitor: &mut impl for<'ast> Visit<'ast>, tokens: TokenStream) {
+    let tokens = macro_input_tokens(tokens);
     if let Ok(file) = syn::parse2::<syn::File>(tokens.clone()) {
         visitor.visit_file(&file);
     } else if let Ok(expression) = syn::parse2::<syn::Expr>(tokens.clone()) {
@@ -600,9 +748,10 @@ fn collect_source_inclusion_aliases(
             fn collect(tree: &syn::UseTree, imports: &mut Vec<(String, String)>) {
                 match tree {
                     syn::UseTree::Path(path) => collect(&path.tree, imports),
-                    syn::UseTree::Rename(rename) => {
-                        imports.push((rename.ident.to_string(), rename.rename.to_string()))
-                    }
+                    syn::UseTree::Rename(rename) => imports.push((
+                        rename.ident.unraw().to_string(),
+                        rename.rename.unraw().to_string(),
+                    )),
                     syn::UseTree::Group(group) => {
                         for tree in &group.items {
                             collect(tree, imports);
@@ -741,7 +890,7 @@ fn declared_items(
             continue;
         }
         let mut child_modules = modules.to_vec();
-        child_modules.push(module.ident.to_string());
+        child_modules.push(module.ident.unraw().to_string());
         let (file, explicit_path) = module_file(module, directory, explicit_directory, parsed);
         if let Some((_, children)) = &module.content {
             declared_items(
@@ -850,14 +999,14 @@ impl<'ast> Visit<'ast> for DeclarationBodies<'_> {
     }
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         if !test_only(&item.attrs) {
-            self.modules.push(item.sig.ident.to_string());
+            self.modules.push(item.sig.ident.unraw().to_string());
             visit::visit_item_fn(self, item);
             self.modules.pop();
         }
     }
     fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
         if !test_only(&item.attrs) {
-            self.modules.push(item.sig.ident.to_string());
+            self.modules.push(item.sig.ident.unraw().to_string());
             visit::visit_impl_item_fn(self, item);
             self.modules.pop();
         }
@@ -871,28 +1020,28 @@ impl<'ast> Visit<'ast> for DeclarationBodies<'_> {
     }
     fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
         if !test_only(&item.attrs) {
-            self.modules.push(item.ident.to_string());
+            self.modules.push(item.ident.unraw().to_string());
             visit::visit_item_trait(self, item);
             self.modules.pop();
         }
     }
     fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
         if !test_only(&item.attrs) {
-            self.modules.push(item.sig.ident.to_string());
+            self.modules.push(item.sig.ident.unraw().to_string());
             visit::visit_trait_item_fn(self, item);
             self.modules.pop();
         }
     }
     fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
         if !test_only(&item.attrs) {
-            self.modules.push(item.ident.to_string());
+            self.modules.push(item.ident.unraw().to_string());
             visit::visit_item_static(self, item);
             self.modules.pop();
         }
     }
     fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
         if !test_only(&item.attrs) {
-            self.modules.push(item.ident.to_string());
+            self.modules.push(item.ident.unraw().to_string());
             visit::visit_item_const(self, item);
             self.modules.pop();
         }
@@ -907,7 +1056,7 @@ impl<'ast> Visit<'ast> for DeclarationBodies<'_> {
             .path
             .segments
             .last()
-            .and_then(|part| self.vocabulary.get(&part.ident.to_string()));
+            .and_then(|part| self.vocabulary.get(&part.ident.unraw().to_string()));
         if matches!(
             inclusion,
             Some(AuthorityOperation::SourceInclude | AuthorityOperation::SourceStringInclude)
@@ -991,6 +1140,7 @@ impl SourceCensus {
             );
         }
         collect_source_inclusion_aliases(&parsed, &mut result.vocabulary)?;
+        test_inclusions(&parsed, &result.vocabulary, &mut test_files);
         let mut resolved = BTreeMap::new();
         for path in &leaves {
             let parent = path
@@ -1301,12 +1451,9 @@ struct AliasCollector<'a> {
     prefix: Vec<String>,
 }
 fn implementation_name(item: &syn::ItemImpl) -> String {
-    let ty = item.self_ty.to_token_stream().to_string().replace(' ', "");
+    let ty = semantic_tokens(&item.self_ty).replace(' ', "");
     if let Some((_, path, _)) = &item.trait_ {
-        format!(
-            "<{ty} as {}>",
-            path.to_token_stream().to_string().replace(' ', "")
-        )
+        format!("<{ty} as {}>", semantic_tokens(&path).replace(' ', ""))
     } else {
         ty
     }
@@ -1321,7 +1468,7 @@ impl<'ast> Visit<'ast> for AliasCollector<'_> {
             let trait_name = trait_path
                 .segments
                 .iter()
-                .map(|segment| segment.ident.to_string())
+                .map(|segment| segment.ident.unraw().to_string())
                 .collect::<Vec<_>>()
                 .join("::");
             let scope = self.prefix.join("::");
@@ -1329,7 +1476,7 @@ impl<'ast> Visit<'ast> for AliasCollector<'_> {
                 .iter()
                 .cloned()
                 .chain(std::iter::once(
-                    item.self_ty.to_token_stream().to_string().replace(' ', ""),
+                    semantic_tokens(&item.self_ty).replace(' ', ""),
                 ))
                 .collect::<Vec<_>>()
                 .join("::");
@@ -1337,15 +1484,21 @@ impl<'ast> Visit<'ast> for AliasCollector<'_> {
                 if let syn::ImplItem::Type(associated) = associated
                     && !test_only(&associated.attrs)
                 {
-                    let target = format!("{scope}::{}", associated.ident);
+                    let target = format!("{scope}::{}", associated.ident.unraw());
                     for key in [
-                        format!("{scope}::<Self as {trait_name}>::{}", associated.ident),
-                        format!("{scope}::{trait_name}::{}", associated.ident),
+                        format!(
+                            "{scope}::<Self as {trait_name}>::{}",
+                            associated.ident.unraw()
+                        ),
+                        format!("{scope}::{trait_name}::{}", associated.ident.unraw()),
                         format!(
                             "{inherent_scope}::<Self as {trait_name}>::{}",
-                            associated.ident
+                            associated.ident.unraw()
                         ),
-                        format!("{inherent_scope}::{trait_name}::{}", associated.ident),
+                        format!(
+                            "{inherent_scope}::{trait_name}::{}",
+                            associated.ident.unraw()
+                        ),
                     ] {
                         self.projections
                             .entry(key)
@@ -1362,7 +1515,7 @@ impl<'ast> Visit<'ast> for AliasCollector<'_> {
         if test_only(&item.attrs) {
             return;
         }
-        self.prefix.push(item.sig.ident.to_string());
+        self.prefix.push(item.sig.ident.unraw().to_string());
         visit::visit_item_fn(self, item);
         self.prefix.pop();
     }
@@ -1370,14 +1523,18 @@ impl<'ast> Visit<'ast> for AliasCollector<'_> {
         if test_only(&item.attrs) {
             return;
         }
-        self.prefix.push(item.sig.ident.to_string());
+        self.prefix.push(item.sig.ident.unraw().to_string());
         visit::visit_impl_item_fn(self, item);
         self.prefix.pop();
     }
     fn visit_impl_item_type(&mut self, item: &'ast syn::ImplItemType) {
         if !test_only(&item.attrs) {
             self.aliases
-                .entry(format!("{}::{}", self.prefix.join("::"), item.ident))
+                .entry(format!(
+                    "{}::{}",
+                    self.prefix.join("::"),
+                    item.ident.unraw()
+                ))
                 .or_default()
                 .push(item.ty.clone());
         }
@@ -1386,14 +1543,18 @@ impl<'ast> Visit<'ast> for AliasCollector<'_> {
         if test_only(&item.attrs) {
             return;
         }
-        self.prefix.push(item.ident.to_string());
+        self.prefix.push(item.ident.unraw().to_string());
         visit::visit_item_mod(self, item);
         self.prefix.pop();
     }
     fn visit_item_type(&mut self, item: &'ast syn::ItemType) {
         if !test_only(&item.attrs) {
             self.aliases
-                .entry(format!("{}::{}", self.prefix.join("::"), item.ident))
+                .entry(format!(
+                    "{}::{}",
+                    self.prefix.join("::"),
+                    item.ident.unraw()
+                ))
                 .or_default()
                 .push((*item.ty).clone());
         }
@@ -1422,7 +1583,7 @@ impl<'ast> Visit<'ast> for AliasCollector<'_> {
                     let ident = &name.ident;
                     if let Ok(ty) = syn::parse2(quote::quote!(#prefix #ident)) {
                         aliases
-                            .entry(format!("{scope}::{ident}"))
+                            .entry(format!("{scope}::{}", ident.unraw()))
                             .or_default()
                             .push(ty);
                     }
@@ -1431,7 +1592,7 @@ impl<'ast> Visit<'ast> for AliasCollector<'_> {
                     let ident = &rename.ident;
                     if let Ok(ty) = syn::parse2(quote::quote!(#prefix #ident)) {
                         aliases
-                            .entry(format!("{scope}::{}", rename.rename))
+                            .entry(format!("{scope}::{}", rename.rename.unraw()))
                             .or_default()
                             .push(ty);
                     }
@@ -1468,7 +1629,7 @@ fn authority_type(
     impl<'ast> Visit<'ast> for Types<'_> {
         fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
             for segment in &path.path.segments {
-                let name = segment.ident.to_string();
+                let name = segment.ident.unraw().to_string();
                 if self.names.contains(&name.as_str()) {
                     self.protected = true;
                 }
@@ -1477,17 +1638,17 @@ fn authority_type(
                 .path
                 .segments
                 .iter()
-                .map(|s| s.ident.to_string())
+                .map(|s| s.ident.unraw().to_string())
                 .collect::<Vec<_>>()
                 .join("::");
             if let Some(qualified) = &path.qself {
-                let ty = qualified.ty.to_token_stream().to_string().replace(' ', "");
+                let ty = semantic_tokens(&qualified.ty).replace(' ', "");
                 let trait_name = path
                     .path
                     .segments
                     .iter()
                     .take(qualified.position)
-                    .map(|segment| segment.ident.to_string())
+                    .map(|segment| segment.ident.unraw().to_string())
                     .collect::<Vec<_>>()
                     .join("::");
                 let associated = path
@@ -1495,7 +1656,7 @@ fn authority_type(
                     .segments
                     .iter()
                     .skip(qualified.position)
-                    .map(|segment| segment.ident.to_string())
+                    .map(|segment| segment.ident.unraw().to_string())
                     .collect::<Vec<_>>()
                     .join("::");
                 path_name = if qualified.position == 0 {
@@ -1629,6 +1790,7 @@ impl Scanner<'_> {
         name
     }
     fn macro_tokens(&mut self, tokens: TokenStream) {
+        let tokens = macro_input_tokens(tokens);
         // Literal Rust items retain their module, trait and impl boundaries.
         // Expression-style macro inputs fall through to the token-tree walker.
         if let Ok(syntax) = syn::parse2::<syn::File>(tokens.clone()) {
@@ -1649,26 +1811,26 @@ impl Scanner<'_> {
         let tokens: Vec<_> = tokens.into_iter().collect();
         let mut index = 0;
         while index < tokens.len() {
-            if matches!(&tokens[index], TokenTree::Ident(name) if name == "mod" || name == "impl" || name == "trait")
+            if matches!(&tokens[index], TokenTree::Ident(name) if name.unraw() == "mod" || name.unraw() == "impl" || name.unraw() == "trait")
             {
                 self.census
                     .unknown_apis
                     .push(format!("unclassified macro item scope in {}", self.file));
                 return;
             }
-            if matches!(&tokens[index], TokenTree::Ident(i) if i == "fn")
+            if matches!(&tokens[index], TokenTree::Ident(i) if i.unraw() == "fn")
                 && let Some(TokenTree::Ident(name)) = tokens.get(index + 1)
                 && let Some((offset, TokenTree::Group(body))) = tokens[index + 2..].iter().enumerate().find(|(_, token)| matches!(token, TokenTree::Group(group) if group.delimiter() == Delimiter::Brace))
             {
                 let span = tokens[index].span().join(body.span()).unwrap_or(body.span());
-                let owner = self.owner(&name.to_string(), span);
+                let owner = self.owner(&name.unraw().to_string(), span);
                 let previous = self.current_owner.replace(owner);
                 self.macro_tokens(body.stream());
                 self.current_owner = previous;
                 index += offset + 3;
                 continue;
             }
-            if matches!(&tokens[index], TokenTree::Ident(name) if name == "static")
+            if matches!(&tokens[index], TokenTree::Ident(name) if name.unraw() == "static")
                 && let Some(TokenTree::Ident(name)) = tokens.get(index + 1)
                 && let Some(end) = tokens[index + 2..]
                     .iter()
@@ -1679,7 +1841,7 @@ impl Scanner<'_> {
                     .span()
                     .join(tokens[end].span())
                     .unwrap_or(name.span());
-                let owner = self.owner(&name.to_string(), span);
+                let owner = self.owner(&name.unraw().to_string(), span);
                 let previous = self.current_owner.replace(owner);
                 self.macro_tokens(tokens[index + 2..end].iter().cloned().collect());
                 self.current_owner = previous;
@@ -1690,10 +1852,10 @@ impl Scanner<'_> {
                 self.macro_tokens(group.stream());
             }
             if let TokenTree::Ident(method) = &tokens[index] {
-                let method_name = method.to_string();
+                let method_name = method.unraw().to_string();
                 self.task_call(&method_name);
                 let description = index >= 2
-                    && matches!(&tokens[index - 2], TokenTree::Ident(i) if i == "description");
+                    && matches!(&tokens[index - 2], TokenTree::Ident(i) if i.unraw() == "description");
                 if matches!(
                     self.census.vocabulary.get(&method_name),
                     Some(AuthorityOperation::K1 | AuthorityOperation::DescriptionIo)
@@ -1795,8 +1957,8 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         let previous = self.current_owner.take();
         self.current_owner = previous
             .as_ref()
-            .map(|parent| format!("{parent}::{}", item.ident));
-        self.modules.push(item.ident.to_string());
+            .map(|parent| format!("{parent}::{}", item.ident.unraw()));
+        self.modules.push(item.ident.unraw().to_string());
         visit::visit_item_mod(self, item);
         self.modules.pop();
         self.current_owner = previous;
@@ -1823,11 +1985,11 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             self.test_span(item.span());
             return;
         }
-        let previous = self.implementation.replace(item.ident.to_string());
+        let previous = self.implementation.replace(item.ident.unraw().to_string());
         let previous_owner = self.current_owner.take();
         self.current_owner = previous_owner
             .as_ref()
-            .map(|parent| format!("{parent}::{}", item.ident));
+            .map(|parent| format!("{parent}::{}", item.ident.unraw()));
         visit::visit_item_trait(self, item);
         self.implementation = previous;
         self.current_owner = previous_owner;
@@ -1840,7 +2002,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         if item.default.is_none() {
             return;
         }
-        let owner = self.owner(&item.sig.ident.to_string(), item.span());
+        let owner = self.owner(&item.sig.ident.unraw().to_string(), item.span());
         let previous = self.current_owner.replace(owner);
         visit::visit_trait_item_fn(self, item);
         self.current_owner = previous;
@@ -1856,7 +2018,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             self.test_span(item.span());
             return;
         }
-        let owner = self.owner(&item.sig.ident.to_string(), item.span());
+        let owner = self.owner(&item.sig.ident.unraw().to_string(), item.span());
         let previous = self.current_owner.replace(owner);
         visit::visit_item_fn(self, item);
         self.current_owner = previous;
@@ -1866,7 +2028,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             self.test_span(item.span());
             return;
         }
-        let owner = self.owner(&item.sig.ident.to_string(), item.span());
+        let owner = self.owner(&item.sig.ident.unraw().to_string(), item.span());
         // A renamed/new guard accessor must not disappear from the closed call
         // census. Existing private implementation helpers and the reservation
         // guard are explicit boundaries rather than migration API calls.
@@ -1918,7 +2080,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     }
     fn visit_foreign_item_static(&mut self, item: &'ast syn::ForeignItemStatic) {
         if !test_only(&item.attrs) {
-            self.owner(&item.ident.to_string(), item.span());
+            self.owner(&item.ident.unraw().to_string(), item.span());
         }
     }
     fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
@@ -1926,7 +2088,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             self.test_span(item.span());
             return;
         }
-        let owner = self.owner(&item.ident.to_string(), item.span());
+        let owner = self.owner(&item.ident.unraw().to_string(), item.span());
         let previous = self.current_owner.replace(owner);
         visit::visit_item_static(self, item);
         self.current_owner = previous;
@@ -1936,7 +2098,7 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             self.test_span(item.span());
             return;
         }
-        let owner = self.owner(&item.ident.to_string(), item.span());
+        let owner = self.owner(&item.ident.unraw().to_string(), item.span());
         let previous = self.current_owner.replace(owner);
         visit::visit_item_const(self, item);
         self.current_owner = previous;
@@ -1949,8 +2111,8 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         let name = item
             .ident
             .as_ref()
-            .map(|ident| ident.to_string())
-            .unwrap_or_else(|| item.mac.path.to_token_stream().to_string());
+            .map(|ident| ident.unraw().to_string())
+            .unwrap_or_else(|| semantic_tokens(&item.mac.path));
         let owner = if let Some(owner) = &self.current_owner {
             owner.clone()
         } else {
@@ -1975,10 +2137,10 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         self.macro_tokens(mac.tokens.clone());
     }
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
-        let method = call.method.to_string();
+        let method = call.method.unraw().to_string();
         self.task_call(&method);
         let description = if let syn::Expr::Field(field) = call.receiver.as_ref() {
-            field.member.to_token_stream().to_string() == "description"
+            semantic_tokens(&field.member) == "description"
         } else {
             false
         };
@@ -2005,11 +2167,11 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             .path
             .segments
             .iter()
-            .any(|segment| segment.ident == "OpenDescriptionRef")
+            .any(|segment| segment.ident.unraw() == "OpenDescriptionRef")
         {
             self.call("OpenDescriptionRef", path.span());
         } else if let Some(segment) = path.path.segments.last() {
-            let operation = segment.ident.to_string();
+            let operation = segment.ident.unraw().to_string();
             if matches!(
                 self.census.vocabulary.get(&operation),
                 Some(AuthorityOperation::K1 | AuthorityOperation::DescriptionIo)
@@ -2019,13 +2181,13 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                     .path
                     .segments
                     .iter()
-                    .any(|part| part.ident == "FileDescription"))
+                    .any(|part| part.ident.unraw() == "FileDescription"))
             {
                 self.call(&operation, path.span());
             }
         }
         if let Some(segment) = path.path.segments.last() {
-            self.task_call(&segment.ident.to_string());
+            self.task_call(&segment.ident.unraw().to_string());
         }
         visit::visit_expr_path(self, path);
     }

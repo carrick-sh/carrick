@@ -196,7 +196,7 @@ def _tokenize(source: str) -> list[Token]:
             i += 2
             while i < n and (source[i].isalnum() or source[i] == "_"):
                 i += 1
-            tokens.append(Token("IDENT", source[start_pos:i], start_pos))
+            tokens.append(Token("IDENT", source[start_pos + 2:i], start_pos))
             continue
 
         if c.isalpha() or c == "_":
@@ -309,10 +309,7 @@ class _Scope:
     brace_depth: int
 
 
-def _production_attributes(tokens: Sequence[Token]) -> bool:
-    # Reuse the retained abort scanner's cfg evaluator, including cfg_attr and
-    # test-support. Test-only findings are useful in scanner fixtures but are
-    # not production authority debt.
+def _scope_scanner():
     import importlib.util
     spec = importlib.util.spec_from_file_location("authority_scope_cfg", Path(__file__).with_name("check-runtime-aborts.py"))
     module = sys.modules.get(spec.name)
@@ -320,6 +317,14 @@ def _production_attributes(tokens: Sequence[Token]) -> bool:
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
+    return module
+
+
+def _production_attributes(tokens: Sequence[Token]) -> bool:
+    # Reuse the retained abort scanner's cfg evaluator, including cfg_attr and
+    # test-support. Test-only findings are useful in scanner fixtures but are
+    # not production authority debt.
+    module = _scope_scanner()
     parsed = module.lex_rust(" ".join(token.text for token in tokens))
     index = 0
     while index < len(parsed):
@@ -344,6 +349,7 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
         path.as_posix() if isinstance(path, (Path, PurePosixPath)) else str(path)
     )
     tokens = _tokenize(source)
+    opaque = _scope_scanner().opaque_macro_inputs(tokens)
     findings: list[Finding] = []
 
     scope_stack: list[_Scope] = []
@@ -388,12 +394,12 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
                         attr_bracket -= 1
                     idx += 1
                 attr_tokens = tokens[attr_start:idx]
-                if is_inner and _is_cfg_attr(attr_tokens):
+                if not opaque[attr_start] and is_inner and _is_cfg_attr(attr_tokens):
                     if scope_stack:
                         scope_stack[-1].cfgs.append(attr_tokens)
                     else:
                         file_cfgs.extend(attr_tokens)
-                elif not is_inner:
+                elif not opaque[attr_start] and not is_inner:
                     pending_attributes.append(attr_tokens)
                 continue
             else:
