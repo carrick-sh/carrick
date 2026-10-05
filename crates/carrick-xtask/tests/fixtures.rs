@@ -1124,50 +1124,66 @@ fn actions_restore_entrypoint_preserves_modes_and_passes_fixture_preflight() {
 }
 
 #[test]
-fn cache_opt_out_preserves_ambient_wrapper_rejection_at_fixture_entrypoint() {
+fn cache_selection_preserves_ambient_wrapper_rejection_at_fixture_entrypoint() {
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
-    let out = p
-        .command("just")
-        .current_dir(&p.checkout)
-        .arg("fixtures-restore")
-        .arg(&p.archive)
-        .env("CARRICK_SCCACHE", "0")
-        .env("RUSTC_WRAPPER", "/ambient/compiler-wrapper")
-        .output()
-        .unwrap();
-    assert!(
-        !out.status.success(),
-        "cache opt-out hid an ambient compiler wrapper"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("ambient RUSTC_WRAPPER"), "{stderr}");
-    assert!(carrick_xtask::accept::verify_signed_fixtures(&p.checkout).is_err());
+    for cache in ["0", "1"] {
+        let out = p
+            .command("just")
+            .current_dir(&p.checkout)
+            .arg("fixtures-restore")
+            .arg(&p.archive)
+            .env("CARRICK_SCCACHE", cache)
+            .env(
+                "CARRICK_SCCACHE_BIN",
+                p.scratch.path().join("absent-sccache"),
+            )
+            .env_remove("CARRICK_CARGO_CACHE_CONFIG")
+            .env_remove("CARRICK_SCCACHE_RESOLVED")
+            .env("RUSTC_WRAPPER", "/ambient/compiler-wrapper")
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "cache selection {cache} hid an ambient compiler wrapper"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("ambient RUSTC_WRAPPER"), "{stderr}");
+        assert!(carrick_xtask::accept::verify_signed_fixtures(&p.checkout).is_err());
+    }
 }
 
 #[test]
-fn cache_opt_out_preserves_ambient_wrapper_rejection_at_fixture_publish() {
+fn cache_selection_preserves_ambient_wrapper_rejection_at_fixture_publish() {
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
     let sha = git(f.repo.path(), &["rev-parse", "HEAD"]);
-    let out = p
-        .command("just")
-        .current_dir(&p.checkout)
-        .arg("fixtures-publish")
-        .arg(sha)
-        .env("CARRICK_SCCACHE", "0")
-        .env("RUSTC_WRAPPER", "/ambient/compiler-wrapper")
-        .output()
-        .unwrap();
-    assert!(
-        !out.status.success(),
-        "cache opt-out hid an ambient compiler wrapper"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("ambient RUSTC_WRAPPER"), "{stderr}");
-    assert!(!p.checkout.join("target/fixtures/published").exists());
+    for cache in ["0", "1"] {
+        let out = p
+            .command("just")
+            .current_dir(&p.checkout)
+            .arg("fixtures-publish")
+            .arg(&sha)
+            .env("CARRICK_SCCACHE", cache)
+            .env(
+                "CARRICK_SCCACHE_BIN",
+                p.scratch.path().join("absent-sccache"),
+            )
+            .env_remove("CARRICK_CARGO_CACHE_CONFIG")
+            .env_remove("CARRICK_SCCACHE_RESOLVED")
+            .env("RUSTC_WRAPPER", "/ambient/compiler-wrapper")
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "cache selection {cache} hid an ambient compiler wrapper"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("ambient RUSTC_WRAPPER"), "{stderr}");
+        assert!(!p.checkout.join("target/fixtures/published").exists());
+    }
 }
 
 #[test]
