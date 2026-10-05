@@ -14,7 +14,7 @@ for tool in qm pvesh curl jq genisoimage sha512sum; do command -v "$tool" >/dev/
 pve_call() {
   # The credential exists only in this on-host pipe, never argv or output.
   jq -r '"header = \"Authorization: PVEAPIToken=" + .["full-tokenid"] + "=" + .value + "\""' /root/carrick-ci-token.json |
-    curl --fail --silent --show-error --max-time 40 --config - \
+    curl --disable --fail --silent --show-error --max-time 40 --config - \
       --resolve willow.atxconsulting.com:8006:127.0.0.1 --request "$1" \
       "https://willow.atxconsulting.com:8006/api2/json$2"
 }
