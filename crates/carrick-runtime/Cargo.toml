@@ -68,6 +68,7 @@ carrick-fatal.workspace = true
 carrick-abi = { path = "../carrick-abi" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-el1 = { path = "../carrick-el1" }
+carrick-core = { path = "../carrick-core" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-kernel = { path = "../carrick-kernel" }
 carrick-portable = { path = "../carrick-portable" }
