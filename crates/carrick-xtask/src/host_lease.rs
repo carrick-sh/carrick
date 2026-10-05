@@ -1,3 +1,4 @@
+use crate::lock_file::OwnedFileLock;
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CString, OsString};
@@ -129,7 +130,7 @@ impl ScopeIdentity {
 }
 
 struct LeaseHolder {
-    _fd: std::fs::File,
+    _fd: OwnedFileLock,
     directory: tempfile::TempDir,
     stopping: Arc<AtomicBool>,
     server: Option<std::thread::JoinHandle<()>>,
@@ -143,7 +144,8 @@ impl Drop for LeaseHolder {
         if let Some(server) = self.server.take() {
             let _ = server.join();
         }
-        // The owned fd closes after the server stops. Clients never owned it.
+        // The owned guard unlocks after the server stops, then closes its fd.
+        // Unrelated fork copies cannot extend this lease; clients never own it.
     }
 }
 
@@ -300,6 +302,7 @@ impl HostLease {
 
         // SAFETY: fd is uniquely owned after successful acquisition.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = OwnedFileLock::from_locked(std::fs::File::from(fd));
         Self::serve(path, mode, fd, scope).map_err(|source| HostLeaseError::Io {
             path: path.to_path_buf(),
             source,
@@ -309,7 +312,7 @@ impl HostLease {
     fn serve(
         path: &Path,
         mode: HostLeaseMode,
-        fd: OwnedFd,
+        fd: OwnedFileLock,
         scope: Option<ScopeIdentity>,
     ) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
@@ -321,7 +324,6 @@ impl HostLease {
             .tempdir_in("/tmp")?;
         let socket = directory.path().join("lease.sock");
         let listener = UnixListener::bind(&socket)?;
-        let fd = std::fs::File::from(fd);
         let metadata = fd.metadata()?;
         let identity = serde_json::to_vec(&LeaseIdentity {
             dev: metadata.dev(),
@@ -533,9 +535,22 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    // An unrelated parallel fork can briefly retain even CLOEXEC descriptions
-    // until it execs. Exclusion is immediate; release waits for that exec boundary.
-    const TEST_LEASE_RELEASE_LIMIT: Duration = Duration::from_secs(30);
+    #[test]
+    fn unrelated_fork_exec_cannot_extend_host_lease() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let lease = HostLease::acquire_path(file.path(), HostLeaseMode::Gate).unwrap();
+        let immediate = crate::lock_file::tests::with_unrelated_fork_exec(
+            || {
+                drop(lease);
+                HostLease::try_exclusive(file.path()).unwrap().is_some()
+            },
+            || assert!(HostLease::try_exclusive(file.path()).unwrap().is_some()),
+        );
+        assert!(
+            immediate,
+            "unrelated pre-exec child retained dropped host lease despite CLOEXEC"
+        );
+    }
 
     #[test]
     fn gate_and_docker_exclude_all_other_modes() {
@@ -561,12 +576,7 @@ mod tests {
                     "{holder} must exclude {contender}"
                 );
                 drop(held);
-                HostLease::acquire_path_with_limit(
-                    temp.path(),
-                    contender,
-                    TEST_LEASE_RELEASE_LIMIT,
-                )
-                .unwrap();
+                HostLease::acquire_path_with_limit(temp.path(), contender, Duration::ZERO).unwrap();
             }
         }
     }
@@ -583,12 +593,8 @@ mod tests {
             Err(HostLeaseError::Timeout { .. })
         ));
         drop(gate);
-        HostLease::acquire_path_with_limit(
-            temp.path(),
-            HostLeaseMode::Gate,
-            TEST_LEASE_RELEASE_LIMIT,
-        )
-        .unwrap();
+        HostLease::acquire_path_with_limit(temp.path(), HostLeaseMode::Gate, Duration::ZERO)
+            .unwrap();
         assert!(
             HostLease::inherit(temp.path(), HostLeaseMode::Carrick, &nested.socket).is_err(),
             "stale capability must fail closed"
@@ -647,13 +653,10 @@ mod tests {
         // Drop the shared lease, releasing the lock
         drop(shared_lease);
 
-        // Release can cross a concurrent fork's exec boundary.
-        let _exclusive = HostLease::acquire_path_with_limit(
-            path,
-            HostLeaseMode::Docker,
-            TEST_LEASE_RELEASE_LIMIT,
-        )
-        .expect("exclusive lock should succeed after shared dropped");
+        // Release is immediate even if an unrelated fork has not executed yet.
+        let _exclusive =
+            HostLease::acquire_path_with_limit(path, HostLeaseMode::Docker, Duration::ZERO)
+                .expect("exclusive lock should succeed after shared dropped");
 
         // SAFETY: fd2 is an open file descriptor.
         unsafe {
@@ -687,13 +690,10 @@ mod tests {
         // Drop the exclusive lease, releasing the lock
         drop(exclusive_lease);
 
-        // Release can cross a concurrent fork's exec boundary.
-        let _shared = HostLease::acquire_path_with_limit(
-            path,
-            HostLeaseMode::Carrick,
-            TEST_LEASE_RELEASE_LIMIT,
-        )
-        .expect("shared lock should succeed after exclusive dropped");
+        // Release is immediate even if an unrelated fork has not executed yet.
+        let _shared =
+            HostLease::acquire_path_with_limit(path, HostLeaseMode::Carrick, Duration::ZERO)
+                .expect("shared lock should succeed after exclusive dropped");
 
         // SAFETY: fd2 is an open file descriptor.
         unsafe {

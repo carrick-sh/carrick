@@ -1,5 +1,6 @@
 //! Target cleanup with lifetime-held directory and native Cargo authorities.
 use crate::host_lease::{DEFAULT_LOCK_PATH, HostLease};
+use crate::lock_file::OwnedFileLock;
 use crate::prune_fs as at;
 use crate::remote_accept::shell_quote;
 use crate::worktree_gc::{GcError, WorktreeGcArgs};
@@ -364,6 +365,7 @@ fn prune_target(
             }
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
         }
+        let lock = OwnedFileLock::from_locked(lock);
         handles.insert(directory.as_raw_fd(), canonical.join(name));
         handles.insert(lock.as_raw_fd(), canonical.join(name).join(".cargo-lock"));
         profiles.push((name, directory, lock));

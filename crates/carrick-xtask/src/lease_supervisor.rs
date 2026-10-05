@@ -6,7 +6,9 @@
 use crate::host_lease::{HostLease, HostLeaseError, HostLeaseMode, extract_exit_code};
 use std::ffi::OsString;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(not(target_os = "linux"))]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
@@ -296,6 +298,19 @@ fn complete_cleanup<T>(
 #[cfg(test)]
 mod cleanup_tests {
     #[test]
+    fn scope_descriptors_are_cloexec_before_explicit_handoff() {
+        use std::os::fd::AsRawFd;
+        let (reader, writer) = super::scope_pipe().unwrap();
+        for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
+            // SAFETY: both descriptors remain owned by this fixture.
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+        }
+    }
+
+    #[test]
     fn permanent_cleanup_error_returns_instead_of_retaining_forever() {
         let (send, receive) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -350,21 +365,13 @@ mod cleanup_tests {
 }
 
 fn scope_pipe() -> io::Result<(std::fs::File, OwnedFd)> {
-    let mut fds = [-1; 2];
-    // SAFETY: valid two-fd output; uniquely owned on successful pipe.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: the two descriptors were just created and uniquely owned.
-    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    for fd in [&read, &write] {
-        // SAFETY: owned descriptor; only workload's explicit handoff clears it.
-        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok((std::fs::File::from(read), write))
+    // std creates both ends CLOEXEC, atomically with respect to Command forks.
+    // Only the child-specific pre_exec handoff above makes its writer inheritable;
+    // dropping Command closes the supervisor-side copy after spawn.
+    let (reader, writer) = std::io::pipe()?;
+    let reader: OwnedFd = reader.into();
+    let writer: OwnedFd = writer.into();
+    Ok((std::fs::File::from(reader), writer))
 }
 
 struct Workload {
