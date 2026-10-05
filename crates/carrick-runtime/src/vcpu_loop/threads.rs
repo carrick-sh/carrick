@@ -1491,6 +1491,38 @@ mod child_tid_owner_tests {
     }
 
     #[test]
+    fn serial_host_child_tid_clear_survives_nonleader_exec_identity_change() {
+        let (kernel, root) = clear_kernel(72_520);
+        let sibling = clear_sibling(&root);
+        let registry_tid = sibling.thread().registry_id();
+        let prepared = root.kernel().prepare_exec(&sibling, None).unwrap();
+        let committed = root.kernel().commit_exec(prepared, None).unwrap();
+        assert_eq!(committed.thread().registry_id(), registry_tid);
+        assert_ne!(registry_tid.raw(), committed.thread().key().tid.raw());
+        let registry = Arc::new(ThreadRegistry::new(registry_tid));
+        // A new image installs its own clear address on the surviving runner.
+        registry.set_clear_child_tid(registry_tid, VA);
+        let mut state = clear_state(
+            &kernel,
+            &committed,
+            registry.clone(),
+            VcpuThreadRegistry::new(),
+        );
+        state.this_tid = registry_tid;
+        state
+            .capture_child_tid_clear()
+            .expect("the retained registry identity must bind to its promoted Linux thread");
+        let pending = state.child_tid_clear.as_ref().unwrap();
+        assert_eq!(pending.context.thread().key(), committed.thread().key());
+        assert_eq!(pending.mm, committed.shared().mm().id());
+        pending.validate(&committed).unwrap();
+        assert!(
+            pending.validate(&root).is_err(),
+            "old MM cannot finish the new image clear"
+        );
+    }
+
+    #[test]
     fn serial_host_normal_child_tid_exit_waits_and_cancels_permit_before_graph_retry() {
         let (kernel, root) = clear_kernel(72_510);
         let sibling = clear_sibling(&root);
