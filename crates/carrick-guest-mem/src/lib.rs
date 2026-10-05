@@ -721,6 +721,16 @@ pub trait GuestMemory {
         })
     }
 
+    /// Complete backing maintenance for an exact pending owner retirement.
+    /// Generic raw zeroing cannot manufacture this operation. Owner backends
+    /// authenticate the request and incarnation before selecting physical bytes.
+    fn zero_pending_backing(
+        &mut self,
+        _pending: carrick_el1_abi::ReservationRequest,
+    ) -> Result<(), MemoryError> {
+        Err(MemoryError::Unsupported)
+    }
+
     /// Discard private anonymous backing while preserving the semantic mapping
     /// and its exact permissions. The caller holds current-MM mutation exclusion
     /// and has authenticated private-anonymous VMA provenance. `Ok(false)` means
