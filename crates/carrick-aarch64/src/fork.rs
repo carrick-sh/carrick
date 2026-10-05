@@ -221,12 +221,13 @@ pub fn prepare<'a, C: ForkCustody + ?Sized>(
         },
         &mut effect,
     );
-    if let Err(error) = outcome {
-        carrick_fatal::carrick_fatal!(
+    let service_stage = match outcome {
+        Ok(frame) => frame.x[1],
+        Err(error) => carrick_fatal::carrick_fatal!(
             "aarch64::fork_cow",
             "owner Fork transport failed before exact settlement: {error}"
-        );
-    }
+        ),
+    };
     if let Some(completion) = slot.published() {
         if completion.request != request
             || completion.child.mm() != request.child_mm
@@ -256,7 +257,16 @@ pub fn prepare<'a, C: ForkCustody + ?Sized>(
         return Err(error);
     }
     match completion {
-        Err(errno) => Ok(Err(errno)),
+        Err(errno) => {
+            carrick_observability::probes::hvpatch_owner_fork_refusal(
+                errno,
+                service_stage,
+                request.operation.mm.raw(),
+                request.child_mm.raw(),
+                request.parent_generation.raw(),
+            );
+            Ok(Err(errno))
+        }
         Ok(_) => Err(TrapError::Hypervisor(
             "owner Fork committed without task decision".into(),
         )),
