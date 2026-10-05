@@ -103,7 +103,7 @@ impl PreparedHostReservations for View {
         self.0.table.lock_waiting(
             self.0.slot(mm)?,
             mm,
-            &crate::dispatch::mem::el1_reservations::RootHostWait::new(),
+            &carrick_el1::memory::reservations::NoRootWait,
         )
     }
 }
@@ -1203,14 +1203,10 @@ fn delegated_fault_on_a_root_owned_page_is_planned_from_the_root() {
     answers(&twin, "after an munmap of a root-owned page");
 }
 
-/// A guest-venue editor (EL1 on a sibling vCPU of the same MM) holds the
-/// root while the host classifies a fault there. The host waits the holder
-/// out: an EL1 critical section never blocks and its executor resumes it to
-/// completion. Answering `Busy` as a broken root aborted the carrier
-/// (go-build with reservations on: "refused a first-touch observation:
-/// Busy", then every executor's boundary audit saw the abort's mask).
+/// A fault classifier runs before editor exclusion. Contention is admission
+/// to the mutation route, not a policy answer or a wait on the guest editor.
 #[test]
-fn delegated_fault_classifier_waits_out_a_guest_venue_holder() {
+fn delegated_fault_classifier_routes_busy_root_to_mutation_without_waiting() {
     let mut twin = Twin::new();
     let base = LINUX_MMAP_BASE + 4 * PAGE;
     twin.anonymous(base, 2 * PAGE, RW);
@@ -1219,20 +1215,19 @@ fn delegated_fault_classifier_waits_out_a_guest_venue_holder() {
     } = &twin;
     // EL1 on slot 9 holds the root while its vCPU is in the run loop.
     const SLOT: u32 = 9;
-    let running = carrick_el1_abi::SlotRun::enter(Some(SLOT as usize));
     let slot = root.carrier.slot(root.mm).unwrap();
     let held = root.carrier.table.lock_el1(slot, root.mm, SLOT).unwrap();
-    let tracked = std::thread::scope(|scope| {
-        let classifier = scope.spawn(|| delegated.fault_requires_mm_mutation(base));
-        // The classifier reaches the held root before it is released.
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        drop(held);
-        drop(running);
-        classifier.join().expect("the classifier finishes")
-    });
     assert!(
-        tracked,
-        "a root-owned page's first touch is the host's to serve"
+        delegated.fault_requires_mm_mutation(base),
+        "a busy owner must reach the exact-MM mutation authority"
+    );
+    let hole = base + 8 * PAGE;
+    assert!(delegated.fault_requires_mm_mutation(hole));
+    drop(held);
+    assert!(delegated.fault_requires_mm_mutation(base));
+    assert!(
+        !delegated.fault_requires_mm_mutation(hole),
+        "contention cannot invent a mapping after exact owner access resumes"
     );
 }
 
