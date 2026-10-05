@@ -12,6 +12,6 @@ extern crate std;
 
 pub mod aarch64;
 
-pub mod x86;
 mod host_backing;
+pub mod x86;
 pub use host_backing::HostBackingIdentity;
