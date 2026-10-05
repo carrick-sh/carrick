@@ -23,6 +23,9 @@ pub enum Commands {
     #[command(about = "Display repository information as JSON")]
     Info,
 
+    #[command(about = "Prove unit shards preserve every unsharded Cargo test selection")]
+    CheckTestShards,
+
     #[command(about = "Per-landing Carrick vs native Docker receipts")]
     Impact(crate::impact::ImpactArgs),
 
@@ -126,6 +129,8 @@ pub struct RepoInfo {
 pub enum CliError {
     #[error("impact: {0}")]
     Impact(String),
+    #[error("test shards: {0}")]
+    TestShards(String),
     #[error("{0}")]
     Clap(#[from] clap::Error),
 
@@ -250,6 +255,15 @@ where
 {
     let cli = Cli::try_parse_from(args)?;
     match cli.command {
+        Commands::CheckTestShards => {
+            let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+            let report = crate::test_shards::check(&root)
+                .map_err(|e| CliError::TestShards(e.to_string()))?;
+            writeln!(writer, "{report}").map_err(|source| CliError::Io {
+                path: PathBuf::from("stdout"),
+                source,
+            })
+        }
         Commands::Impact(args) => crate::impact::run(cli.root.as_deref(), args.action)
             .map_err(|e| CliError::Impact(e.to_string())),
         Commands::Info => {

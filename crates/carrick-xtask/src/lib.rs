@@ -11,3 +11,4 @@ pub mod probe_inventory;
 pub mod provision;
 pub mod remote_accept;
 pub mod remote_recapture;
+pub mod test_shards;

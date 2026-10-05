@@ -67,6 +67,9 @@ jobs:
       - name: Install Semgrep
         if: ${{ !cancelled() }}
         run: just ci-install-semgrep
+      - name: Exact unit shard coverage
+        if: ${{ !cancelled() }}
+        run: just check-test-shards
       - name: Formatting
         if: ${{ !cancelled() }}
         run: just fmt-check
@@ -152,6 +155,9 @@ jobs:
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: macos-host
+      - name: Exact unit shard coverage
+        if: ${{ !cancelled() }}
+        run: just check-test-shards
       - name: Clippy (no-panic gate)
         if: ${{ !cancelled() }}
         run: just clippy
@@ -186,7 +192,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: just check-fuzz
 
-  macos-unit:
+  macos-unit-a:
     needs: changes
     if: needs.changes.outputs.heavy == 'true'
     runs-on: macos-15
@@ -203,9 +209,72 @@ jobs:
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
         with:
           shared-key: macos-host
-      - name: Unit tests (host fd headroom)
+      - name: Unit shard a (host fd headroom)
         if: ${{ !cancelled() }}
-        run: just ci-macos-test test
+        run: just ci-macos-test test-shard-a
+
+  macos-unit-b:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: macos-host
+      - name: Unit shard b (host fd headroom)
+        if: ${{ !cancelled() }}
+        run: just ci-macos-test test-shard-b
+
+  macos-unit-c:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: macos-host
+      - name: Unit shard c (host fd headroom)
+        if: ${{ !cancelled() }}
+        run: just ci-macos-test test-shard-c
+
+  macos-unit-d:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: just
+      - name: Install repository Rust toolchain
+        run: just ci-toolchain
+      - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
+        with:
+          shared-key: macos-host
+      - name: Unit shard d (host fd headroom)
+        if: ${{ !cancelled() }}
+        run: just ci-macos-test test-shard-d
 
   macos-integration:
     needs: changes
@@ -363,7 +432,10 @@ jobs:
       - linux-doc
       - macos-clippy
       - macos-build
-      - macos-unit
+      - macos-unit-a
+      - macos-unit-b
+      - macos-unit-c
+      - macos-unit-d
       - macos-integration
       - cross-check-linux
       - kernel-linux-native

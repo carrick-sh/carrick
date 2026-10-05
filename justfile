@@ -440,11 +440,52 @@ test-loom:
 test-kernel-semantics *ARGS:
     cargo test -p carrick-kernel-example --tests {{ARGS}}
 
-# Host unit/integration tests that do NOT need the HVF runtime or Docker.
-test *ARGS:
+# Host unit/harness tests without HVF guests or Docker. This ordered list is
+# the unsharded authority; check-test-shards compares the exact Cargo command
+# multiset (including features, filters, serial threads and stack budgets).
+test *ARGS: _test-stdio
     #!/usr/bin/env bash
     set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
+        groups=(workspace semantics contracts cli host vfs kernel runtime hvf)
+    else
+        groups=(workspace cli host runtime contracts)
+    fi
+    for group in "${groups[@]}"; do
+        just --justfile {{justfile()}} "_test-unit-$group" {{ARGS}}
+    done
+
+# Unit groups are whole Cargo selections: newly added tests stay selected.
+test-shard-a *ARGS: _test-stdio
+    just --justfile {{justfile()}} _test-unit-workspace {{ARGS}}
+    just --justfile {{justfile()}} _test-unit-semantics {{ARGS}}
+    just --justfile {{justfile()}} _test-unit-contracts {{ARGS}}
+
+test-shard-b *ARGS: _test-stdio
+    just --justfile {{justfile()}} _test-unit-cli {{ARGS}}
+    just --justfile {{justfile()}} _test-unit-host {{ARGS}}
+    just --justfile {{justfile()}} _test-unit-vfs {{ARGS}}
+
+test-shard-c *ARGS: _test-stdio
+    just --justfile {{justfile()}} _test-unit-kernel {{ARGS}}
+
+test-shard-d *ARGS: _test-stdio
+    just --justfile {{justfile()}} _test-unit-runtime {{ARGS}}
+    just --justfile {{justfile()}} _test-unit-hvf {{ARGS}}
+
+# Fail on missing, duplicate or changed selections, plus missing workflow jobs.
+check-test-shards:
+    cargo test --locked -p carrick-xtask --test test_shards
+    cargo run --locked -p carrick-xtask -- check-test-shards
+
+[private]
+_test-stdio:
     python3 -c 'import fcntl, os; [fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) & ~os.O_NONBLOCK) for fd in (0, 1, 2)]' 2>/dev/null || true
+
+[private]
+_test-unit-workspace *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
     if [ "{{os()}}" = "macos" ]; then
         # Runtime tests exercise process-wide signal dispositions, custom-x18
         # transitions, and fork from the test harness. Running those cases on
@@ -468,6 +509,25 @@ test *ARGS:
         # those belong to a guest-capable lane (`just conformance*`,
         # `cargo test -p carrick-cli --test <name>`).
         cargo test --workspace --exclude carrick-runtime --exclude carrick-kernel --exclude carrick-cli --exclude carrick-host --exclude carrick-vfs --exclude carrick-vmm-hvf --lib --bins {{ARGS}}
+    else
+        # Off-macOS: run the lib tests of THIS host's own crates only (-p list from
+        # _platform_crates) under the backend feature set — `--workspace --lib` would
+        # pull in carrick-vmm-hvf + the macos-default features and fail to compile.
+        # CLI/runtime/host have the same process-global state on every host; keep
+        # their complete test processes serial, as above. The remaining package
+        # selection still comes from the platform closure, including all its bins.
+        pkgs="$(just --justfile {{justfile()}} _platform_crates | sed -E 's/-p carrick-(cli|runtime|host) //g')"
+        # Runtime's self dev-dependency previously enabled these test doubles for
+        # the whole selection. Keep them explicit when its test target is separate.
+        cargo test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} -- --skip serial_host
+        env RUST_TEST_THREADS=1 cargo test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} serial_host
+    fi
+
+[private]
+_test-unit-semantics *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
         # carrick-kernel-example's proof (`tests/fork_pipe_wait.rs`) is an
         # integration target, and the `--lib --bins` line above never reaches
         # a crate's `tests/` directory -- the same house trap the `--bins`
@@ -475,10 +535,28 @@ test *ARGS:
         # threads (no `libc::fork()` from the harness), so it needs no serial
         # slot. One case deliberately costs its 5 s wait bound.
         cargo test -p carrick-kernel-example --tests {{ARGS}}
+    else
+        : # Not part of the portable unsharded selection.
+    fi
+
+[private]
+_test-unit-contracts *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
         # The contract registry's own tests (`tests/claims.rs` loads the live
         # conformance-contracts/ tree) are integration targets too, so the
         # `--lib --bins` line never ran them; name the crate.
         cargo test -p carrick-conformance-contract --tests {{ARGS}}
+    else
+        cargo test -p carrick-conformance-contract --tests {{ARGS}}
+    fi
+
+[private]
+_test-unit-cli *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -488,6 +566,15 @@ test *ARGS:
         # carrick-cli includes tests that fork and mutate process-wide env vars
         # (e.g. supervisor_perf), so serialize test execution to avoid host fork races.
         env RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-cli --bin carrick {{ARGS}}
+    else
+        env RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-cli {{_platform_features}} --bin carrick {{ARGS}}
+    fi
+
+[private]
+_test-unit-host *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
         # carrick-host needs the same serial treatment, for the same reason and
         # one more. Its `guest_cpu` tests `libc::fork()` from the harness and
         # drive a real SIGSTOP/waitpid handshake with the child; its
@@ -501,17 +588,53 @@ test *ARGS:
         # completed after a debugger attach resumed it — an indefinite gate
         # hang, not a slow test.
         env RUST_TEST_THREADS=1 cargo test -p carrick-host --lib {{ARGS}}
+    else
+        env RUST_TEST_THREADS=1 cargo test -p carrick-host --lib {{ARGS}}
+    fi
+
+[private]
+_test-unit-vfs *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
         # Parallel cache churn previously measured 47 host opens against an
         # expected 15; exact budgets and process-wide state stay serial.
         # carrick-vfs runs parallel tests with --skip serial_host, followed by
         # its process-global and budget tests serially under RUST_TEST_THREADS=1.
         cargo test -p carrick-vfs --lib {{ARGS}} -- --skip serial_host
         env RUST_TEST_THREADS=1 cargo test -p carrick-vfs --lib {{ARGS}} serial_host
+    else
+        : # This selection is already in the portable workspace group.
+    fi
+
+[private]
+_test-unit-kernel *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
         # carrick-kernel runs parallel tests with --skip serial_host, followed by
         # its harness-fork and shared-state tests serially under RUST_TEST_THREADS=1.
         cargo test -p carrick-kernel --lib --features test-support {{ARGS}} -- --skip serial_host
         env RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib --features test-support {{ARGS}} serial_host
+    else
+        : # This selection is already in the portable workspace group.
+    fi
+
+[private]
+_test-unit-runtime *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
         env RUST_TEST_THREADS=1 cargo test -p carrick-runtime --lib {{ARGS}}
+    else
+        env RUST_TEST_THREADS=1 cargo test -p carrick-runtime {{_platform_features}} --lib {{ARGS}}
+    fi
+
+[private]
+_test-unit-hvf *ARGS:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ "{{os()}}" = "macos" ]; then
         # carrick-vmm-hvf is serial for a THIRD reason, and it is structural
         # rather than a test-hygiene lapse: the carrier is process-global by
         # design, so its alias registry, replay mappings, global-frame owner
@@ -526,23 +649,9 @@ test *ARGS:
         # too. Serial: 0 of 8. A per-registry lock would have to cover every
         # carrier global to work, which is what one test process already is.
         env RUST_TEST_THREADS=1 cargo test -p carrick-vmm-hvf --lib {{ARGS}}
-        exit 0
+    else
+        : # Not part of the portable unsharded selection.
     fi
-    # Off-macOS: run the lib tests of THIS host's own crates only (-p list from
-    # _platform_crates) under the backend feature set — `--workspace --lib` would
-    # pull in carrick-vmm-hvf + the macos-default features and fail to compile.
-    # CLI/runtime/host have the same process-global state on every host; keep
-    # their complete test processes serial, as above. The remaining package
-    # selection still comes from the platform closure, including all its bins.
-    pkgs="$(just --justfile {{justfile()}} _platform_crates | sed -E 's/-p carrick-(cli|runtime|host) //g')"
-    # Runtime's self dev-dependency previously enabled these test doubles for
-    # the whole selection. Keep them explicit when its test target is separate.
-    cargo test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} -- --skip serial_host
-    env RUST_TEST_THREADS=1 cargo test $pkgs {{_platform_features}} --features carrick-kernel/test-support,carrick-vfs/test-support --lib --bins {{ARGS}} serial_host
-    env RUST_MIN_STACK=8388608 RUST_TEST_THREADS=1 cargo test -p carrick-cli {{_platform_features}} --bin carrick {{ARGS}}
-    env RUST_TEST_THREADS=1 cargo test -p carrick-host --lib {{ARGS}}
-    env RUST_TEST_THREADS=1 cargo test -p carrick-runtime {{_platform_features}} --lib {{ARGS}}
-    cargo test -p carrick-conformance-contract --tests {{ARGS}}
 
 # Rustdoc gate: broken intra-doc links / unclosed-tag lints fail the build (matches CI).
 doc *ARGS:
