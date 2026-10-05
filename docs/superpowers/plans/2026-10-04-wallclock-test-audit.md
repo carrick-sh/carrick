@@ -186,7 +186,7 @@ budgets and the ignored benchmark are unchanged.
 Receipts for this correction use `/tmp/wallclock2-evidence/r3-*.log`.
 macOS unsigned tests and compilation used pushed source
 `5984209cf9d40e456d8ccdad8ea704afa0d9a662` under `just lease carrick`.
-Subsequent edits are audit/commit metadata and mechanical inventory positions;
+Final amendments within that correction were audit/commit metadata and mechanical inventory positions;
 the five source files tested in this correction are unchanged. The scratch
 macOS worktree was removed after verifying restoration. No signed guest,
 Docker or batch acceptance result is claimed.
@@ -243,3 +243,58 @@ reconciliation (`/tmp/wallclock2-evidence/r3-lint-domains.log`). The live
 host-authority subset covers `linux-cli` and `linux-runtime`; other profiles
 remain pending in that census. This receipt amendment changes documentation
 only. Full acceptance still belongs to the director.
+
+
+## Control teardown correction (2026-10-05)
+
+`running_exec_wait_poll_does_not_monopolize_status_connection` now moves
+its held `ExecWork` into a binding **after** server creation. Rust's reverse
+local drop order therefore releases the explicit gate, completes held work,
+and only then joins the server's handlers. The earlier work binding has been
+moved from and owns nothing. Success-path assertions are unchanged. This is
+entirely inside `#[cfg(test)]`: no production behavior or seam changed.
+
+The real implementation mutant changes `ExecRuntime::wait`'s `Running` arm
+from returning `Running` to waiting on its existing `changed` condvar until
+work completion. The mutex is released while waiting, so `ExecWork::drop`
+can complete the record and notify it. The mutation was local/uncommitted
+and restored byte-for-byte after both fixture runs.
+
+| Fixture / version | Result | Outer process watchdog | Receipt |
+|---|---|---|---|
+| Original control teardown + waiting mutant | Client watchdog panics at 30 s; server Drop remains stuck. The independent harness terminates the hung process at 45.005 s (signal exit -9). This is reproduction of the flaw, not an acceptable converted-test red. | Hit; failure only | `/tmp/wallclock2-evidence/r4-old-teardown-hangs.log` |
+| Corrected control teardown + same waiting mutant | Normal test failure, EXIT 101, 30.108 s including startup and teardown | Not hit | `/tmp/wallclock2-evidence/r4-control-waits-for-work.log` |
+| Consume-poll fixture + same waiting mutant | Normal test failure, EXIT 101, 30.011 s | Not hit | `/tmp/wallclock2-evidence/r4-consume-waits-for-work.log` |
+| Corrected control test after restoring production wait | EXIT 0 | Existing failing observers retained | `/tmp/wallclock2-evidence/r4-control-green.log` |
+| Consume-poll test after restoring production wait | EXIT 0 | Existing failing observer retained | `/tmp/wallclock2-evidence/r4-consume-green.log` |
+
+The external 45-second process watchdog bounds the reproduction harness;
+its expiry cannot satisfy either corrected-test red. Compilation is outside
+that safety budget. Both corrected red runs must return EXIT 101 and print
+`test result: FAILED` without that watchdog being hit. No assertion is
+inverted. Exact executable commands, exits, elapsed safety observations and
+watchdog state are retained in
+`/tmp/wallclock2-evidence/r4-mutations.jsonl`; the reproducible local harness
+is `/tmp/wallclock4-red.py`.
+
+| Verification command | EXIT | Receipt |
+|---|---:|---|
+| `cargo test -p carrick-kernel --features test-support -- --skip serial_host` | 0 | `/tmp/wallclock2-evidence/r4-kernel.log` |
+| `env RUST_TEST_THREADS=1 cargo test -p carrick-kernel --lib --features test-support serial_host` | 0 | `/tmp/wallclock2-evidence/r4-kernel-serial.log` |
+| `cargo test -p carrick-kernel-example --no-fail-fast` | 101 | `/tmp/wallclock2-evidence/r4-kernel-example.log` |
+| `just test-kernel-semantics` | 101 | `/tmp/wallclock2-evidence/r4-kernel-semantics.log` |
+| `just check` | 0 | `/tmp/wallclock2-evidence/r4-check.log` |
+| `just clippy` | 0 | `/tmp/wallclock2-evidence/r4-clippy.log` |
+| `just fmt-check` | 0 | `/tmp/wallclock2-evidence/r4-fmt-check.log` |
+
+Both EXIT 101 integration gates fail only at the already disclosed
+`futex_wake_exit_receipt_replays` / `replay source hash mismatch`. The replay
+fixture is unchanged; PR #46 remains the integration dependency. This
+teardown-only correction does not change HVF or probe source. No signed,
+Docker or batch acceptance result is claimed. Clean-tree reconciliation exited 0 with no inventory changes
+(`/tmp/wallclock2-evidence/r4-reconcile.log`). Static source comparisons confirm
+unchanged production control/exec source, the probe report sections, the replay
+fixture and the previously macOS-tested source files.
+Final `just lint-domains` on the clean committed reconciled tree exited 0
+(`/tmp/wallclock2-evidence/r4-lint-domains.log`); its live census is the Linux
+subset. This final receipt amendment changes documentation only.
