@@ -650,6 +650,44 @@ impl AddressSpaces {
         owner: NonZeroU64,
         venue: Option<SpaceReleaseVenue<'a>>,
     ) -> Result<SpaceEditor<'a>, EditAdmissionRefusal> {
+        self.try_begin_edit_mode(index, key, owner, venue, false)
+    }
+
+    /// Borrow the paused MM's editor for its owner's pending maintenance.
+    /// This does not install a runnable root or lower the host's exclusion.
+    /// The caller authenticates the exact pending operation before any effect;
+    /// the host must not settle physical grants until this borrow returns.
+    pub fn try_begin_maintenance_edit<'a>(
+        &'a self,
+        index: SpaceIndex,
+        key: u64,
+        owner: NonZeroU64,
+        venue: Option<SpaceReleaseVenue<'a>>,
+    ) -> Result<SpaceEditor<'a>, EditAdmissionRefusal> {
+        self.try_begin_edit_mode(index, key, owner, venue, true)
+    }
+
+    /// Identity observation only, never admission to run guest user code.
+    pub fn paused_root_identity(&self, index: SpaceIndex, key: u64) -> Option<u64> {
+        let entry = self.entry(index);
+        let gate = entry.gate.load(Ordering::SeqCst);
+        let root = entry.ttbr0.load(Ordering::Acquire);
+        (gate != 0
+            && gate & (GATE_CLOSED | GATE_INITIAL_BIND) == 0
+            && key != 0
+            && entry.key.load(Ordering::SeqCst) == key
+            && root != 0)
+            .then_some(root)
+    }
+
+    fn try_begin_edit_mode<'a>(
+        &'a self,
+        index: SpaceIndex,
+        key: u64,
+        owner: NonZeroU64,
+        venue: Option<SpaceReleaseVenue<'a>>,
+        maintenance: bool,
+    ) -> Result<SpaceEditor<'a>, EditAdmissionRefusal> {
         let entry = self.entry(index);
         assert!(
             !entry.notifications.attached() || venue.is_some(),
@@ -687,7 +725,12 @@ impl AddressSpaces {
         if entry.key.load(Ordering::SeqCst) != key {
             return Err(EditAdmissionRefusal::Stale);
         }
-        if entry.gate.load(Ordering::SeqCst) != 0 {
+        let admitted = if maintenance {
+            self.paused_root_identity(index, key).is_some()
+        } else {
+            entry.gate.load(Ordering::SeqCst) == 0
+        };
+        if !admitted {
             return Err(EditAdmissionRefusal::Gate); // RAII publishes rollback.
         }
         Ok(editor)

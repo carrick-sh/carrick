@@ -216,6 +216,22 @@ pub trait TransferCustody {
         target: TransferTarget,
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<bool, TrapError>;
+    fn finish_maintenance(
+        &self,
+        _target: TransferTarget,
+        _request: carrick_el1_abi::PortalBackingMaintenance,
+    ) -> Result<(), TrapError> {
+        Err(TrapError::Hypervisor(
+            "owner maintenance settlement unavailable".into(),
+        ))
+    }
+    fn refill_maintenance(
+        &self,
+        _target: TransferTarget,
+        _request: carrick_el1_abi::PortalBackingMaintenance,
+    ) -> Result<bool, TrapError> {
+        Ok(false)
+    }
     fn retain(
         &self,
         selected: PortalSelectedData,
@@ -559,6 +575,58 @@ fn run_selected_service<V: Aarch64Vmm>(
     }
 }
 
+/// Retain the exact retirement cursor across physical supply. No root/editor
+/// or driving-vCPU loan survives the host allocation. Each page either completes
+/// immediately or consumes one newly supplied grant; this is not wait polling.
+pub fn scrub_pending_backing<V: Aarch64Vmm>(
+    engine: &Aarch64EngineCore<V>,
+    handle: carrick_el1_abi::El1MmHandle,
+    pending: carrick_el1_abi::ReservationRequest,
+) -> Result<(), TrapError> {
+    let failure = || TrapError::Hypervisor("owner backing maintenance refused".into());
+    let custody = engine
+        .backend()
+        .owner_transfer_custody()
+        .ok_or_else(failure)?;
+    let ttbr0 = engine.transfer_service_loan()?.target_ttbr0()?;
+    let target = TransferTarget::from_handle(handle, ttbr0);
+    let mut page = pending.range.start();
+    while page < pending.range.end() {
+        let request = carrick_el1_abi::PortalBackingMaintenance::new(handle, pending, page)
+            .ok_or_else(failure)?;
+        let serve = || {
+            let mut frame = TrapFrame {
+                esr: carrick_el1_abi::MM_PORTAL_MAINTENANCE_ESR,
+                ..TrapFrame::default()
+            };
+            frame.x[1..9].copy_from_slice(&request.words());
+            engine
+                .transfer_service_loan()?
+                .run_user(frame, &mut || false)
+        };
+        let mut reply = serve()?;
+        if reply.x[0] == 11 {
+            if !custody.refill_maintenance(target, request)? {
+                return Err(failure());
+            }
+            reply = serve()?;
+        }
+        if reply.x[0] != 0 {
+            return Err(TrapError::Hypervisor(format!(
+                "owner backing maintenance errno={} page=0x{page:x}",
+                reply.x[0]
+            )));
+        }
+        custody.finish_maintenance(target, request)?;
+        let next = reply.x[9];
+        if next <= page || next > pending.range.end() || !next.is_multiple_of(4096) {
+            return Err(failure());
+        }
+        page = next;
+    }
+    Ok(())
+}
+
 /// Erase only the retained physical pin type for a backend-owned byte venue.
 pub struct ErasedTransferCustody<C>(pub C);
 impl<C: TransferCustody> TransferCustody for ErasedTransferCustody<C>
@@ -589,6 +657,20 @@ where
         window: carrick_el1_abi::PortalGrantWindow,
     ) -> Result<bool, TrapError> {
         self.0.refill_cow(target, window)
+    }
+    fn finish_maintenance(
+        &self,
+        target: TransferTarget,
+        request: carrick_el1_abi::PortalBackingMaintenance,
+    ) -> Result<(), TrapError> {
+        self.0.finish_maintenance(target, request)
+    }
+    fn refill_maintenance(
+        &self,
+        target: TransferTarget,
+        request: carrick_el1_abi::PortalBackingMaintenance,
+    ) -> Result<bool, TrapError> {
+        self.0.refill_maintenance(target, request)
     }
     fn retain(
         &self,
