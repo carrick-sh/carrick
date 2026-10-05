@@ -196,7 +196,10 @@ impl CowGrantPool {
             if word & STATE_MASK != EMPTY {
                 continue;
             }
-            let writing = (word & !STATE_MASK).wrapping_add(EPOCH_ONE) | WRITING;
+            let Some(epoch) = (word & !STATE_MASK).checked_add(EPOCH_ONE) else {
+                continue;
+            };
+            let writing = epoch | WRITING;
             if record
                 .state
                 .compare_exchange(word, writing, Ordering::AcqRel, Ordering::Acquire)
@@ -804,5 +807,31 @@ mod tests {
         pool.note_declined(CowDecline::PoolEmpty);
         pool.note_declined(CowDecline::NotCowArmed);
         assert_eq!(pool.declined(), [0, 1, 0, 0, 0, 2, 0, 0, 0]);
+    }
+    #[test]
+    fn exhausted_grant_epoch_never_reuses_an_incarnation() {
+        let pool = CowGrantPool::new();
+        for offset in 0..COW_GRANT_PROBES {
+            pool.records[CowGrantPool::probe(7, offset)]
+                .state
+                .store(!STATE_MASK, Ordering::Relaxed);
+        }
+        assert!(
+            pool.publish(7, 0x8_0000_4000, backing(10)).is_none(),
+            "exhausted epoch minted a reused incarnation"
+        );
+    }
+
+    #[test]
+    fn overflowed_completion_span_is_refused_without_panicking() {
+        let pool = CowGrantPool::new();
+        pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
+        let claimed = pool.claim(7).unwrap();
+        let mut bad = completion(claimed);
+        bad.span_len = !4095;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pool.complete(&bad)));
+        assert!(result.is_ok(), "wire span overflow panicked");
+        assert!(!result.unwrap());
+        assert!(pool.authenticates_claimed(&claimed));
     }
 }
