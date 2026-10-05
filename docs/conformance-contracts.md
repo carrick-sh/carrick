@@ -317,6 +317,9 @@ descriptor image. Signed bindings remain
 `el1_delegated_root_concurrent_vma_ops` and
 `el1_delegated_root_map_fixed_over_cow_pages`; their serving and exit budgets
 remain part of correctness.
+The shared core bindings `aarch64_owner_fault_window_excludes_inherited_backing`
+and `x86_owner_fault_window_excludes_inherited_backing` require the same bounded
+selection rule over both descriptor geometries.
 
 `kernel.mm.copyout-owner-gate` covers a peer closing the MM gate between
 SELECT and PREPARE. The hardware preamble must observe the exact Gate
