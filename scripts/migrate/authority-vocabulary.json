@@ -1,0 +1,64 @@
+{
+  "k1": [
+    "read_open_files",
+    "write_open_files",
+    "lock_next_fd",
+    "lock_stdio_cloexec",
+    "lock_closed_stdio",
+    "read_fd_open_paths",
+    "write_fd_open_paths",
+    "lock_splice_pushback",
+    "read_epoll_fds",
+    "write_epoll_fds",
+    "epoll_wake_registry",
+    "nofile_soft",
+    "set_nofile_soft",
+    "OpenDescriptionRef",
+    "open_description",
+    "concrete_backing"
+  ],
+  "description_io": [
+    "read_for_io",
+    "write_for_io"
+  ],
+  "description_guard": [
+    "inspect",
+    "try_inspect"
+  ],
+  "task": [
+    "threads",
+    "live",
+    "live_thread_count",
+    "enter_crash_safe_point_participation",
+    "leave_crash_safe_point_participation",
+    "ForkBarrierParticipants",
+    "CrashBarrierParticipants",
+    "ThreadExitParticipants",
+    "CrashCaptureParticipants",
+    "CoreNoteParticipants",
+    "GuestExecutorCensus"
+  ],
+  "raw_lock": [
+    "lock",
+    "try_lock",
+    "try_lock_for",
+    "try_lock_until",
+    "lock_arc",
+    "read",
+    "try_read",
+    "try_read_for",
+    "try_read_until",
+    "read_arc",
+    "write",
+    "try_write",
+    "try_write_for",
+    "try_write_until",
+    "write_arc"
+  ],
+  "source_include": [
+    "include"
+  ],
+  "source_string_include": [
+    "include_str"
+  ]
+}

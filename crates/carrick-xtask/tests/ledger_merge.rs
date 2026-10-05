@@ -69,8 +69,6 @@ fn duplicate_json_key_fails() {
     }
 }
 
-
-
 #[test]
 fn cli_ledger_merge_success() {
     let temp = tempfile::tempdir().expect("tempdir");

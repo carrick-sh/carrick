@@ -305,7 +305,6 @@ pub enum MergeConflict {
     },
 }
 
-
 fn validate_probe_row(side: &str, name: &str, row: &ParsedValue) -> Result<(), MergeConflict> {
     let obj = row.as_object().ok_or_else(|| MergeConflict::InvalidRow {
         side: side.to_string(),
@@ -694,4 +693,3 @@ fn merge_probe_inventory(
         },
     })
 }
-
