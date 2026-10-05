@@ -6381,53 +6381,141 @@ mod ipc_set_tests {
             );
         }
 
-        #[test]
-        fn watchdog_kills_and_reaps_on_deadlock_timeout() {
-            supervise_watchdog_child();
-            if std::env::var_os("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK").is_some() {
-                if let Some(path) = std::env::var_os("CARRICK_SYSVIPC_WATCHDOG_READY") {
-                    std::fs::write(
-                        path,
-                        format!("{} {}", std::process::id(), unsafe { libc::getppid() }),
-                    )
-                    .expect("publish child ready");
+        fn deadlock_ready(
+            listener: &std::os::unix::net::UnixListener,
+        ) -> std::io::Result<(std::os::unix::net::UnixStream, libc::pid_t, libc::pid_t)> {
+            use std::io::BufRead;
+            use std::os::fd::AsRawFd;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "deadlock worker did not acknowledge IPC readiness",
+                        )
+                    })?;
+                let mut event = libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe {
+                    libc::poll(&mut event, 1, remaining.as_millis().max(1) as libc::c_int)
+                };
+                if ready > 0 {
+                    break;
                 }
-                loop {
-                    std::thread::park();
+                if ready < 0
+                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    return Err(std::io::Error::last_os_error());
                 }
             }
+            let (stream, _) = listener.accept()?;
+            stream.set_read_timeout(Some(
+                deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "deadlock readiness deadline expired",
+                        )
+                    })?,
+            ))?;
+            let mut message = String::new();
+            std::io::BufReader::new(stream.try_clone()?).read_line(&mut message)?;
+            let (worker, supervisor) = message.trim().split_once(' ').ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing ready PIDs")
+            })?;
+            let parse = |pid: &str| {
+                pid.parse::<libc::pid_t>()
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+            };
+            Ok((stream, parse(worker)?, parse(supervisor)?))
+        }
 
+        #[test]
+        fn deadlock_worker_ready_is_an_ipc_handshake() {
+            struct Worker(std::process::Child);
+            impl Drop for Worker {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
+            }
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("ready.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let mut worker = Worker(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "dispatch::sysv::ipc_set_tests::serial_host::watchdog_kills_and_reaps_on_deadlock_timeout", "--nocapture"])
+                .env_remove("CARRICK_SYSVIPC_WATCHDOG_FD")
+                .env("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK", "1")
+                .env("CARRICK_SYSVIPC_WATCHDOG_READY", path)
+                .spawn().unwrap());
+            let (_control, pid, _) =
+                deadlock_ready(&listener).expect("worker must acknowledge IPC before cancellation");
+            assert_eq!(pid, worker.0.id() as libc::pid_t);
+            assert!(
+                worker.0.try_wait().unwrap().is_none(),
+                "ready worker exited without cancellation"
+            );
+            worker.0.kill().unwrap();
+            assert!(!worker.0.wait().unwrap().success());
+        }
+
+        #[test]
+        fn watchdog_kills_and_reaps_on_deadlock_timeout() {
+            use std::io::{Read, Write};
+            supervise_watchdog_child();
+            let ready_path = std::env::var_os("CARRICK_SYSVIPC_WATCHDOG_READY");
+            if std::env::var_os("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK").is_some() {
+                let mut control =
+                    std::os::unix::net::UnixStream::connect(ready_path.expect("ready socket"))
+                        .expect("connect deadlock readiness");
+                writeln!(control, "{} {}", std::process::id(), unsafe {
+                    libc::getppid()
+                })
+                .expect("acknowledge child ready");
+                // Simulated deadlock: the peer keeps this connection open and
+                // never writes. Readiness is IPC, not elapsed wall-clock time.
+                control
+                    .read_exact(&mut [0])
+                    .expect("watchdog must cancel the blocked child");
+                panic!("deadlock control unexpectedly released without cancellation");
+            }
+
+            let own_readiness = if ready_path.is_none() {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("ready.sock");
+                let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+                Some((directory, path, listener))
+            } else {
+                None // Parent-death fixture owns the worker's readiness socket.
+            };
             let mut command =
                 std::process::Command::new(std::env::current_exe().expect("test exe path"));
-            command
-                .env("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK", "1")
+            command.env("CARRICK_SYSVIPC_TEST_CHILD_DEADLOCK", "1")
                 .arg("--exact")
                 .arg("dispatch::sysv::ipc_set_tests::serial_host::watchdog_kills_and_reaps_on_deadlock_timeout")
                 .arg("--nocapture");
+            if let Some((_, path, _)) = &own_readiness {
+                command.env("CARRICK_SYSVIPC_WATCHDOG_READY", path);
+            }
             let mut child = WatchdogChild::spawn(command).expect("spawn deadlocked child process");
-
             if std::env::var_os("CARRICK_SYSVIPC_WATCHDOG_PARENT_HOLD").is_some() {
                 loop {
                     std::thread::park();
                 }
             }
-
-            let start = std::time::Instant::now();
-            let timeout = std::time::Duration::from_millis(200);
-            let mut exited = false;
-            while start.elapsed() < timeout {
-                if child.try_wait().expect("child try_wait").is_some() {
-                    exited = true;
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-
+            let (_control, _, _) = deadlock_ready(&own_readiness.as_ref().unwrap().2)
+                .expect("worker must reach blocked IPC before cancellation");
             assert!(
-                !exited,
-                "deadlocked child exited unexpectedly before timeout"
+                child.try_wait().expect("child try_wait").is_none(),
+                "deadlocked child exited before cancellation"
             );
-            let _ = child.kill();
+            child.kill().expect("cancel deadlock child");
             let status = child.wait().expect("child wait after kill");
             assert!(
                 !status.success(),
@@ -6487,36 +6575,23 @@ mod ipc_set_tests {
                     }
                 }
             }
-            let ready = tempfile::NamedTempFile::new().expect("ready file");
+            let directory = tempfile::tempdir().expect("ready directory");
+            let path = directory.path().join("ready.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).expect("ready listener");
             let mut cleanup = Cleanup {
                 parent: std::process::Command::new(std::env::current_exe().expect("test exe"))
                     .args(["--exact", "dispatch::sysv::ipc_set_tests::serial_host::watchdog_kills_and_reaps_on_deadlock_timeout", "--nocapture"])
                     .env("CARRICK_SYSVIPC_WATCHDOG_PARENT_HOLD", "1")
-                    .env("CARRICK_SYSVIPC_WATCHDOG_READY", ready.path())
+                    .env("CARRICK_SYSVIPC_WATCHDOG_READY", &path)
                     .spawn().expect("parent test process"),
                 worker: None,
                 supervisor: None,
             };
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let pid = loop {
-                let data = std::fs::read_to_string(ready.path()).unwrap();
-                if let Some((worker, supervisor)) = data.split_once(' ') {
-                    let supervisor: libc::pid_t = supervisor.parse().unwrap();
-                    if supervisor != cleanup.parent.id() as libc::pid_t {
-                        cleanup.supervisor = Some(supervisor);
-                    }
-                    break worker.parse::<libc::pid_t>().unwrap();
-                }
-                assert!(
-                    cleanup.parent.try_wait().unwrap().is_none(),
-                    "parent exited before ready"
-                );
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "child readiness timed out"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            };
+            let (_control, pid, supervisor) =
+                deadlock_ready(&listener).expect("worker IPC readiness");
+            if supervisor != cleanup.parent.id() as libc::pid_t {
+                cleanup.supervisor = Some(supervisor);
+            }
             cleanup.worker = Some(pid);
             cleanup.parent.kill().unwrap();
             cleanup.parent.wait().unwrap();
