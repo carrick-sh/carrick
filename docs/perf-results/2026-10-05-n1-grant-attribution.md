@@ -85,3 +85,18 @@ rejects a different registry runner and the old MM, then completes clear,
 wake and exit publication exactly once. All six `child_tid_owner_tests`
 pass serially (`/tmp/n1g2-child-tid-green.log`). Signed attribution remains
 pending the final exact-artifact gate.
+
+## Fork worker integration
+
+Reviewed and cherry-picked worker commits `69639dddb`, `9500b5d50`,
+`27762ac24`, `44e3ca9f1`, and `df282f8bd`, preserving authorship. The final
+change relocates the fixed bootstrap primary into this MM's table pool;
+it restores the original stage-3 pool restriction. The temporary fixed-root
+admission is therefore absent from the final code. No driver stage-3 edits
+were made. The worker's intermediate fingerprint-only `b677e6379` is omitted
+in favor of reconciliation on the integrated clean tree.
+
+Re-verified the worker's bootstrap witness before its final fix: at
+`b6e29a6b9`, it returns fixed `0x2d00020000` instead of pool `0x9a00000000`
+(`/tmp/n1g2-fork-primary-red.log`). Integrated green validation and signed
+refusal-probe receipts follow separately.

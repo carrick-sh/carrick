@@ -503,3 +503,35 @@ leaf with private zero backing, and leaves it invalid until regrowth. The
 VM-free witness checks the original Gate red, ordinary user-copy exclusion,
 request corruption and VA reuse, a live COW peer, adjacent bytes, and bounded
 descriptor work. Signed green remains pending; this contract is not accepted.
+
+## Exact physical grant completion
+
+`kernel.mm.copyout-owner-gate` also covers the interval between physical
+alias publication and its EL1 descriptor receipt. An exact live provisional
+owner is a completion dependency, not a permanent supply refusal. A contender
+must allocate zero extra frames, hold no host I/O lock while suspended, and
+reselect through the semantic owner only after that exact publication commits
+or rolls back. A reused VA or physical generation cannot satisfy its wait.
+The VM-free bindings are
+`concurrent_transfer_waits_for_exact_uncommitted_physical_grant` and
+`transfer_partial_remap_keeps_dirty_neighbor_in_same_compound`; they cover
+rollback, applied settlement, late enrollment and distinct owner completions.
+The same copyout signed fixture remains the required production binding.
+
+## Terminal clear custody
+
+`kernel.thread.clear-tid-custody` covers `set_tid_address(2)` and
+`CLONE_CHILD_CLEARTID`: the exiting thread clears its registered word and
+wakes its joiner before exit becomes observable. Runtime registry identity
+and Linux TID are separate domains; nonleader exec may promote the Linux
+identity while retaining the registry runner. The Kernel thread supplies
+that mapping. Capture retains the exact thread and MM; an unrelated runner
+or retired MM cannot complete the clear. Work is one prepared clear and at
+most one wake per retained obligation; a graph refusal cancels the permit
+without either operation, and a memory wait releases executor capacity.
+
+The VM-free `child_tid_owner_tests` include a real nonleader exec followed by
+capture, clear, wake and terminal publication. `terminal_clear_loom` models
+clear/wake ordering and graph refusal. The signed anonymous and fork-COW
+comparison fixtures bind the terminal runtime path; broader pthread and exec
+acceptance remains open.
