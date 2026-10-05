@@ -816,21 +816,7 @@ where
         &self,
         kernel: &Kernel,
     ) -> Result<(), RuntimeError> {
-        let context = self.service_kernel_context.as_ref().ok_or_else(|| {
-            RuntimeError::Configuration(
-                "persistent sibling stop lost exact Kernel context".to_owned(),
-            )
-        })?;
-        publish_persistent_sibling_stop_with(
-            &self.threads,
-            &self.registry,
-            self.this_tid,
-            self.kicker.as_ref(),
-            &self.futex,
-            self.platform_futex.as_ref(),
-            context,
-            kernel,
-        )
+        self.persistent_sibling_stop_authority()?.publish(kernel)
     }
 }
 
@@ -846,67 +832,57 @@ pub(super) struct PersistentSiblingStopAuthority {
 
 impl PersistentSiblingStopAuthority {
     pub(super) fn publish(&self, kernel: &Kernel) -> Result<(), RuntimeError> {
-        publish_persistent_sibling_stop_with(
-            &self.threads,
-            &self.registry,
-            self.keeper,
-            self.kicker.as_ref(),
-            &self.futex,
-            self.platform_futex.as_ref(),
-            &self.context,
-            kernel,
-        )
-    }
-}
-
-fn publish_persistent_sibling_stop_with(
-    threads: &VcpuThreadRegistry,
-    registry: &ThreadRegistry,
-    keeper: ThreadId,
-    kicker: &dyn VcpuRegistry,
-    futex: &FutexTable,
-    platform_futex: &dyn PlatformFutex,
-    context: &carrick_kernel::kernel::KernelContext,
-    kernel: &Kernel,
-) -> Result<(), RuntimeError> {
-    // Clone/adoption admission is already closed and drained by the caller.
-    // Bind before removing numeric membership; retained contexts pin exact
-    // thread claims across a concurrent retirement and subsequent TID reuse.
-    let witnesses = context.task_binding().capture_threads().map_err(|error| {
-        RuntimeError::Configuration(format!("capture sibling clear custody: {error}"))
-    })?;
-    for witness in witnesses {
-        if witness.thread().key().tid.raw() == keeper.raw() {
-            continue;
+        let Self {
+            threads,
+            registry,
+            keeper,
+            kicker,
+            futex,
+            platform_futex,
+            context,
+        } = self;
+        let keeper = *keeper;
+        // Clone/adoption admission is already closed and drained by the caller.
+        // Bind before removing numeric membership; retained contexts pin exact
+        // thread claims across a concurrent retirement and subsequent TID reuse.
+        let witnesses = context.task_binding().capture_threads().map_err(|error| {
+            RuntimeError::Configuration(format!("capture sibling clear custody: {error}"))
+        })?;
+        for witness in witnesses {
+            if witness.thread().key().tid.raw() == keeper.raw() {
+                continue;
+            }
+            let tid = ThreadId::from_kernel_thread_identity(witness.thread().key().tid.raw());
+            if let Some(clear) = registry.claim_clear_child_tid(tid) {
+                threads.retain_clear(PendingChildTidClear::new(clear, &witness)?);
+            } else if witness.thread().execution_state().generation().is_none()
+                && !witness.thread().child_tid_cleared_in_zone()
+                && threads.1.lock().births.insert(witness.thread().key())
+                && let Some(clear) = registry.claim_detached_child_tid(
+                    tid,
+                    witness.thread().control_slot().clear_child_tid(),
+                )
+            {
+                threads.retain_clear(PendingChildTidClear::new(clear, &witness)?);
+            }
         }
-        let tid = ThreadId::from_kernel_thread_identity(witness.thread().key().tid.raw());
-        if let Some(clear) = registry.claim_clear_child_tid(tid) {
-            threads.retain_clear(PendingChildTidClear::new(clear, &witness)?);
-        } else if witness.thread().execution_state().generation().is_none()
-            && !witness.thread().child_tid_cleared_in_zone()
-            && threads.1.lock().births.insert(witness.thread().key())
-            && let Some(clear) = registry
-                .claim_detached_child_tid(tid, witness.thread().control_slot().clear_child_tid())
-        {
-            threads.retain_clear(PendingChildTidClear::new(clear, &witness)?);
-        }
+        let removed = registry.remove_all_except(keeper);
+        kicker.kick_all_except(keeper);
+        futex.notify_signal_pending();
+        platform_futex.notify_signal_pending();
+        kernel.signal_arrival.wake_all_waiters();
+        let scheduler = kernel
+            .hvpatch_runtime
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration(
+                    "persistent sibling stop has no shared scheduler".to_owned(),
+                )
+            })?
+            .continuation_services(context.kernel())
+            .0;
+        wake_removed_persistent_sibling_threads(context, &scheduler, &removed)
     }
-    let removed = registry.remove_all_except(keeper);
-    kicker.kick_all_except(keeper);
-    futex.notify_signal_pending();
-    platform_futex.notify_signal_pending();
-    kernel.signal_arrival.wake_all_waiters();
-    let scheduler = kernel
-        .hvpatch_runtime
-        .as_ref()
-        .ok_or_else(|| {
-            RuntimeError::Configuration(
-                "persistent sibling stop has no shared scheduler".to_owned(),
-            )
-        })?
-        .continuation_services(context.kernel())
-        .0;
-    wake_removed_persistent_sibling_threads(context, &scheduler, &removed)
 }
 
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
