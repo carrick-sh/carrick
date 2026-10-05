@@ -1,10 +1,11 @@
 //! The production reservation/permit owner, exercised over x86 descriptors.
-use super::test_support::*;
-use super::*;
-use crate::fault::{NoopCowResolver, NoopPreparedResolver};
+use carrick_el1::fault::{NoopCowResolver, NoopPreparedResolver};
+use carrick_el1::personality::mm_portal::test_support::*;
+use carrick_el1::personality::mm_portal::*;
 use carrick_mmu_core::aarch64::descriptor_txn::CallerInvalidatesAsid;
 use carrick_mmu_core::x86::descriptor_txn::{NX, PRESENT, USER, WRITE};
 use carrick_sched_core::AddressSpaces;
+use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
 fn transfer_fixture(pages: usize, unrelated: usize) {
@@ -142,7 +143,7 @@ fn x86_wrong_output_pin_refuses_before_preparing_copy() {
     let mut request = selected
         .request(
             TransferIntent::UserWrite,
-            carrick_el1_abi::PortalRetainedData {
+            carrick_core_abi::PortalRetainedData {
                 record: NonZeroU64::new(7).unwrap(),
                 vm_generation: NonZeroU64::new(1).unwrap(),
                 owner: Some((NonZeroU64::new(3).unwrap(), NonZeroU64::new(1).unwrap())),
@@ -162,4 +163,13 @@ fn x86_wrong_output_pin_refuses_before_preparing_copy() {
             .unwrap()
             .has_prepared_copy()
     );
+}
+
+/// VM-free order-1 witness. CPL0 execution remains a separate integration gate.
+#[test]
+fn x1_shared_mm_owner() {
+    transfer_fixture(16, 16);
+    transfer_fixture(64, 16);
+    transfer_fixture(256, 16);
+    x86_wrong_output_pin_refuses_before_preparing_copy();
 }
