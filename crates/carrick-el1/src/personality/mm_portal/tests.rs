@@ -2105,6 +2105,172 @@ fn owner_fork_publishes_child_with_two_live_same_va_mms() {
 }
 
 #[test]
+fn owner_fork_anonymous_first_touch_excludes_inherited_prepared_neighbors() {
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan, TableGrants,
+    };
+    use carrick_mmu_core::aarch64::{El1PrivateLeafState, SubstrateGpa, el1_private_leaf_state};
+    // kernel.el1.delegated-root-fork: a fresh child MAP_FIXED mapping must
+    // select its own zero-fill window, without inheriting host residency or
+    // replacing prepared stock belonging to the neighboring reservation.
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let parent = admit(&region, &spaces, 77, ROOT, 4, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::new(1).unwrap(), region.table(), &spaces, &view);
+    let parent_tables = Tables::new(ROOT, IPA, 4);
+    for page in 0..4 {
+        parent_tables.words[1536 + page].store(
+            ((IPA + page as u64 * 4096) | RW | (1 << 56) | (1 << 57)) & !1,
+            Ordering::Release,
+        );
+    }
+    let child = Tables::new(ROOT + 0x100000, 0, 0);
+    let supply = Tables::new(ROOT + 0x200000, 0, 0);
+    let request = fork_request(&region, &spaces, parent, 78, &child, &supply);
+    let arenas = [&parent_tables, &child, &supply];
+    let words = ForkWords {
+        arenas: &arenas,
+        loads: core::cell::Cell::new(0),
+    };
+    let plan = portal
+        .prepare_fork(
+            request,
+            ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap(),
+            &words,
+            0,
+        )
+        .unwrap();
+    portal
+        .publish_fork(plan, &words, 0)
+        .unwrap()
+        .commit(&portal, 0)
+        .unwrap();
+    spaces.open(spaces.find(78).unwrap());
+    let parent_identity = {
+        let mut root = region
+            .table()
+            .lock_el1_resolved(spaces.find(77).unwrap().index(), parent, &view, 0)
+            .unwrap();
+        (
+            root.incarnation(),
+            root.generation(),
+            root.mapping(VA).unwrap(),
+        )
+    };
+    let parent_descriptors: Vec<_> = parent_tables
+        .words
+        .iter()
+        .map(|word| word.load(Ordering::Acquire))
+        .collect();
+    let neighbor = child.words[1537].load(Ordering::Acquire);
+    assert_eq!(
+        el1_private_leaf_state(neighbor),
+        El1PrivateLeafState::Prepared
+    );
+    let retired = carrick_mmu_core::aarch64::descriptor_txn::execute_descriptor_txn(
+        &words,
+        SubstrateGpa(child.base),
+        &DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: NonZeroU64::new(78).unwrap(),
+                generation: NonZeroU64::new(1).unwrap(),
+            },
+            root: SubstrateGpa(child.base),
+            op: DescriptorOp::Retire(PageSpan::new(VA, 4096)),
+            tables: TableGrants::NONE,
+        },
+        &mut carrick_mmu_core::aarch64::descriptor_txn::InlineJournal::new(),
+    );
+    assert!(matches!(retired.outcome, DescriptorOutcome::Applied(_)));
+    let fresh = {
+        use crate::memory::reservations::{Decision, Placement};
+        let mut root = region
+            .table()
+            .lock_el1_resolved(spaces.find(78).unwrap().index(), request.child_mm, &view, 0)
+            .unwrap();
+        for remap in [false, true] {
+            let decision = if remap {
+                root.mmap(
+                    Placement::Fixed(VA),
+                    4096,
+                    ReservationProtection::READ_WRITE,
+                )
+                .unwrap()
+            } else {
+                root.munmap(ReservationRange::new(VA, VA + 4096).unwrap())
+                    .unwrap()
+            };
+            let Decision::Work(request) = decision else {
+                panic!("child replacement must commit")
+            };
+            // SAFETY: the exact child leaf was retired above; no new physical
+            // backing is published until the owner first-touch request below.
+            root.complete(unsafe {
+                carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
+                    request,
+                    carrick_el1_abi::ReservationBackingReceipt {
+                        receipt: request.sequence.raw(),
+                        granted_bytes: 0,
+                        returned_bytes: 0,
+                    },
+                )
+                .unwrap()
+            })
+            .unwrap();
+        }
+        root.mapping(VA).unwrap()
+    };
+    let slots = Box::new(carrick_el1_abi::MmPortalSlots::new());
+    assert!(slots.bind_carrier(NonZeroU64::new(1).unwrap()));
+    let mailbox = FrameGrantMailbox::new();
+    assert!(
+        (crate::fault::FileFaultVenue {
+            roots: region.table(),
+            spaces: carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+            slots: &slots,
+            worker: 0,
+            mailbox: &mailbox,
+        })
+        .publish(78, VA, 1),
+        "anonymous first-touch must use the admitted owner handoff"
+    );
+    let fault = mailbox.claim_request().unwrap();
+    let window = slots
+        .grant(0)
+        .unwrap()
+        .fault_selection(78, fault.request_generation)
+        .unwrap();
+    assert_eq!(window.operation.mm, request.child_mm);
+    assert_eq!(window.range, fresh.range);
+    assert_eq!(window.generation, fresh.generation);
+    assert_eq!(window.host_backing, None);
+    assert_eq!(fault.requested_len, 4096);
+    assert_eq!(child.words[1537].load(Ordering::Acquire), neighbor);
+    let mut root = region
+        .table()
+        .lock_el1_resolved(spaces.find(77).unwrap().index(), parent, &view, 0)
+        .unwrap();
+    assert_eq!(
+        (
+            root.incarnation(),
+            root.generation(),
+            root.mapping(VA).unwrap()
+        ),
+        parent_identity,
+        "parent descriptor authority must retain its exact incarnation and generations"
+    );
+    assert_eq!(
+        parent_tables
+            .words
+            .iter()
+            .map(|word| word.load(Ordering::Acquire))
+            .collect::<Vec<_>>(),
+        parent_descriptors
+    );
+}
+
+#[test]
 fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private() {
     use carrick_mmu_core::aarch64::descriptor_txn::{
         BackingIdentity, DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan,
