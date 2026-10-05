@@ -56,10 +56,12 @@ fn transfer_fixture(pages: usize, unrelated: usize) {
                 .select(
                     &transfer,
                     &words,
-                    &mut NoopPreparedResolver,
-                    &mut NoopCowResolver,
-                    &residency(),
-                    0,
+                    carrick_core::mm::transaction::SelectionVenues {
+                        prepared: &mut NoopPreparedResolver,
+                        cow: &mut NoopCowResolver,
+                        residency: &residency(),
+                        slot: 0,
+                    },
                 )
                 .unwrap();
             let TransferStep::Selected(selected) = step else {
@@ -130,10 +132,12 @@ fn x86_wrong_output_pin_refuses_before_preparing_copy() {
         .select(
             &transfer,
             &words,
-            &mut NoopPreparedResolver,
-            &mut NoopCowResolver,
-            &residency(),
-            0,
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency(),
+                slot: 0,
+            },
         )
         .unwrap()
     else {
