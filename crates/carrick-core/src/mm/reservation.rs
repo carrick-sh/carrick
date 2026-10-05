@@ -35,9 +35,8 @@ pub union ReservationNodePayload {
     pub prepared: PreparedNodeHeader,
     pub words: [u64; 14],
 }
-const _: () = assert!(
-    core::mem::size_of::<ReservationNodePayload>() == core::mem::size_of::<ReservationNodeData>()
-);
+const _: [(); core::mem::size_of::<ReservationNodePayload>()] =
+    [(); core::mem::size_of::<ReservationNodeData>()];
 // A live node belongs to exactly one locked root. Free nodes are handed over
 // using the generation-qualified free list's release/acquire operations.
 unsafe impl Sync for ReservationNode {}
