@@ -308,6 +308,41 @@ fn contains_authority_tokens(
         _ => false,
     })
 }
+// Both import and declaration discovery must inspect the same literal macro
+// inputs. Otherwise an import can rename an inclusion before the declaration
+// visitor encounters it, leaving its production file classified as test-only.
+fn visit_macro_inputs(visitor: &mut impl for<'ast> Visit<'ast>, tokens: TokenStream) {
+    if let Ok(file) = syn::parse2::<syn::File>(tokens.clone()) {
+        visitor.visit_file(&file);
+    } else if let Ok(expression) = syn::parse2::<syn::Expr>(tokens.clone()) {
+        visitor.visit_expr(&expression);
+    } else {
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        let mut remaining = tokens.as_slice();
+        while let Some((token, rest)) = remaining.split_first() {
+            if let TokenTree::Ident(name) = token
+                && matches!(remaining.get(1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                && let Some(TokenTree::Group(group)) = remaining.get(2)
+            {
+                visitor.visit_macro(&syn::Macro {
+                    path: syn::Path::from(name.clone()),
+                    bang_token: Default::default(),
+                    delimiter: syn::MacroDelimiter::Paren(Default::default()),
+                    tokens: group.stream(),
+                });
+                // The invoked visitor already consumes this group. Visiting
+                // it again multiplies work through nested macro inputs.
+                remaining = &remaining[3..];
+            } else {
+                if let TokenTree::Group(group) = token {
+                    visit_macro_inputs(visitor, group.stream());
+                }
+                remaining = rest;
+            }
+        }
+    }
+}
+
 // Imported builtin macro names can be re-exported and renamed again. Resolve
 // all such spellings conservatively; conflicting short names fail closed.
 fn collect_source_inclusion_aliases(
@@ -316,6 +351,14 @@ fn collect_source_inclusion_aliases(
 ) -> Result<(), DebtError> {
     struct Imports(Vec<(String, String)>);
     impl<'ast> Visit<'ast> for Imports {
+        fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+            if !test_only(&item.attrs) && item.ident.is_none() {
+                self.visit_macro(&item.mac);
+            }
+        }
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            visit_macro_inputs(self, mac.tokens.clone());
+        }
         fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
             if test_only(&item.attrs) {
                 return;
@@ -579,31 +622,6 @@ impl DeclarationBodies<'_> {
             self.vocabulary,
         )
     }
-    fn nested_inclusions(&mut self, tokens: TokenStream) {
-        let tokens: Vec<_> = tokens.into_iter().collect();
-        for (index, token) in tokens.iter().enumerate() {
-            if let TokenTree::Ident(name) = token
-                && matches!(
-                    self.vocabulary.get(&name.to_string()),
-                    Some(
-                        AuthorityOperation::SourceInclude | AuthorityOperation::SourceStringInclude
-                    )
-                )
-                && matches!(tokens.get(index + 1), Some(TokenTree::Punct(p)) if p.as_char() == '!')
-                && let Some(TokenTree::Group(group)) = tokens.get(index + 2)
-            {
-                let mac = syn::Macro {
-                    path: syn::Path::from(name.clone()),
-                    bang_token: Default::default(),
-                    delimiter: syn::MacroDelimiter::Paren(Default::default()),
-                    tokens: group.stream(),
-                };
-                self.visit_macro(&mac);
-            } else if let TokenTree::Group(group) = token {
-                self.nested_inclusions(group.stream());
-            }
-        }
-    }
 }
 impl<'ast> Visit<'ast> for DeclarationBodies<'_> {
     fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
@@ -694,13 +712,7 @@ impl<'ast> Visit<'ast> for DeclarationBodies<'_> {
             }
             return;
         }
-        if let Ok(file) = syn::parse2::<syn::File>(mac.tokens.clone()) {
-            self.visit_file(&file);
-        } else if let Ok(expression) = syn::parse2::<syn::Expr>(mac.tokens.clone()) {
-            self.visit_expr(&expression);
-        } else {
-            self.nested_inclusions(mac.tokens.clone());
-        }
+        visit_macro_inputs(self, mac.tokens.clone());
     }
     fn visit_expr(&mut self, expression: &'ast syn::Expr) {
         if !expression_test_only(expression) {

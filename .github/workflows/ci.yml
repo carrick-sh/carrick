@@ -173,9 +173,14 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          fetch-depth: 0
       - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
         with:
           tool: just
+      - name: Fetch and validate authority debt base commit
+        env:
+          CI_EVENT: ${{ github.event_name }}
+        run: just ci-probe-coverage-base
       - name: Install repository Rust toolchain
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2

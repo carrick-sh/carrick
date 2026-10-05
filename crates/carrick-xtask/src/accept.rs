@@ -350,12 +350,14 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
     },
     StepSpec {
         name: "host-authority-linux",
-        program: "python3",
+        program: "cargo",
         args: &[
-            "scripts/migrate/check-host-authority-transitions.py",
-            "--check",
-            "--profiles",
-            "linux-*",
+            "run",
+            "--locked",
+            "-p",
+            "carrick-xtask",
+            "--",
+            "authority-debt",
         ],
         env: &[],
         log_name: "07-host-authority-linux.log",
@@ -1831,6 +1833,28 @@ mod tests {
                 .contains(&"carrick-cli/platform-linux,carrick-cli/syscall-shim")
         );
         assert!(clippy.args.ends_with(&["--", "-D", "warnings"]));
+    }
+
+    #[test]
+    fn linux_portable_applies_authority_debt_ceilings_with_live_discovery() {
+        let step = host_steps(AcceptProfile::LinuxPortable)
+            .iter()
+            .find(|step| step.name == "host-authority-linux")
+            .unwrap();
+        assert_eq!(step.program, "cargo");
+        assert_eq!(
+            step.args,
+            [
+                "run",
+                "--locked",
+                "-p",
+                "carrick-xtask",
+                "--",
+                "authority-debt"
+            ]
+        );
+        // Inherit the caller's CARRICK_AUTHORITY_BASE, as lint-domains does.
+        assert!(step.env.is_empty());
     }
 
     #[test]
