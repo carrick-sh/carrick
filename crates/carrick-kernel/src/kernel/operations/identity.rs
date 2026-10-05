@@ -90,10 +90,20 @@ impl Kernel {
     /// exited member's group before reaping it.
     pub fn process_identity(&self, task_id: TaskId) -> Option<ProcessIdentity> {
         let state = self.registry().settled().read();
-        if let Some(record) = state.tasks.get(&task_id) {
-            let container = record.task.container().id();
-            let process_group = record.task.process_group();
-            let session = record.task.session();
+        let visible = state
+            .tasks
+            .get(&task_id)
+            .map(|record| (&record.task, ProcessState::Live))
+            .or_else(|| {
+                state
+                    .retiring_tasks
+                    .get(&task_id)
+                    .map(|task| (task, ProcessState::Zombie))
+            });
+        if let Some((task, process_state)) = visible {
+            let container = task.container().id();
+            let process_group = task.process_group();
+            let session = task.session();
             let namespace_process_group = state
                 .process_groups
                 .get(&process_group)
@@ -106,12 +116,12 @@ impl Kernel {
                 .map(|session| session.namespace_id)?;
             return Some(ProcessIdentity {
                 pid: task_id,
-                parent: record.task.parent().map(|parent| parent.id),
+                parent: task.parent().map(|parent| parent.id),
                 process_group,
                 session,
                 namespace_process_group,
                 namespace_session,
-                state: ProcessState::Live,
+                state: process_state,
             });
         }
         state.zombies.get(&task_id).map(|record| ProcessIdentity {
@@ -194,7 +204,9 @@ impl Kernel {
 
     pub fn task_exists(&self, task_id: TaskId) -> bool {
         let state = self.registry().settled().read();
-        state.tasks.contains_key(&task_id) || state.zombies.contains_key(&task_id)
+        state.tasks.contains_key(&task_id)
+            || state.retiring_tasks.contains_key(&task_id)
+            || state.zombies.contains_key(&task_id)
     }
 
     /// Publish an immutable credential COW for exactly the calling thread.
