@@ -314,10 +314,12 @@ impl<P: PinnedMetadataExtent> NativeForkPortal<P> for MmPortal<'_, P> {
             words,
             request,
             &mut scratch,
-            parent_root,
-            0,
-            0,
-            0,
+            carrick_core::mm::fork::ForkTableCursor {
+                table: parent_root,
+                level: 0,
+                base: 0,
+                child_offset: 0,
+            },
         )?;
         if scratch.reads.iter().any(|(pa, _)| {
             request.child_tables.contains(*pa) || request.parent_tables.contains(*pa)
