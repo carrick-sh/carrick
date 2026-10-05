@@ -257,8 +257,18 @@ impl CowResolver for HardwareCowResolver {
                     },
                 )
             });
-        let Ok(Ok(outcome)) = outcome else {
-            return CowResolution::Refused;
+        let outcome = match outcome {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(crate::cow::CowError::Indeterminate)) => {
+                panic!("EL1 COW translation state indeterminate: failed rollback or alias restore")
+            }
+            Ok(Err(crate::cow::CowError::Corrupt)) => {
+                panic!("EL1 COW descriptor state corrupt")
+            }
+            Ok(Err(crate::cow::CowError::Internal)) => {
+                panic!("EL1 COW internal invariant violation")
+            }
+            Ok(Err(crate::cow::CowError::Refused)) | Err(_) => return CowResolution::Refused,
         };
         self.completion = match outcome {
             crate::cow::GuestCowOutcome::Resolved(completion) => Some(completion),
