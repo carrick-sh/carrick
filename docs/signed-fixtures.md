@@ -14,13 +14,13 @@ The signed steps in `crates/carrick-xtask/src/accept.rs` consume:
 | --- | --- | --- |
 | `generic_probe_shard_`, `case_`, and retained probes in the full profile | `conformance-probes/target/aarch64-unknown-linux-{musl,gnu}/release/<name>` | Locked `cargo build --release --target <triple> --bin <name> …` in `conformance-probes` |
 | `carrick-embed el1_` | `fixtures/linux-aarch64-hello/target/aarch64-unknown-linux-musl/release/<name>` | `scripts/build-linux-fixtures.sh`, raw `rustc --emit=obj` and static ELF linking; PIE declaration retains its static PIE shape |
-| Embed interceptor, file-reader, icache, and EL1 scheduler bindings | `target/embed-fixtures/{interceptor-probe,zone-readers,icache-reuse,el1-sched}-aarch64` | The four `scripts/build-embed-*.sh` builders, local musl Cargo builds |
+| Embed interceptor, file-reader, icache, copyout and EL1 scheduler bindings | `target/embed-fixtures/{interceptor-probe,zone-readers,icache-reuse,copyout,el1-sched}-aarch64` | The five `scripts/build-embed-*.sh` builders, local musl Cargo builds |
 
 The bundle contains every non-excluded `conformance` and `helper` entry in
 `conformance-probes/probe-inventory.json`, for both libcs. This includes
 `probeinit`, the fork/exec transport helper. At introduction there are 530
-names per libc, 68 raw fixture declarations, and four embed executables:
-1,132 executable destinations. Restore derives the inventory from the
+names per libc, 68 raw fixture declarations, and five embed executables after adding N1 copyout:
+1,133 executable destinations. Restore derives the inventory from the
 checkout rather than trusting this count or the manifest's claims.
 
 `case_` scripts and Python fixtures are tracked source inputs, compiled into
