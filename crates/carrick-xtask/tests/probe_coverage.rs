@@ -466,7 +466,7 @@ fn git_checkout_branch(repo_path: &Path, branch: &str) {
 }
 
 #[test]
-fn self_comparison_fails_clearly() {
+fn self_comparison_skips_delta_with_log() {
     let (_dir, repo_path) = init_git_repo();
     write_probe_source(&repo_path, "probe_a");
     let inv = BTreeMap::from([(
@@ -476,22 +476,21 @@ fn self_comparison_fails_clearly() {
     write_inventory(&repo_path, &inv);
     git_commit_all(&repo_path, "commit 1");
 
-    // Explicitly passing HEAD
+    // Explicitly passing HEAD: base equals HEAD, no change range -> skip delta with log and exit 0
     let res = run_probe_coverage(Some(&repo_path), Some("HEAD"));
-    match res {
-        Err(CoverageError::CannotCompareHeadToItself { .. }) => {}
-        other => panic!("expected CannotCompareHeadToItself, got: {other:?}"),
-    }
+    assert!(
+        res.is_ok(),
+        "explicit HEAD must skip delta and exit 0: {res:?}"
+    );
 
-    // Local resolution on main (where merge-base with main is HEAD)
-    // Run with explicit env_base=None so it does not inherit CARRICK_PROBE_COVERAGE_BASE from CI
+    // Local resolution on main (where merge-base with main is HEAD): skip delta with log and exit 0
     let res_none = run_probe_coverage_with_env(Some(&repo_path), None, None);
-    match res_none {
-        Err(CoverageError::CannotCompareHeadToItself { .. }) => {}
-        other => panic!("expected CannotCompareHeadToItself on local resolution, got: {other:?}"),
-    }
+    assert!(
+        res_none.is_ok(),
+        "local resolution on main must skip delta and exit 0: {res_none:?}"
+    );
 
-    // Also verify via child process with CARRICK_PROBE_COVERAGE_BASE removed from environment
+    // Child process execution: exits 0 and logs the skip
     let bin = env!("CARGO_BIN_EXE_carrick-xtask");
     let output = std::process::Command::new(bin)
         .arg("--root")
@@ -501,14 +500,17 @@ fn self_comparison_fails_clearly() {
         .output()
         .expect("execute carrick-xtask child process");
     assert!(
-        !output.status.success(),
-        "child process must fail on self-comparison"
+        output.status.success(),
+        "child process must succeed with exit 0 when no change range exists"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
-        stderr.contains("cannot compare HEAD to itself")
-            || stderr.contains("CannotCompareHeadToItself"),
-        "unexpected stderr from child process: {stderr}"
+        combined.contains("probe coverage delta: no change range"),
+        "expected skip log line, got: {combined}"
     );
 }
 
@@ -785,5 +787,125 @@ fn all_zero_push_base_fails_clearly() {
             );
         }
         other => panic!("expected BaseResolution error for all-zero push base, got: {other:?}"),
+    }
+}
+
+#[test]
+fn no_change_range_logs_skip_and_runs_absolute_checks() {
+    let (_dir, repo_path) = init_git_repo();
+    write_probe_source(&repo_path, "probe_a");
+    let inv = BTreeMap::from([(
+        "probe_a".to_string(),
+        sample_row("conformance", "generic", false),
+    )]);
+    write_inventory(&repo_path, &inv);
+    git_commit_all(&repo_path, "Commit 1: probe_a");
+
+    // 1. Valid repo with NO change range (base equals HEAD or None):
+    // Must log the skip and exit 0 (Ok(()))
+    let bin = env!("CARGO_BIN_EXE_carrick-xtask");
+    let output = std::process::Command::new(bin)
+        .arg("--root")
+        .arg(&repo_path)
+        .arg("probe-coverage")
+        .env_remove("CARRICK_PROBE_COVERAGE_BASE")
+        .output()
+        .expect("execute carrick-xtask child process");
+    assert!(
+        output.status.success(),
+        "probe-coverage must succeed when no change range exists, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    assert!(
+        combined.contains("probe coverage delta: no change range"),
+        "expected skip log line in output: {combined}"
+    );
+    assert!(
+        combined.contains("delta ratchet not applicable"),
+        "expected 'delta ratchet not applicable' in output: {combined}"
+    );
+
+    // 2. Absolute checks still run even with NO change range:
+    // Introduce a membership mismatch (source on disk but missing from inventory)
+    write_probe_source(&repo_path, "probe_missing_from_inv");
+    let res_mismatch = run_probe_coverage_with_env(Some(&repo_path), None, None);
+    assert!(
+        res_mismatch.is_err(),
+        "membership mismatch must still fail even when no change range exists"
+    );
+    match res_mismatch {
+        Err(CoverageError::Inventory(
+            carrick_xtask::probe_inventory::InventoryError::SourceInventoryDrift { .. },
+        )) => {}
+        other => panic!("expected SourceInventoryDrift, got: {other:?}"),
+    }
+}
+
+#[test]
+fn committed_coordinated_removal_with_base_fails() {
+    let (_dir, repo_path) = init_git_repo();
+    write_probe_source(&repo_path, "accessx");
+    write_probe_source(&repo_path, "other_probe");
+    let inv = BTreeMap::from([
+        (
+            "accessx".to_string(),
+            sample_row("conformance", "generic", false),
+        ),
+        (
+            "other_probe".to_string(),
+            sample_row("conformance", "generic", false),
+        ),
+    ]);
+    write_inventory(&repo_path, &inv);
+    git_commit_all(
+        &repo_path,
+        "Commit 1: base commit with accessx and other_probe",
+    );
+    let base_commit =
+        carrick_xtask::command::run_checked("git", ["rev-parse", "HEAD"], Some(&repo_path))
+            .expect("rev-parse Commit 1")
+            .stdout
+            .trim()
+            .to_string();
+
+    // Commit 2: coordinated removal of accessx from BOTH source and inventory
+    remove_probe_source(&repo_path, "accessx");
+    let shrunken_inv = BTreeMap::from([(
+        "other_probe".to_string(),
+        sample_row("conformance", "generic", false),
+    )]);
+    write_inventory(&repo_path, &shrunken_inv);
+    git_commit_all(
+        &repo_path,
+        "Commit 2: committed coordinated removal of accessx without review",
+    );
+
+    // With base = commit before removal, delta ratchet must run and FAIL
+    let res = run_probe_coverage(Some(&repo_path), Some(&base_commit));
+    match res {
+        Err(CoverageError::UnreviewedRemoval { probe, .. }) => {
+            assert_eq!(probe, "accessx");
+        }
+        other => panic!("expected UnreviewedRemoval for accessx, got: {other:?}"),
+    }
+
+    // Also verify closure preflight directly with base = commit before removal
+    let sources = BTreeSet::from(["other_probe".to_string()]);
+    let closure_res = carrick_xtask::probe_coverage::validate_closure_coverage(
+        &repo_path,
+        Some(&base_commit),
+        &shrunken_inv,
+        &sources,
+    );
+    match closure_res {
+        Err(CoverageError::UnreviewedRemoval { probe, .. }) => {
+            assert_eq!(probe, "accessx");
+        }
+        other => {
+            panic!("expected UnreviewedRemoval for accessx in closure preflight, got: {other:?}")
+        }
     }
 }
