@@ -23514,7 +23514,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3141,
+      "line": 3150,
       "categories": [
         "mapping"
       ],
@@ -23523,7 +23523,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3149,
+      "line": 3158,
       "categories": [
         "mapping"
       ],
@@ -23532,7 +23532,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3165,
+      "line": 3174,
       "categories": [
         "mapping"
       ],
@@ -23541,7 +23541,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/hvpatch/mod.rs",
-      "line": 3178,
+      "line": 3187,
       "categories": [
         "mapping"
       ],
