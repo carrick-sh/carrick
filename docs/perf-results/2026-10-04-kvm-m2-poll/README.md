@@ -94,3 +94,31 @@ full syscall conformance, or runtime-ratio claim is made.
   folded into this regression fix.
 
 Signed HVF and Docker gates are director-owned and were not run on this host.
+
+## Portable host readiness
+
+Cloudmac host acceptance on `01f0c26a3` exposed two additional adapter defects
+in the unchanged [poll assertions](poll-macos-red.log): eight ready duplicate
+entries returned one, and an invalid descriptor with `events = 0` returned
+zero instead of `POLLNVAL`. The gate completed with only those two test
+failures; the Linux-portable gate on that commit passed.
+
+Native Darwin `poll` gives readiness only to the last repeated descriptor
+and does not validate a descriptor when its event mask registers no filter.
+The bridge now validates every distinct nonnegative inherited host descriptor
+with `F_GETFD`, combines host interests per descriptor for one host poll,
+then publishes and counts each original Linux pollfd independently. Invalid
+entries are already ready, so the remaining host poll uses a zero timeout.
+Negative descriptors remain ignored. There are no retries or sampling loops.
+
+[Native observations](native-poll-macos.log) also show that Darwin needs an
+explicit `POLLHUP` interest to detect a closed peer when no input events were
+requested. Adding that interest does not report ordinary readable data to an
+entry with an empty mask. The adapter always requests hangup notification and
+filters ordinary readiness against each original entry's own interest mask.
+
+The original assertions remain intact. Additional cases cover distinct
+descriptor populations at 1/8/32, duplicate entries with different interests,
+and an unrequested hangup. Both repeated and distinct populations retain the
+exact 8*n guest bytes read and 2*n bytes written. Final-head results and the
+superseding Linux/cloudmac receipts are reported in the PR.
