@@ -105,14 +105,12 @@ pub struct HostLeaseArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 pub struct ProbeCoverageArgs {
-    #[arg(long, help = "Base commit to validate coverage against")]
-    pub base: Option<String>,
-
     #[arg(
         long,
-        help = "Refresh conformance-probes/coverage-base.json to current HEAD and inventory"
+        env = "CARRICK_PROBE_COVERAGE_BASE",
+        help = "Base commit to validate coverage against"
     )]
-    pub refresh_base: bool,
+    pub base: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,21 +345,11 @@ where
             Ok(())
         }
         Commands::ProbeCoverage(args) => {
-            if args.refresh_base {
-                probe_coverage::refresh_coverage_base(cli.root.as_deref())?;
-                writeln!(writer, "probe-coverage: baseline refreshed").map_err(|e| {
-                    CliError::Io {
-                        path: PathBuf::from("stdout"),
-                        source: e,
-                    }
-                })?;
-            } else {
-                probe_coverage::run_probe_coverage(cli.root.as_deref(), args.base.as_deref())?;
-                writeln!(writer, "probe-coverage: ok").map_err(|e| CliError::Io {
-                    path: PathBuf::from("stdout"),
-                    source: e,
-                })?;
-            }
+            probe_coverage::run_probe_coverage(cli.root.as_deref(), args.base.as_deref())?;
+            writeln!(writer, "probe-coverage: ok").map_err(|e| CliError::Io {
+                path: PathBuf::from("stdout"),
+                source: e,
+            })?;
             Ok(())
         }
         Commands::HostLease(args) => {

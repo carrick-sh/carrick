@@ -1,15 +1,17 @@
 //! Probe coverage ratchet and baseline authority.
 //!
-//! # Baseline Refresh Lifecycle
-//! `conformance-probes/coverage-base.json` is refreshed at each landing, after
-//! the landing's probes are added and blessed, as part of the landing commit.
-//! The refresh is executed via `just xtask probe-coverage --refresh-base` (or
-//! `cargo run -p carrick-xtask -- probe-coverage --refresh-base`).
+//! # Baseline Comparison Lifecycle
+//! Conformance probe coverage ratchet validates the current probe inventory against
+//! the actual PR base (or merge-base) recorded in git. In CI on pull requests,
+//! the target base commit is provided by CI (e.g. `github.event.pull_request.base.sha`
+//! or `github.event.merge_group.base_sha` via the `CARRICK_PROBE_COVERAGE_BASE` environment
+//! variable or `--base` flag).
 //!
-//! Refresh enforces ratchet invariants: before updating `coverage-base.json`
-//! with the current HEAD and current inventory, it validates that no rows have been
-//! silently removed or altered without matching entries in
-//! `conformance-probes/reviewed-retirements.json`.
+//! In local execution, the base is resolved against candidate main branches
+//! (`refs/remotes/github/main`, `refs/remotes/origin/main`, `refs/heads/main`, `main`)
+//! via `git merge-base`. If the resolved merge-base is identical to HEAD (e.g. on main
+//! or a clean branch without commits), execution fails clearly rather than silently
+//! comparing HEAD to itself.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,14 +30,6 @@ pub struct ProbeIdentity {
     pub class: String,
     pub runner: String,
     pub excluded: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CoverageBase {
-    pub schema: String,
-    pub base_head: String,
-    pub probes: BTreeMap<String, ProbeIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,17 +168,12 @@ pub enum CoverageError {
     InvalidClass { probe: String, class: String },
     #[error("probe '{probe}' added to inventory but missing from sources")]
     MissingSourceForAddition { probe: String },
-}
-
-pub fn load_coverage_base(path: &Path) -> Result<CoverageBase, CoverageError> {
-    let raw = std::fs::read_to_string(path).map_err(|e| CoverageError::Io {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
-    serde_json::from_str(&raw).map_err(|e| CoverageError::JsonFile {
-        path: path.to_path_buf(),
-        source: e,
-    })
+    #[error(
+        "cannot compare HEAD to itself ('{head}'): probe coverage requires an explicit distinct base commit or diverged merge-base"
+    )]
+    CannotCompareHeadToItself { head: String },
+    #[error("failed to resolve comparison base: {0}")]
+    BaseResolution(String),
 }
 
 pub fn load_reviewed_retirements(path: &Path) -> Result<ReviewedRetirementsDoc, CoverageError> {
@@ -311,21 +300,73 @@ pub fn validate_coverage(
     Ok(())
 }
 
-pub fn validate_coverage_files(
-    base_path: &Path,
-    retirements_path: &Path,
-    current_inventory: &BTreeMap<String, ProbeInventoryRow>,
-    sources: &BTreeSet<String>,
-) -> Result<(), CoverageError> {
-    let base = load_coverage_base(base_path)?;
-    let retirements_doc = load_reviewed_retirements(retirements_path)?;
-    validate_coverage(
-        &base.base_head,
-        &base.probes,
-        current_inventory,
-        sources,
-        retirements_doc.records(),
-    )
+pub fn resolve_local_base_target(repo_root: &Path) -> Result<String, CoverageError> {
+    let candidates = [
+        "refs/remotes/github/main",
+        "refs/remotes/origin/main",
+        "refs/heads/main",
+        "main",
+    ];
+    let mut tried = Vec::new();
+    for candidate in candidates {
+        if command::run_checked("git", ["rev-parse", "--verify", candidate], Some(repo_root))
+            .is_ok()
+        {
+            if command::run_checked("git", ["merge-base", "HEAD", candidate], Some(repo_root))
+                .is_ok()
+            {
+                return Ok(candidate.to_string());
+            }
+            tried.push(format!("{candidate} (no common merge-base with HEAD)"));
+        } else {
+            tried.push(format!("{candidate} (ref not found)"));
+        }
+    }
+    Err(CoverageError::BaseResolution(format!(
+        "no candidate base ref could resolve a merge-base with HEAD (tried: {}); specify an explicit --base <commit>",
+        tried.join(", ")
+    )))
+}
+
+pub fn resolve_base_commit(
+    repo_root: &Path,
+    explicit_base: Option<&str>,
+    current_head: &str,
+) -> Result<String, CoverageError> {
+    let target = match explicit_base.filter(|s| !s.trim().is_empty()) {
+        Some(b) => b.trim().to_string(),
+        None => {
+            if let Ok(env_base) = std::env::var("CARRICK_PROBE_COVERAGE_BASE") {
+                if !env_base.trim().is_empty() {
+                    env_base.trim().to_string()
+                } else {
+                    resolve_local_base_target(repo_root)?
+                }
+            } else {
+                resolve_local_base_target(repo_root)?
+            }
+        }
+    };
+
+    let mb_out = command::run_checked("git", ["merge-base", "HEAD", &target], Some(repo_root))
+        .map_err(|e| {
+            CoverageError::BaseResolution(format!(
+                "could not compute merge-base between HEAD and '{target}': {e}"
+            ))
+        })?;
+    let resolved_sha = mb_out.stdout.trim().to_string();
+    if resolved_sha.is_empty() {
+        return Err(CoverageError::BaseResolution(format!(
+            "empty merge-base between HEAD and '{target}'"
+        )));
+    }
+    if resolved_sha == current_head {
+        return Err(CoverageError::CannotCompareHeadToItself {
+            head: current_head.to_string(),
+        });
+    }
+
+    Ok(resolved_sha)
 }
 
 pub fn run_probe_coverage(
@@ -341,6 +382,9 @@ pub fn run_probe_coverage(
     })?;
     let repo_root = &repo_info.repository_root;
 
+    let head_out = command::run_checked("git", ["rev-parse", "HEAD"], Some(repo_root))?;
+    let current_head = head_out.stdout.trim().to_string();
+
     let inv_path = repo_root.join("conformance-probes/probe-inventory.json");
     let current_inventory = load_inventory(&inv_path)?;
 
@@ -353,81 +397,18 @@ pub fn run_probe_coverage(
     let ret_path = repo_root.join("conformance-probes/reviewed-retirements.json");
     let retirements_doc = load_reviewed_retirements(&ret_path)?;
 
-    if let Some(commit) = base_commit {
-        let git_out = command::run_checked(
-            "git",
-            [
-                "show",
-                &format!("{commit}:conformance-probes/probe-inventory.json"),
-            ],
-            Some(repo_root),
-        )?;
-        let base_inventory = load_inventory_from_str(&git_out.stdout)?;
-        let base_probes: BTreeMap<String, ProbeIdentity> = base_inventory
-            .into_iter()
-            .map(|(k, v)| {
-                (
-                    k,
-                    ProbeIdentity {
-                        class: v.class,
-                        runner: v.runner,
-                        excluded: v.excluded,
-                    },
-                )
-            })
-            .collect();
+    let resolved_base = resolve_base_commit(repo_root, base_commit, &current_head)?;
 
-        let head_out = command::run_checked("git", ["rev-parse", commit], Some(repo_root))?;
-        let resolved_head = head_out.stdout.trim().to_string();
-
-        validate_coverage(
-            &resolved_head,
-            &base_probes,
-            &current_inventory,
-            &sources,
-            retirements_doc.records(),
-        )?;
-    } else {
-        let base_path = repo_root.join("conformance-probes/coverage-base.json");
-        validate_coverage_files(&base_path, &ret_path, &current_inventory, &sources)?;
-    }
-
-    Ok(())
-}
-
-pub fn refresh_coverage_base(root: Option<&Path>) -> Result<(), CoverageError> {
-    let repo_info = crate::cli::resolve_repo_info(root).map_err(|e| match e {
-        crate::cli::CliError::Io { path, source } => CoverageError::Io { path, source },
-        other => CoverageError::InvalidReviewRecord {
-            probe: "repo".to_string(),
-            reason: other.to_string(),
-        },
-    })?;
-    let repo_root = &repo_info.repository_root;
-
-    let inv_path = repo_root.join("conformance-probes/probe-inventory.json");
-    let current_inventory = load_inventory(&inv_path)?;
-
-    let src_dir = repo_root.join("conformance-probes/src/bin");
-    let sources = read_probe_source_names(&src_dir)?;
-
-    let inv_names: BTreeSet<String> = current_inventory.keys().cloned().collect();
-    validate_source_membership(&inv_names, &sources)?;
-
-    let ret_path = repo_root.join("conformance-probes/reviewed-retirements.json");
-    let base_path = repo_root.join("conformance-probes/coverage-base.json");
-
-    // If an existing coverage-base.json exists, validate current inventory against it first!
-    // This refuses to drop a row or alter identity unless listed in reviewed-retirements.json.
-    if base_path.exists() {
-        validate_coverage_files(&base_path, &ret_path, &current_inventory, &sources)?;
-    }
-
-    // Now construct the new CoverageBase using the current HEAD and current inventory.
-    let head_out = command::run_checked("git", ["rev-parse", "HEAD"], Some(repo_root))?;
-    let current_head = head_out.stdout.trim().to_string();
-
-    let probes: BTreeMap<String, ProbeIdentity> = current_inventory
+    let git_out = command::run_checked(
+        "git",
+        [
+            "show",
+            &format!("{resolved_base}:conformance-probes/probe-inventory.json"),
+        ],
+        Some(repo_root),
+    )?;
+    let base_inventory = load_inventory_from_str(&git_out.stdout)?;
+    let base_probes: BTreeMap<String, ProbeIdentity> = base_inventory
         .into_iter()
         .map(|(k, v)| {
             (
@@ -441,28 +422,13 @@ pub fn refresh_coverage_base(root: Option<&Path>) -> Result<(), CoverageError> {
         })
         .collect();
 
-    let new_base = CoverageBase {
-        schema: "carrick-probe-coverage-base-v1".to_string(),
-        base_head: current_head,
-        probes,
-    };
-
-    let mut json_bytes = serde_json::to_vec_pretty(&new_base).map_err(CoverageError::Json)?;
-    json_bytes.push(b'\n');
-
-    let temp_path = repo_root.join(format!(
-        "conformance-probes/.coverage-base.json.tmp-{}",
-        std::process::id()
-    ));
-
-    std::fs::write(&temp_path, &json_bytes).map_err(|e| CoverageError::Io {
-        path: temp_path.clone(),
-        source: e,
-    })?;
-    std::fs::rename(&temp_path, &base_path).map_err(|e| CoverageError::Io {
-        path: base_path.clone(),
-        source: e,
-    })?;
+    validate_coverage(
+        &resolved_base,
+        &base_probes,
+        &current_inventory,
+        &sources,
+        retirements_doc.records(),
+    )?;
 
     Ok(())
 }
