@@ -150,6 +150,7 @@ applevisor-sys.workspace = true
 mach2.workspace = true
 
 [dev-dependencies]
+wait-timeout = "0.2.1"
 loom = "=0.7.2"
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
