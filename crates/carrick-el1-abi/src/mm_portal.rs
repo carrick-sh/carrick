@@ -6,7 +6,7 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 // SELECT success carries the pre-selection Reservations observation in x16/x17.
-pub const MM_PORTAL_PROTOCOL: u64 = 5;
+pub const MM_PORTAL_PROTOCOL: u64 = 6;
 pub const MM_PORTAL_MAX_BYTES: u64 = 4096;
 pub const MM_PORTAL_BIND_ESR: u64 = 0x4352_4d4d_4249_0004;
 /// A closed initial root's one-publication identity, minted only by the
@@ -83,6 +83,73 @@ impl El1MmHandle {
         self.incarnation
     }
 }
+
+/// A proposal for one page of pending heap retirement, never user-copy authority.
+/// The owner must authenticate the complete request and admitted incarnation
+/// again before selecting any physical backing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortalBackingMaintenance {
+    handle: El1MmHandle,
+    pending: crate::ReservationRequest,
+    page: u64,
+}
+impl PortalBackingMaintenance {
+    pub fn new(handle: El1MmHandle, pending: crate::ReservationRequest, page: u64) -> Option<Self> {
+        (handle.mm() == pending.mm
+            && pending.operation == crate::ReservationOperation::Retire
+            && pending.protection == crate::ReservationProtection::NONE
+            && pending.source.is_none()
+            && page.is_multiple_of(4096)
+            && pending.range.contains(page))
+        .then_some(Self {
+            handle,
+            pending,
+            page,
+        })
+    }
+    pub const fn handle(self) -> El1MmHandle {
+        self.handle
+    }
+    pub const fn pending(self) -> crate::ReservationRequest {
+        self.pending
+    }
+    pub const fn page(self) -> u64 {
+        self.page
+    }
+    pub fn words(self) -> [u64; 8] {
+        [
+            self.handle.carrier().get(),
+            self.pending.mm.raw(),
+            self.handle.incarnation().get(),
+            self.pending.generation.raw(),
+            self.pending.sequence.raw(),
+            self.pending.range.start(),
+            self.pending.range.end(),
+            self.page,
+        ]
+    }
+    pub fn decode(w: [u64; 8]) -> Option<Self> {
+        let mm = crate::ReservationMm::new(w[1])?;
+        // SAFETY: candidate only; the maintenance service authenticates it.
+        let handle = unsafe {
+            El1MmHandle::from_admitted_owner(NonZeroU64::new(w[0])?, mm, NonZeroU64::new(w[2])?)
+        };
+        Self::new(
+            handle,
+            crate::ReservationRequest {
+                mm,
+                generation: crate::ReservationGeneration::new(w[3])?,
+                sequence: crate::ReservationSequence::new(w[4])?,
+                range: crate::ReservationRange::new(w[5], w[6])?,
+                protection: crate::ReservationProtection::NONE,
+                operation: crate::ReservationOperation::Retire,
+                source: None,
+            },
+            w[7],
+        )
+    }
+}
+pub const MM_PORTAL_MAINTENANCE_ESR: u64 = 0x4352_4d4d_424d_0001;
 
 pub const MM_PORTAL_SELECT_ESR: u64 = 0x4352_4d4d_5345_0004;
 pub const MM_PORTAL_SERVICE_ESR: u64 = 0x4352_4d4d_5452_0004;
