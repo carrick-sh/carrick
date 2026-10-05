@@ -13,9 +13,11 @@
  *     2 parent space, 3 table pool/live words, 4 census, 5 prepare,
  *     6 physical custody, 7 owner publication, 8 detached receipt.
  *     hvpatch-el1-root-prepublish(u64 mm, u32 phase) phase 9 records the
- *     closed child publication before this service starts. Live provider
- *     qualification on a signed artifact is pending; zero refusal events
- *     cannot be interpreted as a successful owner Fork. Darwin has no
+ *     closed child publication before this service starts. Live-qualified
+ *     2026-10-05 on e1435e4e0: VMA/ptrace each emitted two controls and
+ *     errno=22/stage=3 with errors=0, bounded=0, consumer drops rejected.
+ *     Receipt: docs/perf-results/2026-10-05-n1-maintenance-gate.md. Zero
+ *     refusal events do not prove a successful owner Fork. Darwin has no
  *     dtrace:::DROP probe (live-qualified 2026-10-05); carrick trace rejects
  *     all libdtrace consumer drop counters. Require --require-script-exit
  *     and a zero CLI exit in addition to this script summary.
