@@ -3,6 +3,8 @@ name = "carrick-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Neutral MM, fork, COW, and wait/lifecycle substrate for Carrick."
 
 [features]
 default = []
@@ -13,11 +15,10 @@ carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-sched-core = { path = "../carrick-sched-core" }
+carrick-el1-abi = { path = "../carrick-el1-abi" }
 
 [dev-dependencies]
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
-
-carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }
 
 [lints]
