@@ -432,6 +432,7 @@ pub enum ReadinessProbe {
 
 #[derive(Clone, Debug)]
 pub struct SignalReadinessProbe {
+    terminal_action: bool,
     pub(crate) kernel: Weak<Kernel>,
     pub(crate) host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
     pub(crate) task_ref: Weak<Task>,
@@ -468,6 +469,7 @@ impl SignalReadinessProbe {
             _ => state.authority.task_wake_generation,
         };
         Self {
+            terminal_action: state.authority.is_terminal_action(),
             kernel: state.authority.kernel.clone(),
             host_signal: Arc::clone(&state.authority.host_signal),
             task_ref: state.authority.task_ref.clone(),
@@ -506,6 +508,11 @@ impl SignalReadinessProbe {
     /// Sample authoritative signal state without assuming that a producer
     /// edge occurred. This is safe to call during continuation enrollment.
     pub fn event(&self) -> Option<ContinuationEvent> {
+        // Terminal actions must finish their retained obligation. Leave every
+        // signal pending; a handler cannot restart or return from an exit.
+        if self.terminal_action {
+            return None;
+        }
         let kernel = self.kernel.upgrade()?;
         let context = kernel.context(self.task.id, self.thread.tid).ok()?;
         if context.task().key() != self.task || context.thread().key() != self.thread {
