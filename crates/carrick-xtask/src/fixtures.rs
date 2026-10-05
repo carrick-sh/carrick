@@ -12,31 +12,11 @@ use thiserror::Error;
 use crate::{command, probe_inventory, provision};
 
 pub mod archive;
+mod inputs;
+use inputs::source_hashes;
 
 const SCHEMA: &str = "carrick.fixtures.v1";
 pub const INSTALLED_MANIFEST: &str = "target/fixtures/installed.json";
-const INPUTS: &[&str] = &[
-    // The EL1 scheduler fixture depends on workspace path crates. Hash the
-    // tracked workspace conservatively, including root dependency/patch and
-    // lint declarations, so adding a transitive local crate cannot escape
-    // provenance without needing Cargo or a registry on the restore host.
-    "Cargo.toml",
-    "Cargo.lock",
-    "crates",
-    "conformance-probes",
-    "fixtures/linux-aarch64-hello",
-    "fixtures/embed-interceptor-probe",
-    "fixtures/embed-zone-readers",
-    "fixtures/embed-icache-reuse",
-    "fixtures/embed-el1-sched",
-    "scripts/build-linux-fixtures.sh",
-    "scripts/build-embed-interceptor-probe.sh",
-    "scripts/build-embed-zone-readers.sh",
-    "scripts/build-embed-icache-reuse.sh",
-    "scripts/build-embed-el1-sched.sh",
-    "rust-toolchain.toml",
-    ".cargo/config.toml",
-];
 const EMBED: &[(&str, &str)] = &[
     ("embed-interceptor-probe", "interceptor-probe"),
     ("embed-zone-readers", "zone-readers"),
@@ -83,6 +63,11 @@ pub enum FixturesAction {
         manifest: Option<PathBuf>,
         #[arg(long, help = "Expected commit (default: checkout HEAD)")]
         sha: Option<String>,
+        #[arg(
+            long,
+            help = "Write fresh input-identity verification evidence as JSON"
+        )]
+        receipt: Option<PathBuf>,
     },
 }
 
@@ -192,8 +177,45 @@ pub struct Manifest {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Installed {
+    validation: ValidationReceipt,
     manifest_sha256: ContentHash,
     manifest: Manifest,
+}
+
+/// Fixture evidence is scoped to input bytes, never a claim of full-tree equality.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationReceipt {
+    pub validation_method: ValidationMethod,
+    pub checkout_head: CommitSha,
+    pub bundle_source_head: CommitSha,
+    pub checkout_dirty: bool,
+    pub manifest_sha256: ContentHash,
+    pub inputs_sha256: ContentHash,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationMethod {
+    InputIdentity,
+}
+
+fn validation_receipt(root: &Path, manifest: &Manifest) -> Result<ValidationReceipt> {
+    Ok(ValidationReceipt {
+        validation_method: ValidationMethod::InputIdentity,
+        checkout_head: expected_head(root, Some(&manifest.source_head.0))?,
+        bundle_source_head: manifest.source_head.clone(),
+        checkout_dirty: !git(root, &["status", "--porcelain", "--untracked-files=all"])?
+            .trim()
+            .is_empty(),
+        manifest_sha256: hash_bytes(&manifest_bytes(manifest)?),
+        inputs_sha256: hash_bytes(&serde_json::to_vec(&manifest.sources)?),
+    })
+}
+
+/// Revalidate all installed bytes before generating evidence for this invocation.
+pub fn verify_installed_receipt(root: &Path) -> Result<ValidationReceipt> {
+    validation_receipt(root, &verify_installed(root)?)
 }
 
 fn hash_bytes(bytes: &[u8]) -> ContentHash {
@@ -264,24 +286,6 @@ fn expected_head(root: &Path, sha: Option<&str>) -> Result<CommitSha> {
         }
     }
     Ok(head)
-}
-fn source_hashes(root: &Path) -> Result<BTreeMap<String, ContentHash>> {
-    let mut args = vec!["status", "--porcelain", "--untracked-files=all", "--"];
-    args.extend(INPUTS);
-    if !git(root, &args)?.trim().is_empty() {
-        return Err(fail("dirty fixture source inputs"));
-    }
-    let mut args = vec!["ls-files", "-z", "--"];
-    args.extend(INPUTS);
-    let paths = git(root, &args)?;
-    let mut sources = BTreeMap::new();
-    for relative in paths.split('\0').filter(|p| !p.is_empty()) {
-        sources.insert(relative.to_owned(), hash_source(root, relative)?);
-    }
-    if sources.is_empty() {
-        return Err(fail("empty fixture source inventory"));
-    }
-    Ok(sources)
 }
 
 fn probe_names(root: &Path) -> Result<Vec<String>> {
@@ -595,6 +599,7 @@ pub fn restore(root: &Path, path: &Path, sha: Option<&str>) -> Result<RestoreWor
         work.executable_publications += 1;
     }
     let installed = Installed {
+        validation: validation_receipt(root, &manifest)?,
         manifest_sha256: hash_bytes(&manifest_bytes(&manifest)?),
         manifest,
     };
@@ -796,15 +801,25 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
                 work.executable_publications, work.durability_flushes
             )?;
         }
-        FixturesAction::Verify { manifest, sha } => {
+        FixturesAction::Verify {
+            manifest,
+            sha,
+            receipt,
+        } => {
             expected_head(root, sha.as_deref())?;
             let manifest = match manifest {
                 Some(path) => verify_bundle(root, &path, sha.as_deref())?,
                 None => verify_installed(root)?,
             };
+            if let Some(path) = receipt {
+                fs::write(
+                    path,
+                    serde_json::to_vec_pretty(&validation_receipt(root, &manifest)?)?,
+                )?;
+            }
             writeln!(
                 writer,
-                "fixtures: verified {} executables for {}",
+                "fixtures: verified {} executables for {} by input_identity",
                 manifest.executables.len(),
                 manifest.source_head.0
             )?;
