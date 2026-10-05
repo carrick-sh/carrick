@@ -12,7 +12,7 @@ impl OwnerForkMmu for X86Mmu {
         level < 3 && word & PRESENT != 0 && word & HUGE == 0
     }
     fn table_word(output: FrameGpa, inherited: Option<u64>) -> u64 {
-        output.raw() | inherited.map_or(PRESENT | WRITE | USER, |word| word & !ADDRESS)
+        output.raw() | inherited.map_or(PRESENT, |word| word & !ADDRESS)
     }
     fn is_user(word: u64) -> bool {
         word & USER != 0
