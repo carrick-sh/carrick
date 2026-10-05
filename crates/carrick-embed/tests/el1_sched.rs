@@ -27,6 +27,107 @@ use carrick_embed::{
 
 const FIXTURE: &str = "/opt/carrick/el1-sched";
 
+/// Failure-only live capture for this witness. The signed embed carrier is
+/// this process, so there is no CLI parent to discover or attach by mistake.
+/// Hold the terminal report's write until LLDB has read both always-on rings
+/// and all host stacks; guest exit_group has not run yet. Passing commands
+/// produce no output, and therefore incur no debugger or file activity.
+struct TlbAckCapture {
+    bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    dir: std::path::PathBuf,
+    fired: bool,
+}
+
+impl std::io::Write for TlbAckCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let report = {
+            let mut output = self.bytes.lock().unwrap();
+            output.extend_from_slice(bytes);
+            let ready = String::from_utf8_lossy(&output).lines().any(|line| {
+                line.starts_with("tlb-command-timeout ") && line.ends_with(" terminal=true")
+            }) && output.ends_with(b"\n");
+            (!self.fired && ready).then(|| output.clone())
+        };
+        if let Some(report) = report {
+            self.fired = true;
+            std::fs::create_dir_all(&self.dir)?;
+            std::fs::write(self.dir.join("terminal-report.txt"), report)?;
+            // The server needs a running carrier, so request its bounded
+            // coherent projection before LLDB pauses the process. Refusals
+            // and degraded responses remain separate evidence.
+            use carrick_kernel::kernel::debug::{ClientError, fetch};
+            match fetch(&common::run_id(), None) {
+                Ok(snapshot) => std::fs::write(
+                    self.dir.join("kernel-debug.json"),
+                    serde_json::to_vec_pretty(&snapshot)?,
+                )?,
+                Err(ClientError::Degraded(degraded)) => std::fs::write(
+                    self.dir.join("kernel-debug.degraded.json"),
+                    serde_json::to_vec_pretty(&degraded)?,
+                )?,
+                Err(error) => {
+                    std::fs::write(self.dir.join("kernel-debug.error.txt"), error.to_string())?
+                }
+            }
+            let exe = std::env::current_exe()?;
+            std::fs::write(
+                self.dir.join("carrier.txt"),
+                format!(
+                    "pid={}\nrun_id={}\nexecutable={}\nsource_head={}\n",
+                    std::process::id(),
+                    common::run_id(),
+                    exe.display(),
+                    String::from_utf8_lossy(
+                        &std::process::Command::new("git")
+                            .args(["rev-parse", "HEAD"])
+                            .output()?
+                            .stdout
+                    )
+                    .trim(),
+                ),
+            )?;
+            std::fs::copy(&exe, self.dir.join("carrier-executable"))?;
+            let dsym = std::path::PathBuf::from(format!("{}.dSYM", exe.display()));
+            let status = std::process::Command::new("/bin/cp")
+                .arg("-R")
+                .arg(dsym)
+                .arg(self.dir.join("carrier-executable.dSYM"))
+                .status()?;
+            assert!(
+                status.success(),
+                "preserving carrier symbols failed: {status}"
+            );
+            let log = std::fs::File::create(self.dir.join("carrier.lldb.txt"))?;
+            let plugin = common::repo_root().join("scripts/carrick_lldb.py");
+            let core = self.dir.join("carrier.core");
+            let status = std::process::Command::new("sudo")
+                .args(["-n", "/usr/bin/lldb", "--batch", "-p"])
+                .arg(std::process::id().to_string())
+                .arg("-o")
+                .arg(format!("command script import {:?}", plugin))
+                .args(["-o", "carrick eventring 8192"])
+                .args(["-o", "carrick eventring --high-rate 8192"])
+                .args(["-o", "thread backtrace all"])
+                .arg("-o")
+                .arg(format!(
+                    "process save-core --style modified-memory {:?}",
+                    core
+                ))
+                .args(["-o", "detach"])
+                .stdout(log.try_clone()?)
+                .stderr(log)
+                .status()?;
+            assert!(status.success(), "TLB ack capture failed: {status}");
+            println!("TLB ack live capture: {}", self.dir.display());
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn measured_sample_backing_is_fixed_across_short_and_long_runs() {
     for (short, long) in [(5_000, 55_000), (200, 1_200)] {
@@ -226,14 +327,29 @@ fn run_fixture(carrier: &Carrier, args: &[&str], timeout: Duration) -> Measured 
     let zone_before = ZoneCounts::read();
     let cpu_before = carrier_cpu_ns();
     let start = std::time::Instant::now();
-    let result = common::run_or_fail(
-        carrier
-            .container(common::SMOKE_IMAGE)
-            .pull_policy(PullPolicy::Missing)
-            .command(command)
-            .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()))
-            .run_blocking(),
-    );
+    let mut builder = carrier
+        .container(common::SMOKE_IMAGE)
+        .pull_policy(PullPolicy::Missing)
+        .command(command)
+        .vfs_mount("/opt/carrick", Box::new(el1_sched_vfs()));
+    let mut captured = None;
+    if args.first() == Some(&"tlb-stale-threads")
+        && (args.get(3) != Some(&"omit-first-write-ack")
+            || std::env::var("CARRICK_TLB_ACK_CAPTURE_INJECTED").as_deref() == Ok("1"))
+        && let Some(dir) = std::env::var_os("CARRICK_TLB_ACK_CAPTURE_DIR")
+    {
+        let bytes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        builder = builder.stdout(carrick_embed::StdioConfig::Piped(Box::new(TlbAckCapture {
+            bytes: bytes.clone(),
+            dir: std::path::PathBuf::from(dir).join(common::run_id()),
+            fired: false,
+        })));
+        captured = Some(bytes);
+    }
+    let mut result = common::run_or_fail(builder.run_blocking());
+    if let Some(bytes) = captured {
+        result.stdout = std::mem::take(&mut *bytes.lock().unwrap());
+    }
     let wall = start.elapsed();
     let cpu_ns = carrier_cpu_ns() - cpu_before;
     let exits = vcpu_run_exits_total() - exits_before;
@@ -2686,6 +2802,8 @@ fn el1_tlb_first_missed_ack_is_terminal() {
         !measured.result.success(),
         "a missed acknowledgement passed"
     );
+    assert_eq!(measured.result.exit_code, 1, "{}", describe(&measured));
+    assert_eq!(measured.result.signal, None, "{}", describe(&measured));
     assert!(
         stdout.contains(
             "tlb-command-timeout command=0x202 op=write-probe phase=read-only round=0 worker=1 "
@@ -2693,6 +2811,23 @@ fn el1_tlb_first_missed_ack_is_terminal() {
         "missing the first unacknowledged command: {stdout:?}"
     );
     assert!(stdout.contains(" vcpu=2 "), "missing vCPU: {stdout:?}");
+    let missing = stdout
+        .lines()
+        .find(|line| line.contains(" missing=true "))
+        .expect("no unacknowledged worker was identified");
+    assert!(missing.contains(" worker=1 tid="), "{missing}");
+    assert!(
+        !missing.contains(" tid=0 "),
+        "unregistered worker: {missing}"
+    );
+    assert!(
+        missing.contains(" seen=0x202 acknowledged=0x101 "),
+        "{missing}"
+    );
+    assert!(
+        missing.contains(" acks=3 target=4 terminal=true"),
+        "{missing}"
+    );
     assert!(
         !stdout.contains("expected_faults="),
         "continued page edits and aggregated contaminated evidence: {stdout:?}"
