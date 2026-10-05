@@ -231,16 +231,15 @@ impl SyscallDispatcher {
 
     /// Commit a published grant once stage-1, stage-2 and inventory are live
     /// (host lane) or EL1's receipt verifies (guest lane). Live grants publish
-    /// residency; grants overtaken by retirement retain only return accounting.
+    /// residency only for the fragments not overtaken by retirement.
     pub fn commit_published_frame_grant<'permit>(
         &self,
         plan: impl Into<PublishedFrameGrantPlan<'permit>>,
         residency: carrick_el1_abi::FrameGrantResidencyIdentity,
     ) {
-        if self.mem_view().commit_published_frame_grant(plan.into())
-            && let Some(table) = carrick_el1_abi::frame_grant_residency_host()
-        {
-            let _ = table.publish(residency);
+        let publication = self.mem_view().commit_published_frame_grant(plan.into());
+        if let Some(table) = carrick_el1_abi::frame_grant_residency_host() {
+            publication.publish(table, residency);
         }
     }
 
