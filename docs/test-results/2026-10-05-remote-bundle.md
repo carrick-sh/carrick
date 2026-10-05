@@ -60,3 +60,49 @@ snapshot inputs`. The final clean-tree result is recorded in the PR handoff.
 
 The director owns the full host/signed acceptance gates. These portable
 results confer no signed artifact receipt or macOS runtime acceptance.
+
+## macOS temporary-root follow-up
+
+The fixture test roots now use `std::fs::canonicalize` immediately after
+creating each owned tempdir. Synthetic symlinks are created beneath that
+physical root and remain unresolved. Admission continues to reject symlinks
+in ancestors and in the final component; callers must supply physical
+store paths, including `/private/var/...` instead of `/var/...` on macOS.
+
+Cloudmac testing used a detached scratch worktree at
+`/Volumes/carrick-build/wt/remote-bundle-portability-20261005-43f2d30-c`,
+with `/Volumes/carrick/dev/env.sh` sourced. Since that environment overrides
+TMPDIR, the tests explicitly used `getconf DARWIN_USER_TEMP_DIR`, which
+returned `/var/folders/0f/31_g11zs5339g5sxg6hjmxgw0000gn/T/`.
+Both runs were protected by `just lease carrick`. Fixture operations used
+a separate scratch lock and cleared the inherited lease environment, so
+they tested private gate admission without upgrading the outer host lease.
+
+Before canonicalization, with specific rejection assertions added:
+
+```sh
+just lease carrick env -u CARRICK_HOST_LEASE_FD -u CARRICK_HOST_LEASE_MODE CARRICK_HOST_LEASE_PATH="$scratch/fixture-test.lock" TMPDIR="$mac_test_tmp" CARGO_TARGET_DIR="$scratch/target" cargo test -p carrick-xtask --test fixtures remote_preparation -- --nocapture
+```
+
+Exit **101**: all seven focused tests failed. Successful preparations hit
+`Not a directory (os error 20)` at `/var`; rejection controls also failed
+their intended-reason assertions instead of passing for that system alias.
+
+After canonicalization, with `CARGO_TARGET_DIR="$scratch/target"` exported:
+
+```sh
+just lease carrick env -u CARRICK_HOST_LEASE_FD -u CARRICK_HOST_LEASE_MODE CARRICK_HOST_LEASE_PATH="$scratch/fixture-test.lock" TMPDIR="$mac_test_tmp" cargo test -p carrick-xtask
+```
+
+Exit **0**: 162 tests passed, one existing subprocess helper ignored. Linux
+`cargo test -p carrick-xtask`, `just clippy`, xtask clippy with `-D warnings`,
+and `just fmt-check` also exited zero. Symlink, publication-name,
+non-regular-source, stale-SHA, gzip and provenance-write negatives now check
+the intended rejection reason as well as failure.
+
+The cloudmac fixture test source SHA-256 matched Linux:
+`880c99b7c76e0302ecae70af44fe0a13ce0317e2e12b48527091697b501d1713`.
+The scratch worktree and transfer files were removed after testing.
+Logs are retained on carrick-vm under
+`/tmp/remote-bundle-portability-{cloudmac-red,cloudmac-green,linux-tests,clippy,xtask-clippy,fmt}.log`.
+These were VM-free macOS tests, not signed/HVF acceptance.

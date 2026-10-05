@@ -9,6 +9,29 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// tempfile may return a path under macOS's symlinked /var. Keep ownership
+// for cleanup, but construct all fixture paths from the physical root. Test
+// symlinks are created beneath this root and deliberately remain unresolved.
+struct CanonicalTempDir {
+    _owner: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl CanonicalTempDir {
+    fn new() -> Self {
+        let owner = tempfile::tempdir().unwrap();
+        let path = fs::canonicalize(owner.path()).unwrap();
+        Self {
+            _owner: owner,
+            path,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 struct RestoreChild(std::process::Child);
 
 impl RestoreChild {
@@ -163,8 +186,8 @@ fn elf(target: GuestTarget, marker: u8) -> Vec<u8> {
     bytes
 }
 struct Fixture {
-    repo: tempfile::TempDir,
-    store: tempfile::TempDir,
+    repo: CanonicalTempDir,
+    store: CanonicalTempDir,
     manifest: Manifest,
     path: PathBuf,
 }
@@ -174,7 +197,7 @@ impl Fixture {
     }
 
     fn with_probe_count(count: usize) -> Self {
-        let repo = tempfile::tempdir().unwrap();
+        let repo = CanonicalTempDir::new();
         let root = repo.path();
         git(root, &["init", "-q"]);
         git(root, &["config", "user.name", "fixture test"]);
@@ -307,7 +330,7 @@ impl Fixture {
             };
             sources.insert(path.to_owned(), digest);
         }
-        let store = tempfile::tempdir().unwrap();
+        let store = CanonicalTempDir::new();
         let mut executables = Vec::new();
         for (index, (path, target)) in fixtures::executable_inventory(root)
             .unwrap()
@@ -795,7 +818,7 @@ fn non_executable_and_symlink_object_are_rejected() {
 #[test]
 fn destination_symlink_is_rejected_without_touching_external_directory() {
     let f = Fixture::new();
-    let external = tempfile::tempdir().unwrap();
+    let external = CanonicalTempDir::new();
     std::os::unix::fs::symlink(external.path(), f.repo.path().join("target")).unwrap();
     f.rejected("symlink fixture path");
     assert_eq!(fs::read_dir(external.path()).unwrap().count(), 0);
@@ -848,7 +871,7 @@ fn identities_reject_abbreviations_and_non_hex_values() {
 // Real Git cleanup, just recipes, archive transport and xtask verification.
 // Only guest/HVF acceptance is replaced with the fixture preflight it needs.
 struct Preparation {
-    scratch: tempfile::TempDir,
+    scratch: CanonicalTempDir,
     archive: PathBuf,
     checkout: PathBuf,
     lock: PathBuf,
@@ -857,7 +880,7 @@ struct Preparation {
 
 impl Preparation {
     fn new(f: &Fixture) -> Self {
-        let scratch = tempfile::tempdir().unwrap();
+        let scratch = CanonicalTempDir::new();
         let archive = scratch.path().join("fixtures.tar.gz");
         let bundle = f.path.parent().unwrap();
         assert!(
@@ -1066,8 +1089,9 @@ fn remote_preparation_rejects_stale_sha_before_acceptance() {
     git(f.repo.path(), &["add", "README.md"]);
     git(f.repo.path(), &["commit", "-qm", "next commit"]);
     p.setup(&f);
-    let (exit, _) = p.remote_job();
+    let (exit, log) = p.remote_job();
     assert_ne!(exit, "0");
+    assert!(log.contains("wrong SHA"), "wrong rejection reason: {log}");
     assert!(!p.scratch.path().join("accepted").exists());
     assert!(carrick_xtask::accept::verify_signed_fixtures(&p.checkout).is_err());
 }
@@ -1516,7 +1540,7 @@ exec "$FIXTURE_TEST_RSYNC" "$@"
 #[test]
 fn fixture_artifact_is_immutable_and_retains_executable_modes() {
     let f = Fixture::new();
-    let output = tempfile::tempdir().unwrap();
+    let output = CanonicalTempDir::new();
     let artifact = fixtures::archive::pack(&f.path, output.path()).unwrap();
     let original = fs::read(&artifact).unwrap();
     assert_eq!(
@@ -1640,9 +1664,36 @@ fn remote_preparation_rejects_unpublished_or_linked_archives() {
         } else {
             input
         };
+        let error = carrick_xtask::remote_accept::capture_fixture_bundle(
+            &p.checkout,
+            &input,
+            p.scratch.path(),
+            carrick_xtask::remote_accept::FixtureBundleSource::Remote,
+        )
+        .unwrap_err();
+        match (case, &error) {
+            ("symlink", fixtures::FixturesError::Io(error)) => {
+                assert_eq!(error.raw_os_error(), Some(libc::ELOOP))
+            }
+            ("parent-symlink", fixtures::FixturesError::Io(error)) => assert!(matches!(
+                error.raw_os_error(),
+                Some(libc::ELOOP | libc::ENOTDIR)
+            )),
+            ("partial", fixtures::FixturesError::Invalid(reason)) => {
+                assert_eq!(reason, "unfinished archive publication")
+            }
+            ("directory", fixtures::FixturesError::Invalid(reason)) => {
+                assert_eq!(reason, "fixture archive source is not a regular file")
+            }
+            _ => panic!("{case}: wrong rejection reason: {error}"),
+        }
         let (exit, log) = p.remote_job_with_bundle(Some(
             carrick_xtask::remote_accept::FixtureBundle::remote(input.to_str().unwrap()),
         ));
+        assert!(
+            log.contains(&error.to_string()),
+            "{case}: wrong remote rejection: {log}"
+        );
         assert_ne!(exit, "0", "{case} admitted: {log}");
         assert!(!p.scratch.path().join("accepted").exists());
         assert!(!p.scratch.path().join("fixture-bundle.json").exists());
@@ -1663,6 +1714,10 @@ fn check_gzip_transport(case: &str) {
         _ => unreachable!(),
     }
     fs::write(&p.archive, bytes).unwrap();
+    let sha = git(&p.checkout, &["rev-parse", "HEAD"]);
+    let reason = fixtures::archive::verify(&p.archive, &sha)
+        .unwrap_err()
+        .to_string();
     let out = p
         .command(env!("CARGO_BIN_EXE_carrick-xtask"))
         .current_dir(&p.checkout)
@@ -1675,10 +1730,18 @@ fn check_gzip_transport(case: &str) {
         "{case} verified: {}",
         String::from_utf8_lossy(&out.stdout)
     );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&reason),
+        "{case}: wrong CLI rejection"
+    );
     let (exit, log) = p.remote_job_with_bundle(Some(
         carrick_xtask::remote_accept::FixtureBundle::remote(p.archive.to_str().unwrap()),
     ));
     assert_ne!(exit, "0", "{case} admitted: {log}");
+    assert!(
+        log.contains(&reason),
+        "{case}: wrong remote rejection: {log}"
+    );
     assert!(!p.checkout.join(fixtures::INSTALLED_MANIFEST).exists());
 }
 
@@ -1763,7 +1826,7 @@ fn replacing_shared_archive_after_verification_restores_captured_bytes() {
     .unwrap();
     f.manifest.executables[0].sha256 = digest;
     f.republish();
-    let output = tempfile::tempdir().unwrap();
+    let output = CanonicalTempDir::new();
     let second = fixtures::archive::pack(&f.path, output.path()).unwrap();
     assert_ne!(
         fixtures::archive::verify(&second, &sha).unwrap().1,
@@ -1790,6 +1853,10 @@ fn remote_preparation_provenance_write_failure_stops_acceptance() {
     fs::create_dir(p.scratch.path().join("fixture-bundle.json")).unwrap();
     let (exit, log) = p.remote_job();
     assert_ne!(exit, "0", "provenance write failure ignored: {log}");
+    assert!(
+        log.contains("Is a directory"),
+        "wrong rejection reason: {log}"
+    );
     assert!(!p.scratch.path().join("accepted").exists());
     assert!(!p.checkout.join(fixtures::INSTALLED_MANIFEST).exists());
 }
