@@ -1528,6 +1528,28 @@ mod tests {
                 }
             }
         }
+        let owner = fs::read_to_string(repo.join("crates/carrick-core/src/mm/reservation/root.rs"))
+            .unwrap();
+        let owner = syn::parse_file(&owner).unwrap();
+        for item in owner.items {
+            if let syn::Item::Impl(implementation) = item {
+                for item in implementation.items {
+                    if let syn::ImplItem::Fn(method) = item
+                        && matches!(
+                            method.sig.ident.to_string().as_str(),
+                            "place" | "mmap" | "mremap" | "brk"
+                        )
+                    {
+                        assert_eq!(
+                            method.block.stmts.len(),
+                            1,
+                            "Linux {} decisions must move to the selected client policy",
+                            method.sig.ident
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
