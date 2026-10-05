@@ -465,8 +465,191 @@ fn git_checkout_branch(repo_path: &Path, branch: &str) {
     assert!(output.status.success());
 }
 
+fn assert_one_skip_line(output: &std::process::Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let skip_lines = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter(|line| line.starts_with("probe coverage delta:"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        skip_lines,
+        ["probe coverage delta: no change range (no base provided); delta ratchet not applicable"],
+        "expected exactly one complete skip line across both streams"
+    );
+    assert!(stderr.is_empty(), "skip must use stdout only: {stderr}");
+}
+
 #[test]
-fn self_comparison_skips_delta_with_log() {
+fn diverged_branch_without_base_skips_but_explicit_base_enforces_delta() {
+    let (_dir, repo_path) = init_git_repo();
+    write_probe_source(&repo_path, "probe_a");
+    write_probe_source(&repo_path, "probe_b");
+    let mut inventory = BTreeMap::from([
+        (
+            "probe_a".to_string(),
+            sample_row("conformance", "generic", false),
+        ),
+        (
+            "probe_b".to_string(),
+            sample_row("conformance", "generic", false),
+        ),
+    ]);
+    write_inventory(&repo_path, &inventory);
+    git_commit_all(&repo_path, "base with two probes");
+    // Reproduce CI's fetched origin/main as well as a local main branch.
+    carrick_xtask::command::run_checked(
+        "git",
+        ["update-ref", "refs/remotes/origin/main", "HEAD"],
+        Some(&repo_path),
+    )
+    .expect("set origin/main");
+    git_checkout_new_branch(&repo_path, "feature");
+    remove_probe_source(&repo_path, "probe_b");
+    inventory.remove("probe_b");
+    write_inventory(&repo_path, &inventory);
+    git_commit_all(&repo_path, "coordinated removal on feature branch");
+
+    for env_base in [Some(""), None] {
+        // Local no-base and workflow_dispatch (empty env) both skip on ANY branch.
+        let result = run_probe_coverage_with_env(Some(&repo_path), None, env_base);
+        assert!(
+            result.is_ok(),
+            "no change range must skip on feature: {result:?}"
+        );
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+        cmd.arg("--root").arg(&repo_path).arg("probe-coverage");
+        match env_base {
+            Some(base) => {
+                cmd.env("CARRICK_PROBE_COVERAGE_BASE", base);
+            }
+            None => {
+                cmd.env_remove("CARRICK_PROBE_COVERAGE_BASE");
+            }
+        }
+        let output = cmd.output().expect("run no-base coverage");
+        assert!(output.status.success(), "{output:?}");
+        assert_one_skip_line(&output);
+    }
+
+    for via_env in [false, true] {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+        cmd.arg("--root").arg(&repo_path).arg("probe-coverage");
+        if via_env {
+            cmd.env("CARRICK_PROBE_COVERAGE_BASE", "main");
+        } else {
+            cmd.arg("--base")
+                .arg("main")
+                .env_remove("CARRICK_PROBE_COVERAGE_BASE");
+        }
+        let output = cmd.output().expect("run explicit-base coverage");
+        assert!(
+            !output.status.success(),
+            "explicit base must enforce removal: {output:?}"
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unreviewed probe removal"));
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("no change range"));
+    }
+}
+
+#[test]
+fn dedicated_runner_cannot_be_generic_without_change_range() {
+    let (_dir, repo_path) = init_git_repo();
+    write_probe_source(&repo_path, "bridge_tcp_peer");
+    let inventory = BTreeMap::from([(
+        "bridge_tcp_peer".to_string(),
+        sample_row("conformance", "generic", false),
+    )]);
+    write_inventory(&repo_path, &inventory);
+    git_commit_all(&repo_path, "dedicated probe incorrectly using generic");
+    let result = run_probe_coverage_with_env(Some(&repo_path), None, None);
+    assert!(
+        matches!(result, Err(CoverageError::UnauthorizedRunner { ref probe, ref runner })
+            if probe == "bridge_tcp_peer" && runner == "generic"),
+        "absolute checks must reject generic for dedicated probe: {result:?}"
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
+        .arg("--root")
+        .arg(&repo_path)
+        .arg("probe-coverage")
+        .env("CARRICK_PROBE_COVERAGE_BASE", "")
+        .output()
+        .expect("run coverage with wrong runner");
+    assert!(!output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unauthorized runner 'generic'"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("no change range"));
+}
+
+#[test]
+fn closure_without_change_range_enforces_absolute_checks_and_logs_once() {
+    // Capture the closure entry point's real stdout/stderr in an isolated
+    // subprocess without mutating process-wide environment in the parent.
+    const ROOT_ENV: &str = "CARRICK_TEST_CLOSURE_COVERAGE_ROOT";
+    if let Some(root) = std::env::var_os(ROOT_ENV) {
+        let root = std::path::PathBuf::from(root);
+        let mut inventory = BTreeMap::from([(
+            "bridge_tcp_peer".to_string(),
+            sample_row("conformance", "conformance_bridge_tcp_peer", false),
+        )]);
+        let sources = BTreeSet::from(["bridge_tcp_peer".to_string()]);
+        let validate = |inventory: &BTreeMap<String, ProbeInventoryRow>, base| {
+            carrick_xtask::probe_coverage::validate_closure_coverage(
+                &root, base, inventory, &sources,
+            )
+        };
+        validate(&inventory, None).expect("valid absolute snapshot must skip delta");
+        let self_comparison = validate(&inventory, Some("HEAD"));
+        assert!(matches!(
+            self_comparison,
+            Err(CoverageError::CannotCompareHeadToItself { .. })
+        ));
+        inventory.get_mut("bridge_tcp_peer").expect("row").runner = "generic".to_string();
+        let wrong_runner = validate(&inventory, None);
+        assert!(
+            matches!(wrong_runner, Err(CoverageError::UnauthorizedRunner { .. })),
+            "{wrong_runner:?}"
+        );
+        return;
+    }
+
+    let (_dir, repo_path) = init_git_repo();
+    write_probe_source(&repo_path, "bridge_tcp_peer");
+    write_probe_source(&repo_path, "temporary_probe");
+    let mut inventory = BTreeMap::from([
+        (
+            "bridge_tcp_peer".to_string(),
+            sample_row("conformance", "conformance_bridge_tcp_peer", false),
+        ),
+        (
+            "temporary_probe".to_string(),
+            sample_row("conformance", "generic", false),
+        ),
+    ]);
+    write_inventory(&repo_path, &inventory);
+    git_commit_all(&repo_path, "base with dedicated probe");
+    git_checkout_new_branch(&repo_path, "feature");
+    // The ancestor contains an extra probe: an inferred main delta would fail.
+    remove_probe_source(&repo_path, "temporary_probe");
+    inventory.remove("temporary_probe");
+    write_inventory(&repo_path, &inventory);
+    git_commit_all(&repo_path, "feature change");
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "closure_without_change_range_enforces_absolute_checks_and_logs_once",
+            "--nocapture",
+        ])
+        .env(ROOT_ENV, &repo_path)
+        .env_remove("CARRICK_PROBE_COVERAGE_BASE")
+        .output()
+        .expect("capture closure entry point");
+    assert!(output.status.success(), "{output:?}");
+    assert_one_skip_line(&output);
+}
+
+#[test]
+fn explicit_self_comparison_fails_while_no_base_skips() {
     let (_dir, repo_path) = init_git_repo();
     write_probe_source(&repo_path, "probe_a");
     let inv = BTreeMap::from([(
@@ -476,18 +659,23 @@ fn self_comparison_skips_delta_with_log() {
     write_inventory(&repo_path, &inv);
     git_commit_all(&repo_path, "commit 1");
 
-    // Explicitly passing HEAD: base equals HEAD, no change range -> skip delta with log and exit 0
+    // An explicit base requests the delta; HEAD-to-HEAD cannot satisfy it.
     let res = run_probe_coverage(Some(&repo_path), Some("HEAD"));
     assert!(
-        res.is_ok(),
-        "explicit HEAD must skip delta and exit 0: {res:?}"
+        matches!(res, Err(CoverageError::CannotCompareHeadToItself { .. })),
+        "explicit HEAD must fail rather than report delta success: {res:?}"
     );
+    let env_res = run_probe_coverage_with_env(Some(&repo_path), None, Some("HEAD"));
+    assert!(matches!(
+        env_res,
+        Err(CoverageError::CannotCompareHeadToItself { .. })
+    ));
 
-    // Local resolution on main (where merge-base with main is HEAD): skip delta with log and exit 0
+    // No base means no change range, even when main exists locally.
     let res_none = run_probe_coverage_with_env(Some(&repo_path), None, None);
     assert!(
         res_none.is_ok(),
-        "local resolution on main must skip delta and exit 0: {res_none:?}"
+        "local run without a base must skip delta and exit 0: {res_none:?}"
     );
 
     // Child process execution: exits 0 and logs the skip
@@ -503,15 +691,7 @@ fn self_comparison_skips_delta_with_log() {
         output.status.success(),
         "child process must succeed with exit 0 when no change range exists"
     );
-    let combined = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("probe coverage delta: no change range"),
-        "expected skip log line, got: {combined}"
-    );
+    assert_one_skip_line(&output);
 }
 
 #[test]
@@ -801,7 +981,7 @@ fn no_change_range_logs_skip_and_runs_absolute_checks() {
     write_inventory(&repo_path, &inv);
     git_commit_all(&repo_path, "Commit 1: probe_a");
 
-    // 1. Valid repo with NO change range (base equals HEAD or None):
+    // 1. Valid repo with NO change range (no base):
     // Must log the skip and exit 0 (Ok(()))
     let bin = env!("CARGO_BIN_EXE_carrick-xtask");
     let output = std::process::Command::new(bin)
@@ -816,17 +996,7 @@ fn no_change_range_logs_skip_and_runs_absolute_checks() {
         "probe-coverage must succeed when no change range exists, stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}\n{stderr}");
-    assert!(
-        combined.contains("probe coverage delta: no change range"),
-        "expected skip log line in output: {combined}"
-    );
-    assert!(
-        combined.contains("delta ratchet not applicable"),
-        "expected 'delta ratchet not applicable' in output: {combined}"
-    );
+    assert_one_skip_line(&output);
 
     // 2. Absolute checks still run even with NO change range:
     // Introduce a membership mismatch (source on disk but missing from inventory)
@@ -845,7 +1015,7 @@ fn no_change_range_logs_skip_and_runs_absolute_checks() {
 }
 
 #[test]
-fn committed_coordinated_removal_with_base_fails() {
+fn preserved_committed_coordinated_removal_with_base_fails() {
     let (_dir, repo_path) = init_git_repo();
     write_probe_source(&repo_path, "accessx");
     write_probe_source(&repo_path, "other_probe");
@@ -883,7 +1053,8 @@ fn committed_coordinated_removal_with_base_fails() {
         "Commit 2: committed coordinated removal of accessx without review",
     );
 
-    // With base = commit before removal, delta ratchet must run and FAIL
+    // Preservation witness: this enforcement already passed at 128baf9fe.
+    // With base = commit before removal, delta ratchet must run and FAIL.
     let res = run_probe_coverage(Some(&repo_path), Some(&base_commit));
     match res {
         Err(CoverageError::UnreviewedRemoval { probe, .. }) => {
