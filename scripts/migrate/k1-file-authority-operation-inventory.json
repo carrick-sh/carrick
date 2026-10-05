@@ -7,7 +7,7 @@
     "description_backing": 26,
     "epoll": 522,
     "stream": 176,
-    "mapping": 1635,
+    "mapping": 1636,
     "lifecycle": 34
   },
   "production_counts": {
@@ -16,7 +16,7 @@
     "description_backing": 10,
     "epoll": 223,
     "stream": 120,
-    "mapping": 1032,
+    "mapping": 1033,
     "lifecycle": 16
   },
   "files": {
@@ -23658,7 +23658,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 6632,
+      "line": 6704,
       "categories": [
         "mapping"
       ],
@@ -23667,7 +23667,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 6640,
+      "line": 6712,
       "categories": [
         "mapping"
       ],
@@ -23676,7 +23676,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 6656,
+      "line": 6728,
       "categories": [
         "mapping"
       ],
@@ -24558,7 +24558,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 693,
+      "line": 695,
       "categories": [
         "mapping"
       ],
@@ -24567,7 +24567,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 1122,
+      "line": 1124,
       "categories": [
         "mapping"
       ],
@@ -24576,7 +24576,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 3492,
+      "line": 3494,
       "categories": [
         "mapping"
       ],
@@ -24666,7 +24666,16 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/threads.rs",
-      "line": 257,
+      "line": 28,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// runtime registry identity survives. The Kernel owns this mapping.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/vcpu_loop/threads.rs",
+      "line": 259,
       "categories": [
         "mapping"
       ],
