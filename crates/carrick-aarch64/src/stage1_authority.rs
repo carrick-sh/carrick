@@ -969,7 +969,7 @@ impl Stage1Authority {
             .rebase(root, None)
             .map_err(|error| error.to_string())?;
         image
-            .map_kernel_aliased(
+            .map_kernel_data_aliased(
                 carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE,
                 root,
                 carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE,
@@ -3214,6 +3214,18 @@ mod tests {
 
     fn boot_root_fixture(old: u64, capacity: u64) -> (Stage1Authority, Arc<BootTablePublisher>) {
         let mut image = test_manager();
+        image
+            .map_private_aliased(
+                LINUX_MMAP_BASE,
+                0x9c_1234_5000,
+                4096,
+                UserLeafAccess {
+                    writable: true,
+                    executable: false,
+                },
+                None,
+            )
+            .unwrap();
         image.rebase(old, None).unwrap();
         let authority = Stage1Authority::new_with_manager(Some(image));
         let returned = Arc::new(Mutex::new(Vec::new()));
@@ -3266,10 +3278,16 @@ mod tests {
             assert_eq!(switched.get(), Some(root));
             assert_eq!(authority.root_base(), Some(root));
             let image = authority.snapshot_image().unwrap();
+            assert_eq!(original.translate(LINUX_MMAP_BASE), Some(0x9c_1234_5000));
+            assert_eq!(image.translate(LINUX_MMAP_BASE), Some(0x9c_1234_5000));
             assert_eq!(
-                image.translate(LINUX_MMAP_BASE),
-                original.translate(LINUX_MMAP_BASE)
+                image.debug_walk(LINUX_MMAP_BASE)[3],
+                original.debug_walk(LINUX_MMAP_BASE)[3]
             );
+            let alias = image.debug_walk(carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE)[3];
+            assert_ne!(alias & (1 << 53), 0, "table data must be EL1 execute-never");
+            assert_ne!(alias & (1 << 54), 0, "table data must be EL0 execute-never");
+            assert_eq!(alias & (1 << 6), 0, "table data must not admit EL0 access");
             assert_eq!(
                 image.translate(carrick_el1_abi::AARCH64_STAGE1_TABLES_ALIAS_BASE),
                 Some(root),
