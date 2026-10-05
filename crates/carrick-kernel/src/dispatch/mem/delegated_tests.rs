@@ -3502,7 +3502,7 @@ fn delegated_bind_admission_seals_the_exact_external_charges() {
     );
     // Canonical boot image rows retain their source in the owner as well;
     // no address or data charges remain external to the reservation tree.
-    let layout = root.lock().layout();
+    let layout = carrick_personality_linux::mm::LinuxReservationLayout::from(root.lock().layout());
     assert_eq!(
         (layout.external_address_bytes, layout.external_data_bytes),
         (0, 0)
