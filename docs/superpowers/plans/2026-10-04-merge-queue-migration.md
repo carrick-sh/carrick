@@ -30,8 +30,10 @@ macOS, 30 on Linux, and 5 for filtering/aggregation.
 | `macos-integration` (`macos-15`) | `test-integration` with existing fd-limit setup |
 
 The four Mac jobs use the same rust-cache `shared-key`, so they can reuse a
-compatible dependency cache without serial dependencies between jobs. Cold jobs
-still compile independently; the cache is an optimization, never evidence.
+compatible dependency cache without serial dependencies between jobs. Linux
+jobs retain separate caches: a small cross-check must not populate the only
+cache for the larger lint/doc/semantics jobs. Cold jobs still compile
+independently; the cache is an optimization, never evidence.
 `if: !cancelled()` on check steps allows independent checks to report after an
 earlier failure in the same job, without `continue-on-error`. A recipe's own
 internal prerequisite ordering remains intact. Setup failures also remain red.
