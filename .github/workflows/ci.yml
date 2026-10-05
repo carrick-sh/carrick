@@ -25,6 +25,7 @@ jobs:
   check:
     name: hosted macOS · source + host-only tests
     runs-on: macos-15 # Apple Silicon; SDK provides the macOS 15 hv_gic_* APIs
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -151,6 +152,7 @@ jobs:
   cross-check-linux:
     name: aarch64-linux cross-check · no-hvf closure
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -200,6 +202,7 @@ jobs:
   kernel-linux-native:
     name: aarch64-linux native · kernel semantics suites (no VMM)
     runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -225,6 +228,7 @@ jobs:
   cross-check-freebsd:
     name: x86_64-freebsd cross-check · cli + runtime
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       # Use the permanent release archive so a cold cache survives mirror expiry.
       FBSD_VERSION: 14.3-RELEASE
@@ -283,6 +287,7 @@ jobs:
   cross-check-netbsd:
     name: x86_64-netbsd cross-check · nvmm backend
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -307,6 +312,7 @@ jobs:
   deny:
     name: cargo-deny · licenses
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
