@@ -5841,6 +5841,27 @@ mod ipc_set_tests {
             }
         }
 
+        fn worker_watch<T>(watch: std::io::Result<T>) -> Option<T> {
+            match watch {
+                Ok(watch) => Some(watch),
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => None,
+                Err(error) => panic!("worker watch: {error}"),
+            }
+        }
+
+        #[test]
+        fn exited_watchdog_worker_does_not_panic_at_registration() {
+            let mut worker = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 37"])
+                .spawn()
+                .unwrap();
+            let status = worker.wait().unwrap(); // deterministic pre-registration exit
+            let watch = worker_watch::<()>(Err(std::io::Error::from_raw_os_error(libc::ESRCH)));
+            assert!(watch.is_none());
+            assert_eq!(worker.wait().unwrap(), status);
+            assert_eq!(status.code(), Some(37));
+        }
+
         fn supervise_watchdog_child() {
             use std::io::Write;
             use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -5940,13 +5961,22 @@ mod ipc_set_tests {
             );
             let worker_pid = worker.0.id() as libc::pid_t;
             #[cfg(target_os = "linux")]
-            let worker_exit = pidfd(worker_pid).expect("worker pidfd");
+            let worker_exit = match worker_watch(pidfd(worker_pid)) {
+                Some(watch) => watch,
+                None => {
+                    control
+                        .write_all(&[1])
+                        .expect("supervisor ready after worker exit");
+                    let status = worker.0.wait().unwrap();
+                    std::process::exit(status.code().unwrap_or(1));
+                }
+            };
             #[cfg(not(target_os = "linux"))]
             {
-                if let Err(err) = watch(&queue, worker_pid) {
-                    if err.raw_os_error() != Some(libc::ESRCH) {
-                        panic!("worker watch: {err}");
-                    }
+                if worker_watch(watch(&queue, worker_pid)).is_none() {
+                    control
+                        .write_all(&[1])
+                        .expect("supervisor ready after worker exit");
                     let status = worker.0.wait().unwrap();
                     std::process::exit(status.code().unwrap_or(1));
                 }
