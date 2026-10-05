@@ -298,8 +298,8 @@ pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
     },
     StepSpec {
         name: "kvm-tests",
-        program: "cargo",
-        args: &["test", "-p", "carrick-vmm-kvm"],
+        program: "just",
+        args: &["kvm-tests"],
         env: &[],
         log_name: "03-kvm-tests.log",
     },

@@ -906,6 +906,20 @@ build-fixture:
 build-x86-fixture:
     ./crates/carrick-vmm-bhyve/fixtures/hello-x86_64/build.sh
 
+# Build the freestanding CPL0 kernel image for x86_64 KVM tests.
+build-cpl0:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -s):$(uname -m)" in
+        Linux:x86_64|Linux:amd64)
+            cargo build -p carrick-x86-cpl0 --release --target x86_64-unknown-none
+            ;;
+    esac
+
+# Run KVM VMM unit and integration tests, building the CPL0 image on x86_64 first.
+kvm-tests *ARGS: build-cpl0
+    cargo test -p carrick-vmm-kvm {{ARGS}}
+
 # L1 cross-check: our owned crates compile for aarch64-linux AND the
 # platform-linux closure links no HVF/applevisor (the C4-decouple proof).
 # Runs on the Mac (no nested VM needed) — matches the CI cross-check job.
