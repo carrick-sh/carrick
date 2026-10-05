@@ -247,6 +247,33 @@ impl KernelTaskBinding {
         Ok(context)
     }
 
+    /// Retain a coherent thread census for a closed-admission terminal drain.
+    /// Each context keeps its exact thread claim and predecessor MM alive even
+    /// if a member retires immediately after this snapshot is released.
+    pub fn capture_threads(&self) -> Result<Vec<KernelContext>, KernelError> {
+        let state = self.kernel.registry.settled().read();
+        let record = state
+            .tasks
+            .get(&self.task.id)
+            .ok_or(KernelError::UnknownTask(self.task.id))?;
+        if record.task.key() != self.task {
+            return Err(KernelError::StaleTaskBinding(self.task.id));
+        }
+        Ok(record
+            .task
+            .threads()
+            .into_iter()
+            .map(|thread| {
+                KernelContext::capture(
+                    Arc::clone(&self.kernel),
+                    Arc::clone(&record.task),
+                    thread,
+                    record.revision,
+                )
+            })
+            .collect())
+    }
+
     /// Capture current signal authority for this exact task generation.
     ///
     /// The registry read lock spans task-generation validation, live-thread
@@ -1420,6 +1447,7 @@ impl Kernel {
                 container_inits: BTreeMap::from([(container.id(), task_key)]),
                 tasks: BTreeMap::from([(bootstrap.task_id, task_record)]),
                 zombies: BTreeMap::new(),
+                retiring_tasks: BTreeMap::new(),
                 process_groups: BTreeMap::from([(
                     process_group_id,
                     ProcessGroupRecord {
@@ -1753,11 +1781,15 @@ impl Kernel {
                 .filter(|(_, record)| record.task.container().id() == container_id)
                 .map(|(id, _)| *id)
                 .collect();
-            if (!selected.contains(&init.id)
-                && state
-                    .zombies
-                    .get(&init.id)
-                    .is_none_or(|record| record.zombie.key != init))
+            if state
+                .retiring_tasks
+                .values()
+                .any(|task| task.container().id() == container_id)
+                || (!selected.contains(&init.id)
+                    && state
+                        .zombies
+                        .get(&init.id)
+                        .is_none_or(|record| record.zombie.key != init))
                 || selected
                     .iter()
                     .any(|id| state.reservations.contains_key(id))
@@ -1819,6 +1851,10 @@ impl Kernel {
                 .tasks
                 .values()
                 .any(|record| record.task.container().id() == container_id)
+                || state
+                    .retiring_tasks
+                    .values()
+                    .any(|task| task.container().id() == container_id)
                 || state.reservations.keys().any(|task| {
                     state
                         .tasks
@@ -2177,11 +2213,17 @@ impl Kernel {
                 .tasks
                 .get(&root.id)
                 .is_none_or(|record| record.task.key() != *root)
+                && state
+                    .retiring_tasks
+                    .get(&root.id)
+                    .is_none_or(|task| task.key() != *root)
         }) {
             return Err(RegistryInvariantError::RootNotLive);
         }
         if state.reservations.keys().any(|task_id| {
-            !state.tasks.contains_key(task_id) && !state.zombies.contains_key(task_id)
+            !state.tasks.contains_key(task_id)
+                && !state.zombies.contains_key(task_id)
+                && !state.retiring_tasks.contains_key(task_id)
         }) {
             return Err(RegistryInvariantError::OrphanReservation);
         }
@@ -2258,6 +2300,11 @@ impl Kernel {
                         return Err(RegistryInvariantError::ProcessGroupBacklink);
                     }
                     (task.task.process_group(), task.task.container().id())
+                } else if let Some(task) = state.retiring_tasks.get(&member.id) {
+                    if task.key() != *member {
+                        return Err(RegistryInvariantError::ProcessGroupBacklink);
+                    }
+                    (task.process_group(), task.container().id())
                 } else if let Some(zombie) = state.zombies.get(&member.id) {
                     if zombie.zombie.key != *member {
                         return Err(RegistryInvariantError::ProcessGroupBacklink);
@@ -2345,7 +2392,10 @@ impl Kernel {
                     .zombies
                     .get(&child.id)
                     .is_some_and(|record| record.zombie.parent == Some(parent.task.key()));
-                if !live_matches && !zombie_matches {
+                let retiring_matches = state.retiring_tasks.get(&child.id).is_some_and(|task| {
+                    task.key() == child && task.parent() == Some(parent.task.key())
+                });
+                if !live_matches && !zombie_matches && !retiring_matches {
                     return Err(RegistryInvariantError::ChildBacklink);
                 }
             }
@@ -2733,6 +2783,7 @@ pub(super) struct RegistryState {
     pub(super) container_inits: BTreeMap<ContainerId, TaskKey>,
     pub(super) tasks: BTreeMap<TaskId, TaskRecord>,
     pub(super) zombies: BTreeMap<TaskId, ZombieRecord>,
+    pub(super) retiring_tasks: BTreeMap<TaskId, TaskRef>,
     pub(super) process_groups: BTreeMap<ProcessGroupId, ProcessGroupRecord>,
     pub(super) process_group_by_namespace: BTreeMap<(ContainerId, u32), ProcessGroupId>,
     pub(super) reservations: BTreeMap<TaskId, carrick_hal::KernelTransactionId>,

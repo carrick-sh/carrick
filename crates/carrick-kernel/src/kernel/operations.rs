@@ -38,7 +38,7 @@ pub use thread::{
     ThreadPublicationReservationAttempt,
 };
 pub mod exit;
-pub use exit::PreparedTaskExit;
+pub use exit::{PreparedTaskExit, RetiredTaskExit};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelFailpoint {
