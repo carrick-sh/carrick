@@ -440,6 +440,13 @@ impl carrick_aarch64::stage1_authority::TableArenaPublisher for MmArenaPublisher
             .ok_or_else(|| "raw Fork capacity lost exact structural owner".to_owned())?;
         retire_carrier_stage2_record_at_safe_point(&self.custody, owner.record_identity())
             .map_err(|error| error.to_string())?;
+        if self
+            .custody
+            .stage2_record_snapshot(owner.record_identity().record_id)
+            .is_some()
+        {
+            return Err("raw table capacity retirement is still pinned".to_owned());
+        }
         state.release_structural_owner_at(base, 2 * 1024 * 1024);
         Ok(())
     }
@@ -1293,7 +1300,7 @@ impl MmAccessState {
         // through backend retirement and pool release. A cached owner Arc keeps
         // storage resident, but does not stop a pooled slot being reissued.
         let page_tables = self.page_tables.read();
-        let retire = |manager: Option<&carrick_mmu_core::aarch64::PageTableManager>| {
+        let mut retire = |manager: Option<&carrick_mmu_core::aarch64::PageTableManager>| {
             // Descriptor publication records the root high-water mark while
             // holding this authority, then takes mm_root_stage2. Match that
             // order so retirement cannot wait for the publisher while holding
@@ -1379,11 +1386,16 @@ impl MmAccessState {
                 owner,
             })
         };
-        if terminal {
-            page_tables.retire_with_exclusion(retire)
+        let disposition = if terminal {
+            carrick_aarch64::stage1_authority::TableArenaRetirement::Terminal
         } else {
-            page_tables.with_retirement_exclusion(retire)
-        }
+            carrick_aarch64::stage1_authority::TableArenaRetirement::ExecHandoff
+        };
+        page_tables
+            .retire_table_capacity(Some(expected_root_slot.0), disposition, |manager| {
+                retire(manager).map_err(|error| error.to_string())
+            })
+            .map_err(TrapError::Hypervisor)
     }
 
     pub(crate) fn retain_physical_backing_in(

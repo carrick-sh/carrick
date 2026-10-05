@@ -71,6 +71,15 @@ pub trait TableArenaPublisher: Send + Sync {
     }
 }
 
+/// Software-image disposition after exact physical table-capacity retirement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableArenaRetirement {
+    /// Revoke the stopped MM's image before released backing is accessible.
+    Terminal,
+    /// Preserve the quiesced image for the existing exec successor handoff.
+    ExecHandoff,
+}
+
 struct Stage1AuthorityInner {
     manager: TrackedStage1Image,
     arena_source: Option<Box<dyn TableArenaSource>>,
@@ -546,7 +555,11 @@ impl Stage1Authority {
                     PageTableError::UnresolvedArena(unpublished),
                 ));
             }
-            inner_ref.published_arenas = arenas;
+            for base in arenas {
+                if !inner_ref.published_arenas.contains(&base) {
+                    inner_ref.published_arenas.push(base);
+                }
+            }
         }
         inner.txn_generation = generation.get();
         Ok(txn)
@@ -779,33 +792,49 @@ impl Stage1Authority {
         self.inner.lock().manager.as_ref().map(f)
     }
 
-    /// Exclude descriptor access while retiring its physical backing.
-    ///
-    /// Unlike `with_manager`, the callback also runs when no image is installed:
-    /// abandoned publication may still own backing that needs retirement. The
-    /// callback must not re-enter this authority.
-    pub fn with_retirement_exclusion<R>(
+    /// Retire this authority's published physical table capacity after its MM
+    /// has stopped. An exact root retirement receipt may retain the primary
+    /// for the callback to retire under the same exclusion. The publisher
+    /// must prove terminal
+    /// physical custody before acknowledging each arena; failure quarantines
+    /// the remaining capacity. No other MM's structural backing is selected.
+    /// The callback also runs without a software image and must not re-enter
+    /// this authority. Terminal disposition revokes the image before unlock.
+    pub fn retire_table_capacity<R>(
         &self,
-        f: impl FnOnce(Option<&PageTableManager>) -> R,
-    ) -> R {
-        let inner = self.inner.lock();
-        f(inner.manager.as_ref())
-    }
-
-    /// Run terminal backing retirement while excluding descriptor access,
-    /// then revoke this authority's software image before the backing can be
-    /// recycled. On error the authority remains intact for rollback/retry.
-    pub fn retire_with_exclusion<R, E>(
-        &self,
-        f: impl FnOnce(Option<&PageTableManager>) -> Result<R, E>,
-    ) -> Result<R, E> {
+        root: Option<u64>,
+        disposition: TableArenaRetirement,
+        retire_root: impl FnOnce(Option<&PageTableManager>) -> Result<R, String>,
+    ) -> Result<R, String> {
         let (result, image, source) = {
             let mut inner = self.inner.lock();
-            let result = f(inner.manager.as_ref())?;
-            let image = inner.manager.take();
-            let source = inner.arena_source.take();
-            inner.host_resolver = None;
-            inner.published_arenas.clear();
+            if inner
+                .published_arenas
+                .iter()
+                .any(|base| Some(*base) != root)
+            {
+                let publisher = inner.arena_publisher.clone().ok_or_else(|| {
+                    "published table capacity has no physical retirement authority".to_owned()
+                })?;
+                let mut index = 0;
+                while index < inner.published_arenas.len() {
+                    let base = inner.published_arenas[index];
+                    if Some(base) == root {
+                        index += 1;
+                        continue;
+                    }
+                    publisher.retire_raw_table_arena(base)?;
+                    inner.published_arenas.swap_remove(index);
+                }
+            }
+            let result = retire_root(inner.manager.as_ref())?;
+            let (image, source) = if disposition == TableArenaRetirement::Terminal {
+                inner.host_resolver = None;
+                inner.published_arenas.clear();
+                (inner.manager.take(), inner.arena_source.take())
+            } else {
+                (None, None)
+            };
             (result, image, source)
         };
         if let Some(image) = image {
