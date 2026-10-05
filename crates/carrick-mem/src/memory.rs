@@ -1547,6 +1547,8 @@ impl AddressSpace {
         let mut rw_spans = crate::elf::rw_page_spans(&plan);
 
         if let Some(interpreter_path) = plan.interpreter.as_deref() {
+            let interpreter_path = std::str::from_utf8(interpreter_path)
+                .map_err(ElfInspectError::InterpreterPathEncoding)?;
             let interpreter = read_interp(interpreter_path)
                 .ok_or_else(|| AddressSpaceError::Io(std::io::ErrorKind::NotFound.into()))?;
             let interpreter_plan = plan_elf_load_bytes_for(&interpreter, machine)

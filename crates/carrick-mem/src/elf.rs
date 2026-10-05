@@ -59,7 +59,8 @@ pub struct ElfMetadata {
     pub endianness: ElfEndianness,
     pub machine: Machine,
     pub entry: u64,
-    pub interpreter: Option<String>,
+    /// Validated PT_INTERP pathname bytes, up to the first NUL.
+    pub interpreter: Option<Vec<u8>>,
     pub is_dynamic: bool,
     pub program_header_count: usize,
     pub shared_object: bool,
@@ -69,7 +70,8 @@ pub struct ElfMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LoadPlan {
     pub entry: u64,
-    pub interpreter: Option<String>,
+    /// Validated PT_INTERP pathname bytes, up to the first NUL.
+    pub interpreter: Option<Vec<u8>>,
     pub program_header_address: Option<u64>,
     pub program_header_entry_size: u16,
     pub program_header_count: u16,
@@ -350,6 +352,8 @@ pub enum ElfInspectError {
     Parse(#[from] goblin::error::Error),
     #[error("unsupported ELF machine: {0}")]
     UnsupportedMachine(u16),
+    #[error("PT_INTERP pathname cannot be represented as UTF-8: {0}")]
+    InterpreterPathEncoding(#[source] std::str::Utf8Error),
 }
 
 pub fn inspect_elf(path: impl AsRef<Path>) -> Result<ElfMetadata, ElfInspectError> {
@@ -358,8 +362,8 @@ pub fn inspect_elf(path: impl AsRef<Path>) -> Result<ElfMetadata, ElfInspectErro
 }
 
 pub fn inspect_elf_bytes(bytes: &[u8]) -> Result<ElfMetadata, ElfInspectError> {
-    let elf = parse_elf_bytes(bytes)?;
-    Ok(metadata_from_elf(&elf))
+    let (elf, interpreter) = parse_elf_bytes(bytes)?;
+    Ok(metadata_from_elf(&elf, interpreter))
 }
 
 pub fn plan_elf_load(path: impl AsRef<Path>) -> Result<LoadPlan, ElfInspectError> {
@@ -387,7 +391,7 @@ pub fn plan_elf_load_bytes(bytes: &[u8]) -> Result<LoadPlan, ElfInspectError> {
 /// The default aarch64 callers use [`plan_elf_load_bytes`] which delegates
 /// here with `EM_AARCH64`, preserving byte-identical behaviour.
 pub fn plan_elf_load_bytes_for(bytes: &[u8], machine: u16) -> Result<LoadPlan, ElfInspectError> {
-    let elf = parse_elf_bytes(bytes)?;
+    let (elf, interpreter) = parse_elf_bytes(bytes)?;
     if elf.header.e_machine != machine {
         return Err(ElfInspectError::UnsupportedMachine(elf.header.e_machine));
     }
@@ -400,15 +404,16 @@ pub fn plan_elf_load_bytes_for(bytes: &[u8], machine: u16) -> Result<LoadPlan, E
         ))
         .into());
     }
-    Ok(load_plan_from_elf(&elf))
+    Ok(load_plan_from_elf(&elf, interpreter))
 }
 
-fn parse_elf_bytes(bytes: &[u8]) -> Result<Elf<'_>, ElfInspectError> {
+fn parse_elf_bytes(bytes: &[u8]) -> Result<(Elf<'_>, Option<&[u8]>), ElfInspectError> {
     if !bytes.starts_with(b"\x7fELF") {
         return Err(ElfInspectError::NotElf);
     }
 
-    let mut elf = Elf::parse(bytes)?;
+    let elf = Elf::parse(bytes)?;
+    let mut interpreter = None;
     for header in &elf.program_headers {
         // elf(5) / System V ABI: file bytes must fit in the loaded segment.
         if header.p_type == PT_LOAD && header.p_filesz > header.p_memsz {
@@ -418,9 +423,9 @@ fn parse_elf_bytes(bytes: &[u8]) -> Result<Elf<'_>, ElfInspectError> {
             .into());
         }
         if header.p_type == goblin::elf::program_header::PT_INTERP {
-            // Decode pathname bytes ourselves: Goblin drops the last byte and
-            // silently loses non-UTF-8 interpreters. Validate the full extent,
-            // then stop at the first NUL, as pathname lookup does on Linux.
+            // Preserve pathname bytes: Goblin's string view drops the last
+            // byte and loses non-UTF-8 metadata. Representability matters only
+            // when the main image's interpreter pathname is actually resolved.
             let path = usize::try_from(header.p_offset)
                 .ok()
                 .zip(usize::try_from(header.p_filesz).ok())
@@ -435,18 +440,13 @@ fn parse_elf_bytes(bytes: &[u8]) -> Result<Elf<'_>, ElfInspectError> {
                 )
                 .into());
             }
-            let pathname = path.split(|byte| *byte == 0).next().unwrap_or_default();
-            elf.interpreter = Some(std::str::from_utf8(pathname).map_err(|_| {
-                goblin::error::Error::Malformed(
-                    "PT_INTERP pathname cannot be represented as UTF-8".into(),
-                )
-            })?);
+            interpreter = Some(path.split(|byte| *byte == 0).next().unwrap_or_default());
         }
     }
-    Ok(elf)
+    Ok((elf, interpreter))
 }
 
-fn metadata_from_elf(elf: &Elf<'_>) -> ElfMetadata {
+fn metadata_from_elf(elf: &Elf<'_>, interpreter: Option<&[u8]>) -> ElfMetadata {
     ElfMetadata {
         class: if elf.is_64 {
             ElfClass::Elf64
@@ -464,7 +464,7 @@ fn metadata_from_elf(elf: &Elf<'_>) -> ElfMetadata {
             other => Machine::Other(other),
         },
         entry: elf.entry,
-        interpreter: elf.interpreter.map(str::to_owned),
+        interpreter: interpreter.map(<[u8]>::to_vec),
         is_dynamic: elf.dynamic.is_some(),
         program_header_count: elf.program_headers.len(),
         shared_object: elf.is_lib,
@@ -480,7 +480,7 @@ fn elf_type_from(e_type: u16) -> ElfType {
     }
 }
 
-fn load_plan_from_elf(elf: &Elf<'_>) -> LoadPlan {
+fn load_plan_from_elf(elf: &Elf<'_>, interpreter: Option<&[u8]>) -> LoadPlan {
     let e_type = elf_type_from(elf.header.e_type);
     let load_bias = match e_type {
         ElfType::Dyn => LINUX_PIE_DEFAULT_BASE,
@@ -515,7 +515,7 @@ fn load_plan_from_elf(elf: &Elf<'_>) -> LoadPlan {
 
     LoadPlan {
         entry: load_bias.wrapping_add(elf.entry),
-        interpreter: elf.interpreter.map(str::to_owned),
+        interpreter: interpreter.map(<[u8]>::to_vec),
         program_header_address: program_header_address(elf, &segments),
         program_header_entry_size: elf.header.e_phentsize,
         program_header_count: elf.header.e_phnum,
