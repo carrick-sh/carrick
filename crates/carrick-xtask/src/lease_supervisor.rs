@@ -116,9 +116,7 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
         #[cfg(target_os = "macos")]
         cancelled: std::collections::BTreeMap::new(),
     };
-    let supervision = events
-        .watch_worker(workload.child.id() as libc::pid_t)
-        .and_then(|()| events.wait());
+    let supervision = supervise_worker(&mut events, workload.child.id() as libc::pid_t);
 
     // On owner death AND normal command exit, terminate remaining run-scoped
     // descendants. Retain exclusion across this whole operation and EOF.
@@ -143,6 +141,39 @@ pub fn run(args: SupervisorArgs) -> Result<i32, HostLeaseError> {
     supervision.map_err(HostLeaseError::ChildWait)?;
     drop(lease);
     Ok(extract_exit_code(&status))
+}
+
+fn supervise_worker(events: &mut ExitEvents, pid: libc::pid_t) -> io::Result<()> {
+    match events.watch_worker(pid) {
+        Ok(()) => events.wait(),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod registration_tests {
+    use super::*;
+
+    #[test]
+    fn exited_before_registration_preserves_real_status() {
+        // Waiting is the deterministic scheduling hook: registration is strictly
+        // after exit/reaping, so both native watch APIs return ESRCH.
+        for command in ["exit 0", "exit 37"] {
+            let mut child = Command::new("/bin/sh")
+                .args(["-c", command])
+                .spawn()
+                .unwrap();
+            let status = child.wait().unwrap();
+            let mut events = ExitEvents::new(std::process::id() as libc::pid_t).unwrap();
+            let registration = supervise_worker(&mut events, child.id() as libc::pid_t);
+            assert!(
+                registration.is_ok(),
+                "already-exited workload rejected: {registration:?}"
+            );
+            assert_eq!(child.wait().unwrap(), status, "real workload status lost");
+        }
+    }
 }
 
 fn complete_cleanup<T>(operation: &str, mut attempt: impl FnMut() -> io::Result<T>) -> T {
