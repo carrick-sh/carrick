@@ -57,10 +57,12 @@ use crate::linux_abi::LinuxErrno;
 use crate::memory::AddressSpace;
 use crate::thread::{FutexTable, ThreadId, ThreadRegistry};
 use crate::trap::{SyscallTrap, TrapError};
+#[cfg(test)]
+use carrick_kernel::dispatch::CurrentMmMemory;
 use carrick_kernel::dispatch::routing::{MutationDispatchRoute, OrdinaryDispatchRoute};
 use carrick_kernel::dispatch::{
-    CurrentMmMemory, DispatchError, DispatchOutcome, PreparedDispatch, PreparedSyscall,
-    SyscallCompletionToken, SyscallDispatcher, SyscallRequest, ThreadCtx,
+    DispatchError, DispatchOutcome, PreparedDispatch, PreparedSyscall, SyscallCompletionToken,
+    SyscallDispatcher, SyscallRequest, ThreadCtx,
 };
 use carrick_kernel::kernel::CarrierProcess;
 use carrick_kernel::run_result::{RunResult, RuntimeError};
