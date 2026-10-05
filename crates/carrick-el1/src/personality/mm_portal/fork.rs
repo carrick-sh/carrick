@@ -48,7 +48,10 @@ pub use carrick_core::mm::fork::{ForkScratch, PreparedOwnerFork};
 pub struct LinuxForkPolicy;
 
 impl carrick_core::mm::fork::MappingInheritancePolicy for LinuxForkPolicy {
-    fn inheritance_policy(&self, mapping: &carrick_core::mm::fork::Mapping) -> carrick_core::mm::fork::Policy {
+    fn inheritance_policy(
+        &self,
+        mapping: &carrick_core::mm::fork::Mapping,
+    ) -> carrick_core::mm::fork::Policy {
         if mapping.flags.contains(ReservationNodeFlags::DONTFORK) {
             carrick_core::mm::fork::Policy::Omit
         } else if mapping.flags.contains(ReservationNodeFlags::WIPEONFORK) {
@@ -64,6 +67,7 @@ impl carrick_core::mm::fork::MappingInheritancePolicy for LinuxForkPolicy {
         !mapping.flags.contains(ReservationNodeFlags::PRIVATE)
     }
 }
+
 
 /// An unpublished memory result. Task admission chooses commit or rollback;
 /// the child gate is closed throughout, and its exact parent undo remains owned.
@@ -118,7 +122,9 @@ impl UnpublishedEl1Child {
             .ok_or(MmError::Busy)?;
         let root = portal.root(parent, worker)?;
         let child_root = portal.child_root(child, worker)?;
-        self.inner.abort(words, root, child_root).map_err(Into::into)
+        self.inner
+            .abort(words, root, child_root)
+            .map_err(Into::into)
     }
 }
 
