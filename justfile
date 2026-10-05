@@ -172,6 +172,7 @@ lint-domains: lint-domains-source
 lint-domains-source:
     python3 scripts/conformance/check-next-strategy.py
     cargo run --locked -p carrick-xtask -- probe-coverage
+    cargo test -p carrick-xtask --test probe_coverage
     ./scripts/closure-assert-vmfree-schedule.sh
     ./scripts/lint-domains.sh
     # The self-tests run FIRST and in the same gate as --check: every one of
@@ -475,6 +476,7 @@ test *ARGS:
         # conformance-contracts/ tree) are integration targets too, so the
         # `--lib --bins` line never ran them; name the crate.
         cargo test -p carrick-conformance-contract --tests {{ARGS}}
+        cargo test -p carrick-xtask --test probe_coverage {{ARGS}}
         # The authenticated jit-shape builders/parsers have measured >1 MiB
         # debug frames. Several tests need two in one body; libtest's ~2 MiB
         # default has repeatedly been tipped over by unrelated additions. Keep
@@ -539,6 +541,7 @@ test *ARGS:
     env RUST_TEST_THREADS=1 cargo test -p carrick-host --lib {{ARGS}}
     env RUST_TEST_THREADS=1 cargo test -p carrick-runtime {{_platform_features}} --lib {{ARGS}}
     cargo test -p carrick-conformance-contract --tests {{ARGS}}
+    cargo test -p carrick-xtask --test probe_coverage {{ARGS}}
 
 # Rustdoc gate: broken intra-doc links / unclosed-tag lints fail the build (matches CI).
 doc *ARGS:

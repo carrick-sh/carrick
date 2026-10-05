@@ -18,7 +18,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  CARRICK_PROBE_COVERAGE_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || 'HEAD~1' }}
+  CARRICK_PROBE_COVERAGE_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
 
 jobs:
   # Source, ABI, kernel-graph, and host-semantic validation on public hosted
@@ -32,6 +32,34 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Fetch and validate probe coverage base commit
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            BEFORE="${{ github.event.before }}"
+            if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              echo "::error::Push event base commit (github.event.before) is unavailable or all-zero (new branch without base)"
+              exit 1
+            fi
+            echo "Fetching push base commit $BEFORE"
+            git fetch --no-tags origin "$BEFORE"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            if [ -z "$BASE" ]; then
+              echo "::error::Pull request base SHA is missing"
+              exit 1
+            fi
+            echo "Fetching PR base commit $BASE"
+            git fetch --no-tags origin "$BASE"
+          elif [ "${{ github.event_name }}" = "merge_group" ]; then
+            BASE="${{ github.event.merge_group.base_sha }}"
+            if [ -z "$BASE" ]; then
+              echo "::error::Merge group base SHA is missing"
+              exit 1
+            fi
+            echo "Fetching merge group base commit $BASE"
+            git fetch --no-tags origin "$BASE"
+          fi
 
       - name: Conformance contract coverage (PR changed surfaces)
         if: github.event_name == 'pull_request'
@@ -65,7 +93,7 @@ jobs:
 
       - name: Typed-domain lints (semgrep gate)
         env:
-          CARRICK_PROBE_COVERAGE_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || 'HEAD~1' }}
+          CARRICK_PROBE_COVERAGE_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: just lint-domains
 
       - name: Dependency audit (cargo-deny gate)

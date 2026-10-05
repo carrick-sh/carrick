@@ -3052,6 +3052,29 @@ fn validate_closure_probe_rows(
         ));
     }
 
+    let xtask_inventory: BTreeMap<String, carrick_xtask::probe_inventory::ProbeInventoryRow> =
+        inventory
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    carrick_xtask::probe_inventory::ProbeInventoryRow {
+                        class: v.class.clone(),
+                        runner: v.runner.clone(),
+                        excluded: v.excluded,
+                        contract_ids: None,
+                    },
+                )
+            })
+            .collect();
+    carrick_xtask::probe_coverage::validate_closure_coverage(
+        &repo_path(""),
+        None,
+        &xtask_inventory,
+        source_names,
+    )
+    .map_err(|e| format!("closure probe coverage ratchet violation: {e}"))?;
+
     let dedicated = DEDICATED_PROBE_RUNNERS
         .iter()
         .copied()
@@ -4754,6 +4777,12 @@ fn closure_probe_inventory_enforces_authoritative_runners_and_denominator() {
     renamed.get_mut("bridge_tcp_peer").expect("tcp row").runner = udp_runner;
     renamed.get_mut("bridge_udp_peer").expect("udp row").runner = tcp_runner;
     assert!(validate_closure_probe_rows(&renamed, &sources).is_err());
+
+    let mut shrunken_inventory = inventory();
+    shrunken_inventory.remove("clockgetres");
+    let mut shrunken_sources = sources.clone();
+    shrunken_sources.remove("clockgetres");
+    assert!(validate_closure_probe_rows(&shrunken_inventory, &shrunken_sources).is_err());
 }
 
 #[test]

@@ -1,7 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use carrick_xtask::probe_coverage::{
-    CoverageError, ProbeIdentity, ReviewedRetirementRecord, run_probe_coverage, validate_coverage,
+    CoverageError, ProbeIdentity, ReviewedRetirementRecord, run_probe_coverage,
+    run_probe_coverage_with_env, validate_coverage,
 };
 use carrick_xtask::probe_inventory::{
     ProbeInventoryRow, derive_partition, load_inventory_from_str, validate_source_membership,
@@ -483,11 +484,32 @@ fn self_comparison_fails_clearly() {
     }
 
     // Local resolution on main (where merge-base with main is HEAD)
-    let res_none = run_probe_coverage(Some(&repo_path), None);
+    // Run with explicit env_base=None so it does not inherit CARRICK_PROBE_COVERAGE_BASE from CI
+    let res_none = run_probe_coverage_with_env(Some(&repo_path), None, None);
     match res_none {
         Err(CoverageError::CannotCompareHeadToItself { .. }) => {}
         other => panic!("expected CannotCompareHeadToItself on local resolution, got: {other:?}"),
     }
+
+    // Also verify via child process with CARRICK_PROBE_COVERAGE_BASE removed from environment
+    let bin = env!("CARGO_BIN_EXE_carrick-xtask");
+    let output = std::process::Command::new(bin)
+        .arg("--root")
+        .arg(&repo_path)
+        .arg("probe-coverage")
+        .env_remove("CARRICK_PROBE_COVERAGE_BASE")
+        .output()
+        .expect("execute carrick-xtask child process");
+    assert!(
+        !output.status.success(),
+        "child process must fail on self-comparison"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot compare HEAD to itself")
+            || stderr.contains("CannotCompareHeadToItself"),
+        "unexpected stderr from child process: {stderr}"
+    );
 }
 
 #[test]
@@ -682,4 +704,86 @@ fn git_probe_addition_passes_without_baseline_file() {
             .join("conformance-probes/coverage-base.json")
             .exists()
     );
+}
+
+#[test]
+fn multi_commit_push_removal_detected_by_push_base() {
+    let (_dir, repo_path) = init_git_repo();
+    write_probe_source(&repo_path, "probe_a");
+    write_probe_source(&repo_path, "probe_b");
+    let inv = BTreeMap::from([
+        (
+            "probe_a".to_string(),
+            sample_row("conformance", "generic", false),
+        ),
+        (
+            "probe_b".to_string(),
+            sample_row("conformance", "generic", false),
+        ),
+    ]);
+    write_inventory(&repo_path, &inv);
+    git_commit_all(&repo_path, "Commit A: base with probe_a and probe_b");
+    let head_a =
+        carrick_xtask::command::run_checked("git", ["rev-parse", "HEAD"], Some(&repo_path))
+            .expect("rev-parse A")
+            .stdout
+            .trim()
+            .to_string();
+
+    // Commit B: unreviewed removal of probe_b
+    remove_probe_source(&repo_path, "probe_b");
+    let shrunken_inv = BTreeMap::from([(
+        "probe_a".to_string(),
+        sample_row("conformance", "generic", false),
+    )]);
+    write_inventory(&repo_path, &shrunken_inv);
+    git_commit_all(&repo_path, "Commit B: remove probe_b without review");
+
+    // Commit C: unrelated documentation change
+    let doc_path = repo_path.join("README.md");
+    std::fs::write(&doc_path, "unrelated documentation update\n").expect("write doc");
+    git_commit_all(&repo_path, "Commit C: update docs");
+
+    // Flawed HEAD~1 comparison (as previously in CI): compares C to B, escapes detection!
+    let head1_res = run_probe_coverage(Some(&repo_path), Some("HEAD~1"));
+    assert!(
+        head1_res.is_ok(),
+        "comparing against HEAD~1 blindly passes despite probe_b removal in B: {head1_res:?}"
+    );
+
+    // Correct push base comparison (github.event.before, which is commit A):
+    // compares C to A, catches unreviewed probe removal in B!
+    let push_res = run_probe_coverage(Some(&repo_path), Some(&head_a));
+    match push_res {
+        Err(CoverageError::UnreviewedRemoval { probe, .. }) => {
+            assert_eq!(probe, "probe_b");
+        }
+        other => panic!(
+            "expected UnreviewedRemoval when comparing against push base commit A, got: {other:?}"
+        ),
+    }
+}
+
+#[test]
+fn all_zero_push_base_fails_clearly() {
+    let (_dir, repo_path) = init_git_repo();
+    write_probe_source(&repo_path, "probe_a");
+    let inv = BTreeMap::from([(
+        "probe_a".to_string(),
+        sample_row("conformance", "generic", false),
+    )]);
+    write_inventory(&repo_path, &inv);
+    git_commit_all(&repo_path, "commit 1");
+
+    let zero_base = "0000000000000000000000000000000000000000";
+    let res = run_probe_coverage_with_env(Some(&repo_path), None, Some(zero_base));
+    match res {
+        Err(CoverageError::BaseResolution(msg)) => {
+            assert!(
+                msg.contains("all-zero"),
+                "expected all-zero error, got: {msg}"
+            );
+        }
+        other => panic!("expected BaseResolution error for all-zero push base, got: {other:?}"),
+    }
 }
