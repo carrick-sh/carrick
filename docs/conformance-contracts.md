@@ -516,6 +516,10 @@ The VM-free bindings are
 `concurrent_transfer_waits_for_exact_uncommitted_physical_grant` and
 `transfer_partial_remap_keeps_dirty_neighbor_in_same_compound`; they cover
 rollback, applied settlement, late enrollment and distinct owner completions.
+Both settlement paths release the publisher's temporary physical pin before
+publishing readiness or invoking callbacks; a waiter may immediately retire
+that exact owner. The witnesses sample the exact stage-2 pin count inside
+the callback and require zero, rather than checking only after producer Drop.
 The same copyout signed fixture remains the required production binding.
 
 ## Terminal clear custody
