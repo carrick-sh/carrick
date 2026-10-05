@@ -700,5 +700,13 @@ path = "crates/carrick-x86/src/bringup_fns/poll_tests.rs"
 contracts = ["x86.run-elf.poll"]
 
 [[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests.rs"
+contracts = ["kernel.net.connect-wake-scope"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests/loom_models.rs"
+contracts = ["kernel.net.connect-wake-scope"]
+
+[[surfaces]]
 path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs"
 contracts = ["x86.run-elf.poll"]
