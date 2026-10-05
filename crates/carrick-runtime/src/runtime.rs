@@ -3176,6 +3176,11 @@ mod tests {
             // SCOPE here, not retired: every one of them is still gated, by
             // `scripts/migrate/check-carrier-only-process-invariant.py` in
             // `just lint-domains`, whose scan roots follow the code.
+            // The cfg(test) nonce-exhaustion witness self-spawns its exact
+            // ignored child to isolate a process-global SIGABRT. It bounds
+            // and reaps that child; committed retirement creates no host
+            // process in production.
+            ("hvpatch/stage1_mm.rs", [0, 0, 1]),
             // This unit test self-spawns to isolate a process-global abort
             // boundary while proving pending exec error preservation. It is
             // not production host-process-per-guest architecture.
