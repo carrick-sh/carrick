@@ -59,7 +59,10 @@ Demand requires the complete four-label set, `workflow_dispatch`, this
 repository's `willow-pilot.yml`, `work/willow-pilot`, and the approved SHA.
 GitHub can assign a different compatible job; the reservation never binds a
 job ID. A guest job-start hook checks repository/event/workflow ref/SHA before
-workflow steps. Unexpected assignments fail visibly at that hook. The ledger
+workflow steps. The launcher isolates listener/worker/hook in a fresh process
+group; rejection kills that entire group with SIGKILL, so `always()` and
+`failure()` workflow steps cannot continue after a failed authorization.
+The ledger
 records the actual assigned job, including completed alternate assignments.
 
 Reservations count before clone POST, are fsynced before side effects, and
@@ -89,8 +92,12 @@ Every 60 seconds reconciliation preserves busy/unknown assignments. After
 15 minutes, an unassigned registered guest is drained under the same flock as
 the job-start hook, then its assignment is rechecked before removal. A passed
 hook leaves a busy marker; a competing drain prevents steps from starting.
-Completed jobs export runner stdout, remove any remaining registration and
-delete the clone through the API. GitHub job artifacts preserve capability,
+Completed jobs export runner stdout, stop and delete the clone through the
+API, verify absence, then remove any remaining registration. Persisted
+`Reaping` is durable teardown authorization: restart continues from owned VM
+state without querying assignment, including when registration is already
+gone or the VM is already stopped. Preparation errors do not grant that
+authorization. GitHub job artifacts preserve capability,
 build and CPL0 execution logs.
 
 Restart recovers successful JIT registration by its exact ledger name. Failed
@@ -111,3 +118,12 @@ DHCP/DNS are allowed; new private/link-local destination traffic is rejected.
 Cloud-init administrative grants are removed before runner qualification.
 This remains trusted-workflow infrastructure, not an adversarial isolation
 claim. No load generator or Docker oracle is part of the pilot.
+
+Authenticated curl calls use `--disable` as the first argument to prevent an
+ambient `.curlrc` from tracing Authorization headers. Cloud-init exit 2 must
+include at least one exact allowlisted Proxmox deprecation; an empty warning
+map is not qualified. Template boot uses the same 80% CPU ceiling as clones.
+
+The [security review regressions](willow-pilot-security-review.md) cover these
+controls locally. The historical live receipt predates these fixes; no new
+live Willow operations or deployment were performed for this review.
