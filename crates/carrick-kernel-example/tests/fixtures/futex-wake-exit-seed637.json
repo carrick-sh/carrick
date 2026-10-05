@@ -2,7 +2,7 @@
   "schema_version": 1,
   "generator_version": 3,
   "seed": 637,
-  "source_hash": "89bfe62af79ed53f5aad4e5de330a7e658bdca09f7ce6073eb9b839c0583bd56",
+  "source_hash": "ca0f51b93258ab06a6d3c9e42f5878ac3563f4cdd9497b48dd463ca5162e1b2d",
   "fixture_hash": "5dc969a4d055328d71984baf24ad74987fbc6445f98bb3021e129cf83dae7b06",
   "backend": "kernel-example/portable",
   "scale": 1,
