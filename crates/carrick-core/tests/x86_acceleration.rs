@@ -33,6 +33,26 @@ impl TestMemory {
     }
 }
 
+struct LinuxForkPolicy;
+
+impl carrick_core::mm::fork::MappingInheritancePolicy for LinuxForkPolicy {
+    fn inheritance_policy(&self, mapping: &Mapping) -> carrick_core::mm::fork::Policy {
+        if mapping.flags.contains(ReservationNodeFlags::DONTFORK) {
+            carrick_core::mm::fork::Policy::Omit
+        } else if mapping.flags.contains(ReservationNodeFlags::WIPEONFORK) {
+            carrick_core::mm::fork::Policy::Wipe
+        } else if mapping.flags.contains(ReservationNodeFlags::PRIVATE) {
+            carrick_core::mm::fork::Policy::Private
+        } else {
+            carrick_core::mm::fork::Policy::Keep
+        }
+    }
+
+    fn is_shared(&self, mapping: &Mapping) -> bool {
+        !mapping.flags.contains(ReservationNodeFlags::PRIVATE)
+    }
+}
+
 impl LiveDescriptorWords for TestMemory {
     fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
         Ok(self.words.lock().unwrap().get(&pa).copied().unwrap_or(0))
@@ -215,7 +235,7 @@ fn x2_shared_fork_cow() {
     scratch.mappings = mappings;
 
     // Run copy_table with X86Mmu
-    copy_table::<X86Mmu, _>(&mem, req, &mut scratch, root_pa, 0, 0, 0).unwrap();
+    copy_table::<X86Mmu, _, _>(&LinuxForkPolicy, &mem, req, &mut scratch, root_pa, 0, 0, 0).unwrap();
 
     // Check that parent leaf was armed for COW: WRITE removed, COW | MAY_WRITE added
     let parent_edit = scratch.edits.iter().find(|e| e.pa == l1_pa).unwrap();
@@ -276,7 +296,7 @@ fn x2_shared_fork_cow() {
         host_backing: None,
     }];
 
-    copy_table::<Aarch64Mmu, _>(&arm_mem, req, &mut arm_scratch, arm_root, 0, 0, 0).unwrap();
+    copy_table::<Aarch64Mmu, _, _>(&LinuxForkPolicy, &arm_mem, req, &mut arm_scratch, arm_root, 0, 0, 0).unwrap();
     assert!(
         !arm_scratch.edits.is_empty(),
         "AArch64 copy_table runs using the exact same generic capsule"
@@ -310,7 +330,7 @@ fn x2_shared_fork_cow() {
         host_backing: None,
     }];
 
-    copy_table::<X86Mmu, _>(&perms_mem, req, &mut perms_scratch, root_pa, 0, 0, 0).unwrap();
+    copy_table::<X86Mmu, _, _>(&LinuxForkPolicy, &perms_mem, req, &mut perms_scratch, root_pa, 0, 0, 0).unwrap();
 
     // Check the child table descriptors created in perms_scratch.child
     // Index 0 in child root table (offset 0) points to child L3 table.
@@ -336,5 +356,38 @@ fn x2_shared_fork_cow() {
         0,
         "child table descriptor must preserve supervisor (no USER) from parent ancestor"
     );
+
+    // 5. Witness: uncovered x86 descriptors must use B::is_user, not ARM bit 6.
+    let clean_user = 0x1000 | PRESENT | WRITE | USER;
+    let pol_user = carrick_core::mm::fork::policy::<X86Mmu, _>(
+        &LinuxForkPolicy,
+        &[],
+        0,
+        4096,
+        clean_user,
+    )
+    .unwrap();
+    assert_eq!(
+        pol_user,
+        carrick_core::mm::fork::Policy::Omit,
+        "uncovered clean x86 user leaf must be omitted"
+    );
+
+    let dirty_supervisor = 0x2000 | PRESENT | WRITE | (1 << 6);
+    let pol_sup = carrick_core::mm::fork::policy::<X86Mmu, _>(
+        &LinuxForkPolicy,
+        &[],
+        0,
+        4096,
+        dirty_supervisor,
+    )
+    .unwrap();
+    assert_eq!(
+        pol_sup,
+        carrick_core::mm::fork::Policy::Keep,
+        "uncovered dirty x86 supervisor leaf must be kept"
+    );
 }
+
+
 

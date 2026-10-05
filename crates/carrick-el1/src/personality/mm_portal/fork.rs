@@ -43,6 +43,27 @@ pub(super) fn fork_table_window(
 
 pub use carrick_core::mm::fork::{ForkScratch, PreparedOwnerFork};
 
+#[derive(Clone, Copy, Default)]
+pub struct LinuxForkPolicy;
+
+impl carrick_core::mm::fork::MappingInheritancePolicy for LinuxForkPolicy {
+    fn inheritance_policy(&self, mapping: &carrick_core::mm::fork::Mapping) -> carrick_core::mm::fork::Policy {
+        if mapping.flags.contains(ReservationNodeFlags::DONTFORK) {
+            carrick_core::mm::fork::Policy::Omit
+        } else if mapping.flags.contains(ReservationNodeFlags::WIPEONFORK) {
+            carrick_core::mm::fork::Policy::Wipe
+        } else if mapping.flags.contains(ReservationNodeFlags::PRIVATE) {
+            carrick_core::mm::fork::Policy::Private
+        } else {
+            carrick_core::mm::fork::Policy::Keep
+        }
+    }
+
+    fn is_shared(&self, mapping: &carrick_core::mm::fork::Mapping) -> bool {
+        !mapping.flags.contains(ReservationNodeFlags::PRIVATE)
+    }
+}
+
 /// An unpublished memory result. Task admission chooses commit or rollback;
 /// the child gate is closed throughout, and its exact parent undo remains owned.
 pub struct UnpublishedEl1Child {
@@ -227,7 +248,8 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
                 })
                 .count(),
         };
-        census_table::<carrick_mmu_core::owner_mmu::Aarch64Mmu, _>(
+        census_table::<carrick_mmu_core::owner_mmu::Aarch64Mmu, _, _>(
+            &LinuxForkPolicy,
             words,
             &mappings,
             grant.ttbr0 & PA,
@@ -321,7 +343,8 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
             return Err(MmError::NoMemory);
         }
         let parent_root = grant.ttbr0 & PA;
-        copy_table::<carrick_mmu_core::owner_mmu::Aarch64Mmu, _>(
+        copy_table::<carrick_mmu_core::owner_mmu::Aarch64Mmu, _, _>(
+            &LinuxForkPolicy,
             words,
             request,
             &mut scratch,
