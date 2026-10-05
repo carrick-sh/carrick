@@ -798,7 +798,7 @@ mod tests {
                 self.table.lock_waiting(
                     self.index,
                     self.mm,
-                    &crate::dispatch::mem::el1_reservations::RootHostWait::new(),
+                    &carrick_el1::memory::reservations::NoRootWait,
                 )
             }
         }
@@ -1141,9 +1141,7 @@ pub use projection::{NonAnonymousVmas, ReservationProcMaps};
 #[path = "el1_reservations/provider.rs"]
 mod provider;
 pub(in crate::dispatch) use provider::{DelegatedRoot, ReservationProviderSlot};
-pub use provider::{
-    HostReservationProvider, PreparedHostReservations, PreparedReservationSession, RootHostWait,
-};
+pub use provider::{HostReservationProvider, PreparedHostReservations, PreparedReservationSession};
 
 #[path = "el1_reservations/returns.rs"]
 mod returns;
