@@ -661,35 +661,39 @@ pub fn census_entry<
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ForkTableCursor {
+    pub table: u64,
+    pub level: usize,
+    pub base: u64,
+    pub child_offset: usize,
+}
+
 pub fn copy_table<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescriptorWords + ?Sized>(
     policy_provider: &P,
     words: &W,
     request: PortalForkRequest,
     scratch: &mut ForkScratch,
-    table: u64,
-    level: usize,
-    base: u64,
-    child_offset: usize,
+    cursor: ForkTableCursor,
 ) -> Result<(), ForkError> {
     for index in 0..512 {
-        let address = table + index as u64 * 8;
+        let address = cursor.table + index as u64 * 8;
         let descriptor = words.load(address).map_err(|_| ForkError::Core)?;
         if scratch.reads.len() == scratch.reads.capacity() {
             return Err(ForkError::NoMemory);
         }
         scratch.reads.push((address, descriptor));
-        let va = base + ((index as u64) << SHIFTS[level]);
+        let va = cursor.base + ((index as u64) << SHIFTS[cursor.level]);
         let (parent, child) = copy_entry::<B, P, W>(
             policy_provider,
             words,
             request,
             scratch,
             descriptor,
-            level,
+            cursor.level,
             va,
         )?;
-        scratch.child[child_offset + index] = child;
+        scratch.child[cursor.child_offset + index] = child;
         if parent != descriptor {
             if scratch.edits.len() == scratch.edits.capacity() {
                 return Err(ForkError::NoMemory);
@@ -699,8 +703,8 @@ pub fn copy_table<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
                 before: descriptor,
                 after: parent,
                 bbm_va: va,
-                bbm_len: if B::needs_break_before_make(descriptor, parent, level) {
-                    1 << SHIFTS[level]
+                bbm_len: if B::needs_break_before_make(descriptor, parent, cursor.level) {
+                    1 << SHIFTS[cursor.level]
                 } else {
                     0
                 },
@@ -729,10 +733,12 @@ pub fn copy_entry<B: OwnerForkMmu, P: MappingInheritancePolicy, W: LiveDescripto
             words,
             request,
             scratch,
-            descriptor & B::ADDRESS_MASK,
-            level + 1,
-            va,
-            child,
+            ForkTableCursor {
+                table: descriptor & B::ADDRESS_MASK,
+                level: level + 1,
+                base: va,
+                child_offset: child,
+            },
         )?;
         return Ok((
             descriptor,
