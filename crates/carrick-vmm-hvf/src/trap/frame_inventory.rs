@@ -744,10 +744,6 @@ pub(crate) struct ArmedSpanCandidate(CowArmedSpan);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl ArmedSpanCandidate {
-    pub(crate) fn executable(&self) -> bool {
-        self.0.executable
-    }
-
     /// The span one COW at `va` may repoint: the largest run of 4 KiB pages
     /// of the candidate, containing `va`, whose retained stage-1 output keeps
     /// the exact affine relation to `va`'s output. A page with no leaf at all

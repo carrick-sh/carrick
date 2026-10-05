@@ -12993,6 +12993,14 @@ mod guest_cow {
         let (mut child, pool) =
             forked_guest_child_with(810, 0x9a01_3800_0000, 0x9b01_3800_0000, true);
         child.state.cow_armed.lock().restore(Vec::new());
+        let root = child.owners.0[0].0;
+        for (page, access) in [(1, AP_RO_EL0), (2, 0b10 << 6)] {
+            let word = leaf_word(root, TEST_VA + page * 4096);
+            // SAFETY: the fixture owns the live table storage under its lock.
+            unsafe {
+                word.write_volatile((word.read_volatile() & !(AP | MAY_WRITE)) | access);
+            }
+        }
         let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
         let mm = child.snapshot.mm.get();
         provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
@@ -13008,6 +13016,9 @@ mod guest_cow {
         let spaces = AddressSpaces::new();
         let excluded = spaces.unpublished(mm).unwrap();
         let completion = pool.completions(&excluded).next().unwrap();
+        let leaves: Vec<_> = (0..4)
+            .map(|page| unsafe { leaf_word(root, TEST_VA + page * 4096).read_volatile() })
+            .collect();
         let runtime = child.state.cow_runtime.read().clone().unwrap();
         let mut wrong_mm = completion;
         wrong_mm.grant.mm_key += 1;
@@ -13021,6 +13032,16 @@ mod guest_cow {
             crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &wrong_output)
                 .is_err()
         );
+        let word = leaf_word(root, TEST_VA);
+        // SAFETY: the fixture owns the live table storage under its lock.
+        unsafe { word.write_volatile(leaves[0] | COW) };
+        assert!(
+            crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion)
+                .is_err(),
+            "an uncompleted live COW arm is not a physical handoff"
+        );
+        // SAFETY: restore the fixture's completed EL1 descriptor.
+        unsafe { word.write_volatile(leaves[0]) };
         crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion)
             .expect("owner COW completion needs no host semantic arm map");
         let replacement = alias_registry()
@@ -13035,6 +13056,13 @@ mod guest_cow {
         assert!(replacement.guest_writable);
         assert!(child.state.cow_armed.lock().ranges.is_empty());
         assert_eq!(child.state.host_cow_stats.host_cow_resolutions(), 0);
+        for (page, leaf) in leaves.iter().enumerate() {
+            assert_eq!(
+                unsafe { leaf_word(root, TEST_VA + page as u64 * 4096).read_volatile() },
+                *leaf,
+                "settlement preserves read-only and inaccessible neighbors"
+            );
+        }
         assert_eq!(
             unsafe { std::slice::from_raw_parts(model_owner_host(grant.physical_ipa), 4) },
             b"old!",

@@ -417,17 +417,38 @@ pub(crate) fn settle_one(
         }
         false
     } else {
-        let cow_armed = state.cow_armed.lock();
-        let first = cow_armed.span_for(completion.span_va);
-        let covered = (0..completion.span_len / PAGE).all(|index| {
-            cow_armed
-                .span_for(completion.span_va + index * PAGE)
-                .is_some()
-        });
-        first
-            .filter(|_| covered)
-            .ok_or_else(|| TrapError::Hypervisor("span is not COW-armed".to_owned()))?
-            .executable()
+        // Owner fork arms COW in its live descriptors, without host semantic
+        // arm ranges. The exact MM grant and outputs above authenticate the
+        // physical handoff; permissions come from the completed live leaves.
+        // Prepared neighbors may move without becoming resident, and resident
+        // neighbors must have lost their COW arm without widening permissions.
+        tables
+            .with_manager(|manager| {
+                (0..completion.span_len / PAGE).try_fold(false, |executable, index| {
+                    use carrick_mmu_core::aarch64::{El1PrivateLeafState, LeafAccess};
+                    let leaf = carrick_mmu_core::aarch64::terminal_descriptor(
+                        manager.debug_walk(completion.span_va + index * PAGE),
+                    );
+                    if !matches!(
+                        carrick_mmu_core::aarch64::el1_private_leaf_state(leaf),
+                        El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident
+                    ) || carrick_mmu_core::aarch64::terminal_descriptor_is_fork_cow(leaf)
+                    {
+                        return None;
+                    }
+                    Some(
+                        executable
+                            || carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(
+                                leaf,
+                                LeafAccess::Execute,
+                            ),
+                    )
+                })
+            })
+            .flatten()
+            .ok_or_else(|| {
+                TrapError::Hypervisor("live leaves are not completed private COW".to_owned())
+            })?
     };
     let span = CowArmedSpan {
         va: completion.span_va,
