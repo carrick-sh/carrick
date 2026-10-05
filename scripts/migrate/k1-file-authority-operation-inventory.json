@@ -23604,7 +23604,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 3151,
+      "line": 3164,
       "categories": [
         "mapping"
       ],
@@ -23613,7 +23613,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 3404,
+      "line": 3417,
       "categories": [
         "stream"
       ],
@@ -23658,7 +23658,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 6078,
+      "line": 6281,
       "categories": [
         "mapping"
       ],
@@ -23667,7 +23667,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 6086,
+      "line": 6289,
       "categories": [
         "mapping"
       ],
@@ -23676,7 +23676,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 6102,
+      "line": 6305,
       "categories": [
         "mapping"
       ],
@@ -24378,7 +24378,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1577,
+      "line": 1582,
       "categories": [
         "mapping"
       ],
@@ -24387,7 +24387,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1708,
+      "line": 1737,
       "categories": [
         "mapping"
       ],
@@ -24396,7 +24396,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1941,
+      "line": 1970,
       "categories": [
         "mapping"
       ],
@@ -24405,7 +24405,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1944,
+      "line": 1973,
       "categories": [
         "mapping"
       ],
@@ -24414,7 +24414,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1951,
+      "line": 1980,
       "categories": [
         "mapping"
       ],
@@ -24423,7 +24423,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1955,
+      "line": 1984,
       "categories": [
         "mapping"
       ],
@@ -24432,7 +24432,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 1971,
+      "line": 2000,
       "categories": [
         "mapping"
       ],
@@ -24441,7 +24441,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3263,
+      "line": 3293,
       "categories": [
         "mapping"
       ],
@@ -24450,7 +24450,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3265,
+      "line": 3295,
       "categories": [
         "mapping"
       ],
@@ -24459,7 +24459,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3273,
+      "line": 3303,
       "categories": [
         "mapping"
       ],
@@ -24468,7 +24468,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3285,
+      "line": 3315,
       "categories": [
         "mapping"
       ],
@@ -24477,7 +24477,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3289,
+      "line": 3319,
       "categories": [
         "mapping"
       ],
@@ -24486,7 +24486,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3292,
+      "line": 3322,
       "categories": [
         "mapping"
       ],
@@ -24558,7 +24558,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 663,
+      "line": 693,
       "categories": [
         "mapping"
       ],
@@ -24567,7 +24567,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 1092,
+      "line": 1122,
       "categories": [
         "mapping"
       ],
@@ -24576,7 +24576,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/signal.rs",
-      "line": 3462,
+      "line": 3492,
       "categories": [
         "mapping"
       ],
