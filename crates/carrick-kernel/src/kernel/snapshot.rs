@@ -1099,6 +1099,9 @@ impl Kernel {
 
     fn copy_registry(&self, deadline: Instant) -> Result<RegistryCopy, AttemptError> {
         let state = lock_result(self.registry().settled().try_read_until(deadline), deadline)?;
+        if !state.retiring_tasks.is_empty() {
+            return Err(AttemptError::Race);
+        }
         let tasks = state
             .tasks
             .values()
