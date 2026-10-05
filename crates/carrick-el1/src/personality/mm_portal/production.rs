@@ -995,6 +995,53 @@ unsafe impl PinnedMetadataExtent for GuestMetadataPin {
     }
 }
 
+/// Resolve the pre-service root before a hardware table window can be built.
+/// Kept in the VM-free owner layer so the hardware preamble's refusal uses
+/// the same exact operation and release producer as the transfer body.
+#[cfg(any(test, target_os = "none"))]
+pub(super) fn admit_service_root<'s, P: PinnedMetadataExtent>(
+    portal: &MmPortal<'_, P>,
+    service: carrick_el1_abi::PortalTransferService<'s>,
+) -> Option<(
+    carrick_el1_abi::PortalTransferService<'s>,
+    carrick_sched_core::spaces::SpaceGrant,
+)> {
+    let request = service.request();
+    // SAFETY: candidate identity only; observe_wait authenticates the exact
+    // current incarnation and carrier before returning a release receipt.
+    let handle = unsafe {
+        El1MmHandle::from_admitted_owner(
+            request.operation.carrier,
+            request.operation.mm,
+            request.operation.incarnation,
+        )
+    };
+    // Observe BEFORE checking the gate. Release before enrollment then
+    // reports Changed; release after enrollment delivers this owned wait.
+    let gate = match portal.observe_wait(handle, carrick_el1_abi::PortalWaitCause::Gate) {
+        Ok(gate) => gate,
+        Err(error) => {
+            service.complete(0, error.errno());
+            return None;
+        }
+    };
+    let Some(index) = portal.spaces.find(request.operation.mm.raw()) else {
+        service.complete(0, MmError::Stale.errno());
+        return None;
+    };
+    let Some(grant) = portal.spaces.grant(index, request.operation.mm.raw()) else {
+        if let Some(wait) = gate {
+            service.suspend_prepare(carrick_el1_abi::PortalPrepareSuspension::Owner(wait));
+        } else {
+            // VM-free portals without a zone have no producer to enroll on.
+            // Production always authenticates a zone notification above.
+            service.complete(0, MmError::Busy.errno());
+        }
+        return None;
+    };
+    Some((service, grant))
+}
+
 #[cfg(target_os = "none")]
 pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let Some(executor_slot) = carrick_el1_abi::service_slot_from_stack(
@@ -1044,12 +1091,7 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         );
         return;
     }
-    let Some(grant) = zone
-        .spaces
-        .find(request.operation.mm.raw())
-        .and_then(|index| zone.spaces.grant(index, request.operation.mm.raw()))
-    else {
-        service.complete(0, 11);
+    let Some((service, grant)) = admit_service_root(&portal, service) else {
         return;
     };
     let live_ttbr: u64;
