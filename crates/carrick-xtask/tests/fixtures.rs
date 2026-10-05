@@ -536,6 +536,9 @@ fn acceptance_rejects_untracked_host_test_even_with_valid_fixtures() {
     let output = Command::new(env!("CARGO_BIN_EXE_carrick-xtask"))
         .current_dir(f.repo.path())
         .args(["accept", "--phase", "signed"])
+        .env("CARRICK_HOST_LEASE_PATH", f.store.path().join("host.lock"))
+        .env_remove("CARRICK_HOST_LEASE_FD")
+        .env_remove("CARRICK_HOST_LEASE_MODE")
         .output()
         .unwrap();
     assert!(!output.status.success());
