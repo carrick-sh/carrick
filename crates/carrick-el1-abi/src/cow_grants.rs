@@ -282,6 +282,9 @@ impl CowGrantPool {
     /// EL1, still holding the editor: the claimed grant was not used (the
     /// repoint refused before storing anything); it is ready again.
     pub fn abandon(&self, grant: &CowGrant) -> bool {
+        if !self.authenticates_claimed(grant) {
+            return false;
+        }
         let Some(record) = self.records.get(grant.slot) else {
             return false;
         };
@@ -304,9 +307,7 @@ impl CowGrantPool {
         let Some(record) = self.records.get(grant.slot) else {
             return false;
         };
-        if !completion.is_well_formed()
-            || record.state.load(Ordering::Acquire) != grant.epoch | CLAIMED
-        {
+        if !completion.is_well_formed() || !self.authenticates_claimed(&grant) {
             return false;
         }
         record
@@ -482,7 +483,7 @@ impl CowGrantPool {
         let Some(record) = self.records.get(grant.slot) else {
             return false;
         };
-        if record.mm_key.load(Ordering::Relaxed) != grant.mm_key {
+        if record.grant(grant.slot, grant.epoch | from) != Some(*grant) {
             return false;
         }
         let freed = record
@@ -748,6 +749,52 @@ mod tests {
         assert!(!pool.has_completions_for(8));
         assert!(pool.finish(&excluded(&spaces, 7), &claimed));
         assert!(!pool.has_completions_for(7));
+    }
+
+    #[test]
+    fn completion_and_abandon_require_the_exact_claimed_identity() {
+        for field in 0..3 {
+            let pool = CowGrantPool::new();
+            pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
+            let claimed = pool.claim(7).unwrap();
+            let mut wrong = claimed;
+            match field {
+                0 => wrong.mm_key = 8,
+                1 => wrong.physical_ipa += COW_GRANT_SIZE,
+                _ => wrong.backing = backing(20),
+            }
+            assert!(
+                !pool.complete(&completion(wrong)),
+                "foreign grant field {field} completed"
+            );
+            assert!(
+                !pool.abandon(&wrong),
+                "foreign grant field {field} abandoned"
+            );
+            assert!(pool.authenticates_claimed(&claimed));
+            assert!(pool.complete(&completion(claimed)));
+        }
+    }
+
+    #[test]
+    fn settlement_requires_the_exact_backing_identity() {
+        let spaces = carrick_sched_core::AddressSpaces::new();
+        let seven = excluded(&spaces, 7);
+        let pool = CowGrantPool::new();
+        let original = pool.publish(7, 0x8_0000_4000, backing(10)).unwrap();
+        let mut wrong = original;
+        wrong.backing = backing(20);
+        assert!(
+            !pool.revoke(&seven, &wrong),
+            "wrong backing revoked a live record"
+        );
+        let claimed = pool.claim(7).unwrap();
+        assert!(pool.complete(&completion(claimed)));
+        assert!(
+            !pool.finish(&seven, &wrong),
+            "wrong backing settled a used record"
+        );
+        assert!(pool.finish(&seven, &original));
     }
 
     #[test]
