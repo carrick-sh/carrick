@@ -375,7 +375,11 @@ impl<
             )
         }))
     }
-    fn editor_for(&self, handle: El1MmHandle, slot: u32) -> Result<SpaceEditor<'_>, MmError> {
+    pub(crate) fn editor_for(
+        &self,
+        handle: El1MmHandle,
+        slot: u32,
+    ) -> Result<SpaceEditor<'_>, MmError> {
         use carrick_core_abi::PortalWaitCause;
         use carrick_sched_core::spaces::EditAdmissionRefusal;
         let editor = self.observe_wait(handle, PortalWaitCause::Editor)?;
@@ -395,7 +399,7 @@ impl<
                 EditAdmissionRefusal::Stale => MmError::Stale,
             })
     }
-    fn root_for(
+    pub(crate) fn root_for(
         &self,
         handle: El1MmHandle,
         slot: u32,
@@ -973,87 +977,6 @@ pub fn admit_service_root<
         return None;
     };
     Some((service, grant))
-}
-
-/// An editor retained from target admission through descriptor completion.
-pub struct GrantTarget<'a> {
-    window: carrick_core_abi::PortalGrantWindow,
-    grant: carrick_sched_core::SpaceGrant,
-    _editor: SpaceEditor<'a>,
-    authenticated: bool,
-}
-
-impl<'a> GrantTarget<'a> {
-    pub fn grant(&self) -> carrick_sched_core::SpaceGrant {
-        self.grant
-    }
-    pub fn into_parts(
-        self,
-    ) -> (
-        PortalGrantWindow,
-        carrick_sched_core::SpaceGrant,
-        SpaceEditor<'a>,
-        bool,
-    ) {
-        (self.window, self.grant, self._editor, self.authenticated)
-    }
-}
-
-pub fn grant_target<
-    'a,
-    P: PinnedMetadataExtent,
-    Policy: ReservationPolicy,
-    Geometry: ReservationGeometry,
-    Venue: OwnerVenue,
-    B: OwnerMmu,
->(
-    portal: &'a MmPortal<'_, P, Policy, Geometry, Venue, B>,
-    window: carrick_core_abi::PortalGrantWindow,
-    worker: u32,
-) -> Result<GrantTarget<'a>, MmError> {
-    if window.operation.carrier != portal.carrier {
-        return Err(MmError::Stale);
-    }
-    // SAFETY: this is only a candidate identity. editor_for authenticates its
-    // exact notification source before admitting it; root_for and the fault
-    // plan below validate incarnation, generation, range, protection and source.
-    let handle = unsafe {
-        El1MmHandle::from_admitted_owner(
-            window.operation.carrier,
-            window.operation.mm,
-            window.operation.incarnation,
-        )
-    };
-    let gate = portal.observe_wait(handle, carrick_core_abi::PortalWaitCause::Gate)?;
-    let editor = portal.editor_for(handle, worker)?;
-    let index = portal
-        .spaces
-        .find(window.operation.mm.raw())
-        .ok_or(MmError::Stale)?;
-    // A host can raise the gate after admission, then wait for this editor.
-    // Observe before probing and release the editor before parking that wait.
-    let grant = portal
-        .spaces
-        .grant(index, window.operation.mm.raw())
-        .ok_or_else(|| gate.map_or(MmError::Busy, MmError::Wait))?;
-    let mut root = portal.root_for(handle, worker)?;
-    let authenticated = root.authenticate_fork_transfer_fault(
-        ReservationFaultPlan {
-            mm: window.operation.mm,
-            generation: window.generation,
-            range: window.range,
-            protection: window.protection,
-            fault_page: window.fault_page,
-        },
-        window.host_backing,
-        window.fork_sequence,
-    );
-    Ok(GrantTarget {
-        window,
-        grant,
-        _editor: editor,
-        authenticated,
-    })
 }
 
 pub fn bind_service_root(
