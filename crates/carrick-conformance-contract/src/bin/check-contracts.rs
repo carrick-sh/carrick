@@ -67,29 +67,8 @@ fn run(root: &Path) -> Result<(), String> {
         }
     }
 
-    // Verify inventory matches live generation
+    // Generate live syscall inventory from registry
     let inventory = SyscallInventory::generate(&registry);
-    let serialized = serde_json::to_string_pretty(&inventory)
-        .map_err(|e| format!("cannot serialize inventory: {e}"))?;
-    let inventory_path = root.join("conformance-contracts").join("inventory.json");
-    if !inventory_path.exists() {
-        return Err(format!(
-            "missing inventory file {} (run `cargo run -p carrick-conformance-contract --bin generate-inventory` to generate it)",
-            inventory_path.display()
-        ));
-    }
-    let existing = std::fs::read_to_string(&inventory_path).map_err(|e| {
-        format!(
-            "cannot read inventory file {}: {e}",
-            inventory_path.display()
-        )
-    })?;
-    if existing.trim() != serialized.trim() {
-        return Err(format!(
-            "inventory drift detected at {} (run `cargo run -p carrick-conformance-contract --bin generate-inventory` to refresh)",
-            inventory_path.display()
-        ));
-    }
 
     println!(
         "conformance contracts checked: {} contracts, {} claims, {} surfaces (inventory: {} syscalls, {} with claims)",

@@ -3,13 +3,8 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::path::Path;
 use thiserror::Error;
-
-use crate::command::{CommandError, CommandOutput};
-
 pub const ALLOWED_PROBE_INVENTORY_PATH: &str = "conformance-probes/probe-inventory.json";
-pub const CONTRACTS_INVENTORY_PATH: &str = "conformance-contracts/inventory.json";
 
 pub const ALLOWED_ABORT_SHARDS: &[(&str, &str)] = &[
     ("scripts/migrate/runtime-aborts/hvf.json", "hvf.json"),
@@ -321,11 +316,6 @@ impl fmt::Display for MergedLedger {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MergeConflict {
-    #[error(
-        "conformance-contracts/inventory.json is a generated artifact that requires regeneration via `ledger-regenerate-contracts`"
-    )]
-    GeneratedArtifactNeedsRegeneration { path: String },
-
     #[error("unsupported ledger path '{0}'")]
     UnsupportedPath(String),
 
@@ -381,15 +371,6 @@ pub enum MergeConflict {
         ours: Option<String>,
         theirs: Option<String>,
     },
-}
-
-#[derive(Debug, Error)]
-pub enum RegenerateError {
-    #[error("invalid path: {0}")]
-    InvalidPath(String),
-
-    #[error("generation failed during {stage}: {error}")]
-    GenerationFailed { stage: &'static str, error: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1089,10 +1070,6 @@ pub fn merge_ledger(
 ) -> Result<MergedLedger, MergeConflict> {
     let norm_path = normalize_repo_path(path);
 
-    if norm_path == CONTRACTS_INVENTORY_PATH {
-        return Err(MergeConflict::GeneratedArtifactNeedsRegeneration { path: norm_path });
-    }
-
     if norm_path == ALLOWED_PROBE_INVENTORY_PATH {
         return merge_probe_inventory(base, ours, theirs);
     }
@@ -1648,65 +1625,4 @@ fn indent_row(s: &str, spaces: usize) -> String {
         out.push_str(line);
     }
     out
-}
-
-pub fn regenerate_contracts_with_runner<F>(root: &Path, runner: F) -> Result<(), RegenerateError>
-where
-    F: Fn(&str, &[&str], Option<&Path>) -> Result<CommandOutput, CommandError>,
-{
-    let root_str = root.to_str().ok_or_else(|| {
-        RegenerateError::InvalidPath(format!(
-            "root path contains invalid UTF-8: {}",
-            root.display()
-        ))
-    })?;
-
-    // Step 1: generate inventory with --root
-    runner(
-        "cargo",
-        &[
-            "run",
-            "-p",
-            "carrick-conformance-contract",
-            "--bin",
-            "generate-inventory",
-            "--",
-            "--root",
-            root_str,
-        ],
-        None,
-    )
-    .map_err(|err| RegenerateError::GenerationFailed {
-        stage: "generate",
-        error: err.to_string(),
-    })?;
-
-    // Step 2: verify inventory drift with --root <root> --check
-    runner(
-        "cargo",
-        &[
-            "run",
-            "-p",
-            "carrick-conformance-contract",
-            "--bin",
-            "generate-inventory",
-            "--",
-            "--root",
-            root_str,
-            "--check",
-        ],
-        None,
-    )
-    .map_err(|err| RegenerateError::GenerationFailed {
-        stage: "check",
-        error: err.to_string(),
-    })?;
-
-    Ok(())
-}
-
-pub fn regenerate_contracts(root: &Path) -> Result<(), RegenerateError> {
-    regenerate_contracts_with_runner(root, |prog, args, cwd| {
-        crate::command::run_checked(prog, args, cwd)
-    })
 }

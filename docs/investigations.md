@@ -54,7 +54,7 @@ The host-wide coordinator manages advisory resource leases under `$TMPDIR/carric
 
 ## Syscall Inventory & Claim Model
 
-The syscall inventory (`conformance-contracts/inventory.json`) is generated from the authoritative 463 AArch64 syscall table in `carrick-abi`:
+The syscall inventory is generated live from the authoritative 463 AArch64 syscall table in `carrick-abi`:
 
 - **Bring-Up:** Calls emulated in Carrick. Must be mapped to explicit claims or enumerated in `uncovered_behaviors`.
 - **Deferred:** Calls explicitly not emulated (e.g. `io_uring`). Covered by claims asserting declared refusal errnos (e.g. `ENOSYS`).
@@ -68,14 +68,11 @@ Each claim records its `CapabilityClass` and `CoverageState` (`Declared`, `Bound
 
 ### 1. Inventory Management
 
-Generate or check the syscall inventory:
+Generate the syscall inventory on demand:
 
 ```sh
-# Generate fresh inventory.json and report summary
+# Generate fresh inventory and report summary
 just inventory
-
-# Check for drift between checked-in inventory and ABI table
-just check-inventory
 ```
 
 ### 2. Running Investigations
