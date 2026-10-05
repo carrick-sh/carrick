@@ -476,6 +476,7 @@ dependencies = [
  "carrick-inotify-core",
  "carrick-mem",
  "carrick-mmu-core",
+ "carrick-personality-linux",
  "carrick-sched-core",
 ]
 
@@ -696,6 +697,7 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
+ "carrick-personality-linux",
  "carrick-portable",
  "carrick-sched-core",
  "carrick-signal-linux",
@@ -798,6 +800,14 @@ dependencies = [
  "tempfile",
  "thiserror",
  "usdt",
+]
+
+[[package]]
+name = "carrick-personality-linux"
+version = "0.1.0"
+dependencies = [
+ "carrick-core",
+ "carrick-core-abi",
 ]
 
 [[package]]
