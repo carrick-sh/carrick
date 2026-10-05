@@ -221,8 +221,8 @@ pub fn prepare<'a, C: ForkCustody + ?Sized>(
         },
         &mut effect,
     );
-    let service_stage = match outcome {
-        Ok(frame) => frame.x[1],
+    let (service_stage, stage3_check, parent_ttbr0) = match outcome {
+        Ok(frame) => (frame.x[1], frame.x[2], frame.x[3]),
         Err(error) => carrick_fatal::carrick_fatal!(
             "aarch64::fork_cow",
             "owner Fork transport failed before exact settlement: {error}"
@@ -258,6 +258,15 @@ pub fn prepare<'a, C: ForkCustody + ?Sized>(
     }
     match completion {
         Err(errno) => {
+            if service_stage == 3 && errno == 22 {
+                carrick_observability::probes::hvpatch_owner_fork_stage3_refusal(
+                    stage3_check,
+                    parent_ttbr0,
+                    request.child_tables.base,
+                    request.parent_tables.base,
+                    (request.child_tables.len << 32) | request.parent_tables.len,
+                );
+            }
             carrick_observability::probes::hvpatch_owner_fork_refusal(
                 errno,
                 service_stage,
