@@ -4,6 +4,7 @@ use crate::aarch64::LeafAccess;
 use crate::owner_mmu::{OwnerForkMmu, OwnerMmu, OwnerMmuRefusal, OwnerTranslation};
 use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct X86Mmu;
 impl OwnerForkMmu for X86Mmu {
     const ADDRESS_MASK: u64 = ADDRESS;

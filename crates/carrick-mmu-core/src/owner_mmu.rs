@@ -54,6 +54,7 @@ pub trait OwnerForkMmu: OwnerMmu {
     fn needs_break_before_make(before: u64, after: u64, level: usize) -> bool;
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Aarch64Mmu;
 impl OwnerForkMmu for Aarch64Mmu {
     const ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
