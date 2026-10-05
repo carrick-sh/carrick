@@ -13037,11 +13037,11 @@ mod guest_cow {
         );
         let word = leaf_word(root, TEST_VA);
         // SAFETY: the fixture owns the live table storage under its lock.
-        unsafe { word.write_volatile(leaves[0] | COW) };
+        unsafe { word.write_volatile(leaves[0] & !PRIVATE) };
         assert!(
             crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion)
                 .is_err(),
-            "an uncompleted live COW arm is not a physical handoff"
+            "a leaf outside private owner authority is not a physical handoff"
         );
         // SAFETY: restore the fixture's completed EL1 descriptor.
         unsafe { word.write_volatile(leaves[0]) };
@@ -13072,6 +13072,87 @@ mod guest_cow {
             "the private grant preserves the source bytes"
         );
         assert!(pool.finish(&excluded, &completion.grant));
+    }
+
+    fn settle_after_owner_edit(ordinal: u64, root: u64, data: u64, rearm: bool) {
+        use carrick_mmu_core::aarch64::descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, InlineJournal, PageSpan, TableGrants, TerminalEdit,
+            execute_descriptor_op,
+        };
+        let _guard = FOREIGN_MM_TEST_LOCK.lock();
+        let _external = ExternalAliasStateRestore::capture();
+        let _stub = ScopedStage2MapTestStub::enable();
+        let (mut child, pool) = forked_guest_child(ordinal, root, data);
+        child.state.cow_armed.lock().restore(Vec::new());
+        let custody = Arc::clone(legacy_test_carrier_vm_custody_arc());
+        let mm = child.snapshot.mm.get();
+        provision_guest_cow_grants(&child.state, &custody, pool, 1).unwrap();
+        let grant = pool.ready(mm).next().unwrap();
+        child
+            .owners
+            .0
+            .push((grant.physical_ipa, CowArmedRanges::COMPOUND_SIZE));
+        assert!(matches!(
+            el1_write_fault(&child, pool, TEST_VA + 8),
+            GuestCowOutcome::Resolved(_)
+        ));
+        let words = unsafe {
+            PrimaryTableWords::new(
+                model_owner_host(root).cast(),
+                root,
+                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                &Maintenance,
+            )
+        }
+        .unwrap();
+        let span = PageSpan::new(TEST_VA, CowArmedRanges::COMPOUND_SIZE);
+        let op = if rearm {
+            DescriptorOp::Terminal {
+                span,
+                edit: TerminalEdit::fork_arm(false, false, false, true, 0, 0),
+            }
+        } else {
+            DescriptorOp::Retire(span)
+        };
+        assert!(matches!(
+            execute_descriptor_op(
+                &words,
+                SubstrateGpa(root),
+                op,
+                &TableGrants::NONE,
+                &mut InlineJournal::new(),
+            ),
+            DescriptorOutcome::Applied(_)
+        ));
+        let leaves: Vec<_> = (0..4)
+            .map(|page| unsafe { leaf_word(root, TEST_VA + page * 4096).read_volatile() })
+            .collect();
+        let spaces = AddressSpaces::new();
+        let excluded = spaces.unpublished(mm).unwrap();
+        let completion = pool.completions(&excluded).next().unwrap();
+        let runtime = child.state.cow_runtime.read().clone().unwrap();
+        crate::trap::guest_cow::settle_one(&child.state, &custody, &runtime, &completion)
+            .expect("physical settlement preserves later owner edits");
+        for (page, leaf) in leaves.iter().enumerate() {
+            assert_eq!(
+                unsafe { leaf_word(root, TEST_VA + page as u64 * 4096).read_volatile() },
+                *leaf,
+                "settlement must not undo retirement or a later fork arm"
+            );
+        }
+        assert!(child.state.cow_armed.lock().ranges.is_empty());
+        assert_eq!(child.state.host_cow_stats.host_cow_resolutions(), 0);
+        assert!(pool.finish(&excluded, &completion.grant));
+    }
+
+    #[test]
+    fn settlement_preserves_later_owner_retirement() {
+        settle_after_owner_edit(811, 0x9a01_3900_0000, 0x9b01_3900_0000, false);
+    }
+
+    #[test]
+    fn settlement_preserves_later_owner_fork_arm() {
+        settle_after_owner_edit(812, 0x9a01_3a00_0000, 0x9b01_3a00_0000, true);
     }
 
     /// The initial process carves its sparse mmap arena and apertures with
