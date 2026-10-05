@@ -238,3 +238,79 @@ exact-MM exclusion, kernel/backend inventory publication and last-reference
 retirement. Logs: `owner-cow-green.log` and `owner-cow-suite.log`. The first
 focused green run exposed an unused candidate helper; it was removed before
 the clean 11-test suite. Signed verification still needs a new exact bundle.
+
+## Postmortem correction: the first settlement is the parent's
+
+Reading the retained `bdc151b36` core corrects the earlier child-stack
+attribution. The first completion belongs to parent PID 1/TID 1/MM 2/ASID 1,
+not child MM 3. Its grant names MM 2, frame 344, mapping 345, generation 5.
+Disassembly reads the arm Arc at the state-relative offset 728 plus its
+16-byte Arc header; DWARF confirms the field offset and state identity.
+The actual arm map has `ranges.len=0`, capacity zero and generation zero.
+Logs: `cow-postmortem-identity.log` and `cow-postmortem-arm.log` in the
+`fork-bdc151b36` evidence directory. Seeding only child arm metadata would
+not have addressed this first failure. No timing claim comes from LLDB.
+
+## Exact 7af3fdfb6 cycle: vvar, late retirement and clone copyout
+
+Source `7af3fdfb6ab9f91e3ef34857f91e4f422594dc5c`; director bundle:
+`/Volumes/carrick-build/fixtures/published/7af3fdfb6ab9f91e3ef34857f91e4f422594dc5c/3275604be5ed70ccaaaf68b8586afa9e3d6f2dbde63fcefcae03e6000a3b85db.tar.gz`.
+Archive SHA-256:
+`df5a3f9de57d96e2c2eebb2f6c32c7f2c1aceef65ce34e4d76ae63cf7b43d36e`.
+Restore and all five scoped runners verify 1,133 executable inputs by
+`input_identity`. The exclusive gate rebuilds the CLI and scheduler, records
+each signed artifact identity, verifies unchanged hashes and image layers,
+and leaves zero scoped processes after every signed/trace run.
+Evidence directory: `target/n1-cm/fork-7af3fdfb6/`.
+
+CLI SHA-256 `eeb780a6aa1fc7c44cbab403deea0918e9dcb2cf8e3bf4a4d1942c5927ee34d7`,
+CDHash `1caf852cbd4db4b1f9533bc996324a84ed84239e`, LC_UUID
+`2CFCE846-3945-3F3F-A4FD-A9CF31BA995A`; entitlement and DOF present.
+Every scheduler identity is retained in `sN-scheduler.*` with its executable.
+
+All five runners fail; every unentitled negative control passes:
+
+| Case | Result after parent settlement correction | Historical main comparison |
+|---|---|---|
+| concurrent VMA | Child vvar generation requires absent host COW arm | Workload and isolation complete; serving budget red |
+| MAP_FIXED/COW | User-write completion's live private leaf is retired before settlement; new guard rejects it | Twelve fixed mappings and isolation complete; serving budget red |
+| ptrace TRACECLONE | Child vvar generation requires absent host COW arm | Fork/initial stop complete; SETOPTIONS ENOSYS 38 |
+| spawn slope | Restore-failed clone TID copyout waits on owner Gate, MM 2/incarnation 1/revision 68 | Workload complete; clone forwarding slope red |
+| fork COW | Child vvar generation requires absent host COW arm | Isolation complete; exit budget red |
+
+There is progress beyond the original stage-six refusal and parent-stack
+settlement, but no completed workload or N1 closure. Clone TID copyout was
+reported to the director before any edit; it remains the owner worker's area.
+
+The VMA and ptrace captures qualify as failure diagnostics with external
+wait status 25856, one guest result code 1, two closed publications, zero
+refusals, `witness_closed=1|errors=0|bounded=0`. The fixed-mapping capture
+records wait status 6, no guest result, and correctly fails qualification.
+No stage-three check/arena companion probes fire. The trace CLI's zero for
+two qualified captures is not a workload pass. Raw files: `trace1..3.raw`.
+
+Retained fixed-mapping LLDB run `n1-cm-7af3fdfb6-lldb-leaf2` proves the
+rejected live descriptor at VA `0x60000c7000` is `0x03e0009b0001bf42`:
+invalid, EL1-private, retired, retaining output `0x9b0001b000`. The exact
+UserWrite completion names that same output and parent MM 2, with span
+4096 and physical grant `0x9b00018000`, frame 611/mapping 612/generation 11.
+This is a completed physical repoint followed by a legitimate owner
+retirement, not an unfinished copy. The authoritative ring has 90/90
+records and zero errors; all stacks, modified-memory core and cleanup zero
+are retained in `rejected-leaf2-*` and `rejected-leaf2.core`.
+
+An earlier source-line breakpoint stopped on an accepted stack leaf. Raw
+absolute breakpoints in the next diagnostic did not relocate under ASLR.
+Neither is attribution for the rejected leaf. The final capture uses
+`BreakpointCreateBySBAddress(ResolveFileAddress(...))` on the disassembled
+retirement/refusal branches; its actual register values and matching
+completion establish the diagnosis.
+
+Two new composed VM-free witnesses execute the real EL1 resolver followed
+by the real descriptor retirement or fork-arm operation before settling
+its still-pending physical completion. On `7af3fdfb6` both fail with
+`live leaves are not completed private COW`, proving settlement cannot
+require the current semantic state to equal its earlier write completion.
+No serialization, retry or wider bound was introduced. Red log:
+`owner-cow-later-red.log`. The existing negative control now removes private
+ownership instead of simulating a later valid fork arm.
