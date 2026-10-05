@@ -41,9 +41,13 @@
  *     Phases 25/26 identify owner SELECT/PREPARE refusals, including exact
  *     errno and transport receipt. Phase 27 preserves the owner preparation
  *     fault at dispatch lowering and the committed byte count (VA/length
- *     are zero when that error carries no range). These phases are not yet
- *     live-qualified; owner waits/supply do not emit them. They are needed
- *     for embed callers whose optional syscall-return observer is disabled.
+ *     are zero when that error carries no range). Phases 26/27 were
+ *     live-qualified on 2026-10-05, source 3e73dd1d2: the hardware PREPARE
+ *     preamble completed with errno 11 when a peer closed the MM gate;
+ *     dispatch lowered this zero-progress refusal to EFAULT. The capture
+ *     had 3,656 mapping events, no errors and no drops. Phase 25 remains
+ *     unqualified; owner waits/supply do not emit these probes. They are
+ *     needed when the embed syscall-return observer is disabled.
  *     el1-mapping-leaf(phase, MM key, VA, span length, live descriptor)
  *     samples a focus page and its neighbour: phases 0 preparation,
  *     1 submitted, 2 host publication, 3 applied receipt before backend
