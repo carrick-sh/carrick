@@ -14127,18 +14127,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/kernel/frame_inventory.rs:1143 in `prepare_reservation`, `std::process::id` identifies only the calling host process so the authority discards cached entropy after a host fork; it neither supplies a guest identity nor selects a host target.",
+    "rationale": "At crates/carrick-kernel/src/kernel/frame_inventory.rs:1142 in `prepare_reservation`, `std::process::id` identifies only the calling host process so the authority discards cached entropy after a host fork; it neither supplies a guest identity nor selects a host target.",
     "review_id": "HA-000649",
     "source": {
-      "byte_end": 42221,
-      "byte_start": 42205,
+      "byte_end": 42137,
+      "byte_start": 42121,
       "column": 48,
       "column_end": 64,
       "column_start": 48,
       "file": "crates/carrick-kernel/src/kernel/frame_inventory.rs",
-      "line": 1143,
-      "line_end": 1143,
-      "line_start": 1143
+      "line": 1142,
+      "line_end": 1142,
+      "line_start": 1142
     }
   },
   {
@@ -15828,8 +15828,8 @@
     "rationale": "At crates/carrick-runtime/src/hvpatch/mod.rs:1068 in `initialize_root_process`, `std::process::id` acts only on the current carrier identity passed to the deliberately ignored HVPatch bootstrap seam used by `initialize_root_process`; no guest identity selects its host target.",
     "review_id": "HA-000523",
     "source": {
-      "byte_end": 38863,
-      "byte_start": 38847,
+      "byte_end": 38889,
+      "byte_start": 38873,
       "column": 44,
       "column_end": 60,
       "column_start": 44,
