@@ -10,3 +10,5 @@ pub mod cow;
 pub use cow::*;
 pub mod fork;
 pub use fork::*;
+pub mod cow_pool;
+pub use cow_pool::*;

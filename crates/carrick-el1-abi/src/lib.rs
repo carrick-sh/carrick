@@ -191,7 +191,7 @@ pub const EL1_DYNAMIC_METADATA_BASE: u64 = 0x2D_0800_0000;
 pub const EL1_DYNAMIC_METADATA_SIZE: u64 = 0x0400_0000;
 
 /// Standard quantum size of a dynamic metadata extent granted by the host (512 KiB).
-pub const EL1_DYNAMIC_METADATA_EXTENT_SIZE: usize = 512 * 1024;
+pub use carrick_core_abi::EL1_DYNAMIC_METADATA_EXTENT_SIZE;
 
 /// Operation code for requesting an extent grant from the host (HVC #6).
 pub const METADATA_GRANT_OP_ALLOC: u64 = 1;

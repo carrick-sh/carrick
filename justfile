@@ -452,6 +452,7 @@ test-kernel-semantics *ARGS:
 
 # Host unit/integration tests that do NOT need the HVF runtime or Docker.
 test-mm-owner *ARGS:
+    cargo test --locked -p carrick-core -p carrick-core-abi --lib
     cargo test --locked -p carrick-core --doc
     cargo test --locked -p carrick-core --test x86_acceleration {{ARGS}}
 
