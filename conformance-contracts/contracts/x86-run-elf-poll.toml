@@ -17,7 +17,13 @@ The VM-free binding normalizes an actual x86 frame and asserts ready counts
 at 1, 8 and 32 descriptors, exactly 8*n guest bytes read and 2*n guest bytes
 written. Only revents is copied out; fd/events stay unchanged. One host poll
 serves the batch, with no retries or user-space polling loop. No runtime ratio
-is claimed. This does not cover the full kernel's virtual descriptor graph,
+is claimed. Distinct nonnegative host descriptors are validated once before
+poll, including entries with no requested events. Host interests are combined
+per descriptor, then readiness is copied to and counted for each original
+entry. Duplicate and distinct ready descriptor populations both retain the
+same exact guest-copy budgets. Invalid descriptors make the batch immediately
+ready; hangups are reported even with no requested events. This does not cover
+the full kernel's virtual descriptor graph,
 signal delivery, or the standalone loop's pre-existing ppoll approximation.
 """
 

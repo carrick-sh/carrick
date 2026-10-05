@@ -1173,6 +1173,9 @@ mod poll_tests;
 /// dispatch cannot construct it or call the host-descriptor bridge.
 struct StandaloneHostFds;
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct StandaloneHostFd(i32);
+
 /// Serves only `run_elf_service_loop`'s inherited host descriptors, like its
 /// read/write handlers. This must never back the product's virtual fd or rlimit
 /// path: those authorities belong to the common kernel dispatcher.
@@ -1218,33 +1221,91 @@ fn sys_poll<E: carrick_guest_mem::GuestMemory>(
     if bytes.len() != length {
         return LINUX_EFAULT.guest_retval();
     }
-    let mut host_fds = Vec::new();
-    if host_fds.try_reserve_exact(count).is_err() {
+    let mut host_fds: Vec<libc::pollfd> = Vec::new();
+    let mut host_indices: std::collections::HashMap<StandaloneHostFd, usize> =
+        std::collections::HashMap::new();
+    if host_fds.try_reserve_exact(count).is_err() || host_indices.try_reserve(count).is_err() {
         return LINUX_ENOMEM.guest_retval();
     }
+    let mut has_invalid = false;
     for bytes in bytes.chunks_exact(size_of::<LinuxPollFd>()) {
         let Ok(fd) = LinuxPollFd::read_from_bytes(bytes) else {
             return LINUX_EFAULT.guest_retval();
         };
+        if fd.fd < 0 {
+            continue;
+        }
+        let key = StandaloneHostFd(fd.fd);
+        // Darwin poll coalesces duplicate descriptors and returns readiness to
+        // only one entry. Give the host one union of interests per descriptor;
+        // guest result publication below still visits every original entry.
+        let events = poll_events_to_host(carrick_abi::LinuxPollEvents::from_bits_retain(fd.events))
+            | libc::POLLHUP;
+        if let Some(&index) = host_indices.get(&key) {
+            let Some(host) = host_fds.get_mut(index) else {
+                return carrick_abi::LINUX_EIO.guest_retval();
+            };
+            host.events |= events;
+            continue;
+        }
+        // Host poll can ignore an invalid descriptor when events is zero.
+        // Validate each distinct inherited host descriptor explicitly. Invalid
+        // entries are already ready, so the remaining host poll must not wait.
+        // SAFETY: F_GETFD inspects this host descriptor without taking ownership.
+        let valid = if unsafe { libc::fcntl(fd.fd, libc::F_GETFD) } >= 0 {
+            true
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF) {
+            false
+        } else {
+            return poll_host_error().guest_retval();
+        };
+        has_invalid |= !valid;
+        host_indices.insert(key, host_fds.len());
         host_fds.push(libc::pollfd {
-            fd: fd.fd,
-            events: poll_events_to_host(carrick_abi::LinuxPollEvents::from_bits_retain(fd.events)),
+            fd: if valid { fd.fd } else { -1 },
+            events,
             revents: 0,
         });
     }
-    // SAFETY: host_fds owns count initialized pollfd values for this one call.
+    // POLLHUP is reported even without an input interest. Asking for it also
+    // makes Darwin observe hangups on valid descriptors with events == 0.
+    let timeout_ms = if has_invalid { 0 } else { timeout_ms };
+    // SAFETY: host_fds owns its initialized pollfd values for this one call.
     // No guest pointer crosses the host boundary; negative timeouts keep their
     // poll meaning. Do not retry EINTR or replace this with a sampling loop.
-    if unsafe { libc::poll(host_fds.as_mut_ptr(), count as libc::nfds_t, timeout_ms) } < 0 {
+    if unsafe {
+        libc::poll(
+            host_fds.as_mut_ptr(),
+            host_fds.len() as libc::nfds_t,
+            timeout_ms,
+        )
+    } < 0
+    {
         return poll_host_error().guest_retval();
     }
     let mut ready = 0;
-    for (index, (host, original)) in host_fds.iter().zip(bytes.chunks_exact(8)).enumerate() {
+    for (index, original) in bytes.chunks_exact(8).enumerate() {
+        let fd = i32::from_le_bytes([original[0], original[1], original[2], original[3]]);
         let requested = carrick_abi::LinuxPollEvents::from_bits_retain(i16::from_le_bytes([
             original[4],
             original[5],
         ]));
-        let revents = poll_events_from_host(host.revents, requested).bits();
+        let revents = if fd < 0 {
+            carrick_abi::LinuxPollEvents::empty()
+        } else {
+            let Some(host) = host_indices
+                .get(&StandaloneHostFd(fd))
+                .and_then(|&index| host_fds.get(index))
+            else {
+                return carrick_abi::LINUX_EIO.guest_retval();
+            };
+            if host.fd < 0 {
+                carrick_abi::LinuxPollEvents::NVAL
+            } else {
+                poll_events_from_host(host.revents, requested)
+            }
+        }
+        .bits();
         // Only the result field is writable, not the descriptor or interest.
         if engine
             .write_bytes(fds.0 + (index * 8 + 6) as u64, &revents.to_le_bytes())

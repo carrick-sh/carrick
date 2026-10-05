@@ -1379,18 +1379,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-x86/src/bringup_fns.rs:1197 in `sys_poll`, `libc::getrlimit` bounds the standalone VMM harness host pollfd allocation against the inherited host-descriptor capacity. The only callers are standalone VMM binaries/tests; carrick run uses the common kernel dispatcher and its virtual guest rlimit authority. See docs/perf-results/2026-10-04-kvm-m2-poll/README.md for the caller census.",
+    "rationale": "At crates/carrick-x86/src/bringup_fns.rs:1200 in `sys_poll`, `libc::getrlimit` bounds the standalone VMM harness host pollfd allocation against the inherited host-descriptor capacity. The only callers are standalone VMM binaries/tests; carrick run uses the common kernel dispatcher and its virtual guest rlimit authority. See docs/perf-results/2026-10-04-kvm-m2-poll/README.md for the caller census.",
     "review_id": "HA-000754",
     "source": {
-      "byte_end": 44869,
-      "byte_start": 44854,
+      "byte_end": 44944,
+      "byte_start": 44929,
       "column": 17,
       "column_end": 32,
       "column_start": 17,
       "file": "crates/carrick-x86/src/bringup_fns.rs",
-      "line": 1197,
-      "line_end": 1197,
-      "line_start": 1197
+      "line": 1200,
+      "line_end": 1200,
+      "line_start": 1200
     }
   },
   {

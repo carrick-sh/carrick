@@ -1,0 +1,9 @@
+empty events 0 return 0 revents 0
+empty events 16 return 0 revents 0
+empty events 56 return 0 revents 0
+readable events 0 return 0 revents 0
+readable events 16 return 0 revents 0
+readable events 56 return 0 revents 0
+closed events 0 return 0 revents 0
+closed events 16 return 1 revents 16
+closed events 56 return 1 revents 16

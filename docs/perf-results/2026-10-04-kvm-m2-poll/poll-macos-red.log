@@ -1,0 +1,62 @@
+test bringup_fns::tests::plan_windows_preserves_shared_aperture_backing ... ok
+test bringup_fns::tests::plan_windows_covers_full_runtime_mmap_arena ... ok
+test cpl0_entry::tests::iret_return_rejects_noncanonical_targets_and_privileged_flags ... ok
+test cpl0_entry::tests::native_entry_keeps_arguments_number_and_captured_stack ... ok
+test engine::tests::complete_sysret_batches_rax_rip_into_one_set_gprs ... ok
+test engine::tests::complete_sysret_batches_rcx_r11_into_one_get_gprs ... ok
+test bringup_fns::poll_tests::normalized_poll_clears_stale_events_and_reports_invalid_descriptors ... FAILED
+test bringup_fns::poll_tests::normalized_poll_reports_readiness_and_linear_guest_copy_work ... FAILED
+test engine::tests::current_pc_does_not_rewrite_plain_user_rip_at_trampoline_address ... ok
+test engine::tests::current_pc_reports_user_rcx_after_kvm_trampoline_base_resume ... ok
+test engine::tests::current_pc_reports_user_rcx_while_parked_at_sysret ... ok
+test engine::tests::interrupted_rflags_reports_user_r11_while_parked_at_sysret ... ok
+test engine::tests::kick_at_doorbell_out_is_swallowed_and_syscall_traps ... ok
+test engine::tests::kick_at_fault_stub_pc_is_swallowed ... ok
+test engine::tests::kick_at_split_layout_doorbell_out_is_swallowed ... ok
+test engine::tests::kick_at_sysret_with_fresh_stash_keeps_it ... ok
+test engine::tests::kick_at_sysret_with_no_stash_synthesizes_user_context ... ok
+test cpl0_scheduler::tests::shared_queue_cross_mm_admission_refuses_stale_native_custody ... ok
+test engine::tests::kick_at_user_pc_is_reported ... ok
+test engine::tests::private_repoint_cr3_flush_failure_is_indeterminate ... ok
+test engine::tests::snapshot_boundary_is_typed_and_rejects_corrupt_payloads ... ok
+test engine::tests::x86_non_page_fault_vectors_match_linux_oracle ... ok
+test engine::tests::x86_page_fault_present_bit_selects_accerr ... ok
+test engine::tests::x86_set_no_access_records_and_default_gate_efaults ... ok
+test fault::tests::fault_record_decodes_qword_pairs ... ok
+test fault::tests::fault_stub_streams_fixed_record_words ... ok
+test engine::tests::syscall_copies_cross_shared_private_shared_fragments_page_by_page ... ok
+test fault::tests::fault_tables_fit_in_kernel_window_headroom ... ok
+test fault::tests::memory_record_decodes_packed_bytes ... ok
+test fault::tests::memory_record_fault_stub_writes_record_and_rings_once ... ok
+test vdso::tests::offsets_recover_host_time_from_guest_tsc ... ok
+test vdso::tests::offsets_scale_with_frequency ... ok
+test bringup_fns::tests::build_pml4_applies_image_ro_spans_to_leaves ... ok
+test bringup_fns::tests::build_pml4_translates_full_runtime_mmap_arena ... ok
+test engine::tests::concurrent_guest_run_receipts_do_not_alias_past_512_host_threads ... ok
+
+failures:
+
+---- bringup_fns::poll_tests::normalized_poll_clears_stale_events_and_reports_invalid_descriptors stdout ----
+
+thread 'bringup_fns::poll_tests::normalized_poll_clears_stale_events_and_reports_invalid_descriptors' (8367938) panicked at crates/carrick-x86/src/bringup_fns/poll_tests.rs:140:5:
+assertion `left == right` failed
+  left: [0]
+ right: [1]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- bringup_fns::poll_tests::normalized_poll_reports_readiness_and_linear_guest_copy_work stdout ----
+
+thread 'bringup_fns::poll_tests::normalized_poll_reports_readiness_and_linear_guest_copy_work' (8367939) panicked at crates/carrick-x86/src/bringup_fns/poll_tests.rs:107:9:
+assertion `left == right` failed
+  left: [1]
+ right: [8]
+
+
+failures:
+    bringup_fns::poll_tests::normalized_poll_clears_stale_events_and_reports_invalid_descriptors
+    bringup_fns::poll_tests::normalized_poll_reports_readiness_and_linear_guest_copy_work
+
+test result: FAILED. 43 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p carrick-x86 --lib`
+error: recipe `test` failed with exit code 101
