@@ -1460,6 +1460,14 @@ mod tests {
                 "ARM transport must not retain displaced {name}"
             );
         }
+        let old_owner = fs::read_to_string(
+            repo.join("crates/carrick-el1/src/personality/mm_portal/production.rs"),
+        )
+        .unwrap();
+        assert!(
+            !old_owner.contains("pub struct TransferContinuation"),
+            "the old portal must not retain a displaced transfer cursor"
+        );
         let manifest = fs::read_to_string(repo.join("crates/carrick-core-abi/Cargo.toml")).unwrap();
         assert!(!manifest.contains("carrick-el1-abi"));
         assert!(!source.contains("TrapFrame"));
