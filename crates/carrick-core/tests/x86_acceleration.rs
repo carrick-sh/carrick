@@ -1639,6 +1639,7 @@ fn pin_retirement_fixture(page_shift: u32) {
         PinFixture(record.clone()),
     )
     .unwrap();
+    assert_eq!(pin.identity(), identity);
     for wrong in [
         peer_identity,
         CarrierStage2RecordIdentity {
