@@ -447,6 +447,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-core"
+version = "0.1.0"
+dependencies = [
+ "carrick-core-abi",
+ "carrick-el1",
+ "carrick-mmu-core",
+ "carrick-sched-core",
+]
+
+[[package]]
 name = "carrick-core-abi"
 version = "0.1.0"
 dependencies = [
@@ -459,6 +469,7 @@ name = "carrick-el1"
 version = "0.1.0"
 dependencies = [
  "carrick-aarch64",
+ "carrick-core",
  "carrick-el1-abi",
  "carrick-guest-arch",
  "carrick-hal",

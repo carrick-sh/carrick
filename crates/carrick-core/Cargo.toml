@@ -1,0 +1,13 @@
+[package]
+name = "carrick-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+carrick-core-abi = { path = "../carrick-core-abi" }
+carrick-sched-core = { path = "../carrick-sched-core" }
+
+[dev-dependencies]
+carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
+carrick-mmu-core = { path = "../carrick-mmu-core" }
