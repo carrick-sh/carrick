@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 
 struct Words {
     words: RefCell<BTreeMap<u64, u64>>,
+    reads: Cell<usize>,
+    stores: Cell<usize>,
     writes: Cell<usize>,
     fail: Cell<usize>,
 }
@@ -14,6 +16,8 @@ impl Words {
     fn new() -> Self {
         Self {
             words: RefCell::new((0x1000..0x20000).step_by(8).map(|pa| (pa, 0)).collect()),
+            reads: Cell::new(0),
+            stores: Cell::new(0),
             writes: Cell::new(0),
             fail: Cell::new(usize::MAX),
         }
@@ -21,6 +25,7 @@ impl Words {
 }
 impl LiveDescriptorWords for Words {
     fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+        self.reads.set(self.reads.get() + 1);
         self.words
             .borrow()
             .get(&pa)
@@ -33,6 +38,7 @@ impl LiveDescriptorWords for Words {
         before: u64,
         after: u64,
     ) -> Result<bool, DescriptorRefusal> {
+        self.stores.set(self.stores.get() + 1);
         let n = self.writes.get();
         self.writes.set(n + 1);
         if n == self.fail.get() {
@@ -47,6 +53,7 @@ impl LiveDescriptorWords for Words {
         Ok(true)
     }
     fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+        self.stores.set(self.stores.get() + 1);
         self.words.borrow_mut().insert(pa, value);
         Ok(())
     }
@@ -117,6 +124,190 @@ fn builds_all_four_levels_and_nonidentity_output() {
     assert_eq!(words.load(0x1000).unwrap() & ADDRESS, 0x2000);
     assert_eq!(words.load(0x3000).unwrap() & ADDRESS, 0x4000);
     assert_eq!(words.load(0x4000 + 4 * 8).unwrap() & ADDRESS, 0x800000);
+}
+
+// Independent descriptor words: no transaction planner or VMA permission model.
+// Bind kernel.el1.stage1-publication and kernel.mm.address-space-occupancy only
+// for hardware interpretation (Intel SDM Vol. 3A, four-level paging).
+fn raw_translation(size: LeafSize) -> (Words, u64, u64, Vec<u64>) {
+    let (bytes, terminal, output) = match size {
+        LeafSize::Page => (4096, 3, 0x1234_5000),
+        LeafSize::Block2M => (1 << 21, 2, 0x4560_0000),
+        LeafSize::Block1G => (1 << 30, 1, 0x1_c000_0000),
+    };
+    let va = ((3 << 39) | (5 << 30) | (7 << 21) | (11 << 12)) & !(bytes - 1);
+    let words = Words::new();
+    let tables = [0x1000, 0x2000, 0x3000, 0x4000];
+    let mut path = Vec::new();
+    for level in 0..=terminal {
+        let pa = tables[level] + ((va >> (39 - level * 9)) & 511) * 8;
+        let entry = if level == terminal {
+            output | PRESENT | WRITE | USER | if terminal < 3 { HUGE } else { 0 }
+        } else {
+            tables[level + 1] | PRESENT | WRITE | USER
+        };
+        words.words.borrow_mut().insert(pa, entry);
+        path.push(pa);
+    }
+    (words, va, output, path)
+}
+
+fn ancestor_permission_matrix(
+    clear: u64,
+    set: u64,
+    denied_access: Option<Access>,
+    fault: FaultClass,
+) {
+    let mut mismatches = Vec::new();
+    for size in [LeafSize::Page, LeafSize::Block2M, LeafSize::Block1G] {
+        let (words, va, output, path) = raw_translation(size);
+        for (level, &pa) in path[..path.len() - 1].iter().enumerate() {
+            let original = words.words.borrow()[&pa];
+            words
+                .words
+                .borrow_mut()
+                .insert(pa, (original & !clear) | set);
+            for user in [false, true] {
+                for access in [Access::Read, Access::Write, Access::Execute] {
+                    let denied = denied_access.map_or(user, |denied| access == denied);
+                    let expected = if denied {
+                        Err(fault)
+                    } else {
+                        Ok(FrameGpa::new(output + 19))
+                    };
+                    let actual =
+                        translate(&words, root(0x1000), UserVa::new(va + 19), access, user);
+                    if actual != expected {
+                        mismatches.push((size, level, access, user, actual, expected));
+                    }
+                }
+            }
+            words.words.borrow_mut().insert(pa, original);
+        }
+    }
+    // Collect all rows so the injected terminal-only defect witnesses every
+    // ancestor, rather than stopping at the first PML4 denial.
+    assert!(
+        mismatches.is_empty(),
+        "ancestor permission mismatches: {mismatches:?}"
+    );
+}
+
+#[test]
+fn supervisor_ancestors_deny_user_access_beneath_permissive_terminals() {
+    ancestor_permission_matrix(USER, 0, None, FaultClass::Protection);
+}
+
+#[test]
+fn readonly_ancestors_deny_writes_beneath_permissive_terminals() {
+    ancestor_permission_matrix(WRITE, 0, Some(Access::Write), FaultClass::Protection);
+}
+
+#[test]
+fn nx_ancestors_deny_execution_beneath_permissive_terminals() {
+    ancestor_permission_matrix(0, NX, Some(Access::Execute), FaultClass::Nx);
+}
+
+#[test]
+fn nonidentity_terminal_offsets_cover_4k_2m_and_1g() {
+    let mut mismatches = Vec::new();
+    for (size, bytes) in [
+        (LeafSize::Page, 4096),
+        (LeafSize::Block2M, 1 << 21),
+        (LeafSize::Block1G, 1 << 30),
+    ] {
+        let (words, va, output, _) = raw_translation(size);
+        for offset in [0, 19, bytes / 2 + 37, bytes - 1] {
+            for access in [Access::Read, Access::Write, Access::Execute] {
+                let expected = Ok(FrameGpa::new(output + offset));
+                let actual =
+                    translate(&words, root(0x1000), UserVa::new(va + offset), access, true);
+                if actual != expected {
+                    mismatches.push((size, offset, access, actual, expected));
+                }
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "terminal offset mismatches: {mismatches:?}"
+    );
+}
+
+#[test]
+fn translation_load_budget_is_independent_of_unrelated_branches() {
+    let mut mismatches = Vec::new();
+    for branches in [16, 64, 256] {
+        for (size, depth) in [
+            (LeafSize::Page, 4),
+            (LeafSize::Block2M, 3),
+            (LeafSize::Block1G, 2),
+        ] {
+            let (words, va, output, _) = raw_translation(size);
+            // Distinct populated, unrelated PML4 branches, each with a PDPT
+            // and a 1 GiB terminal. None aliases the queried PML4 index 3.
+            for i in 0..branches {
+                let table = 0x20_0000 + i * PAGE;
+                let mut entries = words.words.borrow_mut();
+                entries.insert(0x1000 + (32 + i) * 8, table | PRESENT | WRITE | USER);
+                entries.insert(table, 0x2_0000_0000 | PRESENT | WRITE | USER | HUGE);
+            }
+            for access in [Access::Read, Access::Write, Access::Execute] {
+                words.reads.set(0);
+                assert_eq!(
+                    translate(&words, root(0x1000), UserVa::new(va + 19), access, true),
+                    Ok(FrameGpa::new(output + 19))
+                );
+                let loads = words.reads.get();
+                if loads != depth || loads > 4 {
+                    mismatches.push((branches, size, access, loads, depth));
+                }
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "translation load budget exceeded: {mismatches:?}"
+    );
+}
+
+#[test]
+fn translation_performs_zero_stores_even_when_ancestors_deny_access() {
+    let mut mismatches = Vec::new();
+    for branches in [16, 64, 256] {
+        for size in [LeafSize::Page, LeafSize::Block2M, LeafSize::Block1G] {
+            let (words, va, _, path) = raw_translation(size);
+            for i in 0..branches {
+                words.words.borrow_mut().insert(
+                    0x1000 + (32 + i) * 8,
+                    (0x20_0000 + i * PAGE) | PRESENT | WRITE | USER,
+                );
+            }
+            for restriction in [0, USER, WRITE, NX] {
+                let pa = path[0];
+                let original = words.words.borrow()[&pa];
+                let entry = if restriction == NX {
+                    original | NX
+                } else {
+                    original & !restriction
+                };
+                words.words.borrow_mut().insert(pa, entry);
+                let before = words.words.borrow().clone();
+                words.stores.set(0);
+                for access in [Access::Read, Access::Write, Access::Execute] {
+                    let _ = translate(&words, root(0x1000), UserVa::new(va + 19), access, true);
+                }
+                if words.stores.get() != 0 || *words.words.borrow() != before {
+                    mismatches.push((branches, size, restriction, words.stores.get()));
+                }
+                words.words.borrow_mut().insert(pa, original);
+            }
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "translation performed stores: {mismatches:?}"
+    );
 }
 #[test]
 fn every_publication_failure_restores_all_levels_and_grants() {
