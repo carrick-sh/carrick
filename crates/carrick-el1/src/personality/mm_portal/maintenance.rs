@@ -8,6 +8,8 @@ use carrick_mmu_core::aarch64::descriptor_txn::{
     CowRepointAccess, DescriptorOp, DescriptorOutcome, InlineJournal, LiveDescriptorWords,
     TableGrants, execute_descriptor_op, plan_descriptor_op,
 };
+#[cfg(target_os = "none")]
+use carrick_personality_linux::mm::MmErrorLinux;
 use carrick_sched_core::SpaceEditor;
 use core::num::NonZeroU64;
 
@@ -22,8 +24,15 @@ pub struct BackingMaintenance<'a> {
     ttbr0: u64,
 }
 
-impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
-    pub fn begin_backing_maintenance(
+pub trait NativeBackingMaintenance<P: PinnedMetadataExtent> {
+    fn begin_backing_maintenance(
+        &self,
+        request: PortalBackingMaintenance,
+        slot: u32,
+    ) -> Result<BackingMaintenance<'_>, MmError>;
+}
+impl<P: PinnedMetadataExtent> NativeBackingMaintenance<P> for MmPortal<'_, P> {
+    fn begin_backing_maintenance(
         &self,
         request: PortalBackingMaintenance,
         slot: u32,
@@ -221,6 +230,7 @@ pub fn serve_backing_maintenance_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let zone =
             unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
         let portal = MmPortal::<super::production::GuestMetadataPin> {
+            backend: core::marker::PhantomData,
             carrier: request.handle().carrier(),
             roots: crate::memory::reservations::shared_guest(),
             spaces: &zone.spaces,

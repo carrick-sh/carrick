@@ -1,6 +1,6 @@
 //! Owner-selected fork over live descriptors and the production reservation root.
 use super::{El1MmHandle, MmError, MmPortal};
-use crate::memory::reservations::{Mapping, Reservations};
+use crate::memory::reservations::Mapping;
 #[cfg(target_os = "none")]
 use crate::rust_alloc::vec::Vec;
 use carrick_el1_abi::{
@@ -12,6 +12,8 @@ use carrick_mmu_core::aarch64::{
     El1PrivateLeafState, TerminalRule, el1_private_leaf_state, split_terminal_descriptor,
     terminal_rule_edit,
 };
+#[cfg(target_os = "none")]
+use carrick_personality_linux::mm::MmErrorLinux;
 use core::num::NonZeroU64;
 #[cfg(not(target_os = "none"))]
 use std::vec::Vec;
@@ -350,29 +352,32 @@ impl UnpublishedEl1Child {
     }
 }
 
-impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
-    pub fn fork_mapping_count(
+pub trait NativeForkPortal<P: PinnedMetadataExtent> {
+    fn census_fork<W: LiveDescriptorWords + ?Sized>(
         &self,
-        mm: carrick_el1_abi::ReservationMm,
+        request: PortalForkRequest,
+        words: &W,
         worker: u32,
-    ) -> Result<usize, MmError> {
-        let mut root = self.root(mm, worker)?;
-        let mut count = 0usize;
-        root.observe_mappings(&mut |_| count += 1)?;
-        Ok(count)
-    }
-    fn child_root(
+    ) -> Result<ForkScratch, MmError>;
+    fn prepare_fork<W: LiveDescriptorWords + ?Sized>(
         &self,
-        mm: carrick_el1_abi::ReservationMm,
+        request: PortalForkRequest,
+        scratch: ForkScratch,
+        words: &W,
         worker: u32,
-    ) -> Result<Reservations<'_>, MmError> {
-        self.root_any(mm, worker)
-    }
-
+    ) -> Result<PreparedOwnerFork, MmError>;
+    fn publish_fork<W: LiveDescriptorWords + ?Sized>(
+        &self,
+        plan: PreparedOwnerFork,
+        words: &W,
+        worker: u32,
+    ) -> Result<UnpublishedEl1Child, MmError>;
+}
+impl<P: PinnedMetadataExtent> NativeForkPortal<P> for MmPortal<'_, P> {
     /// First census the reachable graph with fixed recursion and a bounded
     /// temporary owner reservation observation. Allocate undo/table storage
     /// only after releasing editors and metadata, proportional to actual work.
-    pub fn census_fork<W: LiveDescriptorWords + ?Sized>(
+    fn census_fork<W: LiveDescriptorWords + ?Sized>(
         &self,
         request: PortalForkRequest,
         words: &W,
@@ -443,7 +448,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
             count.custody,
         )
     }
-    pub fn prepare_fork<W: LiveDescriptorWords + ?Sized>(
+    fn prepare_fork<W: LiveDescriptorWords + ?Sized>(
         &self,
         request: PortalForkRequest,
         mut scratch: ForkScratch,
@@ -536,7 +541,7 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
     /// Physical custody is acquired from `plan.custody()` with no owner lock.
     /// After that effect, this phase revalidates every live parent word before
     /// linking any new table, then clones only the owner's reservation tree.
-    pub fn publish_fork<W: LiveDescriptorWords + ?Sized>(
+    fn publish_fork<W: LiveDescriptorWords + ?Sized>(
         &self,
         plan: PreparedOwnerFork,
         words: &W,
@@ -655,13 +660,13 @@ impl<P: PinnedMetadataExtent> MmPortal<'_, P> {
         }
         // Root/editor exclusion proves these metadata transitions cannot
         // change between preflight and this publication. Advance only once.
-        let parent_generation = root.publish_fork_parent(request);
-        child.publish_fork_child(request);
+        let parent_generation = root.publish_fork_parent(request)?;
+        child.publish_fork_child(request)?;
         let child_handle = unsafe {
             El1MmHandle::from_admitted_owner(self.carrier, request.child_mm, child_incarnation)
         };
         child_editor.set_mmap_next(editor.mmap_next());
-        child_editor.set_brk_current(root.layout().brk);
+        child_editor.set_brk_current(root.brk_current());
         words.publish_barrier();
         words.invalidate_range(0, 1 << 48);
         Ok(UnpublishedEl1Child {
@@ -1065,7 +1070,7 @@ pub(super) fn authenticate_pending_parent_write(
     Ok(())
 }
 #[cfg(target_os = "none")]
-pub(super) fn reconcile_pending_parent_write<W: LiveDescriptorWords + ?Sized>(
+pub(crate) fn reconcile_pending_parent_write<W: LiveDescriptorWords + ?Sized>(
     slot: usize,
     handle: El1MmHandle,
     sequence: NonZeroU64,
@@ -1112,6 +1117,7 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let zone =
             unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
         let portal = MmPortal::<super::production::GuestMetadataPin> {
+            backend: core::marker::PhantomData,
             carrier: request.operation.carrier,
             roots: crate::memory::reservations::shared_guest(),
             spaces: &zone.spaces,
@@ -1199,6 +1205,7 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let zone =
             unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
         let portal = MmPortal::<super::production::GuestMetadataPin> {
+            backend: core::marker::PhantomData,
             carrier: request.operation.carrier,
             roots: crate::memory::reservations::shared_guest(),
             spaces: &zone.spaces,

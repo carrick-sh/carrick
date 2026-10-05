@@ -3,7 +3,6 @@
 //! host aliases are cached only in an owned, venue-local resolved view.
 
 use super::*;
-use crate::alloc::{ExtentGrantReceipt, MetadataStorage};
 
 pub(super) const BANK_NODES: usize = 4096;
 const BANKS: usize = 256;
@@ -50,13 +49,19 @@ pub(super) trait NodeBanks {
 /// The host's owned mapping pins. Refresh after MetadataRequired, outside MM
 /// locks; an unchanged generation does zero resolution/allocation work. A view
 /// for one carrier/table cannot be attached to another table.
-pub struct ResolvedReservationNodes<P: PinnedMetadataExtent> {
-    pub(super) table: *const SharedReservations,
+pub struct ResolvedReservationNodes<
+    P: PinnedMetadataExtent,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+> {
+    pub(super) table: *const SharedReservations<Policy, Geometry>,
     count: u32,
     bases: [*mut Node; BANKS],
     pins: [Option<P>; BANKS],
 }
-impl<P: PinnedMetadataExtent> Default for ResolvedReservationNodes<P> {
+impl<P: PinnedMetadataExtent, Policy: ReservationPolicy, Geometry: ReservationGeometry> Default
+    for ResolvedReservationNodes<P, Policy, Geometry>
+{
     fn default() -> Self {
         Self {
             table: core::ptr::null(),
@@ -66,7 +71,9 @@ impl<P: PinnedMetadataExtent> Default for ResolvedReservationNodes<P> {
         }
     }
 }
-impl<P: PinnedMetadataExtent> ResolvedReservationNodes<P> {
+impl<P: PinnedMetadataExtent, Policy: ReservationPolicy, Geometry: ReservationGeometry>
+    ResolvedReservationNodes<P, Policy, Geometry>
+{
     /// Dynamic banks are resolved from exact grants. Bootstrap banks require
     /// the same carrier-owned EL1 region as `table`; its mapping already owns
     /// the table's lifetime and is never translated as guest user memory.
@@ -76,11 +83,13 @@ impl<P: PinnedMetadataExtent> ResolvedReservationNodes<P> {
     /// remain mapped through every use of this resolved view.
     pub unsafe fn refresh<R: MetadataExtentResolver<Pin = P>>(
         &mut self,
-        table: &SharedReservations,
+        table: &SharedReservations<Policy, Geometry>,
         resolver: &R,
         region: core::ptr::NonNull<u8>,
     ) -> Result<(), Refusal> {
-        if table.layout_hash.load(Ordering::Acquire) != LAYOUT_HASH {
+        if table.layout_hash.load(Ordering::Acquire)
+            != SharedReservations::<Policy, Geometry>::LAYOUT_HASH
+        {
             return Err(Refusal::Stale);
         }
         if !self.table.is_null() && !core::ptr::eq(self.table, table) {
@@ -94,12 +103,12 @@ impl<P: PinnedMetadataExtent> ResolvedReservationNodes<P> {
             let bank = table.storage.bank(self.count as usize);
             let bytes = core::mem::size_of::<Node>() * BANK_NODES;
             let (base, pin) = if bank.token == 0 {
-                if bank.extent_base != EL1_BOOTSTRAP_METADATA_BASE
-                    || bank.extent_len != EL1_BOOTSTRAP_METADATA_SIZE
+                if bank.extent_base != Geometry::BOOTSTRAP_BASE
+                    || bank.extent_len != Geometry::BOOTSTRAP_SIZE
                 {
                     return Err(Refusal::Stale);
                 }
-                let offset = usize::try_from(bank.guest_base - EL1_REGION_BASE)
+                let offset = usize::try_from(bank.guest_base - Geometry::REGION_BASE)
                     .map_err(|_| Refusal::Invalid)?;
                 // SAFETY: caller owns this carrier's region; published bank
                 // construction checked containment in its enclosing extent.
@@ -127,7 +136,9 @@ impl<P: PinnedMetadataExtent> ResolvedReservationNodes<P> {
         Ok(())
     }
 }
-impl<P: PinnedMetadataExtent> NodeBanks for ResolvedReservationNodes<P> {
+impl<P: PinnedMetadataExtent, Policy: ReservationPolicy, Geometry: ReservationGeometry> NodeBanks
+    for ResolvedReservationNodes<P, Policy, Geometry>
+{
     fn count(&self) -> u32 {
         self.count
     }
@@ -136,8 +147,12 @@ impl<P: PinnedMetadataExtent> NodeBanks for ResolvedReservationNodes<P> {
     }
 }
 
-struct IdentityBanks<'a>(&'a SharedReservations);
-impl NodeBanks for IdentityBanks<'_> {
+struct IdentityBanks<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry>(
+    &'a SharedReservations<Policy, Geometry>,
+);
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> NodeBanks
+    for IdentityBanks<'_, Policy, Geometry>
+{
     fn count(&self) -> u32 {
         self.0.storage.count.load(Ordering::Acquire)
     }
@@ -146,7 +161,9 @@ impl NodeBanks for IdentityBanks<'_> {
     }
 }
 
-impl SharedReservations {
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
+    SharedReservations<Policy, Geometry>
+{
     /// Layout of one elastic reservation bank, independent of MM population.
     pub fn metadata_bank_layout() -> core::alloc::Layout {
         core::alloc::Layout::new::<[Node; BANK_NODES]>()
@@ -190,7 +207,7 @@ impl SharedReservations {
     /// freed nodes across MM incarnations.
     fn provision_nodes(
         &self,
-        allocator: &MetadataStorage,
+        allocator: &impl ReservationMetadataAllocator,
         expected_capacity: u32,
     ) -> Result<(), Refusal> {
         if self.storage.capacity() > expected_capacity {
@@ -265,17 +282,19 @@ impl SharedReservations {
         &'a self,
         index: usize,
         mm: ReservationMm,
-        nodes: &'a ResolvedReservationNodes<P>,
+        nodes: &'a ResolvedReservationNodes<P, Policy, Geometry>,
         wait: &dyn RootWait,
-    ) -> Result<Reservations<'a>, Refusal> {
+    ) -> Result<Reservations<'a, Policy, Geometry>, Refusal> {
         if !core::ptr::eq(nodes.table, self) {
             return Err(Refusal::Stale);
         }
         self.lock_using(
             index,
             mm,
-            Some(nodes),
-            false,
+            RootStorageAccess {
+                banks: Some(nodes),
+                identity: false,
+            },
             wait,
             RootHolder::Host.word(),
             RootAuthority::SourceFree(self.source_free()),
@@ -289,17 +308,19 @@ impl SharedReservations {
         &'a self,
         index: usize,
         mm: ReservationMm,
-        nodes: &'a ResolvedReservationNodes<P>,
+        nodes: &'a ResolvedReservationNodes<P, Policy, Geometry>,
         slot: u32,
-    ) -> Result<Reservations<'a>, Refusal> {
+    ) -> Result<Reservations<'a, Policy, Geometry>, Refusal> {
         if !core::ptr::eq(nodes.table, self) {
             return Err(Refusal::Stale);
         }
         self.lock_using(
             index,
             mm,
-            Some(nodes),
-            false,
+            RootStorageAccess {
+                banks: Some(nodes),
+                identity: false,
+            },
             &NoRootWait,
             RootHolder::El1Slot(slot).word(),
             RootAuthority::SourceFree(self.source_free()),
@@ -311,12 +332,14 @@ impl SharedReservations {
         &self,
         index: usize,
         mm: ReservationMm,
-    ) -> Result<Reservations<'_>, Refusal> {
+    ) -> Result<Reservations<'_, Policy, Geometry>, Refusal> {
         self.lock_using(
             index,
             mm,
-            None,
-            true,
+            RootStorageAccess {
+                banks: None,
+                identity: true,
+            },
             &NoRootWait,
             RootHolder::Host.word(),
             RootAuthority::SourceFree(self.source_free()),
@@ -341,12 +364,15 @@ impl SharedReservations {
     }
 }
 
-impl Reservations<'_> {
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, Policy, Geometry> {
     /// Consume the MM guard before asking the existing allocator for capacity.
     /// MetadataRequired leaves the Linux operation uncommitted; service the
     /// allocator request at the ordinary host boundary, then reacquire/redecide.
     /// Other MMs remain runnable throughout allocation and bank publication.
-    pub fn provision_metadata(self, allocator: &MetadataStorage) -> Result<(), Refusal> {
+    pub fn provision_metadata(
+        self,
+        allocator: &impl ReservationMetadataAllocator,
+    ) -> Result<(), Refusal> {
         if self.pending().is_some() {
             return Err(Refusal::Busy);
         }
@@ -360,9 +386,25 @@ impl Reservations<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    type SharedReservations = super::SharedReservations<
+        carrick_personality_linux::mm::LinuxReservationPolicy,
+        carrick_el1::memory::reservations::NativeReservationGeometry,
+    >;
+    type Reservations<'a> = super::Reservations<
+        'a,
+        carrick_personality_linux::mm::LinuxReservationPolicy,
+        carrick_el1::memory::reservations::NativeReservationGeometry,
+    >;
+    type ResolvedReservationNodes<P> = super::ResolvedReservationNodes<
+        P,
+        carrick_personality_linux::mm::LinuxReservationPolicy,
+        carrick_el1::memory::reservations::NativeReservationGeometry,
+    >;
+    use carrick_el1::alloc::MetadataStorage;
     use core::ptr::NonNull;
     use std::cell::{Cell, UnsafeCell};
     use std::rc::Rc;
+    use std::{boxed::Box, vec, vec::Vec};
 
     struct Backing(UnsafeCell<Vec<u128>>);
     struct Pin {
@@ -403,8 +445,8 @@ mod tests {
         assert!(!ptr.is_null());
         unsafe { Box::from_raw(ptr.cast()) }
     }
-    fn layout() -> Layout {
-        Layout {
+    fn layout() -> carrick_personality_linux::mm::LinuxReservationLayout {
+        carrick_personality_linux::mm::LinuxReservationLayout {
             heap: ReservationRange::new(4096, 0x100000).unwrap(),
             arena: ReservationRange::new(0x100000, 0x10000000).unwrap(),
             brk: 4096,

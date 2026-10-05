@@ -1,0 +1,24 @@
+[package]
+name = "carrick-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+host-test = ["carrick-sched-core/host-test"]
+
+[dependencies]
+carrick-mmu-core = { path = "../carrick-mmu-core" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-core-abi = { path = "../carrick-core-abi" }
+carrick-sched-core = { path = "../carrick-sched-core" }
+
+[dev-dependencies]
+carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
+
+carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-personality-linux = { path = "../carrick-personality-linux" }
+
+[lints]
+workspace = true

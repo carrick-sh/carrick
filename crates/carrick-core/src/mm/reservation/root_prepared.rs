@@ -2,203 +2,83 @@
 //! Copy settlement touches only permanent atomic node headers. Reclamation
 //! belongs to the next root guard, never the consuming host's critical path.
 use super::*;
+use crate::mm::reservation::prepared::{self as owner, PreparedCopyNodes};
 use core::num::NonZeroU64;
-const LIVE: u64 = 1 << 62;
-const COPYING: u64 = 2 << 62;
-const SETTLED: u64 = 3 << 62;
-const GENERATION: u64 = (1 << 62) - 1;
+use owner::{GENERATION, LIVE, SETTLED};
 
-struct RestoreClaim<'a> {
-    node: &'a Node,
-    live: u64,
-    armed: bool,
-}
-impl Drop for RestoreClaim<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            self.node.next_free.store(self.live, Ordering::Release);
-        }
-    }
-}
-
-pub struct ClaimedPreparedCopy<'a> {
-    node: &'a Node,
-    tail: &'a Node,
-    table: &'a SharedReservations,
+/// Retains the existing table and its authenticated metadata-bank view.
+pub struct BorrowedReservationNodes<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry> {
+    table: &'a SharedReservations<Policy, Geometry>,
     banks: Option<&'a dyn storage::NodeBanks>,
-    settled: &'a carrick_sched_core::completion_queue::CompletionQueue,
-    permit: PortalPreparedPermit,
-    notification: Option<carrick_sched_core::object_wait::ObjectWaitKey>,
-    armed: bool,
 }
-impl ClaimedPreparedCopy<'_> {
-    pub fn release(mut self) -> bool {
-        if self
-            .node
-            .next_free
-            .compare_exchange(
-                COPYING | self.permit.generation.get(),
-                SETTLED | self.permit.generation.get(),
-                Ordering::Release,
-                Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            return false;
-        }
-        self.armed = false;
-        // Only settled nodes are queued. The guarded doubly-linked live list
-        // retains root lifetime until this publication is visible and reaped.
-        // SAFETY: the detached primary/tail remain owner-linked until popped.
-        unsafe { AtomicU64::from_ptr(core::ptr::addr_of_mut!((*self.tail.data.get()).words[7])) }
-            .store(0, Ordering::Relaxed);
-        self.settled
-            .push(self.permit.index, self.permit.index, |previous, next| {
-                let previous = self.table.node(previous, self.banks);
-                let tail = unsafe { (*previous.data.get()).prepared.tail };
-                unsafe {
-                    AtomicU64::from_ptr(core::ptr::addr_of_mut!(
-                        (*self.table.node(tail, self.banks).data.get()).words[7]
-                    ))
-                }
-                .store(u64::from(next), Ordering::Release);
-            });
-        true
-    }
-    pub fn notification(&self) -> Option<carrick_sched_core::object_wait::ObjectWaitKey> {
-        self.notification
-    }
-    pub fn permit(&self) -> PortalPreparedPermit {
-        self.permit
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Copy
+    for BorrowedReservationNodes<'_, Policy, Geometry>
+{
+}
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Clone
+    for BorrowedReservationNodes<'_, Policy, Geometry>
+{
+    fn clone(&self) -> Self {
+        *self
     }
 }
-impl Drop for ClaimedPreparedCopy<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            assert!(
-                self.node
-                    .next_free
-                    .compare_exchange(
-                        COPYING | self.permit.generation.get(),
-                        LIVE | self.permit.generation.get(),
-                        Ordering::Release,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok(),
-                "exact prepared claim rollback custody"
-            );
-        }
+// SAFETY: constructed only from the production table and its borrowed pinned
+// view. The original root list prevents reuse until the neutral claim settles.
+unsafe impl<'a, Policy: ReservationPolicy, Geometry: ReservationGeometry> PreparedCopyNodes<'a>
+    for BorrowedReservationNodes<'a, Policy, Geometry>
+{
+    fn allocated(self) -> u32 {
+        self.table.allocated.load(Ordering::Acquire)
+    }
+    fn node(self, index: u32) -> &'a Node {
+        self.table.node(index, self.banks)
     }
 }
-impl SharedReservations {
+pub type ClaimedPreparedCopy<'a, Policy, Geometry> =
+    owner::ClaimedPreparedCopy<'a, BorrowedReservationNodes<'a, Policy, Geometry>>;
+
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
+    SharedReservations<Policy, Geometry>
+{
     /// No root lock or editor acquisition. Metadata-bank pins must outlive
     /// this claim, exactly as they outlive the borrowed production portal.
     pub fn claim_prepared<'a, P: PinnedMetadataExtent>(
         &'a self,
-        nodes: Option<&'a ResolvedReservationNodes<P>>,
+        nodes: Option<&'a ResolvedReservationNodes<P, Policy, Geometry>>,
         permit: PortalPreparedPermit,
         request: PortalTransferRequest,
-    ) -> Result<ClaimedPreparedCopy<'a>, Refusal> {
+    ) -> Result<ClaimedPreparedCopy<'a, Policy, Geometry>, Refusal> {
         self.claim_prepared_inner(nodes, permit, request, || {})
     }
-    #[cfg(test)]
-    pub(crate) fn claim_prepared_with_rejection<'a, P: PinnedMetadataExtent>(
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn claim_prepared_with_rejection<'a, P: PinnedMetadataExtent>(
         &'a self,
-        nodes: Option<&'a ResolvedReservationNodes<P>>,
+        nodes: Option<&'a ResolvedReservationNodes<P, Policy, Geometry>>,
         permit: PortalPreparedPermit,
         request: PortalTransferRequest,
         before_rollback: impl FnOnce(),
-    ) -> Result<ClaimedPreparedCopy<'a>, Refusal> {
+    ) -> Result<ClaimedPreparedCopy<'a, Policy, Geometry>, Refusal> {
         self.claim_prepared_inner(nodes, permit, request, before_rollback)
     }
     fn claim_prepared_inner<'a, P: PinnedMetadataExtent>(
         &'a self,
-        nodes: Option<&'a ResolvedReservationNodes<P>>,
+        nodes: Option<&'a ResolvedReservationNodes<P, Policy, Geometry>>,
         permit: PortalPreparedPermit,
         request: PortalTransferRequest,
         before_rollback: impl FnOnce(),
-    ) -> Result<ClaimedPreparedCopy<'a>, Refusal> {
-        if permit.generation.get() > GENERATION
-            || permit.index == 0
-            || permit.index > self.allocated.load(Ordering::Acquire)
-        {
-            return Err(Refusal::Stale);
-        }
-        let banks: Option<&dyn storage::NodeBanks> = match nodes {
-            Some(nodes) => Some(nodes),
-            None => None,
-        };
-        let node = self.node(permit.index, banks);
-        node.next_free
-            .compare_exchange(
-                LIVE | permit.generation.get(),
-                COPYING | permit.generation.get(),
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            )
-            .map_err(|_| Refusal::Stale)?;
-        let mut rollback = RestoreClaim {
-            node,
-            live: LIVE | permit.generation.get(),
-            armed: true,
-        };
-        // SAFETY: exact-generation CAS owns the immutable permit payload;
-        // the root cannot unlink or free a Live/Copying node or its tail.
-        let words_head = unsafe { (*node.data.get()).prepared.words };
-        let tail_id = unsafe { (*node.data.get()).prepared.tail };
-        if tail_id == 0 || tail_id > self.allocated.load(Ordering::Acquire) {
-            return Err(Refusal::Stale);
-        }
-        let tail = self.node(tail_id, banks);
-        let tail_request: [u64; 4] =
-            unsafe { core::array::from_fn(|i| (*tail.data.get()).words[i]) };
-        let notification_index = unsafe { (*tail.data.get()).words[4] };
-        let notification_generation = unsafe { (*tail.data.get()).words[5] };
-        let queue_index = unsafe { (*tail.data.get()).words[8] };
-        let mut words = [0; 17];
-        words[..13].copy_from_slice(&words_head);
-        words[13..].copy_from_slice(&tail_request);
-        if permit.operation != request.operation
-            || PortalTransferRequest::decode(words) != Some(request)
-        {
-            before_rollback();
-            return Err(Refusal::Stale);
-        }
-        let notification = match u32::try_from(notification_index) {
-            Ok(index) => {
-                carrick_sched_core::object_wait::ObjectWaitKey::new(index, notification_generation)
-            }
-            Err(_) => {
-                return Err(Refusal::Stale);
-            }
-        };
-        if notification.is_none() && (notification_index != 0 || notification_generation != 0) {
-            return Err(Refusal::Stale);
-        }
-        let queue_index = match u32::try_from(queue_index) {
-            Ok(index) if index != 0 && index <= self.allocated.load(Ordering::Acquire) => index,
-            _ => return Err(Refusal::Stale),
-        };
-        rollback.armed = false;
-        Ok(ClaimedPreparedCopy {
-            node,
-            tail,
-            table: self,
-            banks,
-            settled: unsafe {
-                &*self
-                    .node(queue_index, banks)
-                    .data
-                    .get()
-                    .cast::<carrick_sched_core::completion_queue::CompletionQueue>()
-            },
+    ) -> Result<ClaimedPreparedCopy<'a, Policy, Geometry>, Refusal> {
+        let banks: Option<&dyn storage::NodeBanks> =
+            nodes.map(|nodes| nodes as &dyn storage::NodeBanks);
+        owner::claim_prepared(
+            BorrowedReservationNodes { table: self, banks },
             permit,
-            notification,
-            armed: true,
-        })
+            request,
+            before_rollback,
+        )
+        .map_err(|_| Refusal::Stale)
     }
 }
-impl Reservations<'_> {
+impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, Policy, Geometry> {
     pub fn prepared_wait_key(&self) -> Option<carrick_sched_core::object_wait::ObjectWaitKey> {
         carrick_sched_core::object_wait::ObjectWaitKey::address_space(
             self.index(),
@@ -304,6 +184,21 @@ impl Reservations<'_> {
             self.free_node(id);
         }
     }
+    /// Fixture-only construction for custody and work-budget tests.
+    ///
+    /// # Safety
+    /// The fixture must authenticate the request's exact MM, generation,
+    /// permissions and live output, and retain its metadata and output pins.
+    /// Production callers must use the revalidating owner transaction.
+    #[cfg(feature = "host-test")]
+    pub unsafe fn prepare_copy_for_fixture(
+        &mut self,
+        request: PortalTransferRequest,
+        notification: Option<carrick_sched_core::object_wait::ObjectWaitKey>,
+    ) -> Result<PortalPreparedPermit, Refusal> {
+        self.prepare_copy(request, notification)
+    }
+
     pub(crate) fn prepare_copy(
         &mut self,
         request: PortalTransferRequest,
@@ -339,7 +234,10 @@ impl Reservations<'_> {
                     .get()
                     .cast::<carrick_sched_core::completion_queue::CompletionQueue>()
             };
-            assert!(queue.initialize());
+            if !queue.initialize() {
+                self.free_node(queue_id);
+                return Err(Refusal::Stale);
+            }
             self.state_mut().prepared_head = queue_id;
         }
         let id = self.pool_node()?;

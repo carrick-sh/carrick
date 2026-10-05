@@ -447,16 +447,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-core"
+version = "0.1.0"
+dependencies = [
+ "carrick-core-abi",
+ "carrick-el1",
+ "carrick-el1-abi",
+ "carrick-guest-arch",
+ "carrick-mmu-core",
+ "carrick-personality-linux",
+ "carrick-sched-core",
+]
+
+[[package]]
+name = "carrick-core-abi"
+version = "0.1.0"
+dependencies = [
+ "carrick-guest-arch",
+ "carrick-mmu-core",
+ "carrick-sched-core",
+]
+
+[[package]]
 name = "carrick-el1"
 version = "0.1.0"
 dependencies = [
  "carrick-aarch64",
+ "carrick-core",
  "carrick-el1-abi",
  "carrick-guest-arch",
  "carrick-hal",
  "carrick-inotify-core",
  "carrick-mem",
  "carrick-mmu-core",
+ "carrick-personality-linux",
  "carrick-sched-core",
 ]
 
@@ -464,6 +488,7 @@ dependencies = [
 name = "carrick-el1-abi"
 version = "0.1.0"
 dependencies = [
+ "carrick-core-abi",
  "carrick-fd-core",
  "carrick-inotify-core",
  "carrick-mmu-core",
@@ -676,6 +701,7 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
+ "carrick-personality-linux",
  "carrick-portable",
  "carrick-sched-core",
  "carrick-signal-linux",
@@ -778,6 +804,14 @@ dependencies = [
  "tempfile",
  "thiserror",
  "usdt",
+]
+
+[[package]]
+name = "carrick-personality-linux"
+version = "0.1.0"
+dependencies = [
+ "carrick-core",
+ "carrick-core-abi",
 ]
 
 [[package]]
