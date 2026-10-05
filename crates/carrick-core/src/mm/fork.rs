@@ -520,7 +520,7 @@ pub fn copy_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
             descriptor,
             B::table_word(
                 FrameGpa::new(request.child_tables.base + child as u64 * 8),
-                None,
+                Some(descriptor),
             ),
         ));
     }
@@ -554,7 +554,7 @@ pub fn copy_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
             descriptor,
             B::table_word(
                 FrameGpa::new(request.child_tables.base + child as u64 * 8),
-                None,
+                Some(descriptor),
             ),
         ));
     }
@@ -619,14 +619,14 @@ pub fn copy_entry<B: OwnerForkMmu, W: LiveDescriptorWords + ?Sized>(
             if parent_changed {
                 B::table_word(
                     FrameGpa::new(request.parent_tables.base + parent as u64 * 8),
-                    None,
+                    Some(descriptor),
                 )
             } else {
                 descriptor
             },
             B::table_word(
                 FrameGpa::new(request.child_tables.base + child as u64 * 8),
-                None,
+                Some(descriptor),
             ),
         ));
     }
