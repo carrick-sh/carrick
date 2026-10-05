@@ -12,12 +12,26 @@ use carrick_mmu_core::owner_mmu::{Aarch64Mmu, OwnerForkMmu};
 
 const SHIFTS: [u32; 4] = [39, 30, 21, 12];
 
+/// Typed owner refusals preserved across the neutral fork transaction. The
+/// personality adapter decides their guest-visible error representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForkOwnerRefusal {
+    Invalid,
+    Collision,
+    Hole,
+    ForeignMapping,
+    Limit,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ForkError {
     Invalid,
     NoMemory,
     Busy,
     Stale,
+    /// Owner metadata backing must be supplied before publication can finish.
+    MetadataRequired,
+    OwnerRefusal(ForkOwnerRefusal),
     Core,
 }
 

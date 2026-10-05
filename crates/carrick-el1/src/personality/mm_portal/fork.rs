@@ -3,7 +3,7 @@ use super::{El1MmHandle, MmError, MmPortal};
 use crate::memory::reservations::{Refusal, Reservations};
 #[cfg(target_os = "none")]
 use crate::rust_alloc::vec::Vec;
-use carrick_core::mm::fork::{ForkChildRoot, ForkError, ForkParentRoot};
+use carrick_core::mm::fork::{ForkChildRoot, ForkError, ForkOwnerRefusal, ForkParentRoot};
 use carrick_el1_abi::{
     PinnedMetadataExtent, PortalForkCompletion, PortalForkCustody, PortalForkRequest,
     ReservationNodeFlags,
@@ -72,7 +72,12 @@ fn refusal_to_fork_error(e: Refusal) -> ForkError {
     match e {
         Refusal::Stale => ForkError::Stale,
         Refusal::Busy | Refusal::PreparedConflict => ForkError::Busy,
-        _ => ForkError::Core,
+        Refusal::MetadataRequired => ForkError::MetadataRequired,
+        Refusal::Invalid => ForkError::OwnerRefusal(ForkOwnerRefusal::Invalid),
+        Refusal::Collision => ForkError::OwnerRefusal(ForkOwnerRefusal::Collision),
+        Refusal::Hole => ForkError::OwnerRefusal(ForkOwnerRefusal::Hole),
+        Refusal::ForeignMapping => ForkError::OwnerRefusal(ForkOwnerRefusal::ForeignMapping),
+        Refusal::Limit => ForkError::OwnerRefusal(ForkOwnerRefusal::Limit),
     }
 }
 
@@ -680,4 +685,30 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         Ok(())
     })();
     frame.x[0] = result.err().map_or(0, |error| u64::from(error.errno()));
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+
+    #[test]
+    fn fork_refusals_preserve_original_mm_error_and_errno() {
+        for refusal in [
+            Refusal::Busy,
+            Refusal::PreparedConflict,
+            Refusal::Stale,
+            Refusal::Invalid,
+            Refusal::Collision,
+            Refusal::Hole,
+            Refusal::ForeignMapping,
+            Refusal::Limit,
+            Refusal::MetadataRequired,
+        ] {
+            // Before extraction these owner calls used MmError::from directly.
+            let original = MmError::from(refusal);
+            let through_core = MmError::from(refusal_to_fork_error(refusal));
+            assert_eq!(through_core, original, "{refusal:?}");
+            assert_eq!(through_core.errno(), original.errno(), "{refusal:?}");
+        }
+    }
 }
