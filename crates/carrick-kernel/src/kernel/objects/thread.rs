@@ -426,6 +426,8 @@ impl ThreadExecutionState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ThreadExecutionError {
+    #[error("thread affinity excludes guest CPU {cpu:?}")]
+    AffinityExcluded { cpu: carrick_hal::GuestCpuId },
     #[error("thread {0} cannot identify a transitional executor")]
     InvalidTransitionalExecutor(ThreadId),
     #[error("thread execution generation overflowed")]
@@ -517,6 +519,44 @@ struct ThreadExecutionRecord {
     next_executor_epoch: u64,
     exec_invalidation_pending: bool,
     control_quantum: Option<SchedulerControlQuantum>,
+    affinity_residency: Option<AffinityResidency>,
+}
+
+/// A migration nudge belongs to this loaded incarnation, never to an ambient
+/// host thread or a recycled executor slot. The weak capability cannot keep
+/// an executor alive after its scheduler has retired it.
+#[derive(Debug)]
+struct AffinityResidency {
+    binding: crate::kernel::scheduler::ExecutorBinding,
+    cpu: carrick_hal::GuestCpuId,
+    kick: Weak<dyn crate::kernel::scheduler::ExecutorKick>,
+}
+
+impl AffinityResidency {
+    fn excluded_kick(
+        &self,
+        state: ThreadExecutionState,
+        affinity: CpuAffinity,
+    ) -> Option<(
+        Arc<dyn crate::kernel::scheduler::ExecutorKick>,
+        crate::kernel::scheduler::ExecutorKickToken,
+    )> {
+        match state {
+            ThreadExecutionState::Running {
+                generation,
+                executor,
+                executor_epoch,
+                ..
+            } if generation == self.binding.generation()
+                && executor == self.binding.executor()
+                && executor_epoch == self.binding.executor_epoch()
+                && !affinity.is_allowed(self.cpu) =>
+            {
+                Some((self.kick.upgrade()?, self.binding.token()))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -544,6 +584,7 @@ impl ThreadExecutionRecord {
             next_executor_epoch: 1,
             exec_invalidation_pending: false,
             control_quantum: None,
+            affinity_residency: None,
         }
     }
 }
@@ -999,7 +1040,38 @@ impl Thread {
     }
 
     pub fn set_affinity(&self, affinity: carrick_hal::CpuAffinity) {
-        *self.affinity.write() = affinity;
+        // Claim publication and mask changes serialize on the execution
+        // record. Either this change sees a published residency and kicks it,
+        // or residency publication sees the changed mask and supplies the kick.
+        let kick = {
+            let execution = self.execution.lock();
+            *self.affinity.write() = affinity;
+            execution
+                .affinity_residency
+                .as_ref()
+                .and_then(|residency| residency.excluded_kick(execution.state, affinity))
+        };
+        if let Some((kick, token)) = kick {
+            kick.deliver_exact(token);
+        }
+    }
+
+    pub(in crate::kernel) fn publish_affinity_residency(
+        &self,
+        binding: crate::kernel::scheduler::ExecutorBinding,
+        cpu: carrick_hal::GuestCpuId,
+        kick: Weak<dyn crate::kernel::scheduler::ExecutorKick>,
+    ) {
+        let kick = {
+            let mut execution = self.execution.lock();
+            let residency = AffinityResidency { binding, cpu, kick };
+            let kick = residency.excluded_kick(execution.state, self.affinity());
+            execution.affinity_residency = Some(residency);
+            kick
+        };
+        if let Some((kick, token)) = kick {
+            kick.deliver_exact(token);
+        }
     }
 
     pub(in crate::kernel) fn open_start_gate(&self) {
@@ -1661,6 +1733,22 @@ impl Thread {
         self: &Arc<Self>,
         executor: ExecutorId,
     ) -> Result<ThreadExecutionLease, ThreadExecutionError> {
+        self.claim_runnable_inner(executor, None)
+    }
+
+    pub(in crate::kernel) fn claim_runnable_on_cpu(
+        self: &Arc<Self>,
+        executor: ExecutorId,
+        cpu: carrick_hal::GuestCpuId,
+    ) -> Result<ThreadExecutionLease, ThreadExecutionError> {
+        self.claim_runnable_inner(executor, Some(cpu))
+    }
+
+    fn claim_runnable_inner(
+        self: &Arc<Self>,
+        executor: ExecutorId,
+        cpu: Option<carrick_hal::GuestCpuId>,
+    ) -> Result<ThreadExecutionLease, ThreadExecutionError> {
         let mut execution = self.execution.lock();
         let generation = match execution.state {
             ThreadExecutionState::Runnable { generation } => generation,
@@ -1671,6 +1759,12 @@ impl Thread {
                 });
             }
         };
+        if let Some(cpu) = cpu
+            && !self.affinity().is_allowed(cpu)
+        {
+            return Err(ThreadExecutionError::AffinityExcluded { cpu });
+        }
+        execution.affinity_residency = None;
         let executor_epoch = execution.next_executor_epoch;
         let next_executor_epoch = executor_epoch
             .checked_add(1)

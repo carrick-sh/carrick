@@ -420,7 +420,7 @@ impl ExecutorBinding {
         self.generation
     }
 
-    const fn token(self) -> ExecutorKickToken {
+    pub(in crate::kernel) const fn token(self) -> ExecutorKickToken {
         ExecutorKickToken {
             executor: self.executor,
             executor_epoch: self.executor_epoch,
@@ -3022,7 +3022,8 @@ impl RunQueue {
             self.inner.finish_claim();
             return None;
         }
-        let lease = match row.thread.claim_runnable(executor.id) {
+        let cpu = executor.bound_cpu().unwrap_or(GuestCpuId::new(0));
+        let lease = match row.thread.claim_runnable_on_cpu(executor.id, cpu) {
             Ok(lease) if lease.generation() == row.key.generation => lease,
             Ok(lease) => {
                 let lease_generation = lease.generation();
@@ -3042,6 +3043,16 @@ impl RunQueue {
                         crate::observe::WakeRejectionReason::StaleGeneration,
                     );
                 }
+                self.inner.finish_claim();
+                return None;
+            }
+            Err(ThreadExecutionError::AffinityExcluded { .. }) => {
+                // The row was placed before its mask changed. This is the
+                // same runnable generation, so republish it using current
+                // affinity before releasing the accounted claim. A concurrent
+                // wake coalesces normally; it must never become a discarded
+                // or stranded task merely because its placement changed.
+                let _ = self.inner.enqueue(row, true, None);
                 self.inner.finish_claim();
                 return None;
             }
@@ -4573,6 +4584,8 @@ impl Scheduler {
             self.executors.deliver_kick_to(executor.id);
         }
         let bound_cpu = executor.bound_cpu().unwrap_or(GuestCpuId::new(0));
+        row.thread
+            .publish_affinity_residency(binding, bound_cpu, Arc::downgrade(&executor.kick));
         row.thread.set_last_cpu(bound_cpu);
         let thread_id = SchedThreadId::new(row.thread.key().serial.raw());
         let process_id = SchedProcessId::new(row.thread.task_key().serial.raw());
@@ -4929,6 +4942,13 @@ impl Scheduler {
         };
         running.binding = successor;
         running.lease = Some(lease);
+        if let Some(kick) = self.executors.kick_of(successor.executor()) {
+            running.thread.publish_affinity_residency(
+                successor,
+                running.guest_cpu,
+                Arc::downgrade(&kick),
+            );
+        }
         drop(generation_transition);
         self.kernel
             .release_vfork_after_exec_publication(committed.publication_receipt)?;
