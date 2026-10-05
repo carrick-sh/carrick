@@ -29,12 +29,14 @@ const BUILD_SCRIPTS: &[&str] = &[
     "scripts/build-embed-interceptor-probe.sh",
     "scripts/build-embed-zone-readers.sh",
     "scripts/build-embed-icache-reuse.sh",
+    "scripts/build-embed-copyout.sh",
     "scripts/build-embed-el1-sched.sh",
 ];
 const EMBED: &[(&str, &str)] = &[
     ("embed-interceptor-probe", "interceptor-probe"),
     ("embed-zone-readers", "zone-readers"),
     ("embed-icache-reuse", "icache-reuse"),
+    ("embed-copyout", "copyout"),
     ("embed-el1-sched", "el1-sched"),
 ];
 
