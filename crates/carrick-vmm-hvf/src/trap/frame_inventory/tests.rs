@@ -7589,6 +7589,164 @@ fn carries_conditional_retire_of(task: &mut HvfTaskState, frame: carrick_hal::Fr
     })
 }
 
+#[derive(Debug)]
+struct BootstrapRetirementArenaSource(Option<carrick_mmu_core::aarch64::SubstrateGpa>);
+impl carrick_mmu_core::aarch64::TableArenaSource for BootstrapRetirementArenaSource {
+    fn id(&self) -> carrick_mmu_core::aarch64::TableArenaSourceId {
+        carrick_mmu_core::aarch64::TableArenaSourceId(carrick_mmu_core::aarch64::SubstrateGpa(
+            0x8000,
+        ))
+    }
+    fn take_arena(&mut self) -> Option<carrick_mmu_core::aarch64::SubstrateGpa> {
+        self.0.take()
+    }
+    fn return_arena(&mut self, base: carrick_mmu_core::aarch64::SubstrateGpa) {
+        self.0 = Some(base);
+    }
+}
+
+fn relocate_exit_fixture_root(task: &mut HvfTaskState, base: u64) -> CarrierStage2RecordIdentity {
+    task.mm_root_slot = None; // Bootstrap roots use their source's table capacity.
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let manager = carrick_mmu_core::aarch64::PageTableManager::new(
+        carrick_mem::memory::stage1_hvpatch_page_tables(),
+        carrick_mem::memory::LINUX_PAGE_TABLES_BASE,
+        carrick_mem::memory::AARCH64_LINUX_PAGE_TABLE_LAYOUT,
+    );
+    let tables = carrick_aarch64::Stage1Authority::new_with_manager(Some(manager));
+    task.mm_access = MmAccessState::new(
+        tables.clone(),
+        task.protections.clone(),
+        task.frame_inventory.shared_ledger(),
+        task.cow_armed.clone(),
+        task.cow_deferred_publications.clone(),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
+        crate::trap::foreign_mm::LiveBacking::deferred(custody.clone()),
+    );
+    tables
+        .install_source(Box::new(BootstrapRetirementArenaSource(Some(
+            carrick_mmu_core::aarch64::SubstrateGpa(base),
+        ))))
+        .unwrap();
+    assert_eq!(tables.publish_initial_table_root(|_| Ok(())).unwrap(), base);
+    custody.stage2_record_covering(base, 1).unwrap()
+}
+
+#[test]
+fn two_live_mm_bootstrap_retirement_releases_only_its_published_root_slot() {
+    let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        2,
+    ));
+    custody.install_root_slot_pool(pool.clone());
+    let kernel = std::sync::Arc::new(PerFrameKernel::default());
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let (mut first, _, _, _) =
+        exit_task_holding_owned_lease(701, 0x4000, 701, 702, &kernel, &frames);
+    let (mut second, _, _, _) =
+        exit_task_holding_owned_lease(703, 0x8000, 703, 704, &kernel, &frames);
+    let base = pool.base_ipa();
+    let first_record = relocate_exit_fixture_root(&mut first, base);
+    let second_record = relocate_exit_fixture_root(&mut second, base + 0x20_0000);
+    assert_eq!(pool.allocated_count(), 2);
+    assert_ne!(first_record, second_record);
+    let second_owner =
+        second.mm_access.structural_owners.read()[&(base + 0x20_0000, 0x20_0000)].clone();
+    // SAFETY: both MMs are stopped fixtures and the second owns this complete slot.
+    unsafe { second_owner.ptr().add(0x1000).write(0x73) };
+
+    HvfVmState::retire_task_state_process_mappings(&mut first).unwrap();
+    assert!(
+        custody
+            .stage2_record_snapshot(first_record.record_id)
+            .is_none(),
+        "bootstrap retirement returned logical capacity while physical root remained live"
+    );
+    assert!(
+        first.page_tables_authority().is_none(),
+        "retired table image must be revoked before reuse"
+    );
+    let reused = pool
+        .allocate_slot_at(base)
+        .expect("exact retired bootstrap slot must be reusable");
+    assert!(pool.allocate_slot_at(base + 0x20_0000).is_none());
+    assert!(
+        custody
+            .stage2_record_snapshot(second_record.record_id)
+            .unwrap()
+            .mapped
+    );
+    assert_eq!(unsafe { second_owner.ptr().add(0x1000).read() }, 0x73);
+    HvfVmState::retire_task_state_process_mappings(&mut second).unwrap();
+    drop(reused);
+    assert_eq!(pool.allocated_count(), 0);
+}
+
+#[test]
+fn two_live_mm_pinned_table_retirement_cannot_return_physical_capacity() {
+    use carrick_aarch64::stage1_authority::TableArenaPublisher;
+    let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+    let _stage2_stub = ScopedStage2MapTestStub::enable();
+    let custody = legacy_test_carrier_vm_custody_arc();
+    let pool = std::sync::Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+        2,
+    ));
+    custody.install_root_slot_pool(pool.clone());
+    let kernel = std::sync::Arc::new(PerFrameKernel::default());
+    let frames = std::sync::Arc::new(parking_lot::Mutex::new(InventoryFrameRegistry::default()));
+    let (mut first, key, generation, _) =
+        exit_task_holding_owned_lease(705, 0x4000, 705, 706, &kernel, &frames);
+    let (mut second, _, _, _) =
+        exit_task_holding_owned_lease(707, 0x8000, 707, 708, &kernel, &frames);
+    let base = pool.base_ipa();
+    let record = relocate_exit_fixture_root(&mut first, base);
+    let other = relocate_exit_fixture_root(&mut second, base + 0x20_0000);
+    let pin = custody.pin_stage2_record(record).unwrap();
+    let publisher = first.mm_access.arena_publisher.read().clone().unwrap();
+    let result = publisher.retire_raw_table_arena(base);
+    let kept_owner = first
+        .mm_access
+        .structural_owners
+        .read()
+        .contains_key(&(base, 0x20_0000));
+    let reused = pool.allocate_slot_at(base);
+    let returned_early = reused.is_some();
+    assert!(
+        custody
+            .stage2_record_snapshot(record.record_id)
+            .unwrap()
+            .mapped
+    );
+    assert!(
+        custody
+            .stage2_record_snapshot(other.record_id)
+            .unwrap()
+            .mapped
+    );
+    assert!(pool.allocate_slot_at(base + 0x20_0000).is_none());
+    // Explicit cleanup before the red assertions, preserving no pinned slot.
+    drop(reused);
+    drop(pin);
+    retire_carrier_stage2_record_at_safe_point(custody, record).unwrap();
+    first.mm_access.release_structural_owner_at(base, 0x20_0000);
+    retire_global_frame_host_owner_if_generation_in(custody, key.0, key.1, generation);
+    HvfVmState::retire_task_state_process_mappings(&mut second).unwrap();
+    assert!(
+        result.is_err(),
+        "deferred physical retirement is not a capacity-return receipt"
+    );
+    assert!(
+        kept_owner,
+        "pinned physical custody must keep its exact MM owner"
+    );
+    assert!(
+        !returned_early,
+        "another live MM could acquire a still-pinned slot"
+    );
+}
+
 /// A fork parent and child map one grant frame and both exit. Each
 /// retirement decides before its Kernel unmap is applied, so neither can
 /// know whose unmap is last (signed `el1_anonymous_discard_and_exit_return_frames`
