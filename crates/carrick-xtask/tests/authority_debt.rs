@@ -1398,3 +1398,286 @@ fn renamed_source_inclusions_cannot_hide_production_files() {
     write_source(src.join("lib.rs"), "use std::include as compiled; macro_rules! hidden { () => { compiled!(\"shared.rs\"); }; }").unwrap();
     assert!(carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err());
 }
+
+fn macro_input_alias_source(invocation: &str) -> String {
+    format!(
+        r#"
+macro_rules! passthrough {{ ($($item:item)*) => {{ $($item)* }}; }}
+passthrough! {{
+    use std::include as retirement_include;
+    retirement_include!({invocation});
+}}
+#[cfg(test)] #[path="shared.rs"] mod tests_copy;
+pub fn poll(table: &Table) {{ table.read_open_files(); }}
+"#
+    )
+}
+
+#[test]
+fn review_macro_input_inclusion_alias_cannot_hide_k1() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        macro_input_alias_source(r#""shared.rs""#),
+    )
+    .unwrap();
+    write_source(
+        src.join("shared.rs"),
+        "fn hidden(table: &Table) { table.read_open_files(); }",
+    )
+    .unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert!(!census.is_test_at("crates/carrick-kernel/src/shared.rs", 1, 0));
+    assert!(
+        census
+            .k1
+            .iter()
+            .any(|site| site.owner == "carrick_kernel::hidden")
+    );
+    assert!(
+        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+            .is_err()
+    );
+}
+
+#[test]
+fn review_macro_input_inclusion_alias_cannot_hide_raw_locks() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        macro_input_alias_source(r#""shared.rs""#),
+    )
+    .unwrap();
+    write_source(
+        src.join("shared.rs"),
+        "fn hidden(this: &Dispatcher) { this.proc.lock(); }",
+    )
+    .unwrap();
+    let error =
+        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
+            .unwrap_err()
+            .to_string();
+    assert!(error.contains("unknown authority"), "{error}");
+}
+
+#[test]
+fn review_macro_input_inclusion_alias_rejects_nonliteral_paths() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        macro_input_alias_source(r#"concat!("shared", ".rs")"#),
+    )
+    .unwrap();
+    write_source(
+        src.join("shared.rs"),
+        "fn hidden(table: &Table) { table.read_open_files(); }",
+    )
+    .unwrap();
+    let error = carrick_xtask::authority_source::SourceCensus::load(root.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("nonliteral source inclusion"), "{error}");
+}
+
+fn git_fixture(root: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_AUTHOR_NAME", "Authority fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Authority fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn authority_cli_fixture() -> (tempfile::TempDir, String) {
+    let root = source_fixture();
+    let scripts = root.path().join("scripts/migrate");
+    std::fs::create_dir_all(&scripts).unwrap();
+    for checker in [
+        "check-dispatch-lock-authority.py",
+        "check-runtime-global-state.py",
+        "check-runtime-aborts.py",
+    ] {
+        std::os::unix::fs::symlink(
+            tools_root().join("scripts/migrate").join(checker),
+            scripts.join(checker),
+        )
+        .unwrap();
+    }
+    let path = root
+        .path()
+        .join(carrick_xtask::authority_debt::CEILINGS_PATH);
+    std::fs::write(&path, serde_json::to_vec(&ceilings(1)).unwrap()).unwrap();
+    git_fixture(root.path(), &["init", "-q"]);
+    git_fixture(root.path(), &["add", "."]);
+    git_fixture(root.path(), &["commit", "-qm", "baseline"]);
+    let base = git_fixture(root.path(), &["rev-parse", "HEAD"]);
+    // A coordinated ceiling increase must fail only when a range is supplied.
+    std::fs::write(&path, serde_json::to_vec(&ceilings(2)).unwrap()).unwrap();
+    git_fixture(root.path(), &["add", "."]);
+    git_fixture(root.path(), &["commit", "-qm", "increase ceiling"]);
+    git_fixture(
+        root.path(),
+        &["update-ref", "refs/remotes/github/main", "HEAD"],
+    );
+    (root, base)
+}
+
+fn authority_cli(
+    root: &std::path::Path,
+    base: Option<&str>,
+    env_base: Option<&str>,
+    source_only: bool,
+) -> std::process::Output {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_carrick-xtask"));
+    cmd.args(["--root", root.to_str().unwrap(), "authority-debt"]);
+    cmd.env_remove("CARRICK_AUTHORITY_BASE");
+    if let Some(base) = base {
+        cmd.args(["--base", base]);
+    }
+    if let Some(base) = env_base {
+        cmd.env("CARRICK_AUTHORITY_BASE", base);
+    }
+    if source_only {
+        cmd.arg("--source-only");
+    }
+    cmd.output().unwrap()
+}
+
+fn assert_one_authority_skip(output: &std::process::Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let skip: Vec<_> = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter(|line| line.contains("no change range"))
+        .collect();
+    assert_eq!(
+        skip,
+        ["authority debt delta: no change range (no base provided); delta ratchet not applicable"]
+    );
+    assert!(!stdout.contains("PR-base ratchet passed"));
+}
+
+#[test]
+fn review_no_change_range_skips_only_ratchet_and_enforces_absolute_ceilings() {
+    let (root, base) = authority_cli_fixture();
+    for absent in [None, Some(""), Some("   ")] {
+        let output = authority_cli(root.path(), None, absent, true);
+        assert!(output.status.success(), "{output:?}");
+        assert_one_authority_skip(&output);
+    }
+    let output = authority_cli(root.path(), Some(""), None, true);
+    assert!(output.status.success(), "{output:?}");
+    assert_one_authority_skip(&output);
+    for (explicit, environment) in [
+        (Some(base.as_str()), None),
+        (None, Some(base.as_str())),
+        (Some(""), Some(base.as_str())),
+    ] {
+        let output = authority_cli(root.path(), explicit, environment, true);
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("increase"),
+            "{output:?}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("no change range"));
+    }
+    std::fs::write(
+        root.path()
+            .join(carrick_xtask::authority_debt::CEILINGS_PATH),
+        serde_json::to_vec(&ceilings(0)).unwrap(),
+    )
+    .unwrap();
+    let output = authority_cli(root.path(), None, Some(""), true);
+    assert!(!output.status.success());
+    assert_one_authority_skip(&output);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("exceeds ceiling"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn review_explicit_self_comparison_and_invalid_base_fail_closed() {
+    let (root, _) = authority_cli_fixture();
+    for base in ["HEAD", "github/main", "missing-revision"] {
+        let output = authority_cli(root.path(), Some(base), None, true);
+        assert!(
+            !output.status.success(),
+            "explicit {base} must fail: {output:?}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("no change range"));
+    }
+}
+
+#[test]
+fn review_no_change_range_still_applies_live_host_ceilings() {
+    let (root, _) = authority_cli_fixture();
+    let mut policy = ceilings(2);
+    policy.counters.push(Counter {
+        family: Family::HostForbiddenSemantic,
+        operation: "std::process::id".into(),
+        owner: "carrick_kernel::poll".into(),
+        lane: Lane::LinuxCli,
+        ceiling: 0,
+    });
+    std::fs::write(
+        root.path()
+            .join(carrick_xtask::authority_debt::CEILINGS_PATH),
+        serde_json::to_vec(&policy).unwrap(),
+    )
+    .unwrap();
+    // A fixture diagnostic checks the full CLI dispatch and policy consumer;
+    // live_linux_breaker_alias_macro_and_cfg_cannot_use_stored_evidence above
+    // separately proves actual compiler discovery and owner binding.
+    std::fs::write(root.path().join("scripts/migrate/check-host-authority-transitions.py"), r#"
+import json
+print(json.dumps({"rows": [{"source": {"file": "crates/carrick-kernel/src/lib.rs", "line_start": 1, "column_start": 1}, "operation": "std::process::id", "profiles": ["linux-cli"]}]}))
+"#).unwrap();
+    for base in [None, Some("")] {
+        let output = authority_cli(root.path(), None, base, false);
+        assert!(!output.status.success());
+        assert_one_authority_skip(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("exceeds ceiling 0") && stderr.contains("std::process::id"),
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
+fn review_macos_census_checkout_fetches_the_event_base() {
+    let source = std::fs::read_to_string(tools_root().join(".github/workflows/ci.yml")).unwrap();
+    let workflow = yaml_rust2::YamlLoader::load_from_str(&source).unwrap();
+    for job in ["lint", "macos-clippy"] {
+        let steps = workflow[0]["jobs"][job]["steps"].as_vec().unwrap();
+        let checkout = steps
+            .iter()
+            .find(|step| {
+                step["uses"]
+                    .as_str()
+                    .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+            })
+            .unwrap();
+        assert_eq!(checkout["with"]["fetch-depth"].as_i64(), Some(0), "{job}");
+        assert!(
+            steps
+                .iter()
+                .any(|step| step["run"].as_str() == Some("just ci-probe-coverage-base")),
+            "{job} must fetch the actual event base"
+        );
+    }
+}
