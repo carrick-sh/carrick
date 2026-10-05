@@ -1345,6 +1345,13 @@ impl Drop for CarrierLease {
     }
 }
 
+/// Current carrier generation for process-wide diagnostics.
+pub fn active_carrier_scope() -> Option<CarrierScopeId> {
+    let carrier = active_process_carrier()?;
+    carrier.ensure_current_process().ok()?;
+    Some(carrier.scope().clone())
+}
+
 fn active_process_carrier() -> Option<CarrierRuntime> {
     independent_carrier_gate()
         .lock()
@@ -1660,6 +1667,29 @@ mod tests {
     use super::*;
 
     static TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn serial_host_watchdog_scope_survives_unprepared_and_successive_carriers() {
+        let _serial = TEST_LOCK.lock();
+        let query: fn() -> Option<CarrierScopeId> = active_carrier_scope;
+        assert_eq!(query(), None);
+        let abandoned = CarrierRuntime::new_explicit().expect("unprepared carrier");
+        assert_eq!(query().as_ref(), Some(abandoned.scope()));
+        drop(abandoned);
+        assert_eq!(query(), None);
+        let first = CarrierRuntime::new_explicit().expect("first prepared carrier");
+        let first_scope = first.scope().clone();
+        assert_eq!(query(), Some(first_scope.clone()));
+        first.shutdown_wait().expect("first shutdown");
+        drop(first);
+        assert_eq!(query(), None);
+        let second = CarrierRuntime::new_explicit().expect("successive generation");
+        assert_ne!(second.scope(), &first_scope);
+        assert_eq!(query().as_ref(), Some(second.scope()));
+        second.shutdown_wait().expect("second shutdown");
+        drop(second);
+        assert_eq!(query(), None);
+    }
 
     /// The policy fixes the carrier's `P` set AND the guest's `nproc`, so a
     /// second, different one cannot be accepted quietly: the guest may

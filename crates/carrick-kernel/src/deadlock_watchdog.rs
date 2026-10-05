@@ -105,7 +105,9 @@ pub(crate) fn ensure_private_directory(path: &Path, uid: u32) -> std::io::Result
 /// On a carrier-wide stall the watchdog does the capture itself and reaps the
 /// carrier. It does NOT `SIGSTOP` and wait for a human: a stopped carrier in a
 /// signed test shard is a hang that outlives the gate.
-pub fn arm(window: DeadlockWindow) {
+// A function pointer cannot retain one builder's identity. The query resolves
+// the live generation through the caller's existing carrier authority.
+pub fn arm(window: DeadlockWindow, current_scope: fn() -> Option<crate::kernel::CarrierScopeId>) {
     if ARMED.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -142,7 +144,7 @@ pub fn arm(window: DeadlockWindow) {
                 let request = WedgeCaptureRequest {
                     label: "deadlock".to_owned(),
                     pid,
-                    run_id: std::env::var("CARRICK_RUN_ID").ok(),
+                    run_id: current_scope().map(|scope| scope.as_str().to_owned()),
                     budget_ms: window_ms,
                     elapsed_ms: stalled,
                     out_root: PathBuf::from("target/postmortem"),

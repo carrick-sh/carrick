@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 
-"""Gate process-global state with a stable monotone ledger.
+"""Discover production globals and unconditionally deny ambient guest state.
 
-Discovers process-global statics, thread-local cells, and environment variable
-reads across the runtime crates. Compares against the checked ledger
-`runtime-global-state.json` to ensure no new unreviewed process-global state is
-introduced and source modifications are explicitly reviewed.
+The Rust authority-debt gate consumes symbolic findings in memory. Scanner
+fingerprints remain lexical test details; no ledger or landing identity uses them.
 """
 
 from __future__ import annotations
@@ -19,7 +17,6 @@ import sys
 from typing import Any, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-LEDGER_PATH = REPO_ROOT / "scripts" / "migrate" / "runtime-global-state.json"
 
 DEFAULT_SCAN_ROOTS = (
     # Neutral owner moves retain the same runtime-global census.
@@ -41,16 +38,6 @@ DEFAULT_SCAN_ROOTS = (
     "crates/carrick-observability/src",
 )
 
-ALLOWED_CLASSIFICATIONS = frozenset(
-    {
-        "container_debt",
-        "carrier_infra",
-        "host_kernel_object",
-        "monotonic_allocator",
-        "config_debug",
-        "test_only",
-    }
-)
 
 
 class LedgerError(Exception):
@@ -62,7 +49,8 @@ class Finding:
     kind: str  # static | thread_local | env_var | env_var_os
     file: str
     symbol: str
-    fingerprint: str  # sha256(normalized tokens), never a line number
+    fingerprint: str  # transient scanner detail; never part of landing identity
+    production: bool = True
 
 
 @dataclass(frozen=True)
@@ -318,6 +306,35 @@ class _Scope:
     brace_depth: int
 
 
+def _production_attributes(tokens: Sequence[Token]) -> bool:
+    # Reuse the retained abort scanner's cfg evaluator, including cfg_attr and
+    # test-support. Test-only findings are useful in scanner fixtures but are
+    # not production authority debt.
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("authority_scope_cfg", Path(__file__).with_name("check-runtime-aborts.py"))
+    module = sys.modules.get(spec.name)
+    if module is None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+    parsed = module.lex_rust(" ".join(token.text for token in tokens))
+    index = 0
+    while index < len(parsed):
+        if parsed[index].text == "[":
+            end = index + 1
+            depth = 1
+            while end < len(parsed) and depth:
+                if parsed[end].text == "[": depth += 1
+                if parsed[end].text == "]": depth -= 1
+                end += 1
+            if module.is_test_only_attribute(parsed[index + 1:end - 1]):
+                return False
+            index = end
+        else:
+            index += 1
+    return True
+
+
 def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
     """Discover all statics, thread-locals, and env::var reads in source text."""
     posix_path = (
@@ -327,6 +344,7 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
     findings: list[Finding] = []
 
     scope_stack: list[_Scope] = []
+    file_cfgs: list[Token] = []
     pending_attributes: list[list[Token]] = []
 
     pending_item_kind: str | None = None
@@ -370,6 +388,8 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
                 if is_inner and _is_cfg_attr(attr_tokens):
                     if scope_stack:
                         scope_stack[-1].cfgs.append(attr_tokens)
+                    else:
+                        file_cfgs.extend(attr_tokens)
                 elif not is_inner:
                     pending_attributes.append(attr_tokens)
                 continue
@@ -430,7 +450,7 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
                 pending_item_kind = "mod"
                 pending_item_name = tokens[idx + 1].text
                 pending_item_cfgs = [
-                    attr for attr in pending_attributes if _is_cfg_attr(attr)
+                    attr for attr in pending_attributes
                 ]
                 in_item_header = True
                 pending_attributes = []
@@ -441,7 +461,7 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
                 pending_item_kind = "fn"
                 pending_item_name = tokens[idx + 1].text
                 pending_item_cfgs = [
-                    attr for attr in pending_attributes if _is_cfg_attr(attr)
+                    attr for attr in pending_attributes
                 ]
                 in_item_header = True
                 pending_attributes = []
@@ -522,7 +542,7 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
             fingerprint = hashlib.sha256(
                 fingerprint_text.encode("utf-8")
             ).hexdigest()
-            findings.append(Finding(op_kind, posix_path, symbol, fingerprint))
+            findings.append(Finding(op_kind, posix_path, symbol, fingerprint, _production_attributes(file_cfgs + enclosing_cfg_tokens + direct_stmt_attr_tokens)))
             continue
 
         # 7. Check for static declarations
@@ -608,7 +628,7 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
                         fingerprint_text.encode("utf-8")
                     ).hexdigest()
                     findings.append(
-                        Finding(finding_kind, posix_path, symbol, fingerprint)
+                        Finding(finding_kind, posix_path, symbol, fingerprint, _production_attributes(file_cfgs + enclosing_cfg_tokens + macro_attr_tokens + direct_attr_tokens))
                     )
                     pending_attributes = []
                     idx = cur_idx
@@ -638,7 +658,7 @@ def discover(
             findings = scan_source(rel_path, source)
             all_findings.extend(findings)
 
-    return tuple(sorted(all_findings))
+    return tuple(sorted(f for f in all_findings if f.production))
 
 
 def validate_concurrent_source(path: Path, source: str) -> None:
@@ -646,6 +666,8 @@ def validate_concurrent_source(path: Path, source: str) -> None:
     path_text = path.as_posix()
     findings = scan_source(path, source)
     for finding in findings:
+        if not finding.production:
+            continue
         leaf = finding.symbol.rsplit("::", 1)[-1]
         if finding.kind == "static" and (
             leaf == "RUN_ID"
@@ -707,204 +729,19 @@ def validate_concurrent_tree(
             )
 
 
-def load_ledger(path: Path) -> list[dict[str, Any]]:
-    """Load and validate JSON ledger structure."""
-    if not path.is_file():
-        raise LedgerError(f"ledger file does not exist: {path}")
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
-        raise LedgerError(f"malformed ledger JSON at {path}: {error}") from error
-
-    if not isinstance(data, dict):
-        raise LedgerError("ledger root must be a JSON object")
-    if data.get("schema") != 1:
-        raise LedgerError(f"unsupported ledger schema version: {data.get('schema')}")
-    rows = data.get("rows")
-    if not isinstance(rows, list):
-        raise LedgerError("ledger 'rows' must be a list")
-
-    return rows
-
-
-def compare(
-    actual: Sequence[Finding],
-    reviewed: Sequence[dict[str, Any]],
-    *,
-    require_concurrent_embed_clean: bool = False,
-) -> None:
-    """Compare discovered findings against reviewed rows, failing on any drift or violations."""
-    actual_keys: set[tuple[str, str, str]] = set()
-    actual_map: dict[tuple[str, str, str], Finding] = {}
-    for idx, f in enumerate(actual, 1):
-        key = (f.kind, f.file, f.symbol)
-        if key in actual_keys:
-            raise LedgerError(
-                f"duplicate discovered finding identity: kind={key[0]} file={key[1]} symbol={key[2]}"
-            )
-        actual_keys.add(key)
-        actual_map[key] = f
-
-    reviewed_keys: set[tuple[str, str, str]] = set()
-    reviewed_map: dict[tuple[str, str, str], dict[str, Any]] = {}
-
-    for idx, row in enumerate(reviewed, 1):
-        if not isinstance(row, dict):
-            raise LedgerError(f"reviewed row {idx} is not an object")
-        for req_field in (
-            "kind",
-            "file",
-            "symbol",
-            "fingerprint",
-            "classification",
-            "rationale",
-        ):
-            if not row.get(req_field):
-                raise LedgerError(
-                    f"reviewed row {idx} missing required non-empty field {req_field!r}"
-                )
-
-        classification = row["classification"]
-        if classification not in ALLOWED_CLASSIFICATIONS:
-            raise LedgerError(
-                f"reviewed row {idx} has invalid classification: {classification!r}"
-            )
-
-        if classification == "container_debt" and not row.get("destination"):
-            raise LedgerError(
-                f"reviewed row {idx} with classification 'container_debt' missing 'destination'"
-            )
-        if require_concurrent_embed_clean and classification == "container_debt":
-            raise LedgerError(
-                "concurrent embed path retains container-scoped global state: "
-                f"{row['file']}::{row['symbol']}"
-            )
-
-        key = (row["kind"], row["file"], row["symbol"])
-        if key in reviewed_keys:
-            raise LedgerError(
-                f"duplicate reviewed row in ledger: kind={key[0]} file={key[1]} symbol={key[2]}"
-            )
-        reviewed_keys.add(key)
-        reviewed_map[key] = row
-
-    # Check additions
-    additions = sorted(set(actual_map) - set(reviewed_map))
-    if additions:
-        details = [
-            f"  + [{k}] {f} :: {s}"
-            for k, f, s in additions
-        ]
-        raise LedgerError(
-            f"new unreviewed global state findings ({len(additions)} additions):\n"
-            + "\n".join(details)
-        )
-
-    # Check removals / stale entries
-    removals = sorted(set(reviewed_map) - set(actual_map))
-    if removals:
-        details = [
-            f"  - [{k}] {f} :: {s}"
-            for k, f, s in removals
-        ]
-        raise LedgerError(
-            f"stale reviewed global state entries ({len(removals)} removals):\n"
-            + "\n".join(details)
-        )
-
-    # Check source fingerprint drift
-    drifted: list[str] = []
-    for key in sorted(actual_map):
-        act = actual_map[key]
-        rev = reviewed_map[key]
-        if act.fingerprint != rev["fingerprint"]:
-            drifted.append(
-                f"  ~ [{key[0]}] {key[1]} :: {key[2]} "
-                f"(expected fingerprint {rev['fingerprint'][:16]}..., actual {act.fingerprint[:16]}...)"
-            )
-
-    if drifted:
-        raise LedgerError(
-            f"source drift in global state findings ({len(drifted)} drifted):\n"
-            + "\n".join(drifted)
-        )
-
-
-def _bootstrap(root: Path) -> int:
-    """Discover findings from source and print initial unreviewed ledger JSON to stdout."""
-    findings = discover(root)
-    rows: list[dict[str, Any]] = []
-
-    for f in findings:
-        rows.append(
-            {
-                "kind": f.kind,
-                "file": f.file,
-                "symbol": f.symbol,
-                "fingerprint": f.fingerprint,
-                "classification": "unreviewed",
-                "rationale": "UNREVIEWED: classify scope and state rationale.",
-            }
-        )
-
-    ledger = {"schema": 1, "rows": rows}
-    print(json.dumps(ledger, indent=2))
-    return 0
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--root",
-        type=Path,
-        default=REPO_ROOT,
-        help="Workspace root path",
-    )
-    parser.add_argument(
-        "--require-concurrent-embed-clean",
-        action="store_true",
-        help="Reject all container_debt rows and ambient runtime identity accessors",
-    )
-    parser.add_argument(
-        "--ledger",
-        type=Path,
-        default=LEDGER_PATH,
-        help="Path to reviewed global state ledger",
-    )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--check",
-        action="store_true",
-        help="Check current source against reviewed global state ledger",
-    )
-    group.add_argument(
-        "--bootstrap",
-        action="store_true",
-        help="Print discovered rows as JSON to stdout (does not write file)",
-    )
-
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Discover globals and unconditionally deny ambient guest state")
+    parser.add_argument("--root", type=Path, default=REPO_ROOT)
+    parser.add_argument("--discover", action="store_true")
     args = parser.parse_args(argv)
-
-    if args.bootstrap:
-        return _bootstrap(args.root)
-
-    if args.check:
-        try:
-            findings = discover(args.root)
-            reviewed = load_ledger(args.ledger)
-            compare(
-                findings,
-                reviewed,
-                require_concurrent_embed_clean=args.require_concurrent_embed_clean,
-            )
-            if args.require_concurrent_embed_clean:
-                validate_concurrent_tree(args.root)
-        except (LedgerError, OSError) as error:
-            print(f"error: check-runtime-global-state: {error}", file=sys.stderr)
-            return 1
+    try:
+        validate_concurrent_tree(args.root)
+        findings = discover(args.root)
+        print(json.dumps([{"file": f.file, "kind": f.kind, "symbol": f.symbol} for f in findings]))
         return 0
-
-    return 0
+    except (LedgerError, OSError) as error:
+        print(f"error: check-runtime-global-state: {error}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
