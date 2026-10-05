@@ -139,6 +139,12 @@ impl<'a, S: PreparedService, P: TransferPin> PreparedWrite<'a, S, P> {
                     "PREPARE unexpectedly copied bytes"
                 );
             }
+            carrick_observability::probes::guest_internal_write_fault(
+                request.range.address(),
+                request.range.len(),
+                26,
+                &format!("owner PREPARE refused: {completion:?}"),
+            );
             if completion.errno == 3 {
                 // SAFETY: exact owner completion authenticated this operation.
                 let handle = unsafe {
