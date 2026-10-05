@@ -47,6 +47,15 @@ impl LeafSize {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorOp {
+    /// A complete owner grant: prepare neighbors and publish only the fault
+    /// span under the same rollback journal, with no intermediate receipt.
+    Prepare {
+        span: PageSpan,
+        output: FrameGpa,
+        permissions: Permissions,
+        resident: PageSpan,
+        backing: BackingIdentity,
+    },
     Map {
         span: PageSpan,
         output: FrameGpa,
@@ -79,7 +88,8 @@ pub enum DescriptorOp {
 impl DescriptorOp {
     pub fn span(self) -> PageSpan {
         match self {
-            Self::Map { span, .. }
+            Self::Prepare { span, .. }
+            | Self::Map { span, .. }
             | Self::Publish { span, .. }
             | Self::Protect { span, .. }
             | Self::CowRepoint { span, .. }
@@ -171,6 +181,14 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
     }
     match txn.op {
         DescriptorOp::Map { output, .. } => validate_output(output, span.len, size.bytes())?,
+        DescriptorOp::Prepare {
+            output, resident, ..
+        } => {
+            validate_output(output, span.len, PAGE)?;
+            if !resident.is_well_formed() || !span.contains_span(resident) {
+                return Err(DescriptorRefusal::BadRange);
+            }
+        }
         DescriptorOp::Publish { expected, .. } => validate_output(expected, span.len, PAGE)?,
         DescriptorOp::CowRepoint { old, new, .. } => {
             validate_output(old, span.len, PAGE)?;
@@ -404,7 +422,10 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
         let child;
         let mut link = None;
         if entry == 0 {
-            if !matches!(self.txn.op, DescriptorOp::Map { .. }) {
+            if !matches!(
+                self.txn.op,
+                DescriptorOp::Map { .. } | DescriptorOp::Prepare { .. }
+            ) {
                 return Err(DescriptorRefusal::MissingTable);
             }
             child = self.grant()?;
@@ -446,12 +467,23 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             DescriptorOp::Map {
                 output,
                 permissions: p,
-                resident,
+                ..
+            }
+            | DescriptorOp::Prepare {
+                output,
+                permissions: p,
                 ..
             } => {
                 if entry != 0 {
                     return Err(DescriptorRefusal::Occupied);
                 }
+                let resident = match self.txn.op {
+                    DescriptorOp::Map { resident, .. } => resident,
+                    DescriptorOp::Prepare { resident, span, .. } => {
+                        resident.contains(span.va + offset)
+                    }
+                    _ => false,
+                };
                 (output.raw() + offset)
                     | permissions(p)
                     | if resident { PRESENT } else { PREPARED }
@@ -560,6 +592,17 @@ impl DescriptorTxn<'_> {
                 permissions(p) | u64::from(resident),
                 Some(backing),
             ),
+            DescriptorOp::Prepare {
+                output,
+                permissions: p,
+                resident,
+                backing,
+                ..
+            } => {
+                hash = mix(hash, resident.va);
+                hash = mix(hash, resident.len);
+                (8, output.raw(), PAGE, permissions(p), Some(backing))
+            }
             DescriptorOp::Publish { expected, .. } => (2, expected.raw(), 0, 0, None),
             DescriptorOp::Protect { permissions: p, .. } => (3, 0, 0, permissions(p), None),
             DescriptorOp::ArmCow(_) => (4, 0, 0, 0, None),

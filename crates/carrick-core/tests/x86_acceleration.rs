@@ -1201,3 +1201,224 @@ mod fork_cow {
         assert!(scratch.reads.is_empty());
     }
 }
+
+struct FailGrantStore<'a, W> {
+    words: &'a W,
+    stores: core::cell::Cell<usize>,
+}
+impl<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords>
+    carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords for FailGrantStore<'_, W>
+{
+    fn load(
+        &self,
+        pa: u64,
+    ) -> Result<u64, carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
+        self.words.load(pa)
+    }
+    fn compare_exchange(
+        &self,
+        pa: u64,
+        old: u64,
+        new: u64,
+    ) -> Result<bool, carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
+        let stores = self.stores.get() + 1;
+        self.stores.set(stores);
+        if stores == 2 {
+            Ok(false)
+        } else {
+            self.words.compare_exchange(pa, old, new)
+        }
+    }
+    fn store_unlinked(
+        &self,
+        pa: u64,
+        value: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
+        self.words.store_unlinked(pa, value)
+    }
+    fn publish_barrier(&self) {
+        self.words.publish_barrier()
+    }
+    fn invalidate_range(&self, va: u64, len: u64) {
+        self.words.invalidate_range(va, len)
+    }
+}
+
+fn grant_fixture<B: carrick_mmu_core::owner_mmu::OwnerGrantMmu>(
+    pages: usize,
+    x86: bool,
+    backend: B,
+) {
+    use carrick_core::mm::frames::serve_grant;
+    use carrick_core_abi::PortalGrantSlot;
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan,
+        TableGrants,
+    };
+    use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
+    let mut region = Region::new();
+    region.add_bank();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 11, ROOT, pages, 16);
+    let other = admit(&region, &spaces, 12, ROOT + 0x10000, pages, 512);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view).with_mmu(backend);
+    let tables = Tables::new(ROOT, IPA, 0);
+    if x86 {
+        for (entry, offset) in [(0, 4096), (513, 8192), (1024, 12288)] {
+            tables.words[entry].store((ROOT + offset) | PRESENT | WRITE | USER, Ordering::Release);
+        }
+    }
+    let live = tables.live(&CallerInvalidatesAsid);
+    let residency = residency();
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            1,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let TransferStep::Supply(window) = portal
+        .select(
+            &transfer,
+            &live,
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency,
+                slot: 0,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("missing grant selection");
+    };
+    let nz = |n| NonZeroU64::new(n).unwrap();
+    let txn = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: nz(mm.raw()),
+            generation: nz(1),
+        },
+        root: SubstrateGpa(ROOT),
+        op: DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: window.range.start(),
+                ipa: IPA,
+                len: window.range.len(),
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(VA, 4096),
+            backing: BackingIdentity {
+                frame_id: nz(1),
+                mapping_id: nz(2),
+                owner_generation: nz(3),
+                inventory_revision: nz(4),
+            },
+        },
+        tables: TableGrants::new(&[]).unwrap(),
+    };
+    let wire = PortalGrantSlot::new();
+    for stale in [
+        carrick_core_abi::PortalGrantWindow {
+            generation: carrick_core_abi::ReservationGeneration::new(window.generation.raw() + 1)
+                .unwrap(),
+            ..window
+        },
+        carrick_core_abi::PortalGrantWindow {
+            protection: carrick_core_abi::ReservationProtection::from_bits(1).unwrap(),
+            ..window
+        },
+    ] {
+        assert!(wire.submit(stale, &txn));
+        let receipt = serve_grant(&portal, &wire, &live, &residency, 0, || {})
+            .unwrap()
+            .unwrap();
+        assert!(matches!(receipt.outcome, DescriptorOutcome::Refused(_)));
+        assert!(wire.take_receipt(stale, &txn).is_some());
+        assert_eq!(tables.words[1536].load(Ordering::Acquire), 0);
+        assert!(residency.lookup(mm.raw(), VA).is_none());
+    }
+    // A failure after one live store must undo the complete owner publication,
+    // retire its logical residency and invalidate before any receipt is visible.
+    assert!(wire.submit(window, &txn));
+    let failed = FailGrantStore {
+        words: &live,
+        stores: core::cell::Cell::new(0),
+    };
+    let rollback_invalidated = core::cell::Cell::new(false);
+    let rollback = serve_grant(&portal, &wire, &failed, &residency, 0, || {
+        rollback_invalidated.set(true)
+    })
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(rollback.outcome, DescriptorOutcome::RolledBack(_)),
+        "grant was not rolled back: {:?}",
+        rollback.outcome
+    );
+    assert!(
+        rollback_invalidated.get(),
+        "rollback receipt preceded invalidation"
+    );
+    assert!(wire.take_receipt(window, &txn).is_some());
+    assert!(residency.lookup(mm.raw(), VA).is_none());
+    assert!((0..pages).all(|page| tables.words[1536 + page].load(Ordering::Acquire) == 0));
+    let counted = CountWords {
+        words: &live,
+        loads: core::cell::Cell::new(0),
+    };
+    assert!(wire.submit(window, &txn));
+    let invalidated = core::cell::Cell::new(false);
+    let receipt = serve_grant(&portal, &wire, &counted, &residency, 0, || {
+        assert!(
+            spaces
+                .try_begin_edit(spaces.find(mm.raw()).unwrap(), mm.raw(), nz(9))
+                .is_none()
+        );
+        invalidated.set(true);
+    })
+    .unwrap()
+    .unwrap();
+    assert!(
+        counted.loads.get() <= pages * 9,
+        "grant work {} exceeded {}",
+        counted.loads.get(),
+        pages * 9
+    );
+    txn.verify_receipt(&receipt).unwrap();
+    assert_eq!(
+        invalidated.get(),
+        carrick_mmu_core::aarch64::descriptor_txn::outcome_requires_invalidation(&receipt.outcome),
+        "receipt did not honor required invalidation"
+    );
+    assert!(wire.take_receipt(window, &txn).is_some());
+    assert!(residency.is_guest_committed(mm.raw(), VA));
+    assert!(residency.lookup(other.raw(), VA).is_none());
+    if pages > 1 {
+        assert!(!residency.is_guest_committed(mm.raw(), VA + 4096));
+        assert_eq!(
+            tables.words[1537].load(Ordering::Acquire) & 1,
+            0,
+            "bulk neighbor became resident"
+        );
+    }
+}
+
+#[test]
+fn x3_shared_protocol() {
+    for pages in [16, 64, 256] {
+        grant_fixture::<carrick_mmu_core::owner_mmu::Aarch64Mmu>(
+            pages,
+            false,
+            carrick_mmu_core::owner_mmu::Aarch64Mmu,
+        );
+        grant_fixture::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+            pages,
+            true,
+            carrick_mmu_core::x86::owner_mmu::X86Mmu,
+        );
+    }
+}

@@ -10,4 +10,5 @@ pub mod cow;
 pub use cow::*;
 pub mod cow_pool;
 pub use cow_pool::*;
-
+pub mod grant_slot;
+pub use grant_slot::*;
