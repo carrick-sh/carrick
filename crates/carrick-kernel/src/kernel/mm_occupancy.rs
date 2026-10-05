@@ -1327,6 +1327,12 @@ fn publish_in_held(
     })
 }
 
+impl carrick_core::mm::retirement::AddressPublication for AddressSpacePublication {
+    fn retire_reservations(&self) {
+        AddressSpacePublication::retire_reservations(self);
+    }
+}
+
 impl AddressSpacePublication {
     /// Final-MM settlement, after closing/draining the published address space.
     /// Idempotent so publication rollback and the final Drop use the same path.

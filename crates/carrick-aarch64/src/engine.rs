@@ -5981,7 +5981,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
         apply: &mut dyn FnMut(
             carrick_hal::FrameInventoryCommit<()>,
         )
-            -> Result<carrick_hal::FrameInventoryApplyReceipt, TrapError>,
+            -> Result<carrick_core_abi::FrameInventoryApplyReceipt, TrapError>,
     ) -> Result<bool, TrapError> {
         self.vm.apply_exec_inventory(replacement_mm, apply)
     }
