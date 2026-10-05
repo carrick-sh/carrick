@@ -1104,15 +1104,18 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             .ok_or(MmError::Busy)?;
         let base = grant.ttbr0 & PA;
         frame.x[1] = 3; // Physical table pool and live word access.
+        frame.x[3] = grant.ttbr0; // Failure-only host diagnostic.
         let pool = carrick_el1_abi::stage1_table_pool_window();
-        for arena in [request.child_tables, request.parent_tables] {
+        for (check, arena) in [(1, request.child_tables), (2, request.parent_tables)] {
             if arena.base < pool.physical_base
                 || arena.base + arena.len > pool.physical_base + pool.byte_len as u64
             {
+                frame.x[2] = check;
                 return Err(MmError::Invalid);
             }
         }
         if base < pool.physical_base || base + 4096 > pool.physical_base + pool.byte_len as u64 {
+            frame.x[2] = 3;
             return Err(MmError::Invalid);
         }
         let maintenance = CallerInvalidatesAsid;

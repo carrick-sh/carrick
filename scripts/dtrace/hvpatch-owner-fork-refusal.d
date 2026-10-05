@@ -21,6 +21,12 @@
  *     dtrace:::DROP probe (live-qualified 2026-10-05); carrick trace rejects
  *     all libdtrace consumer drop counters. Require --require-script-exit
  *     and a zero CLI exit in addition to this script summary.
+ *     hvpatch-owner-fork-stage3-refusal(u64 check, u64 parent_ttbr0,
+ *     u64 child_base, u64 parent_base, u64 packed_lengths)
+ *     fires only on stage-3 EINVAL. Check 1=child arena, 2=parent arena,
+ *     3=parent root. Packed lengths are child high/parent low 32 bits;
+ *     TTBR0 includes the ASID in its high bits. Five arguments fit the
+ *     Darwin USDT provider limit.
  *
  * (c) Perturbation: one failure-only scalar probe per refused owner Fork,
  *     plus one low-frequency publication probe per child. No syscall or
@@ -56,6 +62,15 @@ carrick*:::hvpatch-owner-fork-refusal
     printf("OWNERFORKREFUSAL1|refused|errno=%u|stage=%llu|parent_mm=%llu|child_mm=%llu|generation=%llu|pid=%d\n",
         (uint32_t)arg0, (uint64_t)arg1, (uint64_t)arg2, (uint64_t)arg3,
         (uint64_t)arg4, pid);
+}
+
+carrick*:::hvpatch-owner-fork-stage3-refusal
+/pid == $target || progenyof($target)/
+{
+    printf("OWNERFORKREFUSAL1|stage3|check=%llu|parent_ttbr0=0x%llx|child_base=0x%llx|child_len=0x%llx|parent_base=0x%llx|parent_len=0x%llx|pid=%d\n",
+        (uint64_t)arg0, (uint64_t)arg1, (uint64_t)arg2,
+        (uint64_t)(arg4 >> 32), (uint64_t)arg3,
+        (uint64_t)(arg4 & 0xffffffff), pid);
 }
 
 dtrace:::ERROR
