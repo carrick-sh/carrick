@@ -13,12 +13,21 @@ impl From<crate::mm::transfer::TransferError> for MmError {
 
 impl From<crate::mm::fork::ForkError> for MmError {
     fn from(e: crate::mm::fork::ForkError) -> Self {
+        use crate::mm::fork::{ForkError, ForkOwnerRefusal};
         match e {
-            crate::mm::fork::ForkError::Invalid => Self::Invalid,
-            crate::mm::fork::ForkError::NoMemory => Self::NoMemory,
-            crate::mm::fork::ForkError::Busy => Self::Busy,
-            crate::mm::fork::ForkError::Stale => Self::Stale,
-            crate::mm::fork::ForkError::Core => Self::Core,
+            ForkError::Invalid => Self::Invalid,
+            ForkError::NoMemory => Self::NoMemory,
+            ForkError::Busy => Self::Busy,
+            ForkError::Stale => Self::Stale,
+            ForkError::MetadataRequired => Self::MetadataRequired,
+            ForkError::OwnerRefusal(refusal) => Self::from(match refusal {
+                ForkOwnerRefusal::Invalid => Refusal::Invalid,
+                ForkOwnerRefusal::Collision => Refusal::Collision,
+                ForkOwnerRefusal::Hole => Refusal::Hole,
+                ForkOwnerRefusal::ForeignMapping => Refusal::ForeignMapping,
+                ForkOwnerRefusal::Limit => Refusal::Limit,
+            }),
+            ForkError::Core => Self::Core,
         }
     }
 }
