@@ -942,6 +942,9 @@ fn boot_and_register(
                     "carrick-ci-ready.service",
                 ],
             )?;
+            for executable in ["/usr/bin/setsid", "/bin/kill"] {
+                pve.agent(row, &["/usr/bin/test", "-x", executable])?;
+            }
             pve.agent(
                 row,
                 &[

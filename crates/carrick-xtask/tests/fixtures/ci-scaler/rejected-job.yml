@@ -1,0 +1,13 @@
+{
+  "name": "Rejected runner job must never execute conditional steps",
+  "on": { "workflow_dispatch": {} },
+  "jobs": {
+    "rejected": {
+      "runs-on": ["self-hosted", "Linux", "X64", "willow-kvm"],
+      "steps": [
+        { "if": "always()", "run": "printf 'always executed\\n' > always-ran" },
+        { "if": "failure()", "run": "printf 'failure executed\\n' > failure-ran" }
+      ]
+    }
+  }
+}
