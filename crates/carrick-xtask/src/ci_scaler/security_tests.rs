@@ -171,3 +171,201 @@ fn serial_host_authenticated_curl_template_ignores_ambient_trace() {
         "--disable must be curl's first argument"
     );
 }
+
+#[derive(Copy, Clone, PartialEq)]
+enum Interruption {
+    AfterStop,
+    AfterRunnerRemoval,
+}
+struct MockTeardown {
+    vm: Option<Vm>,
+    stopped: bool,
+    registered: bool,
+    name: String,
+    interruption: Option<Interruption>,
+    events: Vec<&'static str>,
+}
+impl TeardownApi for MockTeardown {
+    fn present(&mut self, _: &Record) -> Result<bool, ScalerError> {
+        Ok(self.vm.is_some())
+    }
+    fn stop(&mut self, row: &Record, _: &Path) -> Result<Option<String>, ScalerError> {
+        row.guard(self.vm.as_ref().unwrap())?;
+        if self.stopped {
+            return Ok(None);
+        }
+        self.stopped = true;
+        self.events.push("stop");
+        if self.interruption == Some(Interruption::AfterStop) {
+            self.interruption = None;
+            return Err(ScalerError::External("fixture interruption after VM stop"));
+        }
+        Ok(Some("stop-task".into()))
+    }
+    fn destroy(&mut self, row: &Record) -> Result<String, ScalerError> {
+        row.guard(self.vm.as_ref().unwrap())?;
+        assert!(self.stopped);
+        self.events.push("destroy");
+        self.vm = None;
+        Ok("destroy-task".into())
+    }
+    fn wait_task(&mut self, _: &str) -> Result<(), ScalerError> {
+        Ok(())
+    }
+    fn remove_runner(&mut self, row: &Record) -> Result<(), ScalerError> {
+        assert_eq!(row.name, self.name);
+        assert!(
+            self.vm.is_none(),
+            "registration was removed before VM teardown"
+        );
+        if self.registered {
+            self.events.push("remove runner");
+            self.registered = false;
+            if self.interruption == Some(Interruption::AfterRunnerRemoval) {
+                self.interruption = None;
+                return Err(ScalerError::External(
+                    "fixture interruption after runner removal",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+fn teardown_fixture(dir: &Path) -> (Ledger, Record, MockTeardown, PathBuf) {
+    let mut ledger = Ledger::default();
+    let mut row = ledger
+        .reserve(
+            JobKey {
+                run: RunId(1),
+                attempt: 1,
+                job: JobId(2),
+            },
+            &[],
+            0,
+        )
+        .unwrap();
+    row.state = State::Reaping;
+    row.runner = Some(RunnerId(30));
+    // No actual assignment was observed, as in the review's leaked clone.
+    ledger.rows[0] = row.clone();
+    let path = dir.join("ledger.json");
+    ledger.save(&path).unwrap();
+    let api = MockTeardown {
+        vm: Some(Vm {
+            id: 308,
+            name: row.name.clone(),
+            pool: POOL.into(),
+            template: false,
+        }),
+        stopped: false,
+        registered: true,
+        name: row.name.clone(),
+        interruption: None,
+        events: vec![],
+    };
+    (ledger, row, api, path)
+}
+
+#[test]
+fn teardown_resumes_actual_crashes_after_vm_stop_and_runner_removal() {
+    for interruption in [Interruption::AfterStop, Interruption::AfterRunnerRemoval] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, mut row, mut api, path) = teardown_fixture(dir.path());
+        api.interruption = Some(interruption);
+        assert!(continue_teardown(&mut api, &mut ledger, &mut row, dir.path(), &path).is_err());
+        let mut ledger = Ledger::load(&path).unwrap();
+        let mut row = ledger.rows[0].clone();
+        assert_eq!(row.state, State::Reaping);
+        assert!(row.assigned.is_none());
+        let recovery = recovery_decision(
+            &row,
+            api.vm.is_some(),
+            if row.task.is_some() {
+                TaskState::Succeeded
+            } else {
+                TaskState::Absent
+            },
+            1,
+        );
+        assert_eq!(
+            recovery,
+            if api.vm.is_some() {
+                Recovery::ResumeReaping
+            } else {
+                Recovery::FinishAbsent
+            }
+        );
+        assert!(continue_teardown(&mut api, &mut ledger, &mut row, dir.path(), &path).unwrap());
+        assert_eq!(api.events, ["stop", "destroy", "remove runner"]);
+        assert!(!api.registered && api.vm.is_none());
+        assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Destroyed);
+    }
+}
+
+#[test]
+fn teardown_resumes_legacy_runner_removal_with_vm_still_present() {
+    for stopped in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, mut row, mut api, path) = teardown_fixture(dir.path());
+        api.registered = false;
+        api.stopped = stopped;
+        assert!(continue_teardown(&mut api, &mut ledger, &mut row, dir.path(), &path).unwrap());
+        assert!(api.vm.is_none());
+        assert_eq!(api.events.last(), Some(&"destroy"));
+        assert_eq!(Ledger::load(&path).unwrap().rows[0].state, State::Destroyed);
+    }
+}
+
+#[test]
+fn teardown_requires_durable_license_and_all_ownership_guards() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut ledger, mut row, mut api, path) = teardown_fixture(dir.path());
+    row.state = State::Running;
+    assert!(continue_teardown(&mut api, &mut ledger, &mut row, dir.path(), &path).is_err());
+    row.state = State::Reaping;
+    let unwritable_ledger = dir.path().join("missing-parent/ledger.json");
+    assert!(
+        continue_teardown(
+            &mut api,
+            &mut ledger,
+            &mut row,
+            dir.path(),
+            &unwritable_ledger
+        )
+        .is_err()
+    );
+    assert!(
+        api.events.is_empty(),
+        "failed durable publication allowed side effects"
+    );
+    for vm in [
+        Vm {
+            id: 105,
+            name: row.name.clone(),
+            pool: POOL.into(),
+            template: false,
+        },
+        Vm {
+            id: 308,
+            name: row.name.clone(),
+            pool: "other".into(),
+            template: false,
+        },
+        Vm {
+            id: 308,
+            name: "different-owner".into(),
+            pool: POOL.into(),
+            template: false,
+        },
+        Vm {
+            id: 308,
+            name: row.name.clone(),
+            pool: POOL.into(),
+            template: true,
+        },
+    ] {
+        api.vm = Some(vm);
+        assert!(continue_teardown(&mut api, &mut ledger, &mut row, dir.path(), &path).is_err());
+        assert!(api.events.is_empty());
+    }
+}

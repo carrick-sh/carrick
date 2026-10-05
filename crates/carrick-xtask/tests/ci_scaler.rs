@@ -195,6 +195,45 @@ fn completed_job_remains_deduplicated_after_cleanup_and_restart() {
 }
 
 #[test]
+fn persisted_reaping_resumes_after_runner_removal_or_vm_stop() {
+    for stopped in [false, true] {
+        let mut ledger = Ledger::default();
+        let mut row = ledger.reserve(job(1), &[], 0).unwrap();
+        row.state = State::Reaping;
+        row.runner = Some(RunnerId(30));
+        row.assigned = None;
+        row.task = stopped.then(|| "stop-task".into());
+        ledger.rows[0] = row;
+        let restored: Ledger =
+            serde_json::from_slice(&serde_json::to_vec(&ledger).unwrap()).unwrap();
+        let row = &restored.rows[0];
+        // The registration disappeared before interruption. Neither a missing
+        // assignment nor a misleading live/busy response revokes licensed reap.
+        for assignment in [
+            Assignment::Unknown,
+            Assignment::Busy,
+            Assignment::Unassigned,
+        ] {
+            assert_eq!(
+                reap_decision(row, 1, assignment),
+                Reap::Destroy,
+                "stopped={stopped}"
+            );
+        }
+    }
+}
+
+#[test]
+fn persisted_reaping_finishes_absence_without_a_recorded_delete_task() {
+    let mut row = Ledger::default().reserve(job(1), &[], 0).unwrap();
+    row.state = State::Reaping;
+    assert_eq!(
+        recovery_decision(&row, false, TaskState::Absent, 1),
+        Recovery::FinishAbsent
+    );
+}
+
+#[test]
 fn recovery_distinguishes_failed_absent_clone_from_ambiguous_submission() {
     let mut row = Ledger::default().reserve(job(1), &[], 0).unwrap();
     assert_eq!(
