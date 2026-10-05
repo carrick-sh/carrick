@@ -65,6 +65,7 @@ impl GuestMemory for Memory {
         &mut self,
         ranges: &[GuestWriteRange],
     ) -> Result<Box<dyn PreparedGuestWrite + '_>, MemoryPrepareError> {
+        assert_eq!(*self.0.graph.lock().unwrap(), Graph::Live);
         assert_eq!(ranges.len(), 1);
         Ok(Box::new(Prepared {
             state: self.0.clone(),
