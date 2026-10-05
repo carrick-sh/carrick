@@ -33,10 +33,17 @@
  * (c) Only failed preparation emits the new probe. Existing overlap probes
  *     include peer-resident re-selections, so perturbation is proportional to
  *     conflicts, not syscalls. No events is failure, never absence evidence.
- *     Attach with dtrace -Z -p to the signed embed test during a diagnostic
- *     pre-carrier hold; that hold must be removed from acceptance artifacts.
+ *     Run through carrick trace --require-script-exit -- --external against
+ *     a retained signed embed executable. Owner-bind events are controls;
+ *     no control, a probe error or the 30-second bound rejects the capture.
+ *     Consumer drop counters are checked by carrick trace, not a D probe.
  */
-dtrace:::BEGIN { failures = 0; }
+dtrace:::BEGIN { failures = 0; controls = 0; errors = 0; bounded = 0; }
+carrick*:::hvpatch-el1-owner-bind-result
+/pid == $target || progenyof($target)/
+{ controls++; }
+dtrace:::ERROR { errors++; }
+proc:::exit /pid == $target/ { exit(controls == 0 || errors != 0 ? 3 : 0); }
 carrick*:::hvpatch-el1-owner-grant-supply
 /(pid == $target || progenyof($target)) && arg2 >= 8 && arg2 <= 11/
 {
@@ -67,5 +74,5 @@ carrick*:::hvpatch-thread-terminal
         timestamp, pid, tid, arg0, arg1, arg2, arg3, arg4);
     ustack(24);
 }
-tick-1s /seconds >= 30/ { exit(failures == 0 ? 1 : 0); }
-END { printf("GRANT1|failure_rows=%d\n", failures); }
+tick-1s /seconds >= 30/ { bounded = 1; exit(4); }
+END { printf("GRANT1|failure_rows=%d|controls=%d|errors=%d|bounded=%d\n", failures, controls, errors, bounded); }
