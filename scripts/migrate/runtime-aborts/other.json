@@ -40,7 +40,7 @@
       "file": "crates/carrick-aarch64/src/engine.rs",
       "function": "<Aarch64EngineCore<V> as ThreadedEngine>::build_process_spec",
       "ordinal_in_function": 1,
-      "fingerprint": "92b835306b0cb0bf900ff81d435276667547abcf9ab57d2308247ac02534218d",
+      "fingerprint": "77b51315ca5e17d44dbf2b3bead7a5f1387fb53af9e4a3726bac3d6a6051fdd8",
       "verdict": "carrier_fault",
       "failure_domain": "aarch64::fork_cow",
       "rationale": "Failed page table rollback and TLB invalidation during parent fork copy-on-write setup leaves parent memory protections inconsistent.",
@@ -661,7 +661,7 @@
       "file": "crates/carrick-aarch64/src/fork.rs",
       "function": "prepare",
       "ordinal_in_function": 1,
-      "fingerprint": "4c67cf512456670a11e9480c2e3cba606f2c7db9fc9fbf2fdf789c1cb651c8b5"
+      "fingerprint": "f4b2552c5823a6b7b5ac39b00c62d9e958312dc82a97ccc31cab4479c38987fd"
     },
     {
       "verdict": "carrier_fault",
