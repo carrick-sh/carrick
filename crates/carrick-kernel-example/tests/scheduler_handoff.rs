@@ -610,6 +610,8 @@ fn host_wait_handoff_nested_lineage_and_ancestor_return() {
 fn host_wait_handoff_concurrent_returns() {
     let ncpu = 4;
     let (kernel, ctx_root, _asids) = bootstrap_kernel(55_001);
+    // This fixture owns a four-CPU policy, independent of the host topology.
+    ctx_root.thread().set_affinity(CpuAffinity::all(ncpu));
     publish_task(&ctx_root, 600);
 
     let scheduler = Arc::new(Scheduler::new_with_policy(
@@ -648,21 +650,29 @@ fn host_wait_handoff_concurrent_returns() {
         spare_contexts.push(work_ctx);
     }
 
-    let barrier = Arc::new(Barrier::new(ncpu * 2));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let mut starts = Vec::new();
     let mut handles = Vec::new();
 
     for i in 0..ncpu {
         let (completed_tx, completed_rx) = mpsc::channel();
         let s_c = Arc::clone(&scheduler);
         let m_reg = m_regs[i].clone();
-        let b = Arc::clone(&barrier);
+        let (start_tx, start_rx) = mpsc::channel();
+        starts.push(start_tx);
+        let ready = ready_tx.clone();
+        let done = done_tx.clone();
         let task_ctx = parent_contexts.remove(0);
 
         let parent_thread = thread::spawn(move || {
             s_c.make_runnable(task_ctx.thread().key()).unwrap();
 
             let running = s_c.take(&m_reg).expect("take main task");
-            b.wait();
+            ready.send(()).expect("main task claimed");
+            start_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("all executors ready");
 
             let token = s_c
                 .begin_host_wait(&running, &m_reg)
@@ -673,25 +683,46 @@ fn host_wait_handoff_concurrent_returns() {
             s_c.end_host_wait(&running, &m_reg, token)
                 .expect("end host wait");
             s_c.settle_exited(running).expect("settle main task");
+            done.send(()).expect("main task completed");
         });
         handles.push(parent_thread);
 
         let s_spare = Arc::clone(&scheduler);
         let spare_reg = spares[i].clone();
-        let b_spare = Arc::clone(&barrier);
+        let (start_tx, start_rx) = mpsc::channel();
+        starts.push(start_tx);
+        let ready = ready_tx.clone();
+        let done = done_tx.clone();
         let work_ctx = spare_contexts.remove(0);
 
         let spare_thread = thread::spawn(move || {
             s_spare.make_runnable(work_ctx.thread().key()).unwrap();
 
-            b_spare.wait();
+            ready.send(()).expect("replacement task queued");
+            start_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("all executors ready");
             let running = s_spare.take(&spare_reg).expect("spare take");
             s_spare.settle_exited(running).expect("settle spare task");
             completed_tx.send(()).expect("publish spare completion");
+            done.send(()).expect("replacement task completed");
         });
         handles.push(spare_thread);
     }
 
+    for _ in 0..ncpu * 2 {
+        ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("every bound executor must claim a task");
+    }
+    for start in starts {
+        start.send(()).expect("start concurrent host waits");
+    }
+    for _ in 0..ncpu * 2 {
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("every concurrent host wait must finish");
+    }
     for h in handles {
         h.join().expect("join thread");
     }
