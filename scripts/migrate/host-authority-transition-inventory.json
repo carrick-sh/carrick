@@ -18324,7 +18324,7 @@
       "macos-runtime-default"
     ],
     "rationale": "At crates/carrick-kernel/src/dispatch/mem/el1_reservations/provider.rs:70 in `RootHostWait::wait`, `std::thread::yield_now` acts only on the current host thread waiting on an EL1 reservation root held by guest EL1 used by `RootHostWait::wait`; no guest identity selects its host target.",
-    "review_id": "HA-000755",
+    "review_id": "HA-000758",
     "source": {
       "byte_end": 3424,
       "byte_start": 3402,
