@@ -85,6 +85,14 @@ without waiting, and holds it through deletion. Active admission keeps the
 checkout; a retirement tombstone rejects waiting commands after removal.
 Unmanaged checkouts are reported and preserved.
 
+Admission, retirement, host lease and native Cargo lock descriptions open with
+CLOEXEC. Their owning process explicitly unlocks before closing, so unrelated
+forks still waiting to exec cannot extend a released hold. Dropping an inherited
+guard in a fork child only closes its copy; it cannot unlock the parent's live
+authority. Only the named checkout exec handoff and scoped lifetime writers are
+made inheritable, and supervisor-side writer copies close immediately after
+spawn. The host flock descriptor is never handed to workloads.
+
 Apply also acquires existing native Cargo target locks and rechecks HEAD,
 cleanliness and root-visible process use immediately before deletion. Only
 the exact native Cargo lock descriptors owned by GC are exempted from that
