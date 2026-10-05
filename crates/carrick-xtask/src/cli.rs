@@ -25,6 +25,17 @@ pub enum Commands {
 
     #[command(about = "Owner-approved, one-job Willow ephemeral runner pilot")]
     CiScaler(crate::ci_scaler::ScalerArgs),
+    #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
+    WorktreeGc(crate::worktree_gc::WorktreeGcArgs),
+
+    #[command(
+        hide = true,
+        about = "Descriptor-anchored prebuilt remote pruning helper"
+    )]
+    TargetPrune(crate::target_prune::TargetPruneArgs),
+
+    #[command(about = "Hold checkout admission through a foreground command")]
+    WorktreeRun(crate::worktree_admission::WorktreeRunArgs),
 
     #[command(about = "Per-landing Carrick vs native Docker receipts")]
     Impact(crate::impact::ImpactArgs),
@@ -123,6 +134,8 @@ pub struct RepoInfo {
 pub enum CliError {
     #[error("ci-scaler: {0}")]
     CiScaler(#[from] crate::ci_scaler::ScalerError),
+    #[error("worktree gc: {0}")]
+    WorktreeGc(#[from] crate::worktree_gc::GcError),
     #[error("impact: {0}")]
     Impact(String),
     #[error("{0}")]
@@ -278,6 +291,20 @@ where
     match cli.command {
         Commands::CiScaler(args) => {
             crate::ci_scaler::run(args)?;
+            Ok(())
+        }
+        Commands::TargetPrune(args) => {
+            crate::target_prune::run_helper(args, writer)?;
+            Ok(())
+        }
+        Commands::WorktreeRun(args) => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::worktree_admission::run(&info.repository_root, args)?;
+            Ok(())
+        }
+        Commands::WorktreeGc(args) => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::worktree_gc::run(&info.repository_root, args, writer)?;
             Ok(())
         }
         Commands::Impact(args) => crate::impact::run(cli.root.as_deref(), args.action)

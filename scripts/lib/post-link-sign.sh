@@ -21,6 +21,8 @@
 # Temporaries are <dest>.raw.$$ and <dest>.tmp.$$; callers that want cleanup
 # on failure trap on exactly those names. <built> may equal <dest>.
 # POSIX sh only: it is sourced by a /bin/sh script and by bash 3.2.
+. scripts/lib/build-env.sh
+
 carrick_post_link_sign() {
     _cpls_built="$1"
     _cpls_dest="$2"
