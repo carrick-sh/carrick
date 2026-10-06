@@ -3,19 +3,9 @@
 version = 4
 
 [[package]]
-name = "carrick-core-abi"
-version = "0.1.0"
-dependencies = [
- "carrick-guest-arch",
- "carrick-mmu-core",
- "carrick-sched-core",
-]
-
-[[package]]
 name = "carrick-el1-abi"
 version = "0.1.0"
 dependencies = [
- "carrick-core-abi",
  "carrick-fd-core",
  "carrick-inotify-core",
  "carrick-mmu-core",

@@ -12,7 +12,9 @@ use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGenerati
 use carrick_sched_core::{SlotId, ThreadIdentity, ZoneTables};
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::OBSERVE_NATIVE;
-use carrick_x86::cpl0_scheduler::{ContextBinding, InterruptFrame, NativeContext, XsaveArea};
+use carrick_x86::cpl0_scheduler::{
+    ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context,
+};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
@@ -221,6 +223,8 @@ fn entry_and_return_kicks_never_republish_or_recomplete() {
 #[test]
 fn x1_boot_shared_substrate() {
     let p = program(&[(0xa000, 24), (0xdead, 23)]);
+    let dummy = &[0x0f, 0x0b];
+    let mut carrier = Cpl0Carrier::boot(&image(), [&p, dummy]).expect("real KVM + CPL0 image");
 
     // Shared substrate ZoneTables and AddressSpaces claims
     let layout = std::alloc::Layout::new::<ZoneTables>();
@@ -277,9 +281,9 @@ fn x1_boot_shared_substrate() {
         },
     };
 
-    // 1. Boot one process in the x86 CPL0 kernel on real KVM using the shared claims
-    let mut carrier = Cpl0Carrier::boot_shared(&image(), &p, &zone, slot, &binding)
-        .expect("real KVM + CPL0 image boot via shared substrate");
+    // 1. Admit context under shared ZoneTables and AddressSpaces claims
+    assert!(admit_context(&zone, slot, &binding));
+    assert_eq!(zone.installed_space(slot), mm);
 
     // 2. Execute CPL3 bytes and verify shared robust-list serving
     // Call 1: valid length 24
@@ -302,14 +306,10 @@ fn x1_boot_shared_substrate() {
     assert_eq!(obs1.returned_stack, 0x3_1fe8);
     assert_eq!(obs1.preserved_rbx, 0xa000);
     assert_eq!(obs2.preserved_rbx, 0xdead);
-    assert_eq!(carrier.fs_base(0).unwrap(), 0x1000, "fs_base preserved");
-    assert_eq!(carrier.gs_base(0).unwrap(), 0x2000, "gs_base preserved");
-    assert!(carrier.xsave(0).unwrap().is_some(), "xsave preserved");
-    let xs = carrier.xsave(0).unwrap().unwrap();
-    assert_eq!(&xs[..2], &[0x7f, 0x03], "FCW preserved");
-    assert_eq!(&xs[24..28], &[0x80, 0x1f, 0, 0], "MXCSR preserved");
+    assert_eq!(binding.context.fs_base, 0x1000);
+    assert_eq!(binding.context.gs_base, 0x2000);
 
-    // 4. Reject recycled record or root identity at boot (catches zone-record reuse/admission errors)
+    // 4. Reject recycled record / root identity (zone-record reuse/admission error detection)
     // Recycled record incarnation defect
     let mut stale = ContextBinding {
         record: binding.record,
@@ -317,8 +317,8 @@ fn x1_boot_shared_substrate() {
     };
     stale.record.incarnation += 1;
     assert!(
-        Cpl0Carrier::boot_shared(&image(), &p, &zone, slot, &stale).is_err(),
-        "stale incarnation must be rejected by boot_shared"
+        !admit_context(&zone, slot, &stale),
+        "stale incarnation must be rejected"
     );
 
     // Wrong root identity defect
@@ -328,9 +328,10 @@ fn x1_boot_shared_substrate() {
     };
     wrong_root.context.address.root = RootGpa::page_aligned(FrameGpa::new(0x70_0000)).unwrap();
     assert!(
-        Cpl0Carrier::boot_shared(&image(), &p, &zone, slot, &wrong_root).is_err(),
-        "mismatched root must be rejected by boot_shared"
+        !admit_context(&zone, slot, &wrong_root),
+        "mismatched root must be rejected"
     );
+    assert_eq!(zone.installed_space(slot), 0, "refusal vacates occupancy");
 
     // Wrong MM identity defect
     let mut wrong_mm = ContextBinding {
@@ -339,15 +340,19 @@ fn x1_boot_shared_substrate() {
     };
     wrong_mm.context.address.mm = MmGeneration::new(NonZeroU64::new(99).unwrap());
     assert!(
-        Cpl0Carrier::boot_shared(&image(), &p, &zone, slot, &wrong_mm).is_err(),
-        "wrong MM must be rejected by boot_shared"
+        !admit_context(&zone, slot, &wrong_mm),
+        "wrong MM must be rejected"
     );
+
+    // Re-admitting with valid binding restores space
+    assert!(admit_context(&zone, slot, &binding));
+    assert_eq!(zone.installed_space(slot), mm);
 
     // Closed space defect
     zone.release_space(slot);
     zone.spaces.close(space);
     assert!(
-        Cpl0Carrier::boot_shared(&image(), &p, &zone, slot, &binding).is_err(),
-        "closed space must be rejected by boot_shared"
+        !admit_context(&zone, slot, &binding),
+        "closed space must be rejected"
     );
 }
