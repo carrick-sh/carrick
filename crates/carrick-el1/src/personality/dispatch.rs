@@ -322,6 +322,7 @@ where
     U: sched::UserWord,
     G: GuestDispatchFrame,
 {
+    let is_x86 = frame.arm_frame_ref().is_none();
     let ordinal = frame.canonical_ordinal().raw();
     let mut pending = El1PendingFamilies {
         handoff: None,
@@ -345,7 +346,12 @@ where
     } else {
         u64::MAX
     };
-    match carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending) {
+    let route = if is_x86 {
+        carrick_personality_linux::dispatch::dispatch_x86(ordinal, control, &mut pending)
+    } else {
+        carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending)
+    };
+    match route {
         carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
         carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,

@@ -1,7 +1,7 @@
 //! KvmVm / KvmVcpu: the `carrick-hal` raw-hypervisor layer (HvVm/HvVcpu) on
 //! Linux/KVM. On aarch64: KVM_ARM_PREFERRED_TARGET + KVM_ARM_VCPU_INIT; registers
 //! via KVM_GET/SET_ONE_REG. On x86_64: bare KVM_CREATE_VCPU (no ARM init);
-//! registers via KVM_GET/SET_REGS/SREGS from guest_setup_x86 (Tasks 2–3).
+//! registers via KVM_GET/SET_REGS/SREGS from the CPL0 carrier's register adapter.
 //! Guest RAM via KVM_SET_USER_MEMORY_REGION over a host mmap; run via KVM_RUN.
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -659,7 +659,7 @@ impl KvmVcpu {
     /// exists so `Drop` can move the fd into the recycle pool); the None arm
     /// is unreachable, kept abort-deterministic per the crate's no-panic idiom.
     ///
-    /// `pub(crate)` so `guest_setup_x86` (Task 2) and `trap_engine_x86` (Task 3)
+    /// `pub(crate)` so the CPL0 boot and carrier register adapter
     /// can call `kvm_ioctls::VcpuFd::get_regs`/`set_regs`/`get_sregs`/`set_sregs`
     /// without going through the aarch64 `HvVcpu::reg`/`set_reg` path.
     pub(crate) fn fd(&self) -> &VcpuFd {
@@ -1281,7 +1281,7 @@ impl KvmVm {
             }
         }
         // aarch64: KVM_ARM_PREFERRED_TARGET + KVM_ARM_VCPU_INIT + counter align.
-        // x86_64: no ARM-specific init; the x86 bring-up path (guest_setup_x86.rs)
+        // x86_64: no ARM-specific init; the CPL0 carrier boot
         // programs registers via KVM_SET_SREGS/KVM_SET_REGS/KVM_SET_MSRS instead.
         #[cfg(target_arch = "aarch64")]
         {

@@ -492,6 +492,29 @@ pub fn dispatch<'a>(
     pending: &mut dyn PendingFamilies<'a>,
 ) -> CompletionRoute {
     let family = route_aarch64(ordinal, control);
+    dispatch_family(ordinal, family, pending)
+}
+
+/// x86 canonical routing uses the same admission/completion owner. The ARM
+/// route remains unchanged while x86's registered clear-tid call is admitted.
+pub fn dispatch_x86<'a>(
+    ordinal: u64,
+    control: u64,
+    pending: &mut dyn PendingFamilies<'a>,
+) -> CompletionRoute {
+    let family = if ordinal == crate::abi::x86_64::SYS_SET_TID_ADDRESS {
+        Family::Lifecycle(LifecycleCall::SetTidAddress)
+    } else {
+        route_aarch64(ordinal, control)
+    };
+    dispatch_family(ordinal, family, pending)
+}
+
+fn dispatch_family<'a>(
+    ordinal: u64,
+    family: Family,
+    pending: &mut dyn PendingFamilies<'a>,
+) -> CompletionRoute {
     let completion = match pending.binding().and_then(|binding| {
         if let Some(token) = carrick_core::entry::admit(binding, pending.record_source()) {
             Some(CompletionAuthority::Entry(token))
@@ -516,7 +539,7 @@ pub fn dispatch<'a>(
     }
     let setup = pending.lifecycle_available()
         && matches!(family, Family::Lifecycle(_))
-        && matches!(ordinal, 99 | 132 | 135);
+        && matches!(ordinal, 96 | 99 | 132 | 135);
     let transfer = pending.ipc_available()
         && matches!(family, Family::Read | Family::Write | Family::EpollWait);
     if pending.host_work() && !pending.resumes_operation() && !transfer && !setup {

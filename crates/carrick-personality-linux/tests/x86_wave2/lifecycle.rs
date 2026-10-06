@@ -475,7 +475,12 @@ pub fn registered_clear_tid_is_consumed_by_shared_exit() {
         wrong.thread_generation = EntryThreadGeneration::from_raw(5051);
         assert_eq!(set_registered_tid(thread, wrong), None);
         assert_eq!(thread.slot.clear_child_tid(), 0);
-        assert_eq!(set_registered_tid(thread, turn.binding), Some(7));
+        turn.args = [0x1004, 0, 0, 0, 0, 0];
+        assert_eq!(
+            dispatch::dispatch_x86(96, u64::MAX, &mut turn),
+            dispatch::CompletionRoute::Served
+        );
+        assert_eq!(turn.context.result(), 7);
         assert_eq!(turn.syscall(93, [0; 6]), dispatch::CompletionRoute::Served);
         assert_eq!(turn.words[1], 0);
         assert_eq!(turn.wakes, 1);
