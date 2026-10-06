@@ -213,7 +213,7 @@ fn stage_with_loan<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
             MemorySupplyRequest::Grant(window)
         }));
     }
-    if frame.x[0] != 0 && intent == PortalTransferIntent::UserWrite {
+    if frame.x[0] != 0 && intent.is_write() {
         carrick_observability::probes::guest_internal_write_fault(
             va,
             len as u64,

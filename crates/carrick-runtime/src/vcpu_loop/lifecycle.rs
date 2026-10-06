@@ -858,10 +858,14 @@ pub(crate) fn bootstrap_hvpatch_process_child_identity_with(
     }
     let base = crate::memory::LINUX_IDENTITY_PAGE_BASE;
     let res = if shares_mm {
-        memory.write_bytes(
-            base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
-            &0_u32.to_le_bytes(),
-        )
+        carrick_el1_abi::IdentityControlBase::new(base)
+            .ok_or(carrick_guest_mem::MemoryError::Unsupported)
+            .and_then(|base| {
+                memory.write_carrick_identity(
+                    base,
+                    carrick_el1_abi::CarrickIdentityWrite::ShimGate(0),
+                )
+            })
     } else {
         let id = dispatcher.identity_snapshot(kernel_context);
         stamp_identity_values(

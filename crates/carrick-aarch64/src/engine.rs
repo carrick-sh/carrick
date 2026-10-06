@@ -3315,6 +3315,62 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             carrick_el1_abi::PortalTransferIntent::UserRead,
         )
     }
+
+    fn write_owner_identity(
+        &self,
+        word: carrick_el1_abi::CarrickIdentityWrite,
+    ) -> Result<(), MemoryError> {
+        let handle = self.protections.owner().ok_or(MemoryError::Unsupported)?;
+        if handle.mm().raw() != self.mm_generation {
+            return Err(MemoryError::HostMap(
+                "identity stamp MM incarnation mismatch".into(),
+            ));
+        }
+        let ttbr0 = self
+            .transfer_service_loan()
+            .and_then(|loan| loan.target_ttbr0())
+            .map_err(|error| MemoryError::HostMap(error.to_string()))?;
+        let custody = self
+            .vm
+            .owner_transfer_custody()
+            .ok_or(MemoryError::Unsupported)?;
+        let region = carrick_el1_abi::get_el1_region_host_ptr();
+        if region == 0 {
+            return Err(MemoryError::Unsupported);
+        }
+        // SAFETY: the live engine retains the complete carrier ABI region.
+        let slots = unsafe {
+            &*((region + carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+                as *const carrick_el1_abi::MmPortalSlots)
+        };
+        let target = crate::user_transfer::TransferTarget::from_handle(handle, ttbr0);
+        let mut transfer = crate::user_transfer::OwnedUserTransfer::new(
+            target,
+            crate::user_transfer::UserTransfer::IdentityWrite(word),
+        )
+        .ok_or(MemoryError::Unsupported)?;
+        // A complete manifest word fits one leaf and requires exactly one
+        // selected transfer. Never turn missing control backing into supply
+        // or retry a partial/parked publication during child bootstrap.
+        use crate::user_transfer::TransferProgress;
+        match transfer
+            .advance(self, custody.as_ref(), slots)
+            .map_err(|error| MemoryError::HostMap(error.to_string()))?
+        {
+            TransferProgress::Complete => Ok(()),
+            TransferProgress::Retired(owner) => Err(MemoryError::OwnerRetired(owner)),
+            TransferProgress::Physical(wait) => Err(MemoryError::Physical(wait)),
+            TransferProgress::OwnerWait(wait) => Err(MemoryError::OwnerWait(wait)),
+            TransferProgress::Refused(errno) => Err(MemoryError::HostMap(format!(
+                "identity stamp refused: {errno:?}"
+            ))),
+            TransferProgress::Supply(_)
+            | TransferProgress::Suspended
+            | TransferProgress::Advanced => Err(MemoryError::HostMap(
+                "identity word publication did not complete".into(),
+            )),
+        }
+    }
     fn read_owner_bytes_with_intent(
         &self,
         address: u64,
@@ -3607,6 +3663,21 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
 }
 
 impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
+    fn write_carrick_identity(
+        &mut self,
+        base: carrick_el1_abi::IdentityControlBase,
+        word: carrick_el1_abi::CarrickIdentityWrite,
+    ) -> Result<(), MemoryError> {
+        if base.raw() != carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE {
+            return Err(MemoryError::Unsupported);
+        }
+        if self.protections.owner().is_some() {
+            self.write_owner_identity(word)
+        } else {
+            self.write_bytes(word.address(base), &word.bytes()[..word.len()])
+        }
+    }
+
     fn supply_memory(
         &self,
         request: carrick_guest_mem::MemorySupplyRequest,

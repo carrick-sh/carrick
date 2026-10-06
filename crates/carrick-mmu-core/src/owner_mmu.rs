@@ -8,6 +8,7 @@ use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
 pub struct OwnerTranslation {
     pub output: FrameGpa,
     pub executable: bool,
+    pub kernel_writable_nonexecutable: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnerMmuRefusal {
@@ -101,6 +102,8 @@ impl OwnerMmu for Aarch64Mmu {
                 return Ok(Some(OwnerTranslation {
                     output: FrameGpa::new((descriptor & PA & !mask) + (va.raw() & mask)),
                     executable: terminal_descriptor_permits_el0(descriptor, LeafAccess::Execute),
+                    kernel_writable_nonexecutable: descriptor & (3 << 6) == 0
+                        && descriptor & (1 << 54) != 0,
                 }));
             }
             table = descriptor & PA;

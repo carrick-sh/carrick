@@ -22,3 +22,6 @@ pub use custody::*;
 
 pub mod inventory;
 pub use inventory::*;
+
+pub mod identity_write;
+pub use identity_write::*;

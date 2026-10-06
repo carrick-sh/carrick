@@ -83,6 +83,8 @@ impl OwnerMmu for X86Mmu {
             Ok(leaf) => Ok(Some(OwnerTranslation {
                 output: leaf.output,
                 executable: leaf.executable,
+                kernel_writable_nonexecutable: leaf.ancestors_writable
+                    && leaf.descriptor & (WRITE | USER | NX) == WRITE | NX,
             })),
             Err(FaultClass::NotPresent) => Ok(None),
             Err(FaultClass::Reserved) => Err(OwnerMmuRefusal::Unreachable),

@@ -8,9 +8,32 @@
 //! production, a `LinearMemory` in tests); the ordering argument for the gate
 //! word lives on [`stamp_identity_values`].
 
+use carrick_el1_abi::CarrickIdentityWrite;
 use carrick_guest_mem::CurrentMmMemory;
 
 use crate::dispatch::SyscallDispatcher;
+
+const _: () = {
+    assert!(CarrickIdentityWrite::Pid(0).offset() == crate::memory::IDENTITY_OFF_PID);
+    assert!(CarrickIdentityWrite::ShimGate(0).offset() == crate::memory::IDENTITY_OFF_SHIM_ENABLED);
+    assert!(
+        CarrickIdentityWrite::SyscallCount(0).offset() == crate::memory::IDENTITY_OFF_SHIM_SYSCALLS
+    );
+    assert!(CarrickIdentityWrite::ClockGate(0).offset() == crate::memory::IDENTITY_OFF_CLOCK_GATE);
+};
+
+fn check_identity_base(
+    base: u64,
+) -> Result<carrick_el1_abi::IdentityControlBase, carrick_guest_mem::MemoryError> {
+    if base == carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE {
+        carrick_el1_abi::IdentityControlBase::new(base)
+            .ok_or(carrick_guest_mem::MemoryError::Unsupported)
+    } else {
+        Err(carrick_guest_mem::MemoryError::HostMap(
+            "identity publication names another control window".into(),
+        ))
+    }
+}
 
 /// Stamp the per-process identity page the EL1 syscall shim reads (no-op unless
 /// the shim is enabled). Must run before the guest issues any intercepted
@@ -97,11 +120,9 @@ pub fn stamp_clock_gate<M: CurrentMmMemory>(
     base: u64,
     enabled: u32,
 ) -> Result<(), carrick_guest_mem::MemoryError> {
+    let base = check_identity_base(base)?;
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_CLOCK_GATE,
-        &enabled.to_le_bytes(),
-    )
+    memory.write_carrick_identity(base, CarrickIdentityWrite::ClockGate(enabled))
 }
 
 /// The value to publish in the identity page's shim gate.
@@ -125,6 +146,7 @@ pub fn stamp_identity_values<M: CurrentMmMemory>(
     pid: u32,
     shim_enabled: u32,
 ) -> Result<(), carrick_guest_mem::MemoryError> {
+    let base = check_identity_base(base)?;
     // Disable the fast path FIRST, then publish the identity, then re-enable.
     //
     // The shim word is the gate: while it is non-zero the guest answers
@@ -140,24 +162,18 @@ pub fn stamp_identity_values<M: CurrentMmMemory>(
     //
     // Closing the gate first costs nothing: a guest that reads it mid-stamp
     // takes the trap path and gets the correct answer from the dispatcher.
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
-        &0_u32.to_le_bytes(),
-    )?;
+    memory.write_carrick_identity(base, CarrickIdentityWrite::ShimGate(0))?;
     // Pair for the release below: the CLOSE must be observable before the
     // identity it protects starts changing, or a guest can see the old gate
     // open over a half-written pid.
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    memory.write_bytes(base + crate::memory::IDENTITY_OFF_PID, &pid.to_le_bytes())?;
+    memory.write_carrick_identity(base, CarrickIdentityWrite::Pid(pid))?;
     // A fresh stamp starts a fresh serviced-syscall ledger: a forked child
     // COWs its parent's identity page and must not inherit the parent's
     // counter (Linux children start rusage at zero), and an exec'd image
     // keeps its task ledger but not the page. (The exec re-stamp drops any
     // pre-exec counted-but-unfolded syscalls — a µs-scale undercount.)
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_SHIM_SYSCALLS,
-        &0_u64.to_le_bytes(),
-    )?;
+    memory.write_carrick_identity(base, CarrickIdentityWrite::SyscallCount(0))?;
 
     // RELEASE the identity before opening the gate.
     //
@@ -172,10 +188,7 @@ pub fn stamp_identity_values<M: CurrentMmMemory>(
     // The gate is a publication flag, so it needs release semantics: every
     // store above must be observable before the store that opens it.
     std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-    memory.write_bytes(
-        base + crate::memory::IDENTITY_OFF_SHIM_ENABLED,
-        &shim_enabled.to_le_bytes(),
-    )?;
+    memory.write_carrick_identity(base, CarrickIdentityWrite::ShimGate(shim_enabled))?;
     Ok(())
 }
 
