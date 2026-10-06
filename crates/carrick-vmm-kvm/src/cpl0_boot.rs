@@ -1726,6 +1726,8 @@ impl Cpl0Carrier {
                     control_slot: controls_address,
                 },
                 slot,
+                maintenance_root: RootGpa::page_aligned(FrameGpa::new(root))
+                    .ok_or_else(|| fail("maintenance root"))?,
                 data_start: LIFECYCLE_DATA,
                 data_end: LIFECYCLE_DATA + 4096,
                 wakes: 0,

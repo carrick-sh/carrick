@@ -369,6 +369,7 @@ mod kernel {
                 &*(binding.counters_address as *const Counters),
             )
         };
+        let Some(slot) = checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot)) else { return 5; };
         let serve = |zone_address: KernelVa,
                      residency: &carrick_el1_abi::FrameGrantResidencyTable,
                      pool: &dyn carrick_el1_abi::CowGrantVenue,
@@ -380,7 +381,7 @@ mod kernel {
             let result = dispatch_x86_fault_with_prepared(
                 0, fault, counters, core::slice::from_ref(task),
                 carrick_el1::substrate::sched::object_wait::space_access(
-                    zone, carrick_sched_core::SlotId::new(binding.cpu_slot as u8),
+                    zone, slot,
                 ),
                 GrantMailboxes::own(mailbox),
                 None::<carrick_el1::fault::PreparedFaultPath<'_, NoopPreparedResolver>>,
@@ -516,10 +517,17 @@ mod kernel {
     struct InitialWords {
         start: u64,
         end: u64,
+        source_root: carrick_guest_arch::RootGpa,
+        edit_root: Option<carrick_guest_arch::RootGpa>,
     }
     impl InitialWords {
-        const fn fixture() -> Self { Self { start: 0x20_0000, end: 0xc0_0000 } }
-        const fn production(end: u64) -> Self { Self { start: 0x40_00000, end } }
+        fn fixture() -> Self {
+            let root=carrick_el1::isa::x86::hardware_live_root().unwrap_or_else(|_|carrick_el1::isa::x86::fatal_entry_binding());
+            Self { start:0x20_0000, end:0xc0_0000, source_root:root, edit_root:Some(root) }
+        }
+        const fn production(end: u64, source_root: carrick_guest_arch::RootGpa) -> Self {
+            Self { start:carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA, end, source_root, edit_root:None }
+        }
         fn word(
             &self,
             pa: u64,
@@ -529,7 +537,9 @@ mod kernel {
         > {
             use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
             let in_grants = pa >= self.start && pa.checked_add(8).is_some_and(|end| end <= self.end);
-            let source_root = self.start == 0x40_00000 && (0x60_0000..0x60_1000).contains(&pa);
+            let source_start=self.source_root.address().raw();
+            let source_root = self.start == carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA
+                && (source_start..source_start+4096).contains(&pa);
             if pa & 7 != 0 || !(in_grants || source_root)
             {
                 return Err(DescriptorRefusal::TableOutsidePrimary);
@@ -578,17 +588,16 @@ mod kernel {
             core::sync::atomic::fence(Ordering::SeqCst);
         }
         fn invalidate_range(&self, _: u64, _: u64) {
-            // Initial loading uses an unpublished root. The same words venue
-            // serves fork after the root is live, when COW permission stores
-            // require a local non-global TLB drain before returning to CPL3.
-            if carrick_el1::isa::x86::hardware_live_root()
-                .is_ok_and(|root| root.address().raw() == 0x80_0000)
-            {
-                // SAFETY: this CPL0 CPU owns the live root and has no PCID or
-                // global translations, so MOV CR3 drains its old user leaves.
-                unsafe { core::arch::asm!("mov cr3, {}", in(reg) 0x80_0000_u64, options(nostack, preserves_flags)) }
+            // Unpublished initial roots need no drain. Live fixture edits are
+            // licensed by the captured root, never by a fixed physical number.
+            if let Some(root)=self.edit_root.filter(|root|
+                carrick_el1::isa::x86::hardware_live_root().is_ok_and(|live|live==*root)) {
+                // SAFETY: this CPU owns the exact live root. With no PCID or
+                // global translations, MOV CR3 drains its old user leaves.
+                unsafe { core::arch::asm!("mov cr3, {}", in(reg) root.address().raw(), options(nostack,preserves_flags)) }
             }
         }
+
     }
 
     struct InitialFrames {

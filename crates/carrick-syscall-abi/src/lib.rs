@@ -3,7 +3,9 @@
 
 use bitflags::bitflags;
 
+mod errno;
 pub mod syscall_x86_64;
+pub use errno::{LINUX_EAGAIN, LINUX_ECHILD, LINUX_EFAULT, LINUX_EINVAL, LinuxErrno};
 
 /// Canonical numbers served by the shared guest lifecycle owner.
 pub mod nr {

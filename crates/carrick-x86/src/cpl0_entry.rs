@@ -193,6 +193,13 @@ impl X86Registers for NativeFrame {
     }
 }
 
+/// Convert the issued CPU domain to the bounded scheduler slot domain.
+pub fn checked_scheduler_slot(cpu: CpuId) -> Option<carrick_sched_core::SlotId> {
+    Some(carrick_sched_core::SlotId::new(
+        u8::try_from(cpu.raw()).ok()?,
+    ))
+}
+
 /// Per-vCPU supervisor binding, private to this entry/bootstrap (not a change
 /// to the common ABI). SWAPGS accesses only its first three words.
 #[repr(C)]
@@ -239,6 +246,21 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    #[test]
+    fn scheduler_slot_conversion_rejects_unissued_high_bits() {
+        use super::checked_scheduler_slot;
+        use carrick_guest_arch::CpuId;
+        assert_eq!(
+            checked_scheduler_slot(CpuId::new(0)).map(|slot| slot.raw()),
+            Some(0)
+        );
+        assert_eq!(
+            checked_scheduler_slot(CpuId::new(255)).map(|slot| slot.raw()),
+            Some(255)
+        );
+        assert!(checked_scheduler_slot(CpuId::new(256)).is_none());
+        assert!(checked_scheduler_slot(CpuId::new(u32::MAX)).is_none());
+    }
     #[test]
     fn user_page_fault_decodes_only_cpl3_access_with_valid_error_bits() {
         use carrick_guest_arch::{Access, UserVa};
