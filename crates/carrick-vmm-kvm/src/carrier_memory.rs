@@ -666,6 +666,8 @@ impl CarrierMemory {
                 } => {
                     (entry & PRESENT != 0) == resident
                         && (entry & PREPARED != 0) != resident
+                        && entry & (PRIVATE | MAY_EXEC) == 0
+                        && (entry & MAY_WRITE != 0) == permissions.writable
                         && Self::matches_permissions(entry, permissions)
                 }
                 DescriptorOp::Prepare {
@@ -676,11 +678,17 @@ impl CarrierMemory {
                     let live = resident.contains(va);
                     (entry & PRESENT != 0) == live
                         && (entry & PREPARED != 0) != live
+                        && entry & PRIVATE != 0
+                        && (entry & MAY_WRITE != 0) == permissions.writable
+                        && (entry & MAY_EXEC != 0) == permissions.executable
                         && Self::matches_permissions(entry, permissions)
                 }
                 DescriptorOp::Publish { .. } => entry & PRESENT != 0 && entry & PREPARED == 0,
                 DescriptorOp::Protect { permissions, .. } => {
                     entry & (PRESENT | PREPARED) != 0
+                        && entry & PRIVATE != 0
+                        && (!permissions.writable || entry & MAY_WRITE != 0)
+                        && (!permissions.executable || entry & MAY_EXEC != 0)
                         && Self::matches_permissions(entry, permissions)
                 }
                 DescriptorOp::ArmCow(_) => {
@@ -693,7 +701,9 @@ impl CarrierMemory {
                 DescriptorOp::Unmap(_) => entry & (PRESENT | PREPARED) == 0,
                 DescriptorOp::Retire(_) => {
                     entry == 0
-                        || entry & (PRESENT | PREPARED | RETIRED) == RETIRED && entry & ADDRESS != 0
+                        || entry & (PRESENT | PREPARED | RETIRED) == RETIRED
+                            && entry & PRIVATE != 0
+                            && entry & ADDRESS != 0
                 }
                 DescriptorOp::Coalesce { size: expected, .. } => {
                     entry & PRESENT != 0 && size == expected.bytes()
