@@ -562,8 +562,8 @@ use parking_lot::{Mutex, RwLock};
 use zerocopy::{FromBytes, IntoBytes};
 
 macro_rules! define_syscall_one {
-    (mm_mutation $(#[$meta:meta])* fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block) => {
-            $(#[$meta])*
+    (mm_mutation $(#[doc = $doc:expr])* fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block) => {
+            $(#[doc = $doc])*
             #[allow(unused_variables)]
             pub(super) fn $name<M: CurrentMmMemory>(
                 &self,
@@ -580,8 +580,8 @@ macro_rules! define_syscall_one {
                 $body
             }
     };
-    ($(#[$meta:meta])* fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block) => {
-            $(#[$meta])*
+    ($(#[doc = $doc:expr])* fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block) => {
+            $(#[doc = $doc])*
             #[allow(unused_variables)]
             pub(super) fn $name<M: CurrentMmMemory>(
                 &self,
@@ -604,12 +604,12 @@ macro_rules! define_syscall_one {
 
 macro_rules! define_syscall {
     () => {};
-    ($(#[$meta:meta])* mm_mutation fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block $($rest:tt)*) => {
-        define_syscall_one! { mm_mutation $(#[$meta])* fn $name($this, $cx $(, $arg: $argty)*) $body }
+    ($(#[doc = $doc:expr])* mm_mutation fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block $($rest:tt)*) => {
+        define_syscall_one! { mm_mutation $(#[doc = $doc])* fn $name($this, $cx $(, $arg: $argty)*) $body }
         define_syscall! { $($rest)* }
     };
-    ($(#[$meta:meta])* fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block $($rest:tt)*) => {
-        define_syscall_one! { $(#[$meta])* fn $name($this, $cx $(, $arg: $argty)*) $body }
+    ($(#[doc = $doc:expr])* fn $name:ident ( $this:ident, $cx:ident $(, $arg:ident : $argty:ty )* $(,)? ) $body:block $($rest:tt)*) => {
+        define_syscall_one! { $(#[doc = $doc])* fn $name($this, $cx $(, $arg: $argty)*) $body }
         define_syscall! { $($rest)* }
     };
 }
@@ -622,9 +622,9 @@ macro_rules! define_syscall {
 /// edit (Task A1). Defined before the `mod` declarations so the child dispatch
 /// modules can invoke it.
 macro_rules! syscall_table {
-    ( $(#[$meta:meta])* $vis:vis fn $name:ident ; $( $num:pat => $handler:ident ),* $(,)? ) => {
-        $(#[$meta])*
-        $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<SyscallHandler<M>> {
+    ( $(#[doc = $doc:expr])* $vis:vis fn $name:ident ; $( $num:pat => $handler:ident ),* $(,)? ) => {
+        $(#[doc = $doc])*
+        $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<$crate::dispatch::SyscallHandler<M>> {
             match carrick_abi::CanonicalNr(number) {
                 $( $num => Some(SyscallDispatcher::$handler), )*
                 _ => None,
@@ -634,9 +634,9 @@ macro_rules! syscall_table {
 }
 
 macro_rules! mutation_syscall_table {
-    ( $(#[$meta:meta])* $vis:vis fn $name:ident ; $( $num:pat => $handler:ident ),* $(,)? ) => {
-        $(#[$meta])*
-        $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<MutationSyscallHandler<M>> {
+    ( $(#[doc = $doc:expr])* $vis:vis fn $name:ident ; $( $num:pat => $handler:ident ),* $(,)? ) => {
+        $(#[doc = $doc])*
+        $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<$crate::dispatch::MutationSyscallHandler<M>> {
             match carrick_abi::CanonicalNr(number) {
                 $( $num => Some(SyscallDispatcher::$handler), )*
                 _ => None,

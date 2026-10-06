@@ -90,7 +90,6 @@
 //!   match; `arm64/v7` is *not* (it is a different ISA level we cannot run).
 
 use std::collections::HashMap;
-use std::env;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -122,9 +121,9 @@ impl ImageStore {
     }
 
     pub fn default_for_user() -> Self {
-        let root = env::var_os("CARRICK_HOME")
+        let root = std::env::var_os("CARRICK_HOME")
             .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".carrick")))
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".carrick")))
             .unwrap_or_else(|| PathBuf::from(".carrick"));
         Self::new(root)
     }
@@ -294,7 +293,7 @@ impl PlatformTarget {
 }
 
 pub fn platform_target_from_env() -> PlatformTarget {
-    env::var(PLATFORM_OVERRIDE_ENV)
+    std::env::var(PLATFORM_OVERRIDE_ENV)
         .ok()
         .as_deref()
         .and_then(PlatformTarget::parse)
@@ -323,7 +322,7 @@ fn insecure_registries() -> Vec<String> {
         "localhost:5000".to_string(),
         "127.0.0.1:5000".to_string(),
     ];
-    if let Ok(extra) = env::var(INSECURE_REGISTRIES_ENV) {
+    if let Ok(extra) = std::env::var(INSECURE_REGISTRIES_ENV) {
         hosts.extend(
             extra
                 .split(',')

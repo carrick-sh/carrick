@@ -161,26 +161,37 @@ pub fn host_bsd_syscall_count() -> u64 {
     u64::try_from(info.pti_syscalls_unix).unwrap_or(0)
 }
 
+// These helpers inline to no instructions in production. The cfg attribute
+// belongs to parsed Rust, never to an opaque macro input.
+#[inline(always)]
+fn count_host_openat() {
+    #[cfg(any(test, feature = "test-support"))]
+    record_test_host_openat();
+}
+
+#[inline(always)]
+fn count_host_stat() {
+    #[cfg(any(test, feature = "test-support"))]
+    record_test_host_stat();
+}
+
 macro_rules! host_openat {
     ($($arg:expr),* $(,)?) => {{
-        #[cfg(any(test, feature = "test-support"))]
-        record_test_host_openat();
+        count_host_openat();
         libc::openat($($arg),*)
     }};
 }
 
 macro_rules! host_fstatat {
     ($($arg:expr),* $(,)?) => {{
-        #[cfg(any(test, feature = "test-support"))]
-        record_test_host_stat();
+        count_host_stat();
         libc::fstatat($($arg),*)
     }};
 }
 
 macro_rules! host_fstat {
     ($($arg:expr),* $(,)?) => {{
-        #[cfg(any(test, feature = "test-support"))]
-        record_test_host_stat();
+        count_host_stat();
         libc::fstat($($arg),*)
     }};
 }
@@ -188,8 +199,7 @@ macro_rules! host_fstat {
 #[cfg(target_os = "macos")]
 macro_rules! host_open {
     ($($arg:expr),* $(,)?) => {{
-        #[cfg(any(test, feature = "test-support"))]
-        record_test_host_openat();
+        count_host_openat();
         libc::open($($arg),*)
     }};
 }

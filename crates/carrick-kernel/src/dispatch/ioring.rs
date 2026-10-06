@@ -146,13 +146,13 @@ pub struct IoUringRegionLayout {
     pub mapped_extent: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct HostBackingIdentity {
     pub device: u64,
     pub inode: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct IoUringLayoutSnapshot {
     pub sq_entries: u32,
     pub cq_entries: u32,

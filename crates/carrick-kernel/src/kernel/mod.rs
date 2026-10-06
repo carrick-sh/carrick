@@ -87,7 +87,7 @@ pub use debug::{
     EndpointError as KernelDebugEndpointError, KernelDebugAuxProvider, KernelDebugDegraded,
     KernelDebugDtoError, KernelDebugRequest, KernelDebugServer, KernelDebugSnapshot,
     KernelDebugTable, ServerError as KernelDebugServerError, UnknownTable as UnknownKernelTable,
-    abort as kernel_debug_abort, fetch as kernel_debug_fetch,
+    fetch as kernel_debug_fetch, kernel_debug_abort,
 };
 pub use exec::{ExecError, ExecPrepareError, PreparedExec};
 pub use fd_ceiling::FdCeilingAuthority;

@@ -209,7 +209,7 @@ pub(crate) fn io_open_refusal(error: &std::io::Error) -> Option<LinuxErrno> {
 /// a PID-preserving host exec. The path locates the already-populated scratch;
 /// device/inode identity prevents a substituted path from granting a different
 /// filesystem root.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct HostFsReexecAuthority {
     pub root_path: Vec<u8>,
     pub device: u64,

@@ -63,7 +63,7 @@ pub struct ExecutorPoolConfig {
     pub reserve: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
 pub enum ExecutorPoolConfigError {
     #[error("the backend reports zero available vCPUs")]
     ZeroVcpuCeiling,
@@ -890,7 +890,7 @@ where
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, ::thiserror::Error)]
 #[error("persistent executor pool startup failed: {message}")]
 pub struct ExecutorPoolStartError {
     configured_workers: usize,
@@ -944,7 +944,7 @@ impl ExecutorPoolReport {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, ::thiserror::Error)]
 #[error("persistent executor pool shutdown failed: {message}")]
 pub struct ExecutorPoolShutdownError {
     report: ExecutorPoolReport,

@@ -47,7 +47,7 @@ enum MmapRefusal {
     Internal(&'static str),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, ::thiserror::Error)]
 pub enum SharedFileFixedMremapError {
     #[error("shared file alias entry missing for range 0x{old_address:x}..0x{old_end:x}")]
     MissingAliasEntry { old_address: u64, old_end: u64 },

@@ -1,7 +1,5 @@
-use std::env;
 use std::fs;
 use std::path::PathBuf;
-use std::process;
 
 use carrick_conformance_contract::{ContractRegistry, SyscallInventory};
 
@@ -11,7 +9,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args, String> {
-    let mut args = env::args().skip(1);
+    let mut args = std::env::args().skip(1);
     let mut root = PathBuf::from(".");
     let mut check = false;
 
@@ -36,13 +34,13 @@ fn main() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("error: {e}");
-            process::exit(1);
+            std::process::exit(1);
         }
     };
 
     if let Err(err) = run(&args) {
         eprintln!("{err}");
-        process::exit(1);
+        std::process::exit(1);
     }
 }
 

@@ -874,10 +874,9 @@ fn audit_el1_modules(
     for path in files {
         let relative = path.strip_prefix(&src).unwrap_or(&path);
         if relative.starts_with("personality")
-            || matches!(
-                relative.to_str(),
-                Some("lib.rs" | "entry.rs" | "fault.rs" | "memory.rs")
-            )
+            || relative
+                .to_str()
+                .is_some_and(|name| ["lib.rs", "entry.rs", "fault.rs", "memory.rs"].contains(&name))
         {
             continue;
         }

@@ -78,14 +78,23 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+use zerocopy::IntoBytes;
 
 /// Linux aarch64 `struct ipc64_perm` (UAPI, `include/uapi/asm-generic/ipcbuf.h`).
 /// 48 bytes; embedded in shmid_ds. `mode` is `__kernel_mode_t` which is
 /// `unsigned int` on 64-bit kernels (so 4 bytes, NOT 2 — the old `ipc_perm`
 /// form). `__unused1` is u64-aligned via a 4-byte pad following `pad2`.
 #[repr(C, packed)]
-#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Default)]
+#[derive(
+    Clone,
+    Copy,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+    Default,
+)]
 pub(super) struct LinuxIpcPerm {
     pub key: i32,       // @0
     pub uid: u32,       // @4
@@ -104,7 +113,16 @@ pub(super) struct LinuxIpcPerm {
 /// kernel's `arch/arm64/include/uapi/asm/shmbuf.h` (which falls back to the
 /// generic asm-generic/shmbuf.h for 64-bit). LTP shmctl01 reads each field.
 #[repr(C, packed)]
-#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Default)]
+#[derive(
+    Clone,
+    Copy,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+    Default,
+)]
 pub(super) struct LinuxShmidDs {
     pub shm_perm: LinuxIpcPerm, // 48
     pub shm_segsz: u64,         // 8
@@ -128,7 +146,16 @@ const _: () = assert!(core::mem::size_of::<LinuxIpcPerm>() == 48);
 /// LTP semctl01 reads sem_perm.mode, the owner ids, sem_nsems and sem_otime/
 /// sem_ctime.
 #[repr(C, packed)]
-#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Default)]
+#[derive(
+    Clone,
+    Copy,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+    Default,
+)]
 pub(super) struct LinuxSemidDs {
     pub sem_perm: LinuxIpcPerm, // 48
     pub sem_otime: u64,         // 8 — last semop time
@@ -146,7 +173,16 @@ const _: () = assert!(core::mem::size_of::<LinuxSemidDs>() == 88);
 /// serializes directly from this metadata instead of translating a host
 /// `msqid_ds`.
 #[repr(C, packed)]
-#[derive(Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned, Default)]
+#[derive(
+    Clone,
+    Copy,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+    Default,
+)]
 pub(super) struct LinuxMsqidDs {
     pub msg_perm: LinuxIpcPerm, // 48
     pub msg_stime: u64,         // 8
@@ -1477,7 +1513,7 @@ impl Drop for MsgQueueWaitWord {
     }
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, ::serde::Serialize)]
 pub struct SysvWaitState {
     blocked_id: i32,
     queue_path: PathBuf,

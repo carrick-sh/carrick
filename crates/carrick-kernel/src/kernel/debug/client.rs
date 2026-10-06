@@ -53,7 +53,7 @@ pub fn fetch(
 /// directory it will write the post-mortem into, when one is configured. The
 /// capture itself is produced by the runtime's own runner boundary and
 /// travels to the embedding caller as `EmbedError::KernelAborted`.
-pub fn abort(run_id: &str) -> Result<AbortAck, ClientError> {
+pub fn kernel_debug_abort(run_id: &str) -> Result<AbortAck, ClientError> {
     let endpoint = DebugEndpoint::for_run_id(run_id)?;
     abort_at(&endpoint, run_id)
 }

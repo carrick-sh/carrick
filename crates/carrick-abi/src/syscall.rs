@@ -284,40 +284,38 @@ macro_rules! define_aarch64_syscall_table {
         ($const_name:ident, $nr:literal, $name:literal, $subsys:literal, $level:expr);
     )*) => {
         pub mod nr {
-            use $crate::CanonicalNr;
-
             $(
                 #[doc = concat!("Canonical AArch64 syscall number for `", $name, "` (`", stringify!($nr), "`).")]
-                pub const $const_name: CanonicalNr = CanonicalNr($nr);
+                pub const $const_name: $crate::CanonicalNr = $crate::CanonicalNr($nr);
             )*
 
             // Internal x86 normalized syscall numbers wrapped as CanonicalNr for routing:
-            pub const CARRICK_PRIVATE_X86_DUP2: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_DUP2);
-            pub const CARRICK_PRIVATE_X86_STAT: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_STAT);
-            pub const CARRICK_PRIVATE_X86_FSTAT: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_FSTAT);
-            pub const CARRICK_PRIVATE_X86_LSTAT: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_LSTAT);
-            pub const CARRICK_PRIVATE_X86_NEWFSTATAT: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_NEWFSTATAT);
-            pub const CARRICK_PRIVATE_X86_UNSUPPORTED: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_UNSUPPORTED);
-            pub const CARRICK_PRIVATE_X86_UTIME: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_UTIME);
-            pub const CARRICK_PRIVATE_X86_UTIMES: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_UTIMES);
-            pub const CARRICK_PRIVATE_X86_POLL: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_POLL);
-            pub const CARRICK_PRIVATE_X86_SELECT: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_SELECT);
-            pub const CARRICK_PRIVATE_X86_EPOLL_CREATE: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_EPOLL_CREATE);
-            pub const CARRICK_PRIVATE_X86_ALARM: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_ALARM);
-            pub const CARRICK_PRIVATE_X86_TIME: CanonicalNr =
-                CanonicalNr($crate::CARRICK_PRIVATE_X86_TIME);
+            pub const CARRICK_PRIVATE_X86_DUP2: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_DUP2);
+            pub const CARRICK_PRIVATE_X86_STAT: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_STAT);
+            pub const CARRICK_PRIVATE_X86_FSTAT: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_FSTAT);
+            pub const CARRICK_PRIVATE_X86_LSTAT: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_LSTAT);
+            pub const CARRICK_PRIVATE_X86_NEWFSTATAT: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_NEWFSTATAT);
+            pub const CARRICK_PRIVATE_X86_UNSUPPORTED: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_UNSUPPORTED);
+            pub const CARRICK_PRIVATE_X86_UTIME: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_UTIME);
+            pub const CARRICK_PRIVATE_X86_UTIMES: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_UTIMES);
+            pub const CARRICK_PRIVATE_X86_POLL: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_POLL);
+            pub const CARRICK_PRIVATE_X86_SELECT: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_SELECT);
+            pub const CARRICK_PRIVATE_X86_EPOLL_CREATE: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_EPOLL_CREATE);
+            pub const CARRICK_PRIVATE_X86_ALARM: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_ALARM);
+            pub const CARRICK_PRIVATE_X86_TIME: $crate::CanonicalNr =
+                $crate::CanonicalNr($crate::CARRICK_PRIVATE_X86_TIME);
         }
 
         const AARCH64_SYSCALLS: &[Syscall] = &[
@@ -326,7 +324,7 @@ macro_rules! define_aarch64_syscall_table {
             )*
         ];
 
-        #[cfg(test)]
+        #[allow(dead_code)]
         const GENERATED_CONSTANTS: &[(&'static str, $crate::CanonicalNr)] = &[
             $(
                 ($name, nr::$const_name),

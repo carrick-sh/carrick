@@ -17,7 +17,7 @@ pub mod post_mortem;
 pub mod server;
 pub mod wire;
 
-pub use client::{AbortAck, ClientError, abort, abort_at, fetch, fetch_at};
+pub use client::{AbortAck, ClientError, abort_at, fetch, fetch_at, kernel_debug_abort};
 pub use dto::{
     DebugAltstack, DebugClass, DebugCredentialsRow, DebugExecutorBindingRow,
     DebugExecutorReceiptRow, DebugExecutorReceiptSummary, DebugExecutorRow,

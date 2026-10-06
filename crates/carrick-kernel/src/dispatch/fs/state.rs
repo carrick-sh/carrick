@@ -312,7 +312,7 @@ pub struct MountRetirement {
     prepared: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
 pub enum MountRetirementError {
     #[error("mount retirement belongs to container {actual:?}, not {expected:?}")]
     WrongContainer {

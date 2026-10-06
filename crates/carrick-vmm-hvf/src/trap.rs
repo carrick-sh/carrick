@@ -162,7 +162,6 @@ use crate::syscall_mailbox::{
 };
 use carrick_aarch64::Aarch64VcpuSnapshot;
 use carrick_guest_mem::{GuestVa, MemoryError};
-use serde::Serialize;
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 
@@ -517,7 +516,7 @@ const GUEST_STAGE1_PAGE_SIZE: u64 = 0x1000;
 #[cfg(test)]
 const AARCH64_EXCEPTION_CLASS_SHIFT: u64 = 26;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrapBackend {
     HypervisorFramework,
@@ -550,7 +549,7 @@ pub(crate) mod foreign_mm_tests {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod task_only_carrier_directory_tests;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 pub struct TrapCapabilities {
     pub backend: TrapBackend,
     pub available_on_this_host: bool,
