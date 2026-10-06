@@ -72,7 +72,15 @@ fn retired_x86_leaf_retains_backing_and_repoints_without_publication() {
     assert!(matches!(
         apply(
             &words,
-            map(span.va, 0x800000, PAGE, LeafSize::Page),
+            private_prepare(
+                span,
+                0x800000,
+                Permissions {
+                    writable: true,
+                    executable: false,
+                    user: true
+                }
+            ),
             &[root(0x2000), root(0x3000), root(0x4000)]
         ),
         DescriptorOutcome::Applied { .. }
@@ -222,6 +230,152 @@ fn apply(words: &Words, op: DescriptorOp, tables: &[RootGpa]) -> DescriptorOutco
         &mut InlineJournal::new(),
     )
     .outcome
+}
+
+fn private_prepare(span: PageSpan, output: u64, permissions: Permissions) -> DescriptorOp {
+    DescriptorOp::Prepare {
+        span,
+        output: FrameGpa::new(output),
+        permissions,
+        resident: span,
+        backing: backing(),
+    }
+}
+
+#[test]
+fn guest_protect_refuses_host_map_leaf() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    assert!(matches!(
+        apply(
+            &words,
+            map(span.va, 0x800000, PAGE, LeafSize::Page),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: Permissions {
+                    writable: false,
+                    executable: false,
+                    user: true
+                }
+            },
+            &[]
+        ),
+        DescriptorOutcome::Refused(DescriptorRefusal::NotPrivateAnonymous)
+    );
+    assert_eq!(*words.words.borrow(), before);
+}
+
+#[test]
+fn guest_protect_refuses_write_and_execute_widening_past_grant() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    let readonly = Permissions {
+        writable: false,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(span, 0x800000, readonly),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let before = words.words.borrow().clone();
+    for permissions in [
+        Permissions {
+            writable: true,
+            ..readonly
+        },
+        Permissions {
+            executable: true,
+            ..readonly
+        },
+    ] {
+        assert_eq!(
+            apply(&words, DescriptorOp::Protect { span, permissions }, &[]),
+            DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
+        );
+        assert_eq!(*words.words.borrow(), before);
+    }
+}
+
+#[test]
+fn guest_protect_can_restore_write_within_private_grant_ceiling() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    let writable = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(span, 0x800000, writable),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let readonly = Permissions {
+        writable: false,
+        ..writable
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: readonly
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let (protected, _) =
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(span.va)).unwrap();
+    assert_eq!(protected & WRITE, 0);
+    assert_ne!(protected & MAY_WRITE, 0);
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: writable
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+}
+
+#[test]
+fn guest_retire_refuses_host_map_leaf() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    assert!(matches!(
+        apply(
+            &words,
+            map(span.va, 0x800000, PAGE, LeafSize::Page),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(&words, DescriptorOp::Retire(span), &[]),
+        DescriptorOutcome::Refused(DescriptorRefusal::NotPrivateAnonymous)
+    );
+    assert_eq!(*words.words.borrow(), before);
 }
 
 #[test]
@@ -552,12 +706,34 @@ fn contiguous_unaligned_outputs_must_not_coalesce() {
 fn first_touch_cow_nx_and_protection_have_distinct_classes() {
     let words = Words::new();
     let span = PageSpan::new(0x4000, PAGE);
-    let mut op = map(span.va, 0x800000, span.len, LeafSize::Page);
-    if let DescriptorOp::Map { resident, .. } = &mut op {
-        *resident = false;
-    }
+    let op = DescriptorOp::Prepare {
+        span: PageSpan::new(span.va, 2 * PAGE),
+        output: FrameGpa::new(0x800000),
+        permissions: Permissions {
+            writable: true,
+            executable: true,
+            user: true,
+        },
+        resident: PageSpan::new(span.va + PAGE, PAGE),
+        backing: backing(),
+    };
     assert!(matches!(
         apply(&words, op, &[root(0x2000), root(0x3000), root(0x4000)]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: Permissions {
+                    writable: true,
+                    executable: false,
+                    user: true
+                }
+            },
+            &[]
+        ),
         DescriptorOutcome::Applied { .. }
     ));
     let walk = |access| {
@@ -668,7 +844,8 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
         } else {
             0x3008
         };
-        *words.words.borrow_mut().get_mut(&parent_slot).unwrap() |= PAT_LARGE;
+        // Model an owner-granted huge leaf while retaining the Map topology fixture.
+        *words.words.borrow_mut().get_mut(&parent_slot).unwrap() |= PAT_LARGE | PRIVATE;
         let first_grant = if size == LeafSize::Block1G {
             0x3000
         } else {
@@ -754,6 +931,8 @@ fn failed_split_restores_all_512_children_and_parent() {
             map(1 << 21, 1 << 22, 1 << 21, LeafSize::Block2M),
             &[root(0x2000), root(0x3000)],
         );
+        // The split fixture starts from an owner-granted huge terminal.
+        *words.words.borrow_mut().get_mut(&0x3008).unwrap() |= PRIVATE;
         let before = words.words.borrow().clone();
         words.fail.set(words.writes.get() + failure);
         assert_eq!(
@@ -833,6 +1012,7 @@ fn whole_block_protection_edits_one_terminal_without_split_grants() {
         map(span.va, 1 << 31, span.len, LeafSize::Block1G),
         &[root(0x2000)],
     );
+    *words.words.borrow_mut().get_mut(&0x2008).unwrap() |= PRIVATE;
     let txn = txn(
         DescriptorOp::Protect {
             span,
