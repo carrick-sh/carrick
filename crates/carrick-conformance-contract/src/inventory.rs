@@ -1,11 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use carrick_abi::syscall::{Authority, SupportLevel, SyscallHandler};
-use serde::{Deserialize, Serialize};
 
 use crate::{ClaimId, ContractId, ContractRegistry, CoverageState};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct SyscallInventoryEntry {
     pub number: u64,
     pub name: String,
@@ -23,7 +22,7 @@ pub struct SyscallInventoryEntry {
     pub aliases: Vec<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct InventorySummary {
     pub total_entries: usize,
     pub bring_up: usize,
@@ -35,7 +34,7 @@ pub struct InventorySummary {
     pub with_violation_evidence: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct SyscallInventory {
     pub summary: InventorySummary,
     pub entries: Vec<SyscallInventoryEntry>,

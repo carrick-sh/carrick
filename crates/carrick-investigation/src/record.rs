@@ -2,11 +2,12 @@ use std::fmt;
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 
 use crate::stage::{InvestigationError, Stage};
 
-#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+#[derive(
+    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, ::serde::Serialize, ::serde::Deserialize,
+)]
 #[serde(transparent)]
 pub struct InvestigationId(String);
 
@@ -34,7 +35,7 @@ impl fmt::Display for InvestigationId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct SelectedFailure {
     pub suite: String,
     pub test_id: String,
@@ -43,13 +44,13 @@ pub struct SelectedFailure {
     pub details: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize, Default)]
 pub struct ResourceUsage {
     pub experiments_executed: usize,
     pub elapsed_seconds: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct Hypothesis {
     pub id: String,
     pub statement: String,
@@ -57,7 +58,7 @@ pub struct Hypothesis {
     pub outcome: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct InvestigationHistoryEntry {
     pub timestamp: DateTime<Utc>,
     pub from_stage: String,
@@ -65,7 +66,7 @@ pub struct InvestigationHistoryEntry {
     pub rationale: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct Investigation {
     pub id: InvestigationId,
     pub stage: Stage,

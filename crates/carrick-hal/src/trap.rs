@@ -16,7 +16,6 @@ use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::{Gpa, GuestVa};
 use carrick_mem::memory::AddressSpace;
 use serde::Serialize;
-use thiserror::Error;
 
 use crate::error::OsError;
 
@@ -295,7 +294,7 @@ pub trait SyscallTrap {
 /// is a host `MAP_PRIVATE` (Linux per-page COW: a clean page keeps tracking the
 /// file, a dirtied page detaches). A backend that cannot honour `Private` for a
 /// file MUST refuse rather than silently map the file shared.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostAliasSharing {
     /// `MAP_PRIVATE`: copy-on-write, per guest process.
@@ -368,7 +367,7 @@ impl Serialize for HostAliasOwnedFd {
 /// by. One typed value replaces the former `file: Option<(fd, off, prot)>` +
 /// `shared: bool` pair, whose two-field encoding let a backend map every file
 /// alias `MAP_SHARED` regardless of the guest's `MAP_PRIVATE`.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostAliasBacking {
     /// Fresh anonymous host memory (zeroed), optionally seeded from the
@@ -405,7 +404,7 @@ impl HostAliasBacking {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, ::thiserror::Error)]
 pub enum TrapError {
     #[error("syscall trapping is not available on this platform")]
     UnsupportedPlatform,

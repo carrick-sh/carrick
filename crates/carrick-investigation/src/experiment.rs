@@ -1,7 +1,6 @@
 use carrick_conformance_contract::ExecutionLayer;
-use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct ExperimentPlan {
     pub question: String,
     pub discriminating_outcomes: Vec<String>,
@@ -9,7 +8,7 @@ pub struct ExperimentPlan {
     pub estimated_duration_seconds: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct ExperimentResult {
     pub plan: ExperimentPlan,
     pub observations: Vec<String>,

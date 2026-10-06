@@ -2,19 +2,19 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
-use serde::{Deserialize, Serialize};
-
 use crate::record::SelectedFailure;
 use crate::stage::InvestigationError;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct IntakeCandidate {
     pub failure: SelectedFailure,
     pub severity: IntakeSeverity,
     pub ratio: Option<f64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum IntakeSeverity {
     SemanticRegression,
@@ -25,7 +25,7 @@ pub enum IntakeSeverity {
     Other,
 }
 
-#[derive(Deserialize)]
+#[derive(::serde::Deserialize)]
 struct RawSuiteReport {
     name: String,
     #[serde(default)]
@@ -46,13 +46,13 @@ struct RawSuiteReport {
     timeout_kind: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(::serde::Deserialize)]
 struct RawSideSummary {
     #[serde(default)]
     result: String,
 }
 
-#[derive(Deserialize)]
+#[derive(::serde::Deserialize)]
 struct RawPerfSummary {
     carrick_to_oracle_ratio: Option<f64>,
 }

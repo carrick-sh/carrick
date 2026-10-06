@@ -27,7 +27,7 @@ bitflags::bitflags! {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default, IntoBytes, Immutable)]
+#[derive(Clone, Copy, Default, ::zerocopy::IntoBytes, ::zerocopy::Immutable)]
 struct IdtGate64 {
     offset_low: u16,
     selector: u16,
@@ -166,14 +166,23 @@ impl FaultDoorbellRecord {
     }
 }
 
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+use zerocopy::{FromBytes as _, IntoBytes as _, KnownLayout as _};
 
 /// Memory-backed SP4.3 fault record written by guest IDT stubs for VMMs whose
 /// PIO exits do not expose the `OUT` payload. All fields are u64 so the guest
 /// stub can use plain 64-bit stores and the host can convert to the compact
 /// [`FaultDoorbellRecord`] used by the shared trap engine.
 #[repr(C, packed)]
-#[derive(Clone, Copy, Default, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+#[derive(
+    Clone,
+    Copy,
+    Default,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
+)]
 pub struct FaultMemoryRecord {
     vector: u64,
     error_code: u64,

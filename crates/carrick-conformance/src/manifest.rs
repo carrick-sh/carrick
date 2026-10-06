@@ -2,9 +2,7 @@
 //! serde model. `manifest` is the shared vocabulary every other module reads; it
 //! depends on nothing else in the crate. See design spec §4.1 / §5.
 
-use serde::Deserialize;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ecosystem {
     Cpython,
@@ -24,7 +22,7 @@ impl Ecosystem {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VerdictKind {
     Regrtest,
@@ -34,21 +32,21 @@ pub enum VerdictKind {
     Shell,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Tier {
     Smoke,
     Full,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Weight {
     Heavy,
     Light,
 }
 
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, ::serde::Deserialize, serde::Serialize)]
 pub struct EnvKv {
     pub key: String,
     pub val: String,
@@ -56,7 +54,7 @@ pub struct EnvKv {
 
 /// A value that may be shared across both engines or specialized per-engine.
 /// Resolution: the engine-specific value wins, else `both`.
-#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, Default, ::serde::Deserialize, serde::Serialize)]
 pub struct EnginePair<T> {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub both: Option<T>,
@@ -75,7 +73,7 @@ impl<T: Clone> EnginePair<T> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, ::serde::Deserialize, serde::Serialize)]
 pub struct Suite {
     pub name: String,
     pub ecosystem: Ecosystem,
@@ -164,7 +162,7 @@ impl Suite {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+#[derive(Debug, Clone, ::serde::Deserialize, serde::Serialize)]
 pub struct Manifest {
     #[serde(default)]
     pub suite: Vec<Suite>,

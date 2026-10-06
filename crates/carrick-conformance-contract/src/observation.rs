@@ -1,9 +1,7 @@
-use serde::{Deserialize, Serialize};
-
 use crate::evaluate::ContractFailure;
 use crate::model::{ContractId, ExecutionLayer, TimingStatistic, WorkMetric};
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 pub struct ContractObservation {
     pub contract_id: ContractId,
     pub layer: ExecutionLayer,
@@ -93,14 +91,14 @@ impl ContractObservation {
 
 pub use carrick_observability::work_meter::WorkSnapshot;
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 #[serde(tag = "status", rename_all = "kebab-case")]
 pub enum Completeness {
     Complete,
     Incomplete { reasons: Vec<String> },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 pub struct SemanticAssertion {
     pub name: String,
     pub passed: bool,
@@ -125,7 +123,7 @@ impl SemanticAssertion {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 pub struct TimingDistribution {
     samples: Vec<f64>,
 }

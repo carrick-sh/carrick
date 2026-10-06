@@ -14,7 +14,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize as _, Serialize as _};
 
 use super::super::objects::FileDescriptionBackingSnapshot;
 use super::super::snapshot::{
@@ -28,7 +28,9 @@ pub const KERNEL_DEBUG_RESPONSE_SCHEMA: &str = "carrick.kernel-debug-snapshot.v1
 
 /// One selectable table. The names are the CLI's `--table` vocabulary and are
 /// part of the wire contract; renaming one is a schema change.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ::serde::Serialize, ::serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum KernelDebugTable {
     Task,
@@ -127,7 +129,7 @@ impl KernelDebugTable {
 #[error("unknown kernel debug table `{0}`")]
 pub struct UnknownTable(pub String);
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelDebugRequest {
     pub schema: String,
@@ -142,7 +144,7 @@ pub struct KernelDebugRequest {
 
 /// What a debug request asks for. Reading is the default; aborting is the
 /// operator's replacement for the host-wide shell watchdog's `lldb` step.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KernelDebugAction {
     #[default]
@@ -195,7 +197,7 @@ impl KernelDebugRequest {
 
 /// Object liveness class, mirrored so a reader can tell a live object from one
 /// that is still draining references.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum DebugClass {
     Live,
@@ -211,21 +213,25 @@ impl From<ObjectSnapshotClass> for DebugClass {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ::serde::Serialize, ::serde::Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct DebugTaskKey {
     pub id: i32,
     pub serial: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ::serde::Serialize, ::serde::Deserialize,
+)]
 #[serde(deny_unknown_fields)]
 pub struct DebugThreadKey {
     pub tid: i32,
     pub serial: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugTaskRow {
     pub key: DebugTaskKey,
@@ -241,7 +247,7 @@ pub struct DebugTaskRow {
     pub diagnostic_name: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugZombieRow {
     pub key: DebugTaskKey,
@@ -254,7 +260,7 @@ pub struct DebugZombieRow {
     pub diagnostic_name: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugThreadRow {
     pub key: DebugThreadKey,
@@ -275,7 +281,7 @@ pub struct DebugThreadRow {
     pub exec_invalidation_pending: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugContinuationRow {
     pub id: u64,
@@ -285,7 +291,7 @@ pub struct DebugContinuationRow {
     pub registration: Option<DebugContinuationRegistrationRow>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugContinuationRegistrationRow {
     pub continuation: u64,
@@ -302,14 +308,14 @@ pub struct DebugContinuationRegistrationRow {
     pub has_task_waker: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugPollFdRow {
     pub fd: i32,
     pub events: i16,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugTaskSharedRow {
     pub task: DebugTaskKey,
@@ -319,7 +325,7 @@ pub struct DebugTaskSharedRow {
     pub class: DebugClass,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugThreadResourcesRow {
     pub thread: DebugThreadKey,
@@ -330,7 +336,7 @@ pub struct DebugThreadResourcesRow {
     pub class: DebugClass,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugMmRow {
     pub id: u64,
@@ -344,7 +350,7 @@ pub struct DebugMmRow {
     pub next_legacy_aio_context: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugVmaRow {
     pub mm: u64,
@@ -352,7 +358,7 @@ pub struct DebugVmaRow {
     pub end: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugFrameRow {
     pub frame: u64,
@@ -360,7 +366,7 @@ pub struct DebugFrameRow {
     pub mappings: Vec<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugMappingRow {
     pub mapping: u64,
@@ -376,7 +382,7 @@ pub struct DebugMappingRow {
     pub exec: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugFileTableRow {
     pub id: u64,
@@ -389,7 +395,7 @@ pub struct DebugFileTableRow {
     pub epoll_index_fds: Vec<i32>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugFileSlotRow {
     pub table: u64,
@@ -399,7 +405,7 @@ pub struct DebugFileSlotRow {
     pub open_path: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugFileDescriptionRow {
     pub id: u64,
@@ -419,14 +425,14 @@ pub struct DebugFileDescriptionRow {
     pub epoll_owners: Vec<DebugEpollOwner>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugEpollOwner {
     pub owner: u64,
     pub fd: i32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugFsContextRow {
     pub id: u64,
@@ -436,7 +442,7 @@ pub struct DebugFsContextRow {
     pub chroot_root: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugCredentialsRow {
     pub id: u64,
@@ -453,7 +459,7 @@ pub struct DebugCredentialsRow {
     pub supplementary_groups_override: Option<Vec<u32>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugProcessGroupRow {
     pub id: i32,
@@ -461,14 +467,14 @@ pub struct DebugProcessGroupRow {
     pub members: Vec<DebugTaskKey>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugSessionRow {
     pub id: i32,
     pub process_groups: Vec<i32>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugSighandRow {
     pub id: u64,
@@ -477,7 +483,7 @@ pub struct DebugSighandRow {
     pub actions: Vec<DebugSigaction>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugSigaction {
     pub signal: i32,
@@ -487,7 +493,7 @@ pub struct DebugSigaction {
     pub mask: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugTaskSignalRow {
     pub task: DebugTaskKey,
@@ -496,14 +502,14 @@ pub struct DebugTaskSignalRow {
     pub pending: Vec<DebugPendingSignal>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugPendingSignal {
     pub signal: i32,
     pub has_siginfo: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugThreadSignalRow {
     pub thread: DebugThreadKey,
@@ -518,7 +524,7 @@ pub struct DebugThreadSignalRow {
     pub pending_action_signals: Vec<i32>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugAltstack {
     pub sp: u64,
@@ -526,7 +532,7 @@ pub struct DebugAltstack {
     pub size: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugSchedulerRow {
     /// None means unavailable (including snapshots from older producers), not
@@ -561,7 +567,7 @@ pub struct DebugSchedulerRow {
 /// One zone-held runnable row and who is expected to run it. A row whose
 /// owner is `el1-service` while every EL1 run queue in the zone census is
 /// empty has no owner: it is stranded.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugZoneHeldRow {
     pub thread: DebugThreadKey,
@@ -573,7 +579,7 @@ pub struct DebugZoneHeldRow {
     pub state: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugResidencyRow {
     pub executor: u32,
@@ -587,7 +593,7 @@ pub struct DebugResidencyRow {
     pub ticket_claimed: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugHostWaitCensus {
     pub entered: u64,
@@ -595,7 +601,7 @@ pub struct DebugHostWaitCensus {
     pub slots: Vec<DebugHostWaitSlot>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugHostWaitSlot {
     pub root: u32,
@@ -604,7 +610,7 @@ pub struct DebugHostWaitSlot {
     pub waiters: Vec<DebugHostWaiter>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugHostWaiter {
     pub executor: u32,
@@ -687,7 +693,7 @@ impl DebugHostWaitCensus {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugRunQueueRow {
     pub position: usize,
@@ -696,14 +702,14 @@ pub struct DebugRunQueueRow {
     pub closing_authorized: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugExecutorBindingRow {
     pub thread: DebugThreadKey,
     pub generation: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugExecutorRow {
     pub id: u32,
@@ -721,7 +727,7 @@ pub struct DebugExecutorRow {
     pub hardware_kick_published: Option<bool>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugExecutorReceiptRow {
     pub sequence: u64,
@@ -733,7 +739,7 @@ pub struct DebugExecutorReceiptRow {
     pub reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebugExecutorReceiptSummary {
     pub total: usize,
@@ -756,7 +762,7 @@ pub trait KernelDebugAuxProvider: Send + Sync {
 
 /// The response. Every table is `Option` so a filtered request produces a
 /// response whose absent tables are explicit rather than empty.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelDebugSnapshot {
     pub schema: String,
@@ -1675,7 +1681,7 @@ pub const KERNEL_DEBUG_DEGRADED_SCHEMA: &str = "carrick.kernel-debug-degraded.v1
 /// (typically because a wedge holds an MM mutation coordinator): what each
 /// task and thread is doing, read one object at a time with deadline-bounded
 /// try-locks, and which coordinators are busy and who holds them.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KernelDebugDegraded {
     pub schema: String,
@@ -1687,7 +1693,7 @@ pub struct KernelDebugDegraded {
     pub unreadable: Vec<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DegradedTaskDto {
     pub key: DebugTaskKey,
@@ -1699,7 +1705,7 @@ pub struct DegradedTaskDto {
     pub threads: Option<Vec<DegradedThreadDto>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DegradedThreadDto {
     pub key: DebugThreadKey,
@@ -1707,7 +1713,7 @@ pub struct DegradedThreadDto {
     pub execution: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DegradedMmCoordinatorDto {
     pub mm: u64,

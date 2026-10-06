@@ -5,9 +5,6 @@
 //! unconditionally, so both the HVF threaded/single-threaded loops and the KVM
 //! single-threaded loop return the same `Result<RunResult, RuntimeError>`.
 
-use serde::Serialize;
-use thiserror::Error;
-
 use crate::compat::CompatReport;
 use crate::dispatch::DispatchError;
 use crate::memory::AddressSpaceError;
@@ -15,7 +12,7 @@ use crate::observe::BudgetResource;
 use carrick_hal::TrapError;
 
 /// Why a guest run reached a terminal non-exit state short of regular guest exit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub enum TerminalReason {
     TrapLimit,
     BudgetExceeded {
@@ -27,7 +24,7 @@ pub enum TerminalReason {
 
 /// Why a guest run stopped short of (or completed with) a clean exit. Shared by
 /// the HVF loops and the KVM single-threaded loop.
-#[derive(Debug, Error)]
+#[derive(Debug, ::thiserror::Error)]
 pub enum RuntimeError {
     #[error("an independent carrier is already active in this host process")]
     CarrierAlreadyActive,
@@ -94,7 +91,7 @@ pub enum RuntimeError {
 /// are empty here. `report` / `trap_limit_hit` are the macOS compat-reporting
 /// fields; the KVM loop fills `report` from its (stub) reporter and leaves
 /// `trap_limit_hit` false (it surfaces the limit as `RuntimeError` instead).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct RunResult {
     pub exit_code: i32,
     /// The signal that KILLED this process, if one did.

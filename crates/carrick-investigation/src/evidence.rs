@@ -8,7 +8,6 @@ use crate::InvestigationError;
 use carrick_conformance_contract::{
     ContractFailure, ContractId, ContractObservation, ContractRegistry, ExecutionLayer, evaluate,
 };
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 fn invalid(message: impl ToString) -> InvestigationError {
@@ -79,7 +78,7 @@ pub fn source_identity(root: &Path) -> Result<String, InvestigationError> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecutionReceipt {
     pub schema: u32,

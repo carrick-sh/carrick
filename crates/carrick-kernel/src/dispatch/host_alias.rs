@@ -12,7 +12,7 @@ use super::{DispatchMmAuthority, SyscallDispatcher, mem, sysv};
 /// Typed handle for one dispatcher-to-runtime host-alias installation. The
 /// payload is intentionally opaque: exact VMA/SysV commit data stays owned by
 /// the dispatcher and is published only after the runtime reports success.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::serde::Serialize)]
 #[serde(transparent)]
 pub struct HostAliasTransactionId(pub(crate) u64);
 

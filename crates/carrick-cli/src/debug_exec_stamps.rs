@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, bail};
-use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
 const SCHEMA: &str = "carrick.exec-stamp-census.v1";
@@ -131,7 +130,7 @@ struct ForkParts<'a> {
     parent_return: Option<&'a Record>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, ::serde::Serialize)]
 struct Distribution {
     count: usize,
     sum_ns: u64,
@@ -140,7 +139,7 @@ struct Distribution {
     max_ns: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, ::serde::Serialize)]
 struct SegmentReport {
     wall: Distribution,
     cpu: Distribution,
@@ -148,14 +147,14 @@ struct SegmentReport {
     cpu_share_of_invocation: f64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, ::serde::Serialize)]
 struct RunCpuReport {
     supervisor_ns: u64,
     guest_tree_ns: u64,
     invocation_ns: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, ::serde::Serialize)]
 struct CoverageReport {
     phase_counts: BTreeMap<String, u64>,
     pids: usize,
@@ -165,7 +164,7 @@ struct CoverageReport {
     unreaped_root_exits: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, ::serde::Serialize)]
 struct ExecStampReport {
     schema: &'static str,
     #[serde(skip_serializing_if = "String::is_empty")]

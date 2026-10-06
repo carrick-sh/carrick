@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use oci_client::secrets::RegistryAuth;
-use serde::{Deserialize, Serialize};
 
 use carrick_spec::OciBootstrapError;
 
@@ -22,7 +21,7 @@ use carrick_spec::OciBootstrapError;
 const HUB_KEY: &str = "https://index.docker.io/v1/";
 
 /// Docker's `config.json` (the subset we read/write).
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Default, ::serde::Deserialize, ::serde::Serialize)]
 struct DockerConfig {
     #[serde(default)]
     auths: HashMap<String, AuthEntry>,
@@ -40,7 +39,7 @@ struct DockerConfig {
     cred_helpers: HashMap<String, String>,
 }
 
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, ::serde::Deserialize, ::serde::Serialize)]
 struct AuthEntry {
     // All optional: a credsStore-only config has entries with no inline `auth`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

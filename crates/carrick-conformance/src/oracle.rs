@@ -18,14 +18,14 @@
 
 use crate::manifest::{Suite, VerdictKind};
 use crate::parsers::{Outcome, SuiteOutcome, SuiteResult};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize as _, Serialize as _};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The canonical, stable description of everything that determines docker's
 /// output for a suite. Field order is fixed (struct order), so its JSON form is
 /// reproducible and usable verbatim as the cache key.
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 struct OracleKey<'a> {
     docker_platform: &'a str,
     image: &'a str,
@@ -62,7 +62,9 @@ struct OracleKey<'a> {
 /// Docker execution identity used for duration evidence. Parsing policy is
 /// intentionally absent: it can change whether output is an admissible oracle,
 /// but cannot change how long this declared container execution takes.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize,
+)]
 struct OracleExecutionKey {
     docker_platform: String,
     image: String,
@@ -185,7 +187,7 @@ pub fn oracle_key_with_identity(
 }
 
 /// One cached docker oracle, one JSONL line.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]
 pub struct OracleRecord {
     /// The suite name at cache time — purely for `git diff` legibility; matching
     /// is by `key`, never by name.
@@ -200,7 +202,7 @@ pub struct OracleRecord {
     pub elapsed_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]
 struct OracleTimingRecord {
     name: String,
     execution_key: OracleExecutionKey,

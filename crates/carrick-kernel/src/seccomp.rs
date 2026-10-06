@@ -69,7 +69,6 @@
 //! is exact; see the `tests` module for the canonical libseccomp shape.
 
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // Linux AUDIT_ARCH for the guest. Filters compare seccomp_data.arch against
@@ -98,7 +97,7 @@ pub(crate) const SECCOMP_SET_MODE_STRICT: u32 = 0;
 pub(crate) const SECCOMP_SET_MODE_FILTER: u32 = 1;
 
 /// A cBPF instruction (`struct sock_filter`), 8 bytes on the wire.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct SockFilter {
     pub(crate) code: u16,
     pub(crate) jt: u8,
@@ -301,7 +300,7 @@ pub enum SeccompInstallError {
 /// Complete guest-installed seccomp state retained across native host
 /// self-reexec. The launch-time container policy remains a separate host
 /// boundary; this snapshot is only the irreversible Linux process state.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct SeccompSnapshot {
     filters: Vec<Vec<SockFilter>>,
     strict: bool,

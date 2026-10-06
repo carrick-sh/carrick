@@ -10,7 +10,6 @@ use carrick_kernel::kernel::objects::ExecutionGeneration;
 use carrick_kernel::kernel::{TaskKey, objects::thread::ThreadKey};
 use carrick_observability::work_meter::WorkSnapshot;
 use parking_lot::{Condvar, Mutex};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::operand::Step;
@@ -20,7 +19,9 @@ const GENERATOR_VERSION: u32 = 3;
 const WATCHDOG: Duration = Duration::from_secs(5);
 
 /// A source boundary at which an actor may relinquish its test permit.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ::serde::Serialize, ::serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Point {
     Step,
@@ -39,7 +40,18 @@ pub enum Point {
 }
 
 /// Exact kernel identity, including both incarnation serials and CPU generation.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    ::serde::Serialize,
+    ::serde::Deserialize,
+)]
 pub struct Actor {
     pub task_id: i32,
     pub task_serial: u64,
@@ -61,7 +73,7 @@ impl Actor {
 }
 
 /// One selected transition. The full eligible set makes replay reject drift.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct Decision {
     pub actor: Actor,
     pub point: Point,
@@ -85,7 +97,7 @@ pub enum ReplayExpectation {
 }
 
 /// Portable receipt for strict replay and retained regression fixtures.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct ScheduleReceipt {
     pub schema_version: u32,
     pub generator_version: u32,

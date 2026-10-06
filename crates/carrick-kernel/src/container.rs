@@ -16,10 +16,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize as _, Serialize as _};
 
 /// Lifecycle status of a container in the registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContainerStatus {
     /// Registry entry written, container not yet running.
@@ -40,7 +40,7 @@ pub const UNKNOWN_CARRIER_EXIT_CODE: i32 = 255;
 /// the lifecycle CLI subcommands. Field set is intentionally small and
 /// host-meaningful (the compatibility pids identify the carrier, but are not
 /// guest-signal targets).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]
 pub struct ContainerState {
     /// Full 64-hex container id.
     pub id: String,
@@ -89,7 +89,7 @@ pub struct ContainerState {
     pub config: RunConfig,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CarrierControlState {
     pub schema: String,
@@ -97,14 +97,14 @@ pub struct CarrierControlState {
     pub init: crate::kernel::control::ControlTaskKey,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CarrierTerminalReceipt {
     pub control: CarrierControlState,
     pub exit_code: i32,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StopSignalAbi {
     /// Pre-carrier-control state. A non-default value is ambiguous because the
@@ -123,7 +123,7 @@ fn legacy_stop_signal_abi() -> StopSignalAbi {
 /// `start`/`restart`) can reconstruct a compatible run. `exec` re-resolves the
 /// image layers from the store via [`ContainerState::image`] and re-applies
 /// these, overriding with its own flags.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(default)]
 pub struct RunConfig {
     /// Raw `--platform` string (`None` = host default).
@@ -234,7 +234,7 @@ fn default_max_traps() -> usize {
     crate::run_state::DEFAULT_MAX_TRAPS
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, ::serde::Serialize, ::serde::Deserialize, PartialEq, Eq)]
 pub struct NetworkAttachment {
     pub name: String,
     #[serde(default)]

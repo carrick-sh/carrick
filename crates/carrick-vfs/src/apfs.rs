@@ -23,14 +23,14 @@
 //!     destroy instead of an `rm -rf` of millions of inodes.
 
 use std::path::{Path, PathBuf};
-use thiserror::Error;
+use thiserror::Error as _;
 
 /// Default name of the carrick-owned APFS subvolume. Visible to the
 /// user under `/Volumes/<this>`; chosen to be obvious and unlikely to
 /// collide with anything the user might have created themselves.
 pub const DEFAULT_VOLUME_NAME: &str = "carrick";
 
-#[derive(Debug, Error)]
+#[derive(Debug, ::thiserror::Error)]
 pub enum ApfsError {
     #[error(
         "`diskutil` not found on PATH; APFS volume management requires the macOS Disk Utility binary"

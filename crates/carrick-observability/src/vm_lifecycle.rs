@@ -13,7 +13,6 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 const MAX_RECORDED_EVENTS: usize = 64;
@@ -767,7 +766,7 @@ const VM_LIFECYCLE_SCHEMA_DESCRIPTOR: &[u8] = b"carrick.hvpatch-vm-lifecycle.v1\
 // raw inclusion, so including this source file does not recursively expand it.
 const VM_LIFECYCLE_PROGRAM_SOURCE: &[u8] = include_bytes!("vm_lifecycle.rs");
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, ::serde::Deserialize, Eq, PartialEq, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactEventV1 {
     sequence: u64,
@@ -776,7 +775,7 @@ struct ArtifactEventV1 {
     admission: Option<i32>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, ::serde::Deserialize, Eq, PartialEq, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactTerminalV1 {
     sequence: u64,
@@ -786,7 +785,7 @@ struct ArtifactTerminalV1 {
     trap_limit_hit: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, ::serde::Deserialize, Eq, PartialEq, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactPayloadV1 {
     schema: String,
@@ -800,7 +799,7 @@ struct ArtifactPayloadV1 {
     terminal: ArtifactTerminalV1,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, ::serde::Deserialize, Eq, PartialEq, ::serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct ArtifactEnvelopeV1 {
     payload: ArtifactPayloadV1,

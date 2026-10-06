@@ -3,7 +3,6 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 pub(crate) const AMPLIFICATION_RAW_SCHEMA: &str = "carrick.amplification.raw.v1";
@@ -234,7 +233,9 @@ impl V2ProfileAuthority {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Serialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, ::serde::Serialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum TraceProfileKind {
     HvpatchMmReuseIsolation,
@@ -363,7 +364,7 @@ impl TraceProfileKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ::serde::Serialize)]
 pub(crate) struct ProfileCaptureStatus {
     pub(crate) principal_drops: u64,
     pub(crate) aggregation_drops: u64,

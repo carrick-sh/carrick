@@ -2,11 +2,9 @@
 //! match Docker's JSON exactly (PascalCase) so strongly-typed clients (bollard,
 //! docker-java) deserialize without error.
 
-use serde::Deserialize;
-use serde::Serialize;
 use std::collections::HashMap;
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct VersionResponse {
     pub version: String,
@@ -31,7 +29,7 @@ impl Default for VersionResponse {
 }
 
 /// The subset of Docker's container-create body M0 consumes.
-#[derive(Deserialize, Default)]
+#[derive(::serde::Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct CreateBody {
     pub image: Option<String>,
@@ -49,7 +47,7 @@ pub(crate) struct CreateBody {
     pub networking_config: Option<CreateNetworkingConfig>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(::serde::Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct CreateHostConfig {
     pub auto_remove: Option<bool>,
@@ -70,13 +68,13 @@ pub(crate) struct CreateHostConfig {
     pub security_opt: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(::serde::Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct CreateNetworkingConfig {
     pub endpoints_config: Option<HashMap<String, CreateEndpointSettings>>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(::serde::Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct CreateEndpointSettings {
     #[serde(rename = "IPAMConfig")]
@@ -88,7 +86,7 @@ pub(crate) struct CreateEndpointSettings {
     pub driver_opts: Option<HashMap<String, String>>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(::serde::Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct CreateEndpointIpamConfig {
     #[serde(rename = "IPv4Address")]
@@ -99,7 +97,7 @@ pub(crate) struct CreateEndpointIpamConfig {
     pub link_local_ips: Option<Vec<String>>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(::serde::Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct CreateMount {
     #[serde(rename = "Type")]
@@ -109,7 +107,7 @@ pub(crate) struct CreateMount {
     pub read_only: Option<bool>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(::serde::Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct CreatePortBinding {
     #[serde(rename = "HostIp")]
@@ -117,20 +115,20 @@ pub(crate) struct CreatePortBinding {
     pub host_port: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct CreateResponse {
     pub id: String,
     pub warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct WaitResponse {
     pub status_code: i64,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct InfoResponse {
     pub id: String,
@@ -143,7 +141,7 @@ pub(crate) struct InfoResponse {
     pub images: i64,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct ContainerSummary {
     #[serde(rename = "Id")]
@@ -162,19 +160,19 @@ pub(crate) struct ContainerSummary {
     pub network_settings: NetworkSettingsSummary,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct HostConfigSummary {
     pub network_mode: String,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct NetworkSettingsSummary {
     pub networks: std::collections::HashMap<String, EndpointSettings>,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct EndpointSettings {
     #[serde(rename = "IPAMConfig")]
@@ -204,7 +202,7 @@ pub(crate) struct EndpointSettings {
     pub dns_names: Option<Vec<String>>,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct ImageSummary {
     #[serde(rename = "Id")]
@@ -220,7 +218,7 @@ pub(crate) struct ImageSummary {
     pub containers: i64,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct ImageInspectResponse {
     #[serde(rename = "Id")]
@@ -233,7 +231,7 @@ pub(crate) struct ImageInspectResponse {
     pub architecture: String,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct ExecInspectResponse {
     #[serde(rename = "ID")]
@@ -245,14 +243,14 @@ pub(crate) struct ExecInspectResponse {
     pub pid: i64,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct TopResponse {
     pub titles: Vec<String>,
     pub processes: Vec<Vec<String>>,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(::serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "PascalCase")]
 #[allow(dead_code)]
 pub(crate) struct ExecCreateBody {
@@ -266,13 +264,13 @@ pub(crate) struct ExecCreateBody {
     pub user: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct ExecCreateResponse {
     pub id: String,
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(::serde::Deserialize, Debug, Clone)]
 #[serde(rename_all = "PascalCase")]
 #[allow(dead_code)]
 pub(crate) struct ExecStartBody {
@@ -280,7 +278,7 @@ pub(crate) struct ExecStartBody {
     pub tty: Option<bool>,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(::serde::Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct NetworkCreateBody {
     pub name: String,
@@ -302,21 +300,21 @@ pub(crate) struct NetworkCreateBody {
     pub labels: Option<HashMap<String, String>>,
 }
 
-#[derive(Deserialize)]
+#[derive(::serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct NetworkConnectBody {
     pub container: Option<String>,
     pub endpoint_config: Option<CreateEndpointSettings>,
 }
 
-#[derive(Deserialize)]
+#[derive(::serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct NetworkDisconnectBody {
     pub container: Option<String>,
     pub force: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 pub(crate) struct NetworkCreateResponse {
     #[serde(rename = "Id")]
     pub id: String,
@@ -324,7 +322,7 @@ pub(crate) struct NetworkCreateResponse {
     pub warning: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(::serde::Serialize, ::serde::Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct NetworkResource {
     pub name: String,
@@ -350,7 +348,7 @@ pub(crate) struct NetworkResource {
     pub labels: HashMap<String, String>,
 }
 
-#[derive(Deserialize)]
+#[derive(::serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct VolumeCreateBody {
     pub name: Option<String>,
@@ -359,7 +357,7 @@ pub(crate) struct VolumeCreateBody {
     pub labels: Option<HashMap<String, String>>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(::serde::Serialize, ::serde::Deserialize, Clone)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct VolumeResource {
     pub name: String,
@@ -371,7 +369,7 @@ pub(crate) struct VolumeResource {
     pub options: HashMap<String, String>,
 }
 
-#[derive(Serialize)]
+#[derive(::serde::Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub(crate) struct VolumeListResponse {
     pub volumes: Vec<VolumeResource>,

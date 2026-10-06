@@ -15,7 +15,6 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use carrick_el1_abi::HostExitClass;
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::trace_profile::ProfileCaptureStatus;
@@ -55,7 +54,7 @@ pub(crate) fn program_sha256() -> String {
 }
 
 /// The four buckets the EL1 work ranking reads exits in.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, ::serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ExitBucket {
     Syscall,
@@ -97,7 +96,7 @@ impl ExitBucket {
 }
 
 /// One exit class (or bucket) row.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ::serde::Serialize)]
 pub(crate) struct ExitRow {
     pub(crate) exits: u64,
     /// On-CPU time inside the `hv_vcpu_run` calls that ended in this class.
@@ -119,7 +118,7 @@ impl ExitRow {
 }
 
 /// One host-forwarded Linux syscall number.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize)]
 pub(crate) struct ForwardedRow {
     pub(crate) nr: u64,
     pub(crate) name: Option<&'static str>,
@@ -133,7 +132,7 @@ pub(crate) struct ForwardedRow {
     pub(crate) oncpu_ns: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize)]
 pub(crate) struct HvpatchExitAttributionSummary {
     pub(crate) schema: &'static str,
     pub(crate) program_sha256: String,

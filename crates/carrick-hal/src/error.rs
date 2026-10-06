@@ -1,12 +1,10 @@
 //! Shared HAL error and register/permission types used across the
 //! hypervisor and host-primitive traits.
 
-use thiserror::Error;
-
 /// Uniform OS-operation error for HAL trait methods. Carries the raw host
 /// errno (already host-namespaced; translate to Linux via
 /// `carrick_runtime::host_to_linux_errno`) plus a context string.
-#[derive(Debug, Error)]
+#[derive(Debug, ::thiserror::Error)]
 #[error("{context}: os error {errno}")]
 pub struct OsError {
     pub errno: i32,
