@@ -7,7 +7,7 @@
     "description_backing": 26,
     "epoll": 522,
     "stream": 176,
-    "mapping": 1638,
+    "mapping": 1639,
     "lifecycle": 34
   },
   "production_counts": {
@@ -16,7 +16,7 @@
     "description_backing": 10,
     "epoll": 223,
     "stream": 120,
-    "mapping": 1034,
+    "mapping": 1035,
     "lifecycle": 16
   },
   "files": {
@@ -23604,7 +23604,16 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 1381,
+      "line": 890,
+      "categories": [
+        "mapping"
+      ],
+      "text": "// Seal every user mapping, including the newly-added vvar/vDSO pages.",
+      "scope_kind": "production_callsite"
+    },
+    {
+      "file": "crates/carrick-runtime/src/runtime.rs",
+      "line": 1382,
       "categories": [
         "mapping"
       ],
@@ -23613,7 +23622,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 1386,
+      "line": 1387,
       "categories": [
         "mapping"
       ],
@@ -23622,7 +23631,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 3171,
+      "line": 3268,
       "categories": [
         "mapping"
       ],
@@ -23631,7 +23640,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/runtime.rs",
-      "line": 3429,
+      "line": 3526,
       "categories": [
         "stream"
       ],
