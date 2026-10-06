@@ -13,8 +13,8 @@ use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables}
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::{
     OBSERVE_ALLOCATOR, OBSERVE_DESCRIPTOR_PREPARE_PUBLISH, OBSERVE_DESCRIPTOR_PROTECT,
-    OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE, OBSERVE_SHARED_COW_FAULT,
-    OBSERVE_SHARED_PREPARED_FAULT,
+    OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE, OBSERVE_PORTAL_WINDOW,
+    OBSERVE_SHARED_COW_FAULT, OBSERVE_SHARED_PREPARED_FAULT,
 };
 use carrick_x86::cpl0_scheduler::{
     ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
@@ -307,6 +307,20 @@ fn shared_kernel_x86_cow_copies_and_repoints_through_intent() {
     assert_ne!(leaf & 2, 0, "replacement is writable");
     assert_eq!(leaf & (1 << 10), 0, "COW flag is cleared");
     assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0x91_5000);
+}
+
+#[test]
+fn shared_kernel_portal_window_uses_live_upper_direct_root() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_PORTAL_WINDOW.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(
+        carrier.observe(0).expect("live portal table window").result,
+        1
+    );
 }
 
 // Observe each task in turn while both lifecycle slots remain live. Registration
