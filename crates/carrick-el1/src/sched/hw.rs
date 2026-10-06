@@ -369,5 +369,5 @@ pub(crate) fn fatal_entry_binding() -> ! {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) fn fatal_entry_binding() -> ! {
-    crate::isa::x86::carrick_x86_unbound_entry_fatal()
+    crate::isa::x86::fatal_entry_binding()
 }
