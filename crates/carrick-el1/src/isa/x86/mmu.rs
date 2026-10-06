@@ -6,7 +6,8 @@ use carrick_guest_arch::{
     EditOperation, EditPermissions, FrameGpa, GuestLen, MmuBackend, MmuEditBackend, RootGpa,
     TableWindow, UserRange, UserVa,
 };
-use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorRefusal, LiveDescriptorWords};
+use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
+use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
 use carrick_mmu_core::x86::descriptor_txn::{
     DescriptorOp, DescriptorOutcome, DescriptorReceipt, DescriptorTxn, DescriptorTxnId,
     InlineJournal, LeafSize, PageSpan, Permissions, execute_descriptor_txn,
