@@ -23,7 +23,10 @@ rationale = "EL1 increment 2 permission-transition checkpoint. A resident privat
 structural_budgets = []
 
 [bindings]
-vm_free = "carrick-mmu-core::aarch64::tests::{allocation_free_guest_permission_edit_cycles_existing_l3_leaves,allocation_free_guest_permission_edit_updates_complete_l2_block,live_guest_permission_transaction_preserves_frames_and_refuses_widening,live_host_unmap_preserves_adjacent_guest_private_leaf}; carrick-el1::memory::tests::{resident_anonymous_mprotect_rounds_and_edits_under_exact_mm_guard,ineligible_mapping_forwards_and_permission_widening_returns_eacces}; carrick-el1::fault::tests::permission_fault_never_requests_a_first_touch_frame_grant; carrick-vmm-hvf::trap::frame_inventory::tests::el1_owned_live_leaf_overrides_stale_host_shadow_without_weakening_untagged_parity"
+# Order 5's pending_anonymous entry wrapper retains these real native editor
+# witnesses; core.entry.completion owns result/work publication and counting.
+# The dispatch-only mmap/brk fallback test is not a permission-editor witness.
+vm_free = "carrick-mmu-core::aarch64::tests::{allocation_free_guest_permission_edit_cycles_existing_l3_leaves,allocation_free_guest_permission_edit_updates_complete_l2_block,live_guest_permission_transaction_preserves_frames_and_refuses_widening,live_host_unmap_preserves_adjacent_guest_private_leaf}; carrick-el1::memory::tests::{resident_anonymous_mprotect_rounds_and_edits_under_exact_mm_guard,a_refused_or_forwarded_mprotect_journals_nothing,ineligible_mapping_and_permission_widening_forward}; carrick-el1::fault::tests::permission_fault_never_requests_a_first_touch_frame_grant; carrick-vmm-hvf::trap::frame_inventory::tests::el1_owned_live_leaf_overrides_stale_host_shadow_without_weakening_untagged_parity"
 embed = "carrick-embed::el1_sched::el1_anonymous_permission_transitions_stay_in_guest"
 docker = "native-arm64 same-source permission-transitions fixture at 256, 1024 and 4096 pages; docs/perf-results/2026-09-27-el1-anonymous-permissions"
 

@@ -602,3 +602,69 @@ unchanged predicate beside its retained ARM signal/altstack callers, not behind
 an allow or new policy path. `cargo clippy --locked -p carrick-x86-cpl0 --release
 --target x86_64-unknown-none -- -D warnings` fails red on the old location and
 passes after the move. The separate production/test census is unchanged.
+
+## Hosted CI classification follow-up
+
+The follow-up starts from `7b6d15813d328899c63a01bd1e506cc482425735`,
+including the director's macOS compiler recapture. No rebase occurred; all
+earlier fixes and the recapture are retained.
+
+The ten new entry production paths now have exact `surfaces.toml` mappings to
+`core.entry.completion`. Pending family paths additionally retain the applicable
+futex, lifecycle, file/inotify and anonymous-MM contracts. The already committed
+completion, X4, futex and family tests are classified as their evidence. These
+mappings do not promote the VM-free family assertions to signed acceptance or
+change any contract budget.
+
+Permission and retirement descriptors name the retained native editor witnesses
+separately from the dispatch-only mmap/brk fallback assertion. The permission
+descriptor's stale VM-free test name is rebound to the actual refusal/journal
+tests. `cargo test --locked -p carrick-el1 --lib memory::tests` passes all 16
+tests; no production editor implementation changes accompany this rebinding.
+
+Hosted run `37473750124`, lint job `112303830407`, uses PR base
+`56bf8c0caefe39fcc2260345d0a54772a74bffad` (the PR targets `work/n1`). Before
+the mapping change this exact-base command reports the ten unclassified paths;
+afterwards it prints:
+
+```text
+$ just check-contract-change 56bf8c0caefe39fcc2260345d0a54772a74bffad HEAD
+conformance contract check passed: all changed surfaces covered or exempted
+```
+
+`origin/main` is `2322d859d463b0d6c9e99ae2ce04f044f66abf53`. A direct
+main-to-PR contract comparison additionally reports inherited N1 paths outside
+order 5; the actual CI base is used rather than reclassifying those other orders.
+
+### PendingSignals comparison
+
+The reported nine violations are not reproduced. The hosted lint log itself
+prints `personality boundary checked: 9 substrate crate(s) clean`. The local
+checked-in scan agrees:
+
+```text
+$ cargo run --locked -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json
+personality boundary checked: 9 substrate crate(s) clean
+  [PASS] crate `carrick-signal-core` (shipped deps: [], dev deps: [], scanned files: 5)
+```
+
+Main was exported with `git archive origin/main`, its own locked all-feature
+Cargo metadata generated offline, and its own scanner compiled and run against
+that export (not the PR scanner, whose extra core crates do not exist on main):
+
+```text
+personality boundary checked: 7 substrate crate(s) clean
+  [PASS] crate `carrick-signal-core` (shipped deps: [], dev deps: [], scanned files: 5)
+```
+
+There are nine production occurrences of `PendingSignals` in
+`crates/carrick-signal-core/src/policy.rs`, at lines
+375, 382, 393, 473, 474, 502, 509, 512 and 515, on both revisions.
+`git diff origin/main 7b6d15813 -- crates/carrick-signal-core/src/policy.rs`
+prints nothing. Both file SHA-256 values are
+`34136bd1a6ae357ecd7f337947d799ae680524f0af4d337fb8d83da8a5188fea`.
+The director confirmed the claim originated in another worker's report, with
+no known scan command, and directed that these clean scans and identical source
+be treated as not a finding. No signal code, checker rule or allowlist changes
+are made. Raw hosted/main/head logs and the source comparison are retained in
+`target/order5-ci-followup/`.
