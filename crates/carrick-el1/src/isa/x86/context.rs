@@ -143,8 +143,8 @@ pub fn current_stack_slot() -> Option<usize> {
 }
 
 /// The current CPU's thread CPU identifier.
-pub fn current_thread_cpu() -> u64 {
-    current_cpu_binding().map_or(0, |b| b.cpu_slot as u64)
+pub fn current_thread_cpu() -> Option<u64> {
+    current_cpu_binding().map(|b| b.cpu_slot as u64)
 }
 
 /// A CPL0-only fixture syscall that exercises this shared kernel context module.
@@ -153,7 +153,7 @@ pub const CONTEXT_WITNESS: u64 = 0xffff_ffff_ffff_ff30;
 pub fn witness(op: u64) -> u64 {
     match op {
         0 => current_stack_slot().map_or(u64::MAX, |s| s as u64),
-        1 => current_thread_cpu(),
+        1 => current_thread_cpu().unwrap_or(u64::MAX),
         _ => u64::MAX,
     }
 }

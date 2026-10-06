@@ -70,17 +70,65 @@ pub mod hardware {
         }
     }
     /// # Safety
-    /// A live CPL0 xAPIC with TIMER_VECTOR installed. One shot, divide by 16;
+    /// A live CPL0 xAPIC with TIMER_VECTOR installed. One shot, divide by 1;
     /// None masks/disarms without a host wait, timer thread or semantic exit.
     pub unsafe fn arm_timer(ticks: Option<TimerTicks>) {
         unsafe {
-            write(0x3e0, 3);
+            write(0x3e0, 0b1011);
             write(
                 0x320,
                 u32::from(TIMER_VECTOR) | if ticks.is_none() { 1 << 16 } else { 0 },
             );
             write(0x380, ticks.map_or(0, |ticks| ticks.0));
         }
+    }
+    /// # Safety
+    /// CPL0 with an enabled xAPIC and a qualified TSC-deadline capability.
+    /// The deadline is an absolute TSC value; zero disarms the local timer.
+    pub unsafe fn arm_tsc_deadline(deadline: Option<u64>) {
+        unsafe {
+            write(
+                0x320,
+                u32::from(TIMER_VECTOR) | (1 << 18) | if deadline.is_none() { 1 << 16 } else { 0 },
+            );
+            let value = deadline.unwrap_or(0);
+            core::arch::asm!("wrmsr", in("ecx") 0x6e0_u32,
+                in("eax") value as u32, in("edx") (value >> 32) as u32,
+                options(nostack, preserves_flags));
+        }
+    }
+    /// # Safety
+    /// CPL0 with the mapped local APIC. The caller has a qualified TSC rate;
+    /// this bounded sample measures actual countdown ticks against that TSC.
+    pub unsafe fn measure_timer_rate(tsc_hz: u64) -> Option<u64> {
+        let sample_tsc = (tsc_hz / 1000).max(1);
+        unsafe {
+            write(0x3e0, 0b1011); // divide by 1
+            write(0x320, u32::from(TIMER_VECTOR) | (1 << 16));
+            write(0x380, u32::MAX);
+        }
+        let start = rdtsc();
+        while rdtsc().wrapping_sub(start) < sample_tsc {
+            core::hint::spin_loop();
+        }
+        let elapsed = rdtsc().wrapping_sub(start);
+        let remaining = unsafe { core::ptr::read_volatile((LAPIC_VA + 0x390) as *const u32) };
+        unsafe { write(0x380, 0) };
+        let elapsed_apic = u64::from(u32::MAX - remaining);
+        if elapsed == 0 || elapsed_apic == 0 {
+            return None;
+        }
+        let hz = u128::from(elapsed_apic) * u128::from(tsc_hz) / u128::from(elapsed);
+        u64::try_from(hz).ok().filter(|hz| *hz != 0)
+    }
+    fn rdtsc() -> u64 {
+        let (lo, hi): (u32, u32);
+        // SAFETY: RDTSC only reads the current TSC while CPL0 owns this CPU.
+        unsafe {
+            core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi,
+            options(nomem, nostack, preserves_flags))
+        };
+        (u64::from(hi) << 32) | u64::from(lo)
     }
     /// # Safety
     /// Complete exactly the interrupt accepted by this CPU's handler.

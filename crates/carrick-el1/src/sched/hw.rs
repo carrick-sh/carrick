@@ -251,10 +251,22 @@ impl ThreadCpu for HardwareCpu {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl ThreadCpu for HardwareCpu {
-    fn save(&mut self, _frame: &TrapFrame, _ctx: &mut ThreadCtx) {}
-    fn load(&mut self, _frame: &mut TrapFrame, _ctx: &ThreadCtx) {}
-    fn set_translation(&mut self, _ttbr0: u64, _ttbr1: u64) {}
-    fn invalidate_asid(&mut self, _ttbr0: u64) {}
+    // This ARM TrapFrame/ThreadCtx interface is reached only by the EL1
+    // AArch64 entry. CPL0 switches through ZoneRecord<ParkedContextWords>
+    // and an authenticated CR3 in cpl0_lifecycle. Reaching these leaves on
+    // x86 is an invalid entry-lane mix, never a successful context switch.
+    fn save(&mut self, _frame: &TrapFrame, _ctx: &mut ThreadCtx) {
+        crate::isa::x86::fatal_entry_binding()
+    }
+    fn load(&mut self, _frame: &mut TrapFrame, _ctx: &ThreadCtx) {
+        crate::isa::x86::fatal_entry_binding()
+    }
+    fn set_translation(&mut self, _ttbr0: u64, _ttbr1: u64) {
+        crate::isa::x86::fatal_entry_binding()
+    }
+    fn invalidate_asid(&mut self, _ttbr0: u64) {
+        crate::isa::x86::fatal_entry_binding()
+    }
     fn now(&self) -> u64 {
         let (lo, hi): (u32, u32);
         // SAFETY: RDTSC reads the native monotonic counter.
@@ -269,44 +281,45 @@ impl ThreadCpu for HardwareCpu {
         (u64::from(hi) << 32) | u64::from(lo)
     }
     fn freq(&self) -> u64 {
-        crate::isa::x86::interrupt::tsc_frequency().map_or(0, |f| f.get())
+        crate::isa::x86::interrupt::tsc_frequency()
+            .map_or_else(|| crate::isa::x86::fatal_entry_binding(), |f| f.get())
     }
     fn set_timer(&mut self, cval: Option<u64>) {
         use carrick_guest_arch::InterruptBackend;
         let deadline =
             cval.map(|c| carrick_guest_arch::Deadline(carrick_guest_arch::CounterTick::new(c)));
-        let _ = <crate::isa::x86::X86Backend as InterruptBackend>::arm_timer(
+        if <crate::isa::x86::X86Backend as InterruptBackend>::arm_timer(
             &mut crate::isa::x86::X86Backend,
             deadline,
-        );
+        )
+        .is_err()
+        {
+            crate::isa::x86::fatal_entry_binding();
+        }
     }
     fn send_sgi(&mut self, sgi1r: u64) {
         use carrick_guest_arch::InterruptBackend;
         let target = carrick_guest_arch::CpuTarget {
             cpu: carrick_guest_arch::CpuId::new(sgi1r as u32),
-            generation: carrick_guest_arch::CpuGeneration::new(
-                core::num::NonZeroU64::new(1).unwrap(),
-            ),
+            generation: carrick_guest_arch::CpuGeneration::new(core::num::NonZeroU64::MIN),
         };
         let token = carrick_guest_arch::WakeToken {
             task: carrick_guest_arch::TaskIdentity {
-                carrier: carrick_guest_arch::CarrierGeneration::new(
-                    core::num::NonZeroU64::new(1).unwrap(),
-                ),
-                task: carrick_guest_arch::TaskSerial::new(core::num::NonZeroU64::new(1).unwrap()),
-                execution: carrick_guest_arch::ExecutionGeneration::new(
-                    core::num::NonZeroU64::new(1).unwrap(),
-                ),
+                carrier: carrick_guest_arch::CarrierGeneration::new(core::num::NonZeroU64::MIN),
+                task: carrick_guest_arch::TaskSerial::new(core::num::NonZeroU64::MIN),
+                execution: carrick_guest_arch::ExecutionGeneration::new(core::num::NonZeroU64::MIN),
             },
-            operation: carrick_guest_arch::OperationSequence::new(
-                core::num::NonZeroU64::new(1).unwrap(),
-            ),
+            operation: carrick_guest_arch::OperationSequence::new(core::num::NonZeroU64::MIN),
         };
-        let _ = <crate::isa::x86::X86Backend as InterruptBackend>::send_wake(
+        if <crate::isa::x86::X86Backend as InterruptBackend>::send_wake(
             &mut crate::isa::x86::X86Backend,
             target,
             token,
-        );
+        )
+        .is_err()
+        {
+            crate::isa::x86::fatal_entry_binding();
+        }
     }
     fn ack_irq(&mut self) -> u32 {
         use carrick_guest_arch::InterruptBackend;
@@ -323,10 +336,14 @@ impl ThreadCpu for HardwareCpu {
             reason: carrick_guest_arch::InterruptReason::External,
             hardware: intid,
         };
-        let _ = <crate::isa::x86::X86Backend as InterruptBackend>::end_interrupt(
+        if <crate::isa::x86::X86Backend as InterruptBackend>::end_interrupt(
             &mut crate::isa::x86::X86Backend,
             ack,
-        );
+        )
+        .is_err()
+        {
+            crate::isa::x86::fatal_entry_binding();
+        }
     }
     fn wait_for_interrupt(&mut self) {
         // SAFETY: parks until interrupt.
@@ -337,6 +354,7 @@ impl ThreadCpu for HardwareCpu {
     }
     fn own_sgi_target(&self) -> u64 {
         crate::isa::x86::context::current_thread_cpu()
+            .unwrap_or_else(|| crate::isa::x86::fatal_entry_binding())
     }
 }
 

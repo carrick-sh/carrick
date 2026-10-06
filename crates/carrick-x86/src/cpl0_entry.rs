@@ -118,6 +118,13 @@ pub struct CpuBinding {
     pub scheduler_witness: AtomicU64,
     /// The scheduler slot issued by the stopped-host CPL0 bootstrap.
     pub cpu_slot: u32,
+    /// KVM_GET_TSC_KHZ converted to hertz; zero means no qualified clock.
+    pub tsc_hz: AtomicU64,
+    /// Two 16-bit APIC destinations, encoded as APIC ID + 1; zero is absent.
+    /// This binding is published before either vCPU runs.
+    pub wake_apic_ids: AtomicU64,
+    /// Measured xAPIC timer hertz when TSC-deadline mode is unavailable.
+    pub apic_timer_hz: AtomicU64,
 }
 const _: () = {
     assert!(core::mem::offset_of!(CpuBinding, kernel_stack) == 0);
