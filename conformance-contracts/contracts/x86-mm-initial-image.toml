@@ -1,0 +1,28 @@
+schema_version = 1
+id = "x86.mm.initial-image"
+title = "A fresh x86 address space enters a static ELF through the shared guest MM owner"
+guest_surfaces = ["exec:static-elf", "vmm:kvm", "mm:initial-image"]
+semantic_authority = [
+  "Linux x86_64 ELF and System V ABI: PT_LOAD file bytes and zero BSS, user page permissions, 16-byte aligned entry RSP at argc followed by argv, envp and auxv",
+  "The exact static x86_64 exit_group(7) ELF enters at e_entry and terminates with status 7",
+]
+fixture = "carrick-el1::isa::x86::initial_mm::tests; carrick-vmm-kvm::cpl0_initial_mm::shared_guest_owner_loads_static_elf_and_exits_seven"
+scale_points = [1, 2, 3]
+structural_budgets = []
+rationale = """
+The host parses through the one ISA-neutral ELF planner and lends only file
+bytes and load metadata. The guest creates an unpublished root, copies the
+single supervisor half, builds its own stack, initializes private zeroed
+frames and maps each user page through an edit intent. One publication record
+is returned per mapped page. The VM-free fixture checks three user pages,
+three data grants, one root plus exactly five unique page-table grants, and
+zero-filled BSS. The KVM fixture enters a real static ELF at its mapped RIP
+and observes exit_group(7), with no semantic host forward. This bounded
+carrier fixture does not prove production VM/vCPU lifetime or the CLI x86 run
+path; those belong to the x86-run milestone and director acceptance.
+"""
+
+[bindings]
+vm_free = "carrick-el1::x86_initial_mm_tests::fresh_owner_maps_static_text_data_and_stack_with_publications; guest_stack_has_sysv_order_and_exact_auxv_addresses; carrick-mem::x86_initial_image::static_x86_image_reuses_elf_plan_without_host_mm_edits"
+embed = "KVM-only carrier fixture: carrick-vmm-kvm::cpl0_initial_mm::shared_guest_owner_loads_static_elf_and_exits_seven"
+docker = "Native x86 Linux static-ELF behavior is asserted by the exact exit status; Docker oracle and runtime ratio remain director-owned."
