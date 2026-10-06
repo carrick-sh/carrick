@@ -619,7 +619,7 @@ where
         generation,
         injected_lease: adopted.injected_lease,
         bootstrap_process_child: None,
-        bootstrap_thread_child: false,
+        bootstrap_thread_child: None,
     })?;
     let dormant = runtime.persistent_bindings().prepare_submission(
         &scheduler,

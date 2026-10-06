@@ -11,6 +11,14 @@ use carrick_kernel::kernel::objects::ExecutorId;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct ResidencyGeneration(u64);
 
+/// Which continuation a zone record must retain for a host wake.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ZoneResumeOrigin {
+    Guest,
+    HostSyscall,
+    HostEl0,
+}
+
 impl ResidencyGeneration {
     pub const INITIAL: Self = Self(1);
 
@@ -49,6 +57,7 @@ pub enum TaskCpuResidency {
     Zone {
         base: GuestCpuState,
         record: carrick_el1_abi::RecordRef,
+        origin: ZoneResumeOrigin,
     },
 }
 
@@ -88,8 +97,13 @@ impl TaskCpuResidency {
         &mut self,
         materialize: impl FnOnce(ExecutorId, ResidencyGeneration) -> Result<GuestCpuState, TrapError>,
     ) -> Result<&GuestCpuState, TrapError> {
-        if let Self::Zone { base, record } = self {
-            let cpu = materialize_zone(base, *record)?;
+        if let Self::Zone {
+            base,
+            record,
+            origin,
+        } = self
+        {
+            let cpu = materialize_zone(base, *record, *origin)?;
             *self = Self::Materialized(cpu);
         }
         match self {
@@ -117,16 +131,18 @@ impl TaskCpuResidency {
 pub(crate) fn materialize_zone(
     base: &GuestCpuState,
     record: carrick_el1_abi::RecordRef,
+    origin: ZoneResumeOrigin,
 ) -> Result<GuestCpuState, TrapError> {
     let zone = carrick_el1_abi::zone_tables()
         .ok_or_else(|| TrapError::Hypervisor("zone residency without zone tables".to_owned()))?;
-    materialize_zone_in(zone, base, record)
+    materialize_zone_in(zone, base, record, origin)
 }
 
 fn materialize_zone_in(
     zone: &carrick_sched_core::ZoneTables,
     base: &GuestCpuState,
     record: carrick_el1_abi::RecordRef,
+    origin: ZoneResumeOrigin,
 ) -> Result<GuestCpuState, TrapError> {
     let GuestCpuState::Aarch64V1(base) = base else {
         return Err(TrapError::Hypervisor(
@@ -143,7 +159,12 @@ fn materialize_zone_in(
         )));
     }
     if rec.object_host_continuation() {
-        if !rec.has_object_operation() || base.syscall_continuation.is_none() {
+        if !rec.has_object_operation()
+            || matches!(origin, ZoneResumeOrigin::Guest)
+            || (matches!(origin, ZoneResumeOrigin::HostSyscall)
+                && base.syscall_continuation.is_none())
+            || (matches!(origin, ZoneResumeOrigin::HostEl0) && base.syscall_continuation.is_some())
+        {
             return Err(TrapError::Hypervisor(
                 "host-owned zone wait lost its operation or syscall continuation".to_owned(),
             ));
@@ -153,6 +174,11 @@ fn materialize_zone_in(
         // In particular, preserve the mailbox request across repeated owner
         // waits and executor migration so only complete_returned consumes it.
         return Ok(GuestCpuState::Aarch64V1(base.clone()));
+    }
+    if !matches!(origin, ZoneResumeOrigin::Guest) {
+        return Err(TrapError::Hypervisor(
+            "host-owned zone wait returned as a guest completion".to_owned(),
+        ));
     }
     // SAFETY: the host owns the record (checked above); its context is
     // frozen until the loader frees it.
@@ -234,15 +260,21 @@ mod tests {
 
     #[test]
     fn host_owned_memory_wait_keeps_syscall_through_two_wakes() {
-        exercise_zone_wakes(true);
+        exercise_zone_wakes(ZoneResumeOrigin::HostSyscall);
+    }
+
+    #[test]
+    fn host_owned_el0_ipc_wait_keeps_cpu_without_syscall_continuation() {
+        exercise_zone_wakes(ZoneResumeOrigin::HostEl0);
     }
 
     #[test]
     fn guest_zone_wait_resumes_el0_without_replaying_the_completed_syscall() {
-        exercise_zone_wakes(false);
+        exercise_zone_wakes(ZoneResumeOrigin::Guest);
     }
 
-    fn exercise_zone_wakes(host_owned: bool) -> (Box<ZoneTables>, RecordRef) {
+    fn exercise_zone_wakes(origin: ZoneResumeOrigin) -> (Box<ZoneTables>, RecordRef) {
+        let host_owned = !matches!(origin, ZoneResumeOrigin::Guest);
         let zone = zone();
         let key = ObjectWaitKey::metadata_request(17).unwrap();
         let delivered = RefCell::new(Vec::new());
@@ -253,7 +285,13 @@ mod tests {
         };
         zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &complete)
             .unwrap();
-        let original = pending_read();
+        let mut original = pending_read();
+        if matches!(origin, ZoneResumeOrigin::HostEl0) {
+            let GuestCpuState::Aarch64V1(cpu) = &mut original else {
+                panic!("AArch64 fixture");
+            };
+            std::sync::Arc::make_mut(cpu).syscall_continuation = None;
+        }
         let mut saved = original.clone();
         let mut retired = None;
         for round in 0..if host_owned { 2 } else { 1 } {
@@ -273,11 +311,13 @@ mod tests {
                 })
                 .unwrap();
             let reference = zone.record_ref(record);
-            let ctx = crate::vcpu_loop::zone::zone_ctx_from_state(
-                &saved,
-                crate::vcpu_loop::zone::ZoneExit::Syscall { completed: true },
-            )
-            .expect("a repeated owner wait still owns its syscall");
+            let exit = if matches!(origin, ZoneResumeOrigin::HostEl0) {
+                crate::vcpu_loop::zone::ZoneExit::El0
+            } else {
+                crate::vcpu_loop::zone::ZoneExit::Syscall { completed: true }
+            };
+            let ctx = crate::vcpu_loop::zone::zone_ctx_from_state(&saved, exit)
+                .expect("a repeated owner wait still owns its syscall");
             // SAFETY: this newly allocated record has not been published.
             unsafe { *zone.record(record).ctx_mut() = ctx };
             {
@@ -292,10 +332,10 @@ mod tests {
                 }
                 .unwrap();
             }
-            assert!(materialize_zone_in(&zone, &saved, reference).is_err());
+            assert!(materialize_zone_in(&zone, &saved, reference, origin).is_err());
             source.publish(Waker::Host, &complete);
             assert_eq!(delivered.borrow_mut().pop(), Some(reference));
-            saved = materialize_zone_in(&zone, &saved, reference).unwrap();
+            saved = materialize_zone_in(&zone, &saved, reference, origin).unwrap();
             let GuestCpuState::Aarch64V1(cpu) = &saved else {
                 panic!("AArch64 restore");
             };
@@ -304,8 +344,12 @@ mod tests {
                     cpu.syscall_continuation
                         .as_ref()
                         .map(|request| request.sequence),
-                    Some(73),
-                    "owner wake {round} must retain the original request"
+                    if matches!(origin, ZoneResumeOrigin::HostEl0) {
+                        None
+                    } else {
+                        Some(73)
+                    },
+                    "owner wake {round} must retain its original continuation shape"
                 );
                 assert_eq!(
                     saved, original,
@@ -330,7 +374,7 @@ mod tests {
             // SAFETY: the same host owns the record; consuming is one-shot.
             assert!(unsafe { rec.take_object_operation() }.is_none());
             zone.free_record(record);
-            assert!(materialize_zone_in(&zone, &saved, reference).is_err());
+            assert!(materialize_zone_in(&zone, &saved, reference, origin).is_err());
             retired = Some(reference);
         }
         (zone, retired.unwrap())
@@ -338,7 +382,7 @@ mod tests {
 
     #[test]
     fn recycled_owner_wait_record_resumes_a_completed_futex_without_an_owner_continuation() {
-        let (zone, retired) = exercise_zone_wakes(true);
+        let (zone, retired) = exercise_zone_wakes(ZoneResumeOrigin::HostSyscall);
         let record = zone
             .alloc_record(ThreadIdentity {
                 tid: 102,
@@ -394,7 +438,7 @@ mod tests {
             transfers.pop().unwrap().finish(&BoundedSpin(0)),
             Some(reference)
         );
-        let restored = materialize_zone_in(&zone, &saved, reference)
+        let restored = materialize_zone_in(&zone, &saved, reference, ZoneResumeOrigin::Guest)
             .expect("a completed futex must not inherit a previous owner's continuation");
         let GuestCpuState::Aarch64V1(cpu) = restored else {
             panic!("AArch64 fixture");
@@ -546,7 +590,9 @@ mod tests {
                 carrick_abi::SigSet::EMPTY,
             );
             source.publish(Waker::Host, &complete);
-            let restored = materialize_zone_in(&zone, &saved, reference).unwrap();
+            let restored =
+                materialize_zone_in(&zone, &saved, reference, ZoneResumeOrigin::HostSyscall)
+                    .unwrap();
             assert_eq!(restored, saved);
             let mut result = continuation
                 .resume(ContinuationEvent::ReservedSignal(reserved), &context)

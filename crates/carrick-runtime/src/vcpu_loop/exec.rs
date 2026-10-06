@@ -3514,6 +3514,7 @@ pub(crate) mod tests {
         let PersistentHvpatchCloneAttempt::Complete(threads::CloneThreadSpawn::Started {
             internal: child_tid,
             visible: child_visible_tid,
+            parent_tid_addr,
         }) = spawned
         else {
             panic!("persistent clone must start one child thread")
@@ -3521,9 +3522,12 @@ pub(crate) mod tests {
         assert!(matches!(
             job.complete_persistent_hvpatch_clone(
                 &mut parent_engine,
+                &mut parent_control,
+                frame,
                 threads::CloneThreadSpawn::Started {
                     internal: child_tid,
                     visible: child_visible_tid,
+                    parent_tid_addr,
                 },
             )
             .expect("parent clone completion"),
