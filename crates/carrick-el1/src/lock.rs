@@ -1,4 +1,4 @@
-//! SpinLock for EL1 synchronization.
+//! SpinLock for in-guest synchronization.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -9,7 +9,10 @@ pub struct SpinLock<T> {
     data: UnsafeCell<T>,
 }
 
+// SAFETY: acquiring the atomic lock is the only way to access the data;
+// ownership of the protected value may move between guest CPUs when T: Send.
 unsafe impl<T: Send> Sync for SpinLock<T> {}
+// SAFETY: moving a lock transfers its exclusively owned data when T: Send.
 unsafe impl<T: Send> Send for SpinLock<T> {}
 
 pub struct SpinLockGuard<'a, T> {
@@ -37,12 +40,14 @@ impl<T> SpinLock<T> {
 impl<T> Deref for SpinLockGuard<'_, T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
+        // SAFETY: this guard owns the exclusive lock until Drop releases it.
         unsafe { &*self.lock.data.get() }
     }
 }
 
 impl<T> DerefMut for SpinLockGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        // SAFETY: this guard owns the exclusive lock and &mut self is unique.
         unsafe { &mut *self.lock.data.get() }
     }
 }
