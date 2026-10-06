@@ -397,6 +397,13 @@ In Carrick, guest-visible correctness includes Linux semantics and non-pathologi
   process-vs-carrier scope all break at two processes, invisible to the
   single-process smoke — **a two-live-process test beats any number of
   single-process cases** ([`docs/identity-and-scope-domains.md`](docs/identity-and-scope-domains.md)).
+- **Exit reserves topology, not a live participant's thread membership.** The
+  exiting task, a child or an adopter can finish an already admitted EL1 birth
+  or nonfinal exit while the graph is reserved. An owned participant transition
+  accounts for those revision changes and retains topology-publication
+  headroom; a captured broad revision or closing a live participant's gate is
+  wrong. Test two live threads, late Born/ExitedInZone publication, drop and
+  exhaustion.
 
 ### Authority follows the execution lane, never the host process
 
