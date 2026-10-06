@@ -208,7 +208,7 @@ impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopy
     }
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl PreparedPageResolver for HardwarePreparedResolver {
     fn commit_prepared(
         &mut self,
@@ -233,6 +233,144 @@ impl PreparedPageResolver for HardwarePreparedResolver {
         let mut cpu = crate::sched::HardwareCpu;
         crate::sched::ThreadCpu::invalidate_asid(&mut cpu, ttbr0);
         Ok(outcome)
+    }
+}
+
+/// CPL0 publication of a host-backed prepared leaf while the shared fault
+/// dispatcher holds this MM's exact guest editor.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub struct X86PreparedResolver {
+    mm_key: NonZeroU64,
+    table_alias: carrick_guest_arch::KernelVa,
+    table_bytes: carrick_guest_arch::GuestLen,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+static X86_EDIT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl X86PreparedResolver {
+    /// # Safety
+    /// Use this resolver only inside `dispatch_x86_fault_with_prepared`, whose
+    /// exact-MM editor spans `commit_prepared` and receipt settlement. The
+    /// alias must retain writable supervisor mappings of the target arena.
+    pub unsafe fn under_editor(
+        mm_key: NonZeroU64,
+        table_alias: carrick_guest_arch::KernelVa,
+        table_bytes: carrick_guest_arch::GuestLen,
+    ) -> Self {
+        Self {
+            mm_key,
+            table_alias,
+            table_bytes,
+        }
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl PreparedPageResolver for X86PreparedResolver {
+    fn commit_prepared(
+        &mut self,
+        root_pa: u64,
+        va: u64,
+        expected_pa: u64,
+        access: LeafAccess,
+    ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
+        use carrick_guest_arch::{
+            Access, EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, MmuEditArch, RootGpa,
+            TableWindow, UserRange, UserVa,
+        };
+        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal;
+        use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
+
+        let root = RootGpa::page_aligned(FrameGpa::new(root_pa))
+            .ok_or(GuestPreparedCommitError::BadAddress)?;
+        let address = UserVa::new(va);
+        let range = UserRange::checked(address, GuestLen::new(4096))
+            .ok_or(GuestPreparedCommitError::BadAddress)?;
+        let expected = FrameGpa::new(expected_pa);
+        let fault_access = match access {
+            LeafAccess::Read => Access::Read,
+            LeafAccess::Write => Access::Write,
+            LeafAccess::Execute => Access::Execute,
+        };
+        let sequence = X86_EDIT_SEQUENCE
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .ok()
+            .and_then(NonZeroU64::new)
+            .ok_or(GuestPreparedCommitError::BadAddress)?;
+        // SAFETY: the constructor requires a retained supervisor alias; this
+        // resolver is invoked only while the shared dispatcher holds the
+        // exact editor of the authenticated root.
+        let tables =
+            unsafe { TableWindow::issue(root.address(), self.table_alias, self.table_bytes) }
+                .ok_or(GuestPreparedCommitError::TableOutsidePrimary)?;
+        // SAFETY: `under_editor` requires this resolver to run only under the
+        // exact-MM editor; the caller's grant names the current MM root.
+        let owner = unsafe { EditOwner::issue(root, self.mm_key, sequence) };
+        let intent = EditIntent::checked(
+            owner,
+            range,
+            EditOperation::Publish {
+                expected,
+                access: fault_access,
+            },
+            &[],
+        )
+        .ok_or(GuestPreparedCommitError::BadAddress)?;
+        let mut arch = crate::isa::x86::Kernel::new(crate::isa::x86::X86Backend);
+        // SAFETY: exact editor and retained supervisor table alias are held
+        // through descriptor publication and the local drain receipt.
+        let receipt = unsafe { arch.execute_edit(intent, tables) };
+        match receipt {
+            Ok(receipt) => match receipt.outcome {
+                DescriptorOutcome::Applied { .. } => Ok(GuestPreparedCommit::Committed),
+                DescriptorOutcome::Refused(DescriptorRefusal::NotPrepared) => {
+                    // SAFETY: the same exact editor and table alias remain
+                    // held; the read-only walk authenticates the existing
+                    // user leaf before declaring the retry resident.
+                    let tables = unsafe {
+                        TableWindow::issue(root.address(), self.table_alias, self.table_bytes)
+                    }
+                    .ok_or(GuestPreparedCommitError::TableOutsidePrimary)?;
+                    if unsafe {
+                        crate::isa::x86::resident_leaf_matches(
+                            root,
+                            &tables,
+                            address,
+                            expected,
+                            fault_access,
+                        )
+                    }
+                    .unwrap_or(false)
+                    {
+                        Ok(GuestPreparedCommit::AlreadyResident)
+                    } else {
+                        Err(GuestPreparedCommitError::NotPrepared)
+                    }
+                }
+                DescriptorOutcome::Refused(DescriptorRefusal::WrongBacking) => {
+                    Err(GuestPreparedCommitError::WrongBacking)
+                }
+                DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied) => {
+                    Err(GuestPreparedCommitError::PermissionDenied)
+                }
+                DescriptorOutcome::Refused(DescriptorRefusal::MissingTable) => {
+                    Err(GuestPreparedCommitError::MissingTable)
+                }
+                DescriptorOutcome::Refused(DescriptorRefusal::TableOutsidePrimary) => {
+                    Err(GuestPreparedCommitError::TableOutsidePrimary)
+                }
+                DescriptorOutcome::Indeterminate(_) => {
+                    Err(GuestPreparedCommitError::RollbackFailed)
+                }
+                _ => Err(GuestPreparedCommitError::NotPrepared),
+            },
+            Err(crate::isa::ArchError::Busy) => Err(GuestPreparedCommitError::RollbackFailed),
+            Err(_) => Err(GuestPreparedCommitError::BadAddress),
+        }
     }
 }
 
@@ -884,7 +1022,7 @@ pub fn serve_host_drain_hw(frame: &mut TrapFrame) {
 /// frames, consumes refusals, or resolves in-guest COW faults.
 /// Host builds retain the forward-only path.
 pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let current_tasks = unsafe {
             &*(carrick_el1_abi::EL1_CURRENT_TASKS_BASE
@@ -925,6 +1063,14 @@ pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters) -> Action {
                 completion: None,
             },
         )
+    }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        // CPL0 enters through `dispatch_x86_fault_with_prepared` with its
+        // decoded #PF. This ARM TrapFrame entry has no x86 fault provenance.
+        let _ = frame;
+        counters.fault_taken.fetch_add(1, Ordering::Relaxed);
+        Action::Forward
     }
     #[cfg(not(target_os = "none"))]
     {
