@@ -7,6 +7,107 @@ use carrick_mmu_core::x86::descriptor_txn::{NX, PRESENT, USER, WRITE};
 use carrick_sched_core::AddressSpaces;
 use core::sync::atomic::Ordering;
 
+#[test]
+fn x86_portal_grant_publishes_only_its_resident_page() {
+    use carrick_mmu_core::aarch64::descriptor_txn::{
+        BackingIdentity, DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan,
+        TableGrants,
+    };
+    use carrick_mmu_core::aarch64::{GuestLeafPublication, SubstrateGpa};
+    let mut region = Region::new();
+    region.add_bank();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 1, ROOT, 2, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view)
+        .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
+    let tables = Tables::new(ROOT, IPA, 2);
+    for (entry, offset) in [(0, 4096), (513, 8192), (1024, 12288)] {
+        tables.words[entry].store((ROOT + offset) | PRESENT | WRITE | USER, Ordering::Relaxed);
+    }
+    tables.words[1536].store(0, Ordering::Relaxed);
+    tables.words[1537].store(0, Ordering::Relaxed);
+    let maintenance = CallerInvalidatesAsid;
+    let words = tables.live(&maintenance);
+    let residency = residency();
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserRead,
+            0,
+        )
+        .unwrap();
+    let TransferStep::Supply(window) = portal
+        .select(
+            &transfer,
+            &words,
+            carrick_core::mm::transaction::SelectionVenues {
+                prepared: &mut NoopPreparedResolver,
+                cow: &mut NoopCowResolver,
+                residency: &residency,
+                slot: 0,
+            },
+        )
+        .unwrap()
+    else {
+        panic!("unmapped x86 owner page must request backing");
+    };
+    let one = NonZeroU64::MIN;
+    let txn = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: one,
+            generation: one,
+        },
+        root: SubstrateGpa(ROOT),
+        op: DescriptorOp::Prepare {
+            publication: GuestLeafPublication {
+                va: VA,
+                ipa: IPA,
+                len: 8192,
+                writable: true,
+                executable: false,
+            },
+            resident: PageSpan::new(VA, 4096),
+            backing: BackingIdentity {
+                frame_id: one,
+                mapping_id: one,
+                owner_generation: one,
+                inventory_revision: one,
+            },
+        },
+        tables: TableGrants::NONE,
+    };
+    let slot = carrick_el1_abi::PortalGrantSlot::new();
+    assert!(slot.submit(window, &txn));
+    let receipt = serve_grant(&portal, &slot, &words, &residency, 0, || {})
+        .unwrap()
+        .unwrap();
+    assert!(matches!(receipt.outcome, DescriptorOutcome::Applied(_)));
+    assert!(slot.take_receipt(window, &txn).is_some());
+    let resident = carrick_mmu_core::x86::descriptor_txn::translate_leaf(
+        &words,
+        carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(ROOT)).unwrap(),
+        carrick_guest_arch::UserVa::new(VA),
+        carrick_mmu_core::x86::descriptor_txn::Access::Read,
+        true,
+    )
+    .unwrap();
+    assert_eq!(resident.output.raw(), IPA);
+    assert!(matches!(
+        carrick_mmu_core::x86::descriptor_txn::translate_leaf(
+            &words,
+            carrick_guest_arch::RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(ROOT))
+                .unwrap(),
+            carrick_guest_arch::UserVa::new(VA + 4096),
+            carrick_mmu_core::x86::descriptor_txn::Access::Read,
+            true,
+        ),
+        Err(carrick_mmu_core::x86::descriptor_txn::FaultClass::NotPresent)
+    ));
+}
+
 fn transfer_fixture(pages: usize, unrelated: usize) {
     let mut region = Region::new();
     region.add_bank();

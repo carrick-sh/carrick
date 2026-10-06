@@ -2,7 +2,10 @@
 use super::descriptor_txn::*;
 use crate::aarch64::LeafAccess;
 use crate::owner_mmu::{OwnerForkMmu, OwnerMmu, OwnerMmuRefusal, OwnerTranslation};
-use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
+use carrick_guest_arch::{
+    EditBacking, EditIntent, EditOperation, EditOwner, EditPermissions, FrameGpa, GuestLen,
+    RootGpa, UserRange, UserVa,
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct X86Mmu;
@@ -148,21 +151,44 @@ impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
         let Some(tables) = tables.into_iter().collect::<Option<alloc::vec::Vec<_>>>() else {
             return WireOutcome::Refused(DescriptorRefusal::BadTableGrant);
         };
-        let native = DescriptorTxn {
-            id: txn.id,
-            root,
-            op: DescriptorOp::Prepare {
-                span: PageSpan::new(publication.va, publication.len),
+        let Some(range) =
+            UserRange::checked(UserVa::new(publication.va), GuestLen::new(publication.len))
+        else {
+            return WireOutcome::Refused(DescriptorRefusal::BadRange);
+        };
+        let Some(resident_range) =
+            UserRange::checked(UserVa::new(resident.va), GuestLen::new(resident.len))
+        else {
+            return WireOutcome::Refused(DescriptorRefusal::BadRange);
+        };
+        // SAFETY: apply_grant retains this exact-MM editor, and the authenticated
+        // grant root and operation generation were checked before this call.
+        let owner = unsafe { EditOwner::issue(root, txn.id.mm_key, txn.id.generation) };
+        let Some(intent) = EditIntent::checked(
+            owner,
+            range,
+            EditOperation::Prepare {
                 output: FrameGpa::new(publication.ipa),
-                permissions: Permissions {
+                permissions: EditPermissions {
+                    readable: true,
                     writable: publication.writable,
                     executable: publication.executable,
                     user: true,
                 },
-                resident,
-                backing,
+                resident: resident_range,
+                backing: EditBacking {
+                    frame_id: backing.frame_id,
+                    mapping_id: backing.mapping_id,
+                    owner_generation: backing.owner_generation,
+                    inventory_revision: backing.inventory_revision,
+                },
             },
-            tables: &tables,
+            &tables,
+        ) else {
+            return WireOutcome::Refused(DescriptorRefusal::BadRange);
+        };
+        let Ok(native) = DescriptorTxn::from_intent(&intent) else {
+            return WireOutcome::Refused(DescriptorRefusal::BadEncoding);
         };
         let receipt = execute_descriptor_txn(words, &native, root, &mut InlineJournal::new());
         match receipt.outcome {
