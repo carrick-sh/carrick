@@ -15,7 +15,7 @@ use super::objects::{
     ExecDrain, FileTable, FileTableExecFreeze, Mm, ObjectGraphError, PreparedThreadSet, TaskKey,
     TaskShared, ThreadKey, ThreadRef, ThreadResources,
 };
-use super::operations::KernelFailpoint;
+use super::operations::{KernelFailpoint, TaskGraphReservation};
 
 struct ExecReservation {
     kernel: Arc<Kernel>,
@@ -40,7 +40,12 @@ impl Drop for ExecReservation {
             return;
         }
         let mut state = self.kernel.registry().settled().write();
-        if state.reservations.get(&self.task.id) == Some(&self.transaction) {
+        if state
+            .reservations
+            .get(&self.task.id)
+            .map(TaskGraphReservation::transaction)
+            == Some(self.transaction)
+        {
             state.reservations.remove(&self.task.id);
         }
     }
@@ -296,7 +301,10 @@ impl Kernel {
             if state.reservations.contains_key(&binding.task_id()) {
                 return Err(ExecError::TaskBusy);
             }
-            state.reservations.insert(binding.task_id(), transaction);
+            state.reservations.insert(
+                binding.task_id(),
+                TaskGraphReservation::exclusive(transaction),
+            );
             KernelContext::from_parts(self.clone(), task, thread, shared, resources, revision)
         };
         let prepared = self.prepare_exec_after_reservation(
@@ -361,9 +369,10 @@ impl Kernel {
             if state.reservations.contains_key(&context.task.key().id) {
                 return Err(ExecError::TaskBusy);
             }
-            state
-                .reservations
-                .insert(context.task.key().id, transaction);
+            state.reservations.insert(
+                context.task.key().id,
+                TaskGraphReservation::exclusive(transaction),
+            );
             revision
         };
         self.prepare_exec_after_reservation(
@@ -502,7 +511,12 @@ impl Kernel {
         let leader_tid = LinuxTid::for_task_leader(prepared.task.id);
         let (task, revision) = {
             let state = self.registry().settled().write();
-            if state.reservations.get(&prepared.task.id) != Some(&transaction) {
+            if state
+                .reservations
+                .get(&prepared.task.id)
+                .map(TaskGraphReservation::transaction)
+                != Some(transaction)
+            {
                 return Err(ExecError::ReservationLost);
             }
             let record = state
@@ -549,8 +563,11 @@ impl Kernel {
 
         let mut state = self.registry().settled().write();
         debug_assert_eq!(
-            state.reservations.get(&prepared.task.id),
-            Some(&transaction)
+            state
+                .reservations
+                .get(&prepared.task.id)
+                .map(TaskGraphReservation::transaction),
+            Some(transaction)
         );
         let super::core::RegistryState {
             tasks,
