@@ -7,7 +7,7 @@
     "description_backing": 26,
     "epoll": 522,
     "stream": 176,
-    "mapping": 1663,
+    "mapping": 1662,
     "lifecycle": 34
   },
   "production_counts": {
@@ -16,7 +16,7 @@
     "description_backing": 10,
     "epoll": 223,
     "stream": 120,
-    "mapping": 1049,
+    "mapping": 1048,
     "lifecycle": 16
   },
   "files": {
@@ -23901,7 +23901,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 6777,
+      "line": 6921,
       "categories": [
         "mapping"
       ],
@@ -23910,7 +23910,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 6785,
+      "line": 6929,
       "categories": [
         "mapping"
       ],
@@ -23919,7 +23919,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/binding.rs",
-      "line": 6801,
+      "line": 6945,
       "categories": [
         "mapping"
       ],
@@ -24684,7 +24684,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3369,
+      "line": 3352,
       "categories": [
         "mapping"
       ],
@@ -24693,7 +24693,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3371,
+      "line": 3354,
       "categories": [
         "mapping"
       ],
@@ -24702,7 +24702,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3379,
+      "line": 3362,
       "categories": [
         "mapping"
       ],
@@ -24711,7 +24711,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3391,
+      "line": 3374,
       "categories": [
         "mapping"
       ],
@@ -24720,7 +24720,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3395,
+      "line": 3378,
       "categories": [
         "mapping"
       ],
@@ -24729,7 +24729,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/mod.rs",
-      "line": 3398,
+      "line": 3381,
       "categories": [
         "mapping"
       ],
@@ -24917,17 +24917,8 @@
       "scope_kind": "production_callsite"
     },
     {
-      "file": "crates/carrick-runtime/src/vcpu_loop/threads.rs",
-      "line": 259,
-      "categories": [
-        "mapping"
-      ],
-      "text": "if detail.starts_with(\"HVPatch sparse mmap backing:\") =>",
-      "scope_kind": "production_callsite"
-    },
-    {
       "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
-      "line": 1163,
+      "line": 1271,
       "categories": [
         "epoll"
       ],
@@ -24936,7 +24927,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
-      "line": 1277,
+      "line": 1385,
       "categories": [
         "epoll"
       ],
@@ -24945,7 +24936,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/zone.rs",
-      "line": 1850,
+      "line": 1968,
       "categories": [
         "epoll"
       ],
