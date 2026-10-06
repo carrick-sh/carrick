@@ -201,9 +201,10 @@ pub fn decide_anonymous_syscall(
         SYS_BRK => model.brk(frame.x[0]),
         SYS_MMAP => {
             let flags = frame.x[3];
-            let supported = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_FIXED_NOREPLACE;
+            let supported =
+                MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_FIXED_NOREPLACE | MAP_STACK;
             if flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED) != MAP_ANONYMOUS | MAP_PRIVATE
-                || flags & (MAP_GROWSDOWN | MAP_STACK | MAP_HUGETLB) != 0
+                || flags & (MAP_GROWSDOWN | MAP_HUGETLB) != 0
                 || flags & !supported != 0
             {
                 return ReservationDisposition::Forward;
@@ -1495,6 +1496,28 @@ mod tests {
             );
             assert_eq!(route, DelegatedAnonymous::Forward);
             assert!(editor.calls.is_empty());
+        }
+
+        #[test]
+        fn map_stack_uses_the_admitted_anonymous_root() {
+            let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
+            let task = mm(&spaces, &table, 17, true);
+            let mut editor = Editor::over(RangeBacking::Empty);
+            let (route, address) = syscall(
+                &task,
+                &spaces,
+                &table,
+                &counters,
+                &mut editor,
+                SYS_MMAP,
+                [0, 0x21000, RW, ANON | MAP_STACK, u64::MAX, 0],
+            );
+            assert_eq!(route, DelegatedAnonymous::Served);
+            let mapping = root(&spaces, &table, &task)
+                .mapping(address as u64)
+                .expect("thread stack belongs to the guest anonymous root");
+            assert!(mapping.anonymous);
+            assert_eq!(mapping.protection, ReservationProtection::READ_WRITE);
         }
 
         #[test]
