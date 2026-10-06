@@ -947,6 +947,7 @@ pub(crate) struct ThreadRuntimeState<E: ThreadedEngine> {
     /// An IPC operation this boundary's handback left waiting: the syscall
     /// service parks the thread on its object queue ([`zone`]).
     pub(super) pending_ipc_park: Option<zone::IpcPark>,
+    pub(super) pending_ipc_memory: Option<zone::IpcMemoryPark>,
     #[cfg(test)]
     pub(in crate::vcpu_loop) exec_terminal_context_failpoint:
         Option<exec::ExecTerminalContextFailpoint>,
@@ -1040,6 +1041,7 @@ where
             service_kernel_context: None,
             zone_mm: None,
             pending_ipc_park: None,
+            pending_ipc_memory: None,
             #[cfg(test)]
             exec_terminal_context_failpoint: None,
             #[cfg(test)]
@@ -1549,6 +1551,10 @@ where
             )? {
                 zone::IpcHandbackRoute::Complete(outcome) => ipc_prepared = Some(outcome),
                 zone::IpcHandbackRoute::Restart => {}
+                zone::IpcHandbackRoute::Memory(park) => {
+                    self.pending_ipc_memory = Some(park);
+                    ipc_prepared = Some(DispatchOutcome::Returned { value: 0 });
+                }
                 zone::IpcHandbackRoute::Park(park) => {
                     self.pending_ipc_park = Some(park);
                     // Placeholder: the service parks instead of completing.

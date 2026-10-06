@@ -280,6 +280,16 @@ pub(super) enum HvpatchProductionPhase {
     /// The semantic owner notification retains a fault, with the ordinary
     /// saved CPU and no syscall completion or zone CPU substitution.
     ResumeFaultOwner,
+    ResumeIpcOwner {
+        boundary: zone::IpcBoundary,
+        token: carrick_kernel::kernel::continuation::ipc::OwnedIpcOperation,
+    },
+    ResumeIpcPhysical {
+        boundary: zone::IpcBoundary,
+        token: carrick_kernel::kernel::continuation::ipc::OwnedIpcOperation,
+        wait: carrick_guest_mem::OwnedMemoryWait,
+        _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
+    },
     ExecSiblingDrain {
         context: carrick_kernel::kernel::KernelContext,
         owner: Box<exec::PreparedExecveDrain>,
@@ -440,6 +450,8 @@ impl HvpatchProductionPhase {
             Self::TerminalMemoryRetry { .. } => 21,
             Self::ResumeFaultPhysical { .. } => 22,
             Self::ResumeFaultOwner => 23,
+            Self::ResumeIpcOwner { .. } => 24,
+            Self::ResumeIpcPhysical { .. } => 25,
         }
     }
 }
@@ -4229,6 +4241,32 @@ where
                 HvpatchProductionPhase::ResumeFaultOwner => {
                     return self.resume_owner_fault_zone(engine, control);
                 }
+                HvpatchProductionPhase::ResumeIpcOwner { boundary, token } => {
+                    return self.resume_ipc_owner(engine, control, boundary, token);
+                }
+                HvpatchProductionPhase::ResumeIpcPhysical {
+                    boundary,
+                    token,
+                    wait,
+                    _subscription,
+                } => {
+                    if !wait.0.is_ready() {
+                        self.phase = HvpatchProductionPhase::ResumeIpcPhysical {
+                            boundary,
+                            token,
+                            wait,
+                            _subscription,
+                        };
+                        return Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::Blocked(
+                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                            ),
+                        ));
+                    }
+                    drop(_subscription);
+                    return self.continue_ipc_memory(engine, control, boundary, token);
+                }
                 HvpatchProductionPhase::ResumeOwnerPhysical {
                     frame,
                     wait,
@@ -5192,6 +5230,9 @@ where
         }
         if let Some(park) = self.state.pending_ipc_park.take() {
             return self.ipc_park(engine, control, frame, park);
+        }
+        if let Some(park) = self.state.pending_ipc_memory.take() {
+            return self.ipc_memory_park(engine, control, zone::IpcBoundary::Syscall(frame), park);
         }
         self.service_outcome(engine, control, frame, outcome)
     }
