@@ -1,9 +1,9 @@
 //! Linux decoding and dispatch at the shared native-entry seam.
-use carrick_core_abi::EntryCompletion;
+pub use crate::abi::entry::{CanonicalCall, CanonicalOrdinal, SyscallResult};
 pub use carrick_core_abi::ExecutionBinding;
-use carrick_guest_arch::{CanonicalCall, CanonicalOrdinal, GuestIsa, NativeOrdinal, UserVa};
-
-pub use carrick_guest_arch::SyscallResult;
+use carrick_guest_arch::{
+    GuestIsa, NativeAbi, NativeEntrySnapshot, NativeOrdinal, UserVa, X86Register, X86Registers,
+};
 
 pub const SYS_SET_ROBUST_LIST: usize = 99;
 pub const EINVAL: i64 = -22;
@@ -23,17 +23,47 @@ pub fn decode_x86_64(native: u64, args: [u64; 6], stack: u64) -> CanonicalCall {
     }
 }
 
+/// Decode Linux registers from the full native snapshot, refusing an ISA or
+/// entry-profile mismatch before dispatch or any family effect.
+pub fn decode_x86_snapshot<F: X86Registers>(
+    snapshot: NativeEntrySnapshot<'_, F>,
+) -> Option<CanonicalCall> {
+    if snapshot.isa != GuestIsa::X86_64 || snapshot.abi != NativeAbi::X86_64Syscall {
+        return None;
+    }
+    let frame = snapshot.frame;
+    Some(decode_x86_64(
+        frame.read(X86Register::Rax),
+        [
+            frame.read(X86Register::Rdi),
+            frame.read(X86Register::Rsi),
+            frame.read(X86Register::Rdx),
+            frame.read(X86Register::R10),
+            frame.read(X86Register::R8),
+            frame.read(X86Register::R9),
+        ],
+        frame.read(X86Register::Rsp),
+    ))
+}
+
+/// The native ARM adapter extracts x8 and supplies Linux's six ABI register
+/// arguments. The ordinal is interpreted here, never by the hardware trait.
+pub fn decode_aarch64(native: u64, args: [u64; 6], stack: u64) -> CanonicalCall {
+    CanonicalCall {
+        isa: GuestIsa::Aarch64,
+        canonical: CanonicalOrdinal::new(native),
+        native: NativeOrdinal::new(native),
+        args,
+        stack: UserVa::new(stack),
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum EntryOutcome {
-    Served {
-        result: SyscallResult,
-        completion: EntryCompletion,
-    },
-    ServedWithWork {
-        result: SyscallResult,
-        completion: EntryCompletion,
-    },
+    Served { result: SyscallResult },
+    ServedWithWork { result: SyscallResult },
     Forward,
+    InvalidCompletion,
 }
 
 pub trait LinuxEntryVenue {
@@ -50,7 +80,10 @@ struct CommonFamilies<'a> {
     args: [u64; 6],
     result: Option<i64>,
 }
-impl crate::dispatch::PendingFamilies for CommonFamilies<'_> {
+impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
+    fn binding(&self) -> Option<ExecutionBinding> {
+        Some(self.venue.binding())
+    }
     fn lifecycle(&mut self, ordinal: u64) -> crate::dispatch::FamilyCompletion {
         if ordinal != SYS_SET_ROBUST_LIST as u64 {
             return crate::dispatch::FamilyCompletion::Forward;
@@ -79,11 +112,7 @@ impl crate::dispatch::PendingFamilies for CommonFamilies<'_> {
 }
 
 pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome {
-    let Ok(nr) = usize::try_from(call.canonical.raw()) else {
-        return EntryOutcome::Forward;
-    };
-    let Some(completion) = carrick_core::entry::admit(venue.binding()) else {
-        venue.record_forwarded(nr);
+    let Ok(_) = usize::try_from(call.canonical.raw()) else {
         return EntryOutcome::Forward;
     };
     let mut pending = CommonFamilies {
@@ -92,15 +121,16 @@ pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome 
         result: None,
     };
     let route = crate::dispatch::dispatch(call.canonical.raw(), u64::MAX, &mut pending);
+    if route == crate::dispatch::CompletionRoute::InvalidCompletion {
+        return EntryOutcome::InvalidCompletion;
+    }
     let Some(result) = pending.result else {
         return EntryOutcome::Forward;
     };
     let result = SyscallResult::new(result);
     match route {
-        crate::dispatch::CompletionRoute::Served => EntryOutcome::Served { result, completion },
-        crate::dispatch::CompletionRoute::WithWork => {
-            EntryOutcome::ServedWithWork { result, completion }
-        }
+        crate::dispatch::CompletionRoute::Served => EntryOutcome::Served { result },
+        crate::dispatch::CompletionRoute::WithWork => EntryOutcome::ServedWithWork { result },
         _ => EntryOutcome::Forward,
     }
 }

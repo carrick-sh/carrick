@@ -74,9 +74,11 @@ fn admit(table: &SharedReservations, spaces: &AddressSpaces, key: u64, unrelated
     spaces.open(index);
     assert!(table.admitted(index.index(), key));
     let task = CurrentTask::new();
-    task.task_id.store(key.raw() + 100, Ordering::Relaxed);
-    task.thread_serial.store(1, Ordering::Relaxed);
-    task.zone_mm.store(key.raw(), Ordering::Relaxed);
+    task.execution
+        .task
+        .store(key.raw() + 100, Ordering::Relaxed);
+    task.mm.thread_generation.store(1, Ordering::Relaxed);
+    task.mm.key.store(key.raw(), Ordering::Relaxed);
     Mm {
         task,
         key,

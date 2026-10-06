@@ -1,8 +1,6 @@
 //! Native CPL0 frame and boundary-control transport, shared by the thin image
 //! and its KVM bootstrap. No Linux syscall algorithm lives in this adapter.
-use carrick_guest_arch::CanonicalCall;
-#[cfg(test)]
-use carrick_guest_arch::GuestIsa;
+use carrick_guest_arch::{GuestIsa, NativeAbi, NativeEntrySnapshot, X86Register, X86Registers};
 use core::sync::atomic::{AtomicU32, AtomicU64};
 
 pub const FORWARD_PORT: u16 = 0xc5;
@@ -39,12 +37,12 @@ const _: () = assert!(core::mem::size_of::<NativeFrame>() == 128);
 const _: () = assert!(core::mem::offset_of!(NativeFrame, rax) == 96);
 
 impl NativeFrame {
-    pub fn decode(&self) -> CanonicalCall {
-        carrick_personality_linux::entry::decode_x86_64(
-            self.rax,
-            [self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9],
-            self.rsp,
-        )
+    pub fn snapshot(&self) -> NativeEntrySnapshot<'_, Self> {
+        NativeEntrySnapshot {
+            isa: GuestIsa::X86_64,
+            abi: NativeAbi::X86_64Syscall,
+            frame: self,
+        }
     }
 
     /// IRETQ handles all admitted returns, including TF/RF. Reject privileged
@@ -56,6 +54,29 @@ impl NativeFrame {
             && self.rsp < (1 << 47)
             && self.r11 & 2 != 0
             && self.r11 & ((3 << 12) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20)) == 0
+    }
+}
+
+impl X86Registers for NativeFrame {
+    fn read(&self, register: X86Register) -> u64 {
+        match register {
+            X86Register::Rax => self.rax,
+            X86Register::Rbx => self.rbx,
+            X86Register::Rcx => self.rcx,
+            X86Register::Rdx => self.rdx,
+            X86Register::Rsi => self.rsi,
+            X86Register::Rdi => self.rdi,
+            X86Register::Rbp => self.rbp,
+            X86Register::Rsp => self.rsp,
+            X86Register::R8 => self.r8,
+            X86Register::R9 => self.r9,
+            X86Register::R10 => self.r10,
+            X86Register::R11 => self.r11,
+            X86Register::R12 => self.r12,
+            X86Register::R13 => self.r13,
+            X86Register::R14 => self.r14,
+            X86Register::R15 => self.r15,
+        }
     }
 }
 
@@ -82,7 +103,11 @@ const _: () = assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
+    fn decode(frame: &NativeFrame) -> carrick_personality_linux::entry::CanonicalCall {
+        carrick_personality_linux::entry::decode_x86_snapshot(frame.snapshot()).unwrap()
+    }
     #[test]
     fn native_entry_keeps_full_width_opaque_head() {
         for head in [0, 0x0000_1234_0000_a000, 0x8000_5678_0000_a000, u64::MAX] {
@@ -92,7 +117,7 @@ mod tests {
                 rsi: 24,
                 ..Default::default()
             };
-            assert_eq!(frame.decode().args[0], head, "opaque head {head:#018x}");
+            assert_eq!(decode(&frame).args[0], head, "opaque head {head:#018x}");
         }
     }
 
@@ -104,7 +129,7 @@ mod tests {
             rsi: 0x1_0000_0018,
             ..Default::default()
         };
-        assert_eq!(frame.decode().args[1], 0x1_0000_0018);
+        assert_eq!(decode(&frame).args[1], 0x1_0000_0018);
     }
 
     #[test]
@@ -120,14 +145,14 @@ mod tests {
             rsp: 0x31fe8,
             ..Default::default()
         };
-        let call = frame.decode();
+        let call = decode(&frame);
         assert_eq!(call.isa, GuestIsa::X86_64);
         assert_eq!(call.native.raw(), 273);
         assert_eq!(call.canonical.raw(), 99);
         assert_eq!(call.args, [1, 24, 3, 4, 5, 6]);
         assert_eq!(call.stack.raw(), frame.rsp);
         assert_eq!(
-            NativeFrame { rax: 99, ..frame }.decode().canonical.raw(),
+            decode(&NativeFrame { rax: 99, ..frame }).canonical.raw(),
             u64::MAX
         );
     }

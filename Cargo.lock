@@ -495,6 +495,7 @@ dependencies = [
  "carrick-fd-core",
  "carrick-inotify-core",
  "carrick-mmu-core",
+ "carrick-personality-linux",
  "carrick-pipe-core",
  "carrick-sched-core",
 ]
@@ -820,6 +821,7 @@ dependencies = [
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-guest-arch",
+ "carrick-x86",
 ]
 
 [[package]]
