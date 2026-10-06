@@ -1933,6 +1933,40 @@ impl Cpl0Carrier {
         Ok(())
     }
 
+    /// Measure remaining record capacity using owned allocations while stopped.
+    /// Every temporary record is returned before guest execution resumes.
+    pub fn lifecycle_record_capacity(&self) -> Result<usize, TrapError> {
+        use carrick_sched_core::{ThreadIdentity, ZoneTables};
+        // SAFETY: boot_lifecycle owns initialized aligned retained zone RAM;
+        // all guest CPUs are stopped during this diagnostic.
+        let zone = unsafe {
+            &*self
+                .ram
+                .host_ptr(0x100_0000, size_of::<ZoneTables>())
+                .ok_or_else(|| fail("lifecycle zone"))?
+                .cast::<ZoneTables>()
+        };
+        let identity = ThreadIdentity {
+            tid: 1001,
+            serial: 1,
+            mm: 1001,
+            file_table: 1,
+            generation: 1,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        let mut records = Vec::new();
+        while let Ok(record) = zone.alloc_record(identity) {
+            records.push(record);
+        }
+        let capacity = records.len();
+        for record in records {
+            zone.free_record(record);
+        }
+        Ok(capacity)
+    }
+
     /// Break only the stopped fault-policy counters venue to force a nested
     /// supervisor #PF after the next user fault acquired per-CPU custody.
     pub fn invalidate_user_fault_counters_venue(&mut self) -> Result<(), TrapError> {

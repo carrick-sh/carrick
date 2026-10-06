@@ -51,6 +51,41 @@ fn committed<T>(value: Option<T>, reason: LifecycleInvariant) -> T {
 
 const CHILD_WAIT_KEY: u64 = 0x5_0300;
 
+/// A fresh host-loaded home record remains private until park publication.
+/// Refusal returns that allocation; a switched-in record remains its owner's.
+#[cfg(target_os = "none")]
+struct PendingWaitRecord<'a> {
+    zone: &'a ZoneTables,
+    slot: SlotId,
+    record: carrick_sched_core::RecordId,
+    unpublished: bool,
+}
+#[cfg(target_os = "none")]
+impl<'a> PendingWaitRecord<'a> {
+    fn acquire(zone: &'a ZoneTables, slot: SlotId, identity: ThreadIdentity) -> Option<Self> {
+        let unpublished = zone.slot(slot).current().is_none();
+        let record = zone.current_or_new(slot, identity).ok()?;
+        Some(Self {
+            zone,
+            slot,
+            record,
+            unpublished,
+        })
+    }
+
+    fn published(mut self) {
+        self.unpublished = false;
+    }
+}
+#[cfg(target_os = "none")]
+impl Drop for PendingWaitRecord<'_> {
+    fn drop(&mut self) {
+        if self.unpublished {
+            self.zone.discard_unpublished(self.slot, self.record);
+        }
+    }
+}
+
 /// Owned exclusion for child exit publication and wait enrollment. The
 /// constructor is the only way to acquire this exact MM's child-wait bucket.
 pub struct ChildWaitGuard<'a> {
@@ -758,13 +793,11 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             outputs.complete(child);
             return returned(child_pid as i64);
         }
-        let Some(record) = self
-            .zone
-            .current_or_new(self.lane.slot, self.lane.parent)
-            .ok()
+        let Some(pending) = PendingWaitRecord::acquire(self.zone, self.lane.slot, self.lane.parent)
         else {
             return returned(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
         };
+        let record = pending.record;
         let child_index = committed(
             u32::try_from(child_pid).ok(),
             LifecycleInvariant::WaitEnrollment,
@@ -772,10 +805,11 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         let reference = self.zone.record_ref(record);
         let mut xsave = XsaveArea::ZERO;
         save_extended(&mut xsave);
-        self.frame.rax = child_pid;
-        self.lane.contexts[0] = NativeBirthContext {
+        let mut saved_frame = *self.frame;
+        saved_frame.rax = child_pid;
+        let context = NativeBirthContext {
             record: Some(reference),
-            frame: *self.frame,
+            frame: saved_frame,
             fs_base: read_tls(NativeTlsRegister::Fs),
             gs_base: read_tls(NativeTlsRegister::UserGs),
             xsave,
@@ -794,6 +828,8 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         if guard.enroll(record, seq, child_index).is_err() {
             return returned(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
         }
+        self.frame.rax = child_pid;
+        self.lane.contexts[0] = context;
         process::publish_wait_outputs(outputs);
         self.handoff = Some(committed(
             carrick_core::entry::publish_handoff_park(
@@ -803,6 +839,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             ),
             LifecycleInvariant::WaitPublication,
         ));
+        pending.published();
         self.zone.clear_current(self.lane.slot);
         drop(guard);
         let progress = committed(self.switch_next(), LifecycleInvariant::WaitSwitch);
