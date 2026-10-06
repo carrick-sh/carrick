@@ -11,6 +11,17 @@ scale_points = [1, 8, 32, 128]
 rationale = "Requeue operations must move waiters between queues with work proportional to the moved waiter set and bounded lock acquisitions."
 
 [bindings]
+# Supplemental VM-free witness for the shared wait/park path in
+# crates/carrick-thread/src/thread.rs:
+# carrick-thread::thread::tests::futex_halt_poll_nonzero_delays_parking_until_window_expires
+# uses FutexParkHooks through FutexTable::wait_prepared_with_poll_clock to
+# control only the halt-poll clock and observe parking registration. It proves
+# no parked waiter before the exact nonzero-window deadline and exactly one
+# registration followed by one counted wake at expiry, without host sleep or
+# an elapsed-time threshold. Production still supplies Instant::now.
+# It does not perform requeue or prove CMP_REQUEUE comparison, waiter movement,
+# batch wake cardinality, queue-work scaling, guest execution, or Docker runtime
+# ratios; those remain obligations of the requeue bindings below.
 vm_free = "carrick-kernel-example::futex_requeue_contract"
 embed = "carrick-embed::futex_requeue_contract"
 docker = "probe:futexrequeue"
