@@ -51,6 +51,8 @@ mod service_copy;
 pub use service_copy::*;
 mod internal_read;
 pub use internal_read::*;
+mod kernel_fault_venues;
+pub use kernel_fault_venues::*;
 
 use core::cell::UnsafeCell;
 
