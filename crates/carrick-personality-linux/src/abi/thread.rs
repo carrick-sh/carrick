@@ -1338,3 +1338,143 @@ mod tests {
         assert_eq!(lost, 0, "lost pending observations in {ROUNDS} rounds");
     }
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn pool_entry() {
+        assert_eq!((size_of::<PoolEntry>(), align_of::<PoolEntry>()), (80, 16));
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |PoolEntry {
+                     state: _,
+                     tid: _,
+                     visible_tid: _,
+                     thread_serial: _,
+                     uid_credit: _,
+                     caller_task: _,
+                     caller_serial: _,
+                     clone_flags: _,
+                     clear_child_tid: _,
+                     blocked: _,
+                 }: PoolEntry| {};
+        field!(PoolEntry, state, AtomicEntry, 0, 8, 8);
+        field!(PoolEntry, tid, AtomicU32, 8, 4, 4);
+        field!(PoolEntry, visible_tid, AtomicU32, 12, 4, 4);
+        field!(PoolEntry, thread_serial, AtomicU64, 16, 8, 8);
+        field!(PoolEntry, uid_credit, AtomicU64, 24, 8, 8);
+        field!(PoolEntry, caller_task, AtomicU64, 32, 8, 8);
+        field!(PoolEntry, caller_serial, AtomicU64, 40, 8, 8);
+        field!(PoolEntry, clone_flags, AtomicU64, 48, 8, 8);
+        field!(PoolEntry, clear_child_tid, AtomicU64, 56, 8, 8);
+        field!(PoolEntry, blocked, AtomicU64, 64, 8, 8);
+    }
+
+    #[test]
+    fn thread_control_slot() {
+        assert_eq!(
+            (
+                size_of::<ThreadControlSlot>(),
+                align_of::<ThreadControlSlot>()
+            ),
+            (128, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |ThreadControlSlot {
+                     visible_tid: _,
+                     blocked: _,
+                     alt_seq: _,
+                     alt_sp: _,
+                     alt_size: _,
+                     alt_flags: _,
+                     robust_len: _,
+                     robust_head: _,
+                     clear_child_tid: _,
+                     entry: _,
+                     pending: _,
+                     zone_seq: _,
+                     zone_incarnation: _,
+                     zone_id: _,
+                 }: ThreadControlSlot| {};
+        field!(ThreadControlSlot, visible_tid, AtomicU32, 0, 4, 4);
+        field!(ThreadControlSlot, blocked, AtomicU64, 8, 8, 8);
+        field!(ThreadControlSlot, alt_seq, AtomicU64, 16, 8, 8);
+        field!(ThreadControlSlot, alt_sp, AtomicU64, 24, 8, 8);
+        field!(ThreadControlSlot, alt_size, AtomicU64, 32, 8, 8);
+        field!(ThreadControlSlot, alt_flags, AtomicU32, 40, 4, 4);
+        field!(ThreadControlSlot, robust_len, AtomicU32, 44, 4, 4);
+        field!(ThreadControlSlot, robust_head, AtomicU64, 48, 8, 8);
+        field!(ThreadControlSlot, clear_child_tid, AtomicU64, 56, 8, 8);
+        field!(ThreadControlSlot, entry, AtomicU64, 64, 8, 8);
+        field!(ThreadControlSlot, pending, PendingSummary, 72, 8, 8);
+        field!(ThreadControlSlot, zone_seq, AtomicU64, 80, 8, 8);
+        field!(ThreadControlSlot, zone_incarnation, AtomicU64, 88, 8, 8);
+        field!(ThreadControlSlot, zone_id, AtomicU32, 96, 4, 4);
+    }
+
+    #[test]
+    fn thread_lifecycle_page() {
+        assert_eq!(
+            (
+                size_of::<ThreadLifecyclePage>(),
+                align_of::<ThreadLifecyclePage>()
+            ),
+            (4096, 4096)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |ThreadLifecyclePage {
+                     gate: _,
+                     live: _,
+                     pending: _,
+                     entries: _,
+                     serving: _,
+                     ledger_host: _,
+                     ledger_guest: _,
+                     controls: _,
+                 }: ThreadLifecyclePage| {};
+        field!(ThreadLifecyclePage, gate, AtomicU32, 0, 4, 4);
+        field!(ThreadLifecyclePage, live, AtomicU32, 4, 4, 4);
+        field!(ThreadLifecyclePage, pending, PendingSummary, 8, 8, 8);
+        field!(
+            ThreadLifecyclePage,
+            entries,
+            [PoolEntry; THREAD_POOL_ENTRIES],
+            16,
+            640,
+            16
+        );
+        field!(ThreadLifecyclePage, serving, AtomicU32, 656, 4, 4);
+        field!(ThreadLifecyclePage, ledger_host, AtomicU64, 664, 8, 8);
+        field!(ThreadLifecyclePage, ledger_guest, AtomicU64, 672, 8, 8);
+        field!(
+            ThreadLifecyclePage,
+            controls,
+            [AtomicU64; THREAD_POOL_ENTRIES],
+            680,
+            64,
+            8
+        );
+    }
+}
