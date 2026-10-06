@@ -270,7 +270,16 @@ fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser)
         user: &HardwareUserWord,
         counters: &w.counters,
     };
-    serve(frame, &w.counters, task, Some(sched), &*w.venue, user).map(|result| {
+    let carrick_personality_linux::dispatch::Family::Lifecycle(call) =
+        carrick_personality_linux::dispatch::route_aarch64(frame.x[8], u64::MAX)
+    else {
+        return None;
+    };
+    invoke(call, frame, &w.counters, task, Some(sched), &*w.venue, user).map(|outcome| {
+        let result = carrick_personality_linux::pending_lifecycle::lifecycle_effect(&outcome);
+        if let LifecycleOutcome::Returned { result, .. } = outcome {
+            frame.x[0] = result.raw() as u64;
+        }
         use carrick_personality_linux::dispatch::{CompletionRoute, completion_route};
         match completion_route(result, task.linux.has_pending_host_work()) {
             CompletionRoute::Served => Action::Served,

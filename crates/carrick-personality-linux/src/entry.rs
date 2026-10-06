@@ -110,21 +110,27 @@ impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
     fn binding(&self) -> Option<ExecutionBinding> {
         Some(self.venue.binding())
     }
-    fn lifecycle(&mut self, ordinal: u64) -> crate::dispatch::FamilyCompletion {
-        if ordinal != SYS_SET_ROBUST_LIST as u64 {
-            return crate::dispatch::FamilyCompletion::Forward;
+    fn lifecycle(
+        &mut self,
+        call: crate::pending_lifecycle::LifecycleCall,
+    ) -> Option<crate::pending_lifecycle::LifecycleOutcome> {
+        if call != crate::pending_lifecycle::LifecycleCall::SetRobustList {
+            return None;
         }
-        self.result = self.venue.set_robust_list(self.args[0], self.args[1]);
-        if self.result.is_some() {
-            self.venue
-                .task_state()
-                .orig_arg0
-                .store(self.args[0], core::sync::atomic::Ordering::Relaxed);
-        }
-        self.result.map_or(
-            crate::dispatch::FamilyCompletion::Forward,
-            crate::dispatch::FamilyCompletion::Complete,
-        )
+        let result = self.venue.set_robust_list(self.args[0], self.args[1])?;
+        Some(crate::pending_lifecycle::LifecycleOutcome::Returned {
+            result: SyscallResult::new(result),
+            work: false,
+        })
+    }
+    fn original_argument0(&self) -> u64 {
+        self.args[0]
+    }
+    fn install_result(&mut self, result: SyscallResult) {
+        self.result = Some(result.raw());
+    }
+    fn task_state(&self) -> Option<&crate::abi::entry::LinuxTaskState> {
+        Some(self.venue.task_state())
     }
     fn lifecycle_available(&self) -> bool {
         true
