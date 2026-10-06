@@ -9,21 +9,30 @@ use carrick_guest_arch::{
 pub const SYS_SET_ROBUST_LIST: usize = 99;
 pub const EINVAL: i64 = -22;
 
+#[cfg(test)]
+mod decode_tests {
+    use super::decode_x86_64;
+
+    #[test]
+    fn ordinary_x86_file_call_uses_canonical_family_ordinal() {
+        let call = decode_x86_64(0, [7, 0x1000, 8, 0, 0, 0], 0x8000);
+        assert_eq!(call.canonical.raw(), 63); // read, served by the shared IPC/file family
+        assert_eq!(call.args, [7, 0x1000, 8, 0, 0, 0]);
+        assert_eq!(call.native.raw(), 0);
+    }
+}
+
 /// Decode the Linux x86_64 syscall ABI from a native register snapshot.
 pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCall {
-    let canonical = match native {
-        273 => SYS_SET_ROBUST_LIST as u64,
-        56 => {
-            args.swap(3, 4);
-            220
-        }
-        60 => 93,
-        186 => 178,
-        14 => 135,
-        131 => 132,
-        202 => 98,
-        _ => u64::MAX,
-    };
+    // clone's fourth and fifth native arguments are reversed relative to
+    // the canonical asm-generic order.
+    if native == 56 {
+        args.swap(3, 4);
+    }
+    let canonical = carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
+        carrick_syscall_abi::NativeNr(native),
+    )
+    .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw);
     CanonicalCall {
         isa: GuestIsa::X86_64,
         canonical: CanonicalOrdinal::new(canonical),
