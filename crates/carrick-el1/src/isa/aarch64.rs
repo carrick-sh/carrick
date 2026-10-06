@@ -46,12 +46,9 @@ impl ArchTypes for Aarch64Backend {
     type Context = ThreadCtx;
     type Root = RootGpa;
     type MmOwner = CurrentTask;
-    type OwnedTranslation = ();
-    type LeafEdit = ();
     type DrainTicket = ();
     type DrainReceipt = ();
     type UserTransfer = ();
-    type PublicationReceipt = ();
     type HardwareInterrupt = u32;
     type InterruptMask = hw::IrqGuard;
     type HostPayload = ();
@@ -143,28 +140,6 @@ impl MmuBackend for Aarch64Backend {
     fn install_context(&mut self, _context: AddressContext<RootGpa>) -> Result<(), Self::Error> {
         Err(ArchError::Unbound)
     }
-    fn translate_live(
-        &mut self,
-        _owner: &CurrentTask,
-        _address: UserVa,
-        _access: Access,
-    ) -> Result<(), Self::Error> {
-        Err(ArchError::Unbound)
-    }
-    fn prepare_leaf_edit(
-        &mut self,
-        _owner: &CurrentTask,
-        _range: UserRange,
-        _translation: (),
-    ) -> Result<(), Self::Error> {
-        Err(ArchError::Unbound)
-    }
-    fn apply_leaf_edit(&mut self, _edit: &mut ()) -> Result<(), Self::Error> {
-        Err(ArchError::Unbound)
-    }
-    fn undo_leaf_edit(&mut self, _edit: ()) -> Result<(), Self::Error> {
-        Err(ArchError::Unbound)
-    }
     fn request_invalidation(
         &mut self,
         _context: AddressContext<RootGpa>,
@@ -180,13 +155,6 @@ impl MmuBackend for Aarch64Backend {
         _transfer: &mut (),
         _limit: GuestLen,
     ) -> Result<CopyProgress, Self::Error> {
-        Err(ArchError::Unbound)
-    }
-    fn publish_executable(
-        &mut self,
-        _owner: &CurrentTask,
-        _range: UserRange,
-    ) -> Result<(), Self::Error> {
         Err(ArchError::Unbound)
     }
 }
