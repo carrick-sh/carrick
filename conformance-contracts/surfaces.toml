@@ -838,3 +838,23 @@ contracts = ["kernel.mm.user-va-ceiling"]
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem/anonymous.rs"
 contracts = ["kernel.mm.user-va-ceiling"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/isa/x86/context_words.rs"
+contracts = ["x86.context.tls-base"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/isa/x86/context.rs"
+contracts = ["x86.context.tls-base"]
+
+[[surfaces]]
+path = "crates/carrick-cli/tests/fixtures/x86_arch_prctl.S"
+contracts = ["x86.context.tls-base"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/thread.rs"
+contracts = ["kernel.el1.thread-lifecycle"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/tests/x86_wave2/lifecycle.rs"
+contracts = ["kernel.el1.thread-lifecycle"]

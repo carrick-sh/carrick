@@ -56,3 +56,45 @@ Final focused gate results and source revision are recorded in the draft PR.
 Linux worker scope excludes Docker and signed HVF acceptance; the director
 owns those higher-layer gates and full stacked-batch acceptance. This
 retirement does not claim full x86 conformance or production readiness.
+
+## TLS prerequisite found by the migration
+
+The migrated musl test first refused native syscall 158 (`arch_prctl`) on
+PR #81 head `6fade63a8`; native execution succeeded. Its replacement is in
+the shared kernel's x86 context leaf, classified through the same no_std
+syscall-table source used by `carrick-abi` and the guest personality.
+FS/GS SET edits the typed parked-context TLS projection and writes FS_BASE
+or the user KERNEL_GS_BASE before the same task resumes. GET uses the existing
+exact-task guarded copyout. CPL0's GS binding stays active during handling.
+
+The [arch_prctl manual](https://man7.org/linux/man-pages/man2/arch_prctl.2.html)
+and native Linux are the semantic authority. On this host, invalid GET
+pointers return errno 14, supervisor SET addresses return errno 1, and unknown
+operations return errno 22. Native CPUID GET returns 1 and SET returns errno
+19; the CPL0 lane keeps native CPUID enabled and lacks CPUID faulting.
+The live TLS fixture checks FS/GS loads and GETs, failed SET preservation,
+GET errno 14 and unknown errno 22, with exactly two host forwards (write and
+exit). The VM-free context edit was red before the leaf existed.
+
+The production initial lane still lacks `ZoneRecord` custody. Its private
+TLS projection never becomes a runnable scheduler context; full production
+scheduler custody remains an x86-run open item. This change does not invent
+another task-context registry.
+
+## Preserved red dependency
+
+With TLS implemented, the same musl fixture exposed native `set_tid_address`
+(218). The shared personality now registers the typed user pointer in the
+calling thread's existing lifecycle control slot and returns its Linux-visible
+TID. It authenticates a born-in-zone pool entry and incarnation separately
+from that visible TID. A VM-free red-first test registers after clone without
+`CLONE_CHILD_CLEARTID`, then exercises existing shared `serve_exit`: clear
+before one wake and retirement, with another MM untouched. The ARM entry
+routing remains unchanged.
+
+The migrated musl CLI test remains red at native `poll` (7). Production
+shared host-dispatch binding and real scheduler/futex exit custody are tracked
+dependencies on [PR #81's x86-run follow-up](https://github.com/carrick-sh/carrick/pull/81).
+The initial host exit refuses a registered clear-tid pointer until that
+custody exists; it never reports successful exit while omitting the clear.
+This retained test has no ignore, retry, timeout increase or reduced concurrency.

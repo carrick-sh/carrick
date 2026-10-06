@@ -117,3 +117,8 @@ mod lifecycle;
 fn x5_linux_clone_exit() {
     lifecycle::x5_linux_clone_exit();
 }
+
+#[test]
+fn registered_clear_tid_is_consumed_by_shared_exit() {
+    lifecycle::registered_clear_tid_is_consumed_by_shared_exit();
+}

@@ -347,6 +347,7 @@ dependencies = [
  "base64 0.22.1",
  "bollard",
  "camino",
+ "carrick-abi",
  "carrick-conformance-contract",
  "carrick-el1-abi",
  "carrick-embed",
@@ -829,6 +830,7 @@ dependencies = [
  "carrick-el1-abi",
  "carrick-guest-arch",
  "carrick-sched-core",
+ "carrick-syscall-abi",
  "carrick-signal-core",
  "carrick-x86",
 ]

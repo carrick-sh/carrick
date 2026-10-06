@@ -1,0 +1,28 @@
+schema_version = 1
+id = "x86.context.tls-base"
+title = "Native x86 arch_prctl edits only task-owned TLS bases"
+guest_surfaces = ["syscall:arch_prctl", "vmm:kvm"]
+semantic_authority = [
+  "arch_prctl(2): FS/GS setters take a base value; getters copy the task's base to an unsigned-long user pointer",
+  "Native Linux exact ELF checks effective FS/GS loads after syscall return, successful getters, bad getter pointer errno 14, supervisor base errno 1 with old TLS preserved, unknown operation errno 22",
+]
+fixture = "carrick-el1::x86_context_words_tests::tests::tls_base_edits_preserve_the_other_task_and_context; carrick-cli::x86_kvm_run::arch_prctl_tls_and_errno_match_native_linux_through_shared_kernel"
+scale_points = [1, 2]
+structural_budgets = []
+rationale = """
+The existing parked-context ABI carries FS/GS bases. One typed context edit
+changes only the requested base and preserves the other task and all unrelated
+context bytes. The x86 hardware leaf applies it to FS_BASE or KERNEL_GS_BASE
+while SWAPGS retains CPL0's active GS binding. No host PTE or TLS edit occurs.
+The live fixture requires exactly two host forwards: stdout write and exit.
+The initial production lane does not yet have ZoneRecord custody; its private
+TLS projection is not a runnable saved context. Full scheduler binding remains
+an x86-run follow-up rather than a second task-context store here.
+"""
+
+[bindings]
+vm_free = "carrick-el1::x86_context_words_tests::tests::tls_base_edits_preserve_the_other_task_and_context"
+
+[bindings.unresolved]
+embed_structural = "KVM CLI execution supplies the milestone hardware binding; signed HVF is unavailable on this Linux worker."
+docker = "Native x86_64 Linux execution of the exact static ELF is the authorized oracle; Docker is director-owned."

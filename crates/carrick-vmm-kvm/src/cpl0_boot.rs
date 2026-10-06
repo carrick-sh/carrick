@@ -1038,7 +1038,14 @@ impl Cpl0Carrier {
                         stdio(fd, &bytes) as u64
                     };
                 }
-                60 | 231 => return Ok(((frame.rdi & 255) as i32, exits)),
+                60 | 231 => {
+                    if self.slot(0).clear_child_tid() != 0 {
+                        return Err(fail(
+                            "initial terminal clear-tid requires shared scheduler custody",
+                        ));
+                    }
+                    return Ok(((frame.rdi & 255) as i32, exits));
+                }
                 call => return Err(fail(format!("unported initial x86 syscall {call}"))),
             }
         }

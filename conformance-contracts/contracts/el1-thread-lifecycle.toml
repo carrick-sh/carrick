@@ -14,6 +14,7 @@ guest_surfaces = [
   "syscall:rt_sigqueueinfo",
   "syscall:sigaltstack",
   "syscall:set_robust_list",
+  "syscall:set_tid_address",
   "syscall:futex",
   "syscall:setrlimit",
   "syscall:ptrace",
@@ -23,6 +24,7 @@ guest_surfaces = [
   "vmm:hvf",
 ]
 semantic_authority = [
+  "man 2 set_tid_address: register the calling thread's clear_child_tid pointer without dereferencing it and return its Linux-visible TID; exit clears the registered word before one futex wake in the same MM",
   "man 2 clone: CLONE_PARENT_SETTID stores the child tid in the parent before clone returns, CLONE_CHILD_CLEARTID clears the word and wakes a futex when the child exits; the returned tid is valid for tgkill immediately",
   "man 2 gettid / man 2 tgkill / man 2 kill: a thread's tid is stable for its life; tgkill targets exactly that thread; kill with a thread's tid signals the thread group",
   "man 7 signal: a process-directed signal is delivered to exactly one thread that does not block it; a real-time signal queued with sigqueue is delivered once per send; changing the mask so a pending signal becomes unblocked delivers it",

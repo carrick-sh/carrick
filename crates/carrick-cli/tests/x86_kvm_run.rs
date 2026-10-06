@@ -7,7 +7,6 @@
 ))]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 
 use assert_cmd::Command;
@@ -97,14 +96,47 @@ fn kvm_available() -> bool {
     true
 }
 
-fn assert_shared_kernel_elf(bytes: &[u8], expected: &[u8], status: i32, run_id: &str) {
+fn assert_shared_kernel_elf(
+    bytes: &[u8],
+    expected: &[u8],
+    status: i32,
+    run_id: &str,
+) -> Option<u64> {
     if !kvm_available() {
-        return;
+        return None;
     }
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("hello");
-    std::fs::write(&elf, bytes).unwrap();
-    std::fs::set_permissions(&elf, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Writing executables in this multithreaded process lets another test's
+    // fork transiently inherit the writer fd, yielding ETXTBSY at exec even
+    // after our own close. An owned publisher process closes and exits before
+    // publication completes; guest tests retain their full concurrency.
+    let writer_source = dir.path().join("publish.rs");
+    let writer = dir.path().join("publish");
+    std::fs::write(&writer_source, include_str!("fixtures/publish_elf.rs")).unwrap();
+    let compiled = Command::new("rustc")
+        .timeout(Duration::from_secs(30))
+        .args(["--edition=2021", "-o"])
+        .arg(&writer)
+        .arg(&writer_source)
+        .output()
+        .expect("compile isolated executable publisher");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let published = Command::new(writer)
+        .timeout(Duration::from_secs(5))
+        .arg(&elf)
+        .write_stdin(bytes.to_vec())
+        .output()
+        .expect("publish executable in owned process");
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
     let native = Command::new(&elf)
         .timeout(Duration::from_secs(5))
         .output()
@@ -203,11 +235,12 @@ fn assert_shared_kernel_elf(bytes: &[u8], expected: &[u8], status: i32, run_id: 
             .as_u64()
             .is_some_and(|n| n >= 2)
     );
+    json["report"]["execution_witness"]["host_forwards"].as_u64()
 }
 
 #[test]
 fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
-    assert_shared_kernel_elf(&hello_elf(), b"hello\n", 7, "x86-kvm-hello-test");
+    let _ = assert_shared_kernel_elf(&hello_elf(), b"hello\n", 7, "x86-kvm-hello-test");
 }
 
 /// Migrated M2 coverage: compile the same Rust/std musl fixture rather than
@@ -249,10 +282,53 @@ fn musl_static_hello_runs_through_shared_kernel() {
         "musl fixture compile stderr: {}",
         String::from_utf8_lossy(&compile.stderr)
     );
-    assert_shared_kernel_elf(
+    let _ = assert_shared_kernel_elf(
         &std::fs::read(&executable).unwrap(),
         include_bytes!("../../carrick-vmm-bhyve/fixtures/hello-x86_64/oracle.expected"),
         0,
         "x86-kvm-musl-test",
+    );
+}
+
+#[test]
+fn arch_prctl_tls_and_errno_match_native_linux_through_shared_kernel() {
+    use carrick_abi::syscall_x86_64::{ARCH_PRCTL_X86_NR, ArchPrctlOperation};
+    if !kvm_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("tls.S");
+    let executable = dir.path().join("tls");
+    std::fs::write(&source, include_str!("fixtures/x86_arch_prctl.S")).unwrap();
+    let compile = Command::new("cc")
+        .timeout(Duration::from_secs(30))
+        .args(["-nostdlib", "-static", "-Wl,--build-id=none"])
+        .args([
+            format!("-DNR_ARCH_PRCTL={ARCH_PRCTL_X86_NR}"),
+            format!("-DSET_FS={}", ArchPrctlOperation::SetFs as u32),
+            format!("-DGET_FS={}", ArchPrctlOperation::GetFs as u32),
+            format!("-DSET_GS={}", ArchPrctlOperation::SetGs as u32),
+            format!("-DGET_GS={}", ArchPrctlOperation::GetGs as u32),
+        ])
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .expect("compile native TLS witness");
+    assert!(
+        compile.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let forwards = assert_shared_kernel_elf(
+        &std::fs::read(executable).unwrap(),
+        b"tls-ok\n",
+        0,
+        "x86-kvm-tls-test",
+    )
+    .unwrap();
+    assert_eq!(
+        forwards, 2,
+        "only stdout write and terminal exit cross to the host"
     );
 }

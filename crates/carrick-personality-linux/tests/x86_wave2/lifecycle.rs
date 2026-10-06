@@ -434,3 +434,57 @@ pub fn x5_linux_clone_exit() {
         }
     }
 }
+
+pub fn registered_clear_tid_is_consumed_by_shared_exit() {
+    for x86 in [false, true] {
+        let process = Process::new(7);
+        let peer = Process::new(8);
+        let mut turn = Turn::new(&process, x86);
+        process
+            .page
+            .stock(
+                0,
+                EntryIdentity {
+                    tid: 50,
+                    visible_tid: 7,
+                    thread_serial: 5050,
+                    uid_credit: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            turn.syscall(
+                220,
+                [
+                    FLAGS & !0x0020_0000,
+                    0xdead0000,
+                    0x1000,
+                    0x77770000,
+                    0x1004,
+                    0
+                ]
+            ),
+            dispatch::CompletionRoute::Served
+        );
+        turn.enter_child();
+        let thread = turn.thread().unwrap();
+        assert_eq!(thread.slot.clear_child_tid(), 0);
+        // Registry task 50 and Linux-visible TID 7 are separate identities;
+        // a born-in-zone binding has no host task generation.
+        let mut wrong = turn.binding;
+        wrong.thread_generation = EntryThreadGeneration::from_raw(5051);
+        assert_eq!(set_registered_tid(thread, wrong), None);
+        assert_eq!(thread.slot.clear_child_tid(), 0);
+        assert_eq!(set_registered_tid(thread, turn.binding), Some(7));
+        assert_eq!(turn.syscall(93, [0; 6]), dispatch::CompletionRoute::Served);
+        assert_eq!(turn.words[1], 0);
+        assert_eq!(turn.wakes, 1);
+        assert_eq!(peer.slots[1].clear_child_tid(), 0);
+        assert_eq!(peer.page.live(), 1);
+    }
+}
+
+fn set_registered_tid(thread: LifecycleThread<'_>, binding: ExecutionBinding) -> Option<i64> {
+    carrick_personality_linux::thread::set_tid_address(thread, binding, UserVa::new(0x1004))
+        .map(|result| result.raw())
+}
