@@ -111,12 +111,17 @@ mod kernel {
     use carrick_el1_abi::{Counters, CurrentTask};
     use core::sync::atomic::Ordering;
 
-    // The control port is shared by the carrier's CPL0 CPUs. Keep each
-    // port write within one in-guest admission, including native observations.
-    static CONTROL_PORT_LOCK: SpinLock<()> = SpinLock::new(());
+    // Count native exits across CPL0 CPUs for image/link and live diagnostics.
+    // A port write exits the VM, so no lock may remain held across it: another
+    // CPU can enter and need the same lock before the first CPU resumes.
+    #[unsafe(no_mangle)]
+    pub static CARRICK_CPL0_DOORBELL_COUNT: SpinLock<u64> = SpinLock::new(0);
 
     fn doorbell(port: u16, frame: &mut NativeFrame) {
-        let _guard = CONTROL_PORT_LOCK.lock();
+        {
+            let mut count = CARRICK_CPL0_DOORBELL_COUNT.lock();
+            *count = count.wrapping_add(1);
+        }
         // SAFETY: CPL0 owns the declared control/forwarding transport.
         unsafe {
             core::arch::asm!("out dx, al", in("dx") port, in("rax") frame as *mut _ as u64,
