@@ -73,8 +73,9 @@ pub(crate) unsafe fn copy_to_user_guarded(
     }
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     {
-        let _ = (cur_task, dest, src, len);
-        crate::isa::x86::carrick_x86_unbound_user_access()
+        // SAFETY: `dest` is the guarded user operand and `src` is retained
+        // kernel memory for the duration of the copy.
+        unsafe { crate::isa::x86::user_access::copy(cur_task, dest, src, len, dest as u64, true) }
     }
 }
 
@@ -139,8 +140,9 @@ pub(crate) unsafe fn copy_from_user_guarded(
     }
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
     {
-        let _ = (cur_task, dest, src, len);
-        crate::isa::x86::carrick_x86_unbound_user_access()
+        // SAFETY: `src` is the guarded user operand and `dest` is retained
+        // kernel memory for the duration of the copy.
+        unsafe { crate::isa::x86::user_access::copy(cur_task, dest, src, len, src as u64, false) }
     }
 }
 
@@ -233,11 +235,11 @@ impl MemoryValidator for HardwareValidator {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl MemoryValidator for HardwareValidator {
-    fn writable_bytes(&self, _user_va: u64, _len: usize) -> usize {
-        crate::isa::x86::carrick_x86_unbound_user_access()
+    fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
+        crate::isa::x86::user_access::accessible_bytes(user_va, len, true)
     }
-    fn readable_bytes(&self, _user_va: u64, _len: usize) -> usize {
-        crate::isa::x86::carrick_x86_unbound_user_access()
+    fn readable_bytes(&self, user_va: u64, len: usize) -> usize {
+        crate::isa::x86::user_access::accessible_bytes(user_va, len, false)
     }
 }
 
