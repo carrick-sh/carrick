@@ -1,4 +1,4 @@
-//! VM-free bindings for kernel.el1.ipc-continuation: the host completing
+//! VM-free bindings for kernel.el1.ipc-lifecycle: the host completing
 //! operations EL1 owns, over real shared records and a guest-memory model.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -279,6 +279,329 @@ fn memory(bytes: &[u8]) -> LinearMemory {
     let mut m = LinearMemory::new(BUF, vec![0; 1 << 20]);
     m.write_bytes(BUF, bytes).unwrap();
     m
+}
+
+/// An admitted Linux-writable destination whose live leaf still needs owner
+/// preparation (for example a private COW leaf). Legacy prevalidation cannot
+/// authorize it; only PREPARE can, before the pipe source is consumed.
+struct OwnerDestination<'a> {
+    memory: LinearMemory,
+    world: &'a World,
+    object: IpcObjectHandle,
+    prepares: usize,
+    suspend_at: Option<usize>,
+}
+
+impl carrick_guest_mem::CurrentMmMemory for OwnerDestination<'_> {}
+impl GuestMemory for OwnerDestination<'_> {
+    fn user_memory_venue(&self) -> carrick_guest_mem::UserMemoryVenue {
+        carrick_guest_mem::UserMemoryVenue::Owner
+    }
+    fn guest_range_is_writable(&self, _: u64, _: usize) -> bool {
+        false
+    }
+    fn read_bytes_raw(
+        &self,
+        address: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
+        self.memory.read_bytes(address, length)
+    }
+    fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), carrick_guest_mem::MemoryError> {
+        panic!("admitted IPC destination requires a prepared write")
+    }
+    fn prepare_write(
+        &mut self,
+        ranges: &[carrick_guest_mem::GuestWriteRange],
+    ) -> Result<
+        Box<dyn carrick_guest_mem::PreparedGuestWrite + '_>,
+        carrick_guest_mem::MemoryPrepareError,
+    > {
+        assert_eq!(
+            self.world.region.lock_holder(self.object),
+            None,
+            "PREPARE must hold no IPC lock"
+        );
+        assert!(
+            self.world.unread(self.object) > 0,
+            "PREPARE must hold no IPC lock and see a ready source"
+        );
+        assert_eq!(ranges.len(), 1);
+        assert!(ranges[0].len() <= 4096);
+        self.prepares += 1;
+        if self.suspend_at == Some(self.prepares) {
+            #[derive(Debug)]
+            struct Pending;
+            impl carrick_guest_mem::PhysicalMemoryWait for Pending {
+                fn is_ready(&self) -> bool {
+                    false
+                }
+                fn enroll(
+                    &self,
+                    _: std::sync::Arc<dyn Fn() + Send + Sync>,
+                ) -> (Box<dyn std::fmt::Debug + Send + Sync>, bool) {
+                    (Box::new(()), false)
+                }
+            }
+            return Err(carrick_guest_mem::MemoryPrepareError::Physical(
+                carrick_guest_mem::OwnedMemoryWait(std::sync::Arc::new(Pending)),
+            ));
+        }
+        struct Prepared<'a>(&'a mut LinearMemory, u64, usize);
+        impl carrick_guest_mem::PreparedGuestWrite for Prepared<'_> {
+            fn commit(self: Box<Self>, outputs: &[&[u8]]) {
+                assert_eq!(outputs.len(), 1);
+                assert!(outputs[0].len() <= self.2);
+                self.0.write_bytes(self.1, outputs[0]).unwrap();
+            }
+        }
+        Ok(Box::new(Prepared(
+            &mut self.memory,
+            ranges[0].address().raw(),
+            ranges[0].len(),
+        )))
+    }
+}
+
+#[test]
+fn el1_ipc_owner_destination_is_prepared_before_pipe_consumption() {
+    let world = world();
+    let (reader, writer, object) = world.pipe();
+    let token = world.operation(writer, IpcOpKind::PipeWrite, 8, 64);
+    world.hand_back(&token, IpcHandback::Continue, 0, 0);
+    let mut source = memory(b"abcdefgh");
+    assert_eq!(
+        complete_handback(
+            world.region,
+            token,
+            MM,
+            &mut source,
+            None,
+            &Wakes::default()
+        )
+        .unwrap(),
+        IpcHostOutcome::Complete {
+            result: 8,
+            sigpipe: false
+        }
+    );
+    let token = world.operation(reader, IpcOpKind::PipeRead, 8, 63);
+    world.hand_back(&token, IpcHandback::Continue, 0, 0);
+    let mut destination = OwnerDestination {
+        memory: memory(&[0; 8]),
+        world: &world,
+        object,
+        prepares: 0,
+        suspend_at: None,
+    };
+    assert_eq!(
+        complete_handback(
+            world.region,
+            token,
+            MM,
+            &mut destination,
+            None,
+            &Wakes::default()
+        )
+        .unwrap(),
+        IpcHostOutcome::Complete {
+            result: 8,
+            sigpipe: false
+        },
+        "live COW permissions cannot replace owner preparation"
+    );
+    assert_eq!(destination.prepares, 1);
+    assert_eq!(destination.memory.read_bytes(BUF, 8).unwrap(), b"abcdefgh");
+    assert_eq!(world.unread(object), 0);
+    assert_eq!(world.holds(reader), 1, "completion releases the exact pin");
+}
+
+#[test]
+fn el1_ipc_owner_wait_retains_endpoint_and_committed_read_prefix() {
+    let world = world();
+    let (reader, writer, object) = world.pipe();
+    let bytes: Vec<u8> = (0..5000).map(|at| (at % 251) as u8).collect();
+    let token = world.operation(writer, IpcOpKind::PipeWrite, bytes.len() as u64, 64);
+    world.hand_back(&token, IpcHandback::Continue, 0, 0);
+    assert!(matches!(
+        complete_handback(
+            world.region,
+            token,
+            MM,
+            &mut memory(&bytes),
+            None,
+            &Wakes::default()
+        )
+        .unwrap(),
+        IpcHostOutcome::Complete { result: 5000, .. }
+    ));
+    let token = world.operation(reader, IpcOpKind::PipeRead, bytes.len() as u64, 63);
+    world.hand_back(&token, IpcHandback::Continue, 0, 0);
+    let mut destination = OwnerDestination {
+        memory: memory(&[]),
+        world: &world,
+        object,
+        prepares: 0,
+        suspend_at: Some(2),
+    };
+    let token = match complete_handback(
+        world.region,
+        token,
+        MM,
+        &mut destination,
+        None,
+        &Wakes::default(),
+    ) {
+        Err(IpcCompletionError::Memory {
+            token,
+            dependency: carrick_guest_mem::MemoryPrepareError::Physical(_),
+        }) => token,
+        other => panic!("pre-permit wait must retain its owned IPC operation: {other:?}"),
+    };
+    assert_eq!(
+        world.region.operation(&token).unwrap().progress.written,
+        4096
+    );
+    assert_eq!(world.unread(object), 904);
+    let pin = OfdPin::from_raw(world.region.operation(&token).unwrap().pin);
+    assert_eq!(
+        world.region.fd(HostIpcWait).holds(&pin),
+        Ok((1, 1)),
+        "the continuation retains the endpoint pin"
+    );
+    let _ = pin.into_raw();
+    assert_eq!(
+        destination.memory.read_bytes(BUF, 4096).unwrap(),
+        bytes[..4096]
+    );
+    assert_eq!(
+        complete_handback(
+            world.region,
+            token,
+            MM,
+            &mut destination,
+            None,
+            &Wakes::default()
+        )
+        .unwrap(),
+        IpcHostOutcome::Complete {
+            result: 5000,
+            sigpipe: false
+        }
+    );
+    assert_eq!(destination.memory.read_bytes(BUF, 5000).unwrap(), bytes);
+    assert_eq!(world.unread(object), 0);
+    assert_eq!(world.holds(reader), 1);
+    assert_eq!(
+        destination.prepares, 3,
+        "one prepare per chunk plus the owned suspension"
+    );
+}
+
+#[test]
+fn el1_ipc_owner_empty_source_waits_without_preparing_destination() {
+    let world = world();
+    let (reader, _writer, object) = world.pipe();
+    let token = world.operation(reader, IpcOpKind::PipeRead, 8, 63);
+    world.hand_back(&token, IpcHandback::Continue, 0, 0);
+    let mut destination = OwnerDestination {
+        memory: memory(&[]),
+        world: &world,
+        object,
+        prepares: 0,
+        suspend_at: None,
+    };
+    let outcome = complete_handback(
+        world.region,
+        token,
+        MM,
+        &mut destination,
+        None,
+        &Wakes::default(),
+    )
+    .unwrap();
+    let IpcHostOutcome::Blocked {
+        token,
+        lane: WaitFor::Readable,
+        ..
+    } = outcome
+    else {
+        panic!("empty pipe must wait before accessing its destination: {outcome:?}");
+    };
+    assert_eq!(destination.prepares, 0);
+    interrupt(world.region, token, IpcCause::Control, &Wakes::default()).unwrap();
+}
+
+#[test]
+fn serial_host_el1_ipc_memory_cancellation_releases_a_closed_endpoint() {
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let context = dispatcher.capture_one_task_context().unwrap();
+    let owner = context.kernel().ipc().unwrap();
+    let object = owner.create_pipe(65536).unwrap();
+    let table = owner.create_table(1024, 64).unwrap();
+    let region = owner.region();
+    let open = |end, access| {
+        region
+            .fd(HostIpcWait)
+            .open(
+                table,
+                Fd(0),
+                Description::new(
+                    IpcBacking::Pipe { object, end }.encode(),
+                    access,
+                    StatusFlags::default(),
+                ),
+                false,
+            )
+            .unwrap()
+    };
+    let reader = open(End::Reader, AccessMode::ReadOnly);
+    let writer = open(End::Writer, AccessMode::WriteOnly);
+    let (pin, _) = region.fd(HostIpcWait).pin(table, reader).unwrap();
+    let token = region
+        .begin_operation(IpcOperation {
+            pin: pin.into_raw(),
+            object: object.to_raw(),
+            kind: IpcOpKind::PipeRead,
+            ..IpcOperation::EMPTY
+        })
+        .unwrap();
+    let raw = token.into_raw();
+    let operation = OwnedIpcOperation::new(
+        IpcOpToken::from_raw(raw),
+        ZoneHostServices::for_dispatcher(&dispatcher).unwrap(),
+    );
+    assert_eq!(region.fd(HostIpcWait).close(table, reader), Ok(None));
+    assert!(
+        !region
+            .lock(object, &HostIpcWait)
+            .unwrap()
+            .pipe()
+            .unwrap()
+            .readiness(End::Writer)
+            .err
+    );
+    drop(operation);
+    assert!(matches!(
+        region.operation(&IpcOpToken::from_raw(raw)),
+        Err(IpcError::Stale)
+    ));
+    assert!(
+        region
+            .lock(object, &HostIpcWait)
+            .unwrap()
+            .pipe()
+            .unwrap()
+            .readiness(End::Writer)
+            .err,
+        "cancelled memory wait must release its final reader pin"
+    );
+    let closed = region
+        .fd(HostIpcWait)
+        .close(table, writer)
+        .unwrap()
+        .unwrap();
+    owner.release(closed.backing).unwrap();
 }
 
 #[test]
@@ -615,7 +938,7 @@ fn el1_ipc_continue_rejects_a_stale_address_space_before_copying() {
     let raw = raw.pack();
     w.hand_back(&token, IpcHandback::Continue, 0, 0);
     let mut mem = memory(&[]);
-    assert_eq!(
+    assert!(matches!(
         complete_handback(
             w.region,
             token,
@@ -625,8 +948,8 @@ fn el1_ipc_continue_rejects_a_stale_address_space_before_copying() {
             &Wakes::default()
         )
         .err(),
-        Some(IpcError::Stale)
-    );
+        Some(IpcCompletionError::Ipc(IpcError::Stale))
+    ));
     assert_eq!(w.unread(object), 6, "no byte consumed for another mm");
     assert_eq!(mem.read_bytes(BUF, 6).unwrap(), vec![0; 6]);
     // The owner still holds the operation and can finish it.

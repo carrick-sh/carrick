@@ -6,14 +6,20 @@ semantic_authority = ["man 7 pipe", "man 2 eventfd", "man 2 splice", "man 2 tee"
 fixture = "two live descriptor owners; final endpoint close at 1/8/64 pairs"
 scale_points = [1, 8, 64]
 rationale = "Final shared writer close must release its endpoint without a second host pin owner. Typed fixtures count retained endpoints at every scale. Existing continuation fixtures prove no replay; they do not prove EL1 creation or executor exhaustion. See the M2-M5 witness ledger."
-structural_budgets = []
 
 [bindings]
-vm_free = "carrick-kernel::dispatch::fs::pipe::tests::{red_until_step3_m2_shared_close_still_needs_host_endpoint_release,parked_large_write_keeps_writer_functional_after_numeric_close,in_memory_pipe_broken_pipe_and_eof,in_memory_pipe_zero_length_write_returns_zero}; carrick-el1-abi::ipc::tests::{el1_ipc_blocked_write_resumes_from_its_continuation_without_replay,el1_ipc_two_processes_with_overlapping_user_vas_complete_their_own_reads}"
+vm_free = "carrick-kernel::dispatch::fs::pipe::tests::{red_until_step3_m2_shared_close_still_needs_host_endpoint_release,parked_large_write_keeps_writer_functional_after_numeric_close,in_memory_pipe_broken_pipe_and_eof,in_memory_pipe_zero_length_write_returns_zero}; carrick-el1-abi::ipc::tests::{el1_ipc_blocked_write_resumes_from_its_continuation_without_replay,el1_ipc_two_processes_with_overlapping_user_vas_complete_their_own_reads}; carrick-kernel::kernel::continuation::ipc::tests::{el1_ipc_owner_destination_is_prepared_before_pipe_consumption,el1_ipc_owner_wait_retains_endpoint_and_committed_read_prefix}"
 
 [bindings.unresolved]
 embed_structural = "Cutover must bind two scheduled processes and 32 writers exhausting the default executor pool in carrick-conformance-next; VM-free owners are descriptor tables, not EL0 execution."
 docker = "No Docker in preparation; eventfd/pipe lifecycle differential remains cutover acceptance."
+
+[[structural_budgets]]
+kind = "upper-bound"
+metric = "guest_memory_write_bytes"
+maximum = 4096
+layers = ["vm-free"]
+rationale = "Per prepared stream step, bound destination capacity and committed bytes to 4096. The VM-free destination asserts this on every PREPARE, outside IPC locks. The complete read can span multiple steps: the 5000-byte witness checks two chunks and one suspended preparation, with no replay."
 
 [runtime_ratio]
 maximum = 2.0
