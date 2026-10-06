@@ -5,9 +5,11 @@
 macro_rules! fixture_items {
     ($($item:item)*) => {};
 }
+#[cfg(target_os = "none")]
 macro_rules! fixture_stmt {
     ($($tt:tt)*) => {};
 }
+#[cfg(target_os = "none")]
 macro_rules! fixture_expr {
     ($($tt:tt)*) => {
         false
