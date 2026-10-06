@@ -293,6 +293,33 @@ impl Cpl0Carrier {
         self._vm.retained_bytes()
     }
 
+    /// Guard the 64 bytes each vCPU's old xsave frame would overwrite below
+    /// its 4 KiB #PF entry stack. The vCPU1 guard is below vCPU0's saved
+    /// hardware/GPR frame, so both faults may run before inspection.
+    pub fn arm_user_fault_stack_canary(&mut self) -> Result<(), TrapError> {
+        let first = carrick_x86::fault_stack_base(LAYOUT);
+        for address in [first - 64, first + 4096 - 256] {
+            self._vm
+                .write(FrameGpa::new(address), &[0xa5; 64])
+                .map_err(|e| fail(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn user_fault_stack_canary_intact(&self) -> Result<bool, TrapError> {
+        let first = carrick_x86::fault_stack_base(LAYOUT);
+        for address in [first - 64, first + 4096 - 256] {
+            let bytes = self
+                ._vm
+                .read(FrameGpa::new(address), 64)
+                .map_err(|e| fail(e.to_string()))?;
+            if bytes != [0xa5; 64] {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Enable architectural SMAP before either fixture vCPU starts. The
     /// caller uses this only on KVM hosts whose guest CPUID advertises SMAP.
     pub fn enable_smap(&mut self) -> Result<(), TrapError> {

@@ -149,6 +149,9 @@ core::arch::global_asm!(
     "jz 2f",
     "swapgs",
     "2:",
+    // TSS.RSP0 is a 4 KiB fault-entry stack. Keep its hardware/GPR frame
+    // there, then run xsave and Rust on this CPU's 64 KiB syscall stack.
+    "mov rsp, gs:[0]",
     "sub rsp, 4160",
     "and rsp, -64",
     "mov eax, 7", "xor edx, edx", "xsave64 [rsp]",
@@ -265,7 +268,8 @@ mod kernel {
     use carrick_el1_abi::{Counters, CurrentTask};
     use carrick_guest_arch::InterruptArch;
     fixture_items! { use carrick_guest_arch::EntryArch; }
-    use core::sync::atomic::{AtomicU64, Ordering};
+    fixture_items! { use core::sync::atomic::AtomicU64; }
+    use core::sync::atomic::Ordering;
 
     // Count native exits across CPL0 CPUs for image/link and live diagnostics.
     // A port write exits the VM, so no lock may remain held across it: another
@@ -285,7 +289,6 @@ mod kernel {
         pub(super) mod process {
             include!("process.rs");
         }
-    }
     }
 
     #[repr(C)]
@@ -331,59 +334,44 @@ mod kernel {
                 &*(binding.counters_address as *const Counters),
             )
         };
-        let lane = binding.scheduler_witness.load(Ordering::Acquire);
-        let fixture = crate::fixture_image()
-            && (lane == super::lifecycle::LIFECYCLE_LANE
-                || lane == super::lifecycle::LIFECYCLE_LANE + super::lifecycle::LIFECYCLE_STRIDE);
-        let (zone_address, residency, pool, mailbox) = if fixture {
-            let address = FORK_RESIDENCY_ADDRESS.load(Ordering::Acquire);
-            if address == 0 {
-                return 4;
+        let serve = |zone_address: u64,
+                     residency: &carrick_el1_abi::FrameGrantResidencyTable,
+                     pool: &dyn carrick_el1_abi::CowGrantVenue,
+                     mailbox: &carrick_el1_abi::FrameGrantMailbox| {
+            // SAFETY: the boot owner published this supervisor-only zone and
+            // retains it across the exact CPU's space-edit transaction.
+            let zone = unsafe { &*(zone_address as *const carrick_sched_core::ZoneTables) };
+            let mut cow = X86CowResolver { pool, residency, completion: None };
+            let result = dispatch_x86_fault_with_prepared(
+                0, fault, counters, core::slice::from_ref(task),
+                carrick_el1::substrate::sched::object_wait::space_access(
+                    zone, carrick_sched_core::SlotId::new(binding.cpu_slot as u8),
+                ),
+                GrantMailboxes::own(mailbox),
+                None::<carrick_el1::fault::PreparedFaultPath<'_, NoopPreparedResolver>>,
+                &mut cow,
+            );
+            if result == Action::Served { 0 } else { 6 }
+        };
+        fixture_stmt! {
+            let lane = binding.scheduler_witness.load(Ordering::Acquire);
+            if lane == super::lifecycle::LIFECYCLE_LANE
+                || lane == super::lifecycle::LIFECYCLE_LANE + super::lifecycle::LIFECYCLE_STRIDE
+            {
+                let address = FORK_RESIDENCY_ADDRESS.load(Ordering::Acquire);
+                if address == 0 { return 4; }
+                // SAFETY: the fixture published and retains this aligned table.
+                let residency = unsafe { &*(address as *const carrick_el1_abi::FrameGrantResidencyTable) };
+                return serve(super::lifecycle::LIFECYCLE_ZONE, residency,
+                    &SHARED_COW_POOL, &SHARED_FAULT_MAILBOX);
             }
-            // SAFETY: the fixture published this aligned table only after
-            // initializing every entry; it retains it through VM retirement.
-            let residency = unsafe { &*(address as *const carrick_el1_abi::FrameGrantResidencyTable) };
-            (
-                super::lifecycle::LIFECYCLE_ZONE,
-                residency,
-                &SHARED_COW_POOL as &dyn carrick_el1_abi::CowGrantVenue,
-                &SHARED_FAULT_MAILBOX,
-            )
-        } else {
-            let Some(mailbox) = carrick_el1_abi::frame_grant_mailbox_guest_for_slot(
-                binding.cpu_slot as usize,
-            ) else {
-                return 5;
-            };
-            (
-                carrick_el1_abi::EL1_ZONE_BASE,
-                carrick_el1_abi::frame_grant_residency_guest(),
-                carrick_el1_abi::cow_grant_pool_guest() as &dyn carrick_el1_abi::CowGrantVenue,
-                mailbox,
-            )
-        };
-        // SAFETY: both addresses are supervisor-only boot publications. The
-        // exact current slot owns the active task and its space edit token.
-        let zone = unsafe { &*(zone_address as *const carrick_sched_core::ZoneTables) };
-        let mut cow = X86CowResolver {
-            pool,
-            residency,
-            completion: None,
-        };
-        let result = dispatch_x86_fault_with_prepared(
-            0,
-            fault,
-            counters,
-            core::slice::from_ref(task),
-            carrick_el1::substrate::sched::object_wait::space_access(
-                zone,
-                carrick_sched_core::SlotId::new(binding.cpu_slot as u8),
-            ),
-            GrantMailboxes::own(mailbox),
-            None::<carrick_el1::fault::PreparedFaultPath<'_, NoopPreparedResolver>>,
-            &mut cow,
-        );
-        if result == Action::Served { 0 } else { 6 }
+        }
+        let Some(mailbox) = carrick_el1_abi::frame_grant_mailbox_guest_for_slot(
+            binding.cpu_slot as usize,
+        ) else { return 5; };
+        serve(carrick_el1_abi::EL1_ZONE_BASE,
+            carrick_el1_abi::frame_grant_residency_guest(),
+            carrick_el1_abi::cow_grant_pool_guest(), mailbox)
     }
 
     /// Named fail-closed leaf until x86 task signal delivery can consume an
@@ -755,11 +743,13 @@ mod kernel {
                 doorbell(FATAL_PORT, frame);
                 halt();
             }
-            if frame.rdx == 1
-                && !process::admit_initial(binding, loaded.stack_pointer, loaded.address.root.address().raw())
-            {
-                doorbell(FATAL_PORT, frame);
-                halt();
+            fixture_stmt! {
+                if frame.rdx == 1
+                    && !process::admit_initial(binding, loaded.stack_pointer, loaded.address.root.address().raw())
+                {
+                    doorbell(FATAL_PORT, frame);
+                    halt();
+                }
             }
             frame.rcx = loaded.context.frame[15];
             frame.rsp = loaded.context.frame[18];

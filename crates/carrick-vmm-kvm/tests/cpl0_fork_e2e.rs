@@ -45,11 +45,61 @@ fn fork_wait_elf() -> Vec<u8> {
     bytes
 }
 
+fn fork_wait_elf_with_nonblocking_probe() -> Vec<u8> {
+    let mut bytes = fork_wait_elf();
+    let code_start = 0xb0;
+    let parent_start = code_start + 16;
+    // Preserve fork's child pid in EBX. Linux wait4(child, NULL, WNOHANG)
+    // must return zero while that child is still runnable, and must leave
+    // the parent's status slot for the later blocking wait untouched.
+    let probe = [
+        0x89, 0xc3, 0x89, 0xdf, 0x31, 0xf6, 0xba, 1, 0, 0, 0, 0x45, 0x31, 0xd2, 0xb8, 61, 0, 0, 0,
+        0x0f, 0x05, 0x85, 0xc0, 0x75, 0,
+    ];
+    bytes.splice(parent_start..parent_start, probe);
+    bytes[code_start + 15] = 0x39 + probe.len() as u8; // fork child branch
+    bytes[parent_start + probe.len() + 1] = 0xdf; // blocking wait pid: EBX
+    let failure = bytes
+        .windows(7)
+        .position(|window| window == [0xbf, 9, 0, 0, 0, 0xb8, 0xe7])
+        .expect("ELF failure exit");
+    let jump_end = parent_start + probe.len();
+    bytes[jump_end - 1] = (failure - jump_end) as u8;
+    let file_size = bytes.len() as u64;
+    bytes[96..104].copy_from_slice(&file_size.to_le_bytes());
+    bytes
+}
+
 #[test]
 fn static_elf_fork_child_cow_wait_and_parent_exit_seven() {
     let elf = fork_wait_elf();
     let plan = prepare_static_x86_elf(&elf).expect("shared static ELF plan");
     assert_eq!(plan.entry, 0x4000b0);
+    let program = initial_process_program(&elf);
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("real KVM image");
+    carrier
+        .arm_user_fault_stack_canary()
+        .expect("arm vCPU0 fault stack boundary");
+    let observed = carrier.observe(0).expect("fork, wait4 and exit");
+    assert!(
+        carrier
+            .user_fault_stack_canary_intact()
+            .expect("read fault stack boundary"),
+        "user #PF xstate or Rust call crossed the 4 KiB TSS fault stack"
+    );
+    assert_eq!(observed.result, 7);
+    assert_eq!(observed.semantic_host_exits, 0);
+    let state = carrier
+        .lifecycle_state(0)
+        .expect("zone lifecycle after parent exit");
+    assert_eq!(state.births, 1);
+    assert_eq!(state.retirements, 1);
+    assert_eq!(state.wakes, 1);
+    assert_eq!(state.live, 1);
+}
+
+fn initial_process_program(elf: &[u8]) -> Vec<u8> {
     let mut program = vec![0x48, 0xbf];
     program.extend_from_slice(&0x10100u64.to_le_bytes());
     program.extend_from_slice(&[0x48, 0xbe]);
@@ -60,17 +110,17 @@ fn static_elf_fork_child_cow_wait_and_parent_exit_seven() {
     program.extend_from_slice(&OBSERVE_INITIAL_MM.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     program.resize(0x100, 0x90);
-    program.extend_from_slice(&elf);
+    program.extend_from_slice(elf);
+    program
+}
+
+#[test]
+fn static_elf_wait4_null_status_wnohang_then_blocking_reap() {
+    let elf = fork_wait_elf_with_nonblocking_probe();
+    let program = initial_process_program(&elf);
     let mut carrier =
         Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("real KVM image");
-    let observed = carrier.observe(0).expect("fork, wait4 and exit");
+    let observed = carrier.observe(0).expect("nonblocking then blocking wait4");
     assert_eq!(observed.result, 7);
     assert_eq!(observed.semantic_host_exits, 0);
-    let state = carrier
-        .lifecycle_state(0)
-        .expect("zone lifecycle after parent exit");
-    assert_eq!(state.births, 1);
-    assert_eq!(state.retirements, 1);
-    assert_eq!(state.wakes, 1);
-    assert_eq!(state.live, 1);
 }

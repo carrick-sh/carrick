@@ -1151,6 +1151,7 @@ dependencies = [
  "carrick-mmu-core",
  "carrick-personality-linux",
  "carrick-sched-core",
+ "carrick-syscall-abi",
 ]
 
 [[package]]
