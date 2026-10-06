@@ -383,6 +383,34 @@ mod kernel {
                 },
             })
         }
+        fn copy_guest_data(
+            &mut self,
+            grant: carrick_el1::isa::x86::initial_mm::InitialDataGrant,
+            offset: u16,
+            source: carrick_guest_arch::FrameGpa,
+            len: u16,
+        ) -> bool {
+            let dest = grant.frame.raw();
+            let from = source.raw();
+            if !(0x90_0000..0x91_0000).contains(&dest)
+                || !(0x10_000..0x11_000).contains(&from)
+                || from + u64::from(len) > 0x11_000
+                || u64::from(offset) + u64::from(len) > 4096
+            {
+                return false;
+            }
+            // SAFETY: this stopped fixture identity-maps the staged user code
+            // page and retains its disjoint private destination grant under
+            // the supervisor direct window. The fixture has SMAP disabled.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    from as *const u8,
+                    (DIRECT_VA + dest + u64::from(offset)) as *mut u8,
+                    usize::from(len),
+                );
+            }
+            true
+        }
         fn write_data(
             &mut self,
             grant: carrick_el1::isa::x86::initial_mm::InitialDataGrant,
@@ -441,7 +469,8 @@ mod kernel {
         }
         if crate::fixture_image() && frame.rax == OBSERVE_INITIAL_MM {
             use carrick_el1::isa::x86::initial_mm::{
-                InitialImageRegion, InitialImageSpec, InitialStackSpec, install_initial_image,
+                InitialImageRegion, InitialImageSpec, InitialSourceRange, InitialStackSpec,
+                install_initial_image,
             };
             use carrick_guest_arch::{EditPermissions, MmuBackend};
             // The test stages one already-parsed ET_EXEC image in its RX code
@@ -461,7 +490,10 @@ mod kernel {
                 start: 0x400000,
                 len: 4096,
                 initialized_offset: 0,
-                initialized: elf,
+                initialized: InitialSourceRange {
+                    start: carrick_guest_arch::FrameGpa::new(0x10100),
+                    len: elf.len() as u64,
+                },
                 perms: EditPermissions {
                     readable: true,
                     writable: false,
