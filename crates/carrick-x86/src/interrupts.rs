@@ -5,6 +5,7 @@ pub const TIMER_VECTOR: u8 = 0xe0;
 pub const KICK_VECTOR: u8 = 0xe1;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub const LAPIC_BASE: u64 = 0xfee0_0000;
+pub const LAPIC_VA: u64 = 0xffff_ffff_d000_0000;
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,7 +42,7 @@ pub mod hardware {
     /// CPL0, mapped xAPIC page, bootstrap has enabled IA32_APIC_BASE in xAPIC
     /// mode. The caller serializes access with interrupts masked.
     unsafe fn write(offset: u64, value: u32) {
-        unsafe { core::ptr::write_volatile((LAPIC_BASE + offset) as *mut u32, value) };
+        unsafe { core::ptr::write_volatile((LAPIC_VA + offset) as *mut u32, value) };
     }
     /// # Safety
     /// CPL0 only; the caller restores this mask on the same execution lane.
@@ -100,8 +101,7 @@ pub mod hardware {
     pub unsafe fn send_wake(apic_id: ApicId) -> Result<(), IpiBusy> {
         // A busy command is not a delivered wake. Return owned work to the
         // caller instead of spinning with IF masked or dropping the command.
-        if unsafe { core::ptr::read_volatile((LAPIC_BASE + 0x300) as *const u32) } & (1 << 12) != 0
-        {
+        if unsafe { core::ptr::read_volatile((LAPIC_VA + 0x300) as *const u32) } & (1 << 12) != 0 {
             return Err(IpiBusy);
         }
         unsafe {

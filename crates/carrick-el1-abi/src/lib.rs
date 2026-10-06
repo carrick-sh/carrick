@@ -174,6 +174,7 @@ pub const EL1_BOOTSTRAP_METADATA_BASE: u64 = EL1_REGION_BASE + EL1_BOOTSTRAP_MET
 pub const EL1_BOOTSTRAP_METADATA_SIZE: u64 = 0x90_0000;
 
 /// Base guest virtual address of the dynamic metadata grant aperture (64 MiB window).
+pub const X86_CPL0_DYNAMIC_METADATA_BASE: u64 = 0xffff_ffff_a000_0000;
 pub const EL1_DYNAMIC_METADATA_BASE: u64 = 0x2D_0800_0000;
 
 /// Total size of the dynamic metadata grant aperture (64 MiB).
@@ -732,11 +733,21 @@ impl CurrentTask {
     pub fn lifecycle_refs(&self) -> Option<(&ThreadLifecyclePage, &ThreadControlSlot)> {
         let page = self.metadata.lifecycle_page.load(Ordering::Acquire);
         let slot = self.metadata.control_slot.load(Ordering::Acquire);
+        let expected_base = {
+            #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+            {
+                X86_CPL0_DYNAMIC_METADATA_BASE
+            }
+            #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+            {
+                EL1_DYNAMIC_METADATA_BASE
+            }
+        };
         let contains = |address: u64, len: usize| {
-            address >= EL1_DYNAMIC_METADATA_BASE
+            address >= expected_base
                 && address
                     .checked_add(len as u64)
-                    .is_some_and(|end| end <= EL1_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE)
+                    .is_some_and(|end| end <= expected_base + EL1_DYNAMIC_METADATA_SIZE)
         };
         if !page.is_multiple_of(16384)
             || !slot.is_multiple_of(core::mem::align_of::<ThreadControlSlot>() as u64)

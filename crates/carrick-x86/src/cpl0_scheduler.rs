@@ -50,8 +50,8 @@ pub struct ContextBinding {
 /// Bounded hardware witness/control record, outside the common ABI. This is
 /// NOT a production task graph or MM owner. The carrier initializes it while
 /// stopped and retains it until VM retirement.
-pub const PROGRESS_STATE: u64 = 0x170_0000;
-pub const PROGRESS_ZONE: u64 = 0x100_0000;
+pub const PROGRESS_STATE: u64 = 0xffff_ffff_b070_0000;
+pub const PROGRESS_ZONE: u64 = 0xffff_ffff_b000_0000;
 pub const PROGRESS_HEADER: u64 = 0x1f_0000;
 pub const PROGRESS_MAGIC: u64 = 0x4d34_4350_4c30_0001;
 pub const PROGRESS_DATA: u64 = 0x5_0000;
