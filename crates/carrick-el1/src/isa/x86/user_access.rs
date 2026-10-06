@@ -15,7 +15,7 @@ const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const LARGE: u64 = 1 << 7;
 const TABLE_ADDR: u64 = 0x000f_ffff_ffff_f000;
-const TABLE_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
+const TABLE_DIRECT_VA: u64 = carrick_el1_abi::X86_CPL0_DIRECT_VA;
 const USER_CEILING: u64 = 0x0000_8000_0000_0000;
 
 /// A user operand must be wholly within the canonical lower half. The
