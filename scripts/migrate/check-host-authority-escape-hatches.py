@@ -65,10 +65,13 @@ ASSEMBLY_BOUNDARIES = frozenset(
         PurePosixPath("crates/carrick-el1/src/personality/mm_portal/production.rs"),
         PurePosixPath("crates/carrick-el1/src/sched/hw.rs"),
         PurePosixPath("crates/carrick-el1/src/sched/aarch64_context.rs"),
+        # ARM EL1 TTBR0/HVC instructions moved intact into the ISA leaf.
+        PurePosixPath("crates/carrick-el1/src/isa/aarch64.rs"),
         # Reviewed CPL0-only ISA leaves: stack/TSC instructions and named
         # UD2 fail-closed paths, with no host or Linux policy operation.
         PurePosixPath("crates/carrick-el1/src/isa/x86/context.rs"),
         PurePosixPath("crates/carrick-el1/src/isa/x86/interrupt.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/interrupts.rs"),
         PurePosixPath("crates/carrick-el1/src/isa/x86/mmu.rs"),
         PurePosixPath("crates/carrick-el1/src/isa/x86/transport.rs"),
         PurePosixPath("crates/carrick-el1/src/isa/x86/user_access.rs"),
