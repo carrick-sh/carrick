@@ -1561,6 +1561,7 @@ impl X8664GuestArch {
 
         let canonical = match X8664SyscallTable::remap(x86_number) {
             SyscallRemap::Direct(c) => c,
+            SyscallRemap::Private(c) => c.raw(),
             SyscallRemap::Native => x86_number,
             SyscallRemap::Unknown => carrick_abi::CARRICK_PRIVATE_X86_UNSUPPORTED,
         };

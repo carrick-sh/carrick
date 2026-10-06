@@ -1,6 +1,19 @@
 //! Linux lifecycle policy over neutral pool transitions and native context hooks.
 use crate::abi::entry::SyscallResult;
 use crate::abi::thread::*;
+use carrick_syscall_abi::LinuxWaitOptions;
+
+/// Linux `pid_t` selector carried by wait4 (including negative selectors).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessWaitPid(i32);
+impl ProcessWaitPid {
+    pub const fn from_syscall_argument(raw: u64) -> Self {
+        Self(raw as i32)
+    }
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleCall {
     Exit,
@@ -129,9 +142,9 @@ pub trait LifecycleNative<'a>: UserCopy {
     }
     fn process_wait4(
         &mut self,
-        _pid: u64,
+        _pid: ProcessWaitPid,
         _status: UserVa,
-        _options: u64,
+        _options: LinuxWaitOptions,
     ) -> Option<LifecycleOutcome> {
         None
     }
@@ -238,7 +251,11 @@ pub fn invoke<'a>(
     match call {
         LifecycleCall::Fork => return native.process_fork(),
         LifecycleCall::Wait4 => {
-            return native.process_wait4(args[0], UserVa::new(args[1]), args[2]);
+            return native.process_wait4(
+                ProcessWaitPid::from_syscall_argument(args[0]),
+                UserVa::new(args[1]),
+                LinuxWaitOptions::from_bits_retain(args[2]),
+            );
         }
         LifecycleCall::ExitGroup => return native.process_exit_group(args[0] as u8),
         _ => {}

@@ -365,9 +365,13 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         99 => Family::Lifecycle(LifecycleCall::SetRobustList),
         178 => Family::Lifecycle(LifecycleCall::GetTid),
         220 => Family::Lifecycle(LifecycleCall::Clone),
-        crate::entry::X86_PROCESS_FORK => Family::Lifecycle(LifecycleCall::Fork),
-        crate::entry::X86_PROCESS_WAIT4 => Family::Lifecycle(LifecycleCall::Wait4),
-        crate::entry::X86_PROCESS_EXIT_GROUP => Family::Lifecycle(LifecycleCall::ExitGroup),
+        nr if nr == carrick_syscall_abi::nr::CARRICK_PRIVATE_X86_FORK.raw() => {
+            Family::Lifecycle(LifecycleCall::Fork)
+        }
+        nr if nr == carrick_syscall_abi::nr::WAIT4.raw() => Family::Lifecycle(LifecycleCall::Wait4),
+        nr if nr == carrick_syscall_abi::nr::EXIT_GROUP.raw() => {
+            Family::Lifecycle(LifecycleCall::ExitGroup)
+        }
         nr if allocator_control != u64::MAX && nr == allocator_control => Family::AllocatorControl,
         _ => Family::Unported,
     }

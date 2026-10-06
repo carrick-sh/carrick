@@ -10,6 +10,7 @@ use carrick_el1_abi::{Counters, CurrentTask};
 use carrick_el1_abi::{EntryRef, LifecycleHatches, ThreadControlSlot, ThreadLifecyclePage};
 use carrick_guest_arch::{GuestIsa, NativeOrdinal, UserVa};
 use carrick_personality_linux::entry::CanonicalOrdinal;
+use carrick_personality_linux::entry::decode_aarch64;
 use carrick_personality_linux::entry::{CanonicalCall, decode_x86_snapshot};
 use carrick_x86::cpl0_entry::NativeFrame;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -121,6 +122,24 @@ fn served_result(outcome: EntryOutcome) -> Option<i64> {
             Some(result.raw())
         }
         EntryOutcome::Forward | EntryOutcome::InvalidCompletion => None,
+    }
+}
+
+#[test]
+fn arm_process_calls_still_forward_without_native_hooks() {
+    let world = World::new(LifecycleHatches::ON);
+    for number in [94, 260] {
+        let call = decode_aarch64(number, [0; 6], 0x7000);
+        assert_eq!(
+            serve_canonical(
+                &call,
+                &world.counters,
+                &world.tasks[0],
+                &*world.venue,
+                Some(&world.publications),
+            ),
+            EntryOutcome::Forward,
+        );
     }
 }
 
