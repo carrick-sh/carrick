@@ -16,7 +16,14 @@ pub struct InterruptFrame {
     pub ss: u64,
 }
 const _: () = assert!(core::mem::size_of::<InterruptFrame>() == 160);
-const _: () = assert!(core::mem::offset_of!(InterruptFrame, rip) == 120);
+const _: () = {
+    assert!(core::mem::offset_of!(InterruptFrame, gpr) == 0);
+    assert!(core::mem::offset_of!(InterruptFrame, rip) == 120);
+    assert!(core::mem::offset_of!(InterruptFrame, cs) == 128);
+    assert!(core::mem::offset_of!(InterruptFrame, flags) == 136);
+    assert!(core::mem::offset_of!(InterruptFrame, rsp) == 144);
+    assert!(core::mem::offset_of!(InterruptFrame, ss) == 152);
+};
 
 /// Standard XSAVE with XCR0=x87|SSE|AVX. Bootstrap must qualify CPUID.0D
 /// and reject any other enabled component before publishing a task.
@@ -38,6 +45,15 @@ pub struct NativeContext {
     pub gs_base: u64,
     pub xsave: XsaveArea,
 }
+const _: () = {
+    assert!(core::mem::offset_of!(NativeContext, frame) == 0);
+    assert!(core::mem::offset_of!(NativeContext, address) == 160);
+    assert!(core::mem::offset_of!(NativeContext, fs_base) == 184);
+    assert!(core::mem::offset_of!(NativeContext, gs_base) == 192);
+    assert!(core::mem::offset_of!(NativeContext, xsave) == 256);
+    assert!(core::mem::size_of::<NativeContext>() == 1088);
+    assert!(core::mem::align_of::<NativeContext>() == 64);
+};
 
 /// An ISA sidecar belongs to one exact shared record incarnation. It stores
 /// only machine state, never runnable/blocked state or an alternate queue.
@@ -224,7 +240,7 @@ mod tests {
 // Qualified target_os=none native-context leaves shared by CPL0 bindings.
 #[cfg(target_os = "none")]
 #[derive(Clone, Copy)]
-pub(crate) enum NativeTlsRegister {
+pub enum NativeTlsRegister {
     Fs,
     UserGs,
 }
@@ -238,7 +254,7 @@ impl NativeTlsRegister {
     }
 }
 #[cfg(target_os = "none")]
-pub(crate) fn read_tls(register: NativeTlsRegister) -> u64 {
+pub fn read_tls(register: NativeTlsRegister) -> u64 {
     let low: u32;
     let high: u32;
     // SAFETY: CPL0; only FS_BASE or the user GS retained after SWAPGS is selected.
@@ -248,7 +264,7 @@ pub(crate) fn read_tls(register: NativeTlsRegister) -> u64 {
     u64::from(low) | (u64::from(high) << 32)
 }
 #[cfg(target_os = "none")]
-pub(crate) fn write_tls(register: NativeTlsRegister, value: u64) {
+pub fn write_tls(register: NativeTlsRegister, value: u64) {
     // SAFETY: qualified CPL0 context installation; canonical retained user TLS
     // bases only. UserGs selects KERNEL_GS_BASE while SWAPGS retains kernel GS.
     unsafe {
@@ -256,7 +272,7 @@ pub(crate) fn write_tls(register: NativeTlsRegister, value: u64) {
     }
 }
 #[cfg(target_os = "none")]
-pub(crate) fn save_extended(area: &mut XsaveArea) {
+pub fn save_extended(area: &mut XsaveArea) {
     // SAFETY: stopped-host admission qualified XCR0=7 and the complete 832-byte
     // standard image; XsaveArea has 64-byte alignment and exclusive native custody.
     unsafe {
@@ -264,7 +280,7 @@ pub(crate) fn save_extended(area: &mut XsaveArea) {
     }
 }
 #[cfg(target_os = "none")]
-pub(crate) fn restore_extended(area: &XsaveArea) {
+pub fn restore_extended(area: &XsaveArea) {
     // SAFETY: exact retained native context captured by save_extended, with the
     // same qualified XCR0 and aligned complete image, never a foreign incarnation.
     unsafe {
