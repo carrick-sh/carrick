@@ -9,6 +9,8 @@ carrick-core = { path = "../carrick-core" }
 carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 
+carrick-sched-core = { path = "../carrick-sched-core" }
+
 [lints]
 workspace = true
 

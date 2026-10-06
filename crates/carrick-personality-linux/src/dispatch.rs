@@ -1,6 +1,6 @@
 //! The single Linux ordinal-to-family routing table.
 use crate::abi::entry::SyscallResult;
-use crate::pending_lifecycle::{LifecycleCall, LifecycleOutcome};
+use crate::lifecycle::{LifecycleCall, LifecycleOutcome};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnonymousCall {
@@ -246,8 +246,7 @@ pub trait PendingFamilies<'a> {
     fn epoll_wait(&mut self) -> FamilyCompletion {
         FamilyCompletion::Forward
     }
-    /// Removed by order 6.
-    fn lifecycle(&mut self, _: LifecycleCall) -> Option<LifecycleOutcome> {
+    fn lifecycle_native(&mut self) -> Option<&mut dyn crate::lifecycle::LifecycleNative<'a>> {
         None
     }
     fn original_argument0(&self) -> u64;
@@ -312,14 +311,15 @@ fn serve_family(family: Family, ordinal: u64, pending: &mut dyn PendingFamilies<
     if let Family::Lifecycle(call) = family {
         let original = pending.original_argument0();
         return pending
-            .lifecycle(call)
+            .lifecycle_native()
+            .and_then(|native| crate::lifecycle::invoke(call, native))
             .map_or(FamilyCompletion::Forward.into(), |outcome| {
                 let returned = match outcome {
                     LifecycleOutcome::Returned { result, .. } => Some((result, original)),
                     LifecycleOutcome::Transferred { .. } => None,
                 };
                 FamilyRun {
-                    completion: crate::pending_lifecycle::lifecycle_effect(&outcome),
+                    completion: crate::lifecycle::lifecycle_effect(&outcome),
                     returned,
                 }
             });

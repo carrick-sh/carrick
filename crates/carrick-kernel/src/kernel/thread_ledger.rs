@@ -22,6 +22,7 @@
 //! `CARRICK_THREAD_POOL=0` keeps no standing entries: a clone finds the pool
 //! empty and reserves its one entry at clone time, through the same code.
 
+use carrick_el1_abi::Lifecycle;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -1177,6 +1178,7 @@ impl Kernel {
 
 #[cfg(test)]
 mod tests {
+    use carrick_el1_abi::Lifecycle;
     use std::convert::Infallible;
     use std::sync::Arc;
 
