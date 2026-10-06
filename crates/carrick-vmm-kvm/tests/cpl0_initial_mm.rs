@@ -61,3 +61,24 @@ fn shared_guest_owner_loads_static_elf_and_exits_seven() {
     assert_eq!(observed.result, 7);
     assert_eq!(observed.semantic_host_exits, 0);
 }
+
+#[test]
+fn production_extent_cannot_alias_kernel_metadata() {
+    use carrick_el1_abi::{EL1_DYNAMIC_METADATA_SIZE, X86_CPL0_DYNAMIC_METADATA_BASE};
+
+    let extent_bytes = 192 * 1024 * 1024 + 4096;
+    let mut carrier = Cpl0Carrier::boot_production(extent_bytes).expect("production KVM image");
+    let elf = tiny_elf();
+    let image = prepare_static_x86_elf(&elf).expect("static ELF");
+    carrier
+        .load_guest_mm(&image, &[], &[])
+        .expect("shared MM owner");
+
+    let extent_va = carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA;
+    let extent_end = extent_va + extent_bytes as u64;
+    let metadata_end = X86_CPL0_DYNAMIC_METADATA_BASE + EL1_DYNAMIC_METADATA_SIZE;
+    assert!(
+        extent_end <= X86_CPL0_DYNAMIC_METADATA_BASE || extent_va >= metadata_end,
+        "initial extent aliases the dynamic metadata aperture"
+    );
+}

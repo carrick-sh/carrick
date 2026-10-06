@@ -36,6 +36,16 @@ ordinal!(
     FatalCode
 );
 
+/// Supervisor addresses selected by the image ISA. Offsets within the kernel
+/// region retain the shared ABI; a guest cannot use another ISA's base here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelLayout {
+    pub region: KernelVa,
+    pub zone: KernelVa,
+    pub portal: KernelVa,
+    pub dynamic_metadata: KernelVa,
+}
+
 macro_rules! generation {
     ($($name:ident),+ $(,)?) => {$ (
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -489,6 +499,20 @@ impl<B: ArchTypes> ArchTypes for Arch<B> {
     type InterruptMask = B::InterruptMask;
 }
 
+pub trait LayoutBackend {
+    const KERNEL_LAYOUT: KernelLayout;
+}
+
+pub trait LayoutArch: sealed::Sealed {
+    fn kernel_layout(&self) -> KernelLayout;
+}
+
+impl<B: LayoutBackend> LayoutArch for Arch<B> {
+    fn kernel_layout(&self) -> KernelLayout {
+        B::KERNEL_LAYOUT
+    }
+}
+
 // Generate each sealed projection and its explicit backend extension hook from
 // one signature list, so the hardware and kernel sides cannot drift.
 macro_rules! arch_trait {
@@ -582,11 +606,12 @@ arch_trait!(CrossingArch, CrossingBackend {
 });
 
 pub trait KernelArch:
-    sealed::Sealed + EntryArch + MmuArch + MmuEditArch + InterruptArch + CrossingArch
+    sealed::Sealed + LayoutArch + EntryArch + MmuArch + MmuEditArch + InterruptArch + CrossingArch
 {
 }
-impl<B: EntryBackend + MmuBackend + MmuEditBackend + InterruptBackend + CrossingBackend> KernelArch
-    for Arch<B>
+impl<
+    B: LayoutBackend + EntryBackend + MmuBackend + MmuEditBackend + InterruptBackend + CrossingBackend,
+> KernelArch for Arch<B>
 {
 }
 
