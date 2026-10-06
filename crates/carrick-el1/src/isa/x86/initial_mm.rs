@@ -719,10 +719,10 @@ mod tests {
         .unwrap();
         assert_eq!(loaded.publications.len(), 3);
         assert_eq!(loaded.context.frame[15], 0x400000);
-        assert_eq!(loaded.context.frame[16], 0x1b);
+        assert_eq!(loaded.context.frame[16], 0x23);
         assert_eq!(loaded.context.frame[17], 0x202);
         assert_eq!(loaded.context.frame[18], loaded.stack_pointer);
-        assert_eq!(loaded.context.frame[19], 0x23);
+        assert_eq!(loaded.context.frame[19], 0x1b);
         assert!(loaded.context.authenticates(loaded.address));
         let leaf = translate_leaf(
             &words,
