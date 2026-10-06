@@ -57,14 +57,30 @@ fn fork_wait_elf_with_nonblocking_probe() -> Vec<u8> {
         0x0f, 0x05, 0x85, 0xc0, 0x75, 0,
     ];
     bytes.splice(parent_start..parent_start, probe);
-    bytes[code_start + 15] = 0x39 + probe.len() as u8; // fork child branch
     bytes[parent_start + probe.len() + 1] = 0xdf; // blocking wait pid: EBX
+    // The completed blocking wait must consume the zombie. A second wait for
+    // that child returns -ECHILD, even with a NULL status address.
+    let wait_opcode = [0xb8, 61, 0, 0, 0, 0x0f, 0x05];
+    let wait_end = bytes
+        .windows(wait_opcode.len())
+        .enumerate()
+        .filter(|(_, window)| *window == wait_opcode)
+        .nth(1)
+        .map(|(index, _)| index + wait_opcode.len())
+        .expect("blocking wait4 opcode");
+    let rewait = [
+        0x89, 0xdf, 0x31, 0xf6, 0x31, 0xd2, 0x45, 0x31, 0xd2, 0xb8, 61, 0, 0, 0, 0x0f, 0x05, 0x83,
+        0xf8, 0xf6, 0x75, 0,
+    ];
+    bytes.splice(wait_end..wait_end, rewait);
+    bytes[code_start + 15] = 0x39 + (probe.len() + rewait.len()) as u8;
     let failure = bytes
         .windows(7)
         .position(|window| window == [0xbf, 9, 0, 0, 0, 0xb8, 0xe7])
         .expect("ELF failure exit");
-    let jump_end = parent_start + probe.len();
-    bytes[jump_end - 1] = (failure - jump_end) as u8;
+    for jump_end in [parent_start + probe.len(), wait_end + rewait.len()] {
+        bytes[jump_end - 1] = (failure - jump_end) as u8;
+    }
     let file_size = bytes.len() as u64;
     bytes[96..104].copy_from_slice(&file_size.to_le_bytes());
     bytes
@@ -115,7 +131,7 @@ fn initial_process_program(elf: &[u8]) -> Vec<u8> {
 }
 
 #[test]
-fn static_elf_wait4_null_status_wnohang_then_blocking_reap() {
+fn static_elf_wait4_wnohang_reap_then_echild() {
     let elf = fork_wait_elf_with_nonblocking_probe();
     let program = initial_process_program(&elf);
     let mut carrier =
