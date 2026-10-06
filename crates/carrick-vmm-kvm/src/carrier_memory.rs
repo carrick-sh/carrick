@@ -2,10 +2,11 @@
 //! Dedicated bounded KVM slots project extents, never one slot per page/MM.
 //! This preparation has no public vCPU/run handle. The accepted N1 editor must
 //! enclose publication and physical rollback; M5 will bind execution admission.
-use crate::KvmVm;
 use crate::guest_setup::{GuestRam, WindowKind};
+use crate::{KvmVcpu, KvmVm};
 use carrick_el1_abi::GuestMmuPublication;
 use carrick_guest_arch::{AddressContext, FrameGpa, RootGpa};
+use carrick_hal::HvVm;
 use carrick_mmu_core::x86::descriptor_txn::*;
 use kvm_bindings::kvm_userspace_memory_region;
 use std::collections::{BTreeMap, BTreeSet};
@@ -156,6 +157,41 @@ pub struct CarrierMemory {
     #[cfg(test)]
     fail_install: Option<usize>,
 }
+
+/// One KVM VM and its retained physical backing for a bounded set of vCPUs.
+/// vCPU handles drop before the memory owner and its VM. All CPUs issued by
+/// this owner see the same slot namespace; no standalone CPU can be attached.
+pub struct CarrierMachine {
+    cpus: Vec<KvmVcpu>,
+    memory: CarrierMemory,
+}
+
+impl CarrierMachine {
+    pub fn create_stopped(vcpu_count: usize) -> Result<Self, MemoryError> {
+        if vcpu_count == 0 {
+            return Err(error("carrier requires at least one vCPU"));
+        }
+        let mut memory = CarrierMemory::create()?;
+        let mut cpus = Vec::new();
+        for _ in 0..vcpu_count {
+            cpus.push(memory.vm.add_vcpu().map_err(|e| error(e.to_string()))?);
+        }
+        Ok(Self { cpus, memory })
+    }
+
+    pub fn vcpu_count(&self) -> usize {
+        self.cpus.len()
+    }
+
+    pub fn memory_mut(&mut self) -> &mut CarrierMemory {
+        &mut self.memory
+    }
+
+    pub fn cpu_mut(&mut self, index: usize) -> Option<&mut KvmVcpu> {
+        self.cpus.get_mut(index)
+    }
+}
+
 impl CarrierMemory {
     pub fn create() -> Result<Self, MemoryError> {
         let vm = KvmVm::create_empty().map_err(|e| error(e.to_string()))?;
