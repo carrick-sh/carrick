@@ -157,7 +157,7 @@ pub(crate) fn yield_host_effect() {
     #[cfg(target_arch = "aarch64")]
     crate::isa::aarch64::yield_host_effect();
     #[cfg(target_arch = "x86_64")]
-    crate::isa::x86::carrick_x86_unbound_host_yield();
+    crate::isa::x86::yield_host_effect();
 }
 
 /// Selection entry for a borrowed target root. Input x1..x7 is carrier, MM,
