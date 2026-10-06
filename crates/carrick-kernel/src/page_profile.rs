@@ -11,8 +11,15 @@ pub use carrick_mem::page_geometry::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionPlan {
+    pub backend: ExecutionBackend,
     pub page_geometry: PageGeometry,
     pub diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionBackend {
+    HvfAarch64,
+    KvmX86Cpl0,
 }
 
 #[cfg_attr(
@@ -62,6 +69,20 @@ fn resolve_execution_plan_for_request_for_host(
 ) -> Result<ExecutionPlan, RuntimeError> {
     match exec_backend {
         ExecBackendRequest::HvPatch => {
+            if host_caps.host_os == HostOs::Linux
+                && host_caps.host_isa == Platform::Amd64
+                && platform == Platform::Amd64
+            {
+                return Ok(ExecutionPlan {
+                    backend: ExecutionBackend::KvmX86Cpl0,
+                    page_geometry: PageGeometry {
+                        host_page_size: DEFAULT_LINUX_PAGE_SIZE,
+                        linux_page_size: DEFAULT_LINUX_PAGE_SIZE,
+                        native_profile: None,
+                    },
+                    diagnostics: Vec::new(),
+                });
+            }
             if host_caps.host_os != HostOs::Macos
                 || host_caps.host_isa != Platform::Aarch64
                 || platform != Platform::Aarch64
@@ -72,6 +93,7 @@ fn resolve_execution_plan_for_request_for_host(
                 )));
             }
             Ok(ExecutionPlan {
+                backend: ExecutionBackend::HvfAarch64,
                 page_geometry: PageGeometry {
                     host_page_size: DEFAULT_LINUX_PAGE_SIZE,
                     linux_page_size: DEFAULT_LINUX_PAGE_SIZE,
@@ -162,6 +184,21 @@ mod tests {
         assert_eq!(plan.page_geometry.host_page_size, DEFAULT_LINUX_PAGE_SIZE);
         assert_eq!(plan.page_geometry.linux_page_size, DEFAULT_LINUX_PAGE_SIZE);
         assert_eq!(plan.page_geometry.native_profile, None);
+        assert_eq!(plan.backend, ExecutionBackend::HvfAarch64);
+    }
+
+    #[test]
+    fn linux_amd64_cpl0_plan_uses_linux_geometry() {
+        let plan = resolve_execution_plan_for_host(
+            &spec_with_platform(Platform::Amd64, ExecBackendRequest::HvPatch),
+            caps(HostOs::Linux, Platform::Amd64),
+            DEFAULT_LINUX_PAGE_SIZE,
+        )
+        .expect("Linux x86_64 shared CPL0 plan");
+        assert_eq!(plan.page_geometry.host_page_size, DEFAULT_LINUX_PAGE_SIZE);
+        assert_eq!(plan.page_geometry.linux_page_size, DEFAULT_LINUX_PAGE_SIZE);
+        assert_eq!(plan.page_geometry.native_profile, None);
+        assert_eq!(plan.backend, ExecutionBackend::KvmX86Cpl0);
     }
 
     #[test]

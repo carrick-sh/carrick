@@ -45,6 +45,7 @@ use crate::runtime::{RunElfExecutionOptions, run_elf_from_dispatcher_debug_on};
 use carrick_kernel::dispatch::{StdioSink, SyscallDispatcher};
 use carrick_kernel::kernel::container::LaunchContext;
 use carrick_kernel::network::RuntimeNetwork;
+use carrick_kernel::page_profile::ExecutionBackend;
 use carrick_kernel::run_result::{RunResult, RuntimeError};
 use carrick_vfs::fs_backend::{FsBackend, HostFsBackend};
 use carrick_vfs::{BindVfs, HostResolverSnapshot, Vfs};
@@ -255,6 +256,7 @@ enum RootBacking {
 /// `self`. Field order is drop order — the dispatcher (which owns the fs
 /// backend and the network lease) first, then the terminal restore.
 pub struct PreparedRun {
+    backend: ExecutionBackend,
     executable: String,
     argv: Vec<String>,
     env: Vec<String>,
@@ -790,6 +792,7 @@ fn prepare_with_lease(
 
     let ExecutionPlan { env, .. } = plan;
     Ok(PreparedRun {
+        backend: plan.page.backend,
         executable: spec.process.executable.clone(),
         argv: spec.process.argv.clone(),
         env,
@@ -848,6 +851,7 @@ impl PreparedRun {
     /// ```
     pub fn execute(self) -> Result<RunResult, RuntimeError> {
         let PreparedRun {
+            backend,
             executable,
             argv,
             env,
@@ -859,6 +863,8 @@ impl PreparedRun {
             carrier,
             carrier_lease,
         } = self;
+        #[cfg(feature = "platform-macos")]
+        debug_assert_eq!(backend, ExecutionBackend::HvfAarch64);
         #[cfg(feature = "platform-macos")]
         let run = match root {
             RootBacking::Host => classify_run_outcome(
@@ -898,13 +904,54 @@ impl PreparedRun {
         // and hypervisor-backend axes are distinct, and a negation silently
         // captures every future non-macOS host as well
         // (`.semgrep/typed-domains.yml::no-cfg-not-platform-macos`).
-        #[cfg(any(
-            feature = "platform-linux",
-            feature = "platform-freebsd",
-            feature = "platform-netbsd"
-        ))]
+        #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
+        let run = if backend == ExecutionBackend::KvmX86Cpl0 {
+            let _ = (
+                &argv,
+                &env,
+                max_traps,
+                &debug_state_path,
+                &root,
+                &carrier,
+                &carrier_lease,
+            );
+            let bytes = dispatcher.read_exec_file(&executable).ok_or_else(|| {
+                RuntimeError::Unsupported(format!("guest executable not found: {executable}"))
+            })?;
+            let plan = carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62)
+                .map_err(|error| RuntimeError::Unsupported(format!("x86 ELF load: {error}")))?;
+            let mut machine = carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::boot_production()?;
+            machine.load_guest_mm(&plan, &bytes)?;
+            Err(RuntimeError::Unsupported(
+                "x86 CPL0 execution admission is not yet bound".to_owned(),
+            ))
+        } else {
+            Err(RuntimeError::Unsupported(format!(
+                "Linux execution backend {backend:?} is not available"
+            )))
+        };
+        #[cfg(all(feature = "platform-linux", target_arch = "aarch64"))]
         let run = {
             let _ = (
+                backend,
+                executable,
+                argv,
+                env,
+                max_traps,
+                debug_state_path,
+                root,
+                dispatcher,
+                carrier,
+                carrier_lease,
+            );
+            Err(RuntimeError::Unsupported(
+                "Linux/AArch64 shared carrier is not yet bound".to_owned(),
+            ))
+        };
+        #[cfg(any(feature = "platform-freebsd", feature = "platform-netbsd"))]
+        let run = {
+            let _ = (
+                backend,
                 executable,
                 argv,
                 env,
