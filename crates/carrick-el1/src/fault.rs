@@ -403,7 +403,8 @@ pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
 ) -> Option<Action> {
     let mm_key = current_tasks
         .get(frame.slot as usize)?
-        .zone_mm
+        .mm
+        .key
         .load(Ordering::Acquire);
     if mm_key == 0 || path.slots.submitted_for(mm_key).next().is_none() {
         return None;
@@ -732,7 +733,7 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
     let Some(task) = current_tasks.get(frame.slot as usize) else {
         return action;
     };
-    let mm_key = task.zone_mm.load(Ordering::Acquire);
+    let mm_key = task.mm.key.load(Ordering::Acquire);
     if mm_key == 0 || !slots.in_flight_for(mm_key) {
         return action;
     }
@@ -972,7 +973,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         let Some(task) = current_tasks.get(frame.slot as usize) else {
             return Action::Forward;
         };
-        let mm_key = task.zone_mm.load(Ordering::Acquire);
+        let mm_key = task.mm.key.load(Ordering::Acquire);
         if mm_key == 0 {
             return Action::Forward;
         }
@@ -1012,7 +1013,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
     let Some(task) = current_tasks.get(frame.slot as usize) else {
         return Action::Forward;
     };
-    let mm_key = task.zone_mm.load(Ordering::Acquire);
+    let mm_key = task.mm.key.load(Ordering::Acquire);
     if mm_key == 0 {
         return Action::Forward;
     }
@@ -1172,7 +1173,7 @@ mod tests {
         // first fault, without a grant refusal and a second host fault.
         table.retire_overlapping(mm, base + 2 * 4096, 4096);
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(mm, 0x8800_0000);
         let mailbox = FrameGrantMailbox::new();
@@ -1289,7 +1290,7 @@ mod tests {
             })
             .unwrap();
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let read_translation_fault = |address| TrapFrame {
             esr: (0x24 << 26) | 0x07,
@@ -1346,7 +1347,7 @@ mod tests {
         };
         table.publish(identity).unwrap();
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let mut frame = TrapFrame {
             esr: (0x20 << 26) | 0x07,
             far: va,
@@ -1413,7 +1414,7 @@ mod tests {
             let mm = 9;
             let tasks = [CurrentTask::new(), CurrentTask::new()];
             for task in &tasks {
-                task.zone_mm.store(mm, Ordering::Release);
+                task.mm.key.store(mm, Ordering::Release);
             }
             let spaces = published_space(mm, 0x8800_0000);
             let boxes = FrameGrantMailboxes::new();
@@ -1513,7 +1514,7 @@ mod tests {
     fn missing_guest_table_is_handled_before_commit_without_guest_handback() {
         use core::cell::Cell;
         let task = CurrentTask::new();
-        task.zone_mm.store(7, Ordering::Release);
+        task.mm.key.store(7, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(7, 0x8800_0000);
         let mailbox = FrameGrantMailbox::new();
@@ -1571,7 +1572,7 @@ mod tests {
     fn refused_frame_grant_falls_back_without_republishing_in_the_same_dispatch() {
         let mm = 8;
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(mm, (32_u64 << 48) | 0x8900_0000_0000);
         let mailbox = FrameGrantMailbox::new();
@@ -1620,9 +1621,9 @@ mod tests {
         let va = base + 0x5000;
         for migrated in [false, true] {
             let task = CurrentTask::new();
-            task.zone_mm.store(mm, Ordering::Release);
+            task.mm.key.store(mm, Ordering::Release);
             let tasks = [task, CurrentTask::new()];
-            tasks[1].zone_mm.store(mm, Ordering::Release);
+            tasks[1].mm.key.store(mm, Ordering::Release);
             let spaces = published_space(mm, 0x8800_0000);
             let boxes = FrameGrantMailboxes::new();
             let origin = boxes.slot(0).unwrap();
@@ -1721,7 +1722,7 @@ mod tests {
     fn permission_fault_never_requests_a_first_touch_frame_grant() {
         let mm = 82;
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(mm, (35_u64 << 48) | 0x8c00_0000_0000);
         let mailbox = FrameGrantMailbox::new();
@@ -1750,7 +1751,7 @@ mod tests {
     #[test]
     fn non_translation_or_permission_fault_never_requests_a_grant() {
         let task = CurrentTask::new();
-        task.zone_mm.store(9, Ordering::Release);
+        task.mm.key.store(9, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(9, (33_u64 << 48) | 0x8a00_0000_0000);
         let mailbox = FrameGrantMailbox::new();
@@ -1779,7 +1780,7 @@ mod tests {
         let ttbr0 = (36_u64 << 48) | 0x8d00_0000_0000;
         let fault = 0x4000_3000;
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(mm, ttbr0);
         let mailbox = FrameGrantMailbox::new();
@@ -1812,7 +1813,7 @@ mod tests {
         let ttbr0 = (37_u64 << 48) | 0x8e00_0000_0000;
         let fault = 0x4000_4000;
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let tasks = [task];
         let spaces = published_space(mm, ttbr0);
         let mailbox = FrameGrantMailbox::new();
@@ -2005,7 +2006,7 @@ mod tests {
             counters: &Counters,
         ) -> Action {
             let task = CurrentTask::new();
-            task.zone_mm.store(mm, Ordering::Release);
+            task.mm.key.store(mm, Ordering::Release);
             let mut frame = write_translation_fault(0, fault);
             dispatch_fault_with_descriptor_txns(
                 &mut frame,
@@ -2147,7 +2148,7 @@ mod tests {
 
         fn task(mm: u64) -> CurrentTask {
             let task = CurrentTask::new();
-            task.zone_mm.store(mm, Ordering::Release);
+            task.mm.key.store(mm, Ordering::Release);
             task
         }
 
@@ -2268,7 +2269,7 @@ mod tests {
                 Action::ServedWithWork
             );
             assert_eq!(
-                tasks[0].served_with_work.load(Ordering::Acquire),
+                tasks[0].linux.served_with_work.load(Ordering::Acquire),
                 1,
                 "the host must complete, not re-dispatch, the served call"
             );

@@ -25,7 +25,7 @@ struct Adapter<'a, 's, C: ThreadCpu, U: UserWord> {
 impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
     type Served = Served;
     fn mm(&self) -> Option<ReservationMm> {
-        ReservationMm::new(self.sched.task.zone_mm.load(Ordering::Acquire))
+        ReservationMm::new(self.sched.task.mm.key.load(Ordering::Acquire))
     }
     fn timed_wait_allowed(&self) -> bool {
         let slot = self.sched.zone.slot(self.sched.slot);

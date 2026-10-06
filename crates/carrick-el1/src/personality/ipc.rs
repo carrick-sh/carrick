@@ -110,7 +110,7 @@ pub struct MapTables<'a>(pub &'a IpcTableMap);
 
 impl IpcTables for MapTables<'_> {
     fn table_of(&self, task: &CurrentTask) -> Option<RawTableId> {
-        self.0.lookup(task.file_table.load(Ordering::Acquire))
+        self.0.lookup(task.linux.file_table.load(Ordering::Acquire))
     }
 }
 
@@ -229,11 +229,11 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
 }
 
 fn task_key(task: &CurrentTask) -> IpcTaskKey {
-    IpcTaskKey(task.task_id.load(Ordering::Relaxed))
+    IpcTaskKey(task.execution.task.load(Ordering::Relaxed))
 }
 
 fn mm_key(task: &CurrentTask) -> IpcMmKey {
-    IpcMmKey(task.zone_mm.load(Ordering::Relaxed))
+    IpcMmKey(task.mm.key.load(Ordering::Relaxed))
 }
 
 enum Admission {
@@ -879,7 +879,7 @@ mod tests {
     }
     impl User<'_> {
         fn present(&self, va: u64, len: usize) -> bool {
-            let mm = self.task.zone_mm.load(Ordering::Relaxed);
+            let mm = self.task.mm.key.load(Ordering::Relaxed);
             let pages = self.mem.pages.borrow();
             let mut page = va & !(PAGE - 1);
             while page < va + len as u64 {
@@ -897,14 +897,14 @@ mod tests {
                 return false;
             }
             self.mem
-                .write(self.task.zone_mm.load(Ordering::Relaxed), dst_va, src);
+                .write(self.task.mm.key.load(Ordering::Relaxed), dst_va, src);
             true
         }
         fn copy_in(&mut self, dst: &mut [u8], src_va: u64) -> bool {
             if !self.present(src_va, dst.len()) {
                 return false;
             }
-            let mm = self.task.zone_mm.load(Ordering::Relaxed);
+            let mm = self.task.mm.key.load(Ordering::Relaxed);
             let pages = self.mem.pages.borrow();
             for (i, b) in dst.iter_mut().enumerate() {
                 let at = src_va + i as u64;
@@ -984,9 +984,9 @@ mod tests {
         zone.enter_guest(SLOT);
         let task = CurrentTask::new();
         task.set(El1TaskId::from_linux_tid(101), 1, 5);
-        task.zone_mm.store(MM, Ordering::Relaxed);
-        task.thread_serial.store(1101, Ordering::Relaxed);
-        let a_tid = task.task_id.load(Ordering::Relaxed);
+        task.mm.key.store(MM, Ordering::Relaxed);
+        task.mm.thread_generation.store(1101, Ordering::Relaxed);
+        let a_tid = task.execution.task.load(Ordering::Relaxed);
         // SAFETY: all-zero is the empty table map.
         let map: &'static IpcTableMap = unsafe {
             &*std::alloc::alloc_zeroed(Layout::new::<IpcTableMap>()).cast::<IpcTableMap>()
@@ -1925,7 +1925,7 @@ mod tests {
         let mut f = syscall(SYS_READ, r, va, 16, A_SVC);
         let a_regs = f.x;
         assert_eq!(w.call(&mut f), SWITCHED, "A parks, B runs");
-        assert_eq!(w.task.zone_mm.load(Ordering::Relaxed), OTHER_MM);
+        assert_eq!(w.task.mm.key.load(Ordering::Relaxed), OTHER_MM);
         // The host closes A's fd and the number is reused.
         assert_eq!(w.host().close(a, Fd(r)), Ok(None), "A's pin keeps it");
         let reused = w.eventfd(a, 42, EventMode::Counter, BLOCK);
@@ -1943,7 +1943,7 @@ mod tests {
         let allocated = allocations() - allocs;
         assert_eq!((served, g.x[0]), (RETURNED, 4));
         assert_eq!(w.mem.read(MM, va, 4), b"data");
-        assert_eq!(w.task.zone_mm.load(Ordering::Relaxed), MM);
+        assert_eq!(w.task.mm.key.load(Ordering::Relaxed), MM);
         assert_eq!(allocated, 0, "no allocation for admitted I/O");
         assert_eq!(host_calls(&w), 0, "no host exit or adapter call");
         assert_eq!(w.zone.counters.el1_parks.load(Ordering::Relaxed), 2);
@@ -1985,7 +1985,7 @@ mod tests {
         let mut b_turns = 0;
         loop {
             // B: read until the pipe is empty, then park.
-            if w.task.zone_mm.load(Ordering::Relaxed) == OTHER_MM {
+            if w.task.mm.key.load(Ordering::Relaxed) == OTHER_MM {
                 match w.call(&mut f) {
                     RETURNED => {
                         let n = f.x[0] as usize;
@@ -2118,7 +2118,7 @@ mod tests {
             .collect();
         let task = &tasks[SLOT.raw() as usize];
         task.set(El1TaskId::from_linux_tid(101), 1, 5);
-        task.zone_mm.store(MM, Ordering::Relaxed);
+        task.mm.key.store(MM, Ordering::Relaxed);
         let venue = w.venue();
         // SAFETY: all-zero is a valid empty name cache.
         let names: &carrick_el1_abi::InotifyNameCache = unsafe {
@@ -2160,11 +2160,11 @@ mod tests {
             .collect();
         let task = &tasks[SLOT.raw() as usize];
         for (to, from) in [
-            (&task.task_id, &w.task.task_id),
-            (&task.thread_serial, &w.task.thread_serial),
-            (&task.file_table, &w.task.file_table),
-            (&task.zone_mm, &w.task.zone_mm),
-            (&task.generation, &w.task.generation),
+            (&task.execution.task, &w.task.execution.task),
+            (&task.mm.thread_generation, &w.task.mm.thread_generation),
+            (&task.linux.file_table, &w.task.linux.file_table),
+            (&task.mm.key, &w.task.mm.key),
+            (&task.execution.generation, &w.task.execution.generation),
         ] {
             to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
         }
@@ -2244,7 +2244,7 @@ mod tests {
         );
         assert_eq!(u64::from_ne_bytes(value), 7);
         assert!(!w.zone.record(current).has_object_operation());
-        assert_eq!(task.served_with_work.load(Ordering::Acquire), 1);
+        assert_eq!(task.linux.served_with_work.load(Ordering::Acquire), 1);
     }
 
     /// Host work pending at entry (the host kicked the vCPU, or a write
@@ -2275,9 +2275,9 @@ mod tests {
             "a read with data completes in EL1"
         );
         assert_eq!(&buf, b"ab");
-        assert_eq!(task.orig_arg0.load(Ordering::Relaxed), r as u64);
+        assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), r as u64);
         assert!(task.has_pending_host_work(), "the host still sees its work");
-        assert_eq!(task.served_with_work.load(Ordering::Acquire), 1);
+        assert_eq!(task.linux.served_with_work.load(Ordering::Acquire), 1);
         assert_eq!(w.counters.served[SYS_READ].load(Ordering::Relaxed), 1);
         assert_eq!(w.counters.served[SYS_WRITE].load(Ordering::Relaxed), 1);
         assert_eq!(host_calls(&w), 0);
@@ -2318,7 +2318,7 @@ mod tests {
             "nothing else was switched in"
         );
         assert!(task.has_pending_host_work(), "the host still sees its work");
-        assert_eq!(task.served_with_work.load(Ordering::Acquire), 0);
+        assert_eq!(task.linux.served_with_work.load(Ordering::Acquire), 0);
         assert_eq!(w.counters.forwarded[SYS_READ].load(Ordering::Relaxed), 0);
         assert_eq!(host_calls(&w), 0);
     }
@@ -2366,7 +2366,7 @@ mod tests {
         );
         assert_eq!(w.zone.counters.el1_parks.load(Ordering::Relaxed), parks + 1);
         assert!(task.has_pending_host_work(), "the host still sees its work");
-        assert_eq!(task.served_with_work.load(Ordering::Acquire), 0);
+        assert_eq!(task.linux.served_with_work.load(Ordering::Acquire), 0);
     }
 
     /// N communicating pairs of processes, pipes both ways plus an eventfd,
@@ -2407,8 +2407,8 @@ mod tests {
         for _ in 0..rounds {
             for p in &all {
                 let mut io = |tid: u64, nr, fd, buf, len| {
-                    w.task.task_id.store(tid, Ordering::Relaxed);
-                    w.task.file_table.store(tid, Ordering::Relaxed);
+                    w.task.execution.task.store(tid, Ordering::Relaxed);
+                    w.task.linux.file_table.store(tid, Ordering::Relaxed);
                     let mut f = syscall(nr, fd, buf, len, A_SVC);
                     assert_eq!(w.call(&mut f), RETURNED);
                     copied.set(copied.get() + f.x[0] as usize);
