@@ -83,7 +83,7 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
             Some(Served::Returned { switched: false })
         }
         EditWaitOutcome::Parked(parked) => {
-            if sched.task.has_pending_host_work() {
+            if sched.task.linux.has_pending_host_work() {
                 sched.leave_after_object_park(parked)
             } else {
                 sched.resume_after_object_park(frame, parked, 0)

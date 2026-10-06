@@ -15,3 +15,5 @@ pub use entry::*;
 
 /// Minimum dynamic metadata grant quantum, shared by allocator adapters.
 pub const EL1_DYNAMIC_METADATA_EXTENT_SIZE: usize = 512 * 1024;
+
+pub use entry::Served;

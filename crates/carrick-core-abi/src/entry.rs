@@ -160,3 +160,13 @@ impl<'a> BornEntryCompletion<'a> {
         self.record
     }
 }
+
+/// Native execution progress, without a syscall result or Linux return policy.
+/// Admission/completion authority remains the consuming entry token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Served {
+    /// The execution turn returned; switching changed the native context owner.
+    Returned { switched: bool },
+    /// No execution is currently installed after suspension and native idle.
+    Idle,
+}
