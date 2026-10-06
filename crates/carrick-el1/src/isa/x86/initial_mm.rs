@@ -229,15 +229,15 @@ pub fn build_initial_stack(
 #[derive(Clone, Copy)]
 pub struct InitialSourceRange {
     pub start: FrameGpa,
-    pub len: u64,
+    pub len: GuestLen,
 }
 
 /// One page-aligned PT_LOAD span. File bytes begin at
 /// `start + initialized_offset`; every other byte owes private zero fill.
 pub struct InitialImageRegion {
-    pub start: u64,
-    pub len: u64,
-    pub initialized_offset: u64,
+    pub start: UserVa,
+    pub len: GuestLen,
+    pub initialized_offset: GuestLen,
     pub initialized: InitialSourceRange,
     pub perms: EditPermissions,
 }
@@ -256,7 +256,7 @@ enum RegionContents<'a> {
 impl RegionContents<'_> {
     fn len(&self) -> u64 {
         match self {
-            Self::Guest(source) => source.len,
+            Self::Guest(source) => source.len.raw(),
             Self::Stack(bytes) => bytes.len() as u64,
         }
     }
@@ -324,7 +324,7 @@ fn checked_region(region: &MappedRegion<'_>) -> Result<u64, InitialMmError> {
         || end > USER_END
         || initialized_end > region.len
         || matches!(region.contents, RegionContents::Guest(source) if source.start.raw() == 0
-            || source.start.raw().checked_add(source.len).is_none_or(|end| end > (1 << 52)))
+            || source.start.raw().checked_add(source.len.raw()).is_none_or(|end| end > (1 << 52)))
         || !region.perms.user
         || (!region.perms.readable && (region.perms.writable || region.perms.executable))
     {
@@ -384,9 +384,9 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
         .regions
         .iter()
         .map(|region| MappedRegion {
-            start: region.start,
-            len: region.len,
-            initialized_offset: region.initialized_offset,
+            start: region.start.raw(),
+            len: region.len.raw(),
+            initialized_offset: region.initialized_offset.raw(),
             contents: RegionContents::Guest(region.initialized),
             perms: region.perms,
         })
@@ -403,8 +403,8 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     }
     if !image.regions.iter().any(|region| {
         region.perms.executable
-            && image.stack.entry >= region.start
-            && image.stack.entry < region.start + region.len
+            && image.stack.entry >= region.start.raw()
+            && image.stack.entry < region.start.raw() + region.len.raw()
     }) {
         return Err(InitialMmError::InvalidRange);
     }
@@ -652,12 +652,12 @@ mod tests {
         use carrick_guest_arch::EditPermissions;
         let regions = [
             InitialImageRegion {
-                start: 0x400000,
-                len: 0x1000,
-                initialized_offset: 0,
+                start: UserVa::new(0x400000),
+                len: GuestLen::new(0x1000),
+                initialized_offset: GuestLen::new(0),
                 initialized: InitialSourceRange {
                     start: FrameGpa::new(0x10_000),
-                    len: 12,
+                    len: GuestLen::new(12),
                 },
                 perms: EditPermissions {
                     readable: true,
@@ -667,12 +667,12 @@ mod tests {
                 },
             },
             InitialImageRegion {
-                start: 0x402000,
-                len: 0x1000,
-                initialized_offset: 0,
+                start: UserVa::new(0x402000),
+                len: GuestLen::new(0x1000),
+                initialized_offset: GuestLen::new(0),
                 initialized: InitialSourceRange {
                     start: FrameGpa::new(0x11_000),
-                    len: 3,
+                    len: GuestLen::new(3),
                 },
                 perms: EditPermissions {
                     readable: true,

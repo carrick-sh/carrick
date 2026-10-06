@@ -487,12 +487,12 @@ mod kernel {
                 halt();
             }
             let region = InitialImageRegion {
-                start: 0x400000,
-                len: 4096,
-                initialized_offset: 0,
+                start: carrick_guest_arch::UserVa::new(0x400000),
+                len: carrick_guest_arch::GuestLen::new(4096),
+                initialized_offset: carrick_guest_arch::GuestLen::new(0),
                 initialized: InitialSourceRange {
                     start: carrick_guest_arch::FrameGpa::new(0x10100),
-                    len: elf.len() as u64,
+                    len: carrick_guest_arch::GuestLen::new(elf.len() as u64),
                 },
                 perms: EditPermissions {
                     readable: true,
