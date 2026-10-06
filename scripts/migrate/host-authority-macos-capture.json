@@ -11185,8 +11185,8 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 236652,
-        "byte_start": 236627,
+        "byte_end": 236605,
+        "byte_start": 236580,
         "column": 35,
         "column_end": 60,
         "column_start": 35,
@@ -12347,15 +12347,15 @@
         "macos-runtime-default"
       ],
       "source": {
-        "byte_end": 49336,
-        "byte_start": 49314,
+        "byte_end": 49416,
+        "byte_start": 49394,
         "column": 17,
         "column_end": 39,
         "column_start": 17,
         "file": "crates/carrick-runtime/src/runtime.rs",
-        "line": 1206,
-        "line_end": 1206,
-        "line_start": 1206
+        "line": 1207,
+        "line_end": 1207,
+        "line_start": 1207
       }
     },
     {
@@ -12399,9 +12399,9 @@
       }
     }
   ],
-  "rows_sha256": "42b65e28add6f4f373d36be2274f5e9a96a4c91f8b71c48bc99b3667e3515f23",
+  "rows_sha256": "0570e1291358ca645b20eac0b409974b5d3281fdfc2f7ace5ad6eea11fd6aa2e",
   "schema": 1,
-  "source_head": "514519c372725cb70a19af0bb4c1bf9d1a3fedfe",
+  "source_head": "90ba9dbcc4a1ddc7339621840b0a5d010e4dccf2",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
