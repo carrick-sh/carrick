@@ -2,7 +2,7 @@
 //! host file table: the map EL1 consults to serve a task's IPC descriptors.
 //!
 //! The key is the host's `FileTableId` that every task record already
-//! carries ([`crate::CurrentTask::file_table`], `ThreadIdentity::file_table`),
+//! carries ([`crate::LinuxTaskState::file_table`], `ThreadIdentity::file_table`),
 //! so a thread EL1 switches in — possibly of another process — resolves its
 //! own table with no extra per-switch publication. A file table with no
 //! entry is not served (EL1 forwards): publication is the host's admission
