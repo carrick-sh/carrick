@@ -23,6 +23,22 @@ pub const fn kernel_arch() -> impl carrick_guest_arch::KernelArch {
     carrick_guest_arch::Arch::new(Aarch64Backend)
 }
 
+pub(crate) fn hardware_live_ttbr() -> u64 {
+    let ttbr: u64;
+    // SAFETY: EL1 reads the live TTBR0 register without changing execution.
+    unsafe {
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack));
+    }
+    ttbr
+}
+
+pub(crate) fn yield_host_effect() {
+    // SAFETY: the carrier resumes this exact EL1 stack after the HVC service.
+    unsafe {
+        core::arch::asm!("hvc #1", clobber_abi("C"));
+    }
+}
+
 impl ArchTypes for Aarch64Backend {
     type Error = ArchError;
     type NativeFrame = TrapFrame;
@@ -87,7 +103,7 @@ impl EntryBackend for Aarch64Backend {
 
 impl MmuBackend for Aarch64Backend {
     fn live_root(&mut self) -> Result<RootGpa, Self::Error> {
-        let ttbr = crate::fault::hardware_live_ttbr();
+        let ttbr = hardware_live_ttbr();
         RootGpa::page_aligned(FrameGpa::new(ttbr & 0x0000_ffff_ffff_f000)).ok_or(ArchError::Unbound)
     }
     fn read_user_word(
@@ -245,7 +261,7 @@ impl InterruptBackend for Aarch64Backend {
 
 impl CrossingBackend for Aarch64Backend {
     fn yield_host_effect(&mut self) -> Result<(), Self::Error> {
-        crate::personality::mm_portal::production::yield_host_effect();
+        yield_host_effect();
         Ok(())
     }
     fn submit_host_request(
