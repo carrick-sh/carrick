@@ -28,7 +28,7 @@ pub(crate) unsafe fn copy_to_user_guarded(
 ) -> bool {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
-        let fixup_ptr = &cur_task.fixup_pc as *const _ as *const u64;
+        let fixup_ptr = &cur_task.linux.fixup_pc as *const _ as *const u64;
         let mut success: u64 = 1;
         unsafe {
             core::arch::asm!(
@@ -89,7 +89,7 @@ pub(crate) unsafe fn copy_from_user_guarded(
 ) -> bool {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
-        let fixup_ptr = &cur_task.fixup_pc as *const _ as *const u64;
+        let fixup_ptr = &cur_task.linux.fixup_pc as *const _ as *const u64;
         let mut success: u64 = 1;
         unsafe {
             core::arch::asm!(
