@@ -135,7 +135,11 @@ mod kernel {
             return;
         }
         if frame.rax == carrick_el1_abi::MM_PORTAL_GRANT_ESR {
-            let res = super::mmu::serve_cpl0_grant(binding, frame.rdi as usize);
+            // SAFETY: native entry supplies this lane's carrier-issued binding.
+            // Bootstrap initializes and retains the aligned supervisor metadata,
+            // both wake bindings and identity-mapped table arena until all vCPUs
+            // retire. This call runs in CPL0 under shared exact-MM admission.
+            let res = unsafe { super::mmu::serve_cpl0_grant(binding, frame.rdi as usize) };
             frame.rax = res as u64;
             if binding.return_kick.swap(0, Ordering::AcqRel) != 0 {
                 doorbell(RETURN_KICK_PORT, frame);

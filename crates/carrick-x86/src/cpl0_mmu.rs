@@ -234,7 +234,26 @@ use crate::cpl0_entry::CpuBinding;
 
 /// Execute a grant submission in CPL0, calling the shared `serve_grant` owner.
 /// Returns 0 on success, or Linux errno (e.g. 22 = EINVAL) on refusal/error.
-pub fn serve_cpl0_grant(binding: &CpuBinding, slot_index: usize) -> u32 {
+///
+/// # Safety
+///
+/// The caller must be executing the carrier's CPL0 lane. All nonzero
+/// metadata addresses in `binding` must name aligned, initialized records
+/// mapped in that execution venue, retained for the entire call and every
+/// owner callback. The table-memory interval must be page aligned, writable,
+/// identity-mapped supervisor table memory, exclusively edited through the
+/// shared exact-MM admission. Published wake targets must retain the issued
+/// bindings in the same guest venue. Guest addresses are never host pointers.
+///
+/// An integer-only binding cannot confer these mapping or lifetime rights:
+///
+/// ```compile_fail,E0133
+/// use carrick_x86::{cpl0_entry::CpuBinding, cpl0_mmu::serve_cpl0_grant};
+/// fn unqualified_host_call(binding: &CpuBinding) {
+///     serve_cpl0_grant(binding, 0);
+/// }
+/// ```
+pub unsafe fn serve_cpl0_grant(binding: &CpuBinding, slot_index: usize) -> u32 {
     binding.entries.fetch_add(1, Ordering::Relaxed);
     if binding.zone_address == 0
         || binding.reservations_address == 0
@@ -253,13 +272,13 @@ pub fn serve_cpl0_grant(binding: &CpuBinding, slot_index: usize) -> u32 {
     // SAFETY: the carrier retains these published supervisor records for the
     // vCPU lifetime and binds their exact mapped addresses before entry.
     let zone = unsafe { &*zone_ptr };
-    // SAFETY: checked nonzero above; the carrier publishes and retains the
+    // SAFETY: the caller qualifies the mapping and retains the
     // correctly aligned shared reservation record at this address.
     let reservations = unsafe { &*(reservations_addr as *const SharedReservations) };
-    // SAFETY: checked nonzero above; the carrier publishes and retains the
+    // SAFETY: the caller qualifies the mapping and retains the
     // correctly aligned residency record at this address.
     let residency = unsafe { &*(residency_addr as *const FrameGrantResidencyTable) };
-    // SAFETY: checked nonzero above; the carrier publishes and retains the
+    // SAFETY: the caller qualifies the mapping and retains the
     // correctly aligned portal slots at this address.
     let portal_slots = unsafe { &*(portal_addr as *const MmPortalSlots) };
 
