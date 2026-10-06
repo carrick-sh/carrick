@@ -577,3 +577,33 @@ fn shared_kernel_transport_yield_and_fatal() {
         "expected fatal exit, got {fatal_err}"
     );
 }
+
+fn context_program() -> Vec<u8> {
+    const CONTEXT_WITNESS: u64 = 0xffff_ffff_ffff_ff30;
+    let mut bytes = Vec::new();
+    for op in [0_u64, 1_u64] {
+        bytes.extend_from_slice(&[0x48, 0xbf]); // mov rdi, op
+        bytes.extend_from_slice(&op.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xb8]); // mov rax, CONTEXT_WITNESS
+        bytes.extend_from_slice(&CONTEXT_WITNESS.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05]); // syscall into shared kernel witness
+        bytes.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]); // mov rdi, rax; mov rax, OBSERVE_NATIVE
+        bytes.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05]);
+    }
+    bytes.extend_from_slice(&[0x0f, 0x0b]);
+    bytes
+}
+
+#[test]
+fn shared_kernel_context_stack_slot_and_thread_cpu() {
+    let p0 = context_program();
+    let p1 = context_program();
+    let mut carrier = Cpl0Carrier::boot(&image(), [&p0, &p1]).expect("real KVM + CPL0 image");
+    for task in 0..2 {
+        let obs_stack = carrier.observe(task).expect("stack slot observation");
+        assert_eq!(obs_stack.result, task as i64, "stack slot for task {task}");
+        let obs_cpu = carrier.observe(task).expect("thread cpu observation");
+        assert_eq!(obs_cpu.result, task as i64, "thread cpu for task {task}");
+    }
+}
