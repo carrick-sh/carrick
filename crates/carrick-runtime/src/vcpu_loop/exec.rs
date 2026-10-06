@@ -2195,6 +2195,7 @@ where
             let authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority> =
                 std::sync::Arc::new(super::KernelFrameCowAuthority {
                     runtime: std::sync::Arc::downgrade(kernel),
+                    host_backing: Some(kernel.dispatcher.mem_view().host_backing_access()),
                     deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(committed_mm),
                     kernel: std::sync::Arc::clone(committed_context.kernel()),
                     mm: committed_mm,

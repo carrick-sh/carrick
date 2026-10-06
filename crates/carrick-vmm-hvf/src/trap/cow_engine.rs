@@ -2996,7 +2996,6 @@ impl HvfTaskState {
 
     pub(crate) fn live_stage1_names_writable_private_mapping(
         &self,
-        custody: &CarrierVmCustody,
         fault_va: u64,
         mapping: MappingView,
     ) -> Result<bool, TrapError> {
@@ -3009,23 +3008,16 @@ impl HvfTaskState {
                 TrapError::Hypervisor("HVPatch winner PTE precedes mapping start".to_owned())
             })?)
             .ok_or_else(|| TrapError::Hypervisor("HVPatch winner PTE IPA overflow".to_owned()))?;
-        let page_table_host = self
-            .mapping_for_range_in(
-                custody,
-                crate::memory::LINUX_PAGE_TABLES_BASE,
-                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-            )
-            .map(|mapping| mapping.host_addr)
-            .ok_or_else(|| {
-                TrapError::Hypervisor("HVPatch winner PTE page-table backing is absent".to_owned())
-            })?;
         let page_tables_authority = self.page_tables_authority();
         page_tables_authority
             .with_manager(|manager| -> Result<bool, TrapError> {
                 let shadow = manager.debug_walk(page_va);
-                let page_table_resolver =
-                    self.page_table_resolver(manager.base(), Some(page_table_host));
-                let live = unsafe { manager.debug_walk_host(page_table_resolver, page_va) }
+                // A boot VA lookup can name another MM's table after a root
+                // switch. Pin the selected physical root and extensions.
+                let page_table_resolver = self
+                    .mm_access
+                    .pinned_stage1_arenas(&self.custody_arc(), manager.base())?;
+                let live = unsafe { manager.debug_walk_host(&page_table_resolver, page_va) }
                     .map_err(|e| {
                         TrapError::Hypervisor(format!(
                             "HVPatch winner PTE debug_walk_host failed: {e:?}"
@@ -3395,16 +3387,20 @@ impl HvfTaskState {
         };
         let Some(span) = span else {
             let mapping = self.mapping_for_range_in(custody, fault_va, 1);
-            let write_denied = self
-                .protections
-                .legacy()
-                .is_none_or(|protections| protections.range_write_denied(fault_va, 1));
+            // An EL1-owned MM has no legacy host protection table. Its live
+            // private terminal carries Linux write permission, so an absent
+            // host table cannot veto the exact-leaf winner check below.
+            let write_denied = !guest_lane
+                && self
+                    .protections
+                    .legacy()
+                    .is_none_or(|protections| protections.range_write_denied(fault_va, 1));
             let private_writable_mapping = mapping.is_some_and(|mapping| {
                 mapping.guest_writable && mapping.sharing == GuestMappingSharing::Private
             });
             let live_leaf_is_writable = match mapping {
                 Some(mapping) if private_writable_mapping && !write_denied => {
-                    self.live_stage1_names_writable_private_mapping(custody, fault_va, mapping)?
+                    self.live_stage1_names_writable_private_mapping(fault_va, mapping)?
                 }
                 _ => false,
             };
@@ -5964,6 +5960,9 @@ impl HvfVmState {
     /// True if `[address, address+length)` overlaps any PROT_NONE range. Used
     /// to fault syscall-path accesses to a guest PROT_NONE buffer (EFAULT).
     pub(crate) fn range_no_access(&self, address: u64, length: usize) -> bool {
+        if self.protections.owner().is_some() {
+            return false;
+        }
         self.protections
             .legacy()
             .is_none_or(|protections| protections.range_no_access(address, length))

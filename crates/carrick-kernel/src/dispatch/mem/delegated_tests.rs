@@ -3579,6 +3579,94 @@ fn delegated_bind_admission_is_exact_against_its_host_setup_twin() {
 }
 
 #[test]
+fn delegated_boot_file_protection_keeps_owner_source_for_fork() {
+    let (dispatcher, _memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&dispatcher);
+    let before = root
+        .lock()
+        .mapping(IMAGE + PAGE / 2)
+        .expect("boot file owner");
+    assert!(before.host_backing.is_some());
+    assert!(
+        dispatcher
+            .mem()
+            .lock()
+            .semantic_vmas
+            .overlapping(IMAGE, IMAGE + PAGE)
+            .next()
+            .is_none()
+    );
+
+    dispatcher
+        .mem()
+        .lock()
+        .set_mapping_prot(IMAGE, IMAGE + PAGE, LinuxProtFlags::READ);
+
+    let after = root
+        .lock()
+        .mapping(IMAGE + PAGE / 2)
+        .expect("boot file survives mprotect");
+    assert_eq!(after.host_backing, before.host_backing);
+    assert_eq!(after.protection, ReservationProtection::READ);
+    assert!(
+        dispatcher
+            .mem_view()
+            .read_host_backing(after.host_backing.unwrap(), PAGE as usize)
+            .is_ok()
+    );
+    assert!(
+        dispatcher
+            .mem()
+            .lock()
+            .semantic_vmas
+            .overlapping(IMAGE, IMAGE + PAGE)
+            .next()
+            .is_none()
+    );
+}
+
+#[test]
+fn exec_replacement_keeps_predecessor_source_custody_for_in_flight_owner_transfer() {
+    let (dispatcher, _memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&dispatcher);
+    let source = root
+        .lock()
+        .mapping(IMAGE + PAGE / 2)
+        .unwrap()
+        .host_backing
+        .unwrap();
+    let mut replacement = dispatcher.mem().lock().fork_materialized();
+
+    replacement.reset_for_execve();
+
+    assert!(replacement.host_backing_custody.source(source).is_some());
+}
+
+#[test]
+fn retained_host_backing_access_outlives_dispatcher() {
+    let (dispatcher, _memory, _) = populated_host_setup_mm();
+    let root = Root::admit(&dispatcher);
+    let source = root
+        .lock()
+        .mapping(IMAGE + PAGE / 2)
+        .unwrap()
+        .host_backing
+        .unwrap();
+    let access = dispatcher.mem_view().host_backing_access();
+
+    drop(dispatcher);
+
+    assert!(access.retains_host_backing(source.handle(), source.generation()));
+    assert_eq!(
+        access
+            .read_host_backing(source, PAGE as usize)
+            .unwrap()
+            .len(),
+        PAGE as usize
+    );
+}
+
+#[test]
 fn delegated_bind_admission_seals_the_exact_external_charges() {
     let (dispatcher, _memory, a) = populated_host_setup_mm();
     let root = Root::publish(&dispatcher);
