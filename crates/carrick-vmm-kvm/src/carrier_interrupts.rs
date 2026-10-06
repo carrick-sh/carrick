@@ -7,7 +7,7 @@ use crate::cpl0_boot::{Cpl0Carrier, Watchdog};
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
 use carrick_hal::{HvVcpu, TrapError, VcpuExit};
 use carrick_mem::pml4::Pml4MapSpec;
-use carrick_sched_core::{BoundedSpin, SlotId, ThreadIdentity, ZoneTables};
+use carrick_sched_core::{BoundedSpin, ParkedContextWords, SlotId, ThreadIdentity, ZoneTables};
 use carrick_x86::cpl0_scheduler::*;
 use carrick_x86::interrupts::*;
 use kvm_bindings::{Msrs, kvm_msi, kvm_msr_entry};
@@ -117,7 +117,7 @@ pub fn witness(
 ) -> Result<ProgressObservation, TrapError> {
     let mut carrier = Cpl0Carrier::boot_inner(image, programs, true)?;
     let ram = &mut carrier.ram;
-    if size_of::<ZoneTables>() > (PROGRESS_STATE - PROGRESS_ZONE) as usize
+    if size_of::<ZoneTables<ParkedContextWords>>() > (PROGRESS_STATE - PROGRESS_ZONE) as usize
         || size_of::<ProgressState>() > (SECOND_ROOT - 0x170_0000) as usize
     {
         return Err(fail("progress supervisor regions overlap"));
@@ -151,9 +151,12 @@ pub fn witness(
     // documented empty state. Both vCPUs are stopped during publication.
     let zone = unsafe {
         &*ram
-            .host_ptr(PROGRESS_ZONE_GPA, size_of::<ZoneTables>())
+            .host_ptr(
+                PROGRESS_ZONE_GPA,
+                size_of::<ZoneTables<ParkedContextWords>>(),
+            )
             .ok_or_else(|| fail("zone backing"))?
-            .cast::<ZoneTables>()
+            .cast::<ZoneTables<ParkedContextWords>>()
     };
     zone.drive(SLOT, 1);
     zone.publish_slot(SLOT, 11, Some(0), 0);
@@ -162,6 +165,7 @@ pub fn witness(
         |gpa| RootGpa::page_aligned(FrameGpa::new(gpa)).ok_or_else(|| fail("unaligned root"));
     let nz = |raw| NonZeroU64::new(raw).ok_or_else(|| fail("zero generation"));
     let mut tasks = Vec::new();
+    let mut initial_context = None;
     for index in 0..2u64 {
         let mm = 11 + index;
         let root = root(if index == 0 { FIRST_ROOT } else { SECOND_ROOT })?;
@@ -179,19 +183,6 @@ pub fn witness(
                 ..Default::default()
             })
             .map_err(|_| fail("record admission"))?;
-        if index == 0 {
-            zone.requeue_preempted(SLOT, id);
-        } else {
-            let guard = zone
-                .lock(ZoneTables::bucket_of(mm, WAKE_ADDRESS), &BoundedSpin(0))
-                .ok_or_else(|| fail("wake bucket"))?;
-            let seq = zone.next_seq(id);
-            zone.enqueue(&guard, id, seq, mm, WAKE_ADDRESS, u32::MAX, 0)
-                .map_err(|_| fail("wake enrollment"))?;
-            if !zone.publish_guest_park(&guard, SLOT, id, seq) {
-                return Err(fail("park publication"));
-            }
-        }
         let tag = 0x31 + index as u8;
         let mut xsave = XsaveArea::ZERO;
         // Distinct legal round-down/round-up controls, all exceptions masked.
@@ -230,20 +221,41 @@ pub fn witness(
         };
         frame.gpr[5] = 0; // RBX compute iterations
         frame.gpr[10] = PROGRESS_DATA; // RAX private data VA
+        let address = AddressContext {
+            root,
+            mm: MmGeneration::new(nz(mm)?),
+            generation: ContextGeneration::new(nz(1)?),
+        };
+        let native = NativeContext {
+            frame,
+            address,
+            fs_base: fs,
+            gs_base: gs,
+            xsave,
+        };
+        // SAFETY: both vCPUs are stopped and this newly allocated record is
+        // host-owned until the queue or park publication below.
+        unsafe { *zone.record(id).ctx_mut() = park_native_context(&native) };
+        if initial_context.is_none() {
+            initial_context = Some(native);
+        }
         tasks.push(ContextBinding {
             record: zone.record_ref(id),
-            context: NativeContext {
-                frame,
-                address: AddressContext {
-                    root,
-                    mm: MmGeneration::new(nz(mm)?),
-                    generation: ContextGeneration::new(nz(1)?),
-                },
-                fs_base: fs,
-                gs_base: gs,
-                xsave,
-            },
+            address,
         });
+        if index == 0 {
+            zone.requeue_preempted(SLOT, id);
+        } else {
+            let guard = zone
+                .lock(ZoneTables::bucket_of(mm, WAKE_ADDRESS), &BoundedSpin(0))
+                .ok_or_else(|| fail("wake bucket"))?;
+            let seq = zone.next_seq(id);
+            zone.enqueue(&guard, id, seq, mm, WAKE_ADDRESS, u32::MAX, 0)
+                .map_err(|_| fail("wake enrollment"))?;
+            if !zone.publish_guest_park(&guard, SLOT, id, seq) {
+                return Err(fail("park publication"));
+            }
+        }
     }
     let tasks: [ContextBinding; 2] = tasks.try_into().map_err(|_| fail("two contexts"))?;
     let state_ptr = ram
@@ -253,6 +265,7 @@ pub fn witness(
     unsafe {
         state_ptr.write(ProgressState {
             tasks,
+            active: initial_context.ok_or_else(|| fail("initial context"))?,
             maintenance_root: root(FIRST_ROOT)?,
             turns: 0,
             order: [u64::MAX; PROGRESS_TURNS],
@@ -339,6 +352,15 @@ pub fn witness(
                         .ok_or_else(|| fail("data readback"))?;
                     unsafe { bytes.copy_from_slice(core::slice::from_raw_parts(pointer, 96)) };
                 }
+                let read_context = |index: usize| -> Result<NativeContext, TrapError> {
+                    let task = &state.tasks[index];
+                    // SAFETY: the fixture vCPU has exited at PROGRESS_DONE;
+                    // no guest runner can mutate this exact record now.
+                    let words = unsafe { *zone.record(task.record.id).ctx_mut() };
+                    restore_native_context(words, task.address)
+                        .ok_or_else(|| fail("stale shared progress context"))
+                };
+                let observed = [read_context(0)?, read_context(1)?];
                 return Ok(ProgressObservation {
                     entries: carrier.binding(0).entries.load(Ordering::Acquire),
                     completions: carrier.binding(0).completions.load(Ordering::Acquire),
@@ -348,14 +370,9 @@ pub fn witness(
                     roots: state.roots,
                     iterations: state.iterations,
                     data,
-                    frames: core::array::from_fn(|i| state.tasks[i].context.frame),
-                    tls: core::array::from_fn(|i| {
-                        (
-                            state.tasks[i].context.fs_base,
-                            state.tasks[i].context.gs_base,
-                        )
-                    }),
-                    xsave: core::array::from_fn(|i| state.tasks[i].context.xsave.0),
+                    frames: core::array::from_fn(|i| observed[i].frame),
+                    tls: core::array::from_fn(|i| (observed[i].fs_base, observed[i].gs_base)),
+                    xsave: core::array::from_fn(|i| observed[i].xsave.0),
                     wakes: state.wakes,
                     kick_irqs: state.kick_irqs,
                     timer_irqs: state.timer_irqs,
