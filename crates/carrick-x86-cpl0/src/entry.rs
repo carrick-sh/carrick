@@ -293,6 +293,15 @@ mod kernel {
             frame.rax = arch.live_root().map_or(0, |root| root.address().raw());
             return;
         }
+        if frame.rax == OBSERVE_PORTAL_WINDOW {
+            let root =
+                carrick_el1::isa::x86::hardware_live_root().map_or(0, |root| root.address().raw());
+            frame.rax = u64::from(
+                carrick_el1::isa::x86::portal_root_is_live(root)
+                    && !carrick_el1::isa::x86::portal_root_is_live(root + 4096),
+            );
+            return;
+        }
         if frame.rax == OBSERVE_MMU_DRAIN {
             use carrick_guest_arch::{
                 AddressContext, ContextGeneration, FrameGpa, GuestLen, MmGeneration, MmuBackend,
