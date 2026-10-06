@@ -2645,6 +2645,12 @@ impl<M: CurrentMmMemory, T: SyscallTrap> SyscallTrap for SplitView<'_, M, T> {
     fn inject_signal(&mut self, signal: carrick_hal::SignalInjection) -> Result<(), TrapError> {
         self.trap.inject_signal(signal)
     }
+    fn resume_signal_frame(
+        &mut self,
+        pending: Box<carrick_hal::sigframe::PendingSignalFrame>,
+    ) -> Result<(), TrapError> {
+        self.trap.resume_signal_frame(pending)
+    }
     fn last_syscall_nr(&self) -> Option<u64> {
         self.trap.last_syscall_nr()
     }

@@ -7353,6 +7353,55 @@ fn terminal_zone_capture_rejects_another_threads_execution_lease() {
 }
 
 #[test]
+fn signal_frame_zone_capture_retains_delivery_and_only_reserves_sigkill() {
+    let (_kernel, context) = bootstrap(15_412);
+    publish(&context, 0x704);
+    let executor =
+        crate::kernel::objects::ExecutorId::for_transitional_thread(context.thread().registry_id())
+            .unwrap();
+    let lease = context.thread().claim_runnable(executor).unwrap();
+    let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+    wait.mark_consumed();
+    let continuation =
+        BlockedContinuation::from_signal_frame_zone_park(&context, &lease, wait).unwrap();
+    assert_eq!(continuation.authority().syscall(), None);
+    assert_eq!(continuation.authority().mm(), context.shared().mm().id());
+    assert_eq!(
+        continuation.authority().restart_class(),
+        RestartClass::Never
+    );
+    assert!(!continuation.accepts_generic_scheduler_wake());
+    let signal = crate::kernel::LinuxSignal::for_signal_number(12).unwrap();
+    context
+        .signal_authority()
+        .enqueue_thread_standard(signal, None);
+    let probe = SignalReadinessProbe::from_continuation(&continuation);
+    assert!(
+        probe.event().is_none(),
+        "another handler cannot replace an admitted frame"
+    );
+    assert!(context.signal_authority().thread_pending().contains(12));
+    let kill = crate::kernel::LinuxSignal::for_signal_number(9).unwrap();
+    context
+        .signal_authority()
+        .enqueue_thread_standard(kill, None);
+    let event = probe
+        .event()
+        .expect("SIGKILL cancels the retained delivery");
+    assert_eq!(event.reserved_signal().unwrap().signum(), 9);
+    let result = continuation.resume(event, &context).unwrap();
+    assert_eq!(result.completion, ContinuationCompletion::ResumeSignalFrame);
+    assert_eq!(result.restart(), RestartDecision::NoRestart);
+    assert_eq!(result.reserved_signal().unwrap().signum(), 9);
+    assert!(context.signal_authority().thread_pending().contains(12));
+    drop(result);
+    assert!(
+        context.signal_authority().thread_pending().contains(9),
+        "dropped reservation requeues through its exact owner"
+    );
+}
+
+#[test]
 fn fault_zone_capture_has_no_syscall_and_resumes_the_fault() {
     let (_kernel, context) = bootstrap(15_410);
     publish(&context, 0x704);

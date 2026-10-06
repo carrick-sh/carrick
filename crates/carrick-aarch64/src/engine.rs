@@ -5200,6 +5200,17 @@ impl<V: Aarch64Vmm> SyscallTrap for Aarch64EngineCore<V> {
         self.vcpu.get_mut().prepare_register_resume()
     }
 
+    fn resume_signal_frame(
+        &mut self,
+        pending: Box<carrick_hal::sigframe::PendingSignalFrame>,
+    ) -> Result<(), TrapError> {
+        let (signum, handler) = (pending.signum(), pending.handler());
+        let info = pending.publish(self)?;
+        carrick_observability::probes::signal_inject(signum, info.saved_pc, info.new_sp, handler);
+        self.last_fault_esr = 0;
+        self.vcpu.get_mut().prepare_register_resume()
+    }
+
     fn restore_from_sigframe(&mut self) -> Result<u64, TrapError> {
         // fpsimd_enabled MUST match inject_signal. Returns the SAVED SIGMASK — not
         // saved_pc — mirroring the per-backend impls.
