@@ -76,7 +76,7 @@ impl CurrentReadWindow {
 /// One input window per host checkpoint stream. Misses prepare once using live
 /// authority; unsupported ranges use the original copy path. Revocation errors
 /// during a copy are returned directly, never retried through weaker checks.
-#[derive(Default)]
+#[derive(::core::default::Default)]
 pub struct CurrentReadCache {
     window: Option<CurrentReadWindow>,
 }

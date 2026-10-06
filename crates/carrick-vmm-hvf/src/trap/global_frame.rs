@@ -7,7 +7,7 @@
 
 use super::*;
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct GlobalFrameIpaAllocator {
     pub(crate) next: u64,
     pub(crate) free: Vec<(u64, u64)>,
@@ -136,7 +136,7 @@ impl GlobalFrameIpaAllocator {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct El1FrameGrantLedger {
     active: std::collections::BTreeSet<(u64, u64)>,
     returned: std::collections::BTreeSet<(u64, u64)>,
@@ -160,7 +160,7 @@ impl Default for El1FrameGrantLedger {
 }
 
 /// A snapshot handle owns accounting only, never physical backing or a VM.
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct El1FrameGrantObserver {
     ledger: std::sync::Arc<parking_lot::Mutex<El1FrameGrantLedger>>,
 }
@@ -786,7 +786,7 @@ pub(crate) fn mark_el1_frame_grant_in(
 /// Owned by the physical mapping across VM replay and shared-MM retention.
 /// Taking this receipt after terminal release prevents an old owner from
 /// recording a return against a successor at the same IPA.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct El1FrameGrantReceipt {
     base: u64,
     length: u64,
@@ -839,7 +839,7 @@ pub(crate) fn release_retired_stage2_ipa(base: u64, length: u64) -> Result<(), T
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct GlobalFrameStage2Lease {
     pub(crate) base: u64,
     pub(crate) length: u64,
@@ -982,7 +982,7 @@ impl Drop for GlobalFrameStage2Lease {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone)]
 pub(crate) enum GlobalFrameOwnerEntry {
     Live(std::sync::Arc<GlobalFrameHostOwner>),
     RetirementPending {
@@ -1029,7 +1029,7 @@ impl GlobalFrameOwnerEntry {
 /// happened to service `mmap` would pin the host extent until process exit even
 /// after another thread completed the final `munmap`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) enum GlobalFrameBacking {
     Owned(crate::host_mapping::OwnedHostMapping),
     Pooled(crate::frame_pool::PooledFrameHandle),
@@ -1058,7 +1058,7 @@ impl GlobalFrameBacking {
 /// A content writer retains the existing physical owner rather than allocating
 /// a second shared tracker or keeping a self-reference inside a data span.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct OwnedCodeContent(std::sync::Arc<GlobalFrameSharedMapping>);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1070,7 +1070,7 @@ impl std::ops::Deref for OwnedCodeContent {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct GlobalFrameSharedMapping {
     pub(crate) code_content: super::code_content::CodeContent,
     backing: GlobalFrameBacking,
@@ -1217,7 +1217,7 @@ impl PartialEq for PhysicalGrantCompletion {
 impl Eq for PhysicalGrantCompletion {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct GlobalFrameHostOwner {
     grant_publication: std::sync::OnceLock<std::sync::Weak<PhysicalGrantWait>>,
     pub(crate) mapping: std::sync::Arc<GlobalFrameSharedMapping>,
@@ -1394,7 +1394,7 @@ impl GlobalFrameHostOwner {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct GlobalFrameOwnerPin {
     pub(crate) owner: std::sync::Arc<GlobalFrameHostOwner>,
     pub(crate) _stage2_pin: CarrierStage2Pin,
@@ -1424,7 +1424,7 @@ impl GlobalFrameOwnerPin {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct PhysicalCowSource {
     host_addr: *mut u8,
     physical_ipa: u64,
@@ -1549,7 +1549,7 @@ unsafe impl Send for GlobalFrameHostOwner {}
 unsafe impl Sync for GlobalFrameHostOwner {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct CarrierFrameCowOwnerLease {
     pub(crate) key: (u64, u64),
     pub(crate) pin: GlobalFrameOwnerPin,
@@ -1574,7 +1574,7 @@ impl carrick_hal::FrameCowOwnerLease for CarrierFrameCowOwnerLease {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct CarrierFrameCowOwnerInventory {
     pub(crate) custody: std::sync::Arc<CarrierVmCustody>,
 }
@@ -2139,7 +2139,16 @@ static STRUCTURAL_EPOCH_ALLOCATOR: std::sync::atomic::AtomicU64 =
 
 /// A non-zero monotonically generated structural backing epoch.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 pub(crate) struct StructuralEpoch(std::num::NonZeroU64);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -2184,7 +2193,7 @@ impl StructuralEpoch {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct StructuralBackingOwner {
     pub(crate) custody: std::sync::Weak<CarrierVmCustody>,
     pub(crate) retained: std::sync::Arc<StructuralBackingCustodyEntry>,
@@ -2194,7 +2203,7 @@ pub(crate) struct StructuralBackingOwner {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct StructuralBackingCustodyEntry {
     pub(crate) mapping: std::sync::Arc<GlobalFrameSharedMapping>,
     pub(crate) record_identity: parking_lot::Mutex<CarrierStage2RecordIdentity>,
@@ -2644,7 +2653,13 @@ pub(crate) fn retry_structural_backing_identities_in_using(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct GlobalFrameReplayExtent {
     pub(crate) ipa: u64,
     pub(crate) length: u64,
@@ -2660,7 +2675,14 @@ impl GlobalFrameReplayExtent {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct GlobalFrameReplayReconcileReport {
     pub(crate) rebound: usize,
     pub(crate) retired: usize,
@@ -3500,7 +3522,7 @@ const PENDING_GLOBAL_FRAME_RETIREMENTS_PER_CLASS_PER_IDLE_TURN: usize =
     PENDING_GLOBAL_FRAME_RETIREMENTS_PER_IDLE_TURN / 2;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct PendingGlobalFrameRetirementQueue<K: Copy + Ord> {
     next_sequence: u64,
     by_sequence: std::collections::BTreeMap<u64, K>,
@@ -3569,7 +3591,14 @@ impl<K: Copy + Ord> PendingGlobalFrameRetirementQueue<K> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct PendingGlobalFrameRetirementTurnReport {
     pub(crate) remaining: usize,
     pub(crate) inspected_directory: usize,
@@ -4146,7 +4175,13 @@ fn register_shared_alias_locked(registry: &mut AliasRegistry, b: AliasBacking) {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct RetiredStage2Projection {
     pub(crate) physical_ipa: u64,
     pub(crate) physical_length: u64,
@@ -4165,7 +4200,7 @@ impl From<InventoryExtent> for RetiredStage2Projection {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct RetiredProjectionCleanup {
     pub(crate) removed_aliases: Vec<AliasBacking>,
     pub(crate) preserved_reused_aliases: Vec<AliasBacking>,

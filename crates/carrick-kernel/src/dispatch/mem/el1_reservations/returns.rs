@@ -25,7 +25,7 @@ use super::*;
 use carrick_el1_abi::ReservationSequence;
 
 /// Why a reconciliation acknowledged nothing. The owed extents stay owed.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub enum El1ReturnError {
     /// The permit is not this MM's, or the root refused a host-venue step.
     Authority(Refusal),

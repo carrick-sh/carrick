@@ -82,7 +82,13 @@ syscall_table! {
 use crate::linux_abi::LinuxSiginfo;
 use carrick_abi::{SigBlockMask, SigSet};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct DispatchPendingSignal {
     pub signum: i32,
     pub(crate) owner: crate::kernel::SignalPendingOwner,
@@ -3291,7 +3297,13 @@ fn names_self_pid(x: i64) -> bool {
 /// tid all shared one integer disambiguated by a bool. Each variant names the
 /// domain its payload actually lives in; [`Self::host_kill_encoding`] is the
 /// ONE raw escape back to the kill(2) wire value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum SignalTarget {
     /// One process named by its HOST pid: `kill(pid > 0)` after ns→host
     /// translation or `pidfd_send_signal`'s registered host pid.
@@ -3370,7 +3382,13 @@ pub(crate) fn ns_visible_sender_pid(context: &crate::kernel::KernelContext) -> i
 
 /// A process-directed signal target: the exact task and, when the sender
 /// addressed it by a non-leader thread id, that thread (its recipient).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct ProcessSignalTarget {
     pub(crate) task: crate::kernel::TaskKey,
     pub(crate) named_thread: Option<crate::kernel::ThreadKey>,

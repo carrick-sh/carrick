@@ -82,7 +82,7 @@ const AARCH64_DSB_ISH: u32 = 0xd503_3b9f;
 const AARCH64_ISB: u32 = 0xd503_3fdf;
 const AARCH64_HVC1: u32 = 0xd400_0022;
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 struct TableIpas {
     l1: u64,
     l2: u64,
@@ -101,7 +101,7 @@ const CHILD_TABLE_IPAS: TableIpas = TableIpas {
     l3: CHILD_L3_IPA,
 };
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 struct TablePath {
     l0: Vec<u8>,
     l1: Vec<u8>,
@@ -390,7 +390,7 @@ mod platform {
         vm_live: bool,
     }
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
     struct ExitRecord {
         host_syndrome: u64,
         underlying_syndrome: u64,

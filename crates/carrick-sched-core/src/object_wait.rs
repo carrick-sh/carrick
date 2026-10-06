@@ -105,7 +105,13 @@ pub const OBJECT_WAIT_LAYOUT_HASH: u64 = {
 
 /// Direct queue index plus the exact object incarnation. Different readiness
 /// classes of one object have different indices, assigned by its authority.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(C)]
 pub struct ObjectWaitKey {
     index: u32,
@@ -213,7 +219,7 @@ impl ObjectWaitKey {
 /// length, progress and operation kind). No host pointer or fd is stored here.
 /// Construct only when transferring an admitted operation to the scheduler;
 /// consuming it transfers responsibility for completion/cancellation back.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 #[must_use = "an operation token must be resumed, reparked, or cancelled by its authority"]
 #[repr(C)]
 pub struct OperationToken {
@@ -260,7 +266,13 @@ impl OperationToken {
 }
 
 /// Readiness version sampled before the object predicate is checked.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ObjectWaitSnapshot {
     key: ObjectWaitKey,
     epoch: u64,
@@ -275,7 +287,7 @@ impl ObjectWaitSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub enum ObjectWaitError {
     Busy,
     Stale,
@@ -286,7 +298,14 @@ pub enum ObjectWaitError {
 
 /// Exact work receipt: each visit is to a member of this object's queue;
 /// unrelated records, objects and futex buckets are never visited.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ObjectWakeReport {
     pub visited: u32,
     pub queued: u32,
@@ -298,7 +317,14 @@ pub struct ObjectWakeReport {
 
 /// Host notification receipt. Every claimed waiter is either queued through
 /// the host placement boundary or transferred to the caller for handback.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HostObjectWakeReport {
     pub visited: u32,
     pub queued: u32,
@@ -1243,7 +1269,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
 
 /// Read-only view of one record's object-wait registration (census only;
 /// each word is read once, values may be torn across fields).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ObjectWaitCensus {
     /// The queue index it is linked on (0: not linked).
     pub queue: u32,
@@ -1255,7 +1287,13 @@ pub struct ObjectWaitCensus {
 }
 
 /// Read-only view of one object wait queue (census only).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ObjectQueueCensus {
     pub generation: u64,
     pub epoch: u64,

@@ -39,7 +39,7 @@ pub struct PreparedReservationSession {
     view: Box<dyn PreparedHostReservations>,
 }
 
-#[derive(Default)]
+#[derive(::core::default::Default)]
 pub(in crate::dispatch) struct ReservationProviderSlot {
     published: bool,
     provider: Option<Arc<dyn HostReservationProvider>>,
@@ -69,7 +69,7 @@ impl ReservationProviderSlot {
 /// The exact root that owns a delegated MM's anonymous memory: the installed
 /// carrier provider, this MM's key and its host queue. Minted only from the
 /// MM's own authority, so it cannot name a sibling's or a successor's root.
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub(in crate::dispatch) struct DelegatedRoot {
     provider: Arc<dyn HostReservationProvider>,
     host_serial: Arc<parking_lot::Mutex<()>>,

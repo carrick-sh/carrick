@@ -96,7 +96,13 @@ pub mod events {
 
 /// Which side of which object an item watches.
 #[repr(u32)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum EpollMember {
     EventFd = 1,
     PipeReader = 2,
@@ -130,7 +136,7 @@ impl EpollMember {
 
 /// An epoll object's state (under its lock).
 #[repr(C)]
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub struct EpollState {
     /// First item of the interest list (item number, 0 none).
     interest_head: u32,
@@ -192,14 +198,28 @@ const fn unpack(word: u64) -> IpcObjectHandle {
 }
 
 /// Exact identity of one item: its number and incarnation.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct EpollItemRef {
     number: u32,
     generation: u32,
 }
 
 /// One reported event (Linux `struct epoll_event` without packing).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct EpollReport {
     pub events: u32,
     pub data: u64,
@@ -208,7 +228,13 @@ pub struct EpollReport {
 /// Why a zone `EPOLL_CTL_ADD` did not take the item. `Exists`/`NotFound`
 /// are the guest's `EEXIST`/`ENOENT`; `HostHalf` means the item belongs in
 /// the host's half (a placement refusal, never guest-visible).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum EpollCtlError {
     Exists,
     NotFound,
@@ -218,7 +244,13 @@ pub enum EpollCtlError {
     Ipc(IpcError),
 }
 /// Why an item that could be in the zone is placed in the host half.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub enum HostHalfReason {
     /// The zone item store is exhausted.
     ItemsExhausted,
@@ -236,7 +268,14 @@ impl From<IpcError> for EpollCtlError {
 /// Epolls a member publication queued items on: the caller notifies each
 /// one's `Readable` wait key after unlocking (bounded by
 /// [`MAX_MEMBER_ITEMS`]).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct EpollWakes {
     len: u32,
     epolls: [RawIpcObject; MAX_MEMBER_ITEMS],
@@ -269,7 +308,14 @@ impl EpollWakes {
 }
 
 /// The zone half of an epoll as a harvest found it.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct EpollHarvest {
     /// Reports written to the output.
     pub reported: usize,

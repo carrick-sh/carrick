@@ -208,7 +208,7 @@ impl FileTable {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(super) enum StdioField {
     Closed,
     Cloexec,

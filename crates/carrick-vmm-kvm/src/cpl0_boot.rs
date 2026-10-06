@@ -412,7 +412,7 @@ mod fixture_cpuid_tests {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct Observation {
     pub result: i64,
     pub heads: [(u64, u32); 2],

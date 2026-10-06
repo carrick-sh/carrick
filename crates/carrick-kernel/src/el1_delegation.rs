@@ -454,7 +454,7 @@ impl OwnerState {
 
 /// Keeps one open description counted against its inode's owner record.
 /// Stored on the `FileDescription`; dropped with it.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct InodeOpenRegistration {
     identity: InodeIdentity,
     join_pending: bool,
@@ -988,7 +988,7 @@ fn delegated_cache(region_ptr: usize, handle: u32) -> *mut u8 {
 pub const DELEGATED_SYSCALL_NUMBERS: &[u64] = &[62, 63, 64, 67, 68, 80];
 
 /// Snapshot of active security and observability policies during delegation eligibility checks.
-#[derive(Default, Clone, Copy)]
+#[derive(::core::default::Default, ::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) struct DelegationPolicy<'a> {
     pub seccomp: Option<&'a crate::seccomp::SeccompState>,
     pub observers: Option<&'a crate::observe::ObserverChain>,
@@ -996,7 +996,13 @@ pub(crate) struct DelegationPolicy<'a> {
 }
 
 /// Reasons why a file description cannot be delegated to EL1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(usize)]
 pub enum NotEligible {
     Disabled,
@@ -1070,7 +1076,7 @@ static RECALL_TRIGGERS: Mutex<Vec<(&'static std::panic::Location<'static>, usize
     Mutex::new(Vec::new());
 
 /// Snapshot of the delegation population counters.
-#[derive(Debug, Clone, Default)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::default::Default)]
 pub struct DelegationCounts {
     pub delegations: usize,
     pub recalls: usize,
