@@ -60,9 +60,10 @@ retirement does not claim full x86 conformance or production readiness.
 ## TLS prerequisite found by the migration
 
 The migrated musl test first refused native syscall 158 (`arch_prctl`) on
-PR #81 head `6fade63a8`; native execution succeeded. Its replacement is in
-the shared kernel's x86 context leaf, classified through the same no_std
-syscall-table source used by `carrick-abi` and the guest personality.
+PR #81 head `6fade63a8`; native execution succeeded. Linux policy now lives
+in `personality/x86_native`, classified through the same no_std syscall-table
+source used by `carrick-abi` and the guest personality. Neutral x86 context
+leaves provide typed TLS reads and edits through a task-bound authority.
 FS/GS SET edits the typed parked-context TLS projection and writes FS_BASE
 or the user KERNEL_GS_BASE before the same task resumes. GET uses the existing
 exact-task guarded copyout. CPL0's GS binding stays active during handling.
@@ -80,6 +81,10 @@ The production initial lane still lacks `ZoneRecord` custody. Its private
 TLS projection never becomes a runnable scheduler context; full production
 scheduler custody remains an x86-run open item. This change does not invent
 another task-context registry.
+
+The personality boundary gate was red for eight Linux facade references in
+the neutral context module. Moving Linux operation/errno handling and GET
+copyout into the personality made the unchanged boundary check green.
 
 ## Preserved red dependency
 
