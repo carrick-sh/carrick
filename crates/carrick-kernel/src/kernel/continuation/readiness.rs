@@ -433,6 +433,7 @@ pub enum ReadinessProbe {
 #[derive(Clone, Debug)]
 pub struct SignalReadinessProbe {
     terminal_action: bool,
+    signal_frame_action: bool,
     pub(crate) kernel: Weak<Kernel>,
     pub(crate) host_signal: Arc<dyn carrick_hal::HostSignalBridge>,
     pub(crate) task_ref: Weak<Task>,
@@ -470,6 +471,7 @@ impl SignalReadinessProbe {
         };
         Self {
             terminal_action: state.authority.is_terminal_action(),
+            signal_frame_action: state.authority.is_signal_frame_action(),
             kernel: state.authority.kernel.clone(),
             host_signal: Arc::clone(&state.authority.host_signal),
             task_ref: state.authority.task_ref.clone(),
@@ -526,10 +528,12 @@ impl SignalReadinessProbe {
         }
         let authority = context.signal_authority();
         let host_signum = self.host_signal.take_pending_for(self.thread.tid.raw());
-        if matches!(
-            self.family,
-            ContinuationFamily::VforkParent | ContinuationFamily::PtraceStopSettle
-        ) {
+        if self.signal_frame_action
+            || matches!(
+                self.family,
+                ContinuationFamily::VforkParent | ContinuationFamily::PtraceStopSettle
+            )
+        {
             // A ptrace request waiting out its tracee's stop settlement is
             // killable-only for the same reason: it has performed nothing,
             // and ptrace(2) never fails it with EINTR.

@@ -310,6 +310,14 @@ pub(super) enum HvpatchProductionPhase {
     /// The semantic owner notification retains a fault, with the ordinary
     /// saved CPU and no syscall completion or zone CPU substitution.
     ResumeFaultOwner,
+    ResumeSignalFrameOwner {
+        pending: Box<carrick_hal::sigframe::PendingSignalFrame>,
+    },
+    ResumeSignalFramePhysical {
+        pending: Box<carrick_hal::sigframe::PendingSignalFrame>,
+        wait: carrick_guest_mem::OwnedMemoryWait,
+        _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
+    },
     ResumeIpcOwner {
         boundary: zone::IpcBoundary,
         token: carrick_kernel::kernel::continuation::ipc::OwnedIpcOperation,
@@ -488,6 +496,8 @@ impl HvpatchProductionPhase {
             Self::ResumeStatCopyoutOwner { .. } => 29,
             Self::ResumeGetdentsCopyoutOwner { .. } => 30,
             Self::ResumeReadlinkCopyoutOwner { .. } => 31,
+            Self::ResumeSignalFrameOwner { .. } => 32,
+            Self::ResumeSignalFramePhysical { .. } => 33,
         }
     }
 }
@@ -4449,6 +4459,60 @@ where
                 HvpatchProductionPhase::ResumeFaultOwner => {
                     return self.resume_owner_fault_zone(engine, control);
                 }
+                HvpatchProductionPhase::ResumeSignalFrameOwner { pending } => {
+                    let mut result = self.consume_owner_zone(control)?;
+                    if result.completion != carrick_kernel::kernel::continuation::ContinuationCompletion::ResumeSignalFrame {
+                        return Err(RuntimeError::Configuration("signal frame wait lost its completion authority".to_owned()).into());
+                    }
+                    if let Some(reserved) = result.take_reserved_signal() {
+                        let context = self
+                            .state
+                            .service_kernel_context
+                            .as_ref()
+                            .ok_or_else(|| {
+                                RuntimeError::Configuration(
+                                    "signal frame wait lost exact context".to_owned(),
+                                )
+                            })?
+                            .retain_exact();
+                        if let Some(outcome) = service_signals_threaded(
+                            &self.kernel,
+                            &context,
+                            engine,
+                            self.state.this_tid,
+                            self.state.fatal_image_generation,
+                            None,
+                            None,
+                            None,
+                            Some(reserved),
+                            self.traps,
+                        )? {
+                            return Ok(self.enter_terminal_with_outcome(engine, outcome));
+                        }
+                    }
+                    return self.resume_signal_frame(engine, control, pending);
+                }
+                HvpatchProductionPhase::ResumeSignalFramePhysical {
+                    pending,
+                    wait,
+                    _subscription,
+                } => {
+                    if !wait.0.is_ready() {
+                        self.phase = HvpatchProductionPhase::ResumeSignalFramePhysical {
+                            pending,
+                            wait,
+                            _subscription,
+                        };
+                        return Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::Blocked(
+                                carrick_kernel::kernel::objects::BlockedReason::HostWait,
+                            ),
+                        ));
+                    }
+                    drop(_subscription);
+                    return self.resume_signal_frame(engine, control, pending);
+                }
                 HvpatchProductionPhase::ResumeIpcOwner { boundary, token } => {
                     return self.resume_ipc_owner(engine, control, boundary, token);
                 }
@@ -5507,6 +5571,15 @@ where
             self.kernel.fork_quiesce(),
         );
         let result = self.poll_with_engine(engine, control);
+        let result = match result {
+            Err(ProductionHvpatchPollError::Runtime(RuntimeError::Trap(
+                TrapError::SignalFrameMemory {
+                    pending,
+                    dependency,
+                },
+            ))) => self.park_signal_frame(engine, control, pending, *dependency),
+            other => other,
+        };
         self.route_poll_result(result)
     }
 
