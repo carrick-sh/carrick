@@ -186,9 +186,9 @@ fn cpl0_image() -> std::path::PathBuf {
 
 fn cpl3_grant_program(data_va: u64) -> Vec<u8> {
     let mut code = Vec::new();
-    // One unbound refusal followed by the 16/64/256/512-page owner grants. Each
+    // Unbound and stale refusals surround the 16/64/256/512-page grants. Each
     // control boundary lets the host publish only the next authenticated slot.
-    for _ in 0..5 {
+    for _ in 0..6 {
         code.extend_from_slice(&[0x48, 0x31, 0xff]);
         code.extend_from_slice(&[0x48, 0xb8]);
         code.extend_from_slice(&carrick_el1_abi::MM_PORTAL_GRANT_ESR.to_le_bytes());
@@ -519,6 +519,29 @@ fn x1_shared_mm_owner() {
             "{pages}-page grant did not complete: {receipt:?}"
         );
     }
+
+    // Drive the adapter's real Err branch: this slot submission is valid but
+    // belongs to another carrier. Core admission must refuse it before any
+    // descriptor or residency publication, and the CPL0 façade must lower the
+    // typed Stale error through the Linux personality (ESRCH = 3).
+    let stale_window = PortalGrantWindow {
+        operation: PortalOperation {
+            carrier: nz(2),
+            ..window.operation
+        },
+        ..window
+    };
+    assert!(grant_slot.submit(stale_window, &txn));
+    let refusal = carrier.observe(0).expect("observe core refusal");
+    assert_eq!(
+        refusal.result, 3,
+        "core Stale must lower to Linux ESRCH (3)"
+    );
+    assert_eq!(refusal.publications[0], 4, "refusal published descriptors");
+    assert_eq!(refusal.completions[0], 6, "refusal did not complete entry");
+    assert_eq!(refusal.semantic_host_exits, 0);
+    assert!(grant_slot.take_receipt(stale_window, &txn).is_none());
+    assert!(residency.is_guest_committed(mm11, DATA_VA));
 
     // Case 3: Read hardware bytes at DATA_VA after all four grant scales.
     let obs3 = carrier.observe(0).expect("observe hardware read");

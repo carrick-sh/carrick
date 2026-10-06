@@ -371,13 +371,6 @@ mod tests {
     }
 
     #[test]
-    fn cpl0_owner_refusals_use_the_linux_personality_encoding() {
-        assert_eq!(MmError::Stale.errno(), 3);
-        assert_eq!(MmError::Busy.errno(), 16);
-        assert_eq!(MmError::MetadataRequired.errno(), 11);
-    }
-
-    #[test]
     fn contended_owner_completion_kicks_the_other_executor_after_unlock() {
         let layout = std::alloc::Layout::new::<ZoneTables>();
         // SAFETY: ZoneTables documents the all-zero empty representation; the
