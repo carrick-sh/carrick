@@ -1571,3 +1571,64 @@ fn arm_fake_backend_context_trace_is_unchanged() {
     assert_eq!(cpu.timer, Some(123));
     assert_eq!(cpu.sgis, vec![456]);
 }
+
+#[test]
+fn fresh_record_park_refusal_does_not_leak_unpublished_record_on_occupied_timer_or_guard_error() {
+    use super::object_wait::OperationResumePc;
+    use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
+
+    let zone = zone();
+    publish_space(&zone, MM, TTBR_MM);
+    host_publish(&zone, SLOT, MM, None, 0);
+    zone.enter_guest(SLOT);
+    let task = task_for(101);
+    let (frame, mut cpu) = live(0xa, 0x4000, FUTEX_WAIT_PRIVATE, 0);
+    let counter = counters();
+    let mut sched = Sched {
+        zone: &zone,
+        slot: SLOT,
+        task: &task,
+        cpu: &mut cpu,
+        user: &HardwareUserWord,
+        counters: counter,
+    };
+    assert!(zone.slot(SLOT).current().is_none());
+    assert!(zone.slot(SLOT).host_record().is_none());
+
+    // 1. Occupied timer with deadline
+    let dummy = zone.alloc_record(identity(999)).unwrap();
+    let seq = zone.next_seq(dummy);
+    zone.set_deadline(dummy, 10000);
+    zone.arm_timer(SLOT, dummy, seq).unwrap();
+    zone.publish_park(dummy, seq);
+    assert!(!sched.may_time_park());
+
+    let key = ObjectWaitKey::new(1, 1).unwrap();
+    zone.bind_object_wait(key, &HostWait).unwrap();
+    let snapshot = sched.observe_object(key).unwrap();
+    let resume = OperationResumePc::new(0x8000).unwrap();
+    let op = OperationToken::new(101, 1).unwrap();
+
+    let err = sched.park_object(&frame, key, snapshot, resume, op, Some(5000));
+    assert!(err.is_err());
+    assert_eq!(
+        zone.slot(SLOT).host_record(),
+        None,
+        "occupied timer must not leak fresh record"
+    );
+
+    // Disarm timer for part 2
+    assert!(zone.take_foreign_timer(SLOT).is_some());
+    assert!(sched.may_time_park());
+
+    // 2. Guard acquisition error (stale/unbound key)
+    let stale_key = ObjectWaitKey::new(2, 99).unwrap();
+    let op2 = OperationToken::new(101, 2).unwrap();
+    let err2 = sched.park_object(&frame, stale_key, snapshot, resume, op2, None);
+    assert!(err2.is_err());
+    assert_eq!(
+        zone.slot(SLOT).host_record(),
+        None,
+        "guard error must not leak fresh record"
+    );
+}

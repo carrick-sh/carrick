@@ -1916,9 +1916,45 @@ fn x4_shared_wait_records() {
     let op_token = OperationToken::new(tid, 1).unwrap();
 
     let request = carrick_core_abi::ObjectParkRequest::new(key, snapshot, op_token, None);
-    let parked = park_object_record(&zone, slot, record, false, request, 1024, &|_| {}).unwrap();
+    let parked =
+        park_object_record(&zone, slot, request, 1024, &|_| {}, || Ok((record, false))).unwrap();
     assert!(parked.matches(&zone, slot));
     assert!(zone.slot(slot).current().is_none());
+
+    // Verify park_object_record does not invoke save_context when deadline cannot be parked
+    let context_saved = std::cell::Cell::new(false);
+    let bad_token = OperationToken::new(tid, 2).unwrap();
+    let bad_request =
+        carrick_core_abi::ObjectParkRequest::new(key, snapshot, bad_token, Some(999999));
+    let dummy = zone.alloc_record(identity).unwrap();
+    let d_seq = zone.next_seq(dummy);
+    zone.set_deadline(dummy, 10000);
+    zone.arm_timer(slot, dummy, d_seq).unwrap();
+    zone.publish_park(dummy, d_seq);
+
+    let res = park_object_record(&zone, slot, bad_request, 1024, &|_| {}, || {
+        context_saved.set(true);
+        Ok((record, false))
+    });
+    assert!(res.is_err());
+    assert!(
+        !context_saved.get(),
+        "occupied timer must refuse before saving context or allocating record"
+    );
+
+    // Verify park_object_record does not invoke save_context when guard acquisition fails
+    let stale_token = OperationToken::new(tid, 3).unwrap();
+    let stale_request =
+        carrick_core_abi::ObjectParkRequest::new(stale_key, snapshot, stale_token, None);
+    let res_stale = park_object_record(&zone, slot, stale_request, 1024, &|_| {}, || {
+        context_saved.set(true);
+        Ok((record, false))
+    });
+    assert!(res_stale.is_err());
+    assert!(
+        !context_saved.get(),
+        "guard error must refuse before saving context or allocating record"
+    );
 
     // One-winner: Notify object wakes the waiter
     let (report, _effects) = notify_object(&zone, slot, key, 1024).unwrap();
@@ -1952,23 +1988,57 @@ fn x4_shared_wait_records() {
     assert!(!object_wait_expired(&zone, slot));
 
     // 5. coordinate_prepared_edit_wait
-    let mut region = Region::new();
-    region.add_bank();
+    let region = Region::new();
     let spaces = AddressSpaces::new();
-    let r_mm = admit(&region, &spaces, 1, ROOT, 1, 0);
+    let r_mm = admit(&region, &spaces, 1, ROOT, 1, 16);
     let r_zone = region.zone();
     let r_slot = SlotId::new(0);
     let space_acc = carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces);
 
-    // No prepared key on root -> Refused
-    let target = carrick_core_abi::EditWaitTarget::new(space_acc, 0, r_mm, r_slot);
+    // No prepared key on root (wrong space index) -> Refused
+    let target = carrick_core_abi::EditWaitTarget::new(space_acc, 999, r_mm, r_slot);
     let outcome: EditWaitOutcome<()> = coordinate_prepared_edit_wait(
         region.table(),
         target,
         None,
-        r_zone,
+        |_| Err(ObjectWaitError::Stale),
         |_| Some(false),
         |_, _, _| Ok(()),
     );
     assert_eq!(outcome, EditWaitOutcome::Refused);
+
+    // Witness 1: Completion-enabled key observed through caller-supplied venue in edit wait
+    let observed_key = std::cell::Cell::new(None);
+    let space_idx = spaces.find(r_mm.raw()).unwrap().index();
+    let root = region
+        .table()
+        .lock_in(space_acc, space_idx, r_mm, r_slot.raw() as u32)
+        .unwrap();
+    let wait_key = root.prepared_wait_key().unwrap();
+    drop(root);
+
+    let delivered = std::sync::atomic::AtomicBool::new(false);
+    let comp = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+        let _ = effects;
+        delivered.store(true, std::sync::atomic::Ordering::SeqCst);
+    };
+    r_zone
+        .bind_object_wait_with_completion(wait_key, &wait, &comp)
+        .unwrap();
+
+    let target_valid = carrick_core_abi::EditWaitTarget::new(space_acc, space_idx, r_mm, r_slot);
+    let outcome_comp: EditWaitOutcome<u32> = coordinate_prepared_edit_wait(
+        region.table(),
+        target_valid,
+        None,
+        |k| {
+            observed_key.set(Some(k));
+            carrick_core::wait::observe_object(r_zone, r_slot, k, &comp)
+        },
+        |_| Some(true),
+        |_, _, _| Ok(42),
+    );
+    assert_eq!(outcome_comp, EditWaitOutcome::Parked(42));
+    assert_eq!(observed_key.get(), Some(wait_key));
+    assert!(r_zone.completion_enabled(wait_key));
 }
