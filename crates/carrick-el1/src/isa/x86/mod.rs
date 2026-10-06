@@ -8,7 +8,6 @@ mod mmu;
 mod transport;
 mod user_access;
 
-#[path = "../../../../carrick-x86/src/interrupts.rs"]
 pub mod interrupts;
 
 /// The CPL0 backend's native leaves. Context and MM owners are bound by
