@@ -19,3 +19,6 @@ pub use personality::{file, inotify, sched};
 #[cfg(test)]
 #[path = "personality/native_ownership_tests.rs"]
 mod native_ownership_tests;
+#[cfg(test)]
+#[path = "isa/x86/context_words.rs"]
+mod x86_context_words_tests;
