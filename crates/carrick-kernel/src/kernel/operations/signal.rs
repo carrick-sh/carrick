@@ -4,6 +4,7 @@
 //! credential authorization, process group routing, job control stops,
 //! and ptrace attachment, memory access, and resumption.
 
+use carrick_el1_abi::Lifecycle;
 use std::sync::{Arc, Weak};
 
 use carrick_abi::LinuxSiginfo;

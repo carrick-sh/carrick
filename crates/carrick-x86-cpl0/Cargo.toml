@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-el1 = { path = "../carrick-el1" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }

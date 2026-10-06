@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 extern crate std;
 
+use carrick_core::lifecycle::Lifecycle;
 use carrick_el1::personality::common_entry::{
     EntryOutcome, SYS_SET_ROBUST_LIST, execution_binding, serve_canonical,
 };

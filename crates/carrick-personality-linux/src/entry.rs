@@ -1,5 +1,6 @@
 //! Linux decoding and dispatch at the shared native-entry seam.
 pub use crate::abi::entry::{CanonicalCall, CanonicalOrdinal, SyscallResult};
+use carrick_core_abi::EntryMmKey;
 pub use carrick_core_abi::ExecutionBinding;
 use carrick_guest_arch::{
     GuestIsa, NativeAbi, NativeEntrySnapshot, NativeOrdinal, UserVa, X86Register, X86Registers,
@@ -9,9 +10,18 @@ pub const SYS_SET_ROBUST_LIST: usize = 99;
 pub const EINVAL: i64 = -22;
 
 /// Decode the Linux x86_64 syscall ABI from a native register snapshot.
-pub fn decode_x86_64(native: u64, args: [u64; 6], stack: u64) -> CanonicalCall {
+pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCall {
     let canonical = match native {
         273 => SYS_SET_ROBUST_LIST as u64,
+        56 => {
+            args.swap(3, 4);
+            220
+        }
+        60 => 93,
+        186 => 178,
+        14 => 135,
+        131 => 132,
+        202 => 98,
         _ => u64::MAX,
     };
     CanonicalCall {
@@ -110,19 +120,6 @@ impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
     fn binding(&self) -> Option<ExecutionBinding> {
         Some(self.venue.binding())
     }
-    fn lifecycle(
-        &mut self,
-        call: crate::pending_lifecycle::LifecycleCall,
-    ) -> Option<crate::pending_lifecycle::LifecycleOutcome> {
-        if call != crate::pending_lifecycle::LifecycleCall::SetRobustList {
-            return None;
-        }
-        let result = self.venue.set_robust_list(self.args[0], self.args[1])?;
-        Some(crate::pending_lifecycle::LifecycleOutcome::Returned {
-            result: SyscallResult::new(result),
-            work: false,
-        })
-    }
     fn original_argument0(&self) -> u64 {
         self.args[0]
     }
@@ -131,6 +128,9 @@ impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
     }
     fn task_state(&self) -> Option<&crate::abi::entry::LinuxTaskState> {
         Some(self.venue.task_state())
+    }
+    fn lifecycle_native(&mut self) -> Option<&mut dyn crate::lifecycle::LifecycleNative<'a>> {
+        Some(self)
     }
     fn lifecycle_available(&self) -> bool {
         true
@@ -170,5 +170,85 @@ pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome 
         crate::dispatch::CompletionRoute::Served => EntryOutcome::Served { result },
         crate::dispatch::CompletionRoute::WithWork => EntryOutcome::ServedWithWork { result },
         _ => EntryOutcome::Forward,
+    }
+}
+
+impl crate::lifecycle::UserCopy for CommonFamilies<'_> {
+    fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
+        false
+    }
+    fn copy_out(&mut self, _: u64, _: &[u8]) -> bool {
+        false
+    }
+}
+impl<'a> crate::lifecycle::LifecycleNative<'a> for CommonFamilies<'a> {
+    fn arguments(&self) -> [u64; 6] {
+        self.args
+    }
+    fn binding(&self) -> Option<ExecutionBinding> {
+        Some(self.venue.binding())
+    }
+    fn task_state(&self) -> Option<&'a crate::abi::entry::LinuxTaskState> {
+        Some(self.venue.task_state())
+    }
+    fn register_robust_list(&self, head: u64, len: u64) -> Option<SyscallResult> {
+        self.venue
+            .set_robust_list(head, len)
+            .map(SyscallResult::new)
+    }
+    fn thread(&self) -> Option<crate::thread::LifecycleThread<'a>> {
+        None
+    }
+    fn born_slot(
+        &self,
+        _: &crate::abi::thread::ThreadLifecyclePage,
+        _: carrick_core_abi::EntryRef,
+    ) -> Option<&'a crate::abi::thread::ThreadControlSlot> {
+        None
+    }
+    fn record_decline(&self, _: crate::abi::thread::LifecycleDecline) {}
+    fn has_scheduler(&self) -> bool {
+        false
+    }
+    fn user_sp(&mut self) -> Option<UserVa> {
+        None
+    }
+    fn affinity(&self) -> Option<u64> {
+        None
+    }
+    fn allocate_record(
+        &mut self,
+        _: carrick_sched_core::ThreadIdentity,
+    ) -> Result<carrick_sched_core::RecordRef, carrick_sched_core::Exhausted> {
+        Err(carrick_sched_core::Exhausted)
+    }
+    fn free_record(&mut self, _: carrick_sched_core::RecordRef) {}
+    fn prepare_child(
+        &mut self,
+        _: carrick_sched_core::RecordRef,
+        _: crate::lifecycle::ChildContext,
+    ) {
+    }
+    fn enqueue_born(&mut self, _: carrick_sched_core::RecordRef) {}
+    fn exit_record(&self) -> Option<crate::lifecycle::ExitRecord> {
+        None
+    }
+    fn wake_child_tid(&mut self, _: EntryMmKey, _: UserVa) -> bool {
+        false
+    }
+    fn release_current(&mut self, _: carrick_sched_core::RecordRef) -> bool {
+        false
+    }
+    fn run_next(&mut self, _: SyscallResult) -> (carrick_core::Served, SyscallResult) {
+        (
+            carrick_core::Served::Idle,
+            SyscallResult::new(self.result.unwrap_or(0)),
+        )
+    }
+    fn result(&self) -> SyscallResult {
+        SyscallResult::new(self.result.unwrap_or(self.args[0] as i64))
+    }
+    fn set_result(&mut self, result: SyscallResult) {
+        self.result = Some(result.raw());
     }
 }

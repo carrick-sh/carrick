@@ -113,10 +113,12 @@ pub enum WorkMetric {
     ChildExitNotificationWakeAttempts,
     /// Notification wake calls that actually queued or kicked the target.
     ChildExitNotificationWakeDeliveries,
+    /// Exact retained pool cells acquired by lifecycle state transitions.
+    LifecycleEntryVisits,
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 53;
+    pub const COUNT: usize = 54;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -171,6 +173,7 @@ impl WorkMetric {
         Self::ChildExitNotificationThreadVisits,
         Self::ChildExitNotificationWakeAttempts,
         Self::ChildExitNotificationWakeDeliveries,
+        Self::LifecycleEntryVisits,
     ];
 }
 

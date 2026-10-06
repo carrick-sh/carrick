@@ -621,6 +621,7 @@ mod tests {
         Credentials, FileTable, FsContext, TaskIdentity, ThreadKey, ThreadResources,
     };
     use carrick_abi::LinuxCloneFlags;
+    use carrick_el1_abi::Lifecycle;
     use carrick_hal::ThreadId;
 
     struct Fixture {

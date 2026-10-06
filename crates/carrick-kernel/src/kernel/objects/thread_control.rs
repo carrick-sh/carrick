@@ -1,5 +1,6 @@
 //! Control-only backing retained by the thread and every execution-lane pin.
 
+use carrick_el1_abi::Lifecycle;
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock, Weak};
 

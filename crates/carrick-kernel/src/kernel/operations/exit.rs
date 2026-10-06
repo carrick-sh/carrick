@@ -4,6 +4,7 @@
 //! non-final thread retirement (`exit_thread`), child reparenting / subreaper adoption,
 //! exit subscription notification, and unreferenced file table and MM I/O retirement.
 
+use carrick_el1_abi::Lifecycle;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 

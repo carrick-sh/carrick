@@ -3,6 +3,7 @@
 //! transient set*id errno or change the sibling's inherited credentials.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use carrick_el1_abi::Lifecycle;
 use std::sync::Arc;
 
 use carrick_abi::{LinuxCloneFlags, syscall::nr};
