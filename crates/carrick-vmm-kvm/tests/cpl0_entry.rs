@@ -606,3 +606,46 @@ fn shared_kernel_context_stack_slot_and_thread_cpu() {
         assert_eq!(obs_cpu.result, task as i64, "thread cpu for task {task}");
     }
 }
+
+fn interrupt_program() -> Vec<u8> {
+    const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+    let mut bytes = Vec::new();
+    for (op, arg) in [
+        (0_u64, 0_u64),       // frequency
+        (1_u64, 0_u64),       // arm_timer(None)
+        (1_u64, 100_000_u64), // arm_timer(Some(100_000))
+        (3_u64, 0_u64),       // ack_interrupt (no interrupt pending => 0)
+        (2_u64, 1_u64),       // send_wake to CPU 1 => 0
+    ] {
+        bytes.extend_from_slice(&[0x48, 0xbe]); // mov rsi, arg
+        bytes.extend_from_slice(&arg.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xbf]); // mov rdi, op
+        bytes.extend_from_slice(&op.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xb8]); // mov rax, INTERRUPT_WITNESS
+        bytes.extend_from_slice(&INTERRUPT_WITNESS.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05]); // syscall into shared kernel witness
+        bytes.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]); // mov rdi, rax; mov rax, OBSERVE_NATIVE
+        bytes.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05]);
+    }
+    bytes.extend_from_slice(&[0x0f, 0x0b]); // ud2
+    bytes
+}
+
+#[test]
+fn shared_kernel_interrupt_leaves() {
+    let p0 = interrupt_program();
+    let p1 = interrupt_program();
+    let mut carrier = Cpl0Carrier::boot_with_interrupts(&image(), [&p0, &p1])
+        .expect("real KVM + CPL0 image with interrupts");
+    let obs_freq = carrier.observe(0).expect("frequency observation");
+    assert!(obs_freq.result > 0, "frequency must be non-zero");
+    let obs_disarm = carrier.observe(0).expect("disarm timer observation");
+    assert_eq!(obs_disarm.result, 0, "disarm timer succeeded");
+    let obs_arm = carrier.observe(0).expect("arm timer observation");
+    assert_eq!(obs_arm.result, 0, "arm timer succeeded");
+    let obs_ack = carrier.observe(0).expect("ack interrupt observation");
+    assert_eq!(obs_ack.result, 0, "no pending interrupt acked");
+    let obs_wake = carrier.observe(0).expect("send wake observation");
+    assert_eq!(obs_wake.result, 0, "send wake to CPU 1 succeeded");
+}
