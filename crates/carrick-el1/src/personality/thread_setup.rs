@@ -1,23 +1,16 @@
 //! Frame-independent per-thread setup on the running thread's
 //! [`ThreadControlSlot`]: where the common kernel finds the slot
-//! ([`LifecycleVenue`]) and the robust-list registration body.
+//! ([`LifecycleVenue`]) and robust-list metadata publication.
 //!
 //! Nothing here reads an ISA register frame, copies user memory or touches a
 //! scheduler, so the AArch64 EL1 lifecycle personality and the x86_64 CPL0
 //! entry (through [`super::common_entry`]) call the same bodies with typed
 //! arguments.
 use carrick_el1_abi::{CurrentTask, EntryRef, GateState, ThreadControlSlot, ThreadLifecyclePage};
-use core::sync::atomic::{AtomicU64, Ordering};
-
-/// Canonical `set_robust_list` (the generic table's number, which the
-/// AArch64 table uses natively; x86_64 273 decodes to it).
-pub const SYS_SET_ROBUST_LIST: usize = 99;
-
-/// `sizeof(struct robust_list_head)` on 64-bit Linux.
-pub const ROBUST_LIST_HEAD_SIZE: u64 = 24;
-
-/// Linux `EINVAL`.
-const EINVAL: i64 = 22;
+pub use carrick_personality_linux::entry::SYS_SET_ROBUST_LIST;
+use carrick_personality_linux::pending_lifecycle::RobustListVenue;
+pub use carrick_personality_linux::pending_lifecycle::{RobustListHead, RobustListLen};
+use core::sync::atomic::AtomicU64;
 
 /// Where the common kernel finds the lifecycle state of the thread running
 /// on a vCPU. The host (runtime stage L4) publishes it; placement is per
@@ -45,95 +38,38 @@ pub(crate) fn setup_open(page: &ThreadLifecyclePage) -> bool {
     page.serves_sigmask() && page.gate() != GateState::Closed
 }
 
-/// The `head` argument of `set_robust_list`: a user address that is stored,
-/// never dereferenced here (exit-time walking belongs to its owner).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RobustListHead(u64);
-impl RobustListHead {
-    pub const fn new(user_address: u64) -> Self {
-        Self(user_address)
-    }
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
-
-/// The `len` argument of `set_robust_list`, exactly as the caller passed it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RobustListLen(u64);
-impl RobustListLen {
-    pub const fn new(len: u64) -> Self {
-        Self(len)
-    }
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
-
-/// The caller's owned control slot, with an optional structural witness tied
-/// to this execution binding. Count actual publications in the shared body,
-/// so an adapter cannot mistake one return for one metadata write.
+/// Native view of the caller's owned metadata; Linux decides gate and size policy.
 pub struct RobustListSlot<'a> {
+    page: &'a ThreadLifecyclePage,
     control: &'a ThreadControlSlot,
     publications: Option<&'a AtomicU64>,
 }
 impl<'a> RobustListSlot<'a> {
-    pub const fn new(control: &'a ThreadControlSlot, publications: Option<&'a AtomicU64>) -> Self {
+    pub const fn new(
+        page: &'a ThreadLifecyclePage,
+        control: &'a ThreadControlSlot,
+        publications: Option<&'a AtomicU64>,
+    ) -> Self {
         Self {
+            page,
             control,
             publications,
         }
     }
-    fn publish(self, head: RobustListHead) {
-        self.control
-            .set_robust_list(head.raw(), ROBUST_LIST_HEAD_SIZE as u32);
-        if let Some(count) = self.publications {
-            count.fetch_add(1, Ordering::Relaxed);
-        }
-    }
 }
-
-/// What one `set_robust_list` did to the thread's own slot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RobustListOutcome {
-    /// The head is published in the caller's slot; the call returns 0.
-    Registered,
-    /// `len != sizeof(struct robust_list_head)`: Linux returns `EINVAL`
-    /// and the slot is untouched.
-    InvalidLength,
-    /// The setup gate is closed (tracer/seccomp) or the hatch is off: the
-    /// slot is untouched and the call belongs to the host lane.
-    Declined,
-}
-
-impl RobustListOutcome {
-    /// The Linux result of a served outcome; `None` for [`Self::Declined`].
-    pub const fn linux_result(self) -> Option<i64> {
-        match self {
-            Self::Registered => Some(0),
-            Self::InvalidLength => Some(-EINVAL),
-            Self::Declined => None,
-        }
+impl RobustListVenue for RobustListSlot<'_> {
+    fn setup_enabled(&self) -> bool {
+        self.page.serves_sigmask()
     }
-}
-
-/// `set_robust_list(head, len)` for the running thread: the head goes to
-/// its owned `slot`, where exit finds it. Only the owning thread writes
-/// its slot; no other slot is reachable from here.
-pub fn set_robust_list(
-    page: &ThreadLifecyclePage,
-    slot: RobustListSlot<'_>,
-    head: RobustListHead,
-    len: RobustListLen,
-) -> RobustListOutcome {
-    if !setup_open(page) {
-        return RobustListOutcome::Declined;
+    fn gate_closed(&self) -> bool {
+        self.page.gate() == GateState::Closed
     }
-    if len.raw() != ROBUST_LIST_HEAD_SIZE {
-        return RobustListOutcome::InvalidLength;
+    fn publish(&self, head: RobustListHead, len: u32) {
+        self.control.set_robust_list(head.raw(), len);
     }
-    slot.publish(head);
-    RobustListOutcome::Registered
+    fn publication_counter(&self) -> Option<&AtomicU64> {
+        self.publications
+    }
 }
 
 /// Production venue: addresses are guest-kernel-only retained metadata,
