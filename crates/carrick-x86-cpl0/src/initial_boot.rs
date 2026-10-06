@@ -25,6 +25,17 @@ fn span(gpa: u64, bytes: u64, end: u64) -> bool {
     gpa >= EXTENT_BASE && gpa.checked_add(bytes).is_some_and(|last| last <= end)
 }
 
+fn area(gpa: u64, bytes: u64, end: u64) -> Option<(u64, u64)> {
+    if !span(gpa, bytes, end) { return None; }
+    Some((gpa, gpa.checked_add(bytes)?))
+}
+
+fn disjoint(mut areas: Vec<(u64, u64)>) -> bool {
+    areas.retain(|(start, end)| start != end);
+    areas.sort_unstable_by_key(|(start, _)| *start);
+    areas.windows(2).all(|pair| pair[0].1 <= pair[1].0)
+}
+
 fn records<T>(gpa: u64, count: usize, end: u64) -> Option<&'static [T]> {
     let bytes = count.checked_mul(core::mem::size_of::<T>())? as u64;
     if !gpa.is_multiple_of(core::mem::align_of::<T>() as u64) || !span(gpa, bytes, end) {
@@ -139,9 +150,17 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     if !span(EXTENT_BASE, core::mem::size_of::<X86InitialBootRequest>() as u64, end) {
         return None;
     }
-    let regions = records::<X86InitialBootRegion>(request.regions_gpa, request.region_count as usize, end)?;
-    let strings = records::<X86InitialBootString>(request.strings_gpa, usize::from(request.argc) + usize::from(request.envc), end)?;
+    let string_count = usize::from(request.argc) + usize::from(request.envc);
     let grant_count = (request.table_grant_count as usize).checked_add(request.data_grant_count as usize)?;
+    let mut areas = Vec::with_capacity(5 + request.region_count as usize + string_count);
+    areas.push(area(EXTENT_BASE, core::mem::size_of::<X86InitialBootRequest>() as u64, end)?);
+    areas.push(area(request.regions_gpa, (request.region_count as usize).checked_mul(core::mem::size_of::<X86InitialBootRegion>())? as u64, end)?);
+    areas.push(area(request.strings_gpa, string_count.checked_mul(core::mem::size_of::<X86InitialBootString>())? as u64, end)?);
+    areas.push(area(request.grants_gpa, grant_count.checked_mul(core::mem::size_of::<X86InitialBootGrant>())? as u64, end)?);
+    areas.push(area(request.publications_gpa, (request.publication_capacity as usize).checked_mul(core::mem::size_of::<carrick_el1_abi::GuestMmuPublication>())? as u64, end)?);
+    if !disjoint(areas.clone()) { return None; }
+    let regions = records::<X86InitialBootRegion>(request.regions_gpa, request.region_count as usize, end)?;
+    let strings = records::<X86InitialBootString>(request.strings_gpa, string_count, end)?;
     let grants = records::<X86InitialBootGrant>(request.grants_gpa, grant_count, end)?;
     let publications = records::<carrick_el1_abi::GuestMmuPublication>(request.publications_gpa, request.publication_capacity as usize, end)?;
     let first_grant = grants.first()?.gpa;
@@ -154,6 +173,14 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
         }
     }
     let staged_end = first_grant;
+    areas.push(area(first_grant, grant_count.checked_mul(PAGE as usize)? as u64, end)?);
+    for region in regions {
+        areas.push(area(region.source_gpa, region.initialized_len, staged_end)?);
+    }
+    for string in strings {
+        areas.push(area(string.source_gpa, string.len, staged_end)?);
+    }
+    if !disjoint(areas) { return None; }
     let mut image_regions = Vec::with_capacity(regions.len());
     for region in regions {
         if !span(region.source_gpa, region.initialized_len, staged_end) || region.permissions & !7 != 0 {
@@ -205,8 +232,9 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     let generation = NonZeroU64::new(request.generation)?;
     // SAFETY: CPU 1 is stopped. The caller owns this unopened MM, the one
     // source root and the complete disjoint private frame grant transaction.
+    let table_end = first_grant.checked_add(request.table_grant_count as u64 * PAGE)?;
     let loaded = unsafe { install_initial_image(
-        &InitialWords::production(end), &mut source, source_root, mm, generation,
+        &InitialWords::production(first_grant, table_end), &mut source, source_root, mm, generation,
         &InitialImageSpec { regions: &image_regions, stack },
     ) }.ok()?;
     if loaded.publications.len() > publications.len() { return None; }
@@ -221,6 +249,7 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     request.result_table_used = source.tables_taken as u32;
     request.result_data_used = source.data_taken as u32;
     request.result_initial_break = loaded.initial_break.raw();
+    super::anonymous::admit_tables(first_grant, table_end);
     Some((request.entry, loaded.stack_pointer))
 }
 
@@ -238,9 +267,16 @@ core::arch::global_asm!(
 
 unsafe extern "C" { fn carrick_x86_boot_iret(entry: u64, stack: u64) -> !; }
 
+fn fatal_boot() -> ! {
+    // SAFETY: the carrier owns this fatal control doorbell; HLT prevents a
+    // refused boot from spinning inside KVM_RUN if the host resumes it.
+    unsafe { core::arch::asm!("out dx, al", in("dx") super::FATAL_PORT, in("al") 0_u8, options(nostack, preserves_flags)); }
+    super::halt()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn carrick_x86_initial_boot(request_va: u64) -> ! {
-    if request_va != X86_CPL0_INITIAL_EXTENT_VA { loop { core::hint::spin_loop(); } }
+    if request_va != X86_CPL0_INITIAL_EXTENT_VA { fatal_boot(); }
     // SAFETY: the carrier owns and retained this exact initialized request.
     let request = unsafe { &mut *(request_va as *mut X86InitialBootRequest) };
     let loaded = load(request);
@@ -248,10 +284,10 @@ pub extern "C" fn carrick_x86_initial_boot(request_va: u64) -> ! {
     // SAFETY: OUT is the carrier's privileged boot-completion doorbell. The
     // host authenticates descriptors and inventory before resuming this CPU.
     unsafe { core::arch::asm!("out dx, al", in("dx") X86_INITIAL_BOOT_PORT, in("rax") request_va, options(nostack, preserves_flags)); }
-    let Some((entry, stack)) = loaded else { loop { core::hint::spin_loop(); } };
-    let Some(root) = RootGpa::page_aligned(FrameGpa::new(request.result_root_gpa)) else { loop { core::hint::spin_loop(); } };
-    let Some(mm) = NonZeroU64::new(request.mm_key) else { loop { core::hint::spin_loop(); } };
-    let Some(generation) = NonZeroU64::new(request.generation) else { loop { core::hint::spin_loop(); } };
+    let Some((entry, stack)) = loaded else { fatal_boot() };
+    let Some(root) = RootGpa::page_aligned(FrameGpa::new(request.result_root_gpa)) else { fatal_boot() };
+    let Some(mm) = NonZeroU64::new(request.mm_key) else { fatal_boot() };
+    let Some(generation) = NonZeroU64::new(request.generation) else { fatal_boot() };
     let context = carrick_guest_arch::AddressContext {
         root,
         mm: carrick_guest_arch::MmGeneration::new(mm),

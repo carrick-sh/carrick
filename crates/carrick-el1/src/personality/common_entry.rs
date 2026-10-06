@@ -21,28 +21,51 @@ pub fn serve_canonical(
     venue: &dyn LifecycleVenue,
     publications: Option<&AtomicU64>,
 ) -> EntryOutcome {
-    entry::serve(
-        call,
-        &SharedVenue {
-            binding: || execution_binding(task),
-            state: &task.linux,
-            counters: EntryCounters {
-                served: &counters.served,
-                forwarded: &counters.forwarded,
-            },
-            robust_list: |head, len| {
-                venue.thread(task).and_then(|thread| {
-                    carrick_personality_linux::thread::set_robust_list(
-                        thread.page,
-                        RobustListSlot::new(thread.slot, publications),
-                        RobustListHead::new(head),
-                        RobustListLen::new(len),
-                    )
-                    .linux_result()
-                })
-            },
+    serve_canonical_inner(call, counters, task, venue, publications, None)
+}
+
+pub fn serve_canonical_with_anonymous(
+    call: &CanonicalCall,
+    counters: &Counters,
+    task: &CurrentTask,
+    venue: &dyn LifecycleVenue,
+    publications: Option<&AtomicU64>,
+    anonymous: &mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue,
+) -> EntryOutcome {
+    serve_canonical_inner(call, counters, task, venue, publications, Some(anonymous))
+}
+
+fn serve_canonical_inner(
+    call: &CanonicalCall,
+    counters: &Counters,
+    task: &CurrentTask,
+    venue: &dyn LifecycleVenue,
+    publications: Option<&AtomicU64>,
+    anonymous: Option<&mut dyn carrick_personality_linux::pending_anonymous::PendingAnonymousVenue>,
+) -> EntryOutcome {
+    let shared = SharedVenue {
+        binding: || execution_binding(task),
+        state: &task.linux,
+        counters: EntryCounters {
+            served: &counters.served,
+            forwarded: &counters.forwarded,
         },
-    )
+        robust_list: |head, len| {
+            venue.thread(task).and_then(|thread| {
+                carrick_personality_linux::thread::set_robust_list(
+                    thread.page,
+                    RobustListSlot::new(thread.slot, publications),
+                    RobustListHead::new(head),
+                    RobustListLen::new(len),
+                )
+                .linux_result()
+            })
+        },
+    };
+    match anonymous {
+        Some(anonymous) => entry::serve_with_anonymous(call, &shared, anonymous),
+        None => entry::serve(call, &shared),
+    }
 }
 
 #[cfg(test)]
