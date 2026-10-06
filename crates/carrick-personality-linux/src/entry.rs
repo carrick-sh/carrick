@@ -12,6 +12,11 @@ pub const EINVAL: i64 = -22;
 /// Decode the Linux x86_64 syscall ABI from a native register snapshot.
 pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCall {
     let canonical = match native {
+        12 => 214, // brk
+        11 => 215, // munmap
+        25 => 216, // mremap
+        9 => 222,  // mmap
+        10 => 226, // mprotect
         273 => SYS_SET_ROBUST_LIST as u64,
         56 => {
             args.swap(3, 4);
@@ -113,10 +118,41 @@ impl<B: Fn() -> ExecutionBinding, R: Fn(u64, u64) -> Option<i64>> LinuxEntryVenu
 
 struct CommonFamilies<'a> {
     venue: &'a dyn LinuxEntryVenue,
+    anonymous: Option<&'a mut (dyn crate::pending_anonymous::PendingAnonymousVenue + 'a)>,
     args: [u64; 6],
     result: Option<i64>,
 }
 impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
+    fn anonymous(
+        &mut self,
+        call: crate::dispatch::AnonymousCall,
+    ) -> crate::dispatch::FamilyCompletion {
+        use crate::dispatch::FamilyCompletion;
+        let completion = self
+            .anonymous_venue()
+            .map_or(FamilyCompletion::Forward, |venue| {
+                crate::pending_anonymous::serve(call, venue)
+            });
+        match completion {
+            FamilyCompletion::Complete(value)
+            | FamilyCompletion::CompleteWithWork(value)
+            | FamilyCompletion::Switched(value)
+            | FamilyCompletion::SwitchedWithWork(value)
+            | FamilyCompletion::AccountedSwitched(value)
+            | FamilyCompletion::CommitOwed(value)
+            | FamilyCompletion::AccountedComplete(value) => self.result = Some(value),
+            _ => {}
+        }
+        completion
+    }
+    fn anonymous_venue(
+        &mut self,
+    ) -> Option<&mut dyn crate::pending_anonymous::PendingAnonymousVenue> {
+        match &mut self.anonymous {
+            Some(anonymous) => Some(&mut **anonymous),
+            None => None,
+        }
+    }
     fn binding(&self) -> Option<ExecutionBinding> {
         Some(self.venue.binding())
     }
@@ -150,11 +186,28 @@ impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
 }
 
 pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome {
+    serve_inner(call, venue, None)
+}
+
+pub fn serve_with_anonymous<'a>(
+    call: &CanonicalCall,
+    venue: &'a dyn LinuxEntryVenue,
+    anonymous: &'a mut (dyn crate::pending_anonymous::PendingAnonymousVenue + 'a),
+) -> EntryOutcome {
+    serve_inner(call, venue, Some(anonymous))
+}
+
+fn serve_inner<'a>(
+    call: &CanonicalCall,
+    venue: &'a dyn LinuxEntryVenue,
+    anonymous: Option<&'a mut (dyn crate::pending_anonymous::PendingAnonymousVenue + 'a)>,
+) -> EntryOutcome {
     let Ok(_) = usize::try_from(call.canonical.raw()) else {
         return EntryOutcome::Forward;
     };
     let mut pending = CommonFamilies {
         venue,
+        anonymous,
         args: call.args,
         result: None,
     };
