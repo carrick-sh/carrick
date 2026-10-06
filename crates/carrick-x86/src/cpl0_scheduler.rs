@@ -4,6 +4,22 @@
 use carrick_guest_arch::{AddressContext, RootGpa};
 use carrick_sched_core::{Claim, RecordRef, SlotId, ZoneTables};
 
+/// Invalidate one page in the current CPL0 address space.
+pub(crate) fn invalidate_page(address: u64) {
+    #[cfg(target_os = "none")]
+    // SAFETY: this reviewed CPL0 hardware boundary executes `invlpg` for the
+    // caller's page address and neither reads nor writes Rust memory.
+    unsafe {
+        core::arch::asm!(
+            "invlpg [{}]",
+            in(reg) address,
+            options(nostack, preserves_flags)
+        );
+    }
+    #[cfg(not(target_os = "none"))]
+    let _ = address;
+}
+
 /// PUSH order paired with the interrupt image leaf; IRET's five words follow.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

@@ -13,6 +13,120 @@ use carrick_sched_core::AddressSpaces;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
+struct X86AnonymousEditor<'a, W> {
+    words: &'a W,
+    mm_key: NonZeroU64,
+}
+
+impl<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords>
+    carrick_core::mm::anonymous::AnonymousDescriptorEditor for X86AnonymousEditor<'_, W>
+{
+    fn backing(
+        &mut self,
+        _root: u64,
+        va: u64,
+        len: u64,
+    ) -> carrick_core::mm::anonymous::Stage1Backing {
+        carrick_core::mm::anonymous::Stage1Backing::with_runs(
+            carrick_core::mm::anonymous::RangeBacking::Private,
+            &[(va, va + len)],
+        )
+    }
+
+    fn stock_span(&mut self, _mm_key: u64, _va: u64) -> Option<(u64, u64)> {
+        None
+    }
+
+    fn protect_and_invalidate(
+        &mut self,
+        root: u64,
+        edit: carrick_core::mm::anonymous::PermissionEdit,
+    ) -> Result<(), carrick_core::mm::anonymous::DescriptorEditError> {
+        use carrick_guest_arch::{FrameGpa, RootGpa};
+        use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorTxnId, InlineJournal, PageSpan};
+        use carrick_mmu_core::x86::descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, DescriptorTxn, Permissions, execute_descriptor_txn,
+        };
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: self.mm_key,
+                generation: NonZeroU64::MIN,
+            },
+            root: RootGpa::page_aligned(FrameGpa::new(root)).unwrap(),
+            op: DescriptorOp::Protect {
+                span: PageSpan::new(edit.va, edit.len),
+                permissions: Permissions {
+                    writable: edit.writable,
+                    executable: edit.executable,
+                    user: true,
+                },
+            },
+            tables: &[],
+        };
+        match execute_descriptor_txn(self.words, &txn, txn.root, &mut InlineJournal::new()).outcome
+        {
+            DescriptorOutcome::Applied { .. } => Ok(()),
+            DescriptorOutcome::RolledBack(_) | DescriptorOutcome::Indeterminate(_) => {
+                Err(carrick_core::mm::anonymous::DescriptorEditError::RollbackFailed)
+            }
+            DescriptorOutcome::Refused(_) => {
+                Err(carrick_core::mm::anonymous::DescriptorEditError::Refused)
+            }
+        }
+    }
+
+    fn retire_and_invalidate(
+        &mut self,
+        _root: u64,
+        _address: u64,
+        _len: u64,
+    ) -> Result<(), carrick_core::mm::anonymous::DescriptorEditError> {
+        Err(carrick_core::mm::anonymous::DescriptorEditError::Refused)
+    }
+}
+
+#[test]
+fn x86_anonymous_protect_uses_shared_core_commit() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 31, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view)
+        .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
+    let tables = Tables::new(ROOT, IPA, 1);
+    for (entry, offset) in [(0, 4096), (513, 8192), (1024, 12288)] {
+        tables.words[entry].store((ROOT + offset) | PRESENT | WRITE | USER, Ordering::Release);
+    }
+    tables.words[1536].store(IPA | PRESENT | WRITE | USER | NX, Ordering::Release);
+    let maintenance = CallerInvalidatesAsid;
+    let live = tables.live(&maintenance);
+    let mut root = portal.root(mm, 0).unwrap();
+    let carrick_core::mm::reservation::Decision::Work(request) = root
+        .mprotect(
+            carrick_core_abi::ReservationRange::new(VA, VA + 4096).unwrap(),
+            carrick_core_abi::ReservationProtection::READ,
+        )
+        .unwrap()
+    else {
+        panic!("resident protection must require an owner edit")
+    };
+    let mut editor = X86AnonymousEditor {
+        words: &live,
+        mm_key: NonZeroU64::new(mm.raw()).unwrap(),
+    };
+    assert_eq!(
+        carrick_core::mm::anonymous::edit_and_commit(
+            &mut root,
+            request,
+            ROOT,
+            mm.raw(),
+            &mut editor,
+        ),
+        Ok(0)
+    );
+    assert_eq!(tables.words[1536].load(Ordering::Acquire) & WRITE, 0);
+}
+
 fn transfer_fixture(pages: usize, unrelated: usize) {
     let mut region = Region::new();
     region.add_bank();

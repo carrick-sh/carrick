@@ -39,6 +39,8 @@ mod progress;
 #[allow(dead_code)] // Included native adapter also exposes the host bootstrap API.
 #[path = "../../carrick-x86/src/cpl0_scheduler.rs"]
 mod scheduler;
+#[cfg(target_os = "none")]
+use scheduler as cpl0_scheduler;
 
 #[cfg(target_os = "none")]
 core::arch::global_asm!(

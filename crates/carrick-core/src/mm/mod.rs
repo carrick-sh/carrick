@@ -1,3 +1,4 @@
+pub mod anonymous;
 pub mod capacity;
 pub mod cow;
 pub mod fault;

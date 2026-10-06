@@ -3,6 +3,7 @@
 #[path = "personality/reservations.rs"]
 pub mod reservations;
 
+pub use carrick_core::mm::anonymous::{ForeignBacking, RangeBacking, Stage1Backing};
 use carrick_el1_abi::{CurrentTask, TrapFrame};
 use carrick_mmu_core::aarch64::{
     GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError,
@@ -147,6 +148,25 @@ impl PendingReservationSyscall {
             && frame.elr == self.elr
             && frame.x[8] == self.syscall
             && frame.x[..6] == self.args
+    }
+
+    fn authenticates_frame(&self, frame: &TrapFrame, current: &CurrentTask) -> bool {
+        self.owns_frame(frame, current)
+    }
+
+    fn finish_committed(
+        &self,
+        frame: &mut TrapFrame,
+        current: &CurrentTask,
+        counters: &carrick_el1_abi::Counters,
+        result: u64,
+    ) -> Result<(), reservations::Refusal> {
+        if !self.owns_frame(frame, current) {
+            return Err(reservations::Refusal::Stale);
+        }
+        frame.x[0] = result;
+        counters.served[self.syscall as usize].fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
     /// Finish a clean backing/descriptor refusal on the originating thread.
     /// The service must roll back before invoking this method.
@@ -386,100 +406,12 @@ impl AnonymousRetirementEditor for HardwareAnonymousRetirementEditor {
     }
 }
 
-/// What the exact MM's live stage-1 graph holds under one edit range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RangeBacking {
-    /// No terminal: nothing was ever backed there (a lazy reservation).
-    Empty,
-    /// Only EL1-private grants and holes, and some page is resident (its
-    /// contents may be anything).
-    Private,
-    /// Only EL1-private prepared grants EL1 never committed (such as
-    /// first-touch stock) and holes.
-    Prepared,
-    /// Some terminal is a retired lease whose inventory return is owed.
-    Retired,
-    /// A host-owned terminal, a malformed one, a table outside the primary
-    /// arena, or more backed runs than one edit step takes.
-    Foreign,
-}
-
-/// Backed runs one classification reports; more is [`RangeBacking::Foreign`].
-pub const MAX_BACKED_RUNS: usize = 8;
-
-/// One range's classification and its maximal backed runs (`[start, end)`
-/// of EL1-private terminals, in address order): the spans an editor step
-/// must cover. Pages between runs have no terminal at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Stage1Backing {
-    pub summary: RangeBacking,
-    /// Why a `Foreign` summary is foreign (the leave EL1 counts).
-    pub foreign: ForeignBacking,
-    runs: [(u64, u64); MAX_BACKED_RUNS],
-    count: usize,
-}
-
-/// Which [`RangeBacking::Foreign`] a range is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForeignBacking {
-    /// A terminal the host owns: a page leaf without EL1 tags.
-    HostOwnedLeaf,
-    /// An L1/L2 block terminal.
-    Block,
-    /// More backed runs than one classification reports.
-    TooManyRuns,
-    /// A malformed terminal, a table outside the primary arena, or a range
-    /// that wraps.
-    Malformed,
-}
-
-impl ForeignBacking {
-    pub const fn leave(self) -> carrick_el1_abi::AnonymousLeave {
-        match self {
-            Self::HostOwnedLeaf => carrick_el1_abi::AnonymousLeave::BackingHostOwnedLeaf,
-            Self::Block => carrick_el1_abi::AnonymousLeave::BackingBlock,
-            Self::TooManyRuns => carrick_el1_abi::AnonymousLeave::BackingMultiRun,
-            Self::Malformed => carrick_el1_abi::AnonymousLeave::BackingMalformed,
-        }
-    }
-}
-
-impl Stage1Backing {
-    pub const fn of(summary: RangeBacking) -> Self {
-        Self {
-            summary,
-            foreign: ForeignBacking::Malformed,
-            runs: [(0, 0); MAX_BACKED_RUNS],
-            count: 0,
-        }
-    }
-    /// A `Foreign` range, for `why`.
-    pub const fn foreign(why: ForeignBacking) -> Self {
-        let mut backing = Self::of(RangeBacking::Foreign);
-        backing.foreign = why;
-        backing
-    }
-    /// `summary` over exactly these backed runs; `Foreign` if too many.
-    pub fn with_runs(summary: RangeBacking, runs: &[(u64, u64)]) -> Self {
-        let mut backing = Self::of(summary);
-        for &(start, end) in runs {
-            backing.push(start, end);
-        }
-        backing
-    }
-    fn push(&mut self, start: u64, end: u64) {
-        if self.count > 0 && self.runs[self.count - 1].1 == start {
-            self.runs[self.count - 1].1 = end;
-        } else if self.count == MAX_BACKED_RUNS {
-            self.summary = RangeBacking::Foreign;
-            self.foreign = ForeignBacking::TooManyRuns;
-        } else {
-            self.runs[self.count] = (start, end);
-            self.count += 1;
-        }
-    }
-    pub fn runs(&self) -> &[(u64, u64)] {
-        &self.runs[..self.count]
+const fn foreign_leave(backing: ForeignBacking) -> carrick_el1_abi::AnonymousLeave {
+    match backing {
+        ForeignBacking::HostOwnedLeaf => carrick_el1_abi::AnonymousLeave::BackingHostOwnedLeaf,
+        ForeignBacking::Block => carrick_el1_abi::AnonymousLeave::BackingBlock,
+        ForeignBacking::TooManyRuns => carrick_el1_abi::AnonymousLeave::BackingMultiRun,
+        ForeignBacking::Malformed => carrick_el1_abi::AnonymousLeave::BackingMalformed,
     }
 }
 
@@ -574,6 +506,68 @@ pub trait AnonymousDescriptorEditor:
 impl<T> AnonymousDescriptorEditor for T where
     T: AnonymousBackingProbe + AnonymousPermissionEditor + AnonymousRetirementEditor
 {
+}
+
+struct CoreEditor<'a, T>(&'a mut T);
+
+impl<T> carrick_core::mm::anonymous::AnonymousDescriptorEditor for CoreEditor<'_, T>
+where
+    T: AnonymousDescriptorEditor,
+{
+    fn backing(&mut self, root: u64, va: u64, len: u64) -> Stage1Backing {
+        AnonymousBackingProbe::backing(self.0, root, va, len)
+    }
+
+    fn stock_span(&mut self, mm_key: u64, va: u64) -> Option<(u64, u64)> {
+        AnonymousBackingProbe::stock_span(self.0, mm_key, va)
+    }
+
+    fn protect_and_invalidate(
+        &mut self,
+        root: u64,
+        edit: carrick_core::mm::anonymous::PermissionEdit,
+    ) -> Result<(), carrick_core::mm::anonymous::DescriptorEditError> {
+        AnonymousPermissionEditor::protect_and_invalidate(
+            self.0,
+            root,
+            GuestPermissionEdit {
+                va: edit.va,
+                len: edit.len,
+                readable: edit.readable,
+                writable: edit.writable,
+                executable: edit.executable,
+            },
+        )
+        .map_err(|error| match error {
+            GuestPermissionEditError::RollbackFailed => {
+                carrick_core::mm::anonymous::DescriptorEditError::RollbackFailed
+            }
+            _ => carrick_core::mm::anonymous::DescriptorEditError::Refused,
+        })
+    }
+
+    fn retire_and_invalidate(
+        &mut self,
+        root: u64,
+        address: u64,
+        len: u64,
+    ) -> Result<(), carrick_core::mm::anonymous::DescriptorEditError> {
+        AnonymousRetirementEditor::retire_and_invalidate(self.0, root, address, len).map_err(
+            |error| match error {
+                GuestRetirementError::RollbackFailed => {
+                    carrick_core::mm::anonymous::DescriptorEditError::RollbackFailed
+                }
+                _ => carrick_core::mm::anonymous::DescriptorEditError::Refused,
+            },
+        )
+    }
+
+    fn retire_residency(&mut self, mm_key: u64, address: u64, len: u64) {
+        #[cfg(target_os = "none")]
+        carrick_el1_abi::frame_grant_residency_guest().retire_overlapping(mm_key, address, len);
+        #[cfg(not(target_os = "none"))]
+        let _ = (mm_key, address, len);
+    }
 }
 
 /// Hardware descriptor steps for a delegated MM's root transaction.
@@ -689,7 +683,7 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
     let Ok(mut model) = table.lock_in(spaces, index.index(), mm, frame.slot as u32) else {
         return forward(Leave::RootBusy);
     };
-    let mut pending = match crate::personality::dispatch::dispatch_anonymous_with_reservations(
+    let pending = match crate::personality::dispatch::dispatch_anonymous_with_reservations(
         frame, counters, current, &mut model,
     ) {
         crate::personality::dispatch::AnonymousReservationRoute::Action(
@@ -711,153 +705,58 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         crate::personality::dispatch::AnonymousReservationRoute::Work(pending) => pending,
     };
     let request = pending.request();
-    let refuse = |pending: PendingReservationSyscall,
-                  model: &mut reservations::Reservations<'_>,
-                  why: Leave| {
-        // The proposal is this guard's own; refusing it cannot be stale.
-        let _ = pending.cancel(model);
-        forward(why)
-    };
     let (Some(grant), Some(owner)) = (spaces.grant(index, mm_key), NonZeroU64::new(frame.slot + 1))
     else {
-        return refuse(pending, &mut model, Leave::NoGrant);
+        let _ = pending.cancel(&mut model);
+        return forward(Leave::NoGrant);
     };
     let Some(_editor_guard) = spaces.try_begin_edit(index, mm_key, owner) else {
-        return refuse(pending, &mut model, Leave::EditorBusy);
+        let _ = pending.cancel(&mut model);
+        return forward(Leave::EditorBusy);
     };
-    let (va, len) = (request.range.start(), request.range.len());
-    if request.operation == carrick_el1_abi::ReservationOperation::Move {
-        return refuse(pending, &mut model, Leave::RootDeclined);
+    if !pending.authenticates_frame(frame, current) {
+        let _ = pending.cancel(&mut model);
+        return forward(Leave::RootUnavailable);
     }
-    let backing = editor.backing(grant.ttbr0, va, len);
-    // One editor call is one all-or-nothing step: a range whose backing is
-    // split into several runs by holes goes to the host.
-    let run = match backing.runs() {
-        [] => None,
-        [(start, end)] => Some((*start, *end - *start)),
-        _ => return refuse(pending, &mut model, Leave::BackingMultiRun),
-    };
-    use carrick_el1_abi::ReservationOperation::{Prepare, Protect, Retire};
-    // A fresh mapping into a root hole over this MM's first-touch stock
-    // adopts it: zero backing EL1 never exposed, re-permissioned for the
-    // mapping and committed on first touch; any rest of the range has no
-    // terminal and stays lazy. Anything else prepared is a replaced
-    // mapping's backing and is retired as an owed return.
-    let adopts_stock = request.operation == Prepare
-        && backing.summary == RangeBacking::Prepared
-        && run.is_some_and(|(start, run_len)| {
-            editor
-                .stock_span(mm_key, start)
-                .is_some_and(|(base, end)| base <= start && start + run_len <= end)
-        })
-        && {
-            let mut nodes = 0usize;
-            model
-                .observe_range(request.range, &mut |_| nodes += 1)
-                .is_ok()
-                && nodes == 0
-        };
-    let owed_return = match (request.operation, backing.summary, run) {
-        (_, RangeBacking::Foreign, _) => {
-            return refuse(pending, &mut model, backing.foreign.leave());
+    let mut core_editor = CoreEditor(editor);
+    match carrick_core::mm::anonymous::edit_and_commit(
+        &mut model,
+        request,
+        grant.ttbr0,
+        mm_key,
+        &mut core_editor,
+    ) {
+        Ok(result) => match pending.finish_committed(frame, current, counters, result) {
+            Ok(()) => DelegatedAnonymous::Served,
+            Err(_) => forward(Leave::RootUnavailable),
+        },
+        Err(carrick_core::mm::anonymous::AnonymousRefusal::Foreign(why)) => {
+            forward(foreign_leave(why))
         }
-        // The root refused overlapping proposals while this retirement was
-        // owed. Reaching Prepare means the host acknowledged its stage-2 and
-        // inventory return. A retained invalid retired terminal exposes no
-        // bytes: keep it invalid and publish only the fresh lazy reservation.
-        // First touch obtains new zero backing under the new incarnation.
-        (Prepare, RangeBacking::Retired, None) => None,
-        (_, RangeBacking::Retired, _) => {
-            return refuse(pending, &mut model, Leave::BackingRetired);
+        Err(carrick_core::mm::anonymous::AnonymousRefusal::BackingRetired) => {
+            forward(Leave::BackingRetired)
         }
-        (_, RangeBacking::Empty, _) | (_, _, None) => None,
-        // The permission editor is the descriptor step of an mprotect and
-        // of a stock adoption alike (prepared leaves stay invalid).
-        (Protect, RangeBacking::Private | RangeBacking::Prepared, Some((start, run_len)))
-        | (Prepare, RangeBacking::Prepared, Some((start, run_len)))
-            if request.operation == Protect || adopts_stock =>
-        {
-            let edit = GuestPermissionEdit {
-                va: start,
-                len: run_len,
-                readable: request.protection.bits() & PROT_READ != 0,
-                writable: request.protection.bits() & PROT_WRITE != 0,
-                executable: request.protection.bits() & PROT_EXEC != 0,
-            };
-            match editor.protect_and_invalidate(grant.ttbr0, edit) {
-                Ok(()) => None,
-                Err(GuestPermissionEditError::RollbackFailed) => {
-                    panic!("EL1 anonymous permission rollback failed")
-                }
-                Err(_) => return refuse(pending, &mut model, Leave::EditRefused),
-            }
+        Err(carrick_core::mm::anonymous::AnonymousRefusal::MultiRun) => {
+            forward(Leave::BackingMultiRun)
         }
-        (
-            Retire | Prepare,
-            RangeBacking::Private | RangeBacking::Prepared,
-            Some((start, run_len)),
-        ) => {
-            // The journal slot first: after the descriptor step the commit
-            // must not fail for lack of room. The whole range is owed; its
-            // pages without a terminal have nothing to return.
-            let Ok(slot) = model.reserve_return(request.range) else {
-                return refuse(pending, &mut model, Leave::JournalFull);
-            };
-            match editor.retire_and_invalidate(grant.ttbr0, start, run_len) {
-                Ok(()) => {
-                    #[cfg(target_os = "none")]
-                    carrick_el1_abi::frame_grant_residency_guest()
-                        .retire_overlapping(mm_key, va, len);
-                    Some(slot)
-                }
-                Err(GuestRetirementError::RollbackFailed) => {
-                    panic!("EL1 anonymous retirement rollback failed")
-                }
-                Err(_) => {
-                    model.release_return(slot);
-                    return refuse(pending, &mut model, Leave::EditRefused);
-                }
-            }
+        Err(carrick_core::mm::anonymous::AnonymousRefusal::EditRefused) => {
+            forward(Leave::EditRefused)
         }
-        _ => return refuse(pending, &mut model, Leave::RootDeclined),
-    };
-    // SAFETY: this guard holds the exact MM's root with `request` pending and
-    // its exact descriptor editor. Every descriptor edit and its ASID
-    // invalidation completed above; no frame was granted, and none was
-    // returned yet: a retirement's frames stay in the inventory as an owed
-    // return, journaled in its reserved slot by the commit. The pending sequence names
-    // this substrate transaction.
-    let completion = unsafe {
-        carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
-            request,
-            carrick_el1_abi::ReservationBackingReceipt {
-                receipt: request.sequence.raw(),
-                granted_bytes: 0,
-                returned_bytes: 0,
-            },
-        )
-    };
-    let retired = owed_return.is_some();
-    let completed = match (completion, owed_return) {
-        (Some(completion), Some(slot)) => pending
-            .complete_deferring_return(frame, current, counters, &mut model, completion, slot),
-        (Some(completion), None) => {
-            pending.complete(frame, current, counters, &mut model, completion)
+        Err(carrick_core::mm::anonymous::AnonymousRefusal::JournalFull) => {
+            forward(Leave::JournalFull)
         }
-        (None, slot) => {
-            if let Some(slot) = slot {
-                model.release_return(slot);
-            }
-            Err(reservations::Refusal::Invalid)
+        Err(carrick_core::mm::anonymous::AnonymousRefusal::RootDeclined) => {
+            forward(Leave::RootDeclined)
         }
-    };
-    match completed {
-        Ok(()) => DelegatedAnonymous::Served,
-        // The descriptor edit is live but the root refused to commit it.
-        Err(refusal) if retired => {
-            panic!("EL1 anonymous retirement commit refused: {refusal:?}")
+        Err(carrick_core::mm::anonymous::AnonymousRefusal::Root(_)) => {
+            forward(Leave::RootUnavailable)
         }
-        Err(_) => refuse(pending, &mut model, Leave::RootUnavailable),
+        Err(carrick_core::mm::anonymous::AnonymousRefusal::RollbackFailed) => {
+            panic!("EL1 anonymous descriptor rollback failed")
+        }
+        Err(carrick_core::mm::anonymous::AnonymousRefusal::CommitAfterEdit(refusal)) => {
+            panic!("EL1 anonymous descriptor commit refused: {refusal:?}")
+        }
     }
 }
 

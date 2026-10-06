@@ -64,12 +64,7 @@ impl Cpl0DirectWords {
 
     pub fn invalidate_range(&self, va: u64, len: u64) {
         for page in (va..va.saturating_add(len)).step_by(4096) {
-            #[cfg(target_os = "none")]
-            unsafe {
-                core::arch::asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags));
-            }
-            #[cfg(not(target_os = "none"))]
-            let _ = page;
+            crate::cpl0_scheduler::invalidate_page(page);
         }
     }
 }
