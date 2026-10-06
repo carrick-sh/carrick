@@ -5265,3 +5265,136 @@ mod carrick_owned_window_tests {
         );
     }
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn descriptor_txn_slot() {
+        assert_eq!(
+            (
+                size_of::<DescriptorTxnSlot>(),
+                align_of::<DescriptorTxnSlot>()
+            ),
+            (384, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |DescriptorTxnSlot {
+                     state: _,
+                     mm_key: _,
+                     generation: _,
+                     root: _,
+                     kind: _,
+                     payload: _,
+                     backing: _,
+                     tables_len: _,
+                     tables: _,
+                     receipt_digest: _,
+                     receipt_outcome: _,
+                     receipt_refusal: _,
+                     receipt_pages: _,
+                     receipt_resident_va: _,
+                     receipt_resident_len: _,
+                     receipt_tables_linked: _,
+                     receipt_live_stores: _,
+                     receipt_flush: _,
+                     receipt_reclaimed_len: _,
+                     receipt_reclaimed: _,
+                 }: DescriptorTxnSlot| {};
+        field!(DescriptorTxnSlot, state, AtomicU32, 0, 4, 4);
+        field!(DescriptorTxnSlot, mm_key, AtomicU64, 8, 8, 8);
+        field!(DescriptorTxnSlot, generation, AtomicU64, 16, 8, 8);
+        field!(DescriptorTxnSlot, root, AtomicU64, 24, 8, 8);
+        field!(DescriptorTxnSlot, kind, AtomicU64, 32, 8, 8);
+        field!(DescriptorTxnSlot, payload, [AtomicU64; 6], 40, 48, 8);
+        field!(DescriptorTxnSlot, backing, [AtomicU64; 4], 88, 32, 8);
+        field!(DescriptorTxnSlot, tables_len, AtomicU64, 120, 8, 8);
+        field!(
+            DescriptorTxnSlot,
+            tables,
+            [AtomicU64; MAX_TABLE_GRANTS],
+            128,
+            64,
+            8
+        );
+        field!(DescriptorTxnSlot, receipt_digest, AtomicU64, 192, 8, 8);
+        field!(DescriptorTxnSlot, receipt_outcome, AtomicU64, 200, 8, 8);
+        field!(DescriptorTxnSlot, receipt_refusal, AtomicU64, 208, 8, 8);
+        field!(DescriptorTxnSlot, receipt_pages, AtomicU64, 216, 8, 8);
+        field!(DescriptorTxnSlot, receipt_resident_va, AtomicU64, 224, 8, 8);
+        field!(
+            DescriptorTxnSlot,
+            receipt_resident_len,
+            AtomicU64,
+            232,
+            8,
+            8
+        );
+        field!(
+            DescriptorTxnSlot,
+            receipt_tables_linked,
+            AtomicU64,
+            240,
+            8,
+            8
+        );
+        field!(DescriptorTxnSlot, receipt_live_stores, AtomicU64, 248, 8, 8);
+        field!(DescriptorTxnSlot, receipt_flush, AtomicU64, 256, 8, 8);
+        field!(
+            DescriptorTxnSlot,
+            receipt_reclaimed_len,
+            AtomicU64,
+            264,
+            8,
+            8
+        );
+        field!(
+            DescriptorTxnSlot,
+            receipt_reclaimed,
+            [AtomicU64; MAX_RECLAIMED_TABLES],
+            272,
+            64,
+            8
+        );
+    }
+
+    #[test]
+    fn backing_identity() {
+        assert_eq!(
+            (size_of::<BackingIdentity>(), align_of::<BackingIdentity>()),
+            (32, 8)
+        );
+        let _ = |BackingIdentity {
+                     frame_id: _,
+                     mapping_id: _,
+                     owner_generation: _,
+                     inventory_revision: _,
+                 }: BackingIdentity| {};
+        field!(BackingIdentity, frame_id, NonZeroU64, 0, 8, 8);
+        field!(BackingIdentity, mapping_id, NonZeroU64, 8, 8, 8);
+        field!(BackingIdentity, owner_generation, NonZeroU64, 16, 8, 8);
+        field!(BackingIdentity, inventory_revision, NonZeroU64, 24, 8, 8);
+    }
+}
