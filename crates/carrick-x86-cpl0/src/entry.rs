@@ -124,6 +124,73 @@ mod kernel {
     use carrick_el1_abi::{Counters, CurrentTask};
     use core::sync::atomic::Ordering;
 
+    /// Fixture-only timing interposition, with one actual user translation read
+    /// immediately before the source leaf CAS. This prevents incidental owner
+    /// metadata/TLB churn from hiding a missing-INVLPG control. It also probes
+    /// the retired source immediately after its production invalidation. It
+    /// neither decides an operation nor edits a word.
+    struct PublicationWords<'a> {
+        words: &'a super::mmu::Cpl0DirectWords,
+        prime: Option<carrick_guest_arch::UserVa>,
+        prime_write: bool,
+    }
+    impl carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords for PublicationWords<'_> {
+        fn load(
+            &self,
+            pa: u64,
+        ) -> Result<u64, carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
+            self.words.load(pa)
+        }
+        fn compare_exchange(
+            &self,
+            pa: u64,
+            before: u64,
+            after: u64,
+        ) -> Result<bool, carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
+            if before & carrick_mmu_core::x86::descriptor_txn::PRESENT != 0
+                && let Some(source) = self.prime
+            {
+                // SAFETY: the exact owner's classification proved a retained
+                // resident source. The explicit fixture supplies its last page
+                // under this same editor/CR3; no user return intervenes.
+                unsafe {
+                    core::arch::asm!("mov al, byte ptr [{source}]", source=in(reg) source.raw(), out("al") _, options(nostack, readonly, preserves_flags));
+                }
+            }
+            self.words.compare_exchange(pa, before, after)
+        }
+        fn store_unlinked(
+            &self,
+            pa: u64,
+            word: u64,
+        ) -> Result<(), carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
+            self.words.store_unlinked(pa, word)
+        }
+        fn publish_barrier(&self) {
+            self.words.publish_barrier();
+        }
+        fn invalidate_range(&self, va: u64, len: u64) {
+            self.words.invalidate_range(va, len);
+            if self
+                .prime
+                .is_some_and(|source| source.raw() >= va && source.raw() - va < len)
+            {
+                let source = self.prime.map_or(va, |source| source.raw());
+                // SAFETY: explicit edit fixture probes the changed source
+                // immediately at the native invalidation boundary. A correct
+                // invalidation faults here; fault-doorbell teardown retains all
+                // physical backing until the stopped carrier is destroyed.
+                unsafe {
+                    if self.prime_write {
+                        core::arch::asm!("mov byte ptr [{source}], 0x5a", source=in(reg) source, options(nostack, preserves_flags));
+                    } else {
+                        core::arch::asm!("mov al, byte ptr [{source}]", source=in(reg) source, out("al") _, options(nostack, readonly, preserves_flags));
+                    }
+                }
+            }
+        }
+    }
+
     fn doorbell(port: u16, frame: &mut NativeFrame) {
         // SAFETY: CPL0 owns the declared control/forwarding transport.
         unsafe {
@@ -211,6 +278,70 @@ mod kernel {
                 doorbell(RETURN_KICK_PORT, frame);
             }
             return;
+        }
+        use carrick_personality_linux::mm::anonymous::AnonymousCall;
+        let priming = frame.rax == PRIME_ANONYMOUS_NATIVE;
+        let (ordinal, args) = if priming {
+            (
+                frame.rdi,
+                [frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9, 0],
+            )
+        } else {
+            (
+                frame.rax,
+                [
+                    frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+                ],
+            )
+        };
+        let anonymous = match ordinal {
+            9 => Some(AnonymousCall::Mmap),
+            10 => Some(AnonymousCall::Protect),
+            11 => Some(AnonymousCall::Unmap),
+            12 => Some(AnonymousCall::Brk),
+            25 => Some(AnonymousCall::Remap),
+            _ => None,
+        };
+        if let Some(call) = anonymous {
+            // SAFETY: bootstrap retains this lane's complete identity-mapped
+            // table arena, also under its authenticated shared context root.
+            if let Some(words) = unsafe {
+                super::mmu::Cpl0DirectWords::from_identity_mapped_range(
+                    binding.table_memory_start,
+                    binding.table_memory_end,
+                )
+            } {
+                let words = PublicationWords {
+                    words: &words,
+                    prime: priming
+                        .then(|| {
+                            args[1]
+                                .checked_sub(4096)
+                                .and_then(|last| args[0].checked_add(last))
+                        })
+                        .flatten()
+                        .map(carrick_guest_arch::UserVa::new),
+                    prime_write: ordinal == 10,
+                };
+                // SAFETY: same issued CPL0 records/lifetime and native table
+                // projection as grants. Priming is an explicit bounded fixture.
+                if let Some(result) =
+                    unsafe { super::mmu::serve_cpl0_anonymous(binding, call, args, &words) }
+                {
+                    match result {
+                        super::mmu::AnonymousEntryResult::Served(value) => frame.rax = value as u64,
+                        super::mmu::AnonymousEntryResult::Indeterminate => {
+                            frame.rdi = 7;
+                            doorbell(FATAL_PORT, frame);
+                            halt();
+                        }
+                    }
+                    if binding.return_kick.swap(0, Ordering::AcqRel) != 0 {
+                        doorbell(RETURN_KICK_PORT, frame);
+                    }
+                    return;
+                }
+            }
         }
         // SAFETY: bootstrap retains these supervisor-only records until the
         // VM/vCPUs retire; each binding names its issued current task.

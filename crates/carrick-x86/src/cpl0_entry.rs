@@ -23,6 +23,9 @@ pub const FATAL_PORT: u16 = 0xcc;
 pub const OWNER_PARK_READY_PORT: u16 = 0xd0;
 /// Execution-lane fixture control; never a Linux syscall ordinal.
 pub const PARK_OWNER_NATIVE: u64 = u64::MAX - 1;
+/// Hardware negative-control instrumentation: prime the source immediately
+/// before its live PTE CAS. This is an explicit fixture call, not Linux policy.
+pub const PRIME_ANONYMOUS_NATIVE: u64 = u64::MAX - 2;
 /// Fixture observation only, outside Linux semantic serving.
 pub const OBSERVE_NATIVE: u64 = u64::MAX;
 

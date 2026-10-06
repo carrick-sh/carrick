@@ -459,6 +459,7 @@ dependencies = [
  "carrick-mmu-core",
  "carrick-personality-linux",
  "carrick-sched-core",
+ "carrick-x86",
  "parking_lot",
 ]
 
@@ -815,6 +816,7 @@ dependencies = [
 name = "carrick-personality-linux"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.11.1",
  "carrick-core",
  "carrick-core-abi",
 ]

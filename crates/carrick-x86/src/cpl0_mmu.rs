@@ -257,14 +257,14 @@ fn deliver_owner_effects(
         |slot, current| request_owner_boundary(zone, slot, current),
         |pending| {
             #[cfg(target_os = "none")]
-            if let Some(target) = super::adapter::cpu_binding_address(venue) {
-                if zone.slot(venue).sgi_target() == target {
-                    // SAFETY: qualified current lane binding retained by native entry.
-                    let binding = unsafe { &*(target as *const CpuBinding) };
-                    binding
-                        .pending_owner_wakes
-                        .fetch_or(pending, Ordering::Release);
-                }
+            if let Some(target) = super::adapter::cpu_binding_address(venue)
+                && zone.slot(venue).sgi_target() == target
+            {
+                // SAFETY: qualified current lane binding retained by native entry.
+                let binding = unsafe { &*(target as *const CpuBinding) };
+                binding
+                    .pending_owner_wakes
+                    .fetch_or(pending, Ordering::Release);
             }
             #[cfg(not(target_os = "none"))]
             let _ = pending;
@@ -474,6 +474,292 @@ pub unsafe fn serve_cpl0_grant(binding: &CpuBinding, slot_index: usize) -> u32 {
             err.errno()
         }
     }
+}
+
+/// Native descriptor encoding and retained grant classification for the one
+/// shared anonymous transaction. No reservation decisions live in this adapter.
+pub struct X86AnonymousEditor<'a, W: LiveDescriptorWords + ?Sized> {
+    pub words: &'a W,
+    pub residency: &'a FrameGrantResidencyTable,
+    pub mm: core::num::NonZeroU64,
+}
+impl<W: LiveDescriptorWords + ?Sized> X86AnonymousEditor<'_, W> {
+    fn execute(
+        &self,
+        register: u64,
+        op: carrick_mmu_core::x86::descriptor_txn::DescriptorOp,
+    ) -> Result<(), carrick_core::mm::anonymous::DescriptorEditError> {
+        use carrick_core::mm::anonymous::DescriptorEditError;
+        use carrick_mmu_core::owner_mmu::OwnerMmu;
+        use carrick_mmu_core::x86::descriptor_txn::{
+            DescriptorOutcome, DescriptorTxn, DescriptorTxnId, execute_retained_descriptor_txn,
+        };
+        let root = X86Mmu::root(register).map_err(|_| DescriptorEditError::Refused)?;
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: self.mm,
+                generation: core::num::NonZeroU64::MIN,
+            },
+            root,
+            op,
+            tables: &[],
+        };
+        match execute_retained_descriptor_txn(self.words, &txn, root).outcome {
+            DescriptorOutcome::Applied { .. } => Ok(()),
+            DescriptorOutcome::Refused(_) | DescriptorOutcome::RolledBack(_) => {
+                Err(DescriptorEditError::Refused)
+            }
+            DescriptorOutcome::Indeterminate(_) => Err(DescriptorEditError::RollbackFailed),
+        }
+    }
+}
+impl<W: LiveDescriptorWords + ?Sized> carrick_core::mm::anonymous::AnonymousDescriptorEditor
+    for X86AnonymousEditor<'_, W>
+{
+    fn backing(
+        &mut self,
+        root: u64,
+        va: u64,
+        len: u64,
+    ) -> carrick_core::mm::anonymous::Stage1Backing {
+        use carrick_core::mm::anonymous::{ForeignBacking, RangeBacking, Stage1Backing};
+        use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, COW, HUGE, PREPARED, PRESENT};
+        let malformed = Stage1Backing::foreign(ForeignBacking::Malformed);
+        let Some(end) = va.checked_add(len) else {
+            return malformed;
+        };
+        if !va.is_multiple_of(4096) || !len.is_multiple_of(4096) {
+            return malformed;
+        }
+        let mut backing = Stage1Backing::of(RangeBacking::Empty);
+        let mut resident = false;
+        for page in (va..end).step_by(4096) {
+            let mut table = root;
+            let mut leaf = None;
+            for level in 0..4 {
+                let Ok(word) = self
+                    .words
+                    .load(table + ((page >> (39 - level * 9)) & 511) * 8)
+                else {
+                    return malformed;
+                };
+                if level == 3 {
+                    leaf = Some(word);
+                    break;
+                }
+                if word == 0 {
+                    break;
+                }
+                if word & PRESENT == 0 || word & HUGE != 0 {
+                    return Stage1Backing::foreign(ForeignBacking::Block);
+                }
+                table = word & ADDRESS;
+            }
+            let Some(word) = leaf.filter(|word| *word != 0) else {
+                continue;
+            };
+            let Some(grant) = self.residency.lookup(self.mm.get(), page) else {
+                return Stage1Backing::foreign(ForeignBacking::HostOwnedLeaf);
+            };
+            if word & ADDRESS != grant.expected_ipa
+                || word & (PRESENT | PREPARED) == 0
+                || word & COW != 0
+            {
+                return malformed;
+            }
+            backing.push(page, page + 4096);
+            if backing.summary == RangeBacking::Foreign {
+                return backing;
+            }
+            resident |= word & PRESENT != 0;
+        }
+        if !backing.runs().is_empty() {
+            backing.summary = if resident {
+                RangeBacking::Private
+            } else {
+                RangeBacking::Prepared
+            };
+        }
+        backing
+    }
+    fn stock_span(&mut self, mm_key: u64, va: u64) -> Option<(u64, u64)> {
+        let grant = self.residency.lookup(mm_key, va)?;
+        Some((
+            grant.identity.semantic_base,
+            grant.identity.semantic_base + grant.identity.len,
+        ))
+    }
+    fn protect_and_invalidate(
+        &mut self,
+        root: u64,
+        edit: carrick_core::mm::anonymous::PermissionEdit,
+    ) -> Result<(), carrick_core::mm::anonymous::DescriptorEditError> {
+        use carrick_mmu_core::x86::descriptor_txn::{DescriptorOp, PageSpan, Permissions};
+        self.execute(
+            root,
+            DescriptorOp::Protect {
+                span: PageSpan::new(edit.va, edit.len),
+                permissions: Permissions {
+                    writable: edit.writable,
+                    executable: edit.executable,
+                    user: edit.readable || edit.writable || edit.executable,
+                },
+            },
+        )
+    }
+    fn retire_and_invalidate(
+        &mut self,
+        root: u64,
+        address: u64,
+        len: u64,
+    ) -> Result<(), carrick_core::mm::anonymous::DescriptorEditError> {
+        use carrick_mmu_core::x86::descriptor_txn::{DescriptorOp, PageSpan};
+        self.execute(root, DescriptorOp::Unmap(PageSpan::new(address, len)))
+    }
+    fn supports_move(&self) -> bool {
+        true
+    }
+    fn move_and_invalidate(
+        &mut self,
+        root: u64,
+        _mm_key: u64,
+        source: carrick_core_abi::ReservationRange,
+        destination: carrick_core_abi::ReservationRange,
+    ) -> Result<(), carrick_core::mm::anonymous::DescriptorEditError> {
+        use carrick_mmu_core::x86::descriptor_txn::{DescriptorOp, PageSpan};
+        self.execute(
+            root,
+            DescriptorOp::Move {
+                span: PageSpan::new(destination.start(), destination.len()),
+                source: source.start(),
+            },
+        )
+    }
+}
+
+/// Native entry must stop the lane on an indeterminate owner publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnonymousEntryResult {
+    Served(i64),
+    Indeterminate,
+}
+
+/// Decode and serve an anonymous native syscall through the production owner.
+/// `None` leaves an unsupported/unadmitted route with the ordinary entry.
+///
+/// # Safety
+/// All `serve_cpl0_grant` execution-venue, mapping, alignment and lifetime
+/// requirements apply, including the issued current-task record. `words` must
+/// faithfully access that retained table arena and complete the native CPU
+/// invalidation in this execution lane; it cannot be an independent root view.
+/// The entry must stop, without a user return or physical reuse, if the outcome
+/// is `Indeterminate`. The bounded carrier fixture has one executing lane per
+/// edited MM; this local no-PCID projection does not supply multi-vCPU shootdown.
+pub unsafe fn serve_cpl0_anonymous<W: LiveDescriptorWords + ?Sized>(
+    binding: &CpuBinding,
+    call: carrick_personality_linux::mm::anonymous::AnonymousCall,
+    args: [u64; 6],
+    words: &W,
+) -> Option<AnonymousEntryResult> {
+    use carrick_core::mm::anonymous::{AnonymousRefusal, edit_and_commit};
+    use carrick_personality_linux::mm::anonymous::{self, AnonymousDecision};
+    if binding.zone_address == 0
+        || binding.reservations_address == 0
+        || binding.residency_address == 0
+        || binding.portal_address == 0
+        || binding.context_binding_address == 0
+    {
+        return None;
+    }
+    // SAFETY: caller retains and qualifies each issued aligned supervisor record.
+    let (zone, table, residency, slots, context) = unsafe {
+        (
+            &*(binding.zone_address as *const ZoneTables),
+            &*(binding.reservations_address as *const SharedReservations),
+            &*(binding.residency_address as *const FrameGrantResidencyTable),
+            &*(binding.portal_address as *const MmPortalSlots),
+            &*(binding.context_binding_address as *const crate::cpl0_scheduler::ContextBinding),
+        )
+    };
+    let carrier = slots.carrier()?;
+    let native_mm = crate::cpl0_scheduler::context_mm(
+        zone,
+        carrick_sched_core::SlotId::from_index(binding.slot as usize)?,
+        context,
+    )
+    .ok()?;
+    let mm = carrick_core_abi::ReservationMm::new(native_mm.raw().get())?;
+    let index = zone.spaces.find(mm.raw())?;
+    if !table.admitted(index.index(), mm) {
+        return None;
+    }
+    let portal = carrick_core::mm::transaction::MmPortal::<
+        GuestMetadataPin,
+        LinuxReservationPolicy,
+        NativeReservationGeometry,
+        X86OwnerVenue,
+    >::for_zone(carrier, table, zone)
+    .with_mmu(X86Mmu);
+    let serve = || -> Result<Option<AnonymousEntryResult>, MmError> {
+        let mut model = portal.root(mm, binding.slot)?;
+        let request = match anonymous::decide(call, args, &mut model) {
+            AnonymousDecision::Forward => return Ok(None),
+            AnonymousDecision::Unavailable(error) => return Err(MmError::Reservation(error)),
+            AnonymousDecision::Return(result) => {
+                return Ok(Some(AnonymousEntryResult::Served(result)));
+            }
+            AnonymousDecision::Work(request) => request,
+        };
+        let access = portal.space_access(binding.slot)?;
+        let Some(_grant) = access.grant(index, mm.raw()) else {
+            model.refuse(request)?;
+            return Err(MmError::Busy);
+        };
+        let Some(guard) = access.try_begin_edit(
+            index,
+            mm.raw(),
+            core::num::NonZeroU64::new(u64::from(binding.slot) + 1).ok_or(MmError::Invalid)?,
+        ) else {
+            model.refuse(request)?;
+            return Err(MmError::Busy);
+        };
+        let mut editor = X86AnonymousEditor {
+            words,
+            residency,
+            mm: core::num::NonZeroU64::new(mm.raw()).ok_or(MmError::Stale)?,
+        };
+        // SAFETY: the issued table arena and retained grant custody are bound
+        // to this exact scheduler editor/root in the CPL0 execution venue.
+        let mut authority = unsafe {
+            carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(
+                &guard,
+                &mut editor,
+                Some(residency),
+            )
+        }
+        .ok_or(MmError::Stale)?;
+        match edit_and_commit(&mut model, request, &mut authority) {
+            Ok(result) => {
+                binding.publications.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(AnonymousEntryResult::Served(result as i64)))
+            }
+            Err(AnonymousRefusal::RollbackFailed | AnonymousRefusal::CommitAfterEdit(_)) => {
+                Ok(Some(AnonymousEntryResult::Indeterminate))
+            }
+            Err(_) => Ok(Some(AnonymousEntryResult::Served(-12))),
+        }
+    };
+    let result = match serve() {
+        Ok(result) => result,
+        Err(error) => Some(AnonymousEntryResult::Served(-i64::from(error.errno()))),
+    };
+    if result.is_some() {
+        binding.entries.fetch_add(1, Ordering::Relaxed);
+        if matches!(result, Some(AnonymousEntryResult::Served(_))) {
+            binding.completions.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    result
 }
 
 #[cfg(test)]

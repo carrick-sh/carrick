@@ -119,6 +119,7 @@ pub struct Cpl0Carrier {
     kicks: AtomicU64,
     work_exits: AtomicU64,
     handbacks: std::sync::Mutex<Vec<carrick_sched_core::RecordRef>>,
+    faults: std::sync::Mutex<[Option<carrick_x86::FaultDoorbellRecord>; 2]>,
 }
 
 impl Cpl0Carrier {
@@ -602,6 +603,7 @@ impl Cpl0Carrier {
             kicks: AtomicU64::new(0),
             work_exits: AtomicU64::new(0),
             handbacks: std::sync::Mutex::new(Vec::new()),
+            faults: std::sync::Mutex::new([None; 2]),
         })
     }
 
@@ -841,6 +843,19 @@ impl Cpl0Carrier {
         self.write_guest_bytes(USER_CODE + 4096, program)
     }
 
+    /// Consume the exact hardware fault decoded by the ordinary control runner.
+    pub fn take_fault(
+        &self,
+        index: usize,
+    ) -> Result<Option<carrick_x86::FaultDoorbellRecord>, TrapError> {
+        self.faults
+            .lock()
+            .map_err(|_| fail("fault observation poisoned"))?
+            .get_mut(index)
+            .ok_or_else(|| fail("unknown fault lane"))
+            .map(Option::take)
+    }
+
     pub fn observe(&mut self, index: usize) -> Result<Observation, TrapError> {
         let controls = NativeControls::new(
             &self.ram,
@@ -849,6 +864,7 @@ impl Cpl0Carrier {
             &self.kicks,
             &self.work_exits,
             &self.handbacks,
+            &self.faults,
         )?;
         let cpu = self
             .cpus
@@ -868,6 +884,7 @@ impl Cpl0Carrier {
             &self.kicks,
             &self.work_exits,
             &self.handbacks,
+            &self.faults,
         )?;
         let [owner, waiter] = &mut self.cpus;
         std::thread::scope(|scope| {
@@ -906,6 +923,7 @@ struct NativeControls<'a> {
     kicks: &'a AtomicU64,
     work_exits: &'a AtomicU64,
     handbacks: &'a std::sync::Mutex<Vec<carrick_sched_core::RecordRef>>,
+    faults: &'a std::sync::Mutex<[Option<carrick_x86::FaultDoorbellRecord>; 2]>,
 }
 impl<'a> NativeControls<'a> {
     fn new(
@@ -915,6 +933,7 @@ impl<'a> NativeControls<'a> {
         kicks: &'a AtomicU64,
         work_exits: &'a AtomicU64,
         handbacks: &'a std::sync::Mutex<Vec<carrick_sched_core::RecordRef>>,
+        faults: &'a std::sync::Mutex<[Option<carrick_x86::FaultDoorbellRecord>; 2]>,
     ) -> Result<Self, TrapError> {
         fn record<T>(ram: &GuestRam, offset: u64) -> Result<&T, TrapError> {
             let ptr = ram
@@ -946,6 +965,7 @@ impl<'a> NativeControls<'a> {
             kicks,
             work_exits,
             handbacks,
+            faults,
         })
     }
     fn observe(
@@ -955,6 +975,8 @@ impl<'a> NativeControls<'a> {
         ready: Option<&mpsc::Sender<()>>,
     ) -> Result<Observation, TrapError> {
         let watchdog = Watchdog::start();
+        let mut fault_words = [0u32; carrick_x86::X86_FAULT_RECORD_U32_WORDS];
+        let mut fault_len = 0;
         for _ in 0..32 {
             let exit = HvVcpu::run(cpu).map_err(|e| fail(e.to_string()))?;
             if watchdog.expired.load(Ordering::Acquire) {
@@ -962,11 +984,29 @@ impl<'a> NativeControls<'a> {
                 cpu.append_debug_state(&mut detail);
                 return Err(fail(detail));
             }
-            let VcpuExit::IoOut { port, .. } = exit else {
+            let VcpuExit::IoOut { port, data } = exit else {
                 let mut detail = "unexpected CPL0 non-control exit".to_owned();
                 cpu.append_debug_state(&mut detail);
                 return Err(fail(detail));
             };
+            if port == carrick_x86::FAULT_DOORBELL_PORT {
+                fault_words[fault_len] = u32::from_le_bytes(
+                    data.try_into()
+                        .map_err(|_| fail("invalid CPL0 fault word"))?,
+                );
+                fault_len += 1;
+                if fault_len == fault_words.len() {
+                    let record = carrick_x86::FaultDoorbellRecord::from_u32_words(&fault_words)?;
+                    self.faults
+                        .lock()
+                        .map_err(|_| fail("fault observation poisoned"))?[index] = Some(record);
+                    return Err(fail(format!("CPL0 hardware fault: {record:?}")));
+                }
+                continue;
+            }
+            if fault_len != 0 {
+                return Err(fail("interrupted CPL0 fault record"));
+            }
             if !matches!(
                 port,
                 CONTROL_PORT
@@ -1047,6 +1087,7 @@ impl<'a> NativeControls<'a> {
                         4 => "closed space",
                         5 => "root mismatch",
                         6 => "COW owed",
+                        7 => "indeterminate MM publication",
                         other => {
                             return Err(fail(format!("CPL0 fatal / admission refusal: {other}")));
                         }

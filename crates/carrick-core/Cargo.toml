@@ -17,6 +17,7 @@ carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 
 [dev-dependencies]
+carrick-x86 = { path = "../carrick-x86" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 parking_lot.workspace = true
 carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }

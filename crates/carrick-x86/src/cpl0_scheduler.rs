@@ -131,12 +131,12 @@ pub enum AdmissionError {
     CowOwed = 6,
 }
 
-/// Detailed admission checking for CPL0 context installation.
-pub fn admit_context_detailed(
+/// Authenticate the issued sidecar against its live shared record and lane.
+pub fn context_mm(
     zone: &ZoneTables,
     slot: SlotId,
     binding: &ContextBinding,
-) -> Result<(), AdmissionError> {
+) -> Result<carrick_guest_arch::MmGeneration, AdmissionError> {
     let Some(record) = zone.live(binding.record) else {
         return Err(AdmissionError::StaleRecord);
     };
@@ -146,7 +146,16 @@ pub fn admit_context_detailed(
     if !matches!(record.claim(), Claim::OnCpu { slot: owner, .. } if owner == slot) {
         return Err(AdmissionError::NotOnCpu);
     }
-    let mm = binding.context.address.mm.raw().get();
+    Ok(binding.context.address.mm)
+}
+
+/// Detailed admission checking for CPL0 context installation.
+pub fn admit_context_detailed(
+    zone: &ZoneTables,
+    slot: SlotId,
+    binding: &ContextBinding,
+) -> Result<(), AdmissionError> {
+    let mm = context_mm(zone, slot, binding)?.raw().get();
     let Some(grant) = zone.install_space(slot, mm) else {
         return Err(AdmissionError::ClosedSpace);
     };

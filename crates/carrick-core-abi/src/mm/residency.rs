@@ -156,6 +156,153 @@ impl Drop for FrameGrantTransferPin<'_> {
     }
 }
 
+/// Reserved relocation custody. Dropping it restores source admission and
+/// abandons the unpublished destination; no live physical identity is lost.
+pub struct FrameGrantRelocation<'a, 's> {
+    _guard: &'a carrick_sched_core::SpaceEditor<'s>,
+    table: &'a FrameGrantResidencyTable,
+    page: FrameGrantResidencyPage,
+    destination_slot: usize,
+    moved: FrameGrantResidencyIdentity,
+    committed: [u64; 8],
+    settled: bool,
+}
+impl FrameGrantRelocation<'_, '_> {
+    /// Keep both grant windows closed when descriptor rollback is indeterminate.
+    pub fn quarantine(mut self) {
+        self.settled = true;
+    }
+    /// # Safety
+    /// The exact-MM descriptor editor must have atomically moved this grant's
+    /// leaves to `moved.semantic_base`, preserving outputs/permissions, and
+    /// completed invalidation of both virtual ranges before this publication.
+    pub unsafe fn commit_after_descriptor_invalidation(mut self) -> bool {
+        let source = &self.table.slots[self.page.slot];
+        if source
+            .state
+            .compare_exchange(
+                self.page.epoch,
+                (self.page.epoch & !GRANT_STATE_MASK) | GRANT_RETIRED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.table.dirty[self.page.slot / 64]
+            .fetch_and(!(1 << (self.page.slot % 64)), Ordering::AcqRel);
+        let destination = &self.table.slots[self.destination_slot];
+        destination.publish(self.moved);
+        for (word, bits) in destination.committed.iter().zip(self.committed) {
+            word.store(bits, Ordering::Release);
+        }
+        self.table.dirty[self.destination_slot / 64]
+            .fetch_or(1 << (self.destination_slot % 64), Ordering::Release);
+        self.settled = true;
+        true
+    }
+}
+impl Drop for FrameGrantRelocation<'_, '_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            let destination = &self.table.slots[self.destination_slot];
+            destination
+                .state
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    Some((state & !GRANT_STATE_MASK) | GRANT_RETIRED)
+                })
+                .ok();
+            self.table.slots[self.page.slot]
+                .transfer_pins
+                .store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Closed grant-window pin admission retained across one descriptor retirement.
+/// Storage is constant; walking skips complete grants and never scans the index.
+pub struct FrameGrantRetirement<'a, 's> {
+    _guard: &'a carrick_sched_core::SpaceEditor<'s>,
+    table: &'a FrameGrantResidencyTable,
+    mm: crate::ReservationMm,
+    start: u64,
+    end: u64,
+    closed_end: u64,
+    lookups: usize,
+    settled: bool,
+}
+const _: () = assert!(core::mem::size_of::<FrameGrantRetirement<'static, 'static>>() <= 64);
+impl FrameGrantRetirement<'_, '_> {
+    /// Keep every admitted window closed after a failed descriptor rollback.
+    pub fn quarantine(mut self) {
+        self.settled = true;
+    }
+    pub fn lookup_work(&self) -> usize {
+        self.lookups
+    }
+    /// # Safety
+    /// The exact MM editor remains held from preparation. All affected leaves
+    /// are retired and every required CPU invalidation has completed; physical
+    /// custody remains retained until the separate return receipt settles.
+    pub unsafe fn commit_after_descriptor_invalidation(mut self) -> bool {
+        self.settled = true; // Failed settlement keeps unconsumed closures quarantined.
+        let mut cursor = self.start;
+        while cursor < self.closed_end {
+            let Some(page) = self.table.lookup(self.mm.raw(), cursor) else {
+                cursor += GRANT_PAGE_SIZE;
+                continue;
+            };
+            cursor = page.identity.semantic_base + page.identity.len;
+            let record = &self.table.slots[page.slot];
+            if record.transfer_pins.load(Ordering::Acquire) != TRANSFER_PIN_RETIRED {
+                return false;
+            }
+            let Some(bits) = self.table.committed_words(page.slot, page.identity) else {
+                return false;
+            };
+            if record
+                .state
+                .compare_exchange(
+                    page.epoch,
+                    (page.epoch & !GRANT_STATE_MASK) | GRANT_RETIRED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                return false;
+            }
+            self.table.dirty[page.slot / 64].fetch_and(!(1 << (page.slot % 64)), Ordering::AcqRel);
+            if !self
+                .table
+                .republish_fragments(page.identity, bits, self.start, self.end)
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+impl Drop for FrameGrantRetirement<'_, '_> {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let mut cursor = self.start;
+        while cursor < self.closed_end {
+            if let Some(page) = self.table.lookup(self.mm.raw(), cursor) {
+                cursor = page.identity.semantic_base + page.identity.len;
+                self.table.slots[page.slot]
+                    .transfer_pins
+                    .store(0, Ordering::Release);
+            } else {
+                cursor += GRANT_PAGE_SIZE;
+            }
+        }
+    }
+}
+
 /// Fixed shared open-addressed index. Grants hash by their smallest power-of-two
 /// page-count bucket. A page in a grant lies in its base bucket or the next
 /// bucket, so lookups check those two buckets for each size class. Disjoint
@@ -202,6 +349,12 @@ impl FrameGrantResidencyTable {
                 return None;
             }
         }
+        let slot = self.reserve_slot(identity)?;
+        self.slots[slot].publish(identity);
+        Some(slot)
+    }
+
+    fn reserve_slot(&self, identity: FrameGrantResidencyIdentity) -> Option<usize> {
         let class = (identity.len / GRANT_PAGE_SIZE)
             .next_power_of_two()
             .trailing_zeros();
@@ -226,9 +379,17 @@ impl FrameGrantResidencyTable {
                 available.get_or_insert(slot);
             }
         }
-        let slot = available?;
+        self.claim_candidate(available?)
+    }
+
+    // Another MM can publish the selected free candidate before this final
+    // atomic claim. Never treat the newly observed live/writing epoch as free.
+    fn claim_candidate(&self, slot: usize) -> Option<usize> {
         let record = &self.slots[slot];
         let state = record.state.load(Ordering::Acquire);
+        if !matches!(state & GRANT_STATE_MASK, GRANT_EMPTY | GRANT_RETIRED) {
+            return None;
+        }
         record
             .state
             .compare_exchange(
@@ -238,8 +399,113 @@ impl FrameGrantResidencyTable {
                 Ordering::Acquire,
             )
             .ok()?;
-        record.publish(identity);
         Some(slot)
+    }
+
+    /// Close pin admission and reserve destination index custody before any
+    /// descriptor store. Only a complete exact grant can be relocated here;
+    /// partial ranges retain the existing fragment retirement path.
+    pub fn prepare_relocation<'a, 's>(
+        &'a self,
+        guard: &'a carrick_sched_core::SpaceEditor<'s>,
+        page: FrameGrantResidencyPage,
+        destination: carrick_guest_arch::UserVa,
+    ) -> Option<FrameGrantRelocation<'a, 's>> {
+        let old = page.identity;
+        if guard.grant()?.0.get() != old.mm_key {
+            return None;
+        }
+        let destination = destination.raw();
+        let moved = FrameGrantResidencyIdentity {
+            semantic_base: destination,
+            ..old
+        };
+        if !moved.valid()
+            || destination < old.semantic_base + old.len
+                && old.semantic_base < destination + old.len
+        {
+            return None;
+        }
+        for va in (destination..destination + old.len).step_by(GRANT_PAGE_SIZE as usize) {
+            if self.lookup(old.mm_key, va).is_some() {
+                return None;
+            }
+        }
+        let source = self.slots.get(page.slot)?;
+        if source.state.load(Ordering::Acquire) != page.epoch || source.identity() != old {
+            return None;
+        }
+        source
+            .transfer_pins
+            .compare_exchange(0, TRANSFER_PIN_RETIRED, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        if source.state.load(Ordering::Acquire) != page.epoch || source.identity() != old {
+            source.transfer_pins.store(0, Ordering::Release);
+            return None;
+        }
+        let Some(destination_slot) = self.reserve_slot(moved) else {
+            source.transfer_pins.store(0, Ordering::Release);
+            return None;
+        };
+        Some(FrameGrantRelocation {
+            _guard: guard,
+            table: self,
+            page,
+            destination_slot,
+            moved,
+            committed: core::array::from_fn(|i| source.committed[i].load(Ordering::Acquire)),
+            settled: false,
+        })
+    }
+
+    /// Close independent pin admission before the first descriptor store.
+    /// The caller retains the exact-MM editor until this token settles/drops.
+    /// A conflicting pin refuses whole and reopens every earlier closure.
+    pub fn prepare_retirement<'a, 's>(
+        &'a self,
+        guard: &'a carrick_sched_core::SpaceEditor<'s>,
+        range: crate::ReservationRange,
+    ) -> Option<FrameGrantRetirement<'a, 's>> {
+        let mm = crate::ReservationMm::new(guard.grant()?.0.get())?;
+        let (start, end) = (range.start(), range.end());
+        if start >= end
+            || !start.is_multiple_of(GRANT_PAGE_SIZE)
+            || !range.len().is_multiple_of(GRANT_PAGE_SIZE)
+        {
+            return None;
+        }
+        let mut token = FrameGrantRetirement {
+            _guard: guard,
+            table: self,
+            mm,
+            start,
+            end,
+            closed_end: start,
+            lookups: 0,
+            settled: false,
+        };
+        let mut cursor = start;
+        while cursor < end {
+            token.lookups += 1;
+            if let Some(page) = self.lookup(mm.raw(), cursor) {
+                let record = &self.slots[page.slot];
+                record
+                    .transfer_pins
+                    .compare_exchange(0, TRANSFER_PIN_RETIRED, Ordering::AcqRel, Ordering::Acquire)
+                    .ok()?;
+                cursor = page.identity.semantic_base + page.identity.len;
+                token.closed_end = cursor.min(end);
+                if record.state.load(Ordering::Acquire) != page.epoch
+                    || record.identity() != page.identity
+                {
+                    return None;
+                }
+            } else {
+                cursor += GRANT_PAGE_SIZE;
+                token.closed_end = cursor;
+            }
+        }
+        Some(token)
     }
 
     /// Guest: find the exact live grant covering a prepared leaf.
@@ -523,6 +789,16 @@ impl FrameGrantResidencyTable {
         if !self.retire(slot, identity) {
             return false;
         }
+        self.republish_fragments(identity, bits, start, end)
+    }
+
+    fn republish_fragments(
+        &self,
+        identity: FrameGrantResidencyIdentity,
+        bits: [u64; 8],
+        start: u64,
+        end: u64,
+    ) -> bool {
         let base = identity.semantic_base;
         let grant_end = base + identity.len;
         // A byte-level overlap revokes its entire Linux page.
@@ -541,7 +817,10 @@ impl FrameGrantResidencyTable {
                 len: fragment_end - fragment_start,
                 ..identity
             };
-            if let Some(fragment_slot) = self.publish(fragment) {
+            let Some(fragment_slot) = self.publish(fragment) else {
+                return false;
+            };
+            {
                 let shift = ((fragment_start - base) / GRANT_PAGE_SIZE) as usize;
                 let count = (fragment.len / GRANT_PAGE_SIZE) as usize;
                 for bit in 0..count {
@@ -562,5 +841,39 @@ impl FrameGrantResidencyTable {
 impl Default for FrameGrantResidencyTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn a_live_publication_cannot_be_reclaimed_as_a_free_candidate() {
+        let layout = core::alloc::Layout::new::<FrameGrantResidencyTable>();
+        // SAFETY: typed aligned atomic storage; all zero bits represent the
+        // empty table state, and no instance escapes this isolated fixture.
+        let table = unsafe {
+            let ptr = alloc::alloc::alloc_zeroed(layout).cast::<FrameGrantResidencyTable>();
+            assert!(!ptr.is_null());
+            alloc::boxed::Box::from_raw(ptr)
+        };
+        let owner = FrameGrantResidencyIdentity {
+            mm_key: 1,
+            semantic_base: 0x4000_0000,
+            physical_ipa: 0x1000_0000,
+            len: 4096,
+            mapping_id: 1,
+            frame_id: 1,
+            owner_generation: 1,
+            inventory_revision: 1,
+        };
+        let slot = table.publish(owner).unwrap();
+        // Deterministic final-step race: a free candidate selected earlier is
+        // now live, as it would be after another MM wins its atomic publication.
+        assert!(table.claim_candidate(slot).is_none());
+        assert_eq!(
+            table.lookup(1, owner.semantic_base).unwrap().identity,
+            owner
+        );
     }
 }

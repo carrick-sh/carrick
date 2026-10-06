@@ -80,6 +80,11 @@ pub enum DescriptorOp {
         backing: BackingIdentity,
     },
     Unmap(PageSpan),
+    /// Relocate leaves without changing physical bytes or permissions.
+    Move {
+        span: PageSpan,
+        source: u64,
+    },
     Coalesce {
         span: PageSpan,
         size: LeafSize,
@@ -91,6 +96,7 @@ impl DescriptorOp {
             Self::Prepare { span, .. }
             | Self::Map { span, .. }
             | Self::Publish { span, .. }
+            | Self::Move { span, .. }
             | Self::Protect { span, .. }
             | Self::CowRepoint { span, .. }
             | Self::Coalesce { span, .. }
@@ -121,10 +127,10 @@ impl Default for PlanEntries {
 }
 
 impl PlanEntries {
-    /// One 4 KiB leaf per 2 MiB owner grant, plus both hierarchy paths if
+    /// Both source and destination leaves for a 2 MiB relocation, plus paths if
     /// the span crosses a table boundary. CPL0 retains this on its stack.
     /// Larger host-only descriptor plans may spill.
-    pub const INLINE_CAPACITY: usize = 512 + 2 * 3;
+    pub const INLINE_CAPACITY: usize = 2 * 512 + 2 * 3;
 
     #[must_use]
     pub const fn new() -> Self {
@@ -280,6 +286,7 @@ pub struct DescriptorPlan {
     id: DescriptorTxnId,
     digest: u64,
     span: PageSpan,
+    source_span: Option<PageSpan>,
 }
 impl DescriptorPlan {
     fn empty(txn: &DescriptorTxn<'_>) -> Self {
@@ -291,6 +298,10 @@ impl DescriptorPlan {
             id: txn.id,
             digest: txn.digest(),
             span: txn.op.span(),
+            source_span: match txn.op {
+                DescriptorOp::Move { source, span } => Some(PageSpan::new(source, span.len)),
+                _ => None,
+            },
         }
     }
     pub fn live_stores(&self) -> usize {
@@ -429,15 +440,36 @@ fn fill_descriptor_plan<W: LiveDescriptorWords + ?Sized>(
         } => return Err(DescriptorRefusal::BadRange),
         _ => {}
     }
-    let mut offset = 0;
-    while offset < span.len {
-        offset += editor.edit(
-            txn.root.address().raw(),
-            0,
-            span.va + offset,
-            offset,
-            size.level(),
-        )?;
+    if let DescriptorOp::Move { source, .. } = txn.op {
+        let from = PageSpan::new(source, span.len);
+        if !valid_span(from) || source < span.va + span.len && span.va < source + span.len {
+            return Err(DescriptorRefusal::BadRange);
+        }
+        for offset in (0..span.len).step_by(PAGE as usize) {
+            let old = editor.leaf_slot(txn.root.address().raw(), source + offset)?;
+            let new = editor.leaf_slot(txn.root.address().raw(), span.va + offset)?;
+            let word = editor.read(old)?;
+            validate_entry(word, 3)?;
+            if word & (PRESENT | PREPARED) == 0 || word & COW != 0 {
+                return Err(DescriptorRefusal::MissingTable);
+            }
+            if editor.read(new)? != 0 {
+                return Err(DescriptorRefusal::Occupied);
+            }
+            editor.set(new, word)?;
+            editor.set(old, 0)?;
+        }
+    } else {
+        let mut offset = 0;
+        while offset < span.len {
+            offset += editor.edit(
+                txn.root.address().raw(),
+                0,
+                span.va + offset,
+                offset,
+                size.level(),
+            )?;
+        }
     }
     plan.tables_linked = editor.used;
     plan.words_read = editor.reads;
@@ -584,6 +616,17 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             self.entries.len() - 1,
             &mut self.overlay_comparisons,
         )
+    }
+    fn leaf_slot(&mut self, mut table: u64, va: u64) -> Result<u64, DescriptorRefusal> {
+        for level in 0..3 {
+            let word = self.read(table + ((va >> (39 - level * 9)) & 511) * 8)?;
+            validate_entry(word, level)?;
+            if word & (PRESENT | WRITE | USER | HUGE) != PRESENT | WRITE | USER || word & NX != 0 {
+                return Err(DescriptorRefusal::MissingTable);
+            }
+            table = word & ADDRESS;
+        }
+        Ok(table + ((va >> 12) & 511) * 8)
     }
     fn grant(&mut self) -> Result<u64, DescriptorRefusal> {
         let page = self
@@ -745,6 +788,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 (entry & !(ADDRESS | COW)) | (new.raw() + offset) | WRITE
             }
             DescriptorOp::Unmap(_) => 0,
+            DescriptorOp::Move { .. } => return Err(DescriptorRefusal::BadEncoding),
             DescriptorOp::Coalesce { .. } => self.coalesced(entry, level)?,
         };
         self.set(slot, new)
@@ -837,6 +881,7 @@ impl DescriptorTxn<'_> {
                 old, new, backing, ..
             } => (5, old.raw(), new.raw(), 0, Some(backing)),
             DescriptorOp::Unmap(_) => (6, 0, 0, 0, None),
+            DescriptorOp::Move { source, .. } => (9, source, 0, 0, None),
             DescriptorOp::Coalesce { size, .. } => (7, size.bytes(), 0, 0, None),
         };
         for word in [kind, a, b, flags] {
@@ -872,6 +917,7 @@ fn undo<W: LiveDescriptorWords + ?Sized>(
     words: &W,
     entries: &[JournalEntry],
     span: PageSpan,
+    source_span: Option<PageSpan>,
 ) -> bool {
     let mut restored = true;
     for entry in entries.iter().rev() {
@@ -879,6 +925,9 @@ fn undo<W: LiveDescriptorWords + ?Sized>(
     }
     words.publish_barrier();
     words.invalidate_range(span.va, span.len);
+    if let Some(source) = source_span {
+        words.invalidate_range(source.va, source.len);
+    }
     restored
 }
 /// Undo an applied plan before owner admission reopens (inventory/slot failure).
@@ -887,7 +936,7 @@ pub fn rollback_descriptor_plan<W: LiveDescriptorWords + ?Sized>(
     words: &W,
     plan: &DescriptorPlan,
 ) -> DescriptorOutcome {
-    if undo(words, &plan.entries, plan.span) {
+    if undo(words, &plan.entries, plan.span, plan.source_span) {
         DescriptorOutcome::RolledBack(DescriptorRefusal::Contended)
     } else {
         DescriptorOutcome::Indeterminate(DescriptorRefusal::Contended)
@@ -920,7 +969,7 @@ pub fn apply_descriptor_plan<W: LiveDescriptorWords + ?Sized, J: DescriptorJourn
             }
         }
         if let Some((reason, restored)) = error {
-            if undo(words, journal.entries(), plan.span) && restored {
+            if undo(words, journal.entries(), plan.span, plan.source_span) && restored {
                 DescriptorOutcome::RolledBack(reason)
             } else {
                 DescriptorOutcome::Indeterminate(reason)
@@ -928,6 +977,9 @@ pub fn apply_descriptor_plan<W: LiveDescriptorWords + ?Sized, J: DescriptorJourn
         } else {
             words.publish_barrier();
             words.invalidate_range(plan.span.va, plan.span.len);
+            if let Some(source) = plan.source_span {
+                words.invalidate_range(source.va, source.len);
+            }
             DescriptorOutcome::Applied {
                 stores: plan.entries.len(),
                 tables_linked: plan.tables_linked,

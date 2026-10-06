@@ -931,3 +931,6 @@ fn host_mm_release_uses_carrier_retained_wake_bindings() {
         );
     });
 }
+
+#[path = "carrier_memory/owner.rs"]
+mod owner;

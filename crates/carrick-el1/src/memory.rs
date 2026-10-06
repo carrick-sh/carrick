@@ -21,36 +21,18 @@ const SYS_MPROTECT: u64 = 226;
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
 const PROT_EXEC: u64 = 4;
-const MAP_SHARED: u64 = 0x01;
-const MAP_PRIVATE: u64 = 0x02;
-const MAP_FIXED: u64 = 0x10;
+#[cfg(test)]
 const MAP_ANONYMOUS: u64 = 0x20;
-const MAP_GROWSDOWN: u64 = 0x0100;
-const MAP_STACK: u64 = 0x20000;
-const MAP_HUGETLB: u64 = 0x40000;
-const MAP_FIXED_NOREPLACE: u64 = 0x100000;
+#[cfg(test)]
+const MAP_PRIVATE: u64 = 0x02;
+#[cfg(test)]
+const MAP_FIXED: u64 = 0x10;
+#[cfg(test)]
+use carrick_personality_linux::mm::anonymous::MmapProtectionRoute;
 
 const EINVAL: i64 = 22;
 const ENOMEM: i64 = 12;
 const PAGE_SIZE: u64 = 4096;
-
-/// Keep mmap protection outside EL1's vocabulary on the host decode route.
-/// The memflagmatrix oracle records ignored bits; mprotect is separate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MmapProtectionRoute {
-    Reservation(carrick_el1_abi::ReservationProtection),
-    HostUnrepresentedBits,
-}
-
-impl MmapProtectionRoute {
-    fn decode(bits: u64) -> Self {
-        if let Some(protection) = carrick_el1_abi::ReservationProtection::from_bits(bits) {
-            Self::Reservation(protection)
-        } else {
-            Self::HostUnrepresentedBits
-        }
-    }
-}
 
 /// Decision before T2's descriptor/backing service. `Work` retains the exact
 /// originating frame identity; it must survive the host boundary as an owned
@@ -208,98 +190,38 @@ pub fn decide_anonymous_syscall(
     current: &CurrentTask,
     model: &mut reservations::Reservations<'_>,
 ) -> ReservationDisposition {
-    use carrick_el1_abi::{ReservationProtection, ReservationRange};
-    use reservations::{Decision, Placement, Refusal};
+    use reservations::Refusal;
     let Some(origin) = ReservationOrigin::capture(current) else {
         return ReservationDisposition::Unavailable(Refusal::Stale);
     };
     if origin.mm != model.mm() || !model.is_admitted() {
         return ReservationDisposition::Unavailable(Refusal::Stale);
     }
+    use carrick_personality_linux::mm::anonymous::{self, AnonymousCall, AnonymousDecision};
     let nr = frame.x[8];
-    let result = match nr {
-        SYS_BRK => model.brk(frame.x[0]),
-        SYS_MMAP => {
-            let flags = frame.x[3];
-            let supported = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED | MAP_FIXED_NOREPLACE;
-            if flags & (MAP_ANONYMOUS | MAP_PRIVATE | MAP_SHARED) != MAP_ANONYMOUS | MAP_PRIVATE
-                || flags & (MAP_GROWSDOWN | MAP_STACK | MAP_HUGETLB) != 0
-                || flags & !supported != 0
-            {
-                return ReservationDisposition::Forward;
-            }
-            let prot = match MmapProtectionRoute::decode(frame.x[2]) {
-                MmapProtectionRoute::Reservation(protection) => protection,
-                MmapProtectionRoute::HostUnrepresentedBits => {
-                    return ReservationDisposition::Forward;
-                }
-            };
-            if !frame.x[5].is_multiple_of(PAGE_SIZE) {
-                return ReservationDisposition::Return(-EINVAL);
-            }
-            let placement = if flags & MAP_FIXED_NOREPLACE != 0 {
-                Placement::NoReplace(frame.x[0])
-            } else if flags & MAP_FIXED != 0 {
-                Placement::Fixed(frame.x[0])
-            } else if frame.x[0] == 0 {
-                Placement::Anywhere
-            } else {
-                Placement::Hint(frame.x[0])
-            };
-            model.mmap(placement, frame.x[1], prot)
-        }
-        SYS_MUNMAP | SYS_MPROTECT => {
-            if !frame.x[0].is_multiple_of(PAGE_SIZE) {
-                return ReservationDisposition::Return(-EINVAL);
-            }
-            let prot = if nr == SYS_MPROTECT {
-                let Some(prot) = ReservationProtection::from_bits(frame.x[2]) else {
-                    return ReservationDisposition::Return(-EINVAL);
-                };
-                prot
-            } else {
-                ReservationProtection::NONE
-            };
-            if frame.x[1] == 0 {
-                return ReservationDisposition::Return(if nr == SYS_MUNMAP { -EINVAL } else { 0 });
-            }
-            let range = frame.x[1]
-                .checked_add(PAGE_SIZE - 1)
-                .map(|v| v & !(PAGE_SIZE - 1))
-                .and_then(|len| frame.x[0].checked_add(len))
-                .and_then(|end| ReservationRange::new(frame.x[0], end));
-            let Some(range) = range else {
-                return ReservationDisposition::Return(-ENOMEM);
-            };
-            if nr == SYS_MUNMAP {
-                model.munmap(range)
-            } else {
-                model.mprotect(range, prot)
-            }
-        }
+    let call = match nr {
+        SYS_BRK => AnonymousCall::Brk,
+        SYS_MMAP => AnonymousCall::Mmap,
+        SYS_MUNMAP => AnonymousCall::Unmap,
+        SYS_MPROTECT => AnonymousCall::Protect,
         _ => return ReservationDisposition::Forward,
     };
-    match result {
-        Ok(Decision::Complete(value)) => ReservationDisposition::Return(value as i64),
-        Ok(Decision::Work(request)) => ReservationDisposition::Work(PendingReservationSyscall {
-            request,
-            origin,
-            elr: frame.elr,
-            syscall: nr,
-            args: [
-                frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
-            ],
-        }),
-        Err(Refusal::Collision) => ReservationDisposition::Return(-17),
-        Err(Refusal::Invalid) => ReservationDisposition::Return(-EINVAL),
-        Err(Refusal::Hole | Refusal::Limit) => ReservationDisposition::Return(-ENOMEM),
-        Err(Refusal::ForeignMapping) => ReservationDisposition::Forward,
-        Err(
-            error @ (Refusal::Busy
-            | Refusal::PreparedConflict
-            | Refusal::Stale
-            | Refusal::MetadataRequired),
-        ) => ReservationDisposition::Unavailable(error),
+    let args = [
+        frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
+    ];
+    match anonymous::decide(call, args, model) {
+        AnonymousDecision::Forward => ReservationDisposition::Forward,
+        AnonymousDecision::Unavailable(error) => ReservationDisposition::Unavailable(error),
+        AnonymousDecision::Return(value) => ReservationDisposition::Return(value),
+        AnonymousDecision::Work(request) => {
+            ReservationDisposition::Work(PendingReservationSyscall {
+                request,
+                origin,
+                elr: frame.elr,
+                syscall: nr,
+                args,
+            })
+        }
     }
 }
 
@@ -561,13 +483,6 @@ where
             },
         )
     }
-
-    fn retire_residency(&mut self, mm_key: u64, address: u64, len: u64) {
-        #[cfg(target_os = "none")]
-        carrick_el1_abi::frame_grant_residency_guest().retire_overlapping(mm_key, address, len);
-        #[cfg(not(target_os = "none"))]
-        let _ = (mm_key, address, len);
-    }
 }
 
 /// Hardware descriptor steps for a delegated MM's root transaction.
@@ -722,10 +637,15 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
     let mut core_editor = CoreEditor(editor);
     // SAFETY: this exact MM's descriptor guard retains its published root;
     // the native backend above maps and invalidates that same root.
+    #[cfg(target_os = "none")]
+    let residency = Some(carrick_el1_abi::frame_grant_residency_guest());
+    #[cfg(not(target_os = "none"))]
+    let residency = None;
     let Some(mut authority) = (unsafe {
         carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(
             &_editor_guard,
             &mut core_editor,
+            residency,
         )
     }) else {
         let _ = pending.cancel(&mut model);

@@ -1,4 +1,5 @@
 //! Linux reservation ownership, VMA interpretation and charges.
+pub mod anonymous;
 mod reservation;
 use carrick_core_abi::*;
 

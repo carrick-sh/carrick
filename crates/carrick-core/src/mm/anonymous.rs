@@ -111,7 +111,18 @@ pub trait AnonymousDescriptorEditor {
         address: u64,
         len: u64,
     ) -> Result<(), DescriptorEditError>;
-    fn retire_residency(&mut self, _mm_key: u64, _address: u64, _len: u64) {}
+    fn move_and_invalidate(
+        &mut self,
+        _root: u64,
+        _mm_key: u64,
+        _source: carrick_core_abi::ReservationRange,
+        _destination: carrick_core_abi::ReservationRange,
+    ) -> Result<(), DescriptorEditError> {
+        Err(DescriptorEditError::Refused)
+    }
+    fn supports_move(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +156,7 @@ pub struct AnonymousEditAuthority<'g, 's, E> {
     editor: &'g mut E,
     mm: carrick_core_abi::ReservationMm,
     root: u64,
+    residency: Option<&'g carrick_core_abi::FrameGrantResidencyTable>,
 }
 impl<'g, 's, E: AnonymousDescriptorEditor> AnonymousEditAuthority<'g, 's, E> {
     /// # Safety
@@ -152,10 +164,12 @@ impl<'g, 's, E: AnonymousDescriptorEditor> AnonymousEditAuthority<'g, 's, E> {
     /// using mapped, aligned storage in its qualified execution venue for the
     /// entire borrow. Success must include the required hardware invalidation
     /// and backing custody; failure must leave the old state or report failed
-    /// rollback. No alternate descriptor editor may access the same MM.
+    /// rollback. `residency`, when present, must be the same retained MM's grant
+    /// index. No alternate descriptor editor may access the same MM.
     pub unsafe fn from_editor(
         guard: &'g carrick_sched_core::SpaceEditor<'s>,
         editor: &'g mut E,
+        residency: Option<&'g carrick_core_abi::FrameGrantResidencyTable>,
     ) -> Option<Self> {
         let (mm, grant) = guard.grant()?;
         Some(Self {
@@ -163,6 +177,7 @@ impl<'g, 's, E: AnonymousDescriptorEditor> AnonymousEditAuthority<'g, 's, E> {
             editor,
             mm: carrick_core_abi::ReservationMm::new(mm.get())?,
             root: grant.ttbr0,
+            residency,
         })
     }
 }
@@ -190,7 +205,74 @@ where
     let editor = &mut *authority.editor;
     let (va, len) = (request.range.start(), request.range.len());
     if request.operation == ReservationOperation::Move {
-        return refuse(model, request, AnonymousRefusal::RootDeclined);
+        if !editor.supports_move() {
+            return refuse(model, request, AnonymousRefusal::RootDeclined);
+        }
+        let Some(source) = request.source else {
+            return refuse(model, request, AnonymousRefusal::RootDeclined);
+        };
+        let from = editor.backing(root, source.start(), source.len());
+        let to = editor.backing(root, va, len);
+        if source.len() != len
+            || !matches!(from.summary, RangeBacking::Private | RangeBacking::Prepared)
+            || from.runs() != [(source.start(), source.end())]
+            || to.summary != RangeBacking::Empty
+        {
+            return refuse(model, request, AnonymousRefusal::RootDeclined);
+        }
+        let relocation = if let Some(table) = authority.residency {
+            let Some(page) = table.lookup(mm_key, source.start()) else {
+                return refuse(model, request, AnonymousRefusal::RootDeclined);
+            };
+            if page.identity.semantic_base != source.start() || page.identity.len != source.len() {
+                return refuse(model, request, AnonymousRefusal::RootDeclined);
+            }
+            let Some(token) = table.prepare_relocation(
+                authority._guard,
+                page,
+                carrick_guest_arch::UserVa::new(va),
+            ) else {
+                return refuse(model, request, AnonymousRefusal::EditRefused);
+            };
+            Some(token)
+        } else {
+            None
+        };
+        match editor.move_and_invalidate(root, mm_key, source, request.range) {
+            Ok(()) => {}
+            Err(DescriptorEditError::Refused) => {
+                return refuse(model, request, AnonymousRefusal::EditRefused);
+            }
+            Err(DescriptorEditError::RollbackFailed) => {
+                if let Some(relocation) = relocation {
+                    relocation.quarantine();
+                }
+                return Err(AnonymousRefusal::RollbackFailed);
+            }
+        }
+        if let Some(relocation) = relocation {
+            // SAFETY: the retained exact-MM editor completed both descriptor
+            // ranges and required invalidation before this custody publication.
+            if !unsafe { relocation.commit_after_descriptor_invalidation() } {
+                return Err(AnonymousRefusal::RollbackFailed);
+            }
+        }
+        // SAFETY: the exact editor completed descriptor, invalidation and retained
+        // backing custody before publishing the one root proposal.
+        let completion = unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                request,
+                ReservationBackingReceipt {
+                    receipt: request.sequence.raw(),
+                    granted_bytes: 0,
+                    returned_bytes: 0,
+                },
+            )
+        }
+        .ok_or(AnonymousRefusal::CommitAfterEdit(Refusal::Invalid))?;
+        return model
+            .complete(completion)
+            .map_err(AnonymousRefusal::CommitAfterEdit);
     }
     let backing = editor.backing(root, va, len);
     let run = match backing.runs() {
@@ -260,10 +342,26 @@ where
                 Ok(slot) => slot,
                 Err(_) => return refuse(model, request, AnonymousRefusal::JournalFull),
             };
+            let retirement = match authority.residency {
+                Some(table) => match table.prepare_retirement(authority._guard, request.range) {
+                    Some(token) => Some(token),
+                    None => {
+                        model.release_return(slot);
+                        return refuse(model, request, AnonymousRefusal::EditRefused);
+                    }
+                },
+                None => None,
+            };
             match editor.retire_and_invalidate(root, start, run_len) {
                 Ok(()) => {
                     edited = true;
-                    editor.retire_residency(mm_key, va, len);
+                    if let Some(retirement) = retirement {
+                        // SAFETY: the capability retains this exact MM editor;
+                        // its backend completed retirement and CPU invalidation.
+                        if !unsafe { retirement.commit_after_descriptor_invalidation() } {
+                            return Err(AnonymousRefusal::RollbackFailed);
+                        }
+                    }
                     Some(slot)
                 }
                 Err(DescriptorEditError::Refused) => {
@@ -271,7 +369,11 @@ where
                     return refuse(model, request, AnonymousRefusal::EditRefused);
                 }
                 Err(DescriptorEditError::RollbackFailed) => {
-                    model.release_return(slot);
+                    if let Some(retirement) = retirement {
+                        retirement.quarantine();
+                    }
+                    // The retained return slot also stays quarantined: no
+                    // completion authorizes return of an indeterminate prefix.
                     return Err(AnonymousRefusal::RollbackFailed);
                 }
             }

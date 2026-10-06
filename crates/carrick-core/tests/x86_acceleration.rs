@@ -13,76 +13,22 @@ use carrick_sched_core::AddressSpaces;
 use core::num::NonZeroU64;
 use core::sync::atomic::Ordering;
 
-struct X86AnonymousEditor<'a, W> {
-    words: &'a W,
-    mm_key: NonZeroU64,
-}
-
-impl<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords>
-    carrick_core::mm::anonymous::AnonymousDescriptorEditor for X86AnonymousEditor<'_, W>
-{
-    fn backing(
-        &mut self,
-        _root: u64,
-        va: u64,
-        len: u64,
-    ) -> carrick_core::mm::anonymous::Stage1Backing {
-        carrick_core::mm::anonymous::Stage1Backing::with_runs(
-            carrick_core::mm::anonymous::RangeBacking::Private,
-            &[(va, va + len)],
-        )
-    }
-
-    fn stock_span(&mut self, _mm_key: u64, _va: u64) -> Option<(u64, u64)> {
-        None
-    }
-
-    fn protect_and_invalidate(
-        &mut self,
-        root: u64,
-        edit: carrick_core::mm::anonymous::PermissionEdit,
-    ) -> Result<(), carrick_core::mm::anonymous::DescriptorEditError> {
-        use carrick_guest_arch::{FrameGpa, RootGpa};
-        use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorTxnId, InlineJournal, PageSpan};
-        use carrick_mmu_core::x86::descriptor_txn::{
-            DescriptorOp, DescriptorOutcome, DescriptorTxn, Permissions, execute_descriptor_txn,
-        };
-        let txn = DescriptorTxn {
-            id: DescriptorTxnId {
-                mm_key: self.mm_key,
-                generation: NonZeroU64::MIN,
-            },
-            root: RootGpa::page_aligned(FrameGpa::new(root)).unwrap(),
-            op: DescriptorOp::Protect {
-                span: PageSpan::new(edit.va, edit.len),
-                permissions: Permissions {
-                    writable: edit.writable,
-                    executable: edit.executable,
-                    user: true,
-                },
-            },
-            tables: &[],
-        };
-        match execute_descriptor_txn(self.words, &txn, txn.root, &mut InlineJournal::new()).outcome
-        {
-            DescriptorOutcome::Applied { .. } => Ok(()),
-            DescriptorOutcome::RolledBack(_) | DescriptorOutcome::Indeterminate(_) => {
-                Err(carrick_core::mm::anonymous::DescriptorEditError::RollbackFailed)
-            }
-            DescriptorOutcome::Refused(_) => {
-                Err(carrick_core::mm::anonymous::DescriptorEditError::Refused)
-            }
-        }
-    }
-
-    fn retire_and_invalidate(
-        &mut self,
-        _root: u64,
-        _address: u64,
-        _len: u64,
-    ) -> Result<(), carrick_core::mm::anonymous::DescriptorEditError> {
-        Err(carrick_core::mm::anonymous::DescriptorEditError::Refused)
-    }
+use carrick_x86::cpl0_mmu::X86AnonymousEditor;
+fn private_residency(mm: u64, pages: usize) -> Box<carrick_core_abi::FrameGrantResidencyTable> {
+    let table = residency();
+    table
+        .publish(carrick_core_abi::FrameGrantResidencyIdentity {
+            mm_key: mm,
+            semantic_base: VA,
+            physical_ipa: IPA,
+            len: pages as u64 * 4096,
+            frame_id: 1,
+            mapping_id: 2,
+            owner_generation: 3,
+            inventory_revision: 4,
+        })
+        .unwrap();
+    table
 }
 
 #[test]
@@ -110,16 +56,22 @@ fn x86_anonymous_protect_uses_shared_core_commit() {
     else {
         panic!("resident protection must require an owner edit")
     };
+    let residency = private_residency(mm.raw(), 1);
     let mut editor = X86AnonymousEditor {
         words: &live,
-        mm_key: NonZeroU64::new(mm.raw()).unwrap(),
+        residency: &residency,
+        mm: NonZeroU64::new(mm.raw()).unwrap(),
     };
     let guard = spaces
         .try_begin_edit(spaces.find(mm.raw()).unwrap(), mm.raw(), NonZeroU64::MIN)
         .unwrap();
     // SAFETY: retained table fixture and exclusive guard name the same MM/root.
     let mut authority = unsafe {
-        carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(&guard, &mut editor)
+        carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(
+            &guard,
+            &mut editor,
+            Some(&residency),
+        )
     }
     .unwrap();
     assert_eq!(
@@ -381,6 +333,7 @@ mod fork_cow;
 struct FailGrantStore<'a, W> {
     words: &'a W,
     stores: core::cell::Cell<usize>,
+    rollback_fails: bool,
 }
 impl<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords>
     carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords for FailGrantStore<'_, W>
@@ -399,7 +352,7 @@ impl<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords>
     ) -> Result<bool, carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
         let stores = self.stores.get() + 1;
         self.stores.set(stores);
-        if stores == 2 {
+        if stores == 2 || self.rollback_fails && stores >= 3 {
             Ok(false)
         } else {
             self.words.compare_exchange(pa, old, new)
@@ -523,6 +476,7 @@ fn grant_fixture<B: carrick_mmu_core::owner_mmu::OwnerGrantMmu>(
     let failed = FailGrantStore {
         words: &live,
         stores: core::cell::Cell::new(0),
+        rollback_fails: false,
     };
     let rollback_invalidated = core::cell::Cell::new(false);
     let rollback = serve_grant(&portal, &wire, &failed, &residency, 0, || {
@@ -1273,16 +1227,22 @@ fn x86_anonymous_refuses_stale_requests_before_descriptor_edit() {
     else {
         panic!("replacement proposal");
     };
+    let residency = private_residency(mm.raw(), 1);
     let mut editor = X86AnonymousEditor {
         words: &live,
-        mm_key: NonZeroU64::new(mm.raw()).unwrap(),
+        residency: &residency,
+        mm: NonZeroU64::new(mm.raw()).unwrap(),
     };
     let guard = spaces
         .try_begin_edit(spaces.find(mm.raw()).unwrap(), mm.raw(), NonZeroU64::MIN)
         .unwrap();
     // SAFETY: real retained words under the same MM's exclusive editor.
     let mut authority = unsafe {
-        carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(&guard, &mut editor)
+        carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(
+            &guard,
+            &mut editor,
+            Some(&residency),
+        )
     }
     .unwrap();
     let outcome = edit_and_commit(&mut root, stale, &mut authority);
@@ -1322,9 +1282,11 @@ fn x86_anonymous_refuses_foreign_mm_descriptor_authority() {
     else {
         panic!("proposal");
     };
+    let residency = private_residency(other.raw(), 1);
     let mut editor = X86AnonymousEditor {
         words: &live,
-        mm_key: NonZeroU64::new(other.raw()).unwrap(),
+        residency: &residency,
+        mm: NonZeroU64::new(other.raw()).unwrap(),
     };
     let guard = spaces
         .try_begin_edit(
@@ -1336,7 +1298,11 @@ fn x86_anonymous_refuses_foreign_mm_descriptor_authority() {
     // SAFETY: backend and guard both name the other MM's retained words;
     // safe core admission must reject it against model A before editing B.
     let mut authority = unsafe {
-        carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(&guard, &mut editor)
+        carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(
+            &guard,
+            &mut editor,
+            Some(&residency),
+        )
     }
     .unwrap();
     let outcome = edit_and_commit(&mut root, request, &mut authority);
@@ -1350,4 +1316,380 @@ fn x86_anonymous_refuses_foreign_mm_descriptor_authority() {
         Err(AnonymousRefusal::Root(carrick_core_abi::Refusal::Stale))
     );
     assert_eq!(root.pending(), Some(request));
+}
+
+#[test]
+fn x86_anonymous_unmap_keeps_pinned_grant_descriptors() {
+    use carrick_core::mm::anonymous::{AnonymousRefusal, edit_and_commit};
+    use carrick_core::mm::reservation::Decision;
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 31, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view)
+        .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
+    let tables = anonymous_native_tables(ROOT, 1);
+    let maintenance = CallerInvalidatesAsid;
+    let live = tables.live(&maintenance);
+    let residency = private_residency(mm.raw(), 1);
+    let page = residency.lookup(mm.raw(), VA).unwrap();
+    let pin = residency.pin_transfer(page).unwrap();
+    let mut root = portal.root(mm, 0).unwrap();
+    let Decision::Work(request) = root
+        .munmap(carrick_core_abi::ReservationRange::new(VA, VA + 4096).unwrap())
+        .unwrap()
+    else {
+        panic!("retirement proposal")
+    };
+    let guard = spaces
+        .try_begin_edit(spaces.find(mm.raw()).unwrap(), mm.raw(), NonZeroU64::MIN)
+        .unwrap();
+    let mut editor = X86AnonymousEditor {
+        words: &live,
+        residency: &residency,
+        mm: NonZeroU64::new(mm.raw()).unwrap(),
+    };
+    // SAFETY: descriptor words, exact live scheduler editor and retained frame index share this MM.
+    let mut authority = unsafe {
+        carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(
+            &guard,
+            &mut editor,
+            Some(&residency),
+        )
+    }
+    .unwrap();
+    let outcome = edit_and_commit(&mut root, request, &mut authority);
+    assert_eq!(outcome, Err(AnonymousRefusal::EditRefused));
+    assert_ne!(tables.words[1536].load(Ordering::Acquire) & PRESENT, 0);
+    assert!(residency.lookup(mm.raw(), VA).is_some());
+    drop(pin);
+}
+
+struct AnonymousWorkWords<'a, W> {
+    counted: CountWords<'a, W>,
+    stores: core::cell::Cell<usize>,
+    invalidations: core::cell::RefCell<Vec<(u64, u64)>>,
+}
+impl<W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords>
+    carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords for AnonymousWorkWords<'_, W>
+{
+    fn load(
+        &self,
+        pa: u64,
+    ) -> Result<u64, carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
+        self.counted.load(pa)
+    }
+    fn compare_exchange(
+        &self,
+        pa: u64,
+        before: u64,
+        after: u64,
+    ) -> Result<bool, carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
+        self.stores.set(self.stores.get() + 1);
+        self.counted.compare_exchange(pa, before, after)
+    }
+    fn store_unlinked(
+        &self,
+        pa: u64,
+        word: u64,
+    ) -> Result<(), carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal> {
+        self.stores.set(self.stores.get() + 1);
+        self.counted.store_unlinked(pa, word)
+    }
+    fn publish_barrier(&self) {
+        self.counted.publish_barrier();
+    }
+    fn invalidate_range(&self, va: u64, len: u64) {
+        self.invalidations.borrow_mut().push((va, len));
+        self.counted.invalidate_range(va, len);
+    }
+}
+
+fn anonymous_descriptor_budget(pages: usize, unrelated: usize, operation: u8) {
+    use carrick_core::mm::anonymous::{AnonymousEditAuthority, edit_and_commit};
+    use carrick_core::mm::reservation::Decision;
+    use carrick_core_abi::{MoveTarget, ReservationProtection, ReservationRange};
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 31, ROOT, pages, unrelated);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view)
+        .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
+    let tables = anonymous_native_tables(ROOT, pages);
+    // An existing destination hierarchy, as in the retained KVM fixture.
+    tables.words[1025].store(
+        (ROOT + 4 * 4096) | PRESENT | WRITE | USER,
+        Ordering::Release,
+    );
+    let maintenance = CallerInvalidatesAsid;
+    let live = tables.live(&maintenance);
+    let words = AnonymousWorkWords {
+        counted: CountWords {
+            words: &live,
+            loads: core::cell::Cell::new(0),
+        },
+        stores: core::cell::Cell::new(0),
+        invalidations: core::cell::RefCell::new(Vec::new()),
+    };
+    let residency = private_residency(mm.raw(), pages);
+    for i in 0..unrelated {
+        residency
+            .publish(carrick_core_abi::FrameGrantResidencyIdentity {
+                mm_key: mm.raw(),
+                semantic_base: VA + 0x100_0000 + i as u64 * 8192,
+                physical_ipa: IPA + 0x100_0000 + i as u64 * 8192,
+                len: 4096,
+                frame_id: i as u64 + 10,
+                mapping_id: i as u64 + 10,
+                owner_generation: 3,
+                inventory_revision: 4,
+            })
+            .unwrap();
+    }
+    for page in 0..pages {
+        assert!(
+            residency.record_commit(residency.lookup(mm.raw(), VA + page as u64 * 4096).unwrap())
+        );
+    }
+    let range = ReservationRange::new(VA, VA + pages as u64 * 4096).unwrap();
+    let mut root = portal.root(mm, 0).unwrap();
+    root.work = 0;
+    let decision = match operation {
+        0 => root.mprotect(range, ReservationProtection::READ),
+        1 => root.munmap(range),
+        _ => root.mremap(range, range.len(), MoveTarget::Fixed(VA + 0x20_0000)),
+    }
+    .unwrap();
+    let Decision::Work(request) = decision else {
+        panic!("descriptor proposal")
+    };
+    let guard = spaces
+        .try_begin_edit(spaces.find(mm.raw()).unwrap(), mm.raw(), NonZeroU64::MIN)
+        .unwrap();
+    let mut editor = X86AnonymousEditor {
+        words: &words,
+        residency: &residency,
+        mm: NonZeroU64::new(mm.raw()).unwrap(),
+    };
+    // SAFETY: the production native backend, retained descriptor words/index
+    // and real scheduler editor name one exact simulated MM/root.
+    let mut authority =
+        unsafe { AnonymousEditAuthority::from_editor(&guard, &mut editor, Some(&residency)) }
+            .unwrap();
+    let result = edit_and_commit(&mut root, request, &mut authority).unwrap();
+    let factor = if operation == 2 { 20 } else { 10 };
+    assert_eq!(
+        words.counted.loads.get() + words.stores.get(),
+        factor * pages,
+        "classification, four-level walks and atomic publication visit only touched leaves"
+    );
+    assert_eq!(
+        words.stores.get(),
+        if operation == 2 { 2 * pages } else { pages }
+    );
+    let expected_invalidations = if operation == 2 {
+        vec![(VA + 0x20_0000, range.len()), (VA, range.len())]
+    } else {
+        vec![(VA, range.len())]
+    };
+    assert_eq!(*words.invalidations.borrow(), expected_invalidations);
+    let height_bound = 2 * ((unrelated + 1).ilog2() as usize + 1);
+    assert!(
+        root.work <= 24 * (height_bound + 1),
+        "{} reservation visits at {unrelated} unrelated nodes",
+        root.work
+    );
+    for page in 0..pages {
+        let old = tables.words[1536 + page].load(Ordering::Acquire);
+        match operation {
+            0 => assert_eq!(old & (PRESENT | WRITE), PRESENT),
+            1 => {
+                assert_eq!(old, 0);
+                assert!(
+                    residency
+                        .lookup(mm.raw(), VA + page as u64 * 4096)
+                        .is_none()
+                );
+            }
+            _ => {
+                assert_eq!(old, 0);
+                assert_eq!(
+                    tables.words[2048 + page].load(Ordering::Acquire)
+                        & carrick_mmu_core::x86::descriptor_txn::ADDRESS,
+                    IPA + page as u64 * 4096
+                );
+                assert!(
+                    residency.is_guest_committed(mm.raw(), VA + 0x20_0000 + page as u64 * 4096)
+                );
+                assert!(
+                    residency
+                        .lookup(mm.raw(), VA + page as u64 * 4096)
+                        .is_none()
+                );
+            }
+        }
+    }
+    assert_eq!(result, if operation == 2 { VA + 0x20_0000 } else { 0 });
+}
+#[test]
+fn x86_anonymous_edits_have_touched_leaf_and_tree_height_budgets() {
+    for pages in [16, 64, 256] {
+        for unrelated in [16, 512] {
+            for operation in 0..3 {
+                anonymous_descriptor_budget(pages, unrelated, operation);
+            }
+        }
+    }
+}
+#[test]
+fn grant_retirement_closure_is_bounded_and_preserves_partial_compounds() {
+    for pages in [4, 16, 64, 256] {
+        for unrelated in [16, 512] {
+            let table = private_residency(31, pages);
+            let spaces = AddressSpaces::new();
+            let index = spaces.publish_closed(31, ROOT, 0).unwrap();
+            spaces.open(index);
+            let guard = spaces.try_begin_edit(index, 31, NonZeroU64::MIN).unwrap();
+            for i in 0..unrelated {
+                table
+                    .publish(carrick_core_abi::FrameGrantResidencyIdentity {
+                        mm_key: 31,
+                        semantic_base: VA + 0x100_0000 + i * 8192,
+                        physical_ipa: IPA + 0x100_0000 + i * 8192,
+                        len: 4096,
+                        frame_id: i + 10,
+                        mapping_id: i + 10,
+                        owner_generation: 3,
+                        inventory_revision: 4,
+                    })
+                    .unwrap();
+            }
+            for page in 0..pages {
+                assert!(table.record_commit(table.lookup(31, VA + page as u64 * 4096).unwrap()));
+            }
+            let token = table
+                .prepare_retirement(
+                    &guard,
+                    carrick_core_abi::ReservationRange::new(VA, VA + pages as u64 * 4096).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                token.lookup_work(),
+                1,
+                "whole grant closure skips every contained page and unrelated record"
+            );
+            assert!(table.pin_transfer(table.lookup(31, VA).unwrap()).is_none());
+            drop(token);
+            assert!(table.pin_transfer(table.lookup(31, VA).unwrap()).is_some());
+            let token = table
+                .prepare_retirement(
+                    &guard,
+                    carrick_core_abi::ReservationRange::new(VA, VA + 4096).unwrap(),
+                )
+                .unwrap();
+            // SAFETY: isolated metadata fixture has no live CPU or physical
+            // reuse; descriptor/invalidation semantics are paired in KVM tests.
+            assert!(unsafe { token.commit_after_descriptor_invalidation() });
+            assert!(table.lookup(31, VA).is_none());
+            for page in 1..pages {
+                assert!(table.is_guest_committed(31, VA + page as u64 * 4096));
+            }
+        }
+    }
+}
+
+#[test]
+fn x86_anonymous_remap_rollback_restores_source_and_retained_custody() {
+    anonymous_remap_rollback(false);
+}
+#[test]
+fn x86_anonymous_remap_failed_rollback_keeps_custody_closed() {
+    anonymous_remap_rollback(true);
+}
+fn anonymous_remap_rollback(rollback_fails: bool) {
+    use carrick_core::mm::anonymous::{AnonymousEditAuthority, AnonymousRefusal, edit_and_commit};
+    use carrick_core::mm::reservation::Decision;
+    use carrick_core_abi::{MoveTarget, ReservationRange};
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 31, ROOT, 16, 16);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view)
+        .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
+    let tables = anonymous_native_tables(ROOT, 16);
+    tables.words[1025].store(
+        (ROOT + 4 * 4096) | PRESENT | WRITE | USER,
+        Ordering::Release,
+    );
+    let maintenance = CallerInvalidatesAsid;
+    let live = tables.live(&maintenance);
+    let failed = FailGrantStore {
+        words: &live,
+        stores: core::cell::Cell::new(0),
+        rollback_fails,
+    };
+    let residency = private_residency(mm.raw(), 16);
+    let mut root = portal.root(mm, 0).unwrap();
+    let Decision::Work(request) = root
+        .mremap(
+            ReservationRange::new(VA, VA + 16 * 4096).unwrap(),
+            16 * 4096,
+            MoveTarget::Fixed(VA + 0x20_0000),
+        )
+        .unwrap()
+    else {
+        panic!("move proposal")
+    };
+    let guard = spaces
+        .try_begin_edit(spaces.find(mm.raw()).unwrap(), mm.raw(), NonZeroU64::MIN)
+        .unwrap();
+    let mut editor = X86AnonymousEditor {
+        words: &failed,
+        residency: &residency,
+        mm: NonZeroU64::new(mm.raw()).unwrap(),
+    };
+    // SAFETY: all retained authorities name this real isolated MM/root; the
+    // projection reports its injected store refusal and undoes the full prefix.
+    let mut authority =
+        unsafe { AnonymousEditAuthority::from_editor(&guard, &mut editor, Some(&residency)) }
+            .unwrap();
+    let outcome = edit_and_commit(&mut root, request, &mut authority);
+    if rollback_fails {
+        assert_eq!(outcome, Err(AnonymousRefusal::RollbackFailed));
+        assert!(
+            residency
+                .pin_transfer(residency.lookup(mm.raw(), VA).unwrap())
+                .is_none(),
+            "indeterminate descriptors reopened physical-window pin admission"
+        );
+        assert_eq!(root.pending(), Some(request));
+        assert_ne!(tables.words[2048].load(Ordering::Acquire), 0);
+        return;
+    }
+    assert_eq!(outcome, Err(AnonymousRefusal::EditRefused));
+    for page in 0..16 {
+        assert_ne!(
+            tables.words[1536 + page].load(Ordering::Acquire) & PRESENT,
+            0
+        );
+        assert_eq!(tables.words[2048 + page].load(Ordering::Acquire), 0);
+        assert!(
+            residency
+                .lookup(mm.raw(), VA + page as u64 * 4096)
+                .is_some()
+        );
+        assert!(
+            residency
+                .lookup(mm.raw(), VA + 0x20_0000 + page as u64 * 4096)
+                .is_none()
+        );
+    }
+    assert!(
+        residency
+            .pin_transfer(residency.lookup(mm.raw(), VA).unwrap())
+            .is_some()
+    );
+    assert!(root.mapping(VA).is_some());
+    assert!(root.mapping(VA + 0x20_0000).is_none());
+    assert!(root.pending().is_none());
 }
