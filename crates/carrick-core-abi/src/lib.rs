@@ -6,6 +6,10 @@ pub mod mm;
 pub use mm::*;
 mod metadata_extent;
 pub use metadata_extent::*;
+pub mod wait;
+pub use wait::*;
+pub mod lifecycle;
+pub use lifecycle::*;
 
 /// Minimum dynamic metadata grant quantum, shared by allocator adapters.
 pub const EL1_DYNAMIC_METADATA_EXTENT_SIZE: usize = 512 * 1024;
