@@ -27,6 +27,7 @@ use crate::{Reg, RegAccess, TrapError};
 
 /// All inputs to [`build_sigframe`]: the 10 `inject_signal` arguments plus the
 /// engine-supplied values that are NOT reachable through `RegAccess`/`CurrentMmMemory`.
+#[derive(Debug)]
 pub struct InjectParams {
     pub signum: i32,
     pub handler: u64,
@@ -61,6 +62,23 @@ pub struct InjectParams {
 pub struct SigframeInject {
     pub new_sp: u64,
     pub saved_pc: u64,
+}
+
+/// The captured signal context survives memory admission without dequeuing
+/// another signal or resnapshotting registers from a reused physical vCPU.
+pub struct PendingSignalFrame {
+    frame: carrick_abi::CarrickSigframe,
+    params: InjectParams,
+    new_sp: carrick_guest_mem::GuestVa,
+}
+
+impl std::fmt::Debug for PendingSignalFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingSignalFrame")
+            .field("signum", &self.params.signum)
+            .field("new_sp", &self.new_sp)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The values the restore wrapper needs after [`restore_sigframe`].
@@ -236,99 +254,137 @@ pub fn build_sigframe<E: RegAccess + CurrentMmMemory>(
     // (LTP sigaltstack01 deliberately exercises that).
     let frame_bytes = frame.as_bytes();
     let new_sp = signal_frame_stack_pointer(frame.saved_sp, p.altstack, frame_bytes.len())?;
-    // A prepared lazy leaf is not yet a valid stage-1 translation. The
-    // backend authenticates Linux write intent and commits first touch before
-    // the ordinary whole-range host-buffer check below.
-    engine
-        .prepare_host_write(new_sp, frame_bytes.len())
-        .map_err(|error| {
-            carrick_observability::probes::hvpatch_signal_frame_step(
-                1,
-                new_sp,
-                frame_bytes.len() as u64,
-                signal_frame_memory_error_code(&error),
-            );
-            TrapError::SignalDeliveryFault
-        })?;
-    if !engine.guest_range_is_writable(new_sp, frame_bytes.len()) {
+    PendingSignalFrame {
+        frame,
+        params: p,
+        new_sp: carrick_guest_mem::GuestVa(new_sp),
+    }
+    .publish(engine)
+}
+
+impl PendingSignalFrame {
+    pub fn signum(&self) -> i32 {
+        self.params.signum
+    }
+
+    pub fn restart_syscall(&self) -> bool {
+        self.params.restart_syscall
+    }
+
+    pub fn handler(&self) -> u64 {
+        self.params.handler
+    }
+
+    fn memory_refusal(self, error: MemoryError, step: u32) -> TrapError {
+        use carrick_guest_mem::MemoryPrepareError;
         carrick_observability::probes::hvpatch_signal_frame_step(
-            2,
-            new_sp,
-            frame_bytes.len() as u64,
-            1,
+            step,
+            self.new_sp.raw(),
+            core::mem::size_of::<carrick_abi::CarrickSigframe>() as u64,
+            signal_frame_memory_error_code(&error),
         );
-        // Any unwritable signal stack is Linux force_sigsegv territory. This
-        // check also prevents the unchecked frame write below from modifying
-        // runtime-owned executable mappings when a guest forges SP_EL0.
-        return Err(TrapError::SignalDeliveryFault);
+        let dependency = match error {
+            MemoryError::OwnerWait(wait) => MemoryPrepareError::OwnerWait(wait),
+            MemoryError::Supply(request) => MemoryPrepareError::Supply(*request),
+            MemoryError::Physical(wait) => MemoryPrepareError::Physical(wait),
+            _ => return TrapError::SignalDeliveryFault,
+        };
+        TrapError::SignalFrameMemory {
+            pending: Box::new(self),
+            dependency: Box::new(dependency),
+        }
     }
 
-    // Write the frame into guest memory at the new SP. An unwritable/
-    // unmapped stack is Linux force_sigsegv territory: terminate the
-    // thread-group by SIGSEGV rather than crashing carrick.
-    engine
-        .write_bytes_unchecked(new_sp, frame_bytes)
-        .map_err(|error| {
+    /// Publish only the already captured context. Partial frame bytes may be
+    /// rewritten from this immutable source; no register points at them until
+    /// the whole frame has landed. Each backend bounds preparation internally.
+    pub fn publish<E: RegAccess + CurrentMmMemory>(
+        self,
+        engine: &mut E,
+    ) -> Result<SigframeInject, TrapError> {
+        let frame = &self.frame;
+        let p = &self.params;
+        let new_sp = self.new_sp.raw();
+        let frame_bytes = frame.as_bytes();
+        // A prepared lazy leaf is not yet a valid stage-1 translation. The
+        // backend authenticates Linux write intent and commits first touch before
+        // the ordinary whole-range host-buffer check below.
+        if let Err(error) = engine.prepare_host_write(new_sp, frame_bytes.len()) {
+            return Err(self.memory_refusal(error, 1));
+        }
+        if !engine.guest_range_is_writable(new_sp, frame_bytes.len()) {
             carrick_observability::probes::hvpatch_signal_frame_step(
-                3,
+                2,
                 new_sp,
                 frame_bytes.len() as u64,
-                signal_frame_memory_error_code(&error),
+                1,
             );
-            TrapError::SignalDeliveryFault
-        })?;
+            // Any unwritable signal stack is Linux force_sigsegv territory. This
+            // check also prevents the unchecked frame write below from modifying
+            // runtime-owned executable mappings when a guest forges SP_EL0.
+            return Err(TrapError::SignalDeliveryFault);
+        }
 
-    // Adjust SP_EL0 to point past the freshly-written frame.
-    engine.set_reg(Reg::Sp, new_sp)?;
+        // Write the frame into guest memory at the new SP. An unwritable/
+        // unmapped stack is Linux force_sigsegv territory: terminate the
+        // thread-group by SIGSEGV rather than crashing carrick.
+        if let Err(error) = engine.write_bytes_unchecked(new_sp, frame_bytes) {
+            return Err(self.memory_refusal(error, 3));
+        }
 
-    // First handler argument is the signum.
-    engine.set_reg(Reg::X(0), p.signum as u64)?;
-    // x1/x2 carry siginfo* / ucontext* on SA_SIGINFO. Handlers may inspect
-    // or mutate the saved PC/SP before rt_sigreturn, so keep the embedded
-    // Linux-shaped context authoritative.
-    let siginfo_addr = new_sp + core::mem::offset_of!(carrick_abi::CarrickSigframe, siginfo) as u64;
-    let ucontext_addr =
-        new_sp + core::mem::offset_of!(carrick_abi::CarrickSigframe, ucontext) as u64;
-    engine.set_reg(Reg::X(1), siginfo_addr)?;
-    engine.set_reg(Reg::X(2), ucontext_addr)?;
+        // Adjust SP_EL0 to point past the freshly-written frame.
+        engine.set_reg(Reg::Sp, new_sp)?;
 
-    // LR = the restorer the handler `ret`s to, which must invoke
-    // `rt_sigreturn(2)`. musl/x86-style libcs pass an explicit
-    // `sa_restorer`; glibc on aarch64 passes 0 and relies on the kernel's
-    // VDSO sigreturn trampoline (the aarch64 kernel ABI has no
-    // sa_restorer). Use Carrick's fixed executable user trampoline rather
-    // than writing code into the guest signal stack: stack-resident code is
-    // vulnerable to I-cache coherency and frame-clobber timing at Go's
-    // SIGURG preemption rate.
-    let restorer = if p.sa_restorer != 0 {
-        p.sa_restorer
-    } else {
-        p.sigreturn_trampoline_base
-    };
-    engine.set_reg(Reg::X(30), restorer)?;
+        // First handler argument is the signum.
+        engine.set_reg(Reg::X(0), p.signum as u64)?;
+        // x1/x2 carry siginfo* / ucontext* on SA_SIGINFO. Handlers may inspect
+        // or mutate the saved PC/SP before rt_sigreturn, so keep the embedded
+        // Linux-shaped context authoritative.
+        let siginfo_addr =
+            new_sp + core::mem::offset_of!(carrick_abi::CarrickSigframe, siginfo) as u64;
+        let ucontext_addr =
+            new_sp + core::mem::offset_of!(carrick_abi::CarrickSigframe, ucontext) as u64;
+        engine.set_reg(Reg::X(1), siginfo_addr)?;
+        engine.set_reg(Reg::X(2), ucontext_addr)?;
 
-    // Redirect to the handler entry. On a syscall-boundary injection the
-    // guest is mid-`eret` from the EL1 vector, so the resume PC is ELR_EL1
-    // (previously "instruction after the SVC"); we steal it for the handler
-    // and frame.saved_pc holds the original until rt_sigreturn. On a kick
-    // (CANCELED) injection there is no pending eret — the vCPU resumes
-    // directly at Reg::PC — so redirect PC instead and leave ELR_EL1 alone.
-    // Either way the handler later returns via the rt_sigreturn `svc`, whose
-    // completion restores ELR_EL1 = saved_pc and erets to it.
-    if p.interrupted_pc.is_some() {
-        engine.set_reg(Reg::Pc, p.handler)?;
-    } else {
-        engine.set_reg(Reg::ElrEl1, p.handler)?;
+        // LR = the restorer the handler `ret`s to, which must invoke
+        // `rt_sigreturn(2)`. musl/x86-style libcs pass an explicit
+        // `sa_restorer`; glibc on aarch64 passes 0 and relies on the kernel's
+        // VDSO sigreturn trampoline (the aarch64 kernel ABI has no
+        // sa_restorer). Use Carrick's fixed executable user trampoline rather
+        // than writing code into the guest signal stack: stack-resident code is
+        // vulnerable to I-cache coherency and frame-clobber timing at Go's
+        // SIGURG preemption rate.
+        let restorer = if p.sa_restorer != 0 {
+            p.sa_restorer
+        } else {
+            p.sigreturn_trampoline_base
+        };
+        engine.set_reg(Reg::X(30), restorer)?;
+
+        // Redirect to the handler entry. On a syscall-boundary injection the
+        // guest is mid-`eret` from the EL1 vector, so the resume PC is ELR_EL1
+        // (previously "instruction after the SVC"); we steal it for the handler
+        // and frame.saved_pc holds the original until rt_sigreturn. On a kick
+        // (CANCELED) injection there is no pending eret — the vCPU resumes
+        // directly at Reg::PC — so redirect PC instead and leave ELR_EL1 alone.
+        // Either way the handler later returns via the rt_sigreturn `svc`, whose
+        // completion restores ELR_EL1 = saved_pc and erets to it.
+        if p.interrupted_pc.is_some() {
+            engine.set_reg(Reg::Pc, p.handler)?;
+        } else {
+            engine.set_reg(Reg::ElrEl1, p.handler)?;
+        }
+
+        // Preserve the SPSR_EL1 we snapshotted — we want to return to
+        // EL0t with the same DAIF state, and the EL1 vector path
+        // already set SPSR_EL1 to "EL0t, DAIF masked" when entering
+        // this trap. Nothing to write here; SPSR_EL1 is already
+        // correct for "return to EL0t".
+
+        let saved_pc = frame.saved_pc;
+        Ok(SigframeInject { new_sp, saved_pc })
     }
-
-    // Preserve the SPSR_EL1 we snapshotted — we want to return to
-    // EL0t with the same DAIF state, and the EL1 vector path
-    // already set SPSR_EL1 to "EL0t, DAIF masked" when entering
-    // this trap. Nothing to write here; SPSR_EL1 is already
-    // correct for "return to EL0t".
-
-    let saved_pc = frame.saved_pc;
-    Ok(SigframeInject { new_sp, saved_pc })
 }
 
 /// Snapshot the guest V0–V31 + FPSR/FPCR into the Linux `fpsimd_context`

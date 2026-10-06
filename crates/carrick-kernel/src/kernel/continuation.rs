@@ -107,6 +107,7 @@ enum ContinuationOrigin {
     Syscall(SyscallFrame),
     ChildTidClear,
     Fault,
+    SignalFrame,
 }
 
 #[derive(Debug)]
@@ -325,12 +326,18 @@ impl ContinuationAuthority {
     pub const fn syscall(&self) -> Option<SyscallFrame> {
         match self.origin {
             ContinuationOrigin::Syscall(frame) => Some(frame),
-            ContinuationOrigin::ChildTidClear | ContinuationOrigin::Fault => None,
+            ContinuationOrigin::ChildTidClear
+            | ContinuationOrigin::Fault
+            | ContinuationOrigin::SignalFrame => None,
         }
     }
 
     pub const fn is_terminal_action(&self) -> bool {
         matches!(self.origin, ContinuationOrigin::ChildTidClear)
+    }
+
+    pub const fn is_signal_frame_action(&self) -> bool {
+        matches!(self.origin, ContinuationOrigin::SignalFrame)
     }
 
     pub const fn restart_class(&self) -> RestartClass {
@@ -1607,6 +1614,22 @@ impl BlockedContinuation {
         Ok(Self::from_zone_park(capture, wait, None))
     }
 
+    /// A captured signal frame waits without a fictitious syscall return.
+    /// Only SIGKILL may interrupt the already admitted delivery transaction.
+    pub fn from_signal_frame_zone_park(
+        context: &KernelContext,
+        lease: &crate::kernel::objects::ThreadExecutionLease,
+        wait: ZoneWait,
+    ) -> Result<Self, ContinuationBuildError> {
+        let capture = ContinuationCapture::capture_lease(
+            context,
+            lease,
+            ContinuationOrigin::SignalFrame,
+            RestartClass::Never,
+        )?;
+        Ok(Self::from_zone_park(capture, wait, None))
+    }
+
     /// The zone record a zone wait parks on.
     pub fn zone_wait(&self) -> Option<&ZoneWait> {
         match &self.state().detail {
@@ -2204,7 +2227,8 @@ impl BlockedContinuation {
             event
         };
         let fault_action = matches!(self.authority().origin, ContinuationOrigin::Fault);
-        let fault_signal = fault_action
+        let signal_frame_action = self.authority().is_signal_frame_action();
+        let fault_signal = (fault_action || signal_frame_action)
             .then(|| event.reserved_signal().cloned())
             .flatten();
         let outcome = if self.authority().is_terminal_action() {
@@ -2213,6 +2237,8 @@ impl BlockedContinuation {
             ContinuationCompletion::ResumeTerminalAction
         } else if fault_action {
             ContinuationCompletion::ResumeFault
+        } else if signal_frame_action {
+            ContinuationCompletion::ResumeSignalFrame
         } else if !completed && self.interrupted_by_group_stop(context.task()) {
             ContinuationCompletion::Errno(LINUX_EINTR)
         } else {
@@ -2642,6 +2668,7 @@ impl ContinuationEvent {
 pub enum ContinuationCompletion {
     ResumeTerminalAction,
     ResumeFault,
+    ResumeSignalFrame,
     Return(i64),
     Errno(LinuxErrno),
     Redispatch,
@@ -2765,7 +2792,9 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
     memory: &mut M,
 ) -> Result<Option<DispatchOutcome>, MemoryError> {
     Ok(match completion {
-        ContinuationCompletion::ResumeTerminalAction | ContinuationCompletion::ResumeFault => {
+        ContinuationCompletion::ResumeTerminalAction
+        | ContinuationCompletion::ResumeFault
+        | ContinuationCompletion::ResumeSignalFrame => {
             return Err(MemoryError::Unsupported);
         }
         ContinuationCompletion::Return(value) => Some(DispatchOutcome::Returned { value }),
