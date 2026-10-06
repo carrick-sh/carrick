@@ -75,18 +75,21 @@ fn first_touch_window<B: OwnerForkMmu + Copy>(
     };
     let grant_residency = residency();
     if fault_resident_grant {
-        grant_residency
-            .publish(carrick_core_abi::FrameGrantResidencyIdentity {
-                mm_key: mm.raw(),
-                semantic_base: VA + 4096,
-                physical_ipa: IPA + 4096,
-                len: 4096,
-                mapping_id: 1,
-                frame_id: 1,
-                owner_generation: 1,
-                inventory_revision: 1,
-            })
-            .expect("publish an uncommitted grant at the fault page");
+        assert!(
+            grant_residency
+                .publish(carrick_core_abi::FrameGrantResidencyIdentity {
+                    mm_key: mm.raw(),
+                    semantic_base: VA + 4096,
+                    physical_ipa: IPA + 4096,
+                    len: 4096,
+                    mapping_id: 1,
+                    frame_id: 1,
+                    owner_generation: 1,
+                    inventory_revision: 1,
+                })
+                .is_some(),
+            "publish an uncommitted grant at the fault page"
+        );
     }
     let TransferStep::Supply(window) = portal
         .select(

@@ -17204,7 +17204,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs",
-      "line": 657,
+      "line": 749,
       "categories": [
         "epoll"
       ],
@@ -17213,7 +17213,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs",
-      "line": 730,
+      "line": 822,
       "categories": [
         "epoll"
       ],
@@ -17222,7 +17222,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/continuation/ipc/tests.rs",
-      "line": 1171,
+      "line": 1263,
       "categories": [
         "epoll"
       ],
@@ -17303,7 +17303,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
-      "line": 707,
+      "line": 710,
       "categories": [
         "epoll"
       ],
