@@ -2391,7 +2391,7 @@ impl<'a> FsView<'a> {
 
 macro_rules! forward_fs_handlers {
     ($( $handler:ident ),* $(,)?) => {
-        impl SyscallDispatcher {
+        impl $crate::dispatch::SyscallDispatcher {
             $(
                 #[inline]
                 pub(crate) fn $handler<M: CurrentMmMemory>(
