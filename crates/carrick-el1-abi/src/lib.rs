@@ -711,6 +711,26 @@ pub struct TrapFrame {
     /// Fault Address Register (FAR_EL1) for data/instruction aborts.
     pub far: u64,
 }
+impl carrick_guest_arch::SyscallFrame for TrapFrame {
+    fn canonical_ordinal(&self) -> carrick_guest_arch::CanonicalSyscall {
+        carrick_guest_arch::CanonicalSyscall::new(self.x[8])
+    }
+    fn argument(&self, index: usize) -> u64 {
+        self.x[index]
+    }
+    fn set_result(&mut self, result: carrick_guest_arch::NativeReturnWord) {
+        self.x[0] = result.0;
+    }
+    fn slot(&self) -> u64 {
+        self.slot
+    }
+    fn user_pc(&self) -> carrick_guest_arch::UserVa {
+        carrick_guest_arch::UserVa::new(self.elr)
+    }
+    fn user_sp(&self) -> Option<carrick_guest_arch::UserVa> {
+        None
+    }
+}
 const _: () = {
     assert!(core::mem::offset_of!(TrapFrame, x) == 0);
     assert!(core::mem::offset_of!(TrapFrame, elr) == 248);

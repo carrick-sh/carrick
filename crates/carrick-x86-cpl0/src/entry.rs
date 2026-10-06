@@ -215,12 +215,34 @@ mod kernel {
     mod initial_boot { include!("initial_boot.rs"); }
     use super::adapter::*;
     use carrick_el1::lock::SpinLock;
-    use carrick_el1::personality::common_entry::{EntryOutcome, serve_canonical};
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
-    use carrick_el1_abi::{Counters, CurrentTask};
-    use carrick_guest_arch::InterruptArch;
+    use carrick_el1::personality::{dispatch, sched};
+    use carrick_el1_abi::{Action, Counters, CurrentTask, InotifyNameCache};
+    use carrick_guest_arch::{CanonicalSyscall, InterruptArch, LayoutBackend, NativeReturnWord, SyscallFrame, UserVa};
     fixture_items! { use carrick_guest_arch::EntryArch; }
     use core::sync::atomic::Ordering;
+
+    struct NativeDispatch<'a> {
+        frame: &'a mut NativeFrame,
+        call: carrick_personality_linux::entry::CanonicalCall,
+    }
+
+    impl SyscallFrame for NativeDispatch<'_> {
+        fn canonical_ordinal(&self) -> CanonicalSyscall { CanonicalSyscall::new(self.call.canonical.raw()) }
+        fn argument(&self, index: usize) -> u64 { self.call.args[index] }
+        fn set_result(&mut self, result: NativeReturnWord) { self.frame.rax = result.0; }
+        // The CPU binding owns one exact task. Its table slice is projected
+        // with that task at local index zero, independently of the CPU id.
+        fn slot(&self) -> u64 { 0 }
+        fn user_pc(&self) -> UserVa { UserVa::new(self.frame.rcx) }
+        fn user_sp(&self) -> Option<UserVa> { Some(self.call.stack) }
+    }
+    impl dispatch::GuestDispatchFrame for NativeDispatch<'_> {
+        fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> { None }
+        fn arm_scheduler(&self) -> bool { false }
+    }
+
+    static EMPTY_NAME_CACHE: InotifyNameCache = InotifyNameCache::new();
 
     // Count native exits across CPL0 CPUs for image/link and live diagnostics.
     // A port write exits the VM, so no lock may remain held across it: another
@@ -1265,21 +1287,30 @@ mod kernel {
         }
         });
         if !handled_by_fixture {
-            match serve_canonical(
-                &call,
+            let layout = <carrick_el1::isa::x86::X86Backend as LayoutBackend>::KERNEL_LAYOUT;
+            let mut native = NativeDispatch { frame, call };
+            match dispatch::dispatch_syscall_with_lifecycle(
+                &mut native,
                 counters,
-                task,
-                &GuestLifecycleVenue,
-                Some(&binding.publications),
+                core::slice::from_ref(task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &EMPTY_NAME_CACHE,
+                None::<dispatch::Zone<'_, sched::HardwareCpu, sched::HardwareUserWord>>,
+                None,
+                Some(&GuestLifecycleVenue),
+                |handle| (layout.region.raw() + carrick_el1_abi::EL1_CACHE_OFFSET
+                    + (u64::from(handle) - 1) * carrick_el1_abi::DELEGATED_FILE_MAX_SIZE)
+                    as *mut u8,
             ) {
-                EntryOutcome::Served { result } | EntryOutcome::ServedWithWork { result } => {
-                    frame.rax = result.raw() as u64;
-                }
-                EntryOutcome::InvalidCompletion => {
+                Action::Served | Action::ServedWithWork => {}
+                Action::Idle => {
                     doorbell(FATAL_PORT, frame);
                     halt();
                 }
-                EntryOutcome::Forward => {
+                Action::Forward => {
                     doorbell(FORWARD_PORT, frame);
                 }
             }
