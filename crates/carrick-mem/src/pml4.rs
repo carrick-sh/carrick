@@ -52,16 +52,28 @@ const PT_PAGE: usize = 1 << PML4_PAGE_SHIFT; // 4 KiB
 const PAGE_MASK: u64 = (PT_PAGE as u64) - 1;
 const LARGE_2M: u64 = 1 << 21;
 const LARGE_2M_MASK: u64 = LARGE_2M - 1;
-/// carrick's guest layout is low-half canonical: every VA sits below 2^47
-/// (x86-64 canonical-address rule; the high half is sign-extended kernel
-/// space carrick never maps).
-const VA_LIMIT: u64 = 1 << 47;
+/// Four-level x86 canonical halves. The lower half is user space; the upper
+/// half holds CPL0 supervisor mappings without a lower-half alias.
+const USER_VA_LIMIT: u64 = 1 << 47;
+const KERNEL_VA_START: u64 = !((1 << 47) - 1);
+
+fn canonical_address(va: u64) -> bool {
+    !(USER_VA_LIMIT..KERNEL_VA_START).contains(&va)
+}
+
+fn canonical_range(va: u64, len: u64) -> bool {
+    let Some(end) = va.checked_add(len) else {
+        return false;
+    };
+    (va < USER_VA_LIMIT && end <= USER_VA_LIMIT)
+        || (va >= KERNEL_VA_START && end >= KERNEL_VA_START)
+}
 /// One past the top of the physical-address field (bits 51:12 ⇒ 2^52).
 const PA_LIMIT: u64 = 1 << 52;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pml4Error {
-    /// A VA at or above 2^47 (carrick's layout is low-half canonical).
+    /// A VA outside the canonical halves, or a range crossing either boundary.
     NonCanonical,
     /// A VA/GPA/length not 4 KiB-aligned, or a GPA past bits 51:12.
     Misaligned,
@@ -135,8 +147,7 @@ pub fn pml4_tables(maps: &[Pml4MapSpec], base: u64, capacity: usize) -> Result<V
         if m.va & PAGE_MASK != 0 || m.gpa & PAGE_MASK != 0 || m.len & PAGE_MASK != 0 {
             return Err(Pml4Error::Misaligned);
         }
-        let va_end = m.va.checked_add(m.len).ok_or(Pml4Error::NonCanonical)?;
-        if va_end > VA_LIMIT {
+        if !canonical_range(m.va, m.len) {
             return Err(Pml4Error::NonCanonical);
         }
         if m.gpa.checked_add(m.len).is_none_or(|e| e > PA_LIMIT) {
@@ -631,7 +642,7 @@ impl Pml4Manager {
     /// at PDPT/PD are handled defensively even though [`pml4_tables`] never
     /// builds them.
     pub fn translate(&self, va: u64) -> Option<u64> {
-        if va >= VA_LIMIT {
+        if !canonical_address(va) {
             return None;
         }
         let idx = indices(va);
@@ -675,7 +686,7 @@ impl Pml4Manager {
         let end = va
             .checked_add((len as u64).div_ceil(PT_PAGE as u64) * PT_PAGE as u64)
             .ok_or(Pml4Error::NonCanonical)?;
-        if end > VA_LIMIT {
+        if !canonical_range(va, end - va) {
             return Err(Pml4Error::NonCanonical);
         }
         let mut changed = false;
@@ -764,7 +775,7 @@ impl Pml4Manager {
         let end = va
             .checked_add((len as u64).div_ceil(PT_PAGE as u64) * PT_PAGE as u64)
             .ok_or(Pml4Error::NonCanonical)?;
-        if end > VA_LIMIT {
+        if !canonical_range(va, end - va) {
             return Err(Pml4Error::NonCanonical);
         }
 
@@ -806,7 +817,7 @@ impl Pml4Manager {
         }
         let aligned_len = len.div_ceil(PT_PAGE as u64) * PT_PAGE as u64;
         let va_end = va.checked_add(aligned_len).ok_or(Pml4Error::NonCanonical)?;
-        if va_end > VA_LIMIT {
+        if !canonical_range(va, va_end - va) {
             return Err(Pml4Error::NonCanonical);
         }
         if gpa
@@ -1453,7 +1464,7 @@ mod tests {
 
     #[test]
     fn non_canonical_va_rejected() {
-        // carrick's layout is low-half canonical: VAs must sit below 1 << 47.
+        // The canonical hole remains unmapped even with high CPL0 VAs.
         let high = 1u64 << 47;
         assert_eq!(
             pml4_tables(&[user_rw_nx(GuestVa(high), Gpa(0x1000), 0x1000)], BASE, CAP),
@@ -1479,6 +1490,24 @@ mod tests {
             mgr.set_rw(high, 0x1000, false),
             Err(Pml4Error::NonCanonical)
         );
+    }
+
+    #[test]
+    fn high_half_supervisor_mapping_has_no_low_user_alias() {
+        let high = 0xffff_ffff_8000_0000;
+        let bytes = build(&[Pml4MapSpec {
+            va: high,
+            gpa: 0x10_0000,
+            len: 0x2000,
+            user: false,
+            write: true,
+            exec: true,
+        }]);
+        let mgr = Pml4Manager::new(bytes, BASE);
+        assert_eq!(mgr.translate(high), Some(0x10_0000));
+        assert_eq!(mgr.translate(high + 0x1000), Some(0x10_1000));
+        assert_eq!(mgr.translate(0x8000_0000), None);
+        assert_eq!(mgr.translate(1 << 47), None);
     }
 
     #[test]
