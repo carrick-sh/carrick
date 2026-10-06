@@ -283,6 +283,7 @@ pub fn build_accept_job_script(
     let q_exit_tmp = shell_quote(&format!("{exit_file}.tmp"));
     let q_lock = shell_quote(lock_dir);
     let run_dir = Path::new(exit_file).parent().unwrap_or(Path::new("."));
+    let q_run_id = shell_quote(&run_dir.file_name().unwrap_or_default().to_string_lossy());
     let q_receipt = shell_quote(&run_dir.join("receipt.json").to_string_lossy());
     let command = if phase == AcceptPhase::Host {
         format!("just accept --phase {phase} --receipt {q_receipt}")
@@ -302,7 +303,7 @@ pub fn build_accept_job_script(
         format!("just lease gate sh -c {}", shell_quote(&preparation))
     };
     Ok(format!(
-        "[ -f {q_env} ] && . {q_env}; cd {q_worktree} && {command} > {q_log} 2>&1; echo $? > {q_exit_tmp} && mv {q_exit_tmp} {q_exit}; rm -rf {q_lock}"
+        "[ -f {q_env} ] && . {q_env}; cd {q_worktree} && {command} > {q_log} 2>&1; rc=$?; target/debug/carrick-xtask gate-cleanup --owned-root {q_worktree} --run-id {q_run_id} >> {q_log} 2>&1 || {{ [ \"$rc\" != 0 ] || rc=1; }}; echo $rc > {q_exit_tmp} && mv {q_exit_tmp} {q_exit}; rm -rf {q_lock}"
     ))
 }
 

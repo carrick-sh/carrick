@@ -19,3 +19,5 @@ pub mod remote_recapture;
 mod target_prune;
 pub mod worktree_admission;
 pub mod worktree_gc;
+
+mod gate_target;

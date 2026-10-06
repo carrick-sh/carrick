@@ -900,9 +900,19 @@ impl Preparation {
                 .unwrap()
                 .success()
         );
-        let checkout = scratch.path().join("checkout");
-        let lock = scratch.path().join("checkout.lock");
+        let checkout = scratch.path().join("gate-worktree");
+        let lock = scratch.path().join("gate-worktree.lock");
         fs::create_dir(&lock).unwrap();
+        fs::write(
+            lock.join("run_id"),
+            scratch
+                .path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .unwrap();
         let bin = scratch.path().join("bin");
         fs::create_dir(&bin).unwrap();
         write(
@@ -914,6 +924,8 @@ if [ "$1" = metadata ]; then exec "$FIXTURE_TEST_CARGO" "$@"; fi
 while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
 [ "$#" -gt 0 ] || exit 91
 shift
+mkdir -p target/debug
+cp "$FIXTURE_TEST_XTASK" target/debug/carrick-xtask
 exec "$FIXTURE_TEST_XTASK" "$@"
 "#,
         );
@@ -1470,6 +1482,7 @@ fn check_remote_accept_cli(remote_bundle: bool, invalid_receipt: bool) {
             .success()
     );
     p.checkout = remote.join("gate-worktree");
+    fs::remove_file(p.lock.join("run_id")).unwrap();
     fs::remove_dir(&p.lock).unwrap();
     p.lock = remote.join("gate-worktree.lock");
     // Only the SSH network boundary is replaced. Real Git and rsync servers
@@ -1737,6 +1750,7 @@ fn signed_preparation_requires_a_bundle_and_checkout_admission() {
     let f = Fixture::new();
     let p = Preparation::new(&f);
     p.setup(&f);
+    fs::remove_file(p.lock.join("run_id")).unwrap();
     fs::remove_dir(&p.lock).unwrap();
     let (exit, _) = p.remote_job();
     assert_ne!(exit, "0");

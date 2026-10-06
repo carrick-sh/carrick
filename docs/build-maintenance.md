@@ -189,3 +189,16 @@ closed, with no shell removal fallback. Low-disk recovery needs no Cargo run,
 build or gate checkout mutation. A busy lock, unavailable root lsof or helper,
 or insufficient reclaimed space preserves the 40 GiB refusal. The helper
 honors the existing `CARRICK_HOST_LEASE_PATH` environment plumbing.
+
+Gate workers reclaim their own Cargo profile output immediately after gate
+receipt/recapture publication and host lease completion, while retaining the
+checkout lock. This removes `target/debug`, `target/release`, and those profiles
+under known Rust target triples, plus declared custom profiles such as
+`dev-fast`. Receipts, logs, `el1-gate/`, `remote-gate/`,
+`fixtures/`, and other target contents remain available for review. Ordinary
+checkouts are retained. Set `CARRICK_GATE_KEEP_TARGET=1` in the gate host's
+`env.sh` to retain the outputs for debugging. Cleanup errors fail the worker;
+cleanup never follows a symlinked target directory outside the owned checkout.
+Ownership requires matching the requesting run ID against the checkout lock.
+Direct signed `just accept` on an owned gate checkout can supply
+`--owned-gate-run-id RUN_ID`; its outer launcher cleans after lease completion.

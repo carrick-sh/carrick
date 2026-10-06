@@ -25,6 +25,7 @@ thiserror.workspace = true
 tempfile.workspace = true
 flate2.workspace = true
 tar.workspace = true
+toml.workspace = true
 signal-hook.workspace = true
 
 carrick-conformance = { path = "../carrick-conformance" }

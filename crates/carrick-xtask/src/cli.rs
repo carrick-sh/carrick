@@ -26,6 +26,9 @@ pub enum Commands {
     /// Check nested fixture workspace lockfiles without network access.
     CheckFixtureLocks,
 
+    #[command(hide = true)]
+    GateCleanup(crate::gate_target::CleanupArgs),
+
     #[command(about = "Owner-approved, one-job Willow ephemeral runner pilot")]
     CiScaler(crate::ci_scaler::ScalerArgs),
     #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
@@ -287,11 +290,32 @@ where
                     .into_os_string(),
             ];
             command.extend(argv.into_iter().skip(1));
-            let code = crate::host_lease::run_command(mode, true, &command)?;
+            let mut code = crate::host_lease::run_command(mode, true, &command)?;
+            if let Commands::Accept(args) = &cli.command
+                && args.phase != crate::accept::AcceptPhase::Host
+                && let Some(run_id) = &args.owned_gate_run_id
+            {
+                let info = resolve_repo_info(cli.root.as_deref())?;
+                if let Err(error) = crate::gate_target::cleanup(&info.repository_root, run_id) {
+                    eprintln!("gate target cleanup: {error}");
+                    if code == 0 {
+                        code = 1;
+                    }
+                }
+            }
             std::process::exit(code);
         }
     }
     match cli.command {
+        Commands::GateCleanup(args) => {
+            crate::gate_target::cleanup(&args.owned_root, &args.run_id).map_err(|source| {
+                CliError::Io {
+                    path: args.owned_root,
+                    source,
+                }
+            })?;
+            Ok(())
+        }
         Commands::CheckFixtureLocks => {
             let info = resolve_repo_info(cli.root.as_deref())?;
             crate::fixtures::check_locks(&info.repository_root)?;
