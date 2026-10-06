@@ -68,6 +68,19 @@ impl InterruptBackend for X86Backend {
         Ok(())
     }
     fn current_cpu(&mut self) -> CpuId {
-        carrick_x86_unbound_interrupt_entry()
+        let binding_address: u64;
+        // SAFETY: SWAPGS has installed the retained per-vCPU binding before
+        // any shared-kernel entry; GS:[16] is its immutable self pointer.
+        unsafe {
+            core::arch::asm!(
+                "mov {}, gs:[16]",
+                out(reg) binding_address,
+                options(nostack, preserves_flags)
+            );
+        }
+        // SAFETY: stopped-host bootstrap owns this binding through vCPU
+        // retirement. Its slot is immutable after publication.
+        let binding = unsafe { &*(binding_address as *const super::context::native::CpuBinding) };
+        CpuId::new(binding.cpu_slot)
     }
 }
