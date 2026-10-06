@@ -21,20 +21,23 @@ counted refusals with zero Linux-side publication.
 
 [bindings]
 vm_free = "carrick-personality-linux::x86_wave2::x4_linux_common_entry"
-kvm = "carrick-vmm-kvm::cpl0_entry::x4_linux_common_entry"
+
+[bindings.unresolved]
+embed_structural = "The x86 production binding is carrick-vmm-kvm::cpl0_entry::x4_linux_common_entry; the unchanged-ARM signed embed binding is director-owned."
+docker = "Native Linux oracle qualification remains director-owned; this extraction preserves the existing set_robust_list result mapping."
 
 [[structural_budgets]]
 kind = "affine"
-metric = "entry_completions"
+metric = "kernel_dispatches"
 base = 0
 per_unit = 1
-layers = ["vm-free", "kvm"]
+layers = ["vm-free"]
 rationale = "Each admitted syscall consumes exactly one completion owner; refusal consumes none."
 
 [[structural_budgets]]
 kind = "affine"
-metric = "semantic_host_forwards_for_admitted_calls"
+metric = "kernel_redispatches"
 base = 0
 per_unit = 0
-layers = ["vm-free", "kvm"]
+layers = ["vm-free"]
 rationale = "Pending work changes the return route, never the syscall's semantic owner."
