@@ -1349,7 +1349,18 @@ mod kernel {
         binding
             .captured_stack
             .store(call.stack.raw(), Ordering::Release);
-        let handled_by_fixture = fixture_expr!({
+        let native_call = carrick_personality_linux::abi::x86_64::lookup_native_x86_64(call.native.raw());
+        let handled_by_native = if let Some(carrick_personality_linux::abi::x86_64::NativeX86Call::ArchPrctl) = native_call {
+            let operation = carrick_personality_linux::abi::x86_64::ArchPrctlOperation::decode(call.args[0]);
+            match carrick_el1::isa::x86::context::arch_prctl(
+                task, operation, carrick_guest_arch::UserVa::new(call.args[1]),
+            ) {
+                Ok(result) => frame.rax = result.raw() as u64,
+                Err(_) => { doorbell(FATAL_PORT, frame); halt(); }
+            }
+            true
+        } else { false };
+        let handled_by_fixture = !handled_by_native && fixture_expr!({
             let lifecycle_address = binding.scheduler_witness.load(Ordering::Acquire);
             if lifecycle_address == super::lifecycle::LIFECYCLE_LANE
             || lifecycle_address
@@ -1385,7 +1396,7 @@ mod kernel {
             false
         }
         });
-        if !handled_by_fixture {
+        if !handled_by_native && !handled_by_fixture {
             let layout = <carrick_el1::isa::x86::X86Backend as LayoutBackend>::KERNEL_LAYOUT;
             let mut native = NativeDispatch {
                 frame,

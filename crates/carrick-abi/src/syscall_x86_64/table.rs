@@ -1,36 +1,4 @@
-//! x86_64 Linux syscall number table and canonical remap.
-//!
-//! Maps x86_64 syscall numbers to their canonical (aarch64/asm-generic)
-//! equivalents used by carrick's unified dispatcher. Numbers are sourced
-//! from published references:
-//!   - `syscalls(2)` man page (man7.org)
-//!   - filippo.io/linux-syscall-table (x86_64 column)
-//!   - OSDev Wiki "System calls" (x86_64 ABI table)
-//!
-//! Each canonical (`Direct(N)`) target is cross-checked against
-//! `carrick_abi::syscall::AARCH64_SYSCALLS` by the `carrick-abi`
-//! cross-check test to keep the remap consistent with canonical numbering.
-//!
-//! CLEAN-ROOM: no Linux kernel source (`arch/x86/entry/syscalls/syscall_64.tbl`,
-//! `unistd_64.h`) or glibc source was used. Numbers come exclusively from the
-//! published references cited above.
-//!
-//! The table now covers the WHOLE x86_64 Linux syscall ABI (numbers 0..454):
-//! every x86_64 syscall whose NAME also appears in `AARCH64_SYSCALLS` with a
-//! matching argument shape is a `Direct(canonical)`. Legacy x86_64-only
-//! syscalls whose arg shape differs from their asm-generic successor
-//! (`open` vs `openat`, `access` vs `faccessat`, `dup2` vs `dup3`, `readlink` vs `readlinkat`,
-//! `stat`/`fstat`/`lstat` vs `newfstatat`, `select` vs `pselect6`, `poll` is
-//! the lone exception below as musl calls it with timeout 0) are deliberately
-//! LEFT OUT (→ `Unknown` → private unsupported sink → -ENOSYS); adding a naive `Direct` for them would
-//! silently mis-dispatch the wrong arg shape, which is worse than an honest
-//! ENOSYS. Those are either handled in `normalize_syscall` or listed in a
-//! clearly-marked comment block at the end of the table as needing a future
-//! arg-translation shim.
-//!
-//! `arch_prctl`=158 stays `native` (the backend services FS/GS base). The
-//! shared guest kernel routes fork(57) through a private canonical number;
-//! host backends still lower fork/vfork to clone before table lookup.
+//! Single no_std x86_64 Linux syscall table, shared by host and guest personality.
 
 /// Linux x86_64 native arch_prctl ordinal, sourced from syscalls(2).
 pub const ARCH_PRCTL_X86_NR: u64 = 158;
@@ -77,19 +45,18 @@ impl ArchPrctlOperation {
 }
 
 /// How a guest-ISA syscall number reaches the canonical (aarch64/asm-generic)
-/// dispatcher. Defined in the guest-safe syscall ABI leaf and re-exported by
-/// `carrick-abi` for host backends.
+/// dispatcher. Defined here in `carrick-abi` (the leaf crate) so both
+/// `carrick-abi` and `carrick-hal` can share it without a dependency cycle.
 /// `carrick-hal::guest_arch` re-exports this type.
 ///
-/// `Private` names x86 operations without an asm-generic ordinal; host
-/// backends may lower those operations before consulting this table.
+/// Phase 2 carries `Direct` and `Unknown`; the legacy-shim class (x86_64
+/// `open`→`openat` etc.) gets its variant when the first shim lands
+/// (oracle-gated — M2's musl-static startup is at-era and needs none).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyscallRemap {
     /// Same semantics, different number: dispatch as `canonical` with args
     /// unchanged.
-    Direct(crate::CanonicalNr),
-    /// Canonical Carrick route for an x86 call absent from asm-generic.
-    Private(crate::CanonicalNr),
+    Direct(u64),
     /// ISA-private syscall the backend services natively (x86_64 `arch_prctl`).
     Native,
     /// No canonical equivalent / not in the table: honest -ENOSYS.
@@ -109,7 +76,7 @@ const fn direct(number: u64, name: &'static str, canonical: u64) -> X8664Syscall
     X8664Syscall {
         number,
         name,
-        remap: SyscallRemap::Direct(crate::CanonicalNr(canonical)),
+        remap: SyscallRemap::Direct(canonical),
     }
 }
 
@@ -129,15 +96,6 @@ pub fn lookup_x86_64(number: u64) -> Option<&'static X8664Syscall> {
         .binary_search_by_key(&number, |s| s.number)
         .ok()
         .map(|i| &X86_64_SYSCALLS[i])
-}
-
-/// Resolve a native x86 number into the typed canonical dispatch domain.
-pub fn canonical_x86_64(number: crate::NativeNr) -> Option<crate::CanonicalNr> {
-    match lookup_x86_64(number.raw())?.remap {
-        SyscallRemap::Direct(canonical) => Some(canonical),
-        SyscallRemap::Private(canonical) => Some(canonical),
-        SyscallRemap::Native | SyscallRemap::Unknown => None,
-    }
 }
 
 /// The full x86_64 syscall table — the WHOLE x86_64 Linux ABI (numbers 0..454).
@@ -286,9 +244,9 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // vs the asm-generic order the dispatcher expects — the x86 engine normalizes
     // it (x8664_arch::normalize_syscall). Source: clone(2) man-page.
     direct(56, "clone", 220),
-    // DO NOT add fork(57): no canonical handler exists; host backends lower
-    // fork/vfork to clone before consulting this table.
-    // x86_64=58 vfork remains desugared to clone by host backends.
+    // x86_64=57 fork / 58 vfork: NOT table entries. Desugared to clone(220)
+    // BEFORE the table lookup in x8664_arch::normalize_syscall (asm-generic has
+    // no SYS_fork/SYS_vfork). DO NOT add here.
     // x86_64=59 (syscalls(2)/filippo) → canonical execve=221.
     // glibc/musl execve() lowers to SYS_execve(59); the shared dispatcher's
     // execve handler returns DispatchOutcome::Execve → the loop's handle_execve
@@ -302,7 +260,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(60, "exit", 93),
     // x86_64=61 (syscalls(2)/filippo) → canonical wait4=260.
     // A forking parent reaps its child via wait4.
-    direct(61, "wait4", crate::nr::WAIT4.raw()),
+    direct(61, "wait4", 260),
     // x86_64=62 kill → canonical kill=129 (SAME name+shape)
     direct(62, "kill", 129),
     // x86_64=63 (syscalls(2)/filippo) → canonical uname=160.
@@ -624,7 +582,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=230 clock_nanosleep → canonical clock_nanosleep=115 (SAME name+shape)
     direct(230, "clock_nanosleep", 115),
     // x86_64=231 (syscalls(2)/filippo) → canonical exit_group=94
-    direct(231, "exit_group", crate::nr::EXIT_GROUP.raw()),
+    direct(231, "exit_group", 94),
     // x86_64=232 epoll_wait: LEGACY (asm-generic has epoll_pwait=22).
     // epoll_wait(epfd,events,max,timeout) vs epoll_pwait(...,*sigmask,size) →
     // DIFFERENT arg shape. SHIMMED in x8664_arch::normalize_syscall →
@@ -962,122 +920,3 @@ const _: () = {
         i += 1;
     }
 };
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn write_remaps_to_canonical_64() {
-        let e = lookup_x86_64(1).expect("write must be in the table");
-        assert_eq!(e.name, "write");
-        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(64)));
-    }
-
-    #[test]
-    fn exit_remaps_to_canonical_93() {
-        let e = lookup_x86_64(60).expect("exit must be in the table");
-        assert_eq!(e.name, "exit");
-        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(93)));
-    }
-
-    #[test]
-    fn exit_group_remaps_to_canonical_94() {
-        let e = lookup_x86_64(231).expect("exit_group must be in the table");
-        assert_eq!(e.name, "exit_group");
-        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(94)));
-    }
-
-    #[test]
-    fn brk_remaps_to_canonical_214() {
-        let e = lookup_x86_64(12).expect("brk must be in the table");
-        assert_eq!(e.name, "brk");
-        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(214)));
-    }
-
-    #[test]
-    fn mmap_remaps_to_canonical_222() {
-        let e = lookup_x86_64(9).expect("mmap must be in the table");
-        assert_eq!(e.name, "mmap");
-        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(222)));
-    }
-
-    #[test]
-    fn rt_sigreturn_remaps_to_canonical_139() {
-        let e = lookup_x86_64(15).expect("rt_sigreturn must be in the table");
-        assert_eq!(e.name, "rt_sigreturn");
-        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(139)));
-    }
-
-    #[test]
-    fn clone_remaps_to_canonical_220() {
-        let e = lookup_x86_64(56).expect("clone must be in the table");
-        assert_eq!(e.name, "clone");
-        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(220)));
-    }
-
-    #[test]
-    fn wait4_remaps_to_canonical_260() {
-        let e = lookup_x86_64(61).expect("wait4 must be in the table");
-        assert_eq!(e.name, "wait4");
-        assert_eq!(e.remap, SyscallRemap::Direct(crate::CanonicalNr(260)));
-    }
-
-    #[test]
-    fn fork_without_a_canonical_handler_stays_unmapped() {
-        assert!(lookup_x86_64(57).is_none());
-        assert_eq!(canonical_x86_64(crate::NativeNr(57)), None);
-    }
-
-    #[test]
-    fn futex_gettid_set_robust_list_present() {
-        assert_eq!(
-            lookup_x86_64(202).unwrap().remap,
-            SyscallRemap::Direct(crate::CanonicalNr(98))
-        ); // futex
-        assert_eq!(
-            lookup_x86_64(186).unwrap().remap,
-            SyscallRemap::Direct(crate::CanonicalNr(178))
-        ); // gettid
-        assert_eq!(
-            lookup_x86_64(273).unwrap().remap,
-            SyscallRemap::Direct(crate::CanonicalNr(99))
-        ); // set_robust_list
-    }
-
-    #[test]
-    fn arch_prctl_is_native() {
-        let e = lookup_x86_64(158).expect("arch_prctl must be in the table");
-        assert_eq!(e.name, "arch_prctl");
-        assert_eq!(e.remap, SyscallRemap::Native);
-    }
-
-    #[test]
-    fn iopl_is_not_in_table() {
-        // x86_64 iopl=172 — not in our initial table (no canonical equivalent)
-        assert!(lookup_x86_64(172).is_none());
-    }
-
-    #[test]
-    fn table_is_strictly_sorted() {
-        for w in X86_64_SYSCALLS.windows(2) {
-            assert!(
-                w[0].number < w[1].number,
-                "X86_64_SYSCALLS out of order: {} >= {}",
-                w[0].number,
-                w[1].number
-            );
-        }
-    }
-
-    /// Sanity floor: the table now covers the whole ABI, so it must hold far
-    /// more than the original ~31-entry incremental subset.
-    #[test]
-    fn table_covers_the_whole_abi() {
-        assert!(
-            X86_64_SYSCALLS.len() > 200,
-            "expected the full x86_64 ABI (>200 entries), got {}",
-            X86_64_SYSCALLS.len()
-        );
-    }
-}
