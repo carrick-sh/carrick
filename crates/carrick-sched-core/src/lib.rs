@@ -448,13 +448,13 @@ impl ThreadCtx {
 /// variants, for a type read at most once per thread per crash generation.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Copy, Debug)]
-pub enum ParkedContextRead {
+pub enum ParkedContextRead<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     /// No record matching that exact thread identity is `Parked` right now:
     /// it is running (`Queued`/`OnCpu`), host-owned, or its record is gone.
     /// The caller's own safe-point protocol owns the answer instead.
     NotParked,
     /// The save area, read and re-validated unchanged across the read.
-    Found(ThreadCtx),
+    Found(C),
     /// A record matched the identity when the scan reached it, but its
     /// identity or claim had changed by the time the read completed: the
     /// bytes just read cannot be trusted to belong to that thread. Never
@@ -942,12 +942,12 @@ impl ZoneSlot {
 }
 
 /// A held slot run-queue lock.
-pub struct SlotGuard<'a> {
-    zone: &'a ZoneTables,
+pub struct SlotGuard<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
+    zone: &'a ZoneTables<C>,
     slot: SlotId,
 }
 
-impl Drop for SlotGuard<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SlotGuard<'_, C> {
     fn drop(&mut self) {
         self.zone.slots[self.slot.index()]
             .lock
@@ -1044,7 +1044,7 @@ pub struct ZoneCounters {
 /// The zone: every table, as one `repr(C)` object in the shared EL1 region.
 /// All-zero bytes are a valid empty zone.
 #[repr(C, align(64))]
-pub struct ZoneTables {
+pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     buckets: [ZoneBucket; ZONE_BUCKETS],
     slots: [ZoneSlot; ZONE_SLOTS],
     record_map: [AtomicU64; ZONE_RECORDS / 64],
@@ -1057,7 +1057,7 @@ pub struct ZoneTables {
     queued_map: [AtomicU64; ZONE_SLOTS / 64],
     pub counters: ZoneCounters,
     entries: [ZoneEntry; ZONE_ENTRIES],
-    records: [ZoneRecord; ZONE_RECORDS],
+    records: [ZoneRecord<C>; ZONE_RECORDS],
     /// Which address space each vCPU runs: the one occupancy authority
     /// (EL1 increment 2), shared so EL1 publishes its own switches.
     pub occupancy: Occupancy,
@@ -1080,15 +1080,15 @@ pub struct ZoneTables {
 
 /// How a bucket lock waits: EL1 gives up after a bounded spin (and forwards
 /// the syscall); the host keeps trying, yielding its CPU.
-pub trait LockWait {
+pub trait LockWait<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     /// Called after the `attempt`-th failed acquisition; false gives up.
     fn wait(&self, attempt: u32) -> bool;
     /// Mandatory delivery venue when internal unlink holds a completion-enabled
     /// queue. Legacy venues fail closed rather than silently dropping effects.
     fn complete_object_wake(
         &self,
-        _zone: &ZoneTables,
-        _effects: object_wait::OwnedObjectWakeEffects,
+        _zone: &ZoneTables<C>,
+        _effects: object_wait::OwnedObjectWakeEffects<'_, C>,
     ) {
         _effects.missing_venue();
     }
@@ -1097,7 +1097,7 @@ pub trait LockWait {
 /// Spin at most `0` times, then give up.
 pub struct BoundedSpin(pub u32);
 
-impl LockWait for BoundedSpin {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> LockWait<C> for BoundedSpin {
     fn wait(&self, attempt: u32) -> bool {
         if self.0 == 0 {
             return false;
@@ -1108,12 +1108,12 @@ impl LockWait for BoundedSpin {
 }
 
 /// A held bucket lock.
-pub struct BucketGuard<'a> {
-    zone: &'a ZoneTables,
+pub struct BucketGuard<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
+    zone: &'a ZoneTables<C>,
     bucket: usize,
 }
 
-impl Drop for BucketGuard<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for BucketGuard<'_, C> {
     fn drop(&mut self) {
         self.zone.buckets[self.bucket]
             .lock
@@ -1121,9 +1121,9 @@ impl Drop for BucketGuard<'_> {
     }
 }
 
-impl BucketGuard<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> BucketGuard<'_, C> {
     /// The retained zone owning this bucket guard.
-    pub fn zone(&self) -> &ZoneTables {
+    pub fn zone(&self) -> &ZoneTables<C> {
         self.zone
     }
 
@@ -1222,20 +1222,20 @@ pub enum HostClaim {
 /// Exclusive mutation authority between claiming a record and publishing
 /// host readiness. A deferred wake carries this token, never a bare index.
 #[must_use = "a host transfer must finish cleanup and publish or retire"]
-pub struct HostTransfer<'a> {
-    zone: &'a ZoneTables,
+pub struct HostTransfer<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
+    zone: &'a ZoneTables<C>,
     record: RecordRef,
     seq: u32,
 }
 
-impl HostTransfer<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> HostTransfer<'_, C> {
     fn retire(self) {
         self.zone.free_record(self.record.id);
     }
 
     /// Complete remaining waitv cleanup after releasing all bucket locks,
     /// then publish a ready reference (or retire a cancelled transfer).
-    pub fn finish(self, wait: &impl LockWait) -> Option<RecordRef> {
+    pub fn finish(self, wait: &impl LockWait<C>) -> Option<RecordRef> {
         self.zone.unlink_all(self.record.id, wait);
         self.publish()
     }
@@ -1310,15 +1310,15 @@ impl HostTransfer<'_> {
 
 /// A wake batch owns deferred host cleanup; guest-queued records carry
 /// only their notification identity because their publication is complete.
-pub enum WakeRecord<'a> {
+pub enum WakeRecord<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     Empty,
     Guest(RecordRef),
-    Host(HostTransfer<'a>),
+    Host(HostTransfer<'a, C>),
 }
 
-impl WakeRecord<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> WakeRecord<'_, C> {
     /// Consume a batch entry after dropping its futex bucket locks.
-    pub fn take_ready(&mut self, wait: &impl LockWait) -> Option<RecordRef> {
+    pub fn take_ready(&mut self, wait: &impl LockWait<C>) -> Option<RecordRef> {
         match core::mem::replace(self, Self::Empty) {
             Self::Empty => None,
             Self::Guest(record) => Some(record),
@@ -1411,13 +1411,15 @@ fn mix(mm: u64, uaddr: u64) -> usize {
     (h as usize) % ZONE_BUCKETS
 }
 
-impl ZoneTables {
+impl ZoneTables<ThreadCtx> {
     /// The bucket that `(mm, uaddr)` hashes to.
     pub fn bucket_of(mm: u64, uaddr: u64) -> usize {
         mix(mm, uaddr)
     }
+}
 
-    pub fn record(&self, id: RecordId) -> &ZoneRecord {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
+    pub fn record(&self, id: RecordId) -> &ZoneRecord<C> {
         &self.records[id.index()]
     }
 
@@ -1434,13 +1436,13 @@ impl ZoneTables {
     }
 
     /// The record `r` names, if that incarnation is still live.
-    pub fn live(&self, r: RecordRef) -> Option<&ZoneRecord> {
+    pub fn live(&self, r: RecordRef) -> Option<&ZoneRecord<C>> {
         let record = self.record(r.id);
         (record.incarnation() == r.incarnation && record.claim() != Claim::Free).then_some(record)
     }
 
     /// Take the lock of `bucket`, waiting per `wait`.
-    pub fn lock(&self, bucket: usize, wait: &impl LockWait) -> Option<BucketGuard<'_>> {
+    pub fn lock(&self, bucket: usize, wait: &impl LockWait<C>) -> Option<BucketGuard<'_, C>> {
         let lock = &self.buckets[bucket % ZONE_BUCKETS].lock;
         let mut attempt: u32 = 0;
         loop {
@@ -1797,7 +1799,7 @@ impl ZoneTables {
         &self.entries[id as usize]
     }
 
-    fn link_tail(&self, guard: &BucketGuard<'_>, entry_id: u32) {
+    fn link_tail(&self, guard: &BucketGuard<'_, C>, entry_id: u32) {
         let bucket = &self.buckets[guard.bucket];
         let entry = self.entry(entry_id);
         let tail = bucket.tail.load(Ordering::Relaxed);
@@ -1813,7 +1815,7 @@ impl ZoneTables {
         bucket.len.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn unlink(&self, guard: &BucketGuard<'_>, entry_id: u32) {
+    fn unlink(&self, guard: &BucketGuard<'_, C>, entry_id: u32) {
         let bucket = &self.buckets[guard.bucket];
         let entry = self.entry(entry_id);
         let prev = entry.prev.load(Ordering::Relaxed);
@@ -1840,7 +1842,7 @@ impl ZoneTables {
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue(
         &self,
-        guard: &BucketGuard<'_>,
+        guard: &BucketGuard<'_, C>,
         record: RecordId,
         seq: u32,
         mm: u64,
@@ -1899,7 +1901,7 @@ impl ZoneTables {
     #[must_use]
     pub fn publish_guest_park(
         &self,
-        guard: &BucketGuard<'_>,
+        guard: &BucketGuard<'_, C>,
         slot: SlotId,
         record: RecordId,
         seq: u32,
@@ -1952,13 +1954,13 @@ impl ZoneTables {
     #[allow(clippy::too_many_arguments)]
     pub fn wake<'a>(
         &'a self,
-        guard: &BucketGuard<'_>,
+        guard: &BucketGuard<'_, C>,
         mm: u64,
         uaddr: u64,
         bitset: u32,
         count: u32,
         waker: Waker,
-        woken: &mut [WakeRecord<'a>],
+        woken: &mut [WakeRecord<'a, C>],
     ) -> Result<u32, WakeRefusal> {
         let mut effects = WakeEffects::default();
         self.wake_placed(guard, mm, uaddr, bitset, count, waker, woken, &mut effects)
@@ -1975,13 +1977,13 @@ impl ZoneTables {
     #[allow(clippy::too_many_arguments)]
     pub fn wake_placed<'a>(
         &'a self,
-        guard: &BucketGuard<'_>,
+        guard: &BucketGuard<'_, C>,
         mm: u64,
         uaddr: u64,
         bitset: u32,
         count: u32,
         waker: Waker,
-        woken: &mut [WakeRecord<'a>],
+        woken: &mut [WakeRecord<'a, C>],
         effects: &mut WakeEffects,
     ) -> Result<u32, WakeRefusal> {
         let bucket = &self.buckets[guard.bucket];
@@ -2090,7 +2092,7 @@ impl ZoneTables {
     /// address space there (a hint: [`Self::install_space`] decides). A vCPU
     /// in the idle entry (no task loaded) runs no thread itself; its
     /// executor loads it.
-    fn runs_mm_of(&self, slot: SlotId, rec: &ZoneRecord) -> bool {
+    fn runs_mm_of(&self, slot: SlotId, rec: &ZoneRecord<C>) -> bool {
         let mm = rec.mm.load(Ordering::Relaxed);
         rec.needs_host() || self.installed_space(slot) == mm || self.may_switch_to(slot, mm)
     }
@@ -2112,7 +2114,7 @@ impl ZoneTables {
     /// Whether slot `slot` may take `rec` now: in the guest (idle, unless
     /// `home`), able to run it ([`Self::runs_mm_of`]), and on a CPU the
     /// thread's affinity allows.
-    fn accepts(&self, slot: SlotId, rec: &ZoneRecord, home: bool) -> bool {
+    fn accepts(&self, slot: SlotId, rec: &ZoneRecord<C>, home: bool) -> bool {
         let s = self.slot(slot);
         let state = s.state();
         state.in_guest()
@@ -2124,12 +2126,12 @@ impl ZoneTables {
     }
 
     /// An idle slot other than `waker` that may take `rec`.
-    fn find_idle(&self, rec: &ZoneRecord, waker: SlotId) -> Option<SlotId> {
+    fn find_idle(&self, rec: &ZoneRecord<C>, waker: SlotId) -> Option<SlotId> {
         self.find_idle_except(rec, Some(waker))
     }
 
     /// An idle slot other than `except` that may take `rec`.
-    fn find_idle_except(&self, rec: &ZoneRecord, except: Option<SlotId>) -> Option<SlotId> {
+    fn find_idle_except(&self, rec: &ZoneRecord<C>, except: Option<SlotId>) -> Option<SlotId> {
         for (word_index, word) in self.idle_map.iter().enumerate() {
             let mut bits = word.load(Ordering::Acquire);
             while bits != 0 {
@@ -2237,7 +2239,7 @@ impl ZoneTables {
         true
     }
 
-    fn mark_woken(&self, rec: &ZoneRecord, result: u64) {
+    fn mark_woken(&self, rec: &ZoneRecord<C>, result: u64) {
         rec.result.store(result, Ordering::Relaxed);
         // Readiness schedules the saved operation entry, never a synthetic
         // syscall result. The operation's exact endpoint remains pinned by
@@ -2268,7 +2270,7 @@ impl ZoneTables {
 
     /// Remove `entry_id` from `rec`'s sibling chain and free it. The entry is
     /// already unlinked from its bucket.
-    fn drop_entry(&self, rec: &ZoneRecord, entry_id: u32) {
+    fn drop_entry(&self, rec: &ZoneRecord<C>, entry_id: u32) {
         let mut link = &rec.first_entry;
         loop {
             let current = link.load(Ordering::Relaxed);
@@ -2293,7 +2295,7 @@ impl ZoneTables {
     /// bucket lock in turn (with no other bucket lock held). Only the
     /// record's owner calls this: the host after a claim, or a parker undoing
     /// a park it never published.
-    pub fn unlink_all(&self, record: RecordId, wait: &impl LockWait) {
+    pub fn unlink_all(&self, record: RecordId, wait: &impl LockWait<C>) {
         self.unlink_object(record, wait);
         let rec = self.record(record);
         loop {
@@ -2318,8 +2320,8 @@ impl ZoneTables {
     /// Returns the number moved. Host only (EL1 forwards requeue).
     pub fn requeue(
         &self,
-        from_guard: &BucketGuard<'_>,
-        to_guard: &BucketGuard<'_>,
+        from_guard: &BucketGuard<'_, C>,
+        to_guard: &BucketGuard<'_, C>,
         mm: u64,
         from: u64,
         to: u64,
@@ -2343,7 +2345,7 @@ impl ZoneTables {
     }
 
     /// Take `slot`'s run-queue lock, waiting per `wait`.
-    pub fn slot_lock(&self, slot: SlotId, wait: &impl LockWait) -> Option<SlotGuard<'_>> {
+    pub fn slot_lock(&self, slot: SlotId, wait: &impl LockWait<C>) -> Option<SlotGuard<'_, C>> {
         let lock = &self.slot(slot).lock;
         let mut attempt: u32 = 0;
         loop {
@@ -2363,7 +2365,7 @@ impl ZoneTables {
     /// Append `record` to the run queue `guard` holds. The first thread
     /// queued on an empty queue starts the slice clock at `now` (`None`: the
     /// caller restarts it itself).
-    fn push_locked(&self, guard: &SlotGuard<'_>, record: RecordId, now: Option<u64>) {
+    fn push_locked(&self, guard: &SlotGuard<'_, C>, record: RecordId, now: Option<u64>) {
         let s = self.slot(guard.slot);
         self.record(record).next.store(NIL, Ordering::Relaxed);
         let tail = s.tail.load(Ordering::Relaxed);
@@ -2385,7 +2387,7 @@ impl ZoneTables {
 
     /// Unlink `record` from the run queue `guard` holds, wherever it is.
     /// Returns false if it is not on that queue.
-    fn remove_locked(&self, guard: &SlotGuard<'_>, record: RecordId) -> bool {
+    fn remove_locked(&self, guard: &SlotGuard<'_, C>, record: RecordId) -> bool {
         let s = self.slot(guard.slot);
         let mut prev = NIL;
         let mut cursor = s.head.load(Ordering::Relaxed);
@@ -2457,7 +2459,7 @@ impl ZoneTables {
     /// service, or it is ready at EL0 in an address space other than the one
     /// installed on the slot that EL1 may not install now (unpublished, a
     /// pause of it is raised, or it is retiring), which its executor loads.
-    fn needs_executor(&self, slot: SlotId, rec: &ZoneRecord) -> bool {
+    fn needs_executor(&self, slot: SlotId, rec: &ZoneRecord<C>) -> bool {
         let mm = rec.mm.load(Ordering::Relaxed);
         rec.needs_host() || (self.installed_space(slot) != mm && !self.may_switch_to(slot, mm))
     }
@@ -2517,7 +2519,7 @@ impl ZoneTables {
     /// [`Self::unswitch`], waiting for the slot lock as `wait` says. False:
     /// `record` was not switched in on `slot` (or the lock was not taken),
     /// and nothing changed.
-    fn unswitch_with(&self, slot: SlotId, record: RecordId, wait: &impl LockWait) -> bool {
+    fn unswitch_with(&self, slot: SlotId, record: RecordId, wait: &impl LockWait<C>) -> bool {
         let rec = self.record(record);
         let from = rec.claim();
         let (Claim::OnCpu { slot: owner, seq } | Claim::OnCpuRequested { slot: owner, seq }) = from
@@ -2547,7 +2549,7 @@ impl ZoneTables {
     }
 
     /// Put `record` at the head of the run queue `guard` holds.
-    fn push_front_locked(&self, guard: &SlotGuard<'_>, record: RecordId) {
+    fn push_front_locked(&self, guard: &SlotGuard<'_, C>, record: RecordId) {
         let s = self.slot(guard.slot);
         let head = s.head.load(Ordering::Relaxed);
         self.record(record).next.store(head, Ordering::Release);
@@ -2918,7 +2920,7 @@ impl ZoneTables {
     /// The executor holds `slot`'s stopped vCPU: under the slot's lock, stop
     /// every other vCPU from queueing on it, so the drain that follows takes
     /// everything queued there.
-    pub fn leave_guest(&self, slot: SlotId, wait: &impl LockWait) {
+    pub fn leave_guest(&self, slot: SlotId, wait: &impl LockWait<C>) {
         let guard = self.slot_lock(slot, wait);
         self.slot(slot)
             .state
@@ -3066,7 +3068,7 @@ impl ZoneTables {
         &self,
         slot: SlotId,
         record: RecordId,
-        wait: &impl LockWait,
+        wait: &impl LockWait<C>,
     ) -> CurrentRelease {
         let s = self.slot(slot);
         let rec = self.record(record);
@@ -3356,8 +3358,8 @@ impl ZoneTables {
         record: RecordId,
         from: Claim,
         except: Option<SlotId>,
-        wait: &impl LockWait,
-        claimed: impl FnOnce(&ZoneRecord),
+        wait: &impl LockWait<C>,
+        claimed: impl FnOnce(&ZoneRecord<C>),
     ) -> Placement {
         let rec = self.record(record);
         let (Claim::Parked { seq }
@@ -3512,13 +3514,13 @@ impl ZoneTables {
     #[allow(clippy::too_many_arguments)]
     pub fn wake_host<'a>(
         &'a self,
-        guard: &BucketGuard<'_>,
+        guard: &BucketGuard<'_, C>,
         mm: u64,
         uaddr: u64,
         bitset: u32,
         count: u32,
         place: bool,
-        handed: &mut impl FnMut(HostTransfer<'a>),
+        handed: &mut impl FnMut(HostTransfer<'a, C>),
         placed: &mut impl FnMut(HostPlacement),
     ) -> u32 {
         let bucket = &self.buckets[guard.bucket];
@@ -3581,20 +3583,20 @@ impl ZoneTables {
     }
 
     /// Whether a slot in the guest may run `rec` (idle or not).
-    fn accepts_running(&self, slot: SlotId, rec: &ZoneRecord) -> bool {
+    fn accepts_running(&self, slot: SlotId, rec: &ZoneRecord<C>) -> bool {
         self.runs_mm_of(slot, rec) && rec.allows_cpu(self.slot(slot).cpu.load(Ordering::Relaxed))
     }
 
     /// The slot with the shortest run queue that may run `rec`: among slots
     /// in the guest (`in_guest`), or among all slots an executor drives,
     /// for a thread that needs its executor.
-    fn least_loaded(&self, rec: &ZoneRecord, in_guest: bool) -> Option<SlotId> {
+    fn least_loaded(&self, rec: &ZoneRecord<C>, in_guest: bool) -> Option<SlotId> {
         self.least_loaded_except(rec, in_guest, None)
     }
 
     fn least_loaded_except(
         &self,
-        rec: &ZoneRecord,
+        rec: &ZoneRecord<C>,
         in_guest: bool,
         except: Option<SlotId>,
     ) -> Option<SlotId> {
@@ -3635,7 +3637,7 @@ impl ZoneTables {
         self.slot(slot).resched_owed.swap(0, Ordering::AcqRel) != 0
     }
 
-    fn begin_host_transfer(&self, record: RecordRef, from: Claim) -> Option<HostTransfer<'_>> {
+    fn begin_host_transfer(&self, record: RecordRef, from: Claim) -> Option<HostTransfer<'_, C>> {
         let rec = self.record(record.id);
         if rec.incarnation() != record.incarnation
             || !rec.cas(
@@ -3665,7 +3667,7 @@ impl ZoneTables {
         r: RecordRef,
         seq: Option<u32>,
         kind: Handback,
-        wait: &impl LockWait,
+        wait: &impl LockWait<C>,
     ) -> HostClaim {
         let rec = self.record(r.id);
         if kind == Handback::GroupStop {
@@ -3683,10 +3685,10 @@ impl ZoneTables {
     fn claim_for_host_inner(
         &self,
         r: RecordRef,
-        rec: &ZoneRecord,
+        rec: &ZoneRecord<C>,
         seq: Option<u32>,
         kind: Handback,
-        wait: &impl LockWait,
+        wait: &impl LockWait<C>,
     ) -> HostClaim {
         loop {
             let claim = rec.claim();
@@ -3805,7 +3807,7 @@ impl ZoneTables {
     }
 }
 
-impl ZoneTables {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// The EL1 save area of the thread named by `(mm, tid, serial)`, if EL1
     /// currently holds it `Parked` (queued on a futex wait queue or a vCPU
     /// run queue, not itself running and not host-claimed).
@@ -3830,7 +3832,12 @@ impl ZoneTables {
     /// is either at the barrier already or is the exact thread this call is
     /// reading). Calling this without that authentication is a data race:
     /// [`ZoneRecord::ctx_mut`] is otherwise exclusive to the claim owner.
-    pub unsafe fn read_parked_context(&self, mm: u64, tid: u64, serial: u64) -> ParkedContextRead {
+    pub unsafe fn read_parked_context(
+        &self,
+        mm: u64,
+        tid: u64,
+        serial: u64,
+    ) -> ParkedContextRead<C> {
         for raw in 1..ZONE_RECORDS as u32 {
             let Some(id) = RecordId::from_raw(raw) else {
                 continue;
@@ -4016,7 +4023,7 @@ const EL1_SLOT_LOCK_SPINS: u32 = 1024;
 /// only ever held for a few instructions by a party that is running.
 struct SpinForever;
 
-impl LockWait for SpinForever {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> LockWait<C> for SpinForever {
     fn wait(&self, _attempt: u32) -> bool {
         core::hint::spin_loop();
         true
