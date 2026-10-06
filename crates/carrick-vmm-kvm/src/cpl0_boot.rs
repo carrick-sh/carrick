@@ -5,8 +5,8 @@ use crate::guest_setup::{GuestRam, WindowKind};
 use crate::{KvmKickHandle, KvmVcpu, KvmVm};
 use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
-    BlockedMask, Counters, CurrentTask, EL1_DYNAMIC_METADATA_BASE, El1TaskId, ThreadControlSlot,
-    ThreadLifecyclePage,
+    BlockedMask, Counters, CurrentTask, El1TaskId, ThreadControlSlot, ThreadLifecyclePage,
+    X86_CPL0_DYNAMIC_METADATA_BASE,
 };
 use carrick_hal::{HvVcpu, HvVm, MemPerms, TrapError, VcpuExit, VcpuKick};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
@@ -29,6 +29,10 @@ const TASK_OFFSET: u64 = 0x9000;
 const CONTROL_OFFSET: u64 = 0xa000;
 const STRIDE: u64 = 0x100;
 const IST_STACK_BASE: u64 = 0xf0_0000;
+const IMAGE_VA: u64 = 0xffff_ffff_8000_0000;
+const IMAGE_GPA: u64 = 0x10_0000;
+pub(crate) const DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
+const METADATA_VA: u64 = X86_CPL0_DYNAMIC_METADATA_BASE;
 pub const USER_CODE: u64 = 0x1_0000;
 const LAYOUT: BringupLayout = BringupLayout {
     trampoline_base: 0x10_0000,
@@ -150,7 +154,7 @@ impl Cpl0Carrier {
         let bytes = std::fs::read(image).map_err(|e| fail(format!("CPL0 image: {e}")))?;
         let plan = carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62)
             .map_err(|e| fail(format!("CPL0 ELF: {e}")))?;
-        if !(0x10_0000..0x20_0000).contains(&plan.entry) {
+        if !(IMAGE_VA..IMAGE_VA + 0x10_0000).contains(&plan.entry) {
             return Err(fail("CPL0 entry outside its supervisor image"));
         }
         let mut ram = GuestRam::new();
@@ -166,19 +170,19 @@ impl Cpl0Carrier {
                 .virtual_address
                 .checked_add(segment.memory_size)
                 .ok_or_else(|| fail("CPL0 segment overflow"))?;
-            if segment.virtual_address < 0x10_0000 || end > 0x20_0000 {
+            if segment.virtual_address < IMAGE_VA || end > IMAGE_VA + 0x10_0000 {
                 return Err(fail("CPL0 segment outside its supervisor image"));
             }
             let start = segment.file_offset as usize;
             let data = bytes
                 .get(start..start + segment.file_size as usize)
                 .ok_or_else(|| fail("CPL0 segment file bounds"))?;
-            ram.write_gpa(segment.virtual_address, data)
-                .map_err(|e| fail(e.to_string()))?;
+            let gpa = IMAGE_GPA + segment.virtual_address - IMAGE_VA;
+            ram.write_gpa(gpa, data).map_err(|e| fail(e.to_string()))?;
             let va = segment.virtual_address & !0xfff;
             maps.push(Pml4MapSpec {
                 va,
-                gpa: va,
+                gpa: IMAGE_GPA + va - IMAGE_VA,
                 len: ((end + 0xfff) & !0xfff) - va,
                 user: false,
                 write: segment.perms.write,
@@ -188,7 +192,7 @@ impl Cpl0Carrier {
         // Existing x86 descriptor/TSS/IDT machinery, including private stacks
         // and exception stubs, remains the hardware authority.
         maps.push(Pml4MapSpec {
-            va: 0x20_0000,
+            va: DIRECT_VA + 0x20_0000,
             gpa: 0x20_0000,
             len: 0xa0_0000,
             user: false,
@@ -196,7 +200,7 @@ impl Cpl0Carrier {
             exec: true,
         });
         maps.push(Pml4MapSpec {
-            va: 0xe0_0000,
+            va: DIRECT_VA + 0xe0_0000,
             gpa: 0xe0_0000,
             len: 0x20_0000,
             user: false,
@@ -204,7 +208,7 @@ impl Cpl0Carrier {
             exec: false,
         });
         maps.push(Pml4MapSpec {
-            va: EL1_DYNAMIC_METADATA_BASE,
+            va: METADATA_VA,
             gpa: META_GPA,
             len: META_LEN,
             user: false,
@@ -239,6 +243,15 @@ impl Cpl0Carrier {
         if interrupts {
             maps.extend(crate::carrier_interrupts::supervisor_maps());
             maps.push(crate::carrier_interrupts::data_map(0));
+        }
+        // CPL0 ordinary loads/copies can race a page-table publication after
+        // preflight. Keep every bootstrap supervisor leaf outside the user
+        // range so a changed lower-half leaf cannot expose kernel backing.
+        if maps
+            .iter()
+            .any(|map| !map.user && map.va < 0x0000_8000_0000_0000)
+        {
+            return Err(fail("CPL0 supervisor map in user range"));
         }
         let tables = pml4_tables(
             &maps,
@@ -276,12 +289,38 @@ impl Cpl0Carrier {
         // Reuse the existing descriptors/stubs rather than build another IDT.
         for index in 0..2 {
             let tss = carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), index)?;
-            let ist_top = IST_STACK_BASE + (index + 1) * 4096;
+            let fault_stack =
+                carrick_x86::fault_slot_gpa(carrick_x86::fault_stack_base(LAYOUT), index)?;
+            ram.write_gpa(tss + 4, &(DIRECT_VA + fault_stack + 4096).to_le_bytes())
+                .map_err(|e| fail(e.to_string()))?;
+            let ist_top = DIRECT_VA + IST_STACK_BASE + (index + 1) * 4096;
             ram.write_gpa(tss + 36, &ist_top.to_le_bytes())
                 .map_err(|e| fail(e.to_string()))?;
             let idt = carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index)?;
             ram.write_gpa(idt + 8 * 16 + 4, &[1])
                 .map_err(|e| fail(e.to_string()))?;
+            for vector in 0..256_u64 {
+                let gate_gpa = idt + vector * 16;
+                let ptr = ram
+                    .host_ptr(gate_gpa, 16)
+                    .ok_or_else(|| fail("IDT gate backing"))?;
+                // SAFETY: bootstrap owns retained, initialized IDT backing and
+                // no vCPU can read it before publication completes.
+                let gate = unsafe { core::slice::from_raw_parts(ptr, 16) };
+                if gate[5] & 0x80 == 0 {
+                    continue;
+                }
+                let low = u16::from_le_bytes([gate[0], gate[1]]) as u64;
+                let mid = u16::from_le_bytes([gate[6], gate[7]]) as u64;
+                let high = u32::from_le_bytes([gate[8], gate[9], gate[10], gate[11]]) as u64;
+                let entry = DIRECT_VA + low + (mid << 16) + (high << 32);
+                ram.write_gpa(gate_gpa, &(entry as u16).to_le_bytes())
+                    .map_err(|e| fail(e.to_string()))?;
+                ram.write_gpa(gate_gpa + 6, &((entry >> 16) as u16).to_le_bytes())
+                    .map_err(|e| fail(e.to_string()))?;
+                ram.write_gpa(gate_gpa + 8, &((entry >> 32) as u32).to_le_bytes())
+                    .map_err(|e| fail(e.to_string()))?;
+            }
         }
         // SAFETY: private zeroed backing; typed objects fit and are aligned.
         // They are initialized before registration or any guest execution.
@@ -328,20 +367,17 @@ impl Cpl0Carrier {
                     .thread_generation
                     .store(101 + index as u64, Ordering::Release);
                 (*task).mm.key.store(201 + index as u64, Ordering::Release);
-                (*task).publish_lifecycle(
-                    EL1_DYNAMIC_METADATA_BASE,
-                    EL1_DYNAMIC_METADATA_BASE + CONTROL_OFFSET + offset,
-                );
+                (*task).publish_lifecycle(METADATA_VA, METADATA_VA + CONTROL_OFFSET + offset);
                 let binding = ram
                     .host_ptr(META_GPA + BINDING_OFFSET + offset, size_of::<CpuBinding>())
                     .ok_or_else(|| fail("CPU binding backing"))?
                     .cast::<CpuBinding>();
                 binding.write(CpuBinding {
-                    kernel_stack: 0xe1_0000 + index as u64 * 0x1_0000 - 16,
+                    kernel_stack: DIRECT_VA + 0xe1_0000 + index as u64 * 0x1_0000 - 16,
                     user_stack: 0,
-                    self_address: EL1_DYNAMIC_METADATA_BASE + BINDING_OFFSET + offset,
-                    task_address: EL1_DYNAMIC_METADATA_BASE + TASK_OFFSET + offset,
-                    counters_address: EL1_DYNAMIC_METADATA_BASE + COUNTERS_OFFSET,
+                    self_address: METADATA_VA + BINDING_OFFSET + offset,
+                    task_address: METADATA_VA + TASK_OFFSET + offset,
+                    counters_address: METADATA_VA + COUNTERS_OFFSET,
                     entry_kick: AtomicU32::new(0),
                     return_kick: AtomicU32::new(0),
                     entries: AtomicU64::new(0),
@@ -386,6 +422,15 @@ impl Cpl0Carrier {
                 0x3_1ff0 + index as u64 * 0x1_0000,
             )?;
             carrick_x86::program_fault_segments(cpu, LAYOUT, index as u64)?;
+            let mut system = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+            system.gdt.base = DIRECT_VA + LAYOUT.gdt_base;
+            system.idt.base = DIRECT_VA
+                + carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index as u64)?;
+            system.tr.base = DIRECT_VA
+                + carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), index as u64)?;
+            cpu.fd()
+                .set_sregs(&system)
+                .map_err(|e| fail(e.to_string()))?;
             cpu.set_syscall_msrs(
                 plan.entry,
                 boot.star,
@@ -393,7 +438,7 @@ impl Cpl0Carrier {
             )?;
             let msrs = Msrs::from_entries(&[kvm_msr_entry {
                 index: 0xc000_0102,
-                data: EL1_DYNAMIC_METADATA_BASE + BINDING_OFFSET + index as u64 * STRIDE,
+                data: METADATA_VA + BINDING_OFFSET + index as u64 * STRIDE,
                 ..Default::default()
             }])
             .map_err(|e| fail(e.to_string()))?;
@@ -402,12 +447,17 @@ impl Cpl0Carrier {
             }
             let system = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
             if system.tr.base
-                != carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), index as u64)?
-                || system.idt.base
-                    != carrick_x86::fault_slot_gpa(
-                        carrick_x86::fault_idt_base(LAYOUT),
+                != DIRECT_VA
+                    + carrick_x86::fault_slot_gpa(
+                        carrick_x86::fault_tss_base(LAYOUT),
                         index as u64,
                     )?
+                || system.idt.base
+                    != DIRECT_VA
+                        + carrick_x86::fault_slot_gpa(
+                            carrick_x86::fault_idt_base(LAYOUT),
+                            index as u64,
+                        )?
             {
                 return Err(fail("private TSS/IDT not installed"));
             }
@@ -483,10 +533,7 @@ impl Cpl0Carrier {
         task.mm
             .thread_generation
             .store(binding.thread_generation.raw(), Ordering::Release);
-        task.publish_lifecycle(
-            EL1_DYNAMIC_METADATA_BASE + page_offset,
-            EL1_DYNAMIC_METADATA_BASE + slot_offset,
-        );
+        task.publish_lifecycle(METADATA_VA + page_offset, METADATA_VA + slot_offset);
         Ok(())
     }
 
@@ -573,7 +620,7 @@ impl Cpl0Carrier {
             }
             let ptr = self
                 .ram
-                .host_ptr(address, size_of::<NativeFrame>())
+                .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
                 .ok_or_else(|| fail("CPL0 control frame outside backing"))?
                 .cast::<NativeFrame>();
             // SAFETY: the exclusive stopped vCPU published this supervisor
@@ -666,7 +713,7 @@ impl Cpl0Carrier {
         let zone = unsafe {
             &*carrier
                 .ram
-                .host_ptr(LIFECYCLE_ZONE, size_of::<ZoneTables>())
+                .host_ptr(0x100_0000, size_of::<ZoneTables>())
                 .ok_or_else(|| fail("lifecycle zone"))?
                 .cast::<ZoneTables>()
         };
@@ -696,8 +743,8 @@ impl Cpl0Carrier {
             zone.enter_guest(slot);
             zone.install_space(slot, binding.mm.raw())
                 .ok_or_else(|| fail("lifecycle installed MM"))?;
-            let page_address = EL1_DYNAMIC_METADATA_BASE + index as u64 * 0x4000;
-            let controls_address = EL1_DYNAMIC_METADATA_BASE + 0xb000 + index as u64 * 0x1000;
+            let page_address = METADATA_VA + index as u64 * 0x4000;
+            let controls_address = METADATA_VA + 0xb000 + index as u64 * 0x1000;
             // SAFETY: aligned, disjoint, exclusively stopped metadata storage.
             let controls = unsafe {
                 &mut *carrier
@@ -737,7 +784,10 @@ impl Cpl0Carrier {
             unsafe {
                 carrier
                     .ram
-                    .host_ptr(address, size_of::<LifecycleLane>())
+                    .host_ptr(
+                        0x190_0000 + index as u64 * LIFECYCLE_STRIDE,
+                        size_of::<LifecycleLane>(),
+                    )
                     .ok_or_else(|| fail("native lifecycle sidecar"))?
                     .cast::<LifecycleLane>()
                     .write(lane);
@@ -803,10 +853,7 @@ impl Cpl0Carrier {
         controls[1].reset_for_host_birth(BlockedMask(0));
         page.bind_control_address(
             entry,
-            EL1_DYNAMIC_METADATA_BASE
-                + 0xb000
-                + index as u64 * 0x1000
-                + size_of::<ThreadControlSlot>() as u64,
+            METADATA_VA + 0xb000 + index as u64 * 0x1000 + size_of::<ThreadControlSlot>() as u64,
         )
         .map_err(|e| fail(format!("control: {e:?}")))?;
         Ok(entry)
@@ -832,7 +879,7 @@ impl Cpl0Carrier {
             &*self
                 .ram
                 .host_ptr(
-                    LIFECYCLE_LANE + index as u64 * LIFECYCLE_STRIDE,
+                    0x190_0000 + index as u64 * LIFECYCLE_STRIDE,
                     size_of::<LifecycleLane>(),
                 )
                 .ok_or_else(|| fail("lane observation"))?

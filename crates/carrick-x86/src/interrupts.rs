@@ -3,6 +3,7 @@ pub const TIMER_VECTOR: u8 = 0xe0;
 pub const KICK_VECTOR: u8 = 0xe1;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 pub const LAPIC_BASE: u64 = 0xfee0_0000;
+pub const LAPIC_VA: u64 = 0xffff_ffff_d000_0000;
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
