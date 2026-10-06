@@ -202,16 +202,31 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
 
 #[test]
 fn mounted_static_x86_elf_matches_native_anonymous_memory() {
+    compare_mounted_assembly_with_native("x86_memory_only.S", b"M\n");
+}
+
+#[test]
+fn mounted_static_x86_bad_write_returns_efault_and_continues() {
+    compare_mounted_assembly_with_native("x86_bad_write.S", b"E\n");
+}
+
+#[test]
+fn mounted_static_x86_memory_and_fork_wait_match_native() {
+    compare_mounted_assembly_with_native("x86_memory_fork_wait.S", b"F\n");
+}
+
+fn compare_mounted_assembly_with_native(fixture: &str, expected_stdout: &[u8]) {
     if !std::path::Path::new("/dev/kvm").exists() {
-        let message = b"SKIP x86 KVM memory run: /dev/kvm is absent on this host\n";
+        let message = b"SKIP x86 KVM assembly run: /dev/kvm is absent on this host\n";
         // SAFETY: fixed diagnostic bytes to the test process stderr.
         unsafe { libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len()) };
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let elf = dir.path().join("memory-only");
-    let source =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/x86_memory_only.S");
+    let elf = dir.path().join("assembly-guest");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixture);
     let compile = Command::new("cc")
         .timeout(Duration::from_secs(15))
         .args([
@@ -224,7 +239,7 @@ fn mounted_static_x86_elf_matches_native_anonymous_memory() {
         .arg(&elf)
         .arg(&source)
         .output()
-        .expect("compile native x86 memory oracle");
+        .expect("compile native x86 assembly oracle");
     assert!(
         compile.status.success(),
         "cc stderr: {}",
@@ -233,8 +248,8 @@ fn mounted_static_x86_elf_matches_native_anonymous_memory() {
     let native = Command::new(&elf)
         .timeout(Duration::from_secs(5))
         .output()
-        .expect("run native x86 memory oracle");
-    assert_eq!(native.stdout, b"M\n");
+        .expect("run native x86 assembly oracle");
+    assert_eq!(native.stdout, expected_stdout);
     assert!(native.stderr.is_empty());
     assert_eq!(native.status.code(), Some(7));
 
@@ -256,7 +271,7 @@ fn mounted_static_x86_elf_matches_native_anonymous_memory() {
     let run = Command::new(&cli)
         .timeout(Duration::from_secs(5))
         .env("CARRICK_HOME", &home)
-        .env("CARRICK_RUN_ID", "x86-kvm-memory-only-test")
+        .env("CARRICK_RUN_ID", format!("x86-kvm-{fixture}-test"))
         .args([
             "run",
             "--platform",
@@ -268,7 +283,7 @@ fn mounted_static_x86_elf_matches_native_anonymous_memory() {
             "x86-kvm-hello:latest",
         ])
         .output()
-        .expect("run mounted memory oracle through carrick");
+        .expect("run mounted assembly oracle through carrick");
     assert_eq!(
         run.stdout,
         native.stdout,
