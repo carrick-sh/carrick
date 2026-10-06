@@ -2,7 +2,9 @@
 //! claims, preemption and wake ownership remain in `carrick-sched-core`.
 //! Included directly by the freestanding image; no host dependencies here.
 use carrick_guest_arch::{AddressContext, RootGpa};
-use carrick_sched_core::{Claim, RecordRef, SlotId, ZoneTables};
+use carrick_sched_core::{
+    Claim, ParkedContextWords, RecordRef, SlotId, X86_XSAVE_BYTES, ZoneTables,
+};
 
 /// PUSH order paired with the interrupt image leaf; IRET's five words follow.
 #[repr(C)]
@@ -29,6 +31,7 @@ const _: () = {
 /// and reject any other enabled component before publishing a task.
 pub const XSAVE_BYTES: usize = 832;
 pub const XSTATE_MASK: u64 = 7;
+const _: () = assert!(XSAVE_BYTES == X86_XSAVE_BYTES);
 #[repr(C, align(64))]
 #[derive(Clone)]
 pub struct XsaveArea(pub [u8; XSAVE_BYTES]);
@@ -54,6 +57,53 @@ const _: () = {
     assert!(core::mem::size_of::<NativeContext>() == 1088);
     assert!(core::mem::align_of::<NativeContext>() == 64);
 };
+
+/// Serialize machine state into the zero-valid shared record. The caller owns
+/// that record's claim until it publishes the runnable or parked transition.
+pub fn park_native_context(context: &NativeContext) -> ParkedContextWords {
+    let mut frame = [0; 20];
+    frame[..15].copy_from_slice(&context.frame.gpr);
+    frame[15..].copy_from_slice(&[
+        context.frame.rip,
+        context.frame.cs,
+        context.frame.flags,
+        context.frame.rsp,
+        context.frame.ss,
+    ]);
+    ParkedContextWords::from_parts(
+        frame,
+        context.address,
+        context.fs_base,
+        context.gs_base,
+        context.xsave.0,
+    )
+}
+
+/// Refuse zero, stale or recycled machine state before restoring CR3 or EL0.
+pub fn restore_native_context(
+    words: ParkedContextWords,
+    expected: AddressContext<RootGpa>,
+) -> Option<NativeContext> {
+    if !words.authenticates(expected) {
+        return None;
+    }
+    let mut gpr = [0; 15];
+    gpr.copy_from_slice(&words.frame[..15]);
+    Some(NativeContext {
+        frame: InterruptFrame {
+            gpr,
+            rip: words.frame[15],
+            cs: words.frame[16],
+            flags: words.frame[17],
+            rsp: words.frame[18],
+            ss: words.frame[19],
+        },
+        address: expected,
+        fs_base: words.fs_base,
+        gs_base: words.gs_base,
+        xsave: XsaveArea(words.xsave),
+    })
+}
 
 /// An ISA sidecar belongs to one exact shared record incarnation. It stores
 /// only machine state, never runnable/blocked state or an alternate queue.
