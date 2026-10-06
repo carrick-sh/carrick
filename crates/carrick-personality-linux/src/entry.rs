@@ -62,7 +62,6 @@ pub fn decode_aarch64(native: u64, args: [u64; 6], stack: u64) -> CanonicalCall 
         stack: UserVa::new(stack),
     }
 }
-
 /// AArch64 Linux vDSO wire identity: preserve the process half and replace
 /// the thread's visible tid only when that native vDSO binding is present.
 pub const fn aarch64_child_vdso_identity(parent: u64, visible_tid: u32) -> u64 {

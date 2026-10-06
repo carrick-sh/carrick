@@ -251,6 +251,29 @@ fn pending_host_work_completes_once_and_leaves_with_work() {
 }
 
 #[test]
+fn tid_registration_uses_shared_completion_with_pending_work() {
+    let w = World::new(LifecycleHatches::ON);
+    assert!(w.venue.slots[1].publish_visible_tid(TID_B as u32));
+    w.tasks[1].linux.mark_pending_host_work();
+    let (action, frame) = w.call(
+        1,
+        NativeFrame {
+            rax: 218,
+            rdi: 0x1004,
+            rsp: 0x9000,
+            ..Default::default()
+        },
+    );
+    assert_eq!(action, Action::ServedWithWork);
+    assert_eq!(frame.rax, TID_B);
+    assert_eq!(w.venue.slots[1].clear_child_tid(), 0x1004);
+    assert_eq!(w.venue.slots[0].clear_child_tid(), 0);
+    assert_eq!(w.counters.served[96].load(Ordering::Relaxed), 1);
+    assert_eq!(w.tasks[1].linux.served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(w.tasks[1].linux.orig_arg0.load(Ordering::Relaxed), 0x1004);
+}
+
+#[test]
 fn closed_gate_or_hatch_forwards_without_effect() {
     let w = World::new(LifecycleHatches::ON);
     w.venue.pages[0].close();
