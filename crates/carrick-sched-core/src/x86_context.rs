@@ -19,6 +19,17 @@ pub struct ParkedContextWords {
 
 pub const X86_XSAVE_BYTES: usize = 832;
 
+/// Supervisor IRET/SYSCALL return target checks shared by native frames and
+/// parked scheduler records. Only canonical lower-half user targets qualify.
+pub const fn valid_user_return_words(rip: u64, rsp: u64, flags: u64) -> bool {
+    rip != 0
+        && rip < (1 << 47)
+        && rsp != 0
+        && rsp < (1 << 47)
+        && flags & 2 != 0
+        && flags & ((3 << 12) | (1 << 14) | (1 << 17) | (1 << 19) | (1 << 20)) == 0
+}
+
 const _: () = {
     assert!(core::mem::offset_of!(ParkedContextWords, frame) == 0);
     assert!(core::mem::offset_of!(ParkedContextWords, root) == 160);
