@@ -110,35 +110,7 @@ pub const MM_PORTAL_SELECT_ESR: u64 = 0x4352_4d4d_5345_0004;
 pub const MM_PORTAL_SERVICE_ESR: u64 = 0x4352_4d4d_5452_0004;
 pub const EL1_MM_PORTAL_OFFSET: u64 = 0x1C_0000;
 pub const EL1_MM_PORTAL_BASE: u64 = crate::EL1_REGION_BASE + EL1_MM_PORTAL_OFFSET;
-/// Enrollment authority joined from one retained carrier region and its exact
-/// live MM source. It cannot be paired with another zone or recycled MM.
-pub struct PortalWaitEnrollment<'a> {
-    source: carrick_sched_core::spaces::notification::SpaceNotificationLease<'a>,
-    cause: carrick_sched_core::spaces::notification::SpaceWaitCause,
-    revision: u64,
-}
-impl PortalWaitEnrollment<'_> {
-    pub fn park_host(
-        self,
-        record: carrick_sched_core::RecordId,
-        operation: carrick_sched_core::object_wait::OperationToken,
-        completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>),
-    ) -> Result<
-        (),
-        (
-            carrick_sched_core::object_wait::ObjectWaitError,
-            carrick_sched_core::object_wait::OperationToken,
-        ),
-    > {
-        self.source.reserve(self.cause).park_host_rechecked(
-            self.source.observed_revision(self.cause, self.revision),
-            record,
-            operation,
-            completion,
-            || self.source.is_live(),
-        )
-    }
-}
+pub use carrick_core_abi::PortalWaitEnrollment;
 
 #[repr(C, align(64))]
 pub struct MmPortalSlots {
@@ -196,11 +168,7 @@ impl MmPortalSlots {
             )
             .ok_or(ObjectWaitError::Stale)?;
         let source = entry.notifications(receipt.handle().incarnation())?;
-        Ok(PortalWaitEnrollment {
-            source,
-            cause,
-            revision: receipt.revision(),
-        })
+        Ok(PortalWaitEnrollment::new(source, cause, receipt.revision()))
     }
     pub fn fork(&self, slot: usize) -> Option<&crate::PortalForkSlot> {
         self.forks.get(slot)
