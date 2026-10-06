@@ -241,9 +241,8 @@ pub trait PendingFamilies<'a> {
     fn epoll_wait(&mut self) -> FamilyCompletion {
         FamilyCompletion::Forward
     }
-    /// Removed by order 6.
-    fn lifecycle(&mut self, _: u64) -> FamilyCompletion {
-        FamilyCompletion::Forward
+    fn lifecycle_native(&mut self) -> Option<&mut dyn crate::lifecycle::LifecycleNative<'a>> {
+        None
     }
     /// Removed by order 8.
     fn futex(&mut self) -> FamilyCompletion {
@@ -311,7 +310,11 @@ fn serve_family(
         Family::Read => pending.read(),
         Family::Write => pending.write(),
         Family::EpollWait => pending.epoll_wait(),
-        Family::Lifecycle => pending.lifecycle(ordinal),
+        Family::Lifecycle => pending
+            .lifecycle_native()
+            .map_or(FamilyCompletion::Forward, |native| {
+                crate::lifecycle::serve(ordinal, native)
+            }),
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
         Family::InotifyRemove => pending.inotify_remove(),

@@ -1,8 +1,28 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 extern crate std;
 use carrick_el1_abi::Action;
+use carrick_el1_abi::Lifecycle;
 
 use super::*;
+use carrick_el1_abi::{
+    AltStack, BlockedMask, BornRecord, Counters, CurrentTask, El1TaskId, EntryState,
+    ThreadIdentity, TrapFrame,
+};
+use core::sync::atomic::Ordering;
+
+const CLONE_VM: u64 = 0x0000_0100;
+const CLONE_SYSVSEM: u64 = 0x0004_0000;
+const CLONE_SETTLS: u64 = 0x0008_0000;
+const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+const SIG_BLOCK: u64 = 0;
+const SIG_UNBLOCK: u64 = 1;
+const SIG_SETMASK: u64 = 2;
+const UNBLOCKABLE: u64 = 0x0004_0100;
+
+const SS_DISABLE: u32 = 2;
+
 use crate::personality::dispatch::{Zone, dispatch_syscall_with_lifecycle};
 use crate::personality::sched::{FakeCpu, HardwareUserWord, SYS_FUTEX};
 use carrick_el1_abi::{
@@ -239,7 +259,7 @@ struct FaultingUser {
     deny_out: Vec<u64>,
 }
 
-impl UserCopy for FaultingUser {
+impl crate::file::UserCopy for FaultingUser {
     fn copy_out(&mut self, dst_va: u64, src: &[u8]) -> bool {
         if self.deny_out.contains(&dst_va) {
             return false;
@@ -261,15 +281,29 @@ impl UserCopy for FaultingUser {
 
 fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser) -> Option<Action> {
     let task = &w.tasks[SLOT_IDX];
-    let sched = Sched {
-        zone: &w.zone,
-        slot: SLOT,
-        task,
-        cpu: &mut w.cpu,
-        user: &HardwareUserWord,
+    let name_cache = InotifyNameCache::new();
+    let ordinal = frame.x[8];
+    let mut native = super::El1PendingFamilies {
+        frame,
         counters: &w.counters,
+        current_tasks: &w.tasks,
+        fd_map: &[],
+        object_table: &[],
+        open_table: &[],
+        inotify_table: &[],
+        name_cache: &name_cache,
+        zone: Some(Zone {
+            tables: &w.zone,
+            cpu: &mut w.cpu,
+            user: &HardwareUserWord,
+        }),
+        ipc: None,
+        lifecycle: Some(&*w.venue),
+        cache_lookup: |_| core::ptr::null_mut(),
+        lifecycle_user: Some(user),
     };
-    serve(frame, &w.counters, task, Some(sched), &*w.venue, user).map(|result| {
+    let result = serve(ordinal, &mut native);
+    (result != carrick_personality_linux::dispatch::FamilyCompletion::Forward).then(|| {
         use carrick_personality_linux::dispatch::{CompletionRoute, completion_route};
         match completion_route(result, task.linux.has_pending_host_work()) {
             CompletionRoute::Served => Action::Served,
@@ -736,7 +770,14 @@ fn run_sigprocmask_dekker_storm(process: bool) {
                 page: &venue.page,
                 slot: venue.leader_slot(),
             };
-            works.push(serve_sigprocmask(&frame, thread, &mut FaultingUser::default()).unwrap());
+            works.push(
+                serve_sigprocmask(
+                    frame.x[..6].try_into().unwrap(),
+                    thread,
+                    &mut FaultingUser::default(),
+                )
+                .unwrap(),
+            );
             end.wait();
             end.wait();
         }
@@ -1015,4 +1056,13 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
     assert_eq!(action, Action::Forward);
     assert_eq!(*word, 9);
     assert_eq!(w.page().live(), 2);
+}
+
+impl UserCopy for FaultingUser {
+    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+        crate::file::UserCopy::copy_in(self, dst, src)
+    }
+    fn copy_out(&mut self, dst: u64, src: &[u8]) -> bool {
+        crate::file::UserCopy::copy_out(self, dst, src)
+    }
 }

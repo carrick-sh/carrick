@@ -294,6 +294,8 @@ where
 {
     let ordinal = frame.x[8];
     let mut pending = El1PendingFamilies {
+        #[cfg(test)]
+        lifecycle_user: None,
         frame,
         counters,
         current_tasks,
@@ -336,18 +338,20 @@ fn invalid_completion() -> ! {
 }
 
 pub struct El1PendingFamilies<'a, F, C: sched::ThreadCpu, U: sched::UserWord> {
-    frame: &'a mut TrapFrame,
-    counters: &'a Counters,
-    current_tasks: &'a [CurrentTask],
-    fd_map: &'a [FdMapSlot],
-    object_table: &'a [DelegatedFile],
-    open_table: &'a [DelegatedOpenFile],
-    inotify_table: &'a [DelegatedInotify],
-    name_cache: &'a InotifyNameCache,
-    zone: Option<Zone<'a, C, U>>,
-    ipc: Option<&'a ipc::IpcVenue<'a>>,
-    lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
-    cache_lookup: F,
+    #[cfg(test)]
+    pub(super) lifecycle_user: Option<&'a mut dyn file::UserCopy>,
+    pub(super) frame: &'a mut TrapFrame,
+    pub(super) counters: &'a Counters,
+    pub(super) current_tasks: &'a [CurrentTask],
+    pub(super) fd_map: &'a [FdMapSlot],
+    pub(super) object_table: &'a [DelegatedFile],
+    pub(super) open_table: &'a [DelegatedOpenFile],
+    pub(super) inotify_table: &'a [DelegatedInotify],
+    pub(super) name_cache: &'a InotifyNameCache,
+    pub(super) zone: Option<Zone<'a, C, U>>,
+    pub(super) ipc: Option<&'a ipc::IpcVenue<'a>>,
+    pub(super) lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
+    pub(super) cache_lookup: F,
 }
 impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFamilies<'a>
     for El1PendingFamilies<'a, F, C, U>
@@ -388,30 +392,12 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> Pending
     fn epoll_wait(&mut self) -> FamilyCompletion {
         self.ipc_transfer()
     }
-    fn lifecycle(&mut self, _: u64) -> FamilyCompletion {
-        let frame = &mut *self.frame;
-        let counters = self.counters;
-        let zone = &mut self.zone;
-        let current_tasks = self.current_tasks;
-        let lifecycle = &self.lifecycle;
-        let slot = frame.slot as usize;
-        let cur_task = current_tasks.get(slot);
-        if let (Some(venue), Some(task)) = (lifecycle, cur_task) {
-            let sched = match (zone.as_mut(), SlotId::from_index(slot)) {
-                (Some(zone), Some(zslot)) => Some(native_scheduler(zone, task, counters, zslot)),
-                _ => None,
-            };
-            let mut user = file::ValidatedCopy {
-                task,
-                validator: &file::HardwareValidator,
-            };
-            if let Some(action) = lifecycle::serve(frame, counters, task, sched, *venue, &mut user)
-            {
-                return action;
-            }
-        }
-
-        FamilyCompletion::Forward
+    fn lifecycle_native(
+        &mut self,
+    ) -> Option<&mut dyn carrick_personality_linux::lifecycle::LifecycleNative<'a>> {
+        self.lifecycle?;
+        self.current_tasks.get(self.frame.slot as usize)?;
+        Some(self)
     }
     fn futex(&mut self) -> FamilyCompletion {
         let frame = &mut *self.frame;
@@ -646,7 +632,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord>
     }
 }
 
-fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
+pub(super) fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
     zone: &'s mut Zone<'_, C, U>,
     task: &'s CurrentTask,
     counters: &'s Counters,

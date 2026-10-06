@@ -3,6 +3,7 @@
 //! Observation and kick doorbells are declared fixture control transport.
 use crate::guest_setup::{GuestRam, WindowKind};
 use crate::{KvmKickHandle, KvmVcpu, KvmVm};
+use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
     BlockedMask, Counters, CurrentTask, EL1_DYNAMIC_METADATA_BASE, El1TaskId, ThreadControlSlot,
     ThreadLifecyclePage,
@@ -11,7 +12,7 @@ use carrick_hal::{HvVcpu, HvVm, MemPerms, TrapError, VcpuExit, VcpuKick};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
 use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
-use kvm_bindings::{Msrs, kvm_msr_entry};
+use kvm_bindings::{KVM_MP_STATE_RUNNABLE, Msrs, kvm_mp_state, kvm_msr_entry};
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -517,7 +518,9 @@ impl Cpl0Carrier {
         for _ in 0..32 {
             let exit = HvVcpu::run(&mut self.cpus[index]).map_err(|e| fail(e.to_string()))?;
             if watchdog.expired.load(Ordering::Acquire) {
-                return Err(fail("CPL0 fixture deadline"));
+                let mut detail = "CPL0 fixture deadline".to_owned();
+                self.cpus[index].append_debug_state(&mut detail);
+                return Err(fail(detail));
             }
             let VcpuExit::IoOut { port, .. } = exit else {
                 let mut detail = "unexpected CPL0 non-control exit".to_owned();
@@ -616,5 +619,228 @@ impl Cpl0Carrier {
             }
         }
         Err(fail("CPL0 control exit budget exceeded"))
+    }
+}
+
+#[derive(Debug)]
+pub struct LifecycleObservation {
+    pub births: u64,
+    pub retirements: u64,
+    pub wakes: u64,
+    pub live: u32,
+    pub state: Option<(u64, carrick_el1_abi::EntryState)>,
+    pub entries: u64,
+    pub completions: u64,
+    pub served: [u64; 3],
+    pub forwards: u64,
+    pub words: [u64; 8],
+}
+impl Cpl0Carrier {
+    /// The same KVM carrier, with one fixed native context sidecar per process.
+    /// This binds executing shared owners, not the production executor pool.
+    pub fn boot_lifecycle(image: &Path, programs: [&[u8]; 2]) -> Result<Self, TrapError> {
+        use carrick_sched_core::{SlotId, ThreadIdentity, ZoneTables};
+        use carrick_x86::cpl0_lifecycle::*;
+        let mut carrier = Self::boot_inner(image, programs, true)?;
+        // SAFETY: aligned initialized empty retained supervisor backing; all
+        // fixture CPUs are stopped throughout native custody publication.
+        let zone = unsafe {
+            &*carrier
+                .ram
+                .host_ptr(LIFECYCLE_ZONE, size_of::<ZoneTables>())
+                .ok_or_else(|| fail("lifecycle zone"))?
+                .cast::<ZoneTables>()
+        };
+        for index in 0..2 {
+            let binding = carrick_el1_abi::ExecutionBinding {
+                task: carrick_el1_abi::EntryTaskKey::from_raw(41 + index as u64),
+                generation: carrick_el1_abi::EntryGeneration::from_raw(11 + index as u64),
+                mm: carrick_el1_abi::EntryMmKey::from_raw(11 + index as u64),
+                thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(
+                    101 + index as u64,
+                ),
+            };
+            carrier.bind_execution(index, binding)?;
+            let root = if index == 0 {
+                LAYOUT.pml4_base
+            } else {
+                crate::carrier_interrupts::SECOND_ROOT
+            };
+            let space = zone
+                .spaces
+                .publish_closed(binding.mm.raw(), root, 0)
+                .ok_or_else(|| fail("lifecycle MM"))?;
+            zone.spaces.open(space);
+            let slot = SlotId::new(index as u8);
+            zone.drive(slot, index as u64 + 1);
+            zone.publish_slot(slot, binding.mm.raw(), Some(index as u32), 0);
+            zone.enter_guest(slot);
+            zone.install_space(slot, binding.mm.raw())
+                .ok_or_else(|| fail("lifecycle installed MM"))?;
+            let page_address = EL1_DYNAMIC_METADATA_BASE + index as u64 * 0x4000;
+            let controls_address = EL1_DYNAMIC_METADATA_BASE + 0xb000 + index as u64 * 0x1000;
+            // SAFETY: aligned, disjoint, exclusively stopped metadata storage.
+            let controls = unsafe {
+                &mut *carrier
+                    .metadata_base
+                    .as_ptr()
+                    .add((0xb000 + index * 0x1000) as usize)
+                    .cast::<[ThreadControlSlot; 9]>()
+            };
+            for control in controls.iter_mut() {
+                *control = ThreadControlSlot::new();
+            }
+            controls[0].publish_visible_tid(binding.task.raw() as u32);
+            carrier
+                .task(index)
+                .publish_lifecycle(page_address, controls_address);
+            let lane = LifecycleLane {
+                contexts: [const { NativeBirthContext::EMPTY }; 2],
+                parent: ThreadIdentity {
+                    tid: binding.task.raw(),
+                    serial: binding.thread_generation.raw(),
+                    mm: binding.mm.raw(),
+                    file_table: 5,
+                    generation: binding.generation.raw(),
+                    affinity: 1 << index,
+                    lifecycle_page: page_address,
+                    control_slot: controls_address,
+                },
+                slot,
+                data_start: LIFECYCLE_DATA,
+                data_end: LIFECYCLE_DATA + 4096,
+                wakes: 0,
+                births: 0,
+                retirements: 0,
+            };
+            let address = LIFECYCLE_LANE + index as u64 * LIFECYCLE_STRIDE;
+            // SAFETY: aligned retained sidecar with no live CPU references yet.
+            unsafe {
+                carrier
+                    .ram
+                    .host_ptr(address, size_of::<LifecycleLane>())
+                    .ok_or_else(|| fail("native lifecycle sidecar"))?
+                    .cast::<LifecycleLane>()
+                    .write(lane);
+            }
+            carrier
+                .binding(index)
+                .scheduler_witness
+                .store(address, Ordering::Release);
+            let cpu = &carrier.cpus[index];
+            crate::carrier_interrupts::qualify_xstate(cpu)?;
+            let mut system = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+            system.cr3 = root;
+            cpu.fd()
+                .set_sregs(&system)
+                .map_err(|e| fail(e.to_string()))?;
+            // The irqchip starts secondary CPUs awaiting SIPI. This fixture
+            // installs both native entry states while stopped, then admits
+            // each explicitly instead of relying on firmware AP startup.
+            cpu.fd()
+                .set_mp_state(kvm_mp_state {
+                    mp_state: KVM_MP_STATE_RUNNABLE,
+                })
+                .map_err(|e| fail(e.to_string()))?;
+            carrier
+                .ram
+                .write_gpa(
+                    LIFECYCLE_DATA + index as u64 * 4096 + 0x180,
+                    &[0x5a + index as u8; 16],
+                )
+                .map_err(|e| fail(e.to_string()))?;
+            carrier
+                .ram
+                .write_gpa(
+                    LIFECYCLE_DATA + index as u64 * 4096 + 0x100,
+                    &(0xf500u64 + index as u64).to_le_bytes(),
+                )
+                .map_err(|e| fail(e.to_string()))?;
+        }
+        Ok(carrier)
+    }
+    pub fn stock_lifecycle(
+        &mut self,
+        index: usize,
+    ) -> Result<carrick_el1_abi::EntryRef, TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown lifecycle lane"));
+        }
+        let page: &ThreadLifecyclePage = self.metadata(index as u64 * 0x4000);
+        let entry = page
+            .stock(
+                0,
+                carrick_el1_abi::EntryIdentity {
+                    tid: 501 + index as u32,
+                    visible_tid: 7,
+                    thread_serial: 1001
+                        + index as u64
+                        + 2 * (page.state(0).map_or(0, |(generation, _)| generation) + 1),
+                    uid_credit: 1,
+                },
+            )
+            .map_err(|e| fail(format!("stock: {e:?}")))?;
+        let controls: &[ThreadControlSlot; 9] = self.metadata(0xb000 + index as u64 * 0x1000);
+        controls[1].reset_for_host_birth(BlockedMask(0));
+        page.bind_control_address(
+            entry,
+            EL1_DYNAMIC_METADATA_BASE
+                + 0xb000
+                + index as u64 * 0x1000
+                + size_of::<ThreadControlSlot>() as u64,
+        )
+        .map_err(|e| fail(format!("control: {e:?}")))?;
+        Ok(entry)
+    }
+    pub fn reap_lifecycle(
+        &mut self,
+        index: usize,
+        entry: carrick_el1_abi::EntryRef,
+    ) -> Result<(), TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown lifecycle lane"));
+        }
+        let page: &ThreadLifecyclePage = self.metadata(index as u64 * 0x4000);
+        page.reap(entry).map_err(|e| fail(format!("reap: {e:?}")))
+    }
+    pub fn lifecycle_state(&self, index: usize) -> Result<LifecycleObservation, TrapError> {
+        use carrick_x86::cpl0_lifecycle::*;
+        if index >= 2 {
+            return Err(fail("unknown lifecycle lane"));
+        }
+        // SAFETY: exclusively stopped CPUs; retained aligned initialized sidecar.
+        let lane = unsafe {
+            &*self
+                .ram
+                .host_ptr(
+                    LIFECYCLE_LANE + index as u64 * LIFECYCLE_STRIDE,
+                    size_of::<LifecycleLane>(),
+                )
+                .ok_or_else(|| fail("lane observation"))?
+                .cast::<LifecycleLane>()
+        };
+        let page: &ThreadLifecyclePage = self.metadata(index as u64 * 0x4000);
+        let counters: &Counters = self.metadata(COUNTERS_OFFSET);
+        let data = self
+            .ram
+            .host_ptr(LIFECYCLE_DATA + index as u64 * 4096, 64)
+            .ok_or_else(|| fail("lifecycle user words"))?;
+        let words = core::array::from_fn(|i| {
+            // SAFETY: checked retained user storage; CPUs stopped; unaligned
+            // scalar reads do not require stronger alignment than its mapping.
+            unsafe { core::ptr::read_unaligned(data.add(i * 8).cast::<u64>()) }
+        });
+        Ok(LifecycleObservation {
+            births: lane.births,
+            retirements: lane.retirements,
+            wakes: lane.wakes,
+            live: page.live(),
+            state: page.state(0),
+            entries: self.binding(index).entries.load(Ordering::Acquire),
+            completions: self.binding(index).completions.load(Ordering::Acquire),
+            served: [220, 98, 93].map(|nr| counters.served[nr].load(Ordering::Acquire)),
+            forwards: self.host_forwards,
+            words,
+        })
     }
 }

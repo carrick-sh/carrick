@@ -110,3 +110,10 @@ impl carrick_el1::personality::sched::ThreadCpu for NoCpu {
         panic!("no CPU venue");
     }
 }
+
+#[path = "x86_wave2/lifecycle.rs"]
+mod lifecycle;
+#[test]
+fn x5_linux_clone_exit() {
+    lifecycle::x5_linux_clone_exit();
+}

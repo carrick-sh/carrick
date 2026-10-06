@@ -3,6 +3,7 @@
 //! Governs TID reservation and publication, thread startup handshake,
 //! thread-group joining, and active scheduler generation validation.
 
+use carrick_el1_abi::Lifecycle;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 

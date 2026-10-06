@@ -10,3 +10,6 @@ pub mod sched;
 pub mod pending_file;
 
 pub mod pending_anonymous;
+
+pub mod lifecycle;
+pub mod thread;

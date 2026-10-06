@@ -278,27 +278,7 @@ pub fn witness(
     sregs.cr4 = (sregs.cr4 | (1 << 18)) & !((1 << 17) | (1 << 7));
     sregs.cr0 &= !((1 << 2) | (1 << 3));
     sregs.apic_base = LAPIC_BASE | 0x900;
-    let cpuid = cpu
-        .fd()
-        .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
-        .map_err(|e| fail(e.to_string()))?;
-    let state_leaf = cpuid
-        .as_slice()
-        .iter()
-        .find(|entry| entry.function == 0xd && entry.index == 0)
-        .ok_or_else(|| fail("XSAVE CPUID missing"))?;
-    let avx_leaf = cpuid
-        .as_slice()
-        .iter()
-        .find(|entry| entry.function == 0xd && entry.index == 2)
-        .ok_or_else(|| fail("AVX XSAVE CPUID missing"))?;
-    if state_leaf.eax & 7 != 7 || avx_leaf.ebx != 576 || avx_leaf.eax != 256 {
-        return Err(fail("unsupported standard XSAVE geometry"));
-    }
-    let xcrs = cpu.fd().get_xcrs().map_err(|e| fail(e.to_string()))?;
-    if xcrs.nr_xcrs != 1 || xcrs.xcrs[0].xcr != 0 || xcrs.xcrs[0].value != XSTATE_MASK {
-        return Err(fail("CPL0 requires qualified XCR0=7"));
-    }
+    qualify_xstate(cpu)?;
     cpu.fd()
         .set_sregs(&sregs)
         .map_err(|e| fail(e.to_string()))?;
@@ -394,4 +374,30 @@ pub fn witness(
         }
     }
     Err(fail("progress control exit budget exceeded"))
+}
+
+/// Validate the complete native x87/SSE/AVX image before retaining a context.
+pub(crate) fn qualify_xstate(cpu: &crate::KvmVcpu) -> Result<(), TrapError> {
+    let cpuid = cpu
+        .fd()
+        .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+        .map_err(|e| fail(e.to_string()))?;
+    let state_leaf = cpuid
+        .as_slice()
+        .iter()
+        .find(|entry| entry.function == 0xd && entry.index == 0)
+        .ok_or_else(|| fail("XSAVE CPUID missing"))?;
+    let avx_leaf = cpuid
+        .as_slice()
+        .iter()
+        .find(|entry| entry.function == 0xd && entry.index == 2)
+        .ok_or_else(|| fail("AVX XSAVE CPUID missing"))?;
+    if state_leaf.eax & 7 != 7 || avx_leaf.ebx != 576 || avx_leaf.eax != 256 {
+        return Err(fail("unsupported standard XSAVE geometry"));
+    }
+    let xcrs = cpu.fd().get_xcrs().map_err(|e| fail(e.to_string()))?;
+    if xcrs.nr_xcrs != 1 || xcrs.xcrs[0].xcr != 0 || xcrs.xcrs[0].value != XSTATE_MASK {
+        return Err(fail("CPL0 requires qualified XCR0=7"));
+    }
+    Ok(())
 }
