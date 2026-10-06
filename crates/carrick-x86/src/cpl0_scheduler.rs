@@ -102,6 +102,7 @@ pub enum AdmissionError {
     NotOnCpu = 3,
     ClosedSpace = 4,
     RootMismatch = 5,
+    CowOwed = 6,
 }
 
 /// Detailed admission checking for CPL0 context installation.
@@ -123,7 +124,11 @@ pub fn admit_context_detailed(
     let Some(grant) = zone.install_space(slot, mm) else {
         return Err(AdmissionError::ClosedSpace);
     };
-    if grant.cow_owed.is_some() || grant.ttbr0 != binding.context.address.root.address().raw() {
+    if grant.cow_owed.is_some() {
+        zone.release_space(slot);
+        return Err(AdmissionError::CowOwed);
+    }
+    if grant.ttbr0 != binding.context.address.root.address().raw() {
         zone.release_space(slot);
         return Err(AdmissionError::RootMismatch);
     }

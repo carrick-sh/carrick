@@ -694,6 +694,7 @@ impl Cpl0Carrier {
                         3 => "not on CPU",
                         4 => "closed space",
                         5 => "root mismatch",
+                        6 => "COW owed",
                         other => {
                             return Err(fail(format!("CPL0 fatal / admission refusal: {other}")));
                         }

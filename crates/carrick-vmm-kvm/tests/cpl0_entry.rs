@@ -396,4 +396,23 @@ fn x1_boot_shared_substrate() {
         err.to_string().contains("closed space"),
         "error must report closed space: {err}"
     );
+
+    // COW owed defect
+    let mut cow_owed_carrier = make_shared_carrier(&p, |zone, _| {
+        let index = zone.spaces.find(11).unwrap();
+        zone.spaces.note_cow(index);
+    })
+    .expect("boot cow owed carrier");
+    let err = cow_owed_carrier
+        .observe(0)
+        .expect_err("cow owed must be rejected by CPL0");
+    assert!(
+        err.to_string().contains("COW owed"),
+        "error must report COW owed: {err}"
+    );
+    assert_eq!(
+        cow_owed_carrier.zone().installed_space(slot),
+        0,
+        "refusal vacates occupancy"
+    );
 }
