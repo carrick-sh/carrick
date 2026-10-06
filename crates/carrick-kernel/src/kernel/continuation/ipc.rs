@@ -573,7 +573,10 @@ fn transfer_owner_read<M: carrick_guest_mem::CurrentMmMemory>(
                     && copy.copied == capacity
                     && capacity < available
                     && !op.progress.is_complete() => {}
-            StepStatus::Blocked(_) if op.progress.written > 0 => {
+            terminal if op.progress.written > 0 && !matches!(terminal, StepStatus::Fault) => {
+                // Another reader can drain the remaining bytes and the last
+                // writer can close while PREPARE releases the object lock.
+                // EOF then ends this read; it cannot erase its committed prefix.
                 return Ok(Ok(StepStatus::Complete));
             }
             other => return Ok(Ok(other)),
