@@ -715,6 +715,22 @@ contracts = ["kernel.net.connect-wake-scope"]
 path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs"
 contracts = ["x86.run-elf.poll"]
 
+[[surfaces]]
+path = "crates/carrick-mem/src/x86_initial_image.rs"
+contracts = ["x86.mm.initial-image"]
+
+[[surfaces]]
+path = "crates/carrick-mem/tests/x86_initial_image.rs"
+contracts = ["x86.mm.initial-image"]
+
+[[surfaces]]
+path = "crates/carrick-el1/src/isa/x86/initial_mm.rs"
+contracts = ["x86.mm.initial-image"]
+
+[[surfaces]]
+path = "crates/carrick-vmm-kvm/tests/cpl0_initial_mm.rs"
+contracts = ["x86.mm.initial-image"]
+
 # Fixture-only injection ownership for executor activation and rollback tests.
 [[surfaces]]
 path = "crates/carrick-runtime/src/test_hooks.rs"
