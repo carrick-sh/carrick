@@ -43,6 +43,7 @@ impl ArchTypes for Aarch64Backend {
     type Error = ArchError;
     type NativeFrame = TrapFrame;
     type SavedContext = ThreadCtx;
+    type Context = ThreadCtx;
     type Root = RootGpa;
     type MmOwner = CurrentTask;
     type OwnedTranslation = ();
