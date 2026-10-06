@@ -224,7 +224,8 @@ mod kernel {
     ) -> Result<carrick_mmu_core::x86::descriptor_txn::DescriptorReceipt, carrick_el1::isa::ArchError>
     {
         use carrick_guest_arch::{
-            EditIntent, EditOwner, FrameGpa, GuestLen, MmuEditArch, RootGpa, UserRange, UserVa,
+            EditIntent, EditOwner, FrameGpa, GuestLen, KernelVa, MmuEditArch, RootGpa, TableWindow,
+            UserRange, UserVa,
         };
         let root = RootGpa::page_aligned(FrameGpa::new(0x60_0000))
             .ok_or(carrick_el1::isa::ArchError::Unbound)?;
@@ -236,9 +237,19 @@ mod kernel {
         let intent = EditIntent::checked(owner, range, operation, &[])
             .ok_or(carrick_el1::isa::ArchError::Unbound)?;
         let mut arch = carrick_el1::isa::x86::Kernel::new(carrick_el1::isa::x86::X86Backend);
-        // SAFETY: KVM retains and identity maps the 448-page PML4 window;
-        // the sibling vCPU is stopped while this fixture edits it.
-        unsafe { arch.execute_edit(intent, root.address(), GuestLen::new(FIXTURE_PML4_CAPACITY)) }
+        // SAFETY: KVM retains and maps the 448-page PML4 window under the
+        // upper-half supervisor direct window; the sibling vCPU is stopped here.
+        let tables = unsafe {
+            TableWindow::issue(
+                root.address(),
+                KernelVa::new(DIRECT_VA + root.address().raw()),
+                GuestLen::new(FIXTURE_PML4_CAPACITY),
+            )
+        }
+        .ok_or(carrick_el1::isa::ArchError::Unbound)?;
+        // SAFETY: the exact editor and mapped table window remain held until
+        // the native transaction and its drain receipt have settled.
+        unsafe { arch.execute_edit(intent, tables) }
     }
 
     #[unsafe(no_mangle)]

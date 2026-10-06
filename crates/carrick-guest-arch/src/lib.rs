@@ -26,6 +26,7 @@ macro_rules! ordinal {
 }
 ordinal!(
     UserVa,
+    KernelVa,
     KernelStackPointer,
     FrameGpa,
     GuestLen,
@@ -120,6 +121,47 @@ pub struct EditOwner<R> {
     root: R,
     mm_key: NonZeroU64,
     generation: NonZeroU64,
+}
+
+/// Retained, writable kernel alias of one page-table arena. The physical
+/// root and the virtual access path remain separate address domains.
+pub struct TableWindow {
+    physical: FrameGpa,
+    mapped: KernelVa,
+    bytes: GuestLen,
+}
+
+impl TableWindow {
+    /// # Safety
+    /// The caller retains a writable supervisor mapping of every byte in the
+    /// physical arena at `mapped` and excludes concurrent table reclamation
+    /// for the entire descriptor transaction and receipt settlement.
+    pub unsafe fn issue(physical: FrameGpa, mapped: KernelVa, bytes: GuestLen) -> Option<Self> {
+        if physical.raw() & 4095 != 0
+            || mapped.raw() & 4095 != 0
+            || bytes.raw() < 4096
+            || bytes.raw() & 4095 != 0
+            || physical.raw().checked_add(bytes.raw()).is_none()
+            || mapped.raw().checked_add(bytes.raw()).is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            physical,
+            mapped,
+            bytes,
+        })
+    }
+
+    pub const fn physical(&self) -> FrameGpa {
+        self.physical
+    }
+    pub const fn mapped(&self) -> KernelVa {
+        self.mapped
+    }
+    pub const fn bytes(&self) -> GuestLen {
+        self.bytes
+    }
 }
 
 impl<R: Copy> EditOwner<R> {
@@ -548,14 +590,13 @@ arch_trait!(MmuArch, MmuBackend {
 pub trait MmuEditArch: sealed::Sealed + ArchTypes {
     type EditReceipt;
     /// # Safety
-    /// `table_base..table_base+table_bytes` is the retained page-table window
+    /// `tables` is the retained page-table window
     /// of the intent's root, and the caller keeps the exact editor through
     /// receipt settlement. The backend validates the live root before stores.
     unsafe fn execute_edit(
         &mut self,
         intent: EditIntent<'_, Self::Root>,
-        table_base: FrameGpa,
-        table_bytes: GuestLen,
+        tables: TableWindow,
     ) -> Result<Self::EditReceipt, Self::Error>;
 }
 
@@ -567,8 +608,7 @@ pub trait MmuEditBackend: ArchTypes {
     unsafe fn execute_edit(
         &mut self,
         intent: EditIntent<'_, Self::Root>,
-        table_base: FrameGpa,
-        table_bytes: GuestLen,
+        tables: TableWindow,
     ) -> Result<Self::EditReceipt, Self::Error>;
 }
 
@@ -578,12 +618,11 @@ impl<B: MmuEditBackend> MmuEditArch for Arch<B> {
     unsafe fn execute_edit(
         &mut self,
         intent: EditIntent<'_, Self::Root>,
-        table_base: FrameGpa,
-        table_bytes: GuestLen,
+        tables: TableWindow,
     ) -> Result<Self::EditReceipt, Self::Error> {
         // SAFETY: this sealed adapter forwards the caller's exact editor and
         // retained table-window obligations unchanged to the native backend.
-        unsafe { self.backend.execute_edit(intent, table_base, table_bytes) }
+        unsafe { self.backend.execute_edit(intent, tables) }
     }
 }
 arch_trait!(InterruptArch, InterruptBackend {
