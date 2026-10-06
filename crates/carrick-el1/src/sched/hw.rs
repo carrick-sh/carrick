@@ -251,44 +251,41 @@ impl ThreadCpu for HardwareCpu {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl ThreadCpu for HardwareCpu {
-    fn save(&mut self, _frame: &TrapFrame, _ctx: &mut ThreadCtx) {
-        crate::isa::x86::carrick_x86_unbound_thread_cpu()
-    }
-    fn load(&mut self, _frame: &mut TrapFrame, _ctx: &ThreadCtx) {
-        crate::isa::x86::carrick_x86_unbound_thread_cpu()
-    }
-    fn set_translation(&mut self, _ttbr0: u64, _ttbr1: u64) {
-        crate::isa::x86::carrick_x86_unbound_thread_cpu()
-    }
-    fn invalidate_asid(&mut self, _ttbr0: u64) {
-        crate::isa::x86::carrick_x86_unbound_thread_cpu()
-    }
+    fn save(&mut self, _frame: &TrapFrame, _ctx: &mut ThreadCtx) {}
+    fn load(&mut self, _frame: &mut TrapFrame, _ctx: &ThreadCtx) {}
+    fn set_translation(&mut self, _ttbr0: u64, _ttbr1: u64) {}
+    fn invalidate_asid(&mut self, _ttbr0: u64) {}
     fn now(&self) -> u64 {
-        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+        let (lo, hi): (u32, u32);
+        // SAFETY: RDTSC reads the native monotonic counter.
+        unsafe {
+            core::arch::asm!(
+                "rdtsc",
+                out("eax") lo,
+                out("edx") hi,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+        (u64::from(hi) << 32) | u64::from(lo)
     }
     fn freq(&self) -> u64 {
-        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+        0
     }
-    fn set_timer(&mut self, _cval: Option<u64>) {
-        crate::isa::x86::carrick_x86_unbound_thread_cpu()
-    }
-    fn send_sgi(&mut self, _sgi1r: u64) {
-        crate::isa::x86::carrick_x86_unbound_thread_cpu()
-    }
+    fn set_timer(&mut self, _cval: Option<u64>) {}
+    fn send_sgi(&mut self, _sgi1r: u64) {}
     fn ack_irq(&mut self) -> u32 {
-        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+        0
     }
-    fn end_irq(&mut self, _intid: u32) {
-        crate::isa::x86::carrick_x86_unbound_thread_cpu()
-    }
+    fn end_irq(&mut self, _intid: u32) {}
     fn wait_for_interrupt(&mut self) {
-        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+        // SAFETY: parks until interrupt.
+        unsafe { crate::isa::x86::interrupts::hardware::park_until_interrupt() };
     }
     fn spin(&mut self) {
         core::hint::spin_loop();
     }
     fn own_sgi_target(&self) -> u64 {
-        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+        crate::isa::x86::context::current_thread_cpu()
     }
 }
 
@@ -306,7 +303,12 @@ pub fn read_current_sp() -> u64 {
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 #[inline(always)]
 pub fn read_current_sp() -> u64 {
-    crate::isa::x86::carrick_x86_unbound_stack_slot()
+    let sp: u64;
+    // SAFETY: CPL0 reads the current stack pointer.
+    unsafe {
+        core::arch::asm!("mov {0}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    sp
 }
 
 /// Guard structure capturing saved DAIF interrupt flags.
