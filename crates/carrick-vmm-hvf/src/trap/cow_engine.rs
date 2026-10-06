@@ -3602,16 +3602,31 @@ impl HvfTaskState {
         // first physical/staged-inventory mutation.  A fork-time response can
         // run while the engine's mapping metadata is being rebuilt; failing
         // here must leave no staged MappingId for terminal retirement to see.
-        let page_table_host = self
-            .mapping_for_range_in(
+        let page_table_host = if guest_lane {
+            // Owner Fork retains physical table custody, not the host-plan
+            // fixed-VA projection. Resolve the live manager's exact primary
+            // arena through its authenticated, retaining resolver.
+            self.page_tables_authority()
+                .with_manager(|manager| {
+                    manager.resolver().and_then(|resolver| {
+                        resolver.host_ptr_for_range(
+                            manager.base(),
+                            carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                        )
+                    })
+                })
+                .flatten()
+        } else {
+            self.mapping_for_range_in(
                 custody,
                 crate::memory::LINUX_PAGE_TABLES_BASE,
                 carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
             )
             .map(|mapping| mapping.host_addr)
-            .ok_or_else(|| {
-                TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
-            })?;
+        }
+        .ok_or_else(|| {
+            TrapError::Hypervisor("HVPatch COW page-table backing is absent".to_owned())
+        })?;
         // Reuse grants write to the span's leaves without repointing them, so
         // every 4 KiB page of the span must already name the old frame at its
         // offset (a valid or retained-output leaf). A page with no output at
