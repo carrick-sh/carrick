@@ -20795,7 +20795,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
-      "line": 25,
+      "line": 26,
       "categories": [
         "mapping"
       ],
@@ -20804,7 +20804,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
-      "line": 30,
+      "line": 31,
       "categories": [
         "mapping"
       ],
@@ -20813,7 +20813,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
-      "line": 38,
+      "line": 39,
       "categories": [
         "mapping"
       ],
@@ -20822,7 +20822,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
-      "line": 39,
+      "line": 40,
       "categories": [
         "mapping"
       ],
@@ -20831,7 +20831,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
-      "line": 62,
+      "line": 63,
       "categories": [
         "mapping"
       ],
@@ -20840,7 +20840,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
-      "line": 72,
+      "line": 73,
       "categories": [
         "mapping"
       ],
@@ -20849,7 +20849,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
-      "line": 74,
+      "line": 75,
       "categories": [
         "mapping"
       ],
@@ -20858,7 +20858,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
-      "line": 121,
+      "line": 122,
       "categories": [
         "mapping"
       ],
@@ -20867,7 +20867,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/objects/thread_control.rs",
-      "line": 161,
+      "line": 162,
       "categories": [
         "mapping"
       ],
@@ -21768,7 +21768,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
-      "line": 336,
+      "line": 337,
       "categories": [
         "table_guard"
       ],
@@ -24603,7 +24603,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs",
-      "line": 79,
+      "line": 80,
       "categories": [
         "mapping"
       ],
@@ -24612,7 +24612,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs",
-      "line": 86,
+      "line": 87,
       "categories": [
         "mapping"
       ],
@@ -24621,7 +24621,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs",
-      "line": 123,
+      "line": 124,
       "categories": [
         "mapping"
       ],
@@ -24630,7 +24630,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs",
-      "line": 124,
+      "line": 125,
       "categories": [
         "mapping"
       ],
@@ -24639,7 +24639,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs",
-      "line": 132,
+      "line": 133,
       "categories": [
         "mapping"
       ],
@@ -24648,7 +24648,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs",
-      "line": 179,
+      "line": 180,
       "categories": [
         "mapping"
       ],
@@ -24657,7 +24657,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs",
-      "line": 205,
+      "line": 206,
       "categories": [
         "mapping"
       ],
@@ -24666,7 +24666,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs",
-      "line": 211,
+      "line": 212,
       "categories": [
         "mapping"
       ],
@@ -24675,7 +24675,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/thread_lifecycle.rs",
-      "line": 214,
+      "line": 215,
       "categories": [
         "mapping"
       ],
@@ -24693,7 +24693,7 @@
     },
     {
       "file": "crates/carrick-runtime/src/vcpu_loop/threads.rs",
-      "line": 259,
+      "line": 271,
       "categories": [
         "mapping"
       ],
