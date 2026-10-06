@@ -214,3 +214,47 @@ class RustVerdictContract(unittest.TestCase):
                 with patch.object(checker, pattern, side_effect=change_tree):
                     with self.assertRaisesRegex(Exception, 'source file set changed'):
                         entry(root, verdict=verdict)
+
+    def test_round8_classes_rejected_at_every_retained_cli(self):
+        import json, subprocess, tempfile
+        from scripts.tests.authority_census_support import census_json
+        cases = [
+            (self.path, 'use custom_macros::serde::{self}; #[derive(serde::Serialize)] struct Data;', 'audited macro binding'),
+            (self.path, 'use custom_macros::clap::{self}; #[derive(clap::Parser)] struct Data;', 'audited macro binding'),
+            (self.path, 'fn hidden() { let _ = (std::env::var)("CARRICK_RUN_ID"); }', 'protected operation shape'),
+            (self.path, 'fn hidden() { (std::process::abort)(); }', 'protected operation shape'),
+            (self.path, 'fn hidden() { let read = std::env::var::<&str>; let _ = read("CARRICK_RUN_ID"); }', 'protected operation shape'),
+            (self.path, 'fn hidden() { let acquire = FileTable::read_open_files; }', 'protected operation shape'),
+            (self.path, 'fn hidden() { let callbacks = Callbacks { read: std::env::var::<&str> }; }', 'protected operation shape'),
+            (self.path, 'use std::env::var; fn hidden() { for var in [] {} let read = var; }', 'protected operation shape'),
+            (self.path, 'mod core { mod mem {} } fn hidden() { core::mem::offset_of!(Data, args); }', 'protected operation shape'),
+            (self.path, 'fn hidden() { wrap!(std::env::var("CARRICK_RUN_ID")); }', 'protected operation shape'),
+            (self.path, 'fn hidden() { ::std::vec![std::env::var]; }', 'protected operation shape'),
+            (self.path, 'pass! { OpenDescriptionRef::clone }', 'protected operation shape'),
+            (self.path, '#[derive(::serde::Deserialize)] struct Data { #[serde(skip, default = "std::env::vars")] hidden: std::env::Vars }', 'protected callback'),
+            (self.path, 'use custom_macros::Clone::{self}; #[derive(Clone)] struct Data;', 'compiler derive'),
+            ('crates/carrick-cli/src/args.rs', 'mod extra { #[derive(::clap::Parser)] struct RunArgs { #[arg(env="CARRICK_EXEC_BACKEND")] backend: String } }', 'generated environment read'),
+            ('crates/carrick-cli/src/args.rs', 'fn hidden() { #[derive(::clap::Parser)] struct RunArgs { #[arg(env="CARRICK_EXEC_BACKEND")] backend: String } }', 'generated environment read'),
+        ]
+        for path, source, message in cases:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                file = root / path
+                file.parent.mkdir(parents=True)
+                file.write_text(source)
+                if '/carrick-cli/' in path:
+                    (file.parent / 'main.rs').write_text('mod args;')
+                proof = root / 'verdict.json'
+                proof.write_text(json.dumps(census_json(root)))
+                for checker in [ABORT, GLOBAL, LOCK]:
+                    result = subprocess.run([sys.executable, checker.__file__, '--root', str(root), '--census-verdict', str(proof)], capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0, checker.__file__)
+                    self.assertIn(message, result.stderr, checker.__file__)
+
+
+class CanonicalCallPatterns(unittest.TestCase):
+    def test_plain_exact_item_imports_reach_the_unique_patterns(self):
+        aborts = scan_source(ABORT.scan_abort_source, 'crates/carrick-runtime/src/lib.rs', 'use std::process::abort; fn finish() { abort(); }')
+        self.assertEqual(len(aborts), 1)
+        globals = scan_source(GLOBAL.scan_source, 'crates/carrick-kernel/src/lib.rs', 'use std::env::var; fn read_run() { var("CARRICK_RUN_ID"); }')
+        self.assertEqual([(g.kind, g.argument) for g in globals], [('env_var', 'CARRICK_RUN_ID')])

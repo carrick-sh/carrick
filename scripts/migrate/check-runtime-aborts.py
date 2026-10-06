@@ -233,7 +233,7 @@ def lex_rust(source: str) -> list[Token]:
             continue
         tokens.append(Token("punct", c, line, i))
         i += 1
-    return tokens
+    return census_verdict.canonical_tokens(tokens, source)
 
 
 def normalize_type_tokens(tokens: list[Token]) -> str:

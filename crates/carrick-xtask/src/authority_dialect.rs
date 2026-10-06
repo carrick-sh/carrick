@@ -68,7 +68,7 @@ fn compiler_derive_path(path: &syn::Path) -> bool {
         )
 }
 
-fn ambient_operation(name: &str) -> bool {
+pub(super) fn ambient_operation(name: &str) -> bool {
     matches!(
         name,
         "abort"
@@ -144,14 +144,86 @@ fn doc_template(stream: TokenStream) -> TokenStream {
     }).collect()
 }
 
+#[derive(Debug, serde::Serialize)]
+pub(super) struct CanonicalCall {
+    start: usize,
+    end: usize,
+    path: String,
+}
+impl CanonicalCall {
+    pub(super) fn covers(&self, range: std::ops::Range<usize>) -> bool {
+        self.start == range.start && self.end == range.end
+    }
+}
+type Calls = BTreeMap<String, Vec<CanonicalCall>>;
+
+fn item_imports(syntax: &syn::File) -> BTreeMap<String, String> {
+    struct Imports(BTreeMap<String, String>);
+    impl Imports {
+        fn tree(&mut self, tree: &syn::UseTree, prefix: &[String]) {
+            match tree {
+                syn::UseTree::Path(p) => {
+                    let mut prefix = prefix.to_vec();
+                    prefix.push(p.ident.unraw().to_string());
+                    self.tree(&p.tree, &prefix);
+                }
+                syn::UseTree::Group(g) => {
+                    for tree in &g.items {
+                        self.tree(tree, prefix);
+                    }
+                }
+                syn::UseTree::Name(n) if n.ident.unraw() != "self" => {
+                    let leaf = n.ident.unraw().to_string();
+                    let path = format!("{}::{leaf}", prefix.join("::"));
+                    // Conflicting same-named imports are never an authority
+                    // binding, even when one occurrence is canonical.
+                    self.0
+                        .entry(leaf)
+                        .and_modify(|old| {
+                            if *old != path {
+                                old.clear();
+                            }
+                        })
+                        .or_insert(path);
+                }
+                _ => {}
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Imports {
+        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+            if !super::authority_source::test_only(&item.attrs)
+                && matches!(item.vis, syn::Visibility::Inherited)
+            {
+                self.tree(
+                    &item.tree,
+                    &if item.leading_colon.is_some() {
+                        vec![String::new()]
+                    } else {
+                        Vec::new()
+                    },
+                );
+            }
+        }
+    }
+    let mut imports = Imports(BTreeMap::new());
+    for item in &syntax.items {
+        if let syn::Item::Use(item) = item {
+            imports.visit_item_use(item);
+        }
+    }
+    imports.0
+}
+
 pub(super) fn validate(
     root: &Path,
     parsed: &BTreeMap<PathBuf, syn::File>,
     operations: &BTreeSet<String>,
+    raw_methods: &BTreeSet<String>,
     test_files: &BTreeSet<PathBuf>,
     production: &BTreeSet<PathBuf>,
     module_owners: Option<&BTreeMap<PathBuf, Vec<Vec<String>>>>,
-) -> Result<(), DebtError> {
+) -> Result<Calls, DebtError> {
     let audits: Vec<AttributeAudit> = serde_json::from_str(include_str!(
         "../../../scripts/migrate/authority-attribute-allowlist.json"
     ))?;
@@ -175,6 +247,55 @@ pub(super) fn validate(
                 entry.name
             )));
         }
+    }
+    let macro_audits = super::authority_macro::audits()?;
+    if macro_audits
+        .iter()
+        .any(|a| a.reason.trim().is_empty() || a.names.is_empty())
+    {
+        return Err(DebtError::Policy("invalid executable macro audit".into()));
+    }
+    let mut valid_definitions = BTreeMap::new();
+    for audit in &macro_audits {
+        let valid = match (&audit.definition_file, &audit.definition_sha256) {
+            (Some(file), Some(_hash)) => {
+                let path = root.join(file);
+                parsed
+                    .get(&path)
+                    .zip(std::fs::read(&path).ok())
+                    .is_some_and(|(file, bytes)| {
+                        struct Definitions<'a> {
+                            audit: &'a super::authority_macro::Audit,
+                            bytes: &'a [u8],
+                            valid: bool,
+                        }
+                        impl<'ast> Visit<'ast> for Definitions<'_> {
+                            fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+                                if item.ident.as_ref().is_some_and(|id| {
+                                    self.audit.names.contains(&id.unraw().to_string())
+                                }) && self.bytes.get(item.span().byte_range()).is_some_and(
+                                    |body| {
+                                        super::authority_source::source_hash(body)
+                                            == self.audit.definition_sha256.as_deref().unwrap_or("")
+                                    },
+                                ) {
+                                    self.valid = true;
+                                }
+                            }
+                        }
+                        let mut definitions = Definitions {
+                            audit,
+                            bytes: &bytes,
+                            valid: false,
+                        };
+                        definitions.visit_file(file);
+                        definitions.valid
+                    })
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        valid_definitions.insert(audit.names[0].clone(), valid);
     }
     let mut protected: BTreeSet<String> = operations
         .iter()
@@ -212,6 +333,7 @@ pub(super) fn validate(
             .map(str::to_owned),
         )
         .collect();
+    let original_protected = protected.clone();
     // Name taint is global and monotone: ambiguity only increases rejection.
     // A type alias/re-export cannot turn a protected target into a safe rename.
     loop {
@@ -229,7 +351,9 @@ pub(super) fn validate(
             break;
         }
     }
+    let aliases: BTreeSet<_> = protected.difference(&original_protected).cloned().collect();
     let mut errors = Vec::new();
+    let mut calls = BTreeMap::new();
     for (path, syntax) in parsed {
         if test_files.contains(path) && !production.contains(path) {
             continue;
@@ -238,7 +362,12 @@ pub(super) fn validate(
             root,
             path,
             allowed: &allowed,
+            macro_audits: &macro_audits,
+            valid_definitions: &valid_definitions,
             protected: &protected,
+            operations,
+            aliases: &aliases,
+            raw_methods,
             errors: &mut errors,
             proven_test: false,
             opaque: false,
@@ -248,6 +377,10 @@ pub(super) fn validate(
             helpers: BTreeSet::new(),
             generated_options: &generated_options,
             metadata_owners: Vec::new(),
+            local_bindings: BTreeSet::new(),
+            item_imports: item_imports(syntax),
+            canonical_calls: Vec::new(),
+            lexical_owners: Vec::new(),
             module_owners: module_owners
                 .and_then(|owners| owners.get(path))
                 .cloned()
@@ -258,9 +391,15 @@ pub(super) fn validate(
         // A glob inside a proven cfg(test) module cannot affect its parent.
         validator.glob = production_glob(syntax);
         validator.visit_file(syntax);
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|e| DebtError::Policy(e.to_string()))?
+            .to_string_lossy()
+            .into_owned();
+        calls.insert(relative, validator.canonical_calls);
     }
     if errors.is_empty() {
-        Ok(())
+        Ok(calls)
     } else {
         Err(DebtError::Policy(errors.join("\n")))
     }
@@ -379,7 +518,12 @@ struct Validator<'a> {
     root: &'a Path,
     path: &'a Path,
     allowed: &'a BTreeSet<String>,
+    macro_audits: &'a [super::authority_macro::Audit],
+    valid_definitions: &'a BTreeMap<String, bool>,
     protected: &'a BTreeSet<String>,
+    operations: &'a BTreeSet<String>,
+    aliases: &'a BTreeSet<String>,
+    raw_methods: &'a BTreeSet<String>,
     errors: &'a mut Vec<String>,
     proven_test: bool,
     opaque: bool,
@@ -389,6 +533,10 @@ struct Validator<'a> {
     helpers: BTreeSet<String>,
     generated_options: &'a BTreeMap<String, Vec<GeneratedOption>>,
     metadata_owners: Vec<String>,
+    local_bindings: BTreeSet<String>,
+    item_imports: BTreeMap<String, String>,
+    canonical_calls: Vec<CanonicalCall>,
+    lexical_owners: Vec<String>,
     module_owners: Vec<Vec<String>>,
     check_metadata_owner: bool,
 }
@@ -403,7 +551,132 @@ impl Validator<'_> {
             message.as_ref()
         ));
     }
+    fn has_protected_tokens(&self, stream: TokenStream) -> bool {
+        let tokens: Vec<_> = stream.into_iter().collect();
+        tokens.iter().enumerate().any(|(index, token)| match token {
+            TokenTree::Ident(id) => (self.operation_name(&id.unraw().to_string()) || (id.unraw().to_string().chars().next().is_some_and(char::is_uppercase) && (self.operations.contains(&id.unraw().to_string()) || self.aliases.contains(&id.unraw().to_string()))))
+                && (!self.local_bindings.contains(&id.unraw().to_string())
+                    || matches!(index.checked_sub(1).and_then(|i| tokens.get(i)), Some(TokenTree::Punct(p)) if matches!(p.as_char(), ':' | '.'))),
+            TokenTree::Group(group) => self.has_protected_tokens(group.stream()),
+            _ => false,
+        })
+    }
+    fn operation_name(&self, name: &str) -> bool {
+        ambient_operation(name)
+            || self.operations.contains(name)
+                && name.chars().next().is_some_and(char::is_lowercase)
+                && !matches!(name, "include" | "include_str")
+    }
+    fn protected_operation(&self, path: &syn::Path) -> bool {
+        path.segments
+            .last()
+            .is_some_and(|s| self.operation_name(&s.ident.unraw().to_string()))
+            || path.segments.iter().any(|s| {
+                let name = s.ident.unraw().to_string();
+                name.chars().next().is_some_and(char::is_uppercase)
+                    && (self.operations.contains(&name) || self.aliases.contains(&name))
+            })
+    }
+    fn canonical_call(&self, path: &syn::ExprPath) -> bool {
+        if path.qself.is_some()
+            || path
+                .path
+                .segments
+                .iter()
+                .any(|s| !matches!(s.arguments, syn::PathArguments::None))
+        {
+            return false;
+        }
+        let spelling = name(&path.path);
+        if self.glob.is_some()
+            && path.path.leading_colon.is_none()
+            && path
+                .path
+                .segments
+                .first()
+                .is_some_and(|s| s.ident.unraw() != "crate")
+            && path.path.segments.len() > 1
+        {
+            return false;
+        }
+        if path.path.segments.len() == 1 {
+            return self.item_imports.get(&spelling).is_some_and(|target| {
+                syn::parse_str::<syn::ExprPath>(target)
+                    .is_ok_and(|path| path.path.segments.len() > 1 && self.canonical_call(&path))
+            });
+        }
+        let Some(leaf) = path.path.segments.last() else {
+            return false;
+        };
+        let operation = leaf.ident.unraw().to_string();
+        if ambient_operation(&operation)
+            && (path.path.segments.len() == 1
+                || path
+                    .path
+                    .segments
+                    .iter()
+                    .any(|s| matches!(s.ident.unraw().to_string().as_str(), "env" | "process"))
+                || spelling.starts_with("libc::"))
+        {
+            let namespace = if matches!(operation.as_str(), "abort" | "exit") {
+                "process"
+            } else {
+                "env"
+            };
+            spelling == format!("std::{namespace}::{operation}")
+        } else {
+            // Receiver calls are visited separately. A free authority call
+            // must start at the defining crate, never a type or module alias.
+            path.path.segments.len() >= 2
+                && path.path.segments.first().is_some_and(|s| {
+                    let root = s.ident.unraw().to_string();
+                    root == "crate"
+                        || root.starts_with("carrick_")
+                        || root == "std"
+                        || root == "core"
+                        || root == "libc"
+                        || root == "tokio"
+                })
+        }
+    }
     fn imports(&mut self, tree: &syn::UseTree, prefix: &[String]) {
+        // `self` binds the last path component, never the token "self".
+        // Check the binding before inspecting the imported item's leaf.
+        let bound = match tree {
+            syn::UseTree::Name(n) if n.ident.unraw() == "self" => prefix.last().cloned(),
+            syn::UseTree::Name(n) => Some(n.ident.unraw().to_string()),
+            syn::UseTree::Rename(n) => Some(n.rename.unraw().to_string()),
+            _ => None,
+        };
+        if matches!(tree, syn::UseTree::Name(n) if n.ident.unraw() == "self")
+            && bound.as_ref().is_some_and(|bound| compiler_derive(bound))
+        {
+            self.reject(tree.span(), "self import may rebind a compiler derive");
+        }
+        if bound.as_ref().is_some_and(|bound| {
+            self.allowed.iter().any(|entry| {
+                entry.contains("::") && entry.split("::").next() == Some(bound.as_str())
+            })
+        }) {
+            self.reject(
+                tree.span(),
+                "audited macro binding may rebind a canonical provider",
+            );
+        }
+        if bound.as_ref().is_some_and(|bound| {
+            self.macro_audits.iter().any(|a| {
+                a.names.iter().any(|name| {
+                    name == bound
+                        || name.split("::").next() == Some(bound.as_str()) && name.contains("::")
+                })
+            })
+        }) {
+            let exact_item = matches!(tree, syn::UseTree::Name(n) if n.ident.unraw() != "self"
+                && self.macro_audits.iter().any(|audit| audit.names.contains(&format!("{}::{}", prefix.join("::"), n.ident.unraw()))));
+            if !exact_item {
+                self.reject(tree.span(), "audited macro binding import is unresolved");
+            }
+        }
         match tree {
             syn::UseTree::Path(path) => {
                 let mut prefix = prefix.to_vec();
@@ -472,16 +745,12 @@ impl Validator<'_> {
             }
             syn::UseTree::Name(import)
                 if import.ident.unraw() == "self"
-                    && prefix
-                        .last()
-                        .is_some_and(|p| matches!(p.as_str(), "std" | "env" | "process")) =>
+                    && prefix.last().is_some_and(|p| self.protected.contains(p)) =>
             {
                 self.reject(import.span(), "sensitive namespace self import is unsupported; use the explicit canonical path");
             }
             syn::UseTree::Glob(glob)
-                if prefix
-                    .last()
-                    .is_some_and(|p| matches!(p.as_str(), "std" | "env" | "process")) =>
+                if prefix.last().is_some_and(|p| self.protected.contains(p)) =>
             {
                 self.reject(glob.span(), "sensitive namespace glob import is unsupported; use the explicit canonical path");
             }
@@ -518,11 +787,20 @@ impl Validator<'_> {
                 );
             }
             syn::UseTree::Name(import)
-                if matches!(
-                    import.ident.unraw().to_string().as_str(),
-                    "abort" | "exit" | "env" | "process" | "std"
-                ) || (prefix.iter().any(|p| p == "env")
-                    && self.protected.contains(&import.ident.unraw().to_string())) =>
+                if self.operation_name(&import.ident.unraw().to_string())
+                    && syn::parse_str::<syn::ExprPath>(&format!(
+                        "{}{}::{}",
+                        if self.import_absolute { "::" } else { "" },
+                        prefix.join("::"),
+                        import.ident.unraw()
+                    ))
+                    .is_ok_and(|path| self.canonical_call(&path)) => {}
+            syn::UseTree::Name(import)
+                if self.operation_name(&import.ident.unraw().to_string())
+                    || matches!(
+                        import.ident.unraw().to_string().as_str(),
+                        "env" | "process" | "std" | "core"
+                    ) =>
             {
                 self.reject(import.span(), "unqualified termination or environment import is unsupported; use the explicit canonical path");
             }
@@ -688,9 +966,21 @@ impl<'ast> Visit<'ast> for Validator<'_> {
         }) {
             return;
         }
+        let previous_imports = self.item_imports.clone();
+        self.item_imports.extend(item_imports(file));
         visit::visit_file(self, file);
+        self.item_imports = previous_imports;
     }
     fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+        let previous_imports = self.item_imports.clone();
+        if let Some((_, items)) = &module.content {
+            self.item_imports.extend(item_imports(&syn::File {
+                shebang: None,
+                attrs: Vec::new(),
+                items: items.clone(),
+            }));
+        }
+
         if module.ident.unraw() == "std" {
             self.reject(
                 module.span(),
@@ -701,6 +991,12 @@ impl<'ast> Visit<'ast> for Validator<'_> {
         if self.allowed.iter().any(|entry| {
             entry.contains("::")
                 && entry.split("::").next() == Some(module.ident.unraw().to_string().as_str())
+        }) || self.macro_audits.iter().any(|a| {
+            a.names.iter().any(|name| {
+                name.contains("::")
+                    && !matches!(name.split("::").next(), Some("core" | "std" | "alloc"))
+                    && name.split("::").next() == Some(module.ident.unraw().to_string().as_str())
+            })
         }) {
             self.reject(module.span(), "module may rebind an audited macro provider");
         }
@@ -715,6 +1011,7 @@ impl<'ast> Visit<'ast> for Validator<'_> {
             self.reject(module.span(), "multiple module paths are unsupported");
         }
         visit::visit_item_mod(self, module);
+        self.item_imports = previous_imports;
     }
 
     fn visit_item(&mut self, item: &'ast syn::Item) {
@@ -729,20 +1026,56 @@ impl<'ast> Visit<'ast> for Validator<'_> {
             syn::Item::Struct(i) => &i.attrs,
             syn::Item::Enum(i) => &i.attrs,
             syn::Item::Union(i) => &i.attrs,
+            syn::Item::Type(i) => &i.attrs,
             _ => return visit::visit_item(self, item),
         };
         let previous = self.proven_test;
+        let builtin_test = matches!(item, syn::Item::Fn(_))
+            && attrs
+                .iter()
+                .any(|a| super::authority_source::path_is_ident(a.path(), "test"));
+        let cfg_excluded = attrs.iter().any(|a| {
+            super::authority_source::path_is_ident(a.path(), "cfg")
+                && super::authority_source::cfg_false(&a.meta)
+        });
+        if !self.opaque && !previous && !cfg_excluded && builtin_test && self.glob.is_some() {
+            self.reject(item.span(), "glob import makes test exclusion ambiguous");
+        }
         self.proven_test |= !self.opaque
-            && attrs.iter().any(|a| {
-                super::authority_source::path_is_ident(a.path(), "cfg")
-                    && super::authority_source::cfg_false(&a.meta)
-            });
+            && (builtin_test
+                || attrs.iter().any(|a| {
+                    super::authority_source::path_is_ident(a.path(), "cfg")
+                        && super::authority_source::cfg_false(&a.meta)
+                }));
         let previous_owners = self.metadata_owners.clone();
-        if let syn::Item::Struct(item) = item {
+        let ancestor = match item {
+            syn::Item::Mod(i) => Some(i.ident.unraw().to_string()),
+            syn::Item::Fn(i) => Some(i.sig.ident.unraw().to_string()),
+            syn::Item::Impl(i) => Some(super::authority_source::implementation_name(i)),
+            syn::Item::Trait(i) => Some(i.ident.unraw().to_string()),
+            syn::Item::Const(i) => Some(i.ident.unraw().to_string()),
+            syn::Item::Static(i) => Some(i.ident.unraw().to_string()),
+            syn::Item::Struct(i) => Some(i.ident.unraw().to_string()),
+            syn::Item::Enum(i) => Some(i.ident.unraw().to_string()),
+            syn::Item::Union(i) => Some(i.ident.unraw().to_string()),
+            syn::Item::Type(i) => Some(i.ident.unraw().to_string()),
+            _ => None,
+        };
+        if let Some(ancestor) = &ancestor {
+            self.lexical_owners.push(ancestor.clone());
+        }
+        if matches!(
+            item,
+            syn::Item::Struct(_) | syn::Item::Enum(_) | syn::Item::Union(_)
+        ) {
             self.metadata_owners = self
                 .module_owners
                 .iter()
-                .map(|module| format!("{}::{}", module.join("::"), item.ident.unraw()))
+                .map(|module| {
+                    let mut full = module.clone();
+                    full.extend(self.lexical_owners.clone());
+                    full.join("::")
+                })
                 .collect();
         }
         let previous_helpers = std::mem::take(&mut self.helpers);
@@ -766,11 +1099,6 @@ impl<'ast> Visit<'ast> for Validator<'_> {
                 }
                 let provider = if self.allowed.contains(&derive) {
                     Some(derive)
-                } else if self.derived_imports.contains(&derive) {
-                    self.allowed
-                        .iter()
-                        .find(|n| n.rsplit("::").next() == Some(derive.as_str()))
-                        .cloned()
                 } else {
                     None
                 };
@@ -789,9 +1117,31 @@ impl<'ast> Visit<'ast> for Validator<'_> {
         if !self.proven_test {
             visit::visit_item(self, item);
         }
+        if ancestor.is_some() {
+            self.lexical_owners.pop();
+        }
         self.metadata_owners = previous_owners;
         self.helpers = previous_helpers;
         self.proven_test = previous;
+    }
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        let previous = std::mem::take(&mut self.local_bindings);
+        visit::visit_item_fn(self, item);
+        self.local_bindings = previous;
+    }
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        let previous = std::mem::take(&mut self.local_bindings);
+        self.lexical_owners.push(item.sig.ident.unraw().to_string());
+        visit::visit_impl_item_fn(self, item);
+        self.local_bindings = previous;
+        self.lexical_owners.pop();
+    }
+    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
+        let previous = std::mem::take(&mut self.local_bindings);
+        self.lexical_owners.push(item.sig.ident.unraw().to_string());
+        visit::visit_trait_item_fn(self, item);
+        self.local_bindings = previous;
+        self.lexical_owners.pop();
     }
     fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
         let attribute = name(attr.path());
@@ -922,11 +1272,8 @@ impl<'ast> Visit<'ast> for Validator<'_> {
                                 "glob import makes audited macro binding ambiguous",
                             );
                         }
-                        if !compiler_derive_path(&path)
-                            && !self.allowed.contains(&derive)
-                            && !self.derived_imports.contains(&derive)
-                        {
-                            self.reject(path.span(), format!("unaudited derive macro {derive}; use an explicitly audited provider"));
+                        if !compiler_derive_path(&path) && !self.allowed.contains(&derive) {
+                            self.reject(path.span(), format!("unaudited derive macro {derive}; audited macro binding requires its canonical crate path"));
                         }
                     }
                 } else {
@@ -1047,24 +1394,174 @@ impl<'ast> Visit<'ast> for Validator<'_> {
             self.opaque = previous;
         }
     }
-    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-        fn unqualified(expression: &syn::Expr) -> Option<String> {
-            match expression {
-                syn::Expr::Path(path) if path.path.segments.len() == 1 => Some(name(&path.path)),
-                syn::Expr::Paren(expr) => unqualified(&expr.expr),
-                syn::Expr::Group(expr) => unqualified(&expr.expr),
-                _ => None,
+    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
+        self.local_bindings
+            .insert(pattern.ident.unraw().to_string());
+        visit::visit_pat_ident(self, pattern);
+    }
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        for attribute in &local.attrs {
+            self.visit_attribute(attribute);
+        }
+        if let Some(initializer) = &local.init {
+            self.visit_expr(&initializer.expr);
+            if let Some((_, diverge)) = &initializer.diverge {
+                self.visit_expr(diverge);
             }
         }
-        if unqualified(&call.func).is_some_and(|operation| ambient_operation(&operation)) {
-            self.reject(call.span(), "unresolved unqualified termination or environment call; use the explicit canonical path");
+        self.visit_pat(&local.pat);
+    }
+    fn visit_block(&mut self, block: &'ast syn::Block) {
+        let previous = self.local_bindings.clone();
+        let previous_imports = self.item_imports.clone();
+        let items = block
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                syn::Stmt::Item(item) => Some(item.clone()),
+                _ => None,
+            })
+            .collect();
+        let imports = item_imports(&syn::File {
+            shebang: None,
+            attrs: Vec::new(),
+            items,
+        });
+        for name in imports.keys() {
+            self.local_bindings.remove(name);
+        }
+        for statement in &block.stmts {
+            if let syn::Stmt::Item(syn::Item::Fn(function)) = statement {
+                self.local_bindings
+                    .remove(&function.sig.ident.unraw().to_string());
+            }
+        }
+        self.item_imports.extend(imports);
+        visit::visit_block(self, block);
+        self.local_bindings = previous;
+        self.item_imports = previous_imports;
+    }
+    fn visit_expr_let(&mut self, expression: &'ast syn::ExprLet) {
+        self.visit_expr(&expression.expr);
+        self.visit_pat(&expression.pat);
+    }
+    fn visit_expr_for_loop(&mut self, expression: &'ast syn::ExprForLoop) {
+        let previous = self.local_bindings.clone();
+        self.visit_expr(&expression.expr);
+        self.visit_pat(&expression.pat);
+        self.visit_block(&expression.body);
+        self.local_bindings = previous;
+    }
+    fn visit_expr_if(&mut self, expression: &'ast syn::ExprIf) {
+        let previous = self.local_bindings.clone();
+        self.visit_expr(&expression.cond);
+        self.visit_block(&expression.then_branch);
+        self.local_bindings = previous;
+        if let Some((_, branch)) = &expression.else_branch {
+            self.visit_expr(branch);
+        }
+    }
+    fn visit_expr_while(&mut self, expression: &'ast syn::ExprWhile) {
+        let previous = self.local_bindings.clone();
+        self.visit_expr(&expression.cond);
+        self.visit_block(&expression.body);
+        self.local_bindings = previous;
+    }
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        let previous = self.local_bindings.clone();
+        visit::visit_arm(self, arm);
+        self.local_bindings = previous;
+    }
+    fn visit_expr_closure(&mut self, expression: &'ast syn::ExprClosure) {
+        let previous = self.local_bindings.clone();
+        visit::visit_expr_closure(self, expression);
+        self.local_bindings = previous;
+    }
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if self.raw_methods.contains(&call.method.unraw().to_string()) && call.turbofish.is_some() {
+            self.reject(
+                call.span(),
+                "protected operation shape: receiver call generic arguments are unsupported",
+            );
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if self.opaque || !super::authority_source::expression_test_only(expr) {
+            visit::visit_expr(self, expr);
+        }
+    }
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref()
+            && self.protected_operation(&path.path)
+            && !(path.path.segments.len() == 1
+                && path
+                    .path
+                    .segments
+                    .first()
+                    .is_some_and(|s| self.local_bindings.contains(&s.ident.unraw().to_string())))
+        {
+            if !self.canonical_call(path) {
+                self.reject(call.func.span(), "protected operation shape requires a direct canonical path without generic arguments");
+            } else if path.path.segments.len() == 1 {
+                let range = path.span().byte_range();
+                self.canonical_calls.push(CanonicalCall {
+                    start: range.start,
+                    end: range.end,
+                    path: self.item_imports[&name(&path.path)]
+                        .trim_start_matches("::")
+                        .to_owned(),
+                });
+            }
+            // The callee is the only position in which a protected path is
+            // callable. Arguments and generic expressions are ordinary values.
+            for argument in &call.args {
+                self.visit_expr(argument);
+            }
+            return;
         }
         visit::visit_expr_call(self, call);
+    }
+    fn visit_expr_path(&mut self, path: &'ast syn::ExprPath) {
+        if self.protected_operation(&path.path)
+            && !(path.path.segments.len() == 1
+                && path
+                    .path
+                    .segments
+                    .first()
+                    .is_some_and(|s| self.local_bindings.contains(&s.ident.unraw().to_string())))
+        {
+            self.reject(path.span(), "protected operation shape: function/method values are unsupported; use a direct canonical path call");
+        }
+        visit::visit_expr_path(self, path);
     }
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
         let previous = self.import_absolute;
         self.import_absolute = item.leading_colon.is_some();
         self.imports(&item.tree, &[]);
+        if !matches!(item.vis, syn::Visibility::Inherited) {
+            fn leaves(tree: &syn::UseTree, names: &mut Vec<String>) {
+                match tree {
+                    syn::UseTree::Name(n) => names.push(n.ident.unraw().to_string()),
+                    syn::UseTree::Rename(n) => names.push(n.ident.unraw().to_string()),
+                    syn::UseTree::Path(p) => leaves(&p.tree, names),
+                    syn::UseTree::Group(g) => {
+                        for tree in &g.items {
+                            leaves(tree, names);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut names = Vec::new();
+            leaves(&item.tree, &mut names);
+            if names.iter().any(|n| self.operation_name(n)) {
+                self.reject(
+                    item.span(),
+                    "protected operation shape: re-export is unsupported",
+                );
+            }
+        }
         self.import_absolute = previous;
     }
     fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
@@ -1101,6 +1598,12 @@ impl<'ast> Visit<'ast> for Validator<'_> {
             && (self.protected.contains(&alias.unraw().to_string())
                 || self.allowed.iter().any(|name| {
                     name.split("::").next() == Some(alias.unraw().to_string().as_str())
+                })
+                || self.macro_audits.iter().any(|audit| {
+                    audit.names.iter().any(|name| {
+                        name.contains("::")
+                            && name.split("::").next() == Some(alias.unraw().to_string().as_str())
+                    })
                 }))
         {
             self.reject(
@@ -1110,6 +1613,30 @@ impl<'ast> Visit<'ast> for Validator<'_> {
         }
     }
     fn visit_item_macro(&mut self, item: &'ast syn::ItemMacro) {
+        if let Some(id) = &item.ident
+            && let Some(audit) = self
+                .macro_audits
+                .iter()
+                .find(|a| a.names.contains(&id.unraw().to_string()))
+            && !(audit
+                .definition_file
+                .as_ref()
+                .is_some_and(|file| self.root.join(file) == self.path)
+                && std::fs::read(self.path).is_ok_and(|bytes| {
+                    bytes.get(item.span().byte_range()).is_some_and(|body| {
+                        audit
+                            .definition_sha256
+                            .as_ref()
+                            .is_some_and(|hash| super::authority_source::source_hash(body) == *hash)
+                    })
+                }))
+        {
+            self.reject(
+                item.span(),
+                "audited macro binding definition is unresolved",
+            );
+        }
+
         if item.ident.as_ref().is_some_and(|id| {
             matches!(
                 id.unraw().to_string().as_str(),
@@ -1122,7 +1649,22 @@ impl<'ast> Visit<'ast> for Validator<'_> {
                 "macro may rebind a built-in or audited attribute name",
             );
         }
-        visit::visit_item_macro(self, item);
+        if item.ident.is_none() {
+            self.visit_macro(&item.mac);
+        } else {
+            // Definitions are opaque; the existing census also rejects any
+            // operation vocabulary generated without a compiler-resolved owner.
+            let previous = self.opaque;
+            self.opaque = true;
+            self.tokens(item.mac.tokens.clone(), true);
+            if self.has_protected_tokens(item.mac.tokens.clone()) {
+                self.reject(
+                    item.span(),
+                    "protected operation shape in an opaque macro definition",
+                );
+            }
+            self.opaque = previous;
+        }
     }
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         if name(&mac.path).starts_with("core::include") && mac.path.leading_colon.is_none() {
@@ -1154,6 +1696,44 @@ impl<'ast> Visit<'ast> for Validator<'_> {
         let previous = self.opaque;
         self.opaque = true;
         self.tokens(mac.tokens.clone(), !builtin);
+        let spelling = name(&mac.path);
+        let audit = self.macro_audits.iter().find(|a| {
+            a.names.contains(&spelling)
+                && (a.definition_file.is_some()
+                    || (mac.path.leading_colon.is_some() && spelling.contains("::")))
+        });
+        let protected_input = self.has_protected_tokens(mac.tokens.clone());
+        if let Some(audit) = audit.filter(|_| protected_input) {
+            let definition_valid = self.valid_definitions[&audit.names[0]];
+            if !definition_valid {
+                self.reject(
+                    mac.span(),
+                    "audited macro binding has a missing or changed definition",
+                );
+            } else if self.glob.is_some()
+                && mac.path.segments.len() == 1
+                && audit.definition_file.is_none()
+            {
+                self.reject(
+                    mac.span(),
+                    "audited macro binding is ambiguous under a glob; qualify the provider",
+                );
+            } else {
+                match audit.parse(mac.tokens.clone()) {
+                    Ok(input) => input.visit(self),
+                    Err(_) if self.has_protected_tokens(mac.tokens.clone()) => self.reject(
+                        mac.span(),
+                        "protected operation shape in unparsed audited macro input",
+                    ),
+                    Err(_) => {}
+                }
+            }
+        } else if protected_input {
+            self.reject(
+                mac.span(),
+                "protected operation shape in non-allowlisted or opaque macro input",
+            );
+        }
         self.opaque = previous;
     }
 }
