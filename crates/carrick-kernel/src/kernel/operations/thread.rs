@@ -423,9 +423,21 @@ impl PreparedThreadClone {
         let published_revision = match lane {
             PublicationLane::AbiBorn(ref mut reservation) => record
                 .task
-                .consume_thread_revision(reservation, record.revision),
+                .consume_reserved_revision(reservation, record.revision),
             _ => next_revision(&record.task, record.revision)?,
         };
+        let membership_revision = state
+            .reservations
+            .get(&task.key().id)
+            .map(|reservation| {
+                reservation.prepare_membership_revision(
+                    record.task.key(),
+                    record.revision,
+                    published_revision,
+                )
+            })
+            .transpose()?
+            .flatten();
         check_failpoint(failpoint, KernelFailpoint::BeforePublish)?;
         if pid_identity.is_some_and(|identity| !identity.commit()) {
             return Err(KernelOperationError::PidNamespaceMembership(task.key().id));
@@ -453,6 +465,9 @@ impl PreparedThreadClone {
                 });
         }
         record.thread_claims.insert(tid, claim);
+        if let Some(membership_revision) = membership_revision {
+            membership_revision.publish();
+        }
         record.revision = published_revision;
         // The thread claim inserted above now carries this thread in the
         // `RLIMIT_NPROC` count; release the in-flight charge in the same

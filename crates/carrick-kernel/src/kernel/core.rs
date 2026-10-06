@@ -2811,7 +2811,7 @@ pub(super) struct RegistryState {
     pub(super) retiring_tasks: BTreeMap<TaskId, RetiringTaskRecord>,
     pub(super) process_groups: BTreeMap<ProcessGroupId, ProcessGroupRecord>,
     pub(super) process_group_by_namespace: BTreeMap<(ContainerId, u32), ProcessGroupId>,
-    pub(super) reservations: BTreeMap<TaskId, carrick_hal::KernelTransactionId>,
+    pub(super) reservations: BTreeMap<TaskId, super::operations::TaskGraphReservation>,
     pub(super) retired_threads: super::thread_retirement::RetiredThreads,
     pub(super) sessions: BTreeMap<SessionId, SessionRecord>,
     pub(super) session_by_namespace: BTreeMap<(ContainerId, u32), SessionId>,
