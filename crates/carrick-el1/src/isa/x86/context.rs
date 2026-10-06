@@ -12,6 +12,17 @@ pub mod native;
 #[allow(dead_code)] // Linked CPL0 callers use the public TLS and XSAVE leaves.
 pub mod scheduler;
 
+/// Native syscall-return state. The caller keeps its task and MM custody;
+/// this value owns only machine registers captured on the current CPL0 CPU.
+pub struct SavedSyscallContext {
+    frame: native::NativeFrame,
+    fs_base: u64,
+    gs_base: u64,
+    xsave: scheduler::XsaveArea,
+}
+
+const _: () = assert!(core::mem::align_of::<scheduler::XsaveArea>() == 64);
+
 impl EntryBackend for X86Backend {
     fn current_stack_pointer(&mut self) -> Result<KernelStackPointer, Self::Error> {
         let sp: u64;
@@ -45,16 +56,35 @@ impl EntryBackend for X86Backend {
     }
     fn save_context(
         &mut self,
-        _frame: &Self::NativeFrame,
+        frame: &Self::NativeFrame,
     ) -> Result<Self::SavedContext, Self::Error> {
-        carrick_x86_unbound_thread_cpu()
+        if !frame.valid_user_return() {
+            return Err(ArchError::InvalidFrame);
+        }
+        let fs_base = scheduler::read_tls(scheduler::NativeTlsRegister::Fs);
+        let gs_base = scheduler::read_tls(scheduler::NativeTlsRegister::UserGs);
+        let mut xsave = scheduler::XsaveArea::ZERO;
+        scheduler::save_extended(&mut xsave);
+        Ok(SavedSyscallContext {
+            frame: *frame,
+            fs_base,
+            gs_base,
+            xsave,
+        })
     }
     fn load_context(
         &mut self,
-        _frame: &mut Self::NativeFrame,
-        _saved: &Self::SavedContext,
+        frame: &mut Self::NativeFrame,
+        saved: &Self::SavedContext,
     ) -> Result<(), Self::Error> {
-        carrick_x86_unbound_thread_cpu()
+        if !saved.frame.valid_user_return() {
+            return Err(ArchError::InvalidFrame);
+        }
+        scheduler::write_tls(scheduler::NativeTlsRegister::Fs, saved.fs_base);
+        scheduler::write_tls(scheduler::NativeTlsRegister::UserGs, saved.gs_base);
+        scheduler::restore_extended(&saved.xsave);
+        *frame = saved.frame;
+        Ok(())
     }
     fn prepare_user_return(
         &mut self,

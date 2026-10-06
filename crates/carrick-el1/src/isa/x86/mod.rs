@@ -17,14 +17,14 @@ pub struct X86Backend;
 pub type Kernel = carrick_guest_arch::Arch<X86Backend>;
 
 /// Construct the sealed kernel-facing adapter for CPL0.
-pub const fn kernel_arch() -> impl carrick_guest_arch::KernelArch {
+pub const fn kernel_arch() -> Kernel {
     carrick_guest_arch::Arch::new(X86Backend)
 }
 
 impl carrick_guest_arch::ArchTypes for X86Backend {
     type Error = ArchError;
     type NativeFrame = context::native::NativeFrame;
-    type SavedContext = context::scheduler::NativeContext;
+    type SavedContext = context::SavedSyscallContext;
     type Root = carrick_guest_arch::RootGpa;
     type MmOwner = carrick_el1_abi::CurrentTask;
     type OwnedTranslation = ();
