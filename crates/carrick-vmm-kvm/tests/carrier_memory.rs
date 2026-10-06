@@ -157,6 +157,29 @@ fn revoke_drains_loaded_translation_and_rejects_recycled_slot_edges() {
     w.map(0, DATA_VA, replacement, true).unwrap();
     byte(&mut w, 0, 0x99);
 }
+
+#[test]
+fn retired_guest_leaf_keeps_old_frame_until_owner_settlement() {
+    let program = code(&[(DATA_VA, None)]);
+    let mut w = MemoryWitness::boot([&program, &program]).unwrap();
+    let old = w.private_extent(0x41).unwrap();
+    w.map(0, DATA_VA, old, true).unwrap();
+    w.edit(0, DescriptorOp::Retire(PageSpan::new(DATA_VA, PAGE)))
+        .unwrap();
+    fault(&mut w, 0, 4);
+    assert!(
+        w.revoke(old).is_err(),
+        "retired output still names old frame"
+    );
+    let replacement = w.private_extent(0).unwrap();
+    w.cow_break(0, old, replacement).unwrap();
+    fault(&mut w, 0, 4);
+    w.revoke(old).unwrap();
+    assert!(w.revoke(replacement).is_err());
+    w.edit(0, DescriptorOp::Unmap(PageSpan::new(DATA_VA, PAGE)))
+        .unwrap();
+    w.revoke(replacement).unwrap();
+}
 #[test]
 fn shared_revoke_requires_both_alias_unlinks_and_both_exact_context_drains() {
     let program = code(&[(DATA_VA, None), (DATA_VA, None)]);

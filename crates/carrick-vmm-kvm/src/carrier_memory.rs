@@ -481,6 +481,8 @@ impl CarrierMemory {
         }
         // Track physical alias edges, not reservations or Linux VMA policy.
         // An old slot may not be revoked while any descriptor still names it.
+        // A retired terminal is inaccessible but still names its predecessor
+        // for owner scrub. Keep that physical edge until repoint or unlink.
         if matches!(
             txn.op,
             DescriptorOp::Unmap(_) | DescriptorOp::CowRepoint { .. }
@@ -525,7 +527,7 @@ impl CarrierMemory {
             let (entry, size) = match terminal {
                 Ok(value) => value,
                 Err(DescriptorRefusal::MissingTable)
-                    if matches!(txn.op, DescriptorOp::Unmap(_)) =>
+                    if matches!(txn.op, DescriptorOp::Unmap(_) | DescriptorOp::Retire(_)) =>
                 {
                     (0, PAGE)
                 }
@@ -578,8 +580,13 @@ impl CarrierMemory {
                 }
                 DescriptorOp::CowRepoint { .. } => {
                     entry & PRESENT != 0 && entry & WRITE != 0 && entry & COW == 0
+                        || entry & (PRESENT | PREPARED | RETIRED) == RETIRED && entry & ADDRESS != 0
                 }
                 DescriptorOp::Unmap(_) => entry & (PRESENT | PREPARED) == 0,
+                DescriptorOp::Retire(_) => {
+                    entry == 0
+                        || entry & (PRESENT | PREPARED | RETIRED) == RETIRED && entry & ADDRESS != 0
+                }
                 DescriptorOp::Coalesce { size: expected, .. } => {
                     entry & PRESENT != 0 && size == expected.bytes()
                 }
