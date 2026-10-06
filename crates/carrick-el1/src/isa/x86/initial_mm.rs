@@ -225,19 +225,49 @@ pub fn build_initial_stack(
     })
 }
 
-/// One page-aligned PT_LOAD (or initialized stack-tail) span. The bytes begin
-/// at `start + initialized_offset`; every other byte owes private zero fill.
-pub struct InitialImageRegion<'a> {
+/// File bytes already staged in guest physical memory by the carrier.
+#[derive(Clone, Copy)]
+pub struct InitialSourceRange {
+    pub start: FrameGpa,
+    pub len: u64,
+}
+
+/// One page-aligned PT_LOAD span. File bytes begin at
+/// `start + initialized_offset`; every other byte owes private zero fill.
+pub struct InitialImageRegion {
     pub start: u64,
     pub len: u64,
     pub initialized_offset: u64,
-    pub initialized: &'a [u8],
+    pub initialized: InitialSourceRange,
     pub perms: EditPermissions,
 }
 
 pub struct InitialImageSpec<'a> {
-    pub regions: &'a [InitialImageRegion<'a>],
+    pub regions: &'a [InitialImageRegion],
     pub stack: InitialStackSpec<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum RegionContents<'a> {
+    Guest(InitialSourceRange),
+    Stack(&'a [u8]),
+}
+
+impl RegionContents<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Guest(source) => source.len,
+            Self::Stack(bytes) => bytes.len() as u64,
+        }
+    }
+}
+
+struct MappedRegion<'a> {
+    start: u64,
+    len: u64,
+    initialized_offset: u64,
+    contents: RegionContents<'a>,
+    perms: EditPermissions,
 }
 
 /// A carrier-inventory grant of one zeroed, private 4 KiB frame. The owner
@@ -255,6 +285,13 @@ pub struct InitialDataGrant {
 pub trait InitialFrameSource {
     fn take_zeroed_table(&mut self) -> Option<RootGpa>;
     fn take_zeroed_data(&mut self) -> Option<InitialDataGrant>;
+    fn copy_guest_data(
+        &mut self,
+        grant: InitialDataGrant,
+        offset: u16,
+        source: FrameGpa,
+        len: u16,
+    ) -> bool;
     fn write_data(&mut self, grant: InitialDataGrant, offset: u16, bytes: &[u8]) -> bool;
 }
 
@@ -271,14 +308,14 @@ fn valid_page(frame: FrameGpa) -> bool {
     frame.raw() != 0 && frame.raw() & (PAGE - 1) == 0 && frame.raw() < (1 << 52)
 }
 
-fn checked_region(region: &InitialImageRegion<'_>) -> Result<u64, InitialMmError> {
+fn checked_region(region: &MappedRegion<'_>) -> Result<u64, InitialMmError> {
     let end = region
         .start
         .checked_add(region.len)
         .ok_or(InitialMmError::InvalidRange)?;
     let initialized_end = region
         .initialized_offset
-        .checked_add(region.initialized.len() as u64)
+        .checked_add(region.contents.len())
         .ok_or(InitialMmError::InvalidRange)?;
     if region.start < PAGE
         || region.start & (PAGE - 1) != 0
@@ -286,6 +323,8 @@ fn checked_region(region: &InitialImageRegion<'_>) -> Result<u64, InitialMmError
         || region.len & (PAGE - 1) != 0
         || end > USER_END
         || initialized_end > region.len
+        || matches!(region.contents, RegionContents::Guest(source) if source.start.raw() == 0
+            || source.start.raw().checked_add(source.len).is_none_or(|end| end > (1 << 52)))
         || !region.perms.user
         || (!region.perms.readable && (region.perms.writable || region.perms.executable))
     {
@@ -294,7 +333,7 @@ fn checked_region(region: &InitialImageRegion<'_>) -> Result<u64, InitialMmError
     Ok(end)
 }
 
-fn table_count(regions: &[&InitialImageRegion<'_>]) -> Result<usize, InitialMmError> {
+fn table_count(regions: &[MappedRegion<'_>]) -> Result<usize, InitialMmError> {
     let mut pml4 = BTreeSet::new();
     let mut pdpt = BTreeSet::new();
     let mut pd = BTreeSet::new();
@@ -329,11 +368,11 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     image: &InitialImageSpec<'_>,
 ) -> Result<InitialMmImage, InitialMmError> {
     let stack = build_initial_stack(&image.stack)?;
-    let stack_region = InitialImageRegion {
+    let stack_region = MappedRegion {
         start: stack.base,
         len: stack.bytes.len() as u64,
         initialized_offset: 0,
-        initialized: &stack.bytes,
+        contents: RegionContents::Stack(&stack.bytes),
         perms: EditPermissions {
             readable: true,
             writable: true,
@@ -341,8 +380,18 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
             user: true,
         },
     };
-    let mut spans: Vec<&InitialImageRegion<'_>> = image.regions.iter().collect();
-    spans.push(&stack_region);
+    let mut spans: Vec<MappedRegion<'_>> = image
+        .regions
+        .iter()
+        .map(|region| MappedRegion {
+            start: region.start,
+            len: region.len,
+            initialized_offset: region.initialized_offset,
+            contents: RegionContents::Guest(region.initialized),
+            perms: region.perms,
+        })
+        .collect();
+    spans.push(stack_region);
     spans.sort_by_key(|region| region.start);
     let mut previous_end = 0;
     for region in &spans {
@@ -397,7 +446,7 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     for region in spans {
         let end = region.start + region.len;
         let initialized_start = region.start + region.initialized_offset;
-        let initialized_end = initialized_start + region.initialized.len() as u64;
+        let initialized_end = initialized_start + region.contents.len();
         for va in (region.start..end).step_by(PAGE as usize) {
             let grant = source
                 .take_zeroed_data()
@@ -408,13 +457,23 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
             let copy_start = va.max(initialized_start);
             let copy_end = (va + PAGE).min(initialized_end);
             if copy_start < copy_end {
-                let from = (copy_start - initialized_start) as usize;
-                let to = (copy_end - initialized_start) as usize;
-                if !source.write_data(
-                    grant,
-                    (copy_start - va) as u16,
-                    &region.initialized[from..to],
-                ) {
+                let offset = (copy_start - va) as u16;
+                let from = copy_start - initialized_start;
+                let len = (copy_end - copy_start) as u16;
+                let copied = match region.contents {
+                    RegionContents::Guest(staged) => source.copy_guest_data(
+                        grant,
+                        offset,
+                        FrameGpa::new(staged.start.raw() + from),
+                        len,
+                    ),
+                    RegionContents::Stack(bytes) => source.write_data(
+                        grant,
+                        offset,
+                        &bytes[from as usize..from as usize + usize::from(len)],
+                    ),
+                };
+                if !copied {
                     return Err(InitialMmError::FrameUnavailable);
                 }
             }
@@ -515,6 +574,7 @@ mod tests {
         next_table: u64,
         next_data: u64,
         data: BTreeMap<u64, Box<[u8; 4096]>>,
+        staged: BTreeMap<u64, Vec<u8>>,
     }
     impl TestFrames {
         fn new() -> Self {
@@ -522,6 +582,7 @@ mod tests {
                 next_table: 0x80_0000,
                 next_data: 0x90_0000,
                 data: BTreeMap::new(),
+                staged: BTreeMap::new(),
             }
         }
         fn data_at(&self, pa: u64) -> &[u8; 4096] {
@@ -549,6 +610,30 @@ mod tests {
                 },
             })
         }
+        fn copy_guest_data(
+            &mut self,
+            grant: InitialDataGrant,
+            offset: u16,
+            source: FrameGpa,
+            len: u16,
+        ) -> bool {
+            let Some((&base, staged)) = self.staged.range(..=source.raw()).next_back() else {
+                return false;
+            };
+            let from = (source.raw() - base) as usize;
+            let Some(bytes) = staged.get(from..from + usize::from(len)) else {
+                return false;
+            };
+            let Some(target) = self.data.get_mut(&grant.frame.raw()) else {
+                return false;
+            };
+            let offset = usize::from(offset);
+            let Some(target) = target.get_mut(offset..offset + usize::from(len)) else {
+                return false;
+            };
+            target.copy_from_slice(bytes);
+            true
+        }
         fn write_data(&mut self, grant: InitialDataGrant, offset: u16, bytes: &[u8]) -> bool {
             let Some(page) = self.data.get_mut(&grant.frame.raw()) else {
                 return false;
@@ -570,7 +655,10 @@ mod tests {
                 start: 0x400000,
                 len: 0x1000,
                 initialized_offset: 0,
-                initialized: b"\xb8\xe7\0\0\0\xbf\x07\0\0\0\x0f\x05",
+                initialized: InitialSourceRange {
+                    start: FrameGpa::new(0x10_000),
+                    len: 12,
+                },
                 perms: EditPermissions {
                     readable: true,
                     writable: false,
@@ -582,7 +670,10 @@ mod tests {
                 start: 0x402000,
                 len: 0x1000,
                 initialized_offset: 0,
-                initialized: b"hi\n",
+                initialized: InitialSourceRange {
+                    start: FrameGpa::new(0x11_000),
+                    len: 3,
+                },
                 perms: EditPermissions {
                     readable: true,
                     writable: true,
@@ -604,6 +695,10 @@ mod tests {
         };
         let words = TestWords::new();
         let mut frames = TestFrames::new();
+        frames
+            .staged
+            .insert(0x10_000, b"\xb8\xe7\0\0\0\xbf\x07\0\0\0\x0f\x05".to_vec());
+        frames.staged.insert(0x11_000, b"hi\n".to_vec());
         let image = InitialImageSpec {
             regions: &regions,
             stack,
@@ -639,7 +734,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             frames.data_at(leaf.output.raw())[..12],
-            regions[0].initialized[..]
+            frames.staged[&0x10_000][..]
         );
         assert!(
             frames.data_at(leaf.output.raw())[12..]
