@@ -99,3 +99,50 @@ stage-2 lease and exact owner. `core-inventory-green.log` passes 94 focused
 tests (including the two neutral witnesses and all five native owner-fork
 tests), workspace all-target clippy, fmt-check and diff-check. This is VM-free
 proof, not a signed improvement claim.
+
+## Whole rebased-stack audit
+
+The director requested a witness audit of every pre-rebase fork fix, plus
+the anonymous owner-fault correction. `stack-audit.tsv` in the evidence
+directory records all ten: **five kept, one ported, four dropped**. Here
+"kept" means that the production guarantee and its witness survived the
+core extraction. "Dropped" describes an integration regression, not a
+deliberate retirement or a completed repair.
+
+| Original fix | Classification | Witness result on the integrated core path |
+| --- | --- | --- |
+| `c4b1836c4`, private identity copy | Kept | The two-live-MM fork witness fails with 66 custody entries instead of 6 when structural copy expands beyond identity pages. |
+| `dc85ec647`, live-leaf COW settlement | Kept | The no-host-arm witness fails with `span is not COW-armed` when the old host coverage requirement is reinstated. |
+| `f5121942c`, later owner edits | Kept | Both retirement and later fork-arm witnesses fail when settlement again requires the stale completed-write descriptor shape. |
+| `474d70f0e`, live-leaf vvar refresh | Kept | Both no-host-arm and clipped-neighbor witnesses fail when COW span selection uses only host arm metadata. Their native readonly import coverage was separately dropped. |
+| `e6411c853`, vvar permission ceilings | Dropped | Initial/exec image and native/tagged COW ceiling witnesses are absent. Image builders add vvar after stage-1 sealing; native execute ceilings are absent. The signed vvar leaf is again `0x07a0002e00000fc3`, recording W/X intent. |
+| `1ce444334`, readonly leaf adoption | Dropped | Its witness is absent. The shared core's AArch64 fork-arm hook still adopts only AP_RW leaves, excluding native AP_RO vvar. |
+| `be40000e3`, physical inventory extents | Ported | Two neutral core witnesses and the restored native producer/consumer witness fail before `452fd0e67` and pass after it. |
+| `2414ef7dd`, bound table custody | Dropped | The native-vvar fixture no longer removes its fixed-VA table row. Production COW still requires that row instead of resolving the actual manager's physical arena. |
+| `efc86a9fd`, identity stamp authority | Dropped | Both owner-selection and structural-pin witnesses are absent. The closed identity-write capability was removed; kernel stamping reverted to ordinary `write_bytes`. |
+| `b26645d94`, anonymous owner fault | Kept | Both ISA clipping witnesses fail without live-neighbor clipping. The actual fork fixture and both ISA fixtures fail when the admitted owner venue is replaced by the old unselected lazy request. |
+
+The audit temporarily reverses semantics in the current extracted code,
+rather than restoring old modules that conflict with order 3. Every edited
+file is restored byte-for-byte in a `finally` block. All eleven positive
+tests pass again after restoration. Core extent red/green receipts are
+separate; none of these VM-free controls requires an HVF VM.
+
+Audit receipts are under `stack-audit/`: `controls.tsv`,
+`owner-venue-controls.tsv`, semantic reversal diffs, and per-command logs.
+`dropped-witnesses.json` verifies all eight original witness names or
+fixture shapes present at `50d648e76` and absent at `452fd0e67`.
+`integration-dropped-code.patch` and the original fix patches preserve
+the source comparisons. The first settlement control failed to compile
+because a helper had been removed; its attempt is retained and excluded
+from behavioral evidence. Disabling anonymous clipping alone leaves the
+one-page fork fixture green: that fixture proves the owner handoff, while
+the two ISA fixtures prove neighborhood clipping. Both guarantees have
+qualified negative controls; the incomplete reversal is also retained.
+
+The four dropped guarantees are **not repaired by the extent port**. They
+need correction in the shared owner path with restored red-first witnesses;
+old AArch64 frame retirement authorities must remain retired. Their original
+signed failures are obscured on this artifact by the earlier inventory
+error. No signed pass or complete integration closure is claimed, and no
+file-table, clone-TID, copyout or anonymous-brk code was changed.
