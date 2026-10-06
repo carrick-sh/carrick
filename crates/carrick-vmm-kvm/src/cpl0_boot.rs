@@ -5,8 +5,8 @@ use crate::guest_setup::{GuestRam, WindowKind};
 use crate::{KvmKickHandle, KvmVcpu, KvmVm};
 use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
-    BlockedMask, Counters, CurrentTask, EL1_BOOTSTRAP_METADATA_BASE, EL1_BOOTSTRAP_METADATA_SIZE,
-    El1TaskId, ThreadControlSlot, ThreadLifecyclePage, X86_CPL0_DYNAMIC_METADATA_BASE,
+    BlockedMask, Counters, CurrentTask, EL1_BOOTSTRAP_METADATA_SIZE, El1TaskId, ThreadControlSlot,
+    ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE, X86_CPL0_DYNAMIC_METADATA_BASE,
 };
 use carrick_hal::{HvVcpu, HvVm, MemPerms, TrapError, VcpuExit, VcpuKick};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
@@ -24,9 +24,6 @@ const RAM_SIZE: usize = 16 * 1024 * 1024;
 const META_GPA: u64 = 0xc0_0000;
 const META_LEN: u64 = 0x2_0000;
 const ALLOCATOR_GPA: u64 = 0x20_00000;
-const RESIDENCY_GPA: u64 = 0x30_00000;
-const RESIDENCY_LEN: u64 =
-    (size_of::<carrick_el1_abi::FrameGrantResidencyTable>() as u64 + 4095) & !4095;
 const COUNTERS_OFFSET: u64 = 0x1_0000;
 const BINDING_OFFSET: u64 = 0x8000;
 const TASK_OFFSET: u64 = 0x9000;
@@ -37,6 +34,7 @@ const IMAGE_VA: u64 = 0xffff_ffff_8000_0000;
 const IMAGE_GPA: u64 = 0x10_0000;
 const METADATA_VA: u64 = X86_CPL0_DYNAMIC_METADATA_BASE;
 pub const USER_CODE: u64 = 0x1_0000;
+pub(crate) use carrick_x86::cpl0_entry::DIRECT_VA;
 const LAYOUT: BringupLayout = BringupLayout {
     trampoline_base: 0x10_0000,
     gdt_base: 0x50_0000,
@@ -203,21 +201,6 @@ impl Cpl0Carrier {
             WindowKind::Private,
         )
         .map_err(|e| fail(e.to_string()))?;
-        ram.add_window(RESIDENCY_GPA, RESIDENCY_LEN as usize, WindowKind::Private)
-            .map_err(|e| fail(e.to_string()))?;
-        let residency = ram
-            .host_ptr(
-                RESIDENCY_GPA,
-                size_of::<carrick_el1_abi::FrameGrantResidencyTable>(),
-            )
-            .ok_or_else(|| fail("residency backing"))?;
-        // SAFETY: this retained, page-aligned KVM window is private and no
-        // vCPU has started. Construct the ABI atomics in place for the guest.
-        unsafe {
-            residency
-                .cast::<carrick_el1_abi::FrameGrantResidencyTable>()
-                .write(carrick_el1_abi::FrameGrantResidencyTable::new());
-        }
         let mut maps = Vec::new();
         for segment in &plan.segments {
             let end = segment
@@ -270,21 +253,14 @@ impl Cpl0Carrier {
             exec: false,
         });
         maps.push(Pml4MapSpec {
-            va: EL1_BOOTSTRAP_METADATA_BASE,
+            va: X86_CPL0_BOOTSTRAP_METADATA_BASE,
             gpa: ALLOCATOR_GPA,
             len: EL1_BOOTSTRAP_METADATA_SIZE,
             user: false,
             write: true,
             exec: false,
         });
-        maps.push(Pml4MapSpec {
-            va: CPL0_RESIDENCY_ALIAS_BASE,
-            gpa: RESIDENCY_GPA,
-            len: RESIDENCY_LEN,
-            user: false,
-            write: true,
-            exec: false,
-        });
+
         for (index, program) in programs.iter().enumerate() {
             if program.len() > 4096 {
                 return Err(fail("CPL0 fixture exceeds one code page"));

@@ -342,11 +342,11 @@ mod kernel {
             return;
         }
         if frame.rax == OBSERVE_DESCRIPTOR_PREPARE_PUBLISH {
+            use carrick_core::mm::transfer::resolver::PreparedPageResolver;
             use carrick_guest_arch::{
                 EditBacking, EditLeafSize, EditOperation, EditPermissions, FrameGpa, GuestLen,
                 KernelVa,
             };
-            use carrick_core::mm::transfer::resolver::PreparedPageResolver;
             use carrick_mmu_core::aarch64::{GuestPreparedCommit, LeafAccess};
             use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
             let one = core::num::NonZeroU64::MIN;
@@ -392,12 +392,8 @@ mod kernel {
                     GuestLen::new(FIXTURE_PML4_CAPACITY),
                 )
             };
-            let published = resolver.commit_prepared(
-                0x60_0000,
-                0x3_2000,
-                0x9_0000,
-                LeafAccess::Read,
-            );
+            let published =
+                resolver.commit_prepared(0x60_0000, 0x3_2000, 0x9_0000, LeafAccess::Read);
             match published {
                 Ok(GuestPreparedCommit::Committed) => {}
                 Err(carrick_mmu_core::aarch64::GuestPreparedCommitError::RollbackFailed) => {
@@ -409,12 +405,7 @@ mod kernel {
                     return;
                 }
             }
-            let retry = resolver.commit_prepared(
-                0x60_0000,
-                0x3_2000,
-                0x9_0000,
-                LeafAccess::Read,
-            );
+            let retry = resolver.commit_prepared(0x60_0000, 0x3_2000, 0x9_0000, LeafAccess::Read);
             frame.rax = match retry {
                 Ok(GuestPreparedCommit::AlreadyResident) => 1,
                 Err(carrick_mmu_core::aarch64::GuestPreparedCommitError::RollbackFailed) => {
@@ -478,11 +469,19 @@ mod kernel {
                 doorbell(FATAL_PORT, frame);
                 halt();
             };
-            // SAFETY: the KVM carrier constructed this aligned ABI table in
-            // retained supervisor memory before admitting either vCPU.
+            let layout = core::alloc::Layout::new::<carrick_el1_abi::FrameGrantResidencyTable>();
+            // SAFETY: the global allocator returns an aligned block of this layout;
+            // this fixture owns it exclusively until deallocated below.
+            let ptr = unsafe { crate::rust_alloc::alloc::alloc(layout) };
+            if ptr.is_null() {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            // SAFETY: ptr is non-null, aligned and valid for FrameGrantResidencyTable.
             let residency = unsafe {
-                &*(CPL0_RESIDENCY_ALIAS_BASE
-                    as *const carrick_el1_abi::FrameGrantResidencyTable)
+                let table_ptr = ptr.cast::<carrick_el1_abi::FrameGrantResidencyTable>();
+                carrick_el1_abi::FrameGrantResidencyTable::init_in_place(table_ptr);
+                &*table_ptr
             };
             if residency
                 .publish(FrameGrantResidencyIdentity {
@@ -533,10 +532,10 @@ mod kernel {
                 }),
                 &mut NoopCowResolver,
             );
-            frame.rax = u64::from(
-                action == Action::Served
-                    && residency.is_guest_committed(mm, 0x3_3000),
-            );
+            frame.rax =
+                u64::from(action == Action::Served && residency.is_guest_committed(mm, 0x3_3000));
+            // SAFETY: ptr was returned for layout and has not escaped.
+            unsafe { crate::rust_alloc::alloc::dealloc(ptr, layout) };
             return;
         }
         if frame.rax == OBSERVE_ALLOCATOR {
@@ -559,7 +558,7 @@ mod kernel {
             // SAFETY: the same byte remains allocated until dealloc below.
             let valid = (ptr as usize & 63) == 0
                 && (ptr as u64)
-                    .checked_sub(carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE)
+                    .checked_sub(carrick_el1_abi::X86_CPL0_BOOTSTRAP_METADATA_BASE)
                     .is_some_and(|offset| offset < carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE)
                 && unsafe { core::ptr::read_volatile(ptr.add(127)) } == 0xa5;
             // SAFETY: ptr was returned for layout and has not escaped.

@@ -277,8 +277,8 @@ impl PreparedPageResolver for X86PreparedResolver {
         access: LeafAccess,
     ) -> Result<GuestPreparedCommit, GuestPreparedCommitError> {
         use carrick_guest_arch::{
-            Access, EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, MmuEditArch,
-            RootGpa, TableWindow, UserRange, UserVa,
+            Access, EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, MmuEditArch, RootGpa,
+            TableWindow, UserRange, UserVa,
         };
         use carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal;
         use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
@@ -304,10 +304,9 @@ impl PreparedPageResolver for X86PreparedResolver {
         // SAFETY: the constructor requires a retained supervisor alias; this
         // resolver is invoked only while the shared dispatcher holds the
         // exact editor of the authenticated root.
-        let tables = unsafe {
-            TableWindow::issue(root.address(), self.table_alias, self.table_bytes)
-        }
-        .ok_or(GuestPreparedCommitError::TableOutsidePrimary)?;
+        let tables =
+            unsafe { TableWindow::issue(root.address(), self.table_alias, self.table_bytes) }
+                .ok_or(GuestPreparedCommitError::TableOutsidePrimary)?;
         // SAFETY: `under_editor` requires this resolver to run only under the
         // exact-MM editor; the caller's grant names the current MM root.
         let owner = unsafe { EditOwner::issue(root, self.mm_key, sequence) };
@@ -364,7 +363,9 @@ impl PreparedPageResolver for X86PreparedResolver {
                 DescriptorOutcome::Refused(DescriptorRefusal::TableOutsidePrimary) => {
                     Err(GuestPreparedCommitError::TableOutsidePrimary)
                 }
-                DescriptorOutcome::Indeterminate(_) => Err(GuestPreparedCommitError::RollbackFailed),
+                DescriptorOutcome::Indeterminate(_) => {
+                    Err(GuestPreparedCommitError::RollbackFailed)
+                }
                 _ => Err(GuestPreparedCommitError::NotPrepared),
             },
             Err(crate::isa::ArchError::Busy) => Err(GuestPreparedCommitError::RollbackFailed),
@@ -1515,7 +1516,7 @@ mod tests {
         use carrick_guest_arch::{Access, FaultInfo, UserVa};
         assert_eq!(
             x86_fault_class(FaultInfo {
-                address: UserVa::new(0xffff_9000_0060_0000),
+                address: UserVa::new(0xffff_ffff_9000_0000),
                 access: Access::Write,
                 present: false,
             }),

@@ -175,6 +175,24 @@ impl FrameGrantResidencyTable {
         }
     }
 
+    /// Initialize in place without materializing a large stack temporary.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for writes, non-null, aligned to `align_of::<Self>()`,
+    /// and point to storage of at least `size_of::<Self>()` bytes.
+    pub unsafe fn init_in_place(ptr: *mut Self) {
+        // SAFETY: caller guarantees ptr is valid for writes of size_of::<Self>() and aligned.
+        unsafe {
+            core::ptr::write_bytes(ptr.cast::<u8>(), 0, core::mem::size_of::<Self>());
+            let table = &mut *ptr;
+            for record in table.slots.iter_mut() {
+                record
+                    .transfer_pins
+                    .store(TRANSFER_PIN_RETIRED, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn first_slot(mm_key: u64, bucket: u64, class: u32) -> usize {
         let mixed = mm_key.wrapping_mul(0x9e37_79b9_7f4a_7c15)
             ^ bucket.wrapping_mul(0xbf58_476d_1ce4_e5b9)

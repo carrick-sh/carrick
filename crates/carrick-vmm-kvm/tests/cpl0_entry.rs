@@ -243,11 +243,9 @@ fn shared_kernel_x86_fault_settles_prepared_grant_in_guest() {
     program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
-    let mut carrier = Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM image");
-    assert_eq!(
-        carrier.observe(0).expect("shared x86 fault path").result,
-        1
-    );
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(carrier.observe(0).expect("shared x86 fault path").result, 1);
     let leaf = carrier.fixture_user_leaf(0x3_3000).expect("faulted leaf");
     assert_eq!(leaf & (1 << 9), 0);
     assert_ne!(leaf & 1, 0);
