@@ -28,6 +28,7 @@ use core::sync::atomic::Ordering;
 pub trait GuestDispatchFrame: SyscallFrame {
     fn arm_frame(&mut self) -> Option<&mut TrapFrame>;
     fn arm_scheduler(&self) -> bool;
+    fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64>;
 }
 
 impl GuestDispatchFrame for TrapFrame {
@@ -36,6 +37,9 @@ impl GuestDispatchFrame for TrapFrame {
     }
     fn arm_scheduler(&self) -> bool {
         true
+    }
+    fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+        None
     }
 }
 

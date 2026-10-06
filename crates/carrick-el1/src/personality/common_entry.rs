@@ -1,19 +1,25 @@
 //! ARM image adapter for the single Linux entry dispatcher.
+#[cfg(any(test, feature = "host-test"))]
 use super::thread_setup::{LifecycleVenue, RobustListHead, RobustListLen, RobustListSlot};
-use carrick_el1_abi::{Counters, CurrentTask};
+#[cfg(any(test, feature = "host-test"))]
+use carrick_el1_abi::Counters;
+use carrick_el1_abi::CurrentTask;
+#[cfg(any(test, feature = "host-test"))]
 use carrick_personality_linux::dispatch::EntryCounters;
-use carrick_personality_linux::entry::CanonicalCall;
-use carrick_personality_linux::entry::{self, ExecutionBinding, SharedVenue};
+use carrick_personality_linux::entry::ExecutionBinding;
+#[cfg(any(test, feature = "host-test"))]
+use carrick_personality_linux::entry::{self, CanonicalCall, SharedVenue};
+#[cfg(any(test, feature = "host-test"))]
 use core::sync::atomic::AtomicU64;
 
-pub use carrick_personality_linux::entry::EntryOutcome;
-pub use carrick_personality_linux::entry::SYS_SET_ROBUST_LIST;
-pub use carrick_personality_linux::entry::decode_x86_64;
+#[cfg(any(test, feature = "host-test"))]
+pub use carrick_personality_linux::entry::{EntryOutcome, SYS_SET_ROBUST_LIST, decode_x86_64};
 
 pub fn execution_binding(task: &CurrentTask) -> ExecutionBinding {
     carrick_core::entry::binding(&task.execution, &task.mm)
 }
 
+#[cfg(any(test, feature = "host-test"))]
 pub fn serve_canonical(
     call: &CanonicalCall,
     counters: &Counters,

@@ -1,5 +1,6 @@
 //! Linux decoding and dispatch at the shared native-entry seam.
 pub use crate::abi::entry::{CanonicalCall, CanonicalOrdinal, SyscallResult};
+#[cfg(any(test, feature = "fixture-entry"))]
 use carrick_core_abi::EntryMmKey;
 pub use carrick_core_abi::ExecutionBinding;
 use carrick_guest_arch::{
@@ -77,6 +78,7 @@ pub fn decode_aarch64(native: u64, args: [u64; 6], stack: u64) -> CanonicalCall 
     }
 }
 
+#[cfg(any(test, feature = "fixture-entry"))]
 #[derive(Debug, Eq, PartialEq)]
 pub enum EntryOutcome {
     Served { result: SyscallResult },
@@ -85,6 +87,7 @@ pub enum EntryOutcome {
     InvalidCompletion,
 }
 
+#[cfg(any(test, feature = "fixture-entry"))]
 pub trait LinuxEntryVenue {
     fn binding(&self) -> ExecutionBinding;
     fn set_robust_list(&self, head: u64, len: u64) -> Option<i64>;
@@ -94,12 +97,14 @@ pub trait LinuxEntryVenue {
 }
 
 /// Shared counter/work transport over live native binding and robust-list hooks.
+#[cfg(any(test, feature = "fixture-entry"))]
 pub struct SharedVenue<'a, B, R> {
     pub binding: B,
     pub state: &'a crate::abi::entry::LinuxTaskState,
     pub counters: crate::dispatch::EntryCounters<'a>,
     pub robust_list: R,
 }
+#[cfg(any(test, feature = "fixture-entry"))]
 impl<B: Fn() -> ExecutionBinding, R: Fn(u64, u64) -> Option<i64>> LinuxEntryVenue
     for SharedVenue<'_, B, R>
 {
@@ -120,11 +125,13 @@ impl<B: Fn() -> ExecutionBinding, R: Fn(u64, u64) -> Option<i64>> LinuxEntryVenu
     }
 }
 
+#[cfg(any(test, feature = "fixture-entry"))]
 struct CommonFamilies<'a> {
     venue: &'a dyn LinuxEntryVenue,
     args: [u64; 6],
     result: Option<i64>,
 }
+#[cfg(any(test, feature = "fixture-entry"))]
 impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
     fn binding(&self) -> Option<ExecutionBinding> {
         Some(self.venue.binding())
@@ -158,6 +165,7 @@ impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
     }
 }
 
+#[cfg(any(test, feature = "fixture-entry"))]
 pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome {
     let Ok(_) = usize::try_from(call.canonical.raw()) else {
         return EntryOutcome::Forward;
@@ -182,6 +190,7 @@ pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome 
     }
 }
 
+#[cfg(any(test, feature = "fixture-entry"))]
 impl crate::lifecycle::UserCopy for CommonFamilies<'_> {
     fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> bool {
         false
@@ -190,6 +199,7 @@ impl crate::lifecycle::UserCopy for CommonFamilies<'_> {
         false
     }
 }
+#[cfg(any(test, feature = "fixture-entry"))]
 impl<'a> crate::lifecycle::LifecycleNative<'a> for CommonFamilies<'a> {
     fn arguments(&self) -> [u64; 6] {
         self.args
