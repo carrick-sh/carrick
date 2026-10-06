@@ -6,8 +6,9 @@ use carrick_guest_arch::{
     InterruptReason, WakeToken,
 };
 use core::num::NonZeroU64;
+use core::sync::atomic::Ordering;
 
-/// Query the TSC frequency via CPUID leaves 0x15, 0x16, or nominal 1 GHz fallback.
+/// Query the TSC frequency from architectural CPUID or the exact KVM binding.
 pub fn tsc_frequency() -> Option<NonZeroU64> {
     let max_leaf: u32;
     // SAFETY: CPUID leaf 0 returns max basic leaf without side effects.
@@ -40,12 +41,13 @@ pub fn tsc_frequency() -> Option<NonZeroU64> {
                 options(nomem, preserves_flags),
             );
         }
-        if eax != 0 && ebx != 0 && ecx != 0 {
-            if let Some(prod) = (ecx as u64).checked_mul(ebx as u64) {
-                if let Some(hz) = NonZeroU64::new(prod / (eax as u64)) {
-                    return Some(hz);
-                }
-            }
+        if eax != 0
+            && ebx != 0
+            && ecx != 0
+            && let Some(prod) = (ecx as u64).checked_mul(ebx as u64)
+            && let Some(hz) = NonZeroU64::new(prod / (eax as u64))
+        {
+            return Some(hz);
         }
     }
     if max_leaf >= 0x16 {
@@ -62,16 +64,31 @@ pub fn tsc_frequency() -> Option<NonZeroU64> {
                 options(nomem, preserves_flags),
             );
         }
-        if eax != 0 {
-            if let Some(hz) = (eax as u64)
+        if eax != 0
+            && let Some(hz) = (eax as u64)
                 .checked_mul(1_000_000)
                 .and_then(NonZeroU64::new)
-            {
-                return Some(hz);
-            }
+        {
+            return Some(hz);
         }
     }
-    NonZeroU64::new(1_000_000_000)
+    super::context::current_cpu_binding()
+        .and_then(|binding| NonZeroU64::new(binding.tsc_hz.load(Ordering::Acquire)))
+}
+
+fn has_tsc_deadline() -> bool {
+    let features: u32;
+    // SAFETY: CPUID leaf 1 reports this vCPU's TSC-deadline MSR capability.
+    unsafe {
+        core::arch::asm!(
+            "push rbx", "cpuid", "pop rbx",
+            inout("eax") 1_u32 => _,
+            out("ecx") features,
+            out("edx") _,
+            options(nomem, preserves_flags),
+        );
+    }
+    features & (1 << 24) != 0
 }
 
 impl InterruptBackend for X86Backend {
@@ -95,25 +112,49 @@ impl InterruptBackend for X86Backend {
             .ok_or(ArchError::Unbound)
     }
     fn arm_timer(&mut self, deadline: Option<Deadline>) -> Result<(), Self::Error> {
-        let ticks = match deadline {
-            None => None,
-            Some(d) => {
-                let now = self.counter()?.raw();
-                let delta = d.0.raw().saturating_sub(now);
-                // APIC timer divide by 16
-                let apic_ticks = u32::try_from(delta / 16).unwrap_or(u32::MAX).max(1);
-                Some(interrupts::TimerTicks(apic_ticks))
+        let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+        // SAFETY: this exact CPL0 CPU has its xAPIC mapped by bootstrap.
+        unsafe { interrupts::hardware::enable() };
+        if has_tsc_deadline() {
+            // SAFETY: CPUID qualified IA32_TSC_DEADLINE; the argument uses
+            // the same absolute TSC domain as `counter()`.
+            unsafe { interrupts::hardware::arm_tsc_deadline(deadline.map(|d| d.0.raw())) };
+        } else {
+            let tsc_hz = self.frequency()?.raw().get();
+            let mut apic_hz = binding.apic_timer_hz.load(Ordering::Acquire);
+            if deadline.is_some() && apic_hz == 0 {
+                // SAFETY: this CPU owns its mapped xAPIC timer while stopped
+                // in CPL0. The measured rate is retained for later arms.
+                apic_hz = unsafe { interrupts::hardware::measure_timer_rate(tsc_hz) }
+                    .ok_or(ArchError::Unbound)?;
+                binding.apic_timer_hz.store(apic_hz, Ordering::Release);
             }
-        };
-        // SAFETY: CPL0 local APIC timer programming.
-        unsafe {
-            interrupts::hardware::enable();
-            interrupts::hardware::arm_timer(ticks);
+            let ticks = deadline
+                .map(|d| {
+                    let delta = d.0.raw().saturating_sub(self.counter()?.raw()).max(1);
+                    let ticks = u128::from(delta) * u128::from(apic_hz) / u128::from(tsc_hz);
+                    u32::try_from(ticks.max(1))
+                        .map(interrupts::TimerTicks)
+                        .map_err(|_| ArchError::Unbound)
+                })
+                .transpose()?;
+            // SAFETY: the APIC rate was measured on this CPU; the one-shot
+            // count and divider are in the same calibrated tick domain.
+            unsafe { interrupts::hardware::arm_timer(ticks) };
         }
         Ok(())
     }
     fn send_wake(&mut self, target: CpuTarget, _token: WakeToken) -> Result<(), Self::Error> {
-        let apic_id = u8::try_from(target.cpu.raw()).map_err(|_| ArchError::Unbound)?;
+        let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
+        let shift = target
+            .cpu
+            .raw()
+            .checked_mul(16)
+            .filter(|shift| *shift < 32)
+            .ok_or(ArchError::Unbound)?;
+        let encoded = (binding.wake_apic_ids.load(Ordering::Acquire) >> shift) & 0xffff;
+        let apic_id = u8::try_from(encoded.checked_sub(1).ok_or(ArchError::Unbound)?)
+            .map_err(|_| ArchError::Unbound)?;
         // SAFETY: caller published wake ownership first; target CPU is bound.
         unsafe { interrupts::hardware::send_wake(interrupts::ApicId(apic_id)) }
             .map_err(|_| ArchError::Busy)?;
@@ -164,19 +205,9 @@ impl InterruptBackend for X86Backend {
         Ok(())
     }
     fn current_cpu(&mut self) -> CpuId {
-        let binding_address: u64;
-        // SAFETY: SWAPGS has installed the retained per-vCPU binding before
-        // any shared-kernel entry; GS:[16] is its immutable self pointer.
-        unsafe {
-            core::arch::asm!(
-                "mov {}, gs:[16]",
-                out(reg) binding_address,
-                options(nostack, preserves_flags)
-            );
-        }
-        // SAFETY: stopped-host bootstrap owns this binding through vCPU
-        // retirement. Its slot is immutable after publication.
-        let binding = unsafe { &*(binding_address as *const super::context::native::CpuBinding) };
+        let Some(binding) = super::context::current_cpu_binding() else {
+            super::transport::fatal_entry_binding();
+        };
         CpuId::new(binding.cpu_slot)
     }
 }
@@ -205,25 +236,17 @@ pub fn witness(op: u64, arg: u64) -> u64 {
         2 => {
             let target = CpuTarget {
                 cpu: CpuId::new(arg as u32),
-                generation: carrick_guest_arch::CpuGeneration::new(
-                    core::num::NonZeroU64::new(1).unwrap(),
-                ),
+                generation: carrick_guest_arch::CpuGeneration::new(core::num::NonZeroU64::MIN),
             };
             let token = WakeToken {
                 task: carrick_guest_arch::TaskIdentity {
-                    carrier: carrick_guest_arch::CarrierGeneration::new(
-                        core::num::NonZeroU64::new(1).unwrap(),
-                    ),
-                    task: carrick_guest_arch::TaskSerial::new(
-                        core::num::NonZeroU64::new(1).unwrap(),
-                    ),
+                    carrier: carrick_guest_arch::CarrierGeneration::new(core::num::NonZeroU64::MIN),
+                    task: carrick_guest_arch::TaskSerial::new(core::num::NonZeroU64::MIN),
                     execution: carrick_guest_arch::ExecutionGeneration::new(
-                        core::num::NonZeroU64::new(1).unwrap(),
+                        core::num::NonZeroU64::MIN,
                     ),
                 },
-                operation: carrick_guest_arch::OperationSequence::new(
-                    core::num::NonZeroU64::new(1).unwrap(),
-                ),
+                operation: carrick_guest_arch::OperationSequence::new(core::num::NonZeroU64::MIN),
             };
             match backend.send_wake(target, token) {
                 Ok(()) => 0,
