@@ -776,7 +776,7 @@ impl Cpl0Carrier {
         &mut self,
         max_exits: usize,
         mut stdio: impl FnMut(i32, &[u8]) -> i64,
-    ) -> Result<(i32, usize), TrapError> {
+    ) -> Result<InitialProcessExit, TrapError> {
         let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or_else(|| fail("initial MM key"))?;
         let root = self
             ._vm
@@ -818,7 +818,7 @@ impl Cpl0Carrier {
                         ));
                     }
                     let record = carrick_x86::FaultDoorbellRecord::from_u32_words(&words)?;
-                    return Err(fail(format!("initial process fault: {record:?}")));
+                    return Ok(InitialProcessExit::Fault { record, exits });
                 }
                 let mut detail = match exit {
                     VcpuExit::IoOut { port, .. } => {
@@ -856,7 +856,12 @@ impl Cpl0Carrier {
                     let bytes = self.read_initial_user(root, frame.rsi, len)?;
                     frame.rax = stdio(fd, &bytes) as u64;
                 }
-                60 | 231 => return Ok(((frame.rdi & 255) as i32, exits)),
+                60 | 231 => {
+                    return Ok(InitialProcessExit::Exited {
+                        code: (frame.rdi & 255) as i32,
+                        exits,
+                    });
+                }
                 call => return Err(fail(format!("unported initial x86 syscall {call}"))),
             }
         }
@@ -1959,4 +1964,17 @@ impl Cpl0Carrier {
         }
         Ok(true)
     }
+}
+
+/// A guest exception is an owned process outcome, separate from carrier failure.
+#[derive(Debug)]
+pub enum InitialProcessExit {
+    Exited {
+        code: i32,
+        exits: usize,
+    },
+    Fault {
+        record: carrick_x86::FaultDoorbellRecord,
+        exits: usize,
+    },
 }

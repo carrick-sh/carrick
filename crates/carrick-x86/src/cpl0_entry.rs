@@ -50,6 +50,7 @@ impl PublishedApicIds {
     }
 }
 
+pub const FAULT_DOORBELL_PORT: u16 = 0xc7;
 pub const FORWARD_PORT: u16 = 0xc5;
 pub const CONTROL_PORT: u16 = 0xc8;
 pub const ENTRY_KICK_PORT: u16 = 0xc9;
@@ -83,7 +84,11 @@ pub fn decode_user_page_fault(
     cs: u64,
 ) -> Option<carrick_guest_arch::FaultInfo> {
     use carrick_guest_arch::{Access, FaultInfo, UserVa};
-    if cs & 3 != 3 || error & 4 == 0 || error & 8 != 0 || address >= (1 << 47) {
+    if cs & 3 != 3
+        || error & 4 == 0
+        || error & (8 | (1 << 5) | (1 << 15)) != 0
+        || address >= (1 << 47)
+    {
         return None;
     }
     Some(FaultInfo {
@@ -238,6 +243,8 @@ mod tests {
         assert!(super::decode_user_page_fault(0b111, 0x7fff_e000, 8).is_none());
         assert!(super::decode_user_page_fault(0b011, 0x7fff_e000, 0x1b).is_none());
         assert!(super::decode_user_page_fault(0b1111, 0x7fff_e000, 0x1b).is_none());
+        assert!(super::decode_user_page_fault(7 | (1 << 5), 0x400000, 0x1b).is_none());
+        assert!(super::decode_user_page_fault(7 | (1 << 15), 0x400000, 0x1b).is_none());
         assert!(super::decode_user_page_fault(0b111, 1 << 47, 0x1b).is_none());
     }
 
