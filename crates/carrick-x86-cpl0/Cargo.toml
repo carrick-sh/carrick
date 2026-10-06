@@ -9,6 +9,8 @@ carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-el1 = { path = "../carrick-el1" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-personality-linux = { path = "../carrick-personality-linux" }
+carrick-core = { path = "../carrick-core" }
 
 [[bin]]
 name = "carrick-x86-cpl0"
