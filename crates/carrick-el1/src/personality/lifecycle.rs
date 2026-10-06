@@ -24,24 +24,24 @@
 //! `set_robust_list`'s `EINVAL` for a wrong length, which the shared body
 //! decides before touching the slot.
 use super::sched::{ETIMEDOUT_RESULT, Sched, Served, ThreadCpu, UserWord};
-use super::thread_setup::{self, RobustListHead, RobustListLen, RobustListSlot, setup_open};
 pub use super::thread_setup::{
     GuestLifecycleVenue, LifecycleThread, LifecycleVenue, SYS_SET_ROBUST_LIST, guest_venue,
 };
+use super::thread_setup::{RobustListHead, RobustListLen, RobustListSlot, setup_open};
 use crate::file::UserCopy;
 use carrick_el1_abi::{
     AltStack, BlockedMask, BornRecord, Claim, Counters, CurrentTask, El1TaskId, EntryState,
     GateState, LifecycleDecline, ThreadCtx, ThreadIdentity, TransitionError, TrapFrame,
 };
+use carrick_personality_linux::abi::entry::SyscallResult;
+use carrick_personality_linux::pending_lifecycle::{
+    LifecycleCall, LifecycleOutcome, set_robust_list,
+};
 use core::sync::atomic::Ordering;
 
-/// Linux aarch64 syscall numbers served here (`SYS_SET_ROBUST_LIST` is the
-/// shared canonical number from [`thread_setup`]).
-pub const SYS_EXIT: usize = 93;
-pub const SYS_SIGALTSTACK: usize = 132;
-pub const SYS_RT_SIGPROCMASK: usize = 135;
-pub const SYS_GETTID: usize = 178;
-pub const SYS_CLONE: usize = 220;
+pub use carrick_personality_linux::pending_lifecycle::{
+    SYS_CLONE, SYS_EXIT, SYS_GETTID, SYS_RT_SIGPROCMASK, SYS_SIGALTSTACK,
+};
 
 // clone(2) flags.
 const CLONE_VM: u64 = 0x0000_0100;
@@ -104,103 +104,67 @@ fn stack_t_bytes(words: [u64; 3]) -> [u8; STACK_T_SIZE] {
     bytes
 }
 
-/// Whether `nr` is a call this module may serve.
-pub const fn is_lifecycle_syscall(nr: usize) -> bool {
-    matches!(
-        nr,
-        SYS_EXIT
-            | SYS_SET_ROBUST_LIST
-            | SYS_SIGALTSTACK
-            | SYS_RT_SIGPROCMASK
-            | SYS_GETTID
-            | SYS_CLONE
-    )
-}
-
-/// Serve a lifecycle syscall of the running thread, or `None` to forward it
-/// unchanged. `sched` is the vCPU's in-guest scheduler when the process's
-/// zone is published (clone and exit need it). Counts what it serves.
-pub fn serve<C: ThreadCpu, U: UserWord>(
+/// Invoke the already-decoded operation. Order 6 moves these retained bodies;
+/// Linux owns ordinal decoding, final result installation and completion.
+pub fn invoke<C: ThreadCpu, U: UserWord>(
+    call: LifecycleCall,
     frame: &mut TrapFrame,
     counters: &Counters,
     task: &CurrentTask,
     mut sched: Option<Sched<'_, C, U>>,
     venue: &dyn LifecycleVenue,
     user: &mut impl UserCopy,
-) -> Option<carrick_personality_linux::dispatch::FamilyCompletion> {
-    let nr = frame.x[8] as usize;
+) -> Option<LifecycleOutcome> {
     let thread = venue.thread(task).or_else(|| {
-        if nr == SYS_EXIT {
+        if call == LifecycleCall::Exit {
             counters.record_lifecycle_decline(LifecycleDecline::ExitVenue);
         }
         None
     })?;
-    let orig_x0 = frame.x[0];
-    let served = |frame: &mut TrapFrame, result: u64, work: bool| {
-        frame.x[0] = result;
-        task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
-        if work || task.linux.has_pending_host_work() {
-            carrick_personality_linux::dispatch::FamilyCompletion::CompleteWithWork(result as i64)
-        } else {
-            carrick_personality_linux::dispatch::FamilyCompletion::Complete(result as i64)
-        }
+    let returned = |result: i64, work: bool| LifecycleOutcome::Returned {
+        result: SyscallResult::new(result),
+        work,
     };
-    match nr {
-        SYS_GETTID => {
+    match call {
+        LifecycleCall::GetTid => {
             if !thread.page.serves_threads() {
                 return None;
             }
-            Some(served(frame, u64::from(thread.slot.visible_tid()?), false))
+            Some(returned(i64::from(thread.slot.visible_tid()?), false))
         }
-        SYS_RT_SIGPROCMASK => {
+        LifecycleCall::SigProcMask => {
             let work = serve_sigprocmask(frame, thread, user)?;
-            Some(served(frame, 0, work))
+            Some(returned(0, work))
         }
-        SYS_SIGALTSTACK => {
+        LifecycleCall::SigAltStack => {
             let sp = sched.as_mut().map(|sched| user_sp(sched, frame));
             serve_sigaltstack(frame, thread, user, sp)?;
-            Some(served(frame, 0, false))
+            Some(returned(0, false))
         }
-        SYS_SET_ROBUST_LIST => {
-            // The shared body owns both answers (0 and EINVAL); only a
-            // declined call (closed gate, hatch off) forwards.
-            let [head, len] = [frame.x[0], frame.x[1]];
-            let result = thread_setup::set_robust_list(
-                thread.page,
-                RobustListSlot::new(thread.slot, None),
-                RobustListHead::new(head),
-                RobustListLen::new(len),
+        LifecycleCall::SetRobustList => {
+            let result = set_robust_list(
+                &RobustListSlot::new(thread.page, thread.slot, None),
+                RobustListHead::new(frame.x[0]),
+                RobustListLen::new(frame.x[1]),
             )
             .linux_result()?;
-            Some(served(frame, result as u64, false))
+            Some(returned(result, false))
         }
-        SYS_CLONE => {
+        LifecycleCall::Clone => {
             let visible = serve_clone(sched.as_mut()?, frame, thread, venue, user, counters)?;
-            Some(served(frame, u64::from(visible), false))
+            Some(returned(i64::from(visible), false))
         }
-        SYS_EXIT => {
+        LifecycleCall::Exit => {
             let sched = sched.as_mut().or_else(|| {
                 counters.record_lifecycle_decline(LifecycleDecline::ExitScheduler);
                 None
             })?;
-            let outcome = serve_exit(sched, frame, thread, user, counters)?;
-            Some(match outcome {
-                // The frame is the switched-in thread's, whose own syscall
-                // result the switch applied.
-                Served::Returned { .. } if task.linux.has_pending_host_work() => {
-                    carrick_personality_linux::dispatch::FamilyCompletion::SwitchedWithWork(
-                        frame.x[0] as i64,
-                    )
-                }
-                Served::Returned { .. } => {
-                    carrick_personality_linux::dispatch::FamilyCompletion::Switched(
-                        frame.x[0] as i64,
-                    )
-                }
-                Served::Idle => carrick_personality_linux::dispatch::FamilyCompletion::Suspended,
+            let progress = serve_exit(sched, frame, thread, user, counters)?;
+            Some(LifecycleOutcome::Transferred {
+                progress,
+                result: SyscallResult::new(frame.x[0] as i64),
             })
         }
-        _ => None,
     }
 }
 

@@ -41,9 +41,7 @@ fn decide(model: &mut Reservations<'_>, nr: u64, args: [u64; 6]) -> AnonymousRou
             AnonymousRouteKind::Return(frame.x[0] as i64)
         }
         AnonymousReservationRoute::Work(mut pending) => {
-            pending
-                .refuse(&mut frame, &current, &counters, model)
-                .unwrap();
+            pending.refuse(&mut frame, &current, model).unwrap();
             AnonymousRouteKind::Work
         }
         _ => AnonymousRouteKind::Other,
@@ -106,8 +104,18 @@ fn reservation_decoder_counts_completion_only_and_keeps_two_mm_origins() {
                 }
                 .unwrap();
                 pending
-                    .complete(&mut frame, &current, &counters, &mut model, receipt)
+                    .complete(&mut frame, &current, &mut model, receipt)
                     .unwrap();
+                assert_eq!(
+                    counters.served[222].load(Ordering::Relaxed),
+                    before,
+                    "the resource primitive has no entry counter authority"
+                );
+                carrick_personality_linux::dispatch::EntryCounters {
+                    served: &counters.served,
+                    forwarded: &counters.forwarded,
+                }
+                .served(222);
                 assert_eq!(frame.x[0], 0x100000);
                 assert_eq!(counters.served[222].load(Ordering::Relaxed), before + 1);
                 assert_eq!(model.complete(receipt), Err(Refusal::Stale));
@@ -208,7 +216,7 @@ fn reservation_continuation_rejects_rebound_task_without_losing_owner() {
     .unwrap();
     current.mm.thread_generation.store(12, Ordering::Relaxed);
     assert_eq!(
-        pending.complete(&mut frame, &current, &counters, &mut model, receipt),
+        pending.complete(&mut frame, &current, &mut model, receipt),
         Err(Refusal::Stale)
     );
     assert!(model.mapping(0x100000).is_none());
@@ -216,17 +224,25 @@ fn reservation_continuation_rejects_rebound_task_without_losing_owner() {
     current.mm.thread_generation.store(11, Ordering::Relaxed);
     frame.slot = 7; // The original thread may resume on a different vCPU.
     pending
-        .complete(&mut frame, &current, &counters, &mut model, receipt)
+        .complete(&mut frame, &current, &mut model, receipt)
         .unwrap();
+    carrick_personality_linux::dispatch::EntryCounters {
+        served: &counters.served,
+        forwarded: &counters.forwarded,
+    }
+    .served(222);
     assert_eq!(counters.served[222].load(Ordering::Relaxed), 1);
     let AnonymousReservationRoute::Work(mut pending) =
         dispatch_anonymous_with_reservations(&mut frame, &counters, &current, &mut model)
     else {
         panic!()
     };
-    pending
-        .refuse(&mut frame, &current, &counters, &mut model)
-        .unwrap();
+    pending.refuse(&mut frame, &current, &mut model).unwrap();
+    carrick_personality_linux::dispatch::EntryCounters {
+        served: &counters.served,
+        forwarded: &counters.forwarded,
+    }
+    .served(222);
     assert_eq!(frame.x[0] as i64, -12);
     assert_eq!(counters.served[222].load(Ordering::Relaxed), 2);
     assert_eq!(counters.forwarded[222].load(Ordering::Relaxed), 0);
