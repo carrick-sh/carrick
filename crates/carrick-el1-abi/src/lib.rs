@@ -170,6 +170,9 @@ pub const EL1_BOOTSTRAP_METADATA_OFFSET: u64 = 0x70_0000;
 /// Base guest virtual address of the EL1 bootstrap metadata allocator arena.
 pub const EL1_BOOTSTRAP_METADATA_BASE: u64 = EL1_REGION_BASE + EL1_BOOTSTRAP_METADATA_OFFSET;
 
+/// Base guest virtual address of the x86 CPL0 bootstrap metadata allocator arena.
+pub const X86_CPL0_BOOTSTRAP_METADATA_BASE: u64 = 0xffff_ffff_a800_0000;
+
 /// Size of the EL1 bootstrap metadata allocator arena (9 MiB).
 pub const EL1_BOOTSTRAP_METADATA_SIZE: u64 = 0x90_0000;
 
