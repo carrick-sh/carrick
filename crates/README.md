@@ -66,7 +66,7 @@ lifecycle semantics.
 | Crate | Role |
 | --- | --- |
 | `carrick-vmm-hvf` | macOS Hypervisor.framework backend; mature AArch64 stage-1/stage-2 projection, vCPU execution and coordination, fault/syscall exits, and observability probes. |
-| `carrick-vmm-kvm` | Linux/KVM backend; AArch64 KVM support, x86_64 lane, KVM kick/futex/fork/timer/signal glue, standalone target-host runners. |
+| `carrick-vmm-kvm` | Linux/KVM backend; AArch64 KVM support and ARM standalone runner, x86_64 shared CPL0 kernel carrier, KVM kick/futex/fork/timer/signal glue. |
 | `carrick-vmm-bhyve` | FreeBSD/bhyve backend; x86_64 lane through the shared x86 engine plus bhyve-specific host/VMM glue. |
 | `carrick-vmm-nvmm` | NetBSD/NVMM backend; x86_64 lane through the shared x86 engine plus NVMM-specific host/VMM glue. |
 | `carrick-x86` | Shared x86_64 engine: long-mode bring-up, register/snapshot model, fault tables, VDSO helpers, generic `X86EngineCore<V>`. |
