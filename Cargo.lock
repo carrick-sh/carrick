@@ -822,6 +822,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-core",
  "carrick-core-abi",
+ "carrick-guest-arch",
 ]
 
 [[package]]
@@ -1105,6 +1106,7 @@ dependencies = [
  "carrick-hal",
  "carrick-host",
  "carrick-mem",
+ "carrick-personality-linux",
  "carrick-sched-core",
  "libc",
  "zerocopy",
@@ -1114,9 +1116,11 @@ dependencies = [
 name = "carrick-x86-cpl0"
 version = "0.1.0"
 dependencies = [
+ "carrick-core",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-guest-arch",
+ "carrick-personality-linux",
  "carrick-sched-core",
 ]
 

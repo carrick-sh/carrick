@@ -183,6 +183,11 @@ fn two_live_tasks_serve_robust_lists_without_host_forwards() {
 }
 
 #[test]
+fn x4_linux_common_entry() {
+    two_live_tasks_serve_robust_lists_without_host_forwards();
+}
+
+#[test]
 fn entry_and_return_kicks_never_republish_or_recomplete() {
     let a = program(&[(0xa000, 24), (0xdead, 23)]);
     let b = program(&[(0xb000, 24), (0xbeef, 25)]);
