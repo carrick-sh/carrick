@@ -88,11 +88,14 @@ impl<'a, M: carrick_guest_mem::CurrentMmMemory> PreparedChildTidClear<'a, M> {
 
     fn commit(self) {
         match self {
-            Self::Owner(write) => write.commit(&[&0_i32.to_le_bytes()]),
+            Self::Owner(write) => {
+                write.commit(&[&carrick_personality_linux::thread::CHILD_TID_CLEAR])
+            }
             Self::Legacy { memory, address } => {
                 // Legacy backends have no owner suspension protocol. Preserve
                 // their invalid-address exit disposition.
-                let _ = memory.write_bytes(address, &0_i32.to_le_bytes());
+                let _ = memory
+                    .write_bytes(address, &carrick_personality_linux::thread::CHILD_TID_CLEAR);
             }
             Self::Invalid => {}
         }
@@ -131,11 +134,20 @@ fn wake_persistent_child_tid(
     zone_mm: Option<u64>,
 ) {
     let count = if let Some((zone, mm)) = zone::zone_for(zone_mm) {
-        let woken = carrick_kernel::el1_zone::wake(zone, mm, address, u32::MAX, 1);
+        let woken = carrick_kernel::el1_zone::wake(
+            zone,
+            mm,
+            address,
+            carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
+            carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
+        );
         zone::publish_zone_handbacks(kernel, &woken.handed);
         woken.count
     } else {
-        futex.wake(address, 1)
+        futex.wake(
+            address,
+            carrick_personality_linux::thread::CHILD_TID_WAKE_COUNT,
+        )
     };
     carrick_kernel::event_ring::rec_futex_wake(address, count);
 }
@@ -1268,7 +1280,10 @@ mod child_tid_owner_tests {
             carrick_guest_mem::MemoryPrepareError,
         > {
             assert_eq!(ranges.len(), 1);
-            match self.write_bytes_raw(ranges[0].address().raw(), &0_i32.to_le_bytes()) {
+            match self.write_bytes_raw(
+                ranges[0].address().raw(),
+                &carrick_personality_linux::thread::CHILD_TID_CLEAR,
+            ) {
                 Err(MemoryError::OwnerWait(wait)) => {
                     Err(carrick_guest_mem::MemoryPrepareError::OwnerWait(wait))
                 }

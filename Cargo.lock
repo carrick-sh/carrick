@@ -457,6 +457,7 @@ dependencies = [
 name = "carrick-core"
 version = "0.1.0"
 dependencies = [
+ "carrick-conformance-contract",
  "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
@@ -828,6 +829,7 @@ dependencies = [
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-guest-arch",
+ "carrick-sched-core",
  "carrick-x86",
 ]
 
@@ -870,6 +872,7 @@ dependencies = [
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-observability",
+ "carrick-personality-linux",
  "carrick-portable",
  "carrick-runtime",
  "carrick-sched-core",
@@ -1108,6 +1111,9 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
  "carrick-abi",
+ "carrick-core",
+ "carrick-core-abi",
+ "carrick-el1-abi",
  "carrick-guest-arch",
  "carrick-guest-mem",
  "carrick-hal",
@@ -1124,6 +1130,7 @@ name = "carrick-x86-cpl0"
 version = "0.1.0"
 dependencies = [
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-guest-arch",

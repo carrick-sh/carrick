@@ -32,8 +32,9 @@ pub fn serve_canonical(
             },
             robust_list: |head, len| {
                 venue.thread(task).and_then(|thread| {
-                    carrick_personality_linux::pending_lifecycle::set_robust_list(
-                        &RobustListSlot::new(thread.page, thread.slot, publications),
+                    carrick_personality_linux::thread::set_robust_list(
+                        thread.page,
+                        RobustListSlot::new(thread.slot, publications),
                         RobustListHead::new(head),
                         RobustListLen::new(len),
                     )
