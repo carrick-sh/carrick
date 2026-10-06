@@ -37,8 +37,7 @@ carrick-mem = { path = "../carrick-mem" }
 # Executable publication returns the neutral page-table error domain.
 carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-abi = { path = "../carrick-abi" }
-# The shared x86 engine scaffold (Stage 4-KVM): the KVM x86 lane is migrated onto
-# `X86EngineCore<KvmVmm>` instead of the hand-rolled `KvmX86TrapEngine`.
+# Shared x86 register snapshots, architectural contexts and CPL0 boot helpers.
 carrick-x86 = { path = "../carrick-x86" }
 # The shared aarch64 engine scaffold (Stage 2-KVM): the KVM aarch64 lane is
 # migrated onto `Aarch64EngineCore<KvmAarch64Vmm>` instead of the hand-rolled
