@@ -86,7 +86,7 @@ impl<'a> FsView<'a> {
             },
             None => return DispatchOutcome::errno(LINUX_EBADF),
         };
-        let open_file = OpenFile::new(description, fd_flags);
+        let open_file = crate::dispatch::fd_table::OpenFile::new(description, fd_flags);
         let new_fd = match self.install_fd_at_or_above(min_fd, open_file) {
             Ok(fd) => fd,
             Err(_) => {
@@ -187,7 +187,10 @@ impl<'a> FsView<'a> {
         let files = self.captured_file_table();
         let retained_description = Arc::clone(&description);
         retain_open_file(&description);
-        let replaced = match exact_reservation.commit(OpenFile::new(description, fd_flags)) {
+        let replaced = match exact_reservation.commit(crate::dispatch::fd_table::OpenFile::new(
+            description,
+            fd_flags,
+        )) {
             Ok(replaced) => replaced,
             Err(errno) => {
                 retained_description.release_fd_ref();

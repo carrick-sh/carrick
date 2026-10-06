@@ -346,11 +346,12 @@ impl SyscallDispatcher {
     /// Install an anonymous bpf object fd. Linux creates bpf fds
     /// close-on-exec (`bpf(2)`).
     fn install_bpf_fd(&self, description: OpenDescription) -> Result<i32, LinuxErrno> {
-        let open_file = OpenFile::from_open_description_with_status_flags(
-            std::sync::Arc::new(parking_lot::RwLock::new(description)),
-            carrick_abi::LINUX_O_RDWR,
-            linux_fd_flags_from_open_flags(carrick_abi::LINUX_O_CLOEXEC),
-        );
+        let open_file =
+            crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                std::sync::Arc::new(parking_lot::RwLock::new(description)),
+                carrick_abi::LINUX_O_RDWR,
+                linux_fd_flags_from_open_flags(carrick_abi::LINUX_O_CLOEXEC),
+            );
         self.install_fd_at_or_above(0, open_file)
             .map_err(|_| crate::dispatch::linux_errno::EMFILE)
     }

@@ -3592,7 +3592,7 @@ impl<'a> ProcView<'a> {
             let Some(source) = target_files.slot(targetfd) else {
                 return Ok(DispatchOutcome::errno(LINUX_EBADF));
             };
-            let duplicate = OpenFile::new(source.description(), LINUX_FD_CLOEXEC);
+            let duplicate = crate::dispatch::fd_table::OpenFile::new(source.description(), LINUX_FD_CLOEXEC);
             Ok(match this.cross.install_open_file_at_or_above(0, duplicate) {
                 Ok(fd) => DispatchOutcome::returned_i32(fd),
                 Err(_) => DispatchOutcome::errno(crate::linux_abi::LINUX_EMFILE),
@@ -7512,7 +7512,10 @@ mod kernel_process_dispatch_tests {
         );
         let target_fd = super::resources::with_captured_resources(&child, || {
             dispatcher
-                .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&target_description), 0))
+                .install_fd_at_or_above(
+                    3,
+                    crate::dispatch::fd_table::OpenFile::new(Arc::clone(&target_description), 0),
+                )
                 .expect("install target fd")
         });
         let child_pid = u64::try_from(child.task().key().id.raw()).expect("positive child pid");

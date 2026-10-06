@@ -155,11 +155,12 @@ impl<'a> FsView<'a> {
                     writable: true,
                 };
                 let status = flags & !LINUX_O_CLOEXEC;
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(description)),
-                    status,
-                    linux_fd_flags_from_open_flags(flags),
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(description)),
+                        status,
+                        linux_fd_flags_from_open_flags(flags),
+                    );
                 let fd = match self.install_admitted_open_file(&mut reservation, open_file) {
                     Ok(fd) => fd,
                     Err(e) => return Ok(DispatchOutcome::errno(e)),
@@ -180,11 +181,12 @@ impl<'a> FsView<'a> {
                 writable: true,
             };
             let status = flags & !LINUX_O_CLOEXEC;
-            let open_file = OpenFile::from_open_description_with_status_flags(
-                Arc::new(RwLock::new(description)),
-                status,
-                linux_fd_flags_from_open_flags(flags),
-            );
+            let open_file =
+                crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(description)),
+                    status,
+                    linux_fd_flags_from_open_flags(flags),
+                );
             let fd = match self.install_admitted_open_file(&mut reservation, open_file) {
                 Ok(fd) => fd,
                 Err(e) => return Ok(DispatchOutcome::errno(e)),
@@ -496,7 +498,7 @@ impl<'a> FsView<'a> {
                         stdio_stream: None,
                     };
                     let status = flags & !LINUX_O_CLOEXEC;
-                    let open_file = OpenFile::from_open_description_with_status_flags(
+                    let open_file = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
                         Arc::new(RwLock::new(description)),
                         status,
                         linux_fd_flags_from_open_flags(flags),
@@ -824,11 +826,12 @@ impl<'a> FsView<'a> {
         );
         let opened_is_dir = matches!(&description, OpenDescription::Directory { .. });
         let status = flags & !LINUX_O_CLOEXEC;
-        let open_file = OpenFile::from_open_description_with_status_flags(
-            Arc::new(RwLock::new(description)),
-            status,
-            linux_fd_flags_from_open_flags(flags),
-        );
+        let open_file =
+            crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(description)),
+                status,
+                linux_fd_flags_from_open_flags(flags),
+            );
         if inotify_created {
             open_file.description.common().set_created(true);
         }
@@ -1042,11 +1045,12 @@ impl<'a> FsView<'a> {
             writable: false,
         };
         let status = flags & !LINUX_O_CLOEXEC;
-        let open_file = OpenFile::from_open_description_with_status_flags(
-            Arc::new(RwLock::new(description)),
-            status,
-            linux_fd_flags_from_open_flags(flags),
-        );
+        let open_file =
+            crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(description)),
+                status,
+                linux_fd_flags_from_open_flags(flags),
+            );
         let fd = match self.install_admitted_open_file(reservation, open_file) {
             Ok(fd) => fd,
             Err(e) => return Some(DispatchOutcome::errno(e)),
@@ -1156,11 +1160,12 @@ impl<'a> FsView<'a> {
             trusted_host_dir: Some(trusted),
         };
         let status = flags & !LINUX_O_CLOEXEC;
-        let open_file = OpenFile::from_open_description_with_status_flags(
-            Arc::new(RwLock::new(description)),
-            status,
-            linux_fd_flags_from_open_flags(flags),
-        );
+        let open_file =
+            crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(description)),
+                status,
+                linux_fd_flags_from_open_flags(flags),
+            );
         let fd = match self.install_admitted_open_file(reservation, open_file) {
             Ok(fd) => fd,
             Err(e) => return Some(DispatchOutcome::errno(e)),
@@ -1222,11 +1227,12 @@ impl<'a> FsView<'a> {
                     writable: writable_request,
                 };
                 let status = flags & !LINUX_O_CLOEXEC;
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(description)),
-                    status,
-                    linux_fd_flags_from_open_flags(flags),
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(description)),
+                        status,
+                        linux_fd_flags_from_open_flags(flags),
+                    );
                 let fd = match self.install_admitted_open_file(reservation, open_file) {
                     Ok(fd) => fd,
                     Err(e) => return Some(DispatchOutcome::errno(e)),
@@ -1378,11 +1384,12 @@ impl<'a> FsView<'a> {
                 trusted_host_dir: Some(trusted_dir.child(HostFdRef::new(fd.into_raw_fd()))),
             };
             let status = flags & !LINUX_O_CLOEXEC;
-            let open_file = OpenFile::from_open_description_with_status_flags(
-                Arc::new(RwLock::new(description)),
-                status,
-                linux_fd_flags_from_open_flags(flags),
-            );
+            let open_file =
+                crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                    Arc::new(RwLock::new(description)),
+                    status,
+                    linux_fd_flags_from_open_flags(flags),
+                );
             let new_fd = match self.install_admitted_open_file(reservation, open_file) {
                 Ok(fd) => fd,
                 Err(e) => return Some(DispatchOutcome::errno(e)),
@@ -1439,11 +1446,12 @@ impl<'a> FsView<'a> {
             writable: write,
         };
         let status = flags & !LINUX_O_CLOEXEC;
-        let open_file = OpenFile::from_open_description_with_status_flags(
-            Arc::new(RwLock::new(description)),
-            status,
-            linux_fd_flags_from_open_flags(flags),
-        );
+        let open_file =
+            crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(description)),
+                status,
+                linux_fd_flags_from_open_flags(flags),
+            );
         let new_fd = match self.install_admitted_open_file(reservation, open_file) {
             Ok(fd) => fd,
             Err(e) => return Some(DispatchOutcome::errno(e)),
@@ -1750,11 +1758,12 @@ impl<'a> FsView<'a> {
                     }
                 };
                 let description_status_flags = access | (flags & !LINUX_O_CLOEXEC);
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(description)),
-                    description_status_flags,
-                    linux_fd_flags_from_open_flags(flags),
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(description)),
+                        description_status_flags,
+                        linux_fd_flags_from_open_flags(flags),
+                    );
                 match self.install_admitted_open_file(reservation, open_file) {
                     Ok(new_fd) => VfsOpenAttempt::Installed(new_fd),
                     Err(e) => VfsOpenAttempt::Errno(e),
@@ -1762,14 +1771,15 @@ impl<'a> FsView<'a> {
             }
             carrick_vfs::VfsHandle::SyntheticDevice { kind, status_flags } => {
                 let status = ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC;
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(OpenDescription::SyntheticDevice {
-                        kind,
-                        base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
-                    })),
-                    status,
-                    linux_fd_flags_from_open_flags(flags),
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(OpenDescription::SyntheticDevice {
+                            kind,
+                            base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
+                        })),
+                        status,
+                        linux_fd_flags_from_open_flags(flags),
+                    );
                 match self.install_admitted_open_file(reservation, open_file) {
                     Ok(new_fd) => {
                         self.record_fd_open_path(new_fd, kind.as_str().to_string());
@@ -1783,14 +1793,15 @@ impl<'a> FsView<'a> {
                 status_flags,
             } => {
                 let status = ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC;
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(OpenDescription::VirtualConsole {
-                        base: OpenDescriptionBase::new(status),
-                        console,
-                    })),
-                    status,
-                    linux_fd_flags_from_open_flags(flags),
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(OpenDescription::VirtualConsole {
+                            base: OpenDescriptionBase::new(status),
+                            console,
+                        })),
+                        status,
+                        linux_fd_flags_from_open_flags(flags),
+                    );
                 match self.install_admitted_open_file(reservation, open_file) {
                     Ok(new_fd) => {
                         self.record_fd_open_path(new_fd, "/dev/tty0".to_string());
@@ -1805,16 +1816,17 @@ impl<'a> FsView<'a> {
                 status_flags,
             } => {
                 let status = ((status_flags as u64) | flags) & !LINUX_O_CLOEXEC;
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(OpenDescription::SyntheticFile {
-                        path,
-                        contents,
-                        offset: 0,
-                        base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
-                    })),
-                    status,
-                    linux_fd_flags_from_open_flags(flags),
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(OpenDescription::SyntheticFile {
+                            path,
+                            contents,
+                            offset: 0,
+                            base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
+                        })),
+                        status,
+                        linux_fd_flags_from_open_flags(flags),
+                    );
                 match self.install_admitted_open_file(reservation, open_file) {
                     Ok(new_fd) => VfsOpenAttempt::Installed(new_fd),
                     Err(e) => VfsOpenAttempt::Errno(e),
@@ -1828,28 +1840,29 @@ impl<'a> FsView<'a> {
             } => {
                 crate::dispatch::net::set_host_nonblocking(host_fd);
                 let status = status_flags as u64;
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(OpenDescription::HostPipe {
-                        // A pty end's host inode is a unique id (FASYNC is not
-                        // exercised on ptys).
-                        pipe_id: host_inode_pipe_id(host_fd),
-                        host_fd: HostFdRef::new(host_fd),
-                        // A pty end is bidirectional; route reads and
-                        // writes through the host fd like /dev/null.
-                        is_read_end: true,
-                        base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
-                        pty: Some(crate::vfs::PtyRole {
-                            index: pts_index,
-                            is_master,
-                        }),
-                        // pty bidirectionality is already expressed by `pty`.
-                        bidirectional: false,
-                        write_kind: HostWriteKind::Other,
-                        stdio_stream: None,
-                    })),
-                    status,
-                    linux_fd_flags_from_open_flags(flags),
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(OpenDescription::HostPipe {
+                            // A pty end's host inode is a unique id (FASYNC is not
+                            // exercised on ptys).
+                            pipe_id: host_inode_pipe_id(host_fd),
+                            host_fd: HostFdRef::new(host_fd),
+                            // A pty end is bidirectional; route reads and
+                            // writes through the host fd like /dev/null.
+                            is_read_end: true,
+                            base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
+                            pty: Some(crate::vfs::PtyRole {
+                                index: pts_index,
+                                is_master,
+                            }),
+                            // pty bidirectionality is already expressed by `pty`.
+                            bidirectional: false,
+                            write_kind: HostWriteKind::Other,
+                            stdio_stream: None,
+                        })),
+                        status,
+                        linux_fd_flags_from_open_flags(flags),
+                    );
                 // Remember where this pty's MASTER lives. The slave's close
                 // path has to rescue the master's queued bytes before Darwin
                 // destroys them, and it cannot look the master up through the
@@ -1917,20 +1930,21 @@ impl<'a> FsView<'a> {
                     size: 0,
                 };
                 let status = status_flags as u64;
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(OpenDescription::Directory {
-                        path,
-                        metadata,
-                        listing: DirListing::Fixed(rootfs_entries),
-                        offset: 0,
-                        base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
-                        // VFS-mount (synthetic) directories never take the
-                        // trusted host-dirfd lane.
-                        trusted_host_dir: None,
-                    })),
-                    status,
-                    linux_fd_flags_from_open_flags(flags),
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(OpenDescription::Directory {
+                            path,
+                            metadata,
+                            listing: DirListing::Fixed(rootfs_entries),
+                            offset: 0,
+                            base: OpenDescriptionBase::new(status).with_fs_identity(mount_fs_id),
+                            // VFS-mount (synthetic) directories never take the
+                            // trusted host-dirfd lane.
+                            trusted_host_dir: None,
+                        })),
+                        status,
+                        linux_fd_flags_from_open_flags(flags),
+                    );
                 match self.install_admitted_open_file(reservation, open_file) {
                     Ok(new_fd) => VfsOpenAttempt::Installed(new_fd),
                     Err(e) => VfsOpenAttempt::Errno(e),
@@ -1948,20 +1962,21 @@ impl<'a> FsView<'a> {
                     0,
                     super::inode_for_path(std::path::Path::new(&path)),
                 );
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(OpenDescription::InMemoryFile {
-                        path: path.clone(),
-                        contents,
-                        offset: 0,
-                        writable,
-                        max_size,
-                        base: OpenDescriptionBase::new(status)
-                            .with_fs_identity(mount_fs_id)
-                            .with_inode(inode),
-                    })),
-                    status,
-                    linux_fd_flags_from_open_flags(flags),
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(OpenDescription::InMemoryFile {
+                            path: path.clone(),
+                            contents,
+                            offset: 0,
+                            writable,
+                            max_size,
+                            base: OpenDescriptionBase::new(status)
+                                .with_fs_identity(mount_fs_id)
+                                .with_inode(inode),
+                        })),
+                        status,
+                        linux_fd_flags_from_open_flags(flags),
+                    );
                 match self.install_admitted_open_file(reservation, open_file) {
                     Ok(new_fd) => {
                         self.record_fd_open_path(new_fd, path);
@@ -2353,7 +2368,7 @@ impl<'a> FsView<'a> {
             } else {
                 0
             };
-            let open_file = OpenFile::from_open_description_with_common(
+            let open_file = crate::dispatch::fd_table::OpenFile::from_open_description_with_common(
                 Arc::new(RwLock::new(description)),
                 common,
                 fd_flags,
@@ -2422,7 +2437,7 @@ impl<'a> FsView<'a> {
             } else {
                 0
             };
-            let open_file = OpenFile::from_open_description_with_common(
+            let open_file = crate::dispatch::fd_table::OpenFile::from_open_description_with_common(
                 Arc::new(RwLock::new(description)),
                 common,
                 fd_flags,

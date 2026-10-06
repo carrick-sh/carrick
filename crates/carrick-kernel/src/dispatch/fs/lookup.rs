@@ -551,7 +551,7 @@ impl<'a> FsView<'a> {
                         }
                         if open_flags.contains(LinuxOpenFlags::PATH) {
                             let status = flags & !LINUX_O_CLOEXEC;
-                            let open_file = OpenFile::from_open_description_with_status_flags(
+                            let open_file = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
                                 Arc::new(RwLock::new(OpenDescription::File {
                                     base: OpenDescriptionBase::new(status),
                                     path: path.clone(),
