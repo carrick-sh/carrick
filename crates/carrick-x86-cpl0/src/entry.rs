@@ -405,6 +405,16 @@ mod kernel {
 
     }
 
+    fixture_items! {
+        pub(super) fn lifecycle_invariant_error(reason: super::lifecycle::LifecycleInvariant) -> ! {
+            // SAFETY: terminal kernel custody error; report the named stage
+            // without replaying a partially committed syscall on the host.
+            unsafe { core::arch::asm!("out dx, al", in("dx") FATAL_PORT,
+                in("rax") reason as u64, options(nostack, preserves_flags)); }
+            halt()
+        }
+    }
+
     // A port exit may suspend this CPU while another CPU continues. The
     // admission value can only be produced after the lock guard is dropped.
     struct ExitAdmission;

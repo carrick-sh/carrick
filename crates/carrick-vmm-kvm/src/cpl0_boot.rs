@@ -1857,6 +1857,24 @@ impl Cpl0Carrier {
 }
 
 impl Cpl0Carrier {
+    /// Fill the shared fixture MM census while both CPUs are stopped.
+    pub fn exhaust_fork_address_spaces(&mut self) -> Result<(), TrapError> {
+        use carrick_sched_core::ZoneTables;
+        // SAFETY: boot_lifecycle owns initialized aligned retained zone RAM.
+        let zone = unsafe {
+            &*self
+                .ram
+                .host_ptr(0x100_0000, size_of::<ZoneTables>())
+                .ok_or_else(|| fail("lifecycle zone"))?
+                .cast::<ZoneTables>()
+        };
+        let mut key = 1000;
+        while zone.spaces.publish_closed(key, 0x1000, 0).is_some() {
+            key += 1;
+        }
+        Ok(())
+    }
+
     /// Poison reserved XSAVE header words while the faulting vCPU is stopped.
     pub fn poison_user_fault_xsave_header(&mut self, index: usize) -> Result<(), TrapError> {
         if index >= 2 {
