@@ -22,3 +22,6 @@ mod native_ownership_tests;
 #[cfg(test)]
 #[path = "isa/x86/context_words.rs"]
 mod x86_context_words_tests;
+#[cfg(test)]
+#[path = "isa/x86/initial_mm.rs"]
+mod x86_initial_mm_tests;

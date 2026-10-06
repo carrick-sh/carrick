@@ -279,6 +279,137 @@ mod kernel {
         unsafe { arch.execute_edit(intent, tables) }
     }
 
+    /// One stopped-carrier fixture view of the retained supervisor direct
+    /// window. The production MM owner receives its table authority from the
+    /// portal instead of this fixed test grant.
+    struct InitialWords;
+    impl InitialWords {
+        fn word(
+            &self,
+            pa: u64,
+        ) -> Result<
+            &core::sync::atomic::AtomicU64,
+            carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+        > {
+            use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+            if pa & 7 != 0 || pa < 0x20_0000 || pa.checked_add(8).is_none_or(|end| end > 0xc0_0000)
+            {
+                return Err(DescriptorRefusal::TableOutsidePrimary);
+            }
+            // SAFETY: Cpl0Carrier retains this one supervisor direct mapping
+            // for the VM lifetime; this guest fixture owns the stopped sibling.
+            Ok(unsafe { &*((DIRECT_VA + pa) as *const core::sync::atomic::AtomicU64) })
+        }
+    }
+    impl carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords for InitialWords {
+        fn load(
+            &self,
+            pa: u64,
+        ) -> Result<u64, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+            Ok(self.word(pa)?.load(Ordering::Acquire))
+        }
+        fn compare_exchange(
+            &self,
+            pa: u64,
+            before: u64,
+            after: u64,
+        ) -> Result<bool, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+            Ok(self
+                .word(pa)?
+                .compare_exchange(before, after, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok())
+        }
+        fn store_unlinked(
+            &self,
+            pa: u64,
+            value: u64,
+        ) -> Result<(), carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+            use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+            self.word(pa)?
+                .compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire)
+                .map(|_| ())
+                .map_err(|_| DescriptorRefusal::Contended)
+        }
+        fn publish_barrier(&self) {
+            core::sync::atomic::fence(Ordering::SeqCst);
+        }
+        fn invalidate_range(&self, _: u64, _: u64) {
+            // The fresh root has never been installed. Its first MOV CR3
+            // supplies the local translation boundary.
+        }
+    }
+
+    struct InitialFrames {
+        next_table: u64,
+        next_data: u64,
+    }
+    impl InitialFrames {
+        fn zeroed(pa: u64) {
+            // SAFETY: these private fixture physical pages are mapped RW by
+            // the one retained direct window and not reachable by user PTEs.
+            unsafe { core::ptr::write_bytes((DIRECT_VA + pa) as *mut u8, 0, 4096) };
+        }
+    }
+    impl carrick_el1::isa::x86::initial_mm::InitialFrameSource for InitialFrames {
+        fn take_zeroed_table(&mut self) -> Option<carrick_guest_arch::RootGpa> {
+            use carrick_guest_arch::{FrameGpa, RootGpa};
+            if self.next_table >= 0x81_0000 {
+                return None;
+            }
+            let pa = self.next_table;
+            self.next_table += 4096;
+            Self::zeroed(pa);
+            RootGpa::page_aligned(FrameGpa::new(pa))
+        }
+        fn take_zeroed_data(
+            &mut self,
+        ) -> Option<carrick_el1::isa::x86::initial_mm::InitialDataGrant> {
+            use carrick_el1::isa::x86::initial_mm::InitialDataGrant;
+            use carrick_guest_arch::{EditBacking, FrameGpa};
+            if self.next_data >= 0x91_0000 {
+                return None;
+            }
+            let pa = self.next_data;
+            self.next_data += 4096;
+            Self::zeroed(pa);
+            let identity = core::num::NonZeroU64::new(pa)?;
+            Some(InitialDataGrant {
+                frame: FrameGpa::new(pa),
+                backing: EditBacking {
+                    frame_id: identity,
+                    mapping_id: identity,
+                    owner_generation: core::num::NonZeroU64::MIN,
+                    inventory_revision: core::num::NonZeroU64::MIN,
+                },
+            })
+        }
+        fn write_data(
+            &mut self,
+            grant: carrick_el1::isa::x86::initial_mm::InitialDataGrant,
+            offset: u16,
+            bytes: &[u8],
+        ) -> bool {
+            let pa = grant.frame.raw();
+            if !(0x90_0000..0x91_0000).contains(&pa)
+                || usize::from(offset)
+                    .checked_add(bytes.len())
+                    .is_none_or(|end| end > 4096)
+            {
+                return false;
+            }
+            // SAFETY: the source is the fixed RX fixture ELF and the private
+            // destination grant is disjoint, writable and retained by KVM.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    (DIRECT_VA + pa + u64::from(offset)) as *mut u8,
+                    bytes.len(),
+                );
+            }
+            true
+        }
+    }
+
     #[unsafe(no_mangle)]
     extern "C" fn carrick_x86_enter(frame: &mut NativeFrame, binding: &CpuBinding) {
         if !frame.valid_user_return() {
@@ -306,6 +437,106 @@ mod kernel {
         if crate::fixture_image() && frame.rax == OBSERVE_NATIVE {
             doorbell(CONTROL_PORT, frame);
             frame.rax = 0;
+            return;
+        }
+        if crate::fixture_image() && frame.rax == OBSERVE_INITIAL_MM {
+            use carrick_el1::isa::x86::initial_mm::{
+                InitialImageRegion, InitialImageSpec, InitialStackSpec, install_initial_image,
+            };
+            use carrick_guest_arch::{EditPermissions, MmuBackend};
+            // The test stages one already-parsed ET_EXEC image in its RX code
+            // page. No guest ELF parser or second host descriptor author runs.
+            if frame.rdi != 0x10100 || frame.rsi != 0xc0 {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            // SAFETY: this exact RX user fixture page remains mapped under
+            // the still-live source root until the new MM has copied its bytes.
+            let elf = unsafe { core::slice::from_raw_parts(frame.rdi as *const u8, 0xc0) };
+            if &elf[..4] != b"\x7fELF" {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            let region = InitialImageRegion {
+                start: 0x400000,
+                len: 4096,
+                initialized_offset: 0,
+                initialized: elf,
+                perms: EditPermissions {
+                    readable: true,
+                    writable: false,
+                    executable: true,
+                    user: true,
+                },
+            };
+            let image = InitialImageSpec {
+                regions: core::slice::from_ref(&region),
+                stack: InitialStackSpec {
+                    entry: 0x4000b0,
+                    phdr: 0x400040,
+                    phent: 56,
+                    phnum: 1,
+                    argv: &[b"/tiny"],
+                    envp: &[],
+                    random: [0x5a; 16],
+                    stack_top: 0x7fff_0000,
+                    stack_size: 0x4000,
+                },
+            };
+            let Ok(source_root) = carrick_el1::isa::x86::hardware_live_root() else {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            };
+            if source_root.address().raw() != 0x60_0000 {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            let mut frames = InitialFrames {
+                next_table: 0x80_0000,
+                next_data: 0x90_0000,
+            };
+            // SAFETY: this stopped-carrier fixture owns the unpublished MM,
+            // both disjoint zeroed frame ranges and the sole table editor.
+            let loaded = unsafe {
+                install_initial_image(
+                    &InitialWords,
+                    &mut frames,
+                    source_root,
+                    core::num::NonZeroU64::MIN,
+                    core::num::NonZeroU64::MIN,
+                    &image,
+                )
+            };
+            let Ok(loaded) = loaded else {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            };
+            if loaded.publications.len() != 2
+                || !loaded.context.authenticates(loaded.address)
+                || loaded.context.frame[15] != 0x4000b0
+                || loaded.context.frame[18] != loaded.stack_pointer
+            {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            let mut mmu = carrick_el1::isa::x86::X86Backend;
+            if mmu.install_context(loaded.address).is_err() {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            frame.rcx = loaded.context.frame[15];
+            frame.rsp = loaded.context.frame[18];
+            frame.r11 = loaded.context.frame[17];
+            frame.rax = 0;
+            return;
+        }
+        if crate::fixture_image() && frame.rax == 231
+            && carrick_el1::isa::x86::hardware_live_root()
+                .is_ok_and(|root| root.address().raw() == 0x80_0000)
+        {
+            // The stopped KVM fixture consumes exit_group as its terminal
+            // observation; the production syscall owner is the shared kernel.
+            doorbell(CONTROL_PORT, frame);
             return;
         }
         if crate::fixture_image() && frame.rax == OBSERVE_MMU_ROOT {
