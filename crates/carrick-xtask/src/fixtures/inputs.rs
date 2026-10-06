@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const FIXTURES: &[&str] = &[
+pub(super) const FIXTURES: &[&str] = &[
     "conformance-probes",
     "fixtures/linux-aarch64-hello",
     "fixtures/embed-interceptor-probe",

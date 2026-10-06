@@ -877,3 +877,106 @@ pub fn run(root: &Path, action: FixturesAction, writer: &mut dyn Write) -> Resul
     }
     Ok(())
 }
+
+/// Validate every fixture workspace and other nested publisher inputs, without builds.
+pub fn check_locks(root: &Path) -> Result<()> {
+    let mut workspaces: std::collections::BTreeSet<_> = inputs::FIXTURES
+        .iter()
+        .map(|fixture| root.join(fixture))
+        .collect();
+    for entry in fs::read_dir(root.join("fixtures"))? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.path().join("Cargo.toml").is_file() {
+            workspaces.insert(entry.path());
+        }
+    }
+    for workspace in workspaces {
+        check_workspace_lock(&workspace)?;
+    }
+    Ok(())
+}
+
+fn check_workspace_lock(directory: &Path) -> Result<()> {
+    let output = Command::new("cargo")
+        .current_dir(directory)
+        .args(["metadata", "--locked", "--offline", "--format-version", "1"])
+        .output()?;
+    if !output.status.success() {
+        return Err(fail(format!(
+            "fixture lock check failed at {}: {}",
+            directory.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+    #[test]
+    fn missing_workspace_dependency_rejects_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n[package]\nname='fixture'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("cargo")
+                .args(["generate-lockfile", "--offline"])
+                .current_dir(root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(check_workspace_lock(root).is_ok());
+        fs::create_dir_all(root.join("dep/src")).unwrap();
+        fs::write(root.join("dep/src/lib.rs"), "").unwrap();
+        fs::write(
+            root.join("dep/Cargo.toml"),
+            "[package]\nname='workspace-dependency'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        let manifest = root.join("Cargo.toml");
+        let mut text = fs::read_to_string(&manifest).unwrap();
+        text.push_str("[dependencies]\nworkspace-dependency={path='dep'}\n");
+        fs::write(manifest, text).unwrap();
+        let before = fs::read(root.join("Cargo.lock")).unwrap();
+        assert!(check_workspace_lock(root).is_err());
+        assert_eq!(before, fs::read(root.join("Cargo.lock")).unwrap());
+    }
+    #[test]
+    fn unpublished_fixture_workspace_is_checked() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for (index, directory) in inputs::FIXTURES.iter().enumerate() {
+            let path = root.join(directory);
+            fs::create_dir_all(path.join("src")).unwrap();
+            fs::write(path.join("src/lib.rs"), "").unwrap();
+            fs::write(path.join("Cargo.toml"), format!("[workspace]\n[package]\nname='fixture{index}'\nversion='0.1.0'\nedition='2021'\n")).unwrap();
+            assert!(
+                Command::new("cargo")
+                    .args(["generate-lockfile", "--offline"])
+                    .current_dir(path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert!(check_locks(root).is_ok());
+        let extra = root.join("fixtures/unpublished");
+        fs::create_dir_all(extra.join("src")).unwrap();
+        fs::write(extra.join("src/lib.rs"), "").unwrap();
+        fs::write(
+            extra.join("Cargo.toml"),
+            "[workspace]\n[package]\nname='unpublished'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        let error = check_locks(root).expect_err("unpublished fixture lock must be checked");
+        assert!(error.to_string().contains("unpublished"));
+    }
+}

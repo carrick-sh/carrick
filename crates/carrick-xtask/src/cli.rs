@@ -23,6 +23,9 @@ pub enum Commands {
     #[command(about = "Display repository information as JSON")]
     Info,
 
+    /// Check nested fixture workspace lockfiles without network access.
+    CheckFixtureLocks,
+
     #[command(about = "Owner-approved, one-job Willow ephemeral runner pilot")]
     CiScaler(crate::ci_scaler::ScalerArgs),
     #[command(about = "Census clean landed worktrees; dry-run unless --apply")]
@@ -289,6 +292,11 @@ where
         }
     }
     match cli.command {
+        Commands::CheckFixtureLocks => {
+            let info = resolve_repo_info(cli.root.as_deref())?;
+            crate::fixtures::check_locks(&info.repository_root)?;
+            Ok(())
+        }
         Commands::CiScaler(args) => {
             crate::ci_scaler::run(args)?;
             Ok(())
