@@ -153,3 +153,71 @@ fn unknown_cfg_and_nonliteral_templates_fail_closed() {
     let mixed = commit(root);
     assert!(!diff(root, &base, &mixed, "aarch64").status.success());
 }
+
+#[test]
+fn semantic_cfg_guest_features_and_host_profile_survive_git_roundtrip() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    git(root, &["init", "-q"]);
+    write(
+        root,
+        "crates/carrick-el1/Cargo.toml",
+        "[features]\ndefault = [\"guest\"]\nguest = []\nhost-test = []\nallocator-test-control = []\n",
+    );
+    write(
+        root,
+        "crates/carrick-el1/src/lib.rs",
+        "#[cfg(not(all(target_os=\"none\",target_arch=\"x86_64\")))] fn f() { asm!(\"nop\"); }",
+    );
+    write(
+        root,
+        "crates/carrick-vmm-hvf/src/trap/sysreg.rs",
+        "#[cfg(all(target_os=\"macos\",target_arch=\"aarch64\"))] fn clock() { asm!(\"mrs {}, cntfrq_el0\", out(reg) value); }",
+    );
+    let base = commit(root);
+    write(
+        root,
+        "crates/carrick-el1/src/lib.rs",
+        "#[cfg(all(target_os=\"none\",target_arch=\"aarch64\",feature=\"guest\",not(feature=\"host-test\")))] fn f() { asm!(\"nop\"); }",
+    );
+    write(
+        root,
+        "crates/carrick-vmm-hvf/src/trap/sysreg.rs",
+        "#[cfg(not(any(target_os=\"none\",target_arch=\"x86_64\")))] fn clock() { asm!(\"mrs {}, cntfrq_el0\", out(reg) value); }",
+    );
+    let respelled = commit(root);
+    let output = diff(root, &base, &respelled, "aarch64");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(report.matches("CFG-RESPELLED").count(), 2, "{report}");
+    assert!(report.contains("2 cfg-respelled"), "{report}");
+    write(
+        root,
+        "crates/carrick-el1/src/lib.rs",
+        "#[cfg(any(target_arch=\"x86_64\",feature=\"host-test\"))] fn f() { asm!(\"nop\"); }",
+    );
+    let lost = commit(root);
+    for (old, new) in [(&respelled, &lost), (&lost, &respelled)] {
+        let output = diff(root, old, new, "aarch64");
+        assert_eq!(output.status.code(), Some(1));
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains("CFG-CHANGED")
+        );
+    }
+    write(
+        root,
+        "crates/carrick-el1/src/lib.rs",
+        "#[cfg(custom_predicate)] fn f() { asm!(\"nop\"); }",
+    );
+    let unknown = commit(root);
+    assert_eq!(
+        diff(root, &respelled, &unknown, "aarch64").status.code(),
+        Some(1)
+    );
+}
