@@ -302,9 +302,14 @@ impl ForkFrameInventory {
         if !physical.contains(selected) || source.is_some_and(|source| !source.contains(selected)) {
             return Err(ForkInventoryError::OutsidePhysicalSource);
         }
+        // Leaves describe VA coverage, not physical ownership. Preserve the
+        // canonical parent's logical extent (which may be a COW fragment),
+        // or the complete pinned structural allocation when no inventory row
+        // exists. Repeated leaves/aliases retain that identity only once.
+        let inherited = source.unwrap_or(physical);
         Ok(self
             .inherited
-            .insert((selected.start.raw(), selected.len.raw()))
-            .then_some(selected))
+            .insert((inherited.start.raw(), inherited.len.raw()))
+            .then_some(inherited))
     }
 }

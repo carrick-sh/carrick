@@ -425,11 +425,16 @@ fn owner_fork_frame_descriptions(
                     inherited_frame: source.map(|(_, entry)| entry.frame),
                     inherited_mapping: source.map(|(_, entry)| entry.mapping),
                     backing,
-                    stage2_lease: (record.ipa, record.len as u64),
-                    stage2_owner: InventoryStage2OwnerIdentity {
-                        host_addr: record.host_addr,
-                        generation: owner_generation,
-                    },
+                    stage2_lease: source.map_or((record.ipa, record.len as u64), |(_, entry)| {
+                        (entry.stage2_base, entry.stage2_length)
+                    }),
+                    stage2_owner: source.map_or(
+                        InventoryStage2OwnerIdentity {
+                            host_addr: record.host_addr,
+                            generation: owner_generation,
+                        },
+                        |(_, entry)| entry.stage2_owner,
+                    ),
                     fork_frame_receipt_kind: None,
                 });
             }
