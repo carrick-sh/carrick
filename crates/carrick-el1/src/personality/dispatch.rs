@@ -14,6 +14,7 @@ use carrick_el1_abi::{
     EL1_OBJECT_TABLE_BASE, EL1_OPEN_FILE_TABLE_BASE, EL1_STACK_SLOTS, EL1_ZONE_BASE,
     FD_MAP_CAPACITY, MAX_DELEGATED_INOTIFY,
 };
+use carrick_guest_arch::SyscallFrame;
 use carrick_personality_linux::abi::entry::{LinuxTaskState, SyscallResult};
 use carrick_personality_linux::dispatch::{EntryCounters, LifecycleWorkCounters};
 use carrick_personality_linux::dispatch::{FamilyCompletion, PendingFamilies};
@@ -21,6 +22,22 @@ use carrick_personality_linux::dispatch::{FamilyCompletion, PendingFamilies};
 use carrick_personality_linux::pending_anonymous::{DelegatedStep, PermissionStep, RetirementStep};
 use carrick_personality_linux::pending_file::PendingFileVenue;
 use core::sync::atomic::Ordering;
+
+/// ARM frame access is retained for scheduler/IPC park leaves that have not
+/// yet acquired an ISA-neutral saved-context contract.
+pub trait GuestDispatchFrame: SyscallFrame {
+    fn arm_frame(&mut self) -> Option<&mut TrapFrame>;
+    fn arm_scheduler(&self) -> bool;
+}
+
+impl GuestDispatchFrame for TrapFrame {
+    fn arm_frame(&mut self) -> Option<&mut TrapFrame> {
+        Some(self)
+    }
+    fn arm_scheduler(&self) -> bool {
+        true
+    }
+}
 
 /// T2's SVC integration point. A Work result is an owned continuation, not a
 /// completed syscall and not permission to enter the host syscall dispatcher.
@@ -275,8 +292,8 @@ where
 /// published for this venue ([`lifecycle::LifecycleVenue`]): thread clone
 /// and exit and the per-thread setup calls are served in EL1.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_syscall_with_lifecycle<'a, F, C, U>(
-    frame: &'a mut TrapFrame,
+pub fn dispatch_syscall_with_lifecycle<'a, F, C, U, G>(
+    frame: &'a mut G,
     counters: &'a Counters,
     current_tasks: &'a [CurrentTask],
     fd_map: &'a [FdMapSlot],
@@ -293,8 +310,9 @@ where
     F: Fn(u32) -> *mut u8,
     C: sched::ThreadCpu,
     U: sched::UserWord,
+    G: GuestDispatchFrame,
 {
-    let ordinal = frame.x[8];
+    let ordinal = frame.canonical_ordinal().raw();
     let mut pending = El1PendingFamilies {
         handoff: None,
         #[cfg(test)]
@@ -340,11 +358,17 @@ fn invalid_completion() -> ! {
     )
 }
 
-pub struct El1PendingFamilies<'a, F, C: sched::ThreadCpu, U: sched::UserWord> {
+pub struct El1PendingFamilies<
+    'a,
+    F,
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+    G: GuestDispatchFrame = TrapFrame,
+> {
     pub(super) handoff: Option<carrick_el1_abi::EntryHandoffReceipt>,
     #[cfg(test)]
     pub(super) lifecycle_user: Option<&'a mut dyn file::UserCopy>,
-    pub(super) frame: &'a mut TrapFrame,
+    pub(super) frame: &'a mut G,
     pub(super) counters: &'a Counters,
     pub(super) current_tasks: &'a [CurrentTask],
     pub(super) fd_map: &'a [FdMapSlot],
@@ -357,8 +381,8 @@ pub struct El1PendingFamilies<'a, F, C: sched::ThreadCpu, U: sched::UserWord> {
     pub(super) lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
     pub(super) cache_lookup: F,
 }
-impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFamilies<'a>
-    for El1PendingFamilies<'a, F, C, U>
+impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
+    PendingFamilies<'a> for El1PendingFamilies<'a, F, C, U, G>
 {
     fn take_handoff_receipt(&mut self) -> Option<carrick_el1_abi::EntryHandoffReceipt> {
         self.handoff.take()
@@ -369,7 +393,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> Pending
     fn record_source(&self) -> Option<carrick_el1_abi::BornInZoneSource<'a>> {
         Some(carrick_el1_abi::BornInZoneSource {
             zone: self.zone.as_ref()?.tables,
-            slot: SlotId::from_index(self.frame.slot as usize)?,
+            slot: SlotId::from_index(self.frame.slot() as usize)?,
         })
     }
     #[cfg(target_os = "none")]
@@ -400,20 +424,23 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> Pending
         self.ipc_transfer()
     }
     fn original_argument0(&self) -> u64 {
-        self.frame.x[0]
+        self.frame.argument(0)
     }
     fn install_result(&mut self, result: SyscallResult) {
-        self.frame.x[0] = result.raw() as u64;
+        self.frame
+            .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
     }
     fn lifecycle_native(
         &mut self,
     ) -> Option<&mut dyn carrick_personality_linux::lifecycle::LifecycleNative<'a>> {
         self.lifecycle?;
-        self.current_tasks.get(self.frame.slot as usize)?;
+        self.current_tasks.get(self.frame.slot() as usize)?;
         Some(self)
     }
     fn futex(&mut self) -> FamilyCompletion {
-        let frame = &mut *self.frame;
+        let Some(frame) = self.frame.arm_frame() else {
+            return FamilyCompletion::Forward;
+        };
         let counters = self.counters;
         let zone = &mut self.zone;
         let current_tasks = self.current_tasks;
@@ -504,7 +531,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> Pending
 
     fn resumes_operation(&self) -> bool {
         self.zone.as_ref().is_some_and(|zone| {
-            SlotId::from_index(self.frame.slot as usize)
+            SlotId::from_index(self.frame.slot() as usize)
                 .and_then(|slot| zone.tables.slot(slot).current())
                 .is_some_and(|record| zone.tables.record(record).has_object_operation())
         })
@@ -531,7 +558,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> Pending
                 task,
                 crate::substrate::sched::object_wait::space_access(
                     zone.tables,
-                    SlotId::new(self.frame.slot as u8),
+                    SlotId::new(self.frame.slot() as u8),
                 ),
                 memory::reservations::shared_guest(),
             )
@@ -544,12 +571,12 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> Pending
     }
 }
 #[cfg(target_os = "none")]
-impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord>
+impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
     carrick_personality_linux::pending_anonymous::PendingAnonymousVenue
-    for El1PendingFamilies<'_, F, C, U>
+    for El1PendingFamilies<'_, F, C, U, G>
 {
     fn original_argument0(&self) -> u64 {
-        self.frame.x[0]
+        self.frame.argument(0)
     }
     fn task_state(&self) -> Option<&LinuxTaskState> {
         self.task().map(|task| &task.linux)
@@ -557,16 +584,19 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord>
     fn delegated(&mut self) -> DelegatedStep {
         let (Some(zone), Some(task)) = (
             self.zone.as_ref(),
-            self.current_tasks.get(self.frame.slot as usize),
+            self.current_tasks.get(self.frame.slot() as usize),
         ) else {
             return DelegatedStep::NotDelegated;
         };
         let access = crate::substrate::sched::object_wait::space_access(
             zone.tables,
-            SlotId::new(self.frame.slot as u8),
+            SlotId::new(self.frame.slot() as u8),
         );
         match memory::serve_delegated_anonymous(
-            self.frame,
+            match self.frame.arm_frame() {
+                Some(frame) => frame,
+                None => return DelegatedStep::NotDelegated,
+            },
             self.counters,
             task,
             access,
@@ -576,25 +606,25 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord>
             memory::DelegatedAnonymous::PreparedConflict => DelegatedStep::PreparedConflict,
             memory::DelegatedAnonymous::NotDelegated => DelegatedStep::NotDelegated,
             memory::DelegatedAnonymous::Served => {
-                DelegatedStep::Served(SyscallResult::new(self.frame.x[0] as i64))
+                DelegatedStep::Served(SyscallResult::new(self.frame.argument(0) as i64))
             }
             memory::DelegatedAnonymous::Forward => DelegatedStep::Forward,
         }
     }
     fn park_prepared(&mut self) -> Option<FamilyCompletion> {
-        let slot = SlotId::from_index(self.frame.slot as usize)?;
-        let task = self.current_tasks.get(self.frame.slot as usize)?;
+        let slot = SlotId::from_index(self.frame.slot() as usize)?;
+        let task = self.current_tasks.get(self.frame.slot() as usize)?;
         let zone = self.zone.as_mut()?;
         let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
         let served = super::mm_portal::park_prepared_edit(
             &mut sched,
-            self.frame,
+            self.frame.arm_frame()?,
             memory::reservations::shared_guest(),
         )?;
         Some(
             carrick_personality_linux::dispatch::accounted_scheduler_effect(
                 served,
-                self.frame.x[0] as i64,
+                self.frame.argument(0) as i64,
             ),
         )
     }
@@ -604,10 +634,13 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord>
         };
         let access = crate::substrate::sched::object_wait::space_access(
             zone.tables,
-            SlotId::new(self.frame.slot as u8),
+            SlotId::new(self.frame.slot() as u8),
         );
         match memory::try_serve_mprotect(
-            self.frame,
+            match self.frame.arm_frame() {
+                Some(frame) => frame,
+                None => return PermissionStep::Forward,
+            },
             self.current_tasks,
             access,
             &mut memory::HardwareAnonymousPermissionEditor,
@@ -625,10 +658,13 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord>
         };
         let access = crate::substrate::sched::object_wait::space_access(
             zone.tables,
-            SlotId::new(self.frame.slot as u8),
+            SlotId::new(self.frame.slot() as u8),
         );
         match memory::try_serve_munmap(
-            self.frame,
+            match self.frame.arm_frame() {
+                Some(frame) => frame,
+                None => return RetirementStep::Forward,
+            },
             self.current_tasks,
             access,
             &mut memory::HardwareAnonymousRetirementEditor,
@@ -641,7 +677,8 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord>
         }
     }
     fn install_result(&mut self, result: SyscallResult) {
-        self.frame.x[0] = result.raw() as u64;
+        self.frame
+            .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
     }
 }
 
@@ -663,9 +700,13 @@ pub(super) fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
     }
 }
 
-impl<F, C: sched::ThreadCpu, U: sched::UserWord> El1PendingFamilies<'_, F, C, U> {
+impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
+    El1PendingFamilies<'_, F, C, U, G>
+{
     fn ipc_transfer(&mut self) -> FamilyCompletion {
-        let frame = &mut *self.frame;
+        let Some(frame) = self.frame.arm_frame() else {
+            return FamilyCompletion::Forward;
+        };
         let counters = self.counters;
         let zone = &mut self.zone;
         let current_tasks = self.current_tasks;
@@ -693,23 +734,23 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord> El1PendingFamilies<'_, F, C, U>
         FamilyCompletion::Forward
     }
     fn task(&self) -> Option<&CurrentTask> {
-        self.current_tasks.get(self.frame.slot as usize)
+        self.current_tasks.get(self.frame.slot() as usize)
     }
 }
 
-impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFileVenue
-    for El1PendingFamilies<'_, F, C, U>
+impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
+    PendingFileVenue for El1PendingFamilies<'_, F, C, U, G>
 {
     fn ordinal(&self) -> u64 {
-        self.frame.x[8]
+        self.frame.canonical_ordinal().raw()
     }
     fn inotify_add(&mut self) -> Option<i64> {
         self.task().and_then(|task| {
             inotify::el1_inotify_add_watch(
                 self.file_access(),
-                self.frame.x[0] as i32,
-                self.frame.x[1],
-                self.frame.x[2] as u32,
+                self.frame.argument(0) as i32,
+                self.frame.argument(1),
+                self.frame.argument(2) as u32,
                 task,
                 self.fd_map,
                 self.object_table,
@@ -724,8 +765,8 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFile
         self.task().and_then(|task| {
             inotify::el1_inotify_rm_watch(
                 self.file_access(),
-                self.frame.x[0] as i32,
-                self.frame.x[1] as i32,
+                self.frame.argument(0) as i32,
+                self.frame.argument(1) as i32,
                 task,
                 self.fd_map,
                 self.object_table,
@@ -735,7 +776,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFile
         })
     }
     fn original_argument0(&self) -> u64 {
-        self.frame.x[0]
+        self.frame.argument(0)
     }
     fn task_state(&self) -> Option<&LinuxTaskState> {
         self.task().map(|task| &task.linux)
@@ -744,7 +785,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFile
         try_serve_file_syscall(
             self.file_access(),
             self.frame,
-            self.frame.x[8] as usize,
+            self.frame.canonical_ordinal().raw() as usize,
             self.current_tasks,
             self.fd_map,
             self.object_table,
@@ -755,9 +796,9 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFile
     }
     fn inotify_read(&mut self) -> Option<i64> {
         inotify::el1_inotify_read(
-            self.frame.x[0] as i32,
-            self.frame.x[1],
-            self.frame.x[2] as usize,
+            self.frame.argument(0) as i32,
+            self.frame.argument(1),
+            self.frame.argument(2) as usize,
             self.task()?,
             self.fd_map,
             self.inotify_table,
@@ -771,15 +812,18 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFile
             .any(DelegatedInotify::wake_is_owed)
     }
     fn install_result(&mut self, result: SyscallResult) {
-        self.frame.x[0] = result.raw() as u64;
+        self.frame
+            .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
     }
 }
-impl<F, C: sched::ThreadCpu, U: sched::UserWord> El1PendingFamilies<'_, F, C, U> {
+impl<F, C: sched::ThreadCpu, U: sched::UserWord, G: GuestDispatchFrame>
+    El1PendingFamilies<'_, F, C, U, G>
+{
     fn file_access(&self) -> crate::substrate::file_notification::FileAccess<'_> {
         match self.zone.as_ref() {
             Some(zone) => crate::substrate::file_notification::FileAccess::notified(
                 zone.tables,
-                SlotId::new(self.frame.slot as u8),
+                SlotId::new(self.frame.slot() as u8),
             ),
             None => {
                 #[cfg(any(test, feature = "host-test"))]
@@ -796,9 +840,9 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord> El1PendingFamilies<'_, F, C, U>
 }
 
 #[allow(clippy::too_many_arguments)]
-fn try_serve_file_syscall<'a, F>(
+fn try_serve_file_syscall<'a, F, G: SyscallFrame>(
     access: crate::substrate::file_notification::FileAccess<'a>,
-    frame: &TrapFrame,
+    frame: &G,
     nr: usize,
     current_tasks: &[CurrentTask],
     fd_map: &[FdMapSlot],
@@ -810,13 +854,13 @@ fn try_serve_file_syscall<'a, F>(
 where
     F: Fn(u32) -> *mut u8,
 {
-    let slot = frame.slot as usize;
+    let slot = frame.slot() as usize;
     let cur_task = current_tasks.get(slot)?;
     let file_table = cur_task.linux.file_table.load(Ordering::Acquire);
     if file_table == 0 {
         return None;
     }
-    let fd = frame.x[0] as i32;
+    let fd = frame.argument(0) as i32;
     // fd -> open file (this description's offset and flags) -> inode (bytes).
     let (handle, slot_idx) = fd_map_lookup(fd_map, file_table, fd)?;
     if handle == 0 || handle as usize > MAX_ZONE_OPEN_FILES {
@@ -853,7 +897,7 @@ where
         task: cur_task,
         validator: &file::HardwareValidator,
     };
-    let args = [frame.x[1], frame.x[2], frame.x[3]];
+    let args = [frame.argument(1), frame.argument(2), frame.argument(3)];
     let zone_file = file::ZoneFile { inode: file, open };
     // SAFETY: the inode is locked and revalidated; `cache_ptr` is its slot.
     let outcome = unsafe {
@@ -998,6 +1042,33 @@ pub unsafe fn serve_locked_file_op(
 mod tests {
     use super::*;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn absent_file_venue_forwards_without_answering_from_empty_tables() {
+        let mut frame = TrapFrame::default();
+        frame.x[0] = 7;
+        frame.x[8] = 62; // lseek
+        let tasks = [CurrentTask::new()];
+        let counters = Counters::default();
+        let action = dispatch_syscall_with_lifecycle(
+            &mut frame,
+            &counters,
+            &tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &InotifyNameCache::new(),
+            None::<Zone<'_, sched::FakeCpu, sched::HardwareUserWord>>,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        assert_eq!(action, Action::Forward);
+        assert_eq!(frame.x[0], 7);
+        assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 1);
+        assert_eq!(counters.served[62].load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn invalid_lifecycle_entry_does_not_publish_result_or_original_argument() {

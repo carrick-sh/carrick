@@ -1,5 +1,5 @@
 //! ARM native context and mapping hooks for the shared Linux lifecycle owner.
-use super::dispatch::{El1PendingFamilies, native_scheduler};
+use super::dispatch::{El1PendingFamilies, GuestDispatchFrame, native_scheduler};
 use super::sched::{ThreadCpu, UserWord};
 pub use super::thread_setup::{GuestLifecycleVenue, LifecycleVenue, guest_venue};
 use crate::file::UserCopy as ArmUserCopy;
@@ -15,15 +15,15 @@ use carrick_personality_linux::entry::aarch64_child_vdso_identity;
 pub use carrick_personality_linux::lifecycle::*;
 pub use carrick_personality_linux::thread::{LifecycleThread, SYS_SET_ROBUST_LIST};
 
-impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> UserCopy
-    for El1PendingFamilies<'_, F, C, U>
+impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame> UserCopy
+    for El1PendingFamilies<'_, F, C, U, G>
 {
     fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
             return user.copy_in(dst, src.raw());
         }
-        let Some(task) = self.current_tasks.get(self.frame.slot as usize) else {
+        let Some(task) = self.current_tasks.get(self.frame.slot() as usize) else {
             return false;
         };
         crate::file::ValidatedCopy {
@@ -37,7 +37,7 @@ impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> UserCopy
         if let Some(user) = &mut self.lifecycle_user {
             return user.copy_out(dst.raw(), src);
         }
-        let Some(task) = self.current_tasks.get(self.frame.slot as usize) else {
+        let Some(task) = self.current_tasks.get(self.frame.slot() as usize) else {
             return false;
         };
         crate::file::ValidatedCopy {
@@ -48,32 +48,32 @@ impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> UserCopy
     }
 }
 
-impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> LifecycleNative<'a>
-    for El1PendingFamilies<'a, F, C, U>
+impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame>
+    LifecycleNative<'a> for El1PendingFamilies<'a, F, C, U, G>
 {
     fn arguments(&self) -> [u64; 6] {
         [
-            self.frame.x[0],
-            self.frame.x[1],
-            self.frame.x[2],
-            self.frame.x[3],
-            self.frame.x[4],
-            self.frame.x[5],
+            self.frame.argument(0),
+            self.frame.argument(1),
+            self.frame.argument(2),
+            self.frame.argument(3),
+            self.frame.argument(4),
+            self.frame.argument(5),
         ]
     }
     fn binding(&self) -> Option<carrick_el1_abi::ExecutionBinding> {
         self.current_tasks
-            .get(self.frame.slot as usize)
+            .get(self.frame.slot() as usize)
             .map(super::common_entry::execution_binding)
     }
     fn task_state(&self) -> Option<&'a LinuxTaskState> {
         self.current_tasks
-            .get(self.frame.slot as usize)
+            .get(self.frame.slot() as usize)
             .map(|task| &task.linux)
     }
     fn thread(&self) -> Option<LifecycleThread<'a>> {
         self.lifecycle?
-            .thread(self.current_tasks.get(self.frame.slot as usize)?)
+            .thread(self.current_tasks.get(self.frame.slot() as usize)?)
     }
     fn born_slot(
         &self,
@@ -86,17 +86,22 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> LifecycleNative<'a>
         self.counters.record_lifecycle_decline(reason);
     }
     fn has_scheduler(&self) -> bool {
-        self.zone.is_some() && SlotId::from_index(self.frame.slot as usize).is_some()
+        self.frame.arm_scheduler()
+            && self.zone.is_some()
+            && SlotId::from_index(self.frame.slot() as usize).is_some()
     }
     fn user_sp(&mut self) -> Option<UserVa> {
+        if let Some(sp) = self.frame.user_sp() {
+            return Some(sp);
+        }
         let zone = self.zone.as_mut()?;
         let mut scratch = ThreadCtx::ZERO;
-        zone.cpu.save(self.frame, &mut scratch);
+        zone.cpu.save(self.frame.arm_frame()?, &mut scratch);
         Some(UserVa::new(scratch.sp_el0))
     }
     fn affinity(&self) -> Option<u64> {
         let zone = self.zone.as_ref()?.tables;
-        let slot = SlotId::from_index(self.frame.slot as usize)?;
+        let slot = SlotId::from_index(self.frame.slot() as usize)?;
         Some(match zone.slot(slot).current() {
             Some(record) => zone.record(record).identity().affinity,
             None => zone.slot(slot).affinity(),
@@ -133,7 +138,10 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> LifecycleNative<'a>
         let record = rec;
         // SAFETY: this exact new record is unpublished and exclusively owned by this birth.
         let ctx = unsafe { record.ctx_mut() };
-        zone.cpu.save(self.frame, ctx);
+        let Some(frame) = self.frame.arm_frame() else {
+            return;
+        };
+        zone.cpu.save(frame, ctx);
         ctx.x[0] = context.result.raw() as u64;
         ctx.sp_el0 = context.stack.raw();
         if let Some(tls) = context.tls {
@@ -142,10 +150,10 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> LifecycleNative<'a>
         ctx.tpidrro_el0 = aarch64_child_vdso_identity(ctx.tpidrro_el0, context.visible_tid);
     }
     fn enqueue_born(&mut self, record: RecordRef) {
-        let Some(task) = self.current_tasks.get(self.frame.slot as usize) else {
+        let Some(task) = self.current_tasks.get(self.frame.slot() as usize) else {
             return;
         };
-        let Some(slot) = SlotId::from_index(self.frame.slot as usize) else {
+        let Some(slot) = SlotId::from_index(self.frame.slot() as usize) else {
             return;
         };
         let Some(zone) = &mut self.zone else {
@@ -158,7 +166,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> LifecycleNative<'a>
     }
     fn exit_record(&self) -> Option<ExitRecord> {
         let zone = self.zone.as_ref()?.tables;
-        let slot = SlotId::from_index(self.frame.slot as usize)?;
+        let slot = SlotId::from_index(self.frame.slot() as usize)?;
         let id = zone.slot(slot).current()?;
         let record = zone.record(id);
         Some(ExitRecord {
@@ -173,10 +181,10 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> LifecycleNative<'a>
         })
     }
     fn wake_child_tid(&mut self, mm: EntryMmKey, address: UserVa) -> bool {
-        let Some(task) = self.current_tasks.get(self.frame.slot as usize) else {
+        let Some(task) = self.current_tasks.get(self.frame.slot() as usize) else {
             return false;
         };
-        let Some(slot) = SlotId::from_index(self.frame.slot as usize) else {
+        let Some(slot) = SlotId::from_index(self.frame.slot() as usize) else {
             return false;
         };
         let Some(zone) = &mut self.zone else {
@@ -184,7 +192,10 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> LifecycleNative<'a>
         };
         native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
             .wake_word(
-                self.frame,
+                match self.frame.arm_frame() {
+                    Some(frame) => frame,
+                    None => return false,
+                },
                 mm.raw(),
                 address.raw(),
                 carrick_personality_linux::thread::CHILD_TID_WAKE_MASK,
@@ -193,13 +204,13 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> LifecycleNative<'a>
             .is_some()
     }
     fn release_current(&mut self, record: RecordRef) -> bool {
-        let Some(task) = self.current_tasks.get(self.frame.slot as usize) else {
+        let Some(task) = self.current_tasks.get(self.frame.slot() as usize) else {
             return false;
         };
         let Some(zone) = &self.zone else {
             return false;
         };
-        let Some(slot) = SlotId::from_index(self.frame.slot as usize) else {
+        let Some(slot) = SlotId::from_index(self.frame.slot() as usize) else {
             return false;
         };
         if zone.tables.live(record).is_none() {
@@ -217,33 +228,39 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> LifecycleNative<'a>
         self.handoff.is_some()
     }
     fn run_next(&mut self, timeout_result: SyscallResult) -> (carrick_core::Served, SyscallResult) {
-        let Some(task) = self.current_tasks.get(self.frame.slot as usize) else {
+        let Some(task) = self.current_tasks.get(self.frame.slot() as usize) else {
             return (
                 carrick_core::Served::Idle,
-                SyscallResult::new(self.frame.x[0] as i64),
+                SyscallResult::new(self.frame.argument(0) as i64),
             );
         };
-        let Some(slot) = SlotId::from_index(self.frame.slot as usize) else {
+        let Some(slot) = SlotId::from_index(self.frame.slot() as usize) else {
             return (
                 carrick_core::Served::Idle,
-                SyscallResult::new(self.frame.x[0] as i64),
+                SyscallResult::new(self.frame.argument(0) as i64),
             );
         };
         let Some(zone) = &mut self.zone else {
             return (
                 carrick_core::Served::Idle,
-                SyscallResult::new(self.frame.x[0] as i64),
+                SyscallResult::new(self.frame.argument(0) as i64),
             );
         };
-        let served = native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
-            .run_next(self.frame, timeout_result.raw() as u64);
-        (served, SyscallResult::new(self.frame.x[0] as i64))
+        let served = native_scheduler(zone, task, self.counters, slot, &mut self.handoff).run_next(
+            match self.frame.arm_frame() {
+                Some(frame) => frame,
+                None => return (carrick_core::Served::Idle, SyscallResult::new(0)),
+            },
+            timeout_result.raw() as u64,
+        );
+        (served, SyscallResult::new(self.frame.argument(0) as i64))
     }
     fn result(&self) -> SyscallResult {
-        SyscallResult::new(self.frame.x[0] as i64)
+        SyscallResult::new(self.frame.argument(0) as i64)
     }
     fn set_result(&mut self, result: SyscallResult) {
-        self.frame.x[0] = result.raw() as u64;
+        self.frame
+            .set_result(carrick_guest_arch::NativeReturnWord(result.raw() as u64));
     }
 }
 
