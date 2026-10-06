@@ -1,10 +1,10 @@
 use super::InitialWords;
-use crate::adapter::DIRECT_VA;
 use carrick_el1::isa::x86::initial_mm::{
     InitialDataGrant, InitialFrameSource, InitialImageRegion, InitialImageSpec, InitialSourceRange,
     InitialStackSpec, install_initial_image,
 };
 use carrick_el1_abi::{
+    X86_CPL0_INITIAL_EXTENT_GPA, X86_CPL0_INITIAL_EXTENT_MAX_SIZE, X86_CPL0_INITIAL_EXTENT_VA,
     X86_INITIAL_BOOT_LOADED, X86_INITIAL_BOOT_MAGIC, X86_INITIAL_BOOT_PORT,
     X86_INITIAL_BOOT_REFUSED, X86_INITIAL_BOOT_VERSION, X86_INITIAL_MAX_REGIONS,
     X86_INITIAL_MAX_STRINGS, X86InitialBootGrant, X86InitialBootRegion, X86InitialBootRequest,
@@ -14,8 +14,12 @@ use carrick_guest_arch::{EditBacking, EditPermissions, FrameGpa, GuestLen, MmuBa
 use core::num::NonZeroU64;
 use rust_alloc::vec::Vec;
 
-const EXTENT_BASE: u64 = 0x40_00000;
+const EXTENT_BASE: u64 = X86_CPL0_INITIAL_EXTENT_GPA;
 const PAGE: u64 = 4096;
+
+const fn extent_va(gpa: u64) -> u64 {
+    X86_CPL0_INITIAL_EXTENT_VA + (gpa - EXTENT_BASE)
+}
 
 fn span(gpa: u64, bytes: u64, end: u64) -> bool {
     gpa >= EXTENT_BASE && gpa.checked_add(bytes).is_some_and(|last| last <= end)
@@ -28,7 +32,7 @@ fn records<T>(gpa: u64, count: usize, end: u64) -> Option<&'static [T]> {
     }
     // SAFETY: the sole stopped carrier staged these retained records in the
     // supervisor direct window before this entry was installed on CPU 0.
-    Some(unsafe { core::slice::from_raw_parts((DIRECT_VA + gpa) as *const T, count) })
+    Some(unsafe { core::slice::from_raw_parts(extent_va(gpa) as *const T, count) })
 }
 
 struct GrantedFrames<'a> {
@@ -91,8 +95,8 @@ impl InitialFrameSource for GrantedFrames<'_> {
         // is a distinct retained private frame still hidden from EL0.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                (DIRECT_VA + start) as *const u8,
-                (DIRECT_VA + grant.frame.raw() + u64::from(offset)) as *mut u8,
+                extent_va(start) as *const u8,
+                (extent_va(grant.frame.raw()) + u64::from(offset)) as *mut u8,
                 usize::from(len),
             );
         }
@@ -111,7 +115,7 @@ impl InitialFrameSource for GrantedFrames<'_> {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                (DIRECT_VA + grant.frame.raw() + u64::from(offset)) as *mut u8,
+                (extent_va(grant.frame.raw()) + u64::from(offset)) as *mut u8,
                 bytes.len(),
             );
         }
@@ -129,7 +133,9 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     {
         return None;
     }
-    let end = EXTENT_BASE.checked_add(u64::from(request.extent_pages) * PAGE)?;
+    let extent_bytes = u64::from(request.extent_pages).checked_mul(PAGE)?;
+    if extent_bytes > X86_CPL0_INITIAL_EXTENT_MAX_SIZE { return None; }
+    let end = EXTENT_BASE.checked_add(extent_bytes)?;
     if !span(EXTENT_BASE, core::mem::size_of::<X86InitialBootRequest>() as u64, end) {
         return None;
     }
@@ -171,7 +177,7 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     for (index, string) in strings.iter().enumerate() {
         if string.len > 0x1_0000 || !span(string.source_gpa, string.len, staged_end) { return None; }
         // SAFETY: the host staged immutable bytes in this retained window.
-        let value = unsafe { core::slice::from_raw_parts((DIRECT_VA + string.source_gpa) as *const u8, string.len as usize) };
+        let value = unsafe { core::slice::from_raw_parts(extent_va(string.source_gpa) as *const u8, string.len as usize) };
         if index < request.argc as usize { argv.push(value); } else { envp.push(value); }
     }
     let stack = InitialStackSpec {
@@ -233,7 +239,7 @@ unsafe extern "C" { fn carrick_x86_boot_iret(entry: u64, stack: u64) -> !; }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn carrick_x86_initial_boot(request_va: u64) -> ! {
-    if request_va != DIRECT_VA + EXTENT_BASE { loop { core::hint::spin_loop(); } }
+    if request_va != X86_CPL0_INITIAL_EXTENT_VA { loop { core::hint::spin_loop(); } }
     // SAFETY: the carrier owns and retained this exact initialized request.
     let request = unsafe { &mut *(request_va as *mut X86InitialBootRequest) };
     let loaded = load(request);
