@@ -163,6 +163,7 @@ fn overlaps_clock_stub(address: u64, length: u64) -> Result<bool, LinuxErrno> {
 impl<'a> MemView<'a> {
     define_syscall! {
         mm_mutation fn mmap_served(this, cx, requested: GuestPtr, length: u64, prot: u64, flags: u64, fd: Fd, offset: u64) {
+            let user_ceiling = UserVaCeiling::for_abi(cx.guest_abi());
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let mut flags = flags;
@@ -191,7 +192,11 @@ impl<'a> MemView<'a> {
                 fd: fd.0,
                 offset,
             };
-            let requested = GuestPtr(requested.0 & 0x0000_FFFF_FFFF_FFFF);
+            let requested = if cx.request.guest_abi == carrick_abi::LinuxGuestAbi::Aarch64 {
+                GuestPtr(requested.0 & 0x0000_FFFF_FFFF_FFFF)
+            } else {
+                requested
+            };
 
             let fixed_noreplace = flags & LINUX_MAP_FIXED_NOREPLACE != 0;
             if fixed_noreplace {
@@ -339,6 +344,19 @@ impl<'a> MemView<'a> {
                     ));
                 }
             };
+            // Native x86 pointers are never ARM/Rosetta tags. Refuse a fixed
+            // noncanonical range before replacing metadata or touching backing.
+            if cx.request.guest_abi == carrick_abi::LinuxGuestAbi::X86_64
+                && map_flags.contains(LinuxMmapFlags::FIXED)
+                && requested.0.checked_add(length)
+                    .is_none_or(|end| end > user_ceiling.exclusive_end())
+            {
+                return Ok(request.refused(
+                    MmapRefusal::Spec("MAP_FIXED outside the guest user VA range"),
+                    LINUX_ENOMEM,
+                ));
+            }
+
             if map_flags.contains(LinuxMmapFlags::FIXED) {
                 let refusal = match overlaps_clock_stub(requested.0, length) {
                     Ok(false) => None,
@@ -1107,7 +1125,7 @@ impl<'a> MemView<'a> {
                 // PROT_NONE -> writable commit can install the exact hinted VA
                 // while preserving the original MAP_SHARED provenance.
                 && (requested.0 == 0
-                    || !mmap_address_uses_alias(requested.0, length, this.mem().lock().layout))
+                    || !mmap_address_uses_alias(requested.0, length, this.mem().lock().layout, user_ceiling))
             {
                 let map_len = align_up_u64(length, hvf_page).unwrap_or(length);
                 let alloc = {
@@ -1311,6 +1329,7 @@ impl<'a> MemView<'a> {
                     flags,
                     congruence,
                     root_eligible,
+                    user_ceiling,
                 )? {
                 Some(pair) => pair,
                 None => {
@@ -1319,7 +1338,7 @@ impl<'a> MemView<'a> {
                     // too — CPython's `test_io` asks for 0x8000_0000_0000_1000
                     // on purpose. Only a request that would have fitted, and did
                     // not, is carrick's address space running out.
-                    let refusal = if length > (1u64 << 48) {
+                    let refusal = if length > user_ceiling.exclusive_end() {
                         MmapRefusal::Spec("length exceeds the entire mmap address-space arena")
                     } else {
                         MmapRefusal::Internal("no free address-space region: mmap arena exhausted")
@@ -1332,7 +1351,7 @@ impl<'a> MemView<'a> {
                 && map_flags.contains(LinuxMmapFlags::FIXED);
             let layout = this.mem().lock().layout;
             let in_arena = range_within(address, length, layout.mmap_base, layout.mmap_size);
-            let address_uses_alias_layout = mmap_address_uses_alias(address, length, layout);
+            let address_uses_alias_layout = mmap_address_uses_alias(address, length, layout, user_ceiling);
             // The backing query is only needed for a fixed, non-alias address
             // outside the semantic arena. An admitted owner serves reads via
             // EL1, and this syscall still holds the MM mutation gate.
@@ -2304,6 +2323,7 @@ impl<'a> MemView<'a> {
         }
 
         mm_mutation fn munmap_served(this, cx, address: GuestPtr, length: u64) {
+            let user_ceiling = UserVaCeiling::for_abi(cx.guest_abi());
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let page_size = this.linux_page_size();
@@ -2438,10 +2458,10 @@ impl<'a> MemView<'a> {
             // fd are reclaimed at process teardown.
             // Misaligned addresses (e.g. RLIM_INFINITY, which LTP munmap03 passes
             // to assert EINVAL) are already rejected by the alignment gate above;
-            // addresses >= 2^48 stay EINVAL via the range check below.
+            // addresses outside the guest user VA range stay EINVAL below.
             let layout = this.mem().lock().layout;
             if this.range_is_alias_vma(address.0, length)
-                || mmap_address_uses_alias(address.0, length, layout)
+                || mmap_address_uses_alias(address.0, length, layout, user_ceiling)
             {
                 let Ok(len_usize) = usize::try_from(aligned_len) else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
@@ -2500,6 +2520,7 @@ impl<'a> MemView<'a> {
         }
 
         mm_mutation fn mremap_served(this, cx, old_address: GuestPtr, old_size: u64, new_size_req: u64, flags: u64, new_address: GuestPtr) {
+            let user_ceiling = UserVaCeiling::for_abi(cx.guest_abi());
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let memory = &mut *cx.memory;
@@ -2749,7 +2770,7 @@ impl<'a> MemView<'a> {
                 // MREMAP_FIXED replaces whatever was at the destination range.
                 if new_len > 0 {
                     if this.range_is_alias_vma(va, new_size)
-                        || mmap_address_uses_alias(va, new_size, layout)
+                        || mmap_address_uses_alias(va, new_size, layout, user_ceiling)
                     {
                         let _ = memory.unmap_alias_range(va, new_len);
                     } else {
@@ -2766,6 +2787,7 @@ impl<'a> MemView<'a> {
                         LINUX_MAP_FIXED,
                         MmapGrantCongruence::Any,
                         false,
+                        user_ceiling,
                     )
                     .ok()
                     .flatten()
@@ -2797,7 +2819,7 @@ impl<'a> MemView<'a> {
                 // Reclaim the source range.
                 if old_len > 0 {
                     if this.range_is_alias_vma(old_address.0, old_size)
-                        || mmap_address_uses_alias(old_address.0, old_size, layout)
+                        || mmap_address_uses_alias(old_address.0, old_size, layout, user_ceiling)
                     {
                         let _ = memory.unmap_alias_range(old_address.0, old_len);
                     } else {
@@ -3335,7 +3357,7 @@ impl<'a> MemView<'a> {
                         let unmap_result = if !tracked_shared
                             && !tracked_overlay
                             && (this.range_is_alias_vma(old_address.0, old_size)
-                                 || mmap_address_uses_alias(old_address.0, old_size, layout))
+                                 || mmap_address_uses_alias(old_address.0, old_size, layout, user_ceiling))
                         {
                             memory.unmap_alias_range(tail_start, tail_len_usize)
                         } else {
@@ -3465,6 +3487,7 @@ impl<'a> MemView<'a> {
                         0,
                     MmapGrantCongruence::Any,
                     false,
+                    user_ceiling,
                 )? else {
                         return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                     };
@@ -3612,6 +3635,7 @@ impl<'a> MemView<'a> {
                     LINUX_MAP_FIXED,
                     MmapGrantCongruence::Any,
                     false,
+                    user_ceiling,
                 )? {
                     // Treat a fixed destination as reused: it may carry a prior
                     // owner's bytes, and the copy below fills only `copy_len`.
@@ -3626,6 +3650,7 @@ impl<'a> MemView<'a> {
                     0,
                     MmapGrantCongruence::Any,
                     false,
+                    user_ceiling,
                 )? else {
                     return Ok(DispatchOutcome::errno(LINUX_ENOMEM));
                 };
@@ -3677,6 +3702,7 @@ impl<'a> MemView<'a> {
         }
 
         mm_mutation fn mprotect_served(this, cx, address: GuestPtr, length: u64, prot: u64) {
+            let user_ceiling = UserVaCeiling::for_abi(cx.guest_abi());
             let permit = cx.mm_mutation.host_alias_permit();
             let mut host_alias_dispatch = this.begin_conditional_vma_dispatch(&permit);
             let page_size = this.linux_page_size();
@@ -3723,7 +3749,7 @@ impl<'a> MemView<'a> {
                 .is_some_and(|p| p.range_unmapped(address.0, len));
             let layout = this.mem().lock().layout;
             let address_is_alias_vma = this.range_is_alias_vma(address.0, length)
-                || mmap_address_uses_alias(address.0, length, layout);
+                || mmap_address_uses_alias(address.0, length, layout, user_ceiling);
             // Complete VMA metadata answers whether the Linux address range is
             // mapped; it does NOT answer whether a deliberately-lazy anonymous
             // high-VA reservation has acquired physical alias backing. The

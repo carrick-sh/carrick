@@ -473,7 +473,7 @@ contracts = ["kernel.mm.pt-pause-drain-acknowledgement", "kernel.el1.stage1-publ
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem.rs"
-contracts = ["kernel.el1.stage1-publication"]
+contracts = ["kernel.el1.stage1-publication", "kernel.mm.user-va-ceiling"]
 
 [[surfaces]]
 path = "crates/carrick-kernel/src/dispatch/mem/fault.rs"
@@ -617,7 +617,7 @@ contracts = ["kernel.el1.guest-scheduler"]
 
 [[surfaces]]
 path = "crates/carrick-hal/src/aarch64_arch.rs"
-contracts = ["kernel.el1.guest-scheduler"]
+contracts = ["kernel.el1.guest-scheduler", "kernel.mm.user-va-ceiling"]
 
 [[surfaces]]
 path = "fixtures/embed-el1-sched/src/main.rs"
@@ -806,3 +806,19 @@ contracts = ["kernel.el1.signal-delivery-owner"]
 [[surfaces]]
 path = "crates/carrick-personality-linux/tests/signal_policy_contract.rs"
 contracts = ["kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/guest_arch.rs"
+contracts = ["kernel.mm.user-va-ceiling"]
+
+[[surfaces]]
+path = "crates/carrick-hal/src/x8664_arch.rs"
+contracts = ["kernel.mm.user-va-ceiling"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/mem/mmap.rs"
+contracts = ["kernel.mm.user-va-ceiling"]
+
+[[surfaces]]
+path = "crates/carrick-kernel/src/dispatch/mem/anonymous.rs"
+contracts = ["kernel.mm.user-va-ceiling"]
