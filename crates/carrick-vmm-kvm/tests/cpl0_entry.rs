@@ -32,6 +32,7 @@ fn user_access_program(index: u64) -> (Vec<u8>, Vec<i64>) {
         (mapped, 0, 0x6ace_b00c_1234_5678_i64),
         (mapped, 10, 0), // wrong MM incarnation consumes no kernel bytes
         (mapped, 12, 0), // unsupported word width is typed InvalidWidth
+        (mapped, 13, 0), // foreign task cannot validate this live CR3
         (mapped, 3, 0x1234_5678_i64),
         (mapped, 4, 16),
         (mapped, 5, 16),
