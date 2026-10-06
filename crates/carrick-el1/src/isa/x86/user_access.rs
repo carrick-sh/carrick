@@ -15,6 +15,29 @@ const WRITABLE: u64 = 1 << 1;
 const USER: u64 = 1 << 2;
 const LARGE: u64 = 1 << 7;
 const TABLE_ADDR: u64 = 0x000f_ffff_ffff_f000;
+const TABLE_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
+const USER_CEILING: u64 = 0x0000_8000_0000_0000;
+
+/// A user operand must be wholly within the canonical lower half. The
+/// checked end also excludes wraparound into the supervisor address space.
+const fn lower_half_range(address: u64, len: u64) -> bool {
+    address < USER_CEILING
+        && match address.checked_add(len) {
+            Some(end) => end <= USER_CEILING,
+            None => false,
+        }
+}
+
+// Compile-time range cases also run for the freestanding image, whose x86
+// module cannot be loaded by the host-only carrick-el1 unit-test target.
+const _: () = {
+    assert!(lower_half_range(0, 0));
+    assert!(lower_half_range(USER_CEILING - 8, 8));
+    assert!(!lower_half_range(USER_CEILING - 4, 8));
+    assert!(!lower_half_range(USER_CEILING, 0));
+    assert!(!lower_half_range(0xffff_ffff_8000_0000, 8));
+    assert!(!lower_half_range(u64::MAX - 3, 8));
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransferDirection {
@@ -28,11 +51,15 @@ struct MmKey(NonZeroU64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TaskGeneration(NonZeroU64);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ThreadGeneration(NonZeroU64);
+
 /// An exact running task's bounded CPL0 transfer. The owner, root and offset
 /// stay attached across chunks; a reschedule to another MM cannot reuse it.
 pub struct UserTransfer {
     owner: NonNull<CurrentTask>,
     task_generation: TaskGeneration,
+    thread_generation: ThreadGeneration,
     mm: MmKey,
     root: RootGpa,
     user: UserVa,
@@ -80,7 +107,7 @@ impl UserTransfer {
         total: GuestLen,
         direction: TransferDirection,
     ) -> Result<Self, ArchError> {
-        if !current_task(owner) || user.raw().checked_add(total.raw()).is_none() {
+        if !current_task(owner) || !lower_half_range(user.raw(), total.raw()) {
             return Err(ArchError::Unbound);
         }
         let task_generation = NonZeroU64::new(owner.execution.generation.load(Ordering::Acquire))
@@ -89,9 +116,13 @@ impl UserTransfer {
         let mm = NonZeroU64::new(owner.mm.key.load(Ordering::Acquire))
             .map(MmKey)
             .ok_or(ArchError::Unbound)?;
+        let thread_generation = NonZeroU64::new(owner.mm.thread_generation.load(Ordering::Acquire))
+            .map(ThreadGeneration)
+            .ok_or(ArchError::Unbound)?;
         Ok(Self {
             owner: NonNull::from(owner),
             task_generation,
+            thread_generation,
             mm,
             root: live_root(),
             user,
@@ -111,6 +142,7 @@ impl UserTransfer {
         if !current_task(owner)
             || owner.execution.generation.load(Ordering::Acquire) != self.task_generation.0.get()
             || owner.mm.key.load(Ordering::Acquire) != self.mm.0.get()
+            || owner.mm.thread_generation.load(Ordering::Acquire) != self.thread_generation.0.get()
             || live_root() != self.root
         {
             return Err(ArchError::Unbound);
@@ -160,7 +192,7 @@ impl UserTransfer {
 /// Number of initial bytes whose live stage-1 walk grants the requested user
 /// access. A later unmap is still caught by the guarded load/copy.
 pub fn accessible_bytes(address: u64, len: usize, write: bool) -> usize {
-    if len == 0 {
+    if len == 0 || !lower_half_range(address, len as u64) {
         return 0;
     }
     let mut root: u64;
@@ -173,7 +205,7 @@ pub fn accessible_bytes(address: u64, len: usize, write: bool) -> usize {
         let Some(va) = address.checked_add(done as u64) else {
             break;
         };
-        if va >= 0x0000_8000_0000_0000 || !page_allows(root, va, write) {
+        if !page_allows(root, va, write) {
             break;
         }
         let page_remaining = 4096 - (va as usize & 4095);
@@ -209,8 +241,13 @@ fn page_allows(root: u64, va: u64, write: bool) -> bool {
         // SAFETY: authenticated live CR3 and every present next-level entry
         // point at retained, supervisor-mapped page-table frames. This read
         // observes the current hardware permission chain, not a cached VMA.
-        let desc = unsafe { core::ptr::read_volatile((table + index * 8) as *const u64) };
+        let desc = unsafe {
+            core::ptr::read_volatile((TABLE_DIRECT_VA + table + index * 8) as *const u64)
+        };
         if desc & (PRESENT | USER) != (PRESENT | USER) || (write && desc & WRITABLE == 0) {
+            return false;
+        }
+        if level == 0 && desc & LARGE != 0 {
             return false;
         }
         if level == 3 || (level == 1 || level == 2) && desc & LARGE != 0 {
@@ -235,6 +272,9 @@ fn guarded_read_u64(task: &CurrentTask, address: u64) -> Option<u64> {
     let mut ok = 1_u64;
     // SAFETY: CPL0 owns the current task and its fixup slot. The CPL0 #PF
     // gate resumes only at label 2; CR4.SMAP gates STAC/CLAC on this CPU.
+    // The range check excludes supervisor VA; carrick_mmu_core x86
+    // descriptor_txn::check_leaf_privilege_matches_range must forbid any
+    // supervisor leaf in the lower half during concurrent publication.
     unsafe {
         core::arch::asm!(
             "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 9f", "stac", "9:",
@@ -266,6 +306,8 @@ pub fn read_u32(task: &CurrentTask, address: u64) -> Option<u32> {
     let mut ok = 1_u64;
     // SAFETY: the guarded load and #PF fixup follow the same task-local
     // protocol as read_u64; the e-register load zero extends to 64 bits.
+    // Concurrent leaf publication depends on
+    // descriptor_txn::check_leaf_privilege_matches_range (see read_u64).
     unsafe {
         core::arch::asm!(
             "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 9f", "stac", "9:",
@@ -315,6 +357,8 @@ unsafe fn guarded_copy(task: &CurrentTask, dst: *mut u8, src: *const u8, len: us
     let mut ok = 1_u64;
     // SAFETY: REP MOVSB is guarded by the task-local fixup, and the caller
     // supplies a valid kernel operand. DF is cleared for the forward copy.
+    // The caller's lower-half check relies on
+    // descriptor_txn::check_leaf_privilege_matches_range for concurrent maps.
     unsafe {
         core::arch::asm!(
             "mov {tmp}, cr4", "bt {tmp}, 21", "jnc 9f", "stac", "9:",
@@ -462,7 +506,7 @@ pub fn witness(task: &CurrentTask, address: u64, mode: u64) -> u64 {
                 _ => (-14_i64) as u64,
             }
         }
-        10 => {
+        10 | 14 => {
             use carrick_guest_arch::{GuestLen, MmuBackend};
             let mut word = 0_u64;
             // SAFETY: the fixture retains its task and destination word while
@@ -478,12 +522,17 @@ pub fn witness(task: &CurrentTask, address: u64, mode: u64) -> u64 {
             }) else {
                 return (-14_i64) as u64;
             };
-            let old = task.mm.key.load(Ordering::Acquire);
-            task.mm.key.store(old.wrapping_add(1), Ordering::Release);
+            let changed = if mode == 10 {
+                &task.mm.key
+            } else {
+                &task.mm.thread_generation
+            };
+            let old = changed.load(Ordering::Acquire);
+            changed.store(old.wrapping_add(1), Ordering::Release);
             let refused = super::X86Backend
                 .copy_user_chunk(&mut transfer, GuestLen::new(8))
                 .is_err();
-            task.mm.key.store(old, Ordering::Release);
+            changed.store(old, Ordering::Release);
             if refused && word == 0 {
                 0
             } else {
