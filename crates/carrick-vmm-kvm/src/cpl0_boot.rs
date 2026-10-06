@@ -764,6 +764,18 @@ impl Cpl0Carrier {
     /// Run until a user fixture reports its last result. A finite exit budget
     /// and owned watchdog bound transport loops and an in-guest infinite loop.
     pub fn observe(&mut self, index: usize) -> Result<Observation, TrapError> {
+        self.observe_with_forward(index, |frame| {
+            Err(fail(format!("unported CPL0 native call {}", frame.rax)))
+        })
+    }
+
+    /// Resume a stopped native entry after its host service has completed.
+    /// The closure receives the exact supervisor frame that rang FORWARD_PORT.
+    pub fn observe_with_forward(
+        &mut self,
+        index: usize,
+        mut forward: impl FnMut(&mut NativeFrame) -> Result<(), TrapError>,
+    ) -> Result<Observation, TrapError> {
         if index >= 2 {
             return Err(fail("unknown CPL0 task"));
         }
@@ -850,7 +862,7 @@ impl Cpl0Carrier {
                 }
                 FORWARD_PORT => {
                     self.host_forwards += 1;
-                    return Err(fail(format!("unported CPL0 native call {}", frame.rax)));
+                    forward(frame)?;
                 }
                 ENTRY_KICK_PORT | RETURN_KICK_PORT => {
                     self.task(index).linux.mark_pending_host_work();
