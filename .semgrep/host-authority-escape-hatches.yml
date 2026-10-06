@@ -56,6 +56,10 @@ rules:
         - /crates/carrick-el1/src/isa/x86/user_access.rs
         # Reviewed x86 CPL0 hardware boundary: entry/return, port I/O and halt; no host operation.
         - /crates/carrick-x86-cpl0/src/entry.rs
+        # CPL0 initial-image return uses IRET to enter EL0; the declared
+        # boot-completion port reports to the retained KVM carrier. No host
+        # syscall or undeclared port is reachable from this guest module.
+        - /crates/carrick-x86-cpl0/src/initial_boot.rs
         # Reviewed target_os=none CPL0 hardware leaves: native IRQ/IRET and
         # XSAVE, FS/GS MSRs, CR3, IF/HLT, declared fixture control port I/O.
         # No host instruction path or host semantic syscall dispatch.
