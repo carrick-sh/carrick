@@ -157,6 +157,8 @@ fn production_image_rejects_fixture_syscalls() {
         OBSERVE_SHARED_PREPARED_FAULT,
         OBSERVE_SHARED_COW_FAULT,
         OBSERVE_PORTAL_WINDOW,
+        OBSERVE_FORK_TABLE_WINDOW,
+        OBSERVE_RETIRE_REPOINT,
     ] {
         assert!(
             !plan.segments.iter().any(|segment| {
