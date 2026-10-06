@@ -32,3 +32,6 @@ carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-hal = { path = "../carrick-hal" }
 carrick-sched-core = { path = "../carrick-sched-core", features = ["host-test"] }
 carrick-mem = { path = "../carrick-mem" }
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+carrick-fatal = { path = "../carrick-fatal" }

@@ -322,18 +322,12 @@ where
 /// exact binding failed authentication. This is native fail-stop transport.
 fn invalid_completion() -> ! {
     #[cfg(target_os = "none")]
-    {
-        // SAFETY: EL1 fatal exit is the image's established non-returning
-        // host transport, with no guest result publication or syscall replay.
-        unsafe {
-            core::arch::asm!("hvc #3", options(nostack));
-        }
-        loop {
-            core::hint::spin_loop();
-        }
-    }
+    crate::substrate::sched::hw::fatal_entry_binding();
     #[cfg(not(target_os = "none"))]
-    std::process::abort()
+    carrick_fatal::carrick_fatal!(
+        "el1::entry_completion",
+        "entry completion lost its exact execution binding"
+    )
 }
 
 pub struct El1PendingFamilies<'a, F, C: sched::ThreadCpu, U: sched::UserWord> {

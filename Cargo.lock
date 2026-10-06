@@ -478,6 +478,7 @@ dependencies = [
  "carrick-aarch64",
  "carrick-core",
  "carrick-el1-abi",
+ "carrick-fatal",
  "carrick-guest-arch",
  "carrick-hal",
  "carrick-inotify-core",

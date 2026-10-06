@@ -1,20 +1,269 @@
 # x86 order 5 entry mapping
 
-This table records the result/refusal mapping preserved while the entry owner
-moves. Linux policy lives in `carrick-personality-linux`; core owns only exact
-execution identity and completion admission.
+Order 5 moves entry ownership; orders 6–9 retain their family bodies behind
+`PendingFamilies`. There is one Linux routing/return-work owner in
+`carrick-personality-linux::dispatch`. EL1 implements named family hooks;
+its native wrapper translates the selected route to `Action`. The common
+robust-list entry uses that same dispatcher, not another ordinal switch.
 
-| Pre-move condition | Pre-move result | Order 5 owner and result |
-| --- | --- | --- |
-| issued task, native x86_64 273 / canonical `set_robust_list`, length 24 | served, `0` | Linux entry, served `0`, one core completion |
-| issued task, admitted robust-list with length other than 24 | served, `-22` (`EINVAL`) | Linux entry, served `-22`, one core completion |
-| task generation or task identity absent | forward, no publication | core admission refuses; Linux entry forwards with no publication |
-| lifecycle gate/hatch or exact thread lookup refuses | forward, no publication | Linux venue refuses; entry forwards with no publication |
-| unknown or unported native ordinal | forward, no publication | Linux decoder leaves it unported; entry forwards with no publication |
-| admitted call with pending host return work | served-with-work; host must not redispatch | Linux marks completed-with-work once and returns the sole core completion owner |
-| completion presented after task/thread generation reuse | no prior typed completion check | core returns `WrongGeneration`; successor state is unchanged |
+## Result and refusal preservation
 
-The ARM `TrapFrame`, ESR/IRQ classification, fixed-region acquisition, native
-save/restore, x8 extraction, and x0 return remain in the EL1 adapter. The x86
-`NativeFrame`, SYSCALL/IRET state, rax extraction and rax return remain in the
-x86 adapter. Neither adapter owns a Linux ordinal table.
+All signed family results cross as the identical `i64`; native return registers
+retain their two's-complement bits. No errno is translated by core.
+
+| Pre-move condition / result | Order 5 boundary / exact result |
+| --- | --- |
+| Robust-list native x86 273 / ARM 99, length 24: served `0` | Linux codec → real EL1 pending robust-list body → sole Linux finish; served `0`, one publication |
+| Admitted robust-list length other than 24: served `-22` (`EINVAL`) | Same body returns `-22`; no head publication or sibling mutation |
+| Missing task or cleared ordinary execution generation: Forward | Core ordinary admission refuses; Forward before family effects |
+| Closed lifecycle gate, setup hatch off, absent exact lifecycle slot: Forward | Pending family refuses; Forward, unchanged head and arguments |
+| Unported native x86 ordinal, including numeric ARM alias 99: Forward | Linux x86 codec maps only 273; every other value stays unported, no family effect |
+| Unported ARM ordinal: Forward | Sole Linux family table explicitly returns Unported; unchanged arguments |
+| Ordinary completion with changed task, host generation, MM or thread serial | Core returns `WrongGeneration`; no second completion or result publication; native fail-stop transport prevents replay of effects |
+| Born record with host generation zero, exact owned OnCpu claim | Distinct lifetime-bound `BornEntryCompletion`; see finding below; original Linux result retained |
+| Born admission with wrong MM, serial, record owner, installed MM or adopted generation | Refused before effects; no ordinary generation-zero token is issued |
+| Born completion after owner/record/claim-seq/incarnation change | `WrongGeneration`, not a Linux errno or Forward-after-effects |
+| Host request arrives after Born admission: same-owner OnCpuRequested | Completion accepts only unchanged claim seq/incarnation and exact binding; request remains pending until subsequent native handback |
+| Plain served result with pending return work | ServedWithWork, Linux `SERVED_WAKES_OWED = 1`; completed syscall cannot be redispatched |
+| Metadata commit owed, original argument 0 needed | ServedWithWork, Linux `SERVED_COMMIT_OWED = 2`; same preserved argument; a later wake cannot downgrade 2 to 1 |
+| Pending work at entry, no retained operation/setup exception | Forward before fresh family or descriptor lookup; same decline accounting |
+| Pending work plus retained IPC operation | Original operation offered before fresh fd lookup; progress and endpoint custody retained |
+| IPC explicit decline | File fallback only after Forward; Handback cannot fall through or replay the operation |
+| Family parks or native scheduler switches the running record | Entry-turn token consumed by handoff; existing exact-record wait/scheduler owns continuation; no second continuation ledger or fabricated short completion |
+| IPC/lifecycle/futex returned value, signed failure or positive byte/count/TID result | Named pending hook returns identical `i64`; native argument preservation and register install unchanged |
+| IPC idle / handback | Idle / Forward respectively; retained operation authority unchanged |
+| Anonymous Forward / Return(value) / Work / Unavailable(reason) | Exact variants retained by shared Linux helper; counters publish only for Forward/Return; owned work/refusal unchanged |
+| Already-accounted anonymous completion/decline/park | Accounted disposition avoids a second counter; original result and work flags retained |
+| Delegated read/write/lseek/pread/pwrite and inotify refusal | Forward unchanged; per-family locking, notifications, fd pinning and all signed results unchanged |
+| Unsupported/misaligned futex op, zero MM, invalid user word or disallowed timed wait | Forward (`None`), unchanged frame; no wait submission |
+| Futex value mismatch | Exact `-11` (`EAGAIN`), selected in Linux scheduler policy |
+| Futex timed wait expires | Exact `-110` (`ETIMEDOUT`), selected in Linux scheduler policy; native IRQ/clock/idle mechanics retain it as opaque return bits |
+| Invalid relative timespec (negative seconds/nanos or nanos ≥ 1e9) | Forward unchanged; no deadline or wait submission |
+| Valid relative futex deadline | Same saturating seconds × frequency + nanos ticks, minimum one tick; absolute native clock deadline retained |
+| Allocator control disabled | Forward, same unported diagnostic ordinal |
+| Allocator test control enabled without a loaded task | Existing diagnostic result retained through private AllocatorDiagnostic authority; no fabricated task/MM or guest Linux admission |
+
+`Accounted*` is temporary counter transport for the order-7 MM bodies, not
+another entry owner. The retained `serve_locked_file_op` is a file-family
+operation selector for order 9; it owns neither common routing nor completion.
+
+## Co-evolution finding: Born is not host adoption
+
+The predecessor robust-list-only admission required nonzero host generation.
+The real ARM family path exposed three red lifecycle tests: child exit returned
+Forward, and its existing decline accounting never ran. An in-zone Born record
+intentionally carries host generation zero until executor adoption. Accepting
+all zero generations would conflate an unissued task with a live owned record.
+
+Core now has two distinct constructors/token types: ordinary `admit` and
+`admit_born_in_zone`. Born admission authenticates the live OnCpu owner, slot,
+record id, claim sequence, record incarnation, installed MM, task and thread
+serial, and the scheduler's existing unadopted-birth authority. Its token keeps
+the scheduler region's lifetime. Ordinary completion cannot accept that token.
+After adoption, Born admission refuses and the normal host-generation path
+applies. Completion may observe same-owner OnCpuRequested solely for settlement
+of an already admitted turn. It neither consumes nor clears the host request.
+
+Red-first witnesses:
+
+- Real EL1 pending family name absent: AE witness fails to compile before cut.
+- Linux futex module absent: policy witness fails to compile before extraction.
+- Core handoff/record admission absent: entry-completion witnesses fail to compile.
+- Weakening exact ordinary completion to task-only: `Ok(())` versus expected
+  `WrongGeneration`, caught by stale generation/MM/thread cases.
+- Removing Born/adoption guards: adopted Born admission incorrectly succeeds.
+- Literal-OnCpu-only completion: a request arriving after admission incorrectly
+  yields `WrongGeneration`; same-owner settlement now preserves the request.
+- Wait-owner suspension/resume uses real `park_object_record`, notification,
+  switch and `take_object_operation`, at scales 1/2/8; one result write and
+  completion per operation, second take empty. Compile-fail covers token reuse.
+
+The native migration fixture now publishes the new record's host generation,
+as a real executor/native context load does. Its Linux results and decline
+assertions are preserved, rather than supplying inconsistent task/record facts.
+
+## Physical ABI and native adapter fence
+
+`CurrentTask` is a native aggregate of neutral `ExecutionIdentity` and
+`ExecutionMm`, Linux `LinuxTaskState` and `LinuxTaskMetadata`, and the original
+reserved padding. Size 128, alignment 8, stride shift 7, hash
+`3ff0698f9f1a67f1` are asserted unchanged. Every original byte offset is asserted:
+
+| Word | Offset |
+| --- | ---: |
+| execution generation / task | 0 / 8 |
+| Linux file table / fixup PC / original argument 0 | 16 / 24 / 32 |
+| pending work / served work flags | 40 / 44 |
+| MM / thread serial | 48 / 56 |
+| lifecycle page / control slot | 64 / 72 |
+| reserved padding | 80 |
+
+`TrapFrame`, ESR/IRQ classification, fixed-region acquisition, native CPU state,
+x8/rax extraction and x0/rax return remain native. Hardware `EntryArch` now
+returns a full native snapshot with ISA/profile and opaque native return bits;
+`CanonicalCall`, its six Linux arguments, ordinals and errno result live in
+Linux ABI. x86 production exposes its full frame, not a universal six-argument
+hardware ABI.
+
+Audit the deleted native entry routing/completion (first section only; the
+order-9 file-family selector is deliberately retained):
+
+```sh
+sed '/^pub unsafe fn serve_locked_file_op/,$d' crates/carrick-el1/src/personality/dispatch.rs | rg -n 'route_aarch64|dispatch_aarch64_family|match nr|fn finish|completion_route\('
+rg -n 'CanonicalCall|CanonicalOrdinal|SyscallResult' crates/carrick-guest-arch/src/lib.rs
+rg -n 'carrick_core::entry::complete' crates/carrick-x86-cpl0/src/entry.rs
+```
+
+All three searches must produce no matches. Pending families have no completion
+token constructor or ordinal-to-family table. No rebase was performed; all
+predecessor fixes remain on this branch.
+
+## Gate scope
+
+X4 uses real EL1 family bodies under both native codecs, scales 1/2/8, two live
+MMs and reused visible IDs, malformed/unported refusals, exact identities and
+pending work. KVM execution qualifies native SYSCALL/IRET and real shared entry;
+observation/kick doorbells are fixture transport, never host Linux serving.
+There is no Docker oracle or runtime-ratio claim on x86-w1. X4's x86 admission
+denominator is exactly native 273. Orders 6–9 have not been admitted to x86.
+macOS compiler capture and unchanged-ARM signed packet belong to the director.
+
+## Authorized mechanical MM-fence lines
+
+The director authorized only field-path changes needed for the physical ABI
+split. This is the complete changed-line inventory, including tests and rustfmt
+wrapping; no MM admission, editor, fault, COW or retirement body is restructured.
+
+```diff
+diff --git a/crates/carrick-el1/src/cow.rs b/crates/carrick-el1/src/cow.rs
+index 1091ab6bd..af387d4f9 100644
+--- a/crates/carrick-el1/src/cow.rs
++++ b/crates/carrick-el1/src/cow.rs
+@@ -959 +959 @@ mod tests {
+-        task.zone_mm.store(MM, Ordering::Release);
++        task.mm.key.store(MM, Ordering::Release);
+@@ -1127 +1127 @@ mod tests {
+-        task.zone_mm.store(MM, Ordering::Release);
++        task.mm.key.store(MM, Ordering::Release);
+diff --git a/crates/carrick-el1/src/fault.rs b/crates/carrick-el1/src/fault.rs
+index 1f050c497..5ec83545b 100644
+--- a/crates/carrick-el1/src/fault.rs
++++ b/crates/carrick-el1/src/fault.rs
+@@ -406 +406,2 @@ pub fn serve_descriptor_txns<X: DescriptorTxnApplier>(
+-        .zone_mm
++        .mm
++        .key
+@@ -735 +736 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
+-    let mm_key = task.zone_mm.load(Ordering::Acquire);
++    let mm_key = task.mm.key.load(Ordering::Acquire);
+@@ -975 +976 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
+-        let mm_key = task.zone_mm.load(Ordering::Acquire);
++        let mm_key = task.mm.key.load(Ordering::Acquire);
+@@ -1015 +1016 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
+-    let mm_key = task.zone_mm.load(Ordering::Acquire);
++    let mm_key = task.mm.key.load(Ordering::Acquire);
+@@ -1175 +1176 @@ mod tests {
+-        task.zone_mm.store(mm, Ordering::Release);
++        task.mm.key.store(mm, Ordering::Release);
+@@ -1292 +1293 @@ mod tests {
+-        task.zone_mm.store(mm, Ordering::Release);
++        task.mm.key.store(mm, Ordering::Release);
+@@ -1349 +1350 @@ mod tests {
+-        task.zone_mm.store(mm, Ordering::Release);
++        task.mm.key.store(mm, Ordering::Release);
+@@ -1416 +1417 @@ mod tests {
+-                task.zone_mm.store(mm, Ordering::Release);
++                task.mm.key.store(mm, Ordering::Release);
+@@ -1516 +1517 @@ mod tests {
+-        task.zone_mm.store(7, Ordering::Release);
++        task.mm.key.store(7, Ordering::Release);
+@@ -1574 +1575 @@ mod tests {
+-        task.zone_mm.store(mm, Ordering::Release);
++        task.mm.key.store(mm, Ordering::Release);
+@@ -1623 +1624 @@ mod tests {
+-            task.zone_mm.store(mm, Ordering::Release);
++            task.mm.key.store(mm, Ordering::Release);
+@@ -1625 +1626 @@ mod tests {
+-            tasks[1].zone_mm.store(mm, Ordering::Release);
++            tasks[1].mm.key.store(mm, Ordering::Release);
+@@ -1724 +1725 @@ mod tests {
+-        task.zone_mm.store(mm, Ordering::Release);
++        task.mm.key.store(mm, Ordering::Release);
+@@ -1753 +1754 @@ mod tests {
+-        task.zone_mm.store(9, Ordering::Release);
++        task.mm.key.store(9, Ordering::Release);
+@@ -1782 +1783 @@ mod tests {
+-        task.zone_mm.store(mm, Ordering::Release);
++        task.mm.key.store(mm, Ordering::Release);
+@@ -1815 +1816 @@ mod tests {
+-        task.zone_mm.store(mm, Ordering::Release);
++        task.mm.key.store(mm, Ordering::Release);
+@@ -2008 +2009 @@ mod tests {
+-            task.zone_mm.store(mm, Ordering::Release);
++            task.mm.key.store(mm, Ordering::Release);
+@@ -2150 +2151 @@ mod tests {
+-            task.zone_mm.store(mm, Ordering::Release);
++            task.mm.key.store(mm, Ordering::Release);
+@@ -2271 +2272 @@ mod tests {
+-                tasks[0].served_with_work.load(Ordering::Acquire),
++                tasks[0].linux.served_with_work.load(Ordering::Acquire),
+diff --git a/crates/carrick-el1/src/memory.rs b/crates/carrick-el1/src/memory.rs
+index 8ee168776..962a7faa0 100644
+--- a/crates/carrick-el1/src/memory.rs
++++ b/crates/carrick-el1/src/memory.rs
+@@ -73 +73 @@ impl ReservationOrigin {
+-        let raw = current.task_id.load(Ordering::Acquire);
++        let raw = current.execution.task.load(Ordering::Acquire);
+@@ -77,2 +77,2 @@ impl ReservationOrigin {
+-            serial: NonZeroU64::new(current.thread_serial.load(Ordering::Acquire))?,
+-            mm: carrick_el1_abi::ReservationMm::new(current.zone_mm.load(Ordering::Acquire))?,
++            serial: NonZeroU64::new(current.mm.thread_generation.load(Ordering::Acquire))?,
++            mm: carrick_el1_abi::ReservationMm::new(current.mm.key.load(Ordering::Acquire))?,
+@@ -879 +879 @@ pub fn delegated_anonymous_root(
+-    let mm_key = current.zone_mm.load(Ordering::Acquire);
++    let mm_key = current.mm.key.load(Ordering::Acquire);
+@@ -915 +915 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
+-    let mm_key = task.zone_mm.load(Ordering::Acquire);
++    let mm_key = task.mm.key.load(Ordering::Acquire);
+@@ -978 +978 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
+-    let mm_key = task.zone_mm.load(Ordering::Acquire);
++    let mm_key = task.mm.key.load(Ordering::Acquire);
+@@ -1049 +1049 @@ mod tests {
+-        task.zone_mm.store(mm, Ordering::Release);
++        task.mm.key.store(mm, Ordering::Release);
+@@ -1345,3 +1345,3 @@ mod tests {
+-            task.task_id.store(key + 100, Ordering::Relaxed);
+-            task.thread_serial.store(11, Ordering::Relaxed);
+-            task.zone_mm.store(key, Ordering::Relaxed);
++            task.execution.task.store(key + 100, Ordering::Relaxed);
++            task.mm.thread_generation.store(11, Ordering::Relaxed);
++            task.mm.key.store(key, Ordering::Relaxed);
+diff --git a/crates/carrick-el1/src/personality/mm_portal/edit_wait.rs b/crates/carrick-el1/src/personality/mm_portal/edit_wait.rs
+index cdfd201f6..7e726d885 100644
+--- a/crates/carrick-el1/src/personality/mm_portal/edit_wait.rs
++++ b/crates/carrick-el1/src/personality/mm_portal/edit_wait.rs
+@@ -23 +23 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
+-    let mm = ReservationMm::new(sched.task.zone_mm.load(Ordering::Acquire))?;
++    let mm = ReservationMm::new(sched.task.mm.key.load(Ordering::Acquire))?;
+@@ -77 +77,5 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
+-            sched.task.orig_arg0.store(frame.x[0], Ordering::Relaxed);
++            sched
++                .task
++                .linux
++                .orig_arg0
++                .store(frame.x[0], Ordering::Relaxed);
+diff --git a/crates/carrick-el1/src/personality/mm_portal/tests.rs b/crates/carrick-el1/src/personality/mm_portal/tests.rs
+index 46c6fb4d8..61a8c37f2 100644
+--- a/crates/carrick-el1/src/personality/mm_portal/tests.rs
++++ b/crates/carrick-el1/src/personality/mm_portal/tests.rs
+@@ -3063,2 +3063,2 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
+-            task.zone_mm.store(mm.raw(), Ordering::Release);
+-            task.thread_serial.store(1101, Ordering::Release);
++            task.mm.key.store(mm.raw(), Ordering::Release);
++            task.mm.thread_generation.store(1101, Ordering::Release);
+@@ -3349,2 +3349,2 @@ fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
+-    task.zone_mm.store(mm.raw(), Ordering::Release);
+-    task.thread_serial.store(1101, Ordering::Release);
++    task.mm.key.store(mm.raw(), Ordering::Release);
++    task.mm.thread_generation.store(1101, Ordering::Release);
+```
