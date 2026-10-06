@@ -140,13 +140,18 @@ fn image() -> PathBuf {
 fn production_cpl0_boot_retains_zone_and_initial_mm_in_one_carrier_vm() {
     let carrier =
         Cpl0Carrier::boot_production(0x20_000).expect("production image on one KVM carrier VM");
-    assert_eq!(carrier.physical_slot_count(), 4);
-    let metadata_bytes =
-        (carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize + std::mem::size_of::<ZoneTables>() + 4095)
-            & !4095;
+    assert_eq!(carrier.physical_slot_count(), 5);
+    let metadata_bytes = (carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize
+        + std::mem::size_of::<carrick_el1::memory::reservations::X86Cpl0Zone>()
+        + 4095)
+        & !4095;
     assert_eq!(
         carrier.retained_bytes(),
-        0xc0_0000 + metadata_bytes + 0x90_0000 + 0x20_000
+        0xc0_0000
+            + metadata_bytes
+            + 0x90_0000
+            + carrick_el1_abi::EL1_REGION_SIZE as usize
+            + 0x20_000
     );
     assert!(
         carrier
