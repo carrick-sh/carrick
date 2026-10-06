@@ -11,19 +11,16 @@ pub const EINVAL: i64 = -22;
 
 /// Decode the Linux x86_64 syscall ABI from a native register snapshot.
 pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCall {
-    let canonical = match native {
-        273 => SYS_SET_ROBUST_LIST as u64,
-        56 => {
+    use crate::abi::x86_64::{SyscallRemap, lookup_x86_64};
+    let canonical = lookup_x86_64(native).map_or(u64::MAX, |entry| match entry.remap {
+        SyscallRemap::Direct(220) => {
             args.swap(3, 4);
             220
         }
-        60 => 93,
-        186 => 178,
-        14 => 135,
-        131 => 132,
-        202 => 98,
-        _ => u64::MAX,
-    };
+        SyscallRemap::Direct(ordinal) => ordinal,
+        SyscallRemap::Private(ordinal) => ordinal.raw(),
+        SyscallRemap::Native | SyscallRemap::Unknown => u64::MAX,
+    });
     CanonicalCall {
         isa: GuestIsa::X86_64,
         canonical: CanonicalOrdinal::new(canonical),
