@@ -186,27 +186,19 @@ use crate::cpl0_entry::CpuBinding;
 /// Returns 0 on success, or Linux errno (e.g. 22 = EINVAL) on refusal/error.
 pub fn serve_cpl0_grant(binding: &CpuBinding, slot_index: usize) -> u32 {
     binding.entries.fetch_add(1, Ordering::Relaxed);
-    if binding.zone_address == 0 {
+    if binding.zone_address == 0
+        || binding.reservations_address == 0
+        || binding.residency_address == 0
+        || binding.portal_address == 0
+    {
         binding.completions.fetch_add(1, Ordering::Relaxed);
         return 22;
     }
 
     let zone_ptr = binding.zone_address as *const ZoneTables;
-    let reservations_addr = if binding.reservations_address != 0 {
-        binding.reservations_address
-    } else {
-        PROGRESS_RESERVATIONS
-    };
-    let residency_addr = if binding.residency_address != 0 {
-        binding.residency_address
-    } else {
-        PROGRESS_RESIDENCY
-    };
-    let portal_addr = if binding.portal_address != 0 {
-        binding.portal_address
-    } else {
-        PROGRESS_PORTAL
-    };
+    let reservations_addr = binding.reservations_address;
+    let residency_addr = binding.residency_address;
+    let portal_addr = binding.portal_address;
 
     // SAFETY: the carrier retains these published supervisor records for the
     // vCPU lifetime and binds their exact mapped addresses before entry.
@@ -226,7 +218,10 @@ pub fn serve_cpl0_grant(binding: &CpuBinding, slot_index: usize) -> u32 {
         return 22;
     };
 
-    let carrier = portal_slots.carrier().unwrap_or(core::num::NonZeroU64::MIN);
+    let Some(carrier) = portal_slots.carrier() else {
+        binding.completions.fetch_add(1, Ordering::Relaxed);
+        return MmError::Invalid.errno();
+    };
 
     let portal = carrick_core::mm::transaction::MmPortal::<
         GuestMetadataPin,

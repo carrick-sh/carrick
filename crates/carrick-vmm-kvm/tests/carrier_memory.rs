@@ -388,7 +388,6 @@ fn x1_shared_mm_owner() {
             .guest_ptr::<carrick_el1_abi::MmPortalSlots>(carrick_x86::cpl0_mmu::PROGRESS_PORTAL)
             .unwrap()
     };
-    portal_slots.bind_carrier(NonZeroU64::new(1).unwrap());
     let grant_slot = portal_slots.grant(0).unwrap();
 
     let nz = |n| NonZeroU64::new(n).unwrap();
@@ -431,17 +430,13 @@ fn x1_shared_mm_owner() {
         fork_sequence: None,
     };
 
-    // Case 1: Wrong pin / stale window refusal
-    let stale_window = PortalGrantWindow {
-        generation: ReservationGeneration::new(window.generation.raw() + 1).unwrap(),
-        ..window
-    };
-    assert!(grant_slot.submit(stale_window, &txn));
+    // Case 1: missing carrier authority refuses without consuming the grant.
+    assert!(grant_slot.submit(window, &txn));
 
     let obs1 = carrier.observe(0).expect("observe 1");
     assert_eq!(
         obs1.result, 22,
-        "wrong pin / stale window must refuse with EINVAL (22)"
+        "an unbound carrier must refuse with EINVAL (22)"
     );
     let residency = unsafe {
         &*carrier
@@ -463,14 +458,13 @@ fn x1_shared_mm_owner() {
         obs1.semantic_host_exits, 0,
         "refusal must not cross the semantic host-forward boundary"
     );
-    let receipt1 = grant_slot.take_receipt(stale_window, &txn);
     assert!(
-        matches!(receipt1, Some(r) if matches!(r.outcome, carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot))),
-        "stale window must produce Refused(StaleRoot) receipt, got: {receipt1:?}"
+        grant_slot.take_receipt(window, &txn).is_none(),
+        "missing authority must not manufacture an owner receipt"
     );
 
-    // Case 2: Valid grant on MM11
-    assert!(grant_slot.submit(window, &txn));
+    // Case 2: bind authority and serve the still-pending valid grant on MM11.
+    portal_slots.bind_carrier(NonZeroU64::new(1).unwrap());
 
     let obs2 = carrier.observe(0).expect("observe 2");
     assert_eq!(obs2.result, 0, "valid grant must return 0");
