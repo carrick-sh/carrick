@@ -57,6 +57,26 @@ Linux worker scope excludes Docker and signed HVF acceptance; the director
 owns those higher-layer gates and full stacked-batch acceptance. This
 retirement does not claim full x86 conformance or production readiness.
 
+The final rebase preserves shared-kernel `7cfff5918`'s separate initial-image
+alias and typed kernel region. The shared production-backing census correction
+is cherry-picked from `1eed7075e`: four retained slots, exact fixed supervisor
+bytes, and variable initial bytes checked at three sizes. Rebase testing also
+caught TLS GET copyout walking initial-MM tables through the old direct alias
+(`CR2=0xffffffff94002000`, fatal page-fault fixup). The x86 permission walker
+now reads those tables through the retained initial-image alias, preserving its
+four-level permission checks and the bootstrap fixtures' direct window. The
+same live TLS test is green after rebuilding; musl still fails at `poll` (7).
+Fresh focused logs and the gate manifest are in
+`target/x86-legacy-retire/final/` on `carrick-vm`.
+
+The standalone table-alias correction shares typed `FrameGpa`/`KernelVa`
+resolution between initial-MM construction and user permission validation.
+Its VM-free four-table walk was red through the old alias, then green with
+read-only intermediate descriptors, write refusal and a four-load bound.
+The syscall declarations now live in the shared `carrick-syscall-abi` crate,
+adapted from `1127a5eff`; host ABI and guest personality re-export that one
+table. The fork branch's absent process/MM implementations are not imported.
+
 ## TLS prerequisite found by the migration
 
 The migrated musl test first refused native syscall 158 (`arch_prctl`) on
