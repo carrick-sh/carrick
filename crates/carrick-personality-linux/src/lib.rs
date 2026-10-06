@@ -1,11 +1,14 @@
 //! Linux interpretation of neutral owner records.
 #![no_std]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+extern crate alloc;
+
 pub mod abi;
 pub mod dispatch;
 pub mod entry;
 pub mod mm;
 pub mod sched;
+pub mod signal;
 
 pub mod pending_file;
 
