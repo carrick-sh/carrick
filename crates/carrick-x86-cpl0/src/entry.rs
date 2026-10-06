@@ -11,19 +11,7 @@ fn main() {}
 // from the ordinary carrick-x86-cpl0 image.
 #[cfg(target_os = "none")]
 const fn fixture_image() -> bool {
-    let name = env!("CARGO_BIN_NAME").as_bytes();
-    let fixture = b"carrick-x86-cpl0-fixture";
-    if name.len() != fixture.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < name.len() {
-        if name[i] != fixture[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
+    fixture_expr!(true)
 }
 
 #[cfg(target_os = "none")]
@@ -34,24 +22,32 @@ use carrick_el1::isa::x86::context::native as adapter;
 
 #[cfg(target_os = "none")]
 use carrick_el1::isa::x86::interrupts;
-#[cfg(target_os = "none")]
-mod progress;
-#[cfg(target_os = "none")]
-mod cpl0_scheduler {
-    pub(crate) use super::scheduler::*;
+fixture_items! {
+    #[cfg(target_os = "none")]
+    mod progress;
 }
-#[cfg(target_os = "none")]
-mod cpl0_entry {
-    pub use crate::adapter::*;
+fixture_items! {
+    #[cfg(target_os = "none")]
+    mod cpl0_scheduler {
+        pub(crate) use super::scheduler::*;
+    }
+    #[cfg(target_os = "none")]
+    mod cpl0_entry {
+        pub use crate::adapter::*;
+    }
 }
 #[cfg(target_os = "none")]
 const _: () = assert!(core::mem::offset_of!(adapter::CpuBinding, task_address) == 24);
-#[cfg(target_os = "none")]
-#[path = "../../carrick-x86/src/cpl0_lifecycle.rs"]
-mod lifecycle;
+fixture_items! {
+    #[cfg(target_os = "none")]
+    #[path = "../../carrick-x86/src/cpl0_lifecycle.rs"]
+    mod lifecycle;
+}
 
-#[cfg(target_os = "none")]
-use carrick_el1::isa::x86::context::scheduler;
+fixture_items! {
+    #[cfg(target_os = "none")]
+    use carrick_el1::isa::x86::context::scheduler;
+}
 
 #[cfg(target_os = "none")]
 core::arch::global_asm!(
@@ -206,7 +202,8 @@ mod kernel {
     use carrick_el1::personality::common_entry::{EntryOutcome, serve_canonical};
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
     use carrick_el1_abi::{Counters, CurrentTask};
-    use carrick_guest_arch::{EntryArch, InterruptArch};
+    use carrick_guest_arch::InterruptArch;
+    fixture_items! { use carrick_guest_arch::EntryArch; }
     use core::sync::atomic::Ordering;
 
     // Count native exits across CPL0 CPUs for image/link and live diagnostics.
@@ -217,9 +214,12 @@ mod kernel {
 
     // The KVM fault fixture owns one exact MM and one host-backed prepared
     // page. These records stay live across the native syscall boundary.
-    static SHARED_FAULT_MAILBOX: carrick_el1_abi::FrameGrantMailbox =
-        carrick_el1_abi::FrameGrantMailbox::new();
-    static SHARED_COW_POOL: carrick_el1_abi::CowGrantPool = carrick_el1_abi::CowGrantPool::new();
+    fixture_items! {
+        static SHARED_FAULT_MAILBOX: carrick_el1_abi::FrameGrantMailbox =
+            carrick_el1_abi::FrameGrantMailbox::new();
+        static SHARED_COW_POOL: carrick_el1_abi::CowGrantPool =
+            carrick_el1_abi::CowGrantPool::new();
+    }
 
     // A port exit may suspend this CPU while another CPU continues. The
     // admission value can only be produced after the lock guard is dropped.
@@ -293,7 +293,7 @@ mod kernel {
         // Both retained scheduler witness fixtures qualify XCR0 and XSAVE
         // geometry before entry. Exercise the shared native context leaf while
         // preserving the exact current task and MM authority.
-        if binding.scheduler_witness.load(Ordering::Acquire) != 0 {
+        fixture_stmt! { if binding.scheduler_witness.load(Ordering::Acquire) != 0 {
             let Ok(saved) = arch.save_context(frame) else {
                 doorbell(FATAL_PORT, frame);
                 halt();
@@ -302,7 +302,7 @@ mod kernel {
                 doorbell(FATAL_PORT, frame);
                 halt();
             }
-        }
+        } }
         if crate::fixture_image() && frame.rax == OBSERVE_NATIVE {
             doorbell(CONTROL_PORT, frame);
             frame.rax = 0;
@@ -447,7 +447,7 @@ mod kernel {
             };
             return;
         }
-        if crate::fixture_image() && frame.rax == OBSERVE_SHARED_PREPARED_FAULT {
+        fixture_stmt! { if frame.rax == OBSERVE_SHARED_PREPARED_FAULT {
             use carrick_core::mm::transfer::resolver::NoopCowResolver;
             use carrick_el1::fault::{
                 GrantMailboxes, PreparedFaultPath, X86PreparedResolver,
@@ -569,7 +569,8 @@ mod kernel {
             unsafe { crate::rust_alloc::alloc::dealloc(ptr, layout) };
             return;
         }
-        if crate::fixture_image() && frame.rax == OBSERVE_SHARED_COW_FAULT {
+        }
+        fixture_stmt! { if frame.rax == OBSERVE_SHARED_COW_FAULT {
             use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
             use carrick_el1::fault::{
                 GrantMailboxes, X86CowResolver, dispatch_x86_fault_with_prepared,
@@ -717,6 +718,7 @@ mod kernel {
             unsafe { crate::rust_alloc::alloc::dealloc(ptr, layout) };
             return;
         }
+        }
         if crate::fixture_image() && frame.rax == OBSERVE_ALLOCATOR {
             let layout = match core::alloc::Layout::from_size_align(128, 64) {
                 Ok(layout) => layout,
@@ -771,11 +773,10 @@ mod kernel {
             return;
         }
         binding.entries.fetch_add(1, Ordering::Relaxed);
-        let scheduler_witness =
-            binding.scheduler_witness.load(Ordering::Acquire) == super::scheduler::PROGRESS_STATE;
-        if scheduler_witness {
+        fixture_stmt! { if binding.scheduler_witness.load(Ordering::Acquire)
+            == super::scheduler::PROGRESS_STATE {
             super::progress::entry_boundary();
-        }
+        } }
         if binding.entry_kick.swap(0, Ordering::AcqRel) != 0 {
             doorbell(ENTRY_KICK_PORT, frame);
         }
@@ -787,8 +788,9 @@ mod kernel {
         binding
             .captured_stack
             .store(call.stack.raw(), Ordering::Release);
-        let lifecycle_address = binding.scheduler_witness.load(Ordering::Acquire);
-        if lifecycle_address == super::lifecycle::LIFECYCLE_LANE
+        let handled_by_fixture = fixture_expr!({
+            let lifecycle_address = binding.scheduler_witness.load(Ordering::Acquire);
+            if lifecycle_address == super::lifecycle::LIFECYCLE_LANE
             || lifecycle_address
                 == super::lifecycle::LIFECYCLE_LANE + super::lifecycle::LIFECYCLE_STRIDE
         {
@@ -818,7 +820,12 @@ mod kernel {
                     halt();
                 }
             }
+            true
         } else {
+            false
+        }
+        });
+        if !handled_by_fixture {
             match serve_canonical(
                 &call,
                 counters,
@@ -840,9 +847,10 @@ mod kernel {
             }
         }
         binding.completions.fetch_add(1, Ordering::Relaxed);
-        if scheduler_witness {
+        fixture_stmt! { if binding.scheduler_witness.load(Ordering::Acquire)
+            == super::scheduler::PROGRESS_STATE {
             super::progress::return_boundary();
-        }
+        } }
         if binding.return_kick.swap(0, Ordering::AcqRel) != 0 {
             doorbell(RETURN_KICK_PORT, frame);
         }

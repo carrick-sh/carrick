@@ -28,10 +28,11 @@ const COUNTERS_OFFSET: u64 = 0x1_0000;
 const BINDING_OFFSET: u64 = 0x8000;
 const TASK_OFFSET: u64 = 0x9000;
 const CONTROL_OFFSET: u64 = 0xa000;
-const ROUTES_OFFSET: u64 = 0xb000;
+const ROUTES_OFFSET: u64 = 0xd000;
 const STRIDE: u64 = 0x100;
 const _: () = {
     assert!(size_of::<CpuBinding>() <= STRIDE as usize);
+    assert!(ROUTES_OFFSET >= 0xc000 + 9 * size_of::<ThreadControlSlot>() as u64);
     assert!(ROUTES_OFFSET + size_of::<PublishedApicIds>() as u64 <= COUNTERS_OFFSET);
 };
 const IST_STACK_BASE: u64 = 0xf0_0000;
@@ -191,6 +192,9 @@ impl Cpl0Carrier {
         programs: [&[u8]; 2],
         interrupts: bool,
     ) -> Result<Self, TrapError> {
+        let fixture_image = image
+            .file_name()
+            .is_some_and(|name| name == "carrick-x86-cpl0-fixture");
         let bytes = std::fs::read(image).map_err(|e| fail(format!("CPL0 image: {e}")))?;
         let plan = carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62)
             .map_err(|e| fail(format!("CPL0 ELF: {e}")))?;
@@ -246,9 +250,9 @@ impl Cpl0Carrier {
             exec: true,
         });
         maps.push(Pml4MapSpec {
-            va: DIRECT_VA + 0xe0_0000,
-            gpa: 0xe0_0000,
-            len: 0x20_0000,
+            va: DIRECT_VA + 0xc0_0000,
+            gpa: 0xc0_0000,
+            len: if interrupts { 0x140_0000 } else { 0x40_0000 },
             user: false,
             write: true,
             exec: false,
@@ -444,11 +448,13 @@ impl Cpl0Carrier {
                     publications: AtomicU64::new(0),
                     completions: AtomicU64::new(0),
                     captured_stack: AtomicU64::new(0),
-                    scheduler_witness: AtomicU64::new(if interrupts && index == 0 {
-                        carrick_x86::cpl0_scheduler::PROGRESS_STATE
-                    } else {
-                        0
-                    }),
+                    scheduler_witness: AtomicU64::new(
+                        if fixture_image && interrupts && index == 0 {
+                            carrick_x86::cpl0_scheduler::PROGRESS_STATE
+                        } else {
+                            0
+                        },
+                    ),
                     cpu_slot: index as u32,
                     tsc_hz: AtomicU64::new(0),
                     wake_routes_address: METADATA_VA + ROUTES_OFFSET,
@@ -653,6 +659,13 @@ impl Cpl0Carrier {
     }
     pub(crate) fn slot(&self, index: usize) -> &ThreadControlSlot {
         self.metadata(CONTROL_OFFSET + index as u64 * STRIDE)
+    }
+    /// Read the stopped fixture task's Linux robust-list head.
+    pub fn robust_list_head(&self, index: usize) -> Result<u64, TrapError> {
+        if index >= self.cpus.len() {
+            return Err(fail("unknown CPL0 task"));
+        }
+        Ok(self.slot(index).robust_list().0)
     }
     /// Qualify separate exact task/MM owners, even with reused visible IDs.
     /// All vCPUs are stopped under this exclusively borrowed fixture carrier.
