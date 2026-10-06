@@ -1,7 +1,54 @@
 //! Native CPL0 frame and boundary-control transport, shared by the thin image
 //! and its KVM bootstrap. No Linux syscall algorithm lives in this adapter.
-use carrick_guest_arch::{GuestIsa, NativeAbi, NativeEntrySnapshot, X86Register, X86Registers};
-use core::sync::atomic::{AtomicU32, AtomicU64};
+use carrick_guest_arch::{
+    CpuId, GuestIsa, NativeAbi, NativeEntrySnapshot, X86Register, X86Registers,
+};
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64};
+
+/// One xAPIC destination published for an issued scheduler CPU slot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PublishedApicId(pub u8);
+
+/// Stopped-host publication shared by every CPU binding in one carrier.
+pub struct PublishedApicIds {
+    entries: [AtomicU16; carrick_sched_core::ZONE_SLOTS],
+}
+
+impl Default for PublishedApicIds {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PublishedApicIds {
+    pub const fn new() -> Self {
+        Self {
+            entries: [const { AtomicU16::new(0) }; carrick_sched_core::ZONE_SLOTS],
+        }
+    }
+
+    pub fn publish(&self, slot: CpuId, apic_id: PublishedApicId) -> bool {
+        self.entries.get(slot.raw() as usize).is_some_and(|entry| {
+            entry
+                .compare_exchange(
+                    0,
+                    u16::from(apic_id.0) + 1,
+                    core::sync::atomic::Ordering::Release,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        })
+    }
+
+    pub fn destination(&self, slot: CpuId) -> Option<PublishedApicId> {
+        self.entries
+            .get(slot.raw() as usize)?
+            .load(core::sync::atomic::Ordering::Acquire)
+            .checked_sub(1)
+            .and_then(|id| u8::try_from(id).ok())
+            .map(PublishedApicId)
+    }
+}
 
 pub const FORWARD_PORT: u16 = 0xc5;
 pub const CONTROL_PORT: u16 = 0xc8;
@@ -120,9 +167,8 @@ pub struct CpuBinding {
     pub cpu_slot: u32,
     /// KVM_GET_TSC_KHZ converted to hertz; zero means no qualified clock.
     pub tsc_hz: AtomicU64,
-    /// Two 16-bit APIC destinations, encoded as APIC ID + 1; zero is absent.
-    /// This binding is published before either vCPU runs.
-    pub wake_apic_ids: AtomicU64,
+    /// Shared slot-indexed APIC routing table, retained until all vCPUs stop.
+    pub wake_routes_address: u64,
     /// Measured xAPIC timer hertz when TSC-deadline mode is unavailable.
     pub apic_timer_hz: AtomicU64,
 }
@@ -137,6 +183,18 @@ const _: () = {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[test]
+    fn apic_routes_cover_every_issued_carrier_slot() {
+        let routes = PublishedApicIds::new();
+        assert!(routes.publish(CpuId::new(2), PublishedApicId(7)));
+        assert_eq!(routes.destination(CpuId::new(2)), Some(PublishedApicId(7)));
+        assert!(routes.publish(CpuId::new(255), PublishedApicId(0)));
+        assert_eq!(
+            routes.destination(CpuId::new(255)),
+            Some(PublishedApicId(0))
+        );
+        assert_eq!(routes.destination(CpuId::new(256)), None);
+    }
     fn decode(frame: &NativeFrame) -> carrick_personality_linux::entry::CanonicalCall {
         carrick_personality_linux::entry::decode_x86_snapshot(frame.snapshot()).unwrap()
     }

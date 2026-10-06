@@ -146,15 +146,15 @@ impl InterruptBackend for X86Backend {
     }
     fn send_wake(&mut self, target: CpuTarget, _token: WakeToken) -> Result<(), Self::Error> {
         let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
-        let shift = target
-            .cpu
-            .raw()
-            .checked_mul(16)
-            .filter(|shift| *shift < 32)
-            .ok_or(ArchError::Unbound)?;
-        let encoded = (binding.wake_apic_ids.load(Ordering::Acquire) >> shift) & 0xffff;
-        let apic_id = u8::try_from(encoded.checked_sub(1).ok_or(ArchError::Unbound)?)
-            .map_err(|_| ArchError::Unbound)?;
+        if binding.wake_routes_address == 0 {
+            return Err(ArchError::Unbound);
+        }
+        // SAFETY: stopped-host bootstrap mapped and initialized this exact
+        // table before any vCPU ran; it remains live until every vCPU retires.
+        let routes = unsafe {
+            &*(binding.wake_routes_address as *const super::context::native::PublishedApicIds)
+        };
+        let apic_id = routes.destination(target.cpu).ok_or(ArchError::Unbound)?.0;
         // SAFETY: caller published wake ownership first; target CPU is bound.
         unsafe { interrupts::hardware::send_wake(interrupts::ApicId(apic_id)) }
             .map_err(|_| ArchError::Busy)?;
