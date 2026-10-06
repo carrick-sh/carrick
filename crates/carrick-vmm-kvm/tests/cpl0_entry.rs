@@ -13,7 +13,7 @@ use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables}
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::{
     OBSERVE_ALLOCATOR, OBSERVE_DESCRIPTOR_PREPARE_PUBLISH, OBSERVE_DESCRIPTOR_PROTECT,
-    OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE,
+    OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE, OBSERVE_SHARED_PREPARED_FAULT,
 };
 use carrick_x86::cpl0_scheduler::{
     ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
@@ -270,6 +270,23 @@ fn shared_kernel_x86_prepares_then_publishes_a_user_page() {
     assert_ne!(leaf & 1, 0, "leaf is present after publication");
     assert_ne!(leaf & 4, 0, "leaf permits user access");
     assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0x9_0000);
+}
+
+#[test]
+fn shared_kernel_x86_fault_settles_prepared_grant_in_guest() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_SHARED_PREPARED_FAULT.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(carrier.observe(0).expect("shared x86 fault path").result, 1);
+    let leaf = carrier.fixture_user_leaf(0x3_3000).expect("faulted leaf");
+    assert_eq!(leaf & (1 << 9), 0);
+    assert_ne!(leaf & 1, 0);
+    assert_ne!(leaf & 4, 0);
+    assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0x9_1000);
 }
 
 // Observe each task in turn while both lifecycle slots remain live. Registration

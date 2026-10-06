@@ -253,11 +253,15 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
         }
         .map_err(|_| MmError::Core)?;
+        #[cfg(target_arch = "aarch64")]
+        let prepared = &mut crate::fault::HardwarePreparedResolver;
+        #[cfg(target_arch = "x86_64")]
+        let prepared = &mut carrick_core::mm::transfer::resolver::NoopPreparedResolver;
         match portal.select(
             &continuation,
             &words,
             carrick_core::mm::transaction::SelectionVenues {
-                prepared: &mut crate::fault::HardwarePreparedResolver,
+                prepared,
                 cow: &mut crate::fault::HardwareCowResolver {
                     publication: slots.executable(frame.slot as usize),
                     completion: None,
