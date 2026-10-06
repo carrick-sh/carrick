@@ -45,28 +45,62 @@ pub trait LinuxEntryVenue {
     fn mark_completed_with_work(&self);
 }
 
+struct CommonFamilies<'a> {
+    venue: &'a dyn LinuxEntryVenue,
+    args: [u64; 6],
+    result: Option<i64>,
+}
+impl crate::dispatch::PendingFamilies for CommonFamilies<'_> {
+    fn lifecycle(&mut self, ordinal: u64) -> crate::dispatch::FamilyCompletion {
+        if ordinal != SYS_SET_ROBUST_LIST as u64 {
+            return crate::dispatch::FamilyCompletion::Forward;
+        }
+        self.result = self.venue.set_robust_list(self.args[0], self.args[1]);
+        self.result.map_or(
+            crate::dispatch::FamilyCompletion::Forward,
+            crate::dispatch::FamilyCompletion::Complete,
+        )
+    }
+    fn lifecycle_available(&self) -> bool {
+        true
+    }
+    fn host_work(&self) -> bool {
+        self.venue.pending_work()
+    }
+    fn record_served(&self, ordinal: u64) {
+        self.venue.record_served(ordinal as usize);
+    }
+    fn record_forwarded(&self, ordinal: u64) {
+        self.venue.record_forwarded(ordinal as usize);
+    }
+    fn publish_work(&self, _: bool) {
+        self.venue.mark_completed_with_work();
+    }
+}
+
 pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome {
     let Ok(nr) = usize::try_from(call.canonical.raw()) else {
         return EntryOutcome::Forward;
     };
-    let Some(completion) = EntryCompletion::admit(venue.binding()) else {
+    let Some(completion) = carrick_core::entry::admit(venue.binding()) else {
         venue.record_forwarded(nr);
         return EntryOutcome::Forward;
     };
-    let result = match nr {
-        SYS_SET_ROBUST_LIST => venue.set_robust_list(call.args[0], call.args[1]),
-        _ => None,
+    let mut pending = CommonFamilies {
+        venue,
+        args: call.args,
+        result: None,
     };
-    let Some(result) = result else {
-        venue.record_forwarded(nr);
+    let route = crate::dispatch::dispatch(call.canonical.raw(), u64::MAX, &mut pending);
+    let Some(result) = pending.result else {
         return EntryOutcome::Forward;
     };
-    venue.record_served(nr);
     let result = SyscallResult::new(result);
-    if venue.pending_work() {
-        venue.mark_completed_with_work();
-        EntryOutcome::ServedWithWork { result, completion }
-    } else {
-        EntryOutcome::Served { result, completion }
+    match route {
+        crate::dispatch::CompletionRoute::Served => EntryOutcome::Served { result, completion },
+        crate::dispatch::CompletionRoute::WithWork => {
+            EntryOutcome::ServedWithWork { result, completion }
+        }
+        _ => EntryOutcome::Forward,
     }
 }

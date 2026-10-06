@@ -11,3 +11,7 @@ carrick-guest-arch = { path = "../carrick-guest-arch" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
+carrick-el1-abi = { path = "../carrick-el1-abi" }

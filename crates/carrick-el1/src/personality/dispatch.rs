@@ -14,9 +14,7 @@ use carrick_el1_abi::{
     EL1_OBJECT_TABLE_BASE, EL1_OPEN_FILE_TABLE_BASE, EL1_STACK_SLOTS, EL1_ZONE_BASE,
     FD_MAP_CAPACITY, MAX_DELEGATED_INOTIFY,
 };
-#[cfg(target_os = "none")]
-use carrick_personality_linux::dispatch::AnonymousCall;
-use carrick_personality_linux::dispatch::{Family, route_aarch64};
+use carrick_personality_linux::dispatch::{AnonymousCall, FamilyCompletion, PendingFamilies};
 use core::sync::atomic::Ordering;
 
 /// T2's SVC integration point. A Work result is an owned continuation, not a
@@ -33,22 +31,33 @@ pub fn dispatch_anonymous_with_reservations(
     current: &CurrentTask,
     model: &mut memory::reservations::Reservations<'_>,
 ) -> AnonymousReservationRoute {
-    match memory::decide_anonymous_syscall(frame, current, model) {
-        memory::ReservationDisposition::Forward => {
-            if let Some(counter) = counters.forwarded.get(frame.x[8] as usize) {
-                counter.fetch_add(1, Ordering::Relaxed);
-            }
-            AnonymousReservationRoute::Action(Action::Forward)
+    use carrick_personality_linux::dispatch::ReservationDecision;
+    let decision = match memory::decide_anonymous_syscall(frame, current, model) {
+        memory::ReservationDisposition::Forward => ReservationDecision::Forward,
+        memory::ReservationDisposition::Return(value) => ReservationDecision::Return(value),
+        memory::ReservationDisposition::Work(work) => ReservationDecision::Work(work),
+        memory::ReservationDisposition::Unavailable(reason) => {
+            ReservationDecision::Unavailable(reason)
         }
-        memory::ReservationDisposition::Return(result) => {
-            frame.x[0] = result as u64;
-            counters.served[frame.x[8] as usize].fetch_add(1, Ordering::Relaxed);
+    };
+    let route = carrick_personality_linux::dispatch::dispatch_anonymous(decision, |served| {
+        let table = if served {
+            &counters.served
+        } else {
+            &counters.forwarded
+        };
+        if let Some(counter) = table.get(frame.x[8] as usize) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    match route {
+        ReservationDecision::Forward => AnonymousReservationRoute::Action(Action::Forward),
+        ReservationDecision::Return(value) => {
+            frame.x[0] = value as u64;
             AnonymousReservationRoute::Action(Action::Served)
         }
-        memory::ReservationDisposition::Work(pending) => AnonymousReservationRoute::Work(pending),
-        memory::ReservationDisposition::Unavailable(reason) => {
-            AnonymousReservationRoute::Unavailable(reason)
-        }
+        ReservationDecision::Work(work) => AnonymousReservationRoute::Work(work),
+        ReservationDecision::Unavailable(reason) => AnonymousReservationRoute::Unavailable(reason),
     }
 }
 
@@ -259,18 +268,18 @@ where
 /// published for this venue ([`lifecycle::LifecycleVenue`]): thread clone
 /// and exit and the per-thread setup calls are served in EL1.
 #[allow(clippy::too_many_arguments)]
-pub fn dispatch_syscall_with_lifecycle<F, C, U>(
-    frame: &mut TrapFrame,
-    counters: &Counters,
-    current_tasks: &[CurrentTask],
-    fd_map: &[FdMapSlot],
-    object_table: &[DelegatedFile],
-    open_table: &[DelegatedOpenFile],
-    inotify_table: &[DelegatedInotify],
-    name_cache: &InotifyNameCache,
-    mut zone: Option<Zone<'_, C, U>>,
-    ipc: Option<&ipc::IpcVenue<'_>>,
-    lifecycle: Option<&dyn lifecycle::LifecycleVenue>,
+pub fn dispatch_syscall_with_lifecycle<'a, F, C, U>(
+    frame: &'a mut TrapFrame,
+    counters: &'a Counters,
+    current_tasks: &'a [CurrentTask],
+    fd_map: &'a [FdMapSlot],
+    object_table: &'a [DelegatedFile],
+    open_table: &'a [DelegatedOpenFile],
+    inotify_table: &'a [DelegatedInotify],
+    name_cache: &'a InotifyNameCache,
+    zone: Option<Zone<'a, C, U>>,
+    ipc: Option<&'a ipc::IpcVenue<'a>>,
+    lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
     cache_lookup: F,
 ) -> Action
 where
@@ -278,137 +287,67 @@ where
     C: sched::ThreadCpu,
     U: sched::UserWord,
 {
-    let slot = frame.slot as usize;
-    let cur_task = current_tasks.get(slot);
-    let nr = frame.x[8] as usize;
-    let family = route_aarch64(
-        frame.x[8],
-        #[cfg(feature = "allocator-test-control")]
-        {
-            carrick_el1_abi::SYS_CARRICK_EL1_CONTROL
-        },
-        #[cfg(not(feature = "allocator-test-control"))]
-        {
-            u64::MAX
-        },
-    );
-
-    #[cfg(target_os = "none")]
-    if matches!(family, Family::Anonymous(_))
-        && let (Some(zone), Some(task), Some(zslot)) =
-            (zone.as_mut(), cur_task, SlotId::from_index(slot))
-    {
-        let mut sched = sched::Sched {
-            zone: zone.tables,
-            slot: zslot,
-            task,
-            cpu: &mut *zone.cpu,
-            user: zone.user,
-            counters,
-        };
-        if let Some(served) = super::mm_portal::park_prepared_edit(
-            &mut sched,
-            frame,
-            memory::reservations::shared_guest(),
-        ) {
-            return match served {
-                sched::Served::Returned { .. } => Action::Served,
-                sched::Served::Idle => Action::Idle,
-            };
-        }
-    }
-
-    // Entry check: with host work pending (a kick, a signal, an owed
-    // wake), forward without serving -- except the calls the IPC adapter
-    // takes:
-    // - the slot's switched-in record owns a pending object operation. Its
-    //   thread is re-issuing the SVC to resume that operation, which only
-    //   the adapter may take (before any fd lookup); forwarding would let
-    //   the host run the call afresh while the record kept the operation
-    //   for the thread's next read or write.
-    // - a pipe or eventfd read/write that completes right now. Forwarding
-    //   it only moves a transfer EL1 can finish to the host (one served
-    //   read lost per fork in el1_ipc_two_processes_blocking).
-    // - an epoll_pwait on a zone epoll, for the same reason: Linux reports
-    //   ready events even with a signal pending, and a wait that would block
-    //   parks and leaves as below.
-    // A call that completes leaves with the pending work (`ServedWithWork`),
-    // so the host delivers a signal after the call returns, as Linux does
-    // for one pending at entry; a call that would block parks in the zone
-    // and the vCPU leaves at once (`Idle`), so the host settles the parked
-    // thread and a pending signal interrupts it before it sleeps. Nothing
-    // else is served past pending work. Nonblocking lifecycle setup may also
-    // complete on its authoritative slot, then leave ServedWithWork; clone
-    // and exit remain excluded from this exception.
-    let host_work = cur_task.is_some_and(CurrentTask::has_pending_host_work);
-    let record_lifecycle_host_work = || match family {
-        Family::Lifecycle if nr == lifecycle::SYS_EXIT => counters
-            .record_lifecycle_decline(carrick_el1_abi::LifecycleDecline::ExitDispatchHostWork),
-        Family::Lifecycle if nr == lifecycle::SYS_CLONE => counters
-            .record_lifecycle_decline(carrick_el1_abi::LifecycleDecline::CloneDispatchHostWork),
-        _ => {}
+    let ordinal = frame.x[8];
+    let mut pending = El1PendingFamilies {
+        frame,
+        counters,
+        current_tasks,
+        fd_map,
+        object_table,
+        open_table,
+        inotify_table,
+        name_cache,
+        zone,
+        ipc,
+        lifecycle,
+        cache_lookup,
     };
-    let resumes_operation = zone.as_ref().is_some_and(|zone| {
-        SlotId::from_index(slot)
-            .and_then(|slot| zone.tables.slot(slot).current())
-            .is_some_and(|record| zone.tables.record(record).has_object_operation())
-    });
-    let ipc_transfer =
-        matches!(family, Family::Read | Family::Write | Family::EpollWait) && ipc.is_some();
-    let lifecycle_setup = lifecycle.is_some()
-        && matches!(family, Family::Lifecycle)
-        && nr != lifecycle::SYS_EXIT
-        && nr != lifecycle::SYS_CLONE;
-    if host_work && !resumes_operation && !ipc_transfer && !lifecycle_setup {
-        record_lifecycle_host_work();
-        if nr < 512 {
-            counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
-        }
-        #[cfg(target_os = "none")]
-        if let (Some(zone), Some(task)) = (zone.as_ref(), cur_task)
-            && memory::delegated_anonymous_root(
-                nr as u64,
-                task,
-                crate::substrate::sched::object_wait::space_access(
-                    zone.tables,
-                    SlotId::new(slot as u8),
-                ),
-                memory::reservations::shared_guest(),
-            )
-            .is_some()
-        {
-            counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::PendingHostWork as usize]
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        return Action::Forward;
+    let control = if cfg!(feature = "allocator-test-control") {
+        carrick_el1_abi::SYS_CARRICK_EL1_CONTROL
+    } else {
+        u64::MAX
+    };
+    match carrick_personality_linux::dispatch::dispatch(ordinal, control, &mut pending) {
+        carrick_personality_linux::dispatch::CompletionRoute::Served => Action::Served,
+        carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
+        carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
+        carrick_personality_linux::dispatch::CompletionRoute::Forward => Action::Forward,
     }
+}
 
-    // A delegated MM's anonymous memory has one owner, its admitted
-    // reservation root: brk/mmap/munmap/mprotect are its transactions, the
-    // descriptor editors only their descriptor step. No admitted root: the
-    // MM keeps the paths below unchanged.
-    #[cfg(target_os = "none")]
-    if matches!(family, Family::Anonymous(_))
-        && let (Some(zone), Some(task)) = (zone.as_mut(), cur_task)
-    {
-        let orig_x0 = frame.x[0];
-        match memory::serve_delegated_anonymous(
-            frame,
-            counters,
-            task,
-            crate::substrate::sched::object_wait::space_access(
-                zone.tables,
-                SlotId::new(slot as u8),
-            ),
-            memory::reservations::shared_guest(),
-            &mut memory::HardwareAnonymousEditor,
-        ) {
-            memory::DelegatedAnonymous::PreparedConflict => {
-                // An admission raced the earlier predicate check. No syscall
-                // effect has occurred; enroll against the new owner epoch.
-                let Some(zslot) = SlotId::from_index(slot) else {
-                    return Action::Forward;
-                };
+pub struct El1PendingFamilies<'a, F, C: sched::ThreadCpu, U: sched::UserWord> {
+    frame: &'a mut TrapFrame,
+    counters: &'a Counters,
+    current_tasks: &'a [CurrentTask],
+    fd_map: &'a [FdMapSlot],
+    object_table: &'a [DelegatedFile],
+    open_table: &'a [DelegatedOpenFile],
+    inotify_table: &'a [DelegatedInotify],
+    name_cache: &'a InotifyNameCache,
+    zone: Option<Zone<'a, C, U>>,
+    ipc: Option<&'a ipc::IpcVenue<'a>>,
+    lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
+    cache_lookup: F,
+}
+impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFamilies
+    for El1PendingFamilies<'_, F, C, U>
+{
+    fn prepare_anonymous(&mut self) -> Option<FamilyCompletion> {
+        #[cfg(target_os = "none")]
+        {
+            let Self {
+                frame,
+                counters,
+                zone,
+                current_tasks,
+                ..
+            } = self;
+            let frame = &mut **frame;
+            let slot = frame.slot as usize;
+            let cur_task = current_tasks.get(slot);
+            if let (Some(zone), Some(task), Some(zslot)) =
+                (zone.as_mut(), cur_task, SlotId::from_index(slot))
+            {
                 let mut sched = sched::Sched {
                     zone: zone.tables,
                     slot: zslot,
@@ -417,359 +356,531 @@ where
                     user: zone.user,
                     counters,
                 };
-                return match super::mm_portal::park_prepared_edit(
+                if let Some(served) = super::mm_portal::park_prepared_edit(
                     &mut sched,
                     frame,
                     memory::reservations::shared_guest(),
                 ) {
-                    Some(sched::Served::Returned { .. }) => Action::Served,
-                    Some(sched::Served::Idle) => Action::Idle,
-                    None => Action::Forward,
-                };
-            }
-            memory::DelegatedAnonymous::NotDelegated => {}
-            memory::DelegatedAnonymous::Served => {
-                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                return Action::Served;
-            }
-            memory::DelegatedAnonymous::Forward => return Action::Forward,
-        }
-    }
-
-    #[cfg(target_os = "none")]
-    if matches!(family, Family::Anonymous(AnonymousCall::Mprotect))
-        && let Some(zone) = zone.as_ref()
-    {
-        let orig_x0 = frame.x[0];
-        let mut editor = memory::HardwareAnonymousPermissionEditor;
-        match memory::try_serve_mprotect(
-            frame,
-            current_tasks,
-            crate::substrate::sched::object_wait::space_access(
-                zone.tables,
-                SlotId::new(slot as u8),
-            ),
-            &mut editor,
-        ) {
-            memory::MprotectDisposition::Forward => {}
-            // The edit is in the guest tables and in the space's VMA journal
-            // (or refused): the host applies the journal before it next reads
-            // the MM's rows, so nothing is owed now.
-            memory::MprotectDisposition::Return(result) => {
-                frame.x[0] = result as u64;
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                return Action::Served;
-            }
-            // Journal full: back-pressure. The tables changed but the edit is
-            // not recorded; hand the call to the host, which drains the
-            // journal and commits this edit through the ordinary route.
-            memory::MprotectDisposition::ReturnWithWork => {
-                frame.x[0] = 0;
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                if let Some(task) = cur_task {
-                    return task.leave_commit_owed(orig_x0);
-                }
-                return Action::Served;
-            }
-        }
-    }
-
-    #[cfg(target_os = "none")]
-    if matches!(family, Family::Anonymous(AnonymousCall::Munmap))
-        && let Some(zone) = zone.as_ref()
-    {
-        let orig_x0 = frame.x[0];
-        let mut editor = memory::HardwareAnonymousRetirementEditor;
-        match memory::try_serve_munmap(
-            frame,
-            current_tasks,
-            crate::substrate::sched::object_wait::space_access(
-                zone.tables,
-                SlotId::new(slot as u8),
-            ),
-            &mut editor,
-        ) {
-            memory::MunmapDisposition::Forward => {}
-            memory::MunmapDisposition::Return(result) => {
-                frame.x[0] = result as u64;
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                return Action::Served;
-            }
-            memory::MunmapDisposition::Retired => {
-                frame.x[0] = 0;
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                if let Some(task) = cur_task {
-                    return task.leave_commit_owed(orig_x0);
+                    return Some(match served {
+                        sched::Served::Returned { .. } => {
+                            FamilyCompletion::AccountedComplete(frame.x[0] as i64)
+                        }
+                        sched::Served::Idle => FamilyCompletion::AccountedSuspended,
+                    });
                 }
             }
         }
+        None
     }
+    fn anonymous(&mut self, call: AnonymousCall) -> FamilyCompletion {
+        let _ = call;
+        #[cfg(target_os = "none")]
+        {
+            let Self {
+                frame,
+                counters,
+                current_tasks,
+                zone,
+                ..
+            } = self;
+            let frame = &mut **frame;
+            let slot = frame.slot as usize;
+            let cur_task = current_tasks.get(slot);
+            // A delegated MM's anonymous memory has one owner, its admitted
+            // reservation root: brk/mmap/munmap/mprotect are its transactions, the
+            // descriptor editors only their descriptor step. No admitted root: the
+            // MM keeps the paths below unchanged.
+            if let (Some(zone), Some(task)) = (zone.as_mut(), cur_task) {
+                let orig_x0 = frame.x[0];
+                match memory::serve_delegated_anonymous(
+                    frame,
+                    counters,
+                    task,
+                    crate::substrate::sched::object_wait::space_access(
+                        zone.tables,
+                        SlotId::new(slot as u8),
+                    ),
+                    memory::reservations::shared_guest(),
+                    &mut memory::HardwareAnonymousEditor,
+                ) {
+                    memory::DelegatedAnonymous::PreparedConflict => {
+                        // An admission raced the earlier predicate check. No syscall
+                        // effect has occurred; enroll against the new owner epoch.
+                        let Some(zslot) = SlotId::from_index(slot) else {
+                            return FamilyCompletion::Handback;
+                        };
+                        let mut sched = sched::Sched {
+                            zone: zone.tables,
+                            slot: zslot,
+                            task,
+                            cpu: &mut *zone.cpu,
+                            user: zone.user,
+                            counters,
+                        };
+                        return match super::mm_portal::park_prepared_edit(
+                            &mut sched,
+                            frame,
+                            memory::reservations::shared_guest(),
+                        ) {
+                            Some(sched::Served::Returned { .. }) => {
+                                FamilyCompletion::AccountedComplete(frame.x[0] as i64)
+                            }
+                            Some(sched::Served::Idle) => FamilyCompletion::AccountedSuspended,
+                            None => FamilyCompletion::Handback,
+                        };
+                    }
+                    memory::DelegatedAnonymous::NotDelegated => {}
+                    memory::DelegatedAnonymous::Served => {
+                        task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                        return FamilyCompletion::AccountedComplete(frame.x[0] as i64);
+                    }
+                    memory::DelegatedAnonymous::Forward => {
+                        return FamilyCompletion::AccountedForward;
+                    }
+                }
+            }
 
-    // Pipe and eventfd read/write on the shared IPC objects, and
-    // epoll_pwait on a zone epoll, served (and blocked) in EL1; host-backed
-    // descriptions fall through unchanged.
-    if matches!(family, Family::Read | Family::Write | Family::EpollWait)
-        && let (Some(venue), Some(zone), Some(task), Some(zslot)) =
-            (ipc, zone.as_mut(), cur_task, SlotId::from_index(slot))
-    {
-        let orig_x0 = frame.x[0];
-        let mut sched = sched::Sched {
-            zone: zone.tables,
-            slot: zslot,
-            task,
-            cpu: &mut *zone.cpu,
-            user: zone.user,
+            if call == AnonymousCall::Mprotect
+                && let Some(zone) = zone.as_ref()
+            {
+                let orig_x0 = frame.x[0];
+                let mut editor = memory::HardwareAnonymousPermissionEditor;
+                match memory::try_serve_mprotect(
+                    frame,
+                    current_tasks,
+                    crate::substrate::sched::object_wait::space_access(
+                        zone.tables,
+                        SlotId::new(slot as u8),
+                    ),
+                    &mut editor,
+                ) {
+                    memory::MprotectDisposition::Forward => {}
+                    // The edit is in the guest tables and in the space's VMA journal
+                    // (or refused): the host applies the journal before it next reads
+                    // the MM's rows, so nothing is owed now.
+                    memory::MprotectDisposition::Return(result) => {
+                        frame.x[0] = result as u64;
+                        return FamilyCompletion::Complete(frame.x[0] as i64);
+                    }
+                    // Journal full: back-pressure. The tables changed but the edit is
+                    // not recorded; hand the call to the host, which drains the
+                    // journal and commits this edit through the ordinary route.
+                    memory::MprotectDisposition::ReturnWithWork => {
+                        frame.x[0] = 0;
+                        if let Some(task) = cur_task {
+                            task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                            return FamilyCompletion::CommitOwed(frame.x[0] as i64);
+                        }
+                        return FamilyCompletion::Complete(frame.x[0] as i64);
+                    }
+                }
+            }
+
+            if call == AnonymousCall::Munmap
+                && let Some(zone) = zone.as_ref()
+            {
+                let orig_x0 = frame.x[0];
+                let mut editor = memory::HardwareAnonymousRetirementEditor;
+                match memory::try_serve_munmap(
+                    frame,
+                    current_tasks,
+                    crate::substrate::sched::object_wait::space_access(
+                        zone.tables,
+                        SlotId::new(slot as u8),
+                    ),
+                    &mut editor,
+                ) {
+                    memory::MunmapDisposition::Forward => {}
+                    memory::MunmapDisposition::Return(result) => {
+                        frame.x[0] = result as u64;
+                        return FamilyCompletion::Complete(frame.x[0] as i64);
+                    }
+                    memory::MunmapDisposition::Retired => {
+                        frame.x[0] = 0;
+                        if let Some(task) = cur_task {
+                            task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                            return FamilyCompletion::CommitOwed(frame.x[0] as i64);
+                        }
+                    }
+                }
+            }
+        }
+        FamilyCompletion::Forward
+    }
+    fn read(&mut self) -> FamilyCompletion {
+        self.ipc_transfer()
+    }
+    fn write(&mut self) -> FamilyCompletion {
+        self.ipc_transfer()
+    }
+    fn epoll_wait(&mut self) -> FamilyCompletion {
+        self.ipc_transfer()
+    }
+    fn lifecycle(&mut self, _: u64) -> FamilyCompletion {
+        let Self {
+            frame,
             counters,
-        };
-        let mut user = file::ValidatedCopy {
-            task,
-            validator: &file::HardwareValidator,
-        };
-        match ipc::serve_ipc(&mut sched, frame, venue, &mut user) {
-            ipc::IpcServed::Forward => {}
-            ipc::IpcServed::Returned { switched } => {
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                if !switched {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                }
-                if task.has_pending_host_work() {
-                    return task.leave_served_with_work();
-                }
-                return Action::Served;
-            }
-            ipc::IpcServed::Idle => {
-                counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                return Action::Idle;
-            }
-            ipc::IpcServed::Handback => {
-                counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
-                return Action::Forward;
+            zone,
+            lifecycle,
+            current_tasks,
+            ..
+        } = self;
+        let frame = &mut **frame;
+        let slot = frame.slot as usize;
+        let cur_task = current_tasks.get(slot);
+        if let (Some(venue), Some(task)) = (lifecycle, cur_task) {
+            let sched = match (zone.as_mut(), SlotId::from_index(slot)) {
+                (Some(zone), Some(zslot)) => Some(sched::Sched {
+                    zone: zone.tables,
+                    slot: zslot,
+                    task,
+                    cpu: &mut *zone.cpu,
+                    user: zone.user,
+                    counters,
+                }),
+                _ => None,
+            };
+            let mut user = file::ValidatedCopy {
+                task,
+                validator: &file::HardwareValidator,
+            };
+            if let Some(action) = lifecycle::serve(frame, counters, task, sched, *venue, &mut user)
+            {
+                return action;
             }
         }
-    }
-    // The adapter declined a call admitted past pending host work (a
-    // host-backed description, an unpublished table): the host runs it.
-    if host_work && !lifecycle_setup {
-        record_lifecycle_host_work();
-        if nr < 512 {
-            counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
-        }
-        return Action::Forward;
-    }
 
-    // Thread clone/exit and the per-thread setup calls, on the lifecycle
-    // page and control slots the host published.
-    if let (Some(venue), Some(task)) = (lifecycle, cur_task)
-        && matches!(family, Family::Lifecycle)
-    {
-        let sched = match (zone.as_mut(), SlotId::from_index(slot)) {
-            (Some(zone), Some(zslot)) => Some(sched::Sched {
+        FamilyCompletion::Forward
+    }
+    fn futex(&mut self) -> FamilyCompletion {
+        let Self {
+            frame,
+            counters,
+            zone,
+            current_tasks,
+            ..
+        } = self;
+        let frame = &mut **frame;
+        let slot = frame.slot as usize;
+        let cur_task = current_tasks.get(slot);
+        if let (Some(zone), Some(task), Some(zslot)) =
+            (zone.as_mut(), cur_task, SlotId::from_index(slot))
+            && sched::is_served_futex_op(frame)
+        {
+            let orig_x0 = frame.x[0];
+            let mut sched = sched::Sched {
                 zone: zone.tables,
                 slot: zslot,
                 task,
                 cpu: &mut *zone.cpu,
                 user: zone.user,
                 counters,
-            }),
-            _ => None,
-        };
-        let mut user = file::ValidatedCopy {
-            task,
-            validator: &file::HardwareValidator,
-        };
-        if let Some(action) = lifecycle::serve(frame, counters, task, sched, venue, &mut user) {
-            return action;
+            };
+            match sched.serve_futex(frame) {
+                Some(sched::Served::Returned { switched }) => {
+                    // After a switch the frame is the switched-in thread's,
+                    // whose own futex argument the switch recorded.
+                    if !switched {
+                        task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                    }
+                    return FamilyCompletion::Complete(frame.x[0] as i64);
+                }
+                Some(sched::Served::Idle) => {
+                    return FamilyCompletion::Suspended;
+                }
+                None => {}
+            }
         }
-    }
 
-    // Threads queued on this vCPU wait for the running one to block in a
-    // served futex wait or for its slice to end (EL1 plan 1d: other
-    // syscalls are served or forwarded as usual; 1b forwarded them all so
-    // the host could run the queued threads).
-    let file_access = match zone.as_ref() {
-        Some(zone) => crate::substrate::file_notification::FileAccess::notified(
-            zone.tables,
-            SlotId::new(slot as u8),
-        ),
-        None => {
-            #[cfg(any(test, feature = "host-test"))]
-            {
-                crate::substrate::file_notification::FileAccess::SourceFreeModel
+        FamilyCompletion::Forward
+    }
+    fn inotify_add(&mut self) -> FamilyCompletion {
+        let Self {
+            frame,
+            fd_map,
+            object_table,
+            inotify_table,
+            name_cache,
+            zone,
+            current_tasks,
+            ..
+        } = self;
+        let frame = &mut **frame;
+        let slot = frame.slot as usize;
+        let cur_task = current_tasks.get(slot);
+        let file_access = match zone.as_ref() {
+            Some(zone) => crate::substrate::file_notification::FileAccess::notified(
+                zone.tables,
+                SlotId::new(slot as u8),
+            ),
+            None => {
+                #[cfg(any(test, feature = "host-test"))]
+                {
+                    crate::substrate::file_notification::FileAccess::SourceFreeModel
+                }
+                #[cfg(not(any(test, feature = "host-test")))]
+                {
+                    crate::substrate::file_notification::FileAccess::Unavailable
+                }
             }
-            #[cfg(not(any(test, feature = "host-test")))]
-            {
-                crate::substrate::file_notification::FileAccess::Unavailable
-            }
-        }
-    };
-    if let (Some(zone), Some(task), Some(zslot)) =
-        (zone.as_mut(), cur_task, SlotId::from_index(slot))
-        && matches!(family, Family::Futex)
-        && sched::is_served_futex_op(frame)
-    {
+        };
+
         let orig_x0 = frame.x[0];
-        let mut sched = sched::Sched {
-            zone: zone.tables,
-            slot: zslot,
-            task,
-            cpu: &mut *zone.cpu,
-            user: zone.user,
-            counters,
-        };
-        match sched.serve_futex(frame) {
-            Some(sched::Served::Returned { switched }) => {
-                counters.served[sched::SYS_FUTEX].fetch_add(1, Ordering::Relaxed);
-                // After a switch the frame is the switched-in thread's,
-                // whose own futex argument the switch recorded.
-                if !switched {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                }
-                if task.has_pending_host_work() {
-                    return task.leave_served_with_work();
-                }
-                return Action::Served;
-            }
-            Some(sched::Served::Idle) => {
-                counters.served[sched::SYS_FUTEX].fetch_add(1, Ordering::Relaxed);
-                return Action::Idle;
-            }
-            None => {}
-        }
-    }
-
-    match family {
-        Family::InotifyAdd => {
-            let orig_x0 = frame.x[0];
-            if let Some(task) = cur_task {
-                let validator = file::HardwareValidator;
-                if let Ok(res) = inotify::el1_inotify_add_watch(
-                    file_access,
-                    frame.x[0] as i32,
-                    frame.x[1],
-                    frame.x[2] as u32,
-                    task,
-                    fd_map,
-                    object_table,
-                    inotify_table,
-                    name_cache,
-                    &validator,
-                ) {
-                    frame.x[0] = res as u64;
-                    counters.served[27].fetch_add(1, Ordering::Relaxed);
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    if task.has_pending_host_work() {
-                        return task.leave_served_with_work();
-                    }
-                    return Action::Served;
-                }
-            }
-        }
-        Family::InotifyRemove => {
-            let orig_x0 = frame.x[0];
-            if let Some(task) = cur_task
-                && let Ok(res) = inotify::el1_inotify_rm_watch(
-                    file_access,
-                    frame.x[0] as i32,
-                    frame.x[1] as i32,
-                    task,
-                    fd_map,
-                    object_table,
-                    inotify_table,
-                )
-            {
-                frame.x[0] = res as u64;
-                counters.served[28].fetch_add(1, Ordering::Relaxed);
-                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                claim_owed_inotify_wake(task, inotify_table);
-                if task.has_pending_host_work() {
-                    return task.leave_served_with_work();
-                }
-                return Action::Served;
-            }
-        }
-        Family::Read => {
-            let orig_x0 = frame.x[0];
-            let res = try_serve_file_syscall(
+        if let Some(task) = cur_task {
+            let validator = file::HardwareValidator;
+            if let Ok(res) = inotify::el1_inotify_add_watch(
                 file_access,
-                frame,
-                nr,
-                current_tasks,
+                frame.x[0] as i32,
+                frame.x[1],
+                frame.x[2] as u32,
+                task,
                 fd_map,
                 object_table,
-                open_table,
                 inotify_table,
-                &cache_lookup,
-            )
-            .or_else(|| {
-                if let Some(task) = cur_task {
-                    let validator = file::HardwareValidator;
-                    inotify::el1_inotify_read(
-                        frame.x[0] as i32,
-                        frame.x[1],
-                        frame.x[2] as usize,
-                        task,
-                        fd_map,
-                        inotify_table,
-                        &validator,
-                    )
-                    .ok()
-                } else {
-                    None
-                }
-            });
-            if let Some(res) = res {
-                frame.x[0] = res as u64;
-                counters.served[63].fetch_add(1, Ordering::Relaxed);
-                if let Some(task) = cur_task {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    claim_owed_inotify_wake(task, inotify_table);
-                    if task.has_pending_host_work() {
-                        return task.leave_served_with_work();
-                    }
-                }
-                return Action::Served;
-            }
-        }
-        Family::Write | Family::FileSeek | Family::FilePositioned => {
-            let orig_x0 = frame.x[0];
-            if let Some(res) = try_serve_file_syscall(
-                file_access,
-                frame,
-                nr,
-                current_tasks,
-                fd_map,
-                object_table,
-                open_table,
-                inotify_table,
-                &cache_lookup,
+                name_cache,
+                &validator,
             ) {
                 frame.x[0] = res as u64;
-                if nr < 512 {
-                    counters.served[nr].fetch_add(1, Ordering::Relaxed);
-                }
-                if let Some(task) = cur_task {
-                    task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                    if matches!(nr, 63 | 64 | 67 | 68) {
-                        claim_owed_inotify_wake(task, inotify_table);
-                    }
-                    if task.has_pending_host_work() {
-                        return task.leave_served_with_work();
-                    }
-                }
-                return Action::Served;
+                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                return FamilyCompletion::Complete(frame.x[0] as i64);
             }
         }
-        #[cfg(feature = "allocator-test-control")]
-        Family::AllocatorControl => {
-            let orig_x0 = frame.x[0];
+
+        FamilyCompletion::Forward
+    }
+    fn inotify_remove(&mut self) -> FamilyCompletion {
+        let Self {
+            frame,
+            fd_map,
+            object_table,
+            inotify_table,
+            zone,
+            current_tasks,
+            ..
+        } = self;
+        let frame = &mut **frame;
+        let slot = frame.slot as usize;
+        let cur_task = current_tasks.get(slot);
+        let file_access = match zone.as_ref() {
+            Some(zone) => crate::substrate::file_notification::FileAccess::notified(
+                zone.tables,
+                SlotId::new(slot as u8),
+            ),
+            None => {
+                #[cfg(any(test, feature = "host-test"))]
+                {
+                    crate::substrate::file_notification::FileAccess::SourceFreeModel
+                }
+                #[cfg(not(any(test, feature = "host-test")))]
+                {
+                    crate::substrate::file_notification::FileAccess::Unavailable
+                }
+            }
+        };
+
+        let orig_x0 = frame.x[0];
+        if let Some(task) = cur_task
+            && let Ok(res) = inotify::el1_inotify_rm_watch(
+                file_access,
+                frame.x[0] as i32,
+                frame.x[1] as i32,
+                task,
+                fd_map,
+                object_table,
+                inotify_table,
+            )
+        {
+            frame.x[0] = res as u64;
+            task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+            claim_owed_inotify_wake(task, inotify_table);
+            return FamilyCompletion::Complete(frame.x[0] as i64);
+        }
+
+        FamilyCompletion::Forward
+    }
+    fn file_read(&mut self) -> FamilyCompletion {
+        let Self {
+            frame,
+            current_tasks,
+            fd_map,
+            object_table,
+            open_table,
+            inotify_table,
+            zone,
+            cache_lookup,
+            ..
+        } = self;
+        let frame = &mut **frame;
+        let slot = frame.slot as usize;
+        let cur_task = current_tasks.get(slot);
+        let nr = frame.x[8] as usize;
+        let file_access = match zone.as_ref() {
+            Some(zone) => crate::substrate::file_notification::FileAccess::notified(
+                zone.tables,
+                SlotId::new(slot as u8),
+            ),
+            None => {
+                #[cfg(any(test, feature = "host-test"))]
+                {
+                    crate::substrate::file_notification::FileAccess::SourceFreeModel
+                }
+                #[cfg(not(any(test, feature = "host-test")))]
+                {
+                    crate::substrate::file_notification::FileAccess::Unavailable
+                }
+            }
+        };
+
+        let orig_x0 = frame.x[0];
+        let res = try_serve_file_syscall(
+            file_access,
+            frame,
+            nr,
+            current_tasks,
+            fd_map,
+            object_table,
+            open_table,
+            inotify_table,
+            cache_lookup,
+        )
+        .or_else(|| {
+            if let Some(task) = cur_task {
+                let validator = file::HardwareValidator;
+                inotify::el1_inotify_read(
+                    frame.x[0] as i32,
+                    frame.x[1],
+                    frame.x[2] as usize,
+                    task,
+                    fd_map,
+                    inotify_table,
+                    &validator,
+                )
+                .ok()
+            } else {
+                None
+            }
+        });
+        if let Some(res) = res {
+            frame.x[0] = res as u64;
+            if let Some(task) = cur_task {
+                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                claim_owed_inotify_wake(task, inotify_table);
+            }
+            return FamilyCompletion::Complete(frame.x[0] as i64);
+        }
+
+        FamilyCompletion::Forward
+    }
+    fn file_seek(&mut self) -> FamilyCompletion {
+        let Self {
+            frame,
+            current_tasks,
+            fd_map,
+            object_table,
+            open_table,
+            inotify_table,
+            zone,
+            cache_lookup,
+            ..
+        } = self;
+        let frame = &mut **frame;
+        let slot = frame.slot as usize;
+        let cur_task = current_tasks.get(slot);
+        let nr = frame.x[8] as usize;
+        let file_access = match zone.as_ref() {
+            Some(zone) => crate::substrate::file_notification::FileAccess::notified(
+                zone.tables,
+                SlotId::new(slot as u8),
+            ),
+            None => {
+                #[cfg(any(test, feature = "host-test"))]
+                {
+                    crate::substrate::file_notification::FileAccess::SourceFreeModel
+                }
+                #[cfg(not(any(test, feature = "host-test")))]
+                {
+                    crate::substrate::file_notification::FileAccess::Unavailable
+                }
+            }
+        };
+
+        let orig_x0 = frame.x[0];
+        if let Some(res) = try_serve_file_syscall(
+            file_access,
+            frame,
+            nr,
+            current_tasks,
+            fd_map,
+            object_table,
+            open_table,
+            inotify_table,
+            cache_lookup,
+        ) {
+            frame.x[0] = res as u64;
+            if let Some(task) = cur_task {
+                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                if matches!(nr, 63 | 64 | 67 | 68) {
+                    claim_owed_inotify_wake(task, inotify_table);
+                }
+            }
+            return FamilyCompletion::Complete(frame.x[0] as i64);
+        }
+
+        FamilyCompletion::Forward
+    }
+    fn file_positioned(&mut self, _: u64) -> FamilyCompletion {
+        self.file_seek()
+    }
+    fn file_write(&mut self) -> FamilyCompletion {
+        self.file_seek()
+    }
+    #[cfg(feature = "allocator-test-control")]
+    fn allocator_control(&mut self) -> FamilyCompletion {
+        let Self {
+            frame,
+            counters,
+            zone,
+            current_tasks,
+            ..
+        } = self;
+        let frame = &mut **frame;
+        let slot = frame.slot as usize;
+        let cur_task = current_tasks.get(slot);
+
+        let orig_x0 = frame.x[0];
+        #[cfg(target_os = "none")]
+        let saved = *frame;
+        // Consume the record-owned metadata wait before executing this
+        // control transaction again; IPC cannot construct this token.
+        if let (Some(zone), Some(task), Some(zslot)) =
+            (zone.as_mut(), cur_task, SlotId::from_index(slot))
+        {
+            let sched = sched::Sched {
+                zone: zone.tables,
+                slot: zslot,
+                task,
+                cpu: &mut *zone.cpu,
+                user: zone.user,
+                counters,
+            };
+            if let Ok(Some(operation)) = sched.take_object_operation()
+                && operation.metadata_generation().is_none()
+            {
+                return FamilyCompletion::Handback;
+            }
+        }
+        let res = match frame.x[0] {
+            1 => crate::alloc::run_guest_allocator_test(frame.x[1], frame.x[2]),
+            _ => 1,
+        };
+        if res == carrick_el1_abi::METADATA_GRANT_PENDING {
             #[cfg(target_os = "none")]
-            let saved = *frame;
-            // Consume the record-owned metadata wait before executing this
-            // control transaction again; IPC cannot construct this token.
             if let (Some(zone), Some(task), Some(zslot)) =
                 (zone.as_mut(), cur_task, SlotId::from_index(slot))
             {
-                let sched = sched::Sched {
+                let mailbox = carrick_el1_abi::metadata_mailbox_guest();
+                let generation = mailbox.request_generation();
+                let mut sched = sched::Sched {
                     zone: zone.tables,
                     slot: zslot,
                     task,
@@ -777,72 +888,152 @@ where
                     user: zone.user,
                     counters,
                 };
-                if let Ok(Some(operation)) = sched.take_object_operation()
-                    && operation.metadata_generation().is_none()
+                if let (Some(key), Some(operation), Some(resume)) = (
+                    carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(generation),
+                    carrick_sched_core::object_wait::OperationToken::metadata_request(generation),
+                    crate::substrate::sched::object_wait::OperationResumePc::new(
+                        saved.elr.wrapping_sub(4),
+                    ),
+                ) && let Ok(snapshot) = sched.observe_object(key)
+                    && matches!(
+                        mailbox.state.load(Ordering::Acquire),
+                        carrick_el1_abi::METADATA_MAILBOX_REQUESTED
+                            | carrick_el1_abi::METADATA_MAILBOX_HOST_WORKING
+                    )
+                    && mailbox.request_generation() == generation
+                    && let Ok(parked) =
+                        sched.park_object(&saved, key, snapshot, resume, operation, None)
                 {
-                    return Action::Forward;
+                    let _ = sched.leave_after_object_park(parked);
+                    return FamilyCompletion::AccountedSuspended;
                 }
             }
-            let res = match frame.x[0] {
-                1 => crate::alloc::run_guest_allocator_test(frame.x[1], frame.x[2]),
-                _ => 1,
-            };
-            if res == carrick_el1_abi::METADATA_GRANT_PENDING {
-                #[cfg(target_os = "none")]
-                if let (Some(zone), Some(task), Some(zslot)) =
-                    (zone.as_mut(), cur_task, SlotId::from_index(slot))
-                {
-                    let mailbox = carrick_el1_abi::metadata_mailbox_guest();
-                    let generation = mailbox.request_generation();
-                    let mut sched = sched::Sched {
-                        zone: zone.tables,
-                        slot: zslot,
-                        task,
-                        cpu: &mut *zone.cpu,
-                        user: zone.user,
-                        counters,
-                    };
-                    if let (Some(key), Some(operation), Some(resume)) = (
-                        carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(
-                            generation,
-                        ),
-                        carrick_sched_core::object_wait::OperationToken::metadata_request(
-                            generation,
-                        ),
-                        crate::substrate::sched::object_wait::OperationResumePc::new(
-                            saved.elr.wrapping_sub(4),
-                        ),
-                    ) && let Ok(snapshot) = sched.observe_object(key)
-                        && matches!(
-                            mailbox.state.load(Ordering::Acquire),
-                            carrick_el1_abi::METADATA_MAILBOX_REQUESTED
-                                | carrick_el1_abi::METADATA_MAILBOX_HOST_WORKING
-                        )
-                        && mailbox.request_generation() == generation
-                        && let Ok(parked) =
-                            sched.park_object(&saved, key, snapshot, resume, operation, None)
-                    {
-                        let _ = sched.leave_after_object_park(parked);
-                        return Action::Idle;
-                    }
-                }
-            }
-            frame.x[0] = res;
-            if let Some(task) = cur_task
-                && task.has_pending_host_work()
-            {
-                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
-                return task.leave_served_with_work();
-            }
-            return Action::Served;
         }
-        _ => {}
+        frame.x[0] = res;
+        if let Some(task) = cur_task
+            && task.has_pending_host_work()
+        {
+            task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+            return FamilyCompletion::CompleteWithWork(frame.x[0] as i64);
+        }
+        FamilyCompletion::AccountedComplete(frame.x[0] as i64)
     }
 
-    if nr < 512 {
-        counters.forwarded[nr].fetch_add(1, Ordering::Relaxed);
+    fn host_work(&self) -> bool {
+        self.task().is_some_and(CurrentTask::has_pending_host_work)
     }
-    Action::Forward
+    fn resumes_operation(&self) -> bool {
+        self.zone.as_ref().is_some_and(|zone| {
+            SlotId::from_index(self.frame.slot as usize)
+                .and_then(|slot| zone.tables.slot(slot).current())
+                .is_some_and(|record| zone.tables.record(record).has_object_operation())
+        })
+    }
+    fn ipc_available(&self) -> bool {
+        self.ipc.is_some()
+    }
+    fn lifecycle_available(&self) -> bool {
+        self.lifecycle.is_some()
+    }
+    fn declined_for_work(&self, ordinal: u64) {
+        match ordinal {
+            93 => self
+                .counters
+                .record_lifecycle_decline(carrick_el1_abi::LifecycleDecline::ExitDispatchHostWork),
+            220 => self
+                .counters
+                .record_lifecycle_decline(carrick_el1_abi::LifecycleDecline::CloneDispatchHostWork),
+            _ => {}
+        }
+        #[cfg(target_os = "none")]
+        if let (Some(zone), Some(task)) = (self.zone.as_ref(), self.task())
+            && memory::delegated_anonymous_root(
+                ordinal,
+                task,
+                crate::substrate::sched::object_wait::space_access(
+                    zone.tables,
+                    SlotId::new(self.frame.slot as u8),
+                ),
+                memory::reservations::shared_guest(),
+            )
+            .is_some()
+        {
+            self.counters.anonymous_leaves
+                [carrick_el1_abi::AnonymousLeave::PendingHostWork as usize]
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn record_served(&self, ordinal: u64) {
+        if let Some(counter) = self.counters.served.get(ordinal as usize) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn record_forwarded(&self, ordinal: u64) {
+        if let Some(counter) = self.counters.forwarded.get(ordinal as usize) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn publish_work(&self, commit: bool) {
+        if let Some(task) = self.task() {
+            if commit {
+                let _ = task.leave_commit_owed(task.orig_arg0.load(Ordering::Relaxed));
+            } else {
+                let _ = task.leave_served_with_work();
+            }
+        }
+    }
+}
+impl<F, C: sched::ThreadCpu, U: sched::UserWord> El1PendingFamilies<'_, F, C, U> {
+    fn ipc_transfer(&mut self) -> FamilyCompletion {
+        let Self {
+            frame,
+            counters,
+            zone,
+            ipc,
+            current_tasks,
+            ..
+        } = self;
+        let frame = &mut **frame;
+        let slot = frame.slot as usize;
+        let cur_task = current_tasks.get(slot);
+        if let (Some(venue), Some(zone), Some(task), Some(zslot)) =
+            (ipc, zone.as_mut(), cur_task, SlotId::from_index(slot))
+        {
+            let orig_x0 = frame.x[0];
+            let mut sched = sched::Sched {
+                zone: zone.tables,
+                slot: zslot,
+                task,
+                cpu: &mut *zone.cpu,
+                user: zone.user,
+                counters,
+            };
+            let mut user = file::ValidatedCopy {
+                task,
+                validator: &file::HardwareValidator,
+            };
+            match ipc::serve_ipc(&mut sched, frame, venue, &mut user) {
+                ipc::IpcServed::Forward => {}
+                ipc::IpcServed::Returned { switched } => {
+                    if !switched {
+                        task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                    }
+                    return FamilyCompletion::Complete(frame.x[0] as i64);
+                }
+                ipc::IpcServed::Idle => {
+                    return FamilyCompletion::Suspended;
+                }
+                ipc::IpcServed::Handback => {
+                    return FamilyCompletion::Handback;
+                }
+            }
+        }
+
+        FamilyCompletion::Forward
+    }
+    fn task(&self) -> Option<&CurrentTask> {
+        self.current_tasks.get(self.frame.slot as usize)
+    }
 }
 
 /// An in-guest enqueue that owes a host waiter a wake cannot deliver it
@@ -1113,6 +1304,15 @@ mod tests {
                 assert_eq!(counters.served[nr].load(Ordering::Relaxed), 0);
             }
         }
+    }
+
+    #[test]
+    fn unmigrated_family_completes_once_through_linux_owner() {
+        fn requires_real_family<T: carrick_personality_linux::dispatch::PendingFamilies>() {}
+        requires_real_family::<
+            El1PendingFamilies<'_, fn(u32) -> *mut u8, sched::FakeCpu, sched::HardwareUserWord>,
+        >();
+        test_thread_sleep_survives_task_generation_bump();
     }
 
     #[test]
