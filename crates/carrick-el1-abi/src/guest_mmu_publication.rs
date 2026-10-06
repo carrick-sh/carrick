@@ -24,6 +24,52 @@ impl GuestMmuPublication {
     pub const REVISION: u32 = 1;
     pub const APPLIED: u32 = 1;
 
+    /// Report the shared fork owner's applied parent journal and published
+    /// child table extent. This record carries no descriptor authority.
+    pub fn from_x86_fork(
+        parent_root: u64,
+        completion: crate::PortalForkCompletion,
+        parent_stores: usize,
+    ) -> Option<Self> {
+        let request = completion.request;
+        if parent_root == 0
+            || parent_root & 4095 != 0
+            || !request.valid()
+            || completion.child_tables_used == 0
+            || !completion.child_tables_used.is_multiple_of(4096)
+            || completion.child_tables_used > request.child_tables.len
+            || !completion.parent_tables_used.is_multiple_of(4096)
+            || completion.parent_tables_used > request.parent_tables.len
+            || completion.child.mm() != request.child_mm
+            || completion.child.carrier() != request.operation.carrier
+        {
+            return None;
+        }
+        Some(Self {
+            revision: Self::REVISION,
+            outcome: Self::APPLIED,
+            mm_key: request.operation.mm.raw(),
+            root_gpa: parent_root,
+            generation: completion.parent_generation.raw(),
+            edit_identity: request.operation.sequence.get(),
+            span_va: 0,
+            span_len: 1 << 47,
+            live_stores: u32::try_from(parent_stores).ok()?,
+            tables_linked: u32::try_from(completion.child_tables_used / 4096).ok()?,
+        })
+    }
+
+    /// Authenticate a fork publication against the exact neutral completion
+    /// before the host accepts physical custody of the child root.
+    pub fn matches_x86_fork(
+        self,
+        parent_root: u64,
+        completion: crate::PortalForkCompletion,
+    ) -> bool {
+        Self::from_x86_fork(parent_root, completion, self.live_stores as usize)
+            .is_some_and(|expected| expected == self)
+    }
+
     /// Serialize one successful native receipt after the guest edit and
     /// local drain, while its exact-MM editor is still held.
     pub fn from_x86_receipt(
@@ -87,3 +133,65 @@ const _: () = {
     assert!(core::mem::offset_of!(GuestMmuPublication, live_stores) == 56);
     assert!(core::mem::offset_of!(GuestMmuPublication, tables_linked) == 60);
 };
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    use crate::{
+        El1MmHandle, PortalForkRequest, PortalForkTableArena, PortalOperation,
+        ReservationGeneration, ReservationMm,
+    };
+    use core::num::NonZeroU64;
+
+    #[test]
+    fn x86_fork_publication_binds_child_root_and_parent_journal() {
+        let one = NonZeroU64::MIN;
+        let child_mm = ReservationMm::new(78).unwrap();
+        let request = PortalForkRequest {
+            operation: PortalOperation {
+                carrier: one,
+                mm: ReservationMm::new(77).unwrap(),
+                incarnation: one,
+                sequence: one,
+            },
+            parent_generation: ReservationGeneration::INITIAL,
+            child_mm,
+            child_tables: PortalForkTableArena::new(0x81_0000, 0x4_0000).unwrap(),
+            parent_tables: PortalForkTableArena::new(0x85_0000, 0x1_0000).unwrap(),
+            kernel_control_ipa: 0xa0_0000,
+        };
+        // SAFETY: the test models the exact admitted child owner that the
+        // neutral fork completion will publish; no live root is exposed.
+        let child = unsafe { El1MmHandle::from_admitted_owner(one, child_mm, one) };
+        let completion = crate::PortalForkCompletion {
+            request,
+            child,
+            parent_generation: ReservationGeneration::INITIAL,
+            child_tables_used: 0x5000,
+            parent_tables_used: 0,
+        };
+        let record = GuestMmuPublication::from_x86_fork(0x80_0000, completion, 1).unwrap();
+        assert_eq!(
+            (record.root_gpa, record.mm_key, record.span_len),
+            (0x80_0000, 77, 1 << 47)
+        );
+        assert_eq!((record.live_stores, record.tables_linked), (1, 5));
+        assert!(record.matches_x86_fork(0x80_0000, completion));
+        assert!(!record.matches_x86_fork(0x81_0000, completion));
+        // SAFETY: this wrong test identity is never admitted to a real MM.
+        let wrong_child =
+            unsafe { El1MmHandle::from_admitted_owner(one, ReservationMm::new(79).unwrap(), one) };
+        assert!(
+            GuestMmuPublication::from_x86_fork(
+                0x80_0000,
+                crate::PortalForkCompletion {
+                    child: wrong_child,
+                    ..completion
+                },
+                1,
+            )
+            .is_none()
+        );
+    }
+}
