@@ -127,7 +127,7 @@ impl SyscallTable for X8664SyscallTable {
 // arch_prctl(2) man7.org.
 
 /// The raw x86_64 `arch_prctl` syscall number (man7.org syscalls(2)).
-pub const ARCH_PRCTL_X86_NR: u64 = 158;
+pub use carrick_abi::syscall_x86_64::ARCH_PRCTL_X86_NR;
 
 /// Per-backend FS/GS segment-base register access — the only ISA-mechanism part
 /// of `arch_prctl`. KVM implements it via `KVM_GET/SET_SREGS`; bhyve via

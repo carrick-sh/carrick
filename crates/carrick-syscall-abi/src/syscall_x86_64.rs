@@ -32,6 +32,50 @@
 //! shared guest kernel routes fork(57) through a private canonical number;
 //! host backends still lower fork/vfork to clone before table lookup.
 
+/// Linux x86_64 native arch_prctl ordinal, sourced from syscalls(2).
+pub const ARCH_PRCTL_X86_NR: u64 = 158;
+
+/// Canonical set_tid_address ordinal from the asm-generic Linux table.
+pub const SYS_SET_TID_ADDRESS: u64 = 96;
+
+/// The native operation designated by the shared syscall table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeX86Call {
+    ArchPrctl,
+}
+
+/// Classification comes from the same table used by the host dispatcher.
+pub fn lookup_native_x86_64(number: u64) -> Option<NativeX86Call> {
+    let entry = lookup_x86_64(number)?;
+    (entry.remap == SyscallRemap::Native).then_some(NativeX86Call::ArchPrctl)
+}
+
+/// FS/GS and CPUID operations from arch_prctl(2). The syscall's operation
+/// argument is an int; high register bits are truncated like native Linux.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ArchPrctlOperation {
+    SetFs = 0x1002,
+    SetGs = 0x1001,
+    GetFs = 0x1003,
+    GetGs = 0x1004,
+    GetCpuid = 0x1011,
+    SetCpuid = 0x1012,
+}
+impl ArchPrctlOperation {
+    pub const fn decode(code: u64) -> Option<Self> {
+        match code as u32 {
+            code if code == Self::SetGs as u32 => Some(Self::SetGs),
+            code if code == Self::SetFs as u32 => Some(Self::SetFs),
+            code if code == Self::GetFs as u32 => Some(Self::GetFs),
+            code if code == Self::GetGs as u32 => Some(Self::GetGs),
+            code if code == Self::GetCpuid as u32 => Some(Self::GetCpuid),
+            code if code == Self::SetCpuid as u32 => Some(Self::SetCpuid),
+            _ => None,
+        }
+    }
+}
+
 /// How a guest-ISA syscall number reaches the canonical (aarch64/asm-generic)
 /// dispatcher. Defined in the guest-safe syscall ABI leaf and re-exported by
 /// `carrick-abi` for host backends.
@@ -450,7 +494,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=158 (syscalls(2)/filippo): arch_prctl is x86_64-private (sets FS/GS
     // base via ARCH_SET_FS / ARCH_SET_GS); the bhyve/KVM backend services it
     // natively (normalize_syscall returns SyscallNorm::ArchPrctl before lookup).
-    native(158, "arch_prctl"),
+    native(ARCH_PRCTL_X86_NR, "arch_prctl"),
     // x86_64=159 adjtimex → canonical adjtimex=171 (SAME name+shape)
     direct(159, "adjtimex", 171),
     // x86_64=160 setrlimit → canonical setrlimit=164 (SAME name+shape)
@@ -554,7 +598,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=217 getdents64 → canonical getdents64=61 (SAME name+shape)
     direct(217, "getdents64", 61),
     // x86_64=218 (syscalls(2)/filippo) → canonical set_tid_address=96
-    direct(218, "set_tid_address", 96),
+    direct(218, "set_tid_address", SYS_SET_TID_ADDRESS),
     // x86_64=219 restart_syscall → canonical restart_syscall=128 (SAME name+shape)
     direct(219, "restart_syscall", 128),
     // x86_64=220 semtimedop → canonical semtimedop=192 (SAME name+shape)
