@@ -323,6 +323,27 @@ impl Cpl0Carrier {
                     .ok_or_else(|| fail("binding backing"))?
                     .cast::<ContextBinding>();
                 binding_ptr.write_bytes(0, 1);
+                if let Some(ptr) = ram.host_ptr(
+                    carrick_x86::cpl0_mmu::PROGRESS_RESERVATIONS,
+                    size_of::<carrick_x86::cpl0_mmu::SharedReservations>(),
+                ) {
+                    ptr.cast::<u8>()
+                        .write_bytes(0, size_of::<carrick_x86::cpl0_mmu::SharedReservations>());
+                }
+                if let Some(ptr) = ram.host_ptr(
+                    carrick_x86::cpl0_mmu::PROGRESS_RESIDENCY,
+                    size_of::<carrick_el1_abi::FrameGrantResidencyTable>(),
+                ) {
+                    ptr.cast::<u8>()
+                        .write_bytes(0, size_of::<carrick_el1_abi::FrameGrantResidencyTable>());
+                }
+                if let Some(ptr) = ram.host_ptr(
+                    carrick_x86::cpl0_mmu::PROGRESS_PORTAL,
+                    size_of::<carrick_el1_abi::MmPortalSlots>(),
+                ) {
+                    ptr.cast::<u8>()
+                        .write_bytes(0, size_of::<carrick_el1_abi::MmPortalSlots>());
+                }
                 setup(&*zone_ptr, &mut *binding_ptr);
             }
 
@@ -421,6 +442,21 @@ impl Cpl0Carrier {
                     slot: index as u32,
                     admitted: AtomicU32::new(0),
                     admissions: AtomicU64::new(0),
+                    reservations_address: if let BootMode::Shared { .. } = mode {
+                        carrick_x86::cpl0_mmu::PROGRESS_RESERVATIONS
+                    } else {
+                        0
+                    },
+                    residency_address: if let BootMode::Shared { .. } = mode {
+                        carrick_x86::cpl0_mmu::PROGRESS_RESIDENCY
+                    } else {
+                        0
+                    },
+                    portal_address: if let BootMode::Shared { .. } = mode {
+                        carrick_x86::cpl0_mmu::PROGRESS_PORTAL
+                    } else {
+                        0
+                    },
                 });
             }
         }
@@ -533,6 +569,18 @@ impl Cpl0Carrier {
             )
             .unwrap_or_else(|| NonNull::dangling().as_ptr());
         unsafe { &*ptr.cast::<ZoneTables>() }
+    }
+
+    pub fn guest_ptr<T>(&self, gpa: u64) -> Option<*mut T> {
+        self.ram
+            .host_ptr(gpa, size_of::<T>())
+            .map(|p| p.cast::<T>())
+    }
+
+    pub fn write_guest_bytes(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), TrapError> {
+        self.ram
+            .write_gpa(gpa, bytes)
+            .map_err(|e| fail(e.to_string()))
     }
 
     pub fn fs_base(&self, index: usize) -> Result<u64, TrapError> {

@@ -19,6 +19,7 @@ pub mod arch_context;
 pub mod bringup;
 pub mod bringup_fns;
 pub mod cpl0_entry;
+pub mod cpl0_mmu;
 pub mod cpl0_scheduler;
 pub mod engine;
 pub mod fault;

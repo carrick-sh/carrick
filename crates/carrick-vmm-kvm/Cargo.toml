@@ -60,3 +60,10 @@ kvm-ioctls = "0.22.1"
 kvm-bindings = "0.12.1"
 vmm-sys-util = "0.14.0"
 zerocopy.workspace = true
+
+[dev-dependencies]
+carrick-core = { path = "../carrick-core" }
+carrick-core-abi = { path = "../carrick-core-abi" }
+carrick-personality-linux = { path = "../carrick-personality-linux" }
+carrick-el1 = { path = "../carrick-el1", features = ["host-test"] }
+carrick-x86 = { path = "../carrick-x86", features = ["host-test"] }

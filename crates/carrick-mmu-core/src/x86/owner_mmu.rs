@@ -139,15 +139,21 @@ impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
         if root.address().raw() != txn.root.raw() {
             return WireOutcome::Refused(DescriptorRefusal::StaleRoot);
         }
-        let tables: alloc::vec::Vec<_> = txn
-            .tables
-            .as_slice()
-            .iter()
-            .map(|&pa| RootGpa::page_aligned(FrameGpa::new(pa)))
-            .collect();
-        let Some(tables) = tables.into_iter().collect::<Option<alloc::vec::Vec<_>>>() else {
+        let slice = txn.tables.as_slice();
+        if slice.len() > crate::aarch64::descriptor_txn::MAX_TABLE_GRANTS {
             return WireOutcome::Refused(DescriptorRefusal::BadTableGrant);
+        }
+        let dummy = match RootGpa::page_aligned(FrameGpa::new(0)) {
+            Some(r) => r,
+            None => return WireOutcome::Refused(DescriptorRefusal::BadTableGrant),
         };
+        let mut tables = [dummy; crate::aarch64::descriptor_txn::MAX_TABLE_GRANTS];
+        for (i, &pa) in slice.iter().enumerate() {
+            let Some(root) = RootGpa::page_aligned(FrameGpa::new(pa)) else {
+                return WireOutcome::Refused(DescriptorRefusal::BadTableGrant);
+            };
+            tables[i] = root;
+        }
         let native = DescriptorTxn {
             id: txn.id,
             root,
@@ -162,7 +168,7 @@ impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
                 resident,
                 backing,
             },
-            tables: &tables,
+            tables: &tables[..slice.len()],
         };
         let receipt = execute_descriptor_txn(words, &native, root, &mut InlineJournal::new());
         match receipt.outcome {

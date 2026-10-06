@@ -3,7 +3,7 @@ pub use crate::aarch64::descriptor_txn::{
     BackingIdentity, DescriptorJournal, DescriptorRefusal, DescriptorTxnId, InlineJournal,
     JournalEntry, LiveDescriptorWords, PageSpan,
 };
-use alloc::{collections::BTreeMap, vec::Vec};
+use alloc::vec::Vec;
 use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
 
 pub const PAGE: u64 = 4096;
@@ -107,8 +107,101 @@ pub struct DescriptorTxn<'a> {
     pub tables: &'a [RootGpa],
 }
 #[derive(Clone, Debug)]
+pub struct PlanEntries {
+    inline: [JournalEntry; Self::INLINE_CAPACITY],
+    len: usize,
+    spill: Vec<JournalEntry>,
+    spilled: bool,
+}
+
+impl Default for PlanEntries {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PlanEntries {
+    pub const INLINE_CAPACITY: usize = 16;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            inline: [JournalEntry {
+                pa: 0,
+                before: 0,
+                after: 0,
+                bbm_va: 0,
+                bbm_len: 0,
+            }; Self::INLINE_CAPACITY],
+            len: 0,
+            spill: Vec::new(),
+            spilled: false,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        if self.spilled {
+            self.spill.len()
+        } else {
+            self.len
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn as_slice(&self) -> &[JournalEntry] {
+        if self.spilled {
+            &self.spill
+        } else {
+            &self.inline[..self.len]
+        }
+    }
+
+    pub fn push(&mut self, entry: JournalEntry) -> Result<(), DescriptorRefusal> {
+        if self.spilled {
+            self.spill
+                .try_reserve(1)
+                .map_err(|_| DescriptorRefusal::JournalCapacity)?;
+            self.spill.push(entry);
+            Ok(())
+        } else if self.len < Self::INLINE_CAPACITY {
+            self.inline[self.len] = entry;
+            self.len += 1;
+            Ok(())
+        } else {
+            self.spill
+                .try_reserve(self.len + 1)
+                .map_err(|_| DescriptorRefusal::JournalCapacity)?;
+            self.spill.extend_from_slice(&self.inline[..self.len]);
+            self.spill.push(entry);
+            self.spilled = true;
+            Ok(())
+        }
+    }
+}
+
+impl core::ops::Deref for PlanEntries {
+    type Target = [JournalEntry];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a PlanEntries {
+    type Item = &'a JournalEntry;
+    type IntoIter = core::slice::Iter<'a, JournalEntry>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct DescriptorPlan {
-    entries: Vec<JournalEntry>,
+    entries: PlanEntries,
     pub tables_linked: usize,
     pub words_read: usize,
     id: DescriptorTxnId,
@@ -156,8 +249,7 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
     let mut editor = Planner {
         words,
         txn,
-        overlay: BTreeMap::new(),
-        entries: Vec::new(),
+        entries: PlanEntries::new(),
         used: 0,
         reads: 0,
     };
@@ -327,15 +419,14 @@ pub fn arm_cow_terminal(entry: u64) -> Result<u64, DescriptorRefusal> {
 struct Planner<'a, 't, W: LiveDescriptorWords + ?Sized> {
     words: &'a W,
     txn: &'a DescriptorTxn<'t>,
-    overlay: BTreeMap<u64, u64>,
-    entries: Vec<JournalEntry>,
+    entries: PlanEntries,
     used: usize,
     reads: usize,
 }
 impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
     fn read(&mut self, pa: u64) -> Result<u64, DescriptorRefusal> {
-        if let Some(value) = self.overlay.get(&pa) {
-            return Ok(*value);
+        if let Some(entry) = self.entries.iter().rev().find(|e| e.pa == pa) {
+            return Ok(entry.after);
         }
         self.reads += 1;
         self.words.load(pa)
@@ -345,18 +436,13 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
         if before == after {
             return Ok(());
         }
-        self.entries
-            .try_reserve(1)
-            .map_err(|_| DescriptorRefusal::JournalCapacity)?;
         self.entries.push(JournalEntry {
             pa,
             before,
             after,
             bbm_va: 0,
             bbm_len: 0,
-        });
-        self.overlay.insert(pa, after);
-        Ok(())
+        })
     }
     fn grant(&mut self) -> Result<u64, DescriptorRefusal> {
         let page = self

@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 carrick-sched-core = { path = "../carrick-sched-core" }
+carrick-core = { path = "../carrick-core" }
+carrick-core-abi = { path = "../carrick-core-abi" }
+carrick-mmu-core = { path = "../carrick-mmu-core" }
+carrick-personality-linux = { path = "../carrick-personality-linux" }
 carrick-el1 = { path = "../carrick-el1" }
 carrick-el1-abi = { path = "../carrick-el1-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
@@ -18,3 +22,7 @@ bench = false
 
 [lints]
 workspace = true
+
+[features]
+default = []
+host-test = ["carrick-core/host-test"]

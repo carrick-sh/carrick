@@ -90,6 +90,12 @@ pub struct CpuBinding {
     pub admitted: AtomicU32,
     /// Total successful context admissions performed by CPL0.
     pub admissions: AtomicU64,
+    /// Published SharedReservations guest address; 0 in legacy M2.
+    pub reservations_address: u64,
+    /// Published FrameGrantResidencyTable guest address; 0 in legacy M2.
+    pub residency_address: u64,
+    /// Published MmPortalSlots guest address; 0 in legacy M2.
+    pub portal_address: u64,
 }
 const _: () = assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
 

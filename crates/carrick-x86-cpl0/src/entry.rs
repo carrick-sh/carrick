@@ -31,6 +31,9 @@ mod adapter;
 #[path = "../../carrick-x86/src/interrupts.rs"]
 mod interrupts;
 #[cfg(target_os = "none")]
+#[path = "../../carrick-x86/src/cpl0_mmu.rs"]
+mod mmu;
+#[cfg(target_os = "none")]
 mod progress;
 #[cfg(target_os = "none")]
 #[allow(dead_code)] // Included native adapter also exposes the host bootstrap API.
@@ -127,6 +130,11 @@ mod kernel {
         if frame.rax == OBSERVE_NATIVE {
             doorbell(CONTROL_PORT, frame);
             frame.rax = 0;
+            return;
+        }
+        if frame.rax == carrick_el1_abi::MM_PORTAL_GRANT_ESR {
+            let res = super::mmu::serve_cpl0_grant(binding, frame.rdi as usize);
+            frame.rax = res as u64;
             return;
         }
         // SAFETY: bootstrap retains these supervisor-only records until the

@@ -229,6 +229,11 @@ fn x1_shared_mm_owner() {
     transfer_fixture(64, 16);
     transfer_fixture(256, 16);
     x86_wrong_output_pin_refuses_before_preparing_copy();
+    grant_fixture::<carrick_mmu_core::x86::owner_mmu::X86Mmu>(
+        16,
+        true,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    );
 }
 
 #[path = "x86_acceleration/fork_cow.rs"]
