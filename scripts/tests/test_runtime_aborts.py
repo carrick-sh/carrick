@@ -221,7 +221,7 @@ fn f(c: bool) {
             [("f", 1)],
         )
 
-    def test_always_applied_cfg_attr_test_exclusion(self):
+    def test_conditional_test_exclusion_is_rejected(self):
         source = r'''
 #[cfg_attr(all(), cfg(test))]
 fn hidden_all() { std::process::abort(); }
@@ -235,11 +235,8 @@ fn shown_feature() { std::process::abort(); }
 #[cfg_attr(test, allow(dead_code))]
 fn shown_cfg_attr_test_allow() { std::process::abort(); }
 '''
-        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
-        self.assertEqual(
-            [(r.function, r.ordinal_in_function) for r in rows],
-            [("shown_feature", 1), ("shown_cfg_attr_test_allow", 1)],
-        )
+        with self.assertRaisesRegex(LedgerError, "conditional test attribute is unsupported"):
+            scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
 
     def test_fingerprints_start_at_function_body_brace_excluding_declaration_const_blocks(self):
         source1 = r'''

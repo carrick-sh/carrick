@@ -12,7 +12,7 @@ use syn::{
     visit::{self, Visit},
 };
 
-fn path_is_ident(path: &syn::Path, expected: &str) -> bool {
+pub(super) fn path_is_ident(path: &syn::Path, expected: &str) -> bool {
     path.get_ident()
         .is_some_and(|ident| ident.unraw() == expected)
 }
@@ -277,12 +277,12 @@ const DEFINITION_OWNERS: &[&str] = &[
     "carrick_kernel::dispatch::fd_table::super::SyscallDispatcher::rename_open_paths",
 ];
 
-fn test_only(attrs: &[syn::Attribute]) -> bool {
+pub(super) fn test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
         path_is_ident(a.path(), "test") || (path_is_ident(a.path(), "cfg") && cfg_false(&a.meta))
     })
 }
-fn cfg_false(meta: &syn::Meta) -> bool {
+pub(super) fn cfg_false(meta: &syn::Meta) -> bool {
     use syn::parse::Parser;
     match meta {
         syn::Meta::Path(path) => path_is_ident(path, "test"),
@@ -532,6 +532,85 @@ fn macro_source_references(
             }
         }
         references.insert(source.clone(), visitor.files);
+    }
+    Ok(references)
+}
+
+// Strict source edges come only from literal built-in inclusions in parsed
+// production syntax. Opaque references are rejected by dialect validation,
+// never used to promote a file or to confer test-only scope.
+fn resolved_source_references(
+    parsed: &BTreeMap<PathBuf, syn::File>,
+) -> Result<BTreeMap<PathBuf, BTreeSet<PathBuf>>, DebtError> {
+    struct Includes<'a> {
+        file: &'a Path,
+        references: BTreeSet<PathBuf>,
+    }
+    impl<'ast> Visit<'ast> for Includes<'_> {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            let attrs = match item {
+                syn::Item::Mod(i) => &i.attrs,
+                syn::Item::Fn(i) => &i.attrs,
+                syn::Item::Impl(i) => &i.attrs,
+                syn::Item::Trait(i) => &i.attrs,
+                syn::Item::Macro(i) => &i.attrs,
+                syn::Item::Static(i) => &i.attrs,
+                syn::Item::Const(i) => &i.attrs,
+                _ => return visit::visit_item(self, item),
+            };
+            if !test_only(attrs) {
+                visit::visit_item(self, item);
+            }
+        }
+        fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+            if !test_only(&item.attrs) {
+                visit::visit_impl_item_fn(self, item);
+            }
+        }
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            let builtin = matches!(
+                semantic_tokens(&mac.path)
+                    .replace(' ', "")
+                    .trim_start_matches("::"),
+                "include"
+                    | "include_str"
+                    | "include_bytes"
+                    | "std::include"
+                    | "std::include_str"
+                    | "std::include_bytes"
+                    | "core::include"
+                    | "core::include_str"
+                    | "core::include_bytes"
+            );
+            if builtin && let Ok(literal) = syn::parse2::<syn::LitStr>(mac.tokens.clone()) {
+                let path = normalized_path(
+                    &self
+                        .file
+                        .parent()
+                        .unwrap_or(self.file)
+                        .join(literal.value()),
+                );
+                let code = mac
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|s| s.ident.unraw() == "include");
+                if code || path.extension().is_some_and(|e| e == "rs") {
+                    self.references.insert(path);
+                }
+            }
+        }
+    }
+    let mut references = BTreeMap::new();
+    for (path, file) in parsed {
+        let mut visitor = Includes {
+            file: path,
+            references: BTreeSet::new(),
+        };
+        if !test_only(&file.attrs) {
+            visitor.visit_file(file);
+        }
+        references.insert(path.clone(), visitor.references);
     }
     Ok(references)
 }
@@ -794,7 +873,7 @@ fn collect_source_inclusion_aliases(
         }
     }
 }
-fn normalized_path(path: &Path) -> PathBuf {
+pub(super) fn normalized_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -1092,8 +1171,26 @@ fn expression_test_only(expression: &syn::Expr) -> bool {
     );
     test_only(attributes)
 }
+struct LegacyBaseSnapshot;
+
 impl SourceCensus {
     pub fn load(root: &Path) -> Result<Self, DebtError> {
+        Self::read(root, None)
+    }
+
+    // Only the schema-absent archived PR base may use historical owner recovery.
+    // Undercounting escapes in that base can only make its ceilings/ratchet
+    // stricter; this never supplies exemptions to working-source verification.
+    pub(super) fn legacy_base(root: &Path) -> Result<Self, DebtError> {
+        if root.join(crate::authority_debt::CEILINGS_PATH).exists() {
+            return Err(DebtError::Policy(
+                "legacy base census is unreachable with the ceilings schema".into(),
+            ));
+        }
+        Self::read(root, Some(LegacyBaseSnapshot))
+    }
+
+    fn read(root: &Path, historical: Option<LegacyBaseSnapshot>) -> Result<Self, DebtError> {
         let mut result = Self {
             vocabulary: authority_vocabulary()?,
             ..Self::default()
@@ -1141,6 +1238,22 @@ impl SourceCensus {
         }
         collect_source_inclusion_aliases(&parsed, &mut result.vocabulary)?;
         test_inclusions(&parsed, &result.vocabulary, &mut test_files);
+        if historical.is_none() {
+            // Reject invalid selectors before attempting module resolution.
+            // A second pass below validates any file also reached in production.
+            let provisional = parsed
+                .keys()
+                .filter(|p| !test_files.contains(*p))
+                .cloned()
+                .collect();
+            crate::authority_dialect::validate(
+                root,
+                &parsed,
+                &result.vocabulary.keys().cloned().collect(),
+                &test_files,
+                &provisional,
+            )?;
+        }
         let mut resolved = BTreeMap::new();
         for path in &leaves {
             let parent = path
@@ -1182,7 +1295,11 @@ impl SourceCensus {
         }
         // Macro literals force production scope without inventing a logical
         // owner or extending the retained scanners' source discovery domain.
-        let macro_references = macro_source_references(root, &parsed)?;
+        let macro_references = if historical.is_some() {
+            macro_source_references(root, &parsed)?
+        } else {
+            resolved_source_references(&parsed)?
+        };
         let mut production = resolved.keys().cloned().collect::<BTreeSet<_>>();
         // Only production files seed reachability. Their macro inputs remain
         // conservative even in cfg-gated syntax, but a test-only literal cycle
@@ -1199,6 +1316,15 @@ impl SourceCensus {
             }
         }
         let production = production_files(&parsed, &macro_references, production)?;
+        if historical.is_none() {
+            crate::authority_dialect::validate(
+                root,
+                &parsed,
+                &result.vocabulary.keys().cloned().collect(),
+                &test_files,
+                &production,
+            )?;
+        }
         // Parse aliases before any methods: a later type alias or renamed
         // lock import cannot make a raw storage accessor opaque to the census.
         for (path, syntax) in &parsed {
@@ -1354,6 +1480,9 @@ impl SourceCensus {
     }
     pub fn is_outside_production_at(&self, file: &str, line: usize, column: usize) -> bool {
         self.non_product_files.contains(file) || self.is_test_at(file, line, column)
+    }
+    pub(super) fn test_file_names(&self) -> &BTreeSet<String> {
+        &self.test_files
     }
     pub fn is_test_file(&self, file: &str) -> bool {
         self.test_files.contains(file)

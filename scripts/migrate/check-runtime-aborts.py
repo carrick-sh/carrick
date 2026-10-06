@@ -53,7 +53,7 @@ def opaque_macro_inputs(tokens: Sequence[Token]) -> list[bool]:
             invocation = (
                 index >= 2
                 and tokens[index - 1].text == "!"
-                and tokens[index - 2].text != "#"
+                and tokens[index - 2].kind.lower() == "ident"
             )
             definition = (
                 index >= 3
@@ -66,6 +66,93 @@ def opaque_macro_inputs(tokens: Sequence[Token]) -> list[bool]:
         if token.text in {")", "]", "}"} and delimiters:
             delimiters.pop()
     return opaque
+
+
+def validate_test_dialect(tokens: Sequence[Token], path: str) -> None:
+    """Only built-in attributes outside opaque inputs establish test scope.
+
+    A cfg(test) ancestor proves exclusion independently of imports in its
+    discarded body. Attribute names alone never establish that proof.
+    """
+    tokens = [Token(t.kind.lower(), t.text, getattr(t, "line", 0), t.pos) for t in tokens]
+    opaque = opaque_macro_inputs(tokens)
+    proof = [False] * len(tokens)
+    attrs = []
+    scopes = [False]
+    pending = False
+    i = 0
+    while i < len(tokens):
+        proof[i] = scopes[-1]
+        if tokens[i].text == "#":
+            start = i + 1
+            inner = start < len(tokens) and tokens[start].text == "!"
+            start += int(inner)
+            if start < len(tokens) and tokens[start].text == "[":
+                end = start + 1
+                depth = 1
+                while end < len(tokens) and depth:
+                    depth += (tokens[end].text == "[") - (tokens[end].text == "]")
+                    end += 1
+                if depth:
+                    raise LedgerError(f"{path}: restricted census dialect: unresolved attribute")
+                attr = tokens[start + 1:end - 1]
+                attrs.append((i, attr, scopes[-1] or pending))
+                cfg_proof = (attr and attr[0].text == "cfg" and
+                             is_test_only_attribute(attr) and not opaque[i])
+                if inner and cfg_proof:
+                    scopes[-1] = True
+                elif cfg_proof:
+                    pending = True
+                for j in range(i, end):
+                    proof[j] = scopes[-1]
+                i = end
+                continue
+        if tokens[i].text == "{":
+            scopes.append(scopes[-1] or pending)
+            pending = False
+        elif tokens[i].text == "}" and len(scopes) > 1:
+            scopes.pop()
+        elif tokens[i].text == ";":
+            pending = False
+        i += 1
+    globs = []
+    for i, token in enumerate(tokens):
+        if token.text != "use" or proof[i]:
+            continue
+        end = i + 1
+        while end < len(tokens) and tokens[end].text != ";":
+            end += 1
+        imported = tokens[i + 1:end]
+        if any(t.text == "*" for t in imported):
+            globs.append(i)
+        for j, t in enumerate(imported):
+            if t.text == "test" and (j + 1 == len(imported) or imported[j + 1].text != "::"):
+                raise LedgerError(f"{path}:{getattr(t, 'line', 0)}: restricted census dialect: import may rebind built-in test")
+    for i, attr, proven in attrs:
+        if proven or not attr:
+            continue
+        texts = [t.text for t in attr]
+        head = texts[:texts.index("(")] if "(" in texts else texts
+        if head[-1:] == ["test"]:
+            if head != ["test"]:
+                raise LedgerError(f"{path}:{getattr(tokens[i], 'line', 0)}: restricted census dialect: qualified test attribute is unsupported")
+            if globs:
+                raise LedgerError(f"{path}:{getattr(tokens[i], 'line', 0)}: restricted census dialect: glob import makes test exclusion ambiguous")
+        if texts[0] == "cfg_attr":
+            # Skip the predicate and examine the selected attributes only.
+            depth = 0
+            comma = None
+            for j, text in enumerate(texts[2:-1], 2):
+                depth += (text == "(") - (text == ")")
+                if text == "," and depth == 0:
+                    comma = j
+                    break
+            if comma is None:
+                raise LedgerError(f"{path}: restricted census dialect: unresolved conditional attribute")
+            if "test" in texts[comma + 1:]:
+                raise LedgerError(f"{path}:{getattr(tokens[i], 'line', 0)}: restricted census dialect: conditional test attribute is unsupported")
+        if opaque[i] and is_test_only_attribute(attr):
+            raise LedgerError(f"{path}:{getattr(tokens[i], 'line', 0)}: restricted census dialect: test exclusion in macro input is unsupported")
 
 
 @dataclass
@@ -314,8 +401,6 @@ def cfg_possible_values(tokens: list[Token]) -> set[bool]:
 def is_test_only_attribute(tokens: list[Token]) -> bool:
     if len(tokens) == 1 and tokens[0].text == "test":
         return True
-    if len(tokens) >= 3 and tokens[-1].text == "test" and tokens[-2].text == "::":
-        return True
     if (
         len(tokens) >= 4
         and tokens[0].text == "cfg"
@@ -323,61 +408,6 @@ def is_test_only_attribute(tokens: list[Token]) -> bool:
         and tokens[-1].text == ")"
     ):
         return True not in cfg_possible_values(tokens[2:-1])
-    if (
-        len(tokens) >= 4
-        and tokens[0].text == "cfg_attr"
-        and tokens[1].text == "("
-        and tokens[-1].text == ")"
-    ):
-        inner = tokens[2:-1]
-        comma_idx = None
-        paren_depth = 0
-        bracket_depth = 0
-        for idx, tok in enumerate(inner):
-            if tok.text == "(":
-                paren_depth += 1
-            elif tok.text == ")":
-                paren_depth -= 1
-            elif tok.text == "[":
-                bracket_depth += 1
-            elif tok.text == "]":
-                bracket_depth -= 1
-            elif tok.text == "," and paren_depth == 0 and bracket_depth == 0:
-                comma_idx = idx
-                break
-        if comma_idx is not None:
-            pred_tokens = inner[:comma_idx]
-            attr_tokens = inner[comma_idx + 1:]
-            if cfg_possible_values(pred_tokens) == {True}:
-                sub_attrs: list[list[Token]] = []
-                curr: list[Token] = []
-                p_d = 0
-                b_d = 0
-                for t in attr_tokens:
-                    if t.text == "(":
-                        p_d += 1
-                        curr.append(t)
-                    elif t.text == ")":
-                        p_d -= 1
-                        curr.append(t)
-                    elif t.text == "[":
-                        b_d += 1
-                        curr.append(t)
-                    elif t.text == "]":
-                        b_d -= 1
-                        curr.append(t)
-                    elif t.text == "," and p_d == 0 and b_d == 0:
-                        if curr:
-                            sub_attrs.append(curr)
-                            curr = []
-                    else:
-                        curr.append(t)
-                if curr:
-                    sub_attrs.append(curr)
-
-                for sub_attr in sub_attrs:
-                    if is_test_only_attribute(sub_attr):
-                        return True
     return False
 
 
@@ -774,6 +804,7 @@ def scan_abort_source(
 ) -> Sequence[AbortFinding]:
     posix_path = PurePosixPath(Path(path).as_posix()).as_posix()
     tokens = lex_rust(source)
+    validate_test_dialect(tokens, posix_path)
     opaque = opaque_macro_inputs(tokens)
 
     scopes: list[Scope] = [Scope("root", "<root>", False, 0, 0, 0)]
@@ -1473,12 +1504,14 @@ def scan_abort_source(
     return tuple(findings)
 
 
-def discover_runtime_aborts(root: Path) -> Sequence[AbortFinding]:
+def discover_runtime_aborts(root: Path, *, test_files: Sequence[str] = ()) -> Sequence[AbortFinding]:
     findings: list[AbortFinding] = []
     crates_dir = root / "crates"
-    for p in sorted(crates_dir.rglob("*.rs")):
+    # The strict Rust census rejects production references outside */src.
+    # Integration-test targets and build scripts are not product source inputs.
+    for p in sorted(crates_dir.glob("*/src/**/*.rs")):
         rel = p.relative_to(root).as_posix()
-        if any(rel.startswith(ex) for ex in EXCLUDED_CRATE_PREFIXES):
+        if rel in test_files or any(rel.startswith(ex) for ex in EXCLUDED_CRATE_PREFIXES):
             continue
         source = p.read_text(encoding="utf-8")
         findings.extend(scan_abort_source(rel, source))
