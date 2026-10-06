@@ -2966,3 +2966,37 @@ fn round8_audited_macro_preserves_description_io_call_counts() {
     policy.counters[0].operation = "write_for_io".into();
     carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &policy).unwrap();
 }
+
+#[test]
+fn round8_audited_macro_preserves_description_guard_call_counts() {
+    let root = source_fixture();
+    write_source(
+        root.path().join("crates/carrick-kernel/src/lib.rs"),
+        "fn poll() { let _ = ::std::matches!(description.inspect(), Some(_)); ::std::vec![description.inspect(), open_file.description.try_inspect()]; }",
+    ).unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert_eq!(census.k1.len(), 3);
+    assert_eq!(
+        census
+            .k1
+            .iter()
+            .filter(|site| site.operation == "inspect")
+            .count(),
+        2
+    );
+    assert_eq!(
+        census
+            .k1
+            .iter()
+            .filter(|site| site.operation == "try_inspect")
+            .count(),
+        1
+    );
+    let mut policy = ceilings(2);
+    policy.counters[0].operation = "inspect".into();
+    let mut second = policy.counters[0].clone();
+    second.operation = "try_inspect".into();
+    second.ceiling = 1;
+    policy.counters.push(second);
+    carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &policy).unwrap();
+}
