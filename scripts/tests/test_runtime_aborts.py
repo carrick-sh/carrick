@@ -18,7 +18,10 @@ SPEC.loader.exec_module(CHECKER)
 
 AbortFinding = CHECKER.AbortFinding
 LedgerError = CHECKER.LedgerError
-scan_abort_source = CHECKER.scan_abort_source
+from scripts.tests.authority_census_support import scan_source as census_scan
+
+def scan_abort_source(path, source):
+    return census_scan(CHECKER.scan_abort_source, path, source)
 
 
 
@@ -255,18 +258,15 @@ fn f() where [(); { 2 }]: Sized {
         self.assertEqual(len(r2), 1)
         self.assertEqual(r1[0].fingerprint, r2[0].fingerprint)
 
-    def test_macro_argument_tokens_do_not_overwrite_declaration_identity(self):
+    def test_unresolved_type_macro_item_tokens_fail_closed(self):
         source = r'''
 macro_rules! ty { ($($t:tt)*) => { () }; }
 fn outer(_: ty!(fn fake), _: ty![impl fake2], _: ty!{trait fake3}) -> ty!(fn fake4) {
     std::process::abort();
 }
 '''
-        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
-        self.assertEqual(
-            [(r.function, r.ordinal_in_function) for r in rows],
-            [("outer", 1)],
-        )
+        with self.assertRaisesRegex(LedgerError, "unclassified macro item scope"):
+            scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
 
     def test_curly_type_macro_does_not_open_function_body(self):
         source = r'''
@@ -517,7 +517,7 @@ fn outer(values: [S; 1]) {
             ("for-range-endpoint-block", r'''
 fn outer() {
     #[cfg(test)]
-    for item in 0..{ std::process::abort(); 3 } {
+    for item in 0..({ std::process::abort(); 3 }) {
         let _ = item;
         std::process::abort();
     }
@@ -969,7 +969,7 @@ fn production(kind: Kind, x: i32, y: i32, z: i32, q: i32) -> bool {
     match kind {
         #[cfg(test)]
         Kind::A => x < y,
-        Kind::B => { std::process::abort(); z } > q,
+        Kind::B => ({ std::process::abort(); z }) > q,
         Kind::C => { std::process::abort(); true },
     }
 }
