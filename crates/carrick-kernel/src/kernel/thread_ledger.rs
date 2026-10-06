@@ -1204,6 +1204,338 @@ mod tests {
         ClonePlan::from_flags(LinuxCloneFlags::empty()).expect("fork plan")
     }
 
+    fn staged_abi_birth(
+        kernel: &Arc<crate::kernel::Kernel>,
+        caller: &KernelContext,
+    ) -> (carrick_el1_abi::EntryRef, LinuxTid, impl FnOnce()) {
+        let page = caller.thread().control_lease().lifecycle();
+        let claim = page.claim_any().unwrap();
+        let entry = claim.entry();
+        let identity = page.identity(entry).unwrap();
+        let control = {
+            let state = kernel.registry().settled().read();
+            state.tasks[&caller.task().key().id]
+                .thread_pool
+                .entries
+                .lock()
+                .iter()
+                .find(|candidate| candidate.entry == entry)
+                .unwrap()
+                .control
+                .clone()
+        };
+        let caller = caller.thread().key();
+        let tid = LinuxTid::from_abi_positive(identity.tid as i32).unwrap();
+        (entry, tid, move || {
+            control.reset_for_birth(carrick_el1_abi::BlockedMask(0), 0, entry);
+            page.thread_born().unwrap();
+            page.record_born(
+                claim,
+                carrick_el1_abi::BornRecord {
+                    caller_task: carrick_el1_abi::El1TaskId::from_linux_tid(caller.tid.raw()).raw(),
+                    caller_serial: caller.serial.raw(),
+                    clone_flags: (LinuxCloneFlags::THREAD
+                        | LinuxCloneFlags::SIGHAND
+                        | LinuxCloneFlags::VM
+                        | LinuxCloneFlags::FS
+                        | LinuxCloneFlags::FILES)
+                        .bits(),
+                    clear_child_tid: 0,
+                    blocked: carrick_el1_abi::BlockedMask(0),
+                },
+            )
+            .unwrap();
+        })
+    }
+
+    #[derive(Clone, Copy)]
+    enum ParentExitMembershipWindow {
+        Birth,
+        ZoneExit,
+        HostExit,
+        BirthAfterRetire,
+        ReservedHeadroom,
+    }
+
+    #[test]
+    fn prepared_parent_exit_preserves_late_abi_birth_in_live_child() {
+        parent_exit_membership_interleaving(ParentExitMembershipWindow::Birth);
+    }
+
+    #[test]
+    fn prepared_parent_exit_preserves_late_zone_exit_in_live_child() {
+        parent_exit_membership_interleaving(ParentExitMembershipWindow::ZoneExit);
+    }
+
+    #[test]
+    fn prepared_parent_exit_preserves_late_host_exit_in_live_child() {
+        parent_exit_membership_interleaving(ParentExitMembershipWindow::HostExit);
+    }
+
+    #[test]
+    fn prepared_parent_exit_preserves_membership_until_completion_publication() {
+        parent_exit_membership_interleaving(ParentExitMembershipWindow::BirthAfterRetire);
+    }
+
+    #[test]
+    fn prepared_parent_exit_keeps_revision_headroom_across_child_membership() {
+        parent_exit_membership_interleaving(ParentExitMembershipWindow::ReservedHeadroom);
+    }
+
+    fn parent_exit_membership_interleaving(window: ParentExitMembershipWindow) {
+        let (kernel, root) = bootstrap(9_850);
+        let parent = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_851),
+                "exiting parent".into(),
+                None,
+            )
+            .unwrap();
+        let child = kernel
+            .fork_task(
+                &parent,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_852),
+                "live exit participant".into(),
+                None,
+            )
+            .unwrap();
+        let sibling = kernel
+            .clone_thread(
+                &child,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_853),
+                None,
+            )
+            .unwrap();
+        let page = child.thread().control_lease().lifecycle();
+        let (entry, tid, record_birth) = staged_abi_birth(&kernel, &sibling);
+        let mut record_birth = Some(record_birth);
+        let is_exit = matches!(
+            window,
+            ParentExitMembershipWindow::ZoneExit | ParentExitMembershipWindow::HostExit
+        );
+        let born = if is_exit {
+            record_birth.take().unwrap()();
+            Some(kernel.context(child.task().key().id, tid).unwrap())
+        } else {
+            None
+        };
+        let zone_exit = matches!(window, ParentExitMembershipWindow::ZoneExit)
+            .then(|| page.begin_exit(entry).unwrap());
+
+        // The exiting parent reserves its live child's parent edge, while a
+        // sibling has already admitted a clone or nonfinal exit at EL1.
+        let prepared = kernel
+            .prepare_task_exit_key(
+                parent.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            kernel.prepare_task_exit_key(child.task().key(), LinuxWaitStatus::from_wait_encoding(0), None),
+            Err(KernelOperationError::TaskBusy(id)) if id == child.task().key().id
+        ));
+        assert!(matches!(
+            kernel.create_process_group(child.task().key().id, None),
+            Err(KernelOperationError::TaskBusy(id)) if id == child.task().key().id
+        ));
+        if matches!(window, ParentExitMembershipWindow::ReservedHeadroom) {
+            let current = kernel
+                .context(child.task().key().id, child.thread().key().tid)
+                .unwrap();
+            child
+                .task()
+                .exhaust_unreserved_revisions_for_test(current.revision());
+            assert!(child.task().next_revision(current.revision()).is_none());
+        }
+        let mut prepared = Some(prepared);
+        let retired = if matches!(window, ParentExitMembershipWindow::BirthAfterRetire) {
+            Some(prepared.take().unwrap().retire_notifying(|_| {}).unwrap())
+        } else {
+            None
+        };
+        // No gate closes the live participant's unrelated thread activity.
+        assert_eq!(page.gate(), carrick_el1_abi::GateState::Open);
+        assert!(sibling.exact_thread_is_live());
+        if let Some(record_birth) = record_birth.take() {
+            record_birth();
+        } else if let Some(zone_exit) = zone_exit {
+            page.try_exit().unwrap();
+            zone_exit.commit().unwrap();
+        } else {
+            kernel.exit_thread(born.as_ref().unwrap(), None).unwrap();
+        }
+        // A membership observer forces real ABI settlement while the parent
+        // edge is still reserved, independently of terminal settlement itself.
+        kernel.settle_thread_ledger();
+        let zombie = if let Some(retired) = retired {
+            retired.publish().expect("publish retired parent exit")
+        } else {
+            prepared
+                .take()
+                .unwrap()
+                .commit()
+                .expect("child membership must not invalidate prepared parent exit")
+        };
+        assert_eq!(zombie.key, parent.task().key());
+        assert_eq!(child.task().parent(), Some(root.task().key()));
+        assert!(root.exact_thread_is_live());
+        assert!(sibling.exact_thread_is_live());
+        if is_exit {
+            assert!(kernel.context(child.task().key().id, tid).is_err());
+            assert_eq!(page.live(), 2);
+            assert_eq!(
+                page.state(entry.index()),
+                Some((entry.generation(), EntryState::Reaped))
+            );
+        } else {
+            let born = kernel.context(child.task().key().id, tid).unwrap();
+            assert_eq!(born.thread().key().tid, tid);
+            assert_eq!(page.live(), 3);
+            assert_eq!(
+                page.state(entry.index()),
+                Some((entry.generation(), EntryState::Published))
+            );
+            if matches!(window, ParentExitMembershipWindow::ReservedHeadroom) {
+                assert!(child.task().next_revision(born.revision()).is_none());
+                kernel
+                    .exit_thread(&born, None)
+                    .expect("reserved retirement survives topology publication");
+            }
+        }
+        assert_eq!(kernel.validate_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn prepared_parent_exit_rejects_unowned_participant_revision_change() {
+        let (kernel, root) = bootstrap(9_860);
+        let child = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_861),
+                "reserved child".into(),
+                None,
+            )
+            .unwrap();
+        let prepared = kernel
+            .prepare_task_exit_key(
+                root.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+        {
+            let mut state = kernel.registry().settled().write();
+            let record = state.tasks.get_mut(&child.task().key().id).unwrap();
+            record.revision = record.revision.next().unwrap();
+        }
+        assert!(
+            matches!(prepared.commit(), Err(KernelOperationError::ExitTopologyChanged(id)) if id == child.task().key().id)
+        );
+        assert_eq!(child.task().parent(), Some(root.task().key()));
+        assert!(root.exact_thread_is_live());
+        assert_eq!(kernel.validate_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn prepared_parent_exit_drop_releases_participant_revision_credit() {
+        let (kernel, root) = bootstrap(9_870);
+        let child = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_871),
+                "reserved child".into(),
+                None,
+            )
+            .unwrap();
+        let prepared = kernel
+            .prepare_task_exit_key(
+                root.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+        child
+            .task()
+            .exhaust_unreserved_revisions_for_test(child.revision());
+        assert!(child.task().next_revision(child.revision()).is_none());
+        drop(prepared);
+        assert!(child.task().next_revision(child.revision()).is_some());
+        assert_eq!(child.task().parent(), Some(root.task().key()));
+        assert_eq!(kernel.validate_invariants(), Ok(()));
+    }
+
+    #[test]
+    fn prepared_task_exit_preserves_its_late_abi_birth() {
+        prepared_task_exit_membership_interleaving(false);
+    }
+
+    #[test]
+    fn prepared_task_exit_preserves_its_late_zone_exit() {
+        prepared_task_exit_membership_interleaving(true);
+    }
+
+    fn prepared_task_exit_membership_interleaving(zone_exit: bool) {
+        let (kernel, root) = bootstrap(1);
+        let exiting = kernel
+            .fork_task(
+                &root,
+                fork_plan(),
+                ThreadId::synthetic_for_tests(9_881),
+                "terminal task2".into(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(exiting.task().key().id.raw(), 2);
+        let sibling = kernel
+            .clone_thread(
+                &exiting,
+                thread_plan(),
+                ThreadId::synthetic_for_tests(9_882),
+                None,
+            )
+            .unwrap();
+        let (entry, tid, record_birth) = staged_abi_birth(&kernel, &sibling);
+        let mut record_birth = Some(record_birth);
+        let page = exiting.thread().control_lease().lifecycle();
+        let zone_exit = if zone_exit {
+            record_birth.take().unwrap()();
+            kernel.settle_thread_ledger();
+            Some(page.begin_exit(entry).unwrap())
+        } else {
+            None
+        };
+        let prepared = kernel
+            .prepare_task_exit_key(
+                exiting.task().key(),
+                LinuxWaitStatus::from_wait_encoding(0),
+                None,
+            )
+            .unwrap();
+        // Terminal close prevents new EL1 claims, but an admitted transition
+        // can still finish and must be settled before graph retirement.
+        page.close();
+        if let Some(record_birth) = record_birth {
+            record_birth();
+        } else {
+            page.try_exit().unwrap();
+            zone_exit.unwrap().commit().unwrap();
+        }
+        let zombie = prepared
+            .commit()
+            .expect("task2 membership changed after exit preparation");
+        assert_eq!(zombie.key, exiting.task().key());
+        assert!(kernel.context(exiting.task().key().id, tid).is_err());
+        assert!(root.exact_thread_is_live());
+        assert_eq!(kernel.validate_invariants(), Ok(()));
+    }
+
     #[test]
     fn lifecycle_fork_admission_declines_in_flight_birth_in_only_its_owner() {
         birth_conflict_scope("fork");

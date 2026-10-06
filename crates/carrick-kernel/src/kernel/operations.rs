@@ -253,9 +253,63 @@ impl Drop for PublishedFork {
     }
 }
 
+/// The transaction owns either all task mutations or an exit participant's
+/// topology with separately admitted thread membership publications.
+#[derive(Debug)]
+pub(super) struct TaskGraphReservation {
+    transaction: KernelTransactionId,
+    scope: TaskReservationScope,
+}
+
+#[derive(Debug)]
+enum TaskReservationScope {
+    Exclusive,
+    ExitParticipant(Arc<exit::ExitParticipantRevision>),
+}
+
+impl TaskGraphReservation {
+    pub(super) fn exclusive(transaction: KernelTransactionId) -> Self {
+        Self {
+            transaction,
+            scope: TaskReservationScope::Exclusive,
+        }
+    }
+
+    pub(super) fn transaction(&self) -> KernelTransactionId {
+        self.transaction
+    }
+
+    fn exit_participant(
+        transaction: KernelTransactionId,
+        revision: Arc<exit::ExitParticipantRevision>,
+    ) -> Self {
+        Self {
+            transaction,
+            scope: TaskReservationScope::ExitParticipant(revision),
+        }
+    }
+
+    pub(super) fn permits_nonfinal_thread_exit(&self) -> bool {
+        matches!(self.scope, TaskReservationScope::ExitParticipant(_))
+    }
+
+    fn prepare_membership_revision(
+        &self,
+        task: TaskKey,
+        current: TaskRevision,
+        next: TaskRevision,
+    ) -> Result<Option<exit::PreparedExitMembershipRevision>, KernelOperationError> {
+        match &self.scope {
+            TaskReservationScope::Exclusive => Ok(None),
+            TaskReservationScope::ExitParticipant(revision) => {
+                revision.prepare_membership(task, current, next).map(Some)
+            }
+        }
+    }
+}
+
 /// Non-cloneable ownership of one registry transaction across an exact task
-/// set. External/backend preparation may run only while this guard is live;
-/// dropping it releases every identity still owned by this transaction.
+/// set. Dropping it releases every identity still owned by this transaction.
 #[derive(Debug)]
 pub(super) struct TaskSetReservation {
     kernel: Arc<Kernel>,
@@ -278,7 +332,9 @@ impl TaskSetReservation {
             ensure_task_unreserved(state, *task_id)?;
         }
         for task_id in &task_ids {
-            state.reservations.insert(*task_id, transaction);
+            state
+                .reservations
+                .insert(*task_id, TaskGraphReservation::exclusive(transaction));
         }
         Ok(Self {
             kernel: Arc::clone(kernel),
@@ -290,11 +346,13 @@ impl TaskSetReservation {
     }
 
     pub(super) fn validate(&self, state: &RegistryState) -> Result<(), KernelOperationError> {
-        if self
-            .task_ids
-            .iter()
-            .all(|task_id| state.reservations.get(task_id) == Some(&self.transaction))
-        {
+        if self.task_ids.iter().all(|task_id| {
+            state
+                .reservations
+                .get(task_id)
+                .map(TaskGraphReservation::transaction)
+                == Some(self.transaction)
+        }) {
             Ok(())
         } else {
             Err(KernelOperationError::StaleReservation)
@@ -351,7 +409,12 @@ impl Drop for TaskSetReservation {
         let mut state = self.kernel.registry().settled().write();
         let mut changed = false;
         for task_id in &self.task_ids {
-            if state.reservations.get(task_id) == Some(&self.transaction) {
+            if state
+                .reservations
+                .get(task_id)
+                .map(TaskGraphReservation::transaction)
+                == Some(self.transaction)
+            {
                 state.reservations.remove(task_id);
                 changed = true;
             }

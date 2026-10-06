@@ -1556,7 +1556,7 @@ mod child_tid_owner_tests {
     }
 
     #[test]
-    fn serial_host_normal_child_tid_exit_waits_and_cancels_permit_before_graph_retry() {
+    fn serial_host_normal_child_tid_exit_completes_under_graph_reservation() {
         let (kernel, root) = clear_kernel(72_510);
         let sibling = clear_sibling(&root);
         let tid = ThreadId::from_kernel_thread_identity(sibling.thread().key().tid.raw());
@@ -1590,20 +1590,16 @@ mod child_tid_owner_tests {
             .unwrap();
         assert!(matches!(
             state.handle_persistent_thread_exit(&kernel, &mut engine, 0, 0),
-            PersistentThreadExitDisposition::Busy { .. }
-        ));
-        assert_eq!((engine.prepared_cancels, engine.prepared_commits), (1, 0));
-        assert!(sibling.exact_thread_is_live());
-        assert_eq!(wakes.load(Ordering::SeqCst), 0);
-        drop(reservation);
-        assert!(matches!(
-            state.handle_persistent_thread_exit(&kernel, &mut engine, 0, 0),
             PersistentThreadExitDisposition::Done(VcpuLoopOutcome::ThreadDone)
         ));
+        assert_eq!((engine.prepared_cancels, engine.prepared_commits), (0, 1));
+        assert!(!sibling.exact_thread_is_live());
         assert_eq!(engine.guest_memory[&VA], [0; 4]);
-        assert_eq!(engine.prepared_commits, 1);
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
         assert!(!registry.is_clear_child_tid_addr(VA));
+        reservation
+            .commit()
+            .expect("thread membership must not invalidate prepared task exit");
     }
 
     #[test]
