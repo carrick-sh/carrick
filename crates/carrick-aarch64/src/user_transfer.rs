@@ -346,6 +346,7 @@ pub enum UserTransfer {
         address: u64,
         bytes: Vec<u8>,
     },
+    IdentityWrite(carrick_el1_abi::CarrickIdentityWrite),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -375,6 +376,13 @@ pub struct OwnedUserTransfer {
 impl OwnedUserTransfer {
     pub fn new(target: TransferTarget, request: UserTransfer) -> Option<Self> {
         let (address, intent, bytes) = match request {
+            UserTransfer::IdentityWrite(word) => (
+                word.address(carrick_el1_abi::IdentityControlBase::new(
+                    carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE,
+                )?),
+                PortalTransferIntent::CarrickIdentityWrite,
+                word.bytes()[..word.len()].to_vec(),
+            ),
             UserTransfer::CopyOut { address, bytes } => {
                 (address, PortalTransferIntent::UserWrite, bytes)
             }
@@ -383,7 +391,7 @@ impl OwnedUserTransfer {
                 len,
                 intent,
             } => {
-                if intent == PortalTransferIntent::UserWrite {
+                if intent.is_write() {
                     return None;
                 }
                 (address, intent, vec![0; len])

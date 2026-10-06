@@ -545,6 +545,16 @@ pub trait GuestMemory {
         self.read_bytes_raw(range.address(), range.len() as usize)
     }
 
+    /// Publish one named identity/control word. This is a separate authority
+    /// from Linux user copyout; admitted backends must select it through EL1.
+    fn write_carrick_identity(
+        &mut self,
+        base: carrick_el1_abi::IdentityControlBase,
+        word: carrick_el1_abi::CarrickIdentityWrite,
+    ) -> Result<(), MemoryError> {
+        self.write_bytes(word.address(base), &word.bytes()[..word.len()])
+    }
+
     /// Check the legacy inaccessible-range gate, then delegate to the concrete
     /// access venue. Owner implementations authorize even raw reads through
     /// EL1, so an absent legacy mirror cannot bypass owner permissions.

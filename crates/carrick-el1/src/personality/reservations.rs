@@ -14,6 +14,9 @@ impl owner::ReservationGeometry for NativeReservationGeometry {
     const REGION_BASE: u64 = EL1_REGION_BASE;
     const BOOTSTRAP_BASE: u64 = EL1_BOOTSTRAP_METADATA_BASE;
     const BOOTSTRAP_SIZE: u64 = EL1_BOOTSTRAP_METADATA_SIZE;
+    fn identity_control_base() -> Option<IdentityControlBase> {
+        IdentityControlBase::new(CARRICK_IDENTITY_PAGE_BASE)
+    }
     fn authorizes_internal_read(address: u64, len: u64) -> bool {
         CarrickInternalReadRange::authorizes(address, len)
     }

@@ -2395,6 +2395,14 @@ struct SplitView<'a, M: CurrentMmMemory, T: SyscallTrap> {
 }
 
 impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
+    fn write_carrick_identity(
+        &mut self,
+        base: carrick_el1_abi::IdentityControlBase,
+        word: carrick_el1_abi::CarrickIdentityWrite,
+    ) -> Result<(), MemoryError> {
+        self.mem.write_carrick_identity(base, word)
+    }
+
     // This adapter must be transparent. In particular, inheriting a modelless
     // default here silently bypasses the wrapped backend's physical repoint and
     // provenance publication while `run_syscall_loop` uses this split shape.
@@ -3145,6 +3153,65 @@ mod tests {
         assert!(clock_stub.perms.execute);
         let vdso = image_region(&image, carrick_mem::vdso::LINUX_VDSO_BASE);
         assert_eq!(&vdso[..HvfArch::vdso_bytes().len()], HvfArch::vdso_bytes());
+    }
+
+    #[test]
+    fn split_loop_preserves_private_identity_publication() {
+        struct PrivateIdentity {
+            base: carrick_el1_abi::IdentityControlBase,
+            bytes: [u8; 20],
+        }
+        impl GuestMemory for PrivateIdentity {
+            fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+                Err(MemoryError::Unsupported)
+            }
+            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+                Err(MemoryError::Unsupported)
+            }
+            fn write_carrick_identity(
+                &mut self,
+                base: carrick_el1_abi::IdentityControlBase,
+                word: carrick_el1_abi::CarrickIdentityWrite,
+            ) -> Result<(), MemoryError> {
+                if base != self.base {
+                    return Err(MemoryError::Unsupported);
+                }
+                let offset = word.offset() as usize;
+                self.bytes[offset..offset + word.len()]
+                    .copy_from_slice(&word.bytes()[..word.len()]);
+                Ok(())
+            }
+        }
+        impl CurrentMmMemory for PrivateIdentity {}
+        let base =
+            carrick_el1_abi::IdentityControlBase::new(carrick_el1_abi::CARRICK_IDENTITY_PAGE_BASE)
+                .unwrap();
+        let mut memory = PrivateIdentity {
+            base,
+            bytes: [0xff; 20],
+        };
+        let mut trap = RetryCompletionTrap::default();
+        let mut split = SplitView {
+            mem: &mut memory,
+            trap: &mut trap,
+        };
+        assert!(
+            split
+                .write_bytes(base.raw(), &701_u32.to_le_bytes())
+                .is_err()
+        );
+        carrick_kernel::kernel::identity_page::stamp_identity_values(
+            &mut split,
+            base.raw(),
+            701,
+            1,
+        )
+        .expect("split loop must retain private identity publication");
+        carrick_kernel::kernel::identity_page::stamp_clock_gate(&mut split, base.raw(), 1).unwrap();
+        assert_eq!(&memory.bytes[..4], &701_u32.to_le_bytes());
+        assert_eq!(&memory.bytes[4..8], &1_u32.to_le_bytes());
+        assert_eq!(&memory.bytes[8..16], &0_u64.to_le_bytes());
+        assert_eq!(&memory.bytes[16..20], &1_u32.to_le_bytes());
     }
 
     #[test]
