@@ -1750,14 +1750,14 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, 
         });
         Ok(Decision::Work(request))
     }
-    /// One node from the shared pool. A lost free-list race means another
-    /// allocation completed: a host guard retries it (lock-free progress,
-    /// no wait on any event), EL1 answers `Busy` and forwards. Only an
-    /// empty pool ends a host pop (`MetadataRequired`).
+    /// One node from the shared pool. A failed free-list CAS means another
+    /// allocator completed a pop. Finish the lock-free operation on either
+    /// venue; no root release can wake a PREPARE that mistakes this collision
+    /// for an owner refusal. Empty capacity still returns MetadataRequired.
     fn pool_node(&self) -> Result<u32, Refusal> {
         loop {
             match self.table.allocate(self.banks, self.node_capacity) {
-                Err(Refusal::Busy) if self.host_holder => core::hint::spin_loop(),
+                Err(Refusal::Busy) => core::hint::spin_loop(),
                 result => return result,
             }
         }
@@ -3076,11 +3076,11 @@ mod tests {
         }
     }
 
-    /// A lost free-list race (another allocation won the CAS) is not an
-    /// answer a host guard may give: it retries the pop. EL1 declines with
-    /// its one attempt and forwards.
+    /// A lost free-list CAS is progress by another allocator, not an owner
+    /// refusal. Both venues must finish this lock-free pop: PREPARE has no
+    /// release producer for an unrelated allocator's transient collision.
     #[test]
-    fn a_host_pool_pop_retries_a_lost_race_and_el1_declines() {
+    fn both_venues_complete_a_pool_pop_after_lost_cas() {
         let table = table();
         let mm = ReservationMm::new(61).unwrap();
         table.publish(0, mm, layout()).unwrap();
@@ -3098,10 +3098,9 @@ mod tests {
         drop(host);
         LOSE_POPS.with(|lose| lose.set(1));
         let guest = table.lock_el1(0, mm, 4).unwrap();
-        assert_eq!(
-            guest.pool_node(),
-            Err(Refusal::Busy),
-            "EL1 takes one attempt"
+        assert!(
+            guest.pool_node().is_ok(),
+            "EL1 must complete a contended pop"
         );
         LOSE_POPS.with(|lose| lose.set(0));
     }

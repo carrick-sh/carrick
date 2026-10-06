@@ -2637,12 +2637,12 @@ impl PublicationContext<'static> {
                 );
             }
             // An EL0 first touch can complete after PREPARE chose this page.
-            // A committed residency and the matching physical alias authorize
-            // only a fresh owner selection, never reuse of this stale window.
+            // The exact live residency and physical alias authorize a fresh
+            // owner selection. The guest-committed bit is set only after the
+            // guest installs its leaf, so requiring it here would refuse the
+            // first touch that this retry must complete.
             let peer_resident = resident.is_some_and(|page| {
-                carrick_el1_abi::frame_grant_residency_host().is_some_and(|table| {
-                    table.is_guest_committed(window.operation.mm.raw(), window.fault_page)
-                }) && overlapping.iter().any(|(_, alias)| {
+                overlapping.iter().any(|(_, alias)| {
                     window.fault_page >= alias.start
                         && window.fault_page < alias.start.saturating_add(alias.size as u64)
                         && alias.ipa.checked_add(window.fault_page - alias.start)
