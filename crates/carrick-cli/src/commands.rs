@@ -805,8 +805,124 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             });
         }
         Commands::Rootfs { layers, command } => {
+            if let RootfsCommand::Export {
+                image,
+                platform,
+                destination,
+            } = &command
+            {
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (image, platform, destination);
+                    bail!("native rootfs export requires Linux");
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    if let Some(destination) = destination {
+                        anyhow::ensure!(
+                            image.is_none() && !layers.is_empty(),
+                            "layer export requires --layer and no image"
+                        );
+                        carrick_vfs::rootfs::extract_native_layer_paths_to_dir(
+                            &layers,
+                            destination,
+                        )?;
+                        return Ok(());
+                    }
+                    anyhow::ensure!(layers.is_empty(), "image export takes no --layer");
+                    let image = ImageReference::parse(
+                        image
+                            .as_deref()
+                            .context("rootfs export requires an image")?,
+                    )?;
+                    let platform = carrick_image::PlatformTarget::parse(platform)
+                        .context("invalid rootfs export platform")?;
+                    let resolved = block_on_oci(store.resolve_with_platform(&image, &platform))?;
+                    let summary = block_on_oci(store.load_pull_summary_for(&image, &platform))?;
+                    let digest = summary
+                        .digest
+                        .context("rootfs export requires image digest")?;
+                    anyhow::ensure!(
+                        resolved
+                            .config
+                            .user
+                            .as_deref()
+                            .is_none_or(|user| user.is_empty()
+                                || user == "root"
+                                || user == "0"
+                                || user == "0:0"),
+                        "native oracle currently requires root image user"
+                    );
+                    let cache = store.root().join("native-oracle");
+                    std::fs::create_dir_all(&cache)?;
+                    let root = cache.join(format!(
+                        "{}-metadata-v1",
+                        digest
+                            .strip_prefix("sha256:")
+                            .context("non-SHA256 image digest")?
+                    ));
+                    if !root.is_dir() {
+                        let building = tempfile::Builder::new()
+                            .prefix(".building-")
+                            .tempdir_in(&cache)?;
+                        let mut child = std::process::Command::new("sudo");
+                        child
+                            .args(["-n"])
+                            .arg(std::env::current_exe()?)
+                            .arg("rootfs");
+                        for layer in &resolved.layers {
+                            child.arg("--layer").arg(layer.as_std_path());
+                        }
+                        let status = child
+                            .args(["export", "--destination"])
+                            .arg(building.path())
+                            .status()?;
+                        if !status.success() {
+                            let _ = std::process::Command::new("sudo")
+                                .args(["-n", "rm", "-rf", "--"])
+                                .arg(building.path())
+                                .status();
+                            bail!(
+                                "native OCI extraction failed; unsupported metadata is not an oracle"
+                            );
+                        }
+                        match std::fs::rename(building.path(), &root) {
+                            Ok(()) => {
+                                let _ = building.keep();
+                            }
+                            Err(_) if root.is_dir() => {
+                                let cleaned = std::process::Command::new("sudo")
+                                    .args(["-n", "rm", "-rf", "--"])
+                                    .arg(building.path())
+                                    .status()?;
+                                anyhow::ensure!(
+                                    cleaned.success(),
+                                    "native export staging cleanup failed"
+                                );
+                            }
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    println!(
+                        "{}",
+                        serde_json::to_string(&serde_json::json!({
+                            "root": std::fs::canonicalize(root)?,
+                            "image_digest": digest,
+                        "extractor": carrick_spec::OCI_NATIVE_EXTRACTOR_ID,
+                        "extractor_flags": carrick_spec::OCI_NATIVE_EXTRACTOR_FLAGS,
+                            "env": resolved.config.env,
+                            "entrypoint": resolved.config.entrypoint.unwrap_or_default(),
+                            "cmd": resolved.config.cmd.unwrap_or_default(),
+                            "workdir": resolved.config.working_dir,
+                        }))?
+                    );
+                    return Ok(());
+                }
+            }
+            anyhow::ensure!(!layers.is_empty(), "rootfs inspection requires --layer");
             let rootfs = RootFs::from_layer_paths(&layers)?;
             match command {
+                RootfsCommand::Export { .. } => bail!("rootfs export did not return"),
                 RootfsCommand::Summary => {
                     println!("{}", serde_json::to_string_pretty(&rootfs.summary())?);
                 }

@@ -10,17 +10,18 @@
 //! Invariants: identical trailing argv to both engines; carrick‖docker never
 //! overlap (two-phase); every kill is SCOPED to one run-id (no unscoped reap).
 
-mod argv;
+use carrick_conformance::argv;
 mod closure;
-mod engine;
+use carrick_conformance::engine;
 mod generate;
 mod images;
-mod lane;
-mod manifest;
+use carrick_conformance::lane;
+use carrick_conformance::manifest;
 mod matrix;
-mod oracle;
-mod parsers;
-mod verdict;
+use carrick_conformance::oracle;
+use carrick_conformance::parsers;
+use carrick_conformance::verdict;
+use carrick_conformance::{native, shard};
 
 use crate::closure::{ClosurePolicy, validate_closure_reports, validate_closure_selection};
 use crate::manifest::{Ecosystem, Manifest, Suite, Tier, Weight};
@@ -185,6 +186,15 @@ struct Args {
     /// routine gate executes ONLY carrick and diffs against the cached oracle.
     #[arg(long, default_value = "scripts/conformance/oracle-cache.jsonl")]
     oracle_cache: PathBuf,
+    /// Linux oracle authority. Native requires local x86_64 Linux/KVM.
+    #[arg(long, value_enum, default_value = "docker")]
+    oracle: lane::OracleBackend,
+    /// Deterministic longest-first partition, 1-based i/N.
+    #[arg(long)]
+    shard: Option<String>,
+    /// Merge complete shard reports with identical execution headers, then exit.
+    #[arg(long, num_args = 1..)]
+    merge_shards: Vec<PathBuf>,
     /// Ignore the oracle cache: re-run docker for every selected suite and
     /// overwrite their cached results (use after rebuilding an image's contents).
     #[arg(long)]
@@ -274,6 +284,88 @@ struct Args {
     oracle_fill_profile: String,
 }
 
+struct OracleContext {
+    backend: lane::OracleBackend,
+    roots: std::collections::BTreeMap<String, native::NativeRootfs>,
+    kernel: Option<String>,
+}
+
+impl OracleContext {
+    fn prepare(args: &Args, selected: &[Suite]) -> anyhow::Result<Self> {
+        let mut context = Self {
+            backend: args.oracle,
+            roots: Default::default(),
+            kernel: None,
+        };
+        if args.oracle == lane::OracleBackend::Native {
+            context.kernel = Some(native::kernel_major_minor(&native::kernel_release()?)?);
+            // Native execution cannot remove an inherited seccomp filter.
+            let status = std::fs::read_to_string("/proc/self/status")?;
+            anyhow::ensure!(
+                status.lines().any(|line| line == "Seccomp:\t0"),
+                "native oracle requires a seccomp-unconfined host process"
+            );
+            for suite in selected {
+                let rootfs = if args.dry_run {
+                    native::NativeRootfs {
+                        root: format!("<rootfs:{}>", suite.image).into(),
+                        ..Default::default()
+                    }
+                } else if let Some(rootfs) = context.roots.get(&suite.image) {
+                    rootfs.clone()
+                } else {
+                    native::export_image(&args.carrick_bin, &suite.image)?
+                };
+                argv::native_argv(suite, &rootfs)?;
+                context.roots.insert(suite.image.clone(), rootfs);
+            }
+        }
+        Ok(context)
+    }
+    fn cache(&self, path: &Path) -> anyhow::Result<oracle::OracleCache> {
+        match self.backend {
+            lane::OracleBackend::Docker => Ok(oracle::OracleCache::load(path)),
+            lane::OracleBackend::Native => oracle::OracleCache::load_native(
+                path,
+                self.kernel
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("missing kernel identity"))?,
+                self.roots
+                    .iter()
+                    .map(|(image, root)| (image.clone(), root.image_digest.clone()))
+                    .collect(),
+            ),
+        }
+    }
+    fn root(&self, suite: &Suite) -> anyhow::Result<&native::NativeRootfs> {
+        self.roots
+            .get(&suite.image)
+            .ok_or_else(|| anyhow::anyhow!("missing native rootfs {}", suite.image))
+    }
+    fn argv(
+        &self,
+        suite: &Suite,
+        run_id: &str,
+        platform: lane::DockerPlatform,
+    ) -> anyhow::Result<Vec<String>> {
+        match self.backend {
+            lane::OracleBackend::Docker => Ok(engine::docker_dry_run(suite, run_id, platform)),
+            lane::OracleBackend::Native => argv::native_argv(suite, self.root(suite)?),
+        }
+    }
+    fn run(
+        &self,
+        suite: &Suite,
+        run_id: &str,
+        platform: lane::DockerPlatform,
+    ) -> anyhow::Result<engine::RunOutput> {
+        match self.backend {
+            lane::OracleBackend::Docker => engine::run_docker(suite, run_id, platform),
+            lane::OracleBackend::Native => engine::run_native(suite, run_id, self.root(suite)?),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => code,
@@ -285,7 +377,44 @@ fn main() -> ExitCode {
 }
 
 fn run() -> anyhow::Result<ExitCode> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if args.oracle == lane::OracleBackend::Native {
+        if args.oracle_cache == Path::new(lane::OracleBackend::Docker.cache_path()) {
+            args.oracle_cache = args.oracle.cache_path().into();
+        }
+        anyhow::ensure!(
+            args.oracle_cache
+                .file_name()
+                .is_some_and(|name| name == "oracle-cache.native-amd64.jsonl"),
+            "native oracle requires its separate native-amd64 cache file"
+        );
+        anyhow::ensure!(
+            !args.generate_suites
+                && args.seed_oracle.is_none()
+                && !args.bless
+                && args.bless_from.is_none()
+                && !args.closure,
+            "native oracle cannot generate Docker suites, seed Docker reports, bless the shared baseline, or claim HVF closure"
+        );
+    }
+    if !args.merge_shards.is_empty() {
+        anyhow::ensure!(
+            args.shard.is_none(),
+            "--merge-shards conflicts with --shard"
+        );
+        let merged = shard::merge(&args.merge_shards)?;
+        let reports: Vec<SuiteReport> = merged
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<_, _>>()?;
+        write_reports(&args.results_path(), &reports)?;
+        print_summary(&reports);
+        return Ok(if reports.iter().any(|report| report.gating) {
+            ExitCode::FAILURE
+        } else {
+            ExitCode::SUCCESS
+        });
+    }
 
     if let Err(errors) = ClosurePolicy::validate_args(&args) {
         for error in errors {
@@ -320,6 +449,9 @@ fn run() -> anyhow::Result<ExitCode> {
         args.local_timeout_scale,
     )
     .map_err(|error| anyhow::anyhow!(error))?;
+    args.oracle
+        .validate_host(&lane, std::env::consts::OS, std::env::consts::ARCH)
+        .map_err(anyhow::Error::msg)?;
 
     if args.render_matrix {
         let reports = read_reports(&args.results_path())?;
@@ -380,7 +512,7 @@ fn run() -> anyhow::Result<ExitCode> {
 
     let tier = parse_tier(&args.tier)?;
     let skip_key = amd64_bringup_key(docker_platform, &args.lane);
-    let selected = select(
+    let mut selected = select(
         &manifest.suite,
         tier,
         &args.ecosystem,
@@ -390,8 +522,106 @@ fn run() -> anyhow::Result<ExitCode> {
     if args.closure {
         validate_closure_selection(&selected)?;
     }
+    let shard_spec = args.shard.as_deref().map(shard::Shard::parse).transpose()?;
+    let mut shard_header = None;
+    let mut shard_oracle_selection = None;
+    if let Some(spec) = shard_spec {
+        anyhow::ensure!(
+            !args.closure
+                && !args.bless
+                && args.bless_from.is_none()
+                && args.seed_oracle.is_none()
+                && !args.oracle_fill,
+            "sharded runs cannot bless or claim HVF closure"
+        );
+        let timing_path = Path::new("scripts/conformance/oracle-cache.timings.jsonl");
+        let timing_bytes = Command::new("git")
+            .args([
+                "show",
+                "HEAD:scripts/conformance/oracle-cache.timings.jsonl",
+            ])
+            .output()?;
+        anyhow::ensure!(
+            timing_bytes.status.success(),
+            "committed oracle timings unavailable"
+        );
+        anyhow::ensure!(
+            std::fs::read(timing_path)? == timing_bytes.stdout,
+            "sharding requires committed unchanged oracle timings"
+        );
+        let timings = shard::timings(timing_path)?;
+        let names = selected
+            .iter()
+            .map(|suite| suite.name.clone())
+            .collect::<Vec<_>>();
+        let assignments = shard::partition(&names, &timings, spec.count)?;
+        let head = Command::new("git").args(["rev-parse", "HEAD"]).output()?;
+        anyhow::ensure!(head.status.success(), "cannot determine HEAD");
+        let kernel = Command::new("uname").arg("-r").output()?;
+        anyhow::ensure!(kernel.status.success(), "cannot determine kernel");
+        let identity = shard::RunIdentity {
+            head: String::from_utf8(head.stdout)?.trim().into(),
+            carrick_sha256: if args.dry_run {
+                "dry-run".into()
+            } else {
+                binary_identity(&args.carrick_bin)?
+            },
+            kernel: String::from_utf8(kernel.stdout)?.trim().into(),
+            manifest_hash: shard::hash(&std::fs::read(&args.manifest)?),
+            selection_hash: shard::hash(&serde_json::to_vec(&selected)?),
+            oracle_backend: format!("{:?}", args.oracle),
+            lane: args.lane.clone(),
+            timings_hash: shard::hash(&timing_bytes.stdout),
+            native_images_hash: None,
+        };
+        let members: std::collections::BTreeSet<_> =
+            assignments[spec.index - 1].iter().cloned().collect();
+        if args.oracle == lane::OracleBackend::Native {
+            shard_oracle_selection = Some(selected.clone());
+        }
+        selected.retain(|suite| members.contains(&suite.name));
+        let positions: std::collections::BTreeMap<_, _> = assignments[spec.index - 1]
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), index))
+            .collect();
+        selected.sort_by_key(|suite| positions.get(&suite.name).copied().unwrap_or(usize::MAX));
+        shard_header = Some(shard::ShardHeader {
+            identity,
+            shard_index: spec.index,
+            assignments,
+        });
+    }
+    if args.oracle == lane::OracleBackend::Native {
+        for suite in &mut selected {
+            suite
+                .carrick_flags
+                .extend(["--security-opt".into(), "seccomp=unconfined".into()]);
+        }
+    }
+    let oracle_selection = shard_oracle_selection.as_deref().unwrap_or(&selected);
+    if args.oracle == lane::OracleBackend::Native && !args.dry_run && !args.no_image_refresh {
+        let images: Vec<String> = oracle_selection
+            .iter()
+            .map(|suite| suite.image.clone())
+            .collect();
+        images::refresh_stale_images(&images, &args.carrick_bin.to_string_lossy(), &lane);
+    }
+    let oracle_context = OracleContext::prepare(&args, oracle_selection)?;
+    if args.oracle == lane::OracleBackend::Native
+        && let Some(header) = &mut shard_header
+    {
+        // Include the whole selection, not only this worker's shard, so a
+        // moved image tag cannot splice different Linux authorities together.
+        let images: std::collections::BTreeMap<_, _> = oracle_context
+            .roots
+            .iter()
+            .map(|(image, root)| (image, &root.image_digest))
+            .collect();
+        header.identity.native_images_hash = Some(shard::hash(&serde_json::to_vec(&images)?));
+    }
     if args.oracle_fill {
-        return oracle_fill(&args, &selected, docker_platform);
+        return oracle_fill(&args, &selected, docker_platform, &oracle_context);
     }
     // Transparency: a bring-up lane silently dropping not-yet-applicable
     // ecosystems could be misread as full coverage, so name what was scoped out.
@@ -421,6 +651,10 @@ fn run() -> anyhow::Result<ExitCode> {
         }
     }
     if selected.is_empty() {
+        if let Some(header) = &shard_header {
+            shard::write_header(&args.results_path(), header)?;
+            write_reports(&args.results_path(), &[])?;
+        }
         eprintln!("no suites match the selection");
         return Ok(ExitCode::SUCCESS);
     }
@@ -435,14 +669,14 @@ fn run() -> anyhow::Result<ExitCode> {
                 args.carrick_fast_timeout_s,
                 args.carrick_timeout_cap_s,
             );
-            let d = engine::docker_dry_run(
+            let d = oracle_context.argv(
                 s,
                 &format!("conf-{}-dN", std::process::id()),
                 docker_platform,
-            );
+            )?;
             println!("# {} [{}, {:?}]", s.name, s.ecosystem.as_str(), s.tier);
             println!("  carrick: {}", c.join(" "));
-            println!("  docker:  {}", d.join(" "));
+            println!("  oracle ({:?}): {}", args.oracle, d.join(" "));
         }
         return Ok(ExitCode::SUCCESS);
     }
@@ -513,7 +747,7 @@ fn run() -> anyhow::Result<ExitCode> {
     // Image-freshness guard: re-pull carrick's copy of any selected image whose
     // registry digest moved, SERIALLY before the parallel carrick phase, so
     // carrick and docker run identical bytes (see images.rs). Skipped on request.
-    if !args.no_image_refresh {
+    if !args.no_image_refresh && args.oracle == lane::OracleBackend::Docker {
         let imgs: Vec<String> = selected.iter().map(|s| s.image.clone()).collect();
         let refreshed = images::refresh_stale_images(&imgs, &carrick_bin, &lane);
         if refreshed > 0 {
@@ -587,7 +821,7 @@ fn run() -> anyhow::Result<ExitCode> {
     // phase (live progress instead of a 0-byte file), and a crashed/killed run
     // leaves partial results behind. The authoritative file is still rewritten
     // in full at the end (after flake-retries), so this is purely additive.
-    let mut cache = oracle::OracleCache::load(&args.oracle_cache);
+    let mut cache = oracle_context.cache(&args.oracle_cache)?;
     // Keep prior elapsed evidence even during `--refresh-oracle`: refreshing
     // invalidates verdict bytes, not the fact that an intentionally sleeping
     // Linux test needs longer than the ordinary five-second Carrick budget.
@@ -656,6 +890,9 @@ fn run() -> anyhow::Result<ExitCode> {
         eprintln!("oracle: all {n} selected suite(s) cached; running carrick-only");
     }
 
+    if let Some(header) = &shard_header {
+        shard::write_header(&args.results_path(), header)?;
+    }
     let stream = Mutex::new(std::fs::File::create(args.results_path()).ok());
     let streamed_reports = Mutex::new(Vec::new());
     let fail_fast_stop = AtomicBool::new(false);
@@ -715,7 +952,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 let docker = DockerSide {
                     result: res.clone(),
                     run_id: "<cached>".to_string(),
-                    argv: engine::docker_dry_run(s, "<cached>", docker_platform),
+                    argv: oracle_context.argv(s, "<cached>", docker_platform)?,
                     elapsed_ms: cached_verdict_elapsed[i],
                     timed_out: false,
                 };
@@ -906,8 +1143,9 @@ fn run() -> anyhow::Result<ExitCode> {
     // (`cache`/`cached` were loaded before Phase 1 for the live-stream above.)
     let need_docker: Vec<usize> = (0..n).filter(|&i| cached[i].is_none()).collect();
     eprintln!(
-        "phase 2/4: {} docker run(s), {} cached oracle(s){} (workers={workers}, cpython-workers={cpython_workers})",
+        "phase 2/4: {} {:?} run(s), {} cached oracle(s){} (workers={workers}, cpython-workers={cpython_workers})",
         need_docker.len(),
+        args.oracle,
         n - need_docker.len(),
         if args.refresh_oracle {
             " [--refresh-oracle]"
@@ -937,8 +1175,8 @@ fn run() -> anyhow::Result<ExitCode> {
     let fresh_outs = fan_out_scheduled(&need_docker, &selected, workers, &lanes, |i| {
         let s = &selected[i];
         let run_id = format!("conf-{pid}-d{i:02}");
-        let out = engine::run_docker(s, &run_id, docker_platform);
-        eprintln!("  [docker]  {}", s.name);
+        let out = oracle_context.run(s, &run_id, docker_platform);
+        eprintln!("  [oracle {:?}] {}", args.oracle, s.name);
         out
     });
     drop(phase2_lease);
@@ -990,7 +1228,7 @@ fn run() -> anyhow::Result<ExitCode> {
             None => DockerSide {
                 result: parsers::SuiteResult::empty(),
                 run_id: String::new(),
-                argv: engine::docker_dry_run(s, "spawn-failed", docker_platform),
+                argv: oracle_context.argv(s, "spawn-failed", docker_platform)?,
                 elapsed_ms: None,
                 timed_out: false,
             },
@@ -1016,7 +1254,7 @@ fn run() -> anyhow::Result<ExitCode> {
             Some(res) => DockerSide {
                 result: res.clone(),
                 run_id: "<cached>".to_string(),
-                argv: engine::docker_dry_run(s, "<cached>", docker_platform),
+                argv: oracle_context.argv(s, "<cached>", docker_platform)?,
                 elapsed_ms: cached_verdict_elapsed[i],
                 timed_out: false,
             },
@@ -1333,7 +1571,7 @@ fn parse_oracle_fill_profile(name: &str) -> anyhow::Result<oracle::ParserProfile
     }
 }
 
-/// `--oracle-fill`: re-run DOCKER ONLY for an explicitly named selection and
+/// `--oracle-fill`: re-run the selected Linux oracle only for an explicitly named selection and
 /// rewrite just those oracle-cache rows under one parser profile.
 ///
 /// Repairing a suite DECLARATION mints a new determinant key, so the gate's row
@@ -1349,6 +1587,7 @@ fn oracle_fill(
     args: &Args,
     selected: &[Suite],
     docker_platform: crate::lane::DockerPlatform,
+    oracle_context: &OracleContext,
 ) -> anyhow::Result<ExitCode> {
     if args.closure {
         anyhow::bail!(
@@ -1370,12 +1609,13 @@ fn oracle_fill(
     };
 
     let pid = std::process::id();
-    let mut cache = oracle::OracleCache::load(&args.oracle_cache);
+    let mut cache = oracle_context.cache(&args.oracle_cache)?;
     eprintln!(
-        "oracle-fill: {} suite(s), profile={}, platform={docker_platform:?} (docker only; \
+        "oracle-fill: {} suite(s), profile={}, platform={docker_platform:?} ({:?} only; \
          no carrick, no classification)",
         selected.len(),
         args.oracle_fill_profile,
+        args.oracle,
     );
 
     let mut failures: Vec<String> = Vec::new();
@@ -1384,17 +1624,17 @@ fn oracle_fill(
         // let a later gate fall back to the superseded oracle.
         cache.invalidate_for_profile(suite, docker_platform, profile);
         let run_id = format!("fill-{pid}-d{i:02}");
-        let out = engine::run_docker(suite, &run_id, docker_platform);
+        let out = oracle_context.run(suite, &run_id, docker_platform);
         let out = match out {
             Ok(o) => o,
             Err(e) => {
-                failures.push(format!("{}: docker spawn failed: {e:#}", suite.name));
+                failures.push(format!("{}: oracle spawn failed: {e:#}", suite.name));
                 continue;
             }
         };
         if out.timed_out {
             failures.push(format!(
-                "{}: docker timed out after {} s — no oracle recorded",
+                "{}: oracle timed out after {} s — no oracle recorded",
                 suite.name, suite.timeout_s
             ));
             continue;
@@ -1410,8 +1650,9 @@ fn oracle_fill(
             },
         );
         eprintln!(
-            "  [docker] {} -> {:?} n={} pass={} fail={} broken={} skip={} ({} ms)\n\
+            "  [oracle {:?}] {} -> {:?} n={} pass={} fail={} broken={} skip={} ({} ms)\n\
                         raw: {} / {}",
+            args.oracle,
             suite.name,
             res.result,
             res.totals.n,
@@ -1554,7 +1795,20 @@ impl Args {
         self.jsonl.clone().unwrap_or_else(|| {
             let tier = parse_tier(&self.tier).unwrap_or(Tier::Full);
             let filtered = !self.ecosystem.is_empty() || !self.suite.is_empty();
-            default_results_path(&self.lane, tier, filtered)
+            let mut path = default_results_path(&self.lane, tier, filtered);
+            if self.oracle == lane::OracleBackend::Native || self.shard.is_some() {
+                let backend = if self.oracle == lane::OracleBackend::Native {
+                    "native"
+                } else {
+                    "docker"
+                };
+                let suffix = self.shard.as_deref().unwrap_or("all").replace('/', "-of-");
+                path.set_file_name(format!(
+                    "results.{}.{}.{}.jsonl",
+                    self.lane, backend, suffix
+                ));
+            }
+            path
         })
     }
 }

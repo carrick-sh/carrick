@@ -571,3 +571,40 @@ mod tests {
         assert_eq!(plain, lane_argv);
     }
 }
+
+/// Linux oracle execution authority, independent of the Carrick execution lane.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum OracleBackend {
+    #[default]
+    Docker,
+    Native,
+}
+
+impl OracleBackend {
+    pub fn validate_host(self, lane: &Lane, os: &str, arch: &str) -> Result<(), String> {
+        if self == Self::Native
+            && (!matches!(lane, Lane::KvmLocal(_)) || os != "linux" || arch != "x86_64")
+        {
+            return Err("--oracle native requires --lane kvm-local on native x86_64 Linux".into());
+        }
+        Ok(())
+    }
+
+    pub fn cache_path(self) -> &'static str {
+        match self {
+            Self::Docker => "scripts/conformance/oracle-cache.jsonl",
+            Self::Native => "scripts/conformance/oracle-cache.native-amd64.jsonl",
+        }
+    }
+}

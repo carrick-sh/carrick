@@ -98,7 +98,33 @@ def check_public_gate_is_filtered() -> None:
             fail(f"public probe gate lost required wiring: {marker}")
 
 
+def check_native_oracle_layout() -> None:
+    """Native provenance is a sidecar, never a generic subprocess probe."""
+    root = ROOT / "crates/carrick-cli/tests/probe-oracle"
+    allowed = {"arm64-musl", "arm64-gnu", "amd64-musl", "amd64-gnu",
+               "amd64native-musl", "amd64native-gnu"}
+    for directory in sorted(root.iterdir()):
+        if not directory.is_dir():
+            continue
+        if directory.name not in allowed:
+            fail(f"unknown oracle directory: {directory.relative_to(ROOT)}")
+        if directory.name.startswith("amd64native-"):
+            import json
+            provenance = directory / "PROVENANCE.json"
+            if not provenance.is_file():
+                fail(f"native oracle directory lacks {provenance.relative_to(ROOT)}")
+            data = json.loads(provenance.read_text(encoding="utf-8"))
+            if data.get("oracle_backend") != "native-unshare-v1":
+                fail(f"invalid native oracle provenance: {provenance.relative_to(ROOT)}")
+            for entry in directory.iterdir():
+                if entry.name == "PROVENANCE.json":
+                    continue
+                if not (ROOT / "conformance-probes/src/bin" / f"{entry.name}.rs").is_file():
+                    fail(f"native oracle without probe source: {entry.relative_to(ROOT)}")
+
+
 def main() -> None:
+    check_native_oracle_layout()
     check_next_has_no_subprocesses()
     check_ci_uses_public_gate()
     check_public_gate_is_filtered()
