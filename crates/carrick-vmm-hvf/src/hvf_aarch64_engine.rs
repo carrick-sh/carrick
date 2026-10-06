@@ -1363,6 +1363,9 @@ impl HvpatchTaskOnlyEngineState {
             return Err(error);
         }
         task.publish_pending_fork_frame_receipts();
+        if let Some(registration) = self._backend.take_foreign_mm_registration() {
+            task.foreign_mm_claim.install(registration);
+        }
         task.registration = self._backend.take_registration();
         if self.parked_task.lock().replace(task).is_some() {
             carrick_fatal!(
@@ -2556,16 +2559,14 @@ impl Aarch64Vmm for HvfAarch64Vmm {
             .map(carrick_hal::ForeignAsid::from_kernel_allocation)
             .ok_or_else(|| TrapError::Hypervisor("first-load ASID is invalid".into()))?;
         let backing = self.state.task.mm_access_authority();
-        self.state
-            .carrier_foreign_mm_transport
-            .register_closed_initial_identity(
-                mm,
-                crate::trap::CarrierForeignMmBinding {
-                    asid,
-                    stage1_root: carrick_guest_mem::Gpa(token.ttbr0() & 0x0000_ffff_ffff_f000),
-                },
-                &backing,
-            )?;
+        self.state.task.publish_closed_foreign_mm_identity(
+            &self.state.carrier_foreign_mm_transport,
+            mm,
+            crate::trap::CarrierForeignMmBinding {
+                asid,
+                stage1_root: carrick_guest_mem::Gpa(token.ttbr0() & 0x0000_ffff_ffff_f000),
+            },
+        )?;
         backing.prepare_first_load_owner_backing(authority, protections, token)
     }
 

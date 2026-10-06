@@ -75,7 +75,7 @@ impl UserTransferCustody {
             .states
             .read()
             .get(&binding)
-            .and_then(std::sync::Weak::upgrade)
+            .and_then(CarrierForeignMmStateEntry::upgrade)
             .ok_or_else(invalid)?;
         sparse_materialization::PublicationContext::for_import(
             state,
@@ -249,7 +249,7 @@ impl TransferCustody for UserTransferCustody {
             .states
             .read()
             .get(&binding)
-            .and_then(std::sync::Weak::upgrade);
+            .and_then(CarrierForeignMmStateEntry::upgrade);
         let Some(state) = state else {
             carrick_observability::probes::hvpatch_el1_owner_grant_supply(
                 window.range.start(),

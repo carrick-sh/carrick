@@ -1518,6 +1518,8 @@ pub(crate) struct HvfTaskState {
     /// A distinct Linux process edge onto another process's live CLONE_VM MM.
     /// Exit/exec drops this projection without retiring shared stage-2 state.
     shared_process_mm: bool,
+    /// This task's exact MM directory claim moves with its execution state.
+    pub(crate) foreign_mm_claim: CarrierForeignMmTaskClaim,
     /// Exact MM-owned access authority. This is the only movable MM state:
     /// sibling/CLONE_VM tasks clone this Arc, while copied forks allocate a
     /// distinct value.
@@ -1870,6 +1872,28 @@ impl HvfTaskState {
         }
     }
 
+    fn publish_foreign_mm_identity(
+        &mut self,
+        transport: &std::sync::Arc<CarrierForeignMmTransport>,
+        mm: carrick_hal::ForeignMmId,
+        binding: CarrierForeignMmBinding,
+    ) {
+        let registration = transport.register_owned_identity(mm, binding, &self.mm_access);
+        self.foreign_mm_claim.install(registration);
+    }
+
+    pub(crate) fn publish_closed_foreign_mm_identity(
+        &self,
+        transport: &std::sync::Arc<CarrierForeignMmTransport>,
+        mm: carrick_hal::ForeignMmId,
+        binding: CarrierForeignMmBinding,
+    ) -> Result<(), TrapError> {
+        let registration =
+            transport.register_closed_initial_identity(mm, binding, &self.mm_access)?;
+        self.foreign_mm_claim.install(registration);
+        Ok(())
+    }
+
     fn neutral() -> Self {
         let page_tables = carrick_aarch64::Stage1Authority::new();
         let protections = carrick_guest_mem::UserMemoryAuthority::from_legacy(std::sync::Arc::new(
@@ -1913,6 +1937,7 @@ impl HvfTaskState {
             pending_process_aliases: Vec::new(),
             fail_next_begin_exec_inventory: false,
             cow_rollback_scratch: None,
+            foreign_mm_claim: CarrierForeignMmTaskClaim::default(),
             registration: None,
         };
         let resolver = MmAccessLiveResolver::new(&task.mm_access, task.custody_arc());
@@ -1972,6 +1997,7 @@ impl HvfTaskState {
             && self.pending_fork_frame_receipts.is_empty()
             && self.pending_process_aliases.is_empty()
             && self.cow_rollback_scratch.is_none()
+            && self.foreign_mm_claim.is_empty()
             && self.registration.is_none();
         drop(frames);
         drop(inventory);
@@ -2177,6 +2203,7 @@ pub(crate) fn hvpatch_task_state_test_fixture(
         pending_process_aliases: Vec::new(),
         fail_next_begin_exec_inventory: false,
         cow_rollback_scratch: None,
+        foreign_mm_claim: CarrierForeignMmTaskClaim::default(),
         registration: None,
     }
 }
@@ -2322,13 +2349,13 @@ impl HvfVmState {
             std::num::NonZeroU16::new(identity.asid),
             self.task.mm_root_slot,
         ) {
-            self.carrier_foreign_mm_transport.register_identity(
+            self.task.publish_foreign_mm_identity(
+                &self.carrier_foreign_mm_transport,
                 carrick_hal::ForeignMmId::from_kernel_allocation(mm),
                 CarrierForeignMmBinding {
                     asid: carrick_hal::ForeignAsid::from_kernel_allocation(asid),
                     stage1_root: carrick_guest_mem::Gpa(stage1_root),
                 },
-                &self.task.mm_access,
             );
         }
     }
@@ -3231,6 +3258,12 @@ impl HvpatchTaskOnlyBackendState {
         if let Some(registration) = self.registration.as_mut() {
             registration.unregister_foreign_mm();
         }
+    }
+
+    pub(crate) fn take_foreign_mm_registration(&mut self) -> Option<CarrierForeignMmRegistration> {
+        self.registration
+            .as_mut()
+            .and_then(|registration| registration.foreign_mm_registration.take())
     }
 
     pub(crate) fn carrier_vm_custody(&self) -> Result<std::sync::Arc<CarrierVmCustody>, TrapError> {
@@ -5764,6 +5797,7 @@ impl HvpatchTaskRegistration {
             pending_process_aliases: Vec::new(),
             fail_next_begin_exec_inventory: false,
             cow_rollback_scratch: None,
+            foreign_mm_claim: CarrierForeignMmTaskClaim::default(),
             registration: None,
         })
     }
@@ -7555,6 +7589,7 @@ impl HvfVmState {
                 pending_process_aliases: aliases_to_publish,
                 fail_next_begin_exec_inventory: false,
                 cow_rollback_scratch: None,
+                foreign_mm_claim: CarrierForeignMmTaskClaim::default(),
                 registration: None,
             },
             carrier_mappings: None,

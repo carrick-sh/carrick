@@ -999,7 +999,11 @@ fn prepare_foreign_cow(
             states: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
                 (
                     CarrierForeignMmSnapshot::capture(&installed.snapshot).binding,
-                    Arc::downgrade(&installed.state),
+                    CarrierForeignMmStateEntry {
+                        mm: CarrierForeignMmSnapshot::capture(&installed.snapshot).mm,
+                        state: Arc::downgrade(&installed.state),
+                        registration: std::sync::Weak::new(),
+                    },
                 ),
             ]))),
             custody: Arc::clone(legacy_test_carrier_vm_custody_arc()),
@@ -2352,7 +2356,11 @@ fn rx_ptrace_text_cow_case(guest: bool) {
             states: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
                 (
                     CarrierForeignMmSnapshot::capture(&child.snapshot).binding,
-                    Arc::downgrade(&child.state),
+                    CarrierForeignMmStateEntry {
+                        mm: CarrierForeignMmSnapshot::capture(&child.snapshot).mm,
+                        state: Arc::downgrade(&child.state),
+                        registration: std::sync::Weak::new(),
+                    },
                 ),
             ]))),
             custody: Arc::clone(legacy_test_carrier_vm_custody_arc()),
@@ -2549,7 +2557,11 @@ fn ptrace_text_cow_rejects_source_alias_shorter_than_authenticated_span() {
             states: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
                 (
                     CarrierForeignMmSnapshot::capture(&child.snapshot).binding,
-                    Arc::downgrade(&child.state),
+                    CarrierForeignMmStateEntry {
+                        mm: CarrierForeignMmSnapshot::capture(&child.snapshot).mm,
+                        state: Arc::downgrade(&child.state),
+                        registration: std::sync::Weak::new(),
+                    },
                 ),
             ]))),
             custody: Arc::clone(legacy_test_carrier_vm_custody_arc()),
@@ -2692,7 +2704,11 @@ fn ptrace_text_cow_uses_authenticated_span_when_preexisting_arm_differs() {
             states: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::from([
                 (
                     CarrierForeignMmSnapshot::capture(&child.snapshot).binding,
-                    Arc::downgrade(&child.state),
+                    CarrierForeignMmStateEntry {
+                        mm: CarrierForeignMmSnapshot::capture(&child.snapshot).mm,
+                        state: Arc::downgrade(&child.state),
+                        registration: std::sync::Weak::new(),
+                    },
                 ),
             ]))),
             custody: Arc::clone(legacy_test_carrier_vm_custody_arc()),
@@ -5703,6 +5719,7 @@ fn production_fork_vvar_refresh(
         pending_process_aliases: Vec::new(),
         fail_next_begin_exec_inventory: false,
         cow_rollback_scratch: None,
+        foreign_mm_claim: CarrierForeignMmTaskClaim::default(),
         registration: None,
     };
     // Each fixture owns its root slots; pooled custody from another test
@@ -6062,6 +6079,7 @@ fn production_fork_vvar_refresh(
         pending_process_aliases: Vec::new(),
         fail_next_begin_exec_inventory: false,
         cow_rollback_scratch: None,
+        foreign_mm_claim: CarrierForeignMmTaskClaim::default(),
         registration: None,
     };
     assert!(
@@ -7438,6 +7456,198 @@ fn copied_fork_child_retain_preserves_borrowed_structural_owner() {
 }
 
 #[test]
+fn closed_initial_foreign_binding_survives_sibling_retirement() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = Arc::new(CarrierForeignMmTransport::new());
+    let initial = HvfTaskState::neutral();
+    let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(31).unwrap());
+    let binding = CarrierForeignMmBinding {
+        asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(9).unwrap()),
+        stage1_root: Gpa(0x8800_0040_0000),
+    };
+    let snapshot = registration_snapshot(mm, binding);
+    let admission = initial.protections.begin_selection().unwrap();
+    initial
+        .publish_closed_foreign_mm_identity(&transport, mm, binding)
+        .expect("first-load publication holds the user's admission guard");
+    drop(admission);
+    let sibling = transport.register_owned_identity(mm, binding, &initial.mm_access);
+    drop(sibling);
+    let retained = transport
+        .state_for(&snapshot, Instant::now() + Duration::from_secs(1))
+        .expect("the closed initial task must retain its MM after its sibling retires");
+    assert!(Arc::ptr_eq(&retained, &initial.mm_access));
+    drop(initial);
+    assert!(matches!(
+        transport.state_for(&snapshot, Instant::now() + Duration::from_secs(1)),
+        Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+    ));
+}
+
+#[test]
+fn initial_task_foreign_binding_survives_sibling_retirement() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = Arc::new(CarrierForeignMmTransport::new());
+    let mut initial = HvfTaskState::neutral();
+    let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(31).unwrap());
+    let binding = CarrierForeignMmBinding {
+        asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(9).unwrap()),
+        stage1_root: Gpa(0x8800_0040_0000),
+    };
+    let snapshot = registration_snapshot(mm, binding);
+    // Initial task projections have no copied-child directory registration.
+    assert!(initial.registration.is_none());
+    initial.publish_foreign_mm_identity(&transport, mm, binding);
+    let sibling = transport.register_owned_identity(mm, binding, &initial.mm_access);
+    drop(sibling);
+    let retained = transport
+        .state_for(&snapshot, Instant::now() + Duration::from_secs(1))
+        .expect("an initial task must keep its MM after its only sibling retires");
+    assert!(Arc::ptr_eq(&retained, &initial.mm_access));
+    drop(initial);
+    assert!(matches!(
+        transport.state_for(&snapshot, Instant::now() + Duration::from_secs(1)),
+        Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+    ));
+}
+
+#[test]
+fn exec_task_foreign_binding_survives_successor_sibling_retirement() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = Arc::new(CarrierForeignMmTransport::new());
+    let mut task = HvfTaskState::neutral();
+    let old_mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(31).unwrap());
+    let new_mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(32).unwrap());
+    let old_binding = CarrierForeignMmBinding {
+        asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(9).unwrap()),
+        stage1_root: Gpa(0x8800_0040_0000),
+    };
+    let new_binding = CarrierForeignMmBinding {
+        asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(10).unwrap()),
+        stage1_root: Gpa(0x8800_0060_0000),
+    };
+    let old_snapshot = registration_snapshot(old_mm, old_binding);
+    let new_snapshot = registration_snapshot(new_mm, new_binding);
+    task.publish_foreign_mm_identity(&transport, old_mm, old_binding);
+    let predecessor_peer = transport.register_owned_identity(old_mm, old_binding, &task.mm_access);
+    let predecessor_state = Arc::clone(&task.mm_access);
+
+    // Exec replaces MmAccessState before binding the committed successor.
+    task.mm_access = HvfTaskState::neutral().mm_access;
+    task.publish_foreign_mm_identity(&transport, new_mm, new_binding);
+    let successor_peer = transport.register_owned_identity(new_mm, new_binding, &task.mm_access);
+    drop(successor_peer);
+    let retained = transport
+        .state_for(&new_snapshot, Instant::now() + Duration::from_secs(1))
+        .expect("an exec successor must keep its MM after its only sibling retires");
+    assert!(Arc::ptr_eq(&retained, &task.mm_access));
+    assert!(Arc::ptr_eq(
+        &transport
+            .state_for(&old_snapshot, Instant::now() + Duration::from_secs(1))
+            .expect("the predecessor peer still owns its distinct MM"),
+        &predecessor_state,
+    ));
+    drop(task);
+    assert!(matches!(
+        transport.state_for(&new_snapshot, Instant::now() + Duration::from_secs(1)),
+        Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+    ));
+    drop(predecessor_peer);
+    assert!(matches!(
+        transport.state_for(&old_snapshot, Instant::now() + Duration::from_secs(1)),
+        Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+    ));
+}
+
+fn registration_snapshot(
+    mm: carrick_hal::ForeignMmId,
+    binding: CarrierForeignMmBinding,
+) -> CarrierForeignMmSnapshot {
+    CarrierForeignMmSnapshot {
+        mm,
+        binding,
+        backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(1),
+        vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
+        frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
+        mapping_ids: Vec::new(),
+        executable_ranges: Vec::new(),
+        readable_ranges: Vec::new(),
+    }
+}
+
+#[test]
+fn owned_foreign_mm_registration_survives_same_mm_sibling_retirement() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = Arc::new(CarrierForeignMmTransport::new());
+    let binding = CarrierForeignMmBinding {
+        asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(9).unwrap()),
+        stage1_root: Gpa(0x8800_0040_0000),
+    };
+    let state = MmAccessState::new_unbound(
+        carrick_aarch64::Stage1Authority::new(),
+        carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(MemoryProtections::default())),
+        Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+        Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+        Arc::new(parking_lot::Mutex::new(Vec::new())),
+        crate::hvf_aarch64_engine::HostCowStats::default(),
+    );
+    let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(31).unwrap());
+    let owner = transport.register_owned_identity(mm, binding, &state);
+    let sibling = transport.register_owned_identity(mm, binding, &state);
+    let snapshot = CarrierForeignMmSnapshot {
+        mm,
+        binding,
+        backend_revision: carrick_hal::ForeignBackendRevision::from_authority_raw(1),
+        vma_revision: carrick_hal::ForeignVmaRevision::from_authority_raw(1),
+        frame_inventory_revision: carrick_hal::ForeignFrameInventoryRevision::from_authority_raw(1),
+        mapping_ids: Vec::new(),
+        executable_ranges: Vec::new(),
+        readable_ranges: Vec::new(),
+    };
+
+    transport.register_identity(mm, binding, &state);
+    drop(sibling);
+    assert!(
+        Arc::ptr_eq(
+            &transport
+                .state_for(&snapshot, Instant::now() + Duration::from_secs(1))
+                .expect("one retired sibling must not remove another live task's MM binding"),
+            &state,
+        ),
+        "same-MM task retirement must retain the exact physical supply state"
+    );
+
+    drop(owner);
+    assert!(matches!(
+        transport.state_for(&snapshot, Instant::now() + Duration::from_secs(1)),
+        Err(carrick_hal::ForeignMmTransportError::MissingBinding)
+    ));
+}
+
+#[test]
+fn owned_foreign_mm_registration_removes_expired_state_without_historical_rows() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let transport = Arc::new(CarrierForeignMmTransport::new());
+    let task = HvfTaskState::neutral();
+    let mm = carrick_hal::ForeignMmId::from_kernel_allocation(NonZeroU64::new(31).unwrap());
+    let binding = CarrierForeignMmBinding {
+        asid: carrick_hal::ForeignAsid::from_kernel_allocation(NonZeroU16::new(9).unwrap()),
+        stage1_root: Gpa(0x8800_0040_0000),
+    };
+    let registration = transport.register_owned_identity(mm, binding, &task.mm_access);
+    let weak_state = Arc::downgrade(&task.mm_access);
+    drop(task);
+    assert!(weak_state.upgrade().is_none());
+    assert_eq!(transport.states.read().len(), 1);
+
+    drop(registration);
+    assert!(
+        transport.states.read().is_empty(),
+        "final claim teardown must retain zero historical rows after state destruction"
+    );
+}
+
+#[test]
 fn owned_foreign_mm_registration_teardown_is_exact_and_stale_safe() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
     let transport = Arc::new(CarrierForeignMmTransport::new());
@@ -7919,6 +8129,7 @@ fn production_copied_fork_structural_backing_retention_and_exact_stage2_lifecycl
         pending_process_aliases: Vec::new(),
         fail_next_begin_exec_inventory: false,
         cow_rollback_scratch: None,
+        foreign_mm_claim: CarrierForeignMmTaskClaim::default(),
         registration: None,
     };
 
@@ -13563,9 +13774,9 @@ mod guest_cow {
                 root | (1 << 48),
             )
         };
-        let transport = CarrierForeignMmTransport::new();
+        let transport = Arc::new(CarrierForeignMmTransport::new());
         let admission = protections.begin_selection().unwrap();
-        transport
+        let _registration = transport
             .register_closed_initial_identity(
                 carrick_hal::ForeignMmId::from_kernel_allocation(mm),
                 CarrierForeignMmBinding {
