@@ -10,7 +10,7 @@ use carrick_el1_abi::{
     X86_INITIAL_MAX_STRINGS, X86InitialBootGrant, X86InitialBootRegion, X86InitialBootRequest,
     X86InitialBootString,
 };
-use carrick_guest_arch::{EditBacking, EditPermissions, FrameGpa, MmuBackend, RootGpa};
+use carrick_guest_arch::{EditBacking, EditPermissions, FrameGpa, GuestLen, MmuBackend, RootGpa, UserVa};
 use core::num::NonZeroU64;
 use rust_alloc::vec::Vec;
 
@@ -154,10 +154,10 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
             return None;
         }
         image_regions.push(InitialImageRegion {
-            start: region.start,
-            len: region.len,
-            initialized_offset: region.initialized_offset,
-            initialized: InitialSourceRange { start: FrameGpa::new(region.source_gpa), len: region.initialized_len },
+            start: UserVa::new(region.start),
+            len: GuestLen::new(region.len),
+            initialized_offset: GuestLen::new(region.initialized_offset),
+            initialized: InitialSourceRange { start: FrameGpa::new(region.source_gpa), len: GuestLen::new(region.initialized_len) },
             perms: EditPermissions {
                 readable: region.permissions & 1 != 0,
                 writable: region.permissions & 2 != 0,
