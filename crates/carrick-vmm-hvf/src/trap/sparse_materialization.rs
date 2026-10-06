@@ -2826,6 +2826,29 @@ impl carrick_aarch64::user_transfer::TransferGrant for PendingTransferGrant {
                     "applied grant failed exact settlement; physical ownership retained: {error:?}"
                 )
             });
+            let publication = self.publication.as_ref().unwrap_or_else(|| {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "applied owner grant lost its physical publication"
+                )
+            });
+            // The owner-selected path publishes the same physical frame lease
+            // as an ordinary first-touch grant. Bind its exact owner receipt
+            // before dropping the publisher pin, so retirement accounts for
+            // the grant and its eventual return even if a peer acts at once.
+            global_frame::mark_el1_frame_grant_in(
+                &self.context.custody,
+                publication.alias.physical_ipa,
+                publication.alias.physical_size as u64,
+                self.context.mm_key.get(),
+                publication.ready.owner_generation,
+            )
+            .unwrap_or_else(|error| {
+                carrick_fatal!(
+                    "hvpatch::user_transfer",
+                    "applied owner grant cannot bind exact frame receipt: {error:?}"
+                )
+            });
             // Completion callbacks may immediately retire this exact owner.
             // Release the publisher's temporary pin before publishing readiness.
             drop(self.pin.take());
