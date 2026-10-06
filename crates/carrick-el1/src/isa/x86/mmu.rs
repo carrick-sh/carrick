@@ -98,32 +98,6 @@ pub fn portal_root_is_live(target: u64) -> bool {
     portal_descriptor_words(target).is_ok()
 }
 
-/// Give one owner maintenance operation the live CR3 table words and the
-/// already-retained direct copy window. No ARM service alias is constructed.
-pub(crate) fn with_portal_cow_venue<R>(
-    target: u64,
-    run: impl for<'a> FnOnce(
-        &carrick_core::mm::cow::GuestCowVenue<
-            'a,
-            crate::cow::X86CowMmu,
-            dyn LiveDescriptorWords + 'a,
-        >,
-    ) -> R,
-) -> Result<R, ArchError> {
-    let native = portal_descriptor_words(target)?;
-    let words: &dyn LiveDescriptorWords = &native;
-    let root = carrick_mmu_core::aarch64::SubstrateGpa(target);
-    let venue = carrick_core::mm::cow::GuestCowVenue {
-        publish_executable: None,
-        words,
-        root,
-        pool: carrick_el1_abi::cow_grant_pool_guest(),
-        residency: carrick_el1_abi::frame_grant_residency_guest(),
-        copy_window: carrick_core::mm::cow::CowCopyWindow::target(words, root),
-    };
-    Ok(run(&venue))
-}
-
 /// Drain all non-global translations after a portal grant under the live root.
 pub(crate) fn portal_invalidate_root(target: u64) -> Result<(), ArchError> {
     if live_root()?.address().raw() != target {

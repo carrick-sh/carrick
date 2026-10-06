@@ -329,6 +329,33 @@ pub(super) fn retired_page_x86<W: LiveDescriptorWords + ?Sized>(
     Err(MmError::Core)
 }
 
+/// Bind backing maintenance to the live CR3 table words and the retained
+/// direct copy window. No ARM service alias is constructed for CPL0.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn with_x86_backing_venue<R>(
+    target: u64,
+    run: impl for<'a> FnOnce(
+        &carrick_core::mm::cow::GuestCowVenue<
+            'a,
+            crate::cow::X86CowMmu,
+            dyn LiveDescriptorWords + 'a,
+        >,
+    ) -> R,
+) -> Result<R, MmError> {
+    let native = crate::isa::x86::portal_descriptor_words(target).map_err(|_| MmError::Stale)?;
+    let words: &dyn LiveDescriptorWords = &native;
+    let root = SubstrateGpa(target);
+    let venue = carrick_core::mm::cow::GuestCowVenue {
+        publish_executable: None,
+        words,
+        root,
+        pool: carrick_el1_abi::cow_grant_pool_guest(),
+        residency: carrick_el1_abi::frame_grant_residency_guest(),
+        copy_window: carrick_core::mm::cow::CowCopyWindow::target(words, root),
+    };
+    Ok(run(&venue))
+}
+
 #[cfg(target_os = "none")]
 pub fn serve_backing_maintenance_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let run = |frame: &carrick_el1_abi::TrapFrame| -> Result<BackingMaintenanceProgress, MmError> {
@@ -371,7 +398,7 @@ pub fn serve_backing_maintenance_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             })
             .map_err(|_| MmError::Core)?;
         #[cfg(target_arch = "x86_64")]
-        let progress = crate::isa::x86::with_portal_cow_venue(operation.ttbr0(), |venue| {
+        let progress = with_x86_backing_venue(operation.ttbr0(), |venue| {
             operation.scrub_x86(venue, |_, destination| {
                 // SAFETY: the direct window resolves the private replacement
                 // page and the exact owner editor excludes another writer.
