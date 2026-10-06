@@ -51,6 +51,7 @@ carrick-signal-linux = { path = "../carrick-signal-linux" }
 # vs the macOS os_sync API). carrick-thread compiles on every host (leaf deps).
 carrick-thread = { path = "../carrick-thread" }
 libc.workspace = true
+getrandom.workspace = true
 
 # Linux-only KVM bindings: target-gated so the macOS workspace never resolves
 # them (kvm-ioctls/kvm-bindings are cfg(target_os = "linux") only).
