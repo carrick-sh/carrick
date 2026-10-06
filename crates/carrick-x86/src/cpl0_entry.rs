@@ -219,12 +219,21 @@ pub struct CpuBinding {
     pub wake_routes_address: u64,
     /// Measured xAPIC timer hertz when TSC-deadline mode is unavailable.
     pub apic_timer_hz: AtomicU64,
+    /// Per-CPU fault custody. The outer frame stays on its TSS entry stack.
+    pub fault_active: AtomicU64,
+    pub fault_frame: AtomicU64,
+    pub fault_address: AtomicU64,
+    pub fault_reason: AtomicU64,
 }
 const _: () = {
     assert!(core::mem::offset_of!(CpuBinding, kernel_stack) == 0);
     assert!(core::mem::offset_of!(CpuBinding, user_stack) == 8);
     assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
     assert!(core::mem::offset_of!(CpuBinding, cpu_slot) == 88);
+    assert!(core::mem::offset_of!(CpuBinding, fault_active) == 120);
+    assert!(core::mem::offset_of!(CpuBinding, fault_frame) == 128);
+    assert!(core::mem::offset_of!(CpuBinding, fault_address) == 136);
+    assert!(core::mem::offset_of!(CpuBinding, fault_reason) == 144);
 };
 
 #[cfg(test)]

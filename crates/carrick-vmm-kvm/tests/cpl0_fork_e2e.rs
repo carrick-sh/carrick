@@ -158,6 +158,10 @@ fn user_cow_fault_clears_poisoned_xsave_header() {
             .result,
         7
     );
+    assert_eq!(
+        carrier.user_fault_state(0).expect("fault guard released").0,
+        0
+    );
 }
 
 fn fork_wait_elf_with_child_marker() -> Vec<u8> {

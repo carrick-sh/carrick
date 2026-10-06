@@ -1173,6 +1173,10 @@ impl Cpl0Carrier {
                     tsc_hz: AtomicU64::new(0),
                     wake_routes_address: METADATA_VA + ROUTES_OFFSET,
                     apic_timer_hz: AtomicU64::new(0),
+                    fault_active: AtomicU64::new(0),
+                    fault_frame: AtomicU64::new(0),
+                    fault_address: AtomicU64::new(0),
+                    fault_reason: AtomicU64::new(0),
                 });
             }
         }
@@ -1925,6 +1929,51 @@ impl Cpl0Carrier {
             while zone.alloc_record(identity).is_ok() {}
         }
         Ok(())
+    }
+
+    /// Break only the stopped fault-policy counters venue to force a nested
+    /// supervisor #PF after the next user fault acquired per-CPU custody.
+    pub fn invalidate_user_fault_counters_venue(&mut self) -> Result<(), TrapError> {
+        let address =
+            META_GPA + BINDING_OFFSET + core::mem::offset_of!(CpuBinding, counters_address) as u64;
+        self._vm
+            .write(
+                FrameGpa::new(address),
+                &0xffff_dead_0000_0000_u64.to_le_bytes(),
+            )
+            .map_err(|error| fail(error.to_string()))
+    }
+
+    /// Stopped hardware diagnostics, retained independently of the syscall frame.
+    pub fn user_fault_state(&self, index: usize) -> Result<(u64, u64, u64, u64, u64), TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 task"));
+        }
+        let binding = self.binding(index);
+        let frame = binding.fault_frame.load(Ordering::Acquire);
+        let (error, pc) = if frame == 0 {
+            (0, 0)
+        } else {
+            let bytes = self
+                ._vm
+                .read(FrameGpa::new(frame - DIRECT_VA + 120), 16)
+                .map_err(|error| fail(error.to_string()))?;
+            (
+                u64::from_le_bytes(
+                    bytes[..8]
+                        .try_into()
+                        .map_err(|_| fail("fault error width"))?,
+                ),
+                u64::from_le_bytes(bytes[8..].try_into().map_err(|_| fail("fault PC width"))?),
+            )
+        };
+        Ok((
+            binding.fault_active.load(Ordering::Acquire),
+            binding.fault_address.load(Ordering::Acquire),
+            error,
+            pc,
+            binding.fault_reason.load(Ordering::Acquire),
+        ))
     }
 
     /// Poison reserved XSAVE header words while the faulting vCPU is stopped.

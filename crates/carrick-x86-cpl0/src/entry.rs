@@ -149,6 +149,16 @@ core::arch::global_asm!(
     "jz 2f",
     "swapgs",
     "2:",
+    // Claim before resetting RSP: a nested CPL0 #PF must not overwrite the
+    // outer xstate or Rust frame. XCHG supplies per-CPU atomic ownership.
+    "mov eax, 1",
+    "xchg qword ptr gs:[120], rax",
+    "test rax, rax",
+    "jnz 5f",
+    "mov qword ptr gs:[128], r12",
+    "mov rax, cr2",
+    "mov qword ptr gs:[136], rax",
+    "mov qword ptr gs:[144], 0",
     // TSS.RSP0 is a 4 KiB fault-entry stack. Keep its hardware/GPR frame
     // there, then run xsave and Rust on this CPU's 64 KiB syscall stack.
     "mov rsp, gs:[0]",
@@ -174,6 +184,7 @@ core::arch::global_asm!(
     "jnz 3f",
     "mov eax, 7", "xor edx, edx", "xrstor64 [rsp]",
     "mov rsp, r12",
+    "mov qword ptr gs:[120], 0",
     "test byte ptr [rsp + 136], 3",
     "jz 4f",
     "swapgs",
@@ -188,6 +199,16 @@ core::arch::global_asm!(
     "mov rsi, r14",
     "mov rdx, r13",
     "call carrick_x86_unresolved_user_page_fault",
+    "5:",
+    // Retain the outer frame and original CR2 in this CPU binding. Report a
+    // kernel invariant error, without calling Rust or reusing its outer stack.
+    "mov qword ptr gs:[144], 8",
+    "mov dx, 0xcc", // existing fatal transport
+    "mov eax, 8",
+    "out dx, al",
+    "6:",
+    "cli", "hlt", "jmp 6b",
+
     "ud2",
 );
 
@@ -403,7 +424,10 @@ mod kernel {
     /// the host applies the shared default Linux signal policy to this record.
     #[cold]
     #[unsafe(no_mangle)]
-    extern "C" fn carrick_x86_unresolved_user_page_fault(frame: &PageFaultStack, far: u64, _reason: u64) -> ! {
+    extern "C" fn carrick_x86_unresolved_user_page_fault(frame: &PageFaultStack, far: u64, reason: u64) -> ! {
+        if let Some(binding) = carrick_el1::isa::x86::context::current_cpu_binding() {
+            binding.fault_reason.store(reason, Ordering::Release);
+        }
         fn word(value: u32) {
             // SAFETY: this CPL0 CPU owns the existing 32-bit fault transport.
             unsafe { core::arch::asm!("out dx, eax", in("dx") FAULT_DOORBELL_PORT,
