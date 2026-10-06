@@ -22,10 +22,11 @@ pub const OBSERVE_MMU_DRAIN: u64 = u64::MAX - 3;
 pub const OBSERVE_DESCRIPTOR_PROTECT: u64 = u64::MAX - 4;
 pub const OBSERVE_DESCRIPTOR_PREPARE_PUBLISH: u64 = u64::MAX - 5;
 pub const OBSERVE_SHARED_PREPARED_FAULT: u64 = u64::MAX - 6;
+pub const OBSERVE_SHARED_COW_FAULT: u64 = u64::MAX - 7;
 /// Supervisor direct-window base mapping low physical RAM into the upper half.
-pub const DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
+pub const DIRECT_VA: u64 = carrick_el1_abi::X86_CPL0_DIRECT_VA;
 /// Retained KVM fixture page-table window; the root is its first page.
-pub const FIXTURE_PML4_CAPACITY: u64 = 448 * 4096;
+pub const FIXTURE_PML4_CAPACITY: u64 = carrick_el1_abi::X86_CPL0_TABLE_ARENA_BYTES;
 
 /// Stack order is enforced by the CPL0 assembly and these compile assertions.
 #[repr(C)]

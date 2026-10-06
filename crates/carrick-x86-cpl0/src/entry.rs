@@ -198,6 +198,7 @@ mod kernel {
     // page. These records stay live across the native syscall boundary.
     static SHARED_FAULT_MAILBOX: carrick_el1_abi::FrameGrantMailbox =
         carrick_el1_abi::FrameGrantMailbox::new();
+    static SHARED_COW_POOL: carrick_el1_abi::CowGrantPool = carrick_el1_abi::CowGrantPool::new();
 
     // A port exit may suspend this CPU while another CPU continues. The
     // admission value can only be produced after the lock guard is dropped.
@@ -535,6 +536,154 @@ mod kernel {
             frame.rax =
                 u64::from(action == Action::Served && residency.is_guest_committed(mm, 0x3_3000));
             // SAFETY: ptr was returned for layout and has not escaped.
+            unsafe { crate::rust_alloc::alloc::dealloc(ptr, layout) };
+            return;
+        }
+        if frame.rax == OBSERVE_SHARED_COW_FAULT {
+            use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
+            use carrick_el1::fault::{
+                GrantMailboxes, X86CowResolver, dispatch_x86_fault_with_prepared,
+            };
+            use carrick_el1_abi::{Action, FrameGrantResidencyIdentity};
+            use carrick_guest_arch::{
+                Access, EditBacking, EditOperation, EditPermissions, FaultInfo, FrameGpa, GuestLen,
+                UserVa,
+            };
+            use carrick_mmu_core::x86::descriptor_txn::{BackingIdentity, DescriptorOutcome};
+
+            let one = core::num::NonZeroU64::MIN;
+            let backing = BackingIdentity {
+                frame_id: one,
+                mapping_id: one,
+                owner_generation: one,
+                inventory_revision: one,
+            };
+            let map = fixture_edit(
+                0x3_4000,
+                one,
+                EditOperation::Map {
+                    output: FrameGpa::new(0x91_1000),
+                    permissions: EditPermissions {
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                        user: true,
+                    },
+                    size: carrick_guest_arch::EditLeafSize::Page,
+                    resident: true,
+                    backing: EditBacking {
+                        frame_id: one,
+                        mapping_id: one,
+                        owner_generation: one,
+                        inventory_revision: one,
+                    },
+                },
+            );
+            let arm = fixture_edit(
+                0x3_4000,
+                core::num::NonZeroU64::new(2).unwrap_or(one),
+                EditOperation::ArmCow {
+                    kernel_only: false,
+                    executable: false,
+                    adopt_private: false,
+                    asid_scoped: false,
+                    excluded_ipa: FrameGpa::new(0),
+                    excluded_len: GuestLen::new(0),
+                },
+            );
+            if !matches!(map, Ok(receipt) if matches!(receipt.outcome, DescriptorOutcome::Applied { .. }))
+                || !matches!(arm, Ok(receipt) if matches!(receipt.outcome, DescriptorOutcome::Applied { .. }))
+            {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            // SAFETY: the bootstrap direct window maps both retained frame
+            // pages and this fixture excludes the sibling vCPU.
+            unsafe {
+                ((DIRECT_VA + 0x91_1000) as *mut u8).write_volatile(0x5a);
+                ((DIRECT_VA + 0x91_5000) as *mut u8).write_volatile(0);
+            }
+            // SAFETY: the lifecycle carrier keeps task and zone records live.
+            let task = unsafe { &*(binding.task_address as *const CurrentTask) };
+            let zone = unsafe {
+                &*(super::lifecycle::LIFECYCLE_ZONE as *const carrick_sched_core::ZoneTables)
+            };
+            let mm = task.mm.key.load(Ordering::Acquire);
+            let layout = core::alloc::Layout::new::<carrick_el1_abi::FrameGrantResidencyTable>();
+            // SAFETY: the allocation has this table's alignment and size and
+            // remains owned by the fixture until the resolver returns.
+            let ptr = unsafe { crate::rust_alloc::alloc::alloc(layout) };
+            if ptr.is_null() {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            // SAFETY: ptr is aligned, writable storage for the whole table.
+            let residency = unsafe {
+                let table = ptr.cast::<carrick_el1_abi::FrameGrantResidencyTable>();
+                carrick_el1_abi::FrameGrantResidencyTable::init_in_place(table);
+                &*table
+            };
+            let Some(old_slot) = residency.publish(FrameGrantResidencyIdentity {
+                mm_key: mm,
+                semantic_base: 0x3_4000,
+                physical_ipa: 0x91_1000,
+                len: 4096,
+                mapping_id: 1,
+                frame_id: 1,
+                owner_generation: 1,
+                inventory_revision: 1,
+            }) else {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            };
+            let _ = old_slot;
+            let Some(old_page) = residency.lookup(mm, 0x3_4000) else {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            };
+            if !residency.record_commit(old_page)
+                || SHARED_COW_POOL.publish(mm, 0x91_4000, backing).is_none()
+            {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            let mut cow = X86CowResolver {
+                pool: &SHARED_COW_POOL,
+                residency,
+                completion: None,
+            };
+            // SAFETY: this bound vCPU owns the counter record for its lifetime.
+            let counters = unsafe { &*(binding.counters_address as *const Counters) };
+            let action = dispatch_x86_fault_with_prepared(
+                0,
+                FaultInfo {
+                    address: UserVa::new(0x3_4000),
+                    access: Access::Write,
+                    present: true,
+                },
+                counters,
+                core::slice::from_ref(task),
+                carrick_el1::substrate::sched::object_wait::space_access(
+                    zone,
+                    carrick_sched_core::SlotId::new(0),
+                ),
+                GrantMailboxes::own(&SHARED_FAULT_MAILBOX),
+                None::<carrick_el1::fault::PreparedFaultPath<'_, NoopPreparedResolver>>,
+                &mut cow,
+            );
+            // SAFETY: both pages remain mapped in the supervisor direct window.
+            let copied = unsafe {
+                ((DIRECT_VA + 0x91_1000) as *const u8).read_volatile() == 0x5a
+                    && ((DIRECT_VA + 0x91_5000) as *const u8).read_volatile() == 0x5a
+            };
+            frame.rax = u64::from(
+                action == Action::Served
+                    && copied
+                    && residency.is_guest_committed(mm, 0x3_4000)
+                    && cow.completion.is_some(),
+            );
+            // SAFETY: the fixture's table is no longer borrowed and ptr came
+            // from this exact allocation layout.
             unsafe { crate::rust_alloc::alloc::dealloc(ptr, layout) };
             return;
         }

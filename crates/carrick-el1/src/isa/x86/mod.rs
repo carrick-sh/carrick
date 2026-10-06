@@ -42,6 +42,7 @@ impl carrick_guest_arch::ArchTypes for X86Backend {
 }
 
 pub use context::{carrick_x86_unbound_stack_slot, carrick_x86_unbound_thread_cpu};
+pub(crate) use mmu::NativeDescriptorWords;
 pub use mmu::{
     execute_native_edit_intent, hardware_live_root, resident_leaf_matches,
     unsupported_arm_descriptor_path,
