@@ -28,6 +28,8 @@ static CHILD_ORIGIN: AtomicU64 = AtomicU64::new(0);
 static CHILD_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static PARENT_PENDING: AtomicU64 = AtomicU64::new(0);
 static WAIT_STATUS_VA: AtomicU64 = AtomicU64::new(0);
+static CHILD_EXIT: super::super::lifecycle::ChildExitRecord =
+    super::super::lifecycle::ChildExitRecord::new();
 static FORK_PUBLICATION: carrick_el1::lock::SpinLock<Option<GuestMmuPublication>> =
     carrick_el1::lock::SpinLock::new(None);
 
@@ -152,7 +154,7 @@ pub(super) fn admit_initial(
     };
     let Some(root) = RootGpa::page_aligned(FrameGpa::new(root)) else { return false; };
     let stack_va = stack_pointer & !4095;
-    let Ok(leaf) = translate_leaf(&InitialWords, root, UserVa::new(stack_va), Access::Read, true) else { return false; };
+    let Ok(leaf) = translate_leaf(&InitialWords::fixture(), root, UserVa::new(stack_va), Access::Read, true) else { return false; };
     let identity = FrameGrantResidencyIdentity {
         mm_key: PARENT_MM,
         semantic_base: stack_va,
@@ -210,13 +212,13 @@ pub(crate) fn fork_mm(parent_root: RootGpa) -> Option<(RootGpa, GuestMmuPublicat
         mapping(STACK_BASE, STACK_TOP, ReservationProtection::READ_WRITE)?,
     ];
     let plan = carrick_el1::isa::x86::fork_mm::prepare_owner_fork(
-        &InitialWords, request, parent_root, &mappings, &LinuxPolicy,
+        &InitialWords::fixture(), request, parent_root, &mappings, &LinuxPolicy,
     ).ok()?;
     let parent_stores = plan.scratch.edits.len();
     // SAFETY: the fixture reserved the child root under the same retained
     // carrier before the guest publishes it; no host descriptor author runs.
     let handle = unsafe { El1MmHandle::from_admitted_owner(one, request.child_mm, one) };
-    let mut child = plan.publish(&InitialWords, Parent, Child, handle).ok()?;
+    let mut child = plan.publish(&InitialWords::fixture(), Parent, Child, handle).ok()?;
     let completion = child.commit(Parent, Child).ok()?;
     let publication = GuestMmuPublication::from_x86_fork(
         parent_root.address().raw(), completion, parent_stores,
@@ -226,7 +228,7 @@ pub(crate) fn fork_mm(parent_root: RootGpa) -> Option<(RootGpa, GuestMmuPublicat
 }
 
 pub(crate) fn publish_child_stack(residency: &FrameGrantResidencyTable, parent_root: RootGpa) -> bool {
-    let Ok(leaf) = translate_leaf(&InitialWords, parent_root, UserVa::new(STACK_TOP - 4096), Access::Read, true) else { return false; };
+    let Ok(leaf) = translate_leaf(&InitialWords::fixture(), parent_root, UserVa::new(STACK_TOP - 4096), Access::Read, true) else { return false; };
     let old = leaf.output.raw() & !4095;
     let identity = FrameGrantResidencyIdentity {
         mm_key: CHILD_MM, semantic_base: STACK_TOP - 4096,
@@ -255,6 +257,9 @@ pub(crate) fn publish_child_stack(residency: &FrameGrantResidencyTable, parent_r
 pub(crate) fn child_mm() -> u64 { CHILD_MM }
 pub(crate) fn parent_mm() -> u64 { PARENT_MM }
 pub(crate) fn child_pid(parent_pid: u64) -> u64 { parent_pid + 1 }
+pub(crate) fn child_exit() -> &'static super::super::lifecycle::ChildExitRecord { &CHILD_EXIT }
+pub(crate) fn wait_status_address() -> u64 { WAIT_STATUS_VA.load(Ordering::Acquire) }
+pub(crate) fn clear_wait_status() { WAIT_STATUS_VA.store(0, Ordering::Release); }
 
 pub(crate) fn prepare_wait_status(
     lane: &mut super::super::lifecycle::NativeLane<'_>,
@@ -264,6 +269,10 @@ pub(crate) fn prepare_wait_status(
     use carrick_el1::fault::{GrantMailboxes, X86CowResolver, dispatch_x86_fault_with_prepared};
     use carrick_el1_abi::Action;
     use carrick_guest_arch::{Access as FaultAccess, FaultInfo};
+    if address.raw() == 0 {
+        clear_wait_status();
+        return true;
+    }
     if address.raw() < STACK_TOP - 4096 || address.raw() > STACK_TOP - 4
         || lane.task.mm.key.load(Ordering::Acquire) != PARENT_MM
     { return false; }
@@ -290,9 +299,9 @@ pub(crate) fn prepare_wait_status(
 
 pub(crate) fn write_exit_status(status: u8) -> bool {
     let address = WAIT_STATUS_VA.load(Ordering::Acquire);
-    if address == 0 { return false; }
+    if address == 0 { return true; }
     let Some(root) = RootGpa::page_aligned(FrameGpa::new(0x80_0000)) else { return false; };
-    let Ok(leaf) = translate_leaf(&InitialWords, root, UserVa::new(address), Access::Write, true) else { return false; };
+    let Ok(leaf) = translate_leaf(&InitialWords::fixture(), root, UserVa::new(address), Access::Write, true) else { return false; };
     let Some(destination) = carrick_el1_abi::X86_CPL0_DIRECT_VA.checked_add(leaf.output.raw()) else { return false; };
     if address & 4095 > 4092 { return false; }
     // SAFETY: the guest-owned parent COW resolution just published this exact

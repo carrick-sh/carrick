@@ -24,7 +24,65 @@ use carrick_personality_linux::{
 use carrick_sched_core::{
     BoundedSpin, Claim, RecordRef, SlotId, ThreadIdentity, WakeEffects, Waker, ZoneTables,
 };
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU16, Ordering};
+
+/// Retained one-child fixture exit record. Zero is live, 1..=256 is a zombie
+/// carrying the Linux eight-bit exit code, and 257 is reaped. The wait-bucket
+/// lock couples publication with park/wake; atomics preserve stopped-host
+/// observation and make accidental second reaping fail closed.
+pub struct ChildExitRecord(AtomicU16);
+impl ChildExitRecord {
+    pub const fn new() -> Self {
+        Self(AtomicU16::new(0))
+    }
+    pub fn publish_exit(&self, status: u8) -> bool {
+        self.0
+            .compare_exchange(
+                0,
+                u16::from(status) + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    pub fn exited_status(&self) -> Option<u8> {
+        let state = self.0.load(Ordering::Acquire);
+        (1..=256).contains(&state).then(|| (state - 1) as u8)
+    }
+    pub fn reap(&self, status: u8) -> bool {
+        self.0
+            .compare_exchange(
+                u16::from(status) + 1,
+                257,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    pub fn reaped(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 257
+    }
+}
+impl Default for ChildExitRecord {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod process_exit_tests {
+    use super::ChildExitRecord;
+
+    #[test]
+    fn child_exits_before_parent_waits_and_is_reaped_once() {
+        let record = ChildExitRecord::new();
+        assert!(record.publish_exit(3));
+        assert_eq!(record.exited_status(), Some(3));
+        assert!(record.reap(3));
+        assert_eq!(record.exited_status(), None);
+        assert!(!record.reap(3));
+    }
+}
 
 pub const LIFECYCLE_ZONE: u64 = 0xffff_ffff_b000_0000;
 pub const LIFECYCLE_LANE: u64 = 0xffff_ffff_b090_0000;
@@ -435,24 +493,66 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         &mut self,
         pid: carrick_personality_linux::lifecycle::ProcessWaitPid,
         status: UserVa,
-        options: carrick_abi::LinuxWaitOptions,
+        options: carrick_syscall_abi::LinuxWaitOptions,
     ) -> Option<LifecycleOutcome> {
         use crate::kernel::process;
+        use carrick_syscall_abi::LinuxWaitOptions;
         const WAIT_KEY: u64 = 0x5_0300;
         if !process::process_mode()
-            || i64::from(pid.raw()) != process::child_pid(self.lane.parent.tid) as i64
-            || !options.is_empty()
             || self.task.mm.key.load(Ordering::Acquire) != process::parent_mm()
         {
             return None;
         }
+        let returned = |value| {
+            Some(LifecycleOutcome::Returned {
+                result: SyscallResult::new(value),
+                work: false,
+            })
+        };
+        if options.bits() & !LinuxWaitOptions::WAIT4_SUPPORTED.bits() != 0 {
+            return returned(-22); // EINVAL
+        }
+        let child_pid = process::child_pid(self.lane.parent.tid);
+        if !matches!(i64::from(pid.raw()), -1 | 0) && i64::from(pid.raw()) != child_pid as i64
+            || options.contains(LinuxWaitOptions::WCLONE)
+                && !options.contains(LinuxWaitOptions::WALL)
+            || process::child_exit().reaped()
+        {
+            return returned(-10); // ECHILD
+        }
+        if let Some(code) = process::child_exit().exited_status() {
+            if !process::prepare_wait_status(self, status) || !process::write_exit_status(code) {
+                return returned(-14); // EFAULT
+            }
+            if !process::child_exit().reap(code) {
+                return returned(-10);
+            }
+            process::clear_wait_status();
+            return returned(child_pid as i64);
+        }
+        if options.contains(LinuxWaitOptions::WNOHANG) {
+            return returned(0);
+        }
         if !process::prepare_wait_status(self, status) {
-            return None;
+            return returned(-14);
         }
         let guard = self.zone.lock(
             ZoneTables::bucket_of(process::parent_mm(), WAIT_KEY),
             &BoundedSpin(1024),
         )?;
+        // Child exit publishes under this same bucket lock. The first check
+        // handles exit-before-wait; this one closes status preparation races.
+        if let Some(code) = process::child_exit().exited_status() {
+            drop(guard);
+            if !process::write_exit_status(code) {
+                return returned(-14);
+            }
+            if !process::child_exit().reap(code) {
+                return returned(-10);
+            }
+            process::clear_wait_status();
+            return returned(child_pid as i64);
+        }
         let record = self
             .zone
             .current_or_new(self.lane.slot, self.lane.parent)
@@ -488,12 +588,42 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
                 0,
             )
             .ok()?;
+        // Recheck after enrollment, before publishing the park. The shared
+        // wait-bucket lock excludes publication here, but keep the check at
+        // the exact handoff seam if that ownership changes later.
+        let exit_after_enroll = process::child_exit().exited_status();
         self.handoff = Some(carrick_core::entry::publish_handoff_park(
             start,
             &guard,
             carrick_core_abi::EntryRecordGeneration(seq),
         )?);
         self.zone.clear_current(self.lane.slot);
+        if let Some(code) = exit_after_enroll {
+            if !process::write_exit_status(code) {
+                return None;
+            }
+            let mut effects = WakeEffects::default();
+            let count = self
+                .zone
+                .wake_placed(
+                    &guard,
+                    process::parent_mm(),
+                    WAIT_KEY,
+                    u32::MAX,
+                    1,
+                    Waker::El1 {
+                        slot: self.lane.slot,
+                    },
+                    &mut [],
+                    &mut effects,
+                )
+                .ok()?;
+            if count != 1 || !process::child_exit().reap(code) {
+                return None;
+            }
+            process::clear_wait_status();
+            self.lane.wakes += 1;
+        }
         drop(guard);
         let progress = self.switch_next()?;
         Some(LifecycleOutcome::Transferred {
@@ -507,11 +637,43 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         const WAIT_KEY: u64 = 0x5_0300;
         if !process::process_mode()
             || self.task.mm.key.load(Ordering::Acquire) != process::child_mm()
-            || !process::write_exit_status(status)
-            || !self.wake_word(process::parent_mm(), WAIT_KEY, u32::MAX, 1)
         {
             return None;
         }
+        let guard = self.zone.lock(
+            ZoneTables::bucket_of(process::parent_mm(), WAIT_KEY),
+            &BoundedSpin(1024),
+        )?;
+        if process::wait_status_address() != 0 && !process::write_exit_status(status) {
+            return None;
+        }
+        if !process::child_exit().publish_exit(status) {
+            return None;
+        }
+        let mut effects = WakeEffects::default();
+        let count = self
+            .zone
+            .wake_placed(
+                &guard,
+                process::parent_mm(),
+                WAIT_KEY,
+                u32::MAX,
+                1,
+                Waker::El1 {
+                    slot: self.lane.slot,
+                },
+                &mut [],
+                &mut effects,
+            )
+            .ok()?;
+        if count != 0 {
+            if !process::child_exit().reap(status) {
+                return None;
+            }
+            process::clear_wait_status();
+            self.lane.wakes += u64::from(count);
+        }
+        drop(guard);
         let record = self.zone.slot(self.lane.slot).current()?;
         if !self.release_current(self.zone.record_ref(record)) {
             return None;
