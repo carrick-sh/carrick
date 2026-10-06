@@ -116,7 +116,7 @@ pub fn witness(
     boundary: KickBoundary,
 ) -> Result<ProgressObservation, TrapError> {
     let mut carrier = Cpl0Carrier::boot_inner(image, programs, true)?;
-    let ram = &mut carrier.ram;
+    let ram = &carrier.ram;
     if size_of::<ZoneTables<ParkedContextWords>>() > (PROGRESS_STATE - PROGRESS_ZONE) as usize
         || size_of::<ProgressState>() > (SECOND_ROOT - 0x170_0000) as usize
     {
@@ -144,7 +144,12 @@ pub fn witness(
         pml4_base: FIRST_ROOT,
     });
     for (vector, pc) in [(TIMER_VECTOR, timer), (KICK_VECTOR, kick)] {
-        ram.write_gpa(idt + u64::from(vector) * 16, &interrupt_gate(pc))
+        carrier
+            ._vm
+            .write(
+                FrameGpa::new(idt + u64::from(vector) * 16),
+                &interrupt_gate(pc),
+            )
             .map_err(|e| fail(e.to_string()))?;
     }
     // SAFETY: retained aligned zeroed backing; all-zero ZoneTables is the
@@ -198,19 +203,25 @@ pub fn witness(
         // User compute accumulates AND/OR of every executed control store.
         // Initialize only the AND identities; stores and OR words start zero.
         for offset in [72, 80] {
-            ram.write_gpa(gpa + offset, &u32::MAX.to_le_bytes())
+            carrier
+                ._vm
+                .write(FrameGpa::new(gpa + offset), &u32::MAX.to_le_bytes())
                 .map_err(|e| fail(e.to_string()))?;
         }
-        ram.write_gpa(
-            gpa + fs - PROGRESS_DATA + 8,
-            &(0xf500 + index).to_le_bytes(),
-        )
-        .map_err(|e| fail(e.to_string()))?;
-        ram.write_gpa(
-            gpa + gs - PROGRESS_DATA + 16,
-            &(0x6500 + index).to_le_bytes(),
-        )
-        .map_err(|e| fail(e.to_string()))?;
+        carrier
+            ._vm
+            .write(
+                FrameGpa::new(gpa + fs - PROGRESS_DATA + 8),
+                &(0xf500 + index).to_le_bytes(),
+            )
+            .map_err(|e| fail(e.to_string()))?;
+        carrier
+            ._vm
+            .write(
+                FrameGpa::new(gpa + gs - PROGRESS_DATA + 16),
+                &(0x6500 + index).to_le_bytes(),
+            )
+            .map_err(|e| fail(e.to_string()))?;
         let mut frame = InterruptFrame {
             gpr: core::array::from_fn(|register| 0xabc0 + index * 0x100 + register as u64),
             rip: crate::cpl0_boot::USER_CODE + index * 4096,
@@ -331,7 +342,7 @@ pub fn witness(
                     KickBoundary::Return => PROGRESS_RETURN_PORT,
                 };
                 if port == chosen {
-                    inject_kick(&carrier._vm, ApicId(0))?;
+                    inject_kick(carrier._vm.vm(), ApicId(0))?;
                     injected = true;
                 }
             }
