@@ -9,11 +9,12 @@ use std::sync::Arc;
 
 use carrick_fatal::carrick_fatal;
 use carrick_hal::KernelTransactionId;
+use parking_lot::Mutex;
 
 use super::session::remove_group_member;
 use super::{
-    KernelFailpoint, KernelOperationError, TaskSetReservation, check_failpoint,
-    ensure_task_unreserved, next_revision,
+    KernelFailpoint, KernelOperationError, TaskGraphReservation, TaskSetReservation,
+    check_failpoint, ensure_task_unreserved, next_revision,
 };
 use crate::kernel::core::{
     FileCloseDisposition, FileCloseEvent, Kernel, KernelContext, RegistryState,
@@ -36,6 +37,87 @@ pub(in crate::kernel) enum ThreadRetirementLane {
     },
 }
 
+/// An exit owns a live participant's parent/child edges, not its runnable
+/// threads. Only a prepared membership transition may advance this revision
+/// while the topology reservation is held. Arbitrary revision drift still
+/// invalidates the exit; the exact task generation never changes.
+#[derive(Debug)]
+pub(in crate::kernel) struct ExitParticipantRevision {
+    task: TaskKey,
+    revision: Mutex<TaskRevision>,
+}
+
+impl ExitParticipantRevision {
+    fn validate(&self, task: TaskKey, current: TaskRevision) -> Result<(), KernelOperationError> {
+        if self.task != task || *self.revision.lock() != current {
+            return Err(KernelOperationError::ExitTopologyChanged(self.task.id));
+        }
+        Ok(())
+    }
+
+    pub(super) fn prepare_membership(
+        self: &Arc<Self>,
+        task: TaskKey,
+        current: TaskRevision,
+        next: TaskRevision,
+    ) -> Result<PreparedExitMembershipRevision, KernelOperationError> {
+        self.validate(task, current)?;
+        if current.next() != Some(next) {
+            return Err(KernelOperationError::ExitTopologyChanged(self.task.id));
+        }
+        Ok(PreparedExitMembershipRevision {
+            participant: Arc::clone(self),
+            next,
+        })
+    }
+}
+
+/// Affine membership publication admitted before irreversible thread work.
+/// Admission and publication both run under the same registry write guard.
+pub(super) struct PreparedExitMembershipRevision {
+    participant: Arc<ExitParticipantRevision>,
+    next: TaskRevision,
+}
+
+impl PreparedExitMembershipRevision {
+    pub(super) fn publish(self) {
+        *self.participant.revision.lock() = self.next;
+    }
+}
+
+/// One topology publication credit, retained across concurrent membership
+/// changes. Consuming it advances the current revision rather than overwriting
+/// a thread birth/exit with the successor computed before that activity.
+#[derive(Debug)]
+pub(super) struct PreparedExitParticipant {
+    revision: Arc<ExitParticipantRevision>,
+    publication: crate::kernel::revision_capacity::RevisionReservation,
+}
+
+impl PreparedExitParticipant {
+    fn reserve(record: &TaskRecord) -> Result<Self, KernelOperationError> {
+        let publication = record
+            .task
+            .reserve_exit_participant_revision(record.revision)
+            .ok_or(KernelOperationError::RevisionExhausted)?;
+        Ok(Self {
+            revision: Arc::new(ExitParticipantRevision {
+                task: record.task.key(),
+                revision: Mutex::new(record.revision),
+            }),
+            publication,
+        })
+    }
+
+    fn publish(mut self, record: &mut TaskRecord) {
+        let next = record
+            .task
+            .consume_reserved_revision(&mut self.publication, record.revision);
+        *self.revision.revision.lock() = next;
+        record.revision = next;
+    }
+}
+
 /// Exit publication token whose fallible topology and revision checks have
 /// completed. Dropping it leaves the task graph unchanged and releases every
 /// affected identity reservation.
@@ -43,9 +125,9 @@ pub(in crate::kernel) enum ThreadRetirementLane {
 pub struct PreparedTaskExit {
     pub(super) reservation: TaskSetReservation,
     pub(super) task: TaskKey,
-    pub(super) task_revision: TaskRevision,
+    pub(super) task_revision: Arc<ExitParticipantRevision>,
     pub(super) children: Vec<TaskKey>,
-    pub(super) affected_revisions: BTreeMap<TaskId, (TaskRevision, TaskRevision)>,
+    pub(super) affected_revisions: BTreeMap<TaskId, PreparedExitParticipant>,
     pub(super) adopter: Option<TaskKey>,
     pub(super) prepared_adopter_children: Option<BTreeSet<TaskKey>>,
     pub(super) autoreap_parent: Option<TaskKey>,
@@ -351,7 +433,13 @@ impl Kernel {
         mut lane: ThreadRetirementLane,
         failpoint: Option<KernelFailpoint>,
     ) -> Result<TaskRevision, KernelOperationError> {
-        ensure_task_unreserved(state, context.task.key().id)?;
+        if state
+            .reservations
+            .get(&context.task.key().id)
+            .is_some_and(|reservation| !reservation.permits_nonfinal_thread_exit())
+        {
+            return Err(KernelOperationError::TaskBusy(context.task.key().id));
+        }
         let record = state
             .tasks
             .get(&context.task.key().id)
@@ -387,11 +475,19 @@ impl Kernel {
             ThreadRetirementLane::Host => next_revision(&record.task, record.revision)?,
             ThreadRetirementLane::HostAdopted(owned) => record
                 .task
-                .consume_thread_revision(&mut owned.revisions, record.revision),
+                .consume_reserved_revision(&mut owned.revisions, record.revision),
             ThreadRetirementLane::ExitedInZone { revisions, .. } => record
                 .task
-                .consume_thread_revision(revisions, record.revision),
+                .consume_reserved_revision(revisions, record.revision),
         };
+        let membership_revision = state
+            .reservations
+            .get(&context.task.key().id)
+            .map(|reservation| {
+                reservation.prepare_membership_revision(record.task.key(), record.revision, next)
+            })
+            .transpose()?
+            .flatten();
         if matches!(lane, ThreadRetirementLane::Host) {
             state
                 .retired_threads
@@ -424,6 +520,9 @@ impl Kernel {
             .thread_claims
             .remove(&tid)
             .ok_or(KernelOperationError::UnknownThread(tid))?;
+        if let Some(membership_revision) = membership_revision {
+            membership_revision.publish();
+        }
         record.revision = next;
         if tid == LinuxTid::for_task_leader(context.task.key().id) {
             record.dead_leader = Some(RetiredThreadRecord {
@@ -569,7 +668,10 @@ impl Kernel {
         }
 
         let task = Arc::clone(&task_record.task);
-        let task_revision = task_record.revision;
+        let task_revision = Arc::new(ExitParticipantRevision {
+            task: task_key,
+            revision: Mutex::new(task_record.revision),
+        });
         let diagnostic_name = task_record.diagnostic_name.clone();
         // The run's root task is the reparenting authority only while that
         // exact generation is live. HVPatch process threads are joined by the
@@ -655,10 +757,7 @@ impl Kernel {
                 if child.task.key() != *child_key {
                     return Err(KernelOperationError::ExitTopologyChanged(child_key.id));
                 }
-                affected_revisions.insert(
-                    child_key.id,
-                    (child.revision, next_revision(&child.task, child.revision)?),
-                );
+                affected_revisions.insert(child_key.id, PreparedExitParticipant::reserve(child)?);
             } else if state
                 .zombies
                 .get(&child_key.id)
@@ -688,10 +787,7 @@ impl Kernel {
                 .ok_or(KernelOperationError::ExitTopologyChanged(adopter_key.id))?;
             affected_revisions.insert(
                 adopter_key.id,
-                (
-                    adopter_record.revision,
-                    next_revision(&adopter_record.task, adopter_record.revision)?,
-                ),
+                PreparedExitParticipant::reserve(adopter_record)?,
             );
             let mut prepared = adopter_record.task.children_set();
             if autoreap_parent == Some(adopter_key) {
@@ -714,10 +810,7 @@ impl Kernel {
                 .ok_or(KernelOperationError::ExitTopologyChanged(parent_key.id))?;
             affected_revisions.insert(
                 parent_key.id,
-                (
-                    parent_record.revision,
-                    next_revision(&parent_record.task, parent_record.revision)?,
-                ),
+                PreparedExitParticipant::reserve(parent_record)?,
             );
             let mut prepared = parent_record.task.children_set();
             prepared.remove(&task_key);
@@ -748,6 +841,19 @@ impl Kernel {
         let result_zombie = registry_zombie.clone();
         let task_ids: Vec<_> = reserved_ids.into_iter().collect();
         let reservation = TaskSetReservation::acquired(self, &mut state, task_ids, transaction)?;
+        state.reservations.insert(
+            task_id,
+            TaskGraphReservation::exit_participant(transaction, Arc::clone(&task_revision)),
+        );
+        for (affected_id, participant) in &affected_revisions {
+            state.reservations.insert(
+                *affected_id,
+                TaskGraphReservation::exit_participant(
+                    transaction,
+                    Arc::clone(&participant.revision),
+                ),
+            );
+        }
         drop(state);
         check_failpoint(failpoint, KernelFailpoint::AfterReserve)?;
         check_failpoint(failpoint, KernelFailpoint::AfterObjects)?;
@@ -806,19 +912,19 @@ impl Kernel {
         let Some(exiting_record) = state.tasks.get(&prepared.task.id) else {
             return Err(KernelOperationError::ExitTopologyChanged(prepared.task.id));
         };
-        if exiting_record.task.key() != prepared.task
-            || exiting_record.revision != prepared.task_revision
-            || exiting_record.task.lifecycle() != TaskLifecycle::Live
-        {
+        if exiting_record.task.lifecycle() != TaskLifecycle::Live {
             return Err(KernelOperationError::ExitTopologyChanged(prepared.task.id));
         }
-        for (affected_id, (expected, _)) in &prepared.affected_revisions {
+        prepared
+            .task_revision
+            .validate(exiting_record.task.key(), exiting_record.revision)?;
+        for (affected_id, participant) in &prepared.affected_revisions {
             let Some(affected) = state.tasks.get(affected_id) else {
                 return Err(KernelOperationError::ExitTopologyChanged(*affected_id));
             };
-            if affected.revision != *expected {
-                return Err(KernelOperationError::ExitTopologyChanged(*affected_id));
-            }
+            participant
+                .revision
+                .validate(affected.task.key(), affected.revision)?;
         }
         for child_key in &prepared.children {
             let live_matches = state
@@ -942,9 +1048,9 @@ impl Kernel {
         {
             parent_record.task.publish_prepared_children(children);
         }
-        for (affected_id, (_, published)) in &prepared.affected_revisions {
-            if let Some(affected) = state.tasks.get_mut(affected_id) {
-                affected.revision = *published;
+        for (affected_id, participant) in std::mem::take(&mut prepared.affected_revisions) {
+            if let Some(affected) = state.tasks.get_mut(&affected_id) {
+                participant.publish(affected);
             }
         }
 
