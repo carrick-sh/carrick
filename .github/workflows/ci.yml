@@ -70,7 +70,9 @@ jobs:
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Install Semgrep
         if: ${{ !cancelled() }}
         run: just ci-install-semgrep
@@ -113,7 +115,9 @@ jobs:
       - name: Compiler cache fallback without sccache
         run: cargo test -p carrick-xtask --test build_cache
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Install Linux C cross toolchain
         if: ${{ !cancelled() }}
         run: just ci-install-linux-cross
@@ -143,7 +147,9 @@ jobs:
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Linux crate rustdoc (including Linux host and KVM modules)
         if: ${{ !cancelled() }}
         run: just doc
@@ -166,7 +172,9 @@ jobs:
         with:
           shared-key: macos-host
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Clippy (no-panic gate)
         if: ${{ !cancelled() }}
         run: just clippy
@@ -192,7 +200,9 @@ jobs:
         with:
           shared-key: macos-host
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Workspace build
         if: ${{ !cancelled() }}
         run: just check --workspace
@@ -221,7 +231,9 @@ jobs:
         with:
           shared-key: macos-host
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Unit tests (host fd headroom)
         if: ${{ !cancelled() }}
         run: just ci-macos-test test
@@ -244,7 +256,9 @@ jobs:
         with:
           shared-key: macos-host
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Host integration tests (no HVF)
         if: ${{ !cancelled() }}
         run: just ci-macos-test test-integration
@@ -265,7 +279,9 @@ jobs:
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: aarch64 Linux cross-check and no-HVF closure
         if: ${{ !cancelled() }}
         run: just check-linux
@@ -311,7 +327,9 @@ jobs:
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Kernel semantics natively on ARM Linux
         if: ${{ !cancelled() }}
         run: just test-kernel-semantics
@@ -336,7 +354,9 @@ jobs:
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Install FreeBSD C cross toolchain
         if: ${{ !cancelled() }}
         run: just ci-install-freebsd-cross
@@ -375,7 +395,9 @@ jobs:
         run: just ci-toolchain
       - uses: Swatinem/rust-cache@401aff9a7a08acb9d27b64936a90db81024cff97 # v2.8.2
       - name: Install per-user compiler cache
-        run: test -x "$HOME/.cargo/bin/sccache" || cargo install sccache --locked --root "$HOME/.cargo"
+        uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2
+        with:
+          tool: sccache@0.18.0
       - name: Cross-check NetBSD NVMM backend (including tests)
         if: ${{ !cancelled() }}
         run: just check-netbsd
