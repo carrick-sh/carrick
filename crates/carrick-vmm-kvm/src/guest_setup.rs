@@ -1046,8 +1046,8 @@ impl GuestRam {
 
 /// Result of bring-up: a VM + a vCPU initialised to the EL1 trampoline, ready
 /// for the trap engine to drive. `ram` is kept alive (its mmap backs KVM).
-/// Result of the aarch64 KVM bring-up. The x86_64 analogue is `BroughtUpX86`
-/// in `guest_setup_x86.rs` (Task 2).
+/// Result of the aarch64 KVM bring-up. The x86_64 production lane boots the
+/// shared kernel through `Cpl0Carrier` instead.
 #[cfg(target_arch = "aarch64")]
 pub struct BroughtUp {
     pub vm: KvmVm,

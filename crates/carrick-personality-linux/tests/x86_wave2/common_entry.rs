@@ -176,6 +176,24 @@ fn pending_host_work_completes_once_and_leaves_with_work() {
 }
 
 #[test]
+fn tid_registration_uses_shared_completion_with_pending_work() {
+    let w = World::new(LifecycleHatches::ON);
+    assert!(w.venue.slots[1].publish_visible_tid(TID_B as u32));
+    w.tasks[1].linux.mark_pending_host_work();
+    let call =
+        carrick_personality_linux::entry::decode_x86_64(218, [0x1004, 0, 0, 0, 0, 0], 0x9000);
+    assert!(
+        matches!(serve_canonical(&call, &w.counters, &w.tasks[1], &*w.venue, None),
+        EntryOutcome::ServedWithWork { result } if result.raw() == TID_B as i64)
+    );
+    assert_eq!(w.venue.slots[1].clear_child_tid(), 0x1004);
+    assert_eq!(w.venue.slots[0].clear_child_tid(), 0);
+    assert_eq!(w.counters.served[96].load(Ordering::Relaxed), 1);
+    assert_eq!(w.tasks[1].linux.served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(w.tasks[1].linux.orig_arg0.load(Ordering::Relaxed), 0x1004);
+}
+
+#[test]
 fn closed_gate_or_hatch_forwards_without_effect() {
     let w = World::new(LifecycleHatches::ON);
     w.venue.pages[0].close();

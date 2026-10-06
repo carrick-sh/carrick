@@ -21,25 +21,6 @@ pub fn serve_canonical(
     venue: &dyn LifecycleVenue,
     publications: Option<&AtomicU64>,
 ) -> EntryOutcome {
-    // The x86 initial carrier binds this same lifecycle slot. ARM routing
-    // remains on its existing dispatcher and terminal custody.
-    if call.isa == carrick_guest_arch::GuestIsa::X86_64
-        && call.canonical.raw() == carrick_personality_linux::abi::x86_64::SYS_SET_TID_ADDRESS
-    {
-        let result = venue.thread(task).and_then(|thread| {
-            carrick_personality_linux::thread::set_tid_address(
-                thread,
-                execution_binding(task),
-                carrick_guest_arch::UserVa::new(call.args[0]),
-            )
-        });
-        if let Some(result) = result {
-            counters.served[call.canonical.raw() as usize]
-                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            return EntryOutcome::Served { result };
-        }
-        return EntryOutcome::Forward;
-    }
     entry::serve(
         call,
         &SharedVenue {
@@ -58,6 +39,15 @@ pub fn serve_canonical(
                         RobustListLen::new(len),
                     )
                     .linux_result()
+                })
+            },
+            tid_address: |address| {
+                venue.thread(task).and_then(|thread| {
+                    carrick_personality_linux::thread::set_tid_address(
+                        thread,
+                        execution_binding(task),
+                        address,
+                    )
                 })
             },
         },

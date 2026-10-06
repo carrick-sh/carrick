@@ -76,20 +76,27 @@ pub enum EntryOutcome {
 pub trait LinuxEntryVenue {
     fn binding(&self) -> ExecutionBinding;
     fn set_robust_list(&self, head: u64, len: u64) -> Option<i64>;
+    fn set_tid_address(&self, _: UserVa) -> Option<SyscallResult> {
+        None
+    }
     fn task_state(&self) -> &crate::abi::entry::LinuxTaskState;
     fn record_forwarded(&self, ordinal: usize);
     fn record_served(&self, ordinal: usize);
 }
 
 /// Shared counter/work transport over live native binding and robust-list hooks.
-pub struct SharedVenue<'a, B, R> {
+pub struct SharedVenue<'a, B, R, T> {
     pub binding: B,
     pub state: &'a crate::abi::entry::LinuxTaskState,
     pub counters: crate::dispatch::EntryCounters<'a>,
     pub robust_list: R,
+    pub tid_address: T,
 }
-impl<B: Fn() -> ExecutionBinding, R: Fn(u64, u64) -> Option<i64>> LinuxEntryVenue
-    for SharedVenue<'_, B, R>
+impl<
+    B: Fn() -> ExecutionBinding,
+    R: Fn(u64, u64) -> Option<i64>,
+    T: Fn(UserVa) -> Option<SyscallResult>,
+> LinuxEntryVenue for SharedVenue<'_, B, R, T>
 {
     fn binding(&self) -> ExecutionBinding {
         (self.binding)()
@@ -99,6 +106,9 @@ impl<B: Fn() -> ExecutionBinding, R: Fn(u64, u64) -> Option<i64>> LinuxEntryVenu
     }
     fn set_robust_list(&self, head: u64, len: u64) -> Option<i64> {
         (self.robust_list)(head, len)
+    }
+    fn set_tid_address(&self, address: UserVa) -> Option<SyscallResult> {
+        (self.tid_address)(address)
     }
     fn record_forwarded(&self, ordinal: usize) {
         self.counters.forwarded(ordinal as u64);
@@ -155,7 +165,14 @@ pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome 
         args: call.args,
         result: None,
     };
-    let route = crate::dispatch::dispatch(call.canonical.raw(), u64::MAX, &mut pending);
+    let route = match call.isa {
+        GuestIsa::X86_64 => {
+            crate::dispatch::dispatch_x86(call.canonical.raw(), u64::MAX, &mut pending)
+        }
+        GuestIsa::Aarch64 => {
+            crate::dispatch::dispatch(call.canonical.raw(), u64::MAX, &mut pending)
+        }
+    };
     if route == crate::dispatch::CompletionRoute::InvalidCompletion {
         return EntryOutcome::InvalidCompletion;
     }
@@ -192,6 +209,9 @@ impl<'a> crate::lifecycle::LifecycleNative<'a> for CommonFamilies<'a> {
         self.venue
             .set_robust_list(head, len)
             .map(SyscallResult::new)
+    }
+    fn register_tid_address(&self, address: UserVa) -> Option<SyscallResult> {
+        self.venue.set_tid_address(address)
     }
     fn thread(&self) -> Option<crate::thread::LifecycleThread<'a>> {
         None
