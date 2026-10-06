@@ -143,17 +143,7 @@ fn static_elf_wait4_wnohang_reap_then_echild() {
 
 #[test]
 fn user_cow_fault_clears_poisoned_xsave_header() {
-    let mut elf = fork_wait_elf();
-    let child = elf
-        .windows(5)
-        .position(|bytes| bytes == [0xc6, 0x44, 0x24, 0xf0, 0xa5])
-        .expect("child COW store");
-    let mut marker = vec![0xbf, 42, 0, 0, 0, 0x48, 0xb8];
-    marker.extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_NATIVE.to_le_bytes());
-    marker.extend_from_slice(&[0x0f, 0x05]);
-    elf.splice(child..child, marker);
-    let size = elf.len() as u64;
-    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    let elf = fork_wait_elf_with_child_marker();
     let program = initial_process_program(&elf);
     let mut carrier =
         Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("real KVM image");
@@ -165,6 +155,62 @@ fn user_cow_fault_clears_poisoned_xsave_header() {
         carrier
             .observe(0)
             .expect("resolved COW restores xstate")
+            .result,
+        7
+    );
+}
+
+fn fork_wait_elf_with_child_marker() -> Vec<u8> {
+    let mut elf = fork_wait_elf();
+    let child = elf
+        .windows(5)
+        .position(|bytes| bytes == [0xc6, 0x44, 0x24, 0xf0, 0xa5])
+        .expect("child COW store");
+    let mut marker = vec![0xbf, 42, 0, 0, 0, 0x48, 0xb8];
+    marker.extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_NATIVE.to_le_bytes());
+    marker.extend_from_slice(&[0x0f, 0x05]);
+    elf.splice(child..child, marker);
+    let size = elf.len() as u64;
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    elf
+}
+
+#[test]
+fn wait_any_parks_with_the_issued_child_pid_result() {
+    let mut elf = fork_wait_elf_with_child_marker();
+    // Override the requested selector after mov edi,eax. The saved wait
+    // completion must name child 42, never the -1 selection expression.
+    elf.splice(0xb0 + 18..0xb0 + 18, [0xbf, 0xff, 0xff, 0xff, 0xff]);
+    elf[0xb0 + 15] += 5;
+    let wait_end = elf
+        .windows(7)
+        .position(|bytes| bytes == [0xb8, 61, 0, 0, 0, 0x0f, 0x05])
+        .expect("wait4 opcode")
+        + 7;
+    elf.splice(wait_end..wait_end, [0x83, 0xf8, 42, 0x75, 0]);
+    elf[0xb0 + 15] += 5;
+    let failure = elf
+        .windows(7)
+        .position(|bytes| bytes == [0xbf, 9, 0, 0, 0, 0xb8, 0xe7])
+        .expect("failure exit");
+    elf[wait_end + 4] = (failure - wait_end - 5) as u8;
+    let size = elf.len() as u64;
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    let program = initial_process_program(&elf);
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("real KVM image");
+    assert_eq!(carrier.observe(0).expect("child before COW").result, 42);
+    assert_eq!(
+        carrier
+            .lifecycle_state(0)
+            .expect("parked parent")
+            .parked_parent_result,
+        42
+    );
+    assert_eq!(
+        carrier
+            .observe(0)
+            .expect("wait4(-1) returns the child status")
             .result,
         7
     );

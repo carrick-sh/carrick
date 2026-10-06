@@ -1643,6 +1643,7 @@ pub struct LifecycleObservation {
     pub served: [u64; 3],
     pub forwards: u64,
     pub words: [u64; 8],
+    pub parked_parent_result: u64,
 }
 impl Cpl0Carrier {
     /// The same KVM carrier, with one fixed native context sidecar per process.
@@ -1850,6 +1851,7 @@ impl Cpl0Carrier {
             served: [220, 98, 93].map(|nr| counters.served[nr].load(Ordering::Acquire)),
             forwards: self.host_forwards,
             words,
+            parked_parent_result: lane.contexts[0].frame.rax,
         })
     }
 }
