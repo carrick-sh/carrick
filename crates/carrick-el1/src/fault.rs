@@ -113,11 +113,7 @@ pub struct HardwarePreparedResolver;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub(crate) fn hardware_live_ttbr() -> u64 {
-    let ttbr: u64;
-    unsafe {
-        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack));
-    }
-    ttbr
+    crate::isa::aarch64::hardware_live_ttbr()
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
