@@ -487,6 +487,7 @@ dependencies = [
  "carrick-mmu-core",
  "carrick-personality-linux",
  "carrick-sched-core",
+ "zerocopy",
 ]
 
 [[package]]
@@ -580,6 +581,9 @@ dependencies = [
 [[package]]
 name = "carrick-guest-arch"
 version = "0.1.0"
+dependencies = [
+ "zerocopy",
+]
 
 [[package]]
 name = "carrick-guest-mem"
@@ -914,6 +918,9 @@ dependencies = [
 [[package]]
 name = "carrick-sched-core"
 version = "0.1.0"
+dependencies = [
+ "zerocopy",
+]
 
 [[package]]
 name = "carrick-signal-core"

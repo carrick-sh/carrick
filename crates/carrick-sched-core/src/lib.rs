@@ -378,7 +378,7 @@ impl Handback {
 /// what an in-guest switch saves and restores. FP/SIMD state is 16-byte
 /// aligned for `stp q`/`ldp q` (`v` at offset 304, FPSR and FPCR after it).
 #[repr(C, align(16))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, zerocopy::FromZeros)]
 pub struct ThreadCtx {
     /// X0..X30.
     pub x: [u64; 31],
@@ -546,7 +546,7 @@ pub const HOST_REQUEST_PROTOCOL: u64 = 2;
 
 /// One parked thread. See the crate docs for the ownership protocol.
 #[repr(C, align(64))]
-pub struct ZoneRecord {
+pub struct ZoneRecord<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     claim: AtomicU64,
     /// Bumped on every allocation; with the index it names one use.
     incarnation: AtomicU64,
@@ -585,14 +585,20 @@ pub struct ZoneRecord {
     deadline: AtomicU64,
     affinity: AtomicU64,
     object: object_wait::ObjectRecord,
-    ctx: UnsafeCell<ThreadCtx>,
+    ctx: UnsafeCell<C>,
 }
+
+const _: () = {
+    assert!(core::mem::offset_of!(ZoneRecord, ctx) == 192);
+    assert!(core::mem::size_of::<ZoneRecord>() == 1024);
+    assert!(core::mem::align_of::<ZoneRecord>() == 64);
+};
 
 // SAFETY: the context is accessed only by the claim-word owner (crate docs);
 // every other field is atomic.
-unsafe impl Sync for ZoneRecord {}
+unsafe impl<C: Copy + Send + Sync + zerocopy::FromZeros> Sync for ZoneRecord<C> {}
 
-impl ZoneRecord {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     pub fn claim(&self) -> Claim {
         Claim::decode(self.claim.load(Ordering::Acquire))
     }
@@ -711,7 +717,7 @@ impl ZoneRecord {
     /// publish `Parked`, or holds `Queued`/`OnCpu` for its slot, or has
     /// claimed `Host`.
     #[allow(clippy::mut_from_ref)]
-    pub unsafe fn ctx_mut(&self) -> &mut ThreadCtx {
+    pub unsafe fn ctx_mut(&self) -> &mut C {
         // SAFETY: exclusive access is the caller's contract.
         unsafe { &mut *self.ctx.get() }
     }

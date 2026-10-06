@@ -1239,7 +1239,7 @@ pub struct ObjectQueueCensus {
     pub locked: bool,
 }
 
-impl ZoneRecord {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneRecord<C> {
     /// This record's object-wait registration, if it has one or owns a
     /// pending object operation.
     pub fn object_wait_census(&self) -> Option<ObjectWaitCensus> {

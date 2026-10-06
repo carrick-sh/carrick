@@ -25,6 +25,7 @@ impl carrick_guest_arch::ArchTypes for X86Backend {
     type Error = ArchError;
     type NativeFrame = context::native::NativeFrame;
     type SavedContext = context::SavedSyscallContext;
+    type Context = context::ParkedContextWords;
     type Root = carrick_guest_arch::RootGpa;
     type MmOwner = carrick_el1_abi::CurrentTask;
     type OwnedTranslation = ();
