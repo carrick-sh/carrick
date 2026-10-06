@@ -105,12 +105,12 @@ pub fn restore_native_context(
     })
 }
 
-/// An ISA sidecar belongs to one exact shared record incarnation. It stores
-/// only machine state, never runnable/blocked state or an alternate queue.
+/// Exact shared-record identity and its expected address owner. Machine state
+/// lives only in ZoneRecord<ParkedContextWords>, never in this witness.
 #[repr(C)]
 pub struct ContextBinding {
     pub record: RecordRef,
-    pub context: NativeContext,
+    pub address: AddressContext<RootGpa>,
 }
 
 /// Bounded hardware witness/control record, outside the common ABI. This is
@@ -137,6 +137,8 @@ pub struct ProgressHeader {
 #[repr(C)]
 pub struct ProgressState {
     pub tasks: [ContextBinding; 2],
+    /// One transient native image for the currently executing task only.
+    pub active: NativeContext,
     pub maintenance_root: RootGpa,
     pub turns: u64,
     pub order: [u64; PROGRESS_TURNS],
@@ -152,9 +154,9 @@ pub struct ProgressState {
 }
 
 impl ContextBinding {
-    pub fn owned_on(&self, zone: &ZoneTables, slot: SlotId) -> bool {
+    pub fn owned_on(&self, zone: &ZoneTables<ParkedContextWords>, slot: SlotId) -> bool {
         zone.live(self.record).is_some_and(|record| {
-            record.identity().mm == self.context.address.mm.raw().get()
+            record.identity().mm == self.address.mm.raw().get()
                 && matches!(record.claim(), Claim::OnCpu { slot: owner, .. } if owner == slot)
         })
     }
@@ -164,15 +166,19 @@ impl ContextBinding {
 /// The caller first installs its maintenance root; after this grant it must
 /// install the exact native root before restoring user state. N1's eventual
 /// root receipt validation is deliberately not synthesized here.
-pub fn admit_context(zone: &ZoneTables, slot: SlotId, binding: &ContextBinding) -> bool {
+pub fn admit_context(
+    zone: &ZoneTables<ParkedContextWords>,
+    slot: SlotId,
+    binding: &ContextBinding,
+) -> bool {
     if !binding.owned_on(zone, slot) {
         return false;
     }
-    let mm = binding.context.address.mm.raw().get();
+    let mm = binding.address.mm.raw().get();
     let Some(grant) = zone.install_space(slot, mm) else {
         return false;
     };
-    if grant.cow_owed.is_some() || grant.ttbr0 != binding.context.address.root.address().raw() {
+    if grant.cow_owed.is_some() || grant.ttbr0 != binding.address.root.address().raw() {
         zone.release_space(slot);
         return false;
     }
@@ -201,10 +207,10 @@ mod tests {
 
     #[test]
     fn shared_queue_cross_mm_admission_refuses_stale_native_custody() {
-        let layout = std::alloc::Layout::new::<ZoneTables>();
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
         // SAFETY: documented all-zero empty state; uniquely owned box.
         let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
             assert!(!ptr.is_null());
             Box::from_raw(ptr)
         };
@@ -229,27 +235,31 @@ mod tests {
                     ..Default::default()
                 })
                 .unwrap();
+            let address = AddressContext {
+                root,
+                mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
+                generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+            };
+            let native = NativeContext {
+                frame: InterruptFrame {
+                    gpr: [mm; 15],
+                    rip: mm * 100,
+                    cs: 0x23,
+                    flags: 0x202,
+                    rsp: mm * 1000,
+                    ss: 0x1b,
+                },
+                address,
+                fs_base: mm * 16,
+                gs_base: mm * 32,
+                xsave: XsaveArea([mm as u8; XSAVE_BYTES]),
+            };
+            // SAFETY: this new record remains host-owned until requeue.
+            unsafe { *zone.record(record).ctx_mut() = park_native_context(&native) };
             zone.requeue_preempted(slot, record);
             bindings.push(ContextBinding {
                 record: zone.record_ref(record),
-                context: NativeContext {
-                    frame: InterruptFrame {
-                        gpr: [mm; 15],
-                        rip: mm * 100,
-                        cs: 0x23,
-                        flags: 0x202,
-                        rsp: mm * 1000,
-                        ss: 0x1b,
-                    },
-                    address: AddressContext {
-                        root,
-                        mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
-                        generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
-                    },
-                    fs_base: mm * 16,
-                    gs_base: mm * 32,
-                    xsave: XsaveArea([mm as u8; XSAVE_BYTES]),
-                },
+                address,
             });
         }
         for turn in 0..8 {
@@ -257,10 +267,7 @@ mod tests {
             let binding = &bindings[turn % 2];
             assert_eq!(id, binding.record.id);
             assert!(admit_context(&zone, slot, binding));
-            assert_eq!(
-                zone.installed_space(slot),
-                binding.context.address.mm.raw().get()
-            );
+            assert_eq!(zone.installed_space(slot), binding.address.mm.raw().get());
             assert!(!admit_context(&zone, slot, &bindings[(turn + 1) % 2]));
             zone.release_space(slot);
             zone.requeue_preempted(slot, id);
@@ -268,16 +275,16 @@ mod tests {
         let id = zone.switch_in(slot).unwrap();
         let mut stale = ContextBinding {
             record: bindings[0].record,
-            context: bindings[0].context.clone(),
+            address: bindings[0].address,
         };
         stale.record.incarnation += 1;
         assert!(!admit_context(&zone, slot, &stale));
         let mut wrong_mm = ContextBinding {
             record: bindings[0].record,
-            context: bindings[1].context.clone(),
+            address: bindings[1].address,
         };
         assert!(!admit_context(&zone, slot, &wrong_mm));
-        wrong_mm.context.address.mm = bindings[0].context.address.mm;
+        wrong_mm.address.mm = bindings[0].address.mm;
         assert!(!admit_context(&zone, slot, &wrong_mm), "root mismatch");
         assert_eq!(zone.installed_space(slot), 0, "refusal vacates occupancy");
         let index = zone.spaces.find(11).unwrap();
