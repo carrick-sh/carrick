@@ -15,8 +15,14 @@
  *     never timing or acceptance evidence. The 180-second diagnostic bound
  *     includes signed-launcher fixture verification and signing.
  *
- * carrick trace -s scripts/dtrace/el1-ipc-host-copy.d -o <capture> --
- *   --external ./scripts/test-signed.sh carrick-embed <test> --exact --nocapture
+ * Keep the tracer and signed witness run IDs distinct: the signed runner's
+ * scoped EXIT reap can kill a tracer sharing its run ID, before END prints.
+ * The ed2b48ac6 exit-group capture fired phase 4/detail 1 for a 16-byte
+ * successful-sleep copyout; its preserved stack named continuation folding.
+ *
+ * CARRICK_RUN_ID=<trace-id> carrick trace -s scripts/dtrace/el1-ipc-host-copy.d
+ *   -o <capture> -- --external env CARRICK_RUN_ID=<test-id>
+ *   ./scripts/test-signed.sh carrick-embed <test> --exact --nocapture
  */
 
 carrick*:::guest-internal-write-fault
