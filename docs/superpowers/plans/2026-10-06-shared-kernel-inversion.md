@@ -104,14 +104,24 @@ fence must also inspect macros and disassembly of both image closures.
 Use **`carrick-guest-arch`**, not a new facade crate. It already has typed
 native snapshots and events (`crates/carrick-guest-arch/src/lib.rs:131`, `:177`), exact identity/counter
 units (`:45`, `:57`) and four hardware projections (`:362`, `:370`, `:381`,
-`:393`). Collapse them to one monomorphized `KernelArch` implementation per
-ISA. Delete displaced hooks in the same move; no permanent new interface
-beside the old interface. MM owner, leaf edit ownership, prepare/settle/cancel,
+`:393`). Keep the existing sealed composite `KernelArch = EntryArch + MmuArch +
+InterruptArch + CrossingArch`, with **one concrete backend per ISA** implementing
+its existing backend hooks. At S there is only the blanket `KernelArch for
+Arch<B>` (`crates/carrick-guest-arch/src/lib.rs:401`), no concrete `impl *Backend for` in the tracked
+crates. It is an interface declaration, not a connected production boundary.
+Retype and fold the existing de-facto seams into those projections; do not
+invent a third hardware interface. Delete displaced hooks in the same move.
+MM owner, leaf edit ownership, prepare/settle/cancel,
 physical pins and drain membership belong to their existing owners, not to
 `ArchTypes`' current catch-all associated capabilities (`:287`).
 
-The following is **proposed Rust**, not existing compiling API. All numeric
-storage is private behind `repr(transparent)` units; wire codecs alone expose
+The following is **proposed Rust signature inventory**, not existing
+compiling API. It flattens the existing composite for review; implementation
+places entry/context methods in EntryBackend, table/copy/coherence methods
+in MmuBackend, IRQ/timer methods in InterruptBackend, and transport/fatal
+methods in CrossingBackend. The existing KernelArch blanket composition
+remains; the shown `trait KernelArch` is not a second trait to introduce.
+All numeric storage is private behind `repr(transparent)` units; wire codecs alone expose
 raw integers. `GuestVa` and `Gpa` replace the existing leaf spellings
 `UserVa`/`FrameGpa` once across the image closure (`crates/carrick-guest-arch/src/lib.rs:27`), preserving
 representation. No aliases with deprecated spellings. Host `GuestVa`/`Gpa`
@@ -269,7 +279,7 @@ not become personality-neutral just because their crates say “core”.
 | EL1 `memory.rs:83`, `:186`, `:670` | Linux `mm/{entry,pending}`: decoding, pending syscall lifetime/result and policy. Core takes neutral maintenance/retirement orchestration; native table classification/editing becomes the existing MMU projection (`memory.rs:496`, `:585`). |
 | EL1 `personality/mm_portal/{production.rs:67,fork.rs:76,maintenance.rs:21,edit_wait.rs:1}` | Core `mm/{service,fork/pending,maintenance}` owns the whole remaining service orchestration, extending Wave 1. Linux fork inheritance at `fork.rs:48` joins Linux MM. Native `serve_*_hw` transport and checked region resolution stay EL1. |
 | EL1 `personality/{common_entry.rs:1,dispatch.rs:1,sched.rs:1,thread_setup.rs:1,lifecycle.rs:1}` | Linux `entry/dispatch/sched/thread/lifecycle`, consuming shared core completion/lifecycle. Consume order-5/6 bodies already there; remove EL1 forwarding wrappers when imports switch. Native entry/ESR/frame and context leaves remain EL1. |
-| EL1 `personality/{ipc.rs:185,ipc/epoll.rs:56}` and `substrate/ipc.rs:57` | Linux `ipc/{io,epoll}`, core `io/{transfer,continuation}`. One operation continuation retains byte offset, endpoint pin and completion. Native replay-site calculation replaces `ipc.rs:661`'s ARM SVC subtraction. |
+| EL1 `personality/{ipc.rs:173,ipc/epoll.rs:56}` and `substrate/ipc.rs:57` | Linux `ipc/{io,epoll}`, core `io/{transfer,continuation}`. One operation continuation retains byte offset, endpoint pin and completion. Native replay-site calculation replaces `ipc.rs:661`'s ARM SVC subtraction. |
 | EL1 `file.rs:268`, `:302`, `:414`; `personality/file.rs:25` | Core `io/file_bytes` for bounded bytes/storage/dirty spans; Linux `file` for fd/access/seek/errno. Guarded load/store and validation at `file.rs:23`, `:84`, `:164` stay ISA. |
 | EL1 `personality/inotify.rs:29`, `substrate/watches.rs:5`, `substrate/file_notification.rs:9` | Linux `inotify/{watch,queue,name_cache}`; generic subscription lifetime joins core `object/subscription`. Preserve file-before-instance lock order, exact ready publication and existing fallback/refusal behavior. |
 | EL1-ABI `thread_lifecycle.rs:126`, `:195`, `:234`, `:688` | Neutral state/ref/generation in core-ABI; claim/exit/publication implementation in core; Linux identity, clone, robust, mask, altstack and clear-tid in Linux ABI. Consume O6 rather than move it twice. |
@@ -281,7 +291,66 @@ not become personality-neutral just because their crates say “core”.
 | x86 `engine.rs:1`, `vmm.rs:1`, `fault.rs:1`, `bringup.rs:1`, `bringup_fns.rs:1`, `vdso.rs:1` | Remain host engine, bootstrap and per-ISA Linux vDSO construction. Shared guest owner/policy must not be implemented here. KVM binds CPL0 library types to its bootstrap/service adapter. |
 | EL1 `entry.rs:39`; EL1-image `build.rs:204`, `crates/carrick-guest-arch/src/lib.rs:1`; x86-CPL0 `entry.rs:41`, `progress.rs:24` | Thin image entry/packaging and native vectors remain. Both binaries call the same instantiated core/Linux/scheduler owners; progress fixture remains a fixture, not a production scheduler. |
 
-### Before/after planning ledger
+### Primary production guest denominator and before/after targets
+
+The relocation target uses **guest-resident production source**, excluding
+host AArch64 engine source and test-only syntax. Run the existing O6 Rust/syn
+census (`docs/perf-results/order6-census/src/main.rs:9`, `:170`, O6), changing
+only its line predicate at `:190` to additionally exclude blank and `//`
+lines, and its package list to the twelve rows below. Keep every other cfg
+branch and embedded asm. This is source classification, not compiled
+reachability; the tool's physical-line output is reported independently.
+The temporary tool and log live outside tracked source.
+
+At exact S, the original O6 parser reports **10,950 EL1 + 9,311 EL1-ABI =
+20,261 physical production guest lines**, plus 13,468 host AArch64 lines.
+Applying the brief's non-comment-prefix predicate to those same retained
+spans gives **9,287 + 7,054 = 16,341 production guest lines**, plus 10,501
+host lines. The independent study's 14,618/9,319 pair does not reproduce
+under either published method; without its exclusion rules it cannot be
+used as an authoritative denominator. The host-vs-guest correction is valid
+regardless of that count discrepancy.
+
+| Crate | Production non-comment-prefix before S | After placement budget | Relocation partition |
+| --- | ---: | ---: | --- |
+| carrick-el1 | 9,287 | 1,600 | 7,687: core 4,100; Linux 2,700; sched 887 |
+| carrick-el1-abi | 7,054 | 400 | 6,654: core-ABI 2,000; core 1,000; Linux 3,654 |
+| carrick-aarch64 (host) | 10,501 | 10,301 | 200 aggregate consumer: core 175; Linux 25 |
+| carrick-core | 8,218 | 13,493 | +5,275 |
+| carrick-core-abi | 3,393 | 5,393 | +2,000 |
+| carrick-personality-linux | 1,579 | 7,958 | +6,379 |
+| carrick-sched-core | 5,997 | 6,884 | +887 |
+| carrick-mmu-core | 8,588 | 8,588 | Existing descriptor substrate, no copy |
+| carrick-guest-arch | 355 | 355 | Declaration re-homing/new typed glue measured separately |
+| carrick-x86 | 3,524 | 3,274 | 250 existing native production lines to CPL0 library |
+| carrick-x86-cpl0 | 371 | 621 | +250; shared owner code stays in dependencies |
+| carrick-el1-image | 1 | 1 | Packaging static; unit test source excluded |
+
+**Primary target:** guest-only production residue **16,341 → 2,000**, and
+six shared package production footprint **28,130 → 42,671**. Of that gain,
+14,341 comes from the guest packages and 200 from the generic host transfer
+consumer. Host adapters remain separate at 10,301. The twelve-crate
+production ledger conserves **58,868 existing lines**; these are placement
+budgets, not measured code edits or image bytes. New glue/tests receive
+explicit measured deltas. Native descriptor source within MMU-core is shared
+package footprint, not personality-neutral code. Accept no residual owner
+body simply because the numeric target passes.
+
+Reproduce with the public O6 census against `git archive S`; retain the
+original physical-line run and the modified predicate run side by side.
+The exact changed predicate is:
+
+```rust
+.filter(|(i, line)| !skipped.contains(&(i + 1))
+    && !line.trim().is_empty() && !line.trim_start().starts_with("//"))
+```
+
+Receipt: `target/inversion-plan/production-census.log`. O6 mapping
+`docs/perf-results/2026-10-06-x86-order6-lifecycle-mapping.md:175`, `:189`
+independently publishes the original parser's S counts. Retained/test-only
+source is still useful for review workload; report it separately below.
+
+### Supplementary all-source relocation ledger
 
 Counts below use the reproducible `src/` metric above, **including unit tests**.
 “After” is a **source-placement budget**, not a measured patch or compiled
@@ -314,7 +383,8 @@ lines**. Broad ledger conservation, including x86 and packaging, is
 total; never present these budgeting values as measured achievements.
 
 **Acceptance metric:** no MM, scheduler, wait, lifecycle, IPC or Linux family
-body left in either ISA adapter; aim for **≤4,500 ARM guest adapter/wire
+body left in either ISA adapter; aim for **≤2,000 current production ARM guest
+adapter/wire lines before new typed glue**, separately **≤4,500 all-source ARM guest adapter/wire
 lines including native unit fixtures**, with **no unexplained growth beyond the 2,922 direct ISA sites**
 under the narrower owner's classification. Recount production-only and
 unit-test source separately after every step. The 15k host-engine footprint
@@ -418,8 +488,9 @@ and capture limitations are explicit (O6 mapping `:205`, `:244`).
 
 ## Sequencing: small landable dependency cuts
 
-Each row is a mechanical move/type projection, keeping ARM admission,
-results, refusal, ordering and work identical. Split a row further along
+Each row keeps ARM admission,
+results, refusal, ordering and work identical. Most are mechanical moves/type
+projections; step 1b explicitly adds the missing x86 resume integration. Split a row further along
 module boundaries if its diff is too large; never introduce another family
 trait seam to make a large move easy. A single integrator owns shared
 manifests, context/layout declarations and inventories. All paths below refer
@@ -430,7 +501,9 @@ previous plans' meaning, not a redefinition of acceptance.
 | Step and move | Focused proof; x86 CPL0 execution unlocked | ARM signed comparison to its exact predecessor |
 | --- | --- | --- |
 | **0. Accepted N1 + Wave 1 main, integrate reviewed inputs** | Audit current N1 fixes and O5/O6/X1 ledger. Preserve executing entry/progress/X1 controls and old failures. No new source move is credited. Inventory all fixed casts/native contexts. | N1 main acceptance first. O5, O6, X1 each require no new signed failures against their own integration base before being relied on. |
-| **1. Leaf units and native frame projection** | Rebind guest-arch units and frame accessor once; move ARM native wire declarations without changing offsets. Run existing entry-completion and Linux native-codec tests. KVM X4 plus new `inversion_native_entry_registers` exercises all argument/result/PC/SP/replay conventions, malformed return and kick boundaries. | AE plus fault-context preservation, pending-work return and current admitted syscall families. |
+| **0a. First mechanical implementation: isolate every guest instruction leaf** | Move complete native helper bodies and each asm invocation verbatim under EL1 `isa/aarch64`, including frame save/load, AT/fixup copy, TLBI/GIC/timer/IRQ and HVC. Preserve symbols, inline/asm options, register constraints and call ordering; introduce no owner code there. Wire the existing guest-arch backend projections to these leaves after their typed signatures are ready. The source gate permits asm only in the native subtree; image disassembly must preserve native instruction sequences modulo relocation. KVM's existing native entry/progress tests remain green; this step does not newly admit a Linux family. | EL1_ABI_LAYOUT_HASH unchanged; current signed EL1 packet has no new failure. Preserve the audited FP/SIMD symbol checker. |
+| **1. Leaf units and native frame projection** | Rebind guest-arch units and frame accessor once; move ARM native wire declarations without changing offsets. Run existing entry-completion and Linux native-codec tests. KVM X4 plus new `inversion_native_entry_registers` exercises all argument/result/PC/SP/replay conventions, malformed return and kick boundaries. Replace frame.x[N] with inlined accessors for call/return/service arguments/reply, then compile the real shared bodies for x86 to expose remaining leaks; never accept a stub that forwards those bodies. | AE plus fault-context preservation, pending-work return and current admitted syscall families. |
+| **1b. Nonterminal host-service handoff/resume** | Replace CPL0's terminal forward branch with an owned suspend→host-effect→exact-operation resume/settle path through the existing service protocol. Preserve result, original arguments, prefix and successor context; do not redispatch a served call. New `inversion_service_resume` injects stale/duplicate completion and kicks while two MMs are live. This is explicit x86 integration work, not an ARM algorithm change or a KVM callback substitute. | AE/AM/AW verify ARM service ordering unchanged; existing HVC transport remains. |
 | **2. Layout-preserving neutral/Linux ABI moves** | Move retained records/methods into core-ABI/core/Linux modules as the ABI table specifies; both host/image imports switch. Independent pre/post size/align/offset/hash observations, including lifecycle/version/CurrentTask. Existing X4/X5 plus new `inversion_wire_layout_identity` rejects wrong ISA/version/hash before execution. | ABI refusal negative controls plus AE/AL. No source-only assertion counts as signed proof. |
 | **3a. Generic native scheduler context storage** | Move native context declarations to leaf wire modules; parameterize ZoneRecord/ZoneTables and all claim/capture consumers. Preserve ARM layout byte-for-byte; give x86 its tagged layout. Existing KVM context/progress tests, TLS/XSAVE canaries and `inversion_context_incarnation` prove record reuse cannot load predecessor state. | AW + AR, parked-context/core capture, cross-MM scheduling; preserve ARM FP/SIMD disassembly checker. |
 | **3b. Shared scheduler/wait orchestration** | Move `Sched` and object wait bodies to sched-core, replacing frame result/TLS/root/IRQ spellings with the one ISA surface. Linux selects futex/timeout results. X5 clone→park→clear/wake and `inversion_pool_exhaustion` at `max(32, actual_executor_count+1)` become executing tests on the real persistent pool when bound. Until then bounded CPL0 progress is only bounded proof. | AW/AL, two-live-process MM occupancy, clone storm and more parked threads than default executor capacity. No larger pool, polling or serialized symptom. |
@@ -573,14 +646,52 @@ ARM/HVF, oracle coverage, N3 exit ceilings or the ≤2x performance objective.
 
 | Risk and evidence | Guard / early disproof |
 | --- | --- |
-| **no_std/alloc closure**: EL1 enables rust_alloc only for ARM and excludes substantial x86 modules (`crates/carrick-el1/src/lib.rs:7`, `:9`, `:12`; `personality/mod.rs:7`). CPL0 halts on allocation (`crates/carrick-x86-cpl0/src/entry.rs:11`). AArch64 host crate pulls libc/parking_lot (`Cargo.toml:51`). | Two bare-metal release builds after every move; cargo dependency-closure check rejects std/libc/parking_lot/backend imports into guest packages. Shared allocator binds both global allocators before executing an allocating path; exact grant/refusal/return test precedes IPC/file admission. No dummy allocator or host-test feature in product closure. |
+| **no_std/alloc and forward/resume closure**: EL1 enables rust_alloc only for ARM and excludes substantial x86 modules (`crates/carrick-el1/src/lib.rs:7`, `:9`, `:12`; `personality/mod.rs:7`). CPL0 halts on allocation (`crates/carrick-x86-cpl0/src/entry.rs:11`) and after Forward (`crates/carrick-x86-cpl0/src/entry.rs:153`). AArch64 host crate pulls libc/parking_lot (`Cargo.toml:51`). | Two bare-metal release builds after every move; cargo dependency-closure check rejects std/libc/parking_lot/backend imports into guest packages. Step 1b proves host-effect handoff/resume before any owner can suspend across that boundary. Shared allocator binds both global allocators before executing an allocating path; exact grant/refusal/return test precedes IPC/file admission. No dummy allocator or host-test feature in product closure. |
 | **Image text/control overlap**: ARM linker reserves only 1 MiB before counters (`el1/link.ld:41`), despite a larger kernel region (`crates/carrick-el1-abi/src/lib.rs:58`). EL1-image audits FP/SIMD (`build.rs:36`, `:236`). | Record ELF section sizes, binary end, stack/heap/control bounds and reachable symbols for both images at each step. Keep ARM linker limit unchanged for mechanical moves; investigate excess instantiation/inlining first. A deliberate layout expansion is a separate versioned host/image change with signed proof. x86 map must cover actual PT_LOAD spans, not a fixed bootstrap assumption (`crates/carrick-vmm-kvm/src/cpl0_boot.rs:123`). Common source SLOC is not image size. |
 | **Atomic/order differences**: publication uses atomic execution state and release generation (`crates/carrick-el1/src/sched.rs:91`); lifecycle uses retained CAS/gate states (`crates/carrick-el1-abi/src/thread_lifecycle.rs:940`). x86 TSO can conceal a missing ARM acquire/barrier. | Preserve exact orderings and widths on mechanical moves; no relaxed “x86 optimization”. VM-free interposition at close/enroll/publish/rollback plus ARM signed concurrent Dekker/wake tests; hardware table-store ordering remains ISA-specific. Unaligned packed Linux epoll bytes never become unaligned atomic fields. |
 | **Interrupt/allocator context**: ARM WFI occurs masked (`crates/carrick-el1/src/sched/hw.rs:274`); x86 park uses STI/HLT/CLI (`crates/carrick-x86/src/interrupts.rs:68`). Saving DAIF/flags is not a semantic permission to block. | Noncopyable mask guard restores once; no allocation/host wait while holding short IRQ/MM/root guards. Owned suspension releases execution capacity and all borrowed editors; allocator demand exits through existing pending-work boundary. Inject kick/timeout during clone, copy, COW and return. No new polling, retries or timeout increases. |
 | **Context/layout circularity and code bloat**: scheduler embeds ARM ThreadCtx (`crates/carrick-sched-core/src/lib.rs:573`), while core-ABI depends on sched/MMU/guest-arch (`core-abi/Cargo.toml:9`). | Leaf native wire declarations + generic storage only; avoid sched-core importing either image. Instantiate one ISA per binary. Keep ARM repr/offset packet unchanged and require fail-closed per-ISA host layout tag. Track monomorphized symbol/code size; never link both ISA instruction implementations into one image. |
-| **In-zone authority accidentally delegated**: host engine bodies include native service/custody, not shared guest ownership (`crates/carrick-aarch64/src/user_transfer/prepared.rs:26`; `vmm.rs:555`). Current guest forward paths are real scope limits (`crates/carrick-el1/src/personality/ipc.rs:185`). | Kernel dependency/import fence and CPL0 counters/bytes expose an owner routed to host. Preserve existing refused surfaces; never make a test green by falling back to host semantic execution. Per-operation transfer uses exact-MM selection→physical pin→live mapping revalidation. |
+| **In-zone authority accidentally delegated**: host engine bodies include native service/custody, not shared guest ownership (`crates/carrick-aarch64/src/user_transfer/prepared.rs:26`; `vmm.rs:555`). Current guest forward paths are real scope limits (`crates/carrick-el1/src/personality/ipc.rs:173`). | Kernel dependency/import fence and CPL0 counters/bytes expose an owner routed to host. Preserve existing refused surfaces; never make a test green by falling back to host semantic execution. Per-operation transfer uses exact-MM selection→physical pin→live mapping revalidation. |
 | **Mac-only caller breaks invisible on Linux**: HVF portal callers and runtime terminal sequencer are separately compiled (`hvf_aarch64_engine.rs:2534`; `crates/carrick-runtime/src/vcpu_loop/threads.rs:104`). O6 Mac capture remains pending (O6 mapping `:244`). | Linux host ABI-consumer compile target plus exact Mac check before signed queue. Mac authority capture/line-pin updates are real compiler outputs on clean source; no synthesized capture and no gate weakening. |
 | **“Everything is shared” becomes an unearned result**: image exclusion/NoAllocation and bounded progress fixture are explicit at S (`crates/carrick-el1/src/lib.rs:4`; `crates/carrick-x86-cpl0/src/entry.rs:11`, `progress.rs:1`). | Report three distinct denominators: linked kernel modules, admitted/executed Linux operations, production service/pool/hardware coverage. Final closure needs all three, both native contexts, and the per-step signed bar. |
+
+## Independent cross-check disposition
+
+1. **Agree on host classification; correct the numeric method.** AArch64
+   is a std host engine (`crates/carrick-aarch64/Cargo.toml:16`, `:51`),
+   not guest kernel. The primary production guest denominator is now the
+   reproduced 16,341 non-comment-prefix lines / 20,261 physical lines;
+   49,580 is only the supplied all-source study denominator. The proposed
+   14,618/9,319 counts need a reproducible exclusion method before adoption.
+2. **Agree: use the existing, currently unimplemented ISA interface.** The
+   only existing implementation is blanket composition at
+   `crates/carrick-guest-arch/src/lib.rs:401`. Fold ThreadCpu/UserWord
+   (`crates/carrick-el1/src/sched.rs:20`, `:54`), MemoryValidator/UserCopy
+   (`crates/carrick-el1/src/file.rs:138`, `:229`), anonymous editors
+   (`crates/carrick-el1/src/memory.rs:309`), descriptor application and
+   COW window (`crates/carrick-el1/src/fault.rs:255`, `:466`) into its
+   existing projections with typed roots/targets/access. Keep MMU-core
+   TableMaintenance/OwnerMmu implementations; no third trait or journal.
+3. **Agree on obstacles.** Native context/layout and descriptor namespace
+   mixing are covered above. Direct frame accesses must be replaced through
+   inlined native views, not merely moved under a “shared” crate. The syntax-filtered `.x[` line counts
+   at S are IPC 14, memory 29, portal production 45, dispatch 30 and fork 16
+   (`target/inversion-plan/production-census.log` and Appendix A). The
+   independent 76/46/45/35/16 list therefore is not the same source/method;
+   its qualitative warning stands, but those numbers are not work budgets.
+   AArch64 register service packing is a codec for a shared retained operation, not
+   the shared protocol itself. NoAllocation and Forward→halt prevent an
+   allocating/suspending production kernel from running on CPL0
+   (`crates/carrick-x86-cpl0/src/entry.rs:11`, `:153`). Step 1b explicitly
+   closes the latter; cfg exclusion removal alone does not.
+4. **First step: verbatim native instruction-leaf relocation (0a).** It
+   gives an enforceable asm fence with unchanged ARM wire hash and an
+   instruction-sequence comparison before type/body moves. Accessors and
+   shared-body x86 compile follow. A compile-only x86 stub may be a temporary
+   uncommitted diagnostic, never a landable second kernel implementation or
+   acceptance result. **Reuse core-ABI**, as the owner requested, rather
+   than introducing a new zone-ABI facade; records with Linux semantics
+   enter Linux ABI. Generic native context follows the leaf/record split.
 
 ## Document verification and handoff
 
@@ -599,7 +710,8 @@ ledger. The document is review-ready design, not authority to skip any signed
 comparison or to merge an unqualified input.
 
 Publication checks on P (Linux carrick-vm): the exact embedded census recipe,
-all nine appendix groups, citation bounds and the conservation ledger pass;
+all nine appendix groups, citation bounds, both conservation ledgers and
+the Rust/syn production census pass;
 30 `personality_boundary` tests, focused all-target Clippy, product
 `just clippy`, `just fmt-check`, `just lint-domains` and staged
 `git diff --check` pass. Lint's live compiler census executes only
