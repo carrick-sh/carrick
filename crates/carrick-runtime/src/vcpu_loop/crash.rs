@@ -14,7 +14,7 @@ pub(crate) struct PreparedCorePublication {
         Option<Option<carrick_kernel::dispatch::core_publication::CorePublication>>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) struct CrashLeaseDrainBudget {
     pub(crate) timeout: Duration,
     pub(crate) poll_interval: Duration,
@@ -27,7 +27,13 @@ impl CrashLeaseDrainBudget {
     };
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum CrashLeaseDrainTimeout {
     Waiting(ThreadId),
     Busy(ThreadId),

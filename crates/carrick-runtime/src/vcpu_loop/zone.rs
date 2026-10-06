@@ -59,7 +59,13 @@ fn owe_adoption(record: RecordRef) {
 }
 
 /// How the vCPU left the guest, for capturing a thread's EL0 state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(super) enum ZoneExit {
     /// A syscall forwarded through the mailbox. `completed`: the syscall is
     /// done (served in-guest with pending host work, or a host park), so the
@@ -1032,7 +1038,7 @@ pub(super) enum IpcHandbackRoute {
 }
 
 /// An owned operation the host parks on an object wait queue.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct IpcPark {
     token: IpcOpToken,
     object: IpcObjectHandle,

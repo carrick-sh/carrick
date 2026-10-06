@@ -18,14 +18,21 @@ pub(crate) use el1_publication::{ForeignEl1Publisher, ForeignStage1Services};
 /// operations. Entries retain only weak references: the kernel token keeps the
 /// MM alive, while backend teardown remains the owner of its access state.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct CarrierForeignMmBinding {
     pub(crate) asid: carrick_hal::ForeignAsid,
     pub(crate) stage1_root: carrick_guest_mem::Gpa,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct CarrierForeignMmSnapshot {
     pub(crate) mm: carrick_hal::ForeignMmId,
     pub(crate) binding: CarrierForeignMmBinding,
@@ -117,7 +124,7 @@ impl carrick_hal::ForeignMmSnapshot for CarrierForeignMmSnapshot {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Default, Debug)]
+#[derive(::core::clone::Clone, ::core::default::Default, ::core::fmt::Debug)]
 pub(crate) struct CarrierForeignMmTransport {
     pub(crate) states: std::sync::Arc<
         parking_lot::RwLock<
@@ -278,7 +285,7 @@ impl Drop for CarrierForeignMmRegistration {
 /// Shared backend state whose lifetime and identity belong to one Linux MM,
 /// never to whichever persistent worker currently executes one of its tasks.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct MmRootStage2Authority {
     pub(crate) root_slot: (u64, u64),
     pub(crate) physical_extent: (u64, usize),
@@ -326,7 +333,7 @@ impl MmRootStage2Authority {
 /// coordinates against its one-shot allocator ticket; it cannot construct or
 /// clone this proof itself.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct HvpatchMmRootRetirementProof {
     root_slot: (u64, u64),
 }
@@ -515,7 +522,7 @@ impl MmAccessLiveResolver {
 /// publish executable leaves: production refuses those on page-table-only
 /// resolvers (`HostArenaResolver::publish_user_executable`).
 #[cfg(any(test, feature = "foreign-cow-test-support"))]
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) struct TestPageTableArena(pub(crate) u64, pub(crate) *mut u8);
 
 #[cfg(any(test, feature = "foreign-cow-test-support"))]
@@ -745,7 +752,7 @@ unsafe impl carrick_mmu_core::aarch64::HostArenaResolver for MmAccessLiveResolve
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub(crate) struct MmCowRuntimeBinding {
     pub(crate) authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
     pub(crate) identity: carrick_hal::FrameCowIdentity,
@@ -778,7 +785,13 @@ impl LiveBacking {
 }
 
 /// How binding a stage-1 authority to its live backing treats the manager.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(crate) enum LiveBackingBinding {
     /// The manager becomes live on the resolver at once (exec and fork
     /// children, whose tables and arenas are published before binding).
@@ -1516,7 +1529,7 @@ impl MmAccessState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) enum RetainedPhysicalOwner {
     Global {
         pin: GlobalFrameOwnerPin,
@@ -1574,14 +1587,14 @@ impl RetainedPhysicalOwner {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct RetainedForeignExtent {
     pub(crate) key: (u64, u64),
     pub(crate) owner: RetainedPhysicalOwner,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct RetainedForeignMmBacking {
     pub(crate) extents: Vec<RetainedForeignExtent>,
 }
@@ -1698,7 +1711,7 @@ pub(crate) fn foreign_stage1_translate(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct CarrierForeignMmReceipt {
     pub(crate) snapshot: CarrierForeignMmSnapshot,
     pub(crate) bytes_read: usize,
@@ -1706,7 +1719,7 @@ pub(crate) struct CarrierForeignMmReceipt {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct CarrierForeignCowReceipt {
     pub(crate) snapshot: CarrierForeignMmSnapshot,
     pub(crate) start: carrick_guest_mem::GuestVa,
@@ -1760,7 +1773,7 @@ impl carrick_hal::ForeignCowReceipt for CarrierForeignCowReceipt {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct CarrierForeignWriteReceipt {
     pub(crate) snapshot: CarrierForeignMmSnapshot,
     pub(crate) start: carrick_guest_mem::GuestVa,
@@ -2724,7 +2737,7 @@ pub(crate) fn perform_foreign_cow_transaction(
         .map_err(|_| carrick_hal::ForeignMmTransportError::OwnerStale)?;
         unsafe { page_table_extent.owner.ptr().add(offset) }
     };
-    #[derive(Copy, Clone)]
+    #[derive(::core::marker::Copy, ::core::clone::Clone)]
     struct ForeignMmPageTableResolver<'a> {
         backing: &'a RetainedForeignMmBacking,
         root_ipa: u64,
@@ -4453,7 +4466,7 @@ pub mod foreign_cow_test_support {
         }
     }
 
-    #[derive(Clone, Copy, Debug)]
+    #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
     pub struct InitialInventoryIdentity {
         pub root_mapping: carrick_hal::MappingId,
         pub root_frame: carrick_hal::FrameId,
@@ -4461,7 +4474,13 @@ pub mod foreign_cow_test_support {
         pub data_frame: carrick_hal::FrameId,
     }
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[derive(
+        ::core::clone::Clone,
+        ::core::marker::Copy,
+        ::core::fmt::Debug,
+        ::core::cmp::Eq,
+        ::core::cmp::PartialEq,
+    )]
     pub struct FixtureShape {
         pub stage1_root: carrick_guest_mem::Gpa,
         pub page_table_len: u64,

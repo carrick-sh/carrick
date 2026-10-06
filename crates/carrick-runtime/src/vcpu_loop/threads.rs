@@ -474,7 +474,7 @@ struct ChildTidDrainCustody {
 }
 
 /// Encapsulates the collection of active persistent vCPU thread handles for a process.
-#[derive(Clone, Default)]
+#[derive(::core::clone::Clone, ::core::default::Default)]
 pub(crate) struct VcpuThreadRegistry(
     Arc<parking_lot::Mutex<Vec<VcpuThreadHandle>>>,
     Arc<parking_lot::Mutex<ChildTidDrainCustody>>,

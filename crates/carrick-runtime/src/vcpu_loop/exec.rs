@@ -128,13 +128,19 @@ impl std::fmt::Debug for ProductionHvpatchPollError {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum ExecCompletionOrigin {
     GuestSyscall,
     InternalControl,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct AuthenticatedExecCompletionOrigin(pub(crate) ExecCompletionOrigin);
 
 impl<E: ThreadedEngine + 'static> ThreadRuntimeState<E>
@@ -296,12 +302,18 @@ fn apply_exec_inventory<E>(
     apply(replacement_mm, replacement)
 }
 
-#[derive(Default)]
+#[derive(::core::default::Default)]
 struct ExecBackendPublicationGate {
     engine_replaced: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 struct ExecDispositionRouting {
     predecessor_shared: bool,
     retirement_inventory: bool,
@@ -618,7 +630,13 @@ fn publish_execution_authority_after_exec(
 /// HVPatch sibling teardown. A nonempty absolute `@PATH` suffix is mandatory,
 /// so a container launcher can reach the probe before its selected child
 /// crosses the failure point without arming unrelated execs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 enum HvpatchExecInventoryFailureInjection {
     OldCapacity,
     ReplacementReservation,

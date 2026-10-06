@@ -553,7 +553,13 @@ pub(crate) trait PersistentExecutor: 'static {
 }
 
 /// How an executor's wait in the guest ended ([`PersistentExecutor::wait_in_guest`]).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum GuestIdleExit {
     /// The vCPU left for the host: host work (a control request, a kick), or
     /// a queued thread that needs this executor.
@@ -615,7 +621,7 @@ pub(crate) fn restore_worker_vcpu_before_binding_publication<V, B>(
 
 /// What a clone rollback found when it went to retire the child's exact
 /// published generation.
-#[derive(Debug, Clone, Copy)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) enum FailedCloneRetirement {
     /// The rollback failed the runnable generation itself: the child never
     /// ran, which is the ordinary case.

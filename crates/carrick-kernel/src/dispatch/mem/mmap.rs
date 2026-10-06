@@ -34,7 +34,13 @@ fn retire_anonymous_mapping_backing(
 /// now reports itself through [`MmapRequest::refused`].
 ///
 /// [`SyscallDispatcher::mmap`]: SyscallDispatcher
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 enum MmapRefusal {
     /// Linux itself rejects this request, so the errno handed back IS the
     /// explanation. Logged at `debug`: LTP provokes these by the hundred on
@@ -47,7 +53,7 @@ enum MmapRefusal {
     Internal(&'static str),
 }
 
-#[derive(Debug, ::thiserror::Error)]
+#[derive(::core::fmt::Debug, ::thiserror::Error)]
 pub enum SharedFileFixedMremapError {
     #[error("shared file alias entry missing for range 0x{old_address:x}..0x{old_end:x}")]
     MissingAliasEntry { old_address: u64, old_end: u64 },
@@ -71,7 +77,7 @@ pub enum SharedFileFixedMremapError {
 /// The guest's `mmap` arguments exactly as they arrived, captured before any
 /// normalization so a refusal reports what the guest asked for rather than
 /// what carrick rewrote it to.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 struct MmapRequest {
     pid: i32,
     addr: u64,
@@ -4158,7 +4164,13 @@ impl<'a> MemView<'a> {
 }
 
 /// A well-formed `mremap(2)` request: page-rounded sizes and decoded flags.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(in crate::dispatch) struct MremapRequest {
     pub(in crate::dispatch) old_address: u64,
     pub(in crate::dispatch) old_size: u64,

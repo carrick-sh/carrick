@@ -146,7 +146,7 @@ pub(crate) enum FaultSignalDisposition {
     Terminate(i32),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) struct FaultSignal {
     pub signum: i32,
     pub si_code: i32,
@@ -337,7 +337,13 @@ fn apply_first_touch(
     Some(true)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 enum FrameGrantClaim {
     None,
     ResponsePending,
@@ -522,7 +528,13 @@ fn el1_frame_grants_enabled() -> bool {
 }
 
 /// The operator's choice for the guest descriptor lane, read once per carrier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(super) enum DescriptorLaneHatch {
     /// The lane is admitted wherever the writer census admits it.
     Default,
@@ -553,7 +565,13 @@ impl DescriptorLaneHatch {
 /// guest-owned lane is admitted for an MM only when every one of them submits
 /// descriptor transactions instead; a single unconverted writer would be
 /// refused on that lane and turn an ordinary host edit into a guest fault.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(super) struct GuestDescriptorLanePrecondition {
     /// The descriptor transaction slots are placed in the installed EL1 region.
     pub(super) slots_placed: bool,
@@ -710,7 +728,13 @@ pub(super) fn settle_guest_cow_of(mm: carrick_kernel::kernel::MmId) {
 /// Host-retained copy of one submitted guest-lane frame grant: the exact
 /// transaction (never re-read from shared memory) and what the host commits
 /// once EL1's receipt verifies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(super) struct PendingGuestGrant {
     pub(super) txn: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
     /// The fault and span that produced the first-touch plan; settlement
@@ -722,7 +746,13 @@ pub(super) struct PendingGuestGrant {
 }
 
 /// What settling one guest grant did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(super) enum GuestGrantSettlement {
     /// EL1 published it; residency was committed for exactly this span.
     Committed(carrick_mmu_core::aarch64::descriptor_txn::PageSpan),
@@ -1828,7 +1858,9 @@ pub(crate) fn signal_progress_is_zero_for_executor_boundary() -> bool {
     SIGNAL_PROGRESS.with(|progress| progress.get() == 0)
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(
+    ::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::default::Default,
+)]
 pub(crate) struct SignalRestartContext {
     pub last_syscall_retval: Option<i64>,
     pub interrupted_pc: Option<u64>,
