@@ -680,7 +680,7 @@ fn parse_hvpatch_exec_inventory_failure_injection(
 fn hvpatch_exec_inventory_failure_injection(
     path: &str,
 ) -> Option<HvpatchExecInventoryFailureInjection> {
-    let configured = std::env::var("CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE").ok()?;
+    let configured = ::std::env::var("CARRICK_HVPATCH_EXEC_INVENTORY_FAILURE").ok()?;
     parse_hvpatch_exec_inventory_failure_injection(&configured, path)
 }
 
@@ -2307,7 +2307,7 @@ where
         self.service_kernel_context = Some(committed_context.retain_exact());
         let publication_started = std::time::Instant::now();
         if kernel.hvpatch_process.is_some()
-            && std::env::var_os("CARRICK_HVPATCH_VERIFY_EXEC_CODE").is_some()
+            && ::std::env::var_os("CARRICK_HVPATCH_VERIFY_EXEC_CODE").is_some()
         {
             if let Err(error) = verify_published_exec_image(engine, &img, &path) {
                 return Self::exec_failed_past_no_return(
@@ -2398,7 +2398,7 @@ where
         // a failure branch WITHOUT releasing — the child then `_exit`s
         // and the parent's `read()` gets EOF instead.
         if let Some(fd) = self.vfork_release_fd.take() {
-            let _ = unsafe { libc::write(fd, [0u8; 1].as_ptr().cast(), 1) };
+            let _ = unsafe { ::libc::write(fd, [0u8; 1].as_ptr().cast(), 1) };
             unsafe { libc::close(fd) };
         }
         let replacement_state = carrick_kernel::kernel::objects::MigratableTaskState {

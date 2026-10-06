@@ -106,7 +106,7 @@ impl ControlEndpoint {
     pub fn claim(&self, nonce: ControlNonce) -> Result<(), EndpointError> {
         ensure_owned_private_directory(&self.base)?;
         ensure_owned_private_directory(&self.directory)?;
-        match fs::read(self.owner_path()) {
+        match ::std::fs::read(self.owner_path()) {
             Ok(bytes) => {
                 let owner: OwnerRecord = serde_json::from_slice(&bytes)
                     .map_err(|error| EndpointError::InvalidOwner(error.to_string()))?;
@@ -223,7 +223,7 @@ impl ControlEndpoint {
     }
 
     fn read_owner(&self) -> Result<Option<OwnerRecord>, EndpointError> {
-        match fs::read(self.owner_path()) {
+        match ::std::fs::read(self.owner_path()) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map(Some)
                 .map_err(|error| EndpointError::InvalidOwner(error.to_string())),

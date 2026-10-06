@@ -1096,7 +1096,7 @@ impl Drop for HvpatchLaneScope {
 pub(crate) fn watch_addr() -> Option<u64> {
     static WATCH_ADDR: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *WATCH_ADDR.get_or_init(|| {
-        std::env::var("CARRICK_WATCH_ADDR").ok().and_then(|s| {
+        ::std::env::var("CARRICK_WATCH_ADDR").ok().and_then(|s| {
             let s = s.trim();
             let s = s.strip_prefix("0x").unwrap_or(s);
             u64::from_str_radix(s, 16).ok()
@@ -2239,7 +2239,7 @@ impl SyscallDispatcher {
         if let Some(state) = closing_inotify {
             self.fs.inotify_registry.unregister_all(&state);
         }
-        let is_inmem_stream = matches!(
+        let is_inmem_stream = ::std::matches!(
             open_file.description.inspect().as_deref(),
             Some(
                 OpenDescription::PipeReader { .. }
@@ -2460,7 +2460,7 @@ impl SyscallDispatcher {
         let mut buf = [0u8; 8192];
         while rescued.len() < CAP {
             // BLOCKING-IO-OK: a pty master is adopted O_NONBLOCK.
-            let n = unsafe { libc::read(master_host_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+            let n = unsafe { ::libc::read(master_host_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
             if n <= 0 {
                 break;
             }

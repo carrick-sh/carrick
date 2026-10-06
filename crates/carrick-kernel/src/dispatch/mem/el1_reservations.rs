@@ -97,7 +97,7 @@ pub(in crate::dispatch) struct ForkSeed {
 pub fn el1_reservations_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CARRICK_EL1_RESERVATIONS").map_or(true, |value| value.trim() != "0")
+        ::std::env::var("CARRICK_EL1_RESERVATIONS").map_or(true, |value| value.trim() != "0")
     })
 }
 

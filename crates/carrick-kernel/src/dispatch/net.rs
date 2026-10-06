@@ -838,7 +838,7 @@ impl<'a> NetView<'a> {
     pub(super) fn description_is_oneway_pipe_read_end(
         description: &Arc<crate::kernel::FileDescription>,
     ) -> bool {
-        matches!(
+        ::std::matches!(
             description.inspect().as_deref(),
             Some(OpenDescription::HostPipe {
                 is_read_end: true,
@@ -969,7 +969,7 @@ impl<'a> NetView<'a> {
     /// epoll netpollBreak (EVFILT_READ on the readiness pipe) is unaffected.
     pub(super) fn fd_is_eventfd(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|f| {
-            matches!(
+            ::std::matches!(
                 f.description.inspect().as_deref(),
                 Some(OpenDescription::EventFd { .. })
             )

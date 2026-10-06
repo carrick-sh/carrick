@@ -2524,7 +2524,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
     }
 
     fn is_epoll(&self) -> bool {
-        matches!(
+        ::std::matches!(
             &*self.read(),
             OpenDescription::Epoll { .. } | OpenDescription::Closed { was_epoll: true }
         )
@@ -2643,7 +2643,7 @@ impl crate::kernel::FileDescriptionBacking for RwLock<OpenDescription> {
     }
 
     fn is_closed(&self) -> bool {
-        matches!(&*self.read(), OpenDescription::Closed { .. })
+        ::std::matches!(&*self.read(), OpenDescription::Closed { .. })
     }
 
     fn readiness(

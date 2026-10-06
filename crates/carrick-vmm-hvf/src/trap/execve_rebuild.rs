@@ -533,7 +533,7 @@ pub(crate) fn switch_exec_stage2_transaction(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn exec_stage2_fail_after_maps() -> Option<usize> {
-    std::env::var("CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS")
+    ::std::env::var("CARRICK_HVPATCH_EXEC_FAIL_AFTER_MAPS")
         .ok()
         .and_then(|value| value.parse().ok())
 }

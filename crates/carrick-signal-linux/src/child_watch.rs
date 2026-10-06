@@ -131,7 +131,7 @@ pub fn register(child_pid: i32, parent_tid: i32, exit_signal: i32) {
     } else {
         LINUX_SIGCHLD
     };
-    lock()
+    crate::child_watch::lock()
         .get_or_insert_with(HashMap::new)
         .insert(child_pid, (parent_tid, exit_signal));
 }
@@ -141,7 +141,9 @@ pub fn register(child_pid: i32, parent_tid: i32, exit_signal: i32) {
 /// (the async reaper / kqueue watch) AND to CANCEL a watch when the guest reaps
 /// the child synchronously — both rely on the atomic remove for publish-once.
 pub fn take(child_pid: i32) -> Option<(i32, i32)> {
-    lock().as_mut().and_then(|map| map.remove(&child_pid))
+    crate::child_watch::lock()
+        .as_mut()
+        .and_then(|map| map.remove(&child_pid))
 }
 
 /// Queue the raw `waitid` payload for the next delivery of `exit_signal` to
@@ -174,7 +176,7 @@ pub fn take_siginfo(parent_tid: i32, exit_signal: i32) -> Option<ChildExitSiginf
 /// True iff `child_pid` is a tracked guest child (without consuming the mapping).
 /// Lets a backend distinguish a child-exit event from its other wake sources.
 pub fn is_tracked(child_pid: i32) -> bool {
-    lock()
+    crate::child_watch::lock()
         .as_ref()
         .is_some_and(|map| map.contains_key(&child_pid))
 }
@@ -183,7 +185,7 @@ pub fn is_tracked(child_pid: i32) -> bool {
 /// reaper both iterate this set (HVF to re-add EVFILT_PROC watches; KVM to
 /// `waitid`-peek each tracked child on a pump wake).
 pub fn tracked_pids() -> Vec<i32> {
-    lock()
+    crate::child_watch::lock()
         .as_ref()
         .map(|map| map.keys().copied().collect())
         .unwrap_or_default()
@@ -193,7 +195,7 @@ pub fn tracked_pids() -> Vec<i32> {
 /// inherit (and deliver child-exit signals for) the PARENT's children — its own
 /// children are registered on its own re-armed watch glue.
 pub fn clear() {
-    if let Some(map) = lock().as_mut() {
+    if let Some(map) = crate::child_watch::lock().as_mut() {
         map.clear();
     }
     if let Some(map) = lock_siginfos().as_mut() {
@@ -218,7 +220,7 @@ pub struct ChildWatchForkGuard {
 /// mutexes are not reentrant).
 pub fn hold_for_fork() -> ChildWatchForkGuard {
     ChildWatchForkGuard {
-        _watches: lock(),
+        _watches: crate::child_watch::lock(),
         _siginfos: lock_siginfos(),
     }
 }
@@ -227,7 +229,7 @@ pub fn hold_for_fork() -> ChildWatchForkGuard {
 /// guard is released immediately when the second table is busy, so callers can
 /// retry the complete bundle without lock-order inversion.
 pub fn try_hold_for_fork() -> Option<ChildWatchForkGuard> {
-    let watches = try_lock()?;
+    let watches = crate::child_watch::try_lock()?;
     let siginfos = try_lock_siginfos()?;
     Some(ChildWatchForkGuard {
         _watches: watches,

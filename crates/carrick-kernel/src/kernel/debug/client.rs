@@ -71,7 +71,11 @@ pub(super) fn abort_at_with_wait(
     run_id: &str,
     wait: ResponseWait,
 ) -> Result<AbortAck, ClientError> {
-    let payload = exchange_at(endpoint, &KernelDebugRequest::abort(run_id), wait)?;
+    let payload = exchange_at(
+        endpoint,
+        &crate::kernel::debug::dto::KernelDebugRequest::abort(run_id),
+        wait,
+    )?;
     if let Ok(refusal) = wire::decode_exact::<ServerRefusal>(&payload)
         && refusal.schema == KERNEL_DEBUG_RESPONSE_SCHEMA
     {

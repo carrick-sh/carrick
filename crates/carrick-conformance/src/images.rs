@@ -184,7 +184,7 @@ pub fn refresh_stale_images(
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
-                matches!(
+                ::std::matches!(
                     Command::new("limactl")
                         .args([
                             "shell",

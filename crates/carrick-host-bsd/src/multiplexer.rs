@@ -62,17 +62,17 @@ impl EventMultiplexer for KqueueMultiplexer {
         if interest.read {
             let read = match interest.read_lowat {
                 Some(lowat) => Kevent::read_lowat(fd, base, lowat),
-                None => Kevent::read(fd, base),
+                None => crate::kqueue::Kevent::read(fd, base),
             };
             changes.push(read.with_udata_u64(token));
         } else if current.read {
-            changes.push(Kevent::read(fd, libc::EV_DELETE));
+            changes.push(crate::kqueue::Kevent::read(fd, libc::EV_DELETE));
         }
 
         if interest.write {
-            changes.push(Kevent::write(fd, base).with_udata_u64(token));
+            changes.push(crate::kqueue::Kevent::write(fd, base).with_udata_u64(token));
         } else if current.write {
-            changes.push(Kevent::write(fd, libc::EV_DELETE));
+            changes.push(crate::kqueue::Kevent::write(fd, libc::EV_DELETE));
         }
 
         if interest.oob {
@@ -162,10 +162,10 @@ impl EventMultiplexer for KqueueMultiplexer {
         if let Some(entry) = self.registered.remove(&fd) {
             let mut deletes = Vec::with_capacity(4);
             if entry.read {
-                deletes.push(Kevent::read(fd, libc::EV_DELETE));
+                deletes.push(crate::kqueue::Kevent::read(fd, libc::EV_DELETE));
             }
             if entry.write {
-                deletes.push(Kevent::write(fd, libc::EV_DELETE));
+                deletes.push(crate::kqueue::Kevent::write(fd, libc::EV_DELETE));
             }
             if entry.oob {
                 #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
@@ -195,10 +195,10 @@ impl EventMultiplexer for KqueueMultiplexer {
                 }
                 let mut deletes = Vec::with_capacity(4);
                 if entry.read {
-                    deletes.push(Kevent::read(fd, libc::EV_DELETE));
+                    deletes.push(crate::kqueue::Kevent::read(fd, libc::EV_DELETE));
                 }
                 if entry.write {
-                    deletes.push(Kevent::write(fd, libc::EV_DELETE));
+                    deletes.push(crate::kqueue::Kevent::write(fd, libc::EV_DELETE));
                 }
                 #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]
                 if entry.oob {
@@ -217,10 +217,10 @@ impl EventMultiplexer for KqueueMultiplexer {
         for &fd in fds {
             if let Some(entry) = self.registered.remove(&fd) {
                 if entry.read {
-                    deletes.push(Kevent::read(fd, libc::EV_DELETE));
+                    deletes.push(crate::kqueue::Kevent::read(fd, libc::EV_DELETE));
                 }
                 if entry.write {
-                    deletes.push(Kevent::write(fd, libc::EV_DELETE));
+                    deletes.push(crate::kqueue::Kevent::write(fd, libc::EV_DELETE));
                 }
                 if entry.oob {
                     #[cfg(not(any(target_os = "freebsd", target_os = "netbsd")))]

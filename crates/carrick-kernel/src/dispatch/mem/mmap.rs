@@ -1618,7 +1618,7 @@ impl<'a> MemView<'a> {
                     && !map_flags.contains(LinuxMmapFlags::POPULATE)
                     && !prot_flags.is_empty()
                     && in_arena
-                    && std::env::var("CARRICK_MINCORE_EXACT").as_deref() != Ok("0")
+                    && ::std::env::var("CARRICK_MINCORE_EXACT").as_deref() != Ok("0")
                     && memory
                         .resident_pages(GuestVa(address), 1, this.linux_page_size())
                         .is_none()
@@ -3064,7 +3064,7 @@ impl<'a> MemView<'a> {
                 && alias_file_extent.is_some_and(|(file_len, file_offset)| {
                     shared_file_bus_offset(file_len, file_offset, new_size, page_size).is_none()
                 });
-            if new_size > old_size && std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
+            if new_size > old_size && ::std::env::var_os("CARRICK_FAULT_DEBUG").is_some() {
                 // Which grow plan (if any) matched, and the facts each one keys
                 // on. A refused grow is otherwise indistinguishable from a dozen
                 // other ENOMEM sources in this handler, and the shapes that need
@@ -3898,7 +3898,7 @@ impl<'a> MemView<'a> {
                         .iter()
                         .filter(|map| map.start < hi && lo < map.end)
                         .map(|map| {
-                            format!(
+                            ::std::format!(
                                 "{:#x}-{:#x}{}{}{}",
                                 map.start,
                                 map.end,

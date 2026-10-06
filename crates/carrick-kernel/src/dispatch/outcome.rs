@@ -9,7 +9,6 @@ use carrick_guest_mem::{
     CurrentMmMemory, Gpa, GuestMemory, GuestVa, MemoryError, SharedFutexLocation,
 };
 use carrick_hal::HostAliasBacking;
-use serde::Serialize as _;
 
 use super::sysv::SysvWaitState;
 use super::wait_authority::WaitFds;

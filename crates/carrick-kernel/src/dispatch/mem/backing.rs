@@ -772,7 +772,7 @@ pub(crate) fn host_fd_file_len(fd: i32) -> Option<u64> {
 /// worst; `getenv` is allocation- and syscall-free) so tests and forked guests
 /// observe the current environment rather than a process-cached copy.
 pub(crate) fn mmap_file_backed_lowering_enabled() -> bool {
-    std::env::var_os("CARRICK_MMAP_FILE_BACKED").is_none_or(|value| value != *"0")
+    ::std::env::var_os("CARRICK_MMAP_FILE_BACKED").is_none_or(|value| value != *"0")
 }
 
 /// Eager MAP_PRIVATE materialization plus its map-time Linux EOF contract.

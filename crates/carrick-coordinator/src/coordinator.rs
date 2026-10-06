@@ -187,7 +187,7 @@ impl Coordinator {
         // Write lease metadata
         let metadata_path = self.metadata_path(resource);
         let meta_json = serde_json::to_string_pretty(&owner)?;
-        fs::write(&metadata_path, meta_json)?;
+        ::std::fs::write(&metadata_path, meta_json)?;
 
         Ok(Some(Lease {
             resource,

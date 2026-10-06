@@ -175,7 +175,7 @@ where
         let Some(mut generation) = self.collecting_crash_generation() else {
             return Ok(());
         };
-        if std::env::var_os("CARRICK_CORE_FAILPOINT")
+        if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
             .is_some_and(|value| value == "register-generation")
         {
             generation = generation.skewed_for_failpoint();
@@ -259,7 +259,7 @@ where
             );
         };
         lifecycle(0, 0);
-        if std::env::var_os("CARRICK_CORE_FAILPOINT")
+        if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
             .is_some_and(|value| value == "capture-timeout")
         {
             lifecycle(6, 1);
@@ -267,7 +267,7 @@ where
                 "core publication failpoint capture-timeout".to_owned(),
             ));
         }
-        if std::env::var_os("CARRICK_CORE_FAILPOINT")
+        if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
             .is_some_and(|value| value == "capture-interrupted")
         {
             lifecycle(6, 1);
@@ -291,7 +291,7 @@ where
         let mut quiesced = false;
         let mut lease_drain_guard = None;
         let result = (|| {
-            if std::env::var_os("CARRICK_CORE_FAILPOINT")
+            if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "capture-registers")
             {
                 return Err(RuntimeError::Configuration(
@@ -372,7 +372,7 @@ where
                 return Ok(None);
             }
 
-            if std::env::var_os("CARRICK_CORE_FAILPOINT")
+            if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "missing-thread")
             {
                 return Err(RuntimeError::Configuration(
@@ -489,14 +489,15 @@ where
                 std::thread::sleep(std::time::Duration::from_micros(200));
             };
             threads.sort_by_key(|thread| (thread.tid != fatal_visible_tid, thread.tid));
-            if std::env::var_os("CARRICK_CORE_FAILPOINT").is_some_and(|value| value == "capture-mm")
+            if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
+                .is_some_and(|value| value == "capture-mm")
             {
                 return Err(RuntimeError::Configuration(
                     "core publication failpoint capture-mm".to_owned(),
                 ));
             }
             if process.auxv.is_empty()
-                || std::env::var_os("CARRICK_CORE_FAILPOINT")
+                || ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                     .is_some_and(|value| value == "missing-auxv")
             {
                 return Err(RuntimeError::Configuration(
@@ -504,7 +505,7 @@ where
                 ));
             }
             if process.maps.is_empty()
-                || std::env::var_os("CARRICK_CORE_FAILPOINT")
+                || ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                     .is_some_and(|value| value == "missing-vma")
             {
                 return Err(RuntimeError::Configuration(
@@ -614,7 +615,7 @@ where
             let thread_count = u64::try_from(threads.len()).unwrap_or(u64::MAX);
             let mapping_count = u64::try_from(mappings.len()).unwrap_or(u64::MAX);
             let region_count = u64::try_from(regions.len()).unwrap_or(u64::MAX);
-            if std::env::var_os("CARRICK_CORE_FAILPOINT")
+            if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "missing-file-identity")
             {
                 return Err(RuntimeError::Configuration(
@@ -656,7 +657,7 @@ where
             let segment_offsets = dump.load_segment_file_offsets().map_err(|error| {
                 RuntimeError::FsBackend(anyhow::anyhow!("layout core segment offsets: {error}"))
             })?;
-            if std::env::var_os("CARRICK_CORE_FAILPOINT")
+            if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
                 .is_some_and(|value| value == "memory-read")
             {
                 return Err(RuntimeError::Configuration(
@@ -734,7 +735,8 @@ where
                 .map_err(|error| {
                     RuntimeError::FsBackend(anyhow::anyhow!("build core payload: {error}"))
                 })?;
-            if std::env::var_os("CARRICK_CORE_FAILPOINT").is_some_and(|value| value == "validator")
+            if ::std::env::var_os("CARRICK_CORE_FAILPOINT")
+                .is_some_and(|value| value == "validator")
             {
                 return Err(RuntimeError::Configuration(
                     "core publication failpoint validator".to_owned(),

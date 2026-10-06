@@ -385,7 +385,7 @@ impl PersistentCarrierMappings {
     }
 
     pub(crate) fn mark_vm_destroyed_after_custody_commit(&self) -> Result<(), TrapError> {
-        let committed = matches!(
+        let committed = ::std::matches!(
             self.custody.state.lock().lifecycle,
             CarrierVmLifecycle::Vacant
         );
@@ -490,7 +490,7 @@ impl CarrierFdCeilingPublisher {
             ceiling,
             gate,
         };
-        if std::env::var_os("CARRICK_FD_CEILING").as_deref() == Some(std::ffi::OsStr::new("0")) {
+        if ::std::env::var_os("CARRICK_FD_CEILING").as_deref() == Some(std::ffi::OsStr::new("0")) {
             carrick_hal::FdCeilingPublisher::disable(&publisher);
         }
         Some(publisher)

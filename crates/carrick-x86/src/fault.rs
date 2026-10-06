@@ -166,7 +166,7 @@ impl FaultDoorbellRecord {
     }
 }
 
-use zerocopy::{FromBytes as _, IntoBytes as _, KnownLayout as _};
+use zerocopy::{FromBytes as _, IntoBytes as _};
 
 /// Memory-backed SP4.3 fault record written by guest IDT stubs for VMMs whose
 /// PIO exits do not expose the `OUT` payload. All fields are u64 so the guest

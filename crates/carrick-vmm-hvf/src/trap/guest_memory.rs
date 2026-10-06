@@ -610,7 +610,7 @@ impl HvfVmState {
         ) {
             return self.zero_guest_backing_targets(address, length);
         }
-        let before = MmMaintenanceVisits::read();
+        let before = crate::trap::cow_engine::MmMaintenanceVisits::read();
         let outcome = self.zero_guest_backing_targets(address, length);
         self.emit_mm_maintenance_census(
             carrick_observability::probes::HvpatchMmMaintenanceSite::ScrubTargets,

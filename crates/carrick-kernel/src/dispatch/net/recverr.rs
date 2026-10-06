@@ -87,7 +87,7 @@ fn lock() -> std::sync::MutexGuard<'static, HashMap<i32, State>> {
 
 /// The guest set `IP_RECVERR`/`IPV6_RECVERR` on this socket.
 pub(super) fn enable(host_fd: i32, is_ipv6: bool) {
-    let mut state = lock();
+    let mut state = crate::dispatch::net::recverr::lock();
     let entry = state.entry(host_fd).or_default();
     entry.enabled = true;
     entry.is_ipv6 = is_ipv6;
@@ -95,7 +95,9 @@ pub(super) fn enable(host_fd: i32, is_ipv6: bool) {
 
 /// Whether this socket opted into the error queue.
 pub(in crate::dispatch) fn is_enabled(host_fd: i32) -> bool {
-    lock().get(&host_fd).is_some_and(|s| s.enabled)
+    crate::dispatch::net::recverr::lock()
+        .get(&host_fd)
+        .is_some_and(|s| s.enabled)
 }
 
 /// Reserve `host_addr` for this error-queue socket, or report that another one
@@ -107,7 +109,10 @@ pub(super) fn reserve_bind(host_fd: i32, host_addr: &[u8]) -> bool {
     if !bound.insert(host_addr.to_vec()) {
         return false;
     }
-    lock().entry(host_fd).or_default().bound = Some(host_addr.to_vec());
+    crate::dispatch::net::recverr::lock()
+        .entry(host_fd)
+        .or_default()
+        .bound = Some(host_addr.to_vec());
     true
 }
 
@@ -121,7 +126,7 @@ pub(super) fn reserve_bind(host_fd: i32, host_addr: &[u8]) -> bool {
 /// would have nothing to wake the loop with, and the guest would sit in
 /// `epoll_wait` with a queued error it is never told about.
 pub(super) fn create_shadow_at_bind(host_fd: i32, local: &[u8]) {
-    let mut state = lock();
+    let mut state = crate::dispatch::net::recverr::lock();
     let Some(entry) = state.get_mut(&host_fd) else {
         return;
     };
@@ -135,7 +140,11 @@ pub(super) fn create_shadow_at_bind(host_fd: i32, local: &[u8]) {
 
 /// This socket's shadow fd, for epoll registration.
 pub(super) fn shadow_fd(host_fd: i32) -> Option<i32> {
-    lock().get(&host_fd)?.shadow.as_ref().map(|(fd, _)| *fd)
+    crate::dispatch::net::recverr::lock()
+        .get(&host_fd)?
+        .shadow
+        .as_ref()
+        .map(|(fd, _)| *fd)
 }
 
 /// The shadow to send this datagram through, creating or re-pointing it as
@@ -143,7 +152,7 @@ pub(super) fn shadow_fd(host_fd: i32) -> Option<i32> {
 /// cannot be established — in which case the caller must send normally, since
 /// losing the datagram would be far worse than losing the error report.
 pub(super) fn shadow_for_send(host_fd: i32, local: &[u8], dest: &[u8]) -> Option<i32> {
-    let mut state = lock();
+    let mut state = crate::dispatch::net::recverr::lock();
     let entry = state.get_mut(&host_fd)?;
     if !entry.enabled {
         return None;
@@ -253,7 +262,7 @@ fn set_nonblocking(fd: i32) {
 /// Drain any ICMP error Darwin has reported on the shadow into the queue.
 /// Cheap and idempotent; callers run it before answering readiness or a recv.
 pub(in crate::dispatch) fn poll_errors(host_fd: i32) {
-    let mut state = lock();
+    let mut state = crate::dispatch::net::recverr::lock();
     let Some(entry) = state.get_mut(&host_fd) else {
         return;
     };
@@ -297,7 +306,9 @@ pub(in crate::dispatch) fn poll_errors(host_fd: i32) {
 /// Whether anything is waiting — used to report `EPOLLIN | EPOLLERR`, which is
 /// what makes libuv run both its plain and its `MSG_ERRQUEUE` read.
 pub(in crate::dispatch) fn has_pending(host_fd: i32) -> bool {
-    lock().get(&host_fd).is_some_and(|s| !s.queue.is_empty())
+    crate::dispatch::net::recverr::lock()
+        .get(&host_fd)
+        .is_some_and(|s| !s.queue.is_empty())
 }
 
 /// The last observed error, consumed. Used by tests to assert the error was
@@ -310,13 +321,16 @@ pub(super) fn take_seen(host_fd: i32) -> Option<i32> {
 /// The next error-queue entry, consumed. `None` means `MSG_ERRQUEUE` answers
 /// `EAGAIN`, exactly as a drained Linux queue does.
 pub(super) fn pop(host_fd: i32) -> Option<ErrEntry> {
-    lock().get_mut(&host_fd)?.queue.pop_front()
+    crate::dispatch::net::recverr::lock()
+        .get_mut(&host_fd)?
+        .queue
+        .pop_front()
 }
 
 /// Release everything this socket owned. Host fds are reused, so a membership
 /// that outlived its socket would misroute a later unrelated one.
 pub(super) fn close(host_fd: i32) {
-    let Some(entry) = lock().remove(&host_fd) else {
+    let Some(entry) = crate::dispatch::net::recverr::lock().remove(&host_fd) else {
         return;
     };
     if let Some((shadow, _)) = entry.shadow {

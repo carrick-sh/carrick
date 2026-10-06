@@ -40,18 +40,18 @@ fn lock() -> std::sync::MutexGuard<'static, MasterMap> {
 
 /// Record a pty master as it is opened.
 pub(crate) fn register_master(index: u32, host_fd: i32, description: &Arc<FileDescription>) {
-    lock().insert(index, (host_fd, Arc::downgrade(description)));
+    crate::dispatch::pty_registry::lock().insert(index, (host_fd, Arc::downgrade(description)));
 }
 
 /// Forget a pty master as it closes. A stale entry would name a host fd the
 /// kernel has since reused.
 pub(crate) fn unregister_master(index: u32) {
-    lock().remove(&index);
+    crate::dispatch::pty_registry::lock().remove(&index);
 }
 
 /// The master end of pty `index`, if one is open.
 pub(crate) fn master(index: u32) -> Option<(i32, Arc<FileDescription>)> {
-    lock()
+    crate::dispatch::pty_registry::lock()
         .get(&index)
         .and_then(|(host_fd, weak)| weak.upgrade().map(|desc| (*host_fd, desc)))
 }

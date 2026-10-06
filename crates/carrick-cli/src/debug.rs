@@ -719,7 +719,7 @@ fn record_kernel_capture(
         Err(error) => {
             let error = error.to_string();
             let path = out_dir.join(format!("{run_id}.kernel-debug.error.txt"));
-            Ok(match fs::write(&path, format!("{error}\n")) {
+            Ok(match ::std::fs::write(&path, format!("{error}\n")) {
                 Ok(()) => KernelCapture::Error {
                     path: Some(path),
                     error,
@@ -766,7 +766,7 @@ fn record_kernel_capture(
 
 fn write_json(path: &Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
     let bytes = serde_json::to_vec_pretty(value).context("serialize kernel debug capture")?;
-    fs::write(path, bytes)
+    ::std::fs::write(path, bytes)
         .with_context(|| format!("failed to write kernel capture {}", path.display()))
 }
 
@@ -1257,7 +1257,7 @@ fn run_container_gate(
         "alpha": container_gate_outcome(&alpha_run),
         "beta": container_gate_outcome(&beta_run),
     });
-    fs::write(output, serde_json::to_vec_pretty(&receipt)?)
+    ::std::fs::write(output, serde_json::to_vec_pretty(&receipt)?)
         .with_context(|| format!("failed to write {}", output.display()))?;
     carrier
         .shutdown_wait()

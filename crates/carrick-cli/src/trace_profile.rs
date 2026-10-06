@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -401,8 +400,8 @@ pub(crate) struct ProfileProvenance {
 }
 
 pub(crate) fn capture_provenance(binary: &Path, command: &[String]) -> Result<ProfileProvenance> {
-    let binary_bytes =
-        fs::read(binary).with_context(|| format!("read traced binary {}", binary.display()))?;
+    let binary_bytes = ::std::fs::read(binary)
+        .with_context(|| format!("read traced binary {}", binary.display()))?;
     let binary_sha256 = format!("{:x}", Sha256::digest(binary_bytes));
     let git_sha = command_output("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
     let git_dirty = git_dirty();

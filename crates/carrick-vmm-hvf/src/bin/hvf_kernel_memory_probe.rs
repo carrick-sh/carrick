@@ -890,7 +890,7 @@ mod platform {
     }
 
     fn binary_provenance() -> (String, String, bool) {
-        let executable = std::env::current_exe().expect("resolve current probe binary");
+        let executable = ::std::env::current_exe().expect("resolve current probe binary");
         let executable_text = executable.to_string_lossy();
         let shasum = command_output("/usr/bin/shasum", &["-a", "256", &executable_text]);
         let sha256 = shasum
@@ -914,10 +914,10 @@ mod platform {
         // guest spin or host barrier deadlock. A timeout cannot emit GO.
         // SAFETY: alarm installs the process's standard SIGALRM deadline.
         unsafe { libc::alarm(30) };
-        let run_id = std::env::var("CARRICK_RUN_ID")
+        let run_id = ::std::env::var("CARRICK_RUN_ID")
             .expect("CARRICK_RUN_ID is required for a qualified K0 capture");
         assert!(!run_id.is_empty(), "CARRICK_RUN_ID must not be empty");
-        let source_commit = std::env::var("CARRICK_SOURCE_COMMIT")
+        let source_commit = ::std::env::var("CARRICK_SOURCE_COMMIT")
             .expect("CARRICK_SOURCE_COMMIT is required for a qualified K0 capture");
         let mut load = [0_f64; 3];
         // SAFETY: getloadavg writes at most three f64 values to a valid array.
@@ -928,7 +928,7 @@ mod platform {
             hypervisor_entitlement,
             "signed probe lacks the HVF entitlement"
         );
-        let provenance = serde_json::json!({
+        let provenance = ::serde_json::json!({
             "probe": "k0-provenance",
             "schema": "carrick.hvpatch.k0-memory.v2",
             "run_id": run_id,
@@ -944,7 +944,7 @@ mod platform {
             "macos_version": command_output("sw_vers", &["-productVersion"]),
             "macos_build": command_output("sw_vers", &["-buildVersion"]),
             "kernel": command_output("uname", &["-srvmp"]),
-            "argv": std::env::args().collect::<Vec<_>>(),
+            "argv": ::std::env::args().collect::<Vec<_>>(),
             "host_page_size": unsafe { libc::sysconf(libc::_SC_PAGESIZE) },
             "loadavg1": load[0],
             "cow_iterations": COW_ITERATIONS,
@@ -974,7 +974,7 @@ mod platform {
                         "HV_DENIED: sign this probe with scripts/entitlements.plist before trusting a negative"
                     );
                 }
-                std::process::exit(2);
+                ::std::process::exit(2);
             }
         };
 
@@ -1274,7 +1274,7 @@ fn main() {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn main() {
     eprintln!("hvf_kernel_memory_probe requires macOS arm64");
-    std::process::exit(1);
+    ::std::process::exit(1);
 }
 
 #[cfg(test)]

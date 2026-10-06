@@ -184,7 +184,7 @@ impl DebugEndpoint {
         let encoded = serde_json::to_vec(&record)
             .map_err(|error| EndpointError::UnreadableOwner(error.to_string()))?;
         let path = self.owner_record_path();
-        fs::write(&path, encoded)?;
+        ::std::fs::write(&path, encoded)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(SOCKET_MODE))?;
         Ok(())
     }
@@ -228,7 +228,7 @@ impl DebugEndpoint {
 
     fn read_owner(&self) -> Result<Option<OwnerRecord>, EndpointError> {
         let path = self.owner_record_path();
-        match fs::read(&path) {
+        match ::std::fs::read(&path) {
             Ok(bytes) => {
                 let record: OwnerRecord = serde_json::from_slice(&bytes)
                     .map_err(|error| EndpointError::UnreadableOwner(error.to_string()))?;
