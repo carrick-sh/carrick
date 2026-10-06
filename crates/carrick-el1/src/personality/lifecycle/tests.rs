@@ -1059,10 +1059,10 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
 }
 
 impl UserCopy for FaultingUser {
-    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
-        crate::file::UserCopy::copy_in(self, dst, src)
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
+        crate::file::UserCopy::copy_in(self, dst, src.raw())
     }
-    fn copy_out(&mut self, dst: u64, src: &[u8]) -> bool {
-        crate::file::UserCopy::copy_out(self, dst, src)
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
+        crate::file::UserCopy::copy_out(self, dst.raw(), src)
     }
 }

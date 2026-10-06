@@ -4,6 +4,10 @@
 //! of the runtime's production executor pool.
 use crate::cpl0_entry::{CpuBinding, NativeFrame};
 use crate::cpl0_scheduler::XsaveArea;
+#[cfg(target_os = "none")]
+use crate::cpl0_scheduler::{
+    NativeTlsRegister, read_tls, restore_extended, save_extended, write_tls,
+};
 use carrick_core_abi::EntryMmKey;
 use carrick_el1_abi::{Counters, CurrentTask, EntryRef, ThreadControlSlot, ThreadLifecyclePage};
 use carrick_guest_arch::UserVa;
@@ -155,33 +159,33 @@ impl NativeLane<'_> {
             .store(identity.generation, Ordering::Release);
         #[cfg(target_os = "none")]
         {
-            write_fs(context.fs_base);
-            write_user_gs(context.gs_base);
+            write_tls(NativeTlsRegister::Fs, context.fs_base);
+            write_tls(NativeTlsRegister::UserGs, context.gs_base);
             restore_extended(&context.xsave);
         }
         Some(carrick_core::Served::Returned { switched: true })
     }
 }
 impl UserCopy for NativeLane<'_> {
-    fn copy_in(&mut self, dst: &mut [u8], address: u64) -> bool {
-        if !self.valid_user_range(address, dst.len()) {
+    fn copy_in(&mut self, dst: &mut [u8], address: UserVa) -> bool {
+        if !self.valid_user_range(address.raw(), dst.len()) {
             return false;
         }
         // SAFETY: stopped-host provisioned user aperture, selected by this
         // exact lane/MM; the current native root retains its private backing.
         unsafe {
-            core::ptr::copy_nonoverlapping(address as *const u8, dst.as_mut_ptr(), dst.len());
+            core::ptr::copy_nonoverlapping(address.raw() as *const u8, dst.as_mut_ptr(), dst.len());
         }
         true
     }
-    fn copy_out(&mut self, address: u64, src: &[u8]) -> bool {
-        if !self.valid_user_range(address, src.len()) {
+    fn copy_out(&mut self, address: UserVa, src: &[u8]) -> bool {
+        if !self.valid_user_range(address.raw(), src.len()) {
             return false;
         }
         // SAFETY: same retained writable exact-MM aperture as copy_in; fixture
         // copy buffers are supervisor stack storage and cannot alias it.
         unsafe {
-            core::ptr::copy_nonoverlapping(src.as_ptr(), address as *mut u8, src.len());
+            core::ptr::copy_nonoverlapping(src.as_ptr(), address.raw() as *mut u8, src.len());
         }
         true
     }
@@ -239,16 +243,19 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             self.zone.free_record(record.id);
         }
     }
+    fn can_prepare_child(&self, stack: UserVa, tls: Option<UserVa>) -> bool {
+        child_context_supported(stack, tls)
+    }
     fn prepare_child(&mut self, record: RecordRef, context: ChildContext) {
         let mut frame = *self.frame;
-        frame.rax = 0;
+        frame.rax = context.result.raw() as u64;
         frame.rsp = context.stack.raw();
         #[cfg(target_os = "none")]
-        let inherited_tls = read_fs();
+        let inherited_tls = read_tls(NativeTlsRegister::Fs);
         #[cfg(not(target_os = "none"))]
         let inherited_tls = self.lane.contexts[self.current_index()].fs_base;
         #[cfg(target_os = "none")]
-        let gs_base = read_user_gs();
+        let gs_base = read_tls(NativeTlsRegister::UserGs);
         #[cfg(not(target_os = "none"))]
         let gs_base = self.lane.contexts[self.current_index()].gs_base;
         let mut xsave = XsaveArea::ZERO;
@@ -362,11 +369,11 @@ impl FutexVenue for NativeLane<'_> {
             .ok()?;
         let reference = self.zone.record_ref(record);
         #[cfg(target_os = "none")]
-        let fs_base = read_fs();
+        let fs_base = read_tls(NativeTlsRegister::Fs);
         #[cfg(not(target_os = "none"))]
         let fs_base = 0;
         #[cfg(target_os = "none")]
-        let gs_base = read_user_gs();
+        let gs_base = read_tls(NativeTlsRegister::UserGs);
         #[cfg(not(target_os = "none"))]
         let gs_base = 0;
         let mut xsave = XsaveArea::ZERO;
@@ -444,24 +451,6 @@ impl<'a> PendingFamilies<'a> for NativeLane<'a> {
         )
     }
 }
-#[cfg(target_os = "none")]
-fn read_fs() -> u64 {
-    let low: u32;
-    let high: u32;
-    // SAFETY: CPL0 reads the qualified FS_BASE MSR.
-    unsafe {
-        core::arch::asm!("rdmsr", in("ecx") 0xc0000100u32, out("eax") low, out("edx") high, options(nostack));
-    }
-    u64::from(low) | (u64::from(high) << 32)
-}
-#[cfg(target_os = "none")]
-fn write_fs(value: u64) {
-    // SAFETY: CPL0 installs the retained Linux-selected native TLS value.
-    unsafe {
-        core::arch::asm!("wrmsr", in("ecx") 0xc0000100u32, in("eax") value as u32, in("edx") (value>>32) as u32, options(nostack));
-    }
-}
-
 /// Image acquisition of bounded retained native custody; no Linux routing here.
 /// # Safety
 /// The carrier must retain initialized aligned lane, zone and metadata storage
@@ -505,36 +494,9 @@ pub unsafe fn acquire<'a>(
     })
 }
 
-#[cfg(target_os = "none")]
-fn save_extended(area: &mut XsaveArea) {
-    // SAFETY: stopped-host admission qualified XCR0=7 and the complete 832-byte
-    // standard image; XsaveArea has 64-byte alignment and exclusive native custody.
-    unsafe {
-        core::arch::asm!("xsave64 [{}]", in(reg) area.0.as_mut_ptr(), in("eax") 7u32, in("edx") 0u32, options(nostack));
-    }
-}
-#[cfg(target_os = "none")]
-fn restore_extended(area: &XsaveArea) {
-    // SAFETY: exact retained native context captured by save_extended, with the
-    // same qualified XCR0 and aligned complete image, never a foreign incarnation.
-    unsafe {
-        core::arch::asm!("xrstor64 [{}]", in(reg) area.0.as_ptr(), in("eax") 7u32, in("edx") 0u32, options(nostack));
-    }
-}
-#[cfg(target_os = "none")]
-fn read_user_gs() -> u64 {
-    let low: u32;
-    let high: u32;
-    // SAFETY: SWAPGS selected kernel GS; KERNEL_GS_BASE retains the current user GS.
-    unsafe {
-        core::arch::asm!("rdmsr", in("ecx") 0xc0000102u32, out("eax") low, out("edx") high, options(nostack));
-    }
-    u64::from(low) | (u64::from(high) << 32)
-}
-#[cfg(target_os = "none")]
-fn write_user_gs(value: u64) {
-    // SAFETY: SWAPGS return consumes this retained user base; kernel GS is untouched.
-    unsafe {
-        core::arch::asm!("wrmsr", in("ecx") 0xc0000102u32, in("eax") value as u32, in("edx") (value>>32) as u32, options(nostack));
-    }
+/// Machine return/TLS qualification only; Linux retains clone flag and errno
+/// policy. This bounded native binding uses the existing 48-bit user return
+/// convention and refuses unavailable contexts before any shared birth effect.
+pub fn child_context_supported(stack: UserVa, tls: Option<UserVa>) -> bool {
+    stack.raw() != 0 && stack.raw() < (1u64 << 47) && tls.is_none_or(|tls| tls.raw() < (1u64 << 47))
 }

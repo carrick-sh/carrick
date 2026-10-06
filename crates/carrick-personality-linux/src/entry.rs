@@ -165,10 +165,10 @@ pub fn serve(call: &CanonicalCall, venue: &dyn LinuxEntryVenue) -> EntryOutcome 
 }
 
 impl crate::lifecycle::UserCopy for CommonFamilies<'_> {
-    fn copy_in(&mut self, _: &mut [u8], _: u64) -> bool {
+    fn copy_in(&mut self, _: &mut [u8], _: UserVa) -> bool {
         false
     }
-    fn copy_out(&mut self, _: u64, _: &[u8]) -> bool {
+    fn copy_out(&mut self, _: UserVa, _: &[u8]) -> bool {
         false
     }
 }
@@ -239,5 +239,15 @@ impl<'a> crate::lifecycle::LifecycleNative<'a> for CommonFamilies<'a> {
     }
     fn set_result(&mut self, result: SyscallResult) {
         self.result = Some(result.raw());
+    }
+}
+
+/// AArch64 Linux vDSO wire identity: preserve the process half and replace
+/// the thread's visible tid only when that native vDSO binding is present.
+pub const fn aarch64_child_vdso_identity(parent: u64, visible_tid: u32) -> u64 {
+    if parent == 0 {
+        0
+    } else {
+        (parent & !0xffff_ffff) | visible_tid as u64
     }
 }
