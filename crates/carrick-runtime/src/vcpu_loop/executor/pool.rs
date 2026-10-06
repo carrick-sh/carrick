@@ -53,7 +53,13 @@ use carrick_kernel::kernel::{
 /// `CARRICK_BOUND_EXECUTORS=<n>` is the exact bisection hatch. The effective
 /// bound count must cover every scheduler CPU or pool startup fails; spares
 /// cannot supply a CPU that has no bound executor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ExecutorPoolConfig {
     /// `M`s bound to a guest CPU, round-robin. Several may share one `P`.
     pub bound_workers: usize,
@@ -63,7 +69,14 @@ pub struct ExecutorPoolConfig {
     pub reserve: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::thiserror::Error,
+)]
 pub enum ExecutorPoolConfigError {
     #[error("the backend reports zero available vCPUs")]
     ZeroVcpuCeiling,
@@ -146,7 +159,7 @@ pub fn configured_spare_executors(guest_cpus: usize) -> usize {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub enum ExecutorPoolEvent {
     Created,
     AuditPassed,
@@ -202,14 +215,14 @@ pub enum ExecutorPoolEvent {
     Joined,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub struct ExecutorPoolReceipt {
     pub sequence: u64,
     pub executor: ExecutorId,
     pub event: ExecutorPoolEvent,
 }
 
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 struct ReceiptState {
     next_sequence: u64,
     /// Bounded window of the most recent receipts. Unbounded growth turned
@@ -226,7 +239,7 @@ struct ReceiptState {
 /// Retained receipt-window capacity (see [`ReceiptState::events`]).
 const RECEIPT_WINDOW: usize = 4096;
 
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct ReceiptLog(Mutex<ReceiptState>);
 
 impl ReceiptLog {
@@ -490,14 +503,14 @@ impl ExecutorKick for WorkerKick {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) enum WorkerCommand {
     Initialize,
     Run,
     Stop,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct StartupStatus {
     pub(crate) index: usize,
     pub(crate) error: Option<String>,
@@ -505,14 +518,14 @@ pub(crate) struct StartupStatus {
     pub(crate) kick: Option<Arc<WorkerKick>>,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct WorkerOutcome {
     pub(crate) executor: Option<ExecutorId>,
     pub(crate) failure: Option<String>,
     pub(crate) retired: bool,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct WorkerHandle {
     command: mpsc::Sender<WorkerCommand>,
     join: JoinHandle<WorkerOutcome>,
@@ -520,7 +533,7 @@ struct WorkerHandle {
     kick: Option<Arc<WorkerKick>>,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct WorkerChannels {
     pub(crate) commands: mpsc::Receiver<WorkerCommand>,
     pub(crate) startup: mpsc::Sender<StartupStatus>,
@@ -534,7 +547,7 @@ pub(crate) struct WorkerRuntime<'a> {
     pub(crate) control: &'a PoolControl,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct PoolControl {
     usable_workers: std::sync::atomic::AtomicUsize,
     pub(crate) wait_service: carrick_kernel::kernel::continuation::CarrierWaitService,
@@ -890,7 +903,7 @@ where
     }
 }
 
-#[derive(Debug, ::thiserror::Error)]
+#[derive(::core::fmt::Debug, ::thiserror::Error)]
 #[error("persistent executor pool startup failed: {message}")]
 pub struct ExecutorPoolStartError {
     configured_workers: usize,
@@ -913,7 +926,7 @@ impl ExecutorPoolStartError {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct ExecutorPoolReport {
     events: Vec<ExecutorPoolReceipt>,
     created: usize,
@@ -944,7 +957,7 @@ impl ExecutorPoolReport {
     }
 }
 
-#[derive(Debug, ::thiserror::Error)]
+#[derive(::core::fmt::Debug, ::thiserror::Error)]
 #[error("persistent executor pool shutdown failed: {message}")]
 pub struct ExecutorPoolShutdownError {
     report: ExecutorPoolReport,
@@ -1377,7 +1390,7 @@ mod tests {
 /// Which slot in the pool a worker occupies: its startup-channel index and
 /// whether it is a spare `M` (no guest CPU, parks until phase 3's `handoffp`)
 /// rather than one guest CPU's own executor.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) struct WorkerSlot {
     pub(crate) index: usize,
     pub(crate) is_spare: bool,

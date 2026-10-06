@@ -213,7 +213,7 @@ pub(crate) fn prepare_initial_carrier_before_admission<T, U>(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) enum SetupVcpuCleanup {
     /// The pending VM-creation transaction destroys the recorded vCPU with its
     /// VM on rollback.
@@ -326,7 +326,13 @@ pub(crate) use carrick_core::mm::retirement::{
 };
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub(crate) enum CarrierVmCustodyError {
     LifecycleConflict,
@@ -335,7 +341,13 @@ pub(crate) enum CarrierVmCustodyError {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub(crate) enum CarrierVmLifecycle {
     Vacant,
@@ -345,7 +357,7 @@ pub(crate) enum CarrierVmLifecycle {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub(crate) struct CarrierVmCustodyState {
     pub(crate) next_generation: u64,
@@ -392,7 +404,7 @@ impl CarrierVmCustodyState {
 /// the exact generation; a successful destroy must be committed before a later
 /// generation can begin creation.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 #[allow(dead_code)] // exercised by the lifecycle tests; wired into VM calls in the next slice
 pub(crate) struct CarrierVmCustody {
     pub(crate) transfer_carrier: core::num::NonZeroU64,
@@ -562,7 +574,7 @@ impl CarrierVmCustody {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Default)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::default::Default)]
 pub(crate) enum CarrierFramePoolState {
     #[default]
     Uninitialized,
@@ -571,7 +583,7 @@ pub(crate) enum CarrierFramePoolState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Default)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::default::Default)]
 pub(crate) enum CarrierRootSlotPoolState {
     #[default]
     Uninitialized,
@@ -1380,7 +1392,7 @@ impl CarrierVmCustody {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct CarrierPinVenue(std::sync::Arc<CarrierVmCustody>);
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl carrick_core::mm::retirement::RecordPinVenue for CarrierPinVenue {
@@ -1488,7 +1500,7 @@ pub(crate) fn destroy_vm_with_custody(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) enum CarrierVmDestroyTarget {
     Live,
     Creating(CarrierVmGeneration),

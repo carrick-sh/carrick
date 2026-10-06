@@ -297,7 +297,13 @@ fn resolve_affinity_thread<M: CurrentMmMemory>(
 
 /// Classification of a sched_*/priority `pid` argument relative to the caller,
 /// resolved against carrick's guest process model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(super) enum SchedTarget {
     /// 0, the caller's own pid/alias, or one of its live sibling thread tids —
     /// operate on the calling process.
@@ -456,7 +462,7 @@ fn sched_read_param_priority<M: CurrentMmMemory>(
 }
 
 /// Owned process-subsystem state. Split out of `SyscallDispatcher`.
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub(super) struct ProcState {
     /// Path of the currently-running executable, surfaced via
     /// `/proc/self/exe`, `/proc/self/cmdline`, `/proc/self/comm`, etc.
@@ -611,7 +617,7 @@ pub(super) fn affinity_from_bytes(bytes: &[u8], words: usize) -> Vec<u64> {
 /// Armed interval timer. `value`/`interval` are the configured initial
 /// expiration and reload period; `set_at` anchors `value` to the monotonic
 /// clock so the remaining time is `value - set_at.elapsed()` (saturating).
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(super) struct ItimerState {
     pub set_at: std::time::Instant,
     pub value: std::time::Duration,
@@ -4389,7 +4395,7 @@ fn ptrace_foreign_mm_errno(error: &crate::kernel::MmAccessError) -> LinuxErrno {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 enum PtracePokeFailure {
     Mutation(crate::kernel::MmAccessError),
     Witness(LinuxErrno),

@@ -60,7 +60,7 @@ impl<T> OwnedProcessBirthTemplate<T> {
 }
 
 /// EL0 state comes from the born record; MM/system state belongs to its process.
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 struct ProcessThreadCpuTemplate {
     owner: TaskKey,
     graph: Weak<carrick_kernel::kernel::Kernel>,
@@ -208,7 +208,7 @@ pub(super) struct AdoptedThreadRuntime<E: ThreadedEngine> {
     birth_admission: Option<super::CloneAdmissionPermit>,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(super) enum ThreadRuntimeAdoptionError {
     /// Exec/exit already owns the born thread's kernel-row retirement.
     TerminalOwner,

@@ -200,7 +200,7 @@ pub use user_transfer::UserTransferCustody;
 
 /// One carrier accounting lifetime. Holding the token prevents identity reuse.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct El1FrameGrantScope(std::sync::Arc<()>);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -214,7 +214,15 @@ impl Eq for El1FrameGrantScope {}
 
 /// Exact kernel MM generation used by the EL1 frame-grant request.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialOrd,
+)]
 pub struct El1FrameGrantMm(std::num::NonZeroU64);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -231,7 +239,13 @@ impl El1FrameGrantMm {
 /// absent authority or counter overflow. A logical return does not imply that
 /// the IPA or host storage was released; those have separate counters.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct El1FrameGrantStats {
     pub scope: Option<El1FrameGrantScope>,
     pub mm: Option<El1FrameGrantMm>,
@@ -516,7 +530,14 @@ const GUEST_STAGE1_PAGE_SIZE: u64 = 0x1000;
 #[cfg(test)]
 const AARCH64_EXCEPTION_CLASS_SHIFT: u64 = 26;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::serde::Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum TrapBackend {
     HypervisorFramework,
@@ -549,7 +570,14 @@ pub(crate) mod foreign_mm_tests {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod task_only_carrier_directory_tests;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::serde::Serialize,
+)]
 pub struct TrapCapabilities {
     pub backend: TrapBackend,
     pub available_on_this_host: bool,
@@ -650,7 +678,7 @@ pub(crate) fn rebuilt_vm_cell() -> &'static parking_lot::Mutex<Option<SharedVm>>
 /// `from_persistent_executor_spec` does, so a VM rebuilt after publication
 /// supersedes the bundle's handle.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub(crate) enum PersistentCarrierCellEntry {
     Published(PersistentExecutorSpec),
     CreateCleanup {
@@ -729,7 +757,13 @@ pub fn carrier_vm_live() -> bool {
 /// aperture / MAP_SHARED-file behavior whose IPA is VM-global.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(dead_code)] // Stage-2 mapping is compiled out by the host-test support feature.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum GuestMappingSharing {
     Private,
     ForkSharedAnonymous,
@@ -786,7 +820,17 @@ impl GuestMappingSharing {
 /// stage-1 page table root slot allocations. It identifies container instance
 /// scope in the VMM layer; it is not a guest PID or a security boundary.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialOrd,
+    ::core::hash::Hash,
+)]
 pub struct ContainerRootToken(u64);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -817,7 +861,17 @@ impl ContainerRootToken {
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialOrd,
+    ::core::hash::Hash,
+)]
 pub struct ContainerRootToken(u64);
 
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
@@ -945,7 +999,14 @@ pub(crate) static VCPU_CREATED_TOTAL: std::sync::atomic::AtomicU64 =
 static VCPU_DESTROYED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Process-lifetime vCPU create and destroy counts for this carrier.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct VcpuLifecycleTotals {
     pub created: u64,
     pub destroyed: u64,
@@ -1481,7 +1542,7 @@ pub(crate) struct HvfVmState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub(crate) struct ForkAliasSnapshot {
     pub(crate) revision: u64,
     pub(crate) mm_root_slot: Option<(u64, u64)>,
@@ -1630,7 +1691,7 @@ pub(crate) fn swap_hvpatch_task_state(live: &mut HvfTaskState, parked: &mut HvfT
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Copy, Clone)]
+#[derive(::core::marker::Copy, ::core::clone::Clone)]
 pub(crate) struct HvfPageTableResolver<'a> {
     task: &'a HvfTaskState,
     manager_base: u64,
@@ -2431,7 +2492,7 @@ pub(crate) fn replace_destroyed_vm(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct HvfMappedRegion {
     /// Guest VIRTUAL start (the syscall-path lookup key). Differs from `ipa`
     /// only for the Rosetta high-VA alias.
@@ -2529,7 +2590,7 @@ impl HvfMappedRegion {
 /// base and `host_addr` to its backing base — identical offset math to a real
 /// region.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) struct MappingView {
     start: u64,
     end: u64,
@@ -2553,7 +2614,7 @@ pub(crate) struct MappingView {
 /// root) / ACTLR_EL1 (Rosetta EnTSO) / TPIDR*_EL0 (musl TLS, vDSO/rseq) capture
 /// rationales are documented on the neutral fields.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone)]
 pub(crate) struct VcpuSnapshot {
     /// The ISA-neutral architectural register file (GPRs, EL1 sysregs, V-regs, FP
     /// control) shared with the engine and the KVM lane.
@@ -2569,7 +2630,7 @@ pub(crate) struct VcpuSnapshot {
 /// stage-1 editor, mapping descriptor, frame inventory, or COW authority can be
 /// retained by the factory or copied into an idle worker.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub(crate) struct PersistentExecutorSpec {
     vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     /// VM-global Carrick control mappings needed before any task projection is
@@ -2668,7 +2729,7 @@ impl ProcessMappingHost {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 struct ProcessInventoryDesc {
     pub(crate) gpa: u64,
     pub(crate) length: u64,
@@ -2849,7 +2910,7 @@ fn inherited_fork_inventory_extents_indexed(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) struct PendingForkFrameReceipt {
     pub(crate) transaction: carrick_hal::KernelTransactionId,
     pub(crate) kind: carrick_observability::probes::HvpatchForkFrameKind,
@@ -2890,7 +2951,13 @@ impl carrick_core::mm::retirement::PendingRetirementReference for PendingForkFra
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct PendingFrameCowPublication {
     va: u64,
     len: usize,
@@ -3180,7 +3247,7 @@ impl ProcessSpec {
 
 /// Carrier service handles, with no vCPU, mailbox claim or pthread identity.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub(crate) struct HvpatchThreadServices {
     vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     mailbox_slots: std::sync::Arc<MailboxSlotAllocator>,
@@ -3340,7 +3407,15 @@ impl Drop for HvpatchTaskOnlyBackendState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 pub struct HvpatchCarrierTaskIdentity {
     pub task_serial: u64,
     pub thread_serial: u64,
@@ -3354,7 +3429,15 @@ pub struct HvpatchCarrierTaskIdentity {
 pub use carrick_hal::HvpatchChildKernelToken as HvpatchChildKernelBinding;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 pub(crate) struct HvpatchCarrierTaskStateKey {
     directory_instance: std::num::NonZeroU64,
     task_serial: u64,
@@ -3410,7 +3493,13 @@ enum HvpatchCarrierMmAuthority {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 struct CarrierStage2LogicalLease {
     key: (u64, u64),
     logical_owner: Option<CarrierLogicalOwner>,
@@ -3538,7 +3627,15 @@ fn rollback_failed_directory_publication(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 pub(crate) struct HvpatchMmAuthorityKey {
     task_serial: u64,
     mm_root_slot: Option<(u64, u64)>,
@@ -3557,7 +3654,13 @@ pub(crate) struct HvpatchMmAuthorityKey {
 /// heap frames under a running process whenever a fork was abandoned after
 /// `prepare` (the go `os/exec` crash after a load-induced `fork(2) = EAGAIN`).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 enum GlobalFrameOwnerRole {
     /// Not a reusable global frame, or its owner row belongs to another
     /// authority. Unwinding this task must leave the row alone.
@@ -3623,7 +3726,7 @@ impl HvpatchTaskMappingState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Default)]
+#[derive(::core::default::Default)]
 #[allow(dead_code)] // retained task authority; worker-side load consumes these fields
 struct HvpatchPreparedTaskAuthority {
     custody: Option<std::sync::Arc<CarrierVmCustody>>,
@@ -3658,7 +3761,7 @@ struct HvpatchPreparedTaskAuthority {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Default)]
+#[derive(::core::default::Default)]
 #[allow(dead_code)] // publication/activation is consumed by the next runtime wiring slice
 enum HvpatchTaskInventoryAuthority {
     #[default]
@@ -4095,7 +4198,13 @@ impl HvpatchTaskInventoryAuthority {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum HvpatchTaskMmHolder {
     Registration,
     RegistrationDrop,
@@ -4444,20 +4553,28 @@ fn abort_prepared_task_and_carrier(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Default)]
+#[derive(::core::default::Default)]
 struct AliasPublicationReceipt {
     versions: Vec<(AliasOwnershipScope, AliasPublicationVersionId)>,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 pub(crate) struct AliasPublicationVersionId {
     pub(crate) owner: HvpatchCarrierTaskStateKey,
     pub(crate) ordinal: u32,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct OwnedAliasVersion {
     pub(crate) id: AliasPublicationVersionId,
     pub(crate) value: AliasBacking,
@@ -4465,7 +4582,7 @@ pub(crate) struct OwnedAliasVersion {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct AliasVersionChain {
     // The `(start, ipa, scope)` tuple is the map key; it is deliberately not
     // duplicated into the value, so the key and the row can never disagree.
@@ -4482,7 +4599,7 @@ pub(crate) fn alias_version_key(alias: &AliasBacking) -> AliasVersionKey {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct OwnedReplayVersion {
     pub(crate) id: AliasPublicationVersionId,
     pub(crate) value: ReplayMappingKey,
@@ -4490,7 +4607,7 @@ pub(crate) struct OwnedReplayVersion {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct ReplayVersionChain {
     // `physical_ipa` is the map key; see `AliasVersionChain`.
     pub(crate) base: Vec<ReplayMappingKey>,
@@ -4499,7 +4616,13 @@ pub(crate) struct ReplayVersionChain {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 /// Per-scope alias/replay version state, keyed on every axis it is looked up by.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct AliasVersionRegistry {
     pub(crate) aliases: std::collections::BTreeMap<AliasVersionKey, AliasVersionChain>,
     pub(crate) replays: std::collections::BTreeMap<u64, ReplayVersionChain>,
@@ -4513,7 +4636,13 @@ pub(crate) struct AliasVersionRegistry {
 /// Hot paths whose cost must be a function of the operation, not of the
 /// carrier. Each variant owns one per-thread visited-row counter.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum HotPathScan {
     /// Linear passes over the carrier-global alias registry, replay set and
     /// alias version chains.
@@ -5391,7 +5520,7 @@ pub struct HvpatchCarrierTaskStateDirectory {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Default)]
+#[derive(::core::default::Default)]
 struct HvpatchCarrierTaskDirectoryInner {
     states: std::collections::BTreeMap<HvpatchCarrierTaskStateKey, HvpatchCarrierTaskRow>,
     carrier_mms: std::collections::BTreeMap<
@@ -8400,7 +8529,14 @@ impl VcpuTrapContext for applevisor::prelude::Vcpu {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct SyscallTransportOverhead {
     pub register_reads: u32,
     pub sysreg_reads: u32,
@@ -8415,7 +8551,7 @@ impl SyscallTransportOverhead {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) enum HvcExitOutcome {
     Syscall(carrick_aarch64::Aarch64Exit),
     Maintenance,

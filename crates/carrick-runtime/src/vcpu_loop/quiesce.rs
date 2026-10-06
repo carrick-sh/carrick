@@ -291,7 +291,7 @@ fn try_begin_hvpatch_process_fork_with_admission(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(super) struct ForkRequest {
     pub(super) flags: u64,
     pub(super) pidfd_out: Option<u64>,

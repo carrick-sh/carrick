@@ -315,7 +315,13 @@ pub(crate) struct GlobalExecPlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct ExecStage2Install {
     pub(crate) ipa: u64,
     pub(crate) size: usize,
@@ -328,7 +334,13 @@ pub(crate) struct ExecStage2Install {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct ExecLeaseFingerprint {
     pub(crate) base: u64,
     pub(crate) length: u64,
@@ -351,7 +363,7 @@ impl From<&GlobalFrameStage2Lease> for ExecLeaseFingerprint {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct ExecOwnerFingerprint {
     pub(crate) key: (u64, u64),
     pub(crate) host: usize,
@@ -361,7 +373,13 @@ pub(crate) struct ExecOwnerFingerprint {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct ExecBackendExtentFingerprint {
     pub(crate) key: (u64, u64),
     pub(crate) frame: carrick_hal::FrameId,
@@ -372,7 +390,7 @@ pub(crate) struct ExecBackendExtentFingerprint {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct ExecMappingFingerprint {
     pub(crate) start: u64,
     pub(crate) ipa: u64,
@@ -393,7 +411,7 @@ pub(crate) struct ExecMappingFingerprint {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct ExecAllocatorFingerprint {
     pub(crate) next: u64,
     pub(crate) free: Vec<(u64, u64)>,
@@ -401,7 +419,7 @@ pub(crate) struct ExecAllocatorFingerprint {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) struct ExecAuthorityFingerprint {
     pub(crate) owners: Vec<ExecOwnerFingerprint>,
     pub(crate) inventory_initialized: bool,

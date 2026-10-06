@@ -167,7 +167,13 @@ pub(crate) enum HvpatchContinuationInput {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct DeferredResumeBlocked {
     frame: carrick_hal::RawSyscall,
     vfork_child_pid: Option<i32>,
@@ -457,7 +463,13 @@ pub(crate) enum PersistentTerminal {
     Error(RuntimeError),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum PersistentTerminalRuntimeState {
     Resident,
     Withdrawn,
@@ -5851,7 +5863,7 @@ pub(crate) fn trap_watchdog_wall_window() -> std::time::Duration {
 }
 
 /// One progress-aware trap-watchdog checkpoint decision.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub(crate) enum TrapWatchdog {
     /// Under the count pre-filter — keep running (the cheap hot-path case).
     KeepRunning,
