@@ -582,6 +582,13 @@ fn grant_fixture<B: carrick_mmu_core::owner_mmu::OwnerGrantMmu>(
 }
 
 #[test]
+fn x1_full_size_owner_grant() {
+    let pages = (carrick_core_abi::EL1_FRAME_GRANT_TARGET_SIZE / 4096) as usize;
+    assert_eq!(pages, 512);
+    grant_fixture(pages, true, carrick_mmu_core::x86::owner_mmu::X86Mmu);
+}
+
+#[test]
 fn x3_shared_protocol() {
     retirement_fixture(12);
     retirement_fixture(14);

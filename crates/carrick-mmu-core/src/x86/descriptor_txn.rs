@@ -121,9 +121,10 @@ impl Default for PlanEntries {
 }
 
 impl PlanEntries {
-    /// One leaf per supported 256-page grant plus the three hierarchy links.
-    /// This custody is stack-owned in CPL0; larger host-only plans may spill.
-    pub const INLINE_CAPACITY: usize = 259;
+    /// One 4 KiB leaf per 2 MiB owner grant, plus both hierarchy paths if
+    /// the span crosses a table boundary. CPL0 retains this on its stack.
+    /// Larger host-only descriptor plans may spill.
+    pub const INLINE_CAPACITY: usize = 512 + 2 * 3;
 
     #[must_use]
     pub const fn new() -> Self {
@@ -281,10 +282,55 @@ pub struct DescriptorPlan {
     span: PageSpan,
 }
 impl DescriptorPlan {
+    fn empty(txn: &DescriptorTxn<'_>) -> Self {
+        Self {
+            entries: PlanEntries::new(),
+            tables_linked: 0,
+            words_read: 0,
+            overlay_comparisons: 0,
+            id: txn.id,
+            digest: txn.digest(),
+            span: txn.op.span(),
+        }
+    }
     pub fn live_stores(&self) -> usize {
         self.entries.len()
     }
+
+    /// Apply using the retained plan as rollback storage. A prefix cursor owns
+    /// the successfully published stores; no second copy of the bounded plan
+    /// is needed on the CPL0 stack. Uses the same transaction/undo body.
+    pub fn apply_retained<W: LiveDescriptorWords + ?Sized>(&self, words: &W) -> DescriptorReceipt {
+        let mut journal = PlanJournal {
+            entries: &self.entries,
+            applied: 0,
+        };
+        apply_descriptor_plan(words, self, &mut journal)
+    }
 }
+struct PlanJournal<'a> {
+    entries: &'a [JournalEntry],
+    applied: usize,
+}
+impl DescriptorJournal for PlanJournal<'_> {
+    fn reserve(&mut self, count: usize) -> bool {
+        self.applied == 0 && count <= self.entries.len()
+    }
+    fn push(&mut self, entry: JournalEntry) -> bool {
+        if self.entries.get(self.applied) != Some(&entry) {
+            return false;
+        }
+        self.applied += 1;
+        true
+    }
+    fn entries(&self) -> &[JournalEntry] {
+        &self.entries[..self.applied]
+    }
+    fn clear(&mut self) {
+        self.applied = 0;
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorOutcome {
     Applied { stores: usize, tables_linked: usize },
@@ -308,6 +354,20 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
     txn: &DescriptorTxn<'_>,
     live_root: RootGpa,
 ) -> Result<DescriptorPlan, DescriptorRefusal> {
+    let mut plan = DescriptorPlan::empty(txn);
+    fill_descriptor_plan(words, txn, live_root, &mut plan)?;
+    Ok(plan)
+}
+
+// Fill the caller's retained plan directly. Moving several inline plans through
+// intermediate Result/Planner values exhausts the bounded CPL0 stack even
+// though no heap allocation occurs.
+fn fill_descriptor_plan<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    txn: &DescriptorTxn<'_>,
+    live_root: RootGpa,
+    plan: &mut DescriptorPlan,
+) -> Result<(), DescriptorRefusal> {
     if txn.root != live_root {
         return Err(DescriptorRefusal::StaleRoot);
     }
@@ -321,7 +381,7 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
     let mut editor = Planner {
         words,
         txn,
-        entries: PlanEntries::new(),
+        entries: &mut plan.entries,
         overlay: OverlayIndex::new(),
         used: 0,
         reads: 0,
@@ -379,15 +439,10 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
             size.level(),
         )?;
     }
-    Ok(DescriptorPlan {
-        entries: editor.entries,
-        tables_linked: editor.used,
-        words_read: editor.reads,
-        overlay_comparisons: editor.overlay_comparisons,
-        id: txn.id,
-        digest: txn.digest(),
-        span,
-    })
+    plan.tables_linked = editor.used;
+    plan.words_read = editor.reads;
+    plan.overlay_comparisons = editor.overlay_comparisons;
+    Ok(())
 }
 
 fn valid_pa(pa: u64) -> bool {
@@ -494,7 +549,7 @@ pub fn arm_cow_terminal(entry: u64) -> Result<u64, DescriptorRefusal> {
 struct Planner<'a, 't, W: LiveDescriptorWords + ?Sized> {
     words: &'a W,
     txn: &'a DescriptorTxn<'t>,
-    entries: PlanEntries,
+    entries: &'a mut PlanEntries,
     overlay: OverlayIndex,
     used: usize,
     reads: usize,
@@ -504,7 +559,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
     fn read(&mut self, pa: u64) -> Result<u64, DescriptorRefusal> {
         if let Some(index) = self
             .overlay
-            .find(&self.entries, pa, &mut self.overlay_comparisons)
+            .find(self.entries, pa, &mut self.overlay_comparisons)
         {
             return Ok(self.entries[index].after);
         }
@@ -524,7 +579,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             bbm_len: 0,
         })?;
         self.overlay.insert(
-            &self.entries,
+            self.entries,
             pa,
             self.entries.len() - 1,
             &mut self.overlay_comparisons,
@@ -885,6 +940,24 @@ pub fn apply_descriptor_plan<W: LiveDescriptorWords + ?Sized, J: DescriptorJourn
         outcome,
     }
 }
+/// Execute with one retained planning/rollback buffer, without moving a
+/// large plan through a Result or allocating a second live-store journal.
+pub fn execute_retained_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    txn: &DescriptorTxn<'_>,
+    live_root: RootGpa,
+) -> DescriptorReceipt {
+    let mut plan = DescriptorPlan::empty(txn);
+    match fill_descriptor_plan(words, txn, live_root, &mut plan) {
+        Ok(()) => plan.apply_retained(words),
+        Err(reason) => DescriptorReceipt {
+            id: txn.id,
+            digest: txn.digest(),
+            outcome: DescriptorOutcome::Refused(reason),
+        },
+    }
+}
+
 pub fn execute_descriptor_txn<W: LiveDescriptorWords + ?Sized, J: DescriptorJournal + ?Sized>(
     words: &W,
     txn: &DescriptorTxn<'_>,

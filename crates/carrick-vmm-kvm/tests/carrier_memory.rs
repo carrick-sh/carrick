@@ -186,9 +186,9 @@ fn cpl0_image() -> std::path::PathBuf {
 
 fn cpl3_grant_program(data_va: u64) -> Vec<u8> {
     let mut code = Vec::new();
-    // One unbound refusal followed by the 16/64/256-page owner grants. Each
+    // One unbound refusal followed by the 16/64/256/512-page owner grants. Each
     // control boundary lets the host publish only the next authenticated slot.
-    for _ in 0..4 {
+    for _ in 0..5 {
         code.extend_from_slice(&[0x48, 0x31, 0xff]);
         code.extend_from_slice(&[0x48, 0xb8]);
         code.extend_from_slice(&carrick_el1_abi::MM_PORTAL_GRANT_ESR.to_le_bytes());
@@ -305,6 +305,10 @@ fn x1_shared_mm_owner() {
         .write_guest_bytes(0x70_1000, &0u64.to_le_bytes())
         .unwrap();
 
+    carrier
+        .write_guest_bytes(0x70_0000 + 8, &(0x70_2000u64 | 7).to_le_bytes())
+        .unwrap();
+
     // MM12: PD at 0x71_0000, PT at 0x71_1000.
     carrier
         .write_guest_bytes(0x68_1000 + 8, &(0x71_0000u64 | 7).to_le_bytes())
@@ -318,7 +322,7 @@ fn x1_shared_mm_owner() {
 
     // 2. Put physical backing page at GPA 0x80_0000 with byte 0x5a
     carrier
-        .write_guest_bytes(0x80_0000, &[0x5a; 336 * 4096])
+        .write_guest_bytes(0x80_0000, &[0x5a; 1024 * 4096])
         .unwrap();
 
     // 3. Publish and admit anonymous memory for MM11 and MM12 at DATA_VA
@@ -353,7 +357,7 @@ fn x1_shared_mm_owner() {
     let access1 = carrick_x86::cpl0_mmu::X86OwnerVenue::space_access(zone, SlotId::new(0));
     let mut g1 = table.lock_in(access1, idx1, r_mm11, 0).unwrap();
     g1.import(
-        ReservationRange::new(DATA_VA, DATA_VA + 336 * 4096).unwrap(),
+        ReservationRange::new(DATA_VA, DATA_VA + 1024 * 4096).unwrap(),
         ReservationProtection::READ_WRITE,
         true,
     )
@@ -428,10 +432,16 @@ fn x1_shared_mm_owner() {
         };
         (txn, window)
     };
-    let [(txn, window), (txn64, window64), (txn256, window256)] = [
+    let [
+        (txn, window),
+        (txn64, window64),
+        (txn256, window256),
+        (txn512, window512),
+    ] = [
         make_grant(0, 16, 1),
         make_grant(16, 64, 2),
         make_grant(80, 256, 3),
+        make_grant(512, 512, 4),
     ];
 
     // Case 1: missing carrier authority refuses without consuming the grant.
@@ -494,7 +504,11 @@ fn x1_shared_mm_owner() {
         "served grant must have zero semantic host forwards"
     );
 
-    for (pages, next_window, next_txn) in [(64, window64, txn64), (256, window256, txn256)] {
+    for (pages, next_window, next_txn) in [
+        (64, window64, txn64),
+        (256, window256, txn256),
+        (512, window512, txn512),
+    ] {
         assert!(grant_slot.submit(next_window, &next_txn));
         let observation = carrier.observe(0).expect("observe scaled grant");
         assert_eq!(observation.result, 0, "{pages}-page CPL0 grant failed");
@@ -506,7 +520,7 @@ fn x1_shared_mm_owner() {
         );
     }
 
-    // Case 3: Read hardware bytes at DATA_VA after all three grant scales.
+    // Case 3: Read hardware bytes at DATA_VA after all four grant scales.
     let obs3 = carrier.observe(0).expect("observe hardware read");
     assert_eq!(
         obs3.result, 0x5a,

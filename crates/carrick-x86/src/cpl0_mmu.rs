@@ -16,6 +16,13 @@ use carrick_personality_linux::mm::LinuxReservationPolicy;
 use carrick_sched_core::ZoneTables;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+// A larger production grant must also enlarge the allocation-free hardware
+// adapter storage; the witness requests this exact core ceiling.
+const _: () = assert!(
+    carrick_mmu_core::x86::descriptor_txn::PlanEntries::INLINE_CAPACITY
+        >= (carrick_core_abi::EL1_FRAME_GRANT_TARGET_SIZE / 4096) as usize + 6
+);
+
 pub const PROGRESS_RESERVATIONS: u64 = 0x160_0000;
 pub const PROGRESS_RESIDENCY: u64 = 0x170_0000;
 pub const PROGRESS_PORTAL: u64 = 0x180_0000;
