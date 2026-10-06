@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 carrick-core = { path = "../carrick-core" }
 carrick-core-abi = { path = "../carrick-core-abi" }
+carrick-guest-arch = { path = "../carrick-guest-arch" }
 
 [lints]
 workspace = true
