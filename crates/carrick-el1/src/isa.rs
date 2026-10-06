@@ -24,10 +24,16 @@ impl carrick_guest_arch::LayoutBackend for aarch64::Aarch64Backend {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl carrick_guest_arch::LayoutBackend for x86::X86Backend {
-    const KERNEL_LAYOUT: carrick_guest_arch::KernelLayout = carrick_guest_arch::KernelLayout {
+    const KERNEL_LAYOUT: carrick_guest_arch::KernelLayout = x86_kernel_layout();
+}
+
+/// The host mapping and CPL0 scheduler use this same typed x86 layout.
+/// The zone is a separate metadata aperture, not part of the kernel region.
+pub const fn x86_kernel_layout() -> carrick_guest_arch::KernelLayout {
+    carrick_guest_arch::KernelLayout {
         region: carrick_guest_arch::KernelVa::new(carrick_el1_abi::X86_CPL0_REGION_BASE),
         zone: carrick_guest_arch::KernelVa::new(
-            carrick_el1_abi::X86_CPL0_REGION_BASE + carrick_el1_abi::EL1_ZONE_OFFSET,
+            carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
         ),
         portal: carrick_guest_arch::KernelVa::new(
             carrick_el1_abi::X86_CPL0_REGION_BASE + carrick_el1_abi::EL1_MM_PORTAL_OFFSET,
@@ -35,7 +41,23 @@ impl carrick_guest_arch::LayoutBackend for x86::X86Backend {
         dynamic_metadata: carrick_guest_arch::KernelVa::new(
             carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE,
         ),
-    };
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    #[test]
+    fn x86_zone_uses_the_published_metadata_aperture() {
+        let layout = super::x86_kernel_layout();
+        assert_eq!(
+            layout.zone.raw(),
+            layout.dynamic_metadata.raw() + carrick_el1_abi::X86_CPL0_ZONE_OFFSET
+        );
+        assert_ne!(
+            layout.zone.raw(),
+            layout.region.raw() + carrick_el1_abi::EL1_ZONE_OFFSET
+        );
+    }
 }
 
 /// ISA-neutral descriptor intents lowered to the existing ARM transaction ABI.
