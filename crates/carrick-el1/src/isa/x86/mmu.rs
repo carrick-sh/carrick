@@ -20,6 +20,41 @@ const KERNEL_CANONICAL_BASE: u64 = 0xffff_8000_0000_0000;
 const CR4_PGE: u64 = 1 << 7;
 const CR4_PCIDE: u64 = 1 << 17;
 const LOCAL_PAGE_BUDGET: u64 = 32;
+// Initial MM roots inherit the one upper-half supervisor branch. Its table
+// pages stay retained beside the active MM's private user table arena.
+static SHARED_SUPERVISOR_ROOT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "none")]
+pub(super) fn register_shared_supervisor_tables<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    source: RootGpa,
+) -> Result<(), ArchError> {
+    let root = source.address().raw();
+    if root == 0 || root & 4095 != 0 {
+        return Err(ArchError::Unbound);
+    }
+    match SHARED_SUPERVISOR_ROOT.compare_exchange(0, root, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Ok(()),
+        Err(existing) if existing == root => Ok(()),
+        Err(existing) => {
+            // A later exec may start from a fork child. It is still allowed
+            // only when its whole upper root branch names the original
+            // retained supervisor tables, never a second table alias.
+            for index in 256..512_u64 {
+                let old = words
+                    .load(existing + index * 8)
+                    .map_err(|_| ArchError::Unbound)?;
+                let new = words
+                    .load(root + index * 8)
+                    .map_err(|_| ArchError::Unbound)?;
+                if old != new {
+                    return Err(ArchError::Unbound);
+                }
+            }
+            Ok(())
+        }
+    }
+}
 
 /// A pending local drain bound to the root that issued it.
 pub struct DrainTicket {
@@ -245,6 +280,8 @@ pub(crate) struct NativeDescriptorWords {
     base: u64,
     end: u64,
     mapped: u64,
+    shared_base: u64,
+    shared_end: u64,
     failed_drain: Cell<bool>,
 }
 
@@ -265,6 +302,14 @@ impl NativeDescriptorWords {
             return Err(ArchError::Unbound);
         }
         let end = base.checked_add(bytes).ok_or(ArchError::Unbound)?;
+        let shared_base = SHARED_SUPERVISOR_ROOT.load(Ordering::Acquire);
+        let shared_end = if shared_base == 0 {
+            0
+        } else {
+            shared_base
+                .checked_add(carrick_el1_abi::X86_CPL0_TABLE_ARENA_BYTES)
+                .ok_or(ArchError::Unbound)?
+        };
         Ok(Self {
             context: AddressContext {
                 root,
@@ -274,6 +319,8 @@ impl NativeDescriptorWords {
             base,
             end,
             mapped: tables.mapped().raw(),
+            shared_base,
+            shared_end,
             failed_drain: Cell::new(false),
         })
     }
@@ -291,11 +338,30 @@ impl NativeDescriptorWords {
         // writable supervisor alias of the aligned arena throughout the edit.
         Ok(unsafe { &*(address as *const AtomicU64) })
     }
+
+    fn read_word(&self, pa: u64) -> Result<&AtomicU64, DescriptorRefusal> {
+        if pa >= self.base && pa.checked_add(8).is_some_and(|end| end <= self.end) {
+            return self.word(pa);
+        }
+        if pa & 7 != 0
+            || self.shared_base == 0
+            || pa < self.shared_base
+            || pa.checked_add(8).is_none_or(|end| end > self.shared_end)
+        {
+            return Err(DescriptorRefusal::TableOutsidePrimary);
+        }
+        let address = carrick_el1_abi::X86_CPL0_DIRECT_VA
+            .checked_add(pa)
+            .ok_or(DescriptorRefusal::TableOutsidePrimary)?;
+        // SAFETY: initial MM publication retained this one supervisor branch
+        // for every descended root. It is read-only here; writes use word().
+        Ok(unsafe { &*(address as *const AtomicU64) })
+    }
 }
 
 impl LiveDescriptorWords for NativeDescriptorWords {
     fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
-        Ok(self.word(pa)?.load(Ordering::Acquire))
+        Ok(self.read_word(pa)?.load(Ordering::Acquire))
     }
 
     fn compare_exchange(&self, pa: u64, current: u64, new: u64) -> Result<bool, DescriptorRefusal> {
