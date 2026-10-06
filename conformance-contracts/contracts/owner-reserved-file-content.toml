@@ -37,10 +37,18 @@ reference counts.
 Its positive path is fresh exclusive backing; live guest COW publication and
 signed closure remain required. No registered WorkObservation, runtime ratio
 or signed acceptance is inferred from these local witnesses.
+
+A lazy MAP_FIXED replacement retires the old exact-range first-touch recipe
+after the root admits and replaces its old nodes, before retaining the new
+file recipe. The production deferred-state witness reads the new file offset
+and both untouched fragments, forbids eager content copies, and checks that
+MAP_FIXED_NOREPLACE returns errno 17 without changing the retained recipe.
+Placement and growth collision checks observe all committed owner rows,
+including private file rows removed from the host projection.
 """
 
 [bindings]
-vm_free = "carrick-kernel::dispatch::mem::delegated_tests::delegated_fixed_file_map_reuses_a_retired_el1_reservation; carrick-runtime::runtime::tests::split_loop_preserves_reserved_file_content_writes; carrick-runtime::runtime::tests::split_loop_keeps_reserved_file_backing_and_protection_venue; carrick-vmm-hvf::trap::foreign_mm::tests::native_reserved_file_content_uses_owner_cow_and_copy_admission; carrick-vmm-hvf::trap::foreign_mm::tests::native_reserved_initial_root_uses_bound_root_without_a_pool_slot; carrick-vmm-hvf::trap::foreign_mm::tests::native_reserved_mutable_file_mapping_keeps_clean_page_cache_and_guest_receipt"
+vm_free = "carrick-kernel::dispatch::mem::delegated_tests::delegated_fixed_file_map_reuses_a_retired_el1_reservation; carrick-kernel::dispatch::mem::backing::tests::delegated_fixed_lazy_file_replacement_retires_only_replaced_recipe; carrick-runtime::runtime::tests::split_loop_preserves_reserved_file_content_writes; carrick-runtime::runtime::tests::split_loop_keeps_reserved_file_backing_and_protection_venue; carrick-vmm-hvf::trap::foreign_mm::tests::native_reserved_file_content_uses_owner_cow_and_copy_admission; carrick-vmm-hvf::trap::foreign_mm::tests::native_reserved_initial_root_uses_bound_root_without_a_pool_slot; carrick-vmm-hvf::trap::foreign_mm::tests::native_reserved_mutable_file_mapping_keeps_clean_page_cache_and_guest_receipt"
 embed = "carrick-embed::el1_host_copyout::el1_host_buffers_follow_reused_mapping_in_two_live_processes; carrick-conformance-next::inotify_lifecycle::case_inotify_watch_churn"
 
 [bindings.unresolved]

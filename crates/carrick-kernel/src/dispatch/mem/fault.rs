@@ -680,11 +680,12 @@ impl MemState {
         Some(ResidentFaultRange { range, prot })
     }
 
-    /// Retire the host's residency facts for `holes`: ranges the root held
-    /// no node for, now handed out again. Their facts are already dead
-    /// (they name retired incarnations); this only reclaims them.
-    pub(in crate::dispatch) fn retire_stale_first_touch(&mut self, holes: &[(u64, u64)]) {
-        for &(start, end) in holes {
+    /// Retire first-touch facts for ranges the root hands out again: either
+    /// holes, or the exact old nodes it just retired for a fixed host venue.
+    /// Their previous incarnations are dead before this call. Adjacent file
+    /// recipe fragments keep their retained descriptor and adjusted offset.
+    pub(in crate::dispatch) fn retire_stale_first_touch(&mut self, retired: &[(u64, u64)]) {
+        for &(start, end) in retired {
             let Some(range) = carrick_vfs::GuestMemoryRange::new(GuestVa(start), GuestVa(end))
             else {
                 continue;
@@ -1131,7 +1132,7 @@ impl<'a> MemView<'a> {
                     .dynamic_maps
                     .iter()
                     .any(|map| map.start < current && map.end > low && map.start != current)
-                    || mem.root_anonymous_overlaps(low, current - low);
+                    || mem.root_mapping_overlaps(low, current - low);
                 if obstacle {
                     return None;
                 }

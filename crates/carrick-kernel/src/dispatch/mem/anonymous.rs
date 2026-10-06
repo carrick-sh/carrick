@@ -691,17 +691,17 @@ impl MemState {
         }))
     }
 
-    /// Whether a root-owned anonymous row overlaps `[start, start + len)`.
-    pub(in crate::dispatch) fn root_anonymous_overlaps(&self, start: u64, len: u64) -> bool {
+    /// Whether any committed root mapping overlaps `[start, start + len)`.
+    /// Private file rows leave the host VMA projection when their backing
+    /// source becomes owner-held, but remain occupied for placement checks.
+    pub(in crate::dispatch) fn root_mapping_overlaps(&self, start: u64, len: u64) -> bool {
         let Some(root) = self.delegated_root() else {
             return false;
         };
         let Some(end) = start.checked_add(len).filter(|end| *end > start) else {
             return false;
         };
-        Self::root_mappings(root, start, end)
-            .iter()
-            .any(|mapping| mapping.anonymous)
+        !Self::root_mappings(root, start, end).is_empty()
     }
 
     /// Every Linux-visible VMA row of this MM: the host rows, plus the root's
@@ -1699,7 +1699,16 @@ impl MemView<'_> {
         match placed {
             Ok((placed, holes)) => {
                 mem.open_venue(HostVenue::Reserved(placed));
-                mem.retire_stale_first_touch(&holes);
+                if matches!(placement, Placement::Fixed(_)) {
+                    // The root has retired every prior node in this exact
+                    // replacement, including owner-held private file rows.
+                    // Their lazy recipes must leave before the new recipe is
+                    // offered; retiring only root holes leaves an overlapping
+                    // file view alive and forces an eager-copy fallback.
+                    mem.retire_stale_first_touch(&[(placed.start(), placed.end())]);
+                } else {
+                    mem.retire_stale_first_touch(&holes);
+                }
                 Ok(Ok(placed.start()))
             }
             Err(
