@@ -220,6 +220,15 @@ pub trait SyscallTrap {
     /// See [`SignalInjection`] and the macOS `HvfTrapEngine` impl for the full
     /// per-field contract.
     fn inject_signal(&mut self, signal: SignalInjection) -> Result<(), TrapError>;
+
+    /// Finish the exact signal frame retained across owner memory admission.
+    fn resume_signal_frame(
+        &mut self,
+        pending: Box<crate::sigframe::PendingSignalFrame>,
+    ) -> Result<(), TrapError> {
+        drop(pending);
+        Err(TrapError::UnsupportedPlatform)
+    }
     /// The Linux syscall number of the most recently dispatched `svc`, used to
     /// decide whether an interrupted syscall is in the SA_RESTART-restartable
     /// set. `None` before the first syscall / on traps with no vCPU.
@@ -417,6 +426,11 @@ pub enum TrapError {
     /// termination instead of propagating a fatal carrick error.
     #[error("signal frame could not be delivered to the guest stack")]
     SignalDeliveryFault,
+    #[error("captured signal frame is waiting for owner memory: {dependency:?}")]
+    SignalFrameMemory {
+        pending: Box<crate::sigframe::PendingSignalFrame>,
+        dependency: Box<carrick_guest_mem::MemoryPrepareError>,
+    },
     /// A retained file byte service selected a page beyond the file end.
     #[error("owner-selected retained file page is beyond EOF")]
     HostBackingEof,
