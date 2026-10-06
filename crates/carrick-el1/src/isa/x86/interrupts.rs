@@ -102,4 +102,18 @@ pub mod hardware {
         }
         Ok(())
     }
+    /// # Safety
+    /// CPL0 reads the mapped local APIC In-Service Register (ISR).
+    pub unsafe fn highest_in_service_vector() -> Option<u8> {
+        for reg_idx in (0..8).rev() {
+            let isr_val = unsafe {
+                core::ptr::read_volatile((LAPIC_VA + 0x100 + reg_idx * 0x10) as *const u32)
+            };
+            if isr_val != 0 {
+                let bit = 31 - isr_val.leading_zeros();
+                return Some((reg_idx as u8) * 32 + (bit as u8));
+            }
+        }
+        None
+    }
 }

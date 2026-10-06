@@ -1,17 +1,77 @@
 //! CPL0 APIC and interrupt-mask projection.
 
-use super::{X86Backend, interrupts};
+use super::{ArchError, X86Backend, interrupts};
 use carrick_guest_arch::{
     CounterFrequency, CounterTick, CpuId, CpuTarget, Deadline, InterruptAck, InterruptBackend,
-    WakeToken,
+    InterruptReason, WakeToken,
 };
+use core::num::NonZeroU64;
 
-#[cold]
-#[inline(never)]
-#[unsafe(no_mangle)]
-pub extern "C" fn carrick_x86_unbound_interrupt_entry() -> ! {
-    // SAFETY: an IRQ cannot be acknowledged without its native vector owner.
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
+/// Query the TSC frequency via CPUID leaves 0x15, 0x16, or nominal 1 GHz fallback.
+pub fn tsc_frequency() -> Option<NonZeroU64> {
+    let max_leaf: u32;
+    // SAFETY: CPUID leaf 0 returns max basic leaf without side effects.
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 0u32 => max_leaf,
+            out("ecx") _,
+            out("edx") _,
+            options(nomem, preserves_flags),
+        );
+    }
+    if max_leaf >= 0x15 {
+        let eax: u32;
+        let ebx: u32;
+        let ecx: u32;
+        // SAFETY: CPUID leaf 0x15 returns TSC frequency ratio and crystal clock.
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "cpuid",
+                "mov {0:e}, ebx",
+                "pop rbx",
+                out(reg) ebx,
+                inout("eax") 0x15u32 => eax,
+                out("ecx") ecx,
+                out("edx") _,
+                options(nomem, preserves_flags),
+            );
+        }
+        if eax != 0 && ebx != 0 && ecx != 0 {
+            if let Some(prod) = (ecx as u64).checked_mul(ebx as u64) {
+                if let Some(hz) = NonZeroU64::new(prod / (eax as u64)) {
+                    return Some(hz);
+                }
+            }
+        }
+    }
+    if max_leaf >= 0x16 {
+        let eax: u32;
+        // SAFETY: CPUID leaf 0x16 returns processor base frequency in MHz.
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "cpuid",
+                "pop rbx",
+                inout("eax") 0x16u32 => eax,
+                out("ecx") _,
+                out("edx") _,
+                options(nomem, preserves_flags),
+            );
+        }
+        if eax != 0 {
+            if let Some(hz) = (eax as u64)
+                .checked_mul(1_000_000)
+                .and_then(NonZeroU64::new)
+            {
+                return Some(hz);
+            }
+        }
+    }
+    NonZeroU64::new(1_000_000_000)
 }
 
 impl InterruptBackend for X86Backend {
@@ -30,19 +90,55 @@ impl InterruptBackend for X86Backend {
         Ok(CounterTick::new((u64::from(hi) << 32) | u64::from(lo)))
     }
     fn frequency(&mut self) -> Result<CounterFrequency, Self::Error> {
-        carrick_x86_unbound_interrupt_entry()
+        tsc_frequency()
+            .map(CounterFrequency::new)
+            .ok_or(ArchError::Unbound)
     }
-    fn arm_timer(&mut self, _deadline: Option<Deadline>) -> Result<(), Self::Error> {
-        carrick_x86_unbound_interrupt_entry()
+    fn arm_timer(&mut self, deadline: Option<Deadline>) -> Result<(), Self::Error> {
+        let ticks = match deadline {
+            None => None,
+            Some(d) => {
+                let now = self.counter()?.raw();
+                let delta = d.0.raw().saturating_sub(now);
+                // APIC timer divide by 16
+                let apic_ticks = u32::try_from(delta / 16).unwrap_or(u32::MAX).max(1);
+                Some(interrupts::TimerTicks(apic_ticks))
+            }
+        };
+        // SAFETY: CPL0 local APIC timer programming.
+        unsafe {
+            interrupts::hardware::enable();
+            interrupts::hardware::arm_timer(ticks);
+        }
+        Ok(())
     }
-    fn send_wake(&mut self, _target: CpuTarget, _token: WakeToken) -> Result<(), Self::Error> {
-        // CpuId is a scheduler slot, not necessarily an APIC destination.
-        carrick_x86_unbound_interrupt_entry()
+    fn send_wake(&mut self, target: CpuTarget, _token: WakeToken) -> Result<(), Self::Error> {
+        let apic_id = u8::try_from(target.cpu.raw()).map_err(|_| ArchError::Unbound)?;
+        // SAFETY: caller published wake ownership first; target CPU is bound.
+        unsafe { interrupts::hardware::send_wake(interrupts::ApicId(apic_id)) }
+            .map_err(|_| ArchError::Busy)?;
+        Ok(())
     }
     fn ack_interrupt(
         &mut self,
     ) -> Result<Option<InterruptAck<Self::HardwareInterrupt>>, Self::Error> {
-        carrick_x86_unbound_interrupt_entry()
+        // SAFETY: CPL0 reads the local APIC in-service register to determine the active vector.
+        let vector = unsafe { interrupts::hardware::highest_in_service_vector() };
+        let Some(vector) = vector else {
+            return Ok(None);
+        };
+        if vector == interrupts::SPURIOUS_VECTOR {
+            return Ok(None);
+        }
+        let reason = if vector == interrupts::TIMER_VECTOR {
+            InterruptReason::Timer
+        } else {
+            InterruptReason::External
+        };
+        Ok(Some(InterruptAck {
+            reason,
+            hardware: u32::from(vector),
+        }))
     }
     fn end_interrupt(
         &mut self,
@@ -82,5 +178,63 @@ impl InterruptBackend for X86Backend {
         // retirement. Its slot is immutable after publication.
         let binding = unsafe { &*(binding_address as *const super::context::native::CpuBinding) };
         CpuId::new(binding.cpu_slot)
+    }
+}
+
+/// A CPL0-only fixture syscall that exercises this shared kernel interrupt module.
+pub const INTERRUPT_WITNESS: u64 = 0xffff_ffff_ffff_ff40;
+
+pub fn witness(op: u64, arg: u64) -> u64 {
+    let mut backend = X86Backend;
+    match op {
+        0 => match backend.frequency() {
+            Ok(freq) => freq.raw().get(),
+            Err(_) => 0,
+        },
+        1 => {
+            let deadline = if arg != 0 {
+                Some(Deadline(CounterTick::new(arg)))
+            } else {
+                None
+            };
+            match backend.arm_timer(deadline) {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
+            }
+        }
+        2 => {
+            let target = CpuTarget {
+                cpu: CpuId::new(arg as u32),
+                generation: carrick_guest_arch::CpuGeneration::new(
+                    core::num::NonZeroU64::new(1).unwrap(),
+                ),
+            };
+            let token = WakeToken {
+                task: carrick_guest_arch::TaskIdentity {
+                    carrier: carrick_guest_arch::CarrierGeneration::new(
+                        core::num::NonZeroU64::new(1).unwrap(),
+                    ),
+                    task: carrick_guest_arch::TaskSerial::new(
+                        core::num::NonZeroU64::new(1).unwrap(),
+                    ),
+                    execution: carrick_guest_arch::ExecutionGeneration::new(
+                        core::num::NonZeroU64::new(1).unwrap(),
+                    ),
+                },
+                operation: carrick_guest_arch::OperationSequence::new(
+                    core::num::NonZeroU64::new(1).unwrap(),
+                ),
+            };
+            match backend.send_wake(target, token) {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
+            }
+        }
+        3 => match backend.ack_interrupt() {
+            Ok(Some(ack)) => u64::from(ack.hardware),
+            Ok(None) => 0,
+            Err(_) => u64::MAX,
+        },
+        _ => u64::MAX,
     }
 }
