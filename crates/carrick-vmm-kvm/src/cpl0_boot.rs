@@ -847,6 +847,7 @@ impl Cpl0Carrier {
                 .cast::<NativeFrame>();
             // SAFETY: the stopped CPU published this exact stack-local frame.
             let frame = unsafe { &mut *ptr };
+            self.host_forwards += 1;
             match frame.rax {
                 1 => {
                     let fd =
@@ -861,6 +862,15 @@ impl Cpl0Carrier {
             }
         }
         Err(fail("initial process exit budget exceeded"))
+    }
+
+    /// Counters from the stopped production carrier, including its initial
+    /// image entry and each guest-to-host syscall forward.
+    pub fn initial_execution_witness(&self) -> (u64, u64) {
+        (
+            self.binding(0).entries.load(Ordering::Acquire),
+            self.host_forwards,
+        )
     }
 
     pub(crate) fn boot_inner(
