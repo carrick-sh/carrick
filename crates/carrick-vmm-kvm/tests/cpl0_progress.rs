@@ -88,19 +88,29 @@ fn progress(boundary: KickBoundary) {
             },
             "live hardware CR3"
         );
-        assert!(
-            observed.iterations[turn]
-                > if turn < 2 {
-                    0
-                } else {
-                    observed.iterations[turn - 2]
-                },
-            "preempted compute retains progress"
-        );
+        if turn >= 2 {
+            // A LAPIC interrupt can arrive before the next user instruction;
+            // that is a valid preemption, not a lost scheduler turn. The
+            // per-task counter must never go backwards across a context save.
+            assert!(
+                observed.iterations[turn] >= observed.iterations[turn - 2],
+                "preempted compute preserves progress: turn {turn}, current {}, previous {}",
+                observed.iterations[turn],
+                observed.iterations[turn - 2]
+            );
+        }
     }
     for index in 0..2 {
         let data = &observed.data[index];
         assert!(word(data, 0) > 0, "both same-VA private pages progressed");
+        assert!(
+            observed
+                .order
+                .iter()
+                .enumerate()
+                .any(|(turn, &task)| task == index as u64 && observed.iterations[turn] > 0),
+            "each runnable task executes user compute under preemption"
+        );
         assert_eq!(word(data, 8), 0xf500 + index as u64, "FS task isolation");
         assert_eq!(word(data, 16), 0x6500 + index as u64, "GS task isolation");
         assert_eq!(
