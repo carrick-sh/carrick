@@ -196,3 +196,21 @@ class RustVerdictContract(unittest.TestCase):
             (Path(directory) / 'scripts/migrate/authority-attribute-allowlist.json').write_text('[]')
             with self.assertRaisesRegex(Exception, 'stale Rust census policy'):
                 ABORT.scan_abort_source(self.path, source, verdict=verdict)
+
+    def test_tree_changed_during_scanning_fails_closed(self):
+        from unittest.mock import patch
+        from scripts.tests.authority_census_support import census_tree
+        source = 'fn shown() { this.proc.lock(); }'
+        for checker, entry, pattern in (
+            (ABORT, ABORT.discover_runtime_aborts, '_scan_production_aborts'),
+            (GLOBAL, GLOBAL.discover, '_scan_production_globals'),
+            (LOCK, LOCK.scan_sources, '_scan_production_tokens'),
+        ):
+            with self.subTest(checker=checker.__name__), census_tree({self.path: source}) as (root, verdict):
+                original = getattr(checker, pattern)
+                def change_tree(*args, **kwargs):
+                    (root / self.path).with_name('added.rs').write_text('fn added() {}')
+                    return original(*args, **kwargs)
+                with patch.object(checker, pattern, side_effect=change_tree):
+                    with self.assertRaisesRegex(Exception, 'source file set changed'):
+                        entry(root, verdict=verdict)

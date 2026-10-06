@@ -449,7 +449,6 @@ def scan_sources(repo_root: Path, *, verdict=None) -> list[RawLockSite]:
         for rs_file in files:
             relative = str(rs_file.relative_to(repo_root))
             source = rs_file.read_text(encoding="utf-8")
-            tokens = lex_rust(source)
             file_sites = _scan_production_tokens(lex_rust(verdict.production_source(relative, source)), relative)
             all_sites.extend(file_sites)
 
@@ -460,6 +459,7 @@ def scan_sources(repo_root: Path, *, verdict=None) -> list[RawLockSite]:
             raise ValueError(f"Duplicate site ID generated: {site.id}")
         seen_ids.add(site.id)
 
+    verdict.validate_tree(repo_root)
     return sorted(all_sites, key=lambda s: (s.file, s.line, s.id))
 
 
