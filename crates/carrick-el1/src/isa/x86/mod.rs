@@ -30,8 +30,8 @@ impl carrick_guest_arch::ArchTypes for X86Backend {
     type MmOwner = carrick_el1_abi::CurrentTask;
     type OwnedTranslation = ();
     type LeafEdit = ();
-    type DrainTicket = ();
-    type DrainReceipt = ();
+    type DrainTicket = mmu::DrainTicket;
+    type DrainReceipt = mmu::DrainReceipt;
     type UserTransfer = user_access::UserTransfer;
     type PublicationReceipt = ();
     type HardwareInterrupt = u32;
@@ -39,5 +39,5 @@ impl carrick_guest_arch::ArchTypes for X86Backend {
 }
 
 pub use context::{current_stack_slot, current_thread_cpu};
-pub use mmu::carrick_x86_unbound_mmu_owner;
+pub use mmu::{hardware_live_root, unsupported_arm_descriptor_path};
 pub use transport::{fatal_entry_binding, yield_host_effect};
