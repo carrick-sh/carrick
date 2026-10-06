@@ -80,8 +80,14 @@ mod tests {
         let refusal = DescriptorRefusal::StaleRoot;
         let arm = crate::aarch64::descriptor_txn::DescriptorOutcome::Refused(refusal);
         let x86 = crate::x86::descriptor_txn::DescriptorOutcome::Refused(refusal);
-        assert_eq!(arm, crate::aarch64::descriptor_txn::DescriptorOutcome::Refused(refusal));
-        assert_eq!(x86, crate::x86::descriptor_txn::DescriptorOutcome::Refused(refusal));
+        assert_eq!(
+            arm,
+            crate::aarch64::descriptor_txn::DescriptorOutcome::Refused(refusal)
+        );
+        assert_eq!(
+            x86,
+            crate::x86::descriptor_txn::DescriptorOutcome::Refused(refusal)
+        );
         assert_eq!(DescriptorRefusal::from_code(refusal as u32), Some(refusal));
     }
 }
