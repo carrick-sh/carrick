@@ -112,7 +112,43 @@ fn shared_kernel_user_access_restores_smap_ac() {
 
 fn image() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0")
+        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0-fixture")
+}
+
+#[test]
+fn production_image_rejects_fixture_syscalls() {
+    let production = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0");
+    let bytes = std::fs::read(&production).expect("production CPL0 image built");
+    let plan =
+        carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62).expect("production CPL0 load image");
+    for syscall in [
+        0xffff_ffff_ffff_ff10_u64,
+        0xffff_ffff_ffff_ff20,
+        0xffff_ffff_ffff_ff30,
+        0xffff_ffff_ffff_ff40,
+    ] {
+        assert!(
+            !plan.segments.iter().any(|segment| {
+                let start = segment.file_offset as usize;
+                let end = start + segment.file_size as usize;
+                bytes[start..end]
+                    .windows(8)
+                    .any(|window| window == syscall.to_le_bytes())
+            }),
+            "production image contains fixture syscall {syscall:#x}"
+        );
+    }
+    let probe = transport_program(0);
+    let mut carrier =
+        Cpl0Carrier::boot(&production, [&probe, &probe]).expect("production image on real KVM");
+    let err = carrier
+        .observe(0)
+        .expect_err("synthetic syscall must not dispatch");
+    assert!(
+        err.to_string().contains("unported CPL0 native call"),
+        "{err}"
+    );
 }
 
 fn program(calls: &[(u64, u64)]) -> Vec<u8> {
@@ -616,6 +652,7 @@ fn interrupt_program() -> Vec<u8> {
         (1_u64, 100_000_u64), // arm_timer(Some(100_000))
         (3_u64, 0_u64),       // ack_interrupt (no interrupt pending => 0)
         (2_u64, 1_u64),       // send_wake to CPU 1 => 0
+        (2_u64, 2_u64),       // no published CPU slot 2: refuse wake
     ] {
         bytes.extend_from_slice(&[0x48, 0xbe]); // mov rsi, arg
         bytes.extend_from_slice(&arg.to_le_bytes());
@@ -644,8 +681,29 @@ fn shared_kernel_interrupt_leaves() {
     assert_eq!(obs_disarm.result, 0, "disarm timer succeeded");
     let obs_arm = carrier.observe(0).expect("arm timer observation");
     assert_eq!(obs_arm.result, 0, "arm timer succeeded");
+    if carrier.has_tsc_deadline(0).expect("installed CPUID") {
+        assert_eq!(
+            carrier
+                .lapic_register(0, 0x320)
+                .expect("stopped local timer")
+                & (3 << 17),
+            1 << 18,
+            "TSC deadline mode must use absolute TSC units"
+        );
+    } else {
+        assert_eq!(
+            carrier
+                .lapic_register(0, 0x3e0)
+                .expect("stopped timer divider")
+                & 0b1111,
+            0b1011,
+            "calibrated APIC timer uses the measured undivided rate"
+        );
+    }
     let obs_ack = carrier.observe(0).expect("ack interrupt observation");
     assert_eq!(obs_ack.result, 0, "no pending interrupt acked");
     let obs_wake = carrier.observe(0).expect("send wake observation");
     assert_eq!(obs_wake.result, 0, "send wake to CPU 1 succeeded");
+    let obs_unknown = carrier.observe(0).expect("unknown-slot wake observation");
+    assert_eq!(obs_unknown.result, -1, "unknown CPU slot must be refused");
 }
