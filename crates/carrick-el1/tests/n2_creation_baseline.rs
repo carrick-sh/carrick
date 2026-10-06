@@ -59,7 +59,7 @@ fn first_touch_capacity_forward_is_not_a_linux_syscall_forward() {
     }
     let tasks = [CurrentTask::new(), CurrentTask::new()];
     for (slot, mm) in [71, 83].into_iter().enumerate() {
-        tasks[slot].zone_mm.store(mm, Ordering::Release);
+        tasks[slot].mm.key.store(mm, Ordering::Release);
         let mailbox = FrameGrantMailbox::new();
         let mut frame = TrapFrame {
             esr: (0x24 << 26) | (1 << 6) | 0x07,

@@ -138,7 +138,7 @@ pub fn serve<C: ThreadCpu, U: UserWord>(
     let orig_x0 = frame.x[0];
     let served = |frame: &mut TrapFrame, result: u64, work: bool| {
         frame.x[0] = result;
-        task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+        task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
         if work || task.has_pending_host_work() {
             carrick_personality_linux::dispatch::FamilyCompletion::CompleteWithWork(result as i64)
         } else {
@@ -188,12 +188,12 @@ pub fn serve<C: ThreadCpu, U: UserWord>(
                 // The frame is the switched-in thread's, whose own syscall
                 // result the switch applied.
                 Served::Returned { .. } if task.has_pending_host_work() => {
-                    carrick_personality_linux::dispatch::FamilyCompletion::CompleteWithWork(
+                    carrick_personality_linux::dispatch::FamilyCompletion::SwitchedWithWork(
                         frame.x[0] as i64,
                     )
                 }
                 Served::Returned { .. } => {
-                    carrick_personality_linux::dispatch::FamilyCompletion::Complete(
+                    carrick_personality_linux::dispatch::FamilyCompletion::Switched(
                         frame.x[0] as i64,
                     )
                 }
@@ -407,7 +407,7 @@ fn serve_clone<C: ThreadCpu, U: UserWord>(
         return None;
     }
     let task = sched.task;
-    let mm = task.zone_mm.load(Ordering::Acquire);
+    let mm = task.mm.key.load(Ordering::Acquire);
     if mm == 0 {
         return None;
     }
@@ -452,7 +452,7 @@ fn serve_clone<C: ThreadCpu, U: UserWord>(
         tid: El1TaskId::from_linux_tid(identity.tid as i32).raw(),
         serial: identity.thread_serial,
         mm,
-        file_table: task.file_table.load(Ordering::Acquire),
+        file_table: task.linux.file_table.load(Ordering::Acquire),
         // The host binds the child's execution generation at adoption.
         generation: 0,
         affinity,
@@ -497,8 +497,8 @@ fn serve_clone<C: ThreadCpu, U: UserWord>(
     }
     child_slot.reset_for_birth(blocked, clear_child_tid, entry);
     let born = BornRecord {
-        caller_task: task.task_id.load(Ordering::Relaxed),
-        caller_serial: task.thread_serial.load(Ordering::Relaxed),
+        caller_task: task.execution.task.load(Ordering::Relaxed),
+        caller_serial: task.mm.thread_generation.load(Ordering::Relaxed),
         clone_flags: flags,
         clear_child_tid,
         blocked,
@@ -555,7 +555,7 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
         return decline(LifecycleDecline::ExitPending);
     }
     let task = sched.task;
-    let mm = task.zone_mm.load(Ordering::Acquire);
+    let mm = task.mm.key.load(Ordering::Acquire);
     let (zone, zslot) = (sched.zone, sched.slot);
     // Only a record EL1 switched in: the thread its executor loaded (no
     // record, or the slot's home record) is the executor's to retire.
@@ -589,7 +589,7 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
     if rec.has_object_operation() {
         return decline(LifecycleDecline::ExitObjectOperation);
     }
-    if rec.identity().tid != task.task_id.load(Ordering::Relaxed) {
+    if rec.identity().tid != task.execution.task.load(Ordering::Relaxed) {
         return decline(LifecycleDecline::ExitIdentity);
     }
     let admission = page

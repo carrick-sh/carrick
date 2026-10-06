@@ -20,7 +20,7 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
     if !matches!(nr, 214 | 215 | 216 | 222 | 226) {
         return None;
     }
-    let mm = ReservationMm::new(sched.task.zone_mm.load(Ordering::Acquire))?;
+    let mm = ReservationMm::new(sched.task.mm.key.load(Ordering::Acquire))?;
     let index = sched.zone.spaces.find(mm.raw())?;
     if !table.admitted(index.index(), mm) {
         return None;
@@ -74,7 +74,11 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
 
     match outcome {
         EditWaitOutcome::StaleToken => {
-            sched.task.orig_arg0.store(frame.x[0], Ordering::Relaxed);
+            sched
+                .task
+                .linux
+                .orig_arg0
+                .store(frame.x[0], Ordering::Relaxed);
             frame.x[0] = (-3i64) as u64;
             Some(Served::Returned { switched: false })
         }

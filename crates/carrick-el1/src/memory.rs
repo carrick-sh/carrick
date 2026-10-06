@@ -70,12 +70,12 @@ struct ReservationOrigin {
 }
 impl ReservationOrigin {
     fn capture(current: &CurrentTask) -> Option<Self> {
-        let raw = current.task_id.load(Ordering::Acquire);
+        let raw = current.execution.task.load(Ordering::Acquire);
         let tid = i32::try_from(raw).ok().filter(|tid| *tid > 0)?;
         Some(Self {
             task: carrick_el1_abi::El1TaskId::from_linux_tid(tid),
-            serial: NonZeroU64::new(current.thread_serial.load(Ordering::Acquire))?,
-            mm: carrick_el1_abi::ReservationMm::new(current.zone_mm.load(Ordering::Acquire))?,
+            serial: NonZeroU64::new(current.mm.thread_generation.load(Ordering::Acquire))?,
+            mm: carrick_el1_abi::ReservationMm::new(current.mm.key.load(Ordering::Acquire))?,
         })
     }
 }
@@ -876,7 +876,7 @@ pub fn delegated_anonymous_root(
     if !matches!(nr, SYS_BRK | SYS_MUNMAP | SYS_MMAP | SYS_MPROTECT) {
         return None;
     }
-    let mm_key = current.zone_mm.load(Ordering::Acquire);
+    let mm_key = current.mm.key.load(Ordering::Acquire);
     let mm = carrick_el1_abi::ReservationMm::new(mm_key)?;
     let index = spaces.find(mm_key)?;
     table.admitted(index.index(), mm).then_some((mm, index))
@@ -912,7 +912,7 @@ pub fn try_serve_munmap<E: AnonymousRetirementEditor>(
     let Some(task) = current_tasks.get(frame.slot as usize) else {
         return MunmapDisposition::Forward;
     };
-    let mm_key = task.zone_mm.load(Ordering::Acquire);
+    let mm_key = task.mm.key.load(Ordering::Acquire);
     let Some(index) = spaces.find(mm_key) else {
         return MunmapDisposition::Forward;
     };
@@ -975,7 +975,7 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
     let Some(task) = current_tasks.get(frame.slot as usize) else {
         return MprotectDisposition::Forward;
     };
-    let mm_key = task.zone_mm.load(Ordering::Acquire);
+    let mm_key = task.mm.key.load(Ordering::Acquire);
     let Some(index) = spaces.find(mm_key) else {
         return MprotectDisposition::Forward;
     };
@@ -1046,7 +1046,7 @@ mod tests {
         let mm = 17;
         let ttbr0 = (9_u64 << 48) | 0x8800_0000_0000;
         let task = CurrentTask::new();
-        task.zone_mm.store(mm, Ordering::Release);
+        task.mm.key.store(mm, Ordering::Release);
         let spaces = AddressSpaces::new();
         let index = spaces.publish_closed(mm, ttbr0, ttbr0).unwrap();
         spaces.open(index);
@@ -1342,9 +1342,9 @@ mod tests {
                     .unwrap();
             }
             let task = CurrentTask::new();
-            task.task_id.store(key + 100, Ordering::Relaxed);
-            task.thread_serial.store(11, Ordering::Relaxed);
-            task.zone_mm.store(key, Ordering::Relaxed);
+            task.execution.task.store(key + 100, Ordering::Relaxed);
+            task.mm.thread_generation.store(11, Ordering::Relaxed);
+            task.mm.key.store(key, Ordering::Relaxed);
             Mm { key, ttbr0, task }
         }
         fn root<'a>(

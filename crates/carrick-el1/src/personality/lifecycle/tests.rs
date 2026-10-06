@@ -84,7 +84,7 @@ impl Venue {
 
 impl LifecycleVenue for Venue {
     fn thread<'a>(&'a self, task: &'a CurrentTask) -> Option<LifecycleThread<'a>> {
-        let tid = task.task_id.load(Ordering::Relaxed);
+        let tid = task.execution.task.load(Ordering::Relaxed);
         let slot = if tid == self.leader {
             &self.slots[0]
         } else {
@@ -128,8 +128,9 @@ impl World {
         let tasks: [CurrentTask; 4] = core::array::from_fn(|_| CurrentTask::new());
         let task = &tasks[SLOT_IDX];
         task.set(El1TaskId::from_linux_tid(PARENT_TID as i32), 1, 5);
-        task.zone_mm.store(MM, Ordering::Relaxed);
-        task.thread_serial
+        task.mm.key.store(MM, Ordering::Relaxed);
+        task.mm
+            .thread_generation
             .store(PARENT_TID + 1000, Ordering::Relaxed);
         let mut cpu = FakeCpu::default();
         cpu.regs.sp_el0 = 0x2222_0000;
@@ -275,6 +276,7 @@ fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser)
             CompletionRoute::WithWork => Action::ServedWithWork,
             CompletionRoute::Suspended => Action::Idle,
             CompletionRoute::Forward => Action::Forward,
+            CompletionRoute::InvalidCompletion => panic!("stale entry completion"),
         }
     })
 }
@@ -562,7 +564,7 @@ fn sigprocmask_unblocking_a_pending_signal_serves_with_work() {
     assert_eq!(frame.x[0], 0);
     assert_eq!(*old, SIGUSR1_BIT | 1);
     assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(1));
-    assert_eq!(w.task().served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(w.task().linux.served_with_work.load(Ordering::Relaxed), 1);
     assert_eq!(w.served(SYS_RT_SIGPROCMASK), 1);
 }
 
@@ -588,7 +590,7 @@ fn sigprocmask_unblocking_a_process_pending_signal_serves_with_work() {
     assert_eq!(frame.x[0], 0);
     assert_eq!(*old, SIGUSR1_BIT | 1);
     assert_eq!(w.venue.leader_slot().blocked(), BlockedMask(1));
-    assert_eq!(w.task().served_with_work.load(Ordering::Relaxed), 1);
+    assert_eq!(w.task().linux.served_with_work.load(Ordering::Relaxed), 1);
     assert_eq!(w.served(SYS_RT_SIGPROCMASK), 1);
 }
 
@@ -855,7 +857,7 @@ fn clone_then_join(w: &mut World, word: &u32) -> TrapFrame {
     );
     assert_eq!(action, Action::Served);
     assert_eq!(
-        w.task().task_id.load(Ordering::Relaxed),
+        w.task().execution.task.load(Ordering::Relaxed),
         u64::from(CHILD_TID)
     );
     assert_eq!(frame.elr, CLONE_PC);
@@ -879,7 +881,7 @@ fn exit_of_a_born_thread_clears_cleartid_wakes_the_joiner_and_runs_it() {
     assert_eq!(w.served(SYS_EXIT), 1);
     assert_eq!(w.forwarded(SYS_EXIT), 0);
     // The joiner resumes after its futex wait, which returned 0.
-    assert_eq!(w.task().task_id.load(Ordering::Relaxed), PARENT_TID);
+    assert_eq!(w.task().execution.task.load(Ordering::Relaxed), PARENT_TID);
     assert_eq!(frame.elr, 0x5000);
     assert_eq!(frame.x[0], 0);
     let s = w.zone.slot(SLOT);
@@ -912,6 +914,11 @@ fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
     let record = hosted.zone.alloc_record(identity).unwrap();
     hosted.zone.requeue_preempted(SLOT, record);
     assert_eq!(hosted.zone.switch_in(SLOT), Some(record));
+    hosted
+        .task()
+        .execution
+        .generation
+        .store(identity.generation, Ordering::Release);
     assert_eq!(hosted.page().live(), 2);
     assert_eq!(peer.page().live(), 2);
 
@@ -986,7 +993,7 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
         assert_eq!(w.page().state(0).unwrap().1, EntryState::Born, "{label}");
         assert_eq!(w.page().live(), live, "{label}");
         assert_eq!(
-            w.task().task_id.load(Ordering::Relaxed),
+            w.task().execution.task.load(Ordering::Relaxed),
             u64::from(CHILD_TID)
         );
         assert!(w.zone.slot(SLOT).current().is_some(), "{label}");

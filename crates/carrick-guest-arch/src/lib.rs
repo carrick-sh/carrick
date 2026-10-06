@@ -29,7 +29,6 @@ ordinal!(
     FrameGpa,
     GuestLen,
     CounterTick,
-    CanonicalOrdinal,
     NativeOrdinal,
     UserFlags,
     FatalCode
@@ -119,25 +118,49 @@ pub enum GuestIsa {
     Aarch64,
     X86_64,
 }
+/// Native entry mechanism, without a syscall personality interpretation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CanonicalCall {
+pub enum NativeAbi {
+    Aarch64El0,
+    X86_64Syscall,
+}
+
+/// Retains the complete ISA-native frame; six Linux arguments are decoded only
+/// after crossing into the Linux personality.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeEntrySnapshot<'a, F> {
     pub isa: GuestIsa,
-    pub canonical: CanonicalOrdinal,
-    pub native: NativeOrdinal,
-    /// Register arguments stay raw until the common personality interprets them.
-    pub args: [u64; 6],
-    pub stack: UserVa,
+    pub abi: NativeAbi,
+    pub frame: &'a F,
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SyscallResult(i64);
-impl SyscallResult {
-    pub const fn new(result: i64) -> Self {
-        Self(result)
-    }
-    pub const fn raw(self) -> i64 {
-        self.0
-    }
+pub enum X86Register {
+    Rax,
+    Rbx,
+    Rcx,
+    Rdx,
+    Rsi,
+    Rdi,
+    Rbp,
+    Rsp,
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
 }
+pub trait X86Registers {
+    fn read(&self, register: X86Register) -> u64;
+}
+
+/// Opaque native return-register bits. No errno or Linux result in hardware.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(transparent)]
+pub struct NativeReturnWord(pub u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Access {
     Read,
@@ -338,8 +361,8 @@ macro_rules! arch_trait {
 
 arch_trait!(EntryArch, EntryBackend {
     fn decode_entry(frame: &Self::NativeFrame) -> Result<EntryEvent, Self::Error>;
-    fn decode_syscall(frame: &Self::NativeFrame) -> Result<CanonicalCall, Self::Error>;
-    fn set_result(frame: &mut Self::NativeFrame, result: SyscallResult) -> Result<(), Self::Error>;
+    fn snapshot(frame: &Self::NativeFrame) -> Result<NativeEntrySnapshot<'_, Self::NativeFrame>, Self::Error>;
+    fn set_result(frame: &mut Self::NativeFrame, result: NativeReturnWord) -> Result<(), Self::Error>;
     fn save_context(frame: &Self::NativeFrame) -> Result<Self::SavedContext, Self::Error>;
     fn load_context(frame: &mut Self::NativeFrame, saved: &Self::SavedContext) -> Result<(), Self::Error>;
     fn prepare_user_return(frame: &Self::NativeFrame) -> Result<UserReturn, Self::Error>;

@@ -91,9 +91,7 @@ core::arch::global_asm!(
 #[cfg(target_os = "none")]
 mod kernel {
     use super::adapter::*;
-    use carrick_el1::personality::common_entry::{
-        EntryOutcome, execution_binding, serve_canonical,
-    };
+    use carrick_el1::personality::common_entry::{EntryOutcome, serve_canonical};
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
     use carrick_el1_abi::{Counters, CurrentTask};
     use core::sync::atomic::Ordering;
@@ -130,7 +128,11 @@ mod kernel {
         if binding.entry_kick.swap(0, Ordering::AcqRel) != 0 {
             doorbell(ENTRY_KICK_PORT, frame);
         }
-        let call = frame.decode();
+        let Some(call) = carrick_personality_linux::entry::decode_x86_snapshot(frame.snapshot())
+        else {
+            doorbell(FORWARD_PORT, frame);
+            halt();
+        };
         binding
             .captured_stack
             .store(call.stack.raw(), Ordering::Release);
@@ -141,13 +143,12 @@ mod kernel {
             &GuestLifecycleVenue,
             Some(&binding.publications),
         ) {
-            EntryOutcome::Served { result, completion }
-            | EntryOutcome::ServedWithWork { result, completion } => {
-                if carrick_core::entry::complete(completion, execution_binding(task)).is_err() {
-                    doorbell(FATAL_PORT, frame);
-                    halt();
-                }
+            EntryOutcome::Served { result } | EntryOutcome::ServedWithWork { result } => {
                 frame.rax = result.raw() as u64;
+            }
+            EntryOutcome::InvalidCompletion => {
+                doorbell(FATAL_PORT, frame);
+                halt();
             }
             EntryOutcome::Forward => {
                 doorbell(FORWARD_PORT, frame);

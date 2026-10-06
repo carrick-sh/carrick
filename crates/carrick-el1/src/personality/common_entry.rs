@@ -1,7 +1,7 @@
 //! ARM image adapter for the single Linux entry dispatcher.
 use super::thread_setup::{self, LifecycleVenue, RobustListHead, RobustListLen, RobustListSlot};
 use carrick_el1_abi::{Counters, CurrentTask};
-use carrick_guest_arch::CanonicalCall;
+use carrick_personality_linux::entry::CanonicalCall;
 use carrick_personality_linux::entry::{self, ExecutionBinding, LinuxEntryVenue};
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -18,23 +18,7 @@ struct Adapter<'a> {
 }
 
 pub fn execution_binding(task: &CurrentTask) -> ExecutionBinding {
-    let generation = task.generation.load(Ordering::Acquire);
-    let binding = ExecutionBinding {
-        task: task.task_id.load(Ordering::Acquire),
-        generation,
-        mm: task.zone_mm.load(Ordering::Acquire),
-        thread_generation: task.thread_serial.load(Ordering::Acquire),
-    };
-    if generation != 0 && task.generation.load(Ordering::Acquire) == generation {
-        binding
-    } else {
-        ExecutionBinding {
-            task: 0,
-            generation: 0,
-            mm: 0,
-            thread_generation: 0,
-        }
-    }
+    carrick_core::entry::binding(&task.execution, &task.mm)
 }
 
 impl LinuxEntryVenue for Adapter<'_> {
@@ -54,6 +38,7 @@ impl LinuxEntryVenue for Adapter<'_> {
         });
         if result.is_some() {
             self.task
+                .linux
                 .orig_arg0
                 .store(self.call.args[0], Ordering::Relaxed);
         }

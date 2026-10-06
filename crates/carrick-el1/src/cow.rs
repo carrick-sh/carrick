@@ -956,7 +956,7 @@ mod tests {
 
     fn dispatch(spaces: &AddressSpaces, resolver: &mut ArenaResolver<'_>) -> Action {
         let task = CurrentTask::new();
-        task.zone_mm.store(MM, Ordering::Release);
+        task.mm.key.store(MM, Ordering::Release);
         let mut frame = TrapFrame {
             esr: (0x24 << 26) | (1 << 6) | 0x0f,
             far: VA + 0x10,
@@ -1124,7 +1124,7 @@ mod tests {
         };
 
         let task = CurrentTask::new();
-        task.zone_mm.store(MM, Ordering::Release);
+        task.mm.key.store(MM, Ordering::Release);
         let mut frame = TrapFrame {
             esr: (0x24 << 26) | (1 << 6) | 0x0f,
             far: VA + 0x10,

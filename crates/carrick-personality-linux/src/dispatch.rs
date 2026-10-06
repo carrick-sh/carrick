@@ -31,6 +31,9 @@ pub enum Family {
 pub enum FamilyCompletion {
     Complete(i64),
     CompleteWithWork(i64),
+    Switched(i64),
+    SwitchedWithWork(i64),
+    AccountedSwitched(i64),
     CommitOwed(i64),
     Suspended,
     Forward,
@@ -43,7 +46,11 @@ pub enum FamilyCompletion {
 /// Temporary order-5 seam for families whose bodies move in orders 6-9.
 /// Methods disappear with their named order; implementations never select a
 /// different family and never publish entry completion.
-pub trait PendingFamilies {
+pub trait PendingFamilies<'a> {
+    fn binding(&self) -> Option<carrick_core_abi::ExecutionBinding>;
+    fn record_source(&self) -> Option<carrick_core_abi::BornInZoneSource<'a>> {
+        None
+    }
     fn prepare_anonymous(&mut self) -> Option<FamilyCompletion> {
         None
     }
@@ -118,12 +125,12 @@ pub trait PendingFamilies {
 }
 
 /// The sole ordinal routing decision and family completion owner.
-pub fn dispatch_aarch64_family(
+fn serve_family(
+    family: Family,
     ordinal: u64,
-    allocator_control: u64,
-    pending: &mut dyn PendingFamilies,
+    pending: &mut dyn PendingFamilies<'_>,
 ) -> FamilyCompletion {
-    match route_aarch64(ordinal, allocator_control) {
+    match family {
         Family::Anonymous(call) => pending.anonymous(call),
         Family::Read => pending.read(),
         Family::Write => pending.write(),
@@ -170,18 +177,22 @@ pub enum CompletionRoute {
     WithWork,
     Suspended,
     Forward,
+    InvalidCompletion,
 }
 
 /// Linux return-work ordering, shared by common entry and pending families.
 pub fn completion_route(completion: FamilyCompletion, pending: bool) -> CompletionRoute {
     match completion {
-        FamilyCompletion::Complete(_) if pending => CompletionRoute::WithWork,
-        FamilyCompletion::Complete(_) | FamilyCompletion::AccountedComplete(_) => {
-            CompletionRoute::Served
-        }
-        FamilyCompletion::CompleteWithWork(_) | FamilyCompletion::CommitOwed(_) => {
+        FamilyCompletion::Complete(_) | FamilyCompletion::Switched(_) if pending => {
             CompletionRoute::WithWork
         }
+        FamilyCompletion::Complete(_)
+        | FamilyCompletion::AccountedComplete(_)
+        | FamilyCompletion::Switched(_)
+        | FamilyCompletion::AccountedSwitched(_) => CompletionRoute::Served,
+        FamilyCompletion::CompleteWithWork(_)
+        | FamilyCompletion::SwitchedWithWork(_)
+        | FamilyCompletion::CommitOwed(_) => CompletionRoute::WithWork,
         FamilyCompletion::Suspended | FamilyCompletion::AccountedSuspended => {
             CompletionRoute::Suspended
         }
@@ -191,13 +202,55 @@ pub fn completion_route(completion: FamilyCompletion, pending: bool) -> Completi
     }
 }
 
-fn finish(
+// The retained allocator-test transport previously runs without a loaded task.
+// It is an explicitly enabled diagnostic, never a guest Linux admission and
+// never a fabricated task/MM identity. Its routing still has this one owner.
+enum CompletionAuthority<'a> {
+    Entry(carrick_core_abi::EntryCompletion),
+    BornInZone(carrick_core_abi::BornEntryCompletion<'a>),
+    AllocatorDiagnostic,
+}
+
+fn finish<'a>(
     ordinal: u64,
     result: FamilyCompletion,
-    pending: &dyn PendingFamilies,
+    pending: &dyn PendingFamilies<'a>,
+    authority: CompletionAuthority<'a>,
 ) -> CompletionRoute {
+    let transfers = matches!(
+        result,
+        FamilyCompletion::Suspended
+            | FamilyCompletion::AccountedSuspended
+            | FamilyCompletion::Switched(_)
+            | FamilyCompletion::SwitchedWithWork(_)
+            | FamilyCompletion::AccountedSwitched(_)
+    );
+    let authenticated = match authority {
+        CompletionAuthority::Entry(token) if transfers => {
+            carrick_core::entry::handoff(token);
+            true
+        }
+        CompletionAuthority::BornInZone(token) if transfers => {
+            carrick_core::entry::handoff_born_in_zone(token);
+            true
+        }
+        CompletionAuthority::Entry(token) => pending
+            .binding()
+            .is_some_and(|live| carrick_core::entry::complete(token, live).is_ok()),
+        CompletionAuthority::BornInZone(token) => pending
+            .binding()
+            .zip(pending.record_source())
+            .is_some_and(|(live, source)| {
+                carrick_core::entry::complete_born_in_zone(token, live, source).is_ok()
+            }),
+        CompletionAuthority::AllocatorDiagnostic => true,
+    };
+    if !authenticated {
+        return CompletionRoute::InvalidCompletion;
+    }
     match result {
         FamilyCompletion::AccountedComplete(_)
+        | FamilyCompletion::AccountedSwitched(_)
         | FamilyCompletion::AccountedForward
         | FamilyCompletion::AccountedSuspended => {}
         FamilyCompletion::Forward | FamilyCompletion::Handback => pending.record_forwarded(ordinal),
@@ -212,12 +265,33 @@ fn finish(
 
 /// One routing and completion owner. A retained IPC operation is offered to
 /// its family before any fresh descriptor lookup, even with return work pending.
-pub fn dispatch(ordinal: u64, control: u64, pending: &mut dyn PendingFamilies) -> CompletionRoute {
+pub fn dispatch<'a>(
+    ordinal: u64,
+    control: u64,
+    pending: &mut dyn PendingFamilies<'a>,
+) -> CompletionRoute {
     let family = route_aarch64(ordinal, control);
+    let completion = match pending.binding().and_then(|binding| {
+        if let Some(token) = carrick_core::entry::admit(binding) {
+            Some(CompletionAuthority::Entry(token))
+        } else {
+            pending
+                .record_source()
+                .and_then(|source| carrick_core::entry::admit_born_in_zone(binding, source))
+                .map(CompletionAuthority::BornInZone)
+        }
+    }) {
+        Some(authority) => authority,
+        None if family == Family::AllocatorControl => CompletionAuthority::AllocatorDiagnostic,
+        None => {
+            pending.record_forwarded(ordinal);
+            return CompletionRoute::Forward;
+        }
+    };
     if matches!(family, Family::Anonymous(_))
         && let Some(result) = pending.prepare_anonymous()
     {
-        return finish(ordinal, result, pending);
+        return finish(ordinal, result, pending, completion);
     }
     let setup = pending.lifecycle_available()
         && matches!(family, Family::Lifecycle)
@@ -227,15 +301,15 @@ pub fn dispatch(ordinal: u64, control: u64, pending: &mut dyn PendingFamilies) -
         && matches!(family, Family::Read | Family::Write | Family::EpollWait);
     if pending.host_work() && !pending.resumes_operation() && !transfer && !setup {
         pending.declined_for_work(ordinal);
-        return finish(ordinal, FamilyCompletion::Forward, pending);
+        return finish(ordinal, FamilyCompletion::Forward, pending, completion);
     }
-    let mut result = dispatch_aarch64_family(ordinal, control, pending);
+    let mut result = serve_family(family, ordinal, pending);
     if result != FamilyCompletion::Forward {
-        return finish(ordinal, result, pending);
+        return finish(ordinal, result, pending, completion);
     }
     if pending.host_work() && !setup {
         pending.declined_for_work(ordinal);
-        return finish(ordinal, result, pending);
+        return finish(ordinal, result, pending, completion);
     }
     // File fallback follows the IPC authority's explicit decline, never a
     // retained operation's handback or completion.
@@ -244,7 +318,7 @@ pub fn dispatch(ordinal: u64, control: u64, pending: &mut dyn PendingFamilies) -
         Family::Write => pending.file_write(),
         _ => result,
     };
-    finish(ordinal, result, pending)
+    finish(ordinal, result, pending, completion)
 }
 
 /// The anonymous family retains an owned operation until settlement; only a

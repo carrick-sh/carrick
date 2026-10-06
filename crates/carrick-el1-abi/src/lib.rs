@@ -31,6 +31,9 @@ mod mm_portal_executable;
 mod mm_portal_fork;
 mod mm_portal_grant;
 pub use carrick_core_abi::*;
+pub use carrick_personality_linux::abi::entry::{
+    LinuxTaskMetadata, LinuxTaskState, SERVED_COMMIT_OWED, SERVED_WAKES_OWED, ServedBoundary,
+};
 pub use mm_portal::*;
 pub use mm_portal_executable::*;
 pub use mm_portal_fork::*;
@@ -435,13 +438,13 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
         core::mem::offset_of!(Counters, ipc_leaves) as u64,
         core::mem::offset_of!(Counters, anonymous_leaves) as u64,
         core::mem::size_of::<CurrentTask>() as u64,
-        core::mem::offset_of!(CurrentTask, file_table) as u64,
-        core::mem::offset_of!(CurrentTask, pending_host_work) as u64,
-        core::mem::offset_of!(CurrentTask, served_with_work) as u64,
-        core::mem::offset_of!(CurrentTask, zone_mm) as u64,
-        core::mem::offset_of!(CurrentTask, thread_serial) as u64,
-        core::mem::offset_of!(CurrentTask, lifecycle_page) as u64,
-        core::mem::offset_of!(CurrentTask, control_slot) as u64,
+        core::mem::offset_of!(CurrentTask, linux.file_table) as u64,
+        core::mem::offset_of!(CurrentTask, linux.pending_host_work) as u64,
+        core::mem::offset_of!(CurrentTask, linux.served_with_work) as u64,
+        core::mem::offset_of!(CurrentTask, mm.key) as u64,
+        core::mem::offset_of!(CurrentTask, mm.thread_generation) as u64,
+        core::mem::offset_of!(CurrentTask, metadata.lifecycle_page) as u64,
+        core::mem::offset_of!(CurrentTask, metadata.control_slot) as u64,
         core::mem::size_of::<MetadataGrantMailbox>() as u64,
         core::mem::align_of::<MetadataGrantMailbox>() as u64,
         core::mem::offset_of!(MetadataGrantMailbox, request_generation) as u64,
@@ -685,51 +688,38 @@ impl El1TaskId {
 #[repr(C, align(8))]
 #[derive(Debug)]
 pub struct CurrentTask {
-    /// Host-managed generation of the currently loaded task.
-    pub generation: AtomicU64,
-    /// [`El1TaskId`] word of the currently loaded task (0 = none).
-    pub task_id: AtomicU64,
-    /// Raw FileTableId of the currently loaded task (0 = none/unbound).
-    pub file_table: AtomicU64,
-    /// Per-vCPU fixup PC for EL1 user copies (0 = unarmed).
-    pub fixup_pc: AtomicU64,
-    /// Original x0 / arg0 before EL1 served the syscall (for reconstruction on served_with_work).
-    pub orig_arg0: AtomicU64,
-    /// Return-to-user work pending flag set by the host before kicks/signals/teardown.
-    pub pending_host_work: AtomicU32,
-    /// Flag indicating this syscall completed at EL1 with return value in `x0`/`args[0]`.
-    pub served_with_work: AtomicU32,
-    /// The zone key of the loaded task's process (its address-space id), or 0
-    /// when the process's futexes are not served in-guest. EL1 serves a
-    /// futex operation only for a non-zero key and switches only among
-    /// threads with the same key.
-    pub zone_mm: AtomicU64,
-    /// The host's serial of the loaded thread (with `task_id`, the exact
-    /// kernel thread a parked record names).
-    pub thread_serial: AtomicU64,
-    /// EL1-only metadata addresses retained by the exact carrier.
-    pub lifecycle_page: AtomicU64,
-    pub control_slot: AtomicU64,
+    pub execution: ExecutionIdentity,
+    pub linux: LinuxTaskState,
+    pub mm: ExecutionMm,
+    pub metadata: LinuxTaskMetadata,
     _stride_padding: [u64; 6],
 }
 
 pub const CURRENT_TASK_STRIDE_SHIFT: u32 = 7;
 const _: () = assert!(core::mem::size_of::<CurrentTask>() == 1 << CURRENT_TASK_STRIDE_SHIFT);
 
+const _: () = {
+    assert!(core::mem::align_of::<CurrentTask>() == 8);
+    assert!(core::mem::offset_of!(CurrentTask, execution.generation) == 0);
+    assert!(core::mem::offset_of!(CurrentTask, execution.task) == 8);
+    assert!(core::mem::offset_of!(CurrentTask, linux.file_table) == 16);
+    assert!(core::mem::offset_of!(CurrentTask, linux.fixup_pc) == 24);
+    assert!(core::mem::offset_of!(CurrentTask, linux.orig_arg0) == 32);
+    assert!(core::mem::offset_of!(CurrentTask, linux.pending_host_work) == 40);
+    assert!(core::mem::offset_of!(CurrentTask, linux.served_with_work) == 44);
+    assert!(core::mem::offset_of!(CurrentTask, mm.key) == 48);
+    assert!(core::mem::offset_of!(CurrentTask, mm.thread_generation) == 56);
+    assert!(core::mem::offset_of!(CurrentTask, metadata.lifecycle_page) == 64);
+    assert!(core::mem::offset_of!(CurrentTask, metadata.control_slot) == 72);
+};
+
 impl CurrentTask {
     pub const fn new() -> Self {
         Self {
-            generation: AtomicU64::new(0),
-            task_id: AtomicU64::new(0),
-            file_table: AtomicU64::new(0),
-            fixup_pc: AtomicU64::new(0),
-            orig_arg0: AtomicU64::new(0),
-            pending_host_work: AtomicU32::new(0),
-            served_with_work: AtomicU32::new(0),
-            zone_mm: AtomicU64::new(0),
-            thread_serial: AtomicU64::new(0),
-            lifecycle_page: AtomicU64::new(0),
-            control_slot: AtomicU64::new(0),
+            execution: ExecutionIdentity::new(),
+            linux: LinuxTaskState::new(),
+            mm: ExecutionMm::new(),
+            metadata: LinuxTaskMetadata::new(),
             _stride_padding: [0; 6],
         }
     }
@@ -740,8 +730,8 @@ impl CurrentTask {
     /// validation here gives substrate schedulers and Linux-personality code
     /// one typed boundary for the host-published addresses.
     pub fn lifecycle_refs(&self) -> Option<(&ThreadLifecyclePage, &ThreadControlSlot)> {
-        let page = self.lifecycle_page.load(Ordering::Acquire);
-        let slot = self.control_slot.load(Ordering::Acquire);
+        let page = self.metadata.lifecycle_page.load(Ordering::Acquire);
+        let slot = self.metadata.control_slot.load(Ordering::Acquire);
         let contains = |address: u64, len: usize| {
             address >= EL1_DYNAMIC_METADATA_BASE
                 && address
@@ -767,39 +757,41 @@ impl CurrentTask {
 
     /// Publication belongs to the loaded task, never to the executor itself.
     pub fn publish_lifecycle(&self, page: u64, slot: u64) {
-        self.control_slot.store(slot, Ordering::Relaxed);
-        self.lifecycle_page.store(page, Ordering::Release);
+        self.metadata.control_slot.store(slot, Ordering::Relaxed);
+        self.metadata.lifecycle_page.store(page, Ordering::Release);
     }
 
     #[inline]
     pub fn clear(&self) {
-        self.file_table.store(0, Ordering::Release);
-        self.generation.store(0, Ordering::Release);
-        self.task_id.store(0, Ordering::Release);
-        self.fixup_pc.store(0, Ordering::Relaxed);
-        self.orig_arg0.store(0, Ordering::Relaxed);
-        self.pending_host_work.store(0, Ordering::Release);
-        self.served_with_work.store(0, Ordering::Release);
-        self.zone_mm.store(0, Ordering::Release);
-        self.thread_serial.store(0, Ordering::Release);
+        self.linux.file_table.store(0, Ordering::Release);
+        self.execution.generation.store(0, Ordering::Release);
+        self.execution.task.store(0, Ordering::Release);
+        self.linux.fixup_pc.store(0, Ordering::Relaxed);
+        self.linux.orig_arg0.store(0, Ordering::Relaxed);
+        self.linux.pending_host_work.store(0, Ordering::Release);
+        self.linux.served_with_work.store(0, Ordering::Release);
+        self.mm.key.store(0, Ordering::Release);
+        self.mm.thread_generation.store(0, Ordering::Release);
         self.publish_lifecycle(0, 0);
     }
 
     #[inline]
     pub fn set(&self, task_id: El1TaskId, generation: u64, file_table: u64) {
-        self.task_id.store(task_id.raw(), Ordering::Relaxed);
-        self.generation.store(generation, Ordering::Release);
-        self.file_table.store(file_table, Ordering::Release);
+        self.execution.task.store(task_id.raw(), Ordering::Relaxed);
+        self.execution
+            .generation
+            .store(generation, Ordering::Release);
+        self.linux.file_table.store(file_table, Ordering::Release);
     }
 
     #[inline]
     pub fn has_pending_host_work(&self) -> bool {
-        self.pending_host_work.load(Ordering::Acquire) != 0
+        self.linux.has_pending_host_work()
     }
 
     #[inline]
     pub fn mark_pending_host_work(&self) {
-        self.pending_host_work.store(1, Ordering::Release);
+        self.linux.mark_pending_host_work();
     }
 
     /// Leave for the host with a syscall EL1 already served: its result is
@@ -809,10 +801,7 @@ impl CurrentTask {
     #[inline]
     #[must_use]
     pub fn leave_served_with_work(&self) -> Action {
-        // `fetch_max`: a later drain that cannot complete must not downgrade a
-        // call that already owes its host commit (`leave_commit_owed`).
-        self.served_with_work
-            .fetch_max(SERVED_WAKES_OWED, Ordering::AcqRel);
+        self.linux.record_completed_with_work();
         Action::ServedWithWork
     }
 
@@ -826,15 +815,13 @@ impl CurrentTask {
     #[inline]
     #[must_use]
     pub fn leave_commit_owed(&self, orig_x0: u64) -> Action {
-        self.orig_arg0.store(orig_x0, Ordering::Relaxed);
-        self.served_with_work
-            .store(SERVED_COMMIT_OWED, Ordering::Release);
+        self.linux.record_commit_owed(orig_x0);
         Action::ServedWithWork
     }
 
     #[inline]
     pub fn clear_pending_host_work(&self) {
-        self.pending_host_work.store(0, Ordering::Release);
+        self.linux.pending_host_work.store(0, Ordering::Release);
     }
 }
 
@@ -2254,13 +2241,13 @@ pub fn prepare_idle_entry(slot: usize) -> Option<u64> {
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     // SAFETY: the record lives in the EL1 region; only atomics are touched.
     let task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    task.task_id.store(0, Ordering::Relaxed);
-    task.generation.store(0, Ordering::Relaxed);
-    task.file_table.store(0, Ordering::Relaxed);
-    task.thread_serial.store(0, Ordering::Relaxed);
+    task.execution.task.store(0, Ordering::Relaxed);
+    task.execution.generation.store(0, Ordering::Relaxed);
+    task.linux.file_table.store(0, Ordering::Relaxed);
+    task.mm.thread_generation.store(0, Ordering::Relaxed);
     task.publish_lifecycle(0, 0);
-    task.served_with_work.store(0, Ordering::Relaxed);
-    task.zone_mm.store(0, Ordering::Release);
+    task.linux.served_with_work.store(0, Ordering::Relaxed);
+    task.mm.key.store(0, Ordering::Release);
     let frame = el1_slot_frame_va(slot);
     let frame_offset = (frame - EL1_REGION_BASE) as usize;
     // SAFETY: the frame lies on the slot's EL1 stack in the mapped region,
@@ -2347,7 +2334,10 @@ pub fn mark_pending_host_work(slot: usize) {
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task.pending_host_work.store(1, Ordering::Release);
+    current_task
+        .linux
+        .pending_host_work
+        .store(1, Ordering::Release);
     HOST_WORK_PUBLICATIONS[HostWorkPublishReason::DirectSlot as usize]
         .fetch_add(1, Ordering::Relaxed);
 }
@@ -2360,7 +2350,10 @@ pub fn clear_pending_host_work(slot: usize) {
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task.pending_host_work.store(0, Ordering::Release);
+    current_task
+        .linux
+        .pending_host_work
+        .store(0, Ordering::Release);
 }
 
 /// Check and atomically clear return-to-user work for the vCPU at `slot`.
@@ -2371,7 +2364,11 @@ pub fn take_pending_host_work(slot: usize) -> bool {
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task.pending_host_work.swap(0, Ordering::AcqRel) != 0
+    current_task
+        .linux
+        .pending_host_work
+        .swap(0, Ordering::AcqRel)
+        != 0
 }
 
 /// Mark return-to-user work pending for all vCPU slots.
@@ -2385,7 +2382,10 @@ pub fn mark_pending_host_work_all() {
     for slot in 0..EL1_STACK_SLOTS as usize {
         let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
         let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-        current_task.pending_host_work.store(1, Ordering::Release);
+        current_task
+            .linux
+            .pending_host_work
+            .store(1, Ordering::Release);
     }
 }
 
@@ -2398,8 +2398,11 @@ pub fn mark_pending_host_work_for_task(tid: El1TaskId) {
     for slot in 0..EL1_STACK_SLOTS as usize {
         let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
         let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-        if current_task.task_id.load(Ordering::Relaxed) == tid.raw() {
-            current_task.pending_host_work.store(1, Ordering::Release);
+        if current_task.execution.task.load(Ordering::Relaxed) == tid.raw() {
+            current_task
+                .linux
+                .pending_host_work
+                .store(1, Ordering::Release);
             HOST_WORK_PUBLICATIONS[HostWorkPublishReason::ExactTask as usize]
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -2419,12 +2422,15 @@ pub fn mark_pending_host_work_for_file_tables(tables: &[u64]) {
     for slot in 0..EL1_STACK_SLOTS as usize {
         let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
         let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-        if current_task.task_id.load(Ordering::Relaxed) == 0 {
+        if current_task.execution.task.load(Ordering::Relaxed) == 0 {
             continue;
         }
-        let ft = current_task.file_table.load(Ordering::Relaxed);
+        let ft = current_task.linux.file_table.load(Ordering::Relaxed);
         if tables.contains(&ft) {
-            current_task.pending_host_work.store(1, Ordering::Release);
+            current_task
+                .linux
+                .pending_host_work
+                .store(1, Ordering::Release);
             HOST_WORK_PUBLICATIONS[HostWorkPublishReason::FileTable as usize]
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -2440,8 +2446,11 @@ pub fn update_current_task_file_table_for_task(tid: El1TaskId, file_table: u64) 
     for slot in 0..EL1_STACK_SLOTS as usize {
         let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
         let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-        if current_task.task_id.load(Ordering::Relaxed) == tid.raw() {
-            current_task.file_table.store(file_table, Ordering::Release);
+        if current_task.execution.task.load(Ordering::Relaxed) == tid.raw() {
+            current_task
+                .linux
+                .file_table
+                .store(file_table, Ordering::Release);
         }
     }
 }
@@ -2472,9 +2481,10 @@ pub fn publish_zone_identity(slot: usize, zone_mm: u64, thread_serial: u64) {
     // SAFETY: the record lives in the EL1 region; only atomics are touched.
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
     current_task
-        .thread_serial
+        .mm
+        .thread_generation
         .store(thread_serial, Ordering::Relaxed);
-    current_task.zone_mm.store(zone_mm, Ordering::Release);
+    current_task.mm.key.store(zone_mm, Ordering::Release);
 }
 
 /// For a wedge post-mortem: every slot's task record with its boundary
@@ -2490,17 +2500,17 @@ pub fn write_current_task_census(out: &mut impl core::fmt::Write) -> core::fmt::
         let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
         // SAFETY: the record lives in the EL1 region; only atomics are touched.
         let task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-        let tid = task.task_id.load(Ordering::Acquire);
-        let pending = task.pending_host_work.load(Ordering::Acquire);
-        let served = task.served_with_work.load(Ordering::Acquire);
+        let tid = task.execution.task.load(Ordering::Acquire);
+        let pending = task.linux.pending_host_work.load(Ordering::Acquire);
+        let served = task.linux.served_with_work.load(Ordering::Acquire);
         if tid == 0 && pending == 0 && served == 0 {
             continue;
         }
         writeln!(
             out,
             "el1 task slot {slot}: tid={tid} serial={} mm={} pending_host_work={pending} served_with_work={served}",
-            task.thread_serial.load(Ordering::Acquire),
-            task.zone_mm.load(Ordering::Acquire),
+            task.mm.thread_generation.load(Ordering::Acquire),
+            task.mm.key.load(Ordering::Acquire),
         )?;
     }
     Ok(())
@@ -2517,8 +2527,8 @@ pub fn current_task_snapshot(slot: usize) -> Option<(El1TaskId, u64)> {
     // SAFETY: the record lives in the EL1 region; only atomics are touched.
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
     Some((
-        El1TaskId(current_task.task_id.load(Ordering::Acquire)),
-        current_task.thread_serial.load(Ordering::Acquire),
+        El1TaskId(current_task.execution.task.load(Ordering::Acquire)),
+        current_task.mm.thread_generation.load(Ordering::Acquire),
     ))
 }
 
@@ -2536,27 +2546,7 @@ pub fn peek_served_with_work(slot: usize) -> bool {
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task.served_with_work.load(Ordering::Acquire) != 0
-}
-
-/// `CurrentTask::served_with_work` value: the call is complete, only wakes
-/// (pipe, eventfd, inotify) are owed.
-pub const SERVED_WAKES_OWED: u32 = 1;
-/// `CurrentTask::served_with_work` value: the host must still commit the
-/// call's metadata and re-run it with the preserved argument 0.
-pub const SERVED_COMMIT_OWED: u32 = 2;
-
-/// What a thread owes the host after EL1 served its syscall with work.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ServedBoundary {
-    /// The call is complete; only owed wakes are delivered. The guest
-    /// resumes after the syscall instruction.
-    Completed,
-    /// EL1 edited the guest tables but the host must still commit the call's
-    /// metadata. The host runs the call again, and it must see the ORIGINAL
-    /// arguments: EL1 overwrote x0 with the result, so `x0` here is the
-    /// argument 0 EL1 preserved. Never re-read x0 from the mutated frame.
-    ReplayOriginal { x0: u64 },
+    current_task.linux.served_with_work.load(Ordering::Acquire) != 0
 }
 
 /// Atomically take the served-with-work boundary of an executor slot: `None`
@@ -2568,13 +2558,7 @@ pub fn take_served_boundary(slot: usize) -> Option<ServedBoundary> {
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    match current_task.served_with_work.swap(0, Ordering::AcqRel) {
-        0 => None,
-        SERVED_COMMIT_OWED => Some(ServedBoundary::ReplayOriginal {
-            x0: current_task.orig_arg0.load(Ordering::Relaxed),
-        }),
-        _ => Some(ServedBoundary::Completed),
-    }
+    current_task.linux.take_served_boundary()
 }
 
 /// Read the preserved original argument 0 for an executor slot.
@@ -2585,7 +2569,7 @@ pub fn get_orig_arg0(slot: usize) -> u64 {
     }
     let offset = EL1_CURRENT_TASKS_OFFSET as usize + slot * core::mem::size_of::<CurrentTask>();
     let current_task = unsafe { &*((ptr + offset) as *const CurrentTask) };
-    current_task.orig_arg0.load(Ordering::Relaxed)
+    current_task.linux.orig_arg0.load(Ordering::Relaxed)
 }
 
 pub use carrick_inotify_core::QueuePush;
@@ -3093,34 +3077,37 @@ mod tests {
     fn lifecycle_mapping_binding_is_revoked_on_task_clear() {
         let task = CurrentTask::new();
         task.publish_lifecycle(0x10000, 0x20000);
-        assert_eq!(task.lifecycle_page.load(Ordering::Acquire), 0x10000);
-        assert_eq!(task.control_slot.load(Ordering::Acquire), 0x20000);
+        assert_eq!(
+            task.metadata.lifecycle_page.load(Ordering::Acquire),
+            0x10000
+        );
+        assert_eq!(task.metadata.control_slot.load(Ordering::Acquire), 0x20000);
         task.clear();
-        assert_eq!(task.lifecycle_page.load(Ordering::Acquire), 0);
-        assert_eq!(task.control_slot.load(Ordering::Acquire), 0);
+        assert_eq!(task.metadata.lifecycle_page.load(Ordering::Acquire), 0);
+        assert_eq!(task.metadata.control_slot.load(Ordering::Acquire), 0);
     }
     #[test]
     fn only_a_commit_owed_call_replays_and_a_drain_never_downgrades_it() {
         let task = CurrentTask::new();
         // A plain served call that left because a drain blocked: complete,
         // whatever its stale `orig_arg0` and syscall number.
-        task.orig_arg0.store(0, Ordering::Relaxed);
+        task.linux.orig_arg0.store(0, Ordering::Relaxed);
         let _ = task.leave_served_with_work();
         assert_eq!(
-            task.served_with_work.load(Ordering::Relaxed),
+            task.linux.served_with_work.load(Ordering::Relaxed),
             SERVED_WAKES_OWED
         );
         // A call owing its commit replays with the preserved argument ...
         let _ = task.leave_commit_owed(0x6000);
         assert_eq!(
-            task.served_with_work.load(Ordering::Relaxed),
+            task.linux.served_with_work.load(Ordering::Relaxed),
             SERVED_COMMIT_OWED
         );
-        assert_eq!(task.orig_arg0.load(Ordering::Relaxed), 0x6000);
+        assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), 0x6000);
         // ... and a later blocked drain (`leave_served_with_work`) keeps it.
         let _ = task.leave_served_with_work();
         assert_eq!(
-            task.served_with_work.load(Ordering::Relaxed),
+            task.linux.served_with_work.load(Ordering::Relaxed),
             SERVED_COMMIT_OWED
         );
     }
@@ -3273,13 +3260,19 @@ mod tests {
     fn test_current_task_layout() {
         assert_eq!(core::mem::size_of::<CurrentTask>(), 128);
         assert_eq!(core::mem::align_of::<CurrentTask>(), 8);
-        assert_eq!(core::mem::offset_of!(CurrentTask, generation), 0);
-        assert_eq!(core::mem::offset_of!(CurrentTask, task_id), 8);
-        assert_eq!(core::mem::offset_of!(CurrentTask, file_table), 16);
-        assert_eq!(core::mem::offset_of!(CurrentTask, fixup_pc), 24);
-        assert_eq!(core::mem::offset_of!(CurrentTask, orig_arg0), 32);
-        assert_eq!(core::mem::offset_of!(CurrentTask, pending_host_work), 40);
-        assert_eq!(core::mem::offset_of!(CurrentTask, served_with_work), 44);
+        assert_eq!(core::mem::offset_of!(CurrentTask, execution.generation), 0);
+        assert_eq!(core::mem::offset_of!(CurrentTask, execution.task), 8);
+        assert_eq!(core::mem::offset_of!(CurrentTask, linux.file_table), 16);
+        assert_eq!(core::mem::offset_of!(CurrentTask, linux.fixup_pc), 24);
+        assert_eq!(core::mem::offset_of!(CurrentTask, linux.orig_arg0), 32);
+        assert_eq!(
+            core::mem::offset_of!(CurrentTask, linux.pending_host_work),
+            40
+        );
+        assert_eq!(
+            core::mem::offset_of!(CurrentTask, linux.served_with_work),
+            44
+        );
     }
 
     #[test]
@@ -3322,19 +3315,19 @@ mod tests {
     #[test]
     fn test_current_task_operations() {
         let task = CurrentTask::new();
-        assert_eq!(task.task_id.load(Ordering::Relaxed), 0);
-        assert_eq!(task.generation.load(Ordering::Relaxed), 0);
-        assert_eq!(task.file_table.load(Ordering::Relaxed), 0);
+        assert_eq!(task.execution.task.load(Ordering::Relaxed), 0);
+        assert_eq!(task.execution.generation.load(Ordering::Relaxed), 0);
+        assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 0);
 
         task.set(El1TaskId::from_linux_tid(7), 42, 100);
-        assert_eq!(task.task_id.load(Ordering::Relaxed), 7);
-        assert_eq!(task.generation.load(Ordering::Relaxed), 42);
-        assert_eq!(task.file_table.load(Ordering::Relaxed), 100);
+        assert_eq!(task.execution.task.load(Ordering::Relaxed), 7);
+        assert_eq!(task.execution.generation.load(Ordering::Relaxed), 42);
+        assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 100);
 
         task.clear();
-        assert_eq!(task.task_id.load(Ordering::Relaxed), 0);
-        assert_eq!(task.generation.load(Ordering::Relaxed), 0);
-        assert_eq!(task.file_table.load(Ordering::Relaxed), 0);
+        assert_eq!(task.execution.task.load(Ordering::Relaxed), 0);
+        assert_eq!(task.execution.generation.load(Ordering::Relaxed), 0);
+        assert_eq!(task.linux.file_table.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -3405,19 +3398,19 @@ mod tests {
             &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 6 * core::mem::size_of::<CurrentTask>())
                 as *const CurrentTask)
         };
-        task_6.task_id.store(43, Ordering::Relaxed);
+        task_6.execution.task.store(43, Ordering::Relaxed);
 
-        task_5.task_id.store(42, Ordering::Relaxed);
+        task_5.execution.task.store(42, Ordering::Relaxed);
         mark_pending_host_work_for_task(El1TaskId::from_linux_tid(42));
         assert!(task_5.has_pending_host_work());
         assert!(!task_6.has_pending_host_work()); // sibling task remains untouched
 
-        task_5.file_table.store(100, Ordering::Relaxed);
+        task_5.linux.file_table.store(100, Ordering::Relaxed);
         update_current_task_file_table_for_task(El1TaskId::from_linux_tid(42), 200);
-        assert_eq!(task_5.file_table.load(Ordering::Acquire), 200);
-        assert_eq!(task_6.file_table.load(Ordering::Acquire), 0);
+        assert_eq!(task_5.linux.file_table.load(Ordering::Acquire), 200);
+        assert_eq!(task_6.linux.file_table.load(Ordering::Acquire), 0);
 
-        task_5.served_with_work.store(1, Ordering::Relaxed);
+        task_5.linux.served_with_work.store(1, Ordering::Relaxed);
         assert!(take_served_with_work(5));
         assert!(!take_served_with_work(5));
 
@@ -3427,9 +3420,9 @@ mod tests {
             &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 7 * core::mem::size_of::<CurrentTask>())
                 as *const CurrentTask)
         };
-        task_7.file_table.store(200, Ordering::Relaxed);
+        task_7.linux.file_table.store(200, Ordering::Relaxed);
         // task_7 has task_id = 0 (no task running)
-        assert_eq!(task_7.task_id.load(Ordering::Relaxed), 0);
+        assert_eq!(task_7.execution.task.load(Ordering::Relaxed), 0);
 
         mark_pending_host_work_for_file_tables(&[200]);
         // task_5 has task_id = 42 and file_table = 200, so it must be marked
@@ -4370,3 +4363,5 @@ mod tests {
         );
     }
 }
+
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x3ff0_698f_9f1a_67f1);
