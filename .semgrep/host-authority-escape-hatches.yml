@@ -42,11 +42,15 @@ rules:
         - /crates/carrick-el1/src/sched/hw.rs
         - /crates/carrick-el1/src/sched/aarch64_context.rs
         - /crates/carrick-el1/src/entry.rs
+        # ARM EL1 TTBR0/HVC leaves are guest instructions, moved intact from
+        # the former fault and portal callers into the neutral ISA boundary.
+        - /crates/carrick-el1/src/isa/aarch64.rs
         # Reviewed target_os=none CPL0 ISA leaves in the shared kernel: the
         # native stack/TSC reads and named UD2 fail-closed paths. These execute
         # in the guest and have no host operation or semantic syscall escape.
         - /crates/carrick-el1/src/isa/x86/context.rs
         - /crates/carrick-el1/src/isa/x86/interrupt.rs
+        - /crates/carrick-el1/src/isa/x86/interrupts.rs
         - /crates/carrick-el1/src/isa/x86/mmu.rs
         - /crates/carrick-el1/src/isa/x86/transport.rs
         - /crates/carrick-el1/src/isa/x86/user_access.rs

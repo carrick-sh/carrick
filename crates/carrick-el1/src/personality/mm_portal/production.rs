@@ -155,9 +155,7 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
 #[cfg(target_os = "none")]
 pub(crate) fn yield_host_effect() {
     #[cfg(target_arch = "aarch64")]
-    unsafe {
-        core::arch::asm!("hvc #1", clobber_abi("C"));
-    }
+    crate::isa::aarch64::yield_host_effect();
     #[cfg(target_arch = "x86_64")]
     crate::isa::x86::carrick_x86_unbound_host_yield();
 }
