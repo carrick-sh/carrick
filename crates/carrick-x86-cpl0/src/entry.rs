@@ -275,7 +275,6 @@ mod kernel {
 
     // The KVM fault fixture owns one exact MM and one host-backed prepared
     // page. These records stay live across the native syscall boundary.
-
     fixture_items! {
         static SHARED_FAULT_MAILBOX: carrick_el1_abi::FrameGrantMailbox =
             carrick_el1_abi::FrameGrantMailbox::new();
@@ -283,6 +282,10 @@ mod kernel {
             carrick_el1_abi::CowGrantPool::new();
         // Retained by the stopped fixture carrier until VM retirement.
         static FORK_RESIDENCY_ADDRESS: AtomicU64 = AtomicU64::new(0);
+        pub(super) mod process {
+            include!("process.rs");
+        }
+    }
     }
 
     #[repr(C)]
@@ -328,9 +331,10 @@ mod kernel {
                 &*(binding.counters_address as *const Counters),
             )
         };
+        let lane = binding.scheduler_witness.load(Ordering::Acquire);
         let fixture = crate::fixture_image()
-            && binding.scheduler_witness.load(Ordering::Acquire)
-                == super::lifecycle::LIFECYCLE_LANE;
+            && (lane == super::lifecycle::LIFECYCLE_LANE
+                || lane == super::lifecycle::LIFECYCLE_LANE + super::lifecycle::LIFECYCLE_STRIDE);
         let (zone_address, residency, pool, mailbox) = if fixture {
             let address = FORK_RESIDENCY_ADDRESS.load(Ordering::Acquire);
             if address == 0 {
@@ -518,8 +522,16 @@ mod kernel {
             core::sync::atomic::fence(Ordering::SeqCst);
         }
         fn invalidate_range(&self, _: u64, _: u64) {
-            // The fresh root has never been installed. Its first MOV CR3
-            // supplies the local translation boundary.
+            // Initial loading uses an unpublished root. The same words venue
+            // serves fork after the root is live, when COW permission stores
+            // require a local non-global TLB drain before returning to CPL3.
+            if carrick_el1::isa::x86::hardware_live_root()
+                .is_ok_and(|root| root.address().raw() == 0x80_0000)
+            {
+                // SAFETY: this CPL0 CPU owns the live root and has no PCID or
+                // global translations, so MOV CR3 drains its old user leaves.
+                unsafe { core::arch::asm!("mov cr3, {}", in(reg) 0x80_0000_u64, options(nostack, preserves_flags)) }
+            }
         }
     }
 
@@ -740,6 +752,12 @@ mod kernel {
             }
             let mut mmu = carrick_el1::isa::x86::X86Backend;
             if mmu.install_context(loaded.address).is_err() {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            if frame.rdx == 1
+                && !process::admit_initial(binding, loaded.stack_pointer, loaded.address.root.address().raw())
+            {
                 doorbell(FATAL_PORT, frame);
                 halt();
             }

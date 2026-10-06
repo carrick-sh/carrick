@@ -54,13 +54,23 @@ fn static_elf_fork_child_cow_wait_and_parent_exit_seven() {
     program.extend_from_slice(&0x10100u64.to_le_bytes());
     program.extend_from_slice(&[0x48, 0xbe]);
     program.extend_from_slice(&(elf.len() as u64).to_le_bytes());
+    program.extend_from_slice(&[0x48, 0xba]); // mov rdx, fixture process lane
+    program.extend_from_slice(&1u64.to_le_bytes());
     program.extend_from_slice(&[0x48, 0xb8]);
     program.extend_from_slice(&OBSERVE_INITIAL_MM.to_le_bytes());
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     program.resize(0x100, 0x90);
     program.extend_from_slice(&elf);
-    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("real KVM image");
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("real KVM image");
     let observed = carrier.observe(0).expect("fork, wait4 and exit");
     assert_eq!(observed.result, 7);
     assert_eq!(observed.semantic_host_exits, 0);
+    let state = carrier
+        .lifecycle_state(0)
+        .expect("zone lifecycle after parent exit");
+    assert_eq!(state.births, 1);
+    assert_eq!(state.retirements, 1);
+    assert_eq!(state.wakes, 1);
+    assert_eq!(state.live, 1);
 }
