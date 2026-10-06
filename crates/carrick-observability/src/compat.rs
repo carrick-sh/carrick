@@ -486,6 +486,7 @@ impl CompatReporter {
             syscall_rewrites,
             dropped_rewrite_events: rewrite_diagnostics.dropped_events,
             fast_path_blind_spots,
+            execution_witness: None,
         }
     }
 
@@ -501,6 +502,9 @@ impl CompatReporter {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompatReport {
     pub summary: CompatSummary,
+    /// Execution-lane counters captured after the final guest exit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_witness: Option<ExecutionWitness>,
     /// Hit-but-unimplemented syscalls whose numbers are NOT in the aarch64
     /// table — genuinely unknown to Carrick.
     pub unhandled_syscalls: Vec<SyscallCount>,
@@ -522,6 +526,13 @@ pub struct CompatReport {
     pub dropped_rewrite_events: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fast_path_blind_spots: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionWitness {
+    pub backend: String,
+    pub guest_entries: u64,
+    pub host_forwards: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
