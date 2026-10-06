@@ -1,10 +1,12 @@
 //! Conflicting edits retain their original syscall arguments in the existing
 //! EL1 scheduler context. They have performed no effect before this park.
+
 use crate::memory::reservations::SharedReservations;
-use crate::substrate::sched::object_wait::OperationResumePc;
 use crate::substrate::sched::{Sched, Served, ThreadCpu, UserWord};
+use carrick_core::wait::{
+    EditWaitOutcome, EditWaitTarget, OperationResumePc, coordinate_prepared_edit_wait,
+};
 use carrick_el1_abi::{ReservationMm, ReservationRange, TrapFrame};
-use carrick_sched_core::object_wait::{ObjectWaitError, OperationToken};
 use core::sync::atomic::Ordering;
 
 /// No result means the existing syscall venue continues. A result means its
@@ -23,34 +25,16 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
     if !table.admitted(index.index(), mm) {
         return None;
     }
-    // A resumed edit owns only its unchanged saved SVC context. Unlike a
-    // consuming IPC operation, redispatch has no source effect to replay.
     let resumed = sched.take_object_operation().ok().flatten();
-    loop {
-        let mut root = table
-            .lock_in(
-                crate::substrate::sched::object_wait::space_access(sched.zone, sched.slot),
-                index.index(),
-                mm,
-                frame.slot as u32,
-            )
-            .ok()?;
-        let key = root.prepared_wait_key()?;
-        if resumed.as_ref().is_some_and(|token| {
-            token.index() != u64::from(key.index()) || token.generation() != key.generation()
-        }) {
-            sched.task.orig_arg0.store(frame.x[0], Ordering::Relaxed);
-            frame.x[0] = (-3i64) as u64;
-            return Some(Served::Returned { switched: false });
-        }
+    let resume = OperationResumePc::new(frame.elr.checked_sub(4)?)?;
+    let rounded = |start: u64, len: u64| {
+        let end = start.checked_add(len)?.checked_add(4095)? & !4095;
+        ReservationRange::new(start & !4095, end)
+    };
+    let slot = sched.slot;
+    let space_acc = crate::substrate::sched::object_wait::space_access(sched.zone, slot);
 
-        // Source custody is established at root admission. Contention here
-        // must never try to bind a queue while retaining this root guard.
-        let snapshot = sched.observe_object(key).ok()?;
-        let rounded = |start: u64, len: u64| {
-            let end = start.checked_add(len)?.checked_add(4095)? & !4095;
-            ReservationRange::new(start & !4095, end)
-        };
+    let check_conflict = |root: &mut crate::memory::reservations::Reservations<'_>| {
         let first = match nr {
             215 | 216 | 226 => rounded(frame.x[0], frame.x[1]),
             222 if frame.x[3] & (0x10 | 0x100000) != 0 => rounded(frame.x[0], frame.x[1]),
@@ -64,26 +48,35 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
         let second = (nr == 216 && frame.x[3] & 2 != 0)
             .then(|| rounded(frame.x[4], frame.x[2]))
             .flatten();
-        let conflict = first.is_some_and(|range| root.prepared_overlaps(range))
-            || second.is_some_and(|range| root.prepared_overlaps(range));
-        drop(root);
-        if !conflict {
-            return None;
+        Some(
+            first.is_some_and(|range| root.prepared_overlaps(range))
+                || second.is_some_and(|range| root.prepared_overlaps(range)),
+        )
+    };
+
+    let target = EditWaitTarget::new(space_acc, index.index(), mm, slot);
+    let outcome = coordinate_prepared_edit_wait(
+        table,
+        target,
+        resumed,
+        sched.zone,
+        check_conflict,
+        |key, snapshot, token| sched.park_object(frame, key, snapshot, resume, token, None),
+    );
+
+    match outcome {
+        EditWaitOutcome::StaleToken => {
+            sched.task.orig_arg0.store(frame.x[0], Ordering::Relaxed);
+            frame.x[0] = (-3i64) as u64;
+            Some(Served::Returned { switched: false })
         }
-        let resume = OperationResumePc::new(frame.elr.checked_sub(4)?)?;
-        let token = OperationToken::new(u64::from(key.index()), key.generation())?;
-        match sched.park_object(frame, key, snapshot, resume, token, None) {
-            Ok(parked) => {
-                return if sched.task.has_pending_host_work() {
-                    sched.leave_after_object_park(parked)
-                } else {
-                    sched.resume_after_object_park(frame, parked, 0)
-                };
+        EditWaitOutcome::Parked(parked) => {
+            if sched.task.has_pending_host_work() {
+                sched.leave_after_object_park(parked)
+            } else {
+                sched.resume_after_object_park(frame, parked, 0)
             }
-            // This is a completed owner publication, not a poll. Recheck the
-            // predicate against its new epoch before making any proposal.
-            Err((ObjectWaitError::Changed, _)) => continue,
-            Err(_) => return None,
         }
+        EditWaitOutcome::NoConflict | EditWaitOutcome::Refused => None,
     }
 }
