@@ -8,9 +8,9 @@ license.workspace = true
 name = "carrick_vmm_kvm"
 path = "src/lib.rs"
 
-# The MVP `run-elf` entry point. Self-contained (no carrick-runtime dep), so it
-# links for aarch64-linux independently of the macOS dispatch layer. On non-Linux
-# hosts `main` is a stub (the lib is empty there), so the workspace still builds.
+# ARM MVP `run-elf` entry point, independent of the macOS dispatch layer.
+# The retired x86 entry refuses and names the production shared CPL0 command.
+# On non-Linux hosts the lib is empty and the executable reports unsupported.
 [[bin]]
 name = "carrick-vmm-kvm"
 path = "src/main.rs"
