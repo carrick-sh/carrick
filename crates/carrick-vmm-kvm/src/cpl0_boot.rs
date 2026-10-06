@@ -97,6 +97,7 @@ pub struct Observation {
     pub captured_stack: u64,
     pub returned_stack: u64,
     pub preserved_rbx: u64,
+    pub host_yields: u64,
 }
 
 /// Stopped-vCPU structural observation, including refusal paths that cannot
@@ -120,6 +121,7 @@ pub struct Cpl0Carrier {
     pub(crate) ram: GuestRam,
     metadata_base: NonNull<u8>,
     host_forwards: u64,
+    host_yields: u64,
     kicks: u64,
     work_exits: u64,
 }
@@ -473,6 +475,7 @@ impl Cpl0Carrier {
             ram,
             metadata_base,
             host_forwards: 0,
+            host_yields: 0,
             kicks: 0,
             work_exits: 0,
         })
@@ -601,10 +604,19 @@ impl Cpl0Carrier {
                     | RETURN_KICK_PORT
                     | WORK_PORT
                     | FATAL_PORT
+                    | YIELD_PORT
             ) {
                 let mut detail = format!("unexpected CPL0 port {port:#x}");
                 self.cpus[index].append_debug_state(&mut detail);
                 return Err(fail(detail));
+            }
+            if port == FATAL_PORT {
+                let payload = self.cpus[index].get_gpr(X86Reg::Rax)?;
+                return Err(fail(format!("CPL0 fatal exit: payload {payload:#x}")));
+            }
+            if port == YIELD_PORT {
+                self.host_yields += 1;
+                continue;
             }
             let address = self.cpus[index].get_gpr(X86Reg::Rax)?;
             let stack_end = self.binding(index).kernel_stack + 16;
@@ -649,6 +661,7 @@ impl Cpl0Carrier {
                         captured_stack: self.binding(index).captured_stack.load(Ordering::Acquire),
                         returned_stack: frame.rsp,
                         preserved_rbx: frame.rbx,
+                        host_yields: self.host_yields,
                     });
                 }
                 FORWARD_PORT => {
