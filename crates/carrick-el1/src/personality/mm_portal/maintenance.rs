@@ -32,7 +32,9 @@ pub trait NativeBackingMaintenance<P: PinnedMetadataExtent> {
         slot: u32,
     ) -> Result<BackingMaintenance<'_>, MmError>;
 }
-impl<P: PinnedMetadataExtent> NativeBackingMaintenance<P> for MmPortal<'_, P> {
+impl<P: PinnedMetadataExtent, B: carrick_mmu_core::owner_mmu::OwnerMmu> NativeBackingMaintenance<P>
+    for MmPortal<'_, P, B>
+{
     fn begin_backing_maintenance(
         &self,
         request: PortalBackingMaintenance,
@@ -186,11 +188,26 @@ impl BackingMaintenance<'_> {
     pub fn scrub_x86<W: LiveDescriptorWords + ?Sized>(
         self,
         venue: &carrick_core::mm::cow::GuestCowVenue<'_, crate::cow::X86CowMmu, W>,
-        mut zero_page: impl FnMut(u64, u64),
+        zero_page: impl FnMut(u64, u64),
     ) -> Result<BackingMaintenanceProgress, MmError> {
-        use carrick_core::mm::cow::{CowRepointOp, OwnerCowMmu};
+        self.scrub_retired_x86(venue, zero_page, || crate::isa::x86::fatal_entry_binding())
+    }
+
+    /// The same admitted request and physical settlement with an injected
+    /// native MMU adapter, so a VM-free x86 fixture can exercise the owner
+    /// sequence without a CPL0 hardware portal region.
+    #[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+    pub fn scrub_retired_x86<
+        B: carrick_core::mm::cow::OwnerCowMmu,
+        W: LiveDescriptorWords + ?Sized,
+    >(
+        self,
+        venue: &carrick_core::mm::cow::GuestCowVenue<'_, B, W>,
+        mut zero_page: impl FnMut(u64, u64),
+        fatal: impl Fn() -> MmError,
+    ) -> Result<BackingMaintenanceProgress, MmError> {
+        use carrick_core::mm::cow::CowRepointOp;
         use carrick_mmu_core::x86::descriptor_txn::ADDRESS;
-        type Mmu = crate::cow::X86CowMmu;
         if venue.root.raw() != self.ttbr0 & ADDRESS {
             return Err(MmError::Stale);
         }
@@ -220,12 +237,12 @@ impl BackingMaintenance<'_> {
         };
         let refuse = || {
             if !venue.pool.abandon(&grant) {
-                crate::isa::x86::fatal_entry_binding();
+                return Err(fatal());
             }
             Err(MmError::Core)
         };
         if grant.physical_ipa == old_ipa & !(carrick_el1_abi::COW_GRANT_SIZE - 1)
-            || !Mmu::plan_cow_repoint(venue.words, venue.root.raw(), op)
+            || !B::plan_cow_repoint(venue.words, venue.root.raw(), op)
             || !venue.residency.retire_small_span(mm, va, 4096)
         {
             return refuse();
@@ -235,10 +252,10 @@ impl BackingMaintenance<'_> {
             .with_page(old_ipa, new_ipa, &mut zero_page)
         {
             Ok(()) => {}
-            Err(CowRepointOutcome::Indeterminate) => crate::isa::x86::fatal_entry_binding(),
+            Err(CowRepointOutcome::Indeterminate) => return Err(fatal()),
             Err(_) => return refuse(),
         }
-        match Mmu::execute_cow_repoint(venue.words, venue.root.raw(), op) {
+        match B::execute_cow_repoint(venue.words, venue.root.raw(), op) {
             CowRepointOutcome::Applied {
                 flush_required: false,
             } => {
@@ -250,14 +267,14 @@ impl BackingMaintenance<'_> {
                     old_ipa,
                     new_ipa,
                 }) {
-                    crate::isa::x86::fatal_entry_binding();
+                    return Err(fatal());
                 }
                 Ok(BackingMaintenanceProgress::Complete { next })
             }
             CowRepointOutcome::Applied {
                 flush_required: true,
             }
-            | CowRepointOutcome::Indeterminate => crate::isa::x86::fatal_entry_binding(),
+            | CowRepointOutcome::Indeterminate => Err(fatal()),
             CowRepointOutcome::Refused | CowRepointOutcome::RolledBack => refuse(),
         }
     }
