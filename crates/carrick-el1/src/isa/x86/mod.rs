@@ -3,8 +3,8 @@
 use super::ArchError;
 
 pub mod context;
-pub mod interrupt;
 pub mod initial_mm;
+pub mod interrupt;
 mod mmu;
 pub mod transport;
 pub mod user_access;
