@@ -918,12 +918,30 @@ impl PreparedRun {
             let mut machine =
                 carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::boot_production(extent_bytes)?;
             machine.load_guest_mm(&image, &argv, &env)?;
-            let (exit_code, traps) = machine.run_initial_process(max_traps, |fd, bytes| {
+            let outcome = machine.run_initial_process(max_traps, |fd, bytes| {
                 dispatcher.forward_stdio_bytes(fd, bytes)
             })?;
+            let (exit_code, terminating_signal, traps) = match outcome {
+                carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Exited { code, exits } => {
+                    (code, None, exits)
+                }
+                carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Fault { record, exits } => {
+                    if record.cs & 3 != 3 {
+                        return Err(RuntimeError::Unsupported(format!(
+                            "CPL0 kernel fault: {record:?}"
+                        )));
+                    }
+                    let (signal, _) = record.linux_signal().ok_or_else(|| {
+                        RuntimeError::Unsupported(format!(
+                            "unclassified x86 user fault: {record:?}"
+                        ))
+                    })?;
+                    (128 + signal, Some(signal), exits)
+                }
+            };
             Ok(RunResult {
                 exit_code,
-                terminating_signal: None,
+                terminating_signal,
                 stdout: dispatcher.stdout(),
                 stderr: dispatcher.stderr(),
                 traps,

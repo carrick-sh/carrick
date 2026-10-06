@@ -166,13 +166,14 @@ core::arch::global_asm!(
     "mov qword ptr [rsp + 560], rax",
     "mov qword ptr [rsp + 568], rax",
     "mov eax, 7", "xor edx, edx", "xsave64 [rsp]",
+    "mov r14, cr2",
     "mov rdi, r12",
     "call carrick_x86_handle_user_page_fault",
     "mov r13, rax",
-    "mov eax, 7", "xor edx, edx", "xrstor64 [rsp]",
-    "mov rsp, r12",
     "test r13, r13",
     "jnz 3f",
+    "mov eax, 7", "xor edx, edx", "xrstor64 [rsp]",
+    "mov rsp, r12",
     "test byte ptr [rsp + 136], 3",
     "jz 4f",
     "swapgs",
@@ -183,7 +184,9 @@ core::arch::global_asm!(
     "add rsp, 8", // discard the x86 page-fault error word
     "iretq",
     "3:",
-    "mov rdi, r13",
+    "mov rdi, r12",
+    "mov rsi, r14",
+    "mov rdx, r13",
     "call carrick_x86_unresolved_user_page_fault",
     "ud2",
 );
@@ -395,14 +398,24 @@ mod kernel {
         serve(venues.zone, residency, pool, mailbox)
     }
 
-    /// Named fail-closed leaf until x86 task signal delivery can consume an
-    /// unresolved user fault. Returning to CPL3 would loop or corrupt state.
+    /// Forward the original hardware fault through the existing typed x86
+    /// transport. x86 signal-handler installation is not bound in this lane;
+    /// the host applies the shared default Linux signal policy to this record.
     #[cold]
     #[unsafe(no_mangle)]
-    extern "C" fn carrick_x86_unresolved_user_page_fault(_reason: u64) -> ! {
-        // SAFETY: this is a terminal CPL0 refusal with no safe user return.
-        unsafe { core::arch::asm!("ud2", options(noreturn)) }
-
+    extern "C" fn carrick_x86_unresolved_user_page_fault(frame: &PageFaultStack, far: u64, _reason: u64) -> ! {
+        fn word(value: u32) {
+            // SAFETY: this CPL0 CPU owns the existing 32-bit fault transport.
+            unsafe { core::arch::asm!("out dx, eax", in("dx") FAULT_DOORBELL_PORT,
+                in("eax") value, options(nostack, preserves_flags)); }
+        }
+        word(14);
+        for value in [frame.error, frame.rip, frame.cs, frame.rsp, frame.rflags,
+            frame.saved_gprs[10], far] {
+            word(value as u32);
+            word((value >> 32) as u32);
+        }
+        halt()
     }
 
     fixture_items! {

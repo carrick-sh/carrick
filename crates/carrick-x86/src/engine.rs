@@ -141,7 +141,7 @@ struct SysretResume {
     user_rflags: u64,
 }
 
-fn x86_fault_signal(kind: X86FaultKind, error_code: u64) -> Option<(i32, i32)> {
+pub(crate) fn x86_fault_signal(kind: X86FaultKind, error_code: u64) -> Option<(i32, i32)> {
     const SIGSEGV: i32 = libc::SIGSEGV;
     const SIGBUS: i32 = libc::SIGBUS;
     const SIGFPE: i32 = libc::SIGFPE;

@@ -82,3 +82,41 @@ fn production_extent_cannot_alias_kernel_metadata() {
         "initial extent aliases the dynamic metadata aperture"
     );
 }
+
+#[test]
+fn production_user_page_fault_forwards_the_original_user_frame() {
+    let mut elf = tiny_elf();
+    let mut code = vec![
+        0xbf, 1, 0, 0, 0, 0x31, 0xf6, 0x31, 0xd2, 0xb8, 1, 0, 0, 0, 0x0f, 0x05, 0x48, 0xb8,
+    ];
+    code.extend_from_slice(&0xdead000u64.to_le_bytes());
+    code.extend_from_slice(&[0xc6, 0x00, 1, 0x0f, 0x0b]);
+    elf.truncate(0xb0);
+    elf.extend_from_slice(&code);
+    let size = elf.len() as u64;
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    let plan = prepare_static_x86_elf(&elf).expect("static fault ELF");
+    let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[]).expect("extent");
+    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM");
+    carrier
+        .load_guest_mm(&plan, &[], &[])
+        .expect("production initial MM");
+    let outcome = carrier
+        .run_initial_process(32, |fd, bytes| {
+            assert_eq!(fd, 1);
+            assert!(bytes.is_empty());
+            0
+        })
+        .expect("typed user fault");
+    let carrick_vmm_kvm::cpl0_boot::InitialProcessExit::Fault { record, exits } = outcome else {
+        panic!("expected fault: {outcome:?}");
+    };
+    assert_eq!(record.vector, 14);
+    assert_eq!(record.cs & 3, 3);
+    assert_eq!(record.error_code & 7, 6);
+    assert_eq!(record.cr2, 0xdead000);
+    assert_eq!(record.rip, 0x4000b0 + 16 + 10);
+    assert_eq!(record.saved_rax, 0xdead000);
+    assert_eq!(record.linux_signal(), Some((libc::SIGSEGV, 1)));
+    assert_eq!(exits, 2);
+}
