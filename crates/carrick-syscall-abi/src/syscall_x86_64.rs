@@ -8,9 +8,8 @@
 //!   - OSDev Wiki "System calls" (x86_64 ABI table)
 //!
 //! Each canonical (`Direct(N)`) target is cross-checked against
-//! `carrick_abi::syscall::AARCH64_SYSCALLS` in this file's compile-time
-//! guard (see below) to ensure the remap is self-consistent with carrick's
-//! own canonical numbering.
+//! `carrick_abi::syscall::AARCH64_SYSCALLS` by the `carrick-abi`
+//! cross-check test to keep the remap consistent with canonical numbering.
 //!
 //! CLEAN-ROOM: no Linux kernel source (`arch/x86/entry/syscalls/syscall_64.tbl`,
 //! `unistd_64.h`) or glibc source was used. Numbers come exclusively from the
@@ -29,23 +28,24 @@
 //! clearly-marked comment block at the end of the table as needing a future
 //! arg-translation shim.
 //!
-//! `arch_prctl`=158 stays `native` (the backend services FS/GS base). fork(57)
-//! and vfork(58) are NOT table entries — they are desugared to clone(220)
-//! BEFORE the table lookup in `carrick_hal::x8664_arch::normalize_syscall`.
+//! `arch_prctl`=158 stays `native` (the backend services FS/GS base). The
+//! shared guest kernel routes fork(57) through a private canonical number;
+//! host backends still lower fork/vfork to clone before table lookup.
 
 /// How a guest-ISA syscall number reaches the canonical (aarch64/asm-generic)
-/// dispatcher. Defined here in `carrick-abi` (the leaf crate) so both
-/// `carrick-abi` and `carrick-hal` can share it without a dependency cycle.
+/// dispatcher. Defined in the guest-safe syscall ABI leaf and re-exported by
+/// `carrick-abi` for host backends.
 /// `carrick-hal::guest_arch` re-exports this type.
 ///
-/// Phase 2 carries `Direct` and `Unknown`; the legacy-shim class (x86_64
-/// `open`→`openat` etc.) gets its variant when the first shim lands
-/// (oracle-gated — M2's musl-static startup is at-era and needs none).
+/// `Private` names x86 operations without an asm-generic ordinal; host
+/// backends may lower those operations before consulting this table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyscallRemap {
     /// Same semantics, different number: dispatch as `canonical` with args
     /// unchanged.
     Direct(u64),
+    /// Canonical Carrick route for an x86 call absent from asm-generic.
+    Private(crate::CanonicalNr),
     /// ISA-private syscall the backend services natively (x86_64 `arch_prctl`).
     Native,
     /// No canonical equivalent / not in the table: honest -ENOSYS.
@@ -69,6 +69,14 @@ const fn direct(number: u64, name: &'static str, canonical: u64) -> X8664Syscall
     }
 }
 
+const fn private(number: u64, name: &'static str, canonical: crate::CanonicalNr) -> X8664Syscall {
+    X8664Syscall {
+        number,
+        name,
+        remap: SyscallRemap::Private(canonical),
+    }
+}
+
 const fn native(number: u64, name: &'static str) -> X8664Syscall {
     X8664Syscall {
         number,
@@ -85,6 +93,15 @@ pub fn lookup_x86_64(number: u64) -> Option<&'static X8664Syscall> {
         .binary_search_by_key(&number, |s| s.number)
         .ok()
         .map(|i| &X86_64_SYSCALLS[i])
+}
+
+/// Resolve a native x86 number into the typed canonical dispatch domain.
+pub fn canonical_x86_64(number: crate::NativeNr) -> Option<crate::CanonicalNr> {
+    match lookup_x86_64(number.raw())?.remap {
+        SyscallRemap::Direct(canonical) => Some(crate::CanonicalNr(canonical)),
+        SyscallRemap::Private(canonical) => Some(canonical),
+        SyscallRemap::Native | SyscallRemap::Unknown => None,
+    }
 }
 
 /// The full x86_64 syscall table — the WHOLE x86_64 Linux ABI (numbers 0..454).
@@ -233,9 +250,10 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // vs the asm-generic order the dispatcher expects — the x86 engine normalizes
     // it (x8664_arch::normalize_syscall). Source: clone(2) man-page.
     direct(56, "clone", 220),
-    // x86_64=57 fork / 58 vfork: NOT table entries. Desugared to clone(220)
-    // BEFORE the table lookup in x8664_arch::normalize_syscall (asm-generic has
-    // no SYS_fork/SYS_vfork). DO NOT add here.
+    // No asm-generic fork ordinal. The shared guest kernel owns this call;
+    // host backends lower it to clone before consulting this table.
+    private(57, "fork", crate::nr::CARRICK_PRIVATE_X86_FORK),
+    // x86_64=58 vfork remains desugared to clone by host backends.
     // x86_64=59 (syscalls(2)/filippo) → canonical execve=221.
     // glibc/musl execve() lowers to SYS_execve(59); the shared dispatcher's
     // execve handler returns DispatchOutcome::Execve → the loop's handle_execve
@@ -249,7 +267,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     direct(60, "exit", 93),
     // x86_64=61 (syscalls(2)/filippo) → canonical wait4=260.
     // A forking parent reaps its child via wait4.
-    direct(61, "wait4", 260),
+    direct(61, "wait4", crate::nr::WAIT4.raw()),
     // x86_64=62 kill → canonical kill=129 (SAME name+shape)
     direct(62, "kill", 129),
     // x86_64=63 (syscalls(2)/filippo) → canonical uname=160.
@@ -571,7 +589,7 @@ pub static X86_64_SYSCALLS: &[X8664Syscall] = &[
     // x86_64=230 clock_nanosleep → canonical clock_nanosleep=115 (SAME name+shape)
     direct(230, "clock_nanosleep", 115),
     // x86_64=231 (syscalls(2)/filippo) → canonical exit_group=94
-    direct(231, "exit_group", 94),
+    direct(231, "exit_group", crate::nr::EXIT_GROUP.raw()),
     // x86_64=232 epoll_wait: LEGACY (asm-generic has epoll_pwait=22).
     // epoll_wait(epfd,events,max,timeout) vs epoll_pwait(...,*sigmask,size) →
     // DIFFERENT arg shape. SHIMMED in x8664_arch::normalize_syscall →
@@ -964,6 +982,20 @@ mod tests {
     }
 
     #[test]
+    fn fork_has_its_own_private_canonical_route() {
+        let native = crate::NativeNr(57);
+        let entry = lookup_x86_64(native.raw()).expect("fork table entry");
+        assert_eq!(
+            entry.remap,
+            SyscallRemap::Private(crate::nr::CARRICK_PRIVATE_X86_FORK)
+        );
+        assert_eq!(
+            canonical_x86_64(native),
+            Some(crate::nr::CARRICK_PRIVATE_X86_FORK)
+        );
+    }
+
+    #[test]
     fn wait4_remaps_to_canonical_260() {
         let e = lookup_x86_64(61).expect("wait4 must be in the table");
         assert_eq!(e.name, "wait4");
@@ -999,45 +1031,6 @@ mod tests {
                 w[0].number,
                 w[1].number
             );
-        }
-    }
-
-    /// The real cross-check the file's doc comment promises: for every
-    /// `Direct(c)` entry, prove there EXISTS an `AARCH64_SYSCALLS` entry at
-    /// number `c` whose name equals this x86 entry's name. This catches any
-    /// wrong canonical mapping (e.g. a typo'd number that lands on a different
-    /// canonical syscall) at test time — the const sortedness guard cannot do
-    /// this because it can't index `AARCH64_SYSCALLS` by name in const context.
-    #[test]
-    fn every_direct_canonical_matches_aarch64_by_name() {
-        // `aarch64_table()` is the public accessor for `AARCH64_SYSCALLS`
-        // (the static itself is module-private).
-        let aarch64 = crate::syscall::aarch64_table();
-        // The ONE documented exception: x86_64 `poll`(7) is a Direct to the
-        // DIFFERENTLY-named canonical `ppoll`(73). It is a deliberate bring-up
-        // convenience for the musl startup fd-probe `poll(fds,n,0)` (also listed
-        // in the deferred-shim block above as needing a real timeout→timespec
-        // translation). Every OTHER Direct must name-match exactly.
-        for e in X86_64_SYSCALLS {
-            if let SyscallRemap::Direct(canonical) = e.remap {
-                let found = aarch64
-                    .iter()
-                    .find(|a| a.number == canonical)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "x86_64 {}={} maps to canonical {} which is absent from AARCH64_SYSCALLS",
-                            e.name, e.number, canonical
-                        )
-                    });
-                if e.name == "poll" && found.name == "ppoll" {
-                    continue; // documented bring-up exception (see comment above)
-                }
-                assert_eq!(
-                    found.name, e.name,
-                    "x86_64 {}={} → Direct({}) but AARCH64_SYSCALLS[{}] is named {:?}, not {:?}",
-                    e.name, e.number, canonical, canonical, found.name, e.name
-                );
-            }
         }
     }
 
