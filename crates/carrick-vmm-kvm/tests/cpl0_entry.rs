@@ -228,7 +228,7 @@ fn make_shared_carrier(
 ) -> Result<Cpl0Carrier, carrick_hal::TrapError> {
     let slot = SlotId::new(0);
     let mut mutate_opt = Some(mutate);
-    Cpl0Carrier::boot_shared(&image(), p, slot, move |zone, binding| {
+    Cpl0Carrier::boot_shared(&image(), p, slot, move |zone| {
         zone.drive(slot, 1);
         zone.publish_slot(slot, 11, Some(0), 0);
         zone.enter_guest(slot);
@@ -260,7 +260,7 @@ fn make_shared_carrier(
         xsave.0[512..520].copy_from_slice(&3u64.to_le_bytes());
         xsave.0[400..416].fill(0x31);
 
-        *binding = ContextBinding {
+        let mut binding = ContextBinding {
             record: zone.record_ref(record),
             context: NativeContext {
                 frame: InterruptFrame {
@@ -283,8 +283,9 @@ fn make_shared_carrier(
         };
 
         if let Some(m) = mutate_opt.take() {
-            m(zone, binding);
+            m(zone, &mut binding);
         }
+        binding
     })
 }
 

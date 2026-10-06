@@ -235,7 +235,7 @@ fn x1_shared_mm_owner() {
 
     let mut waiter_context = None;
     let p = cpl3_grant_program(DATA_VA);
-    let mut carrier = Cpl0Carrier::boot_shared(&cpl0_image(), &p, slot, |zone, binding| {
+    let mut carrier = Cpl0Carrier::boot_shared(&cpl0_image(), &p, slot, |zone| {
         zone.drive(slot, 1);
         zone.publish_slot(slot, 11, Some(0), 0);
         zone.enter_guest(slot);
@@ -269,7 +269,7 @@ fn x1_shared_mm_owner() {
         xsave.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
         xsave.0[512..520].copy_from_slice(&3u64.to_le_bytes());
 
-        *binding = ContextBinding {
+        let binding = ContextBinding {
             record: zone.record_ref(record),
             context: NativeContext {
                 frame: InterruptFrame {
@@ -308,6 +308,7 @@ fn x1_shared_mm_owner() {
             record: zone.record_ref(record),
             context: binding.context.clone(),
         });
+        binding
     })
     .expect("boot shared carrier on KVM");
 
@@ -744,7 +745,7 @@ fn host_mm_release_uses_carrier_retained_wake_bindings() {
 
     let owner = SlotId::new(0);
     let waiter = SlotId::new(1);
-    let carrier = Cpl0Carrier::boot_shared(&cpl0_image(), &[0x0f, 0x0b], owner, |zone, _| {
+    let carrier = Cpl0Carrier::boot_shared(&cpl0_image(), &[0x0f, 0x0b], owner, |zone| {
         let space = zone.spaces.publish_closed(11, 0x60_0000, 0).unwrap();
         zone.spaces.open(space);
         for slot in [owner, waiter] {
@@ -753,6 +754,37 @@ fn host_mm_release_uses_carrier_retained_wake_bindings() {
             zone.enter_guest(slot);
         }
         assert!(zone.enter_idle(waiter, true));
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                mm: 11,
+                tid: 41,
+                serial: 101,
+                generation: 5,
+                ..Default::default()
+            })
+            .unwrap();
+        zone.requeue_preempted(owner, record);
+        assert_eq!(zone.switch_in(owner), Some(record));
+        use carrick_guest_arch::{
+            AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa,
+        };
+        use carrick_x86::cpl0_scheduler::{
+            ContextBinding, InterruptFrame, NativeContext, XsaveArea,
+        };
+        ContextBinding {
+            record: zone.record_ref(record),
+            context: NativeContext {
+                frame: InterruptFrame::default(),
+                address: AddressContext {
+                    root: RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap(),
+                    mm: MmGeneration::new(NonZeroU64::new(11).unwrap()),
+                    generation: ContextGeneration::new(NonZeroU64::MIN),
+                },
+                fs_base: 0x1000,
+                gs_base: 0x2000,
+                xsave: XsaveArea::ZERO,
+            },
+        }
     })
     .unwrap();
     // SAFETY: the stopped carrier retains these initialized records; each

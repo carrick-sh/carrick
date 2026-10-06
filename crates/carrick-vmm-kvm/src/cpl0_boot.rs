@@ -47,7 +47,7 @@ pub enum BootMode<'a> {
     Interrupts,
     Shared {
         slot: SlotId,
-        setup: &'a mut dyn FnMut(&ZoneTables, &mut ContextBinding),
+        setup: &'a mut dyn FnMut(&ZoneTables) -> ContextBinding,
     },
 }
 
@@ -129,7 +129,7 @@ impl Cpl0Carrier {
         image: &Path,
         program: &[u8],
         slot: SlotId,
-        mut setup: impl FnMut(&ZoneTables, &mut ContextBinding),
+        mut setup: impl FnMut(&ZoneTables) -> ContextBinding,
     ) -> Result<Self, TrapError> {
         Self::boot_inner(
             image,
@@ -316,8 +316,7 @@ impl Cpl0Carrier {
                         size_of::<ContextBinding>(),
                     )
                     .ok_or_else(|| fail("binding backing"))?
-                    .cast::<ContextBinding>();
-                binding_ptr.write_bytes(0, 1);
+                    .cast::<core::mem::MaybeUninit<ContextBinding>>();
                 if let Some(ptr) = ram.host_ptr(
                     carrick_x86::cpl0_mmu::PROGRESS_RESERVATIONS,
                     size_of::<carrick_x86::cpl0_mmu::SharedReservations>(),
@@ -339,7 +338,9 @@ impl Cpl0Carrier {
                     ptr.cast::<u8>()
                         .write_bytes(0, size_of::<carrick_el1_abi::MmPortalSlots>());
                 }
-                setup(&*zone_ptr, &mut *binding_ptr);
+                carrick_x86::cpl0_scheduler::initialize_context_binding(&mut *binding_ptr, || {
+                    setup(&*zone_ptr)
+                });
             }
 
             for index in 0..2 {

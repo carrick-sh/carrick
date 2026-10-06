@@ -63,6 +63,15 @@ pub struct ContextBinding {
     pub context: NativeContext,
 }
 
+/// Publish a fully initialized native sidecar into retained uninitialized
+/// storage. No reference to the NonZero-containing record exists beforehand.
+pub fn initialize_context_binding(
+    storage: &mut core::mem::MaybeUninit<ContextBinding>,
+    setup: impl FnOnce() -> ContextBinding,
+) -> &mut ContextBinding {
+    storage.write(setup())
+}
+
 /// Bounded hardware witness/control record, outside the common ABI. This is
 /// NOT a production task graph or MM owner. The carrier initializes it while
 /// stopped and retains it until VM retirement.
@@ -179,6 +188,32 @@ mod tests {
     use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
     use carrick_sched_core::ThreadIdentity;
     use std::num::NonZeroU64;
+
+    #[test]
+    fn shared_binding_initialization_never_borrows_zero_validity() {
+        let record = RecordRef {
+            id: carrick_sched_core::RecordId::from_raw(1).unwrap(),
+            incarnation: 7,
+        };
+        let mut storage = core::mem::MaybeUninit::<ContextBinding>::zeroed();
+        let binding = initialize_context_binding(&mut storage, || ContextBinding {
+            record,
+            context: NativeContext {
+                frame: InterruptFrame::default(),
+                address: AddressContext {
+                    root: RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap(),
+                    mm: MmGeneration::new(NonZeroU64::new(11).unwrap()),
+                    generation: ContextGeneration::new(NonZeroU64::MIN),
+                },
+                fs_base: 0x1000,
+                gs_base: 0x2000,
+                xsave: XsaveArea::ZERO,
+            },
+        });
+        assert_eq!(binding.context.address.mm.raw().get(), 11);
+        assert_eq!(binding.context.address.generation.raw().get(), 1);
+        assert_eq!(binding.record, record);
+    }
 
     #[test]
     fn shared_queue_cross_mm_admission_refuses_stale_native_custody() {
