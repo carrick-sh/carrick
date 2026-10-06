@@ -118,7 +118,7 @@ pub(crate) fn hardware_live_ttbr() -> u64 {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn hardware_live_ttbr() -> u64 {
-    crate::isa::x86::carrick_x86_unbound_mmu_owner()
+    crate::isa::x86::unsupported_arm_descriptor_path()
 }
 
 #[cfg(target_os = "none")]
@@ -153,10 +153,10 @@ impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopy
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopyMaintenance {
     fn publish_barrier(&self) {
-        crate::isa::x86::carrick_x86_unbound_mmu_owner();
+        crate::isa::x86::unsupported_arm_descriptor_path();
     }
     fn invalidate_range(&self, _va: u64, _len: u64) {
-        crate::isa::x86::carrick_x86_unbound_mmu_owner();
+        crate::isa::x86::unsupported_arm_descriptor_path();
     }
 }
 
