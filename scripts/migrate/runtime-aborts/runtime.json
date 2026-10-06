@@ -3857,6 +3857,28 @@
       "domain": "kernel::task_exit_publication",
       "fingerprint": "7ee6f9b0fd4b46702ea7f2e10d4e25f66abdd5a25e87501cd038728eb86a961a",
       "sink": "fatal"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
+      "function": "<OwnedIpcOperation as Drop>::drop",
+      "ordinal_in_function": 1,
+      "fingerprint": "d785cdb8b4e03b8ca22b2369727d171f03da68b0fa7a540b1aea40fe59962e6a",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::ipc_continuation",
+      "rationale": "Cancellation retains the exact HostIpc kernel authority and an unretired owned operation token. Numeric fd close leaves its endpoint pin alive; normal owner waits are outside this destructor. A rejected retirement means stale or duplicate internal operation custody. The cancellation-after-fd-close witness proves ordinary close is not a fatal path.",
+      "sink": "fatal",
+      "domain": "kernel::ipc_continuation"
+    },
+    {
+      "file": "crates/carrick-kernel/src/kernel/continuation/ipc.rs",
+      "function": "OwnedIpcOperation::into_token",
+      "ordinal_in_function": 1,
+      "fingerprint": "aeab7c43e7ff6bd6aeca58e146e40aae3fd04831f14dd745952aab5a0fc81e43",
+      "verdict": "carrier_fault",
+      "failure_domain": "kernel::ipc_continuation",
+      "rationale": "The consuming method owns self and takes the private token initialized by the sole constructor. An absent token cannot come from a guest syscall or an owner-memory dependency; it means internal IPC custody was consumed twice.",
+      "sink": "fatal",
+      "domain": "kernel::ipc_continuation"
     }
   ]
 }
