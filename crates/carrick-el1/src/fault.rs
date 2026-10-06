@@ -748,7 +748,8 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
     };
     match (outcome, action) {
         (DrainOutcome::Blocked, Action::Served | Action::ServedWithWork) if is_syscall(frame) => {
-            task.leave_served_with_work()
+            task.linux.record_completed_with_work();
+            Action::ServedWithWork
         }
         (DrainOutcome::Blocked, Action::Served) => Action::Forward,
         _ => action,

@@ -29,6 +29,9 @@ impl LinuxTaskState {
     pub fn mark_pending_host_work(&self) {
         self.pending_host_work.store(1, Ordering::Release);
     }
+    pub fn clear_pending_host_work(&self) {
+        self.pending_host_work.store(0, Ordering::Release);
+    }
     pub fn take_served_boundary(&self) -> Option<ServedBoundary> {
         match self.served_with_work.swap(0, Ordering::AcqRel) {
             0 => None,

@@ -162,8 +162,8 @@ mod kernel {
         if binding.return_kick.swap(0, Ordering::AcqRel) != 0 {
             doorbell(RETURN_KICK_PORT, frame);
         }
-        if task.has_pending_host_work() {
-            let _ = task.leave_served_with_work();
+        if task.linux.has_pending_host_work() {
+            task.linux.record_completed_with_work();
             doorbell(WORK_PORT, frame);
         }
     }
