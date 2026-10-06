@@ -28,9 +28,9 @@ fn admitted(table: &SharedReservations, index: usize, raw: u64) -> Reservations<
 fn decide(model: &mut Reservations<'_>, nr: u64, args: [u64; 6]) -> AnonymousRouteKind {
     use crate::{AnonymousReservationRoute, dispatch_anonymous_with_reservations};
     let current = CurrentTask::new();
-    current.task_id.store(1, Ordering::Relaxed);
-    current.thread_serial.store(11, Ordering::Relaxed);
-    current.zone_mm.store(model.mm().raw(), Ordering::Relaxed);
+    current.execution.task.store(1, Ordering::Relaxed);
+    current.mm.thread_generation.store(11, Ordering::Relaxed);
+    current.mm.key.store(model.mm().raw(), Ordering::Relaxed);
     let counters = Counters::default();
     let mut frame = TrapFrame::default();
     frame.x[8] = nr;
@@ -79,9 +79,12 @@ fn reservation_decoder_counts_completion_only_and_keeps_two_mm_origins() {
                 frame.x[8] = 222;
                 frame.x[..6].copy_from_slice(&[0x100000, 4096, 3, 0x32, u64::MAX, 0]);
                 let current = CurrentTask::new();
-                current.task_id.store(slot as u64 + 1, Ordering::Relaxed);
-                current.thread_serial.store(11, Ordering::Relaxed);
-                current.zone_mm.store(mm.raw(), Ordering::Relaxed);
+                current
+                    .execution
+                    .task
+                    .store(slot as u64 + 1, Ordering::Relaxed);
+                current.mm.thread_generation.store(11, Ordering::Relaxed);
+                current.mm.key.store(mm.raw(), Ordering::Relaxed);
                 let before = counters.served[222].load(Ordering::Relaxed);
                 let AnonymousReservationRoute::Work(mut pending) =
                     dispatch_anonymous_with_reservations(
@@ -127,9 +130,9 @@ fn reservation_mmap_overflow_preserves_linux_errno() {
     let mut model = table.lock(0, mm).unwrap();
     model.finish_import().unwrap();
     let current = CurrentTask::new();
-    current.task_id.store(1, Ordering::Relaxed);
-    current.thread_serial.store(11, Ordering::Relaxed);
-    current.zone_mm.store(mm.raw(), Ordering::Relaxed);
+    current.execution.task.store(1, Ordering::Relaxed);
+    current.mm.thread_generation.store(11, Ordering::Relaxed);
+    current.mm.key.store(mm.raw(), Ordering::Relaxed);
     let counters = Counters::default();
     for (address, length, flags, errno) in [
         (0, 0, 0x22, 22),
@@ -158,9 +161,9 @@ fn reservation_unadmitted_root_never_serves_a_syscall() {
     table.publish(0, mm, layout()).unwrap();
     let mut model = table.lock(0, mm).unwrap();
     let current = CurrentTask::new();
-    current.task_id.store(1, Ordering::Relaxed);
-    current.thread_serial.store(11, Ordering::Relaxed);
-    current.zone_mm.store(mm.raw(), Ordering::Relaxed);
+    current.execution.task.store(1, Ordering::Relaxed);
+    current.mm.thread_generation.store(11, Ordering::Relaxed);
+    current.mm.key.store(mm.raw(), Ordering::Relaxed);
     let counters = Counters::default();
     let mut frame = TrapFrame::default();
     frame.x[8] = 222;
@@ -180,9 +183,9 @@ fn reservation_continuation_rejects_rebound_task_without_losing_owner() {
     let mut model = table.lock(0, mm).unwrap();
     model.finish_import().unwrap();
     let current = CurrentTask::new();
-    current.task_id.store(1, Ordering::Relaxed);
-    current.thread_serial.store(11, Ordering::Relaxed);
-    current.zone_mm.store(mm.raw(), Ordering::Relaxed);
+    current.execution.task.store(1, Ordering::Relaxed);
+    current.mm.thread_generation.store(11, Ordering::Relaxed);
+    current.mm.key.store(mm.raw(), Ordering::Relaxed);
     let counters = Counters::default();
     let mut frame = TrapFrame::default();
     frame.x[8] = 222;
@@ -203,14 +206,14 @@ fn reservation_continuation_rejects_rebound_task_without_losing_owner() {
         )
     }
     .unwrap();
-    current.thread_serial.store(12, Ordering::Relaxed);
+    current.mm.thread_generation.store(12, Ordering::Relaxed);
     assert_eq!(
         pending.complete(&mut frame, &current, &counters, &mut model, receipt),
         Err(Refusal::Stale)
     );
     assert!(model.mapping(0x100000).is_none());
     assert_eq!(counters.served[222].load(Ordering::Relaxed), 0);
-    current.thread_serial.store(11, Ordering::Relaxed);
+    current.mm.thread_generation.store(11, Ordering::Relaxed);
     frame.slot = 7; // The original thread may resume on a different vCPU.
     pending
         .complete(&mut frame, &current, &counters, &mut model, receipt)

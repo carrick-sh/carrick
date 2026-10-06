@@ -7078,6 +7078,7 @@ pub(crate) mod tests {
 
         // Test 1: negative return value (-22, -EINVAL)
         current_task
+            .linux
             .served_with_work
             .store(1, std::sync::atomic::Ordering::Relaxed);
         let frame_err = carrick_hal::RawSyscall {
@@ -7100,6 +7101,7 @@ pub(crate) mod tests {
 
         // Test 2: non-negative return value (42)
         current_task
+            .linux
             .served_with_work
             .store(1, std::sync::atomic::Ordering::Relaxed);
         let frame_ok = carrick_hal::RawSyscall {
