@@ -348,6 +348,54 @@ mod kernel {
             );
             return;
         }
+        if crate::fixture_image() && frame.rax == OBSERVE_RETIRE_REPOINT {
+            use carrick_guest_arch::{
+                EditBacking, EditCowAccess, EditLeafSize, EditOperation, EditPermissions, FrameGpa,
+            };
+            use carrick_mmu_core::x86::descriptor_txn::{DescriptorOutcome, DescriptorReceipt};
+            let one = core::num::NonZeroU64::MIN;
+            let backing = EditBacking {
+                frame_id: one,
+                mapping_id: one,
+                owner_generation: one,
+                inventory_revision: one,
+            };
+            let applied = |receipt: Result<DescriptorReceipt, carrick_el1::isa::ArchError>| {
+                receipt
+                    .is_ok_and(|value| matches!(value.outcome, DescriptorOutcome::Applied { .. }))
+            };
+            let mapped = fixture_edit(
+                0x3_4000,
+                one,
+                EditOperation::Map {
+                    output: FrameGpa::new(0x91_1000),
+                    permissions: EditPermissions {
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                        user: true,
+                    },
+                    size: EditLeafSize::Page,
+                    resident: true,
+                    backing,
+                },
+            );
+            let retired =
+                applied(mapped) && applied(fixture_edit(0x3_4000, one, EditOperation::Unmap));
+            let repointed = retired
+                && applied(fixture_edit(
+                    0x3_4000,
+                    one,
+                    EditOperation::CowRepoint {
+                        old: FrameGpa::new(0x91_1000),
+                        new: FrameGpa::new(0x91_5000),
+                        backing,
+                        access: EditCowAccess::RecordedPrivate,
+                    },
+                ));
+            frame.rax = u64::from(repointed);
+            return;
+        }
         if crate::fixture_image() && frame.rax == OBSERVE_MMU_DRAIN {
             use carrick_guest_arch::{
                 AddressContext, ContextGeneration, FrameGpa, GuestLen, MmGeneration, MmuBackend,
