@@ -76,6 +76,9 @@ pub struct FrameGrantResidencyRecord {
     inventory_revision: AtomicU64,
     committed: [AtomicU64; 8],
     transfer_pins: AtomicU64,
+    // Keep the existing 192-byte wire record fully initialized. This occupies
+    // the former tail padding without moving any published field.
+    _reserved: [u64; 6],
 }
 
 impl FrameGrantResidencyRecord {
@@ -94,6 +97,7 @@ impl FrameGrantResidencyRecord {
             inventory_revision: AtomicU64::new(0),
             committed: [const { AtomicU64::new(0) }; 8],
             transfer_pins: AtomicU64::new(TRANSFER_PIN_RETIRED),
+            _reserved: [0; 6],
         }
     }
 
@@ -168,10 +172,18 @@ pub struct FrameGrantResidencyTable {
 }
 
 impl FrameGrantResidencyTable {
+    const fn initial_slot() -> FrameGrantResidencyRecord {
+        FrameGrantResidencyRecord::new()
+    }
+
+    const fn initial_dirty() -> AtomicU64 {
+        AtomicU64::new(0)
+    }
+
     pub const fn new() -> Self {
         Self {
-            slots: [const { FrameGrantResidencyRecord::new() }; FRAME_GRANT_RESIDENCY_SLOTS],
-            dirty: [const { AtomicU64::new(0) }; FRAME_GRANT_RESIDENCY_SLOTS / 64],
+            slots: [const { Self::initial_slot() }; FRAME_GRANT_RESIDENCY_SLOTS],
+            dirty: [const { Self::initial_dirty() }; FRAME_GRANT_RESIDENCY_SLOTS / 64],
         }
     }
 
@@ -181,14 +193,17 @@ impl FrameGrantResidencyTable {
     /// `ptr` must be valid for writes, non-null, aligned to `align_of::<Self>()`,
     /// and point to storage of at least `size_of::<Self>()` bytes.
     pub unsafe fn init_in_place(ptr: *mut Self) {
-        // SAFETY: caller guarantees ptr is valid for writes of size_of::<Self>() and aligned.
+        // SAFETY: caller guarantees aligned, writable storage for the table.
+        // Each record constructor initializes its complete wire image; no
+        // reference to partially initialized storage is formed.
         unsafe {
-            core::ptr::write_bytes(ptr.cast::<u8>(), 0, core::mem::size_of::<Self>());
-            let table = &mut *ptr;
-            for record in table.slots.iter_mut() {
-                record
-                    .transfer_pins
-                    .store(TRANSFER_PIN_RETIRED, Ordering::Relaxed);
+            let slots = core::ptr::addr_of_mut!((*ptr).slots).cast::<FrameGrantResidencyRecord>();
+            for index in 0..FRAME_GRANT_RESIDENCY_SLOTS {
+                slots.add(index).write(Self::initial_slot());
+            }
+            let dirty = core::ptr::addr_of_mut!((*ptr).dirty).cast::<AtomicU64>();
+            for index in 0..FRAME_GRANT_RESIDENCY_SLOTS / 64 {
+                dirty.add(index).write(Self::initial_dirty());
             }
         }
     }
@@ -580,5 +595,47 @@ impl FrameGrantResidencyTable {
 impl Default for FrameGrantResidencyTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+
+    #[test]
+    fn constructors_have_identical_wire_bytes_and_frozen_arm_layout() {
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(compare_constructors)
+            .expect("spawn layout test")
+            .join()
+            .expect("compare constructors");
+    }
+
+    fn compare_constructors() {
+        assert_eq!(core::mem::size_of::<FrameGrantResidencyRecord>(), 192);
+        assert_eq!(core::mem::align_of::<FrameGrantResidencyRecord>(), 64);
+        assert_eq!(FrameGrantResidencyRecord::COMMITTED_OFFSET, 72);
+        assert_eq!(FrameGrantResidencyRecord::TRANSFER_PINS_OFFSET, 136);
+        assert_eq!(core::mem::size_of::<FrameGrantResidencyTable>(), 786_944);
+        assert_eq!(core::mem::align_of::<FrameGrantResidencyTable>(), 64);
+
+        let layout = std::alloc::Layout::new::<FrameGrantResidencyTable>();
+        // SAFETY: both allocations use the table layout, are checked for null,
+        // initialized before reading, and deallocated using that same layout.
+        unsafe {
+            let ordinary = std::alloc::alloc(layout).cast::<FrameGrantResidencyTable>();
+            let inplace = std::alloc::alloc(layout).cast::<FrameGrantResidencyTable>();
+            assert!(!ordinary.is_null() && !inplace.is_null());
+            ordinary.write(FrameGrantResidencyTable::new());
+            FrameGrantResidencyTable::init_in_place(inplace);
+            let ordinary_bytes = core::slice::from_raw_parts(ordinary.cast::<u8>(), layout.size());
+            let inplace_bytes = core::slice::from_raw_parts(inplace.cast::<u8>(), layout.size());
+            assert_eq!(ordinary_bytes, inplace_bytes);
+            std::alloc::dealloc(ordinary.cast(), layout);
+            std::alloc::dealloc(inplace.cast(), layout);
+        }
     }
 }
