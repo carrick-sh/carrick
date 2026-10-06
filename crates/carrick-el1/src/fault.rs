@@ -460,6 +460,25 @@ pub struct X86CowResolver<'a> {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl CowResolver for X86CowResolver<'_> {
+    fn reconcile_parent_write<
+        W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
+    >(
+        &mut self,
+        slot: u32,
+        handle: carrick_el1_abi::El1MmHandle,
+        sequence: core::num::NonZeroU64,
+        completion: carrick_el1_abi::CowGrantCompletion,
+        words: &W,
+    ) -> Result<(), crate::personality::mm_portal::MmError> {
+        crate::personality::mm_portal::reconcile_pending_parent_write(
+            slot as usize,
+            handle,
+            sequence,
+            completion,
+            words,
+        )
+    }
+
     fn resolve_cow(&mut self, root: u64, mm_key: u64, far: u64) -> bool {
         self.resolve_cow_outcome(root, mm_key, far) == CowResolution::Resolved
     }
