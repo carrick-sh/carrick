@@ -44,4 +44,3 @@ impl carrick_guest_arch::ArchTypes for X86Backend {
 pub use context::{carrick_x86_unbound_stack_slot, carrick_x86_unbound_thread_cpu};
 pub use mmu::carrick_x86_unbound_mmu_owner;
 pub use transport::{carrick_x86_unbound_entry_fatal, carrick_x86_unbound_host_yield};
-pub use user_access::{carrick_x86_unbound_user_access, carrick_x86_unbound_user_word};
