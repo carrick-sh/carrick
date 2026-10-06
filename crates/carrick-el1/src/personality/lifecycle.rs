@@ -75,6 +75,20 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord, G: GuestDispatchFrame
         self.lifecycle?
             .thread(self.current_tasks.get(self.frame.slot() as usize)?)
     }
+    fn register_robust_list(&self, head: u64, len: u64) -> Option<SyscallResult> {
+        use super::thread_setup::{RobustListHead, RobustListLen, RobustListSlot};
+        let publications = self.frame.robust_publications()?;
+        let task = self.current_tasks.get(self.frame.slot() as usize)?;
+        let thread = self.lifecycle?.thread(task)?;
+        carrick_personality_linux::thread::set_robust_list(
+            thread.page,
+            RobustListSlot::new(thread.slot, Some(publications)),
+            RobustListHead::new(head),
+            RobustListLen::new(len),
+        )
+        .linux_result()
+        .map(SyscallResult::new)
+    }
     fn born_slot(
         &self,
         page: &ThreadLifecyclePage,

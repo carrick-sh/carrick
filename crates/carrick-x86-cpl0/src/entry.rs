@@ -225,6 +225,7 @@ mod kernel {
     struct NativeDispatch<'a> {
         frame: &'a mut NativeFrame,
         call: carrick_personality_linux::entry::CanonicalCall,
+        publications: &'a core::sync::atomic::AtomicU64,
     }
 
     impl SyscallFrame for NativeDispatch<'_> {
@@ -240,6 +241,9 @@ mod kernel {
     impl dispatch::GuestDispatchFrame for NativeDispatch<'_> {
         fn arm_frame(&mut self) -> Option<&mut carrick_el1_abi::TrapFrame> { None }
         fn arm_scheduler(&self) -> bool { false }
+        fn robust_publications(&self) -> Option<&core::sync::atomic::AtomicU64> {
+            Some(self.publications)
+        }
     }
 
     static EMPTY_NAME_CACHE: InotifyNameCache = InotifyNameCache::new();
@@ -1249,7 +1253,11 @@ mod kernel {
         });
         if !handled_by_fixture {
             let layout = <carrick_el1::isa::x86::X86Backend as LayoutBackend>::KERNEL_LAYOUT;
-            let mut native = NativeDispatch { frame, call };
+            let mut native = NativeDispatch {
+                frame,
+                call,
+                publications: &binding.publications,
+            };
             match dispatch::dispatch_syscall_with_lifecycle(
                 &mut native,
                 counters,
