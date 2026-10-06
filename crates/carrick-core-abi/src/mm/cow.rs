@@ -105,3 +105,73 @@ pub trait CowGrantVenue {
 pub trait ServiceCopyWindowLease {
     fn base(&self) -> u64;
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn cow_grant() {
+        assert_eq!((size_of::<CowGrant>(), align_of::<CowGrant>()), (64, 8));
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |CowGrant {
+                     slot: _,
+                     epoch: _,
+                     mm_key: _,
+                     physical_ipa: _,
+                     backing: _,
+                 }: CowGrant| {};
+        field!(CowGrant, slot, usize, 32, 8, 8);
+        field!(CowGrant, epoch, u64, 40, 8, 8);
+        field!(CowGrant, mm_key, u64, 48, 8, 8);
+        field!(CowGrant, physical_ipa, u64, 56, 8, 8);
+        field!(CowGrant, backing, BackingIdentity, 0, 32, 8);
+    }
+
+    #[test]
+    fn cow_grant_completion() {
+        assert_eq!(
+            (
+                size_of::<CowGrantCompletion>(),
+                align_of::<CowGrantCompletion>()
+            ),
+            (104, 8)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |CowGrantCompletion {
+                     purpose: _,
+                     grant: _,
+                     span_va: _,
+                     span_len: _,
+                     old_ipa: _,
+                     new_ipa: _,
+                 }: CowGrantCompletion| {};
+        field!(CowGrantCompletion, purpose, CowGrantPurpose, 0, 8, 8);
+        field!(CowGrantCompletion, grant, CowGrant, 8, 64, 8);
+        field!(CowGrantCompletion, span_va, u64, 72, 8, 8);
+        field!(CowGrantCompletion, span_len, u64, 80, 8, 8);
+        field!(CowGrantCompletion, old_ipa, u64, 88, 8, 8);
+        field!(CowGrantCompletion, new_ipa, u64, 96, 8, 8);
+    }
+}
