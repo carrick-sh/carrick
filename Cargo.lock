@@ -830,8 +830,8 @@ dependencies = [
  "carrick-el1-abi",
  "carrick-guest-arch",
  "carrick-sched-core",
- "carrick-syscall-abi",
  "carrick-signal-core",
+ "carrick-syscall-abi",
  "carrick-x86",
 ]
 
