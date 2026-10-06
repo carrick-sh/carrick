@@ -3,6 +3,7 @@
 //! setitimer(2), wait(2), clone(2), fork(2), execve(2), https://man7.org/.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use carrick_personality_linux::signal::*;
 use carrick_signal_core::SignalSet;
 use carrick_signal_core::policy::*;
 use carrick_signal_core::timer::*;
