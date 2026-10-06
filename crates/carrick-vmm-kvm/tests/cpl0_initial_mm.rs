@@ -82,3 +82,17 @@ fn production_extent_cannot_alias_kernel_metadata() {
         "initial extent aliases the dynamic metadata aperture"
     );
 }
+
+#[test]
+fn production_initial_mm_admits_one_shared_reservation_root() {
+    let elf = tiny_elf();
+    let plan = prepare_static_x86_elf(&elf).expect("static ELF plan");
+    let argv = vec!["/tiny".to_owned()];
+    let extent =
+        Cpl0Carrier::initial_extent_bytes_for(&plan, &argv, &[]).expect("typed initial extent");
+    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production CPL0 image");
+    carrier
+        .load_guest_mm(&plan, &argv, &[])
+        .expect("guest initial MM publication");
+    assert!(carrier.initial_reservation_admitted());
+}
