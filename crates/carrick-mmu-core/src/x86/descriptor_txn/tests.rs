@@ -550,6 +550,11 @@ fn touched_work_scales_with_range_not_unrelated_population() {
         assert_eq!(plan.tables_linked, 3);
         assert_eq!(plan.live_stores(), n as usize + 3);
         assert!(plan.words_read <= 3 * 512 + 6 * n as usize + 3);
+        assert!(
+            plan.overlay_comparisons <= 12 * n as usize + 32,
+            "overlay lookup work must remain linear at {n} pages: {} comparisons",
+            plan.overlay_comparisons
+        );
         // Unrelated populated PML4 branches are never scanned.
         for i in 1..512 {
             words

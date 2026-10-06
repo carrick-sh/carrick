@@ -199,11 +199,81 @@ impl<'a> IntoIterator for &'a PlanEntries {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct OverlaySlot {
+    entry_plus_one: u16,
+}
+
+#[derive(Clone, Debug)]
+struct OverlayIndex {
+    slots: [OverlaySlot; Self::CAPACITY],
+}
+
+impl OverlayIndex {
+    // Two consecutive coarse splits plus parent links fit without heap-backed
+    // indexing; larger plans refuse before any descriptor store.
+    const CAPACITY: usize = 4096;
+
+    const fn new() -> Self {
+        Self {
+            slots: [OverlaySlot { entry_plus_one: 0 }; Self::CAPACITY],
+        }
+    }
+
+    fn start(pa: u64) -> usize {
+        ((pa >> 3).wrapping_mul(0x9e37_79b9_7f4a_7c15) as usize) & (Self::CAPACITY - 1)
+    }
+
+    fn find(&self, entries: &[JournalEntry], pa: u64, comparisons: &mut usize) -> Option<usize> {
+        let start = Self::start(pa);
+        for distance in 0..Self::CAPACITY {
+            let slot = self.slots[(start + distance) & (Self::CAPACITY - 1)];
+            if slot.entry_plus_one == 0 {
+                return None;
+            }
+            *comparisons += 1;
+            let index = usize::from(slot.entry_plus_one - 1);
+            if entries[index].pa == pa {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    fn insert(
+        &mut self,
+        entries: &[JournalEntry],
+        pa: u64,
+        entry_index: usize,
+        comparisons: &mut usize,
+    ) -> Result<(), DescriptorRefusal> {
+        let encoded =
+            u16::try_from(entry_index + 1).map_err(|_| DescriptorRefusal::JournalCapacity)?;
+        let start = Self::start(pa);
+        for distance in 0..Self::CAPACITY {
+            let slot = &mut self.slots[(start + distance) & (Self::CAPACITY - 1)];
+            if slot.entry_plus_one == 0 {
+                slot.entry_plus_one = encoded;
+                return Ok(());
+            }
+            *comparisons += 1;
+            let old = usize::from(slot.entry_plus_one - 1);
+            if entries[old].pa == pa {
+                slot.entry_plus_one = encoded;
+                return Ok(());
+            }
+        }
+        Err(DescriptorRefusal::JournalCapacity)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DescriptorPlan {
     entries: PlanEntries,
     pub tables_linked: usize,
     pub words_read: usize,
+    /// Descriptor-address comparisons used to resolve planned overlay words.
+    pub overlay_comparisons: usize,
     id: DescriptorTxnId,
     digest: u64,
     span: PageSpan,
@@ -250,8 +320,10 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
         words,
         txn,
         entries: PlanEntries::new(),
+        overlay: OverlayIndex::new(),
         used: 0,
         reads: 0,
+        overlay_comparisons: 0,
     };
     for (i, grant) in txn.tables.iter().enumerate() {
         let pa = grant.address().raw();
@@ -309,6 +381,7 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
         entries: editor.entries,
         tables_linked: editor.used,
         words_read: editor.reads,
+        overlay_comparisons: editor.overlay_comparisons,
         id: txn.id,
         digest: txn.digest(),
         span,
@@ -420,13 +493,18 @@ struct Planner<'a, 't, W: LiveDescriptorWords + ?Sized> {
     words: &'a W,
     txn: &'a DescriptorTxn<'t>,
     entries: PlanEntries,
+    overlay: OverlayIndex,
     used: usize,
     reads: usize,
+    overlay_comparisons: usize,
 }
 impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
     fn read(&mut self, pa: u64) -> Result<u64, DescriptorRefusal> {
-        if let Some(entry) = self.entries.iter().rev().find(|e| e.pa == pa) {
-            return Ok(entry.after);
+        if let Some(index) = self
+            .overlay
+            .find(&self.entries, pa, &mut self.overlay_comparisons)
+        {
+            return Ok(self.entries[index].after);
         }
         self.reads += 1;
         self.words.load(pa)
@@ -442,7 +520,13 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             after,
             bbm_va: 0,
             bbm_len: 0,
-        })
+        })?;
+        self.overlay.insert(
+            &self.entries,
+            pa,
+            self.entries.len() - 1,
+            &mut self.overlay_comparisons,
+        )
     }
     fn grant(&mut self) -> Result<u64, DescriptorRefusal> {
         let page = self
