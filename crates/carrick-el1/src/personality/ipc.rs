@@ -89,19 +89,7 @@ pub struct IpcVenue<'a> {
 }
 
 /// How a read/write reached the IPC adapter ended.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum IpcServed {
-    /// Not an IPC call, or refused before any effect: continue dispatch
-    /// (the frame is unchanged).
-    Forward,
-    /// Completed in EL1. Without `switched`, `x0` holds the result; with it
-    /// the caller parked and the frame is another thread's.
-    Returned { switched: bool },
-    /// The caller parked, nothing was runnable and host work arrived.
-    Idle,
-    /// The frame now carries an [`IPC_HANDBACK_NR`] call for the host.
-    Handback,
-}
+pub use carrick_personality_linux::dispatch::IpcServed;
 
 /// Tables resolved through the host-published [`IpcTableMap`], keyed by the
 /// running task's host file table (which an EL1 switch-in updates): a table
@@ -194,7 +182,9 @@ pub fn serve_ipc<C: ThreadCpu, U: UserWord, M: UserCopy>(
     }
     let (token, op, resumed) = match sched.take_object_operation() {
         // The slot's record is not this task's: the host settles it.
-        Err(_) => return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward),
+        Err(_) => {
+            return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward);
+        }
         Ok(Some(t)) => {
             let Some(token) = from_sched_token(t) else {
                 return leave(sched, IpcLeave::StaleOperation, IpcServed::Forward);
@@ -385,7 +375,7 @@ fn release_pin<C: ThreadCpu, U: UserWord>(
         return;
     };
     if wake.host_owed {
-        sched.task.mark_pending_host_work();
+        sched.task.linux.mark_pending_host_work();
     }
     // A freed object has no waiters: each holds a pin on it.
     if !freed {
@@ -469,7 +459,7 @@ fn run<C: ThreadCpu, U: UserWord, M: UserCopy>(
         };
         let published = guard.publish(wake);
         if published.host_owed {
-            sched.task.mark_pending_host_work();
+            sched.task.linux.mark_pending_host_work();
         }
         let effects = notify(sched, object, wake);
         let epoll_effects = notify_epolls(sched, &published);
@@ -602,7 +592,7 @@ fn notify<C: ThreadCpu, U: UserWord>(
             match sched.notify_object(key) {
                 Ok((report, effects)) => {
                     if report.deferred != 0 {
-                        sched.task.mark_pending_host_work();
+                        sched.task.linux.mark_pending_host_work();
                     }
                     out[i] = Some(effects);
                     break;
@@ -611,7 +601,7 @@ fn notify<C: ThreadCpu, U: UserWord>(
                 // Never bound: nobody ever waited on this incarnation.
                 Err(ObjectWaitError::Stale) => break,
                 Err(_) => {
-                    sched.task.mark_pending_host_work();
+                    sched.task.linux.mark_pending_host_work();
                     break;
                 }
             }
@@ -671,7 +661,7 @@ fn park<C: ThreadCpu, U: UserWord>(
     };
     match sched.park_object(frame, key, snap, resume, sched_token, deadline) {
         Ok(parked) => {
-            let served = if sched.task.has_pending_host_work() {
+            let served = if sched.task.linux.has_pending_host_work() {
                 sched.leave_after_object_park(parked)
             } else {
                 sched.resume_after_object_park(frame, parked, 0)
@@ -2168,7 +2158,7 @@ mod tests {
         ] {
             to.store(from.load(Ordering::Relaxed), Ordering::Relaxed);
         }
-        task.mark_pending_host_work();
+        task.linux.mark_pending_host_work();
         tasks
     }
 
@@ -2276,7 +2266,10 @@ mod tests {
         );
         assert_eq!(&buf, b"ab");
         assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), r as u64);
-        assert!(task.has_pending_host_work(), "the host still sees its work");
+        assert!(
+            task.linux.has_pending_host_work(),
+            "the host still sees its work"
+        );
         assert_eq!(task.linux.served_with_work.load(Ordering::Acquire), 1);
         assert_eq!(w.counters.served[SYS_READ].load(Ordering::Relaxed), 1);
         assert_eq!(w.counters.served[SYS_WRITE].load(Ordering::Relaxed), 1);
@@ -2317,7 +2310,10 @@ mod tests {
             None,
             "nothing else was switched in"
         );
-        assert!(task.has_pending_host_work(), "the host still sees its work");
+        assert!(
+            task.linux.has_pending_host_work(),
+            "the host still sees its work"
+        );
         assert_eq!(task.linux.served_with_work.load(Ordering::Acquire), 0);
         assert_eq!(w.counters.forwarded[SYS_READ].load(Ordering::Relaxed), 0);
         assert_eq!(host_calls(&w), 0);
@@ -2365,7 +2361,10 @@ mod tests {
             "the parked record still owns the read"
         );
         assert_eq!(w.zone.counters.el1_parks.load(Ordering::Relaxed), parks + 1);
-        assert!(task.has_pending_host_work(), "the host still sees its work");
+        assert!(
+            task.linux.has_pending_host_work(),
+            "the host still sees its work"
+        );
         assert_eq!(task.linux.served_with_work.load(Ordering::Acquire), 0);
     }
 

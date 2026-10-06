@@ -783,46 +783,6 @@ impl CurrentTask {
             .store(generation, Ordering::Release);
         self.linux.file_table.store(file_table, Ordering::Release);
     }
-
-    #[inline]
-    pub fn has_pending_host_work(&self) -> bool {
-        self.linux.has_pending_host_work()
-    }
-
-    #[inline]
-    pub fn mark_pending_host_work(&self) {
-        self.linux.mark_pending_host_work();
-    }
-
-    /// Leave for the host with a syscall EL1 already served: its result is
-    /// in the frame and its effects are taken, so the host must complete it,
-    /// never dispatch it again. The flag and the action are one step; no
-    /// path may return [`Action::ServedWithWork`] without this.
-    #[inline]
-    #[must_use]
-    pub fn leave_served_with_work(&self) -> Action {
-        self.linux.record_completed_with_work();
-        Action::ServedWithWork
-    }
-
-    /// Leave for the host with a call whose guest-table effect EL1 has made
-    /// but whose host metadata commit is still owed (a retired `munmap`, an
-    /// `mprotect` whose VMA journal was full). `orig_x0` is the call's
-    /// argument 0 before EL1 wrote the result over it; the host re-issues the
-    /// call with it ([`ServedBoundary::ReplayOriginal`]). Only this entry
-    /// point asks for a replay: a call that merely left served (a drain that
-    /// could not finish, an owed wake) is complete and is never re-run.
-    #[inline]
-    #[must_use]
-    pub fn leave_commit_owed(&self, orig_x0: u64) -> Action {
-        self.linux.record_commit_owed(orig_x0);
-        Action::ServedWithWork
-    }
-
-    #[inline]
-    pub fn clear_pending_host_work(&self) {
-        self.linux.pending_host_work.store(0, Ordering::Release);
-    }
 }
 
 impl Default for CurrentTask {
@@ -3071,6 +3031,8 @@ impl Default for InotifyNameCache {
     }
 }
 
+const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x3ff0_698f_9f1a_67f1);
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -3092,20 +3054,20 @@ mod tests {
         // A plain served call that left because a drain blocked: complete,
         // whatever its stale `orig_arg0` and syscall number.
         task.linux.orig_arg0.store(0, Ordering::Relaxed);
-        let _ = task.leave_served_with_work();
+        task.linux.record_completed_with_work();
         assert_eq!(
             task.linux.served_with_work.load(Ordering::Relaxed),
             SERVED_WAKES_OWED
         );
         // A call owing its commit replays with the preserved argument ...
-        let _ = task.leave_commit_owed(0x6000);
+        task.linux.record_commit_owed(0x6000);
         assert_eq!(
             task.linux.served_with_work.load(Ordering::Relaxed),
             SERVED_COMMIT_OWED
         );
         assert_eq!(task.linux.orig_arg0.load(Ordering::Relaxed), 0x6000);
-        // ... and a later blocked drain (`leave_served_with_work`) keeps it.
-        let _ = task.leave_served_with_work();
+        // ... and a later blocked drain (`record_completed_with_work`) keeps it.
+        task.linux.record_completed_with_work();
         assert_eq!(
             task.linux.served_with_work.load(Ordering::Relaxed),
             SERVED_COMMIT_OWED
@@ -3389,10 +3351,10 @@ mod tests {
             &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 5 * core::mem::size_of::<CurrentTask>())
                 as *const CurrentTask)
         };
-        assert!(task_5.has_pending_host_work());
+        assert!(task_5.linux.has_pending_host_work());
 
         clear_pending_host_work(5);
-        assert!(!task_5.has_pending_host_work());
+        assert!(!task_5.linux.has_pending_host_work());
 
         let task_6 = unsafe {
             &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 6 * core::mem::size_of::<CurrentTask>())
@@ -3402,8 +3364,8 @@ mod tests {
 
         task_5.execution.task.store(42, Ordering::Relaxed);
         mark_pending_host_work_for_task(El1TaskId::from_linux_tid(42));
-        assert!(task_5.has_pending_host_work());
-        assert!(!task_6.has_pending_host_work()); // sibling task remains untouched
+        assert!(task_5.linux.has_pending_host_work());
+        assert!(!task_6.linux.has_pending_host_work()); // sibling task remains untouched
 
         task_5.linux.file_table.store(100, Ordering::Relaxed);
         update_current_task_file_table_for_task(El1TaskId::from_linux_tid(42), 200);
@@ -3414,8 +3376,8 @@ mod tests {
         assert!(take_served_with_work(5));
         assert!(!take_served_with_work(5));
 
-        task_5.clear_pending_host_work();
-        task_6.clear_pending_host_work();
+        task_5.linux.clear_pending_host_work();
+        task_6.linux.clear_pending_host_work();
         let task_7 = unsafe {
             &*((ptr + EL1_CURRENT_TASKS_OFFSET as usize + 7 * core::mem::size_of::<CurrentTask>())
                 as *const CurrentTask)
@@ -3426,11 +3388,11 @@ mod tests {
 
         mark_pending_host_work_for_file_tables(&[200]);
         // task_5 has task_id = 42 and file_table = 200, so it must be marked
-        assert!(task_5.has_pending_host_work());
+        assert!(task_5.linux.has_pending_host_work());
         // task_6 has task_id = 43 and file_table = 0, so it must NOT be marked
-        assert!(!task_6.has_pending_host_work());
+        assert!(!task_6.linux.has_pending_host_work());
         // task_7 has no task (task_id = 0), so it must NEVER be marked
-        assert!(!task_7.has_pending_host_work()); // cleared after take
+        assert!(!task_7.linux.has_pending_host_work()); // cleared after take
 
         record_el1_region_host_ptr(0);
         assert_eq!(get_el1_region_host_ptr(), 0);
@@ -4363,5 +4325,3 @@ mod tests {
         );
     }
 }
-
-const _: () = assert!(EL1_ABI_LAYOUT_HASH == 0x3ff0_698f_9f1a_67f1);
