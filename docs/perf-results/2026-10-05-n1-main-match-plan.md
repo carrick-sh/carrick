@@ -129,3 +129,10 @@ exit/exec red-first repair; see `2026-10-05-n1-fork-control-retirement.md`.
 Neither repair has a new signed verdict yet. Main's exact first failure lines
 for its six excluded reds remain requested; ptrace errno 38 is not established
 as a stack-only regression.
+
+Owner-fault completion additionally discarded an actual Editor wait in the
+retained MM5 TLS-fault core. Its native completion and exact fault-mailbox
+handoff have red-first repairs; see `2026-10-06-n1-owner-fault-wait.md`.
+The new fault continuation uses existing owner enrollment and ordinary saved
+CPU state, with immediate reserved-signal delivery. Signed confirmation and
+all main-pass closure remain open.

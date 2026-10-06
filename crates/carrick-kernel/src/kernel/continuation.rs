@@ -100,11 +100,13 @@ impl SyscallFrame {
     }
 }
 
-/// The boundary that owns a wait. Terminal work has no guest return frame.
+/// The boundary that owns a wait. Faults and terminal work have no syscall
+/// return frame; their distinct completions preserve the original action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContinuationOrigin {
     Syscall(SyscallFrame),
     ChildTidClear,
+    Fault,
 }
 
 #[derive(Debug)]
@@ -323,7 +325,7 @@ impl ContinuationAuthority {
     pub const fn syscall(&self) -> Option<SyscallFrame> {
         match self.origin {
             ContinuationOrigin::Syscall(frame) => Some(frame),
-            ContinuationOrigin::ChildTidClear => None,
+            ContinuationOrigin::ChildTidClear | ContinuationOrigin::Fault => None,
         }
     }
 
@@ -1585,6 +1587,23 @@ impl BlockedContinuation {
         Ok(Self::from_zone_park(capture, wait, None))
     }
 
+    /// Retain a faulting instruction while its exact MM owner releases
+    /// admission. The normal saved CPU remains authoritative; no syscall
+    /// request, return value, or syscall restart belongs to this wait.
+    pub fn from_fault_zone_park(
+        context: &KernelContext,
+        lease: &crate::kernel::objects::ThreadExecutionLease,
+        wait: ZoneWait,
+    ) -> Result<Self, ContinuationBuildError> {
+        let capture = ContinuationCapture::capture_lease(
+            context,
+            lease,
+            ContinuationOrigin::Fault,
+            RestartClass::Never,
+        )?;
+        Ok(Self::from_zone_park(capture, wait, None))
+    }
+
     /// The zone record a zone wait parks on.
     pub fn zone_wait(&self) -> Option<&ZoneWait> {
         match &self.state().detail {
@@ -2181,10 +2200,16 @@ impl BlockedContinuation {
         } else {
             event
         };
+        let fault_action = matches!(self.authority().origin, ContinuationOrigin::Fault);
+        let fault_signal = fault_action
+            .then(|| event.reserved_signal().cloned())
+            .flatten();
         let outcome = if self.authority().is_terminal_action() {
             // A notification makes the retained action eligible to prepare
             // again. Even a raced signal cannot synthesize an exit return.
             ContinuationCompletion::ResumeTerminalAction
+        } else if fault_action {
+            ContinuationCompletion::ResumeFault
         } else if !completed && self.interrupted_by_group_stop(context.task()) {
             ContinuationCompletion::Errno(LINUX_EINTR)
         } else {
@@ -2497,7 +2522,7 @@ impl BlockedContinuation {
         Ok(ContinuationResult {
             completion: outcome,
             restart: RestartDecision::NoRestart,
-            reserved_signal: None,
+            reserved_signal: fault_signal,
         })
     }
 
@@ -2610,6 +2635,7 @@ impl ContinuationEvent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ContinuationCompletion {
     ResumeTerminalAction,
+    ResumeFault,
     Return(i64),
     Errno(LinuxErrno),
     Redispatch,
@@ -2733,7 +2759,9 @@ pub fn fold_continuation_completion<M: CurrentMmMemory>(
     memory: &mut M,
 ) -> Result<Option<DispatchOutcome>, MemoryError> {
     Ok(match completion {
-        ContinuationCompletion::ResumeTerminalAction => return Err(MemoryError::Unsupported),
+        ContinuationCompletion::ResumeTerminalAction | ContinuationCompletion::ResumeFault => {
+            return Err(MemoryError::Unsupported);
+        }
         ContinuationCompletion::Return(value) => Some(DispatchOutcome::Returned { value }),
         ContinuationCompletion::Errno(errno) => Some(DispatchOutcome::Errno { errno }),
         ContinuationCompletion::Redispatch => None,

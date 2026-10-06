@@ -103,34 +103,43 @@ fn finish_supply(
         })
     } else if slot.withdraw(window, grant.transaction()) {
         trace_grant_refusal(window, 2);
-        let frame = result?;
-        carrick_observability::probes::el1_grant_refusal(
-            24,
-            frame.x[0],
-            frame.slot,
-            frame.x[16],
-            frame.x[17],
-        );
-        // Withdrawal proves no descriptor was claimed. Release the speculative
-        // physical grant before handing a generation-exact wait to the caller.
-        drop(grant);
-        if frame.x[0] == 11 && frame.x[14] == 3 {
-            let cause = carrick_el1_abi::PortalWaitCause::decode(frame.x[16])
-                .ok_or_else(|| TrapError::Hypervisor("grant returned invalid owner wait".into()))?;
-            // SAFETY: the exact carrier service authenticated this target's
-            // notification source before testing its admission condition.
-            let wait = unsafe {
-                carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, cause, frame.x[17])
-            };
-            Ok(SupplyProgress::OwnerWait(wait))
-        } else {
-            Ok(SupplyProgress::Declined)
-        }
+        finish_unclaimed_supply(grant, target, result)
     } else {
         carrick_fatal::carrick_fatal!(
             "aarch64::user_transfer",
             "unsettled owner grant retains physical custody"
         );
+    }
+}
+
+/// Both syscall supply and fault supply have proved that this exact grant
+/// was withdrawn before EL1 claimed its descriptor. Preserve only the
+/// authenticated owner notification, after releasing physical custody.
+pub(crate) fn finish_unclaimed_supply(
+    grant: Box<dyn TransferGrant>,
+    target: TransferTarget,
+    result: Result<TrapFrame, TrapError>,
+) -> Result<SupplyProgress, TrapError> {
+    let frame = result?;
+    carrick_observability::probes::el1_grant_refusal(
+        24,
+        frame.x[0],
+        frame.slot,
+        frame.x[16],
+        frame.x[17],
+    );
+    drop(grant);
+    if frame.x[0] == 11 && frame.x[14] == 3 {
+        let cause = carrick_el1_abi::PortalWaitCause::decode(frame.x[16])
+            .ok_or_else(|| TrapError::Hypervisor("grant returned invalid owner wait".into()))?;
+        // SAFETY: the exact carrier service authenticated this target's
+        // notification source before testing its admission condition.
+        let wait = unsafe {
+            carrick_el1_abi::PortalOwnerWait::from_owner(target.handle, cause, frame.x[17])
+        };
+        Ok(SupplyProgress::OwnerWait(wait))
+    } else {
+        Ok(SupplyProgress::Declined)
     }
 }
 
@@ -768,6 +777,15 @@ mod grant_wait_tests {
 
     #[test]
     fn unclaimed_owner_wait_releases_physical_custody_before_parking() {
+        exercise_unclaimed_owner_wait(false);
+    }
+
+    #[test]
+    fn fault_owner_wait_releases_physical_custody_before_parking() {
+        exercise_unclaimed_owner_wait(true);
+    }
+
+    fn exercise_unclaimed_owner_wait(owner_fault: bool) {
         let nz = |n| NonZeroU64::new(n).unwrap();
         let operation = PortalOperation {
             carrier: nz(1),
@@ -802,7 +820,7 @@ mod grant_wait_tests {
             tables: TableGrants::NONE,
         };
         let slot = PortalGrantSlot::new();
-        for cause in [PortalWaitCause::Gate, PortalWaitCause::Editor] {
+        for cause in [PortalWaitCause::Editor, PortalWaitCause::Gate] {
             assert!(slot.submit(window, &txn));
             let retained = Arc::new(AtomicBool::new(true));
             let grant = Box::new(PhysicalGrant {
@@ -814,7 +832,12 @@ mod grant_wait_tests {
             frame.x[14] = 3;
             frame.x[16] = cause.encode();
             frame.x[17] = 19;
-            let result = finish_supply(
+            let finish = if owner_fault {
+                crate::engine::finish_owner_fault_supply
+            } else {
+                finish_supply
+            };
+            let result = finish(
                 grant,
                 &slot,
                 window,

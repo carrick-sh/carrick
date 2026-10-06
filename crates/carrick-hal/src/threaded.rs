@@ -2488,6 +2488,9 @@ pub enum OwnerFaultOutcome {
     Resolved,
     /// Reselect only after the exact predecessor publishes or rolls back.
     Pending(carrick_guest_mem::OwnedMemoryWait),
+    /// The semantic owner refused admission until this exact producer releases.
+    /// No speculative physical grant or syscall completion crosses this wait.
+    OwnerWait(carrick_el1_abi::PortalOwnerWait),
     Refused,
     BusFault,
 }

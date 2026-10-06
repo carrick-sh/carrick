@@ -7353,6 +7353,96 @@ fn terminal_zone_capture_rejects_another_threads_execution_lease() {
 }
 
 #[test]
+fn fault_zone_capture_has_no_syscall_and_resumes_the_fault() {
+    let (_kernel, context) = bootstrap(15_410);
+    publish(&context, 0x704);
+    let executor =
+        crate::kernel::objects::ExecutorId::for_transitional_thread(context.thread().registry_id())
+            .unwrap();
+    let lease = context.thread().claim_runnable(executor).unwrap();
+    let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+    wait.mark_consumed();
+    let continuation = BlockedContinuation::from_fault_zone_park(&context, &lease, wait).unwrap();
+    assert!(!continuation.authority().is_terminal_action());
+    assert_eq!(continuation.authority().syscall(), None);
+    assert_eq!(continuation.authority().mm(), context.shared().mm().id());
+    assert_eq!(
+        continuation.authority().execution_generation(),
+        lease.generation()
+    );
+    assert_eq!(
+        continuation.authority().restart_class(),
+        RestartClass::Never
+    );
+    assert!(!continuation.accepts_generic_scheduler_wake());
+    let result = continuation
+        .resume(ContinuationEvent::Ready, &context)
+        .unwrap();
+    assert_eq!(result.completion, ContinuationCompletion::ResumeFault);
+    assert_eq!(result.restart(), RestartDecision::NoRestart);
+    assert!(result.reserved_signal().is_none());
+    let dispatcher = crate::dispatch::SyscallDispatcher::new();
+    let mut memory = crate::dispatch::LinearMemory::new(0x4000, vec![0; 16]);
+    assert_eq!(
+        fold_continuation_completion(result.completion, &dispatcher, &context, &mut memory),
+        Err(MemoryError::Unsupported)
+    );
+}
+
+#[test]
+fn fault_zone_capture_preserves_a_signal_reservation_without_eintr_or_restart() {
+    let (_kernel, context) = bootstrap(15_411);
+    publish(&context, 0x704);
+    let executor =
+        crate::kernel::objects::ExecutorId::for_transitional_thread(context.thread().registry_id())
+            .unwrap();
+    let lease = context.thread().claim_runnable(executor).unwrap();
+    let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+    wait.mark_consumed();
+    let continuation = BlockedContinuation::from_fault_zone_park(&context, &lease, wait).unwrap();
+    let signal = crate::kernel::LinuxSignal::for_signal_number(10).unwrap();
+    context
+        .signal_authority()
+        .enqueue_thread_standard(signal, None);
+    let event = SignalReadinessProbe::from_continuation(&continuation)
+        .event()
+        .expect("fault wait is interruptible");
+    assert_eq!(event.reserved_signal().unwrap().signum(), 10);
+    let result = continuation.resume(event, &context).unwrap();
+    assert_eq!(result.completion, ContinuationCompletion::ResumeFault);
+    assert_eq!(result.restart(), RestartDecision::NoRestart);
+    assert_eq!(
+        result.reserved_signal().unwrap().signum(),
+        10,
+        "fault runtime owns this exact signal until delivery"
+    );
+    assert!(!context.signal_authority().thread_pending().contains(10));
+    drop(result);
+    assert!(
+        context.signal_authority().thread_pending().contains(10),
+        "discarded completion requeues its reservation"
+    );
+}
+
+#[test]
+fn fault_zone_capture_rejects_another_threads_execution_lease() {
+    let (_kernel, context) = bootstrap(15_412);
+    let (_other_kernel, other) = bootstrap(15_413);
+    publish(&context, 0x704);
+    publish(&other, 0x704);
+    let executor =
+        crate::kernel::objects::ExecutorId::for_transitional_thread(context.thread().registry_id())
+            .unwrap();
+    let lease = context.thread().claim_runnable(executor).unwrap();
+    let wait = ZoneWait::new(carrick_el1_abi::RecordRef::PLACEHOLDER, 1);
+    wait.mark_consumed();
+    assert!(matches!(
+        BlockedContinuation::from_fault_zone_park(&other, &lease, wait),
+        Err(ContinuationBuildError::StaleExecutionAuthority)
+    ));
+}
+
+#[test]
 fn terminal_action_cannot_be_folded_into_a_guest_syscall_result() {
     let (_kernel, context) = bootstrap(15_402);
     let dispatcher = crate::dispatch::SyscallDispatcher::new();
