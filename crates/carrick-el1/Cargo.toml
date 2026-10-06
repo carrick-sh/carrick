@@ -17,7 +17,7 @@ zerocopy.workspace = true
 
 [features]
 default = []
-host-test = ["carrick-sched-core/host-test", "carrick-core/host-test"]
+host-test = ["carrick-sched-core/host-test", "carrick-core/host-test", "carrick-personality-linux/fixture-entry"]
 allocator-test-control = []
 
 [[bin]]
@@ -28,6 +28,7 @@ path = "src/entry.rs"
 path = "src/lib.rs"
 
 [dev-dependencies]
+carrick-personality-linux = { path = "../carrick-personality-linux", features = ["fixture-entry"] }
 carrick-core = { path = "../carrick-core", features = ["host-test"] }
 carrick-aarch64 = { path = "../carrick-aarch64" }
 carrick-hal = { path = "../carrick-hal" }

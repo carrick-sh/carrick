@@ -8,6 +8,7 @@ use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 
 fn tiny_elf(code: &[u8]) -> Vec<u8> {
     let mut bytes = vec![0; 0xb0 + code.len()];
+    let file_size = bytes.len() as u64;
     bytes[..4].copy_from_slice(b"\x7fELF");
     bytes[4..7].copy_from_slice(&[2, 1, 1]);
     bytes[16..18].copy_from_slice(&2u16.to_le_bytes()); // ET_EXEC
@@ -21,7 +22,7 @@ fn tiny_elf(code: &[u8]) -> Vec<u8> {
     bytes[64..68].copy_from_slice(&1u32.to_le_bytes()); // PT_LOAD
     bytes[68..72].copy_from_slice(&5u32.to_le_bytes()); // PF_R|X
     bytes[80..88].copy_from_slice(&0x400000u64.to_le_bytes());
-    bytes[96..104].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+    bytes[96..104].copy_from_slice(&file_size.to_le_bytes());
     bytes[104..112].copy_from_slice(&0x1000u64.to_le_bytes());
     bytes[112..120].copy_from_slice(&0x1000u64.to_le_bytes());
     bytes[0xb0..].copy_from_slice(code);
@@ -31,8 +32,9 @@ fn tiny_elf(code: &[u8]) -> Vec<u8> {
 #[test]
 fn production_sigprocmask_uses_shared_lifecycle_family() {
     let code = [
-        0x6a, 0x01, // push 1: one-bit signal set
-        0x48, 0x89, 0xe6, // mov rsi,rsp: set
+        // NULL set and oldset need no guest memory or host resource. The old
+        // CommonFamilies lifecycle path still forwarded this valid call.
+        0x31, 0xf6, // xor esi,esi: no new set
         0x31, 0xff, // xor edi,edi: SIG_BLOCK
         0x31, 0xd2, // xor edx,edx: no old set
         0x49, 0xc7, 0xc2, 0x08, 0x00, 0x00, 0x00, // mov r10,8
@@ -47,7 +49,9 @@ fn production_sigprocmask_uses_shared_lifecycle_family() {
     ];
     let elf = tiny_elf(&code);
     let image = prepare_static_x86_elf(&elf).expect("static x86 ELF");
-    let mut carrier = Cpl0Carrier::boot_production(0x20_000).expect("production KVM image");
+    let extent =
+        Cpl0Carrier::initial_extent_bytes_for(&image, &[], &[]).expect("bounded initial extent");
+    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM image");
     carrier
         .load_guest_mm(&image, &[], &[])
         .expect("initial guest MM");

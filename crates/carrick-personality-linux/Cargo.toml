@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+fixture-entry = []
+
 [dependencies]
 carrick-syscall-abi = { path = "../carrick-syscall-abi" }
 carrick-core = { path = "../carrick-core" }
