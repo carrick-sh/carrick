@@ -48,6 +48,17 @@ impl Default for MetadataStorage {
     }
 }
 
+fn bootstrap_metadata_base() -> u64 {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        carrick_el1_abi::X86_CPL0_BOOTSTRAP_METADATA_BASE
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    {
+        carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE
+    }
+}
+
 impl MetadataStorage {
     pub const fn new() -> Self {
         Self {
@@ -60,7 +71,7 @@ impl MetadataStorage {
         let mut core = self.lock.lock();
         if core.diagnostics().active_extents == 0 {
             let _ = core.admit_extent(
-                carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE,
+                bootstrap_metadata_base(),
                 carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE as usize,
                 ExtentKind::Bootstrap,
             );
@@ -241,7 +252,7 @@ impl MetadataStorage {
         #[cfg(target_os = "none")]
         if core.diagnostics().active_extents == 0 {
             let _ = core.admit_extent(
-                carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE,
+                bootstrap_metadata_base(),
                 carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE as usize,
                 ExtentKind::Bootstrap,
             );
