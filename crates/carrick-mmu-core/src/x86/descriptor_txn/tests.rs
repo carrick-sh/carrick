@@ -64,6 +64,63 @@ fn neutral_prepare_intent_publishes_one_native_page() {
     assert!(words.stores.get() > 0);
 }
 
+#[test]
+fn retired_x86_leaf_retains_backing_and_repoints_without_publication() {
+    use carrick_guest_arch::{EditIntent, EditOperation, EditOwner, GuestLen, UserRange};
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    assert!(matches!(
+        apply(
+            &words,
+            map(span.va, 0x800000, PAGE, LeafSize::Page),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    // SAFETY: the fixture holds the sole editor for this synthetic root.
+    let owner = unsafe { EditOwner::issue(root(0x1000), NonZeroU64::MIN, NonZeroU64::MIN) };
+    let range = UserRange::checked(UserVa::new(span.va), GuestLen::new(span.len)).unwrap();
+    let intent = EditIntent::checked(owner, range, EditOperation::Unmap, &[]).unwrap();
+    let retirement = DescriptorTxn::from_intent(&intent).unwrap();
+    assert!(matches!(retirement.op, DescriptorOp::Retire(_)));
+    assert!(matches!(
+        execute_descriptor_txn(&words, &retirement, root(0x1000), &mut InlineJournal::new())
+            .outcome,
+        DescriptorOutcome::Applied { .. }
+    ));
+    let (retired, _) =
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(span.va)).unwrap();
+    assert_eq!(retired & ADDRESS, 0x800000);
+    assert_eq!(retired & (PRESENT | PREPARED), 0);
+    assert_eq!(
+        translate(
+            &words,
+            root(0x1000),
+            UserVa::new(span.va),
+            Access::Read,
+            true
+        ),
+        Err(FaultClass::NotPresent)
+    );
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::CowRepoint {
+                span,
+                old: FrameGpa::new(0x800000),
+                new: FrameGpa::new(0x900000),
+                backing: backing()
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let (repointed, _) =
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(span.va)).unwrap();
+    assert_eq!(repointed & ADDRESS, 0x900000);
+    assert_eq!(repointed & (PRESENT | PREPARED), 0);
+}
+
 struct Words {
     words: RefCell<BTreeMap<u64, u64>>,
     reads: Cell<usize>,
