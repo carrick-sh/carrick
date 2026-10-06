@@ -26,6 +26,29 @@ use carrick_sched_core::{
 };
 use core::sync::atomic::{AtomicU16, Ordering};
 
+/// Terminal native-custody failures after guest mutation. These are kernel
+/// invariant errors, never a request to replay the syscall on the host.
+#[repr(u64)]
+#[derive(Clone, Copy, Debug)]
+pub enum LifecycleInvariant {
+    ForkBacking = 0x101,
+    ForkCommit,
+    ForkPublication,
+    WaitEnrollment,
+    WaitPublication,
+    WaitSwitch,
+    ExitPublication,
+    ExitWake,
+    ExitReap,
+    ExitRecord,
+    ExitRetirement,
+    ExitSwitch,
+}
+#[cfg(target_os = "none")]
+fn committed<T>(value: Option<T>, reason: LifecycleInvariant) -> T {
+    value.unwrap_or_else(|| crate::kernel::lifecycle_invariant_error(reason))
+}
+
 const CHILD_WAIT_KEY: u64 = 0x5_0300;
 
 /// Owned exclusion for child exit publication and wait enrollment. The
@@ -572,51 +595,76 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         {
             return None;
         }
+        let refused = || {
+            Some(LifecycleOutcome::Returned {
+                result: SyscallResult::new(-11),
+                work: false,
+            })
+        };
         let mut child = self.lane.parent;
         child.tid = process::child_pid(child.tid);
-        child.serial = child.serial.checked_add(1)?;
-        child.generation = child.generation.checked_add(1)?;
+        let Some(serial) = child.serial.checked_add(1) else {
+            return refused();
+        };
+        child.serial = serial;
+        let Some(generation) = child.generation.checked_add(1) else {
+            return refused();
+        };
+        child.generation = generation;
         child.mm = process::child_mm();
-        child.control_slot = child
+        let Some(control) = child
             .control_slot
-            .checked_add(core::mem::size_of::<ThreadControlSlot>() as u64)?;
-        let record = self.zone.alloc_record(child).ok()?;
-        let reference = self.zone.record_ref(record);
-        let parent_root = carrick_el1::isa::x86::hardware_live_root().ok()?;
+            .checked_add(core::mem::size_of::<ThreadControlSlot>() as u64)
+        else {
+            return refused();
+        };
+        child.control_slot = control;
+        let Some(visible_tid) = u32::try_from(child.tid).ok() else {
+            return refused();
+        };
+        let Some(parent_root) = carrick_el1::isa::x86::hardware_live_root().ok() else {
+            return refused();
+        };
         let Some(residency) = process::residency() else {
-            self.zone.free_record(record);
-            return None;
+            return refused();
         };
-        if !process::publish_child_stack(residency, parent_root) {
-            self.zone.free_record(record);
-            return None;
-        }
-        let Some((child_root, publication)) = process::fork_mm(parent_root) else {
-            self.zone.free_record(record);
-            return None;
+        let Some(record) = self.zone.alloc_record(child).ok() else {
+            return refused();
         };
-        let Some(index) = self
-            .zone
-            .spaces
-            .publish_closed(child.mm, child_root.address().raw(), 0)
+        let reference = self.zone.record_ref(record);
+        // Reserve scheduler capacity before the fork owner changes any MM,
+        // COW grant or residency publication. The entry stays closed.
+        let Some(index) =
+            self.zone
+                .spaces
+                .publish_closed(child.mm, process::child_root().address().raw(), 0)
         else {
             self.zone.free_record(record);
-            return None;
+            return refused();
         };
+        committed(
+            process::publish_child_stack(residency, parent_root).then_some(()),
+            LifecycleInvariant::ForkBacking,
+        );
+        let (child_root, publication) = committed(
+            process::fork_mm(parent_root),
+            LifecycleInvariant::ForkCommit,
+        );
+        committed(
+            (publication.mm_key == self.lane.parent.mm
+                && publication.root_gpa == parent_root.address().raw()
+                && child_root == process::child_root())
+            .then_some(()),
+            LifecycleInvariant::ForkPublication,
+        );
         self.zone.spaces.open(index);
-        if publication.mm_key != self.lane.parent.mm
-            || publication.root_gpa != parent_root.address().raw()
-        {
-            self.zone.free_record(record);
-            return None;
-        }
         self.prepare_child(
             reference,
             ChildContext {
                 result: SyscallResult::new(0),
                 stack: UserVa::new(self.frame.rsp),
                 tls: None,
-                visible_tid: child.tid as u32,
+                visible_tid,
             },
         );
         self.enqueue_born(reference);
@@ -672,7 +720,12 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         if !process::prepare_wait_status(self, status) {
             return returned(-14);
         }
-        let guard = ChildWaitGuard::acquire(self.zone, EntryMmKey::from_raw(process::parent_mm()))?;
+        let Some(guard) =
+            ChildWaitGuard::acquire(self.zone, EntryMmKey::from_raw(process::parent_mm()))
+        else {
+            process::clear_wait_status();
+            return returned(-11);
+        };
         // Child exit publishes under this same bucket lock. The first check
         // handles exit-before-wait; this one closes status preparation races.
         if let Some(code) = process::child_exit().exited_status() {
@@ -686,10 +739,18 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             process::clear_wait_status();
             return returned(child_pid as i64);
         }
-        let record = self
+        let Some(record) = self
             .zone
             .current_or_new(self.lane.slot, self.lane.parent)
-            .ok()?;
+            .ok()
+        else {
+            process::clear_wait_status();
+            return returned(-11);
+        };
+        let child_index = committed(
+            u32::try_from(child_pid).ok(),
+            LifecycleInvariant::WaitEnrollment,
+        );
         let reference = self.zone.record_ref(record);
         let mut xsave = XsaveArea::ZERO;
         save_extended(&mut xsave);
@@ -701,26 +762,33 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             gs_base: read_tls(NativeTlsRegister::UserGs),
             xsave,
         };
-        let start = carrick_core::entry::prepare_handoff(
+        let Some(start) = carrick_core::entry::prepare_handoff(
             carrick_core::entry::binding(&self.task.execution, &self.task.mm),
             carrick_core_abi::BornInZoneSource {
                 zone: self.zone,
                 slot: self.lane.slot,
             },
             record,
-        )?;
+        ) else {
+            process::clear_wait_status();
+            return returned(-11);
+        };
         let seq = self.zone.next_seq(record);
-        guard
-            .enroll(record, seq, u32::try_from(child_pid).ok()?)
-            .ok()?;
-        self.handoff = Some(carrick_core::entry::publish_handoff_park(
-            start,
-            &guard.bucket,
-            carrick_core_abi::EntryRecordGeneration(seq),
-        )?);
+        if guard.enroll(record, seq, child_index).is_err() {
+            process::clear_wait_status();
+            return returned(-11);
+        }
+        self.handoff = Some(committed(
+            carrick_core::entry::publish_handoff_park(
+                start,
+                &guard.bucket,
+                carrick_core_abi::EntryRecordGeneration(seq),
+            ),
+            LifecycleInvariant::WaitPublication,
+        ));
         self.zone.clear_current(self.lane.slot);
         drop(guard);
-        let progress = self.switch_next()?;
+        let progress = committed(self.switch_next(), LifecycleInvariant::WaitSwitch);
         Some(LifecycleOutcome::Transferred {
             progress,
             result: SyscallResult::new(self.frame.rax as i64),
@@ -734,42 +802,59 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         {
             return None;
         }
-        let guard = ChildWaitGuard::acquire(self.zone, EntryMmKey::from_raw(process::parent_mm()))?;
+        let guard = committed(
+            ChildWaitGuard::acquire(self.zone, EntryMmKey::from_raw(process::parent_mm())),
+            LifecycleInvariant::ExitPublication,
+        );
         if process::wait_status_address() != 0 && !process::write_exit_status(status) {
-            return None;
+            crate::kernel::lifecycle_invariant_error(LifecycleInvariant::ExitPublication);
         }
-        if !process::child_exit().publish_exit(&guard, status) {
-            return None;
-        }
+        committed(
+            process::child_exit()
+                .publish_exit(&guard, status)
+                .then_some(()),
+            LifecycleInvariant::ExitPublication,
+        );
         let mut effects = WakeEffects::default();
-        let count = self
-            .zone
-            .wake_placed(
-                &guard.bucket,
-                process::parent_mm(),
-                CHILD_WAIT_KEY,
-                u32::MAX,
-                1,
-                Waker::El1 {
-                    slot: self.lane.slot,
-                },
-                &mut [],
-                &mut effects,
-            )
-            .ok()?;
+        let count = committed(
+            self.zone
+                .wake_placed(
+                    &guard.bucket,
+                    process::parent_mm(),
+                    CHILD_WAIT_KEY,
+                    u32::MAX,
+                    1,
+                    Waker::El1 {
+                        slot: self.lane.slot,
+                    },
+                    &mut [],
+                    &mut effects,
+                )
+                .ok(),
+            LifecycleInvariant::ExitWake,
+        );
         if count != 0 {
-            if !process::child_exit().reap(status) {
-                return None;
-            }
+            committed(
+                process::child_exit().reap(status).then_some(()),
+                LifecycleInvariant::ExitReap,
+            );
             process::clear_wait_status();
             self.lane.wakes += u64::from(count);
         }
         drop(guard);
-        let record = self.zone.slot(self.lane.slot).current()?;
-        if !self.release_current(self.zone.record_ref(record)) {
-            return None;
-        }
-        self.resume_after_child_exit()
+        let record = committed(
+            self.zone.slot(self.lane.slot).current(),
+            LifecycleInvariant::ExitRecord,
+        );
+        committed(
+            self.release_current(self.zone.record_ref(record))
+                .then_some(()),
+            LifecycleInvariant::ExitRetirement,
+        );
+        Some(committed(
+            self.resume_after_child_exit(),
+            LifecycleInvariant::ExitSwitch,
+        ))
     }
 }
 impl FutexVenue for NativeLane<'_> {

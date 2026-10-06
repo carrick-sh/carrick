@@ -222,9 +222,9 @@ pub(crate) fn fork_mm(parent_root: RootGpa) -> Option<(RootGpa, GuestMmuPublicat
     let completion = child.commit(Parent, Child).ok()?;
     let publication = GuestMmuPublication::from_x86_fork(
         parent_root.address().raw(), completion, parent_stores,
-    )?;
+    ).unwrap_or_else(|| super::lifecycle_invariant_error(super::super::lifecycle::LifecycleInvariant::ForkPublication));
     *FORK_PUBLICATION.lock() = Some(publication);
-    Some((RootGpa::page_aligned(FrameGpa::new(CHILD_ROOT))?, publication))
+    Some((child_root(), publication))
 }
 
 pub(crate) fn publish_child_stack(residency: &FrameGrantResidencyTable, parent_root: RootGpa) -> bool {
@@ -254,6 +254,10 @@ pub(crate) fn publish_child_stack(residency: &FrameGrantResidencyTable, parent_r
     SHARED_COW_POOL.publish(PARENT_MM, 0x91_8000, parent_backing).is_some()
 }
 
+pub(crate) fn child_root() -> RootGpa {
+    RootGpa::page_aligned(FrameGpa::new(CHILD_ROOT)).unwrap_or_else(||
+        super::lifecycle_invariant_error(super::super::lifecycle::LifecycleInvariant::ForkPublication))
+}
 pub(crate) fn child_mm() -> u64 { CHILD_MM }
 pub(crate) fn parent_mm() -> u64 { PARENT_MM }
 pub(crate) fn child_pid(parent_pid: u64) -> u64 { parent_pid + 1 }

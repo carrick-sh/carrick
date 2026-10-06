@@ -215,3 +215,29 @@ fn wait_any_parks_with_the_issued_child_pid_result() {
         7
     );
 }
+
+#[test]
+fn exhausted_fork_spaces_return_eagain_without_host_forwarding() {
+    let mut elf = fork_wait_elf();
+    let mut code = vec![0xbf, 42, 0, 0, 0, 0x48, 0xb8];
+    code.extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_NATIVE.to_le_bytes());
+    code.extend_from_slice(&[
+        0x0f, 0x05, 0xb8, 57, 0, 0, 0, 0x0f, 0x05, 0x83, 0xf8, 0xf5, 0x75, 12, 0xbf, 7, 0, 0, 0,
+        0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0xbf, 9, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0x0f,
+        0x0b,
+    ]);
+    elf.truncate(0xb0);
+    elf.extend_from_slice(&code);
+    let size = elf.len() as u64;
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    let program = initial_process_program(&elf);
+    let mut carrier = Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM");
+    assert_eq!(carrier.observe(0).expect("before fork").result, 42);
+    carrier
+        .exhaust_fork_address_spaces()
+        .expect("fill MM table");
+    let result = carrier.observe(0).expect("explicit fork capacity result");
+    assert_eq!(result.result, 7);
+    assert_eq!(result.semantic_host_exits, 0);
+    assert_eq!(carrier.lifecycle_state(0).expect("no birth").births, 0);
+}
