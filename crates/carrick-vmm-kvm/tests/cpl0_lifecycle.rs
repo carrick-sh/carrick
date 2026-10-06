@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 fn image() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0")
+        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0-fixture")
 }
 fn mov(bytes: &mut Vec<u8>, opcode: &[u8], value: u64) {
     bytes.extend_from_slice(opcode);
