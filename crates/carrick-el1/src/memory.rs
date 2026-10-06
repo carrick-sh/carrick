@@ -3,10 +3,12 @@
 #[path = "personality/reservations.rs"]
 pub mod reservations;
 
+use carrick_core::mm::reservation::ReservationGeometry;
 use carrick_el1_abi::{CurrentTask, TrapFrame};
 use carrick_mmu_core::aarch64::{
     GuestPermissionEdit, GuestPermissionEditError, GuestRetirementError,
 };
+use carrick_personality_linux::mm::LinuxReservationPolicy;
 #[cfg(test)]
 use carrick_sched_core::AddressSpaces;
 use carrick_sched_core::spaces::notification::SpaceAccess;
@@ -32,6 +34,8 @@ const MAP_FIXED_NOREPLACE: u64 = 0x100000;
 const EINVAL: i64 = 22;
 const ENOMEM: i64 = 12;
 const PAGE_SIZE: u64 = 4096;
+type ReservationModel<'a, G> =
+    carrick_core::mm::reservation::Reservations<'a, LinuxReservationPolicy, G>;
 
 /// Keep mmap protection outside EL1's vocabulary on the host decode route.
 /// The memflagmatrix oracle records ignored bits; mprotect is separate.
@@ -94,11 +98,11 @@ impl PendingReservationSyscall {
     /// Complete exactly once, on the saved originating frame after T2 completed
     /// descriptors and authenticated backing. Failed authentication keeps the
     /// pending proposal intact so its owner can explicitly refuse/settle it.
-    pub fn complete(
+    pub fn complete<G: ReservationGeometry>(
         &mut self,
         frame: &mut TrapFrame,
         current: &CurrentTask,
-        model: &mut reservations::Reservations<'_>,
+        model: &mut ReservationModel<'_, G>,
         completion: carrick_el1_abi::ReservationCompletion,
     ) -> Result<(), reservations::Refusal> {
         self.complete_as(frame, current, model, completion, None)
@@ -107,21 +111,21 @@ impl PendingReservationSyscall {
     /// venue retired: the root commits and journals the range as an owed
     /// return ([`reservations::Reservations::complete_deferring_return`]);
     /// its frames stay unreusable until the host's inventory receipt.
-    pub fn complete_deferring_return(
+    pub fn complete_deferring_return<G: ReservationGeometry>(
         &mut self,
         frame: &mut TrapFrame,
         current: &CurrentTask,
-        model: &mut reservations::Reservations<'_>,
+        model: &mut ReservationModel<'_, G>,
         completion: carrick_el1_abi::ReservationCompletion,
         slot: reservations::ReturnSlot,
     ) -> Result<(), reservations::Refusal> {
         self.complete_as(frame, current, model, completion, Some(slot))
     }
-    fn complete_as(
+    fn complete_as<G: ReservationGeometry>(
         &mut self,
         frame: &mut TrapFrame,
         current: &CurrentTask,
-        model: &mut reservations::Reservations<'_>,
+        model: &mut ReservationModel<'_, G>,
         completion: carrick_el1_abi::ReservationCompletion,
         owed_return: Option<reservations::ReturnSlot>,
     ) -> Result<(), reservations::Refusal> {
@@ -146,11 +150,11 @@ impl PendingReservationSyscall {
     }
     /// Finish a clean backing/descriptor refusal on the originating thread.
     /// The service must roll back before invoking this method.
-    pub fn refuse(
+    pub fn refuse<G: ReservationGeometry>(
         &mut self,
         frame: &mut TrapFrame,
         current: &CurrentTask,
-        model: &mut reservations::Reservations<'_>,
+        model: &mut ReservationModel<'_, G>,
     ) -> Result<(), reservations::Refusal> {
         if !self.owns_frame(frame, current) {
             return Err(reservations::Refusal::Stale);
@@ -165,9 +169,9 @@ impl PendingReservationSyscall {
     }
     /// Cancel after service rollback when the originating thread is gone.
     /// Cancellation delivers no syscall result and increments no served count.
-    pub fn cancel(
+    pub fn cancel<G: ReservationGeometry>(
         self,
-        model: &mut reservations::Reservations<'_>,
+        model: &mut ReservationModel<'_, G>,
     ) -> Result<(), reservations::Refusal> {
         model.refuse(self.request)
     }
@@ -177,10 +181,10 @@ impl PendingReservationSyscall {
 /// exact-MM reservation guard. No descriptor operation occurs in this layer.
 /// T2 integration replaces the existing dispatch fallback with this decision,
 /// retaining `Work` until completion instead of forwarding the original SVC.
-pub fn decide_anonymous_syscall(
+pub fn decide_anonymous_syscall<G: ReservationGeometry>(
     frame: &TrapFrame,
     current: &CurrentTask,
-    model: &mut reservations::Reservations<'_>,
+    model: &mut ReservationModel<'_, G>,
 ) -> ReservationDisposition {
     use carrick_el1_abi::{ReservationProtection, ReservationRange};
     use reservations::{Decision, Placement, Refusal};

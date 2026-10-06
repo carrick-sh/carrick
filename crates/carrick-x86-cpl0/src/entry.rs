@@ -208,9 +208,12 @@ mod user_fault_gate {
 #[cfg(target_os = "none")]
 mod kernel {
     mod initial_boot { include!("initial_boot.rs"); }
+    mod anonymous { include!("anonymous.rs"); }
     use super::adapter::*;
     use carrick_el1::lock::SpinLock;
-    use carrick_el1::personality::common_entry::{EntryOutcome, serve_canonical};
+    use carrick_el1::personality::common_entry::{
+        EntryOutcome, serve_canonical, serve_canonical_with_anonymous,
+    };
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
     use carrick_el1_abi::{Counters, CurrentTask};
     use carrick_guest_arch::InterruptArch;
@@ -299,7 +302,9 @@ mod kernel {
     }
     impl InitialWords {
         const fn fixture() -> Self { Self { start: 0x20_0000, end: 0xc0_0000 } }
-        const fn production(end: u64) -> Self { Self { start: 0x40_00000, end } }
+        const fn production(table_start: u64, table_end: u64) -> Self {
+            Self { start: table_start, end: table_end }
+        }
         fn word(
             &self,
             pa: u64,
@@ -309,7 +314,7 @@ mod kernel {
         > {
             use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
             let in_grants = pa >= self.start && pa.checked_add(8).is_some_and(|end| end <= self.end);
-            let source_root = self.start == 0x40_00000 && (0x60_0000..0x60_1000).contains(&pa);
+            let source_root = self.start >= 0x40_00000 && (0x60_0000..0x60_1000).contains(&pa);
             if pa & 7 != 0 || !(in_grants || source_root)
             {
                 return Err(DescriptorRefusal::TableOutsidePrimary);
@@ -1185,13 +1190,20 @@ mod kernel {
         }
         });
         if !handled_by_fixture {
-            match serve_canonical(
-                &call,
-                counters,
-                task,
-                &GuestLifecycleVenue,
-                Some(&binding.publications),
-            ) {
+            let outcome = if crate::fixture_image() {
+                serve_canonical(
+                    &call, counters, task, &GuestLifecycleVenue,
+                    Some(&binding.publications),
+                )
+            } else {
+                let mut anonymous =
+                    anonymous::X86AnonymousVenue::new(&call, task, binding.cpu_slot, frame.rcx);
+                serve_canonical_with_anonymous(
+                    &call, counters, task, &GuestLifecycleVenue,
+                    Some(&binding.publications), &mut anonymous,
+                )
+            };
+            match outcome {
                 EntryOutcome::Served { result } | EntryOutcome::ServedWithWork { result } => {
                     frame.rax = result.raw() as u64;
                 }

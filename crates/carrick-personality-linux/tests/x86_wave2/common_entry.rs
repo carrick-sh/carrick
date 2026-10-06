@@ -4,13 +4,19 @@ extern crate std;
 use carrick_core::lifecycle::Lifecycle;
 use carrick_el1::personality::common_entry::{
     EntryOutcome, SYS_SET_ROBUST_LIST, execution_binding, serve_canonical,
+    serve_canonical_with_anonymous,
 };
 use carrick_el1::personality::thread_setup::{LifecycleThread, LifecycleVenue};
 use carrick_el1_abi::{Counters, CurrentTask};
 use carrick_el1_abi::{EntryRef, LifecycleHatches, ThreadControlSlot, ThreadLifecyclePage};
 use carrick_guest_arch::{GuestIsa, NativeOrdinal, UserVa};
+use carrick_personality_linux::dispatch::FamilyCompletion;
 use carrick_personality_linux::entry::CanonicalOrdinal;
+use carrick_personality_linux::entry::SyscallResult;
 use carrick_personality_linux::entry::{CanonicalCall, decode_x86_snapshot};
+use carrick_personality_linux::pending_anonymous::{
+    DelegatedStep, PendingAnonymousVenue, PermissionStep, RetirementStep,
+};
 use carrick_x86::cpl0_entry::NativeFrame;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::boxed::Box;
@@ -122,6 +128,62 @@ fn served_result(outcome: EntryOutcome) -> Option<i64> {
         }
         EntryOutcome::Forward | EntryOutcome::InvalidCompletion => None,
     }
+}
+
+struct AnonymousBreak;
+impl PendingAnonymousVenue for AnonymousBreak {
+    fn original_argument0(&self) -> u64 {
+        0
+    }
+    fn task_state(&self) -> Option<&carrick_personality_linux::abi::entry::LinuxTaskState> {
+        None
+    }
+    fn delegated(&mut self) -> DelegatedStep {
+        DelegatedStep::Served(SyscallResult::new(0x403000))
+    }
+    fn park_prepared(&mut self) -> Option<FamilyCompletion> {
+        None
+    }
+    fn permission(&mut self) -> PermissionStep {
+        PermissionStep::Forward
+    }
+    fn retirement(&mut self) -> RetirementStep {
+        RetirementStep::Forward
+    }
+    fn install_result(&mut self, _: SyscallResult) {}
+}
+
+#[test]
+fn x86_brk_enters_the_common_linux_anonymous_route() {
+    let world = World::new(LifecycleHatches::ON);
+    let call = decode_x86_snapshot(
+        NativeFrame {
+            rax: 12,
+            rsp: 0x7fff_0000,
+            ..Default::default()
+        }
+        .snapshot(),
+    )
+    .unwrap();
+    let mut anonymous = AnonymousBreak;
+    let result = serve_canonical_with_anonymous(
+        &call,
+        &world.counters,
+        &world.tasks[0],
+        &*world.venue,
+        Some(&world.publications),
+        &mut anonymous,
+    );
+    assert_eq!(
+        served_result(result),
+        Some(0x403000),
+        "canonical: {:?}; served: {}; forwarded: {}",
+        call.canonical,
+        world.counters.served[214].load(Ordering::Relaxed),
+        world.counters.forwarded[214].load(Ordering::Relaxed)
+    );
+    assert_eq!(world.counters.served[214].load(Ordering::Relaxed), 1);
+    assert_eq!(world.counters.forwarded[214].load(Ordering::Relaxed), 0);
 }
 
 #[test]
