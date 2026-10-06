@@ -579,7 +579,7 @@ pub(crate) fn with_hardware_cow_venue<R>(
                         core::arch::asm!("hvc #1", options(nostack));
                     }
                     #[cfg(target_arch = "x86_64")]
-                    crate::isa::x86::carrick_x86_unbound_host_yield();
+                    crate::isa::x86::yield_host_effect();
                 },
             )
         })
