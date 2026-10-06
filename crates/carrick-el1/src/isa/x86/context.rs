@@ -106,21 +106,54 @@ impl EntryBackend for X86Backend {
     }
 }
 
-/// No x86 slot binding has been published for the ARM stack-slot caller.
-#[cold]
-#[inline(never)]
-#[unsafe(no_mangle)]
-pub extern "C" fn carrick_x86_unbound_stack_slot() -> ! {
-    // SAFETY: an unsupported guest-kernel path must fault at CPL0 rather
-    // than returning an unauthenticated stack slot.
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
+/// Read the current CPU binding published through GS:[16].
+#[inline(always)]
+pub fn current_cpu_binding() -> Option<&'static native::CpuBinding> {
+    let binding_address: u64;
+    // SAFETY: SWAPGS has installed the retained per-vCPU binding before
+    // any shared-kernel entry; GS:[16] is its immutable self pointer.
+    unsafe {
+        core::arch::asm!(
+            "mov {}, gs:[16]",
+            out(reg) binding_address,
+            options(nostack, preserves_flags)
+        );
+    }
+    if binding_address == 0 {
+        return None;
+    }
+    // SAFETY: stopped-host bootstrap owns this binding through vCPU
+    // retirement. Its slot is immutable after publication.
+    Some(unsafe { &*(binding_address as *const native::CpuBinding) })
 }
 
-/// The ARM ThreadCpu record must never be interpreted as x86 context.
-#[cold]
-#[inline(never)]
-#[unsafe(no_mangle)]
-pub extern "C" fn carrick_x86_unbound_thread_cpu() -> ! {
-    // SAFETY: the invalid context path must stop before state publication.
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
+/// The current CPU's supervisor stack slot index.
+pub fn current_stack_slot() -> Option<usize> {
+    let binding = current_cpu_binding()?;
+    let sp: u64;
+    // SAFETY: CPL0 reads its current stack pointer.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags));
+    }
+    let stack_end = binding.kernel_stack.checked_add(16)?;
+    if sp < stack_end.checked_sub(0x1_0000)? || sp > stack_end {
+        return None;
+    }
+    Some(binding.cpu_slot as usize)
+}
+
+/// The current CPU's thread CPU identifier.
+pub fn current_thread_cpu() -> u64 {
+    current_cpu_binding().map_or(0, |b| b.cpu_slot as u64)
+}
+
+/// A CPL0-only fixture syscall that exercises this shared kernel context module.
+pub const CONTEXT_WITNESS: u64 = 0xffff_ffff_ffff_ff30;
+
+pub fn witness(op: u64) -> u64 {
+    match op {
+        0 => current_stack_slot().map_or(u64::MAX, |s| s as u64),
+        1 => current_thread_cpu(),
+        _ => u64::MAX,
+    }
 }
