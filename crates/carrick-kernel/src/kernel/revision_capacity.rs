@@ -1,4 +1,4 @@
-//! Exact-task revision headroom owned before an ABI birth is admitted.
+//! Exact-task revision headroom retained by ABI and exit publications.
 
 use super::TaskRevision;
 use parking_lot::Mutex;
