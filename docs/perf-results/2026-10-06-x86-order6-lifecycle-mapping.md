@@ -1,5 +1,8 @@
 # Order 6: lifecycle ownership and X5 comparison packet
 
+Historical pre-rebase evidence. The current reviewed-base resolution and
+verification are recorded in [the rebase packet](2026-10-06-x86-order6-rebase.md).
+
 Comparison base: `0f476ce7a` (order 5), on integrated N1 `56bf8c0ca`.
 The exit-participant custody from `af7bda476` is an ancestor of this base.
 This extraction consumes its current graph operations; it does not replace
