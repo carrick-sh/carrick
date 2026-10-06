@@ -95,6 +95,7 @@ fn production_initial_mm_admits_one_shared_reservation_root() {
         .load_guest_mm(&plan, &argv, &[])
         .expect("guest initial MM publication");
     assert!(carrier.initial_reservation_admitted());
+    assert!(carrier.initial_inventory_custody());
     assert!(
         carrier.initial_thread_custody(),
         "initial x86 task must own one typed scheduler record"
