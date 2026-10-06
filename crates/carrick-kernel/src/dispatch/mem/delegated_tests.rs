@@ -1424,6 +1424,7 @@ fn delegated_exec_leaves_no_root_row_in_the_new_image() {
                 LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
                 MmapGrantCongruence::Any,
                 true,
+                UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::Aarch64),
             )
             .unwrap()
     });
