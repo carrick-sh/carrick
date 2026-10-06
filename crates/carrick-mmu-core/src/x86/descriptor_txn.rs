@@ -67,6 +67,7 @@ pub enum DescriptorOp {
     Publish {
         span: PageSpan,
         expected: FrameGpa,
+        access: Access,
     },
     Protect {
         span: PageSpan,
@@ -236,6 +237,21 @@ fn valid_span(span: PageSpan) -> bool {
         && span.end().is_some_and(|end| {
             canonical(span.va) && canonical(end - 1) && ((span.va ^ (end - 1)) >> 47 == 0)
         })
+}
+/// A CPL0 leaf may grant user access only in the lower canonical half. The
+/// kernel image, metadata, stacks, and LAPIC live in the upper half. Check
+/// prepared leaves too, so a later Publish cannot reveal a mismatched leaf.
+pub fn check_leaf_privilege_matches_range(va: UserVa, entry: u64) -> Result<(), DescriptorRefusal> {
+    if !canonical(va.raw()) {
+        return Err(DescriptorRefusal::BadRange);
+    }
+    if entry & (PRESENT | PREPARED) != 0 {
+        let lower_half = va.raw() < (1 << 47);
+        if (entry & USER != 0) != lower_half {
+            return Err(DescriptorRefusal::PermissionDenied);
+        }
+    }
+    Ok(())
 }
 fn validate_output(output: FrameGpa, len: u64, alignment: u64) -> Result<(), DescriptorRefusal> {
     if !valid_pa(output.raw())
@@ -489,12 +505,20 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                     | if resident { PRESENT } else { PREPARED }
                     | if level < 3 { HUGE } else { 0 }
             }
-            DescriptorOp::Publish { expected, .. } => {
+            DescriptorOp::Publish {
+                expected, access, ..
+            } => {
                 if entry & PREPARED == 0 || entry & PRESENT != 0 {
                     return Err(DescriptorRefusal::NotPrepared);
                 }
                 if leaf_output(entry, level) != expected.raw() + offset {
                     return Err(DescriptorRefusal::WrongBacking);
+                }
+                if entry & USER == 0
+                    || matches!(access, Access::Write) && entry & WRITE == 0
+                    || matches!(access, Access::Execute) && entry & NX != 0
+                {
+                    return Err(DescriptorRefusal::PermissionDenied);
                 }
                 (entry | PRESENT) & !PREPARED
             }
@@ -520,6 +544,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             DescriptorOp::Unmap(_) => 0,
             DescriptorOp::Coalesce { .. } => self.coalesced(entry, level)?,
         };
+        check_leaf_privilege_matches_range(UserVa::new(self.txn.op.span().va + offset), new)?;
         self.set(slot, new)
     }
     fn coalesced(&mut self, entry: u64, level: usize) -> Result<u64, DescriptorRefusal> {
@@ -603,7 +628,19 @@ impl DescriptorTxn<'_> {
                 hash = mix(hash, resident.len);
                 (8, output.raw(), PAGE, permissions(p), Some(backing))
             }
-            DescriptorOp::Publish { expected, .. } => (2, expected.raw(), 0, 0, None),
+            DescriptorOp::Publish {
+                expected, access, ..
+            } => (
+                2,
+                expected.raw(),
+                0,
+                match access {
+                    Access::Read => 1,
+                    Access::Write => 2,
+                    Access::Execute => 3,
+                },
+                None,
+            ),
             DescriptorOp::Protect { permissions: p, .. } => (3, 0, 0, permissions(p), None),
             DescriptorOp::ArmCow(_) => (4, 0, 0, 0, None),
             DescriptorOp::CowRepoint {
