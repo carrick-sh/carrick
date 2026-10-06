@@ -1369,21 +1369,26 @@ pub enum TerminalRefusal {
     Malformed,
 }
 
-/// The EL1-private tags a host-published leaf needs before fork arming so EL1
-/// resolves its COW itself: a valid, EL0-writable 4 KiB leaf that no EL1 grant
-/// produced gets `SW_EL1_PRIVATE` and the write (and execute) ceiling its
-/// current permission implies. Only a writable leaf qualifies: an
-/// already-restricted leaf carries no recoverable Linux write intent, so it
-/// stays with the host. Blocks stay with the host (EL1 never splits).
+/// Adopt a resident native user page into the private fork lane without
+/// recovering permission that its current descriptor does not grant. A
+/// read-only page still needs physical sharing authority for privileged
+/// backing maintenance (vvar refresh), but carries no Linux write intent.
+/// Blocks and privileged-only pages remain outside this leaf adoption.
 fn adopt_host_leaf_as_el1_private(desc: u64, level: usize) -> u64 {
     if level != 3
         || desc & (VALID | SW_EL1_PRIVATE) != VALID
         || desc & TYPE_BITS != TYPE_TABLE_OR_PAGE
-        || desc & AP_MASK != AP_RW
+        || !matches!(desc & AP_MASK, AP_RW | AP_RO)
     {
         return desc;
     }
-    desc | SW_EL1_PRIVATE | SW_EL1_MAY_WRITE | if desc & UXN == 0 { SW_EL1_MAY_EXEC } else { 0 }
+    desc | SW_EL1_PRIVATE
+        | if desc & AP_MASK == AP_RW {
+            SW_EL1_MAY_WRITE
+        } else {
+            0
+        }
+        | if desc & UXN == 0 { SW_EL1_MAY_EXEC } else { 0 }
 }
 
 /// Apply `rule` to one covering terminal. `Ok(None)`: the terminal already
@@ -13139,7 +13144,7 @@ mod tests {
             assert_eq!(leaf & AP_MASK, AP_RO, "hardware write restriction");
             assert!(descriptor_txn::guest_cow::is_guest_cow_write_leaf(3, leaf));
         }
-        // A read-only leaf has no recoverable write intent: never adopted.
+        // A read-only private leaf is adopted without inventing write intent.
         let mut ro = image.snapshot_image().unwrap();
         let ro_va = LINUX_MMAP_BASE + 8 * TWO_MIB;
         ro.set_rw(ro_va, 2 * TWO_MIB as usize, false, None).unwrap();
@@ -13148,8 +13153,42 @@ mod tests {
         ro.set_fork_readonly_adopting(ro_va + PT_PAGE, 2 * PT_PAGE as usize, None)
             .unwrap();
         let leaf = terminal_descriptor(ro.debug_walk(ro_va + PT_PAGE));
-        assert_eq!(leaf & SW_EL1_PRIVATE, 0);
+        assert_ne!(leaf & SW_EL1_PRIVATE, 0);
+        assert!(el1_cow(leaf));
+        assert_eq!(leaf & SW_EL1_MAY_WRITE, 0);
+        assert!(!descriptor_txn::guest_cow::is_guest_cow_write_leaf(3, leaf));
         let _ = (GuestCowClass::AlreadyWritable, GuestCowNotArmed::Unmapped);
+    }
+
+    #[test]
+    fn fork_adopts_readonly_native_pages_without_write_or_execute_intent() {
+        let source = 0x2e_0000_0000 | (USER_PAGE_FLAGS & !AP_MASK) | AP_RO | UXN | NON_GLOBAL;
+        let leaf = terminal_rule_edit(
+            true,
+            TerminalRule::fork_arm(true),
+            source,
+            3,
+            0x2e_0000_0000,
+        )
+        .unwrap()
+        .unwrap_or(source);
+        assert_ne!(
+            leaf & SW_EL1_PRIVATE,
+            0,
+            "private readonly source belongs to EL1"
+        );
+        assert!(
+            el1_cow(leaf),
+            "physical fork maintenance needs the private sharing arm"
+        );
+        assert_eq!(leaf & (SW_EL1_MAY_WRITE | SW_EL1_MAY_EXEC), 0);
+        assert_eq!(
+            leaf & (PA_MASK_4KIB | AP_MASK | UXN),
+            source & (PA_MASK_4KIB | AP_MASK | UXN)
+        );
+        assert!(!descriptor_txn::guest_cow::is_guest_cow_write_leaf(3, leaf));
+        assert!(!terminal_descriptor_permits_el0(leaf, LeafAccess::Write));
+        assert!(!terminal_descriptor_permits_el0(leaf, LeafAccess::Execute));
     }
 
     #[test]
