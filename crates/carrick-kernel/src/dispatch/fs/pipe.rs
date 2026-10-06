@@ -964,7 +964,7 @@ impl<'a> FsView<'a> {
                 .with_fs_identity(carrick_vfs::FsIdentity::Pipe);
             write_base.set_shared_pipe(Arc::clone(&pipe));
 
-            let read_open = OpenFile::from_open_description_with_status_flags(
+            let read_open = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
                 Arc::new(parking_lot::RwLock::new(OpenDescription::PipeReader {
                     base: read_base,
                     pipe: Arc::clone(&pipe),
@@ -972,7 +972,7 @@ impl<'a> FsView<'a> {
                 LINUX_O_RDONLY | nonblock,
                 fd_flags,
             );
-            let write_open = OpenFile::from_open_description_with_status_flags(
+            let write_open = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
                 Arc::new(parking_lot::RwLock::new(OpenDescription::PipeWriter {
                     base: write_base,
                     pipe,

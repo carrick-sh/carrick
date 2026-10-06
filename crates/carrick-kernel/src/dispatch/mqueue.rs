@@ -827,7 +827,7 @@ impl<'a> IpcView<'a> {
                 base: OpenDescriptionBase::new(0),
                 queue,
             };
-            let open_file = OpenFile::from_open_description_with_status_flags(
+            let open_file = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
                 std::sync::Arc::new(parking_lot::RwLock::new(description)),
                 status_flags,
                 linux_fd_flags_from_open_flags(oflag),

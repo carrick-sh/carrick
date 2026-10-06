@@ -2342,7 +2342,7 @@ impl FileTable {
         Self {
             id,
             fd_ceiling,
-            open_files: RwLock::new(FileSlotMap::default()),
+            open_files: RwLock::new(crate::kernel::objects::FileSlotMap::default()),
             ipc: Mutex::new(None),
             next_fd: Mutex::new(3),
             reserved_slots: Mutex::new(HashMap::new()),

@@ -860,7 +860,9 @@ impl SyscallDispatcher {
                     return DispatchOutcome::errno(linux_errno::ENOMEM);
                 }
             };
-        let Ok(fd) = self.install_fd_at_or_above(3, OpenFile::new(description, 0)) else {
+        let Ok(fd) = self
+            .install_fd_at_or_above(3, crate::dispatch::fd_table::OpenFile::new(description, 0))
+        else {
             return DispatchOutcome::errno(linux_errno::EMFILE);
         };
         DispatchOutcome::returned_i32(fd)
@@ -1770,7 +1772,10 @@ mod tests {
         let context = dispatcher.capture_one_task_context().unwrap();
         let (description, _backing) = test_description();
         let fd = dispatcher
-            .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), 0))
+            .install_fd_at_or_above(
+                3,
+                crate::dispatch::fd_table::OpenFile::new(Arc::clone(&description), 0),
+            )
             .unwrap();
         context.shared().mm().replace_io_uring_mappings(
             0x3000,

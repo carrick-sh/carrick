@@ -23,7 +23,7 @@ use super::support::*;
 use super::*;
 use crate::dispatch::net::{recverr, reuseport, scm_rights};
 use crate::dispatch::{
-    CurrentMmMemory, DispatchOutcome, Fd, GuestPtr, HostFd, OpenDescription, OpenFile, SyscallCtx,
+    CurrentMmMemory, DispatchOutcome, Fd, GuestPtr, HostFd, OpenDescription, SyscallCtx,
 };
 use carrick_spec::PortProtocol;
 
@@ -497,19 +497,20 @@ impl<'a> NetView<'a> {
         }
         let status_flags = LINUX_O_RDWR | if nonblock { LINUX_O_NONBLOCK } else { 0 };
         let fd_flags = if cloexec { LINUX_FD_CLOEXEC } else { 0 };
-        let open_file = OpenFile::from_open_description_with_status_flags(
-            Arc::new(RwLock::new(OpenDescription::HostSocket {
-                host_fd: HostFdRef::new(host_fd),
-                family,
-                type_: base_type,
-                protocol,
-                base: OpenDescriptionBase::new(status_flags),
-                mcast_memberships: Vec::new(),
-                synthetic_recv: std::collections::VecDeque::new(),
-            })),
-            status_flags,
-            fd_flags,
-        );
+        let open_file =
+            crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostSocket {
+                    host_fd: HostFdRef::new(host_fd),
+                    family,
+                    type_: base_type,
+                    protocol,
+                    base: OpenDescriptionBase::new(status_flags),
+                    mcast_memberships: Vec::new(),
+                    synthetic_recv: std::collections::VecDeque::new(),
+                })),
+                status_flags,
+                fd_flags,
+            );
         let linux_fd = match self.install_fd_at_or_above(3, open_file) {
             Ok(fd) => fd,
             Err(_) => {
@@ -588,7 +589,10 @@ impl<'a> NetView<'a> {
                 libc::close(host_fd);
             }
             let installed = self
-                .install_fd_at_or_above(3, OpenFile::new(Arc::clone(&description), fd_flags))
+                .install_fd_at_or_above(
+                    3,
+                    crate::dispatch::fd_table::OpenFile::new(Arc::clone(&description), fd_flags),
+                )
                 .ok();
             // The install took its own reference; the vault's is done.
             description.release_fd_ref();
@@ -667,11 +671,12 @@ impl<'a> NetView<'a> {
         // On an install failure (EMFILE) the dropped OpenFile's description —
         // the fd's ONE owner — closes the received host fd; the caller must
         // not close it again.
-        let open_file = OpenFile::from_open_description_with_status_flags(
-            Arc::new(RwLock::new(description)),
-            0,
-            fd_flags,
-        );
+        let open_file =
+            crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(description)),
+                0,
+                fd_flags,
+            );
         self.install_fd_at_or_above(3, open_file).ok()
     }
 
@@ -1404,11 +1409,12 @@ impl<'a> NetView<'a> {
                     base,
                     socket: server_half,
                 };
-                let open_file = OpenFile::from_open_description_with_status_flags(
-                    Arc::new(RwLock::new(open_desc)),
-                    status_flags,
-                    fd_flags,
-                );
+                let open_file =
+                    crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                        Arc::new(RwLock::new(open_desc)),
+                        status_flags,
+                        fd_flags,
+                    );
                 let linux_fd = match self.install_fd_at_or_above(3, open_file) {
                     Ok(n) => n,
                     Err(_) => return DispatchOutcome::errno(carrick_abi::LINUX_EMFILE),
@@ -1606,19 +1612,20 @@ impl<'a> NetView<'a> {
         };
         let mut base = OpenDescriptionBase::new(status_flags);
         base.set_connected(true);
-        let open_file = OpenFile::from_open_description_with_status_flags(
-            Arc::new(RwLock::new(OpenDescription::HostSocket {
-                host_fd: HostFdRef::new(new_host),
-                family,
-                type_,
-                protocol,
-                base,
-                mcast_memberships: Vec::new(),
-                synthetic_recv: std::collections::VecDeque::new(),
-            })),
-            status_flags,
-            fd_flags,
-        );
+        let open_file =
+            crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
+                Arc::new(RwLock::new(OpenDescription::HostSocket {
+                    host_fd: HostFdRef::new(new_host),
+                    family,
+                    type_,
+                    protocol,
+                    base,
+                    mcast_memberships: Vec::new(),
+                    synthetic_recv: std::collections::VecDeque::new(),
+                })),
+                status_flags,
+                fd_flags,
+            );
         if peer_cred.is_some() {
             open_file.description.common().set_peer_cred(peer_cred);
         }
@@ -2024,7 +2031,7 @@ impl<'a> NetView<'a> {
             };
             let mut base_first = OpenDescriptionBase::new(status_flags);
             base_first.set_connected(true);
-            let first = OpenFile::from_open_description_with_status_flags(
+            let first = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostSocket {
                     host_fd: HostFdRef::new(host_fds[0]),
                     family,
@@ -2040,7 +2047,7 @@ impl<'a> NetView<'a> {
             first.description.common().set_peer_cred(Some(my_cred));
             let mut base_second = OpenDescriptionBase::new(status_flags);
             base_second.set_connected(true);
-            let second = OpenFile::from_open_description_with_status_flags(
+            let second = crate::dispatch::fd_table::OpenFile::from_open_description_with_status_flags(
                 Arc::new(RwLock::new(OpenDescription::HostSocket {
                     host_fd: HostFdRef::new(host_fds[1]),
                     family,
