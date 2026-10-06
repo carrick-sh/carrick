@@ -1,4 +1,5 @@
 use super::*;
+use core::sync::atomic::Ordering;
 #[test]
 fn native_binding_adapter_preserves_exact_words() {
     let task = CurrentTask::new();

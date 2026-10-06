@@ -248,7 +248,7 @@ fn host_request_during_repark(kind: Handback) {
                 carrick_el1_abi::HostClaim::El1Held { slot: SLOT }
             );
             // Model delivery of the claimant's kick after dispatch admission.
-            task.mark_pending_host_work();
+            task.linux.mark_pending_host_work();
             HardwareUserWord.read_u32(task, uaddr)
         }
         fn read_u64(&self, task: &CurrentTask, uaddr: u64) -> Option<u64> {
@@ -361,7 +361,7 @@ fn a_wait_with_nothing_runnable_idles_until_host_work() {
         serve_on(SLOT, &mut frame, &task, &zone, &mut cpu, counters),
         Some(Served::Idle)
     );
-    assert!(task.has_pending_host_work());
+    assert!(task.linux.has_pending_host_work());
     assert_eq!(
         counters.irq_taken[GIC_KICK_INTID as usize].load(Ordering::Relaxed),
         1
@@ -513,7 +513,7 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
         serve_on(OTHER, &mut frame_b, &task_b, &zone, &mut cpu_b, counters),
         Some(Served::Idle)
     );
-    task_b.clear_pending_host_work();
+    task_b.linux.clear_pending_host_work();
     // Pretend the kick never happened: OTHER is parked in WFI.
     assert!(!zone.enter_idle(OTHER, false));
     assert!(zone.enter_idle(OTHER, true));
@@ -651,7 +651,7 @@ fn a_kick_taken_at_el0_forwards() {
     }
     .serve_irq(&mut frame);
     assert_eq!(action, carrick_el1_abi::Action::Forward);
-    assert!(task.has_pending_host_work());
+    assert!(task.linux.has_pending_host_work());
     assert_eq!(frame, copy);
 }
 
@@ -840,7 +840,7 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
     assert_eq!(frame.x[0], 50);
     assert_eq!(counters.forwarded[62].load(Ordering::Relaxed), 0);
     // A pending host kick forwards even a servable futex call.
-    tasks[3].mark_pending_host_work();
+    tasks[3].linux.mark_pending_host_work();
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
     assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Forward);
     let mut retirement = authority.try_host().unwrap().unwrap();
@@ -1018,7 +1018,7 @@ fn the_idle_entry_runs_a_queued_thread_or_leaves_for_the_host() {
     );
     assert_eq!(zone.runnable_head(SLOT), Some(service));
     // Host work pending: it leaves without looking.
-    idle_task.mark_pending_host_work();
+    idle_task.linux.mark_pending_host_work();
     assert_eq!(
         entry(&mut idle_frame, &mut idle_cpu, &idle_task),
         carrick_el1_abi::Action::Idle
@@ -1532,7 +1532,7 @@ fn el1_ipc_wait_cross_slot_wake_sends_sgi_after_queue_unlock() {
         sched.cpu.sgis,
         [target | (u64::from(GIC_RESCHED_INTID) << 24)]
     );
-    assert!(!task.has_pending_host_work());
+    assert!(!task.linux.has_pending_host_work());
 }
 
 /// Fixed pre-extraction trace: save A, load B, save B, load A, then roots/timer/
