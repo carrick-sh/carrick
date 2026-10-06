@@ -220,6 +220,7 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     request.result_rsp = loaded.stack_pointer;
     request.result_table_used = source.tables_taken as u32;
     request.result_data_used = source.data_taken as u32;
+    request.result_initial_break = loaded.initial_break.raw();
     Some((request.entry, loaded.stack_pointer))
 }
 
