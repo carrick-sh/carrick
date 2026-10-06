@@ -1160,6 +1160,7 @@ dependencies = [
  "tar",
  "tempfile",
  "thiserror",
+ "toml",
  "yaml-rust2",
 ]
 
