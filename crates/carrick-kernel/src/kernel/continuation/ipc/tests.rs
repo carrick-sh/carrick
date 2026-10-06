@@ -818,7 +818,7 @@ fn serial_host_el1_ipc_every_slot_boundary_delivers_owed_host_wakes() {
         let step = guard.eventfd().unwrap().try_write(1);
         assert!(guard.publish(step.wake).host_owed);
         drop(guard);
-        task(SLOT).mark_pending_host_work();
+        task(SLOT).linux.mark_pending_host_work();
     };
     // A switched-in thread whose write was served with work owed exits;
     // the executor adopts it (the syscall is complete, not dispatched).
@@ -833,7 +833,7 @@ fn serial_host_el1_ipc_every_slot_boundary_delivers_owed_host_wakes() {
     el1_write();
     assert!(crate::el1_delegation::settle_el1_boundary(SLOT, context.kernel()).is_none());
     let idled = wakes.load(Ordering::Relaxed);
-    assert!(!task(SLOT).has_pending_host_work());
+    assert!(!task(SLOT).linux.has_pending_host_work());
     drop(reader);
     owner
         .release(IpcBacking::EventFd { object }.encode())
@@ -1012,7 +1012,7 @@ fn mixed_venue_readv_wakes_on_el1_write(write_before_enroll: bool) {
             "a wake is owed exactly when the host reader is subscribed"
         );
         if published.host_owed {
-            task(SLOT).mark_pending_host_work();
+            task(SLOT).linux.mark_pending_host_work();
         }
         task(SLOT)
             .linux
@@ -1069,7 +1069,7 @@ fn mixed_venue_readv_wakes_on_el1_write(write_before_enroll: bool) {
     );
     let value = memory.read_bytes(0x4000, 8).unwrap();
     assert_eq!(u64::from_ne_bytes(value.try_into().unwrap()), 5);
-    assert!(!task(SLOT).has_pending_host_work());
+    assert!(!task(SLOT).linux.has_pending_host_work());
     carrick_el1_abi::record_el1_region_host_ptr(0);
 }
 

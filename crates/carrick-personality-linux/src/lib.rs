@@ -6,3 +6,7 @@ pub mod dispatch;
 pub mod entry;
 pub mod mm;
 pub mod sched;
+
+pub mod pending_file;
+
+pub mod pending_anonymous;
