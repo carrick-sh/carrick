@@ -1038,6 +1038,7 @@ mod tests {
                 frame.x[0] = 0xfeed;
                 frame.x[8] = 178;
                 let mut pending = El1PendingFamilies {
+                    lifecycle_user: None,
                     handoff: None,
                     #[cfg(test)]
                     lifecycle_user: None,
@@ -1207,6 +1208,7 @@ mod tests {
                         frame.x[8] = 98;
                         frame.elr = 0x4000;
                         let mut pending = El1PendingFamilies {
+                            lifecycle_user: None,
                             handoff: None,
                             #[cfg(test)]
                             lifecycle_user: None,
