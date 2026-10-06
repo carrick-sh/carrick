@@ -4,7 +4,7 @@ use super::{ArchError, X86Backend, user_access};
 use carrick_guest_arch::{
     Access, AddressContext, CopyProgress, EditBacking, EditCowAccess, EditIntent, EditLeafSize,
     EditOperation, EditPermissions, FrameGpa, GuestLen, MmuBackend, MmuEditBackend, RootGpa,
-    UserRange, UserVa,
+    TableWindow, UserRange, UserVa,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorRefusal, LiveDescriptorWords};
 use carrick_mmu_core::x86::descriptor_txn::{
@@ -15,6 +15,7 @@ use core::cell::Cell;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+const KERNEL_CANONICAL_BASE: u64 = 0xffff_8000_0000_0000;
 const CR4_PGE: u64 = 1 << 7;
 const CR4_PCIDE: u64 = 1 << 17;
 const LOCAL_PAGE_BUDGET: u64 = 32;
@@ -69,12 +70,13 @@ pub fn unsupported_arm_descriptor_path() -> u64 {
     unsafe { core::arch::asm!("ud2", options(noreturn)) }
 }
 
-/// Exact physical page-table window retained and identity mapped for a CPL0
-/// descriptor transaction. Construction requires the caller's MM editor.
+/// Exact physical page-table window reached through a retained supervisor
+/// alias for a CPL0 transaction. Construction requires the caller's MM editor.
 struct NativeDescriptorWords {
     context: AddressContext<RootGpa>,
     base: u64,
     end: u64,
+    mapped: u64,
     failed_drain: Cell<bool>,
 }
 
@@ -83,9 +85,14 @@ impl NativeDescriptorWords {
         if pa & 7 != 0 || pa < self.base || pa.checked_add(8).is_none_or(|end| end > self.end) {
             return Err(DescriptorRefusal::TableOutsidePrimary);
         }
+        let offset = pa - self.base;
+        let address = self
+            .mapped
+            .checked_add(offset)
+            .ok_or(DescriptorRefusal::TableOutsidePrimary)?;
         // SAFETY: the caller of execute_native_descriptor_txn retains this
-        // identity mapped and aligned table window through the transaction.
-        Ok(unsafe { &*(pa as *const AtomicU64) })
+        // writable supervisor alias of the aligned arena throughout the edit.
+        Ok(unsafe { &*(address as *const AtomicU64) })
     }
 }
 
@@ -135,18 +142,20 @@ impl LiveDescriptorWords for NativeDescriptorWords {
 /// editor. A caller must treat `Err` as indeterminate and stop guest execution.
 ///
 /// # Safety
-/// `table_base..table_base+table_bytes` must be a retained, writable, identity
-/// mapped page-table window for `txn.root`. The caller holds exclusive MM edit
+/// `tables` must be a retained, writable supervisor alias of the page-table
+/// arena for `txn.root`. The caller holds exclusive MM edit
 /// authority across this call and excludes concurrent hardware A/D writers.
 pub unsafe fn execute_native_descriptor_txn(
     txn: &DescriptorTxn<'_>,
-    table_base: u64,
-    table_bytes: u64,
+    tables: &TableWindow,
 ) -> Result<DescriptorReceipt, ArchError> {
+    let table_base = tables.physical().raw();
+    let table_bytes = tables.bytes().raw();
     if live_root()? != txn.root
         || table_base != txn.root.address().raw()
         || table_bytes < 4096
         || table_bytes & 4095 != 0
+        || tables.mapped().raw() < KERNEL_CANONICAL_BASE
     {
         return Err(ArchError::Unbound);
     }
@@ -161,6 +170,7 @@ pub unsafe fn execute_native_descriptor_txn(
         },
         base: table_base,
         end,
+        mapped: tables.mapped().raw(),
         failed_drain: Cell::new(false),
     };
     let guard = crate::substrate::sched::hw::disable_irq_save();
@@ -206,13 +216,12 @@ fn native_size(size: EditLeafSize) -> LeafSize {
 /// No unsupported permission is rounded up to a successful descriptor.
 ///
 /// # Safety
-/// The table window must remain identity mapped and writable through this
+/// The table window must remain mapped and writable through this
 /// operation. `intent.owner()` must have been issued by the exact-MM editor,
 /// which excludes other software and hardware descriptor writers.
 pub unsafe fn execute_native_edit_intent(
     intent: EditIntent<'_, RootGpa>,
-    table_base: u64,
-    table_bytes: u64,
+    tables: TableWindow,
 ) -> Result<DescriptorReceipt, ArchError> {
     let owner = intent.owner();
     let span = PageSpan::new(intent.range().start().raw(), intent.range().len().raw());
@@ -290,9 +299,9 @@ pub unsafe fn execute_native_edit_intent(
         op: operation,
         tables: intent.table_grants(),
     };
-    // SAFETY: this function's caller retains the exact editor and identity
-    // mapped table window; lowering above preserves the complete intent.
-    unsafe { execute_native_descriptor_txn(&transaction, table_base, table_bytes) }
+    // SAFETY: this function's caller retains the exact editor and page-table
+    // alias; lowering above preserves the complete intent.
+    unsafe { execute_native_descriptor_txn(&transaction, &tables) }
 }
 
 impl MmuEditBackend for X86Backend {
@@ -301,12 +310,11 @@ impl MmuEditBackend for X86Backend {
     unsafe fn execute_edit(
         &mut self,
         intent: EditIntent<'_, RootGpa>,
-        table_base: FrameGpa,
-        table_bytes: GuestLen,
+        tables: TableWindow,
     ) -> Result<Self::EditReceipt, Self::Error> {
         // SAFETY: this trait leaf preserves the caller's exact-MM editor and
         // retained window obligations for the native x86 transaction.
-        unsafe { execute_native_edit_intent(intent, table_base.raw(), table_bytes.raw()) }
+        unsafe { execute_native_edit_intent(intent, tables) }
     }
 }
 

@@ -143,21 +143,23 @@ impl carrick_guest_arch::MmuEditBackend for super::aarch64::Aarch64Backend {
     unsafe fn execute_edit(
         &mut self,
         intent: EditIntent<'_, RootGpa>,
-        table_base: carrick_guest_arch::FrameGpa,
-        table_bytes: carrick_guest_arch::GuestLen,
+        tables: carrick_guest_arch::TableWindow,
     ) -> Result<Self::EditReceipt, Self::Error> {
         use carrick_mmu_core::aarch64::descriptor_txn::{
             DescriptorOutcome, InlineJournal, PrimaryTableWords, execute_descriptor_txn,
         };
         let txn = lower_edit_intent(intent)?;
-        if table_base.raw() != txn.root.raw()
-            || table_bytes.raw() != carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE
+        if tables.physical().raw() != txn.root.raw()
+            || tables.bytes().raw() != carrick_el1_abi::AARCH64_STAGE1_TABLES_PRIMARY_SIZE
         {
             return Err(ArchError::Unbound);
         }
         let live = crate::fault::hardware_live_ttbr();
         let table = carrick_el1_abi::service_target_table_window(live, txn.root.raw())
             .ok_or(ArchError::Unbound)?;
+        if tables.mapped().raw() != table.words as u64 {
+            return Err(ArchError::Unbound);
+        }
         let maintenance = crate::fault::El1TableMaintenance {
             ttbr0: txn.root.raw(),
         };
@@ -168,7 +170,7 @@ impl carrick_guest_arch::MmuEditBackend for super::aarch64::Aarch64Backend {
             PrimaryTableWords::new(
                 table.words,
                 table.physical_base,
-                table_bytes.raw() as usize,
+                tables.bytes().raw() as usize,
                 &maintenance,
             )
             .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))

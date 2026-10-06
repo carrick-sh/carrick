@@ -37,7 +37,6 @@ const _: () = {
 const IST_STACK_BASE: u64 = 0xf0_0000;
 const IMAGE_VA: u64 = 0xffff_ffff_8000_0000;
 const IMAGE_GPA: u64 = 0x10_0000;
-pub(crate) const DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
 const METADATA_VA: u64 = X86_CPL0_DYNAMIC_METADATA_BASE;
 pub const USER_CODE: u64 = 0x1_0000;
 const LAYOUT: BringupLayout = BringupLayout {
