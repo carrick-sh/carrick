@@ -44,7 +44,7 @@ use carrick_vfs::ProcMapSharing;
 use std::borrow::Cow;
 
 /// The one owner of an MM's anonymous-private facts. See the module docs.
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub(in crate::dispatch) enum AnonymousAuthority {
     HostSetup(HostArena),
     /// Constructed only by root admission
@@ -53,7 +53,7 @@ pub(in crate::dispatch) enum AnonymousAuthority {
 }
 
 /// Host-setup anonymous facts. Unreachable once the MM is delegated.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub(in crate::dispatch) struct HostArena {
     /// The byte-precise program break.
     pub(in crate::dispatch) brk: u64,
@@ -92,7 +92,7 @@ impl HostArena {
 
 /// A delegated MM: the exact admitted root, plus the one host-venue step this
 /// MM's current host syscall holds open on it.
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub(in crate::dispatch) struct DelegatedAnonymous {
     root: DelegatedRoot,
     venue: Option<HostVenue>,
@@ -104,7 +104,7 @@ impl DelegatedAnonymous {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 enum HostVenue {
     /// A pending root proposal: its range is root-owned, so the host path
     /// records no row for it and the outcome completes or refuses it.

@@ -21,7 +21,7 @@ pub(crate) fn next_pipe_id() -> u64 {
 }
 
 /// A readiness snapshot, never mutable pipe storage.
-#[derive(Debug, Clone, Copy)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) struct PipeSnapshot {
     pub(crate) unread: usize,
     pub(crate) capacity: usize,
@@ -761,7 +761,7 @@ pub(crate) fn take_pipe_bytes(pipe: &PipeRef, length: usize) -> PipeDrain<'_> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub enum InMemoryTeeOutcome {
     SamePipe,
     BrokenPipe,

@@ -49,7 +49,7 @@ const NOTIFY_DATA_SIZE: usize = 32;
 const MQ_NOTIFY_EVENT_MSG: u32 = 1;
 const MQ_NOTIFY_EVENT_REMOVED: u32 = 2;
 
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct MqueueMessage {
     pub prio: u32,
     #[allow(dead_code)]
@@ -57,7 +57,7 @@ pub struct MqueueMessage {
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub enum MqueueNotifyTarget<KernelResource = (), HostResource = ()> {
     /// One exact Carrick-kernel task generation. A numeric guest pid is never
     /// allowed to escape this variant into a host pid-taking syscall.
@@ -80,7 +80,7 @@ impl<KernelResource, HostResource> MqueueNotifyTarget<KernelResource, HostResour
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct RetainedNetlinkDescription {
     description: Arc<crate::kernel::FileDescription>,
 }
@@ -107,7 +107,7 @@ impl Drop for RetainedNetlinkDescription {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub enum MqueueNotify {
     Silent {
         registration: MqueueRegistration,
@@ -129,7 +129,13 @@ pub enum MqueueNotify {
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct MqueueRegistration {
     file_table: crate::kernel::FileTableId,
     description: crate::kernel::FileDescriptionId,
@@ -145,7 +151,7 @@ impl MqueueNotify {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 enum MqueueNotifySpec {
     Silent {
         target: MqueueNotifyTarget,
@@ -205,7 +211,7 @@ impl MqueueNotify {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct MqueueState {
     pub messages: Vec<MqueueMessage>,
     pub max_msg: usize,
@@ -395,13 +401,13 @@ impl Drop for MqueueChangeSubscription {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 enum BlockingMqueueOperation {
     Send { payload: Vec<u8>, priority: u32 },
     Receive { buffer: u64, priority: Option<u64> },
 }
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub struct BlockingMqueue {
     queue: Arc<MqueueInner>,
     clock: Arc<crate::kernel::container::ClockDomain>,
@@ -413,7 +419,7 @@ pub struct BlockingMqueue {
     deterministic_waiter: Option<Arc<crate::kernel::container::DeterministicWaiterSubscription>>,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct MqueueReceiveWaiter {
     count: Arc<AtomicUsize>,
     active: std::sync::atomic::AtomicBool,
@@ -462,13 +468,13 @@ impl PartialEq for BlockingMqueue {
 
 impl Eq for BlockingMqueue {}
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub enum BlockingMqueueStep {
     Done(DispatchOutcome),
     Wait(BlockingMqueue),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub struct MqueueWaitPlan {
     pub(crate) deadline: Option<std::time::Instant>,
     pub(crate) queue_generation: u64,
@@ -476,7 +482,7 @@ pub struct MqueueWaitPlan {
     pub(crate) virtual_due: Option<std::time::Duration>,
 }
 
-#[derive(Default, Debug)]
+#[derive(::core::default::Default, ::core::fmt::Debug)]
 pub struct MqueueRegistry {
     pub queues: parking_lot::Mutex<HashMap<String, Arc<MqueueInner>>>,
 }

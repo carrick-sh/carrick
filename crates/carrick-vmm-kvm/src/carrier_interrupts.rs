@@ -84,13 +84,13 @@ pub fn inject_kick(vm: &KvmVm, apic_id: ApicId) -> Result<(), TrapError> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub enum KickBoundary {
     Entry,
     Return,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct ProgressObservation {
     pub entries: u64,
     pub completions: u64,

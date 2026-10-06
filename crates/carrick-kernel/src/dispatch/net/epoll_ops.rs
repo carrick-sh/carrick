@@ -88,7 +88,7 @@ fn new_epoll_description(
 /// The zone half of one `epoll_pwait`: its reports (arrival order), the
 /// items taken (restored if the reports cannot be delivered), and the
 /// waiter's host subscription, held while the wait blocks.
-#[derive(Default)]
+#[derive(::core::default::Default)]
 struct ZoneTake {
     events: Vec<LinuxEpollEvent>,
     taken: Vec<carrick_el1_abi::ipc::epoll::EpollItemRef>,

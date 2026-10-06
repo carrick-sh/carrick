@@ -102,7 +102,13 @@ const SUPPORTED_FS_TYPES: &[&str] = &["tmpfs", "proc", "sysfs", "overlay"];
 /// fspick → reconfigure an existing mount). Drives the EBUSY matrix for the
 /// CMD_* commands: the oracle gives EBUSY for CMD_RECONFIGURE on a fresh
 /// fsopen context and for CMD_CREATE on an fspick context.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum FsContextPurpose {
     /// `fsopen(2)`: staging parameters toward FSCONFIG_CMD_CREATE.
     NewSuperblock,
@@ -113,7 +119,7 @@ pub enum FsContextPurpose {
 /// One staged `fsconfig(2)` parameter. carrick stages rather than
 /// interprets: the deferred CMD_CREATE/CMD_RECONFIGURE is where Linux would
 /// consume these.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub enum StagedParam {
     /// FSCONFIG_SET_FLAG: a bare key ("ro").
     Flag(String),
@@ -137,7 +143,7 @@ pub enum StagedParam {
 /// semantics). The phase machine is intentionally two-armed: carrick can
 /// never reach "created" (CMD_CREATE is deferred), so the reachable states
 /// are exactly `purpose × staging`.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct FsContextState {
     /// Filesystem type (fsopen) — `None` for an fspick context, which
     /// reconfigures whatever is mounted at `picked_path`.

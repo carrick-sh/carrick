@@ -263,7 +263,13 @@ mod setid {
 /// Per-process identity served by the EL1 syscall shim. Credentials are not
 /// present because Linux permits them to diverge per thread; credential reads
 /// always trap through the captured KernelContext path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct IdentitySnapshot {
     pub pid: u32,
 }
@@ -1668,7 +1674,13 @@ mod identity_snapshot_tests {
 
 /// The four uids whose transitions Linux keys capability changes on
 /// (capabilities(7), "Effect of user ID changes on capabilities").
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::fmt::Debug,
+)]
 pub(super) struct UidIdentity {
     ruid: u32,
     euid: u32,

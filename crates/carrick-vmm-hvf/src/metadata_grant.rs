@@ -17,7 +17,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const MAX_DYNAMIC_EXTENT_SLOTS: usize = 128;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct MetadataGrantStats {
     pub grants_requested: u64,
     pub grants_succeeded: u64,
@@ -41,7 +48,7 @@ pub unsafe trait RetainedMetadataBacking: std::fmt::Debug + Send + Sync {
     fn mapped_len(&self) -> usize;
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 enum MetadataBacking {
     Allocated(OwnedHostMapping),
     Retained(Arc<dyn RetainedMetadataBacking>),
@@ -66,7 +73,7 @@ impl MetadataBacking {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct GrantedSlotRecord {
     backing: Arc<MetadataBacking>,
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -127,7 +134,7 @@ impl MetadataExtentResolver for HostMetadataExtentResolver<'_> {
 
 /// Exact carrier control mapping and dynamic-extent resolver lifetime.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub struct CarrierMetadataAccess {
     carrier: Arc<crate::trap::PersistentCarrierMappings>,
     generation: crate::trap::CarrierVmGeneration,
@@ -259,7 +266,7 @@ impl MetadataExtentResolver for CarrierMetadataAccess {
 // the guest allocator and the record is retained until stage-2 unmap succeeds.
 unsafe impl Send for GrantedSlotRecord {}
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct HostApertureState {
     occupied_bitmap: [u64; 2],
     slots: [Option<GrantedSlotRecord>; MAX_DYNAMIC_EXTENT_SLOTS],
@@ -784,7 +791,7 @@ mod delayed_owner {
     use super::*;
     use std::sync::{atomic::AtomicBool, mpsc};
 
-    #[derive(Debug)]
+    #[derive(::core::fmt::Debug)]
     pub enum Observation {
         OwnerClaimed,
         Contended { parked: u32 },

@@ -41,7 +41,7 @@ pub(super) struct RetainedAliasTarget {
 
 /// How a `MapAlias` publication stopped. The variants are the facts a caller
 /// needs to choose between refusal, rollback and fail-stop.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(super) enum AliasPublishFailure {
     /// Nothing from this publication is live: nothing was submitted (GIC
     /// window, or the first chunk's plan), or EL1 cleanly refused the first

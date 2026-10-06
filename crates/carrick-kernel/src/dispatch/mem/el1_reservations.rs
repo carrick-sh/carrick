@@ -63,7 +63,13 @@ pub enum El1AdmissionOrigin<'a, 'p> {
 }
 
 /// The owner of an MM's anonymous memory after an admission request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum El1Admission {
     /// The root owns the anonymous-private facts (now, or already).
     Delegated,
@@ -75,7 +81,13 @@ pub enum El1Admission {
 /// The fork a host-setup twin was materialized from: its parent's root and
 /// that root's committed generation. A fork-commit admission seeds the child
 /// root only from exactly this parent generation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(in crate::dispatch) struct ForkSeed {
     pub(in crate::dispatch) parent: ReservationMm,
     pub(in crate::dispatch) generation: ReservationGeneration,

@@ -74,7 +74,7 @@ const MAX_TOTAL_BYTES: u64 = 256 << 20; // 256 MiB per map
 
 /// A live eBPF map: immutable geometry plus mutex-guarded contents. Shared
 /// (`Arc`) by every fd slot that refers to the map object.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct BpfMap {
     key_size: u32,
     value_size: u32,
@@ -85,7 +85,7 @@ pub struct BpfMap {
 /// Map contents. Hash keys iterate in byte-sorted order (a `BTreeMap`), which
 /// satisfies `BPF_MAP_GET_NEXT_KEY`'s contract — some stable order visiting
 /// every element — without matching Linux's (unspecified) bucket order.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 enum BpfMapContents {
     /// Every element pre-allocated and zero-initialised at create
     /// (`max_entries * value_size` bytes), as Linux array maps are.
@@ -252,7 +252,7 @@ impl BpfMap {
 /// A loaded eBPF program object: metadata only. carrick never executes eBPF —
 /// the object exists so the fd lifecycle (`dup`/`close`/proc introspection)
 /// behaves; attachment surfaces reject it honestly.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct BpfProg {
     #[allow(dead_code)]
     prog_type: BpfProgType,

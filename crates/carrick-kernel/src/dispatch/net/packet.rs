@@ -17,7 +17,7 @@ use super::support::write_sockopt_value;
 use super::*;
 use crate::linux_abi::LinuxErrno;
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct PacketRing {
     version: i32,
     block_size: usize,
@@ -215,7 +215,7 @@ impl PacketRing {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct PacketSocket {
     pub(crate) sock_type: i32,
     pub(crate) protocol: u16,

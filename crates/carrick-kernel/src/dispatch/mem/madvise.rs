@@ -22,7 +22,7 @@ pub struct MadviseRangeMeta {
     pub(crate) locked: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub struct MadviseCoveredSegment {
     pub(crate) start: u64,
     pub(crate) end: u64,

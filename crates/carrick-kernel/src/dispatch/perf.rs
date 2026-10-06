@@ -77,7 +77,13 @@ syscall_table! {
 }
 
 /// The software events carrick backs with an honest measurement source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(super) enum PerfSwEvent {
     /// `PERF_COUNT_SW_CPU_CLOCK` — the target thread's guest CPU nanoseconds.
     CpuClock,
@@ -114,7 +120,7 @@ impl PerfSwEvent {
 /// than reading a thread-local slot, is also what lets ANY caller sample the
 /// measured thread: a sibling's `read(2)` on a dup'd counter fd reports the
 /// MEASURED thread's CPU, not the reader's.
-#[derive(Debug, Clone)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone)]
 struct PerfOwner {
     thread: std::sync::Weak<crate::kernel::Thread>,
 }
@@ -137,7 +143,7 @@ impl PerfOwner {
 /// A ledger sample for one perf operation: `Live(ns)` is the measured thread's
 /// current guest-CPU nanoseconds; `Reaped` means that thread is gone and the
 /// counter can no longer advance.
-#[derive(Debug, Clone, Copy)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy)]
 pub(super) enum PerfLedger {
     Live(u64),
     Reaped,
@@ -159,7 +165,7 @@ fn next_event_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct PerfCounterInner {
     enabled: bool,
     /// Accumulated counter value (ns for the clock events, always 0 for Dummy).
@@ -174,7 +180,7 @@ struct PerfCounterInner {
 /// One perf event: the fd-table variant holds `Arc<PerfEventState>`, so
 /// `dup(2)` and fork share the counter the way an open file description is
 /// shared.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct PerfEventState {
     event: PerfSwEvent,
     id: u64,
@@ -282,7 +288,13 @@ impl PerfEventState {
 }
 
 /// The parsed subset of `perf_event_attr` carrick interprets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(super) struct ParsedPerfAttr {
     pub(super) type_: u32,
     pub(super) config: u64,
@@ -293,7 +305,13 @@ pub(super) struct ParsedPerfAttr {
 
 /// Attr rejection: the errno plus whether the kernel writes its supported
 /// size back into the guest's `attr.size` (the E2BIG contract).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(super) enum PerfAttrError {
     /// `attr.size` versioning failure — write `LINUX_PERF_ATTR_SIZE_SUPPORTED`
     /// back to `attr.size`, then E2BIG.

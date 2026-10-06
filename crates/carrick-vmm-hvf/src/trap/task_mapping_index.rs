@@ -12,7 +12,7 @@ use super::*;
 /// into the shadow list cannot be named by a `GuestVa`. Retirement takes a
 /// handle out and hands the same handle back on rollback.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) enum MappingRowRef {
     Live(GuestVa),
     Shadowed(usize),
@@ -21,7 +21,13 @@ pub(crate) enum MappingRowRef {
 /// An extent in either guest virtual address (VA) space or stage-2 intermediate
 /// physical address (IPA) space, used to bound keyed removals.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum MappingExtent {
     Va(GuestVa, u64),
     Ipa(u64, u64),
@@ -115,7 +121,13 @@ impl From<(GuestVa, usize)> for MappingExtent {
 /// start-keyed maps, so candidate discovery probes each active class over its
 /// own radius rather than walking the whole index when a wide row exists.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::clone::Clone,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(crate) struct TaskMappingClassIndex {
     pub(crate) by_class_start: std::collections::BTreeMap<(u32, u64), Vec<u64>>,
     pub(crate) class_counts: std::collections::BTreeMap<u32, usize>,
@@ -215,7 +227,7 @@ impl TaskMappingClassIndex {
 /// The per-task mapping table: sorted by construction, non-overlapping, and
 /// coalescing.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct TaskMappingIndex {
     live: std::collections::BTreeMap<GuestVa, HvfMappedRegion>,
     /// Rows an overlapping insert displaced. Retained only so that displacing

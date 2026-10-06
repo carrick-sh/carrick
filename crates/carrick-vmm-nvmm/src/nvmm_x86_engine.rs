@@ -78,7 +78,7 @@ fn map_err(e: nvmm::NvmmError) -> TrapError {
 /// PML4 decouple the guest VA from it. The engine queries guest memory by VA
 /// (`GuestMemory::read_bytes(va)`), so we record + resolve by `va` and only use
 /// `gpa` for `gpa_map`. (Kernel-window regions are identity: `va == gpa`.)
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 struct Region {
     va: u64,
     gpa: u64,
@@ -99,7 +99,7 @@ type SharedPageTables = Arc<Mutex<Option<carrick_mem::pml4::Pml4Manager>>>;
 type SharedAliasChunks = Arc<Mutex<AliasChunkState>>;
 type SharedPrivateArenas = Arc<Mutex<PrivateArenaState>>;
 
-#[derive(Default)]
+#[derive(::core::default::Default)]
 struct PrivateArenaState {
     arenas: Vec<PrivateArena>,
 }
@@ -196,7 +196,7 @@ fn map_private_ram_on_machine(
 const NVMM_ALIAS_COMPACT_BASE: u64 = 0x1c_0000_0000; // 112 GiB
 const NVMM_ALIAS_COMPACT_LIMIT: u64 = 0x20_0000_0000; // 128 GiB
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 struct AliasChunkState {
     next_gpa: u64,
     chunks: Vec<(u64, u64)>,
