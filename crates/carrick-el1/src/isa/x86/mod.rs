@@ -28,12 +28,9 @@ impl carrick_guest_arch::ArchTypes for X86Backend {
     type Context = context::ParkedContextWords;
     type Root = carrick_guest_arch::RootGpa;
     type MmOwner = carrick_el1_abi::CurrentTask;
-    type OwnedTranslation = ();
-    type LeafEdit = ();
     type DrainTicket = mmu::DrainTicket;
     type DrainReceipt = mmu::DrainReceipt;
     type UserTransfer = user_access::UserTransfer;
-    type PublicationReceipt = ();
     type HardwareInterrupt = u32;
     type InterruptMask = interrupts::InterruptMask;
 }
