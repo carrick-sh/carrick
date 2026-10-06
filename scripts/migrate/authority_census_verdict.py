@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -101,10 +103,55 @@ class CensusVerdict:
             left = len(encoded[:start].decode())
             right = len(encoded[:end].decode())
             chars[left:right] = [c if c in "\r\n" else " " for c in chars[left:right]]
-        return "".join(chars)
+        calls = record.get("canonical_calls")
+        if not isinstance(calls, list):
+            raise CensusError(f"missing Rust canonical call classification: {file}")
+        canonical = []
+        for call in calls:
+            start, end, path = call["start"], call["end"], call["path"]
+            if not 0 <= start < end <= len(encoded) or not re.fullmatch(r"[a-zA-Z_][a-zA-Z_0-9]*(?:::[a-zA-Z_][a-zA-Z_0-9]*)+", path):
+                raise CensusError(f"invalid Rust canonical call range: {file}")
+            left, right = len(encoded[:start].decode()), len(encoded[:end].decode())
+            # Excluded scopes remain spaces; their calls cannot seed patterns.
+            if any(c != " " for c in chars[left:right]):
+                canonical.append((left, right, path))
+        return ProductionSource("".join(chars), canonical)
 
 
 def require(verdict):
     if not isinstance(verdict, CensusVerdict):
         raise CensusError("missing Rust census verdict")
     return verdict
+
+
+class ProductionSource(str):
+    """Source text with Rust-resolved call heads; original offsets are stable."""
+    def __new__(cls, source, canonical):
+        result = super().__new__(cls, source)
+        result.canonical_calls = canonical
+        return result
+
+
+def canonical_tokens(tokens, source):
+    """Apply the Rust verdict verbatim; no Python binding/scope resolution."""
+    calls = getattr(source, "canonical_calls", ())
+    if not calls:
+        return tokens
+    by_start = {start: (end, path) for start, end, path in calls}
+    output = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        call = by_start.get(token.pos)
+        if call is None:
+            output.append(token)
+            index += 1
+            continue
+        end, path = call
+        while index < len(tokens) and tokens[index].pos < end:
+            index += 1
+        for spelling in re.findall(r"[a-zA-Z_][a-zA-Z_0-9]*|::", path):
+            # Each scanner retains its own token-kind convention.
+            kind = ("PUNCT" if token.kind.isupper() else "punct") if spelling == "::" else token.kind
+            output.append(replace(token, text=spelling, kind=kind))
+    return output

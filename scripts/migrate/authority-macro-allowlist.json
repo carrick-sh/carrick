@@ -1,0 +1,175 @@
+[
+  {
+    "names": [
+      "format",
+      "std::format",
+      "core::format",
+      "format_args",
+      "std::format_args",
+      "core::format_args",
+      "format_args_nl",
+      "std::format_args_nl",
+      "core::format_args_nl",
+      "print",
+      "std::print",
+      "core::print",
+      "println",
+      "std::println",
+      "core::println",
+      "eprint",
+      "std::eprint",
+      "core::eprint",
+      "eprintln",
+      "std::eprintln",
+      "core::eprintln",
+      "write",
+      "std::write",
+      "core::write",
+      "writeln",
+      "std::writeln",
+      "core::writeln",
+      "panic",
+      "std::panic",
+      "core::panic",
+      "assert",
+      "std::assert",
+      "core::assert",
+      "assert_eq",
+      "std::assert_eq",
+      "core::assert_eq",
+      "assert_ne",
+      "std::assert_ne",
+      "core::assert_ne",
+      "debug_assert",
+      "std::debug_assert",
+      "core::debug_assert",
+      "debug_assert_eq",
+      "std::debug_assert_eq",
+      "core::debug_assert_eq",
+      "debug_assert_ne",
+      "std::debug_assert_ne",
+      "core::debug_assert_ne",
+      "dbg",
+      "std::dbg",
+      "core::dbg",
+      "alloc::format"
+    ],
+    "grammar": "expressions",
+    "reason": "Rust standard formatting/assertion macros evaluate their input Rust expressions directly. Literal format strings and argument expressions are parsed completely; calls stay visible to the census. Pattern consumers retain the original tokens. Rust std/src/macros.rs and core/src/macros/mod.rs; pinned rust-toolchain.toml."
+  },
+  {
+    "names": [
+      "vec",
+      "std::vec",
+      "core::vec",
+      "alloc::vec"
+    ],
+    "grammar": "vec",
+    "reason": "alloc::vec! evaluates each list element, or the repeated element/count, as Rust expressions. The full list or repetition grammar must parse; protected values remain forbidden. alloc/src/macros.rs, pinned Rust toolchain."
+  },
+  {
+    "names": [
+      "matches",
+      "std::matches",
+      "core::matches"
+    ],
+    "grammar": "matches",
+    "reason": "core::matches! emits a match of the input expression against the parsed pattern and optional guard, preserving any direct calls. core/src/macros/mod.rs, pinned Rust toolchain."
+  },
+  {
+    "names": [
+      "thread_local",
+      "std::thread_local",
+      "core::thread_local"
+    ],
+    "grammar": "items",
+    "reason": "std::thread_local! emits the supplied static initializer expressions as code. Only completely parsed static Rust items are admitted. std/src/thread/local.rs, pinned Rust toolchain."
+  },
+  {
+    "names": [
+      "define_syscall"
+    ],
+    "grammar": "syscalls",
+    "reason": "Carrick dispatch macros emit each supplied function body unchanged, binding the receiver/context and decoded typed arguments. The census parses the complete documented fn/mm_mutation grammar and visits every body with its lexical function owner. No expansion is permitted from a changed definition file.",
+    "definition_file": "crates/carrick-kernel/src/dispatch/mod.rs",
+    "definition_sha256": "c86281e14ef1fdd97a92084c6a650c4810b484f7bffb29a4db74d5c38ddbf946"
+  },
+  {
+    "names": [
+      "define_syscall_one"
+    ],
+    "grammar": "syscalls",
+    "reason": "Carrick dispatch macros emit each supplied function body unchanged, binding the receiver/context and decoded typed arguments. The census parses the complete documented fn/mm_mutation grammar and visits every body with its lexical function owner. No expansion is permitted from a changed definition file.",
+    "definition_file": "crates/carrick-kernel/src/dispatch/mod.rs",
+    "definition_sha256": "e937eabe00e452c91aab7271c769aae6fbd92aca17374ed9a077c159a496fb0e"
+  },
+  {
+    "names": [
+      "core::ptr::addr_of",
+      "std::ptr::addr_of",
+      "core::ptr::addr_of_mut",
+      "std::ptr::addr_of_mut"
+    ],
+    "grammar": "expressions",
+    "reason": "Pinned core ptr address macros take a single Rust place expression, forming a pointer without loading the place. Complete expression parses expose nested direct calls and reject function values. core/src/ptr/mod.rs."
+  },
+  {
+    "names": [
+      "core::mem::offset_of",
+      "std::mem::offset_of"
+    ],
+    "grammar": "offset",
+    "reason": "Pinned compiler offset_of! accepts a type and a dotted member selector. Selectors are metadata, not callable expressions; all other tokens are rejected. core/src/mem/mod.rs."
+  },
+  {
+    "names": [
+      "serde_json::json"
+    ],
+    "grammar": "json",
+    "reason": "Locked serde_json json! recursively builds objects/arrays and serializes each supplied Rust key/value expression as code. The census consumes the complete object/array grammar and visits all expressions, including dynamic keys. serde_json/src/macros.rs; Cargo.lock pins the expansion."
+  },
+  {
+    "names": [
+      "mailbox_offset_const"
+    ],
+    "grammar": "mailbox_offset",
+    "reason": "Carrick mailbox_offset_const! accepts a constant identifier and field selector and emits only a core::mem::offset_of! assertion. No expression input is accepted; the audited definition bytes are fixed.",
+    "definition_file": "crates/carrick-mem/src/memory.rs",
+    "definition_sha256": "8ad1a71f0ca1abc3913e514025f6994b776b358438adfcbe5cf78f8ceeec018f"
+  },
+  {
+    "names": [
+      "anyhow::bail",
+      "anyhow::anyhow"
+    ],
+    "grammar": "expressions",
+    "reason": "anyhow 1.0.102 bail!/anyhow! emit error construction and pass each formatting expression through as code. The full expression list is parsed and counted. anyhow/src/macros.rs; Cargo.lock pins the expansion. The census recognizes only canonical invocation paths; exact macro item imports do not bind the provider module namespace."
+  },
+  {
+    "names": [
+      "stub"
+    ],
+    "grammar": "stub",
+    "definition_file": "crates/carrick-observability/src/probes.rs",
+    "definition_sha256": "c60e7dca7459b140bf85c1bb81320d9daddca2699550d97f376b115862f1a685",
+    "reason": "Exact Carrick observability stub! expansion declares a function with ident:type parameters and an optional return type/tail expression. Parameter identifiers are data declarations, including args/live. Complete grammar parses as a Rust function; types and the optional emitted expression are visited and any protected call must be counted or rejected. This hashed expansion creates no runtime operation beyond that expression."
+  },
+  {
+    "names": [
+      "syscall_table"
+    ],
+    "grammar": "syscall_table",
+    "definition_file": "crates/carrick-kernel/src/dispatch/mod.rs",
+    "definition_sha256": "b154f65ff9d398dabc21bdd1444d03bc9cb4caf53a7212fe000d90312c3be9c5",
+    "reason": "Exact hashed Carrick guest syscall dispatch metadata: ident selectors read/write name the defining crate SyscallDispatcher guest handlers, not ambient/raw-lock functions. The expansion uses a canonical $crate implementation/type and typed SyscallHandler slot (or direct FsView receiver calls); selectors create no additional authority operation. Complete literal-doc/visibility/nr::UPPERCASE=>ident or ident-list grammar is closed; all other protected vocabulary names, function values, expressions and opaque tokens are rejected. Actual handler bodies are separately parsed by the audited define_syscall grammar and counted."
+  },
+  {
+    "names": [
+      "forward_fs_handlers"
+    ],
+    "grammar": "forward_handlers",
+    "definition_file": "crates/carrick-kernel/src/dispatch/fs.rs",
+    "definition_sha256": "6120261dc7e86ec85a2e03374560f4234d813040e9ecf80a5e525d5cc669bc91",
+    "reason": "Exact hashed Carrick guest syscall dispatch metadata: ident selectors read/write name the defining crate SyscallDispatcher guest handlers, not ambient/raw-lock functions. The expansion uses a canonical $crate implementation/type and typed SyscallHandler slot (or direct FsView receiver calls); selectors create no additional authority operation. Complete literal-doc/visibility/nr::UPPERCASE=>ident or ident-list grammar is closed; all other protected vocabulary names, function values, expressions and opaque tokens are rejected. Actual handler bodies are separately parsed by the audited define_syscall grammar and counted."
+  }
+]
