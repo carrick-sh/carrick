@@ -3,9 +3,12 @@
 Read-only audit and draft, 2026-10-06. Continue the first track's purpose:
 Linux/KVM should expose defects in the **same owners** used by AArch64 N1.
 This document claims no implementation, guest run, or acceptance. Carrick
-remains experimental. N1 keeps priority on the signed Mac lanes.
+remains experimental. **Updated owner direction, relayed by the director on
+2026-10-06: N1 is paused; x86 settles the shared core, then N1 rebases once.**
+The per-move ARM bar is no new signed failure versus the `56bf8c0ca` baseline,
+with both ISA callers switched in the same commit to one implementation.
 
-## Stack on N1; keep the audit revision explicit
+## Start from N1; settle the x86 stack with an explicit audit revision
 
 **Every current-code citation and census below is at
 `56bf8c0caefe39fcc2260345d0a54772a74bffad`.** A citation such as
@@ -30,18 +33,31 @@ advanced to `09fff7bfabfdc2849dd4d0ee0ede66f1810b318b` when the scratch
 worktree was created. That is a publication base, **not a replacement audit
 snapshot**. Before implementation, re-inventory the current N1 symbols,
 layouts, witness names and policy debt; do not restore older bodies from this
-audit. Sync at each day's start, before integration, and after an N1 owner fix:
-
-```sh
-git fetch github work/n1:refs/remotes/github/work/n1
-git rebase github/work/n1
-```
+audit. The pause supersedes Wave 1's daily N1 rebase loop. The x86 integrator
+stacks moves and shared fixes on the current x86 integration head, recording
+the exact predecessor SHA for each move. Do not repeatedly rebase N1 while
+interfaces settle. The final section specifies its single rebase.
 
 Move each responsibility once, switch both callers, delete its displaced
 body, and move its witnesses with it. Every discovered shared defect needs a
 deterministic red, exact operation/generation, source SHA, failure log and fix
-in the shared owner. The integrator routes that packet to N1 and preserves
-authorship. A KVM pass does not confer signed N1 acceptance.
+in the shared owner. The integrator preserves that packet and authorship for
+the final N1 fix-stack audit. X4–X8 discovery and KVM execution do not wait for
+N1 signed development work; a KVM pass still does not confer N1 acceptance.
+
+**Predecessor 4b, done-in-flight:** the director reports that x86 X1 exposed
+production protect/retire routing through ARM `HardwareAnonymousEditor` and
+the absence of a shared transfer-service transport. At the audit snapshot,
+dispatch invokes that editor directly
+(`crates/carrick-el1/src/personality/dispatch.rs:384`, `:393`) and the current
+prepared-write service constructs an ARM service frame
+(`crates/carrick-aarch64/src/user_transfer/prepared.rs:26`, `:35`). Worker
+`x86-x1c` is moving those owner/transport responsibilities into core on
+`work/x86-x1a`. This is an in-flight integration input, not a claim about
+implemented code at `56bf8c0ca`. Wave 2 starts **after 4b**, consumes its one
+protect/retire and transfer-service path, and requires its executing X1 receipt
+for same-path cross-MM transfer and peer-physical-pin rejection. Re-inventory
+4b's actual symbol fence before order 5; do not re-extract or copy those bodies.
 
 ## What is shared today, and what the line numbers mean
 
@@ -137,8 +153,10 @@ PY
 
 ## Shared-core extraction order
 
-Recommended sequence: **5 entry → 6 lifecycle → 7 residual MM → 8 IPC →
-9 file/inotify**. Numbering continues Wave 1 orders 1–4; milestones are X4–X8.
+Recommended sequence: **4b owner/transfer-service completion → 5 entry →
+6 lifecycle → 7 residual MM → 8 IPC → 9 file/inotify**. Wave 2 numbering
+continues orders 1–4; its milestones are X4–X8. Each moved order executes on
+KVM against the preceding x86 stack without waiting for N1 signed work.
 The existing VM-free `x4_shared_wait_records` name
 (`crates/carrick-core/tests/x86_acceleration.rs:867`) is preserved and does
 not become evidence for the new X4 entry milestone.
@@ -386,7 +404,7 @@ not the generic notification primitive for every personality.
 
 | Dependency | Reason and admission condition |
 | --- | --- |
-| Wave 1 → every order | Consume the existing MM/wait/retirement capabilities. Requalify X1–X3's actual CPL0 execution before using them as predecessors; source movement and hardware callback tests alone are insufficient. |
+| Wave 1 + in-flight 4b → every order | Consume the existing MM/wait/retirement capabilities and 4b's shared production protect/retire and transfer-service path. Requalify X1–X3's actual CPL0 execution before using them as predecessors, including cross-MM transfer and the peer-physical-pin rejection. Source movement and hardware callback tests alone are insufficient; N1 signed development is not a prerequisite for the x86 rung. |
 | 5 → 6/7/8/9 | Order 5 owns all routing/completion and defines the per-family traits in Linux; ARM implements only operation bodies/native hooks. This dependency inversion preserves ARM calls without a Linux→EL1 cycle. Orders 6–8 and then 9 replace trait bodies with shared implementations; x86 admission grows through the same entry. |
 | 5 + Wave 1 → 6 | Clone outputs and clear-tid use the existing checked MM transfer and wait owners. Birth/exit must preserve exact membership before object operations become widespread. Consume any newer N1 terminal-clear/adoption fixes, never overwrite them. |
 | 5 + 6 + Wave 1 → 7 | Resumed fault/edit work needs the exact execution generation and lifecycle cancellation. Finish checked user-copy, maintenance and the neutral aggregate prepared-write consumer before IPC introduces larger retained transfers. A later preparation suspension must cancel prior permits before releasing its executor loan. |
@@ -397,6 +415,11 @@ Orders 6 and 7 can be prepared against their disjoint symbol fences, but their
 executing gates run in the sequence above. No claim of safe parallel edits to
 the entry, ABI layout, scheduler context, or shared test-support files. One
 integrator owns those seams and re-inventories the clean integrated tree.
+ARM bindings/callers switch in each extraction commit, not at the final N1
+rebase; a signed queue delay cannot justify leaving a second ARM owner alive.
+The director tracks the baseline comparison packet for every moved SHA while
+x86 advances independently. A new ARM signed regression requires a shared fix
+and re-proof; unresolved comparisons remain explicit acceptance debt.
 
 ## Gates for every shared extraction
 
@@ -459,7 +482,12 @@ takeover. Reconcile inventories on the clean integrated tree before lint.
 
 ### Unchanged-ARM signed packet
 
-The Mac runner rebuilds/signs the integrated SHA, then:
+For each move the ARM requirement is **no new signed failure versus
+`56bf8c0ca`**, preserving assertions and budgets. The director records the
+baseline packet and affected per-move packet independently of x86's KVM
+execution schedule; N1 stays paused until the settled-core rebase. No signed
+receipt is inferred from source or KVM results. The Mac runner rebuilds/signs
+each compared SHA and records its artifact identity, then:
 
 ```sh
 just build
@@ -480,8 +508,9 @@ each signed test executable's identity, the test name, nonzero execution and
 observed structural-budget results. Preserve zero host watch registrations,
 preparatory position queries and queue scans
 (`conformance-contracts/contracts/inotify-mark-race-hotpath.toml:47`, `:54`,
-`:61`); missing measurement or an absent budget receipt blocks order 9 even
-if the EL1 packet is green.
+`:61`); missing measurement or an absent budget receipt blocks order 9's ARM
+non-regression claim and final N1 promotion even if the EL1 packet is green.
+It does not hold the x86 executing rung behind the N1 signed queue.
 
 Retain the N1 driver's current complete packet and Wave 1 AM/AF/AW/AR. In
 particular preserve:
@@ -494,12 +523,14 @@ particular preserve:
 | 8 | inherited descriptor lifetime, two-process blocking IPC and epoll ping-pong (`crates/carrick-embed/tests/el1_sched.rs:1114`, `:1141`, `:1397`); mixed host/zone and signal/close controls |
 | 9 | file bytes/shared inode/path mutation/cross-process readers (`crates/carrick-embed/tests/el1_files.rs:15`, `:72`, `:145`, `:351`) and inotify/churn (`crates/carrick-embed/tests/el1_inotify.rs:16`, `:257`), **plus the separately invoked `inotify_hotpath_contract_budget` execution receipt** (`crates/carrick-embed/tests/inotify_hotpath_contract.rs:41`) |
 
-A missing/red affected witness blocks integration. Preserve the invalidation
-negative control. Compare pre/post-move source, CLI/test/fixture SHA-256,
+A missing comparison receipt or new affected failure blocks N1 promotion.
+Baseline failures remain named debt, never relabeled as green; preserve the
+same zero-work budgets and distinguish pre-existing failures from new ones by
+their measured observations. Preserve the invalidation negative control.
+Compare baseline/pre/post-move source, CLI/test/fixture SHA-256,
 CDHash, LC_UUID, entitlement, DOF and layout hashes plus scoped cleanup.
-The director then runs full batch acceptance and `just el1-gate`, followed by
-exact-artifact probe → smoke → full promotion, with SHA/CDHash checked at each
-rung and no intervening rebuild/re-sign. Docker is a separate director phase.
+After the single N1 rebase, the director runs the final signed gate sequence
+below. Docker remains a separate director phase.
 X4–X8 do not close N1/N3 performance, N4 external-writer coherence, or whole
 Linux workload coverage.
 
@@ -520,10 +551,14 @@ cleanup. Do not use the no-allocation bootstrap image for allocating owners;
 bind the existing shared capacity owner with ISA aperture hooks first. Missing
 KVM/image, zero population, missing counters or unbound required contract is
 a failure, not a skip.
+X4 follows the executing 4b/X1 predecessor; X5–X8 use the preceding integrated
+x86 rung. None requires N1 to resume or complete its signed development
+stack. ARM callers and VM-free bindings still switch atomically with each
+move, and the per-move baseline comparison remains an acceptance obligation.
 
 | Milestone / prerequisites | Shared execution / N1 defect classes exposed | VM-free first → exact KVM command (all Wave 2 names **new**) |
 | --- | --- | --- |
-| **X4: native entry into one Linux dispatch** / order 5 | CPL3 issues admitted robust-list and side-effect-free malformed/unported calls; CPL0 uses one Linux decode/dispatch and core execution binding. VM-free controls exercise retained ARM per-family bindings through that same owner, futex admission and IRQ/idle timeout-result policy; x86's unavailable bodies refuse without effects. Two live tasks reuse visible IDs under different exact generations. Entry/return kicks must not repeat publication/completion. Catches wrong current task after switch, canonical/native ordinal aliases, stale generation, result clobber, a binding's duplicate completion, dropped ARM family and pending-work double dispatch. | `cargo test --locked -p carrick-personality-linux --test x86_wave2 x4_linux_common_entry -- --exact` → add in existing `cpl0_entry`: `CARRICK_RUN_ID=x4-wave2-entry cargo test --locked -p carrick-vmm-kvm --test cpl0_entry x4_linux_common_entry -- --exact --nocapture` |
+| **X4: native entry into one Linux dispatch** / order 5 | CPL3 issues admitted robust-list, private-futex wake through bound native scheduler/MM hooks, and side-effect-free malformed/unported calls; CPL0 uses one Linux decode/dispatch and core execution binding. VM-free controls exercise retained ARM per-family bindings through that same owner, futex admission and IRQ/idle timeout-result policy; x86's unavailable bodies refuse without effects. Two live tasks reuse visible IDs under different exact generations. Entry/return kicks must not repeat publication/completion. Catches wrong current task after switch, canonical/native ordinal aliases, stale generation, result clobber, a binding's duplicate completion, dropped ARM family and pending-work double dispatch. | `cargo test --locked -p carrick-personality-linux --test x86_wave2 x4_linux_common_entry -- --exact` → add in existing `cpl0_entry`: `CARRICK_RUN_ID=x4-wave2-entry cargo test --locked -p carrick-vmm-kvm --test cpl0_entry x4_linux_common_entry -- --exact --nocapture` |
 | **X5: shared birth/retirement and Linux clone/clear-tid** / orders 5–6; Wave 1 MM/wait | CPL0 prepares/publishes thread births, runs children, joins admitted nonfinal exits through Linux clear-tid, and cancels unpublished births. Two live processes, tid/entry reuse, parent/child tid-copy failure, exit-vs-publish/exec close, stale completion and host-adopted-job refusal. Check native TLS/extended context separately. Catches birth before resources commit, pool leaks/double release, wrong-MM clear, lost futex wake, successor tid clear and premature terminal notification. | `cargo test --locked -p carrick-core --test x86_wave2 x5_lifecycle_publication -- --exact` **and** `cargo test --locked -p carrick-personality-linux --test x86_wave2 x5_linux_clone_exit -- --exact` → new `cpl0_lifecycle`: `CARRICK_RUN_ID=x5-wave2-lifecycle cargo test --locked -p carrick-vmm-kvm --test cpl0_lifecycle x5_shared_clone_exit -- --exact --nocapture` |
 | **X6: residual owner maintenance and normalized faults** / orders 5–7; executing X1–X3 | CPL0, not a host callback, services first-touch/COW, protect/unmap and pending brk contraction/regrowth. Two same-VA MMs and a retained fork peer; inject grant refusal, alias rollback, parent-write abort, stale maintenance request and late descriptor completion. VM-free shared aggregate controls cover later-prepare suspension, exact commit/cancel, short-prefix delivery and cancellation before executor-loan return with both transport bindings. Catches brk waiting on its own closed gate, zeroing shared predecessor bytes, grant/pin misordering, partial compound return, hole resurrection, leaked aggregate permits and lost drain/retirement authority. | `cargo test --locked -p carrick-core --test x86_wave2 x6_residual_mm_owner -- --exact` **and** `cargo test --locked -p carrick-personality-linux --test x86_wave2 x6_linux_mm_entry -- --exact` → existing `carrier_memory` new CPL0-backed case: `CARRICK_RUN_ID=x6-wave2-mm cargo test --locked -p carrick-vmm-kvm --test carrier_memory x6_residual_mm_owner -- --exact --nocapture` |
 | **X7: in-zone IPC through shared object/wait owners** / orders 5–8 | CPL3 pipe/eventfd/epoll clients execute Linux IPC on core generation/pin/progress owners in CPL0. Two process tables, retained operation across close/dup/reuse, large partial write, writer-close/EOF, signal-after-progress, epoll timeout/ready/close and entry pending work. Catches replayed prefixes, wrong object after fd reuse, missed wake, double unpin, stale operation successor, mixed-harvest loss and ARM epoll packing on x86. | `cargo test --locked -p carrick-core --test x86_wave2 x7_object_subscription -- --exact` **and** `cargo test --locked -p carrick-personality-linux --test x86_wave2 x7_linux_ipc -- --exact` → new `cpl0_ipc`: `CARRICK_RUN_ID=x7-wave2-ipc cargo test --locked -p carrick-vmm-kvm --test cpl0_ipc x7_shared_ipc -- --exact --nocapture` |
@@ -558,6 +593,13 @@ or tests. Do not sum overlapping candidate files twice: dispatch moves only
 its own routing body, not lifecycle/IPC/MM bodies; MM moves portable portal
 fixtures once; file/IPC share checked transfer without duplicating it. Ranges
 reflect mixed-file splits and architecture-bound tests, not measured patches.
+These estimates retain the `56bf8c0ca` denominator. They are not additional
+credit on top of 4b: at its integration SHA, subtract any overlapping
+protect/retire or transfer-service relocation from order 7 and refresh the
+candidate table before implementation. The 400-line aggregate consumer move
+excludes native service transport; consume 4b's shared transport rather than
+inventing or crediting another one. No measured 4b diff or line delta is
+claimed here.
 
 | Order / target | Current candidate footprint | Move range / planning value | Planning split core+ABI / Linux | ARM-resident remainder after order (no new glue) |
 | --- | --- | --- | --- | ---: |
@@ -623,7 +665,8 @@ not core and not a reason to retain a whole second Linux implementation.
 
 ## Dispatch and acceptance limits
 
-First implementation unit: order 5's source fence, normalized per-family traits
+After 4b's executing predecessor receipt, the first Wave 2 implementation
+unit is order 5's source fence, normalized per-family traits
 and ARM bindings, sole Linux routing/completion owner, futex/timeout policy,
 typed context seam, AE red controls, and X4. Next: order 6's actual birth/exit
 owner and X5, with N1's current clear-tid/adoption fixes intact. Then residual
@@ -663,8 +706,9 @@ conformance-contract Clippy, and staged
 and inventory have no diff against that base. This read-only plan leaves the
 pre-existing gate failure open and makes no lint/acceptance success claim.
 
-Review revision checks: 153 explicit citations, 307 including abbreviations,
-across 75 pinned paths pass bounds checks. Twenty-one relevant definitions
+Review-fix commit `8b7dd8424` checks: 153 explicit citations, 307 including
+abbreviations, across 75 pinned paths pass bounds checks. Twenty-one relevant
+definitions
 (entry/file pairs, production validator, futex/IRQ/idle, prepared-write
 protocol/witnesses, existing permit/operation records and the inotify budget
 test) match their cited symbols; the validator's production cfg is also
@@ -675,3 +719,90 @@ repository API. The 30 personality-boundary tests, focused Clippy and fmt pass;
 lint and its focused runtime-aborts checker reproduce the same existing
 fingerprint failure. This revision changes no code and claims no signed or
 runtime acceptance.
+
+Owner-sequencing follow-up checks: 155 explicit citations, 311 including
+abbreviations, across the same 75 paths pass bounds checks. The 4b source
+anchors, both exact budget invocations, final N1 rebase section, normative
+links and one-document diff pass inspection. Rust, scripts and build/gate
+recipes are unchanged from the tested review-fix commit; its focused results
+and existing lint failure still apply. No additional runtime receipt is claimed.
+
+## N1 rebase
+
+N1 rebases **once onto the settled shared-core stack**, after 4b and X4–X8
+execute their required KVM bindings and interfaces stop changing. The director
+publishes an exact settled-core SHA and packet, not a floating branch name.
+This pause changes scheduling, not the requirement that every move switch ARM
+and x86 callers in the same commit. N1 resumes as a caller of those owners,
+not as a second implementation or a cherry-pick of whole old ARM files.
+
+First audit the N1 fix stack since `56bf8c0ca` against the settled core. Record
+one ledger row per fix: original SHA/author, defect and exact operation or
+generation, old/new owner and symbols, disposition, mapped implementation SHA,
+retained witness/scale/budget, pre-fix red and post-fix green receipts, and any
+remaining ISA binding. Classify every fix before rebasing:
+
+| Disposition | Required proof |
+| --- | --- |
+| **Kept** | The fix is still required and already represented by the settled shared owner or the appropriate ISA adapter. Map it to the exact implementation and keep its witness; do not apply a duplicate patch. |
+| **Ported** | The defect remains but the responsibility moved. Reapply its semantics to core or Linux policy, or retain the truly ISA-specific fix in its adapter. Switch every caller and preserve authorship; no private ARM correction beside a defective shared body. |
+| **Dropped** | The fix is superseded by an identified shared fix, or its responsibility was actually retired. Record the superseding SHA and equivalent witness, or a proof that the retired operation is no longer admitted. Conflict difficulty, an absent witness or a green smoke is not a reason to drop it. |
+
+**Re-prove the red for every fix**, including kept and superseded fixes:
+use an isolated pre-fix owner revision or narrowly invert the mapped fix on an
+isolated settled-stack worktree, without restoring an obsolete dispatcher.
+Run the retained witness at the same population, fault injection and work
+budget; record the actual false assertion, exact operation and artifact.
+Restore/apply the mapped implementation and prove green with both relevant
+VM-free ISA bindings and the applicable executing witness. For a retired
+operation, re-run its red at the pre-fix owner and prove the new
+refusal/retirement boundary instead of fabricating a live binding. A missing
+red or unresolved
+disposition blocks the audited rebase packet; do not suppress a fix to make
+the rebase compile.
+
+Rebase the audited remaining N1 fixes onto that recorded SHA in the director's
+clean N1 worktree. Resolve conflicts by responsibility and exact authority,
+preserving the settled shared owner and native hooks; never resurrect the
+old owner. Reconcile line-pinned inventories on the clean integrated tree,
+refresh source/layout/census receipts and run VM-free/P0 and compile checks
+before signing. Carry forward every per-move ARM comparison: **no new signed
+failure versus `56bf8c0ca`** is the required bar, not a fresh zero-failure
+claim about an already imperfect baseline. New failures require attribution,
+a shared/native-owner fix as appropriate, and red/green re-proof.
+
+The director owns this final gate order on the rebased SHA:
+
+1. Run the one full stacked acceptance gate (`just accept`, or its authorized
+   remote runner), rebuilding/signing the exact integrated artifact. Record
+   source, CLI/fixture hashes, CDHash, LC_UUID, entitlement, DOF and layout
+   identities, scoped run IDs and cleanup; preserve the unentitled negative
+   control. No worker runs this gate on VM 210.
+2. Complete the unchanged-ARM comparison packet on that SHA, including both
+   exact commands below and any affected AM/AF/AW/AR bindings. Require separate
+   test-executable identities and the inotify budget execution receipt; the
+   acceptance runner's `el1_` filter is insufficient. Then run
+   `just --no-deps el1-gate` against the held CLI artifact.
+
+   ```sh
+   just --no-deps test-embed el1_ --nocapture
+   just --no-deps test-embed inotify_hotpath_contract_budget --exact --nocapture
+   ```
+
+3. Promote the same CLI artifact through exact-artifact probe → smoke → full:
+
+   ```sh
+   just --no-deps conformance-probes
+   just --no-deps conformance smoke
+   just --no-deps conformance full
+   ```
+
+   Verify SHA/CDHash at each rung, with no intervening CLI rebuild/re-sign.
+   Docker oracle work is a separate director phase with no live Carrick guest.
+   Record unresolved baseline failures and performance/coherence gaps; KVM or
+   the extraction census does not close them.
+
+Only the completed fix ledger, per-move baseline comparisons, final signed
+packet (including the budget receipt) and exact-artifact promotion constitute
+the N1 handoff. Missing evidence stays explicit; the x86 discovery stack is
+not retroactively described as signed N1 acceptance.
