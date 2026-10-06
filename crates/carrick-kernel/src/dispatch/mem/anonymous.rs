@@ -1709,6 +1709,7 @@ impl MemView<'_> {
         flags: u64,
         congruence: MmapGrantCongruence,
         root_eligible: bool,
+        user_ceiling: UserVaCeiling,
     ) -> Result<Option<(u64, bool)>, DispatchError> {
         let page_size = self.linux_page_size();
         let layout = mem.layout;
@@ -1789,7 +1790,7 @@ impl MemView<'_> {
                     let rosetta_start = crate::memory::LINUX_ROSETTA_VA_BASE;
                     let rosetta_end =
                         rosetta_start.saturating_add(crate::memory::LINUX_ROSETTA_WINDOW_SIZE);
-                    if mmap_address_uses_alias(hint, length, layout)
+                    if mmap_address_uses_alias(hint, length, layout, user_ceiling)
                         && !guest_vma_overlaps_locked(mem, hint, length)
                         && !ranges_overlap(hint, length, rosetta_start, rosetta_end)
                     {
@@ -1803,7 +1804,12 @@ impl MemView<'_> {
             Ok(address) => Ok(grant(mem, address)),
             Err(Refusal::MetadataRequired) => Ok(None),
             // The arena is full: the host's high alias window.
-            Err(_) => Ok(find_canonical_high_va_gap(mem, length, congruence)),
+            Err(_) => Ok(find_canonical_high_va_gap(
+                mem,
+                length,
+                congruence,
+                user_ceiling,
+            )),
         }
     }
 
