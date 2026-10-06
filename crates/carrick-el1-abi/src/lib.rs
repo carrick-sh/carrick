@@ -26,6 +26,8 @@ mod descriptor_txn;
 pub use descriptor_txn::*;
 mod guest_mmu_publication;
 pub use guest_mmu_publication::*;
+mod x86_initial_boot;
+pub use x86_initial_boot::*;
 mod delegated_notification;
 pub use delegated_notification::*;
 mod mm_portal;
