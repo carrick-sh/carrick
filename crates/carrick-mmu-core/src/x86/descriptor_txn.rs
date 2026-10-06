@@ -136,6 +136,13 @@ pub struct DescriptorReceipt {
     digest: u64,
 }
 
+impl DescriptorReceipt {
+    /// Identity of the exact edit that produced this guest-owned receipt.
+    pub const fn edit_identity(&self) -> u64 {
+        self.digest
+    }
+}
+
 /// Plan under the exact-MM editor. Grants must be exclusively owned, unlinked
 /// zero pages. All walks and allocation/journal capacity checks precede stores.
 /// No hardware A/D writer may race this editor; a violated exclusion poisons
@@ -589,6 +596,10 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
 }
 
 impl DescriptorTxn<'_> {
+    /// Stable identity checked by the host after this exact guest edit.
+    pub fn edit_identity(&self) -> u64 {
+        self.digest()
+    }
     /// Same receipt binding as ARM: identity alone does not bind an operation.
     pub fn digest(&self) -> u64 {
         let mix = |h: u64, w: u64| (h ^ w).wrapping_mul(0x9e37_79b9_7f4a_7c15);
@@ -800,6 +811,31 @@ pub struct TranslatedLeaf {
     pub ancestors_writable: bool,
     pub descriptor: u64,
     pub size: u64,
+}
+
+/// Read one terminal word, including a prepared non-present leaf. This is
+/// observation only; it never grants backing or descriptor-write authority.
+pub fn read_terminal_descriptor<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: RootGpa,
+    va: UserVa,
+) -> Result<(u64, u64), DescriptorRefusal> {
+    if !canonical(va.raw()) {
+        return Err(DescriptorRefusal::BadRange);
+    }
+    let mut table = root.address().raw();
+    for level in 0..4 {
+        let entry = words.load(table + ((va.raw() >> (39 - level * 9)) & 511) * 8)?;
+        validate_entry(entry, level)?;
+        if level == 3 || entry & HUGE != 0 {
+            return Ok((entry, level_bytes(level)));
+        }
+        if entry & PRESENT == 0 {
+            return Err(DescriptorRefusal::MissingTable);
+        }
+        table = entry & ADDRESS;
+    }
+    Err(DescriptorRefusal::MissingTable)
 }
 pub fn translate_leaf<W: LiveDescriptorWords + ?Sized>(
     words: &W,
