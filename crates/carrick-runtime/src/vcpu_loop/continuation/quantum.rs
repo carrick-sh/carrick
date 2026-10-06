@@ -194,6 +194,7 @@ impl HvpatchTaskQuantum {
 pub(crate) struct ZoneSave {
     pub(crate) base: carrick_hal::threaded::GuestCpuState,
     pub(crate) record: carrick_el1_abi::RecordRef,
+    pub(crate) origin: crate::vcpu_loop::executor::residency::ZoneResumeOrigin,
 }
 
 pub(crate) struct HvpatchTaskBinding {

@@ -2433,7 +2433,6 @@ pub(crate) mod tests {
     use super::binding::*;
     use super::signal::lower_el0_fault;
     use super::*;
-    use carrick_guest_mem::GuestMemory;
     use std::time::{Duration, Instant};
 
     struct ContinueInterceptor;
@@ -2736,23 +2735,7 @@ pub(crate) mod tests {
 
     impl CurrentMmMemory for Memory {}
 
-    impl threads::CloneTidMemory for Memory {
-        fn read_clone_tid_bytes(
-            &self,
-            address: u64,
-            len: usize,
-        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-            self.read_bytes_raw(address, len)
-        }
-
-        fn write_clone_tid_bytes(
-            &mut self,
-            address: u64,
-            bytes: &[u8],
-        ) -> Result<(), carrick_guest_mem::MemoryError> {
-            self.write_bytes_raw(address, bytes)
-        }
-    }
+    impl threads::CloneTidMemory for Memory {}
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub(crate) struct DynamicCloneBackendOps;

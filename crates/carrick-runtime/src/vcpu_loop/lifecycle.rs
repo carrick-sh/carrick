@@ -1196,27 +1196,7 @@ pub(crate) mod tests {
     fn production_clone_failpoints_are_exact_and_consumed_once() {
         #[derive(Default)]
         pub(crate) struct Memory(pub(crate) std::collections::BTreeMap<u64, Vec<u8>>);
-        impl threads::CloneTidMemory for Memory {
-            fn read_clone_tid_bytes(
-                &self,
-                address: u64,
-                _len: usize,
-            ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-                self.0
-                    .get(&address)
-                    .cloned()
-                    .ok_or(carrick_guest_mem::MemoryError::OutOfBounds { address, length: 4 })
-            }
-
-            fn write_clone_tid_bytes(
-                &mut self,
-                address: u64,
-                bytes: &[u8],
-            ) -> Result<(), carrick_guest_mem::MemoryError> {
-                self.0.insert(address, bytes.to_vec());
-                Ok(())
-            }
-        }
+        impl threads::CloneTidMemory for Memory {}
 
         struct FakeBackendOps;
         impl HvpatchCloneBackendOps<Memory> for FakeBackendOps {
@@ -1570,23 +1550,7 @@ pub(crate) mod tests {
 
     impl CurrentMmMemory for Memory {}
 
-    impl threads::CloneTidMemory for Memory {
-        fn read_clone_tid_bytes(
-            &self,
-            address: u64,
-            len: usize,
-        ) -> Result<Vec<u8>, carrick_guest_mem::MemoryError> {
-            self.read_bytes_raw(address, len)
-        }
-
-        fn write_clone_tid_bytes(
-            &mut self,
-            address: u64,
-            bytes: &[u8],
-        ) -> Result<(), carrick_guest_mem::MemoryError> {
-            self.write_bytes_raw(address, bytes)
-        }
-    }
+    impl threads::CloneTidMemory for Memory {}
 
     #[derive(Default)]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

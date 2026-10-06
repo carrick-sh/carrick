@@ -1848,7 +1848,7 @@ where
                         .map(|address| (address, guest_child_pid)),
                 }
             }),
-            bootstrap_thread_child: false,
+            bootstrap_thread_child: None,
         })
         .unwrap_or_else(|error| {
             tracing::error!(child_pid, %error, "prepare process child logical job");

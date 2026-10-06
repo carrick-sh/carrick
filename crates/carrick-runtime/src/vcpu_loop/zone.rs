@@ -33,6 +33,16 @@ use carrick_kernel::el1_zone::HostLockWait;
 
 pub(super) enum OwnerMemoryAction {
     Syscall(carrick_hal::RawSyscall),
+    CloneParentTid {
+        frame: carrick_hal::RawSyscall,
+        address: u64,
+        internal_tid: i32,
+        tid: i32,
+    },
+    CloneChildTid {
+        address: u64,
+        tid: i32,
+    },
     Terminal,
     Fault,
     Ipc {
@@ -396,7 +406,17 @@ where
         };
         let own = zone.record_ref(own);
         let request = SyscallRequest::new(98, carrick_observability::compat::SyscallArgs([0; 6]));
-        let exit = self.settle_into_zone(control, state, own, seq, timeout, request)?;
+        let exit = self.settle_into_zone(
+            control,
+            continuation::quantum::ZoneSave {
+                base: state,
+                record: own,
+                origin: executor::residency::ZoneResumeOrigin::Guest,
+            },
+            seq,
+            timeout,
+            request,
+        )?;
         Ok(Some(exit))
     }
 
@@ -470,12 +490,12 @@ where
     fn settle_into_zone(
         &mut self,
         control: &mut executor::HvpatchQuantumControl<'_, '_>,
-        base: GuestCpuState,
-        record: RecordRef,
+        save: continuation::quantum::ZoneSave,
         seq: u32,
         timeout: Option<std::time::Duration>,
         request: SyscallRequest,
     ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let record = save.record;
         let context = self
             .kernel
             .dispatcher
@@ -500,7 +520,7 @@ where
         let binding = control.binding.ok_or_else(|| {
             RuntimeError::Configuration("EL1 zone settle without a task binding".to_owned())
         })?;
-        binding.set_zone_save(continuation::quantum::ZoneSave { base, record });
+        binding.set_zone_save(save);
         self.state.service_kernel_context = Some(context);
         self.phase = HvpatchProductionPhase::ResumeZone;
         Ok(self.suspend(
@@ -613,7 +633,17 @@ where
         engine.discard_terminal_syscall_continuation()?;
         self.state.retire_syscall()?;
         let record = zone.record_ref(record);
-        self.settle_into_zone(control, state, record, seq, timeout, request)
+        self.settle_into_zone(
+            control,
+            continuation::quantum::ZoneSave {
+                base: state,
+                record,
+                origin: executor::residency::ZoneResumeOrigin::Guest,
+            },
+            seq,
+            timeout,
+            request,
+        )
     }
 
     /// Enroll an exact EL1 owner release before surrendering the executor.
@@ -667,6 +697,7 @@ where
         };
         let syscall_state = match &action {
             OwnerMemoryAction::Syscall(_)
+            | OwnerMemoryAction::CloneParentTid { .. }
             | OwnerMemoryAction::Ipc {
                 boundary: IpcBoundary::Syscall(_),
                 ..
@@ -703,7 +734,9 @@ where
                 );
                 Some((state, ctx, request))
             }
-            OwnerMemoryAction::Terminal | OwnerMemoryAction::Fault => None,
+            OwnerMemoryAction::Terminal
+            | OwnerMemoryAction::Fault
+            | OwnerMemoryAction::CloneChildTid { .. } => None,
         };
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("owner wait lost its Kernel context".to_owned())
@@ -744,10 +777,19 @@ where
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 match (action, syscall_state) {
                     (OwnerMemoryAction::Ipc { boundary, token }, Some((state, _, request))) => {
+                        let origin = match boundary {
+                            IpcBoundary::Syscall(_) => {
+                                executor::residency::ZoneResumeOrigin::HostSyscall
+                            }
+                            IpcBoundary::El0 => executor::residency::ZoneResumeOrigin::HostEl0,
+                        };
                         let exit = self.settle_into_zone(
                             control,
-                            state,
-                            zone.record_ref(record),
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin,
+                            },
                             seq,
                             None,
                             request,
@@ -758,14 +800,64 @@ where
                     (OwnerMemoryAction::Syscall(frame), Some((state, _, request))) => {
                         let exit = self.settle_into_zone(
                             control,
-                            state,
-                            zone.record_ref(record),
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
                             seq,
                             None,
                             request,
                         )?;
                         self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame };
                         Ok(exit)
+                    }
+                    (
+                        OwnerMemoryAction::CloneParentTid {
+                            frame,
+                            address,
+                            internal_tid,
+                            tid,
+                        },
+                        Some((state, _, request)),
+                    ) => {
+                        let exit = self.settle_into_zone(
+                            control,
+                            continuation::quantum::ZoneSave {
+                                base: state,
+                                record: zone.record_ref(record),
+                                origin: executor::residency::ZoneResumeOrigin::HostSyscall,
+                            },
+                            seq,
+                            None,
+                            request,
+                        )?;
+                        self.phase = HvpatchProductionPhase::ResumeCloneParentTid {
+                            frame,
+                            address,
+                            internal_tid,
+                            tid,
+                        };
+                        Ok(exit)
+                    }
+                    (OwnerMemoryAction::CloneChildTid { address, tid }, None) => {
+                        let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
+                            zone.record_ref(record),
+                            seq,
+                        );
+                        let continuation = carrick_kernel::kernel::continuation::BlockedContinuation::from_fault_zone_park(
+                            context,
+                            control.execution_lease_mut().map_err(RuntimeError::Trap)?,
+                            wait,
+                        ).map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                        self.phase = HvpatchProductionPhase::ResumeCloneChildTid { address, tid };
+                        Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::BlockedContinuation {
+                                continuation: Box::new(continuation),
+                                vfork_activation: None,
+                            },
+                        ))
                     }
                     (OwnerMemoryAction::Fault, None) => {
                         let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
@@ -833,6 +925,22 @@ where
                             control.submission.host_wait_context(),
                         )?;
                         self.service_outcome(engine, control, frame, outcome)
+                    }
+                    OwnerMemoryAction::CloneParentTid {
+                        frame,
+                        address,
+                        internal_tid,
+                        tid,
+                    } => self.complete_clone_parent_tid(
+                        engine,
+                        control,
+                        frame,
+                        address,
+                        internal_tid,
+                        tid,
+                    ),
+                    OwnerMemoryAction::CloneChildTid { address, tid } => {
+                        self.complete_clone_child_tid(engine, control, address, tid)
                     }
                     OwnerMemoryAction::Fault => Ok(executor::ExecutorExit::Syscall),
                     OwnerMemoryAction::Terminal => {
@@ -1420,8 +1528,18 @@ where
                     self.state.retire_syscall()?;
                 }
                 let record = zone.record_ref(record);
-                self.settle_into_zone(control, state, record, seq, None, request)
-                    .map(IpcParkAttempt::Parked)
+                self.settle_into_zone(
+                    control,
+                    continuation::quantum::ZoneSave {
+                        base: state,
+                        record,
+                        origin: executor::residency::ZoneResumeOrigin::Guest,
+                    },
+                    seq,
+                    None,
+                    request,
+                )
+                .map(IpcParkAttempt::Parked)
             }
             Err((host_ipc::ObjectWaitError::Changed, token)) => {
                 let token = host_ipc::from_sched_token(token).ok_or_else(|| {
