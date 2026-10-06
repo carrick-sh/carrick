@@ -2,15 +2,14 @@
 
 use super::{ArchError, X86Backend, user_access};
 use carrick_guest_arch::{
-    Access, AddressContext, CopyProgress, EditBacking, EditCowAccess, EditIntent, EditLeafSize,
-    EditOperation, EditPermissions, FrameGpa, GuestLen, KernelVa, MmuBackend, MmuEditBackend,
-    RootGpa, TableWindow, UserRange, UserVa,
+    Access, AddressContext, CopyProgress, EditIntent, FrameGpa, GuestLen, KernelVa, MmuBackend,
+    MmuEditBackend, RootGpa, TableWindow, UserRange, UserVa,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
 use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
 use carrick_mmu_core::x86::descriptor_txn::{
-    DescriptorOp, DescriptorOutcome, DescriptorReceipt, DescriptorTxn, DescriptorTxnId,
-    InlineJournal, LeafSize, PageSpan, Permissions, execute_descriptor_txn,
+    DescriptorOutcome, DescriptorReceipt, DescriptorTxn, DescriptorTxnId, InlineJournal,
+    execute_descriptor_txn,
 };
 use core::cell::Cell;
 use core::num::NonZeroU64;
@@ -270,36 +269,6 @@ pub unsafe fn resident_leaf_matches(
     .is_ok_and(|leaf| leaf.size == 4096 && leaf.output == expected))
 }
 
-fn native_permissions(permissions: EditPermissions) -> Result<Permissions, ArchError> {
-    // Long mode cannot express a present user mapping that denies reads while
-    // allowing a different access. Refuse that semantic intent explicitly.
-    if !permissions.readable {
-        return Err(ArchError::Unbound);
-    }
-    Ok(Permissions {
-        writable: permissions.writable,
-        executable: permissions.executable,
-        user: permissions.user,
-    })
-}
-
-fn native_backing(backing: EditBacking) -> carrick_mmu_core::x86::descriptor_txn::BackingIdentity {
-    carrick_mmu_core::x86::descriptor_txn::BackingIdentity {
-        frame_id: backing.frame_id,
-        mapping_id: backing.mapping_id,
-        owner_generation: backing.owner_generation,
-        inventory_revision: backing.inventory_revision,
-    }
-}
-
-fn native_size(size: EditLeafSize) -> LeafSize {
-    match size {
-        EditLeafSize::Page => LeafSize::Page,
-        EditLeafSize::Block2M => LeafSize::Block2M,
-        EditLeafSize::Block1G => LeafSize::Block1G,
-    }
-}
-
 /// Lower an exact editor's ISA-neutral intent to the four-level x86 engine.
 /// No unsupported permission is rounded up to a successful descriptor.
 ///
@@ -311,82 +280,7 @@ pub unsafe fn execute_native_edit_intent(
     intent: EditIntent<'_, RootGpa>,
     tables: TableWindow,
 ) -> Result<DescriptorReceipt, ArchError> {
-    let owner = intent.owner();
-    let span = PageSpan::new(intent.range().start().raw(), intent.range().len().raw());
-    let operation = match intent.operation() {
-        EditOperation::Prepare {
-            output,
-            permissions,
-            resident,
-            backing,
-        } => DescriptorOp::Prepare {
-            span,
-            output,
-            permissions: native_permissions(permissions)?,
-            resident: PageSpan::new(resident.start().raw(), resident.len().raw()),
-            backing: native_backing(backing),
-        },
-        EditOperation::Map {
-            output,
-            permissions,
-            size,
-            resident,
-            backing,
-        } => DescriptorOp::Map {
-            span,
-            output,
-            permissions: native_permissions(permissions)?,
-            size: native_size(size),
-            resident,
-            backing: native_backing(backing),
-        },
-        EditOperation::Publish { expected, access } => DescriptorOp::Publish {
-            span,
-            expected,
-            access: match access {
-                Access::Read => carrick_mmu_core::x86::descriptor_txn::Access::Read,
-                Access::Write => carrick_mmu_core::x86::descriptor_txn::Access::Write,
-                Access::Execute => carrick_mmu_core::x86::descriptor_txn::Access::Execute,
-            },
-        },
-        EditOperation::Protect { permissions } => DescriptorOp::Protect {
-            span,
-            permissions: native_permissions(permissions)?,
-        },
-        EditOperation::ArmCow {
-            kernel_only: false,
-            executable: false,
-            adopt_private: false,
-            excluded_len,
-            ..
-        } if excluded_len.raw() == 0 => DescriptorOp::ArmCow(span),
-        EditOperation::CowRepoint {
-            old,
-            new,
-            backing,
-            access: EditCowAccess::RecordedPrivate,
-        } => DescriptorOp::CowRepoint {
-            span,
-            old,
-            new,
-            backing: native_backing(backing),
-        },
-        EditOperation::Unmap => DescriptorOp::Unmap(span),
-        EditOperation::Coalesce { size } => DescriptorOp::Coalesce {
-            span,
-            size: native_size(size),
-        },
-        _ => return Err(ArchError::Unbound),
-    };
-    let transaction = DescriptorTxn {
-        id: DescriptorTxnId {
-            mm_key: owner.mm_key(),
-            generation: owner.generation(),
-        },
-        root: owner.root(),
-        op: operation,
-        tables: intent.table_grants(),
-    };
+    let transaction = DescriptorTxn::from_intent(&intent).map_err(|_| ArchError::Unbound)?;
     // SAFETY: this function's caller retains the exact editor and page-table
     // alias; lowering above preserves the complete intent.
     unsafe { execute_native_descriptor_txn(&transaction, &tables) }
