@@ -2016,6 +2016,10 @@ impl<'a> MemView<'a> {
             }
 
             let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
+            let owner_reserved = this
+                .mem()
+                .lock()
+                .owner_venue_reserves(address, address + length);
             // Move-3 E1, phase 2: replace the arena backing with the host file
             // mapping now that every fallible pre-step has passed. On backend
             // refusal (alignment, ownership, may-execute, linux4k, host mmap
@@ -2171,7 +2175,12 @@ impl<'a> MemView<'a> {
                         ),
                     ));
                 }
-                if let Err(error) = memory.write_bytes_unchecked(address, &bytes) {
+                let content_write = if owner_reserved {
+                    memory.write_owner_reserved_bytes(address, &bytes)
+                } else {
+                    memory.write_bytes_unchecked(address, &bytes)
+                };
+                if let Err(error) = content_write {
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(request.refused_by(
                         MmapRefusal::Internal("file content could not be copied into the mapping"),
