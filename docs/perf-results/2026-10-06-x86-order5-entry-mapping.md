@@ -595,3 +595,10 @@ index 962a7faa0..2a13ca548 100644
 +            }
              (route, frame.x[0] as i64)
 ```
+
+The final x86-none warning-strict check exposed the old `setup_open` predicate
+as dead code after robust-list policy left the shared metadata view. Move that
+unchanged predicate beside its retained ARM signal/altstack callers, not behind
+an allow or new policy path. `cargo clippy --locked -p carrick-x86-cpl0 --release
+--target x86_64-unknown-none -- -D warnings` fails red on the old location and
+passes after the move. The separate production/test census is unchanged.
