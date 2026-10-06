@@ -6,9 +6,8 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 
 use super::*;
-use serde::Serialize;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct GuestMappingPlan {
     /// The user-mode entry point (real `_start` of the loaded ELF, already
     /// rebased through any PIE bias). When `el0_trampoline_entry` is `None`
@@ -40,7 +39,7 @@ pub struct GuestMappingPlan {
     pub mappings: Vec<GuestMapping>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct GuestMapping {
     /// Guest VIRTUAL address the region is mapped at (also the key for
     /// software syscall-path memory access). Equals `ipa_start` for every

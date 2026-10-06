@@ -1,6 +1,4 @@
-use std::env;
 use std::path::{Path, PathBuf};
-use std::process;
 
 use carrick_conformance_contract::{CapabilityClass, ContractId, ExecutionLayer};
 use carrick_investigation::{
@@ -27,7 +25,7 @@ fn print_usage() {
 }
 
 fn main() {
-    let args: Vec<String> = env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty()
         || args
             .iter()
@@ -39,7 +37,7 @@ fn main() {
 
     if let Err(err) = run(&args) {
         eprintln!("error: {err}");
-        process::exit(1);
+        std::process::exit(1);
     }
 }
 

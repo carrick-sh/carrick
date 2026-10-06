@@ -15,11 +15,11 @@
 //! comment gated Linux out as "no-op"; that predated usdt's Linux support.)
 //!
 //! Layout:
-//!   * `real` — the genuine `#[usdt::provider]` plus its safe wrappers, compiled
+//!   * `real` — the genuine `#[::usdt::provider]` plus its safe wrappers, compiled
 //!     under `cfg(carrick_usdt_probes)`, which the crate build.rs emits when the
 //!     target is `macos` (both arches — the HVF aarch64 path) or `x86_64`
 //!     `linux`/`freebsd`, AND the build host would make usdt generate code for
-//!     that target. `#[usdt::provider]` is a proc-macro: it and `usdt-impl`
+//!     that target. `#[::usdt::provider]` is a proc-macro: it and `usdt-impl`
 //!     are compiled for the HOST, and `usdt-impl` 0.6 picks both its backend
 //!     (host `target_os`) and its argument registers (host `target_arch`) from
 //!     that host compilation. A cross check of x86_64 Linux from an aarch64
@@ -109,7 +109,7 @@ pub struct HostProcessBirth {
     start_usec: i32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
 pub enum HostProcessBirthError {
     #[error("host process birth PID must be nonzero")]
     ZeroPid,
@@ -491,7 +491,7 @@ pub struct HvpatchGuestLifecycle {
     detail: i64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
 pub enum HvpatchGuestLifecycleError {
     #[error("hvpatch guest pid and tid must be positive")]
     InvalidTaskIdentity,
@@ -3428,12 +3428,12 @@ mod hvpatch_guest_probe_abi {
 
 macro_rules! dsr_ordinal_enum {
     (
-        $(#[$meta:meta])*
+        $(#[doc = $doc:expr])*
         pub enum $name:ident {
             $($variant:ident = $value:expr),+ $(,)?
         }
     ) => {
-        $(#[$meta])*
+        $(#[doc = $doc])*
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         #[repr(u32)]
         pub enum $name {
@@ -3466,7 +3466,7 @@ dsr_ordinal_enum! {
 }
 
 /// Rejected translated-range identity or executable extent.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
 pub enum TranslatedRangeError {
     #[error("translated-range epoch must be nonzero")]
     ZeroEpoch,
@@ -3721,7 +3721,7 @@ fn validate_translated_range(range: &Range<HostVa>) -> Result<(), TranslatedRang
 }
 
 /// Rejected native-owned host-range identity or mapped extent.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
 pub enum NativeOwnedRangeError {
     #[error("native-owned range epoch must be nonzero")]
     ZeroEpoch,
@@ -4961,7 +4961,7 @@ mod real {
     use crate::compat::{CompatEvent, SyscallArgs};
 
     #[cfg(target_os = "macos")]
-    #[derive(Clone, Debug, serde::Serialize)]
+    #[derive(Clone, Debug, ::serde::Serialize)]
     pub(crate) struct HostImageRange {
         start: u64,
         end: u64,
@@ -4969,7 +4969,7 @@ mod real {
     }
 
     #[cfg(target_os = "macos")]
-    #[derive(Clone, Debug, serde::Serialize)]
+    #[derive(Clone, Debug, ::serde::Serialize)]
     pub(crate) struct HostImageCatalog {
         pid: u32,
         ranges: Vec<HostImageRange>,
@@ -5028,7 +5028,7 @@ mod real {
     /// — usdt JSON-encodes it through serde and passes the resulting
     /// C-string pointer to DTrace. Consumers use `copyinstr(argN)` to read
     /// the JSON (looks like `[v0,v1,v2,v3,v4,v5]`).
-    #[usdt::provider(provider = "carrick")]
+    #[::usdt::provider(provider = "carrick")]
     mod carrick_usdt {
         /// Process incarnation from Darwin `PROC_PIDTBSDINFO`.
         fn host__process__birth(_: u32, _: i64, _: i32) {}
