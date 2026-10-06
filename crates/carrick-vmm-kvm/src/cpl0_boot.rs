@@ -148,6 +148,10 @@ impl Cpl0Carrier {
         Self::boot_inner(image, programs, false)
     }
 
+    pub fn boot_with_interrupts(image: &Path, programs: [&[u8]; 2]) -> Result<Self, TrapError> {
+        Self::boot_inner(image, programs, true)
+    }
+
     pub(crate) fn boot_inner(
         image: &Path,
         programs: [&[u8]; 2],
@@ -430,6 +434,11 @@ impl Cpl0Carrier {
                 + carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index as u64)?;
             system.tr.base = DIRECT_VA
                 + carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), index as u64)?;
+            if interrupts {
+                system.apic_base = carrick_x86::interrupts::LAPIC_BASE
+                    | 0x800
+                    | if index == 0 { 0x100 } else { 0 };
+            }
             cpu.fd()
                 .set_sregs(&system)
                 .map_err(|e| fail(e.to_string()))?;
