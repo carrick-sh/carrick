@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
 use carrick_guest_arch::{ContextGeneration, MmGeneration};
+use carrick_hal::{HvVcpu, VcpuExit};
 fn nz(n: u64) -> NonZeroU64 {
     NonZeroU64::new(n).unwrap()
 }
@@ -17,6 +18,52 @@ fn backing(pa: u64, len: usize, tag: u64) -> PreparedBacking {
             inventory_revision: nz(tag),
         },
     }
+}
+
+#[test]
+fn three_vcpus_observe_one_carrier_backing_in_order() {
+    let mut machine = CarrierMachine::create_stopped(3).unwrap();
+    let mut extent = BackingExtent::private(FrameGpa::new(0), PAGE as usize).unwrap();
+    // Real-mode MOV AL, [0x100]; OUT 0xe9, AL; HLT. Each KVM_RUN must
+    // observe the same retained host page through its own vCPU in this VM.
+    extent
+        .initialize(0, &[0xa0, 0x00, 0x01, 0xe6, 0xe9, 0xf4])
+        .unwrap();
+    extent.initialize(0x100, b"A").unwrap();
+    let backing = PreparedBacking {
+        extent: Arc::new(extent),
+        identity: BackingIdentity {
+            frame_id: nz(1),
+            mapping_id: nz(1),
+            owner_generation: nz(1),
+            inventory_revision: nz(1),
+        },
+    };
+    machine.memory_mut().install(&[backing]).unwrap();
+    assert_eq!(machine.memory_mut().slot_count(), 1);
+    for index in 0..machine.vcpu_count() {
+        let cpu = machine.cpu_mut(index).unwrap();
+        let mut sregs = cpu.fd().get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        sregs.ds.base = 0;
+        sregs.ds.selector = 0;
+        cpu.fd().set_sregs(&sregs).unwrap();
+        let mut regs = cpu.fd().get_regs().unwrap();
+        regs.rip = 0;
+        regs.rflags = 2;
+        cpu.fd().set_regs(&regs).unwrap();
+        let exit = HvVcpu::run(cpu).unwrap();
+        assert!(
+            matches!(&exit, VcpuExit::IoOut { port: 0xe9, data } if data == &[b'A' + index as u8]),
+            "vCPU {index} did not read the current shared GPA byte"
+        );
+        machine
+            .memory_mut()
+            .write(FrameGpa::new(0x100), &[b'B' + index as u8])
+            .unwrap();
+    }
+    assert_eq!(machine.memory_mut().retained_bytes(), PAGE as usize);
 }
 
 #[test]
