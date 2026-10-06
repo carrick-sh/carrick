@@ -266,7 +266,7 @@ mod kernel {
     use carrick_el1::personality::common_entry::{EntryOutcome, serve_canonical};
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
     use carrick_el1_abi::{Counters, CurrentTask};
-    use carrick_guest_arch::InterruptArch;
+    use carrick_guest_arch::{InterruptArch, KernelVa};
     fixture_items! { use carrick_guest_arch::EntryArch; }
     fixture_items! { use core::sync::atomic::AtomicU64; }
     use core::sync::atomic::Ordering;
@@ -334,13 +334,13 @@ mod kernel {
                 &*(binding.counters_address as *const Counters),
             )
         };
-        let serve = |zone_address: u64,
+        let serve = |zone_address: KernelVa,
                      residency: &carrick_el1_abi::FrameGrantResidencyTable,
                      pool: &dyn carrick_el1_abi::CowGrantVenue,
                      mailbox: &carrick_el1_abi::FrameGrantMailbox| {
             // SAFETY: the boot owner published this supervisor-only zone and
             // retains it across the exact CPU's space-edit transaction.
-            let zone = unsafe { &*(zone_address as *const carrick_sched_core::ZoneTables) };
+            let zone = unsafe { &*(zone_address.raw() as *const carrick_sched_core::ZoneTables) };
             let mut cow = X86CowResolver { pool, residency, completion: None };
             let result = dispatch_x86_fault_with_prepared(
                 0, fault, counters, core::slice::from_ref(task),
@@ -362,16 +362,26 @@ mod kernel {
                 if address == 0 { return 4; }
                 // SAFETY: the fixture published and retains this aligned table.
                 let residency = unsafe { &*(address as *const carrick_el1_abi::FrameGrantResidencyTable) };
-                return serve(super::lifecycle::LIFECYCLE_ZONE, residency,
+                return serve(KernelVa::new(super::lifecycle::LIFECYCLE_ZONE), residency,
                     &SHARED_COW_POOL, &SHARED_FAULT_MAILBOX);
             }
         }
-        let Some(mailbox) = carrick_el1_abi::frame_grant_mailbox_guest_for_slot(
-            binding.cpu_slot as usize,
-        ) else { return 5; };
-        serve(carrick_el1_abi::EL1_ZONE_BASE,
-            carrick_el1_abi::frame_grant_residency_guest(),
-            carrick_el1_abi::cow_grant_pool_guest(), mailbox)
+        let layout = <carrick_el1::isa::x86::X86Backend as carrick_guest_arch::LayoutBackend>::KERNEL_LAYOUT;
+        let Some(venues) = carrick_el1_abi::KernelFaultVenues::derive(layout)
+            .and_then(carrick_el1_abi::KernelFaultVenues::require_upper_half)
+        else { return 7; };
+        // SAFETY: production KVM bootstrap maps and zero-initializes the
+        // retained x86 kernel region at this typed upper-half layout before
+        // admitting CPL3. The region owner keeps it live until CPU retirement.
+        let (residency, pool, mailboxes) = unsafe {
+            (
+                &*(venues.residency.raw() as *const carrick_el1_abi::FrameGrantResidencyTable),
+                &*(venues.cow_pool.raw() as *const carrick_el1_abi::CowGrantPool),
+                &*(venues.mailboxes.raw() as *const carrick_el1_abi::FrameGrantMailboxes),
+            )
+        };
+        let Some(mailbox) = mailboxes.slot(binding.cpu_slot as usize) else { return 5; };
+        serve(venues.zone, residency, pool, mailbox)
     }
 
     /// Named fail-closed leaf until x86 task signal delivery can consume an

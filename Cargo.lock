@@ -497,6 +497,7 @@ version = "0.1.0"
 dependencies = [
  "carrick-core-abi",
  "carrick-fd-core",
+ "carrick-guest-arch",
  "carrick-inotify-core",
  "carrick-mmu-core",
  "carrick-personality-linux",
