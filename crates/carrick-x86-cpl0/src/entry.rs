@@ -271,6 +271,10 @@ mod kernel {
             frame.rax = carrick_el1::isa::x86::user_access::witness(task, frame.rdi, frame.rsi);
             return;
         }
+        if frame.rax == carrick_el1::isa::x86::transport::TRANSPORT_WITNESS {
+            frame.rax = carrick_el1::isa::x86::transport::witness(frame.rdi);
+            return;
+        }
         binding.entries.fetch_add(1, Ordering::Relaxed);
         let scheduler_witness =
             binding.scheduler_witness.load(Ordering::Acquire) == super::scheduler::PROGRESS_STATE;
