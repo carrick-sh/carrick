@@ -164,12 +164,7 @@ pub(crate) fn hardware_live_ttbr() -> u64 {
     crate::isa::aarch64::hardware_live_ttbr()
 }
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-fn hardware_live_ttbr() -> u64 {
-    crate::isa::x86::unsupported_arm_descriptor_path()
-}
-
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 fn hardware_target_table_window(
     target: u64,
 ) -> Option<carrick_mmu_core::aarch64::descriptor_txn::TableWindow> {
@@ -178,7 +173,7 @@ fn hardware_target_table_window(
 
 /// Only the executing slot uses its pair, so local ASID-0 invalidation is
 /// sufficient and never flushes another executor's maintenance translations.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 struct ServiceCopyMaintenance;
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopyMaintenance {
@@ -195,16 +190,6 @@ impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopy
             }
             core::arch::asm!("dsb ish", "isb", options(nostack));
         }
-    }
-}
-
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
-impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopyMaintenance {
-    fn publish_barrier(&self) {
-        crate::isa::x86::unsupported_arm_descriptor_path();
-    }
-    fn invalidate_range(&self, _va: u64, _len: u64) {
-        crate::isa::x86::unsupported_arm_descriptor_path();
     }
 }
 
@@ -374,14 +359,14 @@ impl PreparedPageResolver for X86PreparedResolver {
     }
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub struct HardwareCowResolver {
     pub service_slot: Option<carrick_el1_abi::SlotId>,
     pub completion: Option<carrick_el1_abi::CowGrantCompletion>,
     pub publication: Option<&'static carrick_el1_abi::PortalExecutableSlot>,
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl CowResolver for HardwareCowResolver {
     fn reconcile_parent_write<
         W: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords + ?Sized,
@@ -748,7 +733,7 @@ pub trait CowCopyWindow {
 
 /// Borrow the existing slot-scoped copy aliases for one bounded owner operation.
 /// The closure cannot carry table words or copy aliases across a host supply.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub(crate) fn with_hardware_cow_venue<R>(
     ttbr0: u64,
     service_slot: Option<carrick_el1_abi::SlotId>,

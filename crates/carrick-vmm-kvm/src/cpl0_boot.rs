@@ -154,6 +154,15 @@ impl Cpl0Carrier {
 
     /// Read a stopped fixture's 4 KiB terminal descriptor.
     pub fn fixture_user_leaf(&self, va: u64) -> Result<u64, TrapError> {
+        let entry = self.fixture_user_leaf_raw(va)?;
+        if entry & 1 == 0 {
+            return Err(fail("fixture requires a present 4 KiB leaf"));
+        }
+        Ok(entry)
+    }
+
+    /// Inspect an invalid retained terminal after all fixture vCPUs stop.
+    pub fn fixture_user_leaf_raw(&self, va: u64) -> Result<u64, TrapError> {
         if !matches!(va, 0x3_0000 | 0x3_2000 | 0x3_3000 | 0x3_4000) {
             return Err(fail("fixture leaf outside admitted user page"));
         }
@@ -168,11 +177,11 @@ impl Cpl0Carrier {
             // SAFETY: the vCPUs are stopped at a fixture control exit and the
             // guest table backing remains mapped until carrier teardown.
             let entry = unsafe { ptr.read_volatile() };
-            if entry & 1 == 0 || (shift == 30 || shift == 21) && entry & (1 << 7) != 0 {
-                return Err(fail("fixture requires a present 4 KiB leaf"));
-            }
             if shift == 12 {
                 return Ok(entry);
+            }
+            if entry & 1 == 0 || (shift == 30 || shift == 21) && entry & (1 << 7) != 0 {
+                return Err(fail("fixture requires a present 4 KiB leaf"));
             }
             table = entry & 0x000f_ffff_ffff_f000;
         }
