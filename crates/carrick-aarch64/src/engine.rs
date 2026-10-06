@@ -3553,6 +3553,39 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         Ok(())
     }
 
+    /// Copy Carrick-owned bytes through already-published stage-1 backing.
+    /// The caller separately proves either legacy backing authority or an
+    /// exact host reservation that excludes guest execution for the range.
+    fn write_existing_backing_unchecked(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        let length = bytes.len();
+        let mut copied = 0usize;
+        while copied < length {
+            let report_fault = |phase, error: MemoryError| {
+                carrick_observability::probes::guest_internal_write_fault(
+                    address,
+                    length as u64,
+                    phase,
+                    &error.to_string(),
+                );
+                error
+            };
+            let (va, ipa, chunk_len) = self
+                .syscall_buffer_chunk(address, copied, length)
+                .map_err(|error| report_fault(0, error))?;
+            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::PrivilegedInternal)
+                .map_err(|error| report_fault(1, error))?;
+            self.vm
+                .translated_write_unchecked(va, ipa.raw(), &bytes[copied..copied + chunk_len])
+                .map_err(|error| report_fault(2, error))?;
+            copied += chunk_len;
+        }
+        Ok(())
+    }
+
     fn prepare_owner_write(
         &self,
         ranges: &[carrick_guest_mem::GuestWriteRange],
@@ -4002,29 +4035,18 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // default `write_bytes_unchecked` doesn't gate either). The translated IPA
         // resolves a `repoint_private` overlay to the private backing.
         self.commit_prepared_host_write(address, bytes.len(), false)?;
-        let length = bytes.len();
-        let mut copied = 0usize;
-        while copied < length {
-            let report_fault = |phase, error: MemoryError| {
-                carrick_observability::probes::guest_internal_write_fault(
-                    address,
-                    length as u64,
-                    phase,
-                    &error.to_string(),
-                );
-                error
-            };
-            let (va, ipa, chunk_len) = self
-                .syscall_buffer_chunk(address, copied, length)
-                .map_err(|error| report_fault(0, error))?;
-            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::PrivilegedInternal)
-                .map_err(|error| report_fault(1, error))?;
-            self.vm
-                .translated_write_unchecked(va, ipa.raw(), &bytes[copied..copied + chunk_len])
-                .map_err(|error| report_fault(2, error))?;
-            copied += chunk_len;
+        self.write_existing_backing_unchecked(address, bytes)
+    }
+
+    fn write_owner_reserved_bytes(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        if self.protections.owner().is_none() {
+            return self.write_bytes_unchecked(address, bytes);
         }
-        Ok(())
+        self.write_existing_backing_unchecked(address, bytes)
     }
 
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {

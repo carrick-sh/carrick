@@ -1334,6 +1334,21 @@ impl MemState {
         )
     }
 
+    /// Whether the current host mapping syscall owns an opaque reservation
+    /// covering this range. Backend preparation may write Carrick-owned file
+    /// content through the owner lane while the placeholder prevents
+    /// guest-visible access; settlement mirrors the final host mapping.
+    pub(in crate::dispatch::mem) fn owner_venue_reserves(&self, start: u64, end: u64) -> bool {
+        let AnonymousAuthority::Delegated(delegated) = &self.anonymous else {
+            return false;
+        };
+        matches!(
+            delegated.venue,
+            Some(HostVenue::Reserved(range))
+                if range.start() <= start && end <= range.end()
+        )
+    }
+
     fn open_venue(&mut self, venue: HostVenue) {
         let AnonymousAuthority::Delegated(delegated) = &mut self.anonymous else {
             broken_root("a host venue on a host-setup MM", Refusal::Stale);
