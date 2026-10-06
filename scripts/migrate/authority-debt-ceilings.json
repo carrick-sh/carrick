@@ -4071,6 +4071,13 @@
     {
       "family": "global_config_debug",
       "operation": "global:env_var_os",
+      "owner": "carrick_runtime::vcpu_loop::ThreadRuntimeState<E>::new::CARRICK_TRACE_TRAPS",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "global_config_debug",
+      "operation": "global:env_var_os",
       "owner": "carrick_runtime::vcpu_loop::crash::ThreadRuntimeState<E>::capture_core_for_publication::CARRICK_CORE_FAILPOINT",
       "lane": "shared",
       "ceiling": 10
