@@ -2502,3 +2502,50 @@ fn restricted_dialect_absolute_providers_prove_helpers_despite_globs() {
         restricted_dialect_error(source, "unresolved derive helper");
     }
 }
+
+#[test]
+fn restricted_dialect_external_module_selection_is_rejected() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    std::fs::create_dir_all(src.join("parent")).unwrap();
+    write_source(
+        src.join("lib.rs"),
+        r#"
+macro_rules! retirement_wrap_module { ($item:item) => { mod parent { $item } }; }
+retirement_wrap_module! { mod hidden; }
+#[cfg(test)] #[path="parent/hidden.rs"] mod test_copy;
+"#,
+    )
+    .unwrap();
+    write_source(src.join("hidden.rs"), "fn harmless() {}").unwrap();
+    write_source(
+        src.join("parent/hidden.rs"),
+        "fn hidden(table: &Table) { table.read_open_files(); }",
+    )
+    .unwrap();
+    assert_dialect_rejection(
+        root.path(),
+        "module selection in macro input is unsupported",
+    );
+    for declaration in [
+        "macro_rules! pass { (@ $item:item) => { $item }; } pass! { @ mod hidden; }",
+        "macro_rules! retirement_bind_module { ($name:ident) => { mod $name; }; } retirement_bind_module!(hidden);",
+    ] {
+        let root = source_fixture();
+        let src = root.path().join("crates/carrick-kernel/src");
+        write_source(
+            src.join("lib.rs"),
+            format!("{declaration}\n#[cfg(test)] #[path=\"hidden.rs\"] mod test_copy;"),
+        )
+        .unwrap();
+        write_source(
+            src.join("hidden.rs"),
+            "fn hidden(table: &Table) { table.read_open_files(); }",
+        )
+        .unwrap();
+        assert_dialect_rejection(
+            root.path(),
+            "module selection in macro input is unsupported",
+        );
+    }
+}
