@@ -106,7 +106,7 @@ pub fn restore_native_context(
 }
 
 /// Exact shared-record identity and its expected address owner. Machine state
-/// lives only in ZoneRecord<ParkedContextWords>, never in this witness.
+/// lives only in `ZoneRecord<ParkedContextWords>`, never in this witness.
 #[repr(C)]
 pub struct ContextBinding {
     pub record: RecordRef,
