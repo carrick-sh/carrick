@@ -9,6 +9,9 @@ pub enum LifecycleCall {
     SetRobustList,
     GetTid,
     Clone,
+    Fork,
+    Wait4,
+    ExitGroup,
 }
 
 /// A primitive returns data, never an entry completion or a final frame write.
@@ -119,6 +122,22 @@ pub trait LifecycleNative<'a>: UserCopy {
     fn run_next(&mut self, timeout_result: SyscallResult) -> (Served, SyscallResult);
     fn result(&self) -> SyscallResult;
     fn set_result(&mut self, result: SyscallResult);
+    /// Native custody for a process fork. The shared owner selects this only
+    /// for an x86 process call with an admitted guest process venue.
+    fn process_fork(&mut self) -> Option<LifecycleOutcome> {
+        None
+    }
+    fn process_wait4(
+        &mut self,
+        _pid: u64,
+        _status: UserVa,
+        _options: u64,
+    ) -> Option<LifecycleOutcome> {
+        None
+    }
+    fn process_exit_group(&mut self, _status: u8) -> Option<LifecycleOutcome> {
+        None
+    }
 }
 /// Linux aarch64 syscall numbers served here (`SYS_SET_ROBUST_LIST` is the
 /// shared canonical number from [`crate::thread`]).
@@ -215,6 +234,14 @@ pub fn invoke<'a>(
             native.register_robust_list(args[0], args[1])?,
             false,
         ));
+    }
+    match call {
+        LifecycleCall::Fork => return native.process_fork(),
+        LifecycleCall::Wait4 => {
+            return native.process_wait4(args[0], UserVa::new(args[1]), args[2]);
+        }
+        LifecycleCall::ExitGroup => return native.process_exit_group(args[0] as u8),
+        _ => {}
     }
     let thread = native.thread().or_else(|| {
         if call == LifecycleCall::Exit {
