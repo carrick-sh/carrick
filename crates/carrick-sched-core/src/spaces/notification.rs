@@ -4,7 +4,7 @@ use crate::object_wait::{
     BorrowedObjectNotificationSource, ObjectNotificationTicket, ObjectWaitError, ObjectWaitKey,
     ObjectWaitSnapshot, OwnedObjectWakeEffects,
 };
-use crate::{LockWait, Waker, ZoneTables};
+use crate::{LockWait, ThreadCtx, Waker, ZoneTables};
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -35,13 +35,13 @@ pub struct SpaceNotificationIdentity {
     pub incarnation: NonZeroU64,
 }
 #[derive(Clone, Copy)]
-pub struct SpaceReleaseVenue<'a> {
-    pub zone: &'a ZoneTables,
+pub struct SpaceReleaseVenue<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
+    pub zone: &'a ZoneTables<C>,
     pub waker: Waker,
-    pub deliver: for<'z> fn(&'z ZoneTables, Waker, OwnedObjectWakeEffects<'z>),
+    pub deliver: for<'z> fn(&'z ZoneTables<C>, Waker, OwnedObjectWakeEffects<'z, C>),
 }
-impl SpaceReleaseVenue<'_> {
-    pub fn publish(self, ticket: ObjectNotificationTicket<'_>) {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> SpaceReleaseVenue<'_, C> {
+    pub fn publish(self, ticket: ObjectNotificationTicket<'_, C>) {
         ticket.publish(self.waker, &|effects| {
             (self.deliver)(self.zone, self.waker, effects)
         });
@@ -123,7 +123,11 @@ impl NotificationSource {
             incarnation: NonZeroU64::new(self.incarnation.load(Ordering::Acquire))?,
         })
     }
-    fn release(&self, zone: &ZoneTables, index: SpaceIndex) {
+    fn release<C: Copy + Send + Sync + zerocopy::FromZeros>(
+        &self,
+        zone: &ZoneTables<C>,
+        index: SpaceIndex,
+    ) {
         let previous = self.state.fetch_sub(1, Ordering::AcqRel);
         assert!(previous & COUNT != 0, "notification admission underflow");
         if previous & COUNT == 1 {
@@ -131,7 +135,11 @@ impl NotificationSource {
             self.finish_entry_retirement(&zone.spaces, index);
         }
     }
-    fn finish(&self, zone: &ZoneTables, index: SpaceIndex) {
+    fn finish<C: Copy + Send + Sync + zerocopy::FromZeros>(
+        &self,
+        zone: &ZoneTables<C>,
+        index: SpaceIndex,
+    ) {
         let state = self.state.load(Ordering::Acquire);
         if state & COUNT != 0 || state & (BINDING | FINISHING) != 0 || state & CLOSING == 0 {
             return;
@@ -165,12 +173,12 @@ fn notification_key(index: SpaceIndex, incarnation: u64, cause: SpaceWaitCause) 
 /// Zone-bound membership. The index is discovered from the exact live MM;
 /// callers cannot transplant an index or pair it with another zone.
 #[derive(Clone, Copy)]
-pub struct SpaceEntryHandle<'a> {
-    zone: &'a ZoneTables,
+pub struct SpaceEntryHandle<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
+    zone: &'a ZoneTables<C>,
     index: SpaceIndex,
     mm: NonZeroU64,
 }
-impl<'a> SpaceEntryHandle<'a> {
+impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEntryHandle<'a, C> {
     pub fn index(self) -> SpaceIndex {
         self.index
     }
@@ -193,8 +201,8 @@ impl<'a> SpaceEntryHandle<'a> {
     pub fn admit_notifications(
         self,
         incarnation: NonZeroU64,
-        wait: &impl LockWait,
-        completion: &dyn Fn(OwnedObjectWakeEffects),
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<(), ObjectWaitError> {
         self.zone.admit_space_notifications(
             self.index,
@@ -206,14 +214,14 @@ impl<'a> SpaceEntryHandle<'a> {
     pub fn notifications(
         self,
         incarnation: NonZeroU64,
-    ) -> Result<SpaceNotificationLease<'a>, ObjectWaitError> {
+    ) -> Result<SpaceNotificationLease<'a, C>, ObjectWaitError> {
         self.zone
             .borrow_space_notifications(self.index, self.identity(incarnation))
     }
     /// Retire a closed entry without waiting for already admitted source
     /// borrowers. The last borrower owns cleanup; publication skips it until
     /// that unique cleanup finishes.
-    pub fn retire_entry(self, venue: SpaceReleaseVenue<'_>) {
+    pub fn retire_entry(self, venue: SpaceReleaseVenue<'_, C>) {
         assert!(
             core::ptr::eq(venue.zone, self.zone),
             "retirement source zone"
@@ -253,7 +261,7 @@ impl<'a> SpaceEntryHandle<'a> {
     pub fn close_notifications(
         self,
         incarnation: NonZeroU64,
-        venue: SpaceReleaseVenue<'_>,
+        venue: SpaceReleaseVenue<'_, C>,
     ) -> Result<(), ObjectWaitError> {
         assert!(core::ptr::eq(venue.zone, self.zone), "closing source zone");
         self.zone
@@ -262,12 +270,12 @@ impl<'a> SpaceEntryHandle<'a> {
 }
 /// Private release custody: even unwinding while constructing several
 /// publications unlocks the protected resource before any receipt is dropped.
-struct ResourceRelease<'a, 'z, 'c> {
+struct ResourceRelease<'a, 'z, 'c, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     word: &'a AtomicU64,
     unlocked: ResourceUnlocked,
-    publications: [Option<crate::object_wait::ObjectNotificationPublication<'z, 'c>>; 6],
+    publications: [Option<crate::object_wait::ObjectNotificationPublication<'z, 'c, C>>; 6],
 }
-impl Drop for ResourceRelease<'_, '_, '_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for ResourceRelease<'_, '_, '_, C> {
     fn drop(&mut self) {
         self.word.store(self.unlocked.word(), Ordering::SeqCst);
         for publication in &mut self.publications {
@@ -279,19 +287,20 @@ impl Drop for ResourceRelease<'_, '_, '_> {
 }
 /// Non-owning view licensed by a counted live-source admission. Its Drop can
 /// complete retirement but never reconstructs or decrements a base pin twice.
-pub struct SpaceNotificationLease<'a> {
-    zone: &'a ZoneTables,
+pub struct SpaceNotificationLease<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
+    zone: &'a ZoneTables<C>,
     index: SpaceIndex,
     source: &'a NotificationSource,
     identity: SpaceNotificationIdentity,
 }
-impl<'a> SpaceNotificationLease<'a> {
-    fn publish_terminal(self, venue: SpaceReleaseVenue<'_>) {
+impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceNotificationLease<'a, C> {
+    fn publish_terminal(self, venue: SpaceReleaseVenue<'_, C>) {
         // CLOSING is already visible: this edge means the exact source is
         // unavailable, not that a resource is ready for another attempt.
         // Retain all receipts before the first callback can run.
-        let complete =
-            |effects: OwnedObjectWakeEffects<'_>| (venue.deliver)(venue.zone, venue.waker, effects);
+        let complete = |effects: OwnedObjectWakeEffects<'_, C>| {
+            (venue.deliver)(venue.zone, venue.waker, effects)
+        };
         let publications = SpaceWaitCause::ALL
             .map(|cause| self.reserve(cause).advance_revision(venue.waker, &complete));
         for publication in publications {
@@ -312,7 +321,7 @@ impl<'a> SpaceNotificationLease<'a> {
     pub fn key(&self, cause: SpaceWaitCause) -> ObjectWaitKey {
         notification_key(self.index, self.identity.incarnation.get(), cause)
     }
-    pub fn reserve(&self, cause: SpaceWaitCause) -> ObjectNotificationTicket<'a> {
+    pub fn reserve(&self, cause: SpaceWaitCause) -> ObjectNotificationTicket<'a, C> {
         // This view's lifetime is bounded by the live admission below. No
         // owning source reconstruction, queue admission or lock acquisition.
         BorrowedObjectNotificationSource::from_live_admission(self.zone, self.key(cause), self)
@@ -326,7 +335,7 @@ impl<'a> SpaceNotificationLease<'a> {
     /// all protected mutation. It must not unlock or access that resource again.
     pub unsafe fn release_retiring_resource(
         &self,
-        venue: SpaceReleaseVenue<'_>,
+        venue: SpaceReleaseVenue<'_, C>,
         word: &AtomicU64,
         unlocked: ResourceUnlocked,
     ) {
@@ -346,7 +355,7 @@ impl<'a> SpaceNotificationLease<'a> {
     /// protected data before calling and must not unlock a second time.
     pub unsafe fn release_resource(
         &self,
-        venue: SpaceReleaseVenue<'_>,
+        venue: SpaceReleaseVenue<'_, C>,
         word: &AtomicU64,
         unlocked: ResourceUnlocked,
         causes: &[SpaceWaitCause],
@@ -355,7 +364,7 @@ impl<'a> SpaceNotificationLease<'a> {
             core::ptr::eq(venue.zone, self.zone),
             "release belongs to exact source zone"
         );
-        let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_>| {
+        let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_, C>| {
             (venue.deliver)(venue.zone, venue.waker, effects)
         };
         let mut release = ResourceRelease {
@@ -384,13 +393,13 @@ impl<'a> SpaceNotificationLease<'a> {
         self.zone.notification_snapshot(self.key(cause))
     }
 }
-impl Drop for SpaceNotificationLease<'_> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceNotificationLease<'_, C> {
     fn drop(&mut self) {
         self.source.release(self.zone, self.index);
     }
 }
-impl ZoneTables {
-    pub fn space_entry(&self, mm: NonZeroU64) -> Option<SpaceEntryHandle<'_>> {
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
+    pub fn space_entry(&self, mm: NonZeroU64) -> Option<SpaceEntryHandle<'_, C>> {
         self.spaces.find(mm.get()).map(|index| SpaceEntryHandle {
             zone: self,
             index,
@@ -405,8 +414,8 @@ impl ZoneTables {
         &self,
         index: SpaceIndex,
         identity: SpaceNotificationIdentity,
-        wait: &impl LockWait,
-        completion: &dyn Fn(OwnedObjectWakeEffects),
+        wait: &impl LockWait<C>,
+        completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
     ) -> Result<(), ObjectWaitError> {
         let entry = self.spaces.entry(index);
         if self.spaces.key(index) != identity.mm.get() {
@@ -423,7 +432,7 @@ impl ZoneTables {
             {
                 return Err(ObjectWaitError::Stale);
             }
-            let mut pins: [Option<crate::object_wait::ObjectNotificationSource<'_>>; 6] =
+            let mut pins: [Option<crate::object_wait::ObjectNotificationSource<'_, C>>; 6] =
                 core::array::from_fn(|_| None);
             for (at, cause) in SpaceWaitCause::ALL.into_iter().enumerate() {
                 let key = notification_key(index, identity.incarnation.get(), cause);
@@ -461,7 +470,7 @@ impl ZoneTables {
         &self,
         index: SpaceIndex,
         identity: SpaceNotificationIdentity,
-    ) -> Result<SpaceNotificationLease<'_>, ObjectWaitError> {
+    ) -> Result<SpaceNotificationLease<'_, C>, ObjectWaitError> {
         let source = &self.spaces.entry(index).notifications;
         if source.retirement.load(Ordering::Acquire) != 0 {
             return Err(ObjectWaitError::Stale);
@@ -489,7 +498,7 @@ impl ZoneTables {
         &self,
         index: SpaceIndex,
         identity: SpaceNotificationIdentity,
-        venue: SpaceReleaseVenue<'_>,
+        venue: SpaceReleaseVenue<'_, C>,
     ) -> Result<(), ObjectWaitError> {
         if self.spaces.gate(index) & super::GATE_CLOSED == 0
             || self.spaces.active_editor(index).is_some()
@@ -505,7 +514,7 @@ impl ZoneTables {
         &self,
         index: SpaceIndex,
         mm: u64,
-    ) -> Option<SpaceNotificationLease<'_>> {
+    ) -> Option<SpaceNotificationLease<'_, C>> {
         let source = &self.spaces.entry(index).notifications;
         if !source.attached() {
             return None;

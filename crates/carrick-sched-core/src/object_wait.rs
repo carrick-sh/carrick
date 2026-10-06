@@ -475,11 +475,13 @@ impl<'scope, 'zone, C: Copy + Send + Sync + zerocopy::FromZeros>
     }
 }
 
-impl<'scope, 'zone> BorrowedObjectNotificationSource<'scope, 'zone> {
+impl<'scope, 'zone, C: Copy + Send + Sync + zerocopy::FromZeros>
+    BorrowedObjectNotificationSource<'scope, 'zone, C>
+{
     pub(crate) fn from_live_admission(
-        zone: &'zone ZoneTables,
+        zone: &'zone ZoneTables<C>,
         key: ObjectWaitKey,
-        _admission: &'scope crate::spaces::notification::SpaceNotificationLease<'zone>,
+        _admission: &'scope crate::spaces::notification::SpaceNotificationLease<'zone, C>,
     ) -> Self {
         Self {
             zone,
