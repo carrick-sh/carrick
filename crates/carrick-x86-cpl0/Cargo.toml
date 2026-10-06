@@ -15,7 +15,13 @@ carrick-core = { path = "../carrick-core" }
 
 [[bin]]
 name = "carrick-x86-cpl0"
-path = "src/entry.rs"
+path = "src/production.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "carrick-x86-cpl0-fixture"
+path = "src/fixture.rs"
 test = false
 bench = false
 

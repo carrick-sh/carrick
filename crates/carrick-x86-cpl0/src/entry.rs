@@ -1,9 +1,30 @@
-//! Thin native entry into Carrick's common in-guest Linux personality.
-#![cfg_attr(target_os = "none", no_std)]
-#![cfg_attr(target_os = "none", no_main)]
+// Thin native entry into Carrick's common in-guest Linux personality.
+// Included by both the production and fixture binaries.
+// Architecture-specific crate attributes belong to their wrappers.
 
 #[cfg(not(target_os = "none"))]
 fn main() {}
+
+// Cargo compiles this source as two distinct targets. The fixture target is
+// the only image that can dispatch synthetic observation syscalls. The const
+// predicate is folded before production linking, so those leaves are absent
+// from the ordinary carrick-x86-cpl0 image.
+#[cfg(target_os = "none")]
+const fn fixture_image() -> bool {
+    let name = env!("CARGO_BIN_NAME").as_bytes();
+    let fixture = b"carrick-x86-cpl0-fixture";
+    if name.len() != fixture.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < name.len() {
+        if name[i] != fixture[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
 
 // Linked cores expose allocation-capable APIs, but this fixture consumes
 // preprovisioned records and contexts. No native heap owner is published.
@@ -257,7 +278,7 @@ mod kernel {
                 halt();
             }
         }
-        if frame.rax == OBSERVE_NATIVE {
+        if crate::fixture_image() && frame.rax == OBSERVE_NATIVE {
             doorbell(CONTROL_PORT, frame);
             frame.rax = 0;
             return;
@@ -267,19 +288,23 @@ mod kernel {
         let task = unsafe { &*(binding.task_address as *const CurrentTask) };
         let counters = unsafe { &*(binding.counters_address as *const Counters) };
         let _user_fault_gate = super::user_fault_gate::install();
-        if frame.rax == carrick_el1::isa::x86::user_access::USER_ACCESS_WITNESS {
+        if crate::fixture_image()
+            && frame.rax == carrick_el1::isa::x86::user_access::USER_ACCESS_WITNESS {
             frame.rax = carrick_el1::isa::x86::user_access::witness(task, frame.rdi, frame.rsi);
             return;
         }
-        if frame.rax == carrick_el1::isa::x86::transport::TRANSPORT_WITNESS {
+        if crate::fixture_image()
+            && frame.rax == carrick_el1::isa::x86::transport::TRANSPORT_WITNESS {
             frame.rax = carrick_el1::isa::x86::transport::witness(frame.rdi);
             return;
         }
-        if frame.rax == carrick_el1::isa::x86::context::CONTEXT_WITNESS {
+        if crate::fixture_image()
+            && frame.rax == carrick_el1::isa::x86::context::CONTEXT_WITNESS {
             frame.rax = carrick_el1::isa::x86::context::witness(frame.rdi);
             return;
         }
-        if frame.rax == carrick_el1::isa::x86::interrupt::INTERRUPT_WITNESS {
+        if crate::fixture_image()
+            && frame.rax == carrick_el1::isa::x86::interrupt::INTERRUPT_WITNESS {
             frame.rax = carrick_el1::isa::x86::interrupt::witness(frame.rdi, frame.rsi);
             return;
         }
