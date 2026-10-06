@@ -80,6 +80,302 @@ fn x86_maintenance_reads_only_an_invalid_retired_leaf() {
     );
 }
 
+struct X86RetiredOwner;
+impl carrick_core::mm::cow::OwnerCowMmu for X86RetiredOwner {
+    const CARRIER_MAINT_ROOT_BASE: u64 = 0;
+    const DEFAULT_COW_COPY_BASE: u64 = 0;
+
+    fn classify_cow_write<
+        W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords + ?Sized,
+    >(
+        _: &W,
+        _: u64,
+        _: u64,
+        _: bool,
+    ) -> carrick_core::mm::cow::CowClassifyOutcome {
+        carrick_core::mm::cow::CowClassifyOutcome::Declined(carrick_el1_abi::CowDecline::Unmapped)
+    }
+
+    fn plan_cow_repoint<W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords + ?Sized>(
+        words: &W,
+        root: u64,
+        op: carrick_core::mm::cow::CowRepointOp,
+    ) -> bool {
+        use carrick_guest_arch::{FrameGpa, RootGpa};
+        use carrick_mmu_core::x86::descriptor_txn::{
+            DescriptorOp, DescriptorTxn, DescriptorTxnId, PageSpan, plan_descriptor_txn,
+        };
+        let root = RootGpa::page_aligned(FrameGpa::new(root)).unwrap();
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: NonZeroU64::new(op.mm_key).unwrap(),
+                generation: NonZeroU64::new(op.grant_epoch).unwrap(),
+            },
+            root,
+            op: DescriptorOp::CowRepoint {
+                span: PageSpan::new(op.va, op.len),
+                old: FrameGpa::new(op.old_ipa),
+                new: FrameGpa::new(op.new_ipa),
+                backing: op.backing,
+            },
+            tables: &[],
+        };
+        plan_descriptor_txn(words, &txn, root).is_ok()
+    }
+
+    fn with_copy_aliases<
+        W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords + ?Sized,
+        F: FnMut(u64, u64),
+    >(
+        _: &W,
+        _: u64,
+        _: u64,
+        source: u64,
+        destination: u64,
+        effect: &mut F,
+    ) -> Result<(), carrick_core::mm::cow::CowRepointOutcome> {
+        effect(source, destination);
+        Ok(())
+    }
+
+    fn execute_cow_repoint<
+        W: carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords + ?Sized,
+    >(
+        words: &W,
+        root: u64,
+        op: carrick_core::mm::cow::CowRepointOp,
+    ) -> carrick_core::mm::cow::CowRepointOutcome {
+        use carrick_core::mm::cow::CowRepointOutcome;
+        use carrick_guest_arch::{FrameGpa, RootGpa};
+        use carrick_mmu_core::x86::descriptor_txn::{
+            DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, InlineJournal,
+            PageSpan, execute_descriptor_txn,
+        };
+        let root = RootGpa::page_aligned(FrameGpa::new(root)).unwrap();
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: NonZeroU64::new(op.mm_key).unwrap(),
+                generation: NonZeroU64::new(op.grant_epoch).unwrap(),
+            },
+            root,
+            op: DescriptorOp::CowRepoint {
+                span: PageSpan::new(op.va, op.len),
+                old: FrameGpa::new(op.old_ipa),
+                new: FrameGpa::new(op.new_ipa),
+                backing: op.backing,
+            },
+            tables: &[],
+        };
+        match execute_descriptor_txn(words, &txn, root, &mut InlineJournal::new()).outcome {
+            DescriptorOutcome::Applied { .. } => CowRepointOutcome::Applied {
+                flush_required: false,
+            },
+            DescriptorOutcome::Refused(_) => CowRepointOutcome::Refused,
+            DescriptorOutcome::RolledBack(_) => CowRepointOutcome::RolledBack,
+            DescriptorOutcome::Indeterminate(_) => CowRepointOutcome::Indeterminate,
+        }
+    }
+}
+
+#[test]
+fn x86_pending_brk_maintenance_scrubs_private_grant_and_keeps_leaf_invalid() {
+    use crate::memory::reservations::{Decision, RootReleaseVenue};
+    use carrick_core::mm::cow::{CowCopyWindow, GuestCowVenue};
+    use carrick_el1_abi::{
+        PortalBackingMaintenance, ReservationBackingReceipt, ReservationCompletion,
+    };
+    use carrick_mmu_core::aarch64::SubstrateGpa;
+    use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, RETIRED};
+    let region = Region::new();
+    let zone = region.zone();
+    let mm = admit_notified(&region, 77, ROOT, 1, 0);
+    let peer_mm = admit_notified(&region, 78, ROOT + 0x100000, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &zone.spaces, &view)
+        .with_zone(zone)
+        .unwrap()
+        .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
+    let handle = portal.admitted_handle(mm, 0).unwrap();
+    let tables = Tables::new(ROOT, IPA, 0);
+    for (entry, offset) in [(0, 4096), (512, 8192), (1024, 12288)] {
+        tables.words[entry].store((ROOT + offset) | PRESENT | WRITE | USER, Ordering::Release);
+    }
+    tables.words[1538].store(IPA | RETIRED | USER, Ordering::Release);
+    let peer_tables = Tables::new(ROOT + 0x100000, IPA, 0);
+    for (entry, offset) in [(0, 4096), (512, 8192), (1024, 12288)] {
+        peer_tables.words[entry].store(
+            (peer_tables.base + offset) | PRESENT | WRITE | USER,
+            Ordering::Release,
+        );
+    }
+    peer_tables.words[1538].store(IPA | PRESENT | USER, Ordering::Release);
+    {
+        let mut root = portal.root(mm, 1).unwrap();
+        let Decision::Work(grow) = root.brk(0x3000).unwrap() else {
+            panic!("heap growth proposal");
+        };
+        // SAFETY: the fixture has installed the owned backing under this root.
+        root.complete(unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                grow,
+                ReservationBackingReceipt {
+                    receipt: 1,
+                    granted_bytes: 8192,
+                    returned_bytes: 0,
+                },
+            )
+            .unwrap()
+        })
+        .unwrap();
+    }
+    let index = zone.spaces.find(mm.raw()).unwrap();
+    let access = portal.space_access(1).unwrap();
+    access.raise(index);
+    let pending = {
+        let venue = RootReleaseVenue::new(region.table(), access.venue().unwrap()).unwrap();
+        let mut root = venue
+            .lock_resolved(
+                index.index(),
+                mm,
+                &view,
+                &crate::memory::reservations::NoRootWait,
+            )
+            .unwrap();
+        root.begin_host_proposal().unwrap();
+        let Decision::Work(shrink) = root.brk(0x2000).unwrap() else {
+            panic!("pending shrink proposal");
+        };
+        shrink
+    };
+    let request = PortalBackingMaintenance::new(handle, pending, 0x2000).unwrap();
+    let arenas = [&tables];
+    let words = X86ForkWords { arenas: &arenas };
+    let pool = carrick_el1_abi::CowGrantPool::new();
+    let resident = residency();
+    let venue = GuestCowVenue::<X86RetiredOwner, _> {
+        words: &words,
+        root: SubstrateGpa(ROOT),
+        pool: &pool,
+        residency: &resident,
+        copy_window: CowCopyWindow::target(&words, SubstrateGpa(ROOT)),
+        publish_executable: None,
+    };
+    assert_eq!(
+        portal
+            .begin_backing_maintenance(request, 0)
+            .unwrap()
+            .scrub_retired_x86(
+                &venue,
+                |_, _| panic!("no grant must not copy"),
+                || panic!("fatal")
+            )
+            .unwrap(),
+        BackingMaintenanceProgress::Supply
+    );
+    let nz = |value| NonZeroU64::new(value).unwrap();
+    let aliased = pool
+        .publish(
+            mm.raw(),
+            IPA,
+            carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                frame_id: nz(20),
+                mapping_id: nz(21),
+                owner_generation: nz(22),
+                inventory_revision: nz(23),
+            },
+        )
+        .unwrap();
+    assert!(
+        portal
+            .begin_backing_maintenance(request, 0)
+            .unwrap()
+            .scrub_retired_x86(
+                &venue,
+                |_, _| panic!("shared predecessor must not be zeroed"),
+                || panic!("fatal"),
+            )
+            .is_err()
+    );
+    {
+        let excluded = access.raise_and_wait_for_editor(index, || panic!("editor did not drain"));
+        assert!(pool.revoke(&excluded, &aliased));
+    }
+    access.lower(index);
+    let grant = pool
+        .publish(
+            mm.raw(),
+            IPA + 0x100000,
+            carrick_mmu_core::aarch64::descriptor_txn::BackingIdentity {
+                frame_id: nz(10),
+                mapping_id: nz(11),
+                owner_generation: nz(12),
+                inventory_revision: nz(13),
+            },
+        )
+        .unwrap();
+    let predecessor = [0xa5u8; 4096];
+    let mut replacement = [0xcdu8; 4096];
+    assert_eq!(
+        portal
+            .begin_backing_maintenance(request, 0)
+            .unwrap()
+            .scrub_retired_x86(
+                &venue,
+                |source, destination| {
+                    assert_eq!((source, destination), (IPA, grant.physical_ipa));
+                    assert_eq!(tables.words[1538].load(Ordering::Acquire) & PRESENT, 0);
+                    replacement.fill(0);
+                },
+                || panic!("fatal"),
+            )
+            .unwrap(),
+        BackingMaintenanceProgress::Complete { next: 0x3000 }
+    );
+    assert_eq!(
+        tables.words[1538].load(Ordering::Acquire) & ADDRESS,
+        grant.physical_ipa
+    );
+    assert_eq!(tables.words[1538].load(Ordering::Acquire) & PRESENT, 0);
+    assert_eq!(predecessor, [0xa5; 4096]);
+    assert_eq!(replacement, [0; 4096]);
+    assert_eq!(
+        peer_tables.words[1538].load(Ordering::Acquire) & (ADDRESS | PRESENT),
+        IPA | PRESENT,
+        "the other live MM retains the predecessor"
+    );
+    assert!(zone.spaces.find(peer_mm.raw()).is_some());
+    let completions: Vec<_> = {
+        let excluded = access.raise_and_wait_for_editor(index, || panic!("editor did not drain"));
+        pool.completions(&excluded).collect()
+    };
+    assert_eq!(completions.len(), 1);
+    assert_eq!(
+        completions[0].purpose,
+        carrick_el1_abi::CowGrantPurpose::RetiredBacking
+    );
+    assert_eq!(completions[0].old_ipa, IPA);
+    assert_eq!(completions[0].new_ipa, grant.physical_ipa);
+    portal
+        .root(mm, 1)
+        .unwrap()
+        // SAFETY: the invalid retained leaf has been privately zeroed and
+        // repointed under the exact admitted maintenance editor above.
+        .complete(unsafe {
+            ReservationCompletion::after_descriptor_and_backing_commit(
+                pending,
+                ReservationBackingReceipt {
+                    receipt: 2,
+                    granted_bytes: 4096,
+                    returned_bytes: 4096,
+                },
+            )
+            .unwrap()
+        })
+        .unwrap();
+    assert!(portal.begin_backing_maintenance(request, 0).is_err());
+    access.lower(index);
+}
+
 #[test]
 fn x86_owner_fork_arms_private_parent_and_restores_on_abort() {
     use carrick_el1_abi::{
