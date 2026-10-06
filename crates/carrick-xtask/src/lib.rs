@@ -1,4 +1,5 @@
 pub mod accept;
+pub mod asm_diff;
 mod atomic_file;
 pub mod ci_scaler;
 pub mod cli;

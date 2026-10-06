@@ -9145,3 +9145,117 @@ mod kernel_only_range_tests {
         ));
     }
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn aarch64_syscall_mailbox() {
+        assert_eq!(
+            (
+                size_of::<Aarch64SyscallMailbox>(),
+                align_of::<Aarch64SyscallMailbox>()
+            ),
+            (256, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |Aarch64SyscallMailbox {
+                     magic: _,
+                     version: _,
+                     size: _,
+                     generation: _,
+                     sequence: _,
+                     state: _,
+                     trap_kind: _,
+                     response_action: _,
+                     flags: _,
+                     native_nr: _,
+                     args: _,
+                     portal_quantum_epoch: _,
+                     resume_pc: _,
+                     spsr: _,
+                     fp: _,
+                     lr: _,
+                     sp: _,
+                     esr: _,
+                     return_value: _,
+                     resume_x16: _,
+                     resume_x17: _,
+                     clock_x9: _,
+                     clock_x10: _,
+                     clock_x11: _,
+                     clock_x12: _,
+                     clock_tmp_x16: _,
+                     clock_tmp_x17: _,
+                     portal_executor_generation: _,
+                     portal_task_serial: _,
+                     portal_mm_generation: _,
+                 }: Aarch64SyscallMailbox| {};
+        field!(Aarch64SyscallMailbox, magic, u64, 0, 8, 8);
+        field!(Aarch64SyscallMailbox, version, u32, 8, 4, 4);
+        field!(Aarch64SyscallMailbox, size, u32, 12, 4, 4);
+        field!(Aarch64SyscallMailbox, generation, u64, 16, 8, 8);
+        field!(Aarch64SyscallMailbox, sequence, u64, 24, 8, 8);
+        field!(
+            Aarch64SyscallMailbox,
+            state,
+            std::sync::atomic::AtomicU32,
+            32,
+            4,
+            4
+        );
+        field!(Aarch64SyscallMailbox, trap_kind, u32, 36, 4, 4);
+        field!(Aarch64SyscallMailbox, response_action, u32, 40, 4, 4);
+        field!(Aarch64SyscallMailbox, flags, u32, 44, 4, 4);
+        field!(Aarch64SyscallMailbox, native_nr, u64, 48, 8, 8);
+        field!(Aarch64SyscallMailbox, args, [u64; 6], 56, 48, 8);
+        field!(Aarch64SyscallMailbox, portal_quantum_epoch, u64, 104, 8, 8);
+        field!(Aarch64SyscallMailbox, resume_pc, u64, 112, 8, 8);
+        field!(Aarch64SyscallMailbox, spsr, u64, 120, 8, 8);
+        field!(Aarch64SyscallMailbox, fp, u64, 128, 8, 8);
+        field!(Aarch64SyscallMailbox, lr, u64, 136, 8, 8);
+        field!(Aarch64SyscallMailbox, sp, u64, 144, 8, 8);
+        field!(Aarch64SyscallMailbox, esr, u64, 152, 8, 8);
+        field!(Aarch64SyscallMailbox, return_value, u64, 160, 8, 8);
+        field!(Aarch64SyscallMailbox, resume_x16, u64, 168, 8, 8);
+        field!(Aarch64SyscallMailbox, resume_x17, u64, 176, 8, 8);
+        field!(Aarch64SyscallMailbox, clock_x9, u64, 184, 8, 8);
+        field!(Aarch64SyscallMailbox, clock_x10, u64, 192, 8, 8);
+        field!(Aarch64SyscallMailbox, clock_x11, u64, 200, 8, 8);
+        field!(Aarch64SyscallMailbox, clock_x12, u64, 208, 8, 8);
+        field!(Aarch64SyscallMailbox, clock_tmp_x16, u64, 216, 8, 8);
+        field!(Aarch64SyscallMailbox, clock_tmp_x17, u64, 224, 8, 8);
+        field!(
+            Aarch64SyscallMailbox,
+            portal_executor_generation,
+            u64,
+            232,
+            8,
+            8
+        );
+        field!(Aarch64SyscallMailbox, portal_task_serial, u64, 240, 8, 8);
+        field!(Aarch64SyscallMailbox, portal_mm_generation, u64, 248, 8, 8);
+    }
+}

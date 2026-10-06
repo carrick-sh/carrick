@@ -26,6 +26,9 @@ tempfile.workspace = true
 flate2.workspace = true
 tar.workspace = true
 signal-hook.workspace = true
+syn = { version = "2", features = ["full", "visit"] }
+quote = "1"
+proc-macro2 = "1"
 
 carrick-conformance = { path = "../carrick-conformance" }
 carrick-portable = { path = "../carrick-portable" }

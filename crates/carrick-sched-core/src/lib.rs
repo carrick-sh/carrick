@@ -4034,3 +4034,116 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> LockWait<C> for SpinForever {
 
 #[cfg(test)]
 mod tests;
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn thread_ctx() {
+        assert_eq!((size_of::<ThreadCtx>(), align_of::<ThreadCtx>()), (832, 16));
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |ThreadCtx {
+                     x: _,
+                     pc: _,
+                     pstate: _,
+                     sp_el0: _,
+                     tpidr_el0: _,
+                     tpidrro_el0: _,
+                     contextidr_el1: _,
+                     _pad: _,
+                     v: _,
+                     fpsr: _,
+                     fpcr: _,
+                 }: ThreadCtx| {};
+        field!(ThreadCtx, x, [u64; 31], 0, 248, 8);
+        field!(ThreadCtx, pc, u64, 248, 8, 8);
+        field!(ThreadCtx, pstate, u64, 256, 8, 8);
+        field!(ThreadCtx, sp_el0, u64, 264, 8, 8);
+        field!(ThreadCtx, tpidr_el0, u64, 272, 8, 8);
+        field!(ThreadCtx, tpidrro_el0, u64, 280, 8, 8);
+        field!(ThreadCtx, contextidr_el1, u64, 288, 8, 8);
+        field!(ThreadCtx, _pad, u64, 296, 8, 8);
+        field!(ThreadCtx, v, [u128; 32], 304, 512, 16);
+        field!(ThreadCtx, fpsr, u64, 816, 8, 8);
+        field!(ThreadCtx, fpcr, u64, 824, 8, 8);
+    }
+
+    #[test]
+    fn zone_record() {
+        assert_eq!(
+            (size_of::<ZoneRecord>(), align_of::<ZoneRecord>()),
+            (1024, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |ZoneRecord {
+                     claim: _,
+                     incarnation: _,
+                     tid: _,
+                     serial: _,
+                     mm: _,
+                     file_table: _,
+                     generation: _,
+                     lifecycle_page: _,
+                     control_slot: _,
+                     result: _,
+                     handback: _,
+                     first_entry: _,
+                     entry_count: _,
+                     last_seq: _,
+                     cancelled: _,
+                     home: _,
+                     last_slot: _,
+                     next: _,
+                     host_wanted: _,
+                     deadline: _,
+                     affinity: _,
+                     object: _,
+                     ctx: _,
+                 }: ZoneRecord| {};
+        field!(ZoneRecord, claim, AtomicU64, 0, 8, 8);
+        field!(ZoneRecord, incarnation, AtomicU64, 8, 8, 8);
+        field!(ZoneRecord, tid, AtomicU64, 16, 8, 8);
+        field!(ZoneRecord, serial, AtomicU64, 24, 8, 8);
+        field!(ZoneRecord, mm, AtomicU64, 32, 8, 8);
+        field!(ZoneRecord, file_table, AtomicU64, 40, 8, 8);
+        field!(ZoneRecord, generation, AtomicU64, 48, 8, 8);
+        field!(ZoneRecord, lifecycle_page, AtomicU64, 56, 8, 8);
+        field!(ZoneRecord, control_slot, AtomicU64, 64, 8, 8);
+        field!(ZoneRecord, result, AtomicU64, 72, 8, 8);
+        field!(ZoneRecord, handback, AtomicU32, 80, 4, 4);
+        field!(ZoneRecord, first_entry, AtomicU32, 84, 4, 4);
+        field!(ZoneRecord, entry_count, AtomicU32, 88, 4, 4);
+        field!(ZoneRecord, last_seq, AtomicU32, 92, 4, 4);
+        field!(ZoneRecord, cancelled, IncarnationRequest, 96, 8, 8);
+        field!(ZoneRecord, home, AtomicU32, 104, 4, 4);
+        field!(ZoneRecord, last_slot, AtomicU32, 108, 4, 4);
+        field!(ZoneRecord, next, AtomicU32, 112, 4, 4);
+        field!(ZoneRecord, host_wanted, HostRequest, 120, 8, 8);
+        field!(ZoneRecord, deadline, AtomicU64, 128, 8, 8);
+        field!(ZoneRecord, affinity, AtomicU64, 136, 8, 8);
+        field!(ZoneRecord, object, object_wait::ObjectRecord, 144, 40, 8);
+        field!(ZoneRecord, ctx, UnsafeCell<ThreadCtx>, 192, 832, 16);
+    }
+}
