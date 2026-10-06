@@ -1,5 +1,8 @@
 use carrick_core::entry::complete;
 use carrick_core_abi::ExecutionBinding;
+use carrick_personality_linux::dispatch::{
+    FamilyCompletion, PendingFamilies, dispatch_aarch64_family,
+};
 use carrick_personality_linux::entry::{EntryOutcome, LinuxEntryVenue, decode_x86_64, serve};
 use core::cell::Cell;
 
@@ -75,4 +78,25 @@ fn x4_linux_common_entry() {
     assert_eq!(serve(&unported, &venue), EntryOutcome::Forward);
     assert_eq!(venue.publications.get(), 1);
     assert_eq!(venue.forwards.get(), 1);
+}
+
+struct PendingFile {
+    calls: Cell<u64>,
+}
+
+impl PendingFamilies for PendingFile {
+    fn file_positioned(&mut self, _: u64) -> FamilyCompletion {
+        self.calls.set(self.calls.get() + 1);
+        FamilyCompletion::Complete(17)
+    }
+}
+
+#[test]
+fn unmigrated_family_completes_once_through_linux_owner() {
+    let mut pending = PendingFile {
+        calls: Cell::new(0),
+    };
+    let result = dispatch_aarch64_family(67, u64::MAX, &mut pending);
+    assert_eq!(result, FamilyCompletion::Complete(17));
+    assert_eq!(pending.calls.get(), 1);
 }
