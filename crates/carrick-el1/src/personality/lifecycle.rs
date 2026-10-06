@@ -626,11 +626,13 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
     }
     // Checked above: the record holds no object operation (only its own
     // park gives it one), so the release is a plain retirement.
-    let _released: carrick_sched_core::CurrentRelease = zone.release_current(
-        zslot,
+    let receipt = carrick_core::entry::retire_current(
+        carrick_core::entry::binding(&task.execution, &task.mm),
+        carrick_el1_abi::BornInZoneSource { zone, slot: zslot },
         record,
-        &carrick_sched_core::BoundedSpin(carrick_el1_abi::EL1_GUEST_LOCK_SPINS),
-    );
+        carrick_el1_abi::EL1_GUEST_LOCK_SPINS,
+    )?;
+    sched.record_handoff(Some(receipt));
     if admission.commit().is_err() {
         // Unreachable (checked above; only this thread leaves Born or
         // Published that way): the host must look at this process.

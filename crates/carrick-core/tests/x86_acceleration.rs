@@ -1872,7 +1872,7 @@ fn x4_shared_wait_records() {
     // 3. ObjectParked
     let zone = alloc_test_zone();
     let slot = SlotId::new(2);
-    let parked = ObjectParked::new(&zone, slot);
+    let parked = ObjectParked::new(&zone, slot, None);
     assert!(parked.matches(&zone, slot));
     assert!(!parked.matches(&zone, SlotId::new(1)));
     assert_eq!(parked.slot(), slot);

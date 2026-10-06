@@ -1101,6 +1101,11 @@ impl Drop for BucketGuard<'_> {
 }
 
 impl BucketGuard<'_> {
+    /// The retained zone owning this bucket guard.
+    pub fn zone(&self) -> &ZoneTables {
+        self.zone
+    }
+
     pub fn bucket(&self) -> usize {
         self.bucket
     }
