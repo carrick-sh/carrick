@@ -253,13 +253,13 @@ attempt fails before remote contact: `cloudmac` does not resolve here.
 A reachable Mac recapture and its reviewed patch are required. No capture
 was fabricated and no gate exception was added.
 
-The later source-boundary command also fails with nine `PendingSignals`
-findings in unchanged `carrick-signal-core/src/policy.rs`. An isolated
-`0f476ce7a` source scan reports the exact same nine diagnostics, with zero
-additions/removals. The other remaining lint recipe checks (contracts,
-locks, participants, aborts, K1 and serial-host inventory) pass separately.
-The full lint result remains red; these supplementary checks do not confer
-a gate pass.
+The later source-boundary command fails with nine `PendingSignals`
+findings. Its isolated baseline comparison used the newer order-6 scanner
+against older sources and cannot establish baseline attribution. The exact
+order-5 CI scanner passes; this is an order-6 gate regression. The subsequent
+signal-boundary correction moves Linux pending policy into the personality
+without changing the auditor. Historical lint results remain recorded here;
+see the correction report for current verification.
 
 PR #68 advanced to `3207564aa` during final verification. The director was
 asked to supply the settled rebase target. This work retains its approved
