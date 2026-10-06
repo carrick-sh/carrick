@@ -587,7 +587,7 @@ impl Cpl0Carrier {
                     return Err(fail(format!("unported CPL0 native call {}", frame.rax)));
                 }
                 ENTRY_KICK_PORT | RETURN_KICK_PORT => {
-                    self.task(index).mark_pending_host_work();
+                    self.task(index).linux.mark_pending_host_work();
                     self.cpus[index].fd_mut().set_kvm_immediate_exit(1);
                     let kicked = HvVcpu::run(&mut self.cpus[index]);
                     self.cpus[index].fd_mut().set_kvm_immediate_exit(0);
