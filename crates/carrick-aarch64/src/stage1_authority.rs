@@ -1042,6 +1042,42 @@ impl Stage1Authority {
         self.reserve_table_arena()
     }
 
+    /// Retain the child's already-published control arena under its table
+    /// capacity lifetime. The root has a separate exact retirement proof;
+    /// this extension must be terminal before that proof can release the
+    /// source lease's logical slots. A host manager never links this arena.
+    pub(crate) fn retain_owner_fork_control(
+        &self,
+        completion: carrick_el1_abi::PortalForkCompletion,
+    ) -> Result<(), String> {
+        const CAPACITY: u64 = 2 * 1024 * 1024;
+        let tables = completion.request.child_tables;
+        let control = completion.request.kernel_control_ipa;
+        let end = control
+            .checked_add(CAPACITY)
+            .filter(|_| control != 0 && control.is_multiple_of(CAPACITY))
+            .ok_or("owner Fork control capacity is invalid")?;
+        let tables_end = tables
+            .base
+            .checked_add(tables.len)
+            .ok_or("owner Fork table capacity overflow")?;
+        if control < tables_end && tables.base < end {
+            return Err("owner Fork control overlaps its table capacity".into());
+        }
+        let mut inner = self.inner.lock();
+        if inner.manager.as_ref().map(PageTableManager::base) != Some(tables.base)
+            || inner.live_owner != LiveDescriptorOwner::Guest
+            || inner.engines != 1
+            || inner.vfork_shares != 0
+        {
+            return Err("owner Fork control lost its unpublished child authority".into());
+        }
+        if !inner.published_arenas.contains(&control) {
+            inner.published_arenas.push(control);
+        }
+        Ok(())
+    }
+
     fn reserve_table_arena(&self) -> Result<ReservedTableArena, String> {
         let (base, publisher) = {
             let mut inner = self.inner.lock();

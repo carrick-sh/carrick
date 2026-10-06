@@ -8940,7 +8940,6 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 pending.completion(),
                 pending.selected(),
             )?;
-            let root = request.child_ttbr0 & 0x0000_ffff_ffff_f000;
             let layout = self
                 .page_tables
                 .with_manager(PageTableManager::layout)
@@ -8950,29 +8949,14 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             let resolver = physical.child_resolver();
             // SAFETY: physical preparation retains every table arena selected
             // by the owner; the resolver owns those exact allocations.
-            let manager = unsafe {
-                PageTableManager::new_live(
-                    root,
+            let authority = unsafe {
+                crate::fork::observe_owner_fork_tables(
+                    pending.completion(),
                     layout,
-                    fork.child_tables.len as usize,
-                    Arc::clone(&resolver),
+                    resolver,
+                    request.table_arena_source.take(),
                 )
-            }
-            .map_err(|error| {
-                TrapError::Hypervisor(format!("observe owner child tables: {error:?}"))
-            })?;
-            let authority = Stage1Authority::new_with_manager(Some(manager));
-            unsafe {
-                authority.bind_live_backing(resolver);
-            }
-            authority.select_guest_descriptor_owner().map_err(|error| {
-                TrapError::Hypervisor(format!("select owner child descriptor lane: {error:?}"))
-            })?;
-            if let Some(source) = request.table_arena_source.take() {
-                authority.install_source(source).map_err(|error| {
-                    TrapError::Hypervisor(format!("install owner child physical source: {error:?}"))
-                })?;
-            }
+            }?;
             let parent = self.vcpu.get_mut().snapshot()?;
             let mut snapshot = seed_sibling_snapshot(&parent, request.entry);
             snapshot.ttbr0 = request.child_ttbr0;

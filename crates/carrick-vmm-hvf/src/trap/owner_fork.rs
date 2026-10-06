@@ -712,6 +712,134 @@ mod tests {
     use super::*;
 
     #[test]
+    fn owner_fork_control_capacity_retires_before_root_proof_and_reuse() {
+        owner_fork_control_capacity_lifecycle(true);
+    }
+
+    #[test]
+    fn owner_fork_control_capacity_retires_before_exec_root_proof_and_reuse() {
+        owner_fork_control_capacity_lifecycle(false);
+    }
+
+    fn owner_fork_control_capacity_lifecycle(terminal: bool) {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let pool = Arc::new(crate::frame_pool::PreMappedRootSlotPool::new_test_fixture(
+            3,
+        ));
+        custody.install_root_slot_pool(pool.clone());
+        let root = carrick_mem::memory::LINUX_HVPATCH_ROOT_SLOT_BASE;
+        let control = root + 0x20_0000;
+        let peer = control + 0x20_0000;
+        let source = MmAccessState::new_unbound(
+            carrick_aarch64::Stage1Authority::new(),
+            carrick_guest_mem::UserMemoryAuthority::from_legacy(Arc::new(
+                MemoryProtections::default(),
+            )),
+            Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
+        );
+        let mut regions = Vec::new();
+        source
+            .publish_raw_stage1_arenas_into(
+                &custody,
+                &[root, control, peer],
+                applevisor::memory::MemPerms::ReadWriteExec,
+                &mut regions,
+            )
+            .unwrap();
+        let owners = regions
+            .iter()
+            .map(|row| row.structural_owner.as_ref().unwrap().clone())
+            .collect::<Vec<_>>();
+        let mut request = request(&custody, 3);
+        request.child_tables = carrick_el1_abi::PortalForkTableArena::new(root, 0x20_0000).unwrap();
+        request.kernel_control_ipa = control;
+        let completion = carrick_el1_abi::PortalForkCompletion {
+            request,
+            // SAFETY: isolated owner fixture authenticated by this custody.
+            child: unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    request.operation.carrier,
+                    request.child_mm,
+                    NonZeroU64::new(4).unwrap(),
+                )
+            },
+            parent_generation: carrick_el1_abi::ReservationGeneration::new(2).unwrap(),
+            child_tables_used: 0x4000,
+            parent_tables_used: 0,
+        };
+        // SAFETY: these exact pooled allocations are retained by the
+        // production Fork resolver; no hardware VM is created.
+        let authority = unsafe {
+            carrick_aarch64::fork::observe_owner_fork_tables(
+                completion,
+                carrick_mmu_core::aarch64::PageTableLayoutConfig::new(0x10000, 0x1c_0000, 0, 0),
+                Arc::new(ForkTableResolver {
+                    owners: owners[..2].to_vec(),
+                }),
+                None,
+            )
+        }
+        .unwrap();
+        let child = MmAccessState::new(
+            authority,
+            carrick_guest_mem::UserMemoryAuthority::from_owner(completion.child),
+            Arc::new(parking_lot::Mutex::new(HvpatchFrameInventory::default())),
+            Arc::new(parking_lot::Mutex::new(CowArmedRanges::default())),
+            Arc::new(parking_lot::Mutex::new(Vec::new())),
+            crate::hvf_aarch64_engine::HostCowStats::default(),
+            super::super::foreign_mm::LiveBacking::immediate(custody.clone()),
+        );
+        for owner in &owners[..2] {
+            child
+                .install_structural_mapping_authority(Some((root, 0x20_0000)), owner.clone())
+                .unwrap();
+        }
+        let control_id = owners[1].record_identity();
+        let peer_id = owners[2].record_identity();
+        let pin = custody.pin_stage2_record(control_id).unwrap();
+        let blocked = if terminal {
+            child.retire_mm_root_stage2_in(&custody, (root, 0x20_0000))
+        } else {
+            child.retire_exec_mm_root_stage2_in(&custody, (root, 0x20_0000))
+        };
+        assert!(
+            blocked.is_err(),
+            "a pinned fork control arena must prevent logical root reuse"
+        );
+        assert!(
+            custody
+                .stage2_record_snapshot(owners[0].record_identity().record_id)
+                .is_some()
+        );
+        assert!(pool.allocate_slot_at(control).is_none());
+        drop(pin);
+        let retired = if terminal {
+            child.retire_mm_root_stage2_in(&custody, (root, 0x20_0000))
+        } else {
+            child.retire_exec_mm_root_stage2_in(&custody, (root, 0x20_0000))
+        }
+        .unwrap();
+        assert_eq!(retired.proof.root_slot_base(), root);
+        assert!(
+            custody
+                .stage2_record_snapshot(control_id.record_id)
+                .is_none()
+        );
+        assert!(custody.stage2_record_snapshot(peer_id.record_id).is_some());
+        assert!(pool.allocate_slot_at(peer).is_none(), "the peer stays live");
+        let next_root = pool.allocate_slot_at(root).expect("terminal root reissued");
+        let next_control = pool
+            .allocate_slot_at(control)
+            .expect("terminal control reissued");
+        assert_ne!(next_root.as_mut_ptr(), next_control.as_mut_ptr());
+    }
+
+    #[test]
     fn owner_fork_leaf_receipts_retain_cow_consumable_physical_extents() {
         let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
         let _stage2_stub = ScopedStage2MapTestStub::enable();

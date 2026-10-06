@@ -122,3 +122,10 @@ Exact `fa98b9f9c` signed execution is complete and red against main: see
 is active; its VM-free controls do not confer signed acceptance. The 78
 unexpected failure rows, early fork failures, incomplete generic subprobes and
 fresh-executable missing result remain open. No budgets were weakened.
+
+Native reserved-content repair and inventories are pushed as `506be1a74` and
+`1e521ab1a`. The retained second-fork pool collision additionally has a native
+exit/exec red-first repair; see `2026-10-05-n1-fork-control-retirement.md`.
+Neither repair has a new signed verdict yet. Main's exact first failure lines
+for its six excluded reds remain requested; ptrace errno 38 is not established
+as a stack-only regression.
