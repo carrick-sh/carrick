@@ -3824,6 +3824,33 @@
     "classification": "declared_backing",
     "evidence": {
       "authority": "authorized_backing",
+      "resource": "CPL0 ELF emitted by this build-script Cargo invocation and its owned OUT_DIR copy"
+    },
+    "expansion": null,
+    "operation": "std::fs::copy",
+    "profiles": [
+      "linux-cli",
+      "linux-runtime"
+    ],
+    "rationale": "At crates/carrick-vmm-kvm/build.rs:53 in `main`, `std::fs::copy` moves only the CPL0 ELF from this build script's private Cargo target directory into its owned OUT_DIR for compile-time embedding.",
+    "review_id": "HA-000758",
+    "source": {
+      "byte_end": 1623,
+      "byte_start": 1610,
+      "column": 5,
+      "column_end": 18,
+      "column_start": 5,
+      "file": "crates/carrick-vmm-kvm/build.rs",
+      "line": 53,
+      "line_end": 53,
+      "line_start": 53
+    }
+  },
+  {
+    "catalog_id": "HA-CATALOG-FS-COPY",
+    "classification": "declared_backing",
+    "evidence": {
+      "authority": "authorized_backing",
       "resource": "digest-keyed OCI layer-cache file copied into the per-run scratch by `reflink_or_copy_file`"
     },
     "expansion": null,
