@@ -1087,6 +1087,7 @@ dependencies = [
  "carrick-guest-mem",
  "carrick-hal",
  "carrick-host",
+ "carrick-kernel",
  "carrick-mem",
  "carrick-mmu-core",
  "carrick-sched-core",

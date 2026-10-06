@@ -124,6 +124,7 @@ struct Alias {
 struct Slot {
     handle: BackingHandle,
     backing: PreparedBacking,
+    frame_identities: BTreeMap<u64, BackingIdentity>,
     bootstrap: bool,
     alias_count: usize,
     allowed: Vec<NonZeroU64>,
@@ -380,6 +381,7 @@ impl CarrierMemory {
                 Slot {
                     handle,
                     backing: b.clone(),
+                    frame_identities: BTreeMap::new(),
                     bootstrap: false,
                     alias_count: 0,
                     allowed: Vec::new(),
@@ -424,9 +426,41 @@ impl CarrierMemory {
     pub fn root(&self, mm: NonZeroU64) -> Option<AddressContext<RootGpa>> {
         self.roots.get(&mm).copied()
     }
+    /// Bind independently inventoried physical frames inside one KVM extent.
+    /// The memslot remains coarse; descriptor outputs authenticate one page.
+    pub fn bind_frame_identities(
+        &mut self,
+        handle: BackingHandle,
+        identities: &[(FrameGpa, BackingIdentity)],
+    ) -> Result<(), MemoryError> {
+        self.admit()?;
+        let slot = self.record(handle)?;
+        if slot.bootstrap || slot.alias_count != 0 || !slot.frame_identities.is_empty() {
+            return Err(error(
+                "frame identities require an unpublished private extent",
+            ));
+        }
+        let base = slot.backing.extent.base.raw();
+        let end = base + slot.backing.extent.len as u64;
+        let mut map = BTreeMap::new();
+        for &(gpa, identity) in identities {
+            if !gpa.raw().is_multiple_of(PAGE)
+                || gpa.raw() < base
+                || gpa.raw().checked_add(PAGE).is_none_or(|last| last > end)
+                || map.insert(gpa.raw(), identity).is_some()
+            {
+                return Err(error("invalid or repeated frame inventory identity"));
+            }
+        }
+        self.slots
+            .get_mut(&handle.slot)
+            .ok_or_else(|| error("missing frame inventory slot"))?
+            .frame_identities = map;
+        Ok(())
+    }
     pub fn share(&self, handle: BackingHandle) -> Result<SharedFrameEdge, MemoryError> {
         let slot = self.record(handle)?;
-        if slot.bootstrap {
+        if slot.bootstrap || !slot.frame_identities.is_empty() {
             return Err(error("bootstrap backing cannot be shared as guest data"));
         }
         Ok(SharedFrameEdge {
@@ -479,8 +513,19 @@ impl CarrierMemory {
         let slot = self
             .locate(output, op.span().len as usize)
             .ok_or_else(|| error("unbacked descriptor output"))?;
+        let expected = if slot.frame_identities.is_empty() {
+            slot.backing.identity
+        } else {
+            if op.span().len != PAGE {
+                return Err(error("frame inventory identity requires one-page output"));
+            }
+            *slot
+                .frame_identities
+                .get(&output.raw())
+                .ok_or_else(|| error("physical frame lacks an inventory identity"))?
+        };
         if slot.bootstrap
-            || slot.backing.identity != identity
+            || expected != identity
             || (!slot.allowed.is_empty() && !slot.allowed.contains(&mm))
         {
             return Err(error(
