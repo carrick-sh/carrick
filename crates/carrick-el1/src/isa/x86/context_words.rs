@@ -112,7 +112,9 @@ mod tests {
     use super::*;
     use carrick_guest_arch::{ContextGeneration, MmGeneration};
     use carrick_sched_core::object_wait::OwnedObjectWakeEffects;
-    use carrick_sched_core::spaces::notification::{SpaceReleaseVenue, SpaceWaitCause};
+    use carrick_sched_core::spaces::notification::{
+        SpaceAccess, SpaceReleaseVenue, SpaceWaitCause,
+    };
     use carrick_sched_core::{BoundedSpin, SlotId, ThreadIdentity, Waker, ZoneTables};
 
     fn deliver_x86_notification(
@@ -217,7 +219,7 @@ mod tests {
             assert!(!ptr.is_null());
             std::boxed::Box::from_raw(ptr)
         };
-        zone.spaces.publish_closed(11, 0x6000, 0).unwrap();
+        let space = zone.spaces.publish_closed(11, 0x6000, 0).unwrap();
         let entry = zone.space_entry(NonZeroU64::new(11).unwrap()).unwrap();
         let incarnation = NonZeroU64::new(1).unwrap();
         entry
@@ -232,6 +234,15 @@ mod tests {
             waker: Waker::Host,
             deliver: deliver_x86_notification,
         };
+        let access = SpaceAccess::notified(venue);
+        access.open(space);
+        let editor = access
+            .try_begin_edit(space, 11, NonZeroU64::new(2).unwrap())
+            .unwrap();
+        editor.set_mmap_next(0x8000);
+        assert_eq!(editor.mmap_next(), 0x8000);
+        drop(editor);
+        zone.spaces.close(space);
         drop(lease);
         entry.close_notifications(incarnation, venue).unwrap();
         entry.retire_entry(venue);
