@@ -2313,4 +2313,69 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn wait_records_and_edit_coordination_have_one_neutral_owner() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let neutral_abi =
+            fs::read_to_string(repo.join("crates/carrick-core-abi/src/wait.rs")).unwrap();
+        assert!(neutral_abi.contains("pub struct OperationResumePc"));
+        assert!(neutral_abi.contains("pub struct ObjectParked"));
+        assert!(neutral_abi.contains("pub struct PortalWaitEnrollment"));
+        assert!(neutral_abi.contains("pub enum EditWaitOutcome"));
+
+        let lifecycle_abi =
+            fs::read_to_string(repo.join("crates/carrick-core-abi/src/lifecycle.rs")).unwrap();
+        assert!(lifecycle_abi.contains("pub struct ThreadLedgerActivity"));
+
+        let old_portal_abi =
+            fs::read_to_string(repo.join("crates/carrick-el1-abi/src/mm_portal.rs")).unwrap();
+        assert!(
+            !old_portal_abi.contains("pub struct PortalWaitEnrollment {"),
+            "ARM ABI must not retain displaced PortalWaitEnrollment definition"
+        );
+
+        let old_lifecycle_abi =
+            fs::read_to_string(repo.join("crates/carrick-el1-abi/src/thread_lifecycle.rs"))
+                .unwrap();
+        assert!(
+            !old_lifecycle_abi.contains("pub struct ThreadLedgerActivity {"),
+            "ARM ABI must not retain displaced ThreadLedgerActivity definition"
+        );
+
+        let neutral_core =
+            fs::read_to_string(repo.join("crates/carrick-core/src/wait.rs")).unwrap();
+        assert!(neutral_core.contains("pub fn coordinate_prepared_edit_wait"));
+        assert!(neutral_core.contains("pub fn park_object_record"));
+        assert!(neutral_core.contains("pub fn take_object_operation"));
+        assert!(!neutral_core.contains("carrick_el1"));
+
+        let old_edit_wait = fs::read_to_string(
+            repo.join("crates/carrick-el1/src/personality/mm_portal/edit_wait.rs"),
+        )
+        .unwrap();
+        assert!(
+            old_edit_wait.contains("coordinate_prepared_edit_wait"),
+            "EL1 edit_wait must delegate to carrick-core"
+        );
+        assert!(
+            old_edit_wait.contains("carrick_core::wait"),
+            "EL1 edit_wait must import from carrick_core::wait"
+        );
+
+        let old_object_wait =
+            fs::read_to_string(repo.join("crates/carrick-el1/src/sched/object_wait.rs")).unwrap();
+        assert!(
+            old_object_wait.contains("carrick_core::wait::"),
+            "EL1 object_wait must delegate to carrick-core"
+        );
+
+        let core_manifest =
+            fs::read_to_string(repo.join("crates/carrick-core/Cargo.toml")).unwrap();
+        let deps_section = core_manifest.split("[dev-dependencies]").next().unwrap();
+        assert!(!deps_section.contains("carrick-el1"));
+        let core_abi_manifest =
+            fs::read_to_string(repo.join("crates/carrick-core-abi/Cargo.toml")).unwrap();
+        assert!(!core_abi_manifest.contains("carrick-el1"));
+    }
 }
