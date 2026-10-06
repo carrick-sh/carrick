@@ -280,7 +280,7 @@ impl PreparedPageResolver for X86PreparedResolver {
             Access, EditIntent, EditOperation, EditOwner, FrameGpa, GuestLen, MmuEditArch, RootGpa,
             TableWindow, UserRange, UserVa,
         };
-        use carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal;
+        use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
         use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
 
         let root = RootGpa::page_aligned(FrameGpa::new(root_pa))
