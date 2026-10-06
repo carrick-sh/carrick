@@ -2103,6 +2103,16 @@ impl SyscallDispatcher {
         self.io.stdout.lock().clone()
     }
 
+    /// Complete a shared-kernel host-crossing fd 1/2 write through this run's
+    /// existing stdio route after its guest MM owner has copied the bytes.
+    pub fn forward_stdio_bytes(&self, fd: i32, bytes: &[u8]) -> i64 {
+        match self.fs_view().write_stdio_sink(fd, bytes) {
+            DispatchOutcome::Returned { value } => value,
+            DispatchOutcome::Errno { errno } => errno.guest_retval(),
+            _ => carrick_abi::LINUX_EIO.guest_retval(),
+        }
+    }
+
     /// Choose where bare fd 1/2 writes go for this run (and every logical
     /// child forked from it). `Inherit` is required for interactive prompts
     /// (`/ # `, cursor-position queries) to reach the terminal before exit;

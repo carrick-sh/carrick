@@ -1,20 +1,37 @@
 //! Bounded M2 hardware binding: one VM, two issued live task slots, native
 //! SYSCALL entry and IRETQ return. This is not an OCI/runtime/MM-owner binding.
 //! Observation and kick doorbells are declared fixture control transport.
-use crate::carrier_memory::{CarrierMachine, CarrierMemory};
+use crate::carrier_memory::{
+    BackingExtent, BackingHandle, CarrierMachine, CarrierMemory, InventoryTransaction,
+    PreparedBacking,
+};
 use crate::guest_setup::{GuestRam, WindowKind};
 use crate::{KvmKickHandle, KvmVcpu};
+use carrick_el1_abi::GuestMmuPublication;
 use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
     BlockedMask, Counters, CurrentTask, EL1_BOOTSTRAP_METADATA_SIZE, El1TaskId, ThreadControlSlot,
     ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE, X86_CPL0_DYNAMIC_METADATA_BASE,
 };
+use carrick_el1_abi::{
+    X86_INITIAL_BOOT_HEADER_GPA, X86_INITIAL_BOOT_LOADED, X86_INITIAL_BOOT_MAGIC,
+    X86_INITIAL_BOOT_PORT, X86_INITIAL_BOOT_VERSION, X86_INITIAL_MAX_REGIONS,
+    X86_INITIAL_MAX_STRINGS, X86InitialBootGrant, X86InitialBootHeader, X86InitialBootRegion,
+    X86InitialBootRequest, X86InitialBootString,
+};
 use carrick_guest_arch::FrameGpa;
+use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, RootGpa, UserVa};
 use carrick_hal::{HvVcpu, TrapError, VcpuExit, VcpuKick};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
+use carrick_mmu_core::x86::descriptor_txn::{
+    Access, BackingIdentity, DescriptorOp, DescriptorTxn, DescriptorTxnId, LeafSize, PageSpan,
+    Permissions, translate_leaf,
+};
 use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
 use kvm_bindings::{KVM_MP_STATE_RUNNABLE, Msrs, kvm_mp_state, kvm_msr_entry};
+use std::io::Read;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -26,6 +43,10 @@ const RAM_SIZE: usize = 16 * 1024 * 1024;
 const META_GPA: u64 = 0xc0_0000;
 const META_LEN: u64 = 0x2_0000;
 const ALLOCATOR_GPA: u64 = 0x20_00000;
+const INITIAL_EXTENT_GPA: u64 = 0x40_00000;
+const INITIAL_MM_KEY: u64 = 301;
+const INITIAL_STACK_TOP: u64 = 0x7fff_0000;
+const INITIAL_STACK_SIZE: u64 = 0x1_0000;
 const COUNTERS_OFFSET: u64 = 0x1_0000;
 const BINDING_OFFSET: u64 = 0x8000;
 const TASK_OFFSET: u64 = 0x9000;
@@ -52,6 +73,48 @@ const _: () = assert!(FIXTURE_PML4_CAPACITY == carrick_x86::X86_PML4_CAPACITY);
 
 fn fail(message: impl Into<String>) -> TrapError {
     TrapError::Hypervisor(message.into())
+}
+
+fn record_bytes<T: Copy>(record: &T) -> &[u8] {
+    // SAFETY: every caller passes a fully initialized fixed-layout ABI
+    // record; its storage remains live for the returned borrow.
+    unsafe { core::slice::from_raw_parts((record as *const T).cast::<u8>(), size_of::<T>()) }
+}
+
+fn append_records<T: Copy>(buffer: &mut Vec<u8>, records: &[T]) -> Result<u64, TrapError> {
+    let offset = u64::try_from(buffer.len()).map_err(|_| fail("initial metadata offset"))?;
+    for record in records {
+        buffer.extend_from_slice(record_bytes(record));
+    }
+    INITIAL_EXTENT_GPA
+        .checked_add(offset)
+        .ok_or_else(|| fail("initial metadata address"))
+}
+
+struct InitialInventory {
+    expected: usize,
+    committed: usize,
+}
+impl InventoryTransaction for InitialInventory {
+    fn publish(&mut self) -> Result<(), crate::carrier_memory::MemoryError> {
+        Ok(())
+    }
+    fn commit(
+        &mut self,
+        publication: &GuestMmuPublication,
+    ) -> Result<(), crate::carrier_memory::MemoryError> {
+        if publication.outcome != GuestMmuPublication::APPLIED || self.committed >= self.expected {
+            return Err(crate::carrier_memory::MemoryError(
+                "initial inventory publication".into(),
+            ));
+        }
+        self.committed += 1;
+        Ok(())
+    }
+    fn rollback(&mut self) -> Result<(), crate::carrier_memory::MemoryError> {
+        self.committed = 0;
+        Ok(())
+    }
 }
 
 /// RAII deadline: one bounded blocking wait, one kick on expiry, always joined.
@@ -129,6 +192,7 @@ pub struct Cpl0Carrier {
     pub(crate) cpus: [KvmVcpu; 2],
     pub(crate) _vm: CarrierMemory,
     pub(crate) ram: Arc<GuestRam>,
+    initial_extent: Option<(BackingHandle, usize)>,
     metadata_base: NonNull<u8>,
     host_forwards: u64,
     host_yields: u64,
@@ -137,6 +201,88 @@ pub struct Cpl0Carrier {
 }
 
 impl Cpl0Carrier {
+    /// Size one private retained aperture for the host-staged PT_LOAD bytes,
+    /// the boot record, and guest-owned table/data grants. Capacity follows
+    /// the submitted image rather than reserving a carrier-wide RAM pool.
+    pub fn initial_extent_bytes_for(
+        image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+        argv: &[String],
+        env: &[String],
+    ) -> Result<usize, TrapError> {
+        const PAGE: usize = 4096;
+        const STACK_PAGES: usize = 16;
+        const MAX_BYTES: usize = 512 * 1024 * 1024;
+        let mut image_pages = 0usize;
+        let mut initialized = 0usize;
+        for region in &image.regions {
+            let pages = usize::try_from((region.end - region.start) / PAGE as u64)
+                .map_err(|_| fail("initial image page count"))?;
+            image_pages = image_pages
+                .checked_add(pages)
+                .ok_or_else(|| fail("initial image pages"))?;
+            initialized = initialized
+                .checked_add(region.file_bytes.len())
+                .ok_or_else(|| fail("initial image bytes"))?;
+        }
+        let strings = argv
+            .iter()
+            .chain(env)
+            .try_fold(0usize, |sum, value| sum.checked_add(value.len()))
+            .ok_or_else(|| fail("initial argv/env bytes"))?;
+        let user_pages = image_pages
+            .checked_add(STACK_PAGES)
+            .ok_or_else(|| fail("initial user pages"))?;
+        let table_pages = user_pages
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| fail("initial table grant count"))?;
+        let grants = table_pages
+            .checked_add(user_pages)
+            .ok_or_else(|| fail("initial grant count"))?;
+        let string_count = argv
+            .len()
+            .checked_add(env.len())
+            .ok_or_else(|| fail("initial string count"))?;
+        let region_bytes = image
+            .regions
+            .len()
+            .checked_mul(size_of::<carrick_el1_abi::X86InitialBootRegion>())
+            .ok_or_else(|| fail("initial region metadata"))?;
+        let string_bytes = string_count
+            .checked_mul(size_of::<carrick_el1_abi::X86InitialBootString>())
+            .ok_or_else(|| fail("initial string metadata"))?;
+        let metadata = size_of::<carrick_el1_abi::X86InitialBootRequest>()
+            .checked_add(region_bytes)
+            .and_then(|n| n.checked_add(string_bytes))
+            .and_then(|n| {
+                n.checked_add(
+                    grants.checked_mul(size_of::<carrick_el1_abi::X86InitialBootGrant>())?,
+                )
+            })
+            .and_then(|n| {
+                n.checked_add(
+                    user_pages.checked_mul(size_of::<carrick_el1_abi::GuestMmuPublication>())?,
+                )
+            })
+            .and_then(|n| n.checked_add(initialized))
+            .and_then(|n| n.checked_add(strings))
+            .and_then(|n| n.checked_add(PAGE * 8)) // bounded alignment and argv terminators
+            .ok_or_else(|| fail("initial request capacity"))?;
+        let metadata_pages = metadata
+            .checked_add(PAGE - 1)
+            .ok_or_else(|| fail("initial metadata alignment"))?
+            / PAGE;
+        let total_pages = metadata_pages
+            .checked_add(grants)
+            .ok_or_else(|| fail("initial extent pages"))?;
+        let bytes = total_pages
+            .checked_mul(PAGE)
+            .ok_or_else(|| fail("initial extent size"))?;
+        if bytes > MAX_BYTES {
+            return Err(fail("initial image exceeds carrier memory budget"));
+        }
+        Ok(bytes)
+    }
     pub fn physical_slot_count(&self) -> usize {
         self._vm.slot_count()
     }
@@ -173,7 +319,7 @@ impl Cpl0Carrier {
 
     /// Inspect an invalid retained terminal after all fixture vCPUs stop.
     pub fn fixture_user_leaf_raw(&self, va: u64) -> Result<u64, TrapError> {
-        if !matches!(va, 0x3_0000 | 0x3_2000 | 0x3_3000 | 0x3_4000) {
+        if !matches!(va, USER_CODE | 0x3_0000 | 0x3_2000 | 0x3_3000 | 0x3_4000) {
             return Err(fail("fixture leaf outside admitted user page"));
         }
         let mut table = LAYOUT.pml4_base;
@@ -208,9 +354,12 @@ impl Cpl0Carrier {
 
     /// Boot the compiled production image in the same retained carrier used
     /// by the hardware fixtures. Guest MM publication follows while stopped.
-    pub fn boot_production() -> Result<Self, TrapError> {
+    pub fn boot_production(initial_extent_bytes: usize) -> Result<Self, TrapError> {
         const IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/carrick-x86-cpl0"));
-        Self::boot_bytes_inner(IMAGE, [&[], &[]], false)
+        if initial_extent_bytes == 0 || !initial_extent_bytes.is_multiple_of(4096) {
+            return Err(fail("invalid initial guest MM extent size"));
+        }
+        Self::boot_bytes_inner(IMAGE, [&[], &[]], false, Some(initial_extent_bytes))
     }
 
     /// The guest MM owner supplies the executable and stack publication here.
@@ -218,9 +367,497 @@ impl Cpl0Carrier {
     /// EL0 admission; no fixture user page is used as an ELF loader.
     pub fn load_guest_mm(
         &mut self,
-        _image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+        image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
+        argv: &[String],
+        env: &[String],
     ) -> Result<(), TrapError> {
-        Err(fail("x86 CPL0 guest MM loader is not yet bound"))
+        let (_, extent_len) = self
+            .initial_extent
+            .ok_or_else(|| fail("initial extent absent"))?;
+        if image.regions.is_empty()
+            || image.regions.len() > X86_INITIAL_MAX_REGIONS
+            || argv.len() + env.len() > X86_INITIAL_MAX_STRINGS
+        {
+            return Err(fail("initial image request population"));
+        }
+        let mut staged = vec![0; size_of::<X86InitialBootRequest>()];
+        let regions_offset = staged.len();
+        staged.resize(
+            regions_offset + image.regions.len() * size_of::<X86InitialBootRegion>(),
+            0,
+        );
+        let strings_offset = staged.len();
+        staged.resize(
+            strings_offset + (argv.len() + env.len()) * size_of::<X86InitialBootString>(),
+            0,
+        );
+        let grants_offset = staged.len();
+        let image_pages: usize = image
+            .regions
+            .iter()
+            .map(|r| ((r.end - r.start) / 4096) as usize)
+            .sum();
+        let data_grants = image_pages
+            .checked_add((INITIAL_STACK_SIZE / 4096) as usize)
+            .ok_or_else(|| fail("initial data grants"))?;
+        let table_grants = data_grants
+            .checked_mul(3)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| fail("initial table grants"))?;
+        let grant_count = table_grants
+            .checked_add(data_grants)
+            .ok_or_else(|| fail("initial grants"))?;
+        staged.resize(
+            grants_offset + grant_count * size_of::<X86InitialBootGrant>(),
+            0,
+        );
+        let publications_offset = staged.len();
+        staged.resize(
+            publications_offset + data_grants * size_of::<carrick_el1_abi::GuestMmuPublication>(),
+            0,
+        );
+        let mut regions = Vec::with_capacity(image.regions.len());
+        for region in &image.regions {
+            let source_gpa = append_records(&mut staged, region.file_bytes)?;
+            regions.push(X86InitialBootRegion {
+                start: region.start,
+                len: region.end - region.start,
+                initialized_offset: region.initialized_offset,
+                source_gpa,
+                initialized_len: region.file_bytes.len() as u64,
+                permissions: u64::from(region.perms.read)
+                    | (u64::from(region.perms.write) << 1)
+                    | (u64::from(region.perms.execute) << 2),
+            });
+        }
+        let mut strings = Vec::with_capacity(argv.len() + env.len());
+        for value in argv.iter().chain(env) {
+            if value.as_bytes().contains(&0) {
+                return Err(fail("NUL in initial argv/env"));
+            }
+            let source_gpa = append_records(&mut staged, value.as_bytes())?;
+            strings.push(X86InitialBootString {
+                source_gpa,
+                len: value.len() as u64,
+            });
+        }
+        let frame_offset = staged
+            .len()
+            .checked_add(4095)
+            .ok_or_else(|| fail("initial frame alignment"))?
+            & !4095;
+        if frame_offset
+            .checked_add(grant_count * 4096)
+            .is_none_or(|end| end > extent_len)
+        {
+            return Err(fail("initial extent too small for frame grants"));
+        }
+        let grants: Vec<X86InitialBootGrant> = (0..grant_count)
+            .map(|index| {
+                let gpa = INITIAL_EXTENT_GPA + (frame_offset + index * 4096) as u64;
+                X86InitialBootGrant {
+                    gpa,
+                    frame_id: 0x100,
+                    mapping_id: 0x100,
+                    owner_generation: 0x100,
+                    inventory_revision: 0x100,
+                }
+            })
+            .collect();
+        // The guest editor's no-op invalidation is valid only while this
+        // unpublished root cannot be in any live vCPU TLB. Both vCPUs are
+        // stopped here; reject a reused root before the first descriptor edit.
+        for cpu in &self.cpus {
+            if cpu.get_gpr(X86Reg::Cr3)? == grants[0].gpa {
+                return Err(fail("initial root already live in a vCPU"));
+            }
+        }
+        let mut random = [0_u8; 16];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut source| source.read_exact(&mut random))
+            .map_err(|error| fail(format!("initial random: {error}")))?;
+        let request = X86InitialBootRequest {
+            magic: X86_INITIAL_BOOT_MAGIC,
+            version: X86_INITIAL_BOOT_VERSION,
+            region_count: image.regions.len() as u32,
+            entry: image.entry,
+            phdr: image.phdr,
+            phent: image.phent,
+            phnum: image.phnum,
+            argc: argv.len() as u16,
+            envc: env.len() as u16,
+            regions_gpa: INITIAL_EXTENT_GPA + regions_offset as u64,
+            strings_gpa: INITIAL_EXTENT_GPA + strings_offset as u64,
+            grants_gpa: INITIAL_EXTENT_GPA + grants_offset as u64,
+            table_grant_count: table_grants as u32,
+            data_grant_count: data_grants as u32,
+            publications_gpa: INITIAL_EXTENT_GPA + publications_offset as u64,
+            publication_capacity: data_grants as u32,
+            publication_count: 0,
+            stack_top: INITIAL_STACK_TOP,
+            stack_size: INITIAL_STACK_SIZE,
+            random,
+            result_root_gpa: 0,
+            result_rsp: 0,
+            result_status: carrick_el1_abi::X86_INITIAL_BOOT_PENDING,
+            extent_pages: (extent_len / 4096) as u32,
+            mm_key: INITIAL_MM_KEY,
+            generation: 1,
+            result_table_used: 0,
+            result_data_used: 0,
+        };
+        staged[..size_of::<X86InitialBootRequest>()].copy_from_slice(record_bytes(&request));
+        staged[regions_offset..strings_offset].copy_from_slice(unsafe {
+            core::slice::from_raw_parts(
+                regions.as_ptr().cast::<u8>(),
+                regions.len() * size_of::<X86InitialBootRegion>(),
+            )
+        });
+        staged[strings_offset..grants_offset].copy_from_slice(unsafe {
+            core::slice::from_raw_parts(
+                strings.as_ptr().cast::<u8>(),
+                strings.len() * size_of::<X86InitialBootString>(),
+            )
+        });
+        staged[grants_offset..publications_offset].copy_from_slice(unsafe {
+            core::slice::from_raw_parts(
+                grants.as_ptr().cast::<u8>(),
+                grants.len() * size_of::<X86InitialBootGrant>(),
+            )
+        });
+        self._vm
+            .write(FrameGpa::new(INITIAL_EXTENT_GPA), &staged)
+            .map_err(|error| fail(error.to_string()))?;
+        let header = self
+            .ram
+            .host_ptr(
+                X86_INITIAL_BOOT_HEADER_GPA,
+                size_of::<X86InitialBootHeader>(),
+            )
+            .ok_or_else(|| fail("production image boot header absent"))?;
+        // SAFETY: the fixed image header is retained but may not be aligned
+        // by the byte-oriented RAM window abstraction.
+        let header = unsafe { header.cast::<X86InitialBootHeader>().read_unaligned() };
+        if header.magic != X86_INITIAL_BOOT_MAGIC
+            || header.version != X86_INITIAL_BOOT_VERSION
+            || !(IMAGE_VA..IMAGE_VA + 0x10_0000).contains(&header.entry_va)
+        {
+            return Err(fail("production image boot header invalid"));
+        }
+        let kernel_stack = self.binding(0).kernel_stack;
+        let cpu = &mut self.cpus[0];
+        let mut sregs = cpu
+            .fd()
+            .get_sregs()
+            .map_err(|error| fail(error.to_string()))?;
+        sregs.cs.selector = 8;
+        sregs.cs.dpl = 0;
+        sregs.ss.selector = 0x10;
+        sregs.ss.dpl = 0;
+        sregs.gs.base = METADATA_VA + BINDING_OFFSET;
+        cpu.fd()
+            .set_sregs(&sregs)
+            .map_err(|error| fail(error.to_string()))?;
+        let msrs = Msrs::from_entries(&[kvm_msr_entry {
+            index: 0xc000_0102,
+            data: 0,
+            ..Default::default()
+        }])
+        .map_err(|error| fail(error.to_string()))?;
+        if cpu
+            .fd()
+            .set_msrs(&msrs)
+            .map_err(|error| fail(error.to_string()))?
+            != 1
+        {
+            return Err(fail("production user GS initialization"));
+        }
+        let mut regs = cpu
+            .fd()
+            .get_regs()
+            .map_err(|error| fail(error.to_string()))?;
+        regs.rip = header.entry_va;
+        regs.rdi = DIRECT_VA + INITIAL_EXTENT_GPA;
+        regs.rsp = kernel_stack;
+        regs.rflags = 2;
+        cpu.fd()
+            .set_regs(&regs)
+            .map_err(|error| fail(error.to_string()))?;
+        let watchdog = Watchdog::start();
+        let exit = HvVcpu::run(&mut self.cpus[0])?;
+        if watchdog.expired() {
+            return Err(fail("production initial MM deadline"));
+        }
+        if !matches!(
+            exit,
+            VcpuExit::IoOut {
+                port: X86_INITIAL_BOOT_PORT,
+                ..
+            }
+        ) {
+            let mut detail = "unexpected production initial MM exit".to_owned();
+            self.cpus[0].append_debug_state(&mut detail);
+            return Err(fail(detail));
+        }
+        if self.cpus[0].get_gpr(X86Reg::Rax)? != DIRECT_VA + INITIAL_EXTENT_GPA {
+            return Err(fail("production initial MM request pointer"));
+        }
+        let reply = self
+            ._vm
+            .read(
+                FrameGpa::new(INITIAL_EXTENT_GPA),
+                size_of::<X86InitialBootRequest>(),
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        // SAFETY: this fixed-size copy is exactly one initialized ABI record.
+        let reply = unsafe {
+            reply
+                .as_ptr()
+                .cast::<X86InitialBootRequest>()
+                .read_unaligned()
+        };
+        if reply.result_status != X86_INITIAL_BOOT_LOADED {
+            return Err(fail(format!(
+                "production initial MM refused: status {}",
+                reply.result_status
+            )));
+        }
+        if reply.magic != request.magic
+            || reply.version != request.version
+            || reply.mm_key != INITIAL_MM_KEY
+            || reply.generation != 1
+            || reply.result_data_used != reply.publication_count
+            || reply.publication_count == 0
+            || reply.publication_count > reply.publication_capacity
+            || reply.result_root_gpa != grants[0].gpa
+            || reply.result_table_used == 0
+            || reply.result_table_used > reply.table_grant_count
+            || reply.result_rsp >= reply.stack_top
+            || reply.result_rsp < reply.stack_top - reply.stack_size
+        {
+            return Err(fail("production initial MM reply identity"));
+        }
+        let mm = NonZeroU64::new(reply.mm_key).ok_or_else(|| fail("initial MM key"))?;
+        let generation =
+            NonZeroU64::new(reply.generation).ok_or_else(|| fail("initial MM generation"))?;
+        let root = RootGpa::page_aligned(FrameGpa::new(reply.result_root_gpa))
+            .ok_or_else(|| fail("initial root alignment"))?;
+        let context = AddressContext {
+            root,
+            mm: MmGeneration::new(mm),
+            generation: ContextGeneration::new(generation),
+        };
+        self._vm
+            .install_root(mm, context)
+            .map_err(|error| fail(error.to_string()))?;
+        let publication_bytes = self
+            ._vm
+            .read(
+                FrameGpa::new(reply.publications_gpa),
+                reply.publication_count as usize * size_of::<GuestMmuPublication>(),
+            )
+            .map_err(|error| fail(error.to_string()))?;
+        let mut publications = Vec::with_capacity(reply.publication_count as usize);
+        for chunk in publication_bytes.chunks_exact(size_of::<GuestMmuPublication>()) {
+            // SAFETY: one complete fixed-layout guest ABI publication was
+            // copied from retained memory while this vCPU is stopped.
+            publications.push(unsafe {
+                chunk
+                    .as_ptr()
+                    .cast::<GuestMmuPublication>()
+                    .read_unaligned()
+            });
+        }
+        let tables: Vec<RootGpa> = grants[1..reply.result_table_used as usize]
+            .iter()
+            .map(|grant| {
+                RootGpa::page_aligned(FrameGpa::new(grant.gpa))
+                    .ok_or_else(|| fail("initial table grant"))
+            })
+            .collect::<Result<_, _>>()?;
+        let identity = BackingIdentity {
+            frame_id: NonZeroU64::new(0x100).ok_or_else(|| fail("initial frame identity"))?,
+            mapping_id: NonZeroU64::new(0x100).ok_or_else(|| fail("initial mapping identity"))?,
+            owner_generation: NonZeroU64::new(0x100)
+                .ok_or_else(|| fail("initial owner generation"))?,
+            inventory_revision: NonZeroU64::new(0x100)
+                .ok_or_else(|| fail("initial inventory revision"))?,
+        };
+        let mut inventory = InitialInventory {
+            expected: publications.len(),
+            committed: 0,
+        };
+        let mut used_tables = 0usize;
+        for (index, publication) in publications.into_iter().enumerate() {
+            let perms = if let Some(region) = image.regions.iter().find(|region| {
+                region.start <= publication.span_va && publication.span_va < region.end
+            }) {
+                Permissions {
+                    writable: region.perms.write,
+                    executable: region.perms.execute,
+                    user: true,
+                }
+            } else if publication.span_va >= reply.stack_top - reply.stack_size
+                && publication.span_va < reply.stack_top
+            {
+                Permissions {
+                    writable: true,
+                    executable: false,
+                    user: true,
+                }
+            } else {
+                return Err(fail("initial publication outside ELF and stack"));
+            };
+            let output = FrameGpa::new(grants[table_grants + index].gpa);
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: mm,
+                    generation,
+                },
+                root,
+                op: DescriptorOp::Map {
+                    span: PageSpan::new(publication.span_va, 4096),
+                    output,
+                    permissions: perms,
+                    size: LeafSize::Page,
+                    resident: true,
+                    backing: identity,
+                },
+                tables: tables
+                    .get(used_tables..)
+                    .ok_or_else(|| fail("initial table receipt count"))?,
+            };
+            self._vm
+                .publish(&txn, publication, &mut inventory)
+                .map_err(|error| fail(error.to_string()))?;
+            used_tables = used_tables
+                .checked_add(publication.tables_linked as usize)
+                .ok_or_else(|| fail("initial table receipt overflow"))?;
+        }
+        if inventory.committed != inventory.expected {
+            return Err(fail("initial inventory incomplete"));
+        }
+        Ok(())
+    }
+
+    fn read_initial_user(
+        &self,
+        root: RootGpa,
+        start: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, TrapError> {
+        if len > 1024 * 1024 {
+            return Err(fail("initial stdout write exceeds bounded transfer"));
+        }
+        let mut bytes = Vec::with_capacity(len);
+        while bytes.len() < len {
+            let va = start
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| fail("initial user pointer overflow"))?;
+            let leaf = translate_leaf(&self._vm.words(), root, UserVa::new(va), Access::Read, true)
+                .map_err(|error| fail(format!("initial user read fault: {error:?}")))?;
+            let span = (4096 - (va & 4095)) as usize;
+            let count = span.min(len - bytes.len());
+            bytes.extend(
+                self._vm
+                    .read(leaf.output, count)
+                    .map_err(|error| fail(error.to_string()))?,
+            );
+        }
+        Ok(bytes)
+    }
+
+    /// Resume the published initial MM through the existing shared Linux
+    /// personality. Only host-crossing calls leave CPL0 through FORWARD_PORT.
+    pub fn run_initial_process(
+        &mut self,
+        max_exits: usize,
+        mut stdio: impl FnMut(i32, &[u8]) -> i64,
+    ) -> Result<(i32, usize), TrapError> {
+        let mm = NonZeroU64::new(INITIAL_MM_KEY).ok_or_else(|| fail("initial MM key"))?;
+        let root = self
+            ._vm
+            .root(mm)
+            .ok_or_else(|| fail("initial MM not published"))?
+            .root;
+        let watchdog = Watchdog::start();
+        for exits in 1..=max_exits {
+            let exit = HvVcpu::run(&mut self.cpus[0])?;
+            if watchdog.expired() {
+                return Err(fail("initial process deadline"));
+            }
+            let VcpuExit::IoOut {
+                port: FORWARD_PORT, ..
+            } = exit
+            else {
+                if let VcpuExit::IoOut {
+                    port: carrick_x86::FAULT_DOORBELL_PORT,
+                    data,
+                } = exit
+                {
+                    let mut words = vec![u32::from_le_bytes(
+                        data.as_slice()
+                            .try_into()
+                            .map_err(|_| fail("initial fault word width"))?,
+                    )];
+                    while words.len() < carrick_x86::X86_FAULT_RECORD_U32_WORDS {
+                        let VcpuExit::IoOut {
+                            port: carrick_x86::FAULT_DOORBELL_PORT,
+                            data,
+                        } = HvVcpu::run(&mut self.cpus[0])?
+                        else {
+                            return Err(fail("initial fault record interrupted"));
+                        };
+                        words.push(u32::from_le_bytes(
+                            data.as_slice()
+                                .try_into()
+                                .map_err(|_| fail("initial fault word width"))?,
+                        ));
+                    }
+                    let record = carrick_x86::FaultDoorbellRecord::from_u32_words(&words)?;
+                    return Err(fail(format!("initial process fault: {record:?}")));
+                }
+                let mut detail = match exit {
+                    VcpuExit::IoOut { port, .. } => {
+                        format!("unexpected initial process port {port:#x}")
+                    }
+                    VcpuExit::Halt => "initial process halted".to_owned(),
+                    _ => "unexpected initial process exit".to_owned(),
+                };
+                self.cpus[0].append_debug_state(&mut detail);
+                return Err(fail(detail));
+            };
+            let address = self.cpus[0].get_gpr(X86Reg::Rax)?;
+            let stack_end = self.binding(0).kernel_stack + 16;
+            if address & 7 != 0
+                || address < stack_end - 0x1_0000
+                || address
+                    .checked_add(size_of::<NativeFrame>() as u64)
+                    .is_none_or(|end| end > stack_end)
+            {
+                return Err(fail("initial syscall frame outside private kernel stack"));
+            }
+            let ptr = self
+                .ram
+                .host_ptr(address - DIRECT_VA, size_of::<NativeFrame>())
+                .ok_or_else(|| fail("initial syscall frame backing"))?
+                .cast::<NativeFrame>();
+            // SAFETY: the stopped CPU published this exact stack-local frame.
+            let frame = unsafe { &mut *ptr };
+            match frame.rax {
+                1 => {
+                    let fd =
+                        i32::try_from(frame.rdi).map_err(|_| fail("initial write fd range"))?;
+                    let len =
+                        usize::try_from(frame.rdx).map_err(|_| fail("initial write size range"))?;
+                    let bytes = self.read_initial_user(root, frame.rsi, len)?;
+                    frame.rax = stdio(fd, &bytes) as u64;
+                }
+                60 | 231 => return Ok(((frame.rdi & 255) as i32, exits)),
+                call => return Err(fail(format!("unported initial x86 syscall {call}"))),
+            }
+        }
+        Err(fail("initial process exit budget exceeded"))
     }
 
     pub(crate) fn boot_inner(
@@ -232,13 +869,14 @@ impl Cpl0Carrier {
             .file_name()
             .is_some_and(|name| name == "carrick-x86-cpl0-fixture");
         let bytes = std::fs::read(image).map_err(|e| fail(format!("CPL0 image: {e}")))?;
-        Self::boot_bytes_inner(&bytes, programs, interrupts)
+        Self::boot_bytes_inner(&bytes, programs, interrupts, None)
     }
 
     fn boot_bytes_inner(
         bytes: &[u8],
         programs: [&[u8]; 2],
         interrupts: bool,
+        initial_extent_bytes: Option<usize>,
     ) -> Result<Self, TrapError> {
         let plan = carrick_mem::elf::plan_elf_load_bytes_for(bytes, 62)
             .map_err(|e| fail(format!("CPL0 ELF: {e}")))?;
@@ -317,6 +955,16 @@ impl Cpl0Carrier {
             write: true,
             exec: false,
         });
+        if let Some(len) = initial_extent_bytes {
+            maps.push(Pml4MapSpec {
+                va: DIRECT_VA + INITIAL_EXTENT_GPA,
+                gpa: INITIAL_EXTENT_GPA,
+                len: len as u64,
+                user: false,
+                write: true,
+                exec: false,
+            });
+        }
 
         for (index, program) in programs.iter().enumerate() {
             if program.is_empty() {
@@ -517,6 +1165,26 @@ impl Cpl0Carrier {
         memory
             .install_bootstrap(Arc::clone(&ram))
             .map_err(|e| fail(e.to_string()))?;
+        let initial_extent = if let Some(len) = initial_extent_bytes {
+            let identity =
+                NonZeroU64::new(0x100).ok_or_else(|| fail("initial backing identity"))?;
+            let extent = BackingExtent::private(FrameGpa::new(INITIAL_EXTENT_GPA), len)
+                .map_err(|e| fail(e.to_string()))?;
+            let handles = memory
+                .install(&[PreparedBacking {
+                    extent: Arc::new(extent),
+                    identity: BackingIdentity {
+                        frame_id: identity,
+                        mapping_id: identity,
+                        owner_generation: identity,
+                        inventory_revision: identity,
+                    },
+                }])
+                .map_err(|e| fail(e.to_string()))?;
+            Some((handles[0], len))
+        } else {
+            None
+        };
         let machine = CarrierMachine::from_memory(memory, 2).map_err(|e| fail(e.to_string()))?;
         let (cpus, vm) = machine.into_parts();
         let [mut a, mut b]: [KvmVcpu; 2] =
@@ -642,6 +1310,7 @@ impl Cpl0Carrier {
             cpus: [a, b],
             _vm: vm,
             ram,
+            initial_extent,
             metadata_base,
             host_forwards: 0,
             host_yields: 0,
