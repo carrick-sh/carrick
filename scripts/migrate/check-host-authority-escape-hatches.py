@@ -82,6 +82,13 @@ ASSEMBLY_BOUNDARIES = frozenset(
         PurePosixPath("crates/carrick-x86-cpl0/src/progress.rs"),
         PurePosixPath("crates/carrick-x86/src/cpl0_scheduler.rs"),
         PurePosixPath("crates/carrick-x86/src/interrupts.rs"),
+        # CPL0-only KernelArch instruction leaves: CPU-local register, TLB,
+        # IRQ and fail-closed traps; none issue host syscalls.
+        PurePosixPath("crates/carrick-el1/src/isa/x86/context.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/interrupt.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/mmu.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/transport.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/user_access.rs"),
     }
 )
 

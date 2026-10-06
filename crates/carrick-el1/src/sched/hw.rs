@@ -381,12 +381,14 @@ pub fn read_current_sp() -> u64 {
 }
 
 /// Guard structure capturing saved DAIF interrupt flags.
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub struct IrqGuard {
     #[allow(dead_code)]
     pub saved_daif: u64,
 }
 
 #[inline(always)]
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub fn disable_irq_save() -> IrqGuard {
     let daif: u64;
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -406,6 +408,7 @@ pub fn disable_irq_save() -> IrqGuard {
 }
 
 #[inline(always)]
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub fn restore_irq(guard: IrqGuard) {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     unsafe {
@@ -418,6 +421,32 @@ pub fn restore_irq(guard: IrqGuard) {
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
     {
         let _ = guard;
+    }
+}
+
+/// RFLAGS.IF captured before entering a CPL0 metadata critical section.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub struct IrqGuard {
+    flags: u64,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn disable_irq_save() -> IrqGuard {
+    let flags: u64;
+    // SAFETY: CPL0 owns RFLAGS.IF; saving it before CLI protects the metadata
+    // lock against interrupt reentry on the executing vCPU.
+    unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+    IrqGuard { flags }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn restore_irq(guard: IrqGuard) {
+    if guard.flags & (1 << 9) != 0 {
+        // SAFETY: this guard captured enabled interrupts before the lock;
+        // callers invoke restore only after dropping the metadata lock.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
     }
 }
 
