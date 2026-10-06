@@ -154,13 +154,13 @@ impl carrick_guest_arch::MmuEditBackend for super::aarch64::Aarch64Backend {
         {
             return Err(ArchError::Unbound);
         }
-        let live = crate::fault::hardware_live_ttbr();
+        let live = super::aarch64::hardware_live_ttbr();
         let table = carrick_el1_abi::service_target_table_window(live, txn.root.raw())
             .ok_or(ArchError::Unbound)?;
         if tables.mapped().raw() != table.words as u64 {
             return Err(ArchError::Unbound);
         }
-        let maintenance = crate::fault::El1TableMaintenance {
+        let maintenance = El1TableMaintenance {
             ttbr0: txn.root.raw(),
         };
         // SAFETY: the exact-MM editor and table-window requirements are
@@ -181,6 +181,27 @@ impl carrick_guest_arch::MmuEditBackend for super::aarch64::Aarch64Backend {
             return Err(ArchError::Busy);
         }
         Ok(receipt)
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) struct El1TableMaintenance {
+    pub(crate) ttbr0: u64,
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for El1TableMaintenance {
+    fn publish_barrier(&self) {
+        // Complete unlinked fills and invalidate the exact live ASID before
+        // a new link can be observed by another walker.
+        let mut cpu = crate::substrate::sched::HardwareCpu;
+        crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, self.ttbr0);
+    }
+
+    fn invalidate_range(&self, _va: u64, _len: u64) {
+        // The whole ASID is a superset of the break-before-make range.
+        let mut cpu = crate::substrate::sched::HardwareCpu;
+        crate::substrate::sched::ThreadCpu::invalidate_asid(&mut cpu, self.ttbr0);
     }
 }
 
