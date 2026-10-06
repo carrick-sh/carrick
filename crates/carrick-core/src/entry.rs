@@ -1,6 +1,10 @@
 //! Neutral one-owner entry completion.
 use carrick_core_abi::{EntryCompletion, ExecutionBinding};
 
+pub fn admit(binding: ExecutionBinding) -> Option<EntryCompletion> {
+    EntryCompletion::admit(binding)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CompletionError {
     WrongGeneration,
