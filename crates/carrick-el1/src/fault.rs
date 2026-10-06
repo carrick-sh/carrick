@@ -53,6 +53,54 @@ fn prepared_fault_access(esr: u64) -> Option<LeafAccess> {
     }
 }
 
+/// The guest fault policy's input after the native entry leaf has classified
+/// its own fault encoding. No ISA syndrome is interpreted by the policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultClass {
+    Translation {
+        access: LeafAccess,
+        grant_access: u64,
+    },
+    WritePermission,
+    Other,
+}
+
+fn arm_fault_class(esr: u64) -> FaultClass {
+    if is_write_permission_fault(esr) {
+        return FaultClass::WritePermission;
+    }
+    match (prepared_fault_access(esr), frame_grant_access(esr)) {
+        (Some(access), Some(grant_access)) => FaultClass::Translation {
+            access,
+            grant_access,
+        },
+        _ => FaultClass::Other,
+    }
+}
+
+fn x86_fault_class(fault: carrick_guest_arch::FaultInfo) -> FaultClass {
+    use carrick_guest_arch::Access;
+    if fault.address.raw() >= (1 << 47) {
+        return FaultClass::Other;
+    }
+    match (fault.present, fault.access) {
+        (true, Access::Write) => FaultClass::WritePermission,
+        (true, _) => FaultClass::Other,
+        (false, Access::Read) => FaultClass::Translation {
+            access: LeafAccess::Read,
+            grant_access: 1,
+        },
+        (false, Access::Write) => FaultClass::Translation {
+            access: LeafAccess::Write,
+            grant_access: 2,
+        },
+        (false, Access::Execute) => FaultClass::Translation {
+            access: LeafAccess::Execute,
+            grant_access: 4,
+        },
+    }
+}
+
 /// Decode an EL0 write permission fault that can be satisfied by in-guest COW resolution.
 pub fn is_write_permission_fault(esr: u64) -> bool {
     let ec = (esr >> 26) & 0x3f;
@@ -960,10 +1008,7 @@ fn consume_refusal(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64, access:
 /// fault. Left in RESPONSE, a mailbox could never carry another request, and
 /// every later first touch on that vCPU slot, in any MM, would fall back to
 /// page-granular host service.
-fn consume_served_refusals(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64, esr: u64) {
-    let Some(access) = frame_grant_access(esr) else {
-        return;
-    };
+fn consume_served_refusals(mailboxes: GrantMailboxes<'_>, mm_key: u64, far: u64, access: u64) {
     let release = |source: &FrameGrantMailbox| {
         if let Some(response) = source.response_covering_fault(mm_key, far, access) {
             release_refusal(source, mm_key, response.request.request_generation);
@@ -981,13 +1026,64 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
     current_tasks: &[CurrentTask],
     spaces: SpaceAccess<'_>,
     mailboxes: GrantMailboxes<'_>,
+    prepared: Option<PreparedFaultPath<'_, P>>,
+    cow_resolver: &mut C,
+) -> Action {
+    dispatch_classified_fault(
+        frame.slot,
+        frame.far,
+        arm_fault_class(frame.esr),
+        counters,
+        current_tasks,
+        spaces,
+        mailboxes,
+        prepared,
+        cow_resolver,
+    )
+}
+
+/// Execute the same guest fault policy for a decoded CPL3 x86 page fault.
+/// The entry backend must have checked the fault's user origin before calling.
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_x86_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
+    slot: u64,
+    fault: carrick_guest_arch::FaultInfo,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    spaces: SpaceAccess<'_>,
+    mailboxes: GrantMailboxes<'_>,
+    prepared: Option<PreparedFaultPath<'_, P>>,
+    cow_resolver: &mut C,
+) -> Action {
+    dispatch_classified_fault(
+        slot,
+        fault.address.raw(),
+        x86_fault_class(fault),
+        counters,
+        current_tasks,
+        spaces,
+        mailboxes,
+        prepared,
+        cow_resolver,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_classified_fault<P: PreparedPageResolver, C: CowResolver>(
+    slot: u64,
+    far: u64,
+    fault: FaultClass,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    spaces: SpaceAccess<'_>,
+    mailboxes: GrantMailboxes<'_>,
     mut prepared: Option<PreparedFaultPath<'_, P>>,
     cow_resolver: &mut C,
 ) -> Action {
     let mailbox = mailboxes.own;
     counters.fault_taken.fetch_add(1, Ordering::Relaxed);
-    if is_write_permission_fault(frame.esr) {
-        let Some(task) = current_tasks.get(frame.slot as usize) else {
+    if fault == FaultClass::WritePermission {
+        let Some(task) = current_tasks.get(slot as usize) else {
             return Action::Forward;
         };
         let mm_key = task.mm.key.load(Ordering::Acquire);
@@ -997,7 +1093,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         let Some(index) = spaces.find(mm_key) else {
             return Action::Forward;
         };
-        let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
+        let Some(owner) = NonZeroU64::new(slot + 1) else {
             return Action::Forward;
         };
         // A closed gate (host pause or retirement) or another EL1 editor:
@@ -1018,16 +1114,20 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
             cow_resolver.editor_busy();
             return Action::Forward;
         };
-        if cow_resolver.resolve_cow(grant.ttbr0, mm_key, frame.far) {
+        if cow_resolver.resolve_cow(grant.ttbr0, mm_key, far) {
             return Action::Served;
         }
         return Action::Forward;
     }
 
-    let Some(prepared_access) = prepared_fault_access(frame.esr) else {
+    let FaultClass::Translation {
+        access: prepared_access,
+        grant_access: access,
+    } = fault
+    else {
         return Action::Forward;
     };
-    let Some(task) = current_tasks.get(frame.slot as usize) else {
+    let Some(task) = current_tasks.get(slot as usize) else {
         return Action::Forward;
     };
     let mm_key = task.mm.key.load(Ordering::Acquire);
@@ -1037,7 +1137,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
 
     if let Some(page) = prepared
         .as_ref()
-        .and_then(|path| path.residency.lookup(mm_key, frame.far))
+        .and_then(|path| path.residency.lookup(mm_key, far))
     {
         // First-touch stock over a root hole is backing, not a mapping: the
         // host answers a touch the root does not map (SIGSEGV), and asks
@@ -1045,9 +1145,9 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         if root_admits_commit(
             prepared.as_ref().and_then(|path| path.roots),
             spaces,
-            frame.slot as u32,
+            slot as u32,
             mm_key,
-            frame.far & !4095,
+            far & !4095,
             prepared_access,
         ) == Some(false)
         {
@@ -1059,7 +1159,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         let Some(grant) = spaces.grant(index, mm_key) else {
             return Action::Forward;
         };
-        let Some(owner) = NonZeroU64::new(frame.slot + 1) else {
+        let Some(owner) = NonZeroU64::new(slot + 1) else {
             return Action::Forward;
         };
         let Some(_editor) = spaces.try_begin_edit(index, mm_key, owner) else {
@@ -1068,17 +1168,17 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         let path = prepared.as_mut().expect("prepared grant path");
         match path.resolver.commit_prepared(
             grant.ttbr0,
-            frame.far & !4095,
+            far & !4095,
             page.expected_ipa,
             prepared_access,
         ) {
             Ok(GuestPreparedCommit::Committed) => {
                 assert!(path.residency.record_commit(page));
-                consume_served_refusals(mailboxes, mm_key, frame.far, frame.esr);
+                consume_served_refusals(mailboxes, mm_key, far, access);
                 return Action::Served;
             }
             Ok(GuestPreparedCommit::AlreadyResident) => {
-                consume_served_refusals(mailboxes, mm_key, frame.far, frame.esr);
+                consume_served_refusals(mailboxes, mm_key, far, access);
                 return Action::Served;
             }
             Err(GuestPreparedCommitError::RollbackFailed) => {
@@ -1088,13 +1188,9 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
         }
     }
 
-    let Some(access) = frame_grant_access(frame.esr) else {
-        return Action::Forward;
-    };
-
     // Only refusals cross back to EL1. Successful grants have already
     // published and released their slot on the host, even after migration.
-    if consume_refusal(mailboxes, mm_key, frame.far, access) {
+    if consume_refusal(mailboxes, mm_key, far, access) {
         return Action::Forward;
     }
 
@@ -1107,15 +1203,15 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
             roots,
             spaces,
             slots,
-            worker: frame.slot as u32,
+            worker: slot as u32,
             mailbox,
         })
-        .publish(mm_key, frame.far, access)
+        .publish(mm_key, far, access)
         {
             return Action::Forward;
         }
     }
-    let _ = request_lazy_frames(mailbox, mm_key, frame.far, access);
+    let _ = request_lazy_frames(mailbox, mm_key, far, access);
     Action::Forward
 }
 
@@ -1215,6 +1311,71 @@ mod tests {
         assert_eq!(prepared.calls, vec![(0x8800_0000, va, 0x9000_1000)]);
         assert!(table.is_guest_committed(mm, va));
         assert!(!mailbox.has_guest_work());
+    }
+
+    #[test]
+    fn x86_translation_fault_uses_shared_prepared_owner_path() {
+        use carrick_guest_arch::{Access, FaultInfo, UserVa};
+        let mm = 91;
+        let va = 0x4000_1000;
+        let residency = carrick_el1_abi::FrameGrantResidencyTable::new();
+        residency
+            .publish(carrick_el1_abi::FrameGrantResidencyIdentity {
+                mm_key: mm,
+                semantic_base: va,
+                physical_ipa: 0x9000_0000,
+                len: 4096,
+                mapping_id: 11,
+                frame_id: 12,
+                owner_generation: 13,
+                inventory_revision: 14,
+            })
+            .unwrap();
+        let task = CurrentTask::new();
+        task.mm.key.store(mm, Ordering::Release);
+        let tasks = [task];
+        let spaces = published_space(mm, 0x8800_0000);
+        let mailbox = FrameGrantMailbox::new();
+        let mut prepared = RecordingPreparedResolver::default();
+        let counters = Counters::default();
+        assert_eq!(
+            dispatch_x86_fault_with_prepared(
+                0,
+                FaultInfo {
+                    address: UserVa::new(va),
+                    access: Access::Read,
+                    present: false,
+                },
+                &counters,
+                &tasks,
+                carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
+                GrantMailboxes::own(&mailbox),
+                Some(PreparedFaultPath {
+                    residency: &residency,
+                    resolver: &mut prepared,
+                    roots: None,
+                }),
+                &mut NoopCowResolver,
+            ),
+            Action::Served
+        );
+        assert_eq!(prepared.calls, vec![(0x8800_0000, va, 0x9000_0000)]);
+        assert!(residency.is_guest_committed(mm, va));
+        assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
+        assert!(!mailbox.has_guest_work());
+    }
+
+    #[test]
+    fn x86_kernel_half_fault_never_requests_guest_backing() {
+        use carrick_guest_arch::{Access, FaultInfo, UserVa};
+        assert_eq!(
+            x86_fault_class(FaultInfo {
+                address: UserVa::new(0xffff_9000_0060_0000),
+                access: Access::Write,
+                present: false,
+            }),
+            FaultClass::Other
+        );
     }
 
     /// A zeroed shared reservation table with `mm`'s root admitted in its
