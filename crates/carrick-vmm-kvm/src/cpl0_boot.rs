@@ -359,7 +359,7 @@ impl Cpl0Carrier {
         if initial_extent_bytes == 0 || !initial_extent_bytes.is_multiple_of(4096) {
             return Err(fail("invalid initial guest MM extent size"));
         }
-        Self::boot_bytes_inner(IMAGE, [&[], &[]], false, Some(initial_extent_bytes))
+        Self::boot_bytes_inner(IMAGE, [&[], &[]], false, Some(initial_extent_bytes), false)
     }
 
     /// The guest MM owner supplies the executable and stack publication here.
@@ -869,7 +869,7 @@ impl Cpl0Carrier {
             .file_name()
             .is_some_and(|name| name == "carrick-x86-cpl0-fixture");
         let bytes = std::fs::read(image).map_err(|e| fail(format!("CPL0 image: {e}")))?;
-        Self::boot_bytes_inner(&bytes, programs, interrupts, None)
+        Self::boot_bytes_inner(&bytes, programs, interrupts, None, fixture_image)
     }
 
     fn boot_bytes_inner(
@@ -877,6 +877,7 @@ impl Cpl0Carrier {
         programs: [&[u8]; 2],
         interrupts: bool,
         initial_extent_bytes: Option<usize>,
+        fixture_image: bool,
     ) -> Result<Self, TrapError> {
         let plan = carrick_mem::elf::plan_elf_load_bytes_for(bytes, 62)
             .map_err(|e| fail(format!("CPL0 ELF: {e}")))?;
