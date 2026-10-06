@@ -471,8 +471,7 @@ pub fn dispatch<'a>(
     }
     let setup = pending.lifecycle_available()
         && matches!(family, Family::Lifecycle)
-        && ordinal != 93
-        && ordinal != 220;
+        && matches!(ordinal, 99 | 132 | 135);
     let transfer = pending.ipc_available()
         && matches!(family, Family::Read | Family::Write | Family::EpollWait);
     if pending.host_work() && !pending.resumes_operation() && !transfer && !setup {
