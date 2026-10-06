@@ -921,13 +921,22 @@ impl PreparedRun {
             let (exit_code, traps) = machine.run_initial_process(max_traps, |fd, bytes| {
                 dispatcher.forward_stdio_bytes(fd, bytes)
             })?;
+            let (guest_entries, host_forwards) = machine.initial_execution_witness();
+            let report = crate::compat::CompatReport {
+                execution_witness: Some(crate::compat::ExecutionWitness {
+                    backend: "kvm-x86-cpl0".to_owned(),
+                    guest_entries,
+                    host_forwards,
+                }),
+                ..Default::default()
+            };
             Ok(RunResult {
                 exit_code,
                 terminating_signal: None,
                 stdout: dispatcher.stdout(),
                 stderr: dispatcher.stderr(),
                 traps,
-                report: crate::compat::CompatReport::default(),
+                report,
                 trap_limit_hit: false,
                 terminal_reason: None,
             })
