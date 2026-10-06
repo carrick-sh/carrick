@@ -12,7 +12,8 @@ use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGenerati
 use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables};
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::{
-    OBSERVE_ALLOCATOR, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE,
+    OBSERVE_ALLOCATOR, OBSERVE_DESCRIPTOR_PROTECT, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT,
+    OBSERVE_NATIVE,
 };
 use carrick_x86::cpl0_scheduler::{
     ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
@@ -227,6 +228,29 @@ fn shared_kernel_drain_receipt_requires_the_live_root() {
         0x60_0000
     );
     assert_eq!(carrier.observe(1).expect("stale root refused").result, -1);
+}
+
+#[test]
+fn shared_kernel_x86_descriptor_protects_a_user_page() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_DESCRIPTOR_PROTECT.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(
+        carrier
+            .observe(0)
+            .expect("descriptor edit and observation")
+            .result,
+        1
+    );
+    let leaf = carrier
+        .fixture_user_leaf(0x3_0000)
+        .expect("4 KiB user leaf");
+    assert_ne!(leaf & 1, 0, "mapping remains present");
+    assert_eq!(leaf & 2, 0, "RW is cleared by the shared-kernel edit");
+    assert_ne!(leaf & (1 << 63), 0, "NX is set by the shared-kernel edit");
 }
 
 // Observe each task in turn while both lifecycle slots remain live. Registration
