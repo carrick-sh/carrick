@@ -75,120 +75,12 @@ pub struct Assembly {
     /// Includes operands, options, clobber ABI and non-literal templates.
     pub specifications: String,
     pub cfg: Vec<String>,
+    pub features: FeatureSet,
 }
 pub type Manifest = BTreeMap<Key, Assembly>;
 
-// Only target_arch is fixed. Features, target_os, test, etc. remain unknown,
-// because this guard protects every possible aarch64 build configuration.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Truth {
-    Yes,
-    No,
-    Unknown,
-}
-impl Truth {
-    fn not(self) -> Self {
-        match self {
-            Self::Yes => Self::No,
-            Self::No => Self::Yes,
-            Self::Unknown => Self::Unknown,
-        }
-    }
-    fn all(values: impl Iterator<Item = Self>) -> Self {
-        values.fold(Self::Yes, |a, b| match (a, b) {
-            (Self::No, _) | (_, Self::No) => Self::No,
-            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
-            _ => Self::Yes,
-        })
-    }
-    fn any(values: impl Iterator<Item = Self>) -> Self {
-        Self::all(values.map(Self::not)).not()
-    }
-}
-fn arguments(meta: &syn::MetaList) -> Option<Vec<syn::Meta>> {
-    use syn::parse::Parser;
-    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
-        .parse2(meta.tokens.clone())
-        .ok()
-        .map(|args| args.into_iter().collect())
-}
-fn condition(meta: &syn::Meta) -> Truth {
-    match meta {
-        syn::Meta::NameValue(value) if value.path.is_ident("target_arch") => {
-            if let syn::Expr::Lit(literal) = &value.value
-                && let syn::Lit::Str(arch) = &literal.lit
-            {
-                if arch.value() == "aarch64" {
-                    Truth::Yes
-                } else {
-                    Truth::No
-                }
-            } else {
-                Truth::Unknown
-            }
-        }
-        syn::Meta::List(list) => {
-            let Some(args) = arguments(list) else {
-                return Truth::Unknown;
-            };
-            if list.path.is_ident("all") {
-                Truth::all(args.iter().map(condition))
-            } else if list.path.is_ident("any") {
-                Truth::any(args.iter().map(condition))
-            } else if list.path.is_ident("not") && args.len() == 1 {
-                condition(&args[0]).not()
-            } else {
-                Truth::Unknown
-            }
-        }
-        _ => Truth::Unknown,
-    }
-}
-fn attribute_condition(meta: &syn::Meta) -> Truth {
-    let syn::Meta::List(list) = meta else {
-        return Truth::Unknown;
-    };
-    let Some(args) = arguments(list) else {
-        return Truth::Unknown;
-    };
-    if list.path.is_ident("cfg") && args.len() == 1 {
-        condition(&args[0])
-    } else if list.path.is_ident("cfg_attr") && args.len() >= 2 {
-        // cfg_attr(C, cfg(P)) means !C || P. Non-cfg attributes do not
-        // constrain reachability; nested cfg_attr is handled recursively.
-        let enabled = condition(&args[0]);
-        let restrictions = Truth::all(args[1..].iter().map(|attr| {
-            if attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr") {
-                attribute_condition(attr)
-            } else {
-                Truth::Yes
-            }
-        }));
-        Truth::any([enabled.not(), restrictions].into_iter())
-    } else {
-        Truth::Unknown
-    }
-}
-fn guarded(key: &Key, asm: &Assembly, arch: Arch) -> bool {
-    if matches!(arch, Arch::All) {
-        return true;
-    }
-    // These ISA crates and explicitly named ISA modules are x86-only even
-    // when their crate-level source has no target_arch attribute.
-    if matches!(key.krate.as_str(), "carrick-x86" | "carrick-x86-cpl0")
-        || key
-            .module
-            .split("::")
-            .any(|part| part == "x86" || part.starts_with("x86_"))
-    {
-        return false;
-    }
-    Truth::all(asm.cfg.iter().map(|cfg| {
-        syn::parse_str::<syn::Meta>(cfg)
-            .map(|meta| attribute_condition(&meta))
-            .unwrap_or(Truth::Unknown)
-    })) != Truth::No
-}
+mod cfg;
+use cfg::{FeatureSet, cfg_equivalent, guarded};
 
 struct ExternalModule {
     module: String,
@@ -291,6 +183,7 @@ impl Extractor {
                     .trim_end()
                     .to_owned(),
                 cfg,
+                features: FeatureSet::default(),
             },
         );
     }
@@ -587,8 +480,26 @@ fn snapshot(root: &Path, rev: &str) -> Result<Manifest, AsmDiffError> {
     ];
     args.extend(CRATES.iter().map(|name| format!("crates/{name}")));
     args.push(SYSREG.into());
+    args.push("crates/carrick-vmm-hvf/Cargo.toml".into());
     let paths = run_checked("git", args, Some(root))?.stdout;
     let mut sources = BTreeMap::new();
+    let mut feature_sets = BTreeMap::new();
+    for path in paths
+        .split('\0')
+        .filter(|path| path.ends_with("Cargo.toml") && Path::new(path).components().count() == 3)
+    {
+        let source = run_checked("git", ["show", &format!("{rev}:{path}")], Some(root))?.stdout;
+        let krate = Path::new(path)
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        feature_sets.insert(
+            krate.to_owned(),
+            FeatureSet::from_manifest(&source)
+                .map_err(|error| AsmDiffError::Unsupported(format!("{path}: {error}")))?,
+        );
+    }
     for path in paths.split('\0').filter(|path| path.ends_with(".rs")) {
         let source = run_checked("git", ["show", &format!("{rev}:{path}")], Some(root))?.stdout;
         sources.insert(PathBuf::from(path), source);
@@ -625,11 +536,20 @@ fn snapshot(root: &Path, rev: &str) -> Result<Manifest, AsmDiffError> {
     if walker.manifest.is_empty() {
         return Err(AsmDiffError::Empty(rev.into()));
     }
+    for (key, asm) in &mut walker.manifest {
+        asm.features = feature_sets.get(&key.krate).cloned().unwrap_or_default();
+    }
     Ok(walker.manifest)
 }
 
-/// Exact payload matches at different keys are moves. Movement preserves the
-/// guard; every instruction, operand, option, cfg, addition or removal fails it.
+fn same_code(old: &Assembly, new: &Assembly) -> bool {
+    old.kind == new.kind
+        && old.instructions == new.instructions
+        && old.specifications == new.specifications
+}
+
+/// Match code and evaluated cfg reachability independently of source spelling.
+/// Unknown cfg changes cannot establish equivalence and remain failures.
 pub fn compare<W: Write>(
     base: &Manifest,
     head: &Manifest,
@@ -638,28 +558,65 @@ pub fn compare<W: Write>(
 ) -> Result<usize, AsmDiffError> {
     let mut old = base.clone();
     let mut new = head.clone();
+    let mut moved = 0;
+    let mut respelled = 0;
+    let mut excluded = 0;
+    let mut failures = 0;
     for (key, asm) in base {
-        if head.get(key) == Some(asm) {
+        if let Some(candidate) = head.get(key)
+            && same_code(asm, candidate)
+            && cfg_equivalent(key, asm, key, candidate, arch)
+        {
+            if asm.cfg != candidate.cfg {
+                writeln!(writer, "CFG-RESPELLED {key}")?;
+                respelled += 1;
+            }
+            old.remove(key);
+            new.remove(key);
+        } else if let Some(candidate) = head.get(key)
+            && same_code(asm, candidate)
+        {
+            // A same-site reachability change is not a relocation. Otherwise
+            // duplicate instruction blocks could conceal each other's loss.
+            let protected = guarded(key, asm, arch) || guarded(key, candidate, arch);
+            failures += usize::from(protected);
+            excluded += usize::from(!protected);
+            let label = if protected {
+                "CFG-CHANGED"
+            } else {
+                "CHANGED-X86"
+            };
+            writeln!(
+                writer,
+                "{label} {key}\n  base: {asm:?}\n  head: {candidate:?}"
+            )?;
             old.remove(key);
             new.remove(key);
         }
     }
     for (key, asm) in old.clone() {
         if let Some(destination) = new.iter().find_map(|(destination, candidate)| {
-            (candidate == &asm
-                && guarded(destination, candidate, arch) == guarded(&key, &asm, arch))
-            .then(|| destination.clone())
+            (same_code(candidate, &asm) && cfg_equivalent(&key, &asm, destination, candidate, arch))
+                .then(|| destination.clone())
         }) {
             writeln!(writer, "MOVED {key} -> {destination}")?;
+            moved += 1;
+            if new
+                .get(&destination)
+                .is_some_and(|candidate| candidate.cfg != asm.cfg)
+            {
+                writeln!(writer, "CFG-RESPELLED {key} -> {destination}")?;
+                respelled += 1;
+            }
             old.remove(&key);
             new.remove(&destination);
         }
     }
-    let mut failures = 0;
     for (key, asm) in old {
         if let Some(replacement) = new.remove(&key) {
             let protected = guarded(&key, &asm, arch) || guarded(&key, &replacement, arch);
             failures += usize::from(protected);
+            excluded += usize::from(!protected);
             let label = if protected { "CHANGED" } else { "CHANGED-X86" };
             writeln!(
                 writer,
@@ -668,6 +625,7 @@ pub fn compare<W: Write>(
         } else {
             let protected = guarded(&key, &asm, arch);
             failures += usize::from(protected);
+            excluded += usize::from(!protected);
             let label = if protected { "REMOVED" } else { "REMOVED-X86" };
             writeln!(writer, "{label} {key}: {asm:?}")?;
         }
@@ -675,12 +633,13 @@ pub fn compare<W: Write>(
     for (key, asm) in new {
         let protected = guarded(&key, &asm, arch);
         failures += usize::from(protected);
+        excluded += usize::from(!protected);
         let label = if protected { "ADDED" } else { "ADDED-X86" };
         writeln!(writer, "{label} {key}: {asm:?}")?;
     }
     writeln!(
         writer,
-        "{} base / {} head assembly blocks; {failures} failure(s)",
+        "{} base / {} head assembly blocks; {moved} moved; {respelled} cfg-respelled; {excluded} excluded changes; {failures} failure(s)",
         base.len(),
         head.len()
     )?;
@@ -861,6 +820,7 @@ macro_rules! barrier { () => { asm!("dsb sy", options(nostack)); } }
                 instructions: vec!["nop".into()],
                 specifications: String::new(),
                 cfg: vec![cfg.into()],
+                features: FeatureSet::default(),
             };
             assert_eq!(guarded(&key, &asm, Arch::Aarch64), expected, "{cfg}");
             assert!(guarded(&key, &asm, Arch::All));
@@ -885,6 +845,144 @@ macro_rules! barrier { () => { asm!("dsb sy", options(nostack)); } }
                 .iter()
                 .filter(|(key, asm)| guarded(key, asm, Arch::Aarch64))
                 .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn cfg_respelled_passes_for_guest_and_host_targets() {
+        let base = manifest(
+            r#"#[cfg(not(all(target_os="none", target_arch="x86_64")))] fn f() { asm!("mrs {}, ttbr0_el1", out(reg) root); }"#,
+        );
+        let head = manifest(
+            r#"#[cfg(all(target_os="none", target_arch="aarch64"))] fn f() { asm!("mrs {}, ttbr0_el1", out(reg) root); }"#,
+        );
+        let mut output = Vec::new();
+        assert_eq!(
+            compare(&base, &head, Arch::Aarch64, &mut output).unwrap(),
+            0
+        );
+        assert!(String::from_utf8(output).unwrap().contains("CFG-RESPELLED"));
+        assert_eq!(
+            compare(&base, &head, Arch::All, &mut Vec::new()).unwrap(),
+            1
+        );
+
+        let host = |source| {
+            extract(
+                "carrick-vmm-hvf",
+                "crate::trap::sysreg",
+                Path::new(SYSREG),
+                source,
+                Vec::new(),
+            )
+            .unwrap()
+            .blocks
+        };
+        let base = host(
+            r#"#[cfg(all(target_os="macos", target_arch="aarch64"))] fn f() { asm!("mrs {}, cntfrq_el0", out(reg) value); }"#,
+        );
+        let head = host(
+            r#"#[cfg(not(any(target_os="none", target_arch="x86_64")))] fn f() { asm!("mrs {}, cntfrq_el0", out(reg) value); }"#,
+        );
+        assert_eq!(
+            compare(&base, &head, Arch::Aarch64, &mut Vec::new()).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn cfg_reachability_lost_or_gained_fails_even_with_duplicate_code() {
+        let base = manifest(
+            r#"fn f() { asm!("nop"); } #[cfg(target_arch="x86_64")] fn g() { asm!("nop"); }"#,
+        );
+        let head = manifest(
+            r#"#[cfg(target_arch="x86_64")] fn f() { asm!("nop"); } fn g() { asm!("nop"); }"#,
+        );
+        let mut output = Vec::new();
+        assert_eq!(
+            compare(&base, &head, Arch::Aarch64, &mut output).unwrap(),
+            2
+        );
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .matches("CFG-CHANGED")
+                .count(),
+            2
+        );
+        assert_eq!(
+            compare(&head, &base, Arch::Aarch64, &mut Vec::new()).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn unknown_cfg_predicate_stays_guarded_and_cannot_prove_respelled() {
+        let base = manifest(r#"fn f() { asm!("nop"); }"#);
+        for source in [
+            r#"#[cfg(unresolved)] fn f() { asm!("nop"); }"#,
+            r#"#[cfg(not(unresolved))] fn f() { asm!("nop"); }"#,
+            r#"#[cfg(feature="undeclared")] fn f() { asm!("nop"); }"#,
+        ] {
+            let head = manifest(source);
+            assert!(
+                head.iter()
+                    .all(|(key, asm)| guarded(key, asm, Arch::Aarch64))
+            );
+            assert_eq!(
+                compare(&base, &head, Arch::Aarch64, &mut Vec::new()).unwrap(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn cfg_image_features_are_evaluated_from_revision_metadata() {
+        let features = FeatureSet::from_manifest("[features]\ndefault = [\"guest\"]\nguest = []\nhost-test = []\nallocator-test-control = []").unwrap();
+        let mut base = manifest(r#"fn f() { asm!("nop"); }"#);
+        let mut head = manifest(
+            r#"#[cfg(all(feature="guest", not(feature="host-test")))] fn f() { asm!("nop"); }"#,
+        );
+        for asm in base.values_mut().chain(head.values_mut()) {
+            asm.features = features.clone();
+        }
+        assert_eq!(
+            compare(&base, &head, Arch::Aarch64, &mut Vec::new()).unwrap(),
+            0
+        );
+        for asm in head.values_mut() {
+            asm.features =
+                FeatureSet::from_manifest("[features]\nguest = []\nhost-test = []").unwrap();
+        }
+        assert_eq!(
+            compare(&base, &head, Arch::Aarch64, &mut Vec::new()).unwrap(),
+            1
+        );
+
+        let mut base = extract(
+            "carrick-el1",
+            "crate",
+            Path::new("src/lib.rs"),
+            r#"fn f() { asm!("nop"); }"#,
+            Vec::new(),
+        )
+        .unwrap()
+        .blocks;
+        let mut head = extract(
+            "carrick-el1",
+            "crate",
+            Path::new("src/lib.rs"),
+            r#"#[cfg(not(feature="allocator-test-control"))] fn f() { asm!("nop"); }"#,
+            Vec::new(),
+        )
+        .unwrap()
+        .blocks;
+        for asm in base.values_mut().chain(head.values_mut()) {
+            asm.features = features.clone();
+        }
+        assert_eq!(
+            compare(&base, &head, Arch::Aarch64, &mut Vec::new()).unwrap(),
             1
         );
     }
