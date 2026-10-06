@@ -1767,8 +1767,8 @@ mod tests {
         let records = [0usize, 1].map(|slot| {
             let record = current_task(&region, slot);
             (
-                record.task_id.load(Ordering::Acquire),
-                record.file_table.load(Ordering::Acquire),
+                record.execution.task.load(Ordering::Acquire),
+                record.linux.file_table.load(Ordering::Acquire),
             )
         });
         drop((occupier, resumed));
