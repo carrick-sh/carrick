@@ -114,14 +114,16 @@ fn x86_anonymous_protect_uses_shared_core_commit() {
         words: &live,
         mm_key: NonZeroU64::new(mm.raw()).unwrap(),
     };
+    let guard = spaces
+        .try_begin_edit(spaces.find(mm.raw()).unwrap(), mm.raw(), NonZeroU64::MIN)
+        .unwrap();
+    // SAFETY: retained table fixture and exclusive guard name the same MM/root.
+    let mut authority = unsafe {
+        carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(&guard, &mut editor)
+    }
+    .unwrap();
     assert_eq!(
-        carrick_core::mm::anonymous::edit_and_commit(
-            &mut root,
-            request,
-            ROOT,
-            mm.raw(),
-            &mut editor,
-        ),
+        carrick_core::mm::anonymous::edit_and_commit(&mut root, request, &mut authority),
         Ok(0)
     );
     assert_eq!(tables.words[1536].load(Ordering::Acquire) & WRITE, 0);
@@ -1222,4 +1224,130 @@ fn x4_shared_wait_records() {
     assert_eq!(outcome_comp, EditWaitOutcome::Parked(42));
     assert_eq!(observed_key.get(), Some(wait_key));
     assert!(r_zone.completion_enabled(wait_key));
+}
+
+fn anonymous_native_tables(root: u64, pages: usize) -> Tables {
+    let tables = Tables::new(root, IPA, pages);
+    for (entry, offset) in [(0, 4096), (513, 8192), (1024, 12288)] {
+        tables.words[entry].store((root + offset) | PRESENT | WRITE | USER, Ordering::Release);
+    }
+    for page in 0..pages {
+        tables.words[1536 + page].store(
+            (IPA + page as u64 * 4096) | PRESENT | WRITE | USER | NX,
+            Ordering::Release,
+        );
+    }
+    tables
+}
+
+#[test]
+fn x86_anonymous_refuses_stale_requests_before_descriptor_edit() {
+    use carrick_core::mm::anonymous::{AnonymousRefusal, edit_and_commit};
+    use carrick_core::mm::reservation::Decision;
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 31, ROOT, 2, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view)
+        .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
+    let tables = anonymous_native_tables(ROOT, 2);
+    let maintenance = CallerInvalidatesAsid;
+    let live = tables.live(&maintenance);
+    let mut root = portal.root(mm, 0).unwrap();
+    let Decision::Work(stale) = root
+        .mprotect(
+            carrick_core_abi::ReservationRange::new(VA, VA + 4096).unwrap(),
+            carrick_core_abi::ReservationProtection::READ,
+        )
+        .unwrap()
+    else {
+        panic!("proposal");
+    };
+    root.refuse(stale).unwrap();
+    let Decision::Work(current) = root
+        .mprotect(
+            carrick_core_abi::ReservationRange::new(VA + 4096, VA + 8192).unwrap(),
+            carrick_core_abi::ReservationProtection::READ,
+        )
+        .unwrap()
+    else {
+        panic!("replacement proposal");
+    };
+    let mut editor = X86AnonymousEditor {
+        words: &live,
+        mm_key: NonZeroU64::new(mm.raw()).unwrap(),
+    };
+    let guard = spaces
+        .try_begin_edit(spaces.find(mm.raw()).unwrap(), mm.raw(), NonZeroU64::MIN)
+        .unwrap();
+    // SAFETY: real retained words under the same MM's exclusive editor.
+    let mut authority = unsafe {
+        carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(&guard, &mut editor)
+    }
+    .unwrap();
+    let outcome = edit_and_commit(&mut root, stale, &mut authority);
+    assert_ne!(
+        tables.words[1536].load(Ordering::Acquire) & WRITE,
+        0,
+        "stale request changed a live descriptor"
+    );
+    assert_eq!(
+        outcome,
+        Err(AnonymousRefusal::Root(carrick_core_abi::Refusal::Stale))
+    );
+    assert_eq!(root.pending(), Some(current));
+}
+
+#[test]
+fn x86_anonymous_refuses_foreign_mm_descriptor_authority() {
+    use carrick_core::mm::anonymous::{AnonymousRefusal, edit_and_commit};
+    use carrick_core::mm::reservation::Decision;
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 31, ROOT, 1, 0);
+    let other = admit(&region, &spaces, 32, ROOT + 0x10000, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view)
+        .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
+    let tables = anonymous_native_tables(ROOT + 0x10000, 1);
+    let maintenance = CallerInvalidatesAsid;
+    let live = tables.live(&maintenance);
+    let mut root = portal.root(mm, 0).unwrap();
+    let Decision::Work(request) = root
+        .mprotect(
+            carrick_core_abi::ReservationRange::new(VA, VA + 4096).unwrap(),
+            carrick_core_abi::ReservationProtection::READ,
+        )
+        .unwrap()
+    else {
+        panic!("proposal");
+    };
+    let mut editor = X86AnonymousEditor {
+        words: &live,
+        mm_key: NonZeroU64::new(other.raw()).unwrap(),
+    };
+    let guard = spaces
+        .try_begin_edit(
+            spaces.find(other.raw()).unwrap(),
+            other.raw(),
+            NonZeroU64::MIN,
+        )
+        .unwrap();
+    // SAFETY: backend and guard both name the other MM's retained words;
+    // safe core admission must reject it against model A before editing B.
+    let mut authority = unsafe {
+        carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(&guard, &mut editor)
+    }
+    .unwrap();
+    let outcome = edit_and_commit(&mut root, request, &mut authority);
+    assert_ne!(
+        tables.words[1536].load(Ordering::Acquire) & WRITE,
+        0,
+        "foreign MM descriptor changed"
+    );
+    assert_eq!(
+        outcome,
+        Err(AnonymousRefusal::Root(carrick_core_abi::Refusal::Stale))
+    );
+    assert_eq!(root.pending(), Some(request));
 }

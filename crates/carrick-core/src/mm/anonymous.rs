@@ -138,19 +138,56 @@ fn refuse<P: ReservationPolicy, G: ReservationGeometry>(
         .and(Err(refusal))
 }
 
+/// A descriptor backend bound to the exact MM and root retained by a live
+/// scheduler editor. The integer root and MM cannot be supplied independently.
+pub struct AnonymousEditAuthority<'g, 's, E> {
+    _guard: &'g carrick_sched_core::SpaceEditor<'s>,
+    editor: &'g mut E,
+    mm: carrick_core_abi::ReservationMm,
+    root: u64,
+}
+impl<'g, 's, E: AnonymousDescriptorEditor> AnonymousEditAuthority<'g, 's, E> {
+    /// # Safety
+    /// `editor` must faithfully classify/edit this guard's retained MM root,
+    /// using mapped, aligned storage in its qualified execution venue for the
+    /// entire borrow. Success must include the required hardware invalidation
+    /// and backing custody; failure must leave the old state or report failed
+    /// rollback. No alternate descriptor editor may access the same MM.
+    pub unsafe fn from_editor(
+        guard: &'g carrick_sched_core::SpaceEditor<'s>,
+        editor: &'g mut E,
+    ) -> Option<Self> {
+        let (mm, grant) = guard.grant()?;
+        Some(Self {
+            _guard: guard,
+            editor,
+            mm: carrick_core_abi::ReservationMm::new(mm.get())?,
+            root: grant.ttbr0,
+        })
+    }
+}
+
 /// Perform and commit one admitted anonymous edit under an exact-MM editor.
 pub fn edit_and_commit<P, G, E>(
     model: &mut Reservations<'_, P, G>,
     request: ReservationRequest,
-    root: u64,
-    mm_key: u64,
-    editor: &mut E,
+    authority: &mut AnonymousEditAuthority<'_, '_, E>,
 ) -> Result<u64, AnonymousRefusal>
 where
     P: ReservationPolicy,
     G: ReservationGeometry,
     E: AnonymousDescriptorEditor,
 {
+    if !model.is_admitted()
+        || model.pending() != Some(request)
+        || request.mm != model.mm()
+        || request.generation != model.generation()
+        || authority.mm != model.mm()
+    {
+        return Err(AnonymousRefusal::Root(Refusal::Stale));
+    }
+    let (root, mm_key) = (authority.root, authority.mm.raw());
+    let editor = &mut *authority.editor;
     let (va, len) = (request.range.start(), request.range.len());
     if request.operation == ReservationOperation::Move {
         return refuse(model, request, AnonymousRefusal::RootDeclined);

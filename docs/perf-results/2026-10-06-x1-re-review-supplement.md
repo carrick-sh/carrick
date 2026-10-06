@@ -41,3 +41,21 @@ Restoring the missing installation yields byte 65 instead of 66 while shared
 admission reports success. No host callback applies a semantic owner edit.
 Both KVM suites are green on the rebuilt image. Receipts:
 `target/x1-review/review2-root-{old-image,red,image,green,clippy,fmt}.log`.
+
+## Pending request and exact-MM descriptor authority
+
+The shared anonymous entry authenticates the exact pending request, current
+reservation generation and MM before calling any backend. Its safe signature
+now accepts `AnonymousEditAuthority`, borrowing a real scheduler `SpaceEditor`.
+The root and MM derive from that guard; callers cannot pass independent integer
+roots. Constructing the capability is unsafe and states the remaining retained
+mapping, exclusion, faithful descriptor and invalidation requirements. ARM binds
+its existing hardware backend and guard to this capability in the same commit.
+
+Both witnesses execute real x86 PTE protection through `edit_and_commit`:
+`x86_anonymous_refuses_stale_requests_before_descriptor_edit` refuses/replaces a
+saved proposal; `x86_anonymous_refuses_foreign_mm_descriptor_authority` supplies
+MM B's real editor against model A. Restoring pre-edit authentication omission
+changes the live PTE write bit to zero in both cases. Green keeps descriptors and
+current pending requests unchanged. Receipts:
+`target/x1-review/review2-authority-{red,green,restored-red,restored-green,arm,clippy,fmt}.log`.

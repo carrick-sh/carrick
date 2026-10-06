@@ -705,7 +705,8 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         crate::personality::dispatch::AnonymousReservationRoute::Work(pending) => pending,
     };
     let request = pending.request();
-    let (Some(grant), Some(owner)) = (spaces.grant(index, mm_key), NonZeroU64::new(frame.slot + 1))
+    let (Some(_grant), Some(owner)) =
+        (spaces.grant(index, mm_key), NonZeroU64::new(frame.slot + 1))
     else {
         let _ = pending.cancel(&mut model);
         return forward(Leave::NoGrant);
@@ -719,13 +720,18 @@ pub fn serve_delegated_anonymous<E: AnonymousDescriptorEditor>(
         return forward(Leave::RootUnavailable);
     }
     let mut core_editor = CoreEditor(editor);
-    match carrick_core::mm::anonymous::edit_and_commit(
-        &mut model,
-        request,
-        grant.ttbr0,
-        mm_key,
-        &mut core_editor,
-    ) {
+    // SAFETY: this exact MM's descriptor guard retains its published root;
+    // the native backend above maps and invalidates that same root.
+    let Some(mut authority) = (unsafe {
+        carrick_core::mm::anonymous::AnonymousEditAuthority::from_editor(
+            &_editor_guard,
+            &mut core_editor,
+        )
+    }) else {
+        let _ = pending.cancel(&mut model);
+        return forward(Leave::RootUnavailable);
+    };
+    match carrick_core::mm::anonymous::edit_and_commit(&mut model, request, &mut authority) {
         Ok(result) => match pending.finish_committed(frame, current, counters, result) {
             Ok(()) => DelegatedAnonymous::Served,
             Err(_) => forward(Leave::RootUnavailable),

@@ -214,6 +214,30 @@ impl ExcludedEditor<'_> {
 }
 
 impl<'a> SpaceEditor<'a> {
+    /// The exact roots and identity retained by this active descriptor editor.
+    /// A raised host gate cannot replace or retire them until this guard drops.
+    pub fn grant(&self) -> Option<(NonZeroU64, SpaceGrant)> {
+        let key = NonZeroU64::new(self.key)?;
+        if self.entry.key.load(Ordering::Acquire) != self.key {
+            return None;
+        }
+        let ttbr0 = self.entry.ttbr0.load(Ordering::Acquire);
+        if ttbr0 == 0 {
+            return None;
+        }
+        let published = self.entry.cow_published.load(Ordering::Acquire);
+        let covered = self.entry.cow_covered.load(Ordering::Acquire);
+        Some((
+            key,
+            SpaceGrant {
+                index: self.index,
+                ttbr0,
+                ttbr1: self.entry.ttbr1.load(Ordering::Acquire),
+                cow_owed: (published != covered).then_some(published),
+            },
+        ))
+    }
+
     pub fn mmap_next(&self) -> u64 {
         self.entry.mmap_next.load(Ordering::Acquire)
     }
