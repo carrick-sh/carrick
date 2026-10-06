@@ -65,6 +65,13 @@ ASSEMBLY_BOUNDARIES = frozenset(
         PurePosixPath("crates/carrick-el1/src/personality/mm_portal/production.rs"),
         PurePosixPath("crates/carrick-el1/src/sched/hw.rs"),
         PurePosixPath("crates/carrick-el1/src/sched/aarch64_context.rs"),
+        # Reviewed CPL0-only ISA leaves: stack/TSC instructions and named
+        # UD2 fail-closed paths, with no host or Linux policy operation.
+        PurePosixPath("crates/carrick-el1/src/isa/x86/context.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/interrupt.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/mmu.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/transport.rs"),
+        PurePosixPath("crates/carrick-el1/src/isa/x86/user_access.rs"),
         # Reviewed x86 CPL0 hardware boundary: entry/return, port I/O and halt; no host operation.
         PurePosixPath("crates/carrick-x86-cpl0/src/entry.rs"),
         # CPL0-only native IRQ/IRET, XSAVE, FS/GS MSRs, CR3 and IF/HLT
