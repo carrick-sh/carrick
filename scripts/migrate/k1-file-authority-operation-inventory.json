@@ -22326,7 +22326,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/vfs/proc.rs",
-      "line": 2973,
+      "line": 2981,
       "categories": [
         "mapping"
       ],
@@ -22335,7 +22335,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/vfs/proc.rs",
-      "line": 3025,
+      "line": 3033,
       "categories": [
         "mapping"
       ],
@@ -22344,7 +22344,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/vfs/proc.rs",
-      "line": 3079,
+      "line": 3087,
       "categories": [
         "mapping"
       ],
@@ -22353,7 +22353,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/vfs/proc.rs",
-      "line": 3082,
+      "line": 3090,
       "categories": [
         "mapping"
       ],
@@ -22362,7 +22362,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/vfs/proc.rs",
-      "line": 5716,
+      "line": 5762,
       "categories": [
         "mapping"
       ],
