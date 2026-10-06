@@ -1,91 +1,75 @@
-//! Linux futex decoding and completion values for EL1 scheduling.
+//! Native scheduler transport for the Linux-owned futex client.
 pub use crate::substrate::sched::*;
 use carrick_el1_abi::TrapFrame;
+use carrick_el1_abi::{ReservationMm, UserVa};
+use carrick_guest_arch::CounterTick;
+pub use carrick_personality_linux::sched::{
+    EAGAIN, ETIMEDOUT_RESULT, FUTEX_WAIT_BITSET_PRIVATE, FUTEX_WAIT_PRIVATE,
+    FUTEX_WAKE_BITSET_PRIVATE, FUTEX_WAKE_PRIVATE, SYS_FUTEX,
+};
+use carrick_personality_linux::sched::{FutexCall, FutexFrequency, FutexVenue, FutexWait};
 use core::sync::atomic::Ordering;
-pub const SYS_FUTEX: usize = 98;
-pub(crate) const FUTEX_WAIT_PRIVATE: u64 = 128;
-pub(crate) const FUTEX_WAKE_PRIVATE: u64 = 129;
-pub(crate) const FUTEX_WAIT_BITSET_PRIVATE: u64 = 128 | 9;
-pub(crate) const FUTEX_WAKE_BITSET_PRIVATE: u64 = 128 | 10;
-pub(crate) const EAGAIN: i64 = -11;
-pub(crate) const ETIMEDOUT_RESULT: u64 = (-110_i64) as u64;
 
-/// Whether `frame` is a futex operation EL1 may serve (the rest forward).
-/// A relative `FUTEX_WAIT_PRIVATE` timeout is servable here; whether this
-/// thread's timeout is, [`Sched::serve_futex`] decides.
 pub fn is_served_futex_op(frame: &TrapFrame) -> bool {
-    if frame.x[8] as usize != SYS_FUTEX || frame.x[0] & 3 != 0 {
-        return false;
+    carrick_personality_linux::sched::is_served_futex_op(frame.x[8], args(frame))
+}
+fn args(frame: &TrapFrame) -> [u64; 6] {
+    [
+        frame.x[0], frame.x[1], frame.x[2], frame.x[3], frame.x[4], frame.x[5],
+    ]
+}
+struct Adapter<'a, 's, C: ThreadCpu, U: UserWord> {
+    sched: &'a mut Sched<'s, C, U>,
+    frame: &'a mut TrapFrame,
+}
+impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, C, U> {
+    type Served = Served;
+    fn mm(&self) -> Option<ReservationMm> {
+        ReservationMm::new(self.sched.task.zone_mm.load(Ordering::Acquire))
     }
-    match frame.x[1] {
-        FUTEX_WAIT_PRIVATE => true,
-        FUTEX_WAIT_BITSET_PRIVATE => frame.x[3] == 0 && frame.x[5] as u32 != 0,
-        FUTEX_WAKE_PRIVATE => (frame.x[2] as i32) > 0,
-        FUTEX_WAKE_BITSET_PRIVATE => (frame.x[2] as i32) > 0 && frame.x[5] as u32 != 0,
-        _ => false,
+    fn timed_wait_allowed(&self) -> bool {
+        let slot = self.sched.zone.slot(self.sched.slot);
+        slot.current().is_none() || slot.current() == slot.host_record()
+    }
+    fn read_u64(&self, address: UserVa) -> Option<u64> {
+        self.sched.user.read_u64(self.sched.task, address.raw())
+    }
+    fn frequency(&self) -> FutexFrequency {
+        FutexFrequency::from_hz(self.sched.cpu.freq())
+    }
+    fn now(&self) -> CounterTick {
+        CounterTick::new(self.sched.cpu.now())
+    }
+    fn wake(
+        &mut self,
+        mm: ReservationMm,
+        address: UserVa,
+        bitset: u32,
+        limit: u32,
+    ) -> Option<Served> {
+        self.sched
+            .wake_word(self.frame, mm.raw(), address.raw(), bitset, limit)
+    }
+    fn wait(&mut self, wait: FutexWait) -> Option<Served> {
+        self.sched.wait_word(
+            self.frame,
+            wait.mm.raw(),
+            wait.address.raw(),
+            wait.bitset,
+            wait.expected,
+            wait.deadline.map(CounterTick::raw),
+            wait.mismatch_result.raw() as u64,
+            wait.timeout_result.raw() as u64,
+        )
     }
 }
-
 impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
-    /// Serve a futex syscall at EL1, or `None` to forward it unchanged.
     pub fn serve_futex(&mut self, frame: &mut TrapFrame) -> Option<Served> {
-        let mm = self.task.zone_mm.load(Ordering::Acquire);
-        if mm == 0 || !is_served_futex_op(frame) {
+        if !is_served_futex_op(frame) {
             return None;
         }
-        let uaddr = frame.x[0];
-        match frame.x[1] {
-            FUTEX_WAKE_PRIVATE | FUTEX_WAKE_BITSET_PRIVATE => {
-                let bitset = if frame.x[1] == FUTEX_WAKE_PRIVATE {
-                    u32::MAX
-                } else {
-                    frame.x[5] as u32
-                };
-                self.wake_word(frame, mm, uaddr, bitset, frame.x[2] as i32 as u32)
-            }
-            FUTEX_WAIT_PRIVATE | FUTEX_WAIT_BITSET_PRIVATE => self.serve_wait(frame, mm, uaddr),
-            _ => None,
-        }
-    }
-
-    fn serve_wait(&mut self, frame: &mut TrapFrame, mm: u64, uaddr: u64) -> Option<Served> {
-        let (zone, slot) = (self.zone, self.slot);
-        let bitset = if frame.x[1] == FUTEX_WAIT_PRIVATE {
-            u32::MAX
-        } else {
-            frame.x[5] as u32
-        };
-        let expected = frame.x[2] as u32;
-        // A timeout is served for the thread the host loaded on this vCPU
-        // (its deadline is this vCPU's to keep, and the host takes it over
-        // at an exit); a switched-in thread's timed wait forwards.
-        let deadline = if frame.x[3] != 0 {
-            let s = zone.slot(slot);
-            if s.current().is_some() && s.current() != s.host_record() {
-                return None;
-            }
-            let secs = self.user.read_u64(self.task, frame.x[3])? as i64;
-            let nanos = self.user.read_u64(self.task, frame.x[3] + 8)? as i64;
-            if secs < 0 || !(0..1_000_000_000).contains(&nanos) {
-                return None;
-            }
-            let ticks = (secs as u64)
-                .saturating_mul(self.cpu.freq())
-                .saturating_add(self.ticks(nanos as u64));
-            Some(self.cpu.now().saturating_add(ticks).max(1))
-        } else {
-            None
-        };
-        self.wait_word(
-            frame,
-            mm,
-            uaddr,
-            bitset,
-            expected,
-            deadline,
-            EAGAIN as u64,
-            ETIMEDOUT_RESULT,
-        )
+        let call = FutexCall { args: args(frame) };
+        carrick_personality_linux::sched::serve_futex(call, &mut Adapter { sched: self, frame })
     }
     pub fn serve_irq(&mut self, frame: &mut TrapFrame) -> carrick_el1_abi::Action {
         self.interrupt(frame, ETIMEDOUT_RESULT)
