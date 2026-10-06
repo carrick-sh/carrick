@@ -69,6 +69,7 @@ pub struct CountingMmapMemory {
     pub(crate) defer_anon: bool,
     pub(crate) discard_anon: bool,
     pub(crate) fail_protect_non_zero: Cell<bool>,
+    pub(crate) fail_unchecked_write: Cell<bool>,
     fail_protect_zero: Cell<bool>,
     concurrent_exec_protection: bool,
     pub(crate) base: u64,
@@ -81,6 +82,7 @@ pub struct CountingMmapMemory {
     fail_unmap_at: Cell<Option<u64>>,
     pub(crate) protect_log: RefCell<Vec<(u64, usize, u64)>>,
     pub(crate) owner_protect_log: RefCell<Vec<(u64, usize, u64)>>,
+    pub(crate) owner_reserved_write_calls: Cell<usize>,
     /// Every backend retirement (`unmap_range`), in order.
     pub(crate) unmap_log: RefCell<Vec<(u64, usize)>>,
 }
@@ -129,6 +131,7 @@ impl CountingMmapMemory {
             defer_anon: false,
             discard_anon: false,
             fail_protect_non_zero: Cell::new(false),
+            fail_unchecked_write: Cell::new(false),
             fail_protect_zero: Cell::new(false),
             concurrent_exec_protection: false,
             base,
@@ -141,6 +144,7 @@ impl CountingMmapMemory {
             fail_unmap_at: Cell::new(None),
             protect_log: RefCell::new(Vec::new()),
             owner_protect_log: RefCell::new(Vec::new()),
+            owner_reserved_write_calls: Cell::new(0),
             unmap_log: RefCell::new(Vec::new()),
         }
     }
@@ -199,6 +203,26 @@ impl GuestMemory for CountingMmapMemory {
             .set(self.write_bytes_total.get() + bytes.len());
         self.bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
         Ok(())
+    }
+
+    fn write_bytes_unchecked(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
+        if self.fail_unchecked_write.get() {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: bytes.len(),
+            });
+        }
+        self.write_bytes_raw(address, bytes)
+    }
+
+    fn write_owner_reserved_bytes(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        self.owner_reserved_write_calls
+            .set(self.owner_reserved_write_calls.get() + 1);
+        self.write_bytes_raw(address, bytes)
     }
 
     fn discard_private_anonymous(
