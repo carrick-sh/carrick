@@ -1875,6 +1875,53 @@ impl Cpl0Carrier {
         Ok(())
     }
 
+    /// Exhaust record or wait-entry capacity in the stopped scheduler fixture.
+    pub fn exhaust_lifecycle_capacity(&mut self, entries: bool) -> Result<(), TrapError> {
+        use carrick_sched_core::{BoundedSpin, ThreadIdentity, ZoneTables};
+        // SAFETY: the fixture owns initialized aligned zone storage; CPUs stopped.
+        let zone = unsafe {
+            &*self
+                .ram
+                .host_ptr(0x100_0000, size_of::<ZoneTables>())
+                .ok_or_else(|| fail("lifecycle zone"))?
+                .cast::<ZoneTables>()
+        };
+        let identity = ThreadIdentity {
+            tid: 1000,
+            serial: 1,
+            mm: 1000,
+            file_table: 1,
+            generation: 1,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        if entries {
+            let record = zone
+                .alloc_record(identity)
+                .map_err(|_| fail("capacity record"))?;
+            let key = 0x70000;
+            let guard = zone
+                .lock(ZoneTables::bucket_of(identity.mm, key), &BoundedSpin(1024))
+                .ok_or_else(|| fail("capacity bucket"))?;
+            while zone
+                .enqueue(
+                    &guard,
+                    record,
+                    zone.next_seq(record),
+                    identity.mm,
+                    key,
+                    u32::MAX,
+                    0,
+                )
+                .is_ok()
+            {}
+        } else {
+            while zone.alloc_record(identity).is_ok() {}
+        }
+        Ok(())
+    }
+
     /// Poison reserved XSAVE header words while the faulting vCPU is stopped.
     pub fn poison_user_fault_xsave_header(&mut self, index: usize) -> Result<(), TrapError> {
         if index >= 2 {

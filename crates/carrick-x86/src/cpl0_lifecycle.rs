@@ -591,7 +591,6 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         if !process::process_mode()
             || self.lane.slot.raw() != 0
             || self.task.mm.key.load(Ordering::Acquire) != process::parent_mm()
-            || self.lane.contexts[1].record.is_some()
         {
             return None;
         }
@@ -601,6 +600,9 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
                 work: false,
             })
         };
+        if self.lane.contexts[1].record.is_some() {
+            return refused();
+        }
         let mut child = self.lane.parent;
         child.tid = process::child_pid(child.tid);
         let Some(serial) = child.serial.checked_add(1) else {
