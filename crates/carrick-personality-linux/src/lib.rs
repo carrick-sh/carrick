@@ -4,3 +4,4 @@
 pub mod dispatch;
 pub mod entry;
 pub mod mm;
+pub mod sched;

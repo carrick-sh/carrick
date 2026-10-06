@@ -1,9 +1,9 @@
 //! Linux decoding and dispatch at the shared native-entry seam.
 use carrick_core_abi::EntryCompletion;
 pub use carrick_core_abi::ExecutionBinding;
-use carrick_guest_arch::{
-    CanonicalCall, CanonicalOrdinal, GuestIsa, NativeOrdinal, SyscallResult, UserVa,
-};
+use carrick_guest_arch::{CanonicalCall, CanonicalOrdinal, GuestIsa, NativeOrdinal, UserVa};
+
+pub use carrick_guest_arch::SyscallResult;
 
 pub const SYS_SET_ROBUST_LIST: usize = 99;
 pub const EINVAL: i64 = -22;
