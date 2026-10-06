@@ -293,6 +293,18 @@ impl Cpl0Carrier {
         self._vm.retained_bytes()
     }
 
+    /// Stopped-vCPU control state for the production KVM boot contract.
+    pub fn supervisor_cr4(&self, index: usize) -> Result<u64, TrapError> {
+        let cpu = self
+            .cpus
+            .get(index)
+            .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+        cpu.fd()
+            .get_sregs()
+            .map(|state| state.cr4)
+            .map_err(|error| fail(format!("KVM_GET_SREGS: {error}")))
+    }
+
     /// Enable architectural SMAP before either fixture vCPU starts. The
     /// caller uses this only on KVM hosts whose guest CPUID advertises SMAP.
     pub fn enable_smap(&mut self) -> Result<(), TrapError> {
@@ -1246,6 +1258,23 @@ impl Cpl0Carrier {
             )?;
             carrick_x86::program_fault_segments(cpu, LAYOUT, index as u64)?;
             let mut system = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+            if initial_extent_bytes.is_some() {
+                const CPUID_SMEP_SMAP: u32 = (1 << 7) | (1 << 20);
+                const CR4_SMEP_SMAP: u64 = (1 << 20) | (1 << 21);
+                let cpuid = cpu
+                    .fd()
+                    .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+                    .map_err(|error| fail(format!("KVM_GET_CPUID2: {error}")))?;
+                let features = cpuid
+                    .as_slice()
+                    .iter()
+                    .find(|entry| entry.function == 7 && entry.index == 0)
+                    .map_or(0, |entry| entry.ebx);
+                if features & CPUID_SMEP_SMAP != CPUID_SMEP_SMAP {
+                    return Err(fail("production CPL0 requires CPUID SMEP and SMAP"));
+                }
+                system.cr4 |= CR4_SMEP_SMAP;
+            }
             system.gdt.base = DIRECT_VA + LAYOUT.gdt_base;
             system.idt.base = DIRECT_VA
                 + carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index as u64)?;
@@ -1274,6 +1303,11 @@ impl Cpl0Carrier {
                 return Err(fail("KERNEL_GS_BASE not installed"));
             }
             let system = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+            if initial_extent_bytes.is_some()
+                && system.cr4 & ((1 << 20) | (1 << 21)) != (1 << 20) | (1 << 21)
+            {
+                return Err(fail("KVM refused production CR4.SMEP/SMAP"));
+            }
             if system.tr.base
                 != DIRECT_VA
                     + carrick_x86::fault_slot_gpa(
