@@ -135,6 +135,13 @@ pub struct CarrierMetadataAccess {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl CarrierMetadataAccess {
+    /// Carrier identity authenticated by this retained mapping's live VM
+    /// generation, for exact reservation admissions issued by its provider.
+    pub fn carrier_identity(&self) -> Result<core::num::NonZeroU64, MetadataResolutionError> {
+        self.region()?;
+        Ok(self.carrier.custody.transfer_carrier)
+    }
+
     pub(crate) fn new(carrier: Arc<crate::trap::PersistentCarrierMappings>) -> Option<Self> {
         let generation = carrier.custody.live_generation()?;
         let access = Self {

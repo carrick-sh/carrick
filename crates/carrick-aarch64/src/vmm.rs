@@ -1031,8 +1031,12 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         _va: u64,
         _len: usize,
         _intent: FrameCowWriteIntent,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
         _flush_stage1: &mut dyn Stage1Services,
     ) -> Result<(), TrapError> {
+        if admission.is_some() {
+            return Err(TrapError::UnsupportedPlatform);
+        }
         Ok(())
     }
 
@@ -1262,7 +1266,11 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
         va: u64,
         ipa: u64,
         bytes: &[u8],
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<(), MemoryError> {
+        if admission.is_some() {
+            return Err(MemoryError::Unsupported);
+        }
         self.translated_write(va, ipa, bytes)
     }
 

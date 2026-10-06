@@ -2629,10 +2629,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         va: u64,
         len: usize,
         intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         self.state
-            .ensure_frame_cow_write(va, len, intent, flush_stage1)
+            .ensure_frame_cow_write(va, len, intent, admission, flush_stage1)
     }
 
     fn observe_frame_cow_protection(
@@ -2722,12 +2723,14 @@ impl Aarch64Vmm for HvfAarch64Vmm {
     fn translated_write_unchecked(
         &mut self,
         va: u64,
-        _ipa: u64,
+        ipa: u64,
         bytes: &[u8],
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<(), MemoryError> {
         // carrick-INTERNAL frame (vdso vvar / sigframe / bootstrap): bypass the
         // guest-visible WRITE permission (the host page is writable).
-        self.state.write_guest_bytes(va, bytes)
+        self.state
+            .write_guest_bytes(va, bytes, Some(ipa), admission)
     }
 
     fn guest_range_is_writable(&self, va: u64, len: usize) -> bool {
@@ -3806,4 +3809,39 @@ mod clock_kick_policy_tests {
         }
         assert!(!super::needs_clock_entry_latch(113, 0x24 << 26));
     }
+}
+
+#[cfg(any(test, feature = "foreign-cow-test-support"))]
+pub(crate) fn native_reserved_content_engine_for_test(
+    state: HvfVmState,
+) -> Result<HvfAarch64Engine, &'static str> {
+    let task = &state.task;
+    let tables = task.page_tables_authority();
+    let protections = task.protections.clone();
+    let identity = task
+        .cow_identity
+        .ok_or("native fixture MM identity absent")?;
+    let plan = GuestMappingPlan {
+        entry: 0,
+        initial_stack_pointer: None,
+        el0_trampoline_entry: None,
+        el1_vectors_base: None,
+        stage1_page_tables_base: tables.root_base(),
+        ro_spans: Vec::new(),
+        rw_spans: Vec::new(),
+        mappings: Vec::new(),
+    };
+    let cpu = HvfAarch64Vcpu::staged(crate::staged_cpu::StagedCpu::initial_root(&plan));
+    Ok(Aarch64EngineCore::from_injected_task_only_backend(
+        HvfAarch64Vmm {
+            state,
+            host_writes: Default::default(),
+        },
+        cpu,
+        tables,
+        protections,
+        Some(identity.asid),
+        identity.mm,
+        identity.mm,
+    ))
 }

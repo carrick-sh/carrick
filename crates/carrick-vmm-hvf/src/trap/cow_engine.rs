@@ -3310,6 +3310,7 @@ impl HvfTaskState {
         custody: &std::sync::Arc<CarrierVmCustody>,
         fault_va: u64,
         intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
         trigger: FrameCowTrigger,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<bool, TrapError> {
@@ -3348,6 +3349,22 @@ impl HvfTaskState {
                 empty,
                 len,
             )
+        };
+        let span = if let Some(admission) = admission {
+            self.authenticate_owner_reserved_write(custody, admission, fault_va, 1)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+            span.and_then(|mut span| {
+                let start = span.va.max(admission.range().start_raw());
+                let end = (span.va + span.len as u64).min(admission.range().end_raw());
+                if start >= end {
+                    return None;
+                }
+                span.va = start;
+                span.len = (end - start) as usize;
+                Some(span)
+            })
+        } else {
+            span
         };
         let Some(span) = span else {
             let mapping = self.mapping_for_range_in(custody, fault_va, 1);
@@ -4600,6 +4617,7 @@ impl HvfTaskState {
             custody,
             generation_address,
             carrick_aarch64::vmm::FrameCowWriteIntent::PrivilegedInternal,
+            None,
             FrameCowTrigger {
                 class:
                     carrick_observability::probes::HvpatchFrameCowTriggerClass::PrivilegedInternal,
@@ -4794,6 +4812,7 @@ impl HvfVmState {
                 &custody,
                 fault_va,
                 carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
+                None,
                 FrameCowTrigger {
                     class: carrick_observability::probes::HvpatchFrameCowTriggerClass::Stage1PermissionFault,
                     syndrome,
@@ -4826,6 +4845,7 @@ impl HvfVmState {
         va: u64,
         len: usize,
         intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         if intent != carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance
@@ -4834,10 +4854,10 @@ impl HvfVmState {
                 len as u64,
             )
         {
-            return self.ensure_frame_cow_write_routed(va, len, intent, flush_stage1);
+            return self.ensure_frame_cow_write_routed(va, len, intent, admission, flush_stage1);
         }
         let before = MmMaintenanceVisits::read();
-        let outcome = self.ensure_frame_cow_write_routed(va, len, intent, flush_stage1);
+        let outcome = self.ensure_frame_cow_write_routed(va, len, intent, admission, flush_stage1);
         self.emit_mm_maintenance_census(
             carrick_observability::probes::HvpatchMmMaintenanceSite::BackingMaintenanceRoute,
             va,
@@ -4889,12 +4909,29 @@ impl HvfVmState {
         va: u64,
         len: usize,
         intent: carrick_aarch64::vmm::FrameCowWriteIntent,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<(), TrapError> {
         let authority = self.protections.clone();
-        let _legacy = authority.legacy().ok_or_else(|| {
-            TrapError::Hypervisor("admitted owner MM cannot enter host COW selection".into())
-        })?;
+        let _legacy = match admission {
+            Some(admission) => {
+                if intent != carrick_aarch64::vmm::FrameCowWriteIntent::PrivilegedInternal {
+                    return Err(TrapError::UnsupportedPlatform);
+                }
+                self.task
+                    .authenticate_owner_reserved_write(
+                        &self.carrier_vm_custody(),
+                        admission,
+                        va,
+                        len,
+                    )
+                    .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+                None
+            }
+            None => Some(authority.legacy().ok_or_else(|| {
+                TrapError::Hypervisor("admitted owner MM cannot enter host COW selection".into())
+            })?),
+        };
         if len == 0 {
             return Ok(());
         }
@@ -4914,10 +4951,16 @@ impl HvfVmState {
             };
             // The live span, not the armed granule: a page past it names
             // another frame and is routed on its own next iteration.
-            let armed_span_end = candidate.map(|candidate| {
-                let span = self.task.live_cow_span(candidate, current);
-                span.va.saturating_add(span.len as u64)
-            });
+            let armed_span_end = if admission.is_some() {
+                self.task
+                    .guest_private_cow_span(current)
+                    .map(|span| span.va.saturating_add(span.len as u64))
+            } else {
+                candidate.map(|candidate| {
+                    let span = self.task.live_cow_span(candidate, current);
+                    span.va.saturating_add(span.len as u64)
+                })
+            };
             let armed = armed_span_end.is_some();
             let (retained_output_has_no_physical_source, retained_output_source_is_shared) =
                 if intent == carrick_aarch64::vmm::FrameCowWriteIntent::BackingMaintenance
@@ -5062,6 +5105,7 @@ impl HvfVmState {
                         &custody,
                         current,
                         intent,
+                        admission,
                         FrameCowTrigger {
                             class,
                             syndrome: 0,
@@ -5075,7 +5119,20 @@ impl HvfVmState {
                         )));
                     }
                 }
-                FrameCowWriteRoute::Direct => {}
+                FrameCowWriteRoute::Direct => {
+                    if let Some(admission) = admission {
+                        let fragment = (end - current).min(0x1000 - (current & 0xfff)) as usize;
+                        self.task
+                            .validate_owner_reserved_mapping(
+                                &self.carrier_vm_custody(),
+                                admission,
+                                current,
+                                fragment,
+                                None,
+                            )
+                            .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
+                    }
+                }
             }
             current =
                 next_frame_cow_write_probe(intent, current, end, armed_span_end, next_armed_start);
@@ -5917,6 +5974,8 @@ impl HvfVmState {
         self.write_guest_bytes(
             crate::vdso::LINUX_VVAR_BASE + crate::vdso::VVAR_OFF_RNG_GENERATION as u64,
             &generation.to_le_bytes(),
+            None,
+            None,
         )
     }
 
@@ -5975,7 +6034,9 @@ impl HvfVmState {
             (crate::vdso::VVAR_OFF_FREQ, freq),
             (crate::vdso::VVAR_OFF_REALTIME_OFF_NS, realtime_off),
         ] {
-            if let Err(error) = self.write_guest_bytes(base + offset as u64, &word.to_le_bytes()) {
+            if let Err(error) =
+                self.write_guest_bytes(base + offset as u64, &word.to_le_bytes(), None, None)
+            {
                 tracing::error!(%error, offset, "vDSO vvar stamp failed");
             }
         }

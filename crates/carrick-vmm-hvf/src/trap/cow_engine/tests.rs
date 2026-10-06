@@ -609,6 +609,7 @@ fn guest_cow_caller_requires_driving_vcpu_before_touching_backing() {
         &custody,
         0x4000,
         carrick_aarch64::vmm::FrameCowWriteIntent::GuestVisible,
+        None,
         FrameCowTrigger {
             class: carrick_observability::probes::HvpatchFrameCowTriggerClass::Stage1PermissionFault,
             syndrome: 0,

@@ -471,14 +471,32 @@ impl HvfVmState {
         &mut self,
         address: u64,
         bytes: &[u8],
+        expected_ipa: Option<u64>,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<(), MemoryError> {
         let authority = self.protections.clone();
-        let _legacy = authority.legacy().ok_or_else(|| {
-            MemoryError::HostMap("admitted owner MM requires owner-selected user transfer".into())
-        })?;
+        let _legacy = match admission {
+            Some(admission) => {
+                self.task.validate_owner_reserved_mapping(
+                    &self.carrier_vm_custody(),
+                    admission,
+                    address,
+                    bytes.len(),
+                    expected_ipa,
+                )?;
+                None
+            }
+            None => Some(authority.legacy().ok_or_else(|| {
+                MemoryError::HostMap(
+                    "admitted owner MM requires owner-selected user transfer".into(),
+                )
+            })?),
+        };
         let length = bytes.len();
         // PROT_NONE gated once in the default `GuestMemory::write_bytes`.
-        self.validate_guest_write_range(address, length, false)?;
+        if admission.is_none() {
+            self.validate_guest_write_range(address, length, false)?;
+        }
         let mut copied = 0usize;
         while copied < length {
             let (chunk_address, chunk_len) = Self::guest_copy_chunk(address, copied, length)?;
@@ -486,7 +504,18 @@ impl HvfVmState {
             // its region+offset via the translated overlay IPA, so a syscall write
             // lands in the PRIVATE overlay backing the guest reads, not the shared
             // aperture. Identity otherwise; PROT_NONE already gated on the VA.
-            let lookup_address = self.syscall_buffer_lookup_addr(chunk_address, chunk_len);
+            let lookup_address = if let Some(admission) = admission {
+                self.task.validate_owner_reserved_mapping(
+                    &self.carrier_vm_custody(),
+                    admission,
+                    chunk_address,
+                    chunk_len,
+                    None,
+                )?;
+                chunk_address
+            } else {
+                self.syscall_buffer_lookup_addr(chunk_address, chunk_len)
+            };
             let mapping = self.task.copy_guest_mapping_in(
                 &self.carrier_vm_custody(),
                 lookup_address,
@@ -1099,7 +1128,7 @@ impl HvfVmState {
 }
 
 #[cfg(test)]
-mod budget_tests;
+pub(crate) mod budget_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1184,6 +1213,106 @@ mod tests {
 // Shared by the checked syscall copier and privileged internal copier. Keeping
 // the resolved fragment here also permits VM-free tests of the production copy.
 impl HvfTaskState {
+    pub(crate) fn authenticate_owner_reserved_write(
+        &self,
+        custody: &CarrierVmCustody,
+        admission: &carrick_guest_mem::OwnerReservedWrite<'_>,
+        address: u64,
+        len: usize,
+    ) -> Result<(), MemoryError> {
+        let owner = admission.owner();
+        let range = admission.range();
+        let bound = *self.mm_access.identity.read();
+        let identity = self.cow_identity;
+        let matches = bound
+            .zip(identity)
+            .is_some_and(|((mm, binding), identity)| {
+                mm.raw_for_probe() == owner.mm().raw()
+                    && identity.mm == owner.mm().raw()
+                    && identity.asid == binding.asid.raw_for_probe()
+                    && self.page_tables_authority().root_base() == Some(binding.stage1_root.raw())
+                    && self
+                        .mm_root_slot
+                        .is_some_and(|slot| slot.0 == binding.stage1_root.raw())
+            });
+        if self.protections.owner() != Some(owner)
+            || owner.carrier() != custody.transfer_carrier
+            || !matches
+            || !range.start_raw().is_multiple_of(0x1000)
+            || !range.len().is_multiple_of(0x1000)
+            || !admission.contains(GuestVa(address), len)
+        {
+            return Err(MemoryError::Unsupported);
+        }
+        Ok(())
+    }
+
+    /// Authenticate the post-COW output before a reserved-content copy. A
+    /// missing arm alone cannot authorize writes through a shared private frame
+    /// or private file view. The subsequent copier retains the exact physical
+    /// generation and backing-wide content-write admission through its copy.
+    pub(crate) fn validate_owner_reserved_mapping(
+        &self,
+        custody: &CarrierVmCustody,
+        admission: &carrick_guest_mem::OwnerReservedWrite<'_>,
+        address: u64,
+        len: usize,
+        expected_ipa: Option<u64>,
+    ) -> Result<(), MemoryError> {
+        self.authenticate_owner_reserved_write(custody, admission, address, len)?;
+        if len == 0 {
+            return Ok(());
+        }
+        let error = || MemoryError::OutOfBounds {
+            address,
+            length: len,
+        };
+        let ipa = self
+            .page_tables_authority()
+            .with_manager(|manager| {
+                let leaf =
+                    carrick_mmu_core::aarch64::terminal_descriptor(manager.debug_walk(address));
+                if carrick_mmu_core::aarch64::terminal_descriptor_is_fork_cow(leaf)
+                    || !carrick_mmu_core::aarch64::terminal_descriptor_permits_el0(
+                        leaf,
+                        carrick_mmu_core::aarch64::LeafAccess::Write,
+                    )
+                {
+                    return None;
+                }
+                manager.translate(address)
+            })
+            .flatten()
+            .ok_or_else(error)?;
+        let exclusive = {
+            let inventory = self.frame_inventory.lock();
+            inventory
+                .extent_containing(ipa)
+                .is_some_and(|(_, extent)| match extent.backing {
+                    InventoryBackingIdentity::Private(_) => {
+                        // Retirement reads these populations under the frame
+                        // registry too: a backend decrement can precede the
+                        // kernel unmap, and either remaining peer forbids copy.
+                        let frames = inventory.frames.lock();
+                        frames.references.get(&extent.frame) == Some(&1)
+                            && self.cow_authority.as_ref().is_some_and(|authority| {
+                                matches!(authority.frame_mapping_count(extent.frame), Ok(Some(1)))
+                            })
+                    }
+                    InventoryBackingIdentity::SharedAnon(_)
+                    | InventoryBackingIdentity::SharedFile { .. } => true,
+                    InventoryBackingIdentity::PrivateFileView(_) => false,
+                })
+        };
+        if expected_ipa.is_some_and(|expected| ipa != expected)
+            || !exclusive
+            || self.mapping_for_range_in(custody, address, len).is_none()
+        {
+            return Err(error());
+        }
+        Ok(())
+    }
+
     pub(crate) fn copy_guest_mapping_in(
         &self,
         custody: &CarrierVmCustody,

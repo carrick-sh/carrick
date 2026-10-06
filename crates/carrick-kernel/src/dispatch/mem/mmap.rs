@@ -1,10 +1,70 @@
 //! Memory allocation, protection, and address space layout syscall implementations.
 
 use super::*;
+use carrick_el1::memory::reservations::Refusal;
+use carrick_el1_abi::{ReservationNodeFlags, ReservationProtection};
 use carrick_fatal::carrick_fatal;
 use carrick_guest_mem::*;
 use carrick_vfs::ProcMapSharing;
 use std::os::fd::{FromRawFd, OwnedFd};
+
+fn write_file_mapping_content(
+    dispatcher: &MemView<'_>,
+    guard: &super::super::mm_mutation::MmMutationGuard<'_>,
+    memory: &mut impl CurrentMmMemory,
+    address: u64,
+    bytes: &[u8],
+) -> Result<(), MemoryError> {
+    let authority = dispatcher.mm_authority();
+    if !guard.authorizes(&authority.mutation_coordinator, authority.mm_id) {
+        return Err(MemoryError::Unsupported);
+    }
+    let venue = authority.lock().owner_reserved_venue();
+    let Some((root, range)) = venue else {
+        return memory.write_bytes_unchecked(address, bytes);
+    };
+    let carrier = root
+        .carrier_identity()
+        .map_err(|_| MemoryError::Unsupported)?;
+    let handle = root
+        .with_root(|model| {
+            let mapping = model.mapping(range.start()).ok_or(Refusal::Stale)?;
+            if model.mm().raw() != authority.mm_id.raw()
+                || mapping.anonymous
+                || mapping.range.start() > range.start()
+                || mapping.range.end() < range.end()
+                || mapping.protection != ReservationProtection::NONE
+                || mapping.flags != ReservationNodeFlags::EMPTY
+            {
+                return Err(Refusal::Stale);
+            }
+            let incarnation =
+                std::num::NonZeroU64::new(model.incarnation().raw()).ok_or(Refusal::Stale)?;
+            // SAFETY: this provider's live carrier and its borrowed, admitted root
+            // authenticate the complete identity. Exact-MM mutation exclusion is
+            // held across the subsequent backend operation.
+            Ok(unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(carrier, model.mm(), incarnation)
+            })
+        })
+        .map_err(|_| MemoryError::Unsupported)?;
+    let len = usize::try_from(range.len()).map_err(|_| MemoryError::Unsupported)?;
+    let reserved = GuestVaRange::from_len(GuestVa(range.start()), len);
+    // SAFETY: the exact open venue is an opaque NONE placeholder. Its MM
+    // mutation guard excludes settlement/replacement until this call returns;
+    // no MemState, provider, or reservation-root guard enters the backend.
+    unsafe {
+        OwnerReservedWrite::with_scope(handle, reserved, |admission| {
+            if !admission.contains(GuestVa(address), bytes.len()) {
+                return Err(MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                });
+            }
+            memory.write_owner_reserved_bytes(admission, address, bytes)
+        })
+    }
+}
 
 fn retire_anonymous_mapping_backing(
     dispatcher: &MemView<'_>,
@@ -2016,10 +2076,6 @@ impl<'a> MemView<'a> {
             }
 
             let locked_range = this.prepare_mmap_locked_range(map_flags, address, length)?;
-            let owner_reserved = this
-                .mem()
-                .lock()
-                .owner_venue_reserves(address, address + length);
             // Move-3 E1, phase 2: replace the arena backing with the host file
             // mapping now that every fallible pre-step has passed. On backend
             // refusal (alignment, ownership, may-execute, linux4k, host mmap
@@ -2175,11 +2231,7 @@ impl<'a> MemView<'a> {
                         ),
                     ));
                 }
-                let content_write = if owner_reserved {
-                    memory.write_owner_reserved_bytes(address, &bytes)
-                } else {
-                    memory.write_bytes_unchecked(address, &bytes)
-                };
+                let content_write = write_file_mapping_content(this, cx.mm_mutation, memory, address, &bytes);
                 if let Err(error) = content_write {
                     mark_range_unmapped(memory, address, length_usize);
                     return Ok(request.refused_by(

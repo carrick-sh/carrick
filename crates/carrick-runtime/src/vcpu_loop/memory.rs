@@ -884,7 +884,7 @@ pub(crate) fn proc_maps_from_address_space(image: &AddressSpace) -> Vec<ProcMaps
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     mod native_buffers;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1296,6 +1296,32 @@ mod tests {
             dispatch_mm,
             carrier,
         }
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    pub(crate) fn with_reserved_native_content_fixture<R>(
+        operation: impl for<'scope> FnOnce(
+            &mut carrick_vmm_hvf::hvf_aarch64_engine::HvfAarch64Engine,
+            &carrick_guest_mem::OwnerReservedWrite<'scope>,
+            &carrick_vmm_hvf::trap::foreign_cow_test_support::ProductionCarrierSourcePin,
+        ) -> R,
+    ) -> R {
+        let (kernel, root) = bootstrap(42_101);
+        let mut fixture = real_production_cow_fixture(
+            &kernel,
+            &root,
+            42_102,
+            0x9a00_e100_0000,
+            0x9b00_e100_0000,
+            ThreadId::synthetic_for_tests(42_102),
+        );
+        let source = fixture.carrier.pin_original_data_for_test().unwrap();
+        fixture
+            .carrier
+            .with_fresh_reserved_engine_for_test(|engine, admission| {
+                operation(engine, admission, &source)
+            })
+            .unwrap()
     }
 
     fn with_mm_mutation<T>(

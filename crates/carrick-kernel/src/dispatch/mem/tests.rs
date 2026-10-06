@@ -83,6 +83,12 @@ pub struct CountingMmapMemory {
     pub(crate) protect_log: RefCell<Vec<(u64, usize, u64)>>,
     pub(crate) owner_protect_log: RefCell<Vec<(u64, usize, u64)>>,
     pub(crate) owner_reserved_write_calls: Cell<usize>,
+    pub(crate) owner_reserved_write_identity: Cell<
+        Option<(
+            carrick_el1_abi::El1MmHandle,
+            carrick_guest_mem::GuestVaRange,
+        )>,
+    >,
     /// Every backend retirement (`unmap_range`), in order.
     pub(crate) unmap_log: RefCell<Vec<(u64, usize)>>,
 }
@@ -145,6 +151,7 @@ impl CountingMmapMemory {
             protect_log: RefCell::new(Vec::new()),
             owner_protect_log: RefCell::new(Vec::new()),
             owner_reserved_write_calls: Cell::new(0),
+            owner_reserved_write_identity: Cell::new(None),
             unmap_log: RefCell::new(Vec::new()),
         }
     }
@@ -217,9 +224,15 @@ impl GuestMemory for CountingMmapMemory {
 
     fn write_owner_reserved_bytes(
         &mut self,
+        admission: &carrick_guest_mem::OwnerReservedWrite<'_>,
         address: u64,
         bytes: &[u8],
     ) -> Result<(), MemoryError> {
+        if !admission.contains(GuestVa(address), bytes.len()) {
+            return Err(MemoryError::Unsupported);
+        }
+        self.owner_reserved_write_identity
+            .set(Some((admission.owner(), admission.range())));
         self.owner_reserved_write_calls
             .set(self.owner_reserved_write_calls.get() + 1);
         self.write_bytes_raw(address, bytes)

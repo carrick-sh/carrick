@@ -2465,10 +2465,12 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     }
     fn write_owner_reserved_bytes(
         &mut self,
+        admission: &carrick_guest_mem::OwnerReservedWrite<'_>,
         address: u64,
         bytes: &[u8],
     ) -> Result<(), MemoryError> {
-        self.mem.write_owner_reserved_bytes(address, bytes)
+        self.mem
+            .write_owner_reserved_bytes(admission, address, bytes)
     }
     fn host_read(&self, address: u64, len: usize) -> Option<carrick_guest_mem::HostRead> {
         self.mem.host_read(address, len)
@@ -3163,44 +3165,47 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn split_loop_preserves_reserved_file_content_writes() {
-        struct ReservedContent {
-            bytes: [u8; 8],
-        }
-        impl GuestMemory for ReservedContent {
-            fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
-                Err(MemoryError::Unsupported)
-            }
-            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
-                Err(MemoryError::Unsupported)
-            }
-            fn write_owner_reserved_bytes(
-                &mut self,
-                address: u64,
-                bytes: &[u8],
-            ) -> Result<(), MemoryError> {
-                if address != 0x1000 || bytes.len() != self.bytes.len() {
-                    return Err(MemoryError::Unsupported);
-                }
-                self.bytes.copy_from_slice(bytes);
-                Ok(())
-            }
-        }
-        impl CurrentMmMemory for ReservedContent {}
-        let mut memory = ReservedContent { bytes: [0; 8] };
-        let mut trap = RetryCompletionTrap::default();
-        let mut split = SplitView {
-            mem: &mut memory,
-            trap: &mut trap,
-        };
-        let content = [0x5a, 0x13, 0x7f, 0, 0x81, 0xff, 0x34, 0x62];
-        assert!(split.write_bytes_unchecked(0x1000, &content).is_err());
-        split
-            .write_owner_reserved_bytes(0x1000, &content)
-            .expect("reserved file content must reach its backend through the split loop");
-        assert!(split.write_bytes_unchecked(0x1000, &content).is_err());
-        assert!(split.write_owner_reserved_bytes(0x2000, &content).is_err());
-        assert_eq!(memory.bytes, content);
+        use carrick_vmm_hvf::trap::foreign_cow_test_support::TEST_VA;
+        crate::vcpu_loop::memory::tests::with_reserved_native_content_fixture(
+            |memory, admission, source| {
+                let mut trap = RetryCompletionTrap::default();
+                let mut split = SplitView {
+                    mem: memory,
+                    trap: &mut trap,
+                };
+                let content = *b"file";
+                split
+                    .write_owner_reserved_bytes(admission, TEST_VA, &content)
+                    .expect("reserved file content must reach the production native copier");
+                let ipa = split
+                    .mem
+                    .page_tables()
+                    .with_manager(|m| m.translate(TEST_VA))
+                    .flatten()
+                    .unwrap();
+                assert_eq!(source.prefix(), content);
+                assert!(
+                    split
+                        .write_owner_reserved_bytes(
+                            admission,
+                            admission.range().end_raw(),
+                            &content
+                        )
+                        .is_err()
+                );
+                use carrick_aarch64::vmm::Aarch64Vmm;
+                assert!(
+                    split
+                        .mem
+                        .backend_mut_for_persistent_factory()
+                        .translated_write_unchecked(TEST_VA, ipa, &content, None)
+                        .is_err(),
+                    "ordinary native raw writes still require legacy admission"
+                );
+            },
+        );
     }
 
     #[test]

@@ -64,6 +64,9 @@
 //! `serde::Serialize`, and `thiserror::Error` — precisely so it sits at the
 //! bottom of the build graph and almost never has to be rebuilt.
 
+mod owner_reserved;
+pub use owner_reserved::OwnerReservedWrite;
+
 mod prepared;
 pub use prepared::{
     GuestWriteRange, LegacyProtectionRead, MemoryPrepareError, MemoryReadSuspension,
@@ -714,6 +717,7 @@ pub trait GuestMemory {
     /// the default preserves legacy backends' unchecked-write behavior.
     fn write_owner_reserved_bytes(
         &mut self,
+        _admission: &OwnerReservedWrite<'_>,
         address: u64,
         bytes: &[u8],
     ) -> Result<(), MemoryError> {
