@@ -656,6 +656,15 @@ pub struct TrapFrame {
     /// Fault Address Register (FAR_EL1) for data/instruction aborts.
     pub far: u64,
 }
+const _: () = {
+    assert!(core::mem::offset_of!(TrapFrame, x) == 0);
+    assert!(core::mem::offset_of!(TrapFrame, elr) == 248);
+    assert!(core::mem::offset_of!(TrapFrame, spsr) == 256);
+    assert!(core::mem::offset_of!(TrapFrame, esr) == 264);
+    assert!(core::mem::offset_of!(TrapFrame, slot) == 272);
+    assert!(core::mem::offset_of!(TrapFrame, far) == 280);
+    assert!(core::mem::size_of::<TrapFrame>() == 288);
+};
 
 pub use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
