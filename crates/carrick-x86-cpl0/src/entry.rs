@@ -104,7 +104,7 @@ mod kernel {
     use carrick_el1::personality::common_entry::{EntryOutcome, serve_canonical};
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
     use carrick_el1_abi::{Counters, CurrentTask};
-    use carrick_guest_arch::InterruptArch;
+    use carrick_guest_arch::{EntryArch, InterruptArch};
     use core::sync::atomic::Ordering;
 
     // Count native exits across CPL0 CPUs for image/link and live diagnostics.
@@ -146,6 +146,19 @@ mod kernel {
         if arch.current_cpu().raw() != binding.cpu_slot {
             doorbell(FATAL_PORT, frame);
             halt();
+        }
+        // Both retained scheduler witness fixtures qualify XCR0 and XSAVE
+        // geometry before entry. Exercise the shared native context leaf while
+        // preserving the exact current task and MM authority.
+        if binding.scheduler_witness.load(Ordering::Acquire) != 0 {
+            let Ok(saved) = arch.save_context(frame) else {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            };
+            if arch.load_context(frame, &saved).is_err() {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
         }
         if frame.rax == OBSERVE_NATIVE {
             doorbell(CONTROL_PORT, frame);
