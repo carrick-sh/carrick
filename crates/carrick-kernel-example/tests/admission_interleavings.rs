@@ -6,6 +6,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use carrick_abi::{LinuxCloneFlags, syscall::nr};
+use carrick_el1_abi::Lifecycle;
 use carrick_hal::{NullGuestTimerBridge, NullHostSignalBridge, ThreadId};
 use carrick_kernel::{
     compat::{CompatReporter, SyscallArgs},

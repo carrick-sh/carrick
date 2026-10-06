@@ -72,6 +72,7 @@ dependencies = [
  "carrick-core",
  "carrick-core-abi",
  "carrick-guest-arch",
+ "carrick-sched-core",
 ]
 
 [[package]]
