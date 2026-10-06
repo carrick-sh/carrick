@@ -844,3 +844,162 @@ fn retirement_receipt_fixture() {
     .unwrap();
     assert_eq!(arenas, vec![0x200000]);
 }
+
+struct TestLockWait;
+
+impl carrick_sched_core::LockWait for TestLockWait {
+    fn wait(&self, _attempt: u32) -> bool {
+        core::hint::spin_loop();
+        true
+    }
+}
+
+fn alloc_test_zone() -> Box<carrick_sched_core::ZoneTables> {
+    let layout = std::alloc::Layout::new::<carrick_sched_core::ZoneTables>();
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout).cast::<carrick_sched_core::ZoneTables>();
+        assert!(!ptr.is_null());
+        Box::from_raw(ptr)
+    }
+}
+
+#[test]
+fn x4_shared_wait_records() {
+    use carrick_core::wait::{
+        coordinate_prepared_edit_wait, notify_object, object_wait_expired, park_object_record,
+        take_object_operation,
+    };
+    use carrick_core_abi::{
+        EditWaitOutcome, ObjectParked, OperationResumePc, ThreadLedgerActivity,
+    };
+    use carrick_sched_core::object_wait::{ObjectWaitError, ObjectWaitKey, OperationToken};
+    use carrick_sched_core::{ExecutionSlot, SlotId, ThreadIdentity};
+
+    // 1. ThreadLedgerActivity
+    let activity = ThreadLedgerActivity::new();
+    assert_eq!(activity.pending(), 0);
+    activity.announce();
+    activity.announce();
+    assert_eq!(activity.pending(), 2);
+    assert_eq!(activity.complete(1), Ok(()));
+    assert_eq!(activity.pending(), 1);
+    assert_eq!(activity.complete(2), Err(1));
+    assert_eq!(activity.complete(1), Ok(()));
+    assert_eq!(activity.pending(), 0);
+
+    // 2. OperationResumePc
+    assert_eq!(
+        OperationResumePc::new(0x401000).map(|p| p.raw()),
+        Some(0x401000)
+    );
+    assert_eq!(OperationResumePc::new(0), None);
+    assert_eq!(OperationResumePc::new(0x401001), None);
+    assert_eq!(
+        OperationResumePc::from_raw(0x401001).map(|p| p.raw()),
+        Some(0x401001)
+    );
+    assert_eq!(OperationResumePc::from_raw(0), None);
+
+    // 3. ObjectParked
+    let zone = alloc_test_zone();
+    let slot = SlotId::new(2);
+    let parked = ObjectParked::new(&zone, slot);
+    assert!(parked.matches(&zone, slot));
+    assert!(!parked.matches(&zone, SlotId::new(1)));
+    assert_eq!(parked.slot(), slot);
+
+    // 4. ZoneTables object wait records, exact generations, one-winner wake/cancel
+    let wait = TestLockWait;
+    let mm = 7;
+    zone.drive(slot, 3);
+    zone.publish_slot(slot, mm, None, 0);
+    let here = ExecutionSlot::zone(slot);
+    zone.occupancy.vacate_any(here);
+    assert!(zone.occupancy.replace(here, 0, mm));
+    zone.enter_guest(slot);
+    let space_idx = zone.spaces.publish_closed(mm, 0x7000, 0x7000).unwrap();
+    zone.spaces.open(space_idx);
+    assert!(zone.install_space(slot, mm).is_some());
+
+    let key = ObjectWaitKey::new(1, 10).unwrap();
+    zone.bind_object_wait(key, &wait).unwrap();
+
+    // Stale generation is refused
+    let stale_key = ObjectWaitKey::new(1, 9).unwrap();
+    assert!(zone.object_wait(stale_key, &wait).is_err());
+
+    let guard = zone.object_wait(key, &wait).unwrap();
+    let snapshot = guard.snapshot();
+    drop(guard);
+
+    let tid = 99;
+    let identity = ThreadIdentity {
+        tid,
+        serial: tid * 10,
+        mm,
+        file_table: 99,
+        generation: 1,
+        affinity: 0,
+        lifecycle_page: 0,
+        control_slot: 0,
+    };
+    let record = zone.alloc_record(identity).unwrap();
+    let op_token = OperationToken::new(tid, 1).unwrap();
+
+    let request = carrick_core_abi::ObjectParkRequest::new(key, snapshot, op_token, None);
+    let parked = park_object_record(&zone, slot, record, false, request, 1024, &|_| {}).unwrap();
+    assert!(parked.matches(&zone, slot));
+    assert!(zone.slot(slot).current().is_none());
+
+    // One-winner: Notify object wakes the waiter
+    let (report, _effects) = notify_object(&zone, slot, key, 1024).unwrap();
+    assert_eq!(report.queued, 1);
+
+    // Switch in the woken record
+    let switched = zone.switch_in_full(slot).unwrap();
+    assert_eq!(switched.record, record);
+    assert_eq!(zone.slot(slot).current(), Some(record));
+
+    // One-winner: take_object_operation
+    // First take succeeds with the owned continuation
+    let taken1 = take_object_operation(&zone, slot, identity).unwrap();
+    let expected_token = OperationToken::new(tid, 1).unwrap();
+    assert_eq!(taken1, Some(expected_token));
+    // Second take returns None (continuation consumed, one winner)
+    let taken2 = take_object_operation(&zone, slot, identity).unwrap();
+    assert_eq!(taken2, None);
+
+    // Mismatched identity returns Err(ObjectWaitError::Stale)
+    let wrong_identity = ThreadIdentity {
+        tid: 100,
+        ..identity
+    };
+    assert_eq!(
+        take_object_operation(&zone, slot, wrong_identity),
+        Err(ObjectWaitError::Stale)
+    );
+
+    // Test object_wait_expired on slot:
+    assert!(!object_wait_expired(&zone, slot));
+
+    // 5. coordinate_prepared_edit_wait
+    let mut region = Region::new();
+    region.add_bank();
+    let spaces = AddressSpaces::new();
+    let r_mm = admit(&region, &spaces, 1, ROOT, 1, 0);
+    let r_zone = region.zone();
+    let r_slot = SlotId::new(0);
+    let space_acc = carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces);
+
+    // No prepared key on root -> Refused
+    let target = carrick_core_abi::EditWaitTarget::new(space_acc, 0, r_mm, r_slot);
+    let outcome: EditWaitOutcome<()> = coordinate_prepared_edit_wait(
+        region.table(),
+        target,
+        None,
+        r_zone,
+        |_| Some(false),
+        |_, _, _| Ok(()),
+    );
+    assert_eq!(outcome, EditWaitOutcome::Refused);
+}
