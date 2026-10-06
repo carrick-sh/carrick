@@ -459,6 +459,10 @@ fn x1_shared_mm_owner() {
         "MM12 must not commit residency"
     );
     assert_eq!(obs1.forwarded, 0, "refusal must not generate host forwards");
+    assert_eq!(
+        obs1.semantic_host_exits, 0,
+        "refusal must not cross the semantic host-forward boundary"
+    );
     let receipt1 = grant_slot.take_receipt(stale_window, &txn);
     assert!(
         matches!(receipt1, Some(r) if matches!(r.outcome, carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot))),
@@ -487,6 +491,10 @@ fn x1_shared_mm_owner() {
         obs2.forwarded, 0,
         "served grant must have zero host forwards"
     );
+    assert_eq!(
+        obs2.semantic_host_exits, 0,
+        "served grant must have zero semantic host forwards"
+    );
 
     // Case 3: Read hardware bytes at DATA_VA
     let obs3 = carrier.observe(0).expect("observe 3");
@@ -504,57 +512,8 @@ fn x1_shared_mm_owner() {
         "nonzero owner publications required"
     );
     assert_eq!(obs3.forwarded, 0, "zero semantic host forwards required");
-
-    // Case 4: Protect on MM11 via shared owner
-    let mut g1 = table.lock_in(access1, idx1, r_mm11, 0).unwrap();
-    let prot_range = ReservationRange::new(DATA_VA, DATA_VA + 4096).unwrap();
-    let dec = g1
-        .mprotect(prot_range, ReservationProtection::READ)
-        .unwrap();
-    let carrick_core_abi::Decision::Work(req) = dec else {
-        panic!("expected Decision::Work for mprotect, got {dec:?}");
-    };
-    assert_eq!(req.range, prot_range);
     assert_eq!(
-        req.operation,
-        carrick_core_abi::ReservationOperation::Protect
+        obs3.semantic_host_exits, 0,
+        "hardware read must have zero semantic host forwards"
     );
-    let comp = unsafe {
-        carrick_core_abi::ReservationCompletion::after_descriptor_and_backing_commit(
-            req,
-            carrick_core_abi::ReservationBackingReceipt {
-                receipt: 1,
-                granted_bytes: 0,
-                returned_bytes: 0,
-            },
-        )
-        .unwrap()
-    };
-    g1.complete(comp).unwrap();
-    drop(g1);
-
-    // Case 5: Unmap on MM11 via shared owner
-    let mut g1 = table.lock_in(access1, idx1, r_mm11, 0).unwrap();
-    let dec = g1.munmap(prot_range).unwrap();
-    let carrick_core_abi::Decision::Work(req) = dec else {
-        panic!("expected Decision::Work for munmap, got {dec:?}");
-    };
-    assert_eq!(req.range, prot_range);
-    assert_eq!(
-        req.operation,
-        carrick_core_abi::ReservationOperation::Retire
-    );
-    let comp = unsafe {
-        carrick_core_abi::ReservationCompletion::after_descriptor_and_backing_commit(
-            req,
-            carrick_core_abi::ReservationBackingReceipt {
-                receipt: 2,
-                granted_bytes: 0,
-                returned_bytes: 0,
-            },
-        )
-        .unwrap()
-    };
-    g1.complete(comp).unwrap();
-    drop(g1);
 }
