@@ -482,6 +482,16 @@ impl Validator<'_> {
                     continue;
                 }
             }
+            // Macro expansion can move a declaration into another module
+            // directory, even when the input parses as literal Rust. Only
+            // inline literal modules keep their complete body visible here.
+            // External modules must be selected by parsed, non-macro Rust.
+            if matches!(&tokens[i], TokenTree::Ident(id) if id.unraw() == "mod")
+                && !(matches!(tokens.get(i + 1), Some(TokenTree::Ident(_)))
+                    && matches!(tokens.get(i + 2), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Brace))
+            {
+                self.reject(tokens[i].span(), "module selection in macro input is unsupported; declare external modules in parsed Rust");
+            }
             if matches!(&tokens[i], TokenTree::Ident(id) if id.unraw() == "use")
                 && let Some(end) = tokens[i..]
                     .iter()

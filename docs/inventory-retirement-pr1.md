@@ -31,6 +31,10 @@ it never supplies test exclusion or silently promotes a source file.
 - Module paths must be literal `#[path = "..."]` selectors. Inline module
   children resolve against the inline-module directory. Duplicate paths and
   conditional `cfg_attr(..., path = ...)` selectors are rejected.
+  External modules must be declared in parsed Rust, outside macro inputs.
+  Macro expansion can change their directory even when the input parses as
+  Rust. Literal inline metadata modules remain usable; dynamic module names
+  and external selections in templates, invocations and DSL tokens fail.
 - Test exclusion requires parsed built-in `#[test]` or a provable built-in
   `#[cfg(...)]` test/test-support predicate. Imports/renames that rebind `test`,
   qualified test attributes, conditional test attributes, and opaque macro
