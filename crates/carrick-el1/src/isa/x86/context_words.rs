@@ -1,121 +1,38 @@
-//! Zero-valid CPL0 scheduler context storage and authenticated conversion.
+//! CPL0 conversion through the shared parked-context ABI.
 
 use crate::isa::ArchError;
-use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
-use core::num::NonZeroU64;
+use carrick_guest_arch::{AddressContext, RootGpa};
+pub use carrick_sched_core::ParkedContextWords;
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 use super::scheduler;
 #[cfg(all(test, not(target_os = "none")))]
 #[path = "../../../../carrick-x86/src/cpl0_scheduler.rs"]
-#[allow(dead_code)] // The host unit test uses only native context records.
+#[allow(dead_code)] // Host unit tests use only native context records.
 mod scheduler;
 
-/// An all-zero valid scheduler record for CPL0. The typed live address
-/// context is reconstructed only with the expected owner generation.
-#[repr(C, align(64))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, zerocopy::FromZeros)]
-pub struct ParkedContextWords {
-    pub frame: scheduler::InterruptFrame,
-    root: u64,
-    mm: u64,
-    generation: u64,
-    pub fs_base: u64,
-    pub gs_base: u64,
-    _xsave_align: [u8; 56],
-    pub xsave: [u8; scheduler::XSAVE_BYTES],
+pub fn from_native(context: &scheduler::NativeContext) -> ParkedContextWords {
+    scheduler::park_native_context(context)
 }
 
-const _: () = {
-    assert!(core::mem::offset_of!(ParkedContextWords, frame) == 0);
-    assert!(core::mem::offset_of!(ParkedContextWords, root) == 160);
-    assert!(core::mem::offset_of!(ParkedContextWords, mm) == 168);
-    assert!(core::mem::offset_of!(ParkedContextWords, generation) == 176);
-    assert!(core::mem::offset_of!(ParkedContextWords, fs_base) == 184);
-    assert!(core::mem::offset_of!(ParkedContextWords, gs_base) == 192);
-    assert!(core::mem::offset_of!(ParkedContextWords, _xsave_align) == 200);
-    assert!(core::mem::offset_of!(ParkedContextWords, xsave) == 256);
-    assert!(core::mem::size_of::<ParkedContextWords>() == 1088);
-    assert!(core::mem::align_of::<ParkedContextWords>() == 64);
-};
-
-impl ParkedContextWords {
-    pub const ZERO: Self = Self {
-        frame: scheduler::InterruptFrame {
-            gpr: [0; 15],
-            rip: 0,
-            cs: 0,
-            flags: 0,
-            rsp: 0,
-            ss: 0,
-        },
-        root: 0,
-        mm: 0,
-        generation: 0,
-        fs_base: 0,
-        gs_base: 0,
-        _xsave_align: [0; 56],
-        xsave: [0; scheduler::XSAVE_BYTES],
-    };
-
-    pub fn from_native(context: &scheduler::NativeContext) -> Self {
-        let mut xsave = [0; scheduler::XSAVE_BYTES];
-        xsave.copy_from_slice(&context.xsave.0);
-        Self {
-            frame: context.frame,
-            root: context.address.root.address().raw(),
-            mm: context.address.mm.raw().get(),
-            generation: context.address.generation.raw().get(),
-            fs_base: context.fs_base,
-            gs_base: context.gs_base,
-            _xsave_align: [0; 56],
-            xsave,
-        }
-    }
-
-    /// Refuse an empty, corrupt or recycled record before installing CR3 or
-    /// restoring user state. The caller supplies its exact live MM authority.
-    pub fn into_native(
-        self,
-        expected: AddressContext<RootGpa>,
-    ) -> Result<scheduler::NativeContext, ArchError> {
-        let root = RootGpa::page_aligned(FrameGpa::new(self.root))
-            .filter(|_| self.root != 0)
-            .ok_or(ArchError::InvalidContext)?;
-        let mm = NonZeroU64::new(self.mm)
-            .map(MmGeneration::new)
-            .ok_or(ArchError::InvalidContext)?;
-        let generation = NonZeroU64::new(self.generation)
-            .map(ContextGeneration::new)
-            .ok_or(ArchError::InvalidContext)?;
-        let address = AddressContext {
-            root,
-            mm,
-            generation,
-        };
-        if address != expected {
-            return Err(ArchError::InvalidContext);
-        }
-        Ok(scheduler::NativeContext {
-            frame: self.frame,
-            address,
-            fs_base: self.fs_base,
-            gs_base: self.gs_base,
-            xsave: scheduler::XsaveArea(self.xsave),
-        })
-    }
+pub fn into_native(
+    words: ParkedContextWords,
+    expected: AddressContext<RootGpa>,
+) -> Result<scheduler::NativeContext, ArchError> {
+    scheduler::restore_native_context(words, expected).ok_or(ArchError::InvalidContext)
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
-    use carrick_guest_arch::{ContextGeneration, MmGeneration};
+    use carrick_guest_arch::{ContextGeneration, FrameGpa, MmGeneration};
     use carrick_sched_core::object_wait::OwnedObjectWakeEffects;
     use carrick_sched_core::spaces::notification::{
         SpaceAccess, SpaceReleaseVenue, SpaceWaitCause,
     };
     use carrick_sched_core::{BoundedSpin, SlotId, ThreadIdentity, Waker, ZoneTables};
+    use core::num::NonZeroU64;
 
     fn deliver_x86_notification(
         _: &ZoneTables<ParkedContextWords>,
@@ -133,7 +50,7 @@ mod tests {
             generation: ContextGeneration::new(NonZeroU64::new(7).unwrap()),
         };
         assert!(matches!(
-            ParkedContextWords::ZERO.into_native(expected),
+            into_native(ParkedContextWords::ZERO, expected),
             Err(ArchError::InvalidContext)
         ));
         let mut xsave = scheduler::XsaveArea::ZERO;
@@ -152,8 +69,8 @@ mod tests {
             gs_base: 0x5000,
             xsave,
         };
-        let words = ParkedContextWords::from_native(&native);
-        let restored = words.into_native(expected).unwrap();
+        let words = from_native(&native);
+        let restored = into_native(words, expected).unwrap();
         assert_eq!(restored.frame, native.frame);
         assert_eq!(restored.address, native.address);
         assert_eq!((restored.fs_base, restored.gs_base), (0x4000, 0x5000));
@@ -163,7 +80,7 @@ mod tests {
             ..expected
         };
         assert!(matches!(
-            words.into_native(recycled),
+            into_native(words, recycled),
             Err(ArchError::InvalidContext)
         ));
     }
@@ -200,11 +117,14 @@ mod tests {
         assert_eq!(zone.switch_in(slot), Some(record));
         // SAFETY: this fixture is the only driver of the on-CPU slot.
         assert!(matches!(
-            unsafe { *zone.record(record).ctx_mut() }.into_native(AddressContext {
-                root: RootGpa::page_aligned(FrameGpa::new(0x6000)).unwrap(),
-                mm: MmGeneration::new(NonZeroU64::new(11).unwrap()),
-                generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
-            }),
+            into_native(
+                unsafe { *zone.record(record).ctx_mut() },
+                AddressContext {
+                    root: RootGpa::page_aligned(FrameGpa::new(0x6000)).unwrap(),
+                    mm: MmGeneration::new(NonZeroU64::new(11).unwrap()),
+                    generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+                }
+            ),
             Err(ArchError::InvalidContext)
         ));
     }
