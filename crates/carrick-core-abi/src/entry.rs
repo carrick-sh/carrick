@@ -115,18 +115,41 @@ pub struct EntryRecordBinding {
 
 /// Owns ordinary completion for one host-generation-bound entry.
 #[derive(Debug, Eq, PartialEq)]
-pub struct EntryCompletion {
+pub struct EntryCompletion<'a> {
     binding: ExecutionBinding,
+    scope: Option<EntryExecutionScope>,
+    owner_lifetime: core::marker::PhantomData<&'a ZoneTables>,
 }
-impl EntryCompletion {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EntryExecutionScope {
+    pub owner: NonNull<ZoneTables>,
+    pub slot: SlotId,
+    pub record: Option<EntryRecordBinding>,
+}
+impl<'a> EntryCompletion<'a> {
     /// # Safety
     /// The caller must authenticate an issued host execution generation and
-    /// retain the exact MM/thread binding for this one entry completion.
-    pub const unsafe fn from_admitted_binding(binding: ExecutionBinding) -> Self {
-        Self { binding }
+    /// retain the exact MM/thread binding for this one entry completion. Any
+    /// scope must name that same retained owner, slot and live record epoch.
+    pub const unsafe fn from_admitted_binding(
+        binding: ExecutionBinding,
+        scope: Option<EntryExecutionScope>,
+        _owner: Option<&'a ZoneTables>,
+    ) -> Self {
+        Self {
+            binding,
+            scope,
+            owner_lifetime: core::marker::PhantomData,
+        }
     }
     pub const fn binding(&self) -> ExecutionBinding {
         self.binding
+    }
+}
+
+impl EntryCompletion<'_> {
+    pub const fn scope(&self) -> Option<EntryExecutionScope> {
+        self.scope
     }
 }
 
@@ -169,4 +192,30 @@ pub enum Served {
     Returned { switched: bool },
     /// No execution is currently installed after suspension and native idle.
     Idle,
+}
+
+/// Owned evidence of the initiating record's successful park or retirement.
+/// This is turn-local evidence, never a second continuation record.
+#[derive(Debug)]
+pub struct EntryHandoffReceipt {
+    binding: ExecutionBinding,
+    record: EntryRecordBinding,
+}
+impl EntryHandoffReceipt {
+    /// # Safety
+    /// The issuer authenticated the exact initiating binding/record before
+    /// publishing its successful owned scheduler/wait transition. No context
+    /// access may follow publication; this receipt is issued once for that turn.
+    pub const unsafe fn from_published_transition(
+        binding: ExecutionBinding,
+        record: EntryRecordBinding,
+    ) -> Self {
+        Self { binding, record }
+    }
+    pub const fn binding(&self) -> ExecutionBinding {
+        self.binding
+    }
+    pub const fn record(&self) -> EntryRecordBinding {
+        self.record
+    }
 }
