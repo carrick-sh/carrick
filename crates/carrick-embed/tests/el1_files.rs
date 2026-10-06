@@ -435,8 +435,10 @@ fn el1_files_exit_group_stress() {
         watchdog.disarm();
         assert!(
             result.success(),
-            "iteration {iteration} failed with exit_code={}",
-            result.exit_code
+            "iteration {iteration} failed with exit_code={}\nstdout: {}\nstderr: {}",
+            result.exit_code,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
         );
     }
 }

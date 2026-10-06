@@ -2361,7 +2361,10 @@ impl BlockedContinuation {
                     ContinuationFamily::WaitOnSignals => {
                         ContinuationCompletion::Errno(LINUX_EAGAIN)
                     }
-                    ContinuationFamily::WaitOnFdsSelect | ContinuationFamily::WaitOnSleep => {
+                    // Linux writes remaining time only for an interrupted
+                    // relative sleep, never after successful expiration.
+                    ContinuationFamily::WaitOnSleep => ContinuationCompletion::Return(0),
+                    ContinuationFamily::WaitOnFdsSelect => {
                         ContinuationCompletion::ReturnWithGuestWrites(
                             0,
                             self.guest_outputs().to_vec(),
