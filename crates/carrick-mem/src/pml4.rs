@@ -62,11 +62,48 @@ fn canonical_address(va: u64) -> bool {
 }
 
 fn canonical_range(va: u64, len: u64) -> bool {
+    // The exclusive end 2^64 cannot be represented by u64. Refuse that final
+    // page rather than treating checked-add overflow as a wrapped range.
     let Some(end) = va.checked_add(len) else {
         return false;
     };
     (va < USER_VA_LIMIT && end <= USER_VA_LIMIT)
         || (va >= KERNEL_VA_START && end >= KERNEL_VA_START)
+}
+
+/// An x86 user leaf can cover only the canonical lower half. Callers retain
+/// this proof before requesting a user descriptor, including alias installs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct X86UserRange {
+    start: GuestVa,
+    len: u64,
+}
+
+impl X86UserRange {
+    pub fn checked(start: GuestVa, len: u64) -> Result<Self, Pml4Error> {
+        if start.raw() < USER_VA_LIMIT
+            && start
+                .raw()
+                .checked_add(len)
+                .is_some_and(|end| end <= USER_VA_LIMIT)
+        {
+            Ok(Self { start, len })
+        } else {
+            Err(Pml4Error::UserOutsideLowerHalf)
+        }
+    }
+
+    pub fn start(self) -> GuestVa {
+        self.start
+    }
+
+    pub fn len(self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
 }
 /// One past the top of the physical-address field (bits 51:12 ⇒ 2^52).
 const PA_LIMIT: u64 = 1 << 52;
@@ -75,6 +112,8 @@ const PA_LIMIT: u64 = 1 << 52;
 pub enum Pml4Error {
     /// A VA outside the canonical halves, or a range crossing either boundary.
     NonCanonical,
+    /// A U/S=1 leaf was requested outside the lower canonical user half.
+    UserOutsideLowerHalf,
     /// A VA/GPA/length not 4 KiB-aligned, or a GPA past bits 51:12.
     Misaligned,
     /// The table region has no free page left for a needed table.
@@ -149,6 +188,9 @@ pub fn pml4_tables(maps: &[Pml4MapSpec], base: u64, capacity: usize) -> Result<V
         }
         if !canonical_range(m.va, m.len) {
             return Err(Pml4Error::NonCanonical);
+        }
+        if m.user {
+            X86UserRange::checked(GuestVa(m.va), m.len)?;
         }
         if m.gpa.checked_add(m.len).is_none_or(|e| e > PA_LIMIT) {
             return Err(Pml4Error::Misaligned);
@@ -697,6 +739,9 @@ impl Pml4Manager {
                 && let Some(off) = self.large_2m_leaf_offset_for_edit(cur)?
             {
                 let desc = self.read_desc(off);
+                if desc & PML4_US != 0 {
+                    X86UserRange::checked(GuestVa(cur), LARGE_2M)?;
+                }
                 let new = edit(desc)?;
                 if new != desc {
                     write_desc(&mut self.bytes, off, new);
@@ -707,6 +752,9 @@ impl Pml4Manager {
             }
             let off = self.leaf_offset_for_edit(cur)?;
             let desc = self.read_desc(off);
+            if desc & PML4_US != 0 {
+                X86UserRange::checked(GuestVa(cur), PT_PAGE as u64)?;
+            }
             let new = edit(desc)?;
             if new != desc {
                 write_desc(&mut self.bytes, off, new);
@@ -820,6 +868,7 @@ impl Pml4Manager {
         if !canonical_range(va, va_end - va) {
             return Err(Pml4Error::NonCanonical);
         }
+        X86UserRange::checked(GuestVa(va), aligned_len)?;
         if gpa
             .checked_add(aligned_len)
             .is_none_or(|end| end > PA_LIMIT)
@@ -1503,11 +1552,79 @@ mod tests {
             write: true,
             exec: true,
         }]);
-        let mgr = Pml4Manager::new(bytes, BASE);
+        let mut mgr = Pml4Manager::new(bytes, BASE);
         assert_eq!(mgr.translate(high), Some(0x10_0000));
         assert_eq!(mgr.translate(high + 0x1000), Some(0x10_1000));
         assert_eq!(mgr.translate(0x8000_0000), None);
         assert_eq!(mgr.translate(1 << 47), None);
+        assert_eq!(mgr.set_readonly(high, 0x1000, false), Ok(true));
+        assert_eq!(walk_descriptors(mgr.bytes(), BASE, high)[3] & PML4_US, 0);
+    }
+
+    #[test]
+    fn high_half_user_spec_and_alias_are_refused() {
+        let high = 0xffff_ffff_8000_0000;
+        let last_user = X86UserRange::checked(GuestVa(USER_VA_LIMIT - 0x1000), 0x1000)
+            .expect("last lower-half page is admissible");
+        assert_eq!(last_user.start().raw(), USER_VA_LIMIT - 0x1000);
+        assert_eq!(last_user.len(), 0x1000);
+        assert!(!last_user.is_empty());
+        assert!(
+            X86UserRange::checked(GuestVa(0), 0)
+                .expect("empty low range")
+                .is_empty()
+        );
+        assert_eq!(
+            X86UserRange::checked(GuestVa(USER_VA_LIMIT - 0x1000), 0x2000),
+            Err(Pml4Error::UserOutsideLowerHalf)
+        );
+        assert_eq!(
+            pml4_tables(
+                &[user_rw_nx(GuestVa(high), Gpa(0x10_0000), 0x1000)],
+                BASE,
+                CAP
+            ),
+            Err(Pml4Error::UserOutsideLowerHalf)
+        );
+        let mut mgr = Pml4Manager::new(build(&[]), BASE);
+        assert_eq!(
+            mgr.map_aliased(GuestVa(high), Gpa(0x10_0000), 0x1000, true, true),
+            Err(Pml4Error::UserOutsideLowerHalf)
+        );
+        assert_eq!(mgr.translate(high), None);
+    }
+
+    #[test]
+    fn protection_refuses_a_high_half_user_leaf() {
+        let high = 0xffff_ffff_8000_0000;
+        let bytes = build(&[Pml4MapSpec {
+            va: high,
+            gpa: 0x10_0000,
+            len: 0x1000,
+            user: false,
+            write: true,
+            exec: false,
+        }]);
+        let mut mgr = Pml4Manager::new(bytes, BASE);
+        // Simulate an imported descriptor image with an illegal user leaf;
+        // protect must not make that existing leaf present/writable again.
+        let off = mgr.leaf_offset_for_edit(high).expect("high leaf");
+        let desc = mgr.read_desc(off);
+        write_desc(&mut mgr.bytes, off, desc | PML4_US);
+        let before = mgr.bytes().to_vec();
+        assert_eq!(
+            mgr.set_prot_none(high, 0x1000),
+            Err(Pml4Error::UserOutsideLowerHalf)
+        );
+        assert_eq!(
+            mgr.set_readonly(high, 0x1000, false),
+            Err(Pml4Error::UserOutsideLowerHalf)
+        );
+        assert_eq!(
+            mgr.set_rw(high, 0x1000, false),
+            Err(Pml4Error::UserOutsideLowerHalf)
+        );
+        assert_eq!(mgr.bytes(), before);
     }
 
     #[test]
