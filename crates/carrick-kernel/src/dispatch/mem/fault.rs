@@ -6,7 +6,7 @@ use carrick_el1::memory::reservations::{Mapping, Refusal, Reservations};
 use carrick_el1_abi::{ReservationIncarnation, ReservationProtection, ReservationRange};
 use carrick_fatal::carrick_fatal;
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub struct ResidentFaultRange {
     pub(crate) range: carrick_vfs::GuestMemoryRange,
     pub(crate) prot: LinuxProtFlags,
@@ -32,14 +32,14 @@ pub struct ResidentFaultRange {
 /// entry. The set is non-overlapping by construction — [`Self::arm`] disarms
 /// what it covers before inserting — which is also what makes the "last entry
 /// at or below" lookup exact.
-#[derive(Clone, Default)]
+#[derive(::core::clone::Clone, ::core::default::Default)]
 pub struct FirstTouchArming {
     revision: u64,
     /// `start -> (end, prot)`, non-overlapping, ordered by `start`.
     extents: std::collections::BTreeMap<u64, FirstTouchArm>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 struct FirstTouchArm {
     end: u64,
     prot: LinuxProtFlags,
@@ -206,7 +206,13 @@ impl FirstTouchArming {
 /// stops matching and is dead by construction. Everything else (host setup,
 /// host-owned rows, the heap, a range the host venue's own pending proposal
 /// holds) is the host's own fact.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(crate) enum ResidencyOwner {
     Host,
     Root(ReservationIncarnation),
@@ -217,7 +223,7 @@ pub(crate) enum ResidencyOwner {
 /// own owner: [`Self::contains`] asks "resident under THIS owner?", so a
 /// fact about a retired incarnation can never describe a new mapping at the
 /// same address.
-#[derive(Clone, Default)]
+#[derive(::core::clone::Clone, ::core::default::Default)]
 pub struct ResidentFacts {
     /// `start -> (end, owner)`, non-overlapping, ordered by `start`.
     facts: std::collections::BTreeMap<u64, (u64, ResidencyOwner)>,
@@ -344,7 +350,7 @@ fn bus_fault_contains(ranges: &[(u64, u64)], address: u64) -> bool {
 /// page is observed on first touch). A root hole has nothing to observe:
 /// whatever the host recorded there describes a mapping the guest venue has
 /// already retired.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(in crate::dispatch) enum FirstTouchOwner {
     /// Host setup, a host-owned (opaque) root node, the root's heap, or the
     /// range this MM's pending host proposal holds: the host's own arming.
@@ -378,7 +384,7 @@ pub(in crate::dispatch) fn root_holes(
 
 /// One root-owned first-touch piece: an anonymous node outside the heap,
 /// clipped to the query, with the incarnation its residency facts must name.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(in crate::dispatch) struct RootPiece {
     pub(in crate::dispatch) range: carrick_vfs::GuestMemoryRange,
     pub(in crate::dispatch) protection: ReservationProtection,

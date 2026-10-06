@@ -6,7 +6,13 @@ use crate::dispatch::mm_quiesce::FrameCowExactMmGuard;
 use crate::kernel::MmId;
 use carrick_el1_abi::ReservationRange;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct HostFirstTouchIntent {
     pub mm: MmId,
     pub page: u64,

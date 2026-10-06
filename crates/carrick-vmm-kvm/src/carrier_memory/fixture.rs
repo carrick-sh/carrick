@@ -55,7 +55,7 @@ impl InventoryRetirement for FixtureInventory {
         Ok(())
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub enum Observation {
     Byte(u8),
     Fault(FaultDoorbellRecord),

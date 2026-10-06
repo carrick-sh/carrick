@@ -11,7 +11,13 @@ use super::*;
 use carrick_vfs::rootfs::RootFsEntryKind;
 
 /// Identifies which fast path (if any) fully resolved and answered the lookup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(in crate::dispatch) enum FastPathKind {
     None,
     TrustedDirfd,

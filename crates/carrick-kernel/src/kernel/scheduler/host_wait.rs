@@ -10,7 +10,7 @@ use super::*;
 use std::marker::PhantomData;
 
 /// One conserved CPU slot and its exact host-wait claimants.
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct HostWaitSlotSnapshot {
     pub root: ExecutorId,
     pub cpu: GuestCpuId,
@@ -20,27 +20,27 @@ pub struct HostWaitSlotSnapshot {
 
 /// Coherent, kernel-local work counters and ownership; never inferred from
 /// global host-thread counts. Acquisition failure is represented by `None`.
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct HostWaitCensus {
     pub entered: u64,
     pub resumed: u64,
     pub slots: Vec<HostWaitSlotSnapshot>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(super) struct ExecutorPlacement {
     pub cpu: Option<GuestCpuId>,
     pub slot: Option<ExecutorId>,
     pub waiting: bool,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct Waiter {
     binding: ExecutorBinding,
     ready: bool,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(super) struct HandoffSlot {
     cpu: GuestCpuId,
     root: ExecutorRegistration,

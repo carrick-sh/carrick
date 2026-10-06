@@ -376,7 +376,13 @@ fn linux_ifreq_inet4(name: &str, addr_be: [u8; 4]) -> LinuxIfreq {
 /// The filesystem an fd's inode lives on, as far as `FICLONE`'s error
 /// precedence can tell them apart. Derived from the oracle's
 /// `ioctl_ficlone04` matrix (every pairing of 17 fd types), not from headers.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::fmt::Debug,
+)]
 enum FicloneFs {
     /// The container rootfs: regular files and directories.
     Root {

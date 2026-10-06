@@ -86,14 +86,14 @@ use zerocopy::IntoBytes;
 /// form). `__unused1` is u64-aligned via a 4-byte pad following `pad2`.
 #[repr(C, packed)]
 #[derive(
-    Clone,
-    Copy,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
     ::zerocopy::Immutable,
     ::zerocopy::Unaligned,
-    Default,
+    ::core::default::Default,
 )]
 pub(super) struct LinuxIpcPerm {
     pub key: i32,       // @0
@@ -114,14 +114,14 @@ pub(super) struct LinuxIpcPerm {
 /// generic asm-generic/shmbuf.h for 64-bit). LTP shmctl01 reads each field.
 #[repr(C, packed)]
 #[derive(
-    Clone,
-    Copy,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
     ::zerocopy::Immutable,
     ::zerocopy::Unaligned,
-    Default,
+    ::core::default::Default,
 )]
 pub(super) struct LinuxShmidDs {
     pub shm_perm: LinuxIpcPerm, // 48
@@ -147,14 +147,14 @@ const _: () = assert!(core::mem::size_of::<LinuxIpcPerm>() == 48);
 /// sem_ctime.
 #[repr(C, packed)]
 #[derive(
-    Clone,
-    Copy,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
     ::zerocopy::Immutable,
     ::zerocopy::Unaligned,
-    Default,
+    ::core::default::Default,
 )]
 pub(super) struct LinuxSemidDs {
     pub sem_perm: LinuxIpcPerm, // 48
@@ -174,14 +174,14 @@ const _: () = assert!(core::mem::size_of::<LinuxSemidDs>() == 88);
 /// `msqid_ds`.
 #[repr(C, packed)]
 #[derive(
-    Clone,
-    Copy,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
     ::zerocopy::Immutable,
     ::zerocopy::Unaligned,
-    Default,
+    ::core::default::Default,
 )]
 pub(super) struct LinuxMsqidDs {
     pub msg_perm: LinuxIpcPerm, // 48
@@ -257,30 +257,30 @@ const MSG_OFF_LRPID: usize = 92;
 const MSG_OFF_HEAD: usize = 96;
 
 bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::default::Default, ::core::cmp::Eq, ::core::cmp::PartialEq)]
     struct IpcCreateFlags: u64 {
         const CREAT = 0o1000;
         const EXCL = 0o2000;
     }
 
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::default::Default, ::core::cmp::Eq, ::core::cmp::PartialEq)]
     struct ShmAttachFlags: u64 {
         const RDONLY = 0o10000;
         const RND = 0o20000;
         const REMAP = 0o40000;
     }
 
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::default::Default, ::core::cmp::Eq, ::core::cmp::PartialEq)]
     struct ShmModeFlags: u32 {
         const LOCKED = 0o2000;
     }
 
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::default::Default, ::core::cmp::Eq, ::core::cmp::PartialEq)]
     struct SemOpFlags: u16 {
         const NOWAIT = 0o4000;
     }
 
-    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::default::Default, ::core::cmp::Eq, ::core::cmp::PartialEq)]
     struct MsgOpFlags: u64 {
         const NOWAIT = 0o4000;
         const NOERROR = 0o10000;
@@ -289,7 +289,14 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct ShmPermMode {
     bits: u32,
 }
@@ -342,7 +349,7 @@ impl ShmPermMode {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct ShmSegment {
     pub path: PathBuf,
     pub key: i32,
@@ -403,7 +410,7 @@ impl ShmSegment {
     }
 }
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 struct SemSet {
     key: i32,
     scan_index: SemScanIndex,
@@ -465,7 +472,13 @@ impl Drop for SemopChangeSubscription {
 
 /// Linux sembuf ABI.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(super) struct LinuxSembuf {
     pub sem_num: u16,
     pub sem_op: i16,
@@ -473,7 +486,13 @@ pub(super) struct LinuxSembuf {
 }
 
 /// Which Linux blocked-waiter counter a `semop` operation feeds while parked.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 enum SemWaitKind {
     /// `sem_op < 0` — waiting for the value to INCREASE (semctl `GETNCNT`).
     Increase,
@@ -498,7 +517,14 @@ impl SemWaitKind {
 type SemWaitCounters = Arc<Mutex<Vec<SemWaitCounts>>>;
 
 /// Carrick's own blocked-waiter counts for one semaphore of a set.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 struct SemWaitCounts {
     increase: u32,
     zero: u32,
@@ -530,7 +556,16 @@ impl SemWaitCounts {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 struct GuestSemId(i32);
 
 impl GuestSemId {
@@ -547,7 +582,16 @@ impl GuestSemId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 struct MsgQueueId(i32);
 
 impl MsgQueueId {
@@ -569,7 +613,14 @@ impl MsgQueueId {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+    ::core::cmp::PartialEq,
+)]
 struct MsgKey(i32);
 
 impl MsgKey {
@@ -588,7 +639,15 @@ impl MsgKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 struct MsgType(i64);
 
 impl MsgType {
@@ -609,20 +668,33 @@ impl MsgType {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 struct MsgRecord {
     msg_type: MsgType,
     payload: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 struct MsgQueueMetrics {
     queues: usize,
     messages: usize,
     bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 enum SemStatSelector {
     StatIndex(SemScanIndex),
     AnyIndex(SemScanIndex),
@@ -640,7 +712,15 @@ impl SemStatSelector {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialOrd,
+)]
 struct SemScanIndex(u32);
 
 impl SemScanIndex {
@@ -768,7 +848,7 @@ pub struct HostAliasShmatCommit {
 /// segment generation. Dropping any unconsumed host-alias transaction rolls
 /// this reservation back, so sibling `IPC_RMID` can never erase the metadata
 /// required by a later successful alias install.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct PendingShmat {
     namespace: std::sync::Arc<SysvIpcNamespace>,
     shmid: i32,
@@ -826,7 +906,7 @@ impl Drop for PendingShmat {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(::core::default::Default, ::core::fmt::Debug)]
 pub struct SysvShmState {
     /// shmid (= host inode number, truncated to i32) → segment metadata.
     /// Populated lazily: a shmat against a known key but unfamiliar shmid
@@ -898,7 +978,7 @@ impl SysvShmState {
 /// One SysV IPC namespace shared by every logical HVPatch process. Linux fork
 /// does not copy the namespace: children see the same segments, queues, and
 /// semaphore sets, including objects created after the fork.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct SysvIpcNamespace {
     state: Mutex<SysvShmState>,
     cleanup_claimed: AtomicBool,
@@ -940,7 +1020,7 @@ impl SysvIpcNamespace {
 /// Per-process attachment bookkeeping. The backing namespace is shared, but
 /// shmat/shmdt state belongs to one Linux process and is inherited by value at
 /// fork just like its VMA graph.
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct SysvProcessAttachments {
     /// Map guest VA (returned from shmat) → shmid so shmdt can find which
     /// segment to decrement when given just an address.
@@ -1092,7 +1172,7 @@ fn wr_i64(buf: &mut [u8], off: usize, value: i64) {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 struct MsgQueueFile {
     id: MsgQueueId,
     key: i32,
@@ -1112,7 +1192,7 @@ struct MsgQueueFile {
     messages: Vec<MsgRecord>,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct MsgQueueEntry {
     path: PathBuf,
     queue: Mutex<MsgQueueFile>,
@@ -1328,7 +1408,13 @@ fn cleanup_msg_queue_files_for_scope() {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 struct CachedMsgQueueIdentity {
     dev: libc::dev_t,
     ino: libc::ino_t,
@@ -1432,7 +1518,7 @@ fn msg_queue_identity(path: &Path) -> Result<CachedMsgQueueIdentity, LinuxErrno>
     })
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct MsgQueueWaitWord {
     ptr: std::ptr::NonNull<std::sync::atomic::AtomicU32>,
     len: usize,
@@ -1513,7 +1599,7 @@ impl Drop for MsgQueueWaitWord {
     }
 }
 
-#[derive(Clone, ::serde::Serialize)]
+#[derive(::core::clone::Clone, ::serde::Serialize)]
 pub struct SysvWaitState {
     blocked_id: i32,
     queue_path: PathBuf,
@@ -3610,7 +3696,7 @@ impl Drop for SysvSemBlockStateGuard {
 /// its locks.  In particular it contains no semid or namespace lookup key:
 /// an `IPC_RMID` followed by id reuse can only resolve to `EIDRM`, never apply
 /// an old operation to the replacement set.
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub struct BlockingSemop {
     sem_set: Box<SemSet>,
     sops: Vec<LinuxSembuf>,

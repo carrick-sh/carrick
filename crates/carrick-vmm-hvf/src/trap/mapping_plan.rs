@@ -7,7 +7,13 @@
 
 use super::*;
 
-#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::serde::Serialize,
+)]
 pub struct GuestMappingPlan {
     /// The user-mode entry point (real `_start` of the loaded ELF, already
     /// rebased through any PIE bias). When `el0_trampoline_entry` is `None`
@@ -39,7 +45,13 @@ pub struct GuestMappingPlan {
     pub mappings: Vec<GuestMapping>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::serde::Serialize,
+)]
 pub struct GuestMapping {
     /// Guest VIRTUAL address the region is mapped at (also the key for
     /// software syscall-path memory access). Equals `ipa_start` for every
@@ -67,7 +79,7 @@ pub struct GuestMapping {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub(crate) struct ExecPrivateFileBacking {
     pub(crate) identity: u64,
     pub(crate) file: std::sync::Arc<std::fs::File>,
@@ -84,7 +96,14 @@ impl PartialEq for ExecPrivateFileBacking {
 impl Eq for ExecPrivateFileBacking {}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+    ::core::cmp::PartialEq,
+)]
 struct ExecPrivateFileKey {
     source_ptr: usize,
     source_len: usize,
@@ -92,7 +111,7 @@ struct ExecPrivateFileKey {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct CachedExecPrivateFile {
     source: std::sync::Arc<Vec<u8>>,
     backing: ExecPrivateFileBacking,
@@ -100,7 +119,7 @@ struct CachedExecPrivateFile {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 struct ExecPrivateFileCache {
     entries: HashMap<ExecPrivateFileKey, CachedExecPrivateFile>,
     mapped_bytes: usize,

@@ -835,7 +835,7 @@ pub(crate) use mm_authority::{
 pub use carrick_guest_mem::{CurrentMmMemory, Gpa, GuestMemory, GuestVa, HostVa, MemoryError};
 
 /// Outcome of [`SyscallDispatcher::try_vfs_open`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 enum VfsOpenAttempt {
     Installed(i32),
     Errno(LinuxErrno),
@@ -846,12 +846,18 @@ enum VfsOpenAttempt {
 /// publication. This is run-scoped dispatcher state, not a host-platform or
 /// process-global presence heuristic: macOS can execute the same container via
 /// native translation or HVF, and only the selected backend knows who kicks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum AsyncSignalWakeOwner {
     SignalPump,
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) enum AuthorityCallError {
     Rejected(crate::file_authority::AuthorityError),
     Fatal(crate::file_authority::AuthorityFatal),

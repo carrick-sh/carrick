@@ -12,7 +12,7 @@ fn scrub_remap_eligible(
     eligible_without_cow && !cow_source_exists()
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 enum MissingMappingResolution<T> {
     Pristine,
     Published(T),

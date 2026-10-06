@@ -67,7 +67,7 @@ fn retained_host_file_for_lock(
 /// Releases the description-owned lock classes when their exact open-file
 /// description loses its final functional reference. The weak table edge keeps
 /// descriptor retirement from owning filesystem state.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct LogicalLockRetirement {
     locks: Weak<LogicalRecordLocks>,
     file: LeaseFileId,
@@ -260,13 +260,26 @@ fn validate_flock_arg<M: CurrentMmMemory>(memory: &M, arg: u64) -> Result<(), Li
 /// [`FsView::same_file_other_openers`]). Two open descriptions
 /// conflict for lease purposes iff they name the same underlying file: the host
 /// inode under `--fs host`, or the guest open-path for the in-memory backing.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+)]
 pub enum LeaseFileId {
     Inode { dev: u64, ino: u64 },
     Path(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+)]
 pub enum LogicalRecordLockOwner {
     Process { pid: i32, serial: u64 },
     Ofd(usize),
@@ -311,7 +324,13 @@ impl From<crate::kernel::TaskKey> for LogicalRecordLockOwner {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct LogicalRecordLockRange {
     pub(crate) start: u64,
     pub(crate) end: u64,
@@ -323,7 +342,7 @@ impl LogicalRecordLockRange {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct LogicalRecordLock {
     pub(crate) file: LeaseFileId,
     pub(crate) owner: LogicalRecordLockOwner,
@@ -331,14 +350,14 @@ pub struct LogicalRecordLock {
     pub(crate) write: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct LogicalFlock {
     pub(crate) file: LeaseFileId,
     pub(crate) owner: usize,
     pub(crate) write: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct LogicalRecordLockRequest {
     pub(crate) file: LeaseFileId,
     pub(crate) owner: LogicalRecordLockOwner,
@@ -348,10 +367,17 @@ pub struct LogicalRecordLockRequest {
 
 /// Token identifying one waiting `LogicalRecordLockRequest` in the wait-for
 /// graph, minted by [`LogicalRecordLocks::mint_wait_id`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+)]
 pub struct RecordLockWaitId(pub(crate) u64);
 
-#[derive(Default)]
+#[derive(::core::default::Default)]
 pub struct LogicalRecordLockState {
     pub(crate) locks: Vec<LogicalRecordLock>,
     pub(crate) flocks: Vec<LogicalFlock>,
@@ -379,7 +405,7 @@ impl LogicalRecordLockState {
     }
 }
 
-#[derive(Default)]
+#[derive(::core::default::Default)]
 pub struct LogicalRecordLocks {
     pub(crate) state: parking_lot::Mutex<LogicalRecordLockState>,
     changed: parking_lot::Condvar,
@@ -775,7 +801,7 @@ impl Drop for RecordLockWaitEdge {
     }
 }
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub struct LogicalRecordLockWait {
     locks: Arc<LogicalRecordLocks>,
     request: LogicalRecordLockRequest,
@@ -911,7 +937,7 @@ impl std::fmt::Debug for LogicalRecordLockWait {
 /// A reactor-driven wait for either POSIX/OFD record locking or whole-file
 /// flock locking. Both use the same continuation family, but only record locks
 /// participate in the POSIX wait-for graph.
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub enum LogicalLockWait {
     Record {
         wait: LogicalRecordLockWait,
@@ -942,7 +968,7 @@ impl LogicalLockWait {
 /// A flock wait retains the exact open-file description through asynchronous
 /// admission. Its owner is that description's stable `Arc` identity, never a
 /// process identity or a guest fd number that may be reused while parked.
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub struct LogicalFlockWait {
     locks: Arc<LogicalRecordLocks>,
     file: LeaseFileId,

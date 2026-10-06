@@ -12,7 +12,15 @@ use super::*;
 pub(crate) mod tests;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialOrd,
+)]
 pub(crate) enum AliasOwnershipScope {
     /// Alias belongs to the root address space of a specific container in this carrier.
     ContainerRoot(ContainerRootToken),
@@ -53,7 +61,13 @@ pub(crate) fn rebind_inherited_alias_to_process(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct AliasBacking {
     /// Guest VIRTUAL start of the alias (the syscall-path region key).
     pub(crate) start: u64,
@@ -220,7 +234,13 @@ pub(crate) type AliasExactFirstIndex = std::collections::BTreeMap<
 /// across active classes (<= 40 classes), eliminating full scans across thousands
 /// of irrelevant rows.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::clone::Clone,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(crate) struct AliasClassIndex {
     pub(crate) by_class_start: std::collections::BTreeMap<(u32, u64), Vec<(u64, AliasBacking)>>,
     pub(crate) class_counts: std::collections::BTreeMap<u32, usize>,
@@ -234,7 +254,14 @@ pub(crate) struct AliasClassIndex {
 /// width must be the width of THAT domain, or containment silently answers
 /// for the wrong extent.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum AliasWindowDomain {
     /// `size` bytes: the guest-VA window keyed by `start`, or the stage-1
     /// IPA window keyed by `ipa`.
@@ -593,7 +620,13 @@ impl AliasClassIndex {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct RetiredRows {
     pub(crate) aliases: Vec<AliasBacking>,
 }
@@ -639,7 +672,13 @@ impl IntoIterator for RetiredRows {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct AliasScopeBucket {
     pub(crate) rows: Vec<(u64, AliasBacking)>,
     pub(crate) replay: std::collections::BTreeSet<ReplayMappingKey>,
@@ -660,7 +699,14 @@ impl std::ops::Deref for AliasScopeBucket {
 /// one registry view and committed against another can name the writer that
 /// changed it instead of reporting only the difference.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum AliasRegistryWriter {
     /// A plain `alias_registry().lock()` mutated rows. Any log entry with
     /// this writer is itself a defect: the site bypassed attribution.
@@ -692,7 +738,14 @@ pub(crate) enum AliasRegistryWriter {
 /// the writer knows it. A writer may change rows of scopes it does not own
 /// (a retired physical projection removes every scope's rows of it).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum AliasWriterActor {
     #[default]
     Unknown,
@@ -705,7 +758,7 @@ pub(crate) enum AliasWriterActor {
 /// One row-changing registry mutation: the scope it changed, that scope's
 /// revision after the change, and who made it.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) struct AliasRegistryMutation {
     pub(crate) scope: AliasOwnershipScope,
     pub(crate) scope_revision: u64,
@@ -748,7 +801,7 @@ impl std::fmt::Display for AliasRegistryMutation {
 /// Bounded history of registry mutations, oldest first. It is written only
 /// under the registry lock, so its order is the mutation order.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Default)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct AliasRegistryMutationLog {
     entries: std::collections::VecDeque<AliasRegistryMutation>,
 }
@@ -788,7 +841,7 @@ impl AliasRegistryMutationLog {
 /// leases it retires, the process-visible scope revisions it read, and how
 /// many visible rows co-held the window's physical extents.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) struct AliasUnmapPlanAuthority<'plan> {
     pub(crate) planned_leases: &'plan std::collections::BTreeSet<(u64, u64)>,
     pub(crate) visible_revisions: Option<AliasVisibleRevisions>,
@@ -797,7 +850,7 @@ pub(crate) struct AliasUnmapPlanAuthority<'plan> {
 /// What a commit found when it re-authenticated a plan under the registry
 /// lock.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Eq, PartialEq)]
+#[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) enum AliasUnmapCommit {
     /// The rows were retired; these are the leases that left the process.
     Retired(std::collections::BTreeSet<(u64, u64)>),
@@ -892,7 +945,13 @@ pub(crate) fn compact_alias_row(alias: &AliasBacking) -> String {
 /// The process-visible scope revisions a plan observed. A commit that finds
 /// the registry changed compares against these to name the writers.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct AliasVisibleRevisions {
     scopes: [(AliasOwnershipScope, u64); 2],
 }
@@ -945,7 +1004,7 @@ impl AliasVisibleRevisions {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default, Clone)]
+#[derive(::core::fmt::Debug, ::core::default::Default, ::core::clone::Clone)]
 pub(crate) struct AliasRegistry {
     pub(crate) by_scope: std::collections::BTreeMap<AliasOwnershipScope, AliasScopeBucket>,
     /// First row for each exact semantic key inside a scope: insertion sequence
@@ -2573,7 +2632,13 @@ pub(crate) const COW_DIAGNOSTIC_EXACT_KEY_LIMIT: usize = 1_024;
 pub(crate) const COW_DIAGNOSTIC_EXACT_HISTORY_LIMIT: usize = 16;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum CowDiagnosticRetirementOutcome {
     Retired,
     DeferredActivePins,
@@ -2587,7 +2652,13 @@ pub(crate) enum CowDiagnosticRetirementOutcome {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum CowDiagnosticLifecycleKind {
     InventoryPublished,
     InventoryRemoved,
@@ -2600,7 +2671,13 @@ pub(crate) enum CowDiagnosticLifecycleKind {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum CowDiagnosticLifecycleSite {
     CowCommit,
     ForeignCowCommit,
@@ -2614,7 +2691,13 @@ pub(crate) enum CowDiagnosticLifecycleSite {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum CowDiagnosticAliasRevisionSite {
     ForkSnapshotBegin,
     ForkSnapshotEnd,
@@ -2624,7 +2707,13 @@ pub(crate) enum CowDiagnosticAliasRevisionSite {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum CowDiagnosticEvent {
     PageTableBind {
         mm_access: usize,
@@ -2766,14 +2855,20 @@ impl CowDiagnosticEvent {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct CowDiagnosticRecord {
     pub(crate) sequence: u64,
     pub(crate) event: CowDiagnosticEvent,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Default)]
+#[derive(::core::default::Default)]
 pub(crate) struct CowDiagnosticHistory {
     pub(crate) rows: std::collections::VecDeque<CowDiagnosticRecord>,
     pub(crate) exact_rows:
@@ -3008,7 +3103,7 @@ pub(crate) fn record_alias_unmap_lifecycle(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub(crate) enum GlobalFrameRetirementOutcome {
     RetiredUnmapped {
         ipa: u64,
@@ -3234,7 +3329,7 @@ pub(crate) type ProcessAliasKey = (u64, u64, usize, usize, u64);
 /// Extremely fast non-cryptographic hasher for fork-path alias indices,
 /// replacing SipHash which otherwise consumes 40%+ of CPU in fork-heavy workloads.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Default, Clone, Copy)]
+#[derive(::core::default::Default, ::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) struct FastKeyHasher(u64);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -3637,7 +3732,14 @@ fn note_alias_stale_incarnation_co_holder() {
 
 /// Snapshot of the alias-retirement census.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct AliasRetirementCensus {
     pub restarts: u64,
     pub stale_incarnation_co_holders: u64,
@@ -3912,7 +4014,7 @@ pub(crate) fn clear_alias_registry() {
 /// before issuing another syscall; a small global cap turns the ninth valid
 /// alias into SIGSEGV. Repeated faults on the same backing still terminate.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Default)]
+#[derive(::core::default::Default)]
 pub(crate) struct AliasRemapLimiter {
     pub(crate) attempts_by_ipa: std::collections::HashMap<u64, u32>,
 }

@@ -7,7 +7,7 @@ use carrick_hal::{ForeignMmReadLease, ForeignMmReadReceipt, ForeignMmSnapshot};
 
 type Error = carrick_hal::ForeignMmTransportError;
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct InstructionReceipt {
     read: Box<dyn ForeignMmReadReceipt>,
     content: Vec<ContentObservation>,

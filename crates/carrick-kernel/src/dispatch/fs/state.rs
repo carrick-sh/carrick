@@ -9,7 +9,7 @@ pub(in crate::dispatch) type PreparedExecImageSlot =
 pub(in crate::dispatch) type PreparedExecImageCache =
     std::sync::Arc<parking_lot::Mutex<HashMap<String, PreparedExecImageSlot>>>;
 
-#[derive(Debug, Clone)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone)]
 pub(in crate::dispatch) struct DnotifyRegistration {
     pub(in crate::dispatch) fd: i32,
     pub(in crate::dispatch) tid: crate::thread::ThreadId,
@@ -17,7 +17,15 @@ pub(in crate::dispatch) struct DnotifyRegistration {
     pub(in crate::dispatch) mask: LinuxDnotifyMask,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialOrd,
+    ::core::cmp::Ord,
+)]
 pub struct LegacyAioContextId(u64);
 
 impl LegacyAioContextId {
@@ -34,13 +42,13 @@ impl LegacyAioContextId {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::default::Default)]
 pub struct SplicePushback {
     chunks: VecDeque<SplicePushbackChunk>,
     len: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 struct SplicePushbackChunk {
     bytes: Vec<u8>,
     offset: usize,
@@ -210,13 +218,20 @@ pub(crate) struct FsState {
     pub(crate) host_sparse_extents: HostSparseExtentsRegistry,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+    ::core::cmp::PartialEq,
+)]
 struct HostFileIdentity {
     device: u64,
     inode: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 struct HostSparseExtents {
     len: u64,
     data: Vec<std::ops::Range<u64>>,
@@ -312,7 +327,14 @@ pub struct MountRetirement {
     prepared: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::thiserror::Error,
+)]
 pub enum MountRetirementError {
     #[error("mount retirement belongs to container {actual:?}, not {expected:?}")]
     WrongContainer {
@@ -432,7 +454,7 @@ pub(in crate::dispatch) type SharedWriter = Arc<Mutex<Box<dyn std::io::Write + S
 /// The dispatcher-side form of [`StdioSink`]: cheap to clone (only `Arc`s), so
 /// a write reads the route once and drops the lock BEFORE the possibly
 /// blocking host/caller write.
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub(in crate::dispatch) enum StdioRoute {
     Captured,
     Inherit,
@@ -525,7 +547,7 @@ pub(super) fn flush_host_fd(host_fd: HostFdRef) -> Result<(), carrick_abi::Linux
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy)]
 pub(super) struct HostFileCopyInfo {
     pub(super) host_fd: i32,
     pub(super) size: u64,
@@ -739,7 +761,7 @@ impl FsState {
     }
 }
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub(crate) struct HostSparseExtentsRegistry {
     extents: std::sync::Arc<parking_lot::Mutex<HashMap<HostFileIdentity, HostSparseExtents>>>,
     has_sparse: std::sync::Arc<std::sync::atomic::AtomicBool>,

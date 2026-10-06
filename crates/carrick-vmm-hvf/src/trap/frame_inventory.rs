@@ -8,7 +8,15 @@
 use super::*;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 pub(crate) enum InventoryBackingIdentity {
     Private(u64),
     /// One unique anonymous object whose host mapping is inherited through an
@@ -32,7 +40,7 @@ pub(crate) enum InventoryBackingIdentity {
 
 /// What backs a freshly materialized sparse-arena extent.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(crate) enum SparseExtentBacking<'a> {
     /// Fresh zero-filled private anonymous frames.
     Anon,
@@ -52,7 +60,13 @@ pub(crate) enum SparseExtentBacking<'a> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct InventoryStage2OwnerIdentity {
     /// Base host pointer for the complete `stage2_base/stage2_length` lease.
     pub(crate) host_addr: usize,
@@ -69,7 +83,13 @@ impl InventoryStage2OwnerIdentity {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct InventoryExtent {
     pub(crate) frame: carrick_hal::FrameId,
     pub(crate) mapping: carrick_hal::MappingId,
@@ -139,7 +159,7 @@ pub(crate) fn cow_lane_is_unpublished(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct CowInventorySplitShape {
     pub(crate) old_key: (u64, u64),
     pub(crate) old: InventoryExtent,
@@ -153,7 +173,7 @@ pub(crate) struct CowInventorySplitShape {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) struct CowInventoryReplacementStage {
     pub(crate) gpa: u64,
     pub(crate) backing: InventoryBackingIdentity,
@@ -162,7 +182,7 @@ pub(crate) struct CowInventoryReplacementStage {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) struct CowInventoryRetirementDecision {
     pub(crate) retire_old_frame: bool,
     pub(crate) backend_frame_references_complete: bool,
@@ -170,7 +190,13 @@ pub(crate) struct CowInventoryRetirementDecision {
 
 /// How a write fault on a fork-armed page is served.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum CowWriteRoute {
     /// Copy the compound to a new frame and repoint the writer at it.
     Copy,
@@ -214,7 +240,7 @@ impl CowInventorySplitShape {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) struct InventoryMappingStage {
     pub(crate) gpa: u64,
     pub(crate) length: u64,
@@ -226,7 +252,7 @@ pub(crate) struct InventoryMappingStage {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) struct CowInventoryFragment {
     pub(crate) gpa: u64,
     pub(crate) length: u64,
@@ -234,7 +260,7 @@ pub(crate) struct CowInventoryFragment {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct CowInventorySplit {
     pub(crate) replacement_is_existing: bool,
     pub(crate) old_key: (u64, u64),
@@ -253,7 +279,15 @@ pub(crate) struct CowInventorySplit {
 /// retired an unrelated live extent (a guest COW grant EL1 had just used, the
 /// `grant is not this MM's extent` fatal).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialOrd,
+)]
 pub(crate) struct AuthenticatedLease {
     lease: (u64, u64),
     owner_generation: u64,
@@ -303,7 +337,7 @@ impl AuthenticatedLease {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub(crate) struct InventoryLeaseRetirement {
     pub(crate) mappings: Vec<((u64, u64), InventoryExtent)>,
     pub(crate) frames: std::collections::BTreeSet<carrick_hal::FrameId>,
@@ -380,7 +414,7 @@ pub(crate) fn increment_inventory_reference<K: Ord + Copy + std::fmt::Debug>(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct InventoryFrameRegistry {
     pub(crate) shared: std::collections::BTreeMap<InventoryBackingIdentity, carrick_hal::FrameId>,
     pub(crate) references: std::collections::BTreeMap<carrick_hal::FrameId, usize>,
@@ -496,7 +530,7 @@ pub(crate) fn reconcile_carrier_stage2_authority_retention(
 /// this type, so it cannot drift from the keys it indexes. Reads borrow the
 /// map through `Deref`; there is no mutable access to it.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct InventoryExtentMap {
     extents: std::collections::BTreeMap<(u64, u64), InventoryExtent>,
     /// Exact stage-2 lease to the per-mm logical extent keys it owns.
@@ -664,7 +698,7 @@ impl FromIterator<((u64, u64), InventoryExtent)> for InventoryExtentMap {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct HvpatchFrameInventory {
     pub(crate) initialized: bool,
     pub(crate) extents: InventoryExtentMap,
@@ -726,7 +760,13 @@ pub(crate) struct HvpatchFrameInventoryState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct CowArmedSpan {
     pub(crate) va: u64,
     pub(crate) len: usize,
@@ -739,7 +779,13 @@ pub(crate) struct CowArmedSpan {
 /// [`CowArmedSpan`] is [`Self::live`], which drops every page whose leaf
 /// names a frame other than the faulting page's.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) struct ArmedSpanCandidate(CowArmedSpan);
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -803,7 +849,7 @@ impl ArmedSpanCandidate {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Default)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct CowArmedRanges {
     pub(crate) ranges: Vec<carrick_aarch64::vmm::ForkCowRange>,
     /// Advances on every non-empty [`Self::arm`] and never moves back (a

@@ -4,7 +4,7 @@
 //! (the fix for Go's netpollBreak lost-wakeup / high-P netpoller stall).
 use super::*;
 
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub(crate) struct EpollWakeTarget {
     pub(crate) fd: i32,
     pub(crate) pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -17,7 +17,7 @@ pub type EpollWakeRegistry = std::sync::Arc<Mutex<Vec<EpollWakeTarget>>>;
 /// This owns only the registry shared by one file table, rather than keeping
 /// that table (or any file description) alive across an asynchronous
 /// continuation.
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct EpollWakeHandle(EpollWakeRegistry);
 
 impl EpollWakeHandle {

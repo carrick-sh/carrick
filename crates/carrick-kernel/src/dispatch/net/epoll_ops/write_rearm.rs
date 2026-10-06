@@ -1,7 +1,13 @@
 //! I/O completion re-arm with no captured file-table authority.
 use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(in crate::dispatch) enum IoRearmDirection {
     Read,
     Write,

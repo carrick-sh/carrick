@@ -212,7 +212,7 @@ pub(crate) fn thread_mapping_semantic_ipa_at(
 /// the most horizontal path there is, so this cost compounds into every
 /// workload that forks.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct ForkOverlayOwnerIndex {
     /// `(translation delta, mapping start) -> source mapping indexes`, for the
     /// mappings that own inherited inventory extents. The value is a list
@@ -335,7 +335,7 @@ pub(super) fn fork_translation_has_overlay_owner(
 /// scopes `alias_matches_process_scope` accepts, plus this container's root
 /// regardless of `mm_root_slot`.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct ForkTranslationOverlayIndex {
     mappings_by_delta_and_start: std::collections::BTreeMap<(u64, u64), Vec<usize>>,
     mappings_widest_by_delta: std::collections::BTreeMap<u64, u64>,
@@ -1662,7 +1662,7 @@ impl HvfTaskState {
             ));
         }
 
-        #[derive(Copy, Clone)]
+        #[derive(::core::marker::Copy, ::core::clone::Clone)]
         struct PlanResolver<'a> {
             mappings: &'a [ProcessMappingDesc],
             custody: &'a CarrierVmCustody,

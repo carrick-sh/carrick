@@ -1095,11 +1095,11 @@ mod netbsd_sockopt {
 #[cfg(target_os = "macos")]
 #[repr(C, packed)]
 #[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
     ::zerocopy::FromBytes,
     ::zerocopy::IntoBytes,
     ::zerocopy::KnownLayout,
@@ -1513,7 +1513,7 @@ struct PendingUnixClient {
     flows: Option<crate::kernel::SocketFlows>,
 }
 
-#[derive(Default)]
+#[derive(::core::default::Default)]
 struct UnixPathRegistry {
     paths: std::collections::HashMap<std::path::PathBuf, Vec<u8>>,
     pending_clients: std::collections::HashMap<i32, std::collections::VecDeque<PendingUnixClient>>,
@@ -1949,7 +1949,7 @@ pub(super) fn read_linux_msghdr(
 }
 
 /// Direction a blocking I/O syscall waits on, in `libc::poll` event terms.
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 pub(super) enum IoDir {
     /// recv/read/accept - wait for the fd to become readable.
     Read,

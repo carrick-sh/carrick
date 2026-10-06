@@ -14,7 +14,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct MemoryError(pub String);
 impl std::fmt::Display for MemoryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -90,14 +90,26 @@ impl BackingExtent {
         self.ram.host_ptr(pa, len)
     }
 }
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub struct PreparedBacking {
     pub extent: Arc<BackingExtent>,
     pub identity: BackingIdentity,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct KvmSlotGeneration(NonZeroU64);
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct BackingHandle {
     slot: u32,
     generation: KvmSlotGeneration,
@@ -116,7 +128,7 @@ pub struct SharedFrameEdge {
     handle: BackingHandle,
     identity: BackingIdentity,
 }
-#[derive(Clone, Copy)]
+#[derive(::core::clone::Clone, ::core::marker::Copy)]
 struct Alias {
     slot: u32,
     span: PageSpan,
@@ -147,12 +159,24 @@ pub trait InventoryRetirement {
     fn retire(&mut self, identity: BackingIdentity) -> Result<(), MemoryError>;
     fn rollback(&mut self) -> Result<(), MemoryError>;
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum Invalidation {
     Invlpg(PageSpan),
     ReloadCr3,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct ShootdownPlan {
     pub context: AddressContext<RootGpa>,
     pub invalidation: Invalidation,

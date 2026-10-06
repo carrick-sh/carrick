@@ -86,13 +86,19 @@ pub(in crate::dispatch) fn coalesce_dynamic_maps_around(mem: &mut MemState, star
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum PrivateRepointRecovery {
     RecoveredCleanly,
     FailStopRetainingOwners,
 }
 
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct MremapMappingMetadata {
     pub(crate) start: u64,
     pub(crate) end: u64,
@@ -168,7 +174,7 @@ pub struct HostAliasMmapCommit {
     pub(crate) private_file: Option<PrivateFileMapEntry>,
 }
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub struct PrivateFileMapEntry {
     pub(crate) start: u64,
     pub(crate) end: u64,
@@ -176,7 +182,7 @@ pub struct PrivateFileMapEntry {
     pub(crate) backing: PrivateFileBacking,
 }
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub enum PrivateFileBacking {
     Description(Arc<crate::kernel::objects::MappedFileReference>),
     LoadedImage {
@@ -271,7 +277,7 @@ pub(crate) fn trim_private_file_maps(maps: &mut Vec<PrivateFileMapEntry>, start:
     *maps = retained;
 }
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub struct SharedFileAliasCommit {
     pub(crate) description: Arc<crate::kernel::FileDescription>,
     pub(crate) mapping: Option<Arc<crate::kernel::objects::MappedFileReference>>,
@@ -279,7 +285,7 @@ pub struct SharedFileAliasCommit {
     pub(crate) row_file_offset: u64,
 }
 
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub struct SharedFileAliasEntry {
     pub(crate) range: carrick_vfs::GuestMemoryRange,
     pub(crate) description: Arc<crate::kernel::FileDescription>,

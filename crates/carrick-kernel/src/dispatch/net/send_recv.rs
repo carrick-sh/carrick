@@ -22,7 +22,7 @@ use crate::network::{ConnectTarget, GuestSocketAddr};
 use carrick_spec::PortProtocol;
 
 /// Everything a send path needs from the socket description, read once.
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 struct SocketSendView {
     host_fd: HostFd,
     family: i32,

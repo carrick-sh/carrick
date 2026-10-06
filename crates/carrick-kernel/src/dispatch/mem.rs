@@ -350,7 +350,7 @@ impl MemAuthority {
 }
 
 /// Owned memory-subsystem state. Split out of `SyscallDispatcher`.
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub struct MemState {
     pub(super) deferred_anonymous: std::sync::Arc<carrick_guest_mem::DeferredAnonymousState>,
     pub layout: MemoryLayout,
@@ -768,7 +768,13 @@ pub(super) fn lower_mmap_next(
 /// Linux only promises page alignment for a hint-less grant, so choosing a
 /// congruent address is ABI-legal and costs at most `modulus - page` of arena
 /// VA, which the allocator parks in its free list rather than stranding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(in crate::dispatch) enum MmapGrantCongruence {
     /// Any page-aligned address.
     Any,
@@ -1228,7 +1234,13 @@ pub(super) fn find_canonical_high_va_gap(
     None
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 enum MmapSharing {
     Private,
     Shared,
@@ -2225,7 +2237,13 @@ impl<'a> MemView<'a> {
 }
 
 /// What happens to an `mremap` source once its contents moved.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(in crate::dispatch::mem) enum MoveSource {
     /// The source is unmapped (a plain move).
     Reclaim,
@@ -2234,7 +2252,7 @@ pub(in crate::dispatch::mem) enum MoveSource {
 }
 
 /// One `mremap` relocation for [`MemView::relocate_contents`].
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(in crate::dispatch::mem) struct Relocation {
     pub(in crate::dispatch::mem) source: u64,
     pub(in crate::dispatch::mem) source_len: u64,

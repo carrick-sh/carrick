@@ -14,7 +14,13 @@ use carrick_guest_mem::{HostRead, HostReadRetention, HostWriteRange};
 use std::{ops::Deref, sync::Arc};
 
 /// Direction of one host access to guest memory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(crate) enum HostAccess {
     Read,
     Write,
@@ -181,7 +187,7 @@ impl MappingSource<'_> {
     }
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 enum BackingOwner {
     Global(GlobalFrameOwnerPin),
     Structural {
@@ -203,7 +209,7 @@ impl Deref for BackingOwner {
 // Retention for one access, kept through the copy/host call. A write's drop
 // ends content admission before releasing the exact stage-2/backing owner
 // inside ContentWrite; a read retains only the owner.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 enum Admission {
     Read(#[allow(dead_code)] Option<BackingOwner>),
     Write(#[cfg_attr(not(test), allow(dead_code))] Option<ContentWrite<BackingOwner>>),
@@ -378,7 +384,7 @@ fn admit_contiguous(
 
 /// Scratch belongs to one executor, never to the shared MM. Capacity is reused
 /// across host calls; finish drops admissions, not the allocation.
-#[derive(Default)]
+#[derive(::core::default::Default)]
 pub(crate) struct HostWrites {
     writes: Vec<BackingAccess>,
 }

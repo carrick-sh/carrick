@@ -5,7 +5,7 @@ use super::*;
 /// `HvfMappedRegion { memory: None }` (UNOWNED) so the sibling never
 /// unmaps/frees buffers the main engine owns.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone)]
 pub(crate) struct ThreadMappingDesc {
     pub(crate) start: u64,
     pub(crate) ipa: u64,
@@ -695,7 +695,7 @@ pub(crate) fn audit_persistent_executor_carrier_mappings(
 /// engine mapped; they are local syscall-path metadata only, because the
 /// stage-2 entries live on the shared HVF VM, not on each vCPU.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone)]
+#[derive(::core::clone::Clone)]
 pub struct ThreadSpec {
     pub(crate) vm: applevisor::vm::VirtualMachineInstance<applevisor::vm::GicDisabled>,
     pub(crate) mappings: Vec<ThreadMappingDesc>,
@@ -740,7 +740,14 @@ unsafe impl Send for ThreadSpec {}
 pub struct ThreadSpec;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+)]
 pub(crate) enum PersistentExecutorInvariantRegister {
     VbarEl1,
     SctlrEl1,

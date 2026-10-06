@@ -1,6 +1,12 @@
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 struct LegacyAioEventCount;
 
 impl LegacyAioEventCount {
@@ -17,7 +23,13 @@ impl LegacyAioEventCount {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 struct LegacyAioSubmitCount(u64);
 
 impl LegacyAioSubmitCount {
@@ -37,7 +49,13 @@ impl LegacyAioSubmitCount {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 struct LegacyAioGetEventsRange {
     max: u64,
 }
@@ -53,7 +71,13 @@ impl LegacyAioGetEventsRange {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 enum LegacyAioOpcode {
     Pread,
     Pwrite,
@@ -86,7 +110,13 @@ impl LegacyAioOpcode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 struct LegacyAioIocb {
     opcode: LegacyAioOpcode,
     fd: Fd,

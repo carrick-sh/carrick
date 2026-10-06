@@ -10,7 +10,13 @@
 use super::*;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(super) enum VmCreateAdmission {
     Initial,
     ExecveRebuild,
@@ -91,7 +97,7 @@ impl GlobalVcpuPermitBackoff {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Default)]
+#[derive(::core::default::Default)]
 pub(crate) struct GlobalVcpuPermitState {
     live: HashMap<u64, GlobalVcpuPermit>,
     pending: Vec<usize>,
@@ -296,7 +302,13 @@ pub(super) mod atomic_permit_slot {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(super) enum SlotState {
     Free,
     Acquiring,
@@ -306,7 +318,7 @@ pub(super) enum SlotState {
 /// A held atomic permit: proof that exactly one generation-stamped slot is owned
 /// by `owner_pid`. `Copy` so events/tokens can be compared without consuming.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Debug, Clone, Copy)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy)]
 pub(super) struct PermitToken {
     slot: u16,
     generation: u32,

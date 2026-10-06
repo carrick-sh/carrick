@@ -5,7 +5,14 @@ use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 use super::*;
 
 /// Provenance of backing for a canonical semantic VMA.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+)]
 pub enum VmaBackingProvenance {
     PrivateAnonymous,
     SharedAnonymous,
@@ -25,7 +32,7 @@ impl VmaBackingProvenance {
 }
 
 /// Canonical semantic VMA representation owned by `MemState`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct SemanticVma {
     pub start: u64,
     pub end: u64,
@@ -75,7 +82,7 @@ impl SemanticVma {
 }
 
 /// Attributes of a semantic VMA excluding its virtual address range (`start`..`end`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct VmaAttributes {
     pub read: bool,
     pub write: bool,
@@ -115,7 +122,13 @@ impl VmaAttributes {
 }
 
 /// Error returned when an `insert` operation detects an overlapping VMA range.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct VmaOverlapError {
     pub start: u64,
     pub end: u64,
@@ -140,7 +153,13 @@ thread_local! {
 }
 
 /// Sorted, non-overlapping collection of `SemanticVma` entries for an address space.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct VmaMap {
     vmas: Vec<SemanticVma>,
 }
@@ -1216,7 +1235,7 @@ pub(crate) fn trim_proc_maps_for_range(maps: &mut Vec<ProcMapsEntry>, start: u64
     *maps = next;
 }
 
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct MremapForkSemantics {
     pub(crate) source_start: u64,
     pub(crate) source_end: u64,

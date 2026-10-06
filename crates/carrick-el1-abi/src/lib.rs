@@ -372,7 +372,13 @@ pub const IMAGE_MAGIC: [u8; 4] = *b"CEL1";
 pub const IMAGE_VERSION: u32 = 2;
 
 /// Why an EL1 image cannot be used with this host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum ImageAbiError {
     /// No complete header, or the wrong magic.
     NotAnImage,
@@ -639,7 +645,13 @@ pub const EL1_ABI_LAYOUT_HASH: u64 = {
 
 /// Fixed header placed at the beginning of the `carrick-el1` binary image.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct ImageHeader {
     /// Magic identifier (`b"CEL1"`).
     pub magic: [u8; 4],
@@ -679,7 +691,13 @@ impl ImageHeader {
 
 /// Action returned by the EL1 kernel syscall dispatcher to the exception vector.
 #[repr(u64)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum Action {
     /// Sycall was serviced entirely at EL1 in-guest; restore registers and `eret` to EL0.
     Served = 0,
@@ -697,7 +715,14 @@ pub enum Action {
 
 /// Register trap frame saved by the exception vector before calling `carrick_el1_syscall`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
+)]
 pub struct TrapFrame {
     /// General-purpose registers x0 through x30.
     pub x: [u64; 31],
@@ -751,7 +776,14 @@ pub use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 /// The record stores a `u64` word; this newtype is the only way to produce or
 /// compare that word, so a bare `tid as u64` (which sign-extends) can never
 /// cross the host/EL1 boundary. `NONE` (0) means no task is bound.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+)]
 #[repr(transparent)]
 pub struct El1TaskId(u64);
 
@@ -773,7 +805,7 @@ impl El1TaskId {
 /// Per-vCPU slot task record published by the host runtime before running
 /// a vCPU and cleared when unloaded.
 #[repr(C, align(8))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct CurrentTask {
     pub execution: ExecutionIdentity,
     pub linux: LinuxTaskState,
@@ -888,7 +920,13 @@ impl Default for CurrentTask {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct MetadataGrantRequest {
     pub op: u64,
     pub arg1: u64,
@@ -897,7 +935,13 @@ pub struct MetadataGrantRequest {
     pub cookie: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct MetadataGrantResponse {
     pub op: u64,
     pub status: u64,
@@ -912,7 +956,7 @@ pub struct MetadataGrantResponse {
 /// host with release/acquire ordering. Host service happens only after EL1 has
 /// unwound to its normal pending-host-work boundary.
 #[repr(C, align(64))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct MetadataGrantMailbox {
     pub state: AtomicU32,
     op: AtomicU32,
@@ -1102,7 +1146,7 @@ pub const FD_MAP_CAPACITY: usize = 512;
 
 /// Inode identity of a delegated file matching the host inotify model.
 #[repr(C)]
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub struct DelegatedInodeIdentity {
     pub dev: AtomicU64,
     pub ino: AtomicU64,
@@ -1133,7 +1177,14 @@ impl DelegatedInodeIdentity {
 
 /// In-guest notification mark attached to a delegated file.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
+)]
 pub struct DelegatedMark {
     pub inotify_handle: u32,
     pub wd: i32,
@@ -1188,7 +1239,7 @@ unsafe impl Sync for DelegatedFile {}
 /// description has its own offset and status flags; every description of an
 /// inode shares its bytes). Guarded by its inode's lock.
 #[repr(C, align(64))]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct DelegatedOpenFile {
     /// Dead (0) or Guest (1).
     pub state: AtomicU32,
@@ -1419,7 +1470,7 @@ impl Default for DelegatedFile {
 
 /// Mapping from `(file_table, fd)` to a 1-based delegated file `handle` and its host incarnation.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct FdMapSlot {
     /// Owning FileTableId (0 = empty).
     pub file_table: AtomicU64,
@@ -1468,7 +1519,13 @@ impl Default for FdMapSlot {
 pub const FD_HANDLE_INOTIFY_TAG: u32 = 0x8000_0000;
 
 /// Kind of delegated object bound to an fd-map slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum FdSlotKind {
     File(u32),
     Inotify(u32),
@@ -1569,7 +1626,13 @@ pub const PANIC_SENTINEL_SYSCALL_NR: usize = 511;
 
 /// Stable classes for one `hv_vcpu_run` return. The host increments exactly
 /// one class at the return boundary, including exits it resumes internally.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(usize)]
 pub enum HostExitClass {
     Canceled,
@@ -1651,7 +1714,13 @@ impl HostExitClass {
 /// Saved ESR_EL1 reason behind an HVC #2 vector trampoline. The HVF HVC
 /// immediate is always 2; the exception class and fault status distinguish
 /// the underlying EL0 exception from an actual forwarded syscall.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvcNotSvcReason {
     pub ec: u8,
     pub fault_status: Option<u8>,
@@ -1673,7 +1742,7 @@ impl HvcNotSvcReason {
 
 /// Process-lifetime HVC #2 returns that were not SVC, grouped by the saved
 /// ESR_EL1 exception class and (for aborts) fault status code.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub struct HvcNotSvcCounts {
     pub by_ec: [u64; HvcNotSvcReason::COUNT],
     pub fault_status: [u64; HvcNotSvcReason::COUNT],
@@ -1682,7 +1751,13 @@ pub struct HvcNotSvcCounts {
 }
 
 /// A SYS64 MRS register behind the EL1 HVC #2 vector trampoline.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(usize)]
 pub enum HvcSysregKind {
     Cntfrq,
@@ -1721,7 +1796,13 @@ pub const fn sys64_sysreg_kind(esr: u64) -> HvcSysregKind {
 /// EL1's reason for an `Idle` or `Kick` HVC. These counters complement the
 /// HVF class: an HVC can be attributed to host work, a service queue, or a
 /// failed address-space switch without guessing from total exit counts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(usize)]
 pub enum El1ExitReason {
     IdleHostWork,
@@ -1737,7 +1818,13 @@ impl El1ExitReason {
 /// Why the EL1 pipe/eventfd adapter left a read or write for the host:
 /// forwarded unchanged before any effect, or its owned operation handed
 /// back. The normal routing of a host-backed description is not counted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(usize)]
 pub enum IpcLeave {
     /// The task's descriptor table is not published to EL1.
@@ -2049,7 +2136,13 @@ pub fn get_el1_region_host_ptr() -> usize {
 /// The shared IPC memory as one venue addresses it: the directory and the
 /// pool at this venue's addresses (the host authority's allocations, or the
 /// fixed EL1 VAs). Nothing here is persisted in shared memory.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct IpcWindow {
     directory: usize,
     directory_len: usize,
@@ -2331,7 +2424,13 @@ pub fn prepare_idle_entry(slot: usize) -> Option<u64> {
 }
 
 /// Host publication path for a vCPU's pending-work bit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(usize)]
 pub enum HostWorkPublishReason {
     DirectSlot,
@@ -2658,7 +2757,14 @@ pub const MAX_DELEGATED_WATCHES: usize = 64;
 
 /// In-guest record of a live watch descriptor registered on an inotify instance.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::core::default::Default,
+)]
 pub struct DelegatedWatch {
     pub wd: i32,
     pub file_handle: u32,

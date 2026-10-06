@@ -49,14 +49,20 @@ use carrick_abi::{NsGid, NsUid};
 /// in-memory backend (cheap clone of an existing Vec) and a host-fs
 /// backend (read-back from disk). Callers that only need to know the
 /// *kind* of the entry should match on the enum and ignore the bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub enum OverlayEntry {
     Dir,
     File(Vec<u8>),
     Deleted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum BackendError {
     Invalid,
     Io,
@@ -72,7 +78,13 @@ pub enum BackendError {
 }
 
 /// Result of asking the writable backend to rename one namespace entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum OverlayRenameOutcome {
     /// The source is not owned by this backend; the layered VFS must copy it up.
     NotOwned,
@@ -101,7 +113,7 @@ impl OverlayRenameOutcome {
 /// fill loop only on `EMFILE` and TBROKs on anything else). The two are now
 /// distinct variants and a refusal carries the guest's errno.
 #[must_use]
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub enum HostFdOpen<T> {
     /// The fd IS the guest's open (caller owns it, must close it).
     Served(T),
@@ -209,7 +221,14 @@ pub(crate) fn io_open_refusal(error: &std::io::Error) -> Option<LinuxErrno> {
 /// a PID-preserving host exec. The path locates the already-populated scratch;
 /// device/inode identity prevents a substituted path from granting a different
 /// filesystem root.
-#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+    ::serde::Serialize,
+    ::serde::Deserialize,
+)]
 pub struct HostFsReexecAuthority {
     pub root_path: Vec<u8>,
     pub device: u64,
@@ -227,7 +246,13 @@ pub struct HostFsReexecAuthority {
 /// a symlink, not whatever it points at) and the real hard-link count.
 /// Only disk-backed backends can produce this; the in-memory backend
 /// returns `None` and the dispatcher falls back to its synthesized stat.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub struct RealStat {
     pub kind: RootFsEntryKind,
     /// Real inode number for disk-backed entries. Host-backed path and fd
@@ -255,7 +280,7 @@ pub struct RealStat {
     pub ctime: (i64, i64),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct SharedFileContents {
     /// Stable identity of the backend file object. Rename preserves it;
     /// unlink followed by recreation allocates a different identity.
@@ -271,13 +296,13 @@ pub struct SharedFileContents {
 /// another instead of copying a snapshot, so rename only moves the namespace
 /// reference and unlink cannot destroy the inode until its last retained handle
 /// is dropped. Those layers opt into this through [`SharedFileEntry::object`].
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 pub struct SharedFileObject {
     object_id: u64,
     state: RwLock<SharedFileObjectState>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub(crate) struct SharedFileObjectState {
     pub(crate) base: Arc<[u8]>,
     pub(crate) dirty: BTreeMap<usize, Vec<u8>>,
@@ -437,7 +462,7 @@ pub fn fresh_file_object_id() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct SharedFileEntry {
     pub metadata: RootFsMetadata,
     pub contents: SharedFileContents,
@@ -456,7 +481,7 @@ thread_local! {
 /// guest mutations. Ordinary mutations take a recursive shared guard, retaining
 /// concurrency; archive validation/apply/rollback takes the exclusive guard.
 #[doc(hidden)]
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub struct ArchiveMutationGate {
     lock: RwLock<()>,
 }
@@ -1240,7 +1265,13 @@ pub trait FsBackend: Send + Sync {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum OverlayEntryKind {
     Dir,
     File,
@@ -1249,7 +1280,13 @@ pub enum OverlayEntryKind {
 
 /// Result of [`FsBackend::validate_parents_fast`] — a one-syscall kernel-walked
 /// check of a path's intermediate (parent) chain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub enum ParentResolve {
     /// Every intermediate exists, is a directory, has NO symlink/Unicode-alias
     /// redirection, and stays in the sandbox — the resolver can skip BOTH the
