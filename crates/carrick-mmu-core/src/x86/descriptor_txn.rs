@@ -18,6 +18,8 @@ pub const HUGE: u64 = 1 << 7;
 pub const PREPARED: u64 = 1 << 9;
 pub const COW: u64 = 1 << 10;
 pub const MAY_WRITE: u64 = 1 << 11;
+/// Invalid terminal retaining the old output until owner scrub settles it.
+pub const RETIRED: u64 = 1 << 8;
 pub const NX: u64 = 1 << 63;
 pub const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
 
@@ -84,6 +86,8 @@ pub enum DescriptorOp {
         new: FrameGpa,
         backing: BackingIdentity,
     },
+    /// Owner retirement retains an inaccessible physical predecessor for scrub.
+    Retire(PageSpan),
     Unmap(PageSpan),
     Coalesce {
         span: PageSpan,
@@ -100,6 +104,7 @@ impl DescriptorOp {
             | Self::CowRepoint { span, .. }
             | Self::Coalesce { span, .. }
             | Self::ArmCow(span)
+            | Self::Retire(span)
             | Self::Unmap(span) => span,
         }
     }
@@ -196,7 +201,7 @@ impl<'a> DescriptorTxn<'a> {
                 new,
                 backing: backing(identity),
             },
-            EditOperation::Unmap => DescriptorOp::Unmap(span),
+            EditOperation::Unmap => DescriptorOp::Retire(span),
             EditOperation::Coalesce { size: leaf_size } => DescriptorOp::Coalesce {
                 span,
                 size: size(leaf_size),
@@ -401,6 +406,7 @@ const FLAGS: u64 = PRESENT
     | ACCESSED
     | DIRTY
     | HUGE
+    | RETIRED
     | PREPARED
     | COW
     | MAY_WRITE
@@ -415,7 +421,7 @@ fn validate_entry(entry: u64, level: usize) -> Result<(), DescriptorRefusal> {
     {
         return Err(DescriptorRefusal::Malformed);
     }
-    if level < 3 && entry & HUGE == 0 && entry & (PREPARED | COW | MAY_WRITE) != 0 {
+    if level < 3 && entry & HUGE == 0 && entry & (PREPARED | COW | MAY_WRITE | RETIRED) != 0 {
         return Err(DescriptorRefusal::Malformed);
     }
     Ok(())
@@ -529,7 +535,12 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
         validate_entry(entry, level)?;
         let bytes = level_bytes(level);
         let remaining = self.txn.op.span().len - offset;
-        if entry == 0 && matches!(self.txn.op, DescriptorOp::Unmap(_)) {
+        if entry == 0
+            && matches!(
+                self.txn.op,
+                DescriptorOp::Unmap(_) | DescriptorOp::Retire(_)
+            )
+        {
             return Ok(remaining.min(bytes - (va & (bytes - 1))));
         }
         let coarse = level > 0
@@ -540,6 +551,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             && match self.txn.op {
                 DescriptorOp::Protect { .. }
                 | DescriptorOp::ArmCow(_)
+                | DescriptorOp::Retire(_)
                 | DescriptorOp::Unmap(_)
                 | DescriptorOp::Publish { .. } => true,
                 DescriptorOp::CowRepoint { new, .. } => (new.raw() + offset).is_multiple_of(bytes),
@@ -647,13 +659,23 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             }
             DescriptorOp::ArmCow(_) => arm_cow_terminal(entry)?,
             DescriptorOp::CowRepoint { old, new, .. } => {
-                if entry & COW == 0 || entry & MAY_WRITE == 0 {
-                    return Err(DescriptorRefusal::NotCowArmed);
-                }
                 if leaf_output(entry, level) != old.raw() + offset {
                     return Err(DescriptorRefusal::WrongBacking);
                 }
-                (entry & !(ADDRESS | COW)) | (new.raw() + offset) | WRITE
+                if entry & RETIRED != 0 && entry & (PRESENT | PREPARED) == 0 {
+                    (entry & !ADDRESS) | (new.raw() + offset)
+                } else {
+                    if entry & COW == 0 || entry & MAY_WRITE == 0 {
+                        return Err(DescriptorRefusal::NotCowArmed);
+                    }
+                    (entry & !(ADDRESS | COW)) | (new.raw() + offset) | WRITE
+                }
+            }
+            DescriptorOp::Retire(_) => {
+                if entry & (PRESENT | PREPARED) == 0 || entry & USER == 0 {
+                    return Err(DescriptorRefusal::NotPrivateAnonymous);
+                }
+                (entry & !(PRESENT | PREPARED | COW)) | RETIRED
             }
             DescriptorOp::Unmap(_) => 0,
             DescriptorOp::Coalesce { .. } => self.coalesced(entry, level)?,
@@ -765,6 +787,7 @@ impl DescriptorTxn<'_> {
                 old, new, backing, ..
             } => (5, old.raw(), new.raw(), 0, Some(backing)),
             DescriptorOp::Unmap(_) => (6, 0, 0, 0, None),
+            DescriptorOp::Retire(_) => (9, 0, 0, 0, None),
             DescriptorOp::Coalesce { size, .. } => (7, size.bytes(), 0, 0, None),
         };
         for word in [kind, a, b, flags] {
