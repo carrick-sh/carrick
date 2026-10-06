@@ -93,3 +93,30 @@ touched-crate all-target Clippy, product `just clippy` and `just fmt-check`
 all exited zero. The product check covers the runtime Linux feature closure.
 The Linux Clippy configuration emits its existing unreachable
 `libc::proc_listallpids` catalog warning; no source diagnostic failed Clippy.
+
+## Clean reconciliation and full lint verdict
+
+The clean-tree reconciler on `8f2707720` exits zero: all five position/fingerprint
+inventories require zero changes, and all 661 authority rows are preserved.
+It executes Linux CLI/runtime capture profiles and explicitly leaves the
+macOS capture untouched. No inventory classification or capture was fabricated.
+
+`just ci` passes formatting, product Clippy, probe coverage, product closure,
+Semgrep, escape-hatch/carrier scans and the scanner self-tests before stopping
+at the authority-artifact fixture suite: one failure and two errors (three
+self-tests) report that the actual reviewed projection disagrees with the
+macOS compiler capture. The director must recapture the rebased source.
+Later CI stages were not executed by that stopped recipe.
+
+**macOS projection is not the only remaining lint finding.** The separate
+`check-personality-boundary` command reports nine `PendingSignals` violations
+in `carrick-signal-core/src/policy.rs`. Running the same auditor against an
+independent `git archive 7b6d15813` tree with that tree's own locked offline
+metadata reports the exact same nine file/line/column/message tuples, with
+zero additions/removals. The source blob is identical in both trees:
+`bd084c723cc4058ef5e4f4c25a8f9cce4db5983e`. These unchanged findings were not
+hidden, weakened or fixed outside the rebase fence. Full lint/CI remains red.
+
+The final qualified CPL0 image SHA-256 is
+`8f53a192ab861dddca6eec6c630a4b5c843a47d67090f0ce55c7cb9aa38a2206`.
+No load generators or CPL0 test processes remain after scoped test completion.

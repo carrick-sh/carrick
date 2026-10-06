@@ -133,6 +133,42 @@
       "exit_code": 0,
       "log": "/tmp/ord6-final-fmt.log",
       "test_output_tail": "cargo --config 'build.rustc-wrapper=\"/usr/local/bin/sccache\"' run --locked -p carrick-xtask -- worktree-run -- cargo --config 'build.rustc-wrapper=\"/usr/local/bin/sccache\"' fmt --all -- --check\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.13s\n     Running `target/debug/carrick-xtask worktree-run -- cargo --config 'build.rustc-wrapper=\"/usr/local/bin/sccache\"' fmt --all -- --check`"
+    },
+    {
+      "command": "python3 scripts/migrate/reconcile-line-pinned-inventories.py",
+      "exit_code": 0,
+      "log": "/tmp/ord6-final-reconcile.log",
+      "test_output_tail": "positions updated: 0\nrationale site references rebound: 0\ninventory rows: 661\ncapture left untouched: candidate executed ['linux-cli', 'linux-runtime'], not the capture's recorded slice\nhost-authority positions: 0 rebound\nruntime-aborts fingerprints: 0 rebound\ndispatch-lock-authority lines: 0 rebound\nk1 operation inventory: 0 rebound\nk1 callsite taxonomy: 0 rebound\ninventories reconciled; review `git diff` (positions only) and commit"
+    },
+    {
+      "command": "just ci",
+      "exit_code": 1,
+      "log": "/tmp/ord6-final-ci.log",
+      "test_output_tail": "inventory rows: 1\ncapture left untouched: candidate executed ['macos-cli-default'], not the capture's recorded slice\npositions updated: 1\nrationale site references rebound: 1\ninventory rows: 1\ncapture rows: 0\npositions updated: 2\nrationale site references rebound: 2\ndropped (call no longer present): HA-CATALOG-PROCESS-GETEUID libc::geteuid crates/x/src/gone.rs\ndropped (call no longer present): HA-CATALOG-PROCESS-GETEUID libc::geteuid crates/x/src/linux_gone.rs\nkept for other hosts' profiles only: HA-000004\ninventory rows: 4\ncapture left untouched: candidate executed ['linux-cli', 'linux-runtime'], not the capture's recorded slice\npositions updated: 1\nrationale site references rebound: 1\ninventory rows: 1\ncapture rows: 0\nhost-authority census subset passed; result is partial; executed profiles: macos-hvf-default; reviewed rows: 1; pending profiles: macos-cli-default, macos-runtime-default, linux-cli, linux-runtime, freebsd-cli, freebsd-runtime, netbsd-cli, netbsd-runtime\nerror: Recipe `lint-domains-source` failed on line 237 with exit code 1\nerror: Recipe `ci` failed with exit code 1"
+    },
+    {
+      "command": "cargo metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json",
+      "exit_code": 0,
+      "log": null,
+      "test_output_tail": null
+    },
+    {
+      "command": "cargo run --locked -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json",
+      "exit_code": 1,
+      "log": "/tmp/ord6-final-boundary.log",
+      "test_output_tail": "   Compiling carrick-conformance-contract v0.1.0 (/home/carrick/dev/wt-ord6-rebase/crates/carrick-conformance-contract)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.20s\n     Running `target/debug/check-personality-boundary --root . --metadata-file target/cargo-metadata.json`\nsubstrate boundary violations detected (9 violation(s)):\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:375:11: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:382:20: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:393:8: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:473:17: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:474:18: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:502:13: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:509:21: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:512:30: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:515:42: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)"
+    },
+    {
+      "command": "cargo metadata --locked --offline --all-features --format-version 1 --manifest-path /tmp/ord6-reviewed-base/Cargo.toml > /tmp/ord6-reviewed-base-metadata.json",
+      "exit_code": 0,
+      "log": null,
+      "test_output_tail": null
+    },
+    {
+      "command": "target/debug/check-personality-boundary --root /tmp/ord6-reviewed-base --metadata-file /tmp/ord6-reviewed-base-metadata.json",
+      "exit_code": 1,
+      "log": "/tmp/ord6-base-boundary.log",
+      "test_output_tail": "substrate boundary violations detected (9 violation(s)):\n  [SRC] /tmp/ord6-reviewed-base/crates/carrick-signal-core/src/policy.rs:375:11: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /tmp/ord6-reviewed-base/crates/carrick-signal-core/src/policy.rs:382:20: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /tmp/ord6-reviewed-base/crates/carrick-signal-core/src/policy.rs:393:8: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /tmp/ord6-reviewed-base/crates/carrick-signal-core/src/policy.rs:473:17: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /tmp/ord6-reviewed-base/crates/carrick-signal-core/src/policy.rs:474:18: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /tmp/ord6-reviewed-base/crates/carrick-signal-core/src/policy.rs:502:13: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /tmp/ord6-reviewed-base/crates/carrick-signal-core/src/policy.rs:509:21: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /tmp/ord6-reviewed-base/crates/carrick-signal-core/src/policy.rs:512:30: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /tmp/ord6-reviewed-base/crates/carrick-signal-core/src/policy.rs:515:42: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)"
     }
   ],
   "red_controls": [
@@ -210,7 +246,30 @@
     "No Docker/HVF signed/accept/remote-accept ran.",
     "Production pool exhaustion and adopted-job retirement remain unqualified."
   ],
-  "remaining_checks": [
-    "Clean-tree inventory reconciliation and lint diagnostics are recorded in the follow-up."
-  ]
+  "remaining_checks": [],
+  "validation_source_commit": "8f270772054380ab36768fca4d94894409e2cdff",
+  "baseline_boundary_comparison": {
+    "base": "7b6d15813",
+    "added": 0,
+    "removed": 0,
+    "findings": [
+      "  [SRC] <root>/crates/carrick-signal-core/src/policy.rs:375:11: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)",
+      "  [SRC] <root>/crates/carrick-signal-core/src/policy.rs:382:20: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)",
+      "  [SRC] <root>/crates/carrick-signal-core/src/policy.rs:393:8: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)",
+      "  [SRC] <root>/crates/carrick-signal-core/src/policy.rs:473:17: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)",
+      "  [SRC] <root>/crates/carrick-signal-core/src/policy.rs:474:18: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)",
+      "  [SRC] <root>/crates/carrick-signal-core/src/policy.rs:502:13: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)",
+      "  [SRC] <root>/crates/carrick-signal-core/src/policy.rs:509:21: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)",
+      "  [SRC] <root>/crates/carrick-signal-core/src/policy.rs:512:30: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)",
+      "  [SRC] <root>/crates/carrick-signal-core/src/policy.rs:515:42: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)"
+    ],
+    "policy_git_blob": "bd084c723cc4058ef5e4f4c25a8f9cce4db5983e"
+  },
+  "gate_status": {
+    "required_focused_commands": "all exit 0",
+    "inventory_reconciliation": "exit 0, zero position changes, 661 rows",
+    "ci": "exit 1 in lint-domains-source; three macOS projection self-tests fail",
+    "supplementary_source_boundary": "exit 1; exactly nine unchanged baseline PendingSignals violations",
+    "macos_recapture": "director-owned, not run on worker"
+  }
 }
