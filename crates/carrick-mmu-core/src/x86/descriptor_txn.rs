@@ -853,5 +853,63 @@ pub fn translate_leaf<W: LiveDescriptorWords + ?Sized>(
     Err(FaultClass::Reserved)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CowClass {
+    Unmapped,
+    NotCowArmed,
+    NoWriteIntent,
+    AlreadyWritable,
+    ExecutableDenied,
+    Unreachable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CowRun {
+    pub va: u64,
+    pub old_ipa: FrameGpa,
+    pub len: u64,
+    pub compound_offset: u64,
+    pub executable: bool,
+}
+
+/// Classify one CPL3 COW write through the live PML4. The exact-MM editor
+/// remains held by the caller through the eventual copy and repoint.
+pub fn classify_guest_cow_write<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: RootGpa,
+    far: UserVa,
+    publish_executable: bool,
+) -> Result<CowRun, CowClass> {
+    let leaf =
+        translate_leaf(words, root, far, Access::Read, true).map_err(|reason| match reason {
+            FaultClass::NotPresent => CowClass::Unmapped,
+            _ => CowClass::Unreachable,
+        })?;
+    if leaf.size != PAGE {
+        return Err(CowClass::Unmapped);
+    }
+    if leaf.descriptor & WRITE != 0 {
+        return Err(CowClass::AlreadyWritable);
+    }
+    if leaf.descriptor & COW == 0 {
+        return Err(CowClass::NotCowArmed);
+    }
+    if leaf.descriptor & MAY_WRITE == 0 {
+        return Err(CowClass::NoWriteIntent);
+    }
+    if leaf.executable && !publish_executable {
+        return Err(CowClass::ExecutableDenied);
+    }
+    let old_ipa = FrameGpa::new(leaf.output.raw() & !(PAGE - 1));
+    Ok(CowRun {
+        va: far.raw() & !(PAGE - 1),
+        old_ipa,
+        len: PAGE,
+        // A host COW grant is one 16 KiB compound on both ISAs.
+        compound_offset: old_ipa.raw() & (16 * 1024 - 1),
+        executable: leaf.executable,
+    })
+}
+
 #[cfg(test)]
 mod tests;

@@ -448,6 +448,69 @@ impl CowResolver for HardwareCowResolver {
     }
 }
 
+/// CPL0 adapter for the same guest COW policy. The normal image uses the
+/// shared pool and residency table; KVM fixtures can supply exact local
+/// records while exercising the production resolver.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub struct X86CowResolver<'a> {
+    pub pool: &'a dyn carrick_el1_abi::CowGrantVenue,
+    pub residency: &'a carrick_el1_abi::FrameGrantResidencyTable,
+    pub completion: Option<carrick_el1_abi::CowGrantCompletion>,
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl CowResolver for X86CowResolver<'_> {
+    fn resolve_cow(&mut self, root: u64, mm_key: u64, far: u64) -> bool {
+        self.resolve_cow_outcome(root, mm_key, far) == CowResolution::Resolved
+    }
+
+    fn resolve_cow_outcome(&mut self, root: u64, mm_key: u64, far: u64) -> CowResolution {
+        let copy_page = |source: u64, destination: u64| {
+            // SAFETY: the x86 adapter verified both supervisor direct
+            // translations for these distinct page frames.
+            unsafe {
+                core::ptr::copy_nonoverlapping(source as *const u8, destination as *mut u8, 4096)
+            }
+        };
+        let invalidate = || {
+            // A stale writable TLB entry can make a permission fault
+            // retryable even when the live leaf is already writable.
+            // SAFETY: INVLPG is local to this CPL0 CPU and the live root.
+            unsafe {
+                core::arch::asm!(
+                    "invlpg [{}]",
+                    in(reg) far & !4095,
+                    options(nostack, preserves_flags)
+                )
+            }
+        };
+        // SAFETY: dispatch_classified_fault holds this MM's exact editor.
+        // resolve_x86_guest_cow authenticates the live CR3 and retained
+        // supervisor table window before reading or changing descriptors.
+        let outcome = unsafe {
+            crate::cow::resolve_x86_guest_cow(
+                root,
+                mm_key,
+                far,
+                self.pool,
+                self.residency,
+                copy_page,
+                invalidate,
+            )
+        };
+        handle_cow_outcome(outcome, &mut self.completion)
+    }
+
+    fn take_cow_completion(&mut self) -> Option<carrick_el1_abi::CowGrantCompletion> {
+        self.completion.take()
+    }
+
+    fn editor_busy(&mut self) {
+        self.pool
+            .note_declined(carrick_el1_abi::CowDecline::EditorBusy);
+    }
+}
+
 /// EL1 execution of host-submitted live descriptor transactions.
 pub trait DescriptorTxnApplier {
     /// Claim and execute the submission in `slot` for `mm_key` against the

@@ -107,6 +107,37 @@ fn apply(words: &Words, op: DescriptorOp, tables: &[RootGpa]) -> DescriptorOutco
     )
     .outcome
 }
+
+#[test]
+fn cow_classifier_names_only_the_faulting_armed_user_page() {
+    let words = Words::new();
+    assert!(matches!(
+        apply(
+            &words,
+            map(0x4000, 0x8000, PAGE, LeafSize::Page),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::ArmCow(PageSpan::new(0x4000, PAGE)),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let run = classify_guest_cow_write(&words, root(0x1000), UserVa::new(0x4008), false)
+        .expect("armed user write");
+    assert_eq!(run.va, 0x4000);
+    assert_eq!(run.old_ipa, FrameGpa::new(0x8000));
+    assert_eq!(run.len, PAGE);
+    assert_eq!(run.compound_offset, 0);
+    assert_eq!(
+        classify_guest_cow_write(&words, root(0x1000), UserVa::new(0x5000), false),
+        Err(CowClass::Unmapped)
+    );
+}
 #[test]
 fn lower_half_supervisor_and_upper_half_user_leaves_are_refused_before_stores() {
     for (va, user) in [(0x4000, false), (0xffff_8000_0000_4000, true)] {

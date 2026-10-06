@@ -172,6 +172,10 @@ pub const EL1_BOOTSTRAP_METADATA_BASE: u64 = EL1_REGION_BASE + EL1_BOOTSTRAP_MET
 
 /// Base guest virtual address of the x86 CPL0 bootstrap metadata allocator arena.
 pub const X86_CPL0_BOOTSTRAP_METADATA_BASE: u64 = 0xffff_ffff_a800_0000;
+/// CPL0's one upper-half supervisor window for retained physical pages.
+pub const X86_CPL0_DIRECT_VA: u64 = 0xffff_ffff_9000_0000;
+/// Retained CPL0 root arena reachable through the supervisor direct window.
+pub const X86_CPL0_TABLE_ARENA_BYTES: u64 = 448 * 4096;
 
 /// Size of the EL1 bootstrap metadata allocator arena (9 MiB).
 pub const EL1_BOOTSTRAP_METADATA_SIZE: u64 = 0x90_0000;
