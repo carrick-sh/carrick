@@ -74,6 +74,30 @@ pub const OBSERVE_PORTAL_WINDOW: u64 = u64::MAX - 8;
 pub const OBSERVE_FORK_TABLE_WINDOW: u64 = u64::MAX - 9;
 pub const OBSERVE_RETIRE_REPOINT: u64 = u64::MAX - 10;
 pub const OBSERVE_INITIAL_MM: u64 = u64::MAX - 11;
+
+/// Decode vector 14 only after the hardware frame proves CPL3 origin. A
+/// reserved-bit fault cannot be repaired by mapping or COW policy.
+pub fn decode_user_page_fault(
+    error: u64,
+    address: u64,
+    cs: u64,
+) -> Option<carrick_guest_arch::FaultInfo> {
+    use carrick_guest_arch::{Access, FaultInfo, UserVa};
+    if cs & 3 != 3 || error & 4 == 0 || error & 8 != 0 || address >= (1 << 47) {
+        return None;
+    }
+    Some(FaultInfo {
+        address: UserVa::new(address),
+        access: if error & 16 != 0 {
+            Access::Execute
+        } else if error & 2 != 0 {
+            Access::Write
+        } else {
+            Access::Read
+        },
+        present: error & 1 != 0,
+    })
+}
 /// Supervisor direct-window base mapping low physical RAM into the upper half.
 pub const DIRECT_VA: u64 = carrick_el1_abi::X86_CPL0_DIRECT_VA;
 /// Retained KVM fixture page-table window; the root is its first page.
@@ -201,6 +225,22 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
+    #[test]
+    fn user_page_fault_decodes_only_cpl3_access_with_valid_error_bits() {
+        use carrick_guest_arch::{Access, UserVa};
+        let write = super::decode_user_page_fault(0b111, 0x7fff_e000, 0x1b).unwrap();
+        assert_eq!(write.address, UserVa::new(0x7fff_e000));
+        assert_eq!(write.access, Access::Write);
+        assert!(write.present);
+        let execute = super::decode_user_page_fault(0b10100, 0x400000, 0x1b).unwrap();
+        assert_eq!(execute.access, Access::Execute);
+        assert!(!execute.present);
+        assert!(super::decode_user_page_fault(0b111, 0x7fff_e000, 8).is_none());
+        assert!(super::decode_user_page_fault(0b011, 0x7fff_e000, 0x1b).is_none());
+        assert!(super::decode_user_page_fault(0b1111, 0x7fff_e000, 0x1b).is_none());
+        assert!(super::decode_user_page_fault(0b111, 1 << 47, 0x1b).is_none());
+    }
+
     use super::*;
     #[test]
     fn apic_routes_cover_every_issued_carrier_slot() {
