@@ -9,8 +9,8 @@ use carrick_guest_arch::{
     Access, AddressContext, ArchTypes, CopyProgress, CounterFrequency, CounterTick, CpuId,
     CpuTarget, CrossingBackend, Deadline, EntryBackend, EntryEvent, FatalReport, FrameGpa,
     GuestIsa, GuestLen, InterruptAck, InterruptBackend, InterruptReason, KernelStackPointer,
-    MmuBackend, NativeAbi, NativeEntrySnapshot, NativeReturnWord, OwnedHostRequest, RequestToken,
-    RootGpa, UserRange, UserReturn, UserVa, WakeToken,
+    MmuBackend, NativeAbi, NativeEntrySnapshot, NativeReturnWord, RootGpa, UserRange, UserReturn,
+    UserVa, WakeToken,
 };
 use core::num::NonZeroU64;
 
@@ -54,9 +54,6 @@ impl ArchTypes for Aarch64Backend {
     type PublicationReceipt = ();
     type HardwareInterrupt = u32;
     type InterruptMask = hw::IrqGuard;
-    type HostPayload = ();
-    type HostTicket = ();
-    type HostCompletion = ();
 }
 
 impl EntryBackend for Aarch64Backend {
@@ -264,18 +261,6 @@ impl CrossingBackend for Aarch64Backend {
     fn yield_host_effect(&mut self) -> Result<(), Self::Error> {
         yield_host_effect();
         Ok(())
-    }
-    fn submit_host_request(
-        &mut self,
-        _request: OwnedHostRequest<()>,
-    ) -> Result<RequestToken<()>, Self::Error> {
-        Err(ArchError::Unbound)
-    }
-    fn consume_completion(&mut self, _token: RequestToken<()>) -> Result<(), Self::Error> {
-        Err(ArchError::Unbound)
-    }
-    fn leave_idle(&mut self) -> Result<(), Self::Error> {
-        Err(ArchError::Unbound)
     }
     fn report_fatal(&mut self, _report: FatalReport) -> ! {
         hw::fatal_entry_binding()

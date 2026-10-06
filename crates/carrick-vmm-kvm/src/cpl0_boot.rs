@@ -27,7 +27,12 @@ const COUNTERS_OFFSET: u64 = 0x1_0000;
 const BINDING_OFFSET: u64 = 0x8000;
 const TASK_OFFSET: u64 = 0x9000;
 const CONTROL_OFFSET: u64 = 0xa000;
+const ROUTES_OFFSET: u64 = 0xb000;
 const STRIDE: u64 = 0x100;
+const _: () = {
+    assert!(size_of::<CpuBinding>() <= STRIDE as usize);
+    assert!(ROUTES_OFFSET + size_of::<PublishedApicIds>() as u64 <= COUNTERS_OFFSET);
+};
 const IST_STACK_BASE: u64 = 0xf0_0000;
 const IMAGE_VA: u64 = 0xffff_ffff_8000_0000;
 const IMAGE_GPA: u64 = 0x10_0000;
@@ -344,6 +349,11 @@ impl Cpl0Carrier {
                 .ok_or_else(|| fail("counter backing"))?
                 .cast::<Counters>();
             counters.write(Counters::new());
+            let routes = ram
+                .host_ptr(META_GPA + ROUTES_OFFSET, size_of::<PublishedApicIds>())
+                .ok_or_else(|| fail("APIC route table backing"))?
+                .cast::<PublishedApicIds>();
+            routes.write(PublishedApicIds::new());
             for index in 0..2 {
                 let offset = index as u64 * STRIDE;
                 let slot = ram
@@ -397,7 +407,7 @@ impl Cpl0Carrier {
                     }),
                     cpu_slot: index as u32,
                     tsc_hz: AtomicU64::new(0),
-                    wake_apic_ids: AtomicU64::new(0),
+                    wake_routes_address: METADATA_VA + ROUTES_OFFSET,
                     apic_timer_hz: AtomicU64::new(0),
                 });
             }
@@ -512,18 +522,25 @@ impl Cpl0Carrier {
             }
         }
         if interrupts {
-            let encoded = u64::from(apic_ids[0]) | (u64::from(apic_ids[1]) << 16);
-            for index in 0..2 {
-                let binding = ram
-                    .host_ptr(
-                        META_GPA + BINDING_OFFSET + index as u64 * STRIDE,
-                        size_of::<CpuBinding>(),
-                    )
-                    .ok_or_else(|| fail("CPU binding backing"))?
-                    .cast::<CpuBinding>();
-                // SAFETY: no vCPU has run; this release store publishes both
-                // destinations as one coherent retained routing snapshot.
-                unsafe { (*binding).wake_apic_ids.store(encoded, Ordering::Release) };
+            if apic_ids[0] == apic_ids[1] {
+                return Err(fail("duplicate KVM xAPIC destination"));
+            }
+            let routes = ram
+                .host_ptr(META_GPA + ROUTES_OFFSET, size_of::<PublishedApicIds>())
+                .ok_or_else(|| fail("APIC route table backing"))?
+                .cast::<PublishedApicIds>();
+            // SAFETY: stopped bootstrap initialized this retained table;
+            // no guest or host reader exists before publication completes.
+            let routes = unsafe { &*routes };
+            for (slot, encoded) in apic_ids.into_iter().enumerate() {
+                let apic = u8::try_from(encoded - 1)
+                    .map_err(|_| fail("APIC ID outside xAPIC destination range"))?;
+                if !routes.publish(
+                    carrick_guest_arch::CpuId::new(slot as u32),
+                    PublishedApicId(apic),
+                ) {
+                    return Err(fail("duplicate or invalid APIC slot publication"));
+                }
             }
         }
         let metadata_base = NonNull::new(

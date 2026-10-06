@@ -36,9 +36,6 @@ impl carrick_guest_arch::ArchTypes for X86Backend {
     type PublicationReceipt = ();
     type HardwareInterrupt = u32;
     type InterruptMask = interrupts::InterruptMask;
-    type HostPayload = ();
-    type HostTicket = ();
-    type HostCompletion = ();
 }
 
 pub use context::{current_stack_slot, current_thread_cpu};
