@@ -1,0 +1,30 @@
+schema_version = 1
+id = "kernel.mm.user-va-ceiling"
+title = "Shared mmap placement stays inside the executing guest ISA's user VA range"
+guest_surfaces = ["syscall:mmap", "syscall:mremap", "syscall:mprotect", "vmm:kvm", "vmm:bhyve", "vmm:nvmm", "vmm:hvf"]
+semantic_authority = [
+  "Linux mmap(2): invalid fixed address ranges fail with ENOMEM (12); advisory hints may be ignored",
+  "Native x86_64 Linux oracle for the four-level lower-half layout: successful mmap(NULL) addresses are below 2^47-4096; MAP_FIXED at 2^47-8192 succeeds and at 2^47-4096 and above returns errno 12",
+  "Aarch64GuestArch retains the existing 2^48 user limit, including ARM-hosted Rosetta aliases",
+]
+fixture = "unit:x86-mmap-crowded-lower-half"
+scale_points = [1, 8, 32]
+rationale = "Ceiling selection uses the existing syscall guest ABI and GuestArch seam, independent of host ISA or reported uname. An exhausted lower half refuses before backend protection work (exactly zero protect calls). Gap search retains the existing sort/merge and single pass over occupancy; the ceiling adds only constant-time range checks, never retries into the backend. No runtime ratio is claimed. The VM-free negative control must return a VA >= 2^47 before the fix."
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::mem::tests (x86_mmap_crowded_lower_half_refuses_noncanonical_gap, x86_mmap_last_lower_half_gap_and_invalid_hint, x86_mmap_fixed_outside_lower_half_returns_errno_12, x86_mmap_task_size_guard_matches_native_linux, arm_mmap_retains_48_bit_ceiling_and_tag_stripping); existing next_mmap_address_canonical_high_va_hint_and_gap_search and next_mmap_address_allocates_large_vmas_in_canonical_high_va_space pin ARM placement"
+docker = "not applicable on x86-w1: native x86_64 Linux oracle is explicitly authorized; committed fixture oracle.json records source hash, native kernel and binary hash"
+
+[bindings.unresolved]
+kvm_live = "The static fixture executes on Linux/KVM: mmap(NULL) bounds match native, but MAP_FIXED returns errno 38 (ENOSYS) from carrick-x86::bringup_fns::run_elf_service_loop (is_fixed rejection). This existing standalone service loop does not call the shared dispatcher. Native oracle returns 0 at 2^47-8192 and 12 at 2^47-4096 and above. The shared-dispatcher live binding is unavailable until Linux/x86 HVPatch is supported."
+embed_structural = "conformance-next embed is HVF-only: TestContainer rejects Linux/Amd64 before guest execution. The director authorized running this static fixture on the existing KVM run-elf lane and natively on x86-w1 instead; neither standalone run-elf nor CPL0 smoke binds the shared dispatcher mmap path. VM-free tests prove the dispatcher placement and zero backend protection work."
+embed_timing = "No runtime ratio measured; this change retains the gap-search algorithm."
+signed = "HVF signed ARM integration and final promotion remain director-owned; x86-w1 cannot run HVF."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "host_backend_calls"
+base = 0
+per_unit = 0
+layers = ["vm-free"]
+rationale = "The scripted PROT_NONE backend observes actual protection calls at 64, 512 and 2048 GiB. Address-space exhaustion returns before requesting backend protection; no placement retries or backing allocations."
