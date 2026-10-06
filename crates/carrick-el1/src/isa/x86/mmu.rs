@@ -5,8 +5,8 @@ use carrick_guest_arch::{
     Access, AddressContext, CopyProgress, EditIntent, FrameGpa, GuestLen, KernelVa, MmuBackend,
     MmuEditBackend, RootGpa, TableWindow, UserRange, UserVa,
 };
-use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
 use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
+use carrick_mmu_core::live_descriptor_words::LiveDescriptorWords;
 use carrick_mmu_core::x86::descriptor_txn::{
     DescriptorOutcome, DescriptorReceipt, DescriptorTxn, DescriptorTxnId, InlineJournal, USER,
     execute_descriptor_txn, translate_leaf,

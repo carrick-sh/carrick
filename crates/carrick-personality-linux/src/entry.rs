@@ -8,11 +8,6 @@ use carrick_guest_arch::{
 
 pub const SYS_SET_ROBUST_LIST: usize = 99;
 pub const EINVAL: i64 = -22;
-// Outside Linux's AArch64 syscall namespace: x86 process calls keep their
-// native meaning without changing ARM's clone/exit routing.
-pub const X86_PROCESS_FORK: u64 = 0x1_0039;
-pub const X86_PROCESS_WAIT4: u64 = 0x1_003d;
-pub const X86_PROCESS_EXIT_GROUP: u64 = 0x1_00e7;
 
 /// Decode the Linux x86_64 syscall ABI from a native register snapshot.
 pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCall {
@@ -27,9 +22,10 @@ pub fn decode_x86_64(native: u64, mut args: [u64; 6], stack: u64) -> CanonicalCa
         14 => 135,
         131 => 132,
         202 => 98,
-        57 => X86_PROCESS_FORK,
-        61 => X86_PROCESS_WAIT4,
-        231 => X86_PROCESS_EXIT_GROUP,
+        57 | 61 | 231 => carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
+            carrick_syscall_abi::NativeNr(native),
+        )
+        .map_or(u64::MAX, carrick_syscall_abi::CanonicalNr::raw),
         _ => u64::MAX,
     };
     CanonicalCall {

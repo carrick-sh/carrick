@@ -185,7 +185,7 @@ pub(super) fn admit_initial(
     true
 }
 
-pub(crate) fn fork_mm(parent_root: u64) -> Option<(u64, GuestMmuPublication)> {
+pub(crate) fn fork_mm(parent_root: RootGpa) -> Option<(RootGpa, GuestMmuPublication)> {
     // The fixture grants an unused physical extent, but its KVM RAM backing
     // is not an allocation contract until CPL0 zeroes every unlinked table.
     for pa in (CHILD_ROOT..PARENT_TABLE_BASE + PARENT_TABLE_BYTES).step_by(4096) {
@@ -218,14 +218,15 @@ pub(crate) fn fork_mm(parent_root: u64) -> Option<(u64, GuestMmuPublication)> {
     let handle = unsafe { El1MmHandle::from_admitted_owner(one, request.child_mm, one) };
     let mut child = plan.publish(&InitialWords, Parent, Child, handle).ok()?;
     let completion = child.commit(Parent, Child).ok()?;
-    let publication = GuestMmuPublication::from_x86_fork(parent_root, completion, parent_stores)?;
+    let publication = GuestMmuPublication::from_x86_fork(
+        parent_root.address().raw(), completion, parent_stores,
+    )?;
     *FORK_PUBLICATION.lock() = Some(publication);
-    Some((CHILD_ROOT, publication))
+    Some((RootGpa::page_aligned(FrameGpa::new(CHILD_ROOT))?, publication))
 }
 
-pub(crate) fn publish_child_stack(residency: &FrameGrantResidencyTable, parent_root: u64) -> bool {
-    let Some(root) = RootGpa::page_aligned(FrameGpa::new(parent_root)) else { return false; };
-    let Ok(leaf) = translate_leaf(&InitialWords, root, UserVa::new(STACK_TOP - 4096), Access::Read, true) else { return false; };
+pub(crate) fn publish_child_stack(residency: &FrameGrantResidencyTable, parent_root: RootGpa) -> bool {
+    let Ok(leaf) = translate_leaf(&InitialWords, parent_root, UserVa::new(STACK_TOP - 4096), Access::Read, true) else { return false; };
     let old = leaf.output.raw() & !4095;
     let identity = FrameGrantResidencyIdentity {
         mm_key: CHILD_MM, semantic_base: STACK_TOP - 4096,

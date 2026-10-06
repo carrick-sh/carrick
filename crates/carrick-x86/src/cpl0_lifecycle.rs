@@ -387,10 +387,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             .checked_add(core::mem::size_of::<ThreadControlSlot>() as u64)?;
         let record = self.zone.alloc_record(child).ok()?;
         let reference = self.zone.record_ref(record);
-        let parent_root = carrick_el1::isa::x86::hardware_live_root()
-            .ok()?
-            .address()
-            .raw();
+        let parent_root = carrick_el1::isa::x86::hardware_live_root().ok()?;
         let Some(residency) = process::residency() else {
             self.zone.free_record(record);
             return None;
@@ -403,12 +400,18 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             self.zone.free_record(record);
             return None;
         };
-        let Some(index) = self.zone.spaces.publish_closed(child.mm, child_root, 0) else {
+        let Some(index) = self
+            .zone
+            .spaces
+            .publish_closed(child.mm, child_root.address().raw(), 0)
+        else {
             self.zone.free_record(record);
             return None;
         };
         self.zone.spaces.open(index);
-        if publication.mm_key != self.lane.parent.mm || publication.root_gpa != parent_root {
+        if publication.mm_key != self.lane.parent.mm
+            || publication.root_gpa != parent_root.address().raw()
+        {
             self.zone.free_record(record);
             return None;
         }
@@ -430,15 +433,15 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
     #[cfg(target_os = "none")]
     fn process_wait4(
         &mut self,
-        pid: u64,
+        pid: carrick_personality_linux::lifecycle::ProcessWaitPid,
         status: UserVa,
-        options: u64,
+        options: carrick_abi::LinuxWaitOptions,
     ) -> Option<LifecycleOutcome> {
         use crate::kernel::process;
         const WAIT_KEY: u64 = 0x5_0300;
         if !process::process_mode()
-            || pid != process::child_pid(self.lane.parent.tid)
-            || options != 0
+            || i64::from(pid.raw()) != process::child_pid(self.lane.parent.tid) as i64
+            || !options.is_empty()
             || self.task.mm.key.load(Ordering::Acquire) != process::parent_mm()
         {
             return None;
@@ -457,7 +460,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         let reference = self.zone.record_ref(record);
         let mut xsave = XsaveArea::ZERO;
         save_extended(&mut xsave);
-        self.frame.rax = pid;
+        self.frame.rax = pid.raw() as u32 as u64;
         self.lane.contexts[0] = NativeBirthContext {
             record: Some(reference),
             frame: *self.frame,

@@ -7,7 +7,8 @@ use carrick_core::mm::fork::{
     copy_table,
 };
 use carrick_el1_abi::PortalForkRequest;
-use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
+use carrick_guest_arch::RootGpa;
+use carrick_mmu_core::live_descriptor_words::LiveDescriptorWords;
 use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 
 /// Prepare the exact x86 table copy and parent COW journal without publishing
@@ -16,11 +17,12 @@ use carrick_mmu_core::x86::owner_mmu::X86Mmu;
 pub fn prepare_owner_fork<W: LiveDescriptorWords + ?Sized, P: MappingInheritancePolicy>(
     words: &W,
     request: PortalForkRequest,
-    parent_root: u64,
+    parent_root: RootGpa,
     mappings: &[Mapping],
     policy: &P,
 ) -> Result<PreparedOwnerFork<X86Mmu>, ForkError> {
-    if !request.valid() || parent_root == 0 || !parent_root.is_multiple_of(4096) {
+    let parent_root = parent_root.address().raw();
+    if !request.valid() || parent_root == 0 {
         return Err(ForkError::Invalid);
     }
     let mut scratch = ForkScratch::new(request, mappings.len())?;
