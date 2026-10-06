@@ -352,30 +352,32 @@ fn x1_shared_mm_owner() {
     let idx1 = zone.spaces.find(mm11).unwrap().index();
     let idx2 = zone.spaces.find(mm12).unwrap().index();
 
-    use carrick_core::mm::transaction::OwnerVenue;
     table.publish(idx1, r_mm11, layout).unwrap();
-    let access1 = carrick_x86::cpl0_mmu::X86OwnerVenue::space_access(zone, SlotId::new(0));
-    let mut g1 = table.lock_in(access1, idx1, r_mm11, 0).unwrap();
-    g1.import(
-        ReservationRange::new(DATA_VA, DATA_VA + 1024 * 4096).unwrap(),
-        ReservationProtection::READ_WRITE,
-        true,
-    )
-    .unwrap();
-    g1.finish_import().unwrap();
-    drop(g1);
+    let host_bindings = carrier.owner_bindings().unwrap();
+    host_bindings.with_space_access(SlotId::new(0), |access1| {
+        let mut g1 = table.lock_in(access1, idx1, r_mm11, 0).unwrap();
+        g1.import(
+            ReservationRange::new(DATA_VA, DATA_VA + 1024 * 4096).unwrap(),
+            ReservationProtection::READ_WRITE,
+            true,
+        )
+        .unwrap();
+        g1.finish_import().unwrap();
+        drop(g1);
+    });
 
     table.publish(idx2, r_mm12, layout).unwrap();
-    let access2 = carrick_x86::cpl0_mmu::X86OwnerVenue::space_access(zone, SlotId::new(0));
-    let mut g2 = table.lock_in(access2, idx2, r_mm12, 0).unwrap();
-    g2.import(
-        ReservationRange::new(DATA_VA, DATA_VA + 4096).unwrap(),
-        ReservationProtection::READ_WRITE,
-        true,
-    )
-    .unwrap();
-    g2.finish_import().unwrap();
-    drop(g2);
+    host_bindings.with_space_access(SlotId::new(0), |access2| {
+        let mut g2 = table.lock_in(access2, idx2, r_mm12, 0).unwrap();
+        g2.import(
+            ReservationRange::new(DATA_VA, DATA_VA + 4096).unwrap(),
+            ReservationProtection::READ_WRITE,
+            true,
+        )
+        .unwrap();
+        g2.finish_import().unwrap();
+        drop(g2);
+    });
 
     assert!(table.admitted(idx1, r_mm11));
     assert!(table.admitted(idx2, r_mm12));
@@ -563,4 +565,114 @@ fn x1_shared_mm_owner() {
         obs3.semantic_host_exits, 0,
         "hardware read must have zero semantic host forwards"
     );
+}
+
+#[test]
+fn host_mm_release_uses_carrier_retained_wake_bindings() {
+    use carrick_core_abi::{ReservationMm, ReservationProtection, ReservationRange};
+    use carrick_personality_linux::mm::LinuxReservationLayout;
+    use carrick_sched_core::object_wait::OperationToken;
+    use carrick_sched_core::spaces::notification::SpaceWaitCause;
+    use carrick_sched_core::{BoundedSpin, SlotId, ThreadIdentity};
+    use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
+    use carrick_x86::cpl0_mmu::{PROGRESS_RESERVATIONS, SharedReservations};
+    use std::num::NonZeroU64;
+
+    let owner = SlotId::new(0);
+    let waiter = SlotId::new(1);
+    let carrier = Cpl0Carrier::boot_shared(&cpl0_image(), &[0x0f, 0x0b], owner, |zone, _| {
+        let space = zone.spaces.publish_closed(11, 0x60_0000, 0).unwrap();
+        zone.spaces.open(space);
+        for slot in [owner, waiter] {
+            zone.drive(slot, 1);
+            zone.publish_slot(slot, 11, Some(u32::from(slot.raw())), 0);
+            zone.enter_guest(slot);
+        }
+        assert!(zone.enter_idle(waiter, true));
+    })
+    .unwrap();
+    // SAFETY: the stopped carrier retains these initialized records; each
+    // typed view is checked against its own RAM backing and alignment.
+    let zone = unsafe {
+        &*carrier
+            .guest_ptr::<carrick_sched_core::ZoneTables>(carrick_x86::cpl0_scheduler::PROGRESS_ZONE)
+            .unwrap()
+    };
+    let roots = unsafe {
+        &*carrier
+            .guest_ptr::<SharedReservations>(PROGRESS_RESERVATIONS)
+            .unwrap()
+    };
+    assert_eq!(
+        zone.slot(waiter).sgi_target(),
+        carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + 0x8100,
+        "use the actual carrier-published guest target, never a host substitute"
+    );
+    let mm = ReservationMm::new(11).unwrap();
+    let index = zone.spaces.find(11).unwrap().index();
+    roots
+        .publish(
+            index,
+            mm,
+            LinuxReservationLayout {
+                heap: ReservationRange::new(4096, DATA_VA).unwrap(),
+                arena: ReservationRange::new(DATA_VA, DATA_VA + 0x1000_0000).unwrap(),
+                brk: 4096,
+                address_limit: u64::MAX,
+                data_limit: u64::MAX,
+                external_address_bytes: 0,
+                external_data_bytes: 0,
+            },
+        )
+        .unwrap();
+    let host_bindings = carrier.owner_bindings().unwrap();
+    host_bindings.with_space_access(owner, |access| {
+        let mut root = roots.lock_in(access, index, mm, 0).unwrap();
+        root.import(
+            ReservationRange::new(DATA_VA, DATA_VA + 4096).unwrap(),
+            ReservationProtection::READ_WRITE,
+            true,
+        )
+        .unwrap();
+        root.finish_import().unwrap();
+        let lease = zone
+            .space_entry(NonZeroU64::new(11).unwrap())
+            .unwrap()
+            .notifications(NonZeroU64::new(root.incarnation().raw()).unwrap())
+            .unwrap();
+        let key = lease.key(SpaceWaitCause::Reservations);
+        let venue = access.venue().unwrap();
+        let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+            (venue.deliver)(zone, venue.waker, effects)
+        };
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                mm: 11,
+                tid: 51,
+                serial: 2,
+                generation: 1,
+                affinity: 1 << waiter.raw(),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = zone
+            .object_wait_with_completion(key, &BoundedSpin(0), &complete)
+            .unwrap();
+        queue
+            .park(queue.snapshot(), record, OperationToken::new(2, 1).unwrap())
+            .unwrap();
+        drop(queue);
+        // The production root release publishes its actual MM notification and
+        // routes its wake through the owner venue, rather than a test callback.
+        drop(root);
+        assert_eq!(zone.slot(waiter).queued(), 1);
+        assert_eq!(
+            host_bindings
+                .binding(waiter)
+                .unwrap()
+                .entry_kick
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+    });
 }

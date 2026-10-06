@@ -136,7 +136,7 @@ pub fn notify_object(
 pub fn space_access<'a>(
     zone: &'a ZoneTables,
     slot: SlotId,
-    deliver: fn(&ZoneTables, Waker, OwnedObjectWakeEffects<'_>),
+    deliver: &'a (dyn for<'z> Fn(&'z ZoneTables, Waker, OwnedObjectWakeEffects<'z>) + Sync),
 ) -> SpaceAccess<'a> {
     SpaceAccess::notified(SpaceReleaseVenue {
         zone,

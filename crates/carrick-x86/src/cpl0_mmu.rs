@@ -114,33 +114,128 @@ impl LiveDescriptorWords for Cpl0DirectWords {
 
 use carrick_personality_linux::mm::MmErrorLinux;
 
-pub struct X86OwnerVenue;
+// The unqualified static venue is confined to the unsafe CPL0 entry.
+// Host guards can obtain only retained HostOwnerBindings access.
+struct X86OwnerVenue;
 
+#[cfg(target_os = "none")]
 fn request_owner_boundary(
     zone: &ZoneTables,
     slot: carrick_sched_core::SlotId,
     current: bool,
 ) -> bool {
-    let target = zone.slot(slot).sgi_target();
-    if target == 0 || !target.is_multiple_of(core::mem::align_of::<CpuBinding>() as u64) {
+    let Some(target) = super::adapter::cpu_binding_address(slot) else {
+        return false;
+    };
+    if zone.slot(slot).sgi_target() != target {
         return false;
     }
-    // SAFETY: x86 slot publication authenticates `sgi_target` as the retained
-    // CpuBinding for that exact executor. The binding outlives the ZoneTables
-    // publication and all owner callbacks.
+    // SAFETY: this guest-only adapter accepts only the carrier's fixed,
+    // retained supervisor binding interval, qualified at native owner entry.
+    // The published target must match this slot, never an arbitrary address.
     let binding = unsafe { &*(target as *const CpuBinding) };
+    if binding.self_address != target || binding.slot != u32::from(slot.raw()) {
+        return false;
+    }
+    publish_owner_boundary(binding, current);
+    true
+}
+
+#[cfg(not(target_os = "none"))]
+fn request_owner_boundary(_: &ZoneTables, _: carrick_sched_core::SlotId, _: bool) -> bool {
+    // A guest target grants no host pointer or transport authority. The host
+    // reservation entry uses HostOwnerBindings and never reaches this hook.
+    false
+}
+
+fn publish_owner_boundary(binding: &CpuBinding, current: bool) {
     if current {
         binding.return_kick.store(1, Ordering::Release);
     } else {
         binding.entry_kick.store(1, Ordering::Release);
     }
-    true
+}
+
+/// Host aliases licensed by the carrier's retained backing, never by casting
+/// an integer guest address. This capability cannot outlive the carrier borrow.
+#[cfg(not(target_os = "none"))]
+pub struct HostOwnerBindings<'a> {
+    zone: &'a ZoneTables,
+    bindings: [&'a CpuBinding; crate::cpl0_entry::CPU_BINDING_COUNT],
+}
+#[cfg(not(target_os = "none"))]
+impl<'a> HostOwnerBindings<'a> {
+    /// # Safety
+    /// The carrier must retain these host aliases of its exact published guest
+    /// binding pages, and the supplied zone, in the same VM for the borrow.
+    pub unsafe fn from_retained_bindings(
+        zone: &'a ZoneTables,
+        bindings: [&'a CpuBinding; crate::cpl0_entry::CPU_BINDING_COUNT],
+    ) -> Option<Self> {
+        for (index, binding) in bindings.iter().enumerate() {
+            let slot = carrick_sched_core::SlotId::new(index as u8);
+            if binding.slot != index as u32
+                || Some(binding.self_address) != crate::cpl0_entry::cpu_binding_address(slot)
+                || zone.slot(slot).sgi_target() != binding.self_address
+            {
+                return None;
+            }
+        }
+        Some(Self { zone, bindings })
+    }
+    pub fn binding(&self, slot: carrick_sched_core::SlotId) -> Option<&CpuBinding> {
+        self.bindings
+            .get(usize::from(slot.raw()))
+            .copied()
+            .filter(|binding| {
+                self.zone.slot(slot).sgi_target() == binding.self_address
+                    && binding.slot == u32::from(slot.raw())
+            })
+    }
+    pub fn with_space_access<R>(
+        &self,
+        boundary: carrick_sched_core::SlotId,
+        use_access: impl FnOnce(carrick_sched_core::spaces::notification::SpaceAccess<'_>) -> R,
+    ) -> R {
+        let deliver =
+            |zone: &ZoneTables,
+             _: carrick_sched_core::Waker,
+             effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+                assert!(core::ptr::eq(zone, self.zone));
+                deliver_owner_effects_with(boundary, effects, |slot, current| {
+                    let Some(binding) = self.binding(slot) else {
+                        return false;
+                    };
+                    publish_owner_boundary(binding, current);
+                    true
+                });
+            };
+        use_access(
+            carrick_sched_core::spaces::notification::SpaceAccess::notified(
+                carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+                    zone: self.zone,
+                    waker: carrick_sched_core::Waker::Host,
+                    deliver: &deliver,
+                },
+            ),
+        )
+    }
 }
 
 fn deliver_owner_effects(
     zone: &ZoneTables,
     venue: carrick_sched_core::SlotId,
     owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+) {
+    deliver_owner_effects_with(venue, owned, |slot, current| {
+        request_owner_boundary(zone, slot, current)
+    });
+}
+
+fn deliver_owner_effects_with(
+    venue: carrick_sched_core::SlotId,
+    owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+    mut request: impl FnMut(carrick_sched_core::SlotId, bool) -> bool,
 ) {
     let (waker, effects, deferred) = owned.defer_handbacks();
     let own = match waker {
@@ -152,10 +247,10 @@ fn deliver_owner_effects(
         .sgi_slots()
         .chain(own.filter(|slot| effects.queued_own && *slot != venue))
     {
-        undelivered |= !request_owner_boundary(zone, slot, slot == venue);
+        undelivered |= !request(slot, slot == venue);
     }
     if deferred || effects.misplaced || (effects.queued_own && own == Some(venue)) || undelivered {
-        let _ = request_owner_boundary(zone, venue, true);
+        let _ = request(venue, true);
     }
 }
 
@@ -179,7 +274,7 @@ impl carrick_core::mm::transaction::OwnerVenue for X86OwnerVenue {
             carrick_sched_core::spaces::notification::SpaceReleaseVenue {
                 zone,
                 waker: carrick_sched_core::Waker::El1 { slot },
-                deliver,
+                deliver: &deliver,
             },
         )
     }
@@ -216,15 +311,6 @@ impl carrick_core::mm::reservation::ReservationGeometry for NativeReservationGeo
 pub type SharedReservations = carrick_core::mm::reservation::SharedReservations<
     LinuxReservationPolicy,
     NativeReservationGeometry,
->;
-
-pub type X86MmPortal<'a, P> = carrick_core::mm::transaction::MmPortal<
-    'a,
-    P,
-    LinuxReservationPolicy,
-    NativeReservationGeometry,
-    X86OwnerVenue,
-    X86Mmu,
 >;
 
 #[cfg(target_os = "none")]
@@ -343,20 +429,6 @@ pub unsafe fn serve_cpl0_grant(binding: &CpuBinding, slot_index: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carrick_sched_core::object_wait::{ObjectWaitKey, OperationToken};
-    use carrick_sched_core::{BoundedSpin, ThreadIdentity};
-    use std::sync::OnceLock;
-
-    static WAKE_ZONE: OnceLock<usize> = OnceLock::new();
-
-    fn complete_owner_wake(owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>) {
-        let address = *WAKE_ZONE.get().unwrap();
-        // SAFETY: the witness leaks this exact ZoneTables through the process
-        // lifetime before registering the completion function.
-        let zone = unsafe { &*(address as *const ZoneTables) };
-        deliver_owner_effects(zone, carrick_sched_core::SlotId::new(0), owned);
-    }
-
     #[test]
     fn direct_words_refuse_every_address_outside_the_qualified_view() {
         // SAFETY: the test never accesses the declared fake range; every
@@ -368,74 +440,5 @@ mod tests {
                 Err(DescriptorRefusal::TableOutsidePrimary)
             );
         }
-    }
-
-    #[test]
-    fn contended_owner_completion_kicks_the_other_executor_after_unlock() {
-        let layout = std::alloc::Layout::new::<ZoneTables>();
-        // SAFETY: ZoneTables documents the all-zero empty representation; the
-        // allocation is uniquely owned for the duration of the witness.
-        let zone = unsafe {
-            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
-            assert!(!ptr.is_null());
-            Box::from_raw(ptr)
-        };
-        let zone = Box::leak(zone);
-        WAKE_ZONE.set(zone as *const ZoneTables as usize).unwrap();
-        // SAFETY: CpuBinding consists only of integers and atomics whose zero
-        // bit patterns are valid. These fixture bindings never enter CPL0.
-        let bindings: Box<[CpuBinding; 2]> = unsafe { Box::new(core::mem::zeroed()) };
-        let owner = carrick_sched_core::SlotId::new(0);
-        let waiter = carrick_sched_core::SlotId::new(1);
-        let space = zone.spaces.publish_closed(11, 0x600000, 0).unwrap();
-        zone.spaces.open(space);
-        for slot in [owner, waiter] {
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 11, Some(u32::from(slot.raw())), 0);
-            zone.slot(slot)
-                .set_sgi_target((&bindings[usize::from(slot.raw())] as *const CpuBinding) as u64);
-            zone.enter_guest(slot);
-        }
-        assert!(zone.enter_idle(waiter, true));
-
-        let key = ObjectWaitKey::new(3, 1).unwrap();
-        zone.bind_object_wait_with_completion(key, &BoundedSpin(0), &complete_owner_wake)
-            .unwrap();
-        let ticket = zone
-            .admit_object_notification(key, &BoundedSpin(0), &complete_owner_wake)
-            .unwrap();
-        let record = zone
-            .alloc_record(ThreadIdentity {
-                mm: 11,
-                tid: 41,
-                serial: 1,
-                generation: 1,
-                affinity: 1 << waiter.raw(),
-                ..Default::default()
-            })
-            .unwrap();
-        let guard = zone
-            .object_wait_with_completion(key, &BoundedSpin(0), &complete_owner_wake)
-            .unwrap();
-        guard
-            .park(guard.snapshot(), record, OperationToken::new(1, 1).unwrap())
-            .unwrap();
-        drop(guard);
-
-        let held = zone
-            .object_wait_with_completion(key, &BoundedSpin(0), &complete_owner_wake)
-            .unwrap();
-        ticket.publish(
-            carrick_sched_core::Waker::El1 { slot: owner },
-            &complete_owner_wake,
-        );
-        assert_eq!(bindings[1].entry_kick.load(Ordering::Acquire), 0);
-        drop(held);
-        assert_eq!(zone.slot(waiter).queued(), 1, "waiter must queue remotely");
-        assert_eq!(
-            bindings[1].entry_kick.load(Ordering::Acquire),
-            1,
-            "unlock completion must preserve and deliver the remote wake"
-        );
     }
 }

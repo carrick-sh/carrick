@@ -38,7 +38,9 @@ pub struct SpaceNotificationIdentity {
 pub struct SpaceReleaseVenue<'a> {
     pub zone: &'a ZoneTables,
     pub waker: Waker,
-    pub deliver: for<'z> fn(&'z ZoneTables, Waker, OwnedObjectWakeEffects<'z>),
+    /// Retained delivery authority; host closures may borrow their exact
+    /// carrier transport instead of reconstructing pointers from guest fields.
+    pub deliver: &'a (dyn for<'z> Fn(&'z ZoneTables, Waker, OwnedObjectWakeEffects<'z>) + Sync),
 }
 impl SpaceReleaseVenue<'_> {
     pub fn publish(self, ticket: ObjectNotificationTicket<'_>) {
@@ -652,7 +654,7 @@ mod tests {
         SpaceAccess::notified(SpaceReleaseVenue {
             zone,
             waker: Waker::Host,
-            deliver,
+            deliver: &deliver,
         })
     }
     fn admitted(zone: &ZoneTables) -> SpaceEntryHandle<'_> {

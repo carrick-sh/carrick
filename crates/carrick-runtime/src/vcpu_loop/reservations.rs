@@ -159,7 +159,7 @@ impl PreparedHostReservations for PreparedView {
             carrick_sched_core::spaces::notification::SpaceReleaseVenue {
                 zone,
                 waker: carrick_sched_core::Waker::Host,
-                deliver,
+                deliver: &deliver,
             },
         )?
         .lock_resolved(

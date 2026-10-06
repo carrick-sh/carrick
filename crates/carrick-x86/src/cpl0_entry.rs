@@ -3,6 +3,17 @@
 use carrick_guest_arch::{CanonicalCall, CanonicalOrdinal, GuestIsa, NativeOrdinal, UserVa};
 use core::sync::atomic::{AtomicU32, AtomicU64};
 
+pub const CPU_BINDING_OFFSET: u64 = 0x8000;
+pub const CPU_BINDING_STRIDE: u64 = 0x100;
+pub const CPU_BINDING_COUNT: usize = 2;
+pub fn cpu_binding_address(slot: carrick_sched_core::SlotId) -> Option<u64> {
+    (usize::from(slot.raw()) < CPU_BINDING_COUNT).then_some(
+        carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE
+            + CPU_BINDING_OFFSET
+            + u64::from(slot.raw()) * CPU_BINDING_STRIDE,
+    )
+}
+
 pub const FORWARD_PORT: u16 = 0xc5;
 pub const CONTROL_PORT: u16 = 0xc8;
 pub const ENTRY_KICK_PORT: u16 = 0xc9;

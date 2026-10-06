@@ -644,7 +644,7 @@ impl SpaceTables {
             |zone| carrick_sched_core::spaces::notification::SpaceReleaseVenue {
                 zone,
                 waker: carrick_sched_core::Waker::Host,
-                deliver,
+                deliver: &deliver,
             },
         )
     }

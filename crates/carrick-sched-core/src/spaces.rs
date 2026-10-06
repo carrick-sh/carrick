@@ -1228,7 +1228,7 @@ mod tests {
         let venue = SpaceReleaseVenue {
             zone: &zone,
             waker: crate::Waker::Host,
-            deliver,
+            deliver: &deliver,
         };
         let completion = |owned: crate::object_wait::OwnedObjectWakeEffects<'_>| {
             let _ = owned.deliver_handbacks(&mut |_| {});

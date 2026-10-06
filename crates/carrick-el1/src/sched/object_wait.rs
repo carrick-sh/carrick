@@ -210,5 +210,5 @@ pub fn space_access(
             deliver_completion(zone, slot, effects);
         }
     }
-    carrick_core::wait::space_access(zone, slot, deliver)
+    carrick_core::wait::space_access(zone, slot, &deliver)
 }

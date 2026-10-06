@@ -25,10 +25,10 @@ const RAM_SIZE: usize = 16 * 1024 * 1024;
 const META_GPA: u64 = 0xc0_0000;
 const META_LEN: u64 = 0x2_0000;
 const COUNTERS_OFFSET: u64 = 0x1_0000;
-const BINDING_OFFSET: u64 = 0x8000;
+const BINDING_OFFSET: u64 = CPU_BINDING_OFFSET;
 const TASK_OFFSET: u64 = 0x9000;
 const CONTROL_OFFSET: u64 = 0xa000;
-const STRIDE: u64 = 0x100;
+const STRIDE: u64 = CPU_BINDING_STRIDE;
 const IST_STACK_BASE: u64 = 0xf0_0000;
 pub const USER_CODE: u64 = 0x1_0000;
 const LAYOUT: BringupLayout = BringupLayout {
@@ -657,6 +657,29 @@ impl Cpl0Carrier {
     pub(crate) fn slot(&self, index: usize) -> &ThreadControlSlot {
         self.metadata(CONTROL_OFFSET + index as u64 * STRIDE)
     }
+    /// Retain and qualify host aliases through this carrier's backing borrow.
+    pub fn owner_bindings(
+        &self,
+    ) -> Result<carrick_x86::cpl0_mmu::HostOwnerBindings<'_>, TrapError> {
+        let zone = self
+            .ram
+            .host_ptr(
+                carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
+                size_of::<ZoneTables>(),
+            )
+            .ok_or_else(|| fail("owner zone backing"))?
+            .cast::<ZoneTables>();
+        // SAFETY: bootstrap initializes these aligned records in this VM's own
+        // backing before publication; the borrow retains that backing and VM.
+        unsafe {
+            carrick_x86::cpl0_mmu::HostOwnerBindings::from_retained_bindings(
+                &*zone,
+                [self.binding(0), self.binding(1)],
+            )
+        }
+        .ok_or_else(|| fail("owner binding publication changed"))
+    }
+
     pub fn inject_boundary_kicks(&mut self, index: usize) -> Result<(), TrapError> {
         if index >= 2 {
             return Err(fail("unknown CPL0 task"));
