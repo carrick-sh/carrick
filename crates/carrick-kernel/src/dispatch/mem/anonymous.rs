@@ -834,19 +834,41 @@ impl MemState {
         Some(cursor >= end)
     }
 
-    /// Every committed root anonymous node overlapping `[start, end)`,
-    /// clipped to it.
-    fn root_anonymous_pieces(root: &DelegatedRoot, start: u64, end: u64) -> Vec<Mapping> {
+    fn root_backed_file_pieces(root: &DelegatedRoot, start: u64, end: u64) -> Vec<Mapping> {
         let mut pieces = Self::root_mappings(root, start, end);
-        pieces.retain(|mapping| mapping.anonymous);
+        pieces.retain(|mapping| {
+            mapping.host_backing.is_some()
+                && mapping
+                    .flags
+                    .contains(ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE))
+        });
         for mapping in &mut pieces {
             mapping.range = reservation_range(
                 mapping.range.start().max(start),
                 mapping.range.end().min(end),
             )
-            .unwrap_or_else(|refusal| broken_root("a clipped observation", refusal));
+            .unwrap_or_else(|refusal| broken_root("a clipped file observation", refusal));
         }
         pieces
+    }
+
+    pub(in crate::dispatch) fn reprotect_root_backed_files(
+        &mut self,
+        start: u64,
+        end: u64,
+        protection: ReservationProtection,
+    ) {
+        let Some(root) = self.delegated_root().cloned() else {
+            return;
+        };
+        let pieces = Self::root_backed_file_pieces(&root, start, end);
+        root.with_root(|model| {
+            for piece in pieces {
+                model.set_backed_file_protection(piece.range, protection)?;
+            }
+            Ok(())
+        })
+        .unwrap_or_else(|refusal| broken_root("a backed file protection edit", refusal));
     }
 
     /// Every locked range of this MM: the host's lock table (host-owned
@@ -1126,11 +1148,18 @@ impl MemState {
                 Refusal::Busy,
             );
         }
-        // Root-owned anonymous nodes are not host rows: the mirror replaces
-        // only the opaque part of the range.
+        // Owner-backed private file nodes have no host VMA row either. The
+        // mirror replaces only ranges whose rows the host actually keeps.
         let root = delegated.root.clone();
-        let covered: Vec<_> = Self::root_anonymous_pieces(&delegated.root, start, end)
+        let covered: Vec<_> = Self::root_mappings(&delegated.root, start, end)
             .iter()
+            .filter(|mapping| {
+                mapping.anonymous
+                    || (mapping.host_backing.is_some()
+                        && mapping.flags.contains(
+                            ReservationNodeFlags::PRIVATE.union(ReservationNodeFlags::FILE),
+                        ))
+            })
             .map(|piece| (piece.range.start(), piece.range.end()))
             .collect();
         let segments = uncovered_segments(start, end, &covered);

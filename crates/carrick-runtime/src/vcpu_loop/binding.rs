@@ -2616,6 +2616,7 @@ where
         };
         let cow_authority = Arc::new(KernelFrameCowAuthority {
             runtime: Arc::downgrade(&self.kernel),
+            host_backing: Some(self.kernel.dispatcher.mem_view().host_backing_access()),
             deferred_anonymous: self.kernel.dispatcher.deferred_anonymous_state(mm),
             kernel: Arc::clone(child_context.kernel()),
             mm,
@@ -6456,6 +6457,7 @@ pub(crate) fn prepare_initial_runner_handoff<E: ThreadedEngine + 'static>(
         engine.bind_frame_cow(
             Arc::new(KernelFrameCowAuthority {
                 runtime: Arc::downgrade(kernel),
+                host_backing: Some(kernel.dispatcher.mem_view().host_backing_access()),
                 deferred_anonymous: kernel.dispatcher.deferred_anonymous_state(mm),
                 kernel: Arc::clone(context.kernel()),
                 mm,

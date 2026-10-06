@@ -119,6 +119,7 @@ pub(crate) fn refuse_alias_install(
 
 pub(crate) struct KernelFrameCowAuthority {
     pub(crate) runtime: Weak<super::KernelState>,
+    pub(crate) host_backing: Option<carrick_kernel::dispatch::mem::HostBackingAccess>,
     pub(crate) deferred_anonymous: Option<Arc<carrick_guest_mem::DeferredAnonymousState>>,
     pub(crate) kernel: Arc<carrick_kernel::kernel::Kernel>,
     pub(crate) mm: carrick_kernel::kernel::MmId,
@@ -225,6 +226,7 @@ pub(crate) fn kernel_frame_cow_authority_for_test(
 ) -> Arc<dyn carrick_hal::FrameCowAuthority> {
     Arc::new(KernelFrameCowAuthority {
         runtime: Weak::new(),
+        host_backing: None,
         deferred_anonymous: None,
         kernel,
         mm,
@@ -246,12 +248,9 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         handle: std::num::NonZeroU64,
         generation: std::num::NonZeroU64,
     ) -> bool {
-        self.runtime.upgrade().is_some_and(|runtime| {
-            runtime
-                .dispatcher
-                .mem_view()
-                .retains_host_backing(handle, generation)
-        })
+        self.host_backing
+            .as_ref()
+            .is_some_and(|access| access.retains_host_backing(handle, generation))
     }
 
     fn read_host_backing(
@@ -259,13 +258,9 @@ impl carrick_hal::FrameCowAuthority for KernelFrameCowAuthority {
         identity: carrick_mmu_core::HostBackingIdentity,
         length: usize,
     ) -> Result<Vec<u8>, carrick_abi::LinuxErrno> {
-        let runtime = self
-            .runtime
-            .upgrade()
-            .ok_or(carrick_abi::LinuxErrno::new(9))?;
-        runtime
-            .dispatcher
-            .mem_view()
+        self.host_backing
+            .as_ref()
+            .ok_or(carrick_abi::LinuxErrno::new(9))?
             .read_host_backing(identity, length)
     }
 

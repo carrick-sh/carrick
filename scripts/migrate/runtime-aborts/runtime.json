@@ -283,6 +283,17 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem.rs",
+      "function": "MemState::set_mapping_prot",
+      "ordinal_in_function": 1,
+      "fingerprint": "06e935d818f4da930775ae4a0888036148f2259f3474f76468d127c13653ac9e",
+      "verdict": "carrier_fault",
+      "failure_domain": "dispatch::mprotect",
+      "rationale": "A typed Linux protection conversion failed after the mprotect edit was accepted; this is an internal ABI invariant, not a guest errno.",
+      "sink": "fatal",
+      "domain": "dispatch::mprotect"
+    },
+    {
+      "file": "crates/carrick-kernel/src/dispatch/mem.rs",
       "function": "MemView<'a>::rollback_fresh_arena_mapping",
       "ordinal_in_function": 1,
       "fingerprint": "54058893df635b231863c780f13fa93aabebe7813c3633288b43a629ba7a58be",

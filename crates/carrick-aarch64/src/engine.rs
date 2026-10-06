@@ -3546,24 +3546,44 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         }
     }
     fn write_owner_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), MemoryError> {
-        let range = carrick_guest_mem::GuestWriteRange::new(GuestVa(address), bytes.len()).ok_or(
+        carrick_guest_mem::GuestWriteRange::new(GuestVa(address), bytes.len()).ok_or(
             MemoryError::OutOfBounds {
                 address,
                 length: bytes.len(),
             },
         )?;
-        let prepared = self.prepare_write(&[range]).map_err(|error| match error {
-            carrick_guest_mem::MemoryPrepareError::Limit(limit) => MemoryError::HostMap(format!(
-                "write requires bounded prepare before consumption: {limit:?}"
-            )),
-            carrick_guest_mem::MemoryPrepareError::Fault(error) => error,
-            carrick_guest_mem::MemoryPrepareError::Physical(wait) => MemoryError::Physical(wait),
-            carrick_guest_mem::MemoryPrepareError::OwnerWait(wait) => MemoryError::OwnerWait(wait),
-            carrick_guest_mem::MemoryPrepareError::Supply(supply) => {
-                MemoryError::Supply(Box::new(supply))
-            }
-        })?;
-        prepared.commit(&[bytes]);
+        // The source bytes already exist in host memory. Prepare and commit one
+        // page at a time: the EL1 portal deliberately bounds a permit to one
+        // transfer chunk, while getdents64 and other completed outputs may be
+        // much larger than that permit.
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let va = address + offset as u64;
+            let len = (bytes.len() - offset).min(4096 - (va as usize & 4095));
+            let range = carrick_guest_mem::GuestWriteRange::new(GuestVa(va), len).ok_or(
+                MemoryError::OutOfBounds {
+                    address,
+                    length: bytes.len(),
+                },
+            )?;
+            let prepared = self.prepare_write(&[range]).map_err(|error| match error {
+                carrick_guest_mem::MemoryPrepareError::Limit(limit) => MemoryError::HostMap(
+                    format!("write requires bounded prepare before consumption: {limit:?}"),
+                ),
+                carrick_guest_mem::MemoryPrepareError::Fault(error) => error,
+                carrick_guest_mem::MemoryPrepareError::Physical(wait) => {
+                    MemoryError::Physical(wait)
+                }
+                carrick_guest_mem::MemoryPrepareError::OwnerWait(wait) => {
+                    MemoryError::OwnerWait(wait)
+                }
+                carrick_guest_mem::MemoryPrepareError::Supply(supply) => {
+                    MemoryError::Supply(Box::new(supply))
+                }
+            })?;
+            prepared.commit(&[&bytes[offset..offset + len]]);
+            offset += len;
+        }
         Ok(())
     }
 
@@ -4094,6 +4114,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             return false;
         };
         let mut cursor = address;
+        let owner_selected = self.protections.owner().is_some();
         while cursor < end {
             let len = (end - cursor).min(4096 - (cursor & 4095)) as usize;
             let live = self
@@ -4102,11 +4123,25 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             if !prevalidate_host_write_page(
                 live,
                 || {
-                    self.vm.guest_range_is_writable(cursor, len)
-                        && !self
-                            .vm
-                            .protections()
-                            .is_some_and(|p| p.range_write_denied(cursor, len))
+                    if owner_selected {
+                        // The legacy host range registry deliberately refuses
+                        // an admitted owner. Its prepared write already
+                        // authenticated the source; retain the live stage-1
+                        // permission ceiling for this follow-up check.
+                        live.is_some_and(|leaf| {
+                            !carrick_mmu_core::aarch64::terminal_descriptor_is_absent(leaf)
+                                && carrick_mmu_core::aarch64::terminal_descriptor_permits_host_buffer(
+                                    leaf,
+                                    carrick_mmu_core::aarch64::LeafAccess::Write,
+                                )
+                        })
+                    } else {
+                        self.vm.guest_range_is_writable(cursor, len)
+                            && !self
+                                .vm
+                                .protections()
+                                .is_some_and(|p| p.range_write_denied(cursor, len))
+                    }
                 },
                 || {
                     self.vm.frame_cow_authority().is_some_and(|authority| {
@@ -4133,6 +4168,35 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
     }
 
     fn prepare_host_write(&mut self, address: u64, length: usize) -> Result<(), MemoryError> {
+        if self.protections.owner().is_some() {
+            carrick_guest_mem::GuestWriteRange::new(GuestVa(address), length)
+                .ok_or(MemoryError::OutOfBounds { address, length })?;
+            let mut offset = 0;
+            while offset < length {
+                let va = address + offset as u64;
+                let len = (length - offset).min(4096 - (va as usize & 4095));
+                let range = carrick_guest_mem::GuestWriteRange::new(GuestVa(va), len)
+                    .ok_or(MemoryError::OutOfBounds { address, length })?;
+                let prepared = self.prepare_write(&[range]).map_err(|error| match error {
+                    carrick_guest_mem::MemoryPrepareError::Limit(limit) => MemoryError::HostMap(
+                        format!("write requires bounded prepare before consumption: {limit:?}"),
+                    ),
+                    carrick_guest_mem::MemoryPrepareError::Fault(error) => error,
+                    carrick_guest_mem::MemoryPrepareError::Physical(wait) => {
+                        MemoryError::Physical(wait)
+                    }
+                    carrick_guest_mem::MemoryPrepareError::OwnerWait(wait) => {
+                        MemoryError::OwnerWait(wait)
+                    }
+                    carrick_guest_mem::MemoryPrepareError::Supply(supply) => {
+                        MemoryError::Supply(Box::new(supply))
+                    }
+                })?;
+                drop(prepared);
+                offset += len;
+            }
+            return Ok(());
+        }
         self.commit_prepared_host_write(address, length, false)
     }
 

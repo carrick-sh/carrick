@@ -1717,6 +1717,7 @@ where
         };
         let cow_authority = Arc::new(KernelFrameCowAuthority {
             runtime: Arc::downgrade(&child_kernel),
+            host_backing: Some(child_kernel.dispatcher.mem_view().host_backing_access()),
             deferred_anonymous: child_kernel
                 .dispatcher
                 .deferred_anonymous_state(child_mm_id),

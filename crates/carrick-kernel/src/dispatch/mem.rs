@@ -73,6 +73,7 @@ pub(crate) use self::fault::*;
 pub(crate) use madvise::MadviseCoveredSegment;
 pub mod backing;
 pub(crate) use self::backing::*;
+pub use backing::HostBackingAccess;
 
 /// True when a non-empty guest range touches the runtime-owned raw-clock
 /// transport. The span is fixed in every HVPatch MM, so syscall paths which
@@ -553,6 +554,13 @@ impl MemState {
             prot.contains(LinuxProtFlags::WRITE),
             prot.contains(LinuxProtFlags::EXEC),
         );
+        mem.reprotect_root_backed_files(
+            start,
+            end,
+            carrick_el1_abi::ReservationProtection::from_bits(prot.bits()).unwrap_or_else(|| {
+                carrick_fatal!("dispatch::mprotect", "invalid typed protection")
+            }),
+        );
         coalesce_dynamic_maps_around(mem, start, end);
 
         let layout = mem.layout;
@@ -624,7 +632,12 @@ impl MemState {
         let layout = self.layout;
         let address_space_regions = self.address_space_regions.take();
         let linux_auxv_image = std::mem::take(&mut self.linux_auxv_image);
+        // An old MM may finish an owner-selected file transfer after exec
+        // publishes the replacement. Its source handle belongs to the same
+        // process lineage, even though all image-specific VMAs are reset.
+        let host_backing_custody = Arc::clone(&self.host_backing_custody);
         *self = Self::new_with_layout(layout);
+        self.host_backing_custody = host_backing_custody;
         self.address_space_regions = address_space_regions;
         self.linux_auxv_image = linux_auxv_image;
     }
