@@ -279,20 +279,31 @@ fn second_fixture_fork_returns_eagain_before_any_mutation() {
 }
 
 #[test]
-fn exhausted_wait_entries_return_eagain_before_parking() {
+fn exhausted_wait_entries_leave_record_capacity_unchanged() {
     let mut elf = fork_wait_elf();
-    // Fork branches to an unused child UD2. The parent reports before wait,
-    // then requires EAGAIN while global wait-entry capacity is exhausted.
-    let mut code = vec![
-        0xb8, 57, 0, 0, 0, 0x0f, 0x05, 0x85, 0xc0, 0x74, 52, 0x89, 0xc3, 0xbf, 42, 0, 0, 0, 0x48,
-        0xb8,
-    ];
-    code.extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_NATIVE.to_le_bytes());
-    code.extend_from_slice(&[
-        0x0f, 0x05, 0x89, 0xdf, 0x31, 0xf6, 0x31, 0xd2, 0x45, 0x31, 0xd2, 0xb8, 61, 0, 0, 0, 0x0f,
-        0x05, 0x83, 0xf8, 0xf5, 0x75, 12, 0xbf, 7, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0xbf,
-        9, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
-    ]);
+    // The child stays queued while the parent repeats failed wait enrollment.
+    let mut code = vec![0xb8, 57, 0, 0, 0, 0x0f, 0x05, 0x89, 0xc3];
+    let report = |code: &mut Vec<u8>| {
+        code.extend_from_slice(&[0xbf, 42, 0, 0, 0, 0x48, 0xb8]);
+        code.extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_NATIVE.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x05]);
+    };
+    report(&mut code);
+    let mut failures = Vec::new();
+    for _ in 0..3 {
+        code.extend_from_slice(&[
+            0x89, 0xdf, 0x31, 0xf6, 0x31, 0xd2, 0x45, 0x31, 0xd2, 0xb8, 61, 0, 0, 0, 0x0f, 0x05,
+            0x83, 0xf8, 0xf5, 0x75, 0,
+        ]);
+        failures.push(code.len() - 1);
+        report(&mut code);
+    }
+    code.extend_from_slice(&[0xbf, 7, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05]);
+    let failure = code.len();
+    code.extend_from_slice(&[0xbf, 9, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05]);
+    for branch in failures {
+        code[branch] = i8::try_from(failure - branch - 1).expect("short branch") as u8;
+    }
     elf.truncate(0xb0);
     elf.extend_from_slice(&code);
     let size = elf.len() as u64;
@@ -303,6 +314,19 @@ fn exhausted_wait_entries_return_eagain_before_parking() {
     carrier
         .exhaust_lifecycle_capacity(true)
         .expect("fill wait entries");
+    let capacity = carrier
+        .lifecycle_record_capacity()
+        .expect("initial capacity");
+    for _ in 0..3 {
+        assert_eq!(carrier.observe(0).expect("wait EAGAIN").result, 42);
+        assert_eq!(
+            carrier
+                .lifecycle_record_capacity()
+                .expect("remaining capacity"),
+            capacity,
+            "failed wait4 must return its unpublished home record"
+        );
+    }
     let result = carrier.observe(0).expect("explicit wait capacity error");
     assert_eq!(result.result, 7);
     assert_eq!(result.semantic_host_exits, 0);
