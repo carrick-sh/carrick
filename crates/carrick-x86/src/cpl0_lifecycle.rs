@@ -125,6 +125,69 @@ mod process_exit_tests {
     use carrick_sched_core::ZoneTables;
 
     #[test]
+    fn child_exit_preserves_an_unrelated_runnable_context_result() {
+        use super::*;
+        let zone = unsafe {
+            // SAFETY: aligned zeroed allocation is the empty ZoneTables representation.
+            let pointer = std::alloc::alloc_zeroed(std::alloc::Layout::new::<ZoneTables>())
+                .cast::<ZoneTables>();
+            assert!(!pointer.is_null());
+            std::boxed::Box::from_raw(pointer)
+        };
+        let slot = SlotId::new(0);
+        let parent = ThreadIdentity {
+            tid: 41,
+            serial: 101,
+            mm: 77,
+            file_table: 5,
+            generation: 11,
+            affinity: 1,
+            lifecycle_page: 0,
+            control_slot: 0,
+        };
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, parent.mm, Some(0), 0);
+        let space = zone
+            .spaces
+            .publish_closed(parent.mm, 0x1000, 0)
+            .expect("space");
+        zone.spaces.open(space);
+        let id = zone.alloc_record(parent).expect("runnable parent");
+        zone.requeue_preempted(slot, id);
+        let mut lane = LifecycleLane {
+            contexts: [const { NativeBirthContext::EMPTY }; 2],
+            parent,
+            slot,
+            data_start: 0,
+            data_end: 0,
+            wakes: 0,
+            births: 0,
+            retirements: 0,
+        };
+        lane.contexts[0].record = Some(zone.record_ref(id));
+        lane.contexts[0].frame.rax = 0xabcdef;
+        let task = CurrentTask::new();
+        let counters = Counters::new();
+        let page = ThreadLifecyclePage::new();
+        let controls = core::array::from_fn(|_| ThreadControlSlot::new());
+        let mut frame = NativeFrame::default();
+        let mut native = NativeLane {
+            handoff: None,
+            frame: &mut frame,
+            task: &task,
+            counters: &counters,
+            zone: &zone,
+            lane: &mut lane,
+            page: &page,
+            controls: &controls,
+            args: [0; 6],
+        };
+        assert!(native.resume_after_child_exit().is_some());
+        assert_eq!(native.frame.rax, 0xabcdef);
+        assert_eq!(task.mm.key.load(Ordering::Acquire), parent.mm);
+    }
+
+    #[test]
     fn child_exits_before_parent_waits_and_is_reaped_once() {
         let record = ChildExitRecord::new();
         // SAFETY: typed zeroed allocation preserves the ZoneTables alignment;
@@ -212,6 +275,18 @@ pub struct NativeLane<'a> {
     pub args: [u64; 6],
 }
 impl NativeLane<'_> {
+    #[cfg(any(target_os = "none", test))]
+    fn resume_after_child_exit(
+        &mut self,
+    ) -> Option<carrick_personality_linux::lifecycle::LifecycleOutcome> {
+        let progress = self.switch_next()?;
+        Some(
+            carrick_personality_linux::lifecycle::LifecycleOutcome::Transferred {
+                progress,
+                result: SyscallResult::new(self.frame.rax as i64),
+            },
+        )
+    }
     fn current_index(&self) -> usize {
         usize::from(self.task.execution.task.load(Ordering::Acquire) != self.lane.parent.tid)
     }
@@ -694,12 +769,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         if !self.release_current(self.zone.record_ref(record)) {
             return None;
         }
-        let progress = self.switch_next()?;
-        self.frame.rax = process::child_pid(self.lane.parent.tid);
-        Some(LifecycleOutcome::Transferred {
-            progress,
-            result: SyscallResult::new(self.frame.rax as i64),
-        })
+        self.resume_after_child_exit()
     }
 }
 impl FutexVenue for NativeLane<'_> {
