@@ -14340,7 +14340,17 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         matches!(receipt.outcome, DescriptorOutcome::Applied(_)),
         "{receipt:?}"
     );
+    let grants_before = global_frame::El1FrameGrantObserver::new(&custody)
+        .snapshot()
+        .grants_succeeded;
     assert!(pending.settle(&receipt).unwrap());
+    assert_eq!(
+        global_frame::El1FrameGrantObserver::new(&custody)
+            .snapshot()
+            .grants_succeeded,
+        grants_before + 1,
+        "the applied owner transfer must own an exact frame-grant receipt"
+    );
     assert_eq!(
         pins_at_wake.load(std::sync::atomic::Ordering::SeqCst),
         0,
@@ -14397,6 +14407,15 @@ fn transfer_partial_remap_keeps_dirty_neighbor_in_same_compound() {
         Some(Some(source.ipa + 4096))
     );
     assert!(alias_registry().lock().contains(&neighbor));
+    alias_registry()
+        .lock()
+        .remove_exact_values_in_batch(&[new_alias]);
+    let _ = retire_global_frame_host_owner_if_generation_in(
+        &custody,
+        new_alias.physical_ipa,
+        new_alias.physical_size as u64,
+        new_alias.owner_generation,
+    );
 }
 
 #[test]
