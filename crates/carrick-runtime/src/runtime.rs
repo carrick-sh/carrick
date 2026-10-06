@@ -2552,6 +2552,26 @@ impl<M: CurrentMmMemory, T: SyscallTrap> GuestMemory for SplitView<'_, M, T> {
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
         self.mem.protect_range(address, len, prot)
     }
+    fn protect_owner_reserved_range(
+        &mut self,
+        address: u64,
+        len: usize,
+        prot: u64,
+    ) -> Result<(), MemoryError> {
+        self.mem.protect_owner_reserved_range(address, len, prot)
+    }
+    fn map_private_file_backed(
+        &mut self,
+        address: u64,
+        len: usize,
+        host_fd: std::os::fd::BorrowedFd<'_>,
+        offset: u64,
+        source: carrick_guest_mem::PrivateFileSource,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
+    ) -> Result<bool, MemoryError> {
+        self.mem
+            .map_private_file_backed(address, len, host_fd, offset, source, admission)
+    }
     fn supports_concurrent_exec_protection(&self) -> bool {
         self.mem.supports_concurrent_exec_protection()
     }
@@ -3206,6 +3226,100 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn split_loop_keeps_reserved_file_backing_and_protection_venue() {
+        struct ReservedFile {
+            owner: carrick_el1_abi::El1MmHandle,
+            mapped: bool,
+            protected: bool,
+        }
+        impl GuestMemory for ReservedFile {
+            fn read_bytes_raw(&self, _: u64, _: usize) -> Result<Vec<u8>, MemoryError> {
+                Err(MemoryError::Unsupported)
+            }
+            fn write_bytes_raw(&mut self, _: u64, _: &[u8]) -> Result<(), MemoryError> {
+                Err(MemoryError::Unsupported)
+            }
+            fn map_private_file_backed(
+                &mut self,
+                address: u64,
+                len: usize,
+                _: std::os::fd::BorrowedFd<'_>,
+                offset: u64,
+                source: carrick_guest_mem::PrivateFileSource,
+                admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
+            ) -> Result<bool, MemoryError> {
+                let proof = admission.ok_or(MemoryError::Unsupported)?;
+                assert_eq!(proof.owner(), self.owner);
+                assert!(proof.contains(carrick_guest_mem::GuestVa(address), len));
+                assert_eq!(offset, 0);
+                assert_eq!(source, carrick_guest_mem::PrivateFileSource::Mutable);
+                self.mapped = true;
+                Ok(true)
+            }
+            fn protect_owner_reserved_range(
+                &mut self,
+                address: u64,
+                len: usize,
+                prot: u64,
+            ) -> Result<(), MemoryError> {
+                assert_eq!((address, len, prot), (0x6000_0000_4000, 0x4000, 3));
+                self.protected = true;
+                Ok(())
+            }
+            fn protect_range(&mut self, _: u64, _: usize, _: u64) -> Result<(), MemoryError> {
+                Err(MemoryError::Unsupported)
+            }
+        }
+        impl CurrentMmMemory for ReservedFile {}
+        // SAFETY: this adapter witness never reaches native memory; it checks
+        // that a caller's sealed admission reaches the selected backend intact.
+        let owner = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                std::num::NonZeroU64::MIN,
+                carrick_el1_abi::ReservationMm::new(41_103).unwrap(),
+                std::num::NonZeroU64::MIN,
+            )
+        };
+        let mut memory = ReservedFile {
+            owner,
+            mapped: false,
+            protected: false,
+        };
+        let mut trap = RetryCompletionTrap::default();
+        let mut split = SplitView {
+            mem: &mut memory,
+            trap: &mut trap,
+        };
+        let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        use std::os::fd::AsFd;
+        unsafe {
+            carrick_guest_mem::OwnerReservedWrite::with_scope(
+                owner,
+                carrick_guest_mem::GuestVaRange::from_len(
+                    carrick_guest_mem::GuestVa(0x6000_0000_4000),
+                    0x4000,
+                ),
+                |admission| {
+                    let mapped = split.map_private_file_backed(
+                        0x6000_0000_4000,
+                        0x4000,
+                        file.as_fd(),
+                        0,
+                        carrick_guest_mem::PrivateFileSource::Mutable,
+                        Some(admission),
+                    );
+                    let protected = split.protect_owner_reserved_range(0x6000_0000_4000, 0x4000, 3);
+                    assert!(
+                        matches!(mapped, Ok(true)) && protected.is_ok(),
+                        "reserved backing route: {mapped:?}; protection route: {protected:?}"
+                    );
+                },
+            );
+        }
+        assert!(memory.mapped && memory.protected);
     }
 
     #[test]

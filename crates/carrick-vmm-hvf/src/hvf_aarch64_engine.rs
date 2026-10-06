@@ -2289,11 +2289,11 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         len: usize,
         fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
-        source: carrick_guest_mem::PrivateFileSource,
+        publication: carrick_guest_mem::PrivateFilePublication<'_, '_>,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<bool, TrapError> {
         self.state
-            .materialize_private_file_backing(va, len, fd, offset, source, flush_stage1)
+            .materialize_private_file_backing(va, len, fd, offset, publication, flush_stage1)
     }
 
     fn frame_inventory_extent_count(&self) -> usize {

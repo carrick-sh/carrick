@@ -15121,6 +15121,360 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
 }
 
 #[test]
+fn native_reserved_mutable_file_mapping_keeps_clean_page_cache_and_guest_receipt() {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::FileExt;
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let mut fixture = retained_reuse_fixture(
+        &transport,
+        314,
+        0x9a00_7400_0000,
+        0x9b00_7400_0000,
+        carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest,
+    );
+    let handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(
+            transport.custody.transfer_carrier,
+            carrick_el1_abi::ReservationMm::new(314).unwrap(),
+            nonzero(1),
+        )
+    };
+    fixture
+        .installed
+        .state
+        .protections
+        .admit_owner(handle)
+        .unwrap();
+    fixture
+        .installed
+        .state
+        .bind_cow_runtime(MmCowRuntimeBinding {
+            authority: fixture.authority.clone(),
+            identity: fixture.task.cow_identity.unwrap(),
+            mm_root_slot: fixture.task.mm_root_slot,
+            container_root: fixture.task.container_root,
+            persistent_vm_lifecycle: true,
+        });
+    let tables = fixture.installed.state.page_tables_authority();
+    let published = std::cell::RefCell::new(Vec::new());
+    let mut service = RetainedReuseGuestService {
+        tables: tables.clone(),
+        authority: fixture.authority.clone(),
+        root: fixture.root_key,
+        host: fixture.root_host,
+        available: true,
+        published: &published,
+        maintenance: RetainedReuseMaintenance(std::cell::Cell::new(0)),
+        not_applied: None,
+    };
+    let path = std::env::temp_dir().join(format!("carrick-reserved-file-{}", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    std::fs::remove_file(path).unwrap();
+    file.set_len(OWNER_LEN as u64).unwrap();
+    file.write_all_at(b"file", 0).unwrap();
+    let mut vm = crate::trap::budget_tests::test_vm_state(fixture.task);
+    let owners_before = owner_keys();
+    let aliases_before = alias_registry().lock().ordered();
+    let inventory_before = inventory_fingerprint(&vm.frame_inventory.lock());
+    let stage1_before = unsafe {
+        std::slice::from_raw_parts(fixture.root_host as *const u8, fixture.root_key.1 as usize)
+    }
+    .to_vec();
+    for rejected in [
+        unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                nonzero(handle.carrier().get() + 1),
+                handle.mm(),
+                handle.incarnation(),
+            )
+        },
+        unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                handle.carrier(),
+                carrick_el1_abi::ReservationMm::new(315).unwrap(),
+                handle.incarnation(),
+            )
+        },
+        unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                handle.carrier(),
+                handle.mm(),
+                nonzero(handle.incarnation().get() + 1),
+            )
+        },
+    ] {
+        unsafe {
+            carrick_guest_mem::OwnerReservedWrite::with_scope(
+                rejected,
+                carrick_guest_mem::GuestVaRange::from_len(GuestVa(TEST_VA), OWNER_LEN),
+                |admission| {
+                    assert!(
+                        vm.materialize_private_file_backing(
+                            TEST_VA,
+                            OWNER_LEN,
+                            file.as_fd(),
+                            0,
+                            carrick_guest_mem::PrivateFilePublication {
+                                source: carrick_guest_mem::PrivateFileSource::Mutable,
+                                admission: Some(admission)
+                            },
+                            &mut service
+                        )
+                        .is_err()
+                    );
+                },
+            );
+        }
+    }
+    unsafe {
+        carrick_guest_mem::OwnerReservedWrite::with_scope(
+            handle,
+            carrick_guest_mem::GuestVaRange::from_len(GuestVa(TEST_VA), OWNER_LEN),
+            |admission| {
+                assert!(
+                    vm.materialize_private_file_backing(
+                        TEST_VA + OWNER_LEN as u64,
+                        OWNER_LEN,
+                        file.as_fd(),
+                        0,
+                        carrick_guest_mem::PrivateFilePublication {
+                            source: carrick_guest_mem::PrivateFileSource::Mutable,
+                            admission: Some(admission)
+                        },
+                        &mut service
+                    )
+                    .is_err()
+                );
+                let old_binding = vm.mm_access.cow_runtime.read().clone().unwrap();
+                let mut stale = old_binding.clone();
+                stale.mm_root_slot =
+                    Some((old_binding.mm_root_slot.unwrap().0 + 0x20_0000, 0x20_0000));
+                vm.mm_access.bind_cow_runtime(stale);
+                assert!(
+                    vm.materialize_private_file_backing(
+                        TEST_VA,
+                        OWNER_LEN,
+                        file.as_fd(),
+                        0,
+                        carrick_guest_mem::PrivateFilePublication {
+                            source: carrick_guest_mem::PrivateFileSource::Mutable,
+                            admission: Some(admission)
+                        },
+                        &mut service
+                    )
+                    .is_err()
+                );
+                vm.mm_access.bind_cow_runtime(old_binding);
+                tables.select_live_descriptor_owner(
+                    carrick_mmu_core::aarch64::LiveDescriptorOwner::Host,
+                );
+                assert!(
+                    vm.materialize_private_file_backing(
+                        TEST_VA,
+                        OWNER_LEN,
+                        file.as_fd(),
+                        0,
+                        carrick_guest_mem::PrivateFilePublication {
+                            source: carrick_guest_mem::PrivateFileSource::Mutable,
+                            admission: Some(admission)
+                        },
+                        &mut service
+                    )
+                    .is_err()
+                );
+                tables.select_live_descriptor_owner(
+                    carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest,
+                );
+                assert!(
+                    published.borrow().is_empty(),
+                    "invalid admissions never reach descriptors"
+                );
+                let ordinary = vm
+                    .materialize_private_file_backing(
+                        TEST_VA,
+                        OWNER_LEN,
+                        file.as_fd(),
+                        0,
+                        carrick_guest_mem::PrivateFilePublication {
+                            source: carrick_guest_mem::PrivateFileSource::Mutable,
+                            admission: None,
+                        },
+                        &mut service,
+                    )
+                    .unwrap_err();
+                assert!(
+                    ordinary
+                        .to_string()
+                        .contains("cannot enter host sparse publication")
+                );
+                service.not_applied = Some(
+                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied,
+                    ),
+                );
+                let refused = vm
+                    .materialize_private_file_backing(
+                        TEST_VA,
+                        OWNER_LEN,
+                        file.as_fd(),
+                        0,
+                        carrick_guest_mem::PrivateFilePublication {
+                            source: carrick_guest_mem::PrivateFileSource::Mutable,
+                            admission: Some(admission),
+                        },
+                        &mut service,
+                    )
+                    .unwrap_err();
+                assert!(refused.to_string().contains("did not apply"), "{refused}");
+                assert_eq!(published.borrow().len(), 1);
+                assert_eq!(owner_keys(), owners_before);
+                assert_eq!(alias_registry().lock().ordered(), aliases_before);
+                assert_eq!(
+                    inventory_fingerprint(&vm.frame_inventory.lock()),
+                    inventory_before
+                );
+                assert_eq!(
+                    std::slice::from_raw_parts(
+                        fixture.root_host as *const u8,
+                        fixture.root_key.1 as usize,
+                    ),
+                    stage1_before
+                );
+                assert!(vm.cow_deferred_publications.lock().is_empty());
+                assert!(fixture.authority.published.lock().is_none());
+                service.not_applied = None;
+                published.borrow_mut().clear();
+                let result = vm.materialize_private_file_backing(
+                    TEST_VA,
+                    OWNER_LEN,
+                    file.as_fd(),
+                    0,
+                    carrick_guest_mem::PrivateFilePublication {
+                        source: carrick_guest_mem::PrivateFileSource::Mutable,
+                        admission: Some(admission),
+                    },
+                    &mut service,
+                );
+                assert!(matches!(result, Ok(true)), "reserved file view: {result:?}");
+            },
+        );
+    }
+    assert_eq!(
+        published.borrow().len(),
+        1,
+        "one owner-selected descriptor receipt"
+    );
+    let mapping = vm.mappings.iter().find(|m| m.start == TEST_VA).unwrap();
+    fixture
+        .installed
+        .owners
+        .0
+        .push((mapping.physical_ipa, mapping.physical_size as u64));
+    let host = mapping.host_addr;
+    assert_eq!(unsafe { std::slice::from_raw_parts(host, 4) }, b"file");
+    file.write_all_at(b"live", 0).unwrap();
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(host, 4) },
+        b"live",
+        "clean private pages follow file writes"
+    );
+    assert_eq!(vm.cow_armed.lock().overlapping(TEST_VA, OWNER_LEN).len(), 1);
+    assert!(matches!(
+        vm.frame_inventory
+            .lock()
+            .extents
+            .get(&(mapping.physical_ipa, mapping.physical_size as u64))
+            .unwrap()
+            .backing,
+        InventoryBackingIdentity::PrivateFileView(_)
+    ));
+    let peer = install_mm(
+        &transport,
+        315,
+        0x9a00_7500_0000,
+        0x9b00_7500_0000,
+        *b"peer",
+    );
+    let peer_host = global_frame_host_owner_identity(peer.owners.0[0].0, peer.owners.0[0].1)
+        .unwrap()
+        .0;
+    // A task's boot lookup window may survive a root switch. It is not the
+    // selected MM's primary arena, even though both roots are live and pinned.
+    vm.mappings
+        .iter_mut()
+        .find(|mapping| mapping.start == carrick_mem::memory::LINUX_PAGE_TABLES_BASE)
+        .unwrap()
+        .host_addr = peer_host as *mut u8;
+    let protection = vm.observe_frame_cow_protection(TEST_VA, OWNER_LEN, 0);
+    assert!(
+        protection.is_ok(),
+        "deferred file protection must read the bound root: {protection:?}"
+    );
+    assert!(vm.cow_deferred_publications.lock().is_empty());
+}
+
+#[test]
+fn native_reserved_initial_root_uses_bound_root_without_a_pool_slot() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let installed = install_mm(
+        &transport,
+        313,
+        0x9a00_7300_0000,
+        0x9b00_7300_0000,
+        *b"keep",
+    );
+    let handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(
+            transport.custody.transfer_carrier,
+            carrick_el1_abi::ReservationMm::new(313).unwrap(),
+            nonzero(1),
+        )
+    };
+    installed.state.protections.admit_owner(handle).unwrap();
+    let mut task = HvfTaskState::neutral();
+    task.mm_access = installed.state.clone();
+    task.cow_identity = Some(carrick_hal::FrameCowIdentity {
+        linux_pid: 313,
+        linux_tid: 313,
+        mm: 313,
+        asid: 313,
+    });
+    assert!(
+        task.mm_root_slot.is_none(),
+        "the initial root has no pool lease"
+    );
+    unsafe {
+        carrick_guest_mem::OwnerReservedWrite::with_scope(
+            handle,
+            carrick_guest_mem::GuestVaRange::from_len(GuestVa(TEST_VA), OWNER_LEN),
+            |admission| {
+                assert_eq!(
+                    task.authenticate_owner_reserved_write(
+                        &transport.custody,
+                        admission,
+                        TEST_VA,
+                        4
+                    ),
+                    Ok(()),
+                    "an exact admitted initial root must not require a pooled root slot"
+                );
+            },
+        );
+    }
+}
+
+#[test]
 fn native_reserved_file_content_uses_owner_cow_and_copy_admission() {
     use carrick_aarch64::vmm::Aarch64Vmm;
     use carrick_guest_mem::GuestMemory;

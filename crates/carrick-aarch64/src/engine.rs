@@ -4419,6 +4419,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         host_fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
         source: carrick_guest_mem::PrivateFileSource,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<bool, MemoryError> {
         let eligible_range = self.process_asid.is_some()
             && self.vm.sparse_mmap_arena_enabled()
@@ -4448,8 +4449,15 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             suspended_el1_sp: self.suspended_el1_sp,
             required_invalidation: None,
         };
-        vm.materialize_private_file_backing(va, len, host_fd, offset, source, &mut flush)
-            .map_err(|error| MemoryError::HostMap(format!("HVPatch private file backing: {error}")))
+        vm.materialize_private_file_backing(
+            va,
+            len,
+            host_fd,
+            offset,
+            carrick_guest_mem::PrivateFilePublication { source, admission },
+            &mut flush,
+        )
+        .map_err(|error| MemoryError::HostMap(format!("HVPatch private file backing: {error}")))
     }
 
     fn defer_private_file_backed(

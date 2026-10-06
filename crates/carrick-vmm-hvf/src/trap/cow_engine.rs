@@ -5,6 +5,13 @@
 use super::*;
 use carrick_fatal::carrick_fatal;
 
+pub(crate) enum SparseExtentMode {
+    FillHole {
+        receipt_range: Option<std::ops::Range<u64>>,
+    },
+    ReplaceFileView,
+}
+
 /// Check the engine's completed mapping before publishing alias metadata.
 /// Walk terminal spans, not every page of a coarse block; perform no writes,
 /// splits, allocation or TLB operations. The caller retains MM exclusion.
@@ -1047,7 +1054,10 @@ impl HvfVmState {
                 transition.len(),
                 transition.fd(),
                 transition.file_offset(),
-                transition.source(),
+                carrick_guest_mem::PrivateFilePublication {
+                    source: transition.source(),
+                    admission: None,
+                },
                 flush_stage1,
             )?;
             if !materialized {
@@ -1260,12 +1270,18 @@ impl HvfVmState {
         len: usize,
         fd: std::os::fd::BorrowedFd<'_>,
         offset: u64,
-        source: carrick_guest_mem::PrivateFileSource,
+        publication: carrick_guest_mem::PrivateFilePublication<'_, '_>,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     ) -> Result<bool, TrapError> {
+        let carrick_guest_mem::PrivateFilePublication { source, admission } = publication;
         const PAGE_SIZE: u64 = 4 * 1024;
         if !self.persistent_vm_lifecycle || len == 0 {
             return Ok(false);
+        }
+        if let Some(admission) = admission {
+            self.task
+                .authenticate_owner_reserved_write(&self.carrier_vm_custody(), admission, va, len)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?;
         }
         let arena_start = crate::memory::LINUX_MMAP_BASE;
         let arena_end = arena_start
@@ -1357,8 +1373,8 @@ impl HvfVmState {
                 hole_end,
                 backing,
                 flush_stage1,
-                None,
-                true,
+                SparseExtentMode::ReplaceFileView,
+                admission,
             )?;
             if next <= current {
                 return Err(TrapError::Hypervisor(format!(
@@ -1383,8 +1399,8 @@ impl HvfVmState {
             end,
             backing,
             flush_stage1,
-            receipt_range,
-            false,
+            SparseExtentMode::FillHole { receipt_range },
+            None,
         )
     }
 
@@ -1831,9 +1847,13 @@ impl HvfVmState {
         end: u64,
         backing: SparseExtentBacking<'_>,
         flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
-        receipt_range: Option<std::ops::Range<u64>>,
-        replacing: bool,
+        mode: SparseExtentMode,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<u64, TrapError> {
+        let (receipt_range, replacing) = match mode {
+            SparseExtentMode::FillHole { receipt_range } => (receipt_range, false),
+            SparseExtentMode::ReplaceFileView => (None, true),
+        };
         const PAGE_SIZE: u64 = 4 * 1024;
 
         if start >= end || !start.is_multiple_of(PAGE_SIZE) || !end.is_multiple_of(PAGE_SIZE) {
@@ -1844,11 +1864,18 @@ impl HvfVmState {
         let identity = self.cow_identity.ok_or_else(|| {
             TrapError::Hypervisor("HVPatch sparse mmap has no bound mm identity".to_owned())
         })?;
-        let publication = sparse_materialization::PublicationContext::for_local(
-            std::sync::Arc::clone(&self.mm_access),
-            self.carrier_vm_custody(),
-            identity,
-        )?;
+        let publication = match admission {
+            Some(admission) => sparse_materialization::PublicationContext::for_reserved(
+                std::sync::Arc::clone(&self.mm_access),
+                self.carrier_vm_custody(),
+                admission,
+            )?,
+            None => sparse_materialization::PublicationContext::for_local(
+                std::sync::Arc::clone(&self.mm_access),
+                self.carrier_vm_custody(),
+                identity,
+            )?,
+        };
         let end = if replacing {
             // Eligibility was screened before exact-MM quiescence. Recheck
             // under topology exclusion before bypassing the hole checks: a
@@ -4764,14 +4791,6 @@ impl ScrubRun {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 impl HvfVmState {
-    pub(crate) fn page_table_resolver<'a>(
-        &'a self,
-        manager_base: u64,
-        primary_host: Option<*mut u8>,
-    ) -> HvfPageTableResolver<'a> {
-        self.task.page_table_resolver(manager_base, primary_host)
-    }
-
     pub(crate) fn record_stage1_populated_prefix(&mut self, base: u64, prefix: usize) {
         self.task.record_stage1_populated_prefix(base, prefix);
     }
@@ -5172,17 +5191,6 @@ impl HvfVmState {
             return Ok(());
         }
 
-        let page_table_host = self
-            .mapping_for_range(
-                crate::memory::LINUX_PAGE_TABLES_BASE,
-                carrick_mem::memory::LINUX_PAGE_TABLES_SIZE as usize,
-            )
-            .map(|mapping| mapping.host_addr)
-            .ok_or_else(|| {
-                TrapError::Hypervisor(
-                    "deferred COW protection has no page-table backing".to_owned(),
-                )
-            })?;
         let prot_flags = carrick_abi::LinuxProtFlags::from_bits_truncate(prot);
         let (expected_ap, phase, must_be_valid) =
             if prot_flags.contains(carrick_abi::LinuxProtFlags::WRITE) {
@@ -5218,8 +5226,11 @@ impl HvfVmState {
         let page_tables_authority = self.page_tables_authority();
         let authenticated = page_tables_authority
             .with_manager(|manager| -> Result<Vec<PendingFrameCowPublication>, TrapError> {
-                let page_table_resolver =
-                    self.page_table_resolver(manager.base(), Some(page_table_host));
+                // A boot VA lookup can still name another live MM's root.
+                // Resolve and pin the selected physical root and extensions.
+                let page_table_resolver = self.mm_access.pinned_stage1_arenas(
+                    &self.carrier_vm_custody(), manager.base(),
+                )?;
                 let mut authenticated = Vec::with_capacity(pending.len());
                 for receipt in pending {
                     let receipt_end = receipt.va.checked_add(receipt.len as u64).ok_or_else(|| {
@@ -5247,7 +5258,7 @@ impl HvfVmState {
                                 )
                             })?;
                         let shadow = manager.debug_walk(page);
-                        let live = unsafe { manager.debug_walk_host(page_table_resolver, page) }
+                        let live = unsafe { manager.debug_walk_host(&page_table_resolver, page) }
                             .map_err(|e| {
                                 TrapError::Hypervisor(format!(
                                     "deferred COW debug_walk_host failed: {e:?}"
