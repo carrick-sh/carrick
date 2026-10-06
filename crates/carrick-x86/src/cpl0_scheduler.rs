@@ -6,7 +6,7 @@ use carrick_sched_core::{Claim, RecordRef, SlotId, ZoneTables};
 
 /// PUSH order paired with the interrupt image leaf; IRET's five words follow.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, zerocopy::FromZeros)]
 pub struct InterruptFrame {
     pub gpr: [u64; 15],
     pub rip: u64,
