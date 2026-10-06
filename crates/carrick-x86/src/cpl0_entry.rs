@@ -9,6 +9,7 @@ pub const ENTRY_KICK_PORT: u16 = 0xc9;
 pub const RETURN_KICK_PORT: u16 = 0xca;
 pub const WORK_PORT: u16 = 0xcb;
 pub const FATAL_PORT: u16 = 0xcc;
+pub const YIELD_PORT: u16 = 0xd0;
 /// Fixture observation only, outside Linux semantic serving.
 pub const OBSERVE_NATIVE: u64 = u64::MAX;
 

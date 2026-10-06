@@ -1,46 +1,86 @@
-//! Native fatal and host-effect transport pending the CPL0 binding.
+//! Native fatal and host-effect transport for CPL0.
 
-use super::X86Backend;
+use super::context::native::{FATAL_PORT, YIELD_PORT};
+use super::{ArchError, X86Backend};
 use carrick_guest_arch::{CrossingBackend, FatalReport, OwnedHostRequest, RequestToken};
+
+pub fn yield_host_effect() {
+    // SAFETY: CPL0 exits to the KVM host through YIELD_PORT. The host
+    // resumes this vCPU on the exact next instruction.
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            in("dx") YIELD_PORT,
+            in("al") 0u8,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+/// Non-returning native fatal transport after an entry loses its exact binding.
+#[cold]
+#[inline(never)]
+pub fn fatal_entry_binding() -> ! {
+    // SAFETY: CPL0 signals fatal boundary to the host via FATAL_PORT with
+    // PANIC_SENTINEL in rax, and enters an infinite halt loop.
+    unsafe {
+        core::arch::asm!(
+            "out dx, al",
+            "2: hlt",
+            "jmp 2b",
+            in("dx") FATAL_PORT,
+            in("rax") carrick_el1_abi::PANIC_SENTINEL,
+            options(noreturn)
+        );
+    }
+}
 
 impl CrossingBackend for X86Backend {
     fn yield_host_effect(&mut self) -> Result<(), Self::Error> {
-        carrick_x86_unbound_host_yield()
+        yield_host_effect();
+        Ok(())
     }
     fn submit_host_request(
         &mut self,
         _request: OwnedHostRequest<Self::HostPayload>,
     ) -> Result<RequestToken<Self::HostTicket>, Self::Error> {
-        carrick_x86_unbound_host_yield()
+        Err(ArchError::Unbound)
     }
     fn consume_completion(
         &mut self,
         _token: RequestToken<Self::HostTicket>,
     ) -> Result<Self::HostCompletion, Self::Error> {
-        carrick_x86_unbound_host_yield()
+        Err(ArchError::Unbound)
     }
     fn leave_idle(&mut self) -> Result<(), Self::Error> {
-        carrick_x86_unbound_host_yield()
+        Err(ArchError::Unbound)
     }
     fn report_fatal(&mut self, _report: FatalReport) -> ! {
-        carrick_x86_unbound_entry_fatal()
+        fatal_entry_binding()
     }
 }
 
-/// The ARM HVC fatal transport has no CPL0 equivalent in this module.
-#[cold]
-#[inline(never)]
-#[unsafe(no_mangle)]
-pub extern "C" fn carrick_x86_unbound_entry_fatal() -> ! {
-    // SAFETY: faulting in CPL0 is terminal for this unsupported path.
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
-}
+/// A CPL0-only fixture syscall that exercises this shared kernel transport.
+pub const TRANSPORT_WITNESS: u64 = 0xffff_ffff_ffff_ff20;
 
-/// HVC service suspension has no CPL0 transport in this kernel path yet.
-#[cold]
-#[inline(never)]
-#[unsafe(no_mangle)]
-pub extern "C" fn carrick_x86_unbound_host_yield() -> ! {
-    // SAFETY: fail closed before pretending a host effect completed.
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
+pub fn witness(op: u64) -> u64 {
+    match op {
+        0 => {
+            let mut arch = super::kernel_arch();
+            use carrick_guest_arch::CrossingArch;
+            match arch.yield_host_effect() {
+                Ok(()) => 0,
+                Err(_) => u64::MAX,
+            }
+        }
+        1 => {
+            let mut arch = super::kernel_arch();
+            use carrick_guest_arch::CrossingArch;
+            arch.report_fatal(FatalReport {
+                task: None,
+                detail: carrick_guest_arch::FatalCode::new(1),
+            });
+        }
+        _ => u64::MAX,
+    }
 }
