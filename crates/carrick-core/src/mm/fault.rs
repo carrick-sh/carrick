@@ -1,5 +1,7 @@
 //! Shared lazy-supply generations and exact reservation fault admission.
-use carrick_core_abi::{EL1_FRAME_GRANT_TARGET_SIZE, FrameGrantMailbox, FrameGrantRequest};
+use carrick_core_abi::{
+    EL1_FRAME_GRANT_TARGET_SIZE, FrameGrantMailbox, FrameGrantRequest, FrameGrantResidencyTable,
+};
 use carrick_guest_arch::{RootGpa, UserVa};
 use carrick_mmu_core::aarch64::LeafAccess;
 use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
@@ -70,6 +72,22 @@ pub fn root_admits_commit<
 
 use core::num::NonZeroU64;
 
+/// Exact MM scope for consulting physical grants while selecting a new fault
+/// window; a live grant owns its pages even before guest VALID is published.
+pub struct OwnerFaultResidency<'a> {
+    table: &'a FrameGrantResidencyTable,
+    mm: carrick_core_abi::ReservationMm,
+}
+
+impl<'a> OwnerFaultResidency<'a> {
+    pub const fn new(
+        table: &'a FrameGrantResidencyTable,
+        mm: carrick_core_abi::ReservationMm,
+    ) -> Self {
+        Self { table, mm }
+    }
+}
+
 /// Select a bounded contiguous unbacked neighborhood inside the exact live
 /// reservation. The caller holds this MM's editor and reservation root.
 /// Prepared stock is physical ownership even though hardware VALID is clear.
@@ -81,6 +99,7 @@ pub fn owner_fault_plan<
 >(
     root: &mut crate::mm::reservation::Reservations<'_, Policy, Geometry>,
     words: &W,
+    residency: OwnerFaultResidency<'_>,
     hardware_root: RootGpa,
     address: UserVa,
     access: carrick_core_abi::ReservationProtection,
@@ -96,6 +115,13 @@ pub fn owner_fault_plan<
     let mut plan = root.fork_transfer_fault_plan(address.raw(), target, access, fork_sequence)?;
     let table = hardware_root.address().raw();
     let unbacked = |va: u64| -> Result<bool, Refusal> {
+        // VALID can still be clear for a host-published grant's untouched
+        // pages. Its live residency owns the physical range, so a later VMA
+        // extension must stop before that range instead of selecting an
+        // overlapping grant and refusing the new fault page.
+        if residency.table.lookup(residency.mm.raw(), va).is_some() {
+            return Ok(false);
+        }
         let mut table = table;
         for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
             let word = words
@@ -136,6 +162,7 @@ pub struct OwnerFaultVenue<
     pub roots: &'a crate::mm::reservation::SharedReservations<Policy, Geometry>,
     pub spaces: SpaceAccess<'a>,
     pub slots: &'a Slots,
+    pub residency: &'a FrameGrantResidencyTable,
     pub worker: u32,
     pub mailbox: &'a FrameGrantMailbox,
 }
@@ -175,6 +202,7 @@ impl<
             let plan = owner_fault_plan::<_, _, B, _>(
                 &mut root,
                 words,
+                OwnerFaultResidency::new(self.residency, mm),
                 B::root(grant.ttbr0).ok()?,
                 UserVa::new(va),
                 protection,

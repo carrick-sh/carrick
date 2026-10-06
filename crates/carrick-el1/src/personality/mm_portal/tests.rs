@@ -1916,7 +1916,8 @@ pub(crate) fn owner_fork_child_has_live_private_cow_and_parent_stays_unchanged_o
             .iter()
             .filter(|item| matches!(item, carrick_el1_abi::PortalForkCustody::Frame { .. }))
             .count(),
-        2
+        1,
+        "adjacent user frames share one custody receipt"
     );
     let original = parent_tables.words[1536].load(Ordering::Acquire);
     let mut unpublished = portal.publish_fork(plan, &words, 0).unwrap();
@@ -2154,8 +2155,8 @@ fn owner_fork_publishes_child_with_two_live_same_va_mms() {
             let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
             assert_eq!(
                 plan.custody().len(),
-                6,
-                "two user frames plus four identity pages, no carrier code or gaps"
+                5,
+                "one contiguous user-frame run plus four identity pages"
             );
             for (index, selected) in plan.custody().iter().copied().enumerate() {
                 assert!(service.retain(index as u64, selected, || {
@@ -2374,6 +2375,7 @@ fn owner_fork_anonymous_first_touch_excludes_inherited_prepared_neighbors() {
             roots: region.table(),
             spaces: carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
             slots: &slots,
+            residency: &residency(),
             worker: 0,
             mailbox: &mailbox,
         })
@@ -2485,6 +2487,7 @@ fn owner_fork_untouched_private_file_reads_source_and_child_write_stays_private(
             roots: region.table(),
             spaces: carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
             slots: &fault_slots,
+            residency: &residency(),
             worker: 0,
             mailbox: &fault_mailbox
         })
@@ -3207,7 +3210,8 @@ fn owner_fork_census_allocates_for_live_graph_not_physical_arena_capacity() {
             .iter()
             .filter(|item| matches!(item, carrick_el1_abi::PortalForkCustody::Frame { .. }))
             .count(),
-        2
+        1,
+        "adjacent user frames share one custody receipt"
     );
     let original = parent_tables.words[1536].load(Ordering::Acquire);
     let mut unpublished = portal.publish_fork(plan, &words, 0).unwrap();

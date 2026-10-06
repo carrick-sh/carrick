@@ -103,10 +103,12 @@ fn first_touch_window<B: OwnerForkMmu + Copy>(
     let slots = Box::new(carrick_el1_abi::MmPortalSlots::new());
     assert!(slots.bind_carrier(NonZeroU64::new(1).unwrap()));
     let mailbox = carrick_core_abi::FrameGrantMailbox::new();
+    let grant_residency = residency();
     let venue = carrick_core::mm::fault::OwnerFaultVenue {
         roots: region.table(),
         spaces: carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
         slots: &*slots,
+        residency: &grant_residency,
         worker: 0,
         mailbox: &mailbox,
     };

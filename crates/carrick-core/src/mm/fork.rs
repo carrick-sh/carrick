@@ -154,6 +154,31 @@ impl ForkScratch {
     }
 
     pub fn custody(&mut self, value: PortalForkCustody) -> Result<(), ForkError> {
+        if let (
+            Some(PortalForkCustody::Frame {
+                va: prior_va,
+                ipa: prior_ipa,
+                len: prior_len,
+                shared: prior_shared,
+            }),
+            PortalForkCustody::Frame {
+                va,
+                ipa,
+                len,
+                shared,
+            },
+        ) = (self.custody.last_mut(), value)
+            && *prior_shared == shared
+            && prior_va.checked_add(*prior_len) == Some(va)
+            && prior_ipa.checked_add(*prior_len) == Some(ipa)
+            && let Some(merged_len) = prior_len.checked_add(len)
+        {
+            // A custody receipt names an exact VA-to-IPA run. The host's
+            // retention walker crosses physical records inside that run, so
+            // keeping one receipt avoids a host HVC for every 4 KiB leaf.
+            *prior_len = merged_len;
+            return Ok(());
+        }
         if self.custody.len() == self.custody.capacity() {
             return Err(ForkError::NoMemory);
         }
@@ -998,3 +1023,47 @@ pub fn validate_fork_completion(
 
 mod reservation;
 pub use reservation::refusal_to_fork_error;
+
+#[cfg(test)]
+mod custody_tests {
+    use super::*;
+
+    #[test]
+    fn contiguous_private_pages_need_one_fork_custody_receipt() {
+        let mut scratch = ForkScratch {
+            child: Vec::new(),
+            parent: Vec::new(),
+            edits: Vec::new(),
+            reads: Vec::new(),
+            custody: Vec::with_capacity(1),
+            mappings: Vec::new(),
+            child_used: 0,
+            parent_used: 0,
+        };
+        scratch
+            .custody(PortalForkCustody::Frame {
+                va: 0x6000,
+                ipa: 0x2000,
+                len: 4096,
+                shared: false,
+            })
+            .unwrap();
+        scratch
+            .custody(PortalForkCustody::Frame {
+                va: 0x7000,
+                ipa: 0x3000,
+                len: 4096,
+                shared: false,
+            })
+            .unwrap();
+        assert_eq!(
+            scratch.custody,
+            [PortalForkCustody::Frame {
+                va: 0x6000,
+                ipa: 0x2000,
+                len: 8192,
+                shared: false,
+            }]
+        );
+    }
+}

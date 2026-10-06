@@ -621,6 +621,7 @@ impl<
             let plan = crate::mm::fault::owner_fault_plan::<_, _, B, _>(
                 &mut root,
                 words,
+                crate::mm::fault::OwnerFaultResidency::new(residency, continuation.handle.mm()),
                 B::root(grant.ttbr0).map_err(mmu_error)?,
                 UserVa::new(va),
                 ReservationProtection::from_bits(bits).ok_or(MmError::Invalid)?,

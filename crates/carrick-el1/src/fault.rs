@@ -1107,6 +1107,7 @@ pub fn dispatch_fault_with_prepared<P: PreparedPageResolver, C: CowResolver>(
                     roots,
                     spaces,
                     slots,
+                    residency: carrick_el1_abi::frame_grant_residency_guest(),
                     worker: frame.slot as u32,
                     mailbox,
                 })
