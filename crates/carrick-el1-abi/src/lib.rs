@@ -4325,3 +4325,107 @@ mod tests {
         );
     }
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn trap_frame() {
+        assert_eq!((size_of::<TrapFrame>(), align_of::<TrapFrame>()), (288, 8));
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |TrapFrame {
+                     x: _,
+                     elr: _,
+                     spsr: _,
+                     esr: _,
+                     slot: _,
+                     far: _,
+                 }: TrapFrame| {};
+        field!(TrapFrame, x, [u64; 31], 0, 248, 8);
+        field!(TrapFrame, elr, u64, 248, 8, 8);
+        field!(TrapFrame, spsr, u64, 256, 8, 8);
+        field!(TrapFrame, esr, u64, 264, 8, 8);
+        field!(TrapFrame, slot, u64, 272, 8, 8);
+        field!(TrapFrame, far, u64, 280, 8, 8);
+    }
+
+    #[test]
+    fn current_task() {
+        assert_eq!(
+            (size_of::<CurrentTask>(), align_of::<CurrentTask>()),
+            (128, 8)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |CurrentTask {
+                     execution: _,
+                     linux: _,
+                     mm: _,
+                     metadata: _,
+                     _stride_padding: _,
+                 }: CurrentTask| {};
+        field!(CurrentTask, execution, ExecutionIdentity, 0, 16, 8);
+        field!(CurrentTask, linux, LinuxTaskState, 16, 32, 8);
+        field!(CurrentTask, mm, ExecutionMm, 48, 16, 8);
+        field!(CurrentTask, metadata, LinuxTaskMetadata, 64, 16, 8);
+        field!(CurrentTask, _stride_padding, [u64; 6], 80, 48, 8);
+    }
+
+    #[test]
+    fn metadata_grant_mailbox() {
+        assert_eq!(
+            (
+                size_of::<MetadataGrantMailbox>(),
+                align_of::<MetadataGrantMailbox>()
+            ),
+            (64, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |MetadataGrantMailbox {
+                     state: _,
+                     op: _,
+                     status: _,
+                     arg1: _,
+                     arg2: _,
+                     arg3: _,
+                     cookie: _,
+                     request_generation: _,
+                 }: MetadataGrantMailbox| {};
+        field!(MetadataGrantMailbox, state, AtomicU32, 0, 4, 4);
+        field!(MetadataGrantMailbox, op, AtomicU32, 4, 4, 4);
+        field!(MetadataGrantMailbox, status, AtomicU64, 8, 8, 8);
+        field!(MetadataGrantMailbox, arg1, AtomicU64, 16, 8, 8);
+        field!(MetadataGrantMailbox, arg2, AtomicU64, 24, 8, 8);
+        field!(MetadataGrantMailbox, arg3, AtomicU64, 32, 8, 8);
+        field!(MetadataGrantMailbox, cookie, AtomicU64, 40, 8, 8);
+        field!(
+            MetadataGrantMailbox,
+            request_generation,
+            AtomicU64,
+            48,
+            8,
+            8
+        );
+    }
+}

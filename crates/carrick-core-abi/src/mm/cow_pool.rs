@@ -774,3 +774,104 @@ mod tests {
         assert!(pool.authenticates_claimed(&claimed));
     }
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn cow_grant_record() {
+        assert_eq!(
+            (size_of::<CowGrantRecord>(), align_of::<CowGrantRecord>()),
+            (128, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |CowGrantRecord {
+                     state: _,
+                     mm_key: _,
+                     physical_ipa: _,
+                     frame_id: _,
+                     mapping_id: _,
+                     owner_generation: _,
+                     inventory_revision: _,
+                     span_va: _,
+                     span_len: _,
+                     old_ipa: _,
+                     new_ipa: _,
+                     purpose: _,
+                 }: CowGrantRecord| {};
+        field!(CowGrantRecord, state, AtomicU64, 0, 8, 8);
+        field!(CowGrantRecord, mm_key, AtomicU64, 8, 8, 8);
+        field!(CowGrantRecord, physical_ipa, AtomicU64, 16, 8, 8);
+        field!(CowGrantRecord, frame_id, AtomicU64, 24, 8, 8);
+        field!(CowGrantRecord, mapping_id, AtomicU64, 32, 8, 8);
+        field!(CowGrantRecord, owner_generation, AtomicU64, 40, 8, 8);
+        field!(CowGrantRecord, inventory_revision, AtomicU64, 48, 8, 8);
+        field!(CowGrantRecord, span_va, AtomicU64, 56, 8, 8);
+        field!(CowGrantRecord, span_len, AtomicU64, 64, 8, 8);
+        field!(CowGrantRecord, old_ipa, AtomicU64, 72, 8, 8);
+        field!(CowGrantRecord, new_ipa, AtomicU64, 80, 8, 8);
+        field!(CowGrantRecord, purpose, AtomicU64, 88, 8, 8);
+    }
+
+    #[test]
+    fn cow_grant_pool() {
+        assert_eq!(
+            (size_of::<CowGrantPool>(), align_of::<CowGrantPool>()),
+            (131328, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |CowGrantPool {
+                     used: _,
+                     resolved: _,
+                     declined: _,
+                     records: _,
+                 }: CowGrantPool| {};
+        field!(
+            CowGrantPool,
+            used,
+            [AtomicU64; COW_GRANT_POOL_SLOTS / 64],
+            0,
+            128,
+            8
+        );
+        field!(CowGrantPool, resolved, AtomicU64, 128, 8, 8);
+        field!(
+            CowGrantPool,
+            declined,
+            [AtomicU64; COW_DECLINE_REASONS],
+            136,
+            72,
+            8
+        );
+        field!(
+            CowGrantPool,
+            records,
+            [CowGrantRecord; COW_GRANT_POOL_SLOTS],
+            256,
+            131072,
+            64
+        );
+    }
+}

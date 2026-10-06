@@ -130,3 +130,74 @@ mod tests {
         assert!(!slot.handle(|_| panic!("completed publication replayed")));
     }
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn portal_executable_publication() {
+        assert_eq!(
+            (
+                size_of::<PortalExecutablePublication>(),
+                align_of::<PortalExecutablePublication>()
+            ),
+            (80, 8)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |PortalExecutablePublication {
+                     grant: _,
+                     ipa: _,
+                     len: _,
+                 }: PortalExecutablePublication| {};
+        field!(PortalExecutablePublication, grant, CowGrant, 0, 64, 8);
+        field!(PortalExecutablePublication, ipa, u64, 64, 8, 8);
+        field!(PortalExecutablePublication, len, u64, 72, 8, 8);
+    }
+
+    #[test]
+    fn portal_executable_slot() {
+        assert_eq!(
+            (
+                size_of::<PortalExecutableSlot>(),
+                align_of::<PortalExecutableSlot>()
+            ),
+            (88, 8)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |PortalExecutableSlot {
+                     state: _,
+                     request: _,
+                 }: PortalExecutableSlot| {};
+        field!(PortalExecutableSlot, state, AtomicU64, 0, 8, 8);
+        field!(
+            PortalExecutableSlot,
+            request,
+            UnsafeCell<Option<PortalExecutablePublication>>,
+            8,
+            80,
+            8
+        );
+    }
+}

@@ -555,3 +555,94 @@ impl FrameGrantMailbox {
     pub const OWNER_GENERATION_OFFSET: usize = core::mem::offset_of!(Self, owner_generation);
     pub const INVENTORY_REVISION_OFFSET: usize = core::mem::offset_of!(Self, inventory_revision);
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn frame_grant_mailbox() {
+        assert_eq!(
+            (
+                size_of::<FrameGrantMailbox>(),
+                align_of::<FrameGrantMailbox>()
+            ),
+            (128, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |FrameGrantMailbox {
+                     state: _,
+                     status: _,
+                     mm_key: _,
+                     request_generation: _,
+                     fault_va: _,
+                     requested_len: _,
+                     access: _,
+                     semantic_base: _,
+                     physical_ipa: _,
+                     granted_len: _,
+                     permissions: _,
+                     frame_id: _,
+                     mapping_id: _,
+                     owner_generation: _,
+                     inventory_revision: _,
+                 }: FrameGrantMailbox| {};
+        field!(FrameGrantMailbox, state, AtomicU32, 0, 4, 4);
+        field!(FrameGrantMailbox, status, AtomicU64, 8, 8, 8);
+        field!(FrameGrantMailbox, mm_key, AtomicU64, 16, 8, 8);
+        field!(FrameGrantMailbox, request_generation, AtomicU64, 24, 8, 8);
+        field!(FrameGrantMailbox, fault_va, AtomicU64, 32, 8, 8);
+        field!(FrameGrantMailbox, requested_len, AtomicU64, 40, 8, 8);
+        field!(FrameGrantMailbox, access, AtomicU64, 48, 8, 8);
+        field!(FrameGrantMailbox, semantic_base, AtomicU64, 56, 8, 8);
+        field!(FrameGrantMailbox, physical_ipa, AtomicU64, 64, 8, 8);
+        field!(FrameGrantMailbox, granted_len, AtomicU64, 72, 8, 8);
+        field!(FrameGrantMailbox, permissions, AtomicU64, 80, 8, 8);
+        field!(FrameGrantMailbox, frame_id, AtomicU64, 88, 8, 8);
+        field!(FrameGrantMailbox, mapping_id, AtomicU64, 96, 8, 8);
+        field!(FrameGrantMailbox, owner_generation, AtomicU64, 104, 8, 8);
+        field!(FrameGrantMailbox, inventory_revision, AtomicU64, 112, 8, 8);
+    }
+
+    #[test]
+    fn frame_grant_mailboxes() {
+        assert_eq!(
+            (
+                size_of::<FrameGrantMailboxes>(),
+                align_of::<FrameGrantMailboxes>()
+            ),
+            (32768, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |FrameGrantMailboxes { slots: _ }: FrameGrantMailboxes| {};
+        field!(
+            FrameGrantMailboxes,
+            slots,
+            [FrameGrantMailbox; carrick_sched_core::ZONE_SLOTS],
+            0,
+            32768,
+            64
+        );
+    }
+}
