@@ -1,0 +1,40 @@
+schema_version = 1
+id = "core.entry.completion"
+title = "A native entry has one exact-generation completion owner"
+guest_surfaces = ["syscall:set_robust_list", "syscall:restart", "vmm:kvm", "vmm:hvf"]
+semantic_authority = [
+  "man 2 set_robust_list",
+  "Linux syscall ABI: an unimplemented native ordinal is refused without effects",
+  "Linux signal/restart ordering: a completed syscall with pending return work is not dispatched again",
+]
+fixture = "carrick-personality-linux:x86_wave2::x4_linux_common_entry"
+scale_points = [1, 2, 8]
+rationale = """
+The ISA adapter retains the native frame and return convention while the Linux
+personality decodes the native ordinal and arguments. Admission captures the
+exact task, execution generation, MM and thread generation in one non-copying
+completion token. Completion authenticates that complete binding. Pending
+return work marks the admitted call complete exactly once; it cannot send the
+same syscall through a semantic host dispatcher. Unknown native ordinals are
+counted refusals with zero Linux-side publication.
+"""
+
+[bindings]
+vm_free = "carrick-personality-linux::x86_wave2::x4_linux_common_entry"
+kvm = "carrick-vmm-kvm::cpl0_entry::x4_linux_common_entry"
+
+[[structural_budgets]]
+kind = "affine"
+metric = "entry_completions"
+base = 0
+per_unit = 1
+layers = ["vm-free", "kvm"]
+rationale = "Each admitted syscall consumes exactly one completion owner; refusal consumes none."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "semantic_host_forwards_for_admitted_calls"
+base = 0
+per_unit = 0
+layers = ["vm-free", "kvm"]
+rationale = "Pending work changes the return route, never the syscall's semantic owner."

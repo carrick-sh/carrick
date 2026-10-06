@@ -1,6 +1,8 @@
 //! Native CPL0 frame and boundary-control transport, shared by the thin image
 //! and its KVM bootstrap. No Linux syscall algorithm lives in this adapter.
-use carrick_guest_arch::{CanonicalCall, CanonicalOrdinal, GuestIsa, NativeOrdinal, UserVa};
+use carrick_guest_arch::CanonicalCall;
+#[cfg(test)]
+use carrick_guest_arch::GuestIsa;
 use core::sync::atomic::{AtomicU32, AtomicU64};
 
 pub const FORWARD_PORT: u16 = 0xc5;
@@ -38,16 +40,11 @@ const _: () = assert!(core::mem::offset_of!(NativeFrame, rax) == 96);
 
 impl NativeFrame {
     pub fn decode(&self) -> CanonicalCall {
-        // M2 admits only this canonical route. Unported native ordinals remain
-        // distinguishable and cannot alias canonical 99.
-        let canonical = if self.rax == 273 { 99 } else { u64::MAX };
-        CanonicalCall {
-            isa: GuestIsa::X86_64,
-            canonical: CanonicalOrdinal::new(canonical),
-            native: NativeOrdinal::new(self.rax),
-            args: [self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9],
-            stack: UserVa::new(self.rsp),
-        }
+        carrick_personality_linux::entry::decode_x86_64(
+            self.rax,
+            [self.rdi, self.rsi, self.rdx, self.r10, self.r8, self.r9],
+            self.rsp,
+        )
     }
 
     /// IRETQ handles all admitted returns, including TF/RF. Reject privileged
