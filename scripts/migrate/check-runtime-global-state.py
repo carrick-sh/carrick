@@ -14,6 +14,10 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import authority_census_verdict as census_verdict
+
 from typing import Any, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -40,8 +44,7 @@ DEFAULT_SCAN_ROOTS = (
 
 
 
-class LedgerError(Exception):
-    """The source state violates the reviewed global-state ledger contract."""
+LedgerError = census_verdict.CensusError
 
 
 @dataclass(frozen=True, order=True)
@@ -50,7 +53,6 @@ class Finding:
     file: str
     symbol: str
     fingerprint: str  # transient scanner detail; never part of landing identity
-    production: bool = True
     line: int = field(default=0, compare=False)
     argument: str | None = None
     column: int = field(default=0, compare=False)
@@ -309,48 +311,19 @@ class _Scope:
     brace_depth: int
 
 
-def _scope_scanner():
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("authority_scope_cfg", Path(__file__).with_name("check-runtime-aborts.py"))
-    module = sys.modules.get(spec.name)
-    if module is None:
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-    return module
-
-
-def _production_attributes(tokens: Sequence[Token]) -> bool:
-    # Reuse the retained abort scanner's cfg evaluator, including cfg_attr and
-    # test-support. Test-only findings are useful in scanner fixtures but are
-    # not production authority debt.
-    module = _scope_scanner()
-    parsed = module.lex_rust(" ".join(token.text for token in tokens))
-    index = 0
-    while index < len(parsed):
-        if parsed[index].text == "[":
-            end = index + 1
-            depth = 1
-            while end < len(parsed) and depth:
-                if parsed[end].text == "[": depth += 1
-                if parsed[end].text == "]": depth -= 1
-                end += 1
-            if module.is_test_only_attribute(parsed[index + 1:end - 1]):
-                return False
-            index = end
-        else:
-            index += 1
-    return True
-
-
-def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
+def scan_source(path: Path | str, source: str, *, verdict=None) -> tuple[Finding, ...]:
     """Discover all statics, thread-locals, and env::var reads in source text."""
     posix_path = (
         path.as_posix() if isinstance(path, (Path, PurePosixPath)) else str(path)
     )
+    verdict = census_verdict.require(verdict)
+    verdict.validate_tree(verdict.data["root"])
+    source = verdict.production_source(posix_path, source)
+    return _scan_production_globals(posix_path, source)
+
+
+def _scan_production_globals(posix_path, source):
     tokens = _tokenize(source)
-    _scope_scanner().validate_test_dialect(tokens, posix_path)
-    opaque = _scope_scanner().opaque_macro_inputs(tokens)
     findings: list[Finding] = []
 
     scope_stack: list[_Scope] = []
@@ -395,12 +368,12 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
                         attr_bracket -= 1
                     idx += 1
                 attr_tokens = tokens[attr_start:idx]
-                if not opaque[attr_start] and is_inner and _is_cfg_attr(attr_tokens):
+                if is_inner and _is_cfg_attr(attr_tokens):
                     if scope_stack:
                         scope_stack[-1].cfgs.append(attr_tokens)
                     else:
                         file_cfgs.extend(attr_tokens)
-                elif not opaque[attr_start] and not is_inner:
+                elif not is_inner:
                     pending_attributes.append(attr_tokens)
                 continue
             else:
@@ -552,7 +525,7 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
             fingerprint = hashlib.sha256(
                 fingerprint_text.encode("utf-8")
             ).hexdigest()
-            findings.append(Finding(op_kind, posix_path, symbol, fingerprint, _production_attributes(file_cfgs + enclosing_cfg_tokens + direct_stmt_attr_tokens), source.count("\n", 0, tokens[call_start].pos) + 1, arg_name, tokens[call_start].pos - source.rfind("\n", 0, tokens[call_start].pos) - 1))
+            findings.append(Finding(op_kind, posix_path, symbol, fingerprint, source.count("\n", 0, tokens[call_start].pos) + 1, arg_name, tokens[call_start].pos - source.rfind("\n", 0, tokens[call_start].pos) - 1))
             continue
 
         # 7. Check for static declarations
@@ -638,7 +611,7 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
                         fingerprint_text.encode("utf-8")
                     ).hexdigest()
                     findings.append(
-                        Finding(finding_kind, posix_path, symbol, fingerprint, _production_attributes(file_cfgs + enclosing_cfg_tokens + macro_attr_tokens + direct_attr_tokens), source.count("\n", 0, tok.pos) + 1, None, tok.pos - source.rfind("\n", 0, tok.pos) - 1)
+                        Finding(finding_kind, posix_path, symbol, fingerprint, source.count("\n", 0, tok.pos) + 1, None, tok.pos - source.rfind("\n", 0, tok.pos) - 1)
                     )
                     pending_attributes = []
                     idx = cur_idx
@@ -650,10 +623,12 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
 
 
 def discover(
-    root: Path, scan_roots: Sequence[str] = DEFAULT_SCAN_ROOTS, *, test_files: Sequence[str] = ()
+    root: Path, scan_roots: Sequence[str] = DEFAULT_SCAN_ROOTS, *, verdict=None
 ) -> tuple[Finding, ...]:
     """Discover all findings across the configured crate roots."""
     all_findings: list[Finding] = []
+    verdict = census_verdict.require(verdict)
+    verdict.validate_tree(root)
     workspace_root = root.resolve()
 
     for rel_root in scan_roots:
@@ -664,22 +639,26 @@ def discover(
             if not file_path.is_file():
                 continue
             rel_path = file_path.relative_to(workspace_root).as_posix()
-            if rel_path in test_files:
-                continue
             source = file_path.read_text(encoding="utf-8")
-            findings = scan_source(rel_path, source)
+            findings = _scan_production_globals(rel_path, verdict.production_source(rel_path, source))
             all_findings.extend(findings)
 
-    return tuple(sorted(f for f in all_findings if f.production))
+    verdict.validate_tree(root)
+    return tuple(sorted(all_findings))
 
 
-def validate_concurrent_source(path: Path, source: str) -> None:
+def validate_concurrent_source(path: Path, source: str, *, verdict=None) -> None:
     """Reject ambient container identity shapes on the concurrent path."""
     path_text = path.as_posix()
-    findings = scan_source(path, source)
+    verdict = census_verdict.require(verdict)
+    verdict.validate_tree(verdict.data["root"])
+    production = verdict.production_source(path, source)
+    return _validate_production_globals(path_text, production)
+
+
+def _validate_production_globals(path_text, production):
+    findings = _scan_production_globals(path_text, production)
     for finding in findings:
-        if not finding.production:
-            continue
         leaf = finding.symbol.rsplit("::", 1)[-1]
         if finding.kind == "static" and (
             leaf == "RUN_ID"
@@ -704,7 +683,7 @@ def validate_concurrent_source(path: Path, source: str) -> None:
                 f"{path_text}::{finding.symbol}"
             )
 
-    tokens = _tokenize(source)
+    tokens = _tokenize(production)
     for index, token in enumerate(tokens[:-3]):
         if token.kind != "IDENT" or token.text != "fn":
             continue
@@ -727,8 +706,10 @@ def validate_concurrent_source(path: Path, source: str) -> None:
 
 
 def validate_concurrent_tree(
-    root: Path, scan_roots: Sequence[str] = DEFAULT_SCAN_ROOTS, *, test_files: Sequence[str] = ()
+    root: Path, scan_roots: Sequence[str] = DEFAULT_SCAN_ROOTS, *, verdict=None
 ) -> None:
+    verdict = census_verdict.require(verdict)
+    verdict.validate_tree(root)
     workspace_root = root.resolve()
     for rel_root in scan_roots:
         target_dir = workspace_root / rel_root
@@ -736,21 +717,20 @@ def validate_concurrent_tree(
             continue
         for file_path in sorted(target_dir.rglob("*.rs")):
             rel_path = file_path.relative_to(workspace_root)
-            if rel_path.as_posix() in test_files:
-                continue
-            validate_concurrent_source(
-                rel_path, file_path.read_text(encoding="utf-8")
-            )
+            _validate_production_globals(rel_path.as_posix(), verdict.production_source(rel_path, file_path.read_text(encoding="utf-8")))
+    verdict.validate_tree(root)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Discover globals and unconditionally deny ambient guest state")
     parser.add_argument("--root", type=Path, default=REPO_ROOT)
     parser.add_argument("--discover", action="store_true")
+    parser.add_argument("--census-verdict", type=Path, help="Fresh authority-census JSON verdict")
     args = parser.parse_args(argv)
     try:
-        validate_concurrent_tree(args.root)
-        findings = discover(args.root)
+        verdict = census_verdict.CensusVerdict.load(args.census_verdict)
+        validate_concurrent_tree(args.root, verdict=verdict)
+        findings = discover(args.root, verdict=verdict)
         print(json.dumps([{"file": f.file, "kind": f.kind, "symbol": f.symbol, "line": f.line, "argument": f.argument, "column": f.column} for f in findings]))
         return 0
     except (LedgerError, OSError) as error:

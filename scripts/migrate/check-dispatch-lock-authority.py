@@ -20,13 +20,18 @@ It enforces that:
 from __future__ import annotations
 
 import argparse
-import importlib.util
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
 import sys
-from typing import Any, Sequence
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import authority_census_verdict as census_verdict
+
+from typing import Sequence
+
+
+LedgerError = census_verdict.CensusError
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -226,119 +231,6 @@ def lex_rust(source: str) -> list[Token]:
     ]
 
 
-def _matching_delimiter(tokens: Sequence[Token], start: int, opening: str, closing: str) -> int:
-    depth = 0
-    for index in range(start, len(tokens)):
-        if tokens[index].text == opening:
-            depth += 1
-        elif tokens[index].text == closing:
-            depth -= 1
-            if depth == 0:
-                return index
-    return len(tokens) - 1
-
-
-# `feature = "test-support"` is test scope, exactly like `test`. Splitting the
-# runtime into carrick-kernel + carrick-runtime moved test fixtures out of the
-# crate whose tests consume them, and `cfg(test)` is per-crate-compilation, so
-# those fixtures are gated `cfg(any(test, feature = "test-support"))`. No
-# product target enables `test-support`, so the gate still means "test code" in
-# every shipped build. Matching the exact feature NAME keeps this narrow: any
-# other `feature = "..."` term is still production.
-_TEST_SUPPORT_TERMS = ("feature", "=", '"test-support"')
-
-
-def _is_test_only_attribute(tokens: Sequence[Token], start: int, end: int) -> bool:
-    """Return True only if the attribute is strictly test-only (e.g. #[test], #[cfg(test)])."""
-    attr_texts = [item.text for item in tokens[start:end]]
-    if attr_texts == ["test"]:
-        return True
-    if attr_texts == ["cfg", "(", "test", ")"]:
-        return True
-    if "any" in attr_texts:
-        # `any(test, feature = "test-support")` (alone or nested inside an
-        # `all(...)`) is still test-only: every disjunct is a test term.
-        stripped = [t for t in attr_texts if t not in ("cfg", "any", "all", "(", ")", ",")]
-        residual = list(stripped)
-        for term in _TEST_SUPPORT_TERMS:
-            if term in residual:
-                residual.remove(term)
-            else:
-                return False
-        return bool(residual) and all(
-            t == "test" or t.startswith('"') or t in ("target_os", "target_arch", "=")
-            for t in residual
-        ) and "test" in residual
-    if "not" in attr_texts and "test" in attr_texts:
-        return False
-    if attr_texts and attr_texts[0] == "cfg" and "test" in attr_texts:
-        return True
-    return False
-
-
-def _scope_scanner():
-    spec = importlib.util.spec_from_file_location("authority_scope_cfg", Path(__file__).resolve().with_name("check-runtime-aborts.py"))
-    module = sys.modules.get(spec.name)
-    if module is None:
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-    return module
-
-
-def production_mask(tokens: Sequence[Token]) -> list[bool]:
-    """Return True for tokens that can compile when cfg(test) is disabled."""
-    opaque = _scope_scanner().opaque_macro_inputs(tokens)
-    production = [True] * len(tokens)
-    test_scope_stack = [False]
-    pending_test_attribute = False
-    pending_test_item = False
-
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        current_test = test_scope_stack[-1]
-
-        if token.text == "#" and index + 1 < len(tokens) and tokens[index + 1].text == "[":
-            end = _matching_delimiter(tokens, index + 1, "[", "]")
-            if not opaque[index] and _is_test_only_attribute(tokens, index + 2, end):
-                pending_test_attribute = True
-            for attr_index in range(index, min(end + 1, len(tokens))):
-                production[attr_index] = not current_test
-            index = end + 1
-            continue
-
-        if pending_test_attribute and token.text in {
-            "fn",
-            "mod",
-            "impl",
-            "trait",
-            "struct",
-            "enum",
-            "const",
-            "static",
-        }:
-            pending_test_item = True
-            pending_test_attribute = False
-
-        if token.text == "{":
-            test_scope_stack.append(current_test or pending_test_item)
-            production[index] = not test_scope_stack[-1]
-            pending_test_item = False
-        elif token.text == "}":
-            production[index] = not current_test
-            if len(test_scope_stack) > 1:
-                test_scope_stack.pop()
-        else:
-            production[index] = not current_test and not pending_test_item
-            if token.text == ";":
-                pending_test_attribute = False
-                pending_test_item = False
-        index += 1
-
-    return production
-
-
 def find_enclosing_item(tokens: Sequence[Token], target_idx: int) -> str:
     """Find enclosing type/trait/fn item path."""
     current_impl = None
@@ -369,10 +261,17 @@ def find_enclosing_item(tokens: Sequence[Token], target_idx: int) -> str:
     return "<top_level>"
 
 
-def scan_tokens(tokens: Sequence[Token], relative_path: str) -> list[RawLockSite]:
+def scan_tokens(tokens: Sequence[Token], relative_path: str, *, source=None, verdict=None) -> list[RawLockSite]:
     """Scan a tokenized Rust file for raw lock acquisition sites."""
-    _scope_scanner().validate_test_dialect(tokens, relative_path)
-    prod_mask = production_mask(tokens)
+    verdict = census_verdict.require(verdict)
+    verdict.validate_tree(verdict.data["root"])
+    if source is None or tokens != lex_rust(source):
+        raise LedgerError("missing or stale source for token scanner")
+    production = verdict.production_source(relative_path, source)
+    return _scan_production_tokens(lex_rust(production), relative_path)
+
+
+def _scan_production_tokens(tokens, relative_path):
     raw_occurrences: list[tuple[int, str, str, str, int]] = []  # (line, item, category, expression, column)
 
     # Track local variable bindings inside functions for local lock alias detection
@@ -380,7 +279,7 @@ def scan_tokens(tokens: Sequence[Token], relative_path: str) -> list[RawLockSite
 
     i = 0
     while i < len(tokens):
-        if not prod_mask[i] or tokens[i].kind == "string":
+        if tokens[i].kind == "string":
             i += 1
             continue
 
@@ -530,8 +429,10 @@ def scan_tokens(tokens: Sequence[Token], relative_path: str) -> list[RawLockSite
     return sites
 
 
-def scan_sources(repo_root: Path, *, test_files: Sequence[str] = ()) -> list[RawLockSite]:
+def scan_sources(repo_root: Path, *, verdict=None) -> list[RawLockSite]:
     """Scan crate source trees; the Rust census resolves production owners."""
+    verdict = census_verdict.require(verdict)
+    verdict.validate_tree(repo_root)
     all_sites: list[RawLockSite] = []
     # A declared kernel module can use #[path] outside its physical crate.
     # The Rust census binds these diagnostics to the declaring module owner.
@@ -547,12 +448,9 @@ def scan_sources(repo_root: Path, *, test_files: Sequence[str] = ()) -> list[Raw
 
         for rs_file in files:
             relative = str(rs_file.relative_to(repo_root))
-            # Only the strict Rust census supplies this parsed parent-module proof.
-            if relative in test_files:
-                continue
             source = rs_file.read_text(encoding="utf-8")
             tokens = lex_rust(source)
-            file_sites = scan_tokens(tokens, relative)
+            file_sites = _scan_production_tokens(lex_rust(verdict.production_source(relative, source)), relative)
             all_sites.extend(file_sites)
 
     # Validate that every site ID is globally unique
@@ -568,15 +466,18 @@ def scan_sources(repo_root: Path, *, test_files: Sequence[str] = ()) -> list[Raw
 def validate_sysv_lock_authority_rules(
     repo_root: Path,
     override_sources: dict[str, str] | None = None,
+    *, verdict=None,
 ) -> list[str]:
     """Validate exact visibility tokens and strict caller boundaries for SysV lock authority APIs."""
+    verdict = census_verdict.require(verdict)
+    verdict.validate_tree(repo_root)
     errors: list[str] = []
 
     def get_source(rel_path: str) -> str:
         if override_sources and rel_path in override_sources:
-            return override_sources[rel_path]
+            return verdict.production_source(rel_path, override_sources[rel_path])
         full_path = repo_root / rel_path
-        return full_path.read_text(encoding="utf-8") if full_path.exists() else ""
+        return verdict.production_source(rel_path, full_path.read_text(encoding="utf-8")) if full_path.exists() else ""
 
     # 1. Check exact visibility tokens in crates/carrick-kernel/src/dispatch/sysv.rs
     sysv_source = get_source("crates/carrick-kernel/src/dispatch/sysv.rs")
@@ -648,11 +549,8 @@ def validate_sysv_lock_authority_rules(
                     files_to_check.append((rpath, path.read_text(encoding="utf-8")))
 
         for rpath, src in files_to_check:
-            tokens = lex_rust(src)
-            prod_mask = production_mask(tokens)
+            tokens = lex_rust(verdict.production_source(rpath, src))
             for idx, token in enumerate(tokens):
-                if not prod_mask[idx]:
-                    continue
                 if token.text in restricted_identifiers:
                     errors.append(
                         f"{rpath}:{token.line}: unauthorized cross-module reference to SysV lock authority identifier '{token.text}' outside dispatch::sysv"
@@ -665,269 +563,33 @@ def validate_sysv_lock_authority_rules(
                                 f"{rpath}:{token.line}: unauthorized cross-module call to '{token.text}' outside dispatch::sysv"
                             )
 
+    verdict.validate_tree(repo_root)
     return errors
-
-
-def run_self_tests() -> bool:
-    """Run comprehensive self-tests verifying red-first fail-closed behavior."""
-    print("Running check-dispatch-lock-authority self-tests...")
-
-    # Test 1: Comments and strings containing lock patterns must be ignored
-    comment_source = """
-    // this.proc.lock() in a comment must be ignored
-    /* dispatcher.sysv_process.lock() */
-    fn safe_fn() {
-        let msg = "parent.proc.lock() in string";
-        let _ = r#".pty_table.lock()"#;
-    }
-    """
-    tokens = lex_rust(comment_source)
-    sites = scan_tokens(tokens, "crates/carrick-runtime/src/test.rs")
-    assert len(sites) == 0, f"Comments/strings produced false positives: {sites}"
-
-    # Test 2: Test scopes (#[test] and #[cfg(test)]) must be ignored
-    test_scope_source = """
-    #[test]
-    fn unit_test() {
-        parent.proc.lock().do_something();
-    }
-    #[cfg(test)]
-    mod tests {
-        fn helper() {
-            dispatcher.sysv_process.lock();
-        }
-    }
-    """
-    tokens = lex_rust(test_scope_source)
-    sites = scan_tokens(tokens, "crates/carrick-runtime/src/test.rs")
-    assert len(sites) == 0, f"Test scopes produced false positives: {sites}"
-
-    # Test 3: Raw proc acquisition in production must be detected
-    raw_proc_source = """
-    impl SyscallDispatcher {
-        fn handle_syscall(&self) {
-            let mut proc = self.proc.lock();
-        }
-    }
-    """
-    tokens = lex_rust(raw_proc_source)
-    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/syscall.rs")
-    assert len(sites) == 1, f"Expected 1 raw proc site, got {len(sites)}"
-    assert sites[0].category == "proc"
-    assert sites[0].ordinal == 1
-    assert sites[0].id == "crates/carrick-kernel/src/dispatch/syscall.rs::SyscallDispatcher::handle_syscall::proc#1"
-
-    # Test 4: Raw sysv_process boundary is detected
-    sysv_proc_source = """
-    impl SyscallDispatcher {
-        pub fn lock_sysv_process(&self) {
-            let guard = self.sysv_process.lock();
-        }
-    }
-    """
-    tokens = lex_rust(sysv_proc_source)
-    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/sysv.rs")
-    assert len(sites) == 1, f"Expected 1 sysv_process site, got {len(sites)}"
-    assert sites[0].category == "sysv_process"
-    assert sites[0].ordinal == 1
-
-    # Test 5: Raw sysv_namespace boundary in lock_authority.rs is detected
-    sysv_ns_source = """
-    impl SysvNamespacePermit {
-        pub fn lock_paired(&self) {
-            let state = self.namespace.state.lock();
-        }
-    }
-    """
-    tokens = lex_rust(sysv_ns_source)
-    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs")
-    assert len(sites) == 1, f"Expected 1 sysv_namespace site, got {len(sites)}"
-    assert sites[0].category == "sysv_namespace"
-    assert sites[0].ordinal == 1
-
-    # Test 6: Multiple identical acquisitions in one function get distinct ordinals
-    multi_source = """
-    impl SyscallDispatcher {
-        fn complex_fn(&self) {
-            let _a = self.proc.lock();
-            let _b = self.proc.lock();
-        }
-    }
-    """
-    tokens = lex_rust(multi_source)
-    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/mod.rs")
-    assert len(sites) == 2, f"Expected 2 sites, got {len(sites)}"
-    assert sites[0].ordinal == 1
-    assert sites[1].ordinal == 2
-    assert sites[0].id != sites[1].id
-
-    # Test 7: FileTable internals in kernel/objects.rs are detected
-    file_table_source = """
-    impl FileTable {
-        fn read_next(&self) {
-            let _ = self.next_fd.lock();
-        }
-    }
-    """
-    tokens = lex_rust(file_table_source)
-    sites = scan_tokens(tokens, "crates/carrick-kernel/src/kernel/objects.rs")
-    assert len(sites) == 1, f"Expected 1 file_table_internals site, got {len(sites)}"
-    assert sites[0].category == "file_table_internals"
-
-    # Adversarial Bypass Test 8: Parenthesized compound field `(x.sysv.state).lock()`
-    paren_compound_source = """
-    fn bypass_paren(d: &SyscallDispatcher) {
-        let _g = (d.sysv.state).lock();
-    }
-    """
-    tokens = lex_rust(paren_compound_source)
-    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/sysv.rs")
-    assert len(sites) == 1, f"Parenthesized compound bypass was not caught: {sites}"
-    assert sites[0].category == "sysv_namespace"
-
-    # Adversarial Bypass Test 9: Parenthesized proc field `(self.proc).read()`
-    paren_proc_source = """
-    impl SyscallDispatcher {
-        fn bypass_proc_paren(&self) {
-            let _g = (self.proc).read();
-        }
-    }
-    """
-    tokens = lex_rust(paren_proc_source)
-    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/proc.rs")
-    assert len(sites) == 1, f"Parenthesized proc bypass was not caught: {sites}"
-    assert sites[0].category == "proc"
-
-    # Adversarial Bypass Test 10: Local lock alias `let p = &self.proc; p.lock();`
-    alias_proc_source = """
-    impl SyscallDispatcher {
-        fn bypass_alias(&self) {
-            let p = &self.proc;
-            let _g = p.lock();
-        }
-    }
-    """
-    tokens = lex_rust(alias_proc_source)
-    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/mod.rs")
-    assert len(sites) == 1, f"Local alias bypass was not caught: {sites}"
-    assert sites[0].category == "proc"
-
-    # Adversarial Bypass Test 11: Timed / alternative lock methods `try_lock_for`, `try_write_until`
-    timed_methods_source = """
-    impl SyscallDispatcher {
-        fn bypass_timed(&self, d: Duration, t: Instant) {
-            let _a = self.proc.try_lock_for(d);
-            let _b = self.sysv_process.try_write_until(t);
-        }
-    }
-    """
-    tokens = lex_rust(timed_methods_source)
-    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/mod.rs")
-    assert len(sites) == 2, f"Timed methods were not caught: {sites}"
-    assert sites[0].category == "proc"
-    assert sites[1].category == "sysv_process"
-
-    # Adversarial Bypass Test 12: Production code under `#[cfg(any(test, target_os = "macos"))]` must NOT be ignored
-    cfg_any_source = """
-    #[cfg(any(test, target_os = "macos"))]
-    fn macos_prod_path(d: &SyscallDispatcher) {
-        let _g = d.proc.lock();
-    }
-    """
-    tokens = lex_rust(cfg_any_source)
-    sites = scan_tokens(tokens, "crates/carrick-kernel/src/dispatch/mod.rs")
-    assert len(sites) == 1, f"cfg(any(...)) production code was falsely ignored: {sites}"
-    assert sites[0].category == "proc"
-
-    # Test 18: Negative visibility test - pub(crate) on with_state must FAIL
-    widened_vis_source = """
-    impl SysvIpcNamespace {
-        pub(crate) fn with_state<F, R>(&self, f: F) -> R { f(&self.state) }
-    }
-    """
-    errs = validate_sysv_lock_authority_rules(
-        REPO_ROOT,
-        override_sources={"crates/carrick-kernel/src/dispatch/sysv.rs": widened_vis_source},
-    )
-    assert any("helper 'with_state' has unauthorized visibility 'pub(crate)'" in e for e in errs), f"Widened visibility did not fail: {errs}"
-
-    # Test 19: Negative visibility test - pub on lock_sysv_process must FAIL
-    pub_vis_source = """
-    impl SyscallDispatcher {
-        pub fn lock_sysv_process(&self) {}
-    }
-    """
-    errs = validate_sysv_lock_authority_rules(
-        REPO_ROOT,
-        override_sources={"crates/carrick-kernel/src/dispatch/sysv.rs": pub_vis_source},
-    )
-    assert any("helper 'lock_sysv_process' has unauthorized visibility 'pub'" in e for e in errs), f"Public visibility did not fail: {errs}"
-
-    # Test 20: Negative caller test - sibling module calling lock_sysv_process must FAIL
-    sibling_caller_source = """
-    impl SyscallDispatcher {
-        fn leak_sysv(&self) {
-            let _g = self.lock_sysv_process();
-        }
-    }
-    """
-    errs = validate_sysv_lock_authority_rules(
-        REPO_ROOT,
-        override_sources={
-            "crates/carrick-kernel/src/dispatch/sysv.rs": "",
-            "crates/carrick-kernel/src/dispatch/fs.rs": sibling_caller_source,
-        },
-    )
-    assert any("unauthorized cross-module reference to SysV lock authority identifier 'lock_sysv_process'" in e for e in errs), f"Sibling caller did not fail: {errs}"
-
-    # Test 21: Negative caller test - sibling module calling namespace.with_state must FAIL
-    sibling_ns_caller_source = """
-    fn leak_ns(d: &SyscallDispatcher) {
-        d.sysv.with_state(|_| ());
-    }
-    """
-    errs = validate_sysv_lock_authority_rules(
-        REPO_ROOT,
-        override_sources={
-            "crates/carrick-kernel/src/dispatch/sysv.rs": "",
-            "crates/carrick-kernel/src/dispatch/net.rs": sibling_ns_caller_source,
-        },
-    )
-    assert any("unauthorized cross-module call to 'with_state'" in e for e in errs), f"Sibling namespace caller did not fail: {errs}"
-
-    # Test 22: Negative caller test - sibling module referencing SysvNamespacePermit must FAIL
-    sibling_permit_source = """
-    fn leak_permit(_p: &SysvNamespacePermit) {}
-    """
-    errs = validate_sysv_lock_authority_rules(
-        REPO_ROOT,
-        override_sources={
-            "crates/carrick-kernel/src/dispatch/sysv.rs": "",
-            "crates/carrick-kernel/src/dispatch/mod.rs": sibling_permit_source,
-        },
-    )
-    assert any("unauthorized cross-module reference to SysV lock authority identifier 'SysvNamespacePermit'" in e for e in errs), f"Sibling permit reference did not fail: {errs}"
-
-    print("All check-dispatch-lock-authority self-tests PASSED (16 fixtures).")
-    return True
 
 
 def main():
     parser = argparse.ArgumentParser(description="Discover raw locks and check structural SysV authority")
     parser.add_argument("--root", type=Path, default=REPO_ROOT)
     parser.add_argument("--discover", action="store_true")
+    parser.add_argument("--census-verdict", type=Path, help="Fresh authority-census JSON verdict")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
-        return 0 if run_self_tests() else 1
-    errors = validate_sysv_lock_authority_rules(args.root)
+        import subprocess
+        return subprocess.call([sys.executable, "-m", "unittest", "discover", "-s", str(REPO_ROOT / "scripts/tests"), "-p", "test_dispatch_locks.py"], cwd=REPO_ROOT)
+    verdict = census_verdict.CensusVerdict.load(args.census_verdict)
+    errors = validate_sysv_lock_authority_rules(args.root, verdict=verdict)
     if errors:
         print("\n".join(errors), file=sys.stderr)
         return 1
-    sites = scan_sources(args.root)
+    sites = scan_sources(args.root, verdict=verdict)
     print(json.dumps([{"file": s.file, "line": s.line, "column": s.column, "category": s.category} for s in sites]))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (LedgerError, OSError) as error:
+        print(f"error: {Path(__file__).stem}: {error}", file=sys.stderr)
+        raise SystemExit(1)

@@ -16,6 +16,77 @@ use syn::{
 struct AttributeAudit {
     name: String,
     reason: String,
+    #[serde(default)]
+    generated_options: Vec<GeneratedOption>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneratedOption {
+    option: String,
+    operation: GeneratedOperation,
+    permitted_owners: BTreeMap<String, BTreeSet<String>>,
+}
+
+#[derive(serde::Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum GeneratedOperation {
+    EnvironmentRead,
+}
+impl GeneratedOperation {
+    fn description(&self) -> &'static str {
+        match self {
+            Self::EnvironmentRead => "environment read",
+        }
+    }
+}
+
+fn compiler_derive(name: &str) -> bool {
+    matches!(
+        name,
+        "Clone" | "Copy" | "Debug" | "Default" | "Eq" | "PartialEq" | "Ord" | "PartialOrd" | "Hash"
+    )
+}
+
+fn compiler_derive_path(path: &syn::Path) -> bool {
+    let spelling = name(path).replacen("std::", "core::", 1);
+    if compiler_derive(&spelling) {
+        return true;
+    }
+    path.leading_colon.is_some()
+        && matches!(
+            spelling.as_str(),
+            "core::clone::Clone"
+                | "core::marker::Copy"
+                | "core::fmt::Debug"
+                | "core::default::Default"
+                | "core::cmp::Eq"
+                | "core::cmp::PartialEq"
+                | "core::cmp::Ord"
+                | "core::cmp::PartialOrd"
+                | "core::hash::Hash"
+        )
+}
+
+fn ambient_operation(name: &str) -> bool {
+    matches!(
+        name,
+        "abort"
+            | "exit"
+            | "var"
+            | "var_os"
+            | "vars"
+            | "vars_os"
+            | "set_var"
+            | "remove_var"
+            | "current_dir"
+            | "set_current_dir"
+            | "current_exe"
+            | "args"
+            | "args_os"
+            | "home_dir"
+            | "temp_dir"
+    )
 }
 
 fn name(path: &syn::Path) -> String {
@@ -79,12 +150,25 @@ pub(super) fn validate(
     operations: &BTreeSet<String>,
     test_files: &BTreeSet<PathBuf>,
     production: &BTreeSet<PathBuf>,
+    module_owners: Option<&BTreeMap<PathBuf, Vec<Vec<String>>>>,
 ) -> Result<(), DebtError> {
     let audits: Vec<AttributeAudit> = serde_json::from_str(include_str!(
         "../../../scripts/migrate/authority-attribute-allowlist.json"
     ))?;
     let mut allowed = BTreeSet::new();
+    let mut generated_options = BTreeMap::new();
     for entry in audits {
+        if matches!(entry.name.as_str(), "arg" | "clap" | "command")
+            && !entry.generated_options.iter().any(|option| {
+                option.option == "env" && option.operation == GeneratedOperation::EnvironmentRead
+            })
+        {
+            return Err(DebtError::Policy(format!(
+                "missing generated environment read audit: {}",
+                entry.name
+            )));
+        }
+        generated_options.insert(entry.name.clone(), entry.generated_options);
         if entry.reason.trim().is_empty() || !allowed.insert(entry.name.clone()) {
             return Err(DebtError::Policy(format!(
                 "invalid attribute audit: {}",
@@ -109,6 +193,7 @@ pub(super) fn validate(
                 "process",
                 "env",
                 "std",
+                "core",
                 "var",
                 "var_os",
                 "vars",
@@ -157,9 +242,17 @@ pub(super) fn validate(
             errors: &mut errors,
             proven_test: false,
             opaque: false,
+            import_absolute: false,
             glob: None,
             derived_imports: derive_imports(syntax, &allowed),
             helpers: BTreeSet::new(),
+            generated_options: &generated_options,
+            metadata_owners: Vec::new(),
+            module_owners: module_owners
+                .and_then(|owners| owners.get(path))
+                .cloned()
+                .unwrap_or_default(),
+            check_metadata_owner: module_owners.is_some(),
         };
         // The source file's outer imports affect all descendant attributes.
         // A glob inside a proven cfg(test) module cannot affect its parent.
@@ -290,9 +383,14 @@ struct Validator<'a> {
     errors: &'a mut Vec<String>,
     proven_test: bool,
     opaque: bool,
+    import_absolute: bool,
     glob: Option<Span>,
     derived_imports: BTreeSet<String>,
     helpers: BTreeSet<String>,
+    generated_options: &'a BTreeMap<String, Vec<GeneratedOption>>,
+    metadata_owners: Vec<String>,
+    module_owners: Vec<Vec<String>>,
+    check_metadata_owner: bool,
 }
 impl Validator<'_> {
     fn reject(&mut self, span: Span, message: impl AsRef<str>) {
@@ -331,6 +429,16 @@ impl Validator<'_> {
                         "import may rebind an audited attribute macro",
                     );
                 }
+                let canonical_anonymous = prefix.len() >= 2
+                    && (self.import_absolute || prefix.first().is_some_and(|p| p == "std"))
+                    && to == "_"
+                    && compiler_derive_path(
+                        &syn::parse_str::<syn::Path>(&format!("::{}::{from}", prefix.join("::")))
+                            .unwrap_or_else(|_| syn::Path::from(rename.ident.clone())),
+                    );
+                if (compiler_derive(&from) || compiler_derive(&to)) && !canonical_anonymous {
+                    self.reject(rename.span(), "import may rebind a compiler derive");
+                }
                 if from == "test" || to == "test" {
                     self.reject(rename.span(), "import may rebind built-in test");
                 }
@@ -345,6 +453,37 @@ impl Validator<'_> {
                         format!("renamed protected import {target} as {to}"),
                     );
                 }
+            }
+            syn::UseTree::Name(import)
+                if compiler_derive(&import.ident.unraw().to_string())
+                    && (prefix.len() < 2
+                        || !(self.import_absolute
+                            || prefix.first().is_some_and(|p| p == "std"))
+                        || !compiler_derive_path(
+                            &syn::parse_str::<syn::Path>(&format!(
+                                "::{}::{}",
+                                prefix.join("::"),
+                                import.ident.unraw()
+                            ))
+                            .unwrap_or_else(|_| syn::Path::from(import.ident.clone())),
+                        )) =>
+            {
+                self.reject(import.span(), "import may rebind a compiler derive");
+            }
+            syn::UseTree::Name(import)
+                if import.ident.unraw() == "self"
+                    && prefix
+                        .last()
+                        .is_some_and(|p| matches!(p.as_str(), "std" | "env" | "process")) =>
+            {
+                self.reject(import.span(), "sensitive namespace self import is unsupported; use the explicit canonical path");
+            }
+            syn::UseTree::Glob(glob)
+                if prefix
+                    .last()
+                    .is_some_and(|p| matches!(p.as_str(), "std" | "env" | "process")) =>
+            {
+                self.reject(glob.span(), "sensitive namespace glob import is unsupported; use the explicit canonical path");
             }
             syn::UseTree::Name(import)
                 if self.allowed.iter().any(|entry| {
@@ -492,6 +631,21 @@ impl Validator<'_> {
             {
                 self.reject(tokens[i].span(), "module selection in macro input is unsupported; declare external modules in parsed Rust");
             }
+            if matches!(&tokens[i], TokenTree::Ident(id) if id.unraw() == "extern")
+                && matches!(tokens.get(i + 1), Some(TokenTree::Ident(id)) if id.unraw() == "crate")
+            {
+                self.reject(
+                    tokens[i].span(),
+                    "extern crate import in macro input is unresolved",
+                );
+            }
+            if !matches!(i.checked_sub(1).and_then(|p| tokens.get(p)), Some(TokenTree::Ident(id)) if id.unraw() == "fn")
+                && matches!(&tokens[i], TokenTree::Ident(id) if ambient_operation(&id.unraw().to_string()))
+                && matches!(tokens.get(i + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+                && !matches!(i.checked_sub(1).and_then(|p| tokens.get(p)), Some(TokenTree::Punct(p)) if matches!(p.as_char(), '.' | ':'))
+            {
+                self.reject(tokens[i].span(), "unresolved unqualified termination or environment call in macro input; use the explicit canonical path");
+            }
             if matches!(&tokens[i], TokenTree::Ident(id) if id.unraw() == "use")
                 && let Some(end) = tokens[i..]
                     .iter()
@@ -499,7 +653,7 @@ impl Validator<'_> {
             {
                 let stream = tokens[i..=i + end].iter().cloned().collect();
                 match syn::parse2::<syn::ItemUse>(stream) {
-                    Ok(item) => self.imports(&item.tree, &[]),
+                    Ok(item) => self.visit_item_use(&item),
                     Err(_) => self.reject(tokens[i].span(), "unresolved import in macro input"),
                 }
                 i += end + 1;
@@ -540,7 +694,7 @@ impl<'ast> Visit<'ast> for Validator<'_> {
         if module.ident.unraw() == "std" {
             self.reject(
                 module.span(),
-                "module may rebind the built-in std namespace",
+                "module may rebind a built-in standard namespace",
             );
         }
 
@@ -583,6 +737,14 @@ impl<'ast> Visit<'ast> for Validator<'_> {
                 super::authority_source::path_is_ident(a.path(), "cfg")
                     && super::authority_source::cfg_false(&a.meta)
             });
+        let previous_owners = self.metadata_owners.clone();
+        if let syn::Item::Struct(item) = item {
+            self.metadata_owners = self
+                .module_owners
+                .iter()
+                .map(|module| format!("{}::{}", module.join("::"), item.ident.unraw()))
+                .collect();
+        }
         let previous_helpers = std::mem::take(&mut self.helpers);
         for attr in attrs {
             if name(attr.path()) != "derive" {
@@ -627,11 +789,15 @@ impl<'ast> Visit<'ast> for Validator<'_> {
         if !self.proven_test {
             visit::visit_item(self, item);
         }
+        self.metadata_owners = previous_owners;
         self.helpers = previous_helpers;
         self.proven_test = previous;
     }
     fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
         let attribute = name(attr.path());
+        if self.opaque && attribute == "macro_use" {
+            self.reject(attr.span(), "macro_use import is unresolved in macro input");
+        }
         if self.allowed.contains(&attribute)
             && self.glob.is_some()
             && attr.path().leading_colon.is_none()
@@ -748,25 +914,16 @@ impl<'ast> Visit<'ast> for Validator<'_> {
                         if self.glob.is_some()
                             && path.leading_colon.is_none()
                             && (self.allowed.contains(&derive)
-                                || self.derived_imports.contains(&derive))
+                                || self.derived_imports.contains(&derive)
+                                || compiler_derive(&derive))
                         {
                             self.reject(
                                 path.span(),
                                 "glob import makes audited macro binding ambiguous",
                             );
                         }
-                        if !matches!(
-                            derive.as_str(),
-                            "Clone"
-                                | "Copy"
-                                | "Debug"
-                                | "Default"
-                                | "Eq"
-                                | "PartialEq"
-                                | "Ord"
-                                | "PartialOrd"
-                                | "Hash"
-                        ) && !self.allowed.contains(&derive)
+                        if !compiler_derive_path(&path)
+                            && !self.allowed.contains(&derive)
                             && !self.derived_imports.contains(&derive)
                         {
                             self.reject(path.span(), format!("unaudited derive macro {derive}; use an explicitly audited provider"));
@@ -783,6 +940,48 @@ impl<'ast> Visit<'ast> for Validator<'_> {
                         .parse2(list.tokens.clone())
             {
                 for meta in children {
+                    if let Some(options) = self.generated_options.get(&attribute) {
+                        for option in options {
+                            if name(meta.path()) != option.option {
+                                continue;
+                            }
+                            let value = match &meta {
+                                syn::Meta::NameValue(nv) => match &nv.value {
+                                    syn::Expr::Lit(expr) => match &expr.lit {
+                                        syn::Lit::Str(s) => Some(s.value()),
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            let permitted = value.is_some_and(|v| {
+                                if self.check_metadata_owner {
+                                    !self.metadata_owners.is_empty()
+                                        && self.metadata_owners.iter().all(|owner| {
+                                            option
+                                                .permitted_owners
+                                                .get(owner)
+                                                .is_some_and(|values| values.contains(&v))
+                                        })
+                                } else {
+                                    option
+                                        .permitted_owners
+                                        .values()
+                                        .any(|values| values.contains(&v))
+                                }
+                            });
+                            if !permitted {
+                                self.reject(
+                                    meta.span(),
+                                    format!(
+                                        "generated {} is outside its audited owner/value boundary",
+                                        option.operation.description()
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     if let syn::Meta::NameValue(nv) = meta
                         && matches!(
                             name(&nv.path).as_str(),
@@ -848,10 +1047,56 @@ impl<'ast> Visit<'ast> for Validator<'_> {
             self.opaque = previous;
         }
     }
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        fn unqualified(expression: &syn::Expr) -> Option<String> {
+            match expression {
+                syn::Expr::Path(path) if path.path.segments.len() == 1 => Some(name(&path.path)),
+                syn::Expr::Paren(expr) => unqualified(&expr.expr),
+                syn::Expr::Group(expr) => unqualified(&expr.expr),
+                _ => None,
+            }
+        }
+        if unqualified(&call.func).is_some_and(|operation| ambient_operation(&operation)) {
+            self.reject(call.span(), "unresolved unqualified termination or environment call; use the explicit canonical path");
+        }
+        visit::visit_expr_call(self, call);
+    }
     fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
+        let previous = self.import_absolute;
+        self.import_absolute = item.leading_colon.is_some();
         self.imports(&item.tree, &[]);
+        self.import_absolute = previous;
     }
     fn visit_item_extern_crate(&mut self, item: &'ast syn::ItemExternCrate) {
+        fn macro_use(meta: &syn::Meta) -> bool {
+            if name(meta.path()) == "macro_use" {
+                return true;
+            }
+            if name(meta.path()) != "cfg_attr" {
+                return false;
+            }
+            let syn::Meta::List(list) = meta else {
+                return false;
+            };
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated
+                .parse2(list.tokens.clone())
+                .is_ok_and(|children| children.iter().skip(1).any(macro_use))
+        }
+        if item.attrs.iter().any(|a| macro_use(&a.meta)) {
+            self.reject(
+                item.span(),
+                "macro_use import is unresolved; use explicit audited bindings",
+            );
+        }
+        if item.rename.as_ref().is_some_and(|(_, alias)| {
+            compiler_derive(&alias.unraw().to_string()) || alias.unraw() == "test"
+        }) {
+            self.reject(
+                item.span(),
+                "extern crate alias may rebind a built-in macro",
+            );
+        }
+        visit::visit_item_extern_crate(self, item);
         if let Some((_, alias)) = &item.rename
             && (self.protected.contains(&alias.unraw().to_string())
                 || self.allowed.iter().any(|name| {
@@ -869,7 +1114,8 @@ impl<'ast> Visit<'ast> for Validator<'_> {
             matches!(
                 id.unraw().to_string().as_str(),
                 "include" | "include_str" | "include_bytes" | "test"
-            ) || self.allowed.contains(&id.unraw().to_string())
+            ) || compiler_derive(&id.unraw().to_string())
+                || self.allowed.contains(&id.unraw().to_string())
         }) {
             self.reject(
                 item.span(),

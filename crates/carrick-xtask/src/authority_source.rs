@@ -95,6 +95,9 @@ struct Owner {
 }
 #[derive(Debug, Default)]
 pub struct SourceCensus {
+    historical_snapshot: bool,
+    source_hashes: BTreeMap<String, String>,
+    classifications: BTreeMap<String, Vec<ItemClassification>>,
     test_files: std::collections::BTreeSet<String>,
     non_product_files: BTreeSet<String>,
     unbound_files: std::collections::BTreeSet<String>,
@@ -107,6 +110,137 @@ pub struct SourceCensus {
     projections: BTreeMap<String, BTreeSet<String>>,
     vocabulary: BTreeMap<String, AuthorityOperation>,
 }
+#[derive(Debug, serde::Serialize)]
+struct ItemClassification {
+    start: usize,
+    end: usize,
+    production: bool,
+}
+
+// A single parsed scope classifier supplies every retained scanner. Opaque
+// macro tokens can never establish exclusion (the dialect rejects that syntax).
+#[derive(Default)]
+struct Classifications(Vec<ItemClassification>);
+impl Classifications {
+    fn record(&mut self, span: Span, production: bool) {
+        let range = span.byte_range();
+        self.0.push(ItemClassification {
+            start: range.start,
+            end: range.end,
+            production,
+        });
+    }
+}
+impl<'ast> Visit<'ast> for Classifications {
+    fn visit_file(&mut self, file: &'ast syn::File) {
+        if test_only(&file.attrs) {
+            self.record(file.span(), false);
+        } else {
+            visit::visit_file(self, file);
+        }
+    }
+    fn visit_item(&mut self, item: &'ast syn::Item) {
+        let attrs: &[syn::Attribute] = match item {
+            syn::Item::Const(i) => &i.attrs,
+            syn::Item::Enum(i) => &i.attrs,
+            syn::Item::ExternCrate(i) => &i.attrs,
+            syn::Item::Fn(i) => &i.attrs,
+            syn::Item::ForeignMod(i) => &i.attrs,
+            syn::Item::Impl(i) => &i.attrs,
+            syn::Item::Macro(i) => &i.attrs,
+            syn::Item::Mod(i) => &i.attrs,
+            syn::Item::Static(i) => &i.attrs,
+            syn::Item::Struct(i) => &i.attrs,
+            syn::Item::Trait(i) => &i.attrs,
+            syn::Item::TraitAlias(i) => &i.attrs,
+            syn::Item::Type(i) => &i.attrs,
+            syn::Item::Union(i) => &i.attrs,
+            syn::Item::Use(i) => &i.attrs,
+            _ => &[],
+        };
+        let production = !test_only(attrs);
+        self.record(item.span(), production);
+        if production {
+            visit::visit_item(self, item);
+        }
+    }
+    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+        let attrs: &[syn::Attribute] = match item {
+            syn::ImplItem::Const(i) => &i.attrs,
+            syn::ImplItem::Fn(i) => &i.attrs,
+            syn::ImplItem::Type(i) => &i.attrs,
+            syn::ImplItem::Macro(i) => &i.attrs,
+            _ => &[],
+        };
+        let production = !test_only(attrs);
+        self.record(item.span(), production);
+        if production {
+            visit::visit_impl_item(self, item);
+        }
+    }
+    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
+        let attrs: &[syn::Attribute] = match item {
+            syn::TraitItem::Const(i) => &i.attrs,
+            syn::TraitItem::Fn(i) => &i.attrs,
+            syn::TraitItem::Type(i) => &i.attrs,
+            syn::TraitItem::Macro(i) => &i.attrs,
+            _ => &[],
+        };
+        let production = !test_only(attrs);
+        self.record(item.span(), production);
+        if production {
+            visit::visit_trait_item(self, item);
+        }
+    }
+    fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+        if expression_test_only(expr) {
+            self.record(expr.span(), false);
+        } else {
+            visit::visit_expr(self, expr);
+        }
+    }
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if test_only(&local.attrs) {
+            self.record(local.span(), false);
+        } else {
+            visit::visit_local(self, local);
+        }
+    }
+    fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+        if test_only(&field.attrs) {
+            self.record(field.span(), false);
+        } else {
+            visit::visit_field_value(self, field);
+        }
+    }
+    fn visit_field(&mut self, field: &'ast syn::Field) {
+        if test_only(&field.attrs) {
+            self.record(field.span(), false);
+        } else {
+            visit::visit_field(self, field);
+        }
+    }
+    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
+        if test_only(&variant.attrs) {
+            self.record(variant.span(), false);
+        } else {
+            visit::visit_variant(self, variant);
+        }
+    }
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if test_only(&arm.attrs) {
+            self.record(arm.span(), false);
+        } else {
+            visit::visit_arm(self, arm);
+        }
+    }
+}
+
+fn source_hash(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum AuthorityOperation {
@@ -1192,6 +1326,7 @@ impl SourceCensus {
 
     fn read(root: &Path, historical: Option<LegacyBaseSnapshot>) -> Result<Self, DebtError> {
         let mut result = Self {
+            historical_snapshot: historical.is_some(),
             vocabulary: authority_vocabulary()?,
             ..Self::default()
         };
@@ -1210,8 +1345,19 @@ impl SourceCensus {
         let mut parsed = BTreeMap::new();
         for path in &leaves {
             let source = std::fs::read_to_string(path)?;
+            let relative = path
+                .strip_prefix(root)
+                .map_err(|e| DebtError::Policy(e.to_string()))?
+                .to_string_lossy()
+                .to_string();
+            result
+                .source_hashes
+                .insert(relative.clone(), source_hash(source.as_bytes()));
             let syntax = syn::parse_file(&source)
                 .map_err(|error| DebtError::Policy(format!("{}: {error}", path.display())))?;
+            let mut classification = Classifications::default();
+            classification.visit_file(&syntax);
+            result.classifications.insert(relative, classification.0);
             parsed.insert(path.clone(), syntax);
         }
         let mut test_files = BTreeSet::new();
@@ -1252,6 +1398,7 @@ impl SourceCensus {
                 &result.vocabulary.keys().cloned().collect(),
                 &test_files,
                 &provisional,
+                None,
             )?;
         }
         let mut resolved = BTreeMap::new();
@@ -1323,6 +1470,7 @@ impl SourceCensus {
                 &result.vocabulary.keys().cloned().collect(),
                 &test_files,
                 &production,
+                Some(&resolved),
             )?;
         }
         // Parse aliases before any methods: a later type alias or renamed
@@ -1481,8 +1629,43 @@ impl SourceCensus {
     pub fn is_outside_production_at(&self, file: &str, line: usize, column: usize) -> bool {
         self.non_product_files.contains(file) || self.is_test_at(file, line, column)
     }
-    pub(super) fn test_file_names(&self) -> &BTreeSet<String> {
-        &self.test_files
+    /// Source-bound verdict; consumers must validate both the complete file set
+    /// and the hashes before applying any exclusion. Policy identity is built
+    /// into the executable so a stale binary cannot bless changed scanner code.
+    pub fn verdict(&self, root: &Path) -> Result<serde_json::Value, DebtError> {
+        let mut files = BTreeMap::new();
+        for (file, hash) in &self.source_hashes {
+            if source_hash(&std::fs::read(root.join(file))?) != *hash {
+                return Err(DebtError::Policy(format!(
+                    "source changed during census: {file}"
+                )));
+            }
+            files.insert(
+                file,
+                serde_json::json!({
+                    "sha256": hash,
+                    "production": !self.test_files.contains(file),
+                    "product_profile": !self.non_product_files.contains(file),
+                    "items": self.classifications.get(file),
+                }),
+            );
+        }
+        let inputs = census_inputs();
+        let tools = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| DebtError::Policy("missing census tool root".into()))?;
+        for (file, hash) in &inputs {
+            if source_hash(&std::fs::read(tools.join(file))?) != *hash {
+                return Err(DebtError::Policy(format!(
+                    "stale census executable: {file}"
+                )));
+            }
+        }
+        Ok(
+            serde_json::json!({"schema": 1, "dialect": if self.historical_snapshot { "historical_base" } else { "strict" }, "root": root.canonicalize()?, "tool_root": tools,
+            "inputs": inputs, "rejections": [], "files": files}),
+        )
     }
     pub fn is_test_file(&self, file: &str) -> bool {
         self.test_files.contains(file)
@@ -2320,4 +2503,41 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
         }
         visit::visit_expr_path(self, path);
     }
+}
+
+fn census_inputs() -> BTreeMap<&'static str, String> {
+    [
+        (
+            "Cargo.lock",
+            include_bytes!("../../../Cargo.lock").as_slice(),
+        ),
+        (
+            "crates/carrick-xtask/src/authority_debt.rs",
+            include_bytes!("authority_debt.rs").as_slice(),
+        ),
+        (
+            "crates/carrick-xtask/src/cli.rs",
+            include_bytes!("cli.rs").as_slice(),
+        ),
+        (
+            "crates/carrick-xtask/src/authority_source.rs",
+            include_bytes!("authority_source.rs").as_slice(),
+        ),
+        (
+            "crates/carrick-xtask/src/authority_dialect.rs",
+            include_bytes!("authority_dialect.rs").as_slice(),
+        ),
+        (
+            "scripts/migrate/authority-vocabulary.json",
+            include_bytes!("../../../scripts/migrate/authority-vocabulary.json").as_slice(),
+        ),
+        (
+            "scripts/migrate/authority-attribute-allowlist.json",
+            include_bytes!("../../../scripts/migrate/authority-attribute-allowlist.json")
+                .as_slice(),
+        ),
+    ]
+    .into_iter()
+    .map(|(file, bytes)| (file, source_hash(bytes)))
+    .collect()
 }
