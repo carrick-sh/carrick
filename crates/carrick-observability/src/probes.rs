@@ -9067,15 +9067,15 @@ mod real {
         carrick_usdt::vcpu__fault__regs!(|| (esr, elr, far, insn, rn, xrn));
     }
 
-    /// [`vcpu_fault_regs`] with the arguments produced lazily: `args` runs
+    /// [`vcpu_fault_regs`] with the arguments produced lazily: `make_args` runs
     /// only when a consumer is attached. The vCPU loop fires this on EVERY
     /// data abort, and decoding the faulting instruction costs a guest read
     /// (two heap allocations) plus a register fetch; paying that on the
     /// happy path with no D script listening was ~1% of the arena-churn
     /// profile. The eager form stays for callers whose values are free.
     #[allow(clippy::redundant_closure)] // the usdt macro requires a closure literal
-    pub fn vcpu_fault_regs_with(args: impl FnOnce() -> (u64, u64, u64, u64, u32, u64)) {
-        carrick_usdt::vcpu__fault__regs!(|| args());
+    pub fn vcpu_fault_regs_with(make_args: impl FnOnce() -> (u64, u64, u64, u64, u32, u64)) {
+        carrick_usdt::vcpu__fault__regs!(|| make_args());
     }
 
     /// Guest x0..x5 paired with [`vcpu_fault_regs`] on the same host thread.
@@ -9088,8 +9088,8 @@ mod real {
     /// [`vcpu_fault_gprs`] with the six register reads deferred until a
     /// consumer is attached (see [`vcpu_fault_regs_with`]).
     #[allow(clippy::redundant_closure)] // the usdt macro requires a closure literal
-    pub fn vcpu_fault_gprs_with(args: impl FnOnce() -> (u64, u64, u64, u64, u64, u64)) {
-        carrick_usdt::vcpu__fault__gprs!(|| args());
+    pub fn vcpu_fault_gprs_with(make_args: impl FnOnce() -> (u64, u64, u64, u64, u64, u64)) {
+        carrick_usdt::vcpu__fault__gprs!(|| make_args());
     }
 
     #[derive(
