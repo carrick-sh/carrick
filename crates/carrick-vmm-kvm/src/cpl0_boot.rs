@@ -218,8 +218,7 @@ impl Cpl0Carrier {
     /// EL0 admission; no fixture user page is used as an ELF loader.
     pub fn load_guest_mm(
         &mut self,
-        _plan: &carrick_mem::elf::LoadPlan,
-        _bytes: &[u8],
+        _image: &carrick_mem::x86_initial_image::X86InitialImage<'_>,
     ) -> Result<(), TrapError> {
         Err(fail("x86 CPL0 guest MM loader is not yet bound"))
     }
@@ -320,6 +319,9 @@ impl Cpl0Carrier {
         });
 
         for (index, program) in programs.iter().enumerate() {
+            if program.is_empty() {
+                continue;
+            }
             if program.len() > 4096 {
                 return Err(fail("CPL0 fixture exceeds one code page"));
             }
