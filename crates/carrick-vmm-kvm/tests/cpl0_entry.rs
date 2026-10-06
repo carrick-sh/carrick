@@ -131,6 +131,15 @@ fn production_image_rejects_fixture_syscalls() {
         0xffff_ffff_ffff_ff20,
         0xffff_ffff_ffff_ff30,
         0xffff_ffff_ffff_ff40,
+        OBSERVE_NATIVE,
+        OBSERVE_MMU_ROOT,
+        OBSERVE_ALLOCATOR,
+        OBSERVE_MMU_DRAIN,
+        OBSERVE_DESCRIPTOR_PROTECT,
+        OBSERVE_DESCRIPTOR_PREPARE_PUBLISH,
+        OBSERVE_SHARED_PREPARED_FAULT,
+        OBSERVE_SHARED_COW_FAULT,
+        OBSERVE_PORTAL_WINDOW,
     ] {
         assert!(
             !plan.segments.iter().any(|segment| {
