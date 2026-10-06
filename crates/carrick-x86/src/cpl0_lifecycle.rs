@@ -24,8 +24,8 @@ use carrick_sched_core::{
 };
 use core::sync::atomic::Ordering;
 
-pub const LIFECYCLE_ZONE: u64 = 0x100_0000;
-pub const LIFECYCLE_LANE: u64 = 0x190_0000;
+pub const LIFECYCLE_ZONE: u64 = 0xffff_ffff_b000_0000;
+pub const LIFECYCLE_LANE: u64 = 0xffff_ffff_b090_0000;
 pub const LIFECYCLE_STRIDE: u64 = 0x1_0000;
 #[cfg(not(target_os = "none"))]
 pub const LIFECYCLE_DATA: u64 = 0x5_0000;
@@ -503,12 +503,12 @@ pub unsafe fn acquire<'a>(
     let zone = unsafe { &*(LIFECYCLE_ZONE as *const ZoneTables) };
     // SAFETY: caller retains this exact lane's initialized aligned lifecycle page.
     let page = unsafe {
-        &*((carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + index * 0x4000)
+        &*((carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE + index * 0x4000)
             as *const ThreadLifecyclePage)
     };
     // SAFETY: caller retains this exact lane's initialized aligned control array.
     let controls = unsafe {
-        &*((carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + 0xb000 + index * 0x1000)
+        &*((carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE + 0xb000 + index * 0x1000)
             as *const [ThreadControlSlot; 9])
     };
     Some(NativeLane {

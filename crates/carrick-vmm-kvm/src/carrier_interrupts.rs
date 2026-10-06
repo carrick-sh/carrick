@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 
 pub const SECOND_ROOT: u64 = 0x180_0000;
 const FIRST_ROOT: u64 = 0x60_0000;
+const PROGRESS_ZONE_GPA: u64 = 0x100_0000;
 const SLOT: SlotId = SlotId::new(0);
 const WAKE_ADDRESS: u64 = 0x5_0080;
 
@@ -28,14 +29,14 @@ pub(crate) fn supervisor_maps() -> [Pml4MapSpec; 2] {
     [
         Pml4MapSpec {
             va: PROGRESS_ZONE,
-            gpa: PROGRESS_ZONE,
+            gpa: PROGRESS_ZONE_GPA,
             len: 0x100_0000,
             user: false,
             write: true,
             exec: false,
         },
         Pml4MapSpec {
-            va: LAPIC_BASE,
+            va: carrick_x86::interrupts::LAPIC_VA,
             gpa: LAPIC_BASE,
             len: 4096,
             user: false,
@@ -117,7 +118,7 @@ pub fn witness(
     let mut carrier = Cpl0Carrier::boot_inner(image, programs, true)?;
     let ram = &mut carrier.ram;
     if size_of::<ZoneTables>() > (PROGRESS_STATE - PROGRESS_ZONE) as usize
-        || size_of::<ProgressState>() > (SECOND_ROOT - PROGRESS_STATE) as usize
+        || size_of::<ProgressState>() > (SECOND_ROOT - 0x170_0000) as usize
     {
         return Err(fail("progress supervisor regions overlap"));
     }
@@ -130,7 +131,7 @@ pub fn witness(
     if words[0] != PROGRESS_MAGIC
         || words[1..]
             .iter()
-            .any(|pc| !(0x10_0000..0x1f_0000).contains(pc))
+            .any(|pc| !(0xffff_ffff_8000_0000..0xffff_ffff_800f_0000).contains(pc))
     {
         return Err(fail("CPL0 progress header/version/entry mismatch"));
     }
@@ -150,7 +151,7 @@ pub fn witness(
     // documented empty state. Both vCPUs are stopped during publication.
     let zone = unsafe {
         &*ram
-            .host_ptr(PROGRESS_ZONE, size_of::<ZoneTables>())
+            .host_ptr(PROGRESS_ZONE_GPA, size_of::<ZoneTables>())
             .ok_or_else(|| fail("zone backing"))?
             .cast::<ZoneTables>()
     };
@@ -246,7 +247,7 @@ pub fn witness(
     }
     let tasks: [ContextBinding; 2] = tasks.try_into().map_err(|_| fail("two contexts"))?;
     let state_ptr = ram
-        .host_ptr(PROGRESS_STATE, size_of::<ProgressState>())
+        .host_ptr(0x170_0000, size_of::<ProgressState>())
         .ok_or_else(|| fail("context backing"))?
         .cast::<ProgressState>();
     unsafe {
@@ -272,7 +273,7 @@ pub fn witness(
     sregs.cs.dpl = 0;
     sregs.ss.selector = 0x10;
     sregs.ss.dpl = 0;
-    sregs.gs.base = carrick_el1_abi::EL1_DYNAMIC_METADATA_BASE + 0x8000;
+    sregs.gs.base = carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE + 0x8000;
     // Explicit no-PCID/no-global mode, x87/SSE/AVX only. Fail closed rather
     // than preserve only a prefix of some other enabled XSAVE component.
     sregs.cr4 = (sregs.cr4 | (1 << 18)) & !((1 << 17) | (1 << 7));
@@ -293,7 +294,7 @@ pub fn witness(
     }
     let mut regs = cpu.fd().get_regs().map_err(|e| fail(e.to_string()))?;
     regs.rip = entry;
-    regs.rsp = 0xe0_fff0;
+    regs.rsp = crate::cpl0_boot::DIRECT_VA + 0xe0_fff0;
     regs.rflags = 2;
     cpu.fd().set_regs(&regs).map_err(|e| fail(e.to_string()))?;
     let watchdog = Watchdog::start();

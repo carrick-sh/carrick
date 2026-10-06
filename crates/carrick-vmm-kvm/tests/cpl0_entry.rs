@@ -31,6 +31,7 @@ fn user_access_program(index: u64) -> (Vec<u8>, Vec<i64>) {
         (mapped, 9, 0),                         // typed chunk copy-out
         (mapped, 0, 0x6ace_b00c_1234_5678_i64),
         (mapped, 10, 0), // wrong MM incarnation consumes no kernel bytes
+        (mapped, 14, 0), // changed thread generation also refuses
         (mapped, 12, 0), // unsupported word width is typed InvalidWidth
         (mapped, 13, 0), // foreign task cannot validate this live CR3
         (mapped, 3, 0x1234_5678_i64),
@@ -38,11 +39,15 @@ fn user_access_program(index: u64) -> (Vec<u8>, Vec<i64>) {
         (mapped, 5, 16),
         (code, 4, 16),
         (code, 5, 0),
-        (0x10_0000, 4, 0), // supervisor image is not a user mapping
-        (0x10_0000, 0, -14),
-        (0x10_0000, 1, -14),
-        (0x10_0000, 2, -14),
-        (unmapped_edge, 4, 8), // prefix ends at the unmapped next page
+        (0xffff_ffff_8000_0000, 4, 0), // mapped supervisor image is outside user range
+        (0xffff_ffff_8000_0000, 0, -14),
+        (0xffff_ffff_8000_0000, 1, -14),
+        (0xffff_ffff_8000_0000, 2, -14),
+        (0x0000_7fff_ffff_fffc, 0, -14), // eight-byte word crosses the ceiling
+        (0x0000_7fff_ffff_fffc, 4, 0),   // validation rejects whole crossed range
+        (u64::MAX - 3, 1, -14),          // wrapped copy cannot alias kernel
+        (u64::MAX - 3, 8, -14),          // typed transfer refuses wrapped range
+        (unmapped_edge, 4, 8),           // prefix ends at the unmapped next page
         (unmapped_edge, 5, 8),
         (unmapped_edge + 4, 1, -14), // preflight refuses a cross-page copy-in
         (unmapped_edge + 4, 2, -14), // preflight refuses a cross-page copy-out
