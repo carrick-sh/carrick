@@ -10,12 +10,7 @@ use core::sync::atomic::Ordering;
 /// A CPL0-only fixture syscall that exercises this shared kernel module.
 pub const USER_ACCESS_WITNESS: u64 = 0xffff_ffff_ffff_ff10;
 
-const PRESENT: u64 = 1;
-const WRITABLE: u64 = 1 << 1;
-const USER: u64 = 1 << 2;
-const LARGE: u64 = 1 << 7;
 const TABLE_ADDR: u64 = 0x000f_ffff_ffff_f000;
-const TABLE_DIRECT_VA: u64 = carrick_el1_abi::X86_CPL0_DIRECT_VA;
 const USER_CEILING: u64 = 0x0000_8000_0000_0000;
 
 /// A user operand must be wholly within the canonical lower half. The
@@ -235,27 +230,15 @@ pub fn validate(
 }
 
 fn page_allows(root: u64, va: u64, write: bool) -> bool {
-    let mut table = root;
-    for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
-        let index = (va >> shift) & 511;
+    let Some(root) = RootGpa::page_aligned(FrameGpa::new(root)) else {
+        return false;
+    };
+    super::user_tables::page_allows(root, UserVa::new(va), write, |mapped| {
         // SAFETY: authenticated live CR3 and every present next-level entry
-        // point at retained, supervisor-mapped page-table frames. This read
-        // observes the current hardware permission chain, not a cached VMA.
-        let desc = unsafe {
-            core::ptr::read_volatile((TABLE_DIRECT_VA + table + index * 8) as *const u64)
-        };
-        if desc & (PRESENT | USER) != (PRESENT | USER) || (write && desc & WRITABLE == 0) {
-            return false;
-        }
-        if level == 0 && desc & LARGE != 0 {
-            return false;
-        }
-        if level == 3 || (level == 1 || level == 2) && desc & LARGE != 0 {
-            return true;
-        }
-        table = desc & TABLE_ADDR;
-    }
-    false
+        // point at retained, supervisor-mapped table frames. The same alias
+        // resolver is used when the initial MM owner builds those tables.
+        Some(unsafe { core::ptr::read_volatile(mapped.raw() as *const u64) })
+    })
 }
 
 /// Read one Linux user word. A fault is a typed absence, never a zero word.

@@ -313,12 +313,9 @@ mod kernel {
             {
                 return Err(DescriptorRefusal::TableOutsidePrimary);
             }
-            let mapped = if in_grants && self.start == carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA {
-                carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA
-                    + (pa - carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA)
-            } else {
-                DIRECT_VA + pa
-            };
+            let mapped = carrick_el1::isa::x86::user_tables::table_alias(
+                carrick_guest_arch::FrameGpa::new(pa & !4095),
+            ).ok_or(DescriptorRefusal::TableOutsidePrimary)?.raw() + (pa & 4095);
             // SAFETY: Cpl0Carrier retains this supervisor mapping for the VM
             // lifetime; the MM owner holds the stopped sibling and exact grant.
             Ok(unsafe { &*(mapped as *const core::sync::atomic::AtomicU64) })
