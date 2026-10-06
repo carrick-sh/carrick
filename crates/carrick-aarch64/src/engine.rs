@@ -8800,6 +8800,29 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                     return Ok(transfer.into_bytes());
                 }
                 crate::user_transfer::TransferProgress::Advanced => {}
+                crate::user_transfer::TransferProgress::Supply(
+                    request @ carrick_guest_mem::MemorySupplyRequest::Cow(_),
+                ) => {
+                    // SELECT released its service loan and editor before
+                    // requesting physical stock. Supply the exact target,
+                    // then resume this cursor, including any copied prefix.
+                    // Child SETTID after FINISH is an ordinary owner write;
+                    // it must not invent another pending-fork capability.
+                    if !matches!(
+                        crate::user_transfer::supply(
+                            self,
+                            custody.as_ref(),
+                            slots,
+                            target,
+                            request,
+                        )?,
+                        crate::user_transfer::SupplyProgress::Ready
+                    ) {
+                        return Err(TrapError::Hypervisor(
+                            "owner parent COW supply refused".into(),
+                        ));
+                    }
+                }
                 crate::user_transfer::TransferProgress::Suspended
                 | crate::user_transfer::TransferProgress::OwnerWait(_)
                 | crate::user_transfer::TransferProgress::Retired(_)
