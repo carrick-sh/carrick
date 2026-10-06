@@ -18,6 +18,7 @@ fn first_touch_window<B: OwnerForkMmu + Copy>(
     resident: u64,
     prepared: u64,
     neighbors: bool,
+    fault_resident_grant: bool,
 ) {
     let region = Region::new();
     let spaces = AddressSpaces::new();
@@ -72,6 +73,21 @@ fn first_touch_window<B: OwnerForkMmu + Copy>(
         words: &live,
         loads: core::cell::Cell::new(0),
     };
+    let grant_residency = residency();
+    if fault_resident_grant {
+        grant_residency
+            .publish(carrick_core_abi::FrameGrantResidencyIdentity {
+                mm_key: mm.raw(),
+                semantic_base: VA + 4096,
+                physical_ipa: IPA + 4096,
+                len: 4096,
+                mapping_id: 1,
+                frame_id: 1,
+                owner_generation: 1,
+                inventory_revision: 1,
+            })
+            .expect("publish an uncommitted grant at the fault page");
+    }
     let TransferStep::Supply(window) = portal
         .select(
             &transfer,
@@ -79,7 +95,7 @@ fn first_touch_window<B: OwnerForkMmu + Copy>(
             SelectionVenues {
                 prepared: &mut NoopPreparedResolver,
                 cow: &mut NoopCowResolver,
-                residency: &residency(),
+                residency: &grant_residency,
                 slot: 0,
             },
         )
@@ -103,7 +119,6 @@ fn first_touch_window<B: OwnerForkMmu + Copy>(
     let slots = Box::new(carrick_el1_abi::MmPortalSlots::new());
     assert!(slots.bind_carrier(NonZeroU64::new(1).unwrap()));
     let mailbox = carrick_core_abi::FrameGrantMailbox::new();
-    let grant_residency = residency();
     let venue = carrick_core::mm::fault::OwnerFaultVenue {
         roots: region.table(),
         spaces: carrick_sched_core::spaces::notification::SpaceAccess::source_free(&spaces),
@@ -149,9 +164,11 @@ fn first_touch_window<B: OwnerForkMmu + Copy>(
             .collect::<Vec<_>>(),
         inherited
     );
+    let descriptor_budget = if fault_resident_grant { 2 } else { 1 } * 4 * (2 * 4 + 1);
     assert!(
-        words.loads.get() <= 4 * (2 * 4 + 1),
-        "selection work must be bounded by the reservation window"
+        words.loads.get() <= descriptor_budget,
+        "selection work {} exceeds the descriptor budget {descriptor_budget}",
+        words.loads.get()
     );
 }
 
@@ -163,6 +180,7 @@ fn aarch64_owner_fault_window_excludes_inherited_backing() {
         RW | (1 << 56) | (1 << 57),
         (RW | (1 << 56) | (1 << 57)) & !1,
         true,
+        false,
     );
 }
 
@@ -175,16 +193,28 @@ fn x86_owner_fault_window_excludes_inherited_backing() {
         PRESENT | USER | WRITE | NX | MAY_WRITE,
         PREPARED | USER | WRITE | NX | MAY_WRITE,
         true,
+        false,
     );
 }
 
 #[test]
 fn aarch64_owner_fault_batches_unbacked_reservation() {
-    first_touch_window(Aarch64Mmu, 3, 0, 0, false);
+    first_touch_window(Aarch64Mmu, 3, 0, 0, false, false);
 }
 
 #[test]
 fn x86_owner_fault_batches_unbacked_reservation() {
     use carrick_mmu_core::x86::descriptor_txn::{PRESENT, USER, WRITE};
-    first_touch_window(X86Mmu, PRESENT | USER | WRITE, 0, 0, false);
+    first_touch_window(X86Mmu, PRESENT | USER | WRITE, 0, 0, false, false);
+}
+
+#[test]
+fn aarch64_owner_fault_reselects_an_uncommitted_grant_page() {
+    first_touch_window(Aarch64Mmu, 3, 0, 0, false, true);
+}
+
+#[test]
+fn x86_owner_fault_reselects_an_uncommitted_grant_page() {
+    use carrick_mmu_core::x86::descriptor_txn::{PRESENT, USER, WRITE};
+    first_touch_window(X86Mmu, PRESENT | USER | WRITE, 0, 0, false, true);
 }
