@@ -138,11 +138,7 @@ fn image() -> PathBuf {
 
 #[test]
 fn production_cpl0_boot_retains_two_extents_in_one_carrier_vm() {
-    let production = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0");
-    let stop = [0x0f, 0x0b];
-    let carrier = Cpl0Carrier::boot(&production, [&stop, &stop])
-        .expect("production image on one KVM carrier VM");
+    let carrier = Cpl0Carrier::boot_production().expect("production image on one KVM carrier VM");
     assert_eq!(carrier.physical_slot_count(), 2);
     assert_eq!(carrier.retained_bytes(), 16 * 1024 * 1024 + 0x90_0000);
 }
