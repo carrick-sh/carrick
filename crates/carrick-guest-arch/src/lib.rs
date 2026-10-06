@@ -289,6 +289,9 @@ pub trait ArchTypes {
     type Error;
     type NativeFrame;
     type SavedContext;
+    /// Zero-valid scheduler record storage for this ISA, distinct from a
+    /// live native context that may contain nonzero ownership generations.
+    type Context: Copy + Send + Sync + zerocopy::FromZeros;
     type Root: Copy + Eq;
     type MmOwner;
     type OwnedTranslation;
@@ -329,6 +332,7 @@ impl<B: ArchTypes> ArchTypes for Arch<B> {
     type Error = B::Error;
     type NativeFrame = B::NativeFrame;
     type SavedContext = B::SavedContext;
+    type Context = B::Context;
     type Root = B::Root;
     type MmOwner = B::MmOwner;
     type OwnedTranslation = B::OwnedTranslation;
