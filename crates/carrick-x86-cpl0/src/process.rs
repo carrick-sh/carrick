@@ -138,10 +138,11 @@ pub(super) fn admit_initial(
     stack_pointer: u64,
     root: u64,
 ) -> bool {
-    use carrick_sched_core::{SlotId, ZoneTables};
+    use carrick_sched_core::ZoneTables;
     if binding.scheduler_witness.load(Ordering::Acquire) != super::super::lifecycle::LIFECYCLE_LANE
         || process_mode() || root != 0x80_0000
     { return false; }
+    let Some(slot)=super::super::adapter::checked_scheduler_slot(carrick_guest_arch::CpuId::new(binding.cpu_slot)) else { return false; };
     let layout = core::alloc::Layout::new::<FrameGrantResidencyTable>();
     // SAFETY: the guest allocator returns storage with the table's alignment
     // and size; ownership stays with this one stopped-carrier fixture.
@@ -180,8 +181,8 @@ pub(super) fn admit_initial(
     };
     let Some(index) = zone.spaces.publish_closed(PARENT_MM, root.address().raw(), 0) else { return false; };
     zone.spaces.open(index);
-    zone.release_space(SlotId::new(binding.cpu_slot as u8));
-    if zone.install_space(SlotId::new(binding.cpu_slot as u8), PARENT_MM).is_none() { return false; }
+    zone.release_space(slot);
+    if zone.install_space(slot, PARENT_MM).is_none() { return false; }
     lane.parent.mm = PARENT_MM;
     task.mm.key.store(PARENT_MM, Ordering::Release);
     FORK_RESIDENCY_ADDRESS.store(pointer as u64, Ordering::Release);

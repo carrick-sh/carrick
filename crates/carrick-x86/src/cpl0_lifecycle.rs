@@ -10,7 +10,7 @@ use crate::cpl0_scheduler::{
 };
 use carrick_core_abi::EntryMmKey;
 use carrick_el1_abi::{Counters, CurrentTask, EntryRef, ThreadControlSlot, ThreadLifecyclePage};
-use carrick_guest_arch::UserVa;
+use carrick_guest_arch::{RootGpa, UserVa};
 use carrick_personality_linux::abi::entry::SyscallResult;
 #[cfg(target_os = "none")]
 use carrick_personality_linux::lifecycle::LifecycleOutcome;
@@ -209,6 +209,8 @@ mod process_exit_tests {
             contexts: [const { NativeBirthContext::EMPTY }; 2],
             parent,
             slot,
+            maintenance_root: RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(0x1000))
+                .expect("maintenance root"),
             data_start: 0,
             data_end: 0,
             wakes: 0,
@@ -309,6 +311,7 @@ pub struct LifecycleLane {
     pub contexts: [NativeBirthContext; 2],
     pub parent: ThreadIdentity,
     pub slot: SlotId,
+    pub maintenance_root: RootGpa,
     pub data_start: u64,
     pub data_end: u64,
     pub wakes: u64,
@@ -391,12 +394,9 @@ impl NativeLane<'_> {
         let changed_mm = self.zone.installed_space(self.lane.slot) != identity.mm;
         #[cfg(target_os = "none")]
         if changed_mm {
-            use carrick_guest_arch::{
-                AddressContext, ContextGeneration, FrameGpa, MmGeneration, MmuBackend, RootGpa,
-            };
-            let maintenance = RootGpa::page_aligned(FrameGpa::new(0x60_0000))?;
+            use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, MmuBackend};
             let context = AddressContext {
-                root: maintenance,
+                root: self.lane.maintenance_root,
                 mm: MmGeneration::new(core::num::NonZeroU64::MIN),
                 generation: ContextGeneration::new(core::num::NonZeroU64::MIN),
             };
@@ -626,7 +626,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         }
         let refused = || {
             Some(LifecycleOutcome::Returned {
-                result: SyscallResult::new(-11),
+                result: SyscallResult::new(carrick_syscall_abi::LINUX_EAGAIN.guest_retval()),
                 work: false,
             })
         };
@@ -726,7 +726,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             })
         };
         if options.bits() & !LinuxWaitOptions::WAIT4_SUPPORTED.bits() != 0 {
-            return returned(-22); // EINVAL
+            return returned(carrick_syscall_abi::LINUX_EINVAL.guest_retval()); // EINVAL
         }
         let child_pid = process::child_pid(self.lane.parent.tid);
         if !matches!(i64::from(pid.raw()), -1 | 0) && i64::from(pid.raw()) != child_pid as i64
@@ -735,13 +735,13 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             || self.lane.contexts[1].record.is_none()
             || process::child_exit().reaped()
         {
-            return returned(-10); // ECHILD
+            return returned(carrick_syscall_abi::LINUX_ECHILD.guest_retval()); // ECHILD
         }
         let Some(guard) = process::child_exit().lock(self.zone) else {
-            return returned(-11);
+            return returned(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
         };
         if process::child_exit().reaped() {
-            return returned(-10);
+            return returned(carrick_syscall_abi::LINUX_ECHILD.guest_retval());
         }
         let code = process::child_exit().exited_status();
         if code.is_none() && options.contains(LinuxWaitOptions::WNOHANG) {
@@ -749,11 +749,11 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         }
         let Some(outputs) = process::prepare_wait_outputs(self, status, UserVa::new(self.args[3]))
         else {
-            return returned(-14);
+            return returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval());
         };
         if let Some(code) = code {
             let Some(child) = process::child_exit().reap(&guard, code) else {
-                return returned(-10);
+                return returned(carrick_syscall_abi::LINUX_ECHILD.guest_retval());
             };
             outputs.complete(child);
             return returned(child_pid as i64);
@@ -763,7 +763,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             .current_or_new(self.lane.slot, self.lane.parent)
             .ok()
         else {
-            return returned(-11);
+            return returned(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
         };
         let child_index = committed(
             u32::try_from(child_pid).ok(),
@@ -788,11 +788,11 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             },
             record,
         ) else {
-            return returned(-11);
+            return returned(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
         };
         let seq = self.zone.next_seq(record);
         if guard.enroll(record, seq, child_index).is_err() {
-            return returned(-11);
+            return returned(carrick_syscall_abi::LINUX_EAGAIN.guest_retval());
         }
         process::publish_wait_outputs(outputs);
         self.handoff = Some(committed(

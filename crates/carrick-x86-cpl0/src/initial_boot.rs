@@ -206,7 +206,7 @@ fn load(request: &mut X86InitialBootRequest) -> Option<(u64, u64)> {
     // SAFETY: CPU 1 is stopped. The caller owns this unopened MM, the one
     // source root and the complete disjoint private frame grant transaction.
     let loaded = unsafe { install_initial_image(
-        &InitialWords::production(end), &mut source, source_root, mm, generation,
+        &InitialWords::production(end, source_root), &mut source, source_root, mm, generation,
         &InitialImageSpec { regions: &image_regions, stack },
     ) }.ok()?;
     if loaded.publications.len() > publications.len() { return None; }
