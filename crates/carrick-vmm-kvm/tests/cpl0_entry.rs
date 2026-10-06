@@ -141,6 +141,12 @@ fn production_cpl0_boot_retains_two_extents_in_one_carrier_vm() {
     let carrier = Cpl0Carrier::boot_production().expect("production image on one KVM carrier VM");
     assert_eq!(carrier.physical_slot_count(), 2);
     assert_eq!(carrier.retained_bytes(), 16 * 1024 * 1024 + 0x90_0000);
+    assert!(
+        carrier
+            .fixture_user_leaf(carrick_vmm_kvm::cpl0_boot::USER_CODE)
+            .is_err(),
+        "production boot must leave user memory to the guest MM owner"
+    );
 }
 
 #[test]

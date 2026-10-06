@@ -918,10 +918,10 @@ impl PreparedRun {
             let bytes = dispatcher.read_exec_file(&executable).ok_or_else(|| {
                 RuntimeError::Unsupported(format!("guest executable not found: {executable}"))
             })?;
-            let plan = carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62)
+            let image = carrick_mem::x86_initial_image::prepare_static_x86_elf(&bytes)
                 .map_err(|error| RuntimeError::Unsupported(format!("x86 ELF load: {error}")))?;
             let mut machine = carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::boot_production()?;
-            machine.load_guest_mm(&plan, &bytes)?;
+            machine.load_guest_mm(&image)?;
             Err(RuntimeError::Unsupported(
                 "x86 CPL0 execution admission is not yet bound".to_owned(),
             ))

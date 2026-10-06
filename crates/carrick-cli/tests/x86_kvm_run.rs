@@ -32,7 +32,7 @@ fn hello_elf() -> Vec<u8> {
     elf[16..18].copy_from_slice(&2_u16.to_le_bytes());
     elf[18..20].copy_from_slice(&62_u16.to_le_bytes());
     elf[20..24].copy_from_slice(&1_u32.to_le_bytes());
-    elf[24..32].copy_from_slice(&0x400000_u64.to_le_bytes());
+    elf[24..32].copy_from_slice(&0x401000_u64.to_le_bytes());
     elf[32..40].copy_from_slice(&64_u64.to_le_bytes());
     elf[52..54].copy_from_slice(&64_u16.to_le_bytes());
     elf[54..56].copy_from_slice(&56_u16.to_le_bytes());
@@ -40,10 +40,11 @@ fn hello_elf() -> Vec<u8> {
     let ph = 64;
     elf[ph..ph + 4].copy_from_slice(&1_u32.to_le_bytes());
     elf[ph + 4..ph + 8].copy_from_slice(&5_u32.to_le_bytes());
-    elf[ph + 8..ph + 16].copy_from_slice(&0x1000_u64.to_le_bytes());
+    elf[ph + 8..ph + 16].copy_from_slice(&0_u64.to_le_bytes());
     elf[ph + 16..ph + 24].copy_from_slice(&0x400000_u64.to_le_bytes());
-    elf[ph + 32..ph + 40].copy_from_slice(&(code.len() as u64).to_le_bytes());
-    elf[ph + 40..ph + 48].copy_from_slice(&0x1000_u64.to_le_bytes());
+    let image_len = elf.len() as u64;
+    elf[ph + 32..ph + 40].copy_from_slice(&image_len.to_le_bytes());
+    elf[ph + 40..ph + 48].copy_from_slice(&image_len.to_le_bytes());
     elf[ph + 48..ph + 56].copy_from_slice(&0x1000_u64.to_le_bytes());
     elf[0x1000..].copy_from_slice(code);
     elf
