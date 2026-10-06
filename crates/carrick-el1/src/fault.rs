@@ -1516,7 +1516,7 @@ mod tests {
         use carrick_guest_arch::{Access, FaultInfo, UserVa};
         assert_eq!(
             x86_fault_class(FaultInfo {
-                address: UserVa::new(0xffff_9000_0060_0000),
+                address: UserVa::new(0xffff_ffff_9000_0000),
                 access: Access::Write,
                 present: false,
             }),
