@@ -55,7 +55,17 @@ it never supplies test exclusion or silently promotes a source file.
   taint closes transitively. Plain renames have no allowlist escape. Environment
   and termination imports must use their explicit canonical paths. Sensitive
   namespace `self` and glob imports, and unresolved unqualified protected
-  calls, are rejected.
+  calls, are rejected. Protected free functions may appear only as direct
+  canonical path calls or through an exact, unrenamed plain item import.
+  Parenthesized callees, generic function references, function-pointer
+  bindings and captures are rejected. Direct receiver calls remain counted;
+  data declarations with the same spelling do not become authority operations.
+  Macro input containing protected operations requires a complete audited
+  grammar in `scripts/migrate/authority-macro-allowlist.json`. Executable
+  expressions and bodies are visited and counted; unparsed input and
+  protected function values fail. Local macro audits bind exact definition
+  hashes. Typed guest syscall selectors are data under their audited defining
+  implementation; their executable handler bodies are separately counted.
 - Custom attributes require an entry in
   `scripts/migrate/authority-attribute-allowlist.json`. Each entry names the
   exact macro/helper and its audited provider, with a rationale for why
@@ -75,7 +85,9 @@ it never supplies test exclusion or silently promotes a source file.
   compiler provider under a production glob (for example `::core::clone::Clone`).
   Canonical standard trait imports remain permitted, including anonymous
   `Hash as _` imports that create no macro binding. Audited names cannot be
-  rebound by imports or modules.
+  rebound by imports or modules, including `{self}` imports whose bound name
+  is the preceding path component. External derives require their canonical
+  crate path even when no production glob is present.
   Protected callbacks in literal metadata are rejected. To add an
   entry, audit the locked implementation, document its expansion, extend the
   closed grammar only if needed, and add positive and rejection witnesses.
@@ -89,7 +101,9 @@ configuration and conformance-harness keys are admitted at their host
 configuration owners. `CARRICK_RUN_ID` helper metadata is rejected everywhere;
 that key remains an explicit read at the LaunchContext boundary. Binding an
 audited source file into a different logical module does not transfer its
-metadata permission.
+metadata permission. Owners include the full lexical path: inline modules,
+enclosing functions and implementations. A nested `RunArgs` namesake does not
+inherit the permission of `carrick_cli::args::RunArgs`.
 
 ## Retained scanner verdicts
 
@@ -102,6 +116,9 @@ compiled census/policy input hashes. A stale executable cannot emit a verdict
 for changed policy inputs. The retained scanners have no test-attribute,
 configuration-predicate or macro-scope classifiers: they mask Rust-excluded
 ranges while preserving positions, then check only their own patterns.
+The verdict also supplies the canonical call heads and byte ranges for exact
+plain item imports. Retained lexers apply those Rust-resolved heads verbatim;
+they never resolve bindings or classify scope independently.
 
 Standalone use requires a fresh verdict:
 
@@ -147,8 +164,9 @@ no existing ceiling was increased and no runtime behavior changed.
 | --- | --- | --- |
 | `global_config_debug / global:env_var_os / carrick_runtime::vcpu_loop::ThreadRuntimeState<E>::new::CARRICK_TRACE_TRAPS / shared = 1` | `crates/carrick-runtime/src/vcpu_loop/mod.rs:1046`: `trace: std::env::var_os("CARRICK_TRACE_TRAPS").is_some(),` | Attributes on preceding `#[cfg(test)]` struct initializer fields leaked into this production sibling. Rust excludes each field independently. |
 
-The entire source file is identical on actual base
-`8233b5488b92b406bce8bbe4ee495c0e09b166a5` and the repaired head; SHA-256
+The entire source file was identical at the accepted Round 7 head
+`2dc25b175` and actual base
+`8233b5488b92b406bce8bbe4ee495c0e09b166a5`; SHA-256
 `6e366be31a1683d49333d250cec2afe744d8e4160823a7b977855c332955ef12`.
 This is an owned ratchet item. Reading `CARRICK_TRACE_TRAPS` in production
 runtime outside the LaunchContext boundary remains a defect for the
