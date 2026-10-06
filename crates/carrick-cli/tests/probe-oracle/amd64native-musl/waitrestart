@@ -1,0 +1,4 @@
+91bd2fa090733aa4e8320c57cc98c019d06a8df117f495f2c6d321badb4b872d
+A_restart_reaps_child=true
+B_norestart_eintr=true
+C_child_exit_no_eintr=true

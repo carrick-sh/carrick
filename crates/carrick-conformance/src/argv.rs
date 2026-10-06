@@ -143,3 +143,126 @@ pub fn docker_argv(suite: &Suite, run_id: &str, platform: DockerPlatform) -> Vec
     a.extend(effective_cmd(suite));
     a
 }
+
+/// Native oracle launch: image defaults plus the same oracle env, entrypoint,
+/// workdir and effective command as Docker. Unknown Docker policy flags fail
+/// closed rather than silently measuring a different execution.
+pub fn native_argv(
+    suite: &Suite,
+    rootfs: &crate::native::NativeRootfs,
+) -> anyhow::Result<Vec<String>> {
+    let mut flags = suite.docker_flags.iter();
+    while let Some(flag) = flags.next() {
+        match flag.as_str() {
+            "--security-opt" => anyhow::ensure!(
+                flags
+                    .next()
+                    .is_some_and(|value| value == "seccomp=unconfined"),
+                "native oracle supports only seccomp=unconfined"
+            ),
+            "--security-opt=seccomp=unconfined" | "--rm" => {}
+            other => anyhow::bail!(
+                "native oracle does not support Docker flag {other:?} for {}",
+                suite.name
+            ),
+        }
+    }
+    anyhow::ensure!(
+        suite.bind_mounts.is_empty(),
+        "native oracle bind mounts are not implemented for {}",
+        suite.name
+    );
+    let root = rootfs
+        .root
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-UTF8 rootfs path"))?;
+    // All data is positional argv, never interpolated into a shell program.
+    // PID 1 remains the waiting shell. Namespace exit kills orphaned descendants;
+    // --kill-child also covers death of the outer unshare supervisor.
+    const SETUP: &str = r#"
+root=$1
+shift
+mount --make-rprivate /
+mkdir -p "$root/proc" "$root/dev" "$root/tmp"
+chmod 1777 "$root/tmp"
+mount -t proc proc "$root/proc"
+mount -t tmpfs -o mode=755 tmpfs "$root/dev"
+for device in null zero random urandom; do
+    touch "$root/dev/$device"
+    mount --bind "/dev/$device" "$root/dev/$device"
+done
+mkdir -p "$root/dev/shm" "$root/dev/pts"
+mount -t tmpfs -o mode=1777 tmpfs "$root/dev/shm"
+mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$root/dev/pts"
+ln -s pts/ptmx "$root/dev/ptmx"
+ln -s /proc/self/fd "$root/dev/fd"
+ln -s /proc/self/fd/0 "$root/dev/stdin"
+ln -s /proc/self/fd/1 "$root/dev/stdout"
+ln -s /proc/self/fd/2 "$root/dev/stderr"
+set +e
+"$@"
+rc=$?
+exit "$rc"
+"#;
+    let mut argv: Vec<String> = ["sudo", "-n", "unshare"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    argv.extend(
+        crate::native::UNSHARE_FLAGS
+            .iter()
+            .map(|flag| (*flag).into()),
+    );
+    argv.extend(
+        [
+            "/bin/sh",
+            "-eu",
+            "-c",
+            SETUP,
+            "native-oracle",
+            root,
+            "env",
+            "-i",
+        ]
+        .into_iter()
+        .map(String::from),
+    );
+    argv.push("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
+    argv.extend(rootfs.env.iter().cloned());
+    argv.extend(
+        suite
+            .env
+            .iter()
+            .chain(&suite.env_docker)
+            .map(|kv| format!("{}={}", kv.key, kv.val)),
+    );
+    argv.extend(["/usr/sbin/chroot".into(), root.into()]);
+    let workdir = suite
+        .workdir
+        .as_deref()
+        .or(rootfs.workdir.as_deref())
+        .unwrap_or("/");
+    if workdir != "/" {
+        anyhow::ensure!(workdir.starts_with('/'), "native workdir must be absolute");
+        argv.extend([
+            "/bin/sh".into(),
+            "-eu".into(),
+            "-c".into(),
+            "cd -- \"$1\"; shift; exec \"$@\"".into(),
+            "native-workdir".into(),
+            workdir.into(),
+        ]);
+    }
+    let entrypoint = suite.entrypoint.as_ref().and_then(|ep| ep.for_docker());
+    match entrypoint {
+        Some(ep) if !ep.is_empty() => argv.push(ep),
+        Some(_) => {}
+        None => argv.extend(rootfs.entrypoint.iter().cloned()),
+    }
+    argv.extend(if suite.cmd.is_empty() {
+        rootfs.cmd.clone()
+    } else {
+        effective_cmd(suite)
+    });
+    Ok(argv)
+}
