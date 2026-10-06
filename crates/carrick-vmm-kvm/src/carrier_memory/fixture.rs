@@ -267,6 +267,7 @@ impl MemoryWitness {
             DescriptorOp::Publish {
                 span: PageSpan::new(DATA_VA, PAGE),
                 expected: output,
+                access: Access::Read,
             },
         )
     }
