@@ -48,6 +48,10 @@ fn assert_opaque_registrations(calls: [&[(u64, u64)]; 2]) {
     let a = program(calls[0]);
     let b = program(calls[1]);
     let mut carrier = Cpl0Carrier::boot(&image(), [&a, &b]).expect("real KVM + CPL0 image");
+    assert!(
+        carrier.zone().is_err(),
+        "ordinary boot has no retained MM zone"
+    );
     let mut heads = [(0, 0); 2];
     let mut entries = [0; 2];
     let mut publications = [0; 2];
@@ -319,6 +323,7 @@ fn x1_boot_shared_substrate() {
     assert_eq!(
         carrier
             .zone()
+            .unwrap()
             .counters
             .el1_space_switches
             .load(std::sync::atomic::Ordering::Acquire),
@@ -327,7 +332,7 @@ fn x1_boot_shared_substrate() {
     );
 
     // Verify admission and occupancy installed inside CPL0
-    assert_eq!(carrier.zone().installed_space(slot), mm);
+    assert_eq!(carrier.zone().unwrap().installed_space(slot), mm);
 
     // 3. Preserve native context / TLS / XSAVE
     assert_eq!(obs1.captured_stack, 0x3_1fe8);
@@ -365,7 +370,7 @@ fn x1_boot_shared_substrate() {
         "error must report root mismatch: {err}"
     );
     assert_eq!(
-        wrong_root_carrier.zone().installed_space(slot),
+        wrong_root_carrier.zone().unwrap().installed_space(slot),
         0,
         "refusal vacates occupancy"
     );
@@ -411,7 +416,7 @@ fn x1_boot_shared_substrate() {
         "error must report COW owed: {err}"
     );
     assert_eq!(
-        cow_owed_carrier.zone().installed_space(slot),
+        cow_owed_carrier.zone().unwrap().installed_space(slot),
         0,
         "refusal vacates occupancy"
     );

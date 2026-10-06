@@ -20,6 +20,9 @@ pub const ENTRY_KICK_PORT: u16 = 0xc9;
 pub const RETURN_KICK_PORT: u16 = 0xca;
 pub const WORK_PORT: u16 = 0xcb;
 pub const FATAL_PORT: u16 = 0xcc;
+pub const OWNER_PARK_READY_PORT: u16 = 0xd0;
+/// Execution-lane fixture control; never a Linux syscall ordinal.
+pub const PARK_OWNER_NATIVE: u64 = u64::MAX - 1;
 /// Fixture observation only, outside Linux semantic serving.
 pub const OBSERVE_NATIVE: u64 = u64::MAX;
 
@@ -111,8 +114,13 @@ pub struct CpuBinding {
     pub table_memory_start: u64,
     /// Exclusive end of the authenticated supervisor table-memory view.
     pub table_memory_end: u64,
+    /// Undelivered native wake destinations, owned until a carrier boundary.
+    pub pending_owner_wakes: AtomicU64,
+    pub owner_wake_irqs: AtomicU64,
 }
 const _: () = assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
+
+const _: () = assert!(core::mem::size_of::<CpuBinding>() <= CPU_BINDING_STRIDE as usize);
 
 #[cfg(test)]
 mod tests {

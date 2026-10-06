@@ -10,6 +10,7 @@ unsafe extern "C" {
     fn carrick_progress_start() -> !;
     fn carrick_timer_irq();
     fn carrick_kick_irq();
+    fn carrick_owner_kick_irq();
 }
 
 #[used]
@@ -19,6 +20,7 @@ static HEADER: ProgressHeader = ProgressHeader {
     entry: carrick_progress_start,
     timer: carrick_timer_irq,
     kick: carrick_kick_irq,
+    owner_kick: carrick_owner_kick_irq,
 };
 
 core::arch::global_asm!(

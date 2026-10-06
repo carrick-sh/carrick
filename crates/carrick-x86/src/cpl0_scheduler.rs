@@ -82,6 +82,7 @@ pub struct ProgressHeader {
     pub entry: unsafe extern "C" fn() -> !,
     pub timer: unsafe extern "C" fn(),
     pub kick: unsafe extern "C" fn(),
+    pub owner_kick: unsafe extern "C" fn(),
 }
 
 #[repr(C)]

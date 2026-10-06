@@ -1,5 +1,6 @@
 //! Bounded M2 hardware binding: one VM, two issued live task slots, native
-//! SYSCALL entry and IRETQ return. This is not an OCI/runtime/MM-owner binding.
+//! SYSCALL entry and IRETQ return, including linked MM-owner serving.
+//! This fixture does not establish OCI/runtime executor-pool acceptance.
 //! Observation and kick doorbells are declared fixture control transport.
 use crate::guest_setup::{GuestRam, WindowKind};
 use crate::{KvmKickHandle, KvmVcpu, KvmVm};
@@ -113,9 +114,10 @@ pub struct Cpl0Carrier {
     pub(crate) _vm: KvmVm,
     pub(crate) ram: GuestRam,
     metadata_base: NonNull<u8>,
-    host_forwards: u64,
-    kicks: u64,
-    work_exits: u64,
+    host_forwards: AtomicU64,
+    kicks: AtomicU64,
+    work_exits: AtomicU64,
+    handbacks: std::sync::Mutex<Vec<carrick_sched_core::RecordRef>>,
 }
 
 impl Cpl0Carrier {
@@ -237,14 +239,7 @@ impl Cpl0Carrier {
             maps.extend(crate::carrier_interrupts::supervisor_maps());
             maps.push(crate::carrier_interrupts::data_map(0));
         } else if let BootMode::Shared { .. } = mode {
-            maps.push(Pml4MapSpec {
-                va: carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
-                gpa: carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
-                len: 0x100_0000,
-                user: false,
-                write: true,
-                exec: false,
-            });
+            maps.extend(crate::carrier_interrupts::supervisor_maps());
         }
         let tables = pml4_tables(
             &maps,
@@ -317,7 +312,7 @@ impl Cpl0Carrier {
                 zone_ptr.write_bytes(0, 1);
                 let binding_ptr = ram
                     .host_ptr(
-                        carrick_x86::cpl0_scheduler::PROGRESS_STATE,
+                        carrick_x86::cpl0_mmu::OWNER_CONTEXT_BASE,
                         size_of::<ContextBinding>(),
                     )
                     .ok_or_else(|| fail("binding backing"))?
@@ -360,7 +355,7 @@ impl Cpl0Carrier {
                             .cast::<ZoneTables>();
                         let binding = &*ram
                             .host_ptr(
-                                carrick_x86::cpl0_scheduler::PROGRESS_STATE,
+                                carrick_x86::cpl0_mmu::OWNER_CONTEXT_BASE,
                                 size_of::<ContextBinding>(),
                             )
                             .ok_or_else(|| fail("binding backing"))?
@@ -405,7 +400,7 @@ impl Cpl0Carrier {
                     if index == 0 {
                         (
                             carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
-                            carrick_x86::cpl0_scheduler::PROGRESS_STATE,
+                            carrick_x86::cpl0_mmu::OWNER_CONTEXT_BASE,
                         )
                     } else {
                         (0, 0)
@@ -459,6 +454,8 @@ impl Cpl0Carrier {
                     },
                     table_memory_start: LAYOUT.pml4_base,
                     table_memory_end: 0xc0_0000,
+                    pending_owner_wakes: AtomicU64::new(0),
+                    owner_wake_irqs: AtomicU64::new(0),
                 });
                 if matches!(mode, BootMode::Shared { .. }) {
                     let zone = &*ram
@@ -473,8 +470,31 @@ impl Cpl0Carrier {
                 }
             }
         }
+        if matches!(mode, BootMode::Shared { .. }) {
+            let header = ram
+                .host_ptr(
+                    carrick_x86::cpl0_scheduler::PROGRESS_HEADER,
+                    size_of::<carrick_x86::cpl0_scheduler::ProgressHeader>(),
+                )
+                .ok_or_else(|| fail("owner interrupt image header"))?;
+            // Validate integer entries before installing the guest handler.
+            let words = unsafe { core::slice::from_raw_parts(header.cast::<u64>(), 5) };
+            if words[0] != carrick_x86::cpl0_scheduler::PROGRESS_MAGIC
+                || !(0x10_0000..0x1f_0000).contains(&words[4])
+            {
+                return Err(fail("owner interrupt header mismatch"));
+            }
+            for index in 0..2 {
+                let idt = carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index)?;
+                ram.write_gpa(
+                    idt + u64::from(carrick_x86::interrupts::KICK_VECTOR) * 16,
+                    &carrick_x86::interrupts::interrupt_gate(words[4]),
+                )
+                .map_err(|e| fail(e.to_string()))?;
+            }
+        }
         let mut vm = KvmVm::create_empty().map_err(|e| fail(e.to_string()))?;
-        if matches!(mode, BootMode::Interrupts) {
+        if matches!(mode, BootMode::Interrupts | BootMode::Shared { .. }) {
             crate::carrier_interrupts::create_irqchip(&vm)?;
         }
         for (gpa, ptr, len) in ram.windows_for_kvm() {
@@ -493,6 +513,15 @@ impl Cpl0Carrier {
         let mut a = vm.add_vcpu().map_err(|e| fail(e.to_string()))?;
         let mut b = vm.add_vcpu().map_err(|e| fail(e.to_string()))?;
         for (index, cpu) in [&mut a, &mut b].into_iter().enumerate() {
+            if matches!(mode, BootMode::Shared { .. }) {
+                // Native executors enter independently; no guest firmware
+                // owns AP startup or can issue an INIT/SIPI sequence here.
+                cpu.fd()
+                    .set_mp_state(kvm_bindings::kvm_mp_state {
+                        mp_state: kvm_bindings::KVM_MP_STATE_RUNNABLE,
+                    })
+                    .map_err(|e| fail(e.to_string()))?;
+            }
             let mut layout = LAYOUT;
             layout.trampoline_base = plan.entry;
             carrick_x86::program_longmode_entry(
@@ -531,7 +560,7 @@ impl Cpl0Carrier {
                 let binding = unsafe {
                     &*ram
                         .host_ptr(
-                            carrick_x86::cpl0_scheduler::PROGRESS_STATE,
+                            carrick_x86::cpl0_mmu::OWNER_CONTEXT_BASE,
                             size_of::<ContextBinding>(),
                         )
                         .ok_or_else(|| fail("binding backing"))?
@@ -566,22 +595,27 @@ impl Cpl0Carrier {
             _vm: vm,
             ram,
             metadata_base,
-            host_forwards: 0,
-            kicks: 0,
-            work_exits: 0,
+            host_forwards: AtomicU64::new(0),
+            kicks: AtomicU64::new(0),
+            work_exits: AtomicU64::new(0),
+            handbacks: std::sync::Mutex::new(Vec::new()),
         })
     }
 
-    pub fn zone(&self) -> &ZoneTables {
-        // SAFETY: carrier-retained common records at PROGRESS_ZONE in guest RAM.
+    pub fn zone(&self) -> Result<&ZoneTables, TrapError> {
         let ptr = self
             .ram
             .host_ptr(
                 carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
                 size_of::<ZoneTables>(),
             )
-            .unwrap_or_else(|| NonNull::dangling().as_ptr());
-        unsafe { &*ptr.cast::<ZoneTables>() }
+            .ok_or_else(|| fail("no retained shared zone in this boot venue"))?;
+        if !(ptr as usize).is_multiple_of(align_of::<ZoneTables>()) {
+            return Err(fail("shared zone alignment"));
+        }
+        // SAFETY: shared/interrupt boot backing contains the initialized,
+        // documented zero-valid zone, retained by this carrier borrow.
+        Ok(unsafe { &*ptr.cast::<ZoneTables>() })
     }
 
     pub fn guest_ptr<T>(&self, gpa: u64) -> Option<*mut T> {
@@ -680,6 +714,16 @@ impl Cpl0Carrier {
         .ok_or_else(|| fail("owner binding publication changed"))
     }
 
+    pub fn owner_transport(&self) -> impl carrick_x86::cpl0_mmu::OwnerExecutionTransport + '_ {
+        OwnerTransport {
+            vm: &self._vm,
+            handbacks: &self.handbacks,
+        }
+    }
+    pub fn take_owner_handbacks(&self) -> Vec<carrick_sched_core::RecordRef> {
+        core::mem::take(&mut *self.handbacks.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     pub fn inject_boundary_kicks(&mut self, index: usize) -> Result<(), TrapError> {
         if index >= 2 {
             return Err(fail("unknown CPL0 task"));
@@ -689,21 +733,207 @@ impl Cpl0Carrier {
         Ok(())
     }
 
-    /// Run until a user fixture reports its last result. A finite exit budget
-    /// and owned watchdog bound transport loops and an in-guest infinite loop.
-    pub fn observe(&mut self, index: usize) -> Result<Observation, TrapError> {
-        if index >= 2 {
-            return Err(fail("unknown CPL0 task"));
+    /// Publish only machine state for an already issued exact waiter while
+    /// both vCPUs are stopped. Runnable and blocked claims stay in ZoneTables.
+    pub fn bind_owner_waiter(
+        &mut self,
+        index: usize,
+        context: &ContextBinding,
+        program: &[u8],
+    ) -> Result<(), TrapError> {
+        if index != 1 || program.len() > 4096 {
+            return Err(fail("unknown owner waiter"));
         }
+        let identity = self
+            .zone()?
+            .live(context.record)
+            .ok_or_else(|| fail("stale owner waiter"))?
+            .identity();
+        let address =
+            carrick_x86::cpl0_mmu::OWNER_CONTEXT_BASE + carrick_x86::cpl0_mmu::OWNER_CONTEXT_STRIDE;
+        let ptr = self
+            .ram
+            .host_ptr(address, size_of::<ContextBinding>())
+            .ok_or_else(|| fail("waiter context backing"))?
+            .cast::<ContextBinding>();
+        // SAFETY: stopped carrier, aligned private sidecar, retained until VM retirement.
+        unsafe {
+            ptr.write(ContextBinding {
+                record: context.record,
+                context: context.context.clone(),
+            });
+            let binding = &mut *self
+                .ram
+                .host_ptr(META_GPA + BINDING_OFFSET + STRIDE, size_of::<CpuBinding>())
+                .ok_or_else(|| fail("waiter binding backing"))?
+                .cast::<CpuBinding>();
+            binding.zone_address = carrick_x86::cpl0_scheduler::PROGRESS_ZONE;
+            binding.context_binding_address = address;
+            binding.admitted.store(0, Ordering::Release);
+        }
+        self.task(index).set(
+            El1TaskId::from_linux_tid(identity.tid as i32),
+            identity.mm,
+            identity.generation,
+        );
+        self.task(index)
+            .thread_serial
+            .store(identity.serial, Ordering::Release);
+        self.slot(index).reset_for_host_birth(BlockedMask(0));
+        if !self.slot(index).publish_visible_tid(identity.tid as u32) {
+            return Err(fail("owner waiter identity"));
+        }
+        // Publish the issued sidecar's machine context before either lane
+        // starts; the park/IRQ path then preserves that actual native state.
+        let msrs = Msrs::from_entries(&[
+            kvm_msr_entry {
+                index: 0xc000_0100,
+                data: context.context.fs_base,
+                ..Default::default()
+            },
+            kvm_msr_entry {
+                index: 0xc000_0101,
+                data: context.context.gs_base,
+                ..Default::default()
+            },
+        ])
+        .map_err(|e| fail(e.to_string()))?;
+        if self.cpus[index]
+            .fd()
+            .set_msrs(&msrs)
+            .map_err(|e| fail(e.to_string()))?
+            != 2
+        {
+            return Err(fail("waiter TLS MSRs not installed"));
+        }
+        let _ = self.cpus[index].set_xsave(&context.context.xsave.0)?;
+        self.write_guest_bytes(USER_CODE + 4096, program)
+    }
+
+    pub fn observe(&mut self, index: usize) -> Result<Observation, TrapError> {
+        let controls = NativeControls::new(
+            &self.ram,
+            &self._vm,
+            &self.host_forwards,
+            &self.kicks,
+            &self.work_exits,
+            &self.handbacks,
+        )?;
+        let cpu = self
+            .cpus
+            .get_mut(index)
+            .ok_or_else(|| fail("unknown CPL0 task"))?;
+        controls.observe(cpu, index, None)
+    }
+
+    /// Both native execution lanes remain borrowed by this carrier. The
+    /// readiness doorbell only observes HLT admission; it cannot complete MM
+    /// work or supply a wake. Each lane retains the existing five-second bound.
+    pub fn observe_owner_completion(&mut self) -> Result<(Observation, Observation), TrapError> {
+        let controls = NativeControls::new(
+            &self.ram,
+            &self._vm,
+            &self.host_forwards,
+            &self.kicks,
+            &self.work_exits,
+            &self.handbacks,
+        )?;
+        let [owner, waiter] = &mut self.cpus;
+        std::thread::scope(|scope| {
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let parked = scope.spawn(move || controls.observe(waiter, 1, Some(&ready_tx)));
+            if ready_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+                return match parked
+                    .join()
+                    .map_err(|_| fail("owner waiter thread panicked"))?
+                {
+                    Err(err) => Err(err),
+                    Ok(_) => Err(fail("owner waiter never parked")),
+                };
+            }
+            let completed = controls.observe(owner, 0, None);
+            let resumed = parked
+                .join()
+                .map_err(|_| fail("owner waiter thread panicked"))?;
+            Ok((
+                completed?,
+                resumed.map_err(|e| fail(format!("parked executor did not resume: {e}")))?,
+            ))
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NativeControls<'a> {
+    ram: &'a GuestRam,
+    vm: &'a KvmVm,
+    bindings: [&'a CpuBinding; 2],
+    tasks: [&'a CurrentTask; 2],
+    slots: [&'a ThreadControlSlot; 2],
+    counters: &'a Counters,
+    host_forwards: &'a AtomicU64,
+    kicks: &'a AtomicU64,
+    work_exits: &'a AtomicU64,
+    handbacks: &'a std::sync::Mutex<Vec<carrick_sched_core::RecordRef>>,
+}
+impl<'a> NativeControls<'a> {
+    fn new(
+        ram: &'a GuestRam,
+        vm: &'a KvmVm,
+        host_forwards: &'a AtomicU64,
+        kicks: &'a AtomicU64,
+        work_exits: &'a AtomicU64,
+        handbacks: &'a std::sync::Mutex<Vec<carrick_sched_core::RecordRef>>,
+    ) -> Result<Self, TrapError> {
+        fn record<T>(ram: &GuestRam, offset: u64) -> Result<&T, TrapError> {
+            let ptr = ram
+                .host_ptr(META_GPA + offset, size_of::<T>())
+                .ok_or_else(|| fail("native control backing"))?;
+            if !(ptr as usize).is_multiple_of(align_of::<T>()) {
+                return Err(fail("native control alignment"));
+            }
+            // SAFETY: bootstrap initialized these retained supervisor records.
+            Ok(unsafe { &*ptr.cast::<T>() })
+        }
+        Ok(Self {
+            ram,
+            vm,
+            bindings: [
+                record(ram, BINDING_OFFSET)?,
+                record(ram, BINDING_OFFSET + STRIDE)?,
+            ],
+            tasks: [
+                record(ram, TASK_OFFSET)?,
+                record(ram, TASK_OFFSET + STRIDE)?,
+            ],
+            slots: [
+                record(ram, CONTROL_OFFSET)?,
+                record(ram, CONTROL_OFFSET + STRIDE)?,
+            ],
+            counters: record(ram, COUNTERS_OFFSET)?,
+            host_forwards,
+            kicks,
+            work_exits,
+            handbacks,
+        })
+    }
+    fn observe(
+        &self,
+        cpu: &mut KvmVcpu,
+        index: usize,
+        ready: Option<&mpsc::Sender<()>>,
+    ) -> Result<Observation, TrapError> {
         let watchdog = Watchdog::start();
         for _ in 0..32 {
-            let exit = HvVcpu::run(&mut self.cpus[index]).map_err(|e| fail(e.to_string()))?;
+            let exit = HvVcpu::run(cpu).map_err(|e| fail(e.to_string()))?;
             if watchdog.expired.load(Ordering::Acquire) {
-                return Err(fail("CPL0 fixture deadline"));
+                let mut detail = format!("CPL0 lane {index} fixture deadline");
+                cpu.append_debug_state(&mut detail);
+                return Err(fail(detail));
             }
             let VcpuExit::IoOut { port, .. } = exit else {
                 let mut detail = "unexpected CPL0 non-control exit".to_owned();
-                self.cpus[index].append_debug_state(&mut detail);
+                cpu.append_debug_state(&mut detail);
                 return Err(fail(detail));
             };
             if !matches!(
@@ -714,13 +944,14 @@ impl Cpl0Carrier {
                     | RETURN_KICK_PORT
                     | WORK_PORT
                     | FATAL_PORT
+                    | OWNER_PARK_READY_PORT
             ) {
                 let mut detail = format!("unexpected CPL0 port {port:#x}");
-                self.cpus[index].append_debug_state(&mut detail);
+                cpu.append_debug_state(&mut detail);
                 return Err(fail(detail));
             }
-            let address = self.cpus[index].get_gpr(X86Reg::Rax)?;
-            let stack_end = self.binding(index).kernel_stack + 16;
+            let address = cpu.get_gpr(X86Reg::Rax)?;
+            let stack_end = self.bindings[index].kernel_stack + 16;
             if address & 7 != 0
                 || address < stack_end - 0x1_0000
                 || address
@@ -740,35 +971,41 @@ impl Cpl0Carrier {
             // frame; no other CPU uses its private kernel stack.
             let frame = unsafe { &mut *ptr };
             match port {
+                OWNER_PARK_READY_PORT => {
+                    ready
+                        .ok_or_else(|| fail("unexpected owner park control"))?
+                        .send(())
+                        .map_err(|_| fail("owner park receiver gone"))?;
+                }
                 CONTROL_PORT => {
-                    let counters: &Counters = self.metadata(COUNTERS_OFFSET);
+                    let counters: &Counters = self.counters;
                     return Ok(Observation {
                         result: frame.rdi as i64,
-                        heads: [self.slot(0).robust_list(), self.slot(1).robust_list()],
+                        heads: [self.slots[0].robust_list(), self.slots[1].robust_list()],
                         served: counters.served[99].load(Ordering::Acquire),
                         forwarded: counters.forwarded[99].load(Ordering::Acquire),
-                        semantic_host_exits: self.host_forwards,
+                        semantic_host_exits: self.host_forwards.load(Ordering::Acquire),
                         entries: core::array::from_fn(|i| {
-                            self.binding(i).entries.load(Ordering::Acquire)
+                            self.bindings[i].entries.load(Ordering::Acquire)
                         }),
                         publications: core::array::from_fn(|i| {
-                            self.binding(i).publications.load(Ordering::Acquire)
+                            self.bindings[i].publications.load(Ordering::Acquire)
                         }),
                         completions: core::array::from_fn(|i| {
-                            self.binding(i).completions.load(Ordering::Acquire)
+                            self.bindings[i].completions.load(Ordering::Acquire)
                         }),
                         admissions: core::array::from_fn(|i| {
-                            self.binding(i).admissions.load(Ordering::Acquire)
+                            self.bindings[i].admissions.load(Ordering::Acquire)
                         }),
-                        kicks: self.kicks,
-                        work_exits: self.work_exits,
-                        captured_stack: self.binding(index).captured_stack.load(Ordering::Acquire),
+                        kicks: self.kicks.load(Ordering::Acquire),
+                        work_exits: self.work_exits.load(Ordering::Acquire),
+                        captured_stack: self.bindings[index].captured_stack.load(Ordering::Acquire),
                         returned_stack: frame.rsp,
                         preserved_rbx: frame.rbx,
                     });
                 }
                 FORWARD_PORT => {
-                    self.host_forwards += 1;
+                    self.host_forwards.fetch_add(1, Ordering::Release);
                     return Err(fail(format!("unported CPL0 native call {}", frame.rax)));
                 }
                 FATAL_PORT => {
@@ -786,27 +1023,88 @@ impl Cpl0Carrier {
                     return Err(fail(format!("CPL0 fatal / admission refusal: {reason}")));
                 }
                 ENTRY_KICK_PORT | RETURN_KICK_PORT => {
-                    self.task(index).mark_pending_host_work();
-                    self.cpus[index].fd_mut().set_kvm_immediate_exit(1);
-                    let kicked = HvVcpu::run(&mut self.cpus[index]);
-                    self.cpus[index].fd_mut().set_kvm_immediate_exit(0);
+                    let mut pending = self.bindings[index]
+                        .pending_owner_wakes
+                        .swap(0, Ordering::AcqRel);
+                    for slot in 0..CPU_BINDING_COUNT {
+                        if pending & (1 << slot) != 0 {
+                            if let Err(err) = crate::carrier_interrupts::inject_kick(
+                                self.vm,
+                                carrick_x86::interrupts::ApicId(slot as u8),
+                            ) {
+                                self.bindings[index]
+                                    .pending_owner_wakes
+                                    .fetch_or(pending, Ordering::Release);
+                                return Err(err);
+                            }
+                            pending &= !(1 << slot);
+                        }
+                    }
+                    if pending != 0 {
+                        // A destination without a retained native lane is not
+                        // delivery. Preserve its ownership and fail explicitly.
+                        self.bindings[index]
+                            .pending_owner_wakes
+                            .fetch_or(pending, Ordering::Release);
+                        return Err(fail(
+                            "owner wake destination outside retained execution lanes",
+                        ));
+                    }
+                    if self.bindings[index].zone_address != 0 {
+                        let zone = self
+                            .ram
+                            .host_ptr(self.bindings[index].zone_address, size_of::<ZoneTables>())
+                            .ok_or_else(|| fail("completion consumer backing"))?;
+                        // SAFETY: retained carrier-qualified shared zone.
+                        let zone = unsafe { &*zone.cast::<ZoneTables>() };
+                        carrick_x86::cpl0_mmu::OwnerExecutionTransport::handbacks(
+                            &OwnerTransport {
+                                vm: self.vm,
+                                handbacks: self.handbacks,
+                            },
+                            zone,
+                        );
+                    }
+                    self.tasks[index].mark_pending_host_work();
+                    cpu.fd_mut().set_kvm_immediate_exit(1);
+                    let kicked = HvVcpu::run(cpu);
+                    cpu.fd_mut().set_kvm_immediate_exit(0);
                     if !matches!(kicked, Ok(VcpuExit::Kicked)) {
                         return Err(fail("boundary kick did not interrupt KVM_RUN"));
                     }
-                    self.kicks += 1;
+                    self.kicks.fetch_add(1, Ordering::Release);
                 }
                 WORK_PORT => {
-                    if self.task(index).served_with_work.swap(0, Ordering::AcqRel) == 0 {
+                    if self.tasks[index].served_with_work.swap(0, Ordering::AcqRel) == 0 {
                         return Err(fail("work exit without completed syscall"));
                     }
-                    self.task(index)
+                    self.tasks[index]
                         .pending_host_work
                         .store(0, Ordering::Release);
-                    self.work_exits += 1;
+                    self.work_exits.fetch_add(1, Ordering::Release);
                 }
                 _ => return Err(fail(format!("unexpected CPL0 doorbell {port:#x}"))),
             }
         }
         Err(fail("CPL0 control exit budget exceeded"))
+    }
+}
+
+struct OwnerTransport<'a> {
+    vm: &'a KvmVm,
+    handbacks: &'a std::sync::Mutex<Vec<carrick_sched_core::RecordRef>>,
+}
+impl carrick_x86::cpl0_mmu::OwnerExecutionTransport for OwnerTransport<'_> {
+    fn wake(&self, slot: SlotId) -> bool {
+        crate::carrier_interrupts::inject_kick(self.vm, carrick_x86::interrupts::ApicId(slot.raw()))
+            .is_ok()
+    }
+    fn handbacks(&self, zone: &ZoneTables) {
+        zone.take_completion_handbacks(&carrick_sched_core::BoundedSpin(0), &mut |record| {
+            self.handbacks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(record);
+        });
     }
 }

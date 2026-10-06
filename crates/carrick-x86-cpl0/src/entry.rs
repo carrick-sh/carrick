@@ -93,6 +93,29 @@ core::arch::global_asm!(
     "iretq",
 );
 
+// A native lane wake changes no task policy or user context. The shared
+// scheduler owns admission after HLT; this leaf only acknowledges the LAPIC.
+#[cfg(target_os = "none")]
+core::arch::global_asm!(
+    ".global carrick_owner_kick_irq",
+    "carrick_owner_kick_irq:",
+    "push rax",
+    "test byte ptr [rsp + 16], 3",
+    "jz 1f",
+    "swapgs",
+    "1:",
+    "lock inc qword ptr gs:[{irq_count}]",
+    "mov rax, 0xfee000b0",
+    "mov dword ptr [rax], 0",
+    "test byte ptr [rsp + 16], 3",
+    "jz 2f",
+    "swapgs",
+    "2:",
+    "pop rax",
+    "iretq",
+    irq_count = const core::mem::offset_of!(adapter::CpuBinding, owner_wake_irqs),
+);
+
 #[cfg(target_os = "none")]
 mod kernel {
     use super::adapter::*;
@@ -115,6 +138,40 @@ mod kernel {
             doorbell(FATAL_PORT, frame);
             halt();
         }
+        if frame.rax == PARK_OWNER_NATIVE {
+            // Carrier-issued supervisor addresses retained for both executors.
+            let zone = unsafe { &*(binding.zone_address as *const carrick_sched_core::ZoneTables) };
+            let context = unsafe {
+                &*(binding.context_binding_address as *const super::scheduler::ContextBinding)
+            };
+            let slot = carrick_sched_core::SlotId::new(binding.slot as u8);
+            binding.entries.fetch_add(1, Ordering::Release);
+            unsafe { super::interrupts::hardware::enable() };
+            if zone.enter_idle(slot, true) {
+                doorbell(OWNER_PARK_READY_PORT, frame);
+                // IF is masked by native SYSCALL. STI/HLT admits a published
+                // pending IPI atomically, with no shared lock held.
+                unsafe { super::interrupts::hardware::park_until_interrupt() };
+            }
+            zone.leave_idle(slot);
+            let Some(record) = zone.switch_in(slot) else {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            };
+            if zone.record_ref(record) != context.record
+                || super::scheduler::admit_context_detailed(zone, slot, context).is_err()
+            {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            unsafe { super::scheduler::install_root(context.context.address.root) };
+            binding.admitted.store(1, Ordering::Release);
+            binding.admissions.fetch_add(1, Ordering::Release);
+            binding.entry_kick.store(0, Ordering::Release);
+            binding.completions.fetch_add(1, Ordering::Release);
+            frame.rax = 0;
+            return;
+        }
         if binding.zone_address != 0 && binding.admitted.swap(1, Ordering::AcqRel) == 0 {
             let zone = unsafe { &*(binding.zone_address as *const carrick_sched_core::ZoneTables) };
             let context_binding = unsafe {
@@ -133,6 +190,11 @@ mod kernel {
             doorbell(CONTROL_PORT, frame);
             frame.rax = 0;
             return;
+        }
+        // Every native owner entry consumes its pending carrier boundary,
+        // including MM grants, before any semantic dispatch branch.
+        if binding.entry_kick.swap(0, Ordering::AcqRel) != 0 {
+            doorbell(ENTRY_KICK_PORT, frame);
         }
         if frame.rax == carrick_el1_abi::MM_PORTAL_GRANT_ESR {
             // SAFETY: native entry supplies this lane's carrier-issued binding.
@@ -155,9 +217,6 @@ mod kernel {
             binding.scheduler_witness.load(Ordering::Acquire) == super::scheduler::PROGRESS_STATE;
         if scheduler_witness {
             super::progress::entry_boundary();
-        }
-        if binding.entry_kick.swap(0, Ordering::AcqRel) != 0 {
-            doorbell(ENTRY_KICK_PORT, frame);
         }
         let call = frame.decode();
         binding

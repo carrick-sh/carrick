@@ -26,6 +26,12 @@ const _: () = assert!(
 pub const PROGRESS_RESERVATIONS: u64 = 0x160_0000;
 pub const PROGRESS_RESIDENCY: u64 = 0x170_0000;
 pub const PROGRESS_PORTAL: u64 = 0x180_0000;
+/// Native context sidecars must never alias the residency authority.
+pub const OWNER_CONTEXT_BASE: u64 = 0x1b0_0000;
+pub const OWNER_CONTEXT_STRIDE: u64 = 4096;
+const _: () = assert!(
+    core::mem::size_of::<crate::cpl0_scheduler::ContextBinding>() <= OWNER_CONTEXT_STRIDE as usize
+);
 
 /// Uninhabited pinned metadata extent for guest execution.
 #[derive(Clone, Copy, Debug)]
@@ -138,7 +144,12 @@ fn request_owner_boundary(
         return false;
     }
     publish_owner_boundary(binding, current);
-    true
+    if current {
+        return true;
+    }
+    // The owned queue publication precedes the native execution-lane wake.
+    // Busy ICR is returned to the retained carrier boundary, never polled.
+    unsafe { crate::interrupts::hardware::send_wake(crate::interrupts::ApicId(slot.raw())) }.is_ok()
 }
 
 #[cfg(not(target_os = "none"))]
@@ -154,6 +165,14 @@ fn publish_owner_boundary(binding: &CpuBinding, current: bool) {
     } else {
         binding.entry_kick.store(1, Ordering::Release);
     }
+}
+
+/// Retained carrier transport. Queue placement is already complete; this
+/// capability only delivers execution-lane wakes and consumes owned handbacks.
+#[cfg(not(target_os = "none"))]
+pub trait OwnerExecutionTransport: Sync {
+    fn wake(&self, slot: carrick_sched_core::SlotId) -> bool;
+    fn handbacks(&self, zone: &ZoneTables);
 }
 
 /// Host aliases licensed by the carrier's retained backing, never by casting
@@ -195,6 +214,7 @@ impl<'a> HostOwnerBindings<'a> {
     pub fn with_space_access<R>(
         &self,
         boundary: carrick_sched_core::SlotId,
+        transport: &impl OwnerExecutionTransport,
         use_access: impl FnOnce(carrick_sched_core::spaces::notification::SpaceAccess<'_>) -> R,
     ) -> R {
         let deliver =
@@ -202,13 +222,27 @@ impl<'a> HostOwnerBindings<'a> {
              _: carrick_sched_core::Waker,
              effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
                 assert!(core::ptr::eq(zone, self.zone));
-                deliver_owner_effects_with(boundary, effects, |slot, current| {
-                    let Some(binding) = self.binding(slot) else {
-                        return false;
-                    };
-                    publish_owner_boundary(binding, current);
-                    true
-                });
+                deliver_owner_effects_with(
+                    boundary,
+                    effects,
+                    |slot, current| {
+                        let Some(binding) = self.binding(slot) else {
+                            return false;
+                        };
+                        publish_owner_boundary(binding, current);
+                        current || transport.wake(slot)
+                    },
+                    |pending| {
+                        if let Some(binding) = self.binding(boundary) {
+                            binding
+                                .pending_owner_wakes
+                                .fetch_or(pending, Ordering::Release);
+                        }
+                    },
+                );
+                // Host releases already own a carrier boundary and can deliver
+                // the existing completion chain without another guest entry.
+                transport.handbacks(zone);
             };
         use_access(
             carrick_sched_core::spaces::notification::SpaceAccess::notified(
@@ -227,29 +261,55 @@ fn deliver_owner_effects(
     venue: carrick_sched_core::SlotId,
     owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
 ) {
-    deliver_owner_effects_with(venue, owned, |slot, current| {
-        request_owner_boundary(zone, slot, current)
-    });
+    deliver_owner_effects_with(
+        venue,
+        owned,
+        |slot, current| request_owner_boundary(zone, slot, current),
+        |pending| {
+            #[cfg(target_os = "none")]
+            if let Some(target) = super::adapter::cpu_binding_address(venue) {
+                if zone.slot(venue).sgi_target() == target {
+                    // SAFETY: qualified current lane binding retained by native entry.
+                    let binding = unsafe { &*(target as *const CpuBinding) };
+                    binding
+                        .pending_owner_wakes
+                        .fetch_or(pending, Ordering::Release);
+                }
+            }
+            #[cfg(not(target_os = "none"))]
+            let _ = pending;
+        },
+    );
 }
 
 fn deliver_owner_effects_with(
     venue: carrick_sched_core::SlotId,
     owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
     mut request: impl FnMut(carrick_sched_core::SlotId, bool) -> bool,
+    mut retain: impl FnMut(u64),
 ) {
     let (waker, effects, deferred) = owned.defer_handbacks();
     let own = match waker {
         carrick_sched_core::Waker::El1 { slot } => Some(slot),
         carrick_sched_core::Waker::Host => None,
     };
-    let mut undelivered = false;
+    let mut undelivered = 0u64;
     for slot in effects
         .sgi_slots()
         .chain(own.filter(|slot| effects.queued_own && *slot != venue))
     {
-        undelivered |= !request(slot, slot == venue);
+        if !request(slot, slot == venue) {
+            undelivered |= 1u64 << slot.raw();
+        }
     }
-    if deferred || effects.misplaced || (effects.queued_own && own == Some(venue)) || undelivered {
+    if undelivered != 0 {
+        retain(undelivered);
+    }
+    if deferred
+        || effects.misplaced
+        || (effects.queued_own && own == Some(venue))
+        || undelivered != 0
+    {
         let _ = request(venue, true);
     }
 }

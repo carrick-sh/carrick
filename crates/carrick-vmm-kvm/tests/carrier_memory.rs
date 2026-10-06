@@ -233,6 +233,7 @@ fn x1_shared_mm_owner() {
     let root1 = RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap();
     let root2 = RootGpa::page_aligned(FrameGpa::new(0x68_0000)).unwrap();
 
+    let mut waiter_context = None;
     let p = cpl3_grant_program(DATA_VA);
     let mut carrier = Cpl0Carrier::boot_shared(&cpl0_image(), &p, slot, |zone, binding| {
         zone.drive(slot, 1);
@@ -289,6 +290,24 @@ fn x1_shared_mm_owner() {
                 xsave,
             },
         };
+        let waiter = SlotId::new(1);
+        zone.drive(waiter, 1);
+        zone.publish_slot(waiter, mm11, Some(1), 0);
+        zone.enter_guest(waiter);
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                mm: mm11,
+                tid: 51,
+                serial: 102,
+                generation: 5,
+                affinity: 1 << 1,
+                ..Default::default()
+            })
+            .unwrap();
+        waiter_context = Some(ContextBinding {
+            record: zone.record_ref(record),
+            context: binding.context.clone(),
+        });
     })
     .expect("boot shared carrier on KVM");
 
@@ -354,7 +373,7 @@ fn x1_shared_mm_owner() {
 
     table.publish(idx1, r_mm11, layout).unwrap();
     let host_bindings = carrier.owner_bindings().unwrap();
-    host_bindings.with_space_access(SlotId::new(0), |access1| {
+    host_bindings.with_space_access(SlotId::new(0), &carrier.owner_transport(), |access1| {
         let mut g1 = table.lock_in(access1, idx1, r_mm11, 0).unwrap();
         g1.import(
             ReservationRange::new(DATA_VA, DATA_VA + 1024 * 4096).unwrap(),
@@ -367,7 +386,7 @@ fn x1_shared_mm_owner() {
     });
 
     table.publish(idx2, r_mm12, layout).unwrap();
-    host_bindings.with_space_access(SlotId::new(0), |access2| {
+    host_bindings.with_space_access(SlotId::new(0), &carrier.owner_transport(), |access2| {
         let mut g2 = table.lock_in(access2, idx2, r_mm12, 0).unwrap();
         g2.import(
             ReservationRange::new(DATA_VA, DATA_VA + 4096).unwrap(),
@@ -482,7 +501,80 @@ fn x1_shared_mm_owner() {
     // Case 2: bind authority and serve the still-pending valid grant on MM11.
     portal_slots.bind_carrier(NonZeroU64::new(1).unwrap());
 
-    let obs2 = carrier.observe(0).expect("observe 2");
+    // Park the real remote executor on this MM editor's notification. The
+    // completion below must send its native wake, not rely on a later syscall.
+    let mut waiter_context = waiter_context.unwrap();
+    waiter_context.context.frame.rip += 4096;
+    waiter_context.context.frame.rsp += 0x1_0000;
+    let lease = zone
+        .space_entry(nz(mm11))
+        .unwrap()
+        .notifications(nz(1))
+        .unwrap();
+    let key = lease.key(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor);
+    let host_bindings = carrier.owner_bindings().unwrap();
+    host_bindings.with_space_access(slot, &carrier.owner_transport(), |access| {
+        let venue = access.venue().unwrap();
+        let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+            (venue.deliver)(zone, venue.waker, effects)
+        };
+        let queue = zone
+            .object_wait_with_completion(key, &carrick_sched_core::BoundedSpin(0), &complete)
+            .unwrap();
+        queue
+            .park(
+                queue.snapshot(),
+                waiter_context.record.id,
+                carrick_sched_core::object_wait::OperationToken::new(102, 5).unwrap(),
+            )
+            .unwrap();
+    });
+    let mut waiter_program = Vec::new();
+    for (register, value) in [
+        (0xb8, carrick_x86::cpl0_entry::PARK_OWNER_NATIVE),
+        (0xbf, 0),
+        (0xb8, 273),
+        (0xbf, 0x1234),
+        (0xbe, 24),
+    ] {
+        waiter_program.extend_from_slice(&[0x48, register]);
+        waiter_program.extend_from_slice(&value.to_le_bytes());
+        if register == 0xbf && value == 0 || register == 0xbe {
+            waiter_program.extend_from_slice(&[0x0f, 0x05]);
+        }
+    }
+    waiter_program.extend_from_slice(&[0x48, 0xbf]);
+    waiter_program.extend_from_slice(&0x77u64.to_le_bytes());
+    waiter_program.extend_from_slice(&[0x48, 0xb8]);
+    waiter_program.extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_NATIVE.to_le_bytes());
+    waiter_program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    carrier
+        .bind_owner_waiter(1, &waiter_context, &waiter_program)
+        .unwrap();
+    let (obs2, resumed) = carrier
+        .observe_owner_completion()
+        .expect("real MM completion must resume parked executor");
+    assert_eq!(carrier.fs_base(1).unwrap(), waiter_context.context.fs_base);
+    assert_eq!(carrier.gs_base(1).unwrap(), waiter_context.context.gs_base);
+    assert_eq!(resumed.returned_stack, waiter_context.context.frame.rsp);
+    assert_eq!(resumed.result, 0x77);
+    assert_eq!(resumed.heads[1], (0x1234, 24));
+    assert!(resumed.entries[1] >= 2 && resumed.completions[1] >= 2 && resumed.admissions[1] > 0);
+    assert_eq!(resumed.semantic_host_exits, 0);
+    assert!(
+        carrier
+            .owner_bindings()
+            .unwrap()
+            .binding(SlotId::new(1))
+            .unwrap()
+            .owner_wake_irqs
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    );
+    assert!(
+        matches!(zone.live(waiter_context.record).unwrap().claim(), carrick_sched_core::Claim::OnCpu {slot: owner, ..} if owner == SlotId::new(1))
+    );
+
     assert_eq!(obs2.result, 0, "valid grant must return 0");
     let receipt2 = grant_slot.take_receipt(window, &txn);
     assert!(
@@ -512,7 +604,79 @@ fn x1_shared_mm_owner() {
         (512, window512, txn512),
     ] {
         assert!(grant_slot.submit(next_window, &next_txn));
+        // On the 64-page rung the target lane is held: the actual CPL0 MM
+        // editor release must transfer the completion to its carrier consumer.
+        let detached = if pages == 64 {
+            let record = zone
+                .alloc_record(ThreadIdentity {
+                    mm: mm11,
+                    tid: 52,
+                    serial: 103,
+                    generation: 5,
+                    affinity: 1 << 1,
+                    ..Default::default()
+                })
+                .unwrap();
+            let bindings = carrier.owner_bindings().unwrap();
+            bindings.with_space_access(slot, &carrier.owner_transport(), |access| {
+                let venue = access.venue().unwrap();
+                let complete =
+                    |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+                        (venue.deliver)(zone, venue.waker, effects)
+                    };
+                let queue = zone
+                    .object_wait_with_completion(
+                        key,
+                        &carrick_sched_core::BoundedSpin(0),
+                        &complete,
+                    )
+                    .unwrap();
+                queue
+                    .park_host_rechecked(
+                        queue.snapshot(),
+                        record,
+                        carrick_sched_core::object_wait::OperationToken::new(103, 5).unwrap(),
+                        || true,
+                    )
+                    .unwrap();
+            });
+            Some((
+                zone.record_ref(record),
+                zone.slot_lock(SlotId::new(1), &carrick_sched_core::BoundedSpin(0))
+                    .unwrap(),
+            ))
+        } else {
+            None
+        };
         let observation = carrier.observe(0).expect("observe scaled grant");
+        if let Some((record, held_slot)) = detached {
+            assert_eq!(
+                carrier.take_owner_handbacks(),
+                [record],
+                "native boundary did not consume exact handback"
+            );
+            assert!(matches!(
+                zone.live(record).unwrap().claim(),
+                carrick_sched_core::Claim::Host { .. }
+            ));
+            // SAFETY: this test now owns the detached exact completion; the
+            // carrier consumer has transferred its record custody here.
+            assert_eq!(
+                unsafe { zone.live(record).unwrap().take_object_operation() },
+                Some(carrick_sched_core::object_wait::OperationToken::new(103, 5).unwrap())
+            );
+            assert!(
+                carrier.take_owner_handbacks().is_empty(),
+                "duplicate handback"
+            );
+            drop(held_slot);
+            assert_eq!(
+                zone.place_from_host(record.id).unwrap().slot,
+                SlotId::new(1)
+            );
+            assert!(zone.place_from_host(record.id).is_none());
+        }
+
         assert_eq!(observation.result, 0, "{pages}-page CPL0 grant failed");
         assert_eq!(observation.semantic_host_exits, 0);
         let receipt = grant_slot.take_receipt(next_window, &next_txn);
@@ -626,7 +790,7 @@ fn host_mm_release_uses_carrier_retained_wake_bindings() {
         )
         .unwrap();
     let host_bindings = carrier.owner_bindings().unwrap();
-    host_bindings.with_space_access(owner, |access| {
+    host_bindings.with_space_access(owner, &carrier.owner_transport(), |access| {
         let mut root = roots.lock_in(access, index, mm, 0).unwrap();
         root.import(
             ReservationRange::new(DATA_VA, DATA_VA + 4096).unwrap(),
@@ -671,6 +835,65 @@ fn host_mm_release_uses_carrier_retained_wake_bindings() {
                 .binding(waiter)
                 .unwrap()
                 .entry_kick
+                .load(std::sync::atomic::Ordering::Acquire),
+            1
+        );
+    });
+    // A refused native delivery retains the exact remote destination at the
+    // owner's carrier boundary; a changed kick flag cannot discard custody.
+    struct BusyTransport;
+    impl carrick_x86::cpl0_mmu::OwnerExecutionTransport for BusyTransport {
+        fn wake(&self, _: SlotId) -> bool {
+            false
+        }
+        fn handbacks(&self, _: &carrick_sched_core::ZoneTables) {}
+    }
+    zone.leave_idle(waiter);
+    assert!(zone.switch_in(waiter).is_some());
+    assert!(zone.enter_idle(waiter, true));
+    host_bindings.with_space_access(owner, &BusyTransport, |access| {
+        let root = roots.lock_in(access, index, mm, 0).unwrap();
+        let lease = zone
+            .space_entry(NonZeroU64::new(11).unwrap())
+            .unwrap()
+            .notifications(NonZeroU64::new(root.incarnation().raw()).unwrap())
+            .unwrap();
+        let key = lease.key(SpaceWaitCause::Reservations);
+        let venue = access.venue().unwrap();
+        let complete = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+            (venue.deliver)(zone, venue.waker, effects)
+        };
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                mm: 11,
+                tid: 52,
+                serial: 3,
+                generation: 1,
+                affinity: 1 << waiter.raw(),
+                ..Default::default()
+            })
+            .unwrap();
+        let queue = zone
+            .object_wait_with_completion(key, &BoundedSpin(0), &complete)
+            .unwrap();
+        queue
+            .park(queue.snapshot(), record, OperationToken::new(3, 1).unwrap())
+            .unwrap();
+        drop(queue);
+        drop(root);
+        assert_eq!(
+            host_bindings
+                .binding(owner)
+                .unwrap()
+                .pending_owner_wakes
+                .load(std::sync::atomic::Ordering::Acquire),
+            1 << waiter.raw()
+        );
+        assert_eq!(
+            host_bindings
+                .binding(owner)
+                .unwrap()
+                .return_kick
                 .load(std::sync::atomic::Ordering::Acquire),
             1
         );
