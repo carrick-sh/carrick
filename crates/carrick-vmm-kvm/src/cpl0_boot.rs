@@ -335,6 +335,7 @@ impl Cpl0Carrier {
                     } else {
                         0
                     }),
+                    cpu_slot: index as u32,
                 });
             }
         }

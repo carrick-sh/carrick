@@ -104,6 +104,7 @@ mod kernel {
     use carrick_el1::personality::common_entry::{EntryOutcome, serve_canonical};
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
     use carrick_el1_abi::{Counters, CurrentTask};
+    use carrick_guest_arch::InterruptArch;
     use core::sync::atomic::Ordering;
 
     // Count native exits across CPL0 CPUs for image/link and live diagnostics.
@@ -138,6 +139,11 @@ mod kernel {
     #[unsafe(no_mangle)]
     extern "C" fn carrick_x86_enter(frame: &mut NativeFrame, binding: &CpuBinding) {
         if !frame.valid_user_return() {
+            doorbell(FATAL_PORT, frame);
+            halt();
+        }
+        let mut arch = carrick_el1::isa::x86::kernel_arch();
+        if arch.current_cpu().raw() != binding.cpu_slot {
             doorbell(FATAL_PORT, frame);
             halt();
         }
