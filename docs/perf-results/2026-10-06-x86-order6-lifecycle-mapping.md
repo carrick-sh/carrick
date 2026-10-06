@@ -163,21 +163,28 @@ qualify x87/SSE/AVX switching geometry and native preemption.
 
 Physical Rust source lines under each crate's `src/`, including comments and
 blank lines, excluding `#[cfg(test)]`/`#[test]` item spans and their out-of-line
-module descendants. Integration tests are outside `src/`. Counts use `syn`
+module descendants, test-only fields/initializers and in-function test blocks. Integration tests are outside `src/`. Counts use `syn`
 span locations, propagate test module context, and conservatively count other
 cfg/feature branches. This is not the plan's all-source relocation metric.
 
+The standalone Rust census is retained in `docs/perf-results/order6-census`.
+Run it with `cargo run --locked --offline --manifest-path
+docs/perf-results/order6-census/Cargo.toml -- <tree>`; the base tree is a
+`git archive 0f476ce7a` extraction of the three crates' `src/` directories.
+It uses the same parser for both snapshots; no source renames receive extra
+credit.
+
 | Crate | Before `0f476ce7a` | After | Net reduction |
 | --- | ---: | ---: | ---: |
-| carrick-el1 | 10,958 | 10,417 | 541 |
+| carrick-el1 | 10,950 | 10,397 | 553 |
 | carrick-el1-abi | 9,311 | 8,053 | 1,258 |
 | carrick-aarch64 | 13,468 | 13,468 | 0 |
-| **Production total** | **33,737** | **31,938** | **1,799** |
+| **Production total** | **33,729** | **31,918** | **1,811** |
 
 All `src/` lines (including tests) fall from 58,578 to 56,272: **2,306**.
 That lies in the plan's 2,100–2,600 source-and-witness forecast, 94 below its
-2,400 central estimate. The requested production-only reduction is 301 below
-the lower forecast bound and 601 below the central estimate. The difference
+2,400 central estimate. The requested production-only reduction is 289 below
+the lower forecast bound and 589 below the central estimate. The difference
 is moved ABI assertions, retained ARM frame fixtures and the native hook seam;
 no reduction credit is taken for runtime constants, new X5 witnesses or new
 x86 bindings. The old ARM policy owner is not retained for those fixtures.
