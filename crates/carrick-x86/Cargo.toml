@@ -14,6 +14,7 @@ workspace = true
 [dependencies]
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
+carrick-personality-linux = { path = "../carrick-personality-linux" }
 # The shared x86 engine scaffold sits ABOVE carrick-hal/carrick-mem/
 # carrick-guest-mem and BELOW the per-VMM backend crates (carrick-vmm-bhyve /
 # carrick-vmm-kvm / carrick-vmm-nvmm). It reuses the ISA-neutral error type

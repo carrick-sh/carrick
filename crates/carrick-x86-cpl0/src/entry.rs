@@ -91,7 +91,9 @@ core::arch::global_asm!(
 #[cfg(target_os = "none")]
 mod kernel {
     use super::adapter::*;
-    use carrick_el1::personality::common_entry::{EntryOutcome, serve_canonical};
+    use carrick_el1::personality::common_entry::{
+        EntryOutcome, execution_binding, serve_canonical,
+    };
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
     use carrick_el1_abi::{Counters, CurrentTask};
     use core::sync::atomic::Ordering;
@@ -139,7 +141,12 @@ mod kernel {
             &GuestLifecycleVenue,
             Some(&binding.publications),
         ) {
-            EntryOutcome::Served(result) | EntryOutcome::ServedWithWork(result) => {
+            EntryOutcome::Served { result, completion }
+            | EntryOutcome::ServedWithWork { result, completion } => {
+                if carrick_core::entry::complete(completion, execution_binding(task)).is_err() {
+                    doorbell(FATAL_PORT, frame);
+                    halt();
+                }
                 frame.rax = result.raw() as u64;
             }
             EntryOutcome::Forward => {
