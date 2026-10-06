@@ -1233,7 +1233,7 @@ impl HvfTaskState {
                     && self.page_tables_authority().root_base() == Some(binding.stage1_root.raw())
                     && self
                         .mm_root_slot
-                        .is_some_and(|slot| slot.0 == binding.stage1_root.raw())
+                        .is_none_or(|slot| slot.0 == binding.stage1_root.raw())
             });
         if self.protections.owner() != Some(owner)
             || owner.carrier() != custody.transfer_carrier

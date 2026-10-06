@@ -432,6 +432,9 @@ fn delegated_fixed_file_map_reuses_a_retired_el1_reservation() {
         .unwrap();
     root.guest_munmap(guest, 4 * PAGE);
     memory.fail_unchecked_write.set(true);
+    // The admitted native lane cannot prepare sparse backing through ordinary
+    // protection publication, even while this host syscall owns a reservation.
+    memory.fail_protect_non_zero.set(true);
 
     let fixed = returned(routed_host_mmap(
         &dispatcher,

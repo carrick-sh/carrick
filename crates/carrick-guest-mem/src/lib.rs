@@ -138,6 +138,13 @@ pub enum PrivateFileSource {
     ImmutableLower,
 }
 
+/// File coherence authority and the caller's borrowed reservation admission
+/// for one backing publication. The reservation proof remains scope-bound.
+pub struct PrivateFilePublication<'admission, 'scope> {
+    pub source: PrivateFileSource,
+    pub admission: Option<&'admission OwnerReservedWrite<'scope>>,
+}
+
 // ─── Address-domain newtypes (the mapping/translation seam) ─────────────────
 //
 // The three address domains a mapping call juggles — guest VIRTUAL, guest
@@ -1050,6 +1057,8 @@ pub trait GuestMemory {
     /// is installed; the caller then publishes protection, sharing, and the
     /// beyond-EOF `BUS_ADRERR` tail. Errors degrade to the eager fallback rather
     /// than becoming guest-visible mmap errors.
+    /// An admitted opaque reservation supplies its borrowed exact-owner proof
+    /// through preparation and publication; ordinary calls supply no proof.
     fn map_private_file_backed(
         &mut self,
         _address: u64,
@@ -1057,6 +1066,7 @@ pub trait GuestMemory {
         _host_fd: std::os::fd::BorrowedFd<'_>,
         _offset: u64,
         _source: PrivateFileSource,
+        _admission: Option<&OwnerReservedWrite<'_>>,
     ) -> Result<bool, MemoryError> {
         Ok(false)
     }

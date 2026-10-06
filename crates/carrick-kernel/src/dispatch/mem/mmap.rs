@@ -8,20 +8,18 @@ use carrick_guest_mem::*;
 use carrick_vfs::ProcMapSharing;
 use std::os::fd::{FromRawFd, OwnedFd};
 
-fn write_file_mapping_content(
+fn with_file_mapping_admission<R>(
     dispatcher: &MemView<'_>,
     guard: &super::super::mm_mutation::MmMutationGuard<'_>,
-    memory: &mut impl CurrentMmMemory,
-    address: u64,
-    bytes: &[u8],
-) -> Result<(), MemoryError> {
+    operation: impl FnOnce(Option<&OwnerReservedWrite<'_>>) -> Result<R, MemoryError>,
+) -> Result<R, MemoryError> {
     let authority = dispatcher.mm_authority();
     if !guard.authorizes(&authority.mutation_coordinator, authority.mm_id) {
         return Err(MemoryError::Unsupported);
     }
     let venue = authority.lock().owner_reserved_venue();
     let Some((root, range)) = venue else {
-        return memory.write_bytes_unchecked(address, bytes);
+        return operation(None);
     };
     let carrier = root
         .carrier_identity()
@@ -54,7 +52,19 @@ fn write_file_mapping_content(
     // mutation guard excludes settlement/replacement until this call returns;
     // no MemState, provider, or reservation-root guard enters the backend.
     unsafe {
-        OwnerReservedWrite::with_scope(handle, reserved, |admission| {
+        OwnerReservedWrite::with_scope(handle, reserved, |admission| operation(Some(admission)))
+    }
+}
+
+fn write_file_mapping_content(
+    dispatcher: &MemView<'_>,
+    guard: &super::super::mm_mutation::MmMutationGuard<'_>,
+    memory: &mut impl CurrentMmMemory,
+    address: u64,
+    bytes: &[u8],
+) -> Result<(), MemoryError> {
+    with_file_mapping_admission(dispatcher, guard, |admission| match admission {
+        Some(admission) => {
             if !admission.contains(GuestVa(address), bytes.len()) {
                 return Err(MemoryError::OutOfBounds {
                     address,
@@ -62,8 +72,31 @@ fn write_file_mapping_content(
                 });
             }
             memory.write_owner_reserved_bytes(admission, address, bytes)
-        })
-    }
+        }
+        None => memory.write_bytes_unchecked(address, bytes),
+    })
+}
+
+fn protect_file_mapping(
+    dispatcher: &MemView<'_>,
+    guard: &super::super::mm_mutation::MmMutationGuard<'_>,
+    memory: &mut impl CurrentMmMemory,
+    address: u64,
+    len: usize,
+    prot: u64,
+) -> Result<(), MemoryError> {
+    with_file_mapping_admission(dispatcher, guard, |admission| match admission {
+        Some(admission) => {
+            if !admission.contains(GuestVa(address), len) {
+                return Err(MemoryError::OutOfBounds {
+                    address,
+                    length: len,
+                });
+            }
+            memory.protect_owner_reserved_range(address, len, prot)
+        }
+        None => memory.protect_range(address, len, prot),
+    })
 }
 
 fn retire_anonymous_mapping_backing(
@@ -2146,13 +2179,14 @@ impl<'a> MemView<'a> {
                             source,
                         )
                     } else {
-                        memory.map_private_file_backed(
+                        with_file_mapping_admission(this, cx.mm_mutation, |admission| memory.map_private_file_backed(
                             address,
                             length_usize,
                             borrowed,
                             offset,
                             source,
-                        )
+                            admission,
+                        ))
                     };
                     match lowering {
                         Ok(true) => {
@@ -2217,7 +2251,7 @@ impl<'a> MemView<'a> {
             // requested Linux permission immediately afterward.
             if !bytes.is_empty() {
                 let rw = crate::linux_abi::LINUX_PROT_READ | crate::linux_abi::LINUX_PROT_WRITE;
-                if let Err(error) = memory.protect_range(address, length_usize, rw)
+                if let Err(error) = protect_file_mapping(this, cx.mm_mutation, memory, address, length_usize, rw)
                     && (in_arena || memory.supports_concurrent_exec_protection())
                 {
                     mark_range_unmapped(memory, address, length_usize);
@@ -2256,7 +2290,7 @@ impl<'a> MemView<'a> {
             } else {
                 prot
             };
-            if let Err(error) = memory.protect_range(address, length_usize, initial_prot)
+            if let Err(error) = protect_file_mapping(this, cx.mm_mutation, memory, address, length_usize, initial_prot)
                 && (in_arena || memory.supports_concurrent_exec_protection())
             {
                 if deferred_file_backed_len.is_some() {
@@ -2279,8 +2313,7 @@ impl<'a> MemView<'a> {
                 && let Ok(bus_len_usize) = usize::try_from(bus_len)
             {
                 memory.set_no_access(bus_start, bus_len_usize, true);
-                if let Err(error) = memory
-                    .protect_range(bus_start, bus_len_usize, 0)
+                if let Err(error) = protect_file_mapping(this, cx.mm_mutation, memory, bus_start, bus_len_usize, 0)
                     .and_then(|()| memory.mark_bus_fault(bus_start, bus_len_usize))
                     && memory.supports_concurrent_exec_protection()
                 {

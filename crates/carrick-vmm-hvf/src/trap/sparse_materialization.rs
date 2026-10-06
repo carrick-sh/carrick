@@ -948,9 +948,55 @@ pub(super) struct PublicationContext<'a> {
     _exclusion: Option<Box<dyn carrick_hal::FrameCowQuiesce>>,
     _invocation: Option<&'a carrick_hal::ForeignMmInvocation>,
     foreign: Option<CarrierForeignMmSnapshot>,
+    reserved: Option<(
+        carrick_el1_abi::El1MmHandle,
+        carrick_guest_mem::GuestVaRange,
+    )>,
 }
 
 impl<'a> PublicationContext<'a> {
+    /// The kernel's open opaque NONE reservation already owns exact-MM pause
+    /// and editor exclusion. Borrow its lifetime; never reacquire that gate.
+    pub(super) fn for_reserved(
+        state: std::sync::Arc<MmAccessState>,
+        custody: std::sync::Arc<CarrierVmCustody>,
+        admission: &'a carrick_guest_mem::OwnerReservedWrite<'_>,
+    ) -> Result<Self, TrapError> {
+        let invalid =
+            || TrapError::Hypervisor("reserved file publication identity mismatch".into());
+        let owner = admission.owner();
+        let bound = *state.identity.read();
+        let binding = state.cow_runtime.read().clone().ok_or_else(invalid)?;
+        if owner.carrier() != custody.transfer_carrier
+            || state.protections.owner() != Some(owner)
+            || !bound.is_some_and(|(mm, root)| {
+                mm.raw_for_probe() == owner.mm().raw()
+                    && binding.identity.mm == owner.mm().raw()
+                    && binding.identity.asid == root.asid.raw_for_probe()
+                    && state.page_tables_authority().root_base() == Some(root.stage1_root.raw())
+                    && binding
+                        .mm_root_slot
+                        .is_none_or(|slot| slot.0 == root.stage1_root.raw())
+            })
+            || !binding.persistent_vm_lifecycle
+            || state.page_tables_authority().live_descriptor_owner()
+                != carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
+        {
+            return Err(invalid());
+        }
+        Ok(Self {
+            mm_key: std::num::NonZeroU64::new(owner.mm().raw()).ok_or_else(invalid)?,
+            state,
+            custody,
+            authority: binding.authority,
+            mm_root_slot: binding.mm_root_slot,
+            container_root: binding.container_root,
+            _exclusion: None,
+            _invocation: None,
+            foreign: None,
+            reserved: Some((owner, admission.range())),
+        })
+    }
     /// A physical grant selected by the target EL1 owner. No host policy
     /// snapshot or caller-vCPU identity can authorize this constructor. The
     /// guest revalidates the generation and window before exposing leaves.
@@ -1043,6 +1089,7 @@ impl<'a> PublicationContext<'a> {
             _exclusion: None,
             _invocation: None,
             foreign: None,
+            reserved: None,
         })
     }
 
@@ -1077,6 +1124,7 @@ impl<'a> PublicationContext<'a> {
             _exclusion: None,
             _invocation: Some(invocation),
             foreign: Some(requested.clone()),
+            reserved: None,
         })
     }
 
@@ -1158,6 +1206,7 @@ impl<'a> PublicationContext<'a> {
             _exclusion: Some(exclusion),
             _invocation: None,
             foreign: None,
+            reserved: None,
         })
     }
 }
@@ -1200,9 +1249,27 @@ pub(super) fn publish_replacing(
     flush_stage1: &mut dyn carrick_aarch64::vmm::Stage1Services,
     retire_previous: &mut dyn FnMut(),
 ) -> Result<PublishedSparseExtent, TrapError> {
-    let _legacy = context.state.protections.legacy().ok_or_else(|| {
-        TrapError::Hypervisor("admitted owner MM cannot enter host sparse publication".into())
-    })?;
+    let _legacy = match context.reserved {
+        Some((owner, range)) => {
+            if context.state.protections.owner() != Some(owner)
+                || start < range.start_raw()
+                || end > range.end_raw()
+                || context
+                    .state
+                    .page_tables_authority()
+                    .live_descriptor_owner()
+                    != carrick_mmu_core::aarch64::LiveDescriptorOwner::Guest
+            {
+                return Err(TrapError::Hypervisor(
+                    "reserved file publication escaped its owner range".into(),
+                ));
+            }
+            None
+        }
+        None => Some(context.state.protections.legacy().ok_or_else(|| {
+            TrapError::Hypervisor("admitted owner MM cannot enter host sparse publication".into())
+        })?),
+    };
     let guest_lane = context
         .state
         .page_tables_authority()
@@ -1823,7 +1890,7 @@ pub(super) fn publish_replacing(
 
 /// Retain exact structural owners and stage-2 pins for a complete table edit.
 /// Raw pointers remain valid even if another holder requests retirement.
-struct PinnedStage1Arenas {
+pub(super) struct PinnedStage1Arenas {
     structural:
         std::collections::BTreeMap<u64, (std::sync::Arc<StructuralBackingOwner>, CarrierStage2Pin)>,
     relocated_primary: Option<(u64, GlobalFrameOwnerPin)>,
@@ -1917,7 +1984,7 @@ impl MmAccessState {
         Ok(())
     }
 
-    fn pinned_stage1_arenas(
+    pub(super) fn pinned_stage1_arenas(
         &self,
         custody: &std::sync::Arc<CarrierVmCustody>,
         primary_base: u64,
@@ -3109,6 +3176,7 @@ impl PublicationContext<'static> {
             _exclusion: None,
             _invocation: None,
             foreign: None,
+            reserved: None,
         })
     }
     pub(crate) fn prepare_import<'a>(
