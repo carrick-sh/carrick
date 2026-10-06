@@ -299,11 +299,12 @@ mod kernel {
     struct InitialWords {
         start: u64,
         end: u64,
+        production: bool,
     }
     impl InitialWords {
-        const fn fixture() -> Self { Self { start: 0x20_0000, end: 0xc0_0000 } }
+        const fn fixture() -> Self { Self { start: 0x20_0000, end: 0xc0_0000, production: false } }
         const fn production(table_start: u64, table_end: u64) -> Self {
-            Self { start: table_start, end: table_end }
+            Self { start: table_start, end: table_end, production: true }
         }
         fn word(
             &self,
@@ -319,7 +320,7 @@ mod kernel {
             {
                 return Err(DescriptorRefusal::TableOutsidePrimary);
             }
-            let mapped = if in_grants && self.start == carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA {
+            let mapped = if in_grants && self.production {
                 carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA
                     + (pa - carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA)
             } else {
