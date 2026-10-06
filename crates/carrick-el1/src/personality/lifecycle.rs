@@ -30,7 +30,7 @@ pub use super::thread_setup::{
 };
 use crate::file::UserCopy;
 use carrick_el1_abi::{
-    Action, AltStack, BlockedMask, BornRecord, Claim, Counters, CurrentTask, El1TaskId, EntryState,
+    AltStack, BlockedMask, BornRecord, Claim, Counters, CurrentTask, El1TaskId, EntryState,
     GateState, LifecycleDecline, ThreadCtx, ThreadIdentity, TransitionError, TrapFrame,
 };
 use core::sync::atomic::Ordering;
@@ -127,7 +127,7 @@ pub fn serve<C: ThreadCpu, U: UserWord>(
     mut sched: Option<Sched<'_, C, U>>,
     venue: &dyn LifecycleVenue,
     user: &mut impl UserCopy,
-) -> Option<Action> {
+) -> Option<carrick_personality_linux::dispatch::FamilyCompletion> {
     let nr = frame.x[8] as usize;
     let thread = venue.thread(task).or_else(|| {
         if nr == SYS_EXIT {
@@ -138,12 +138,11 @@ pub fn serve<C: ThreadCpu, U: UserWord>(
     let orig_x0 = frame.x[0];
     let served = |frame: &mut TrapFrame, result: u64, work: bool| {
         frame.x[0] = result;
-        counters.served[nr].fetch_add(1, Ordering::Relaxed);
         task.orig_arg0.store(orig_x0, Ordering::Relaxed);
         if work || task.has_pending_host_work() {
-            task.leave_served_with_work()
+            carrick_personality_linux::dispatch::FamilyCompletion::CompleteWithWork(result as i64)
         } else {
-            Action::Served
+            carrick_personality_linux::dispatch::FamilyCompletion::Complete(result as i64)
         }
     };
     match nr {
@@ -185,15 +184,20 @@ pub fn serve<C: ThreadCpu, U: UserWord>(
                 None
             })?;
             let outcome = serve_exit(sched, frame, thread, user, counters)?;
-            counters.served[nr].fetch_add(1, Ordering::Relaxed);
             Some(match outcome {
                 // The frame is the switched-in thread's, whose own syscall
                 // result the switch applied.
                 Served::Returned { .. } if task.has_pending_host_work() => {
-                    task.leave_served_with_work()
+                    carrick_personality_linux::dispatch::FamilyCompletion::CompleteWithWork(
+                        frame.x[0] as i64,
+                    )
                 }
-                Served::Returned { .. } => Action::Served,
-                Served::Idle => Action::Idle,
+                Served::Returned { .. } => {
+                    carrick_personality_linux::dispatch::FamilyCompletion::Complete(
+                        frame.x[0] as i64,
+                    )
+                }
+                Served::Idle => carrick_personality_linux::dispatch::FamilyCompletion::Suspended,
             })
         }
         _ => None,
