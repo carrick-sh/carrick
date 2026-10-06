@@ -8,7 +8,7 @@ use crate::carrier_memory::{
 use crate::guest_setup::{GuestRam, WindowKind};
 use crate::{KvmKickHandle, KvmVcpu};
 use carrick_el1::memory::reservations::{
-    LinuxReservationLayout, NoRootWait, X86Cpl0Reservations, X86Cpl0RootReleaseVenue,
+    LinuxReservationLayout, NoRootWait, X86Cpl0Reservations, X86Cpl0RootReleaseVenue, X86Cpl0Zone,
 };
 use carrick_el1_abi::GuestMmuPublication;
 use carrick_el1_abi::Lifecycle;
@@ -37,7 +37,7 @@ use carrick_mmu_core::x86::descriptor_txn::{
     Permissions, translate_leaf,
 };
 use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceReleaseVenue};
-use carrick_sched_core::{SlotId, Waker, ZoneTables};
+use carrick_sched_core::{SlotId, Waker};
 use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
 use kvm_bindings::{KVM_MP_STATE_RUNNABLE, Msrs, kvm_mp_state, kvm_msr_entry};
@@ -460,7 +460,7 @@ impl Cpl0Carrier {
             ),
             self.ram.host_ptr(
                 META_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
-                size_of::<ZoneTables>(),
+                size_of::<X86Cpl0Zone>(),
             ),
             ReservationMm::new(INITIAL_MM_KEY),
         ) else {
@@ -471,12 +471,37 @@ impl Cpl0Carrier {
         let (table, zone) = unsafe {
             (
                 &*table.cast::<X86Cpl0Reservations>(),
-                &*zone.cast::<ZoneTables>(),
+                &*zone.cast::<X86Cpl0Zone>(),
             )
         };
         zone.spaces
             .find(mm.raw())
             .is_some_and(|index| table.admitted(index.index(), mm))
+    }
+
+    /// The initial host-loaded task retains an x86-shaped scheduler record
+    /// in the same zone that owns its MM notifications.
+    pub fn initial_thread_custody(&self) -> bool {
+        let Some(zone) = self.ram.host_ptr(
+            META_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+            size_of::<X86Cpl0Zone>(),
+        ) else {
+            return false;
+        };
+        // SAFETY: this typed production zone is retained for the stopped
+        // carrier; the fixed metadata window supplies its alignment.
+        let zone = unsafe { &*zone.cast::<X86Cpl0Zone>() };
+        let slot = SlotId::new(0);
+        let Some(record) = zone.slot(slot).host_record() else {
+            return false;
+        };
+        let identity = zone.record(record).identity();
+        zone.record(record).home() == Some(slot)
+            && identity.tid == 41
+            && identity.serial == 101
+            && identity.mm == INITIAL_MM_KEY
+            && identity.lifecycle_page == METADATA_VA
+            && identity.control_slot == METADATA_VA + CONTROL_OFFSET
     }
 
     pub fn retained_bytes(&self) -> usize {
@@ -970,10 +995,10 @@ impl Cpl0Carrier {
             .ram
             .host_ptr(
                 META_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
-                size_of::<ZoneTables>(),
+                size_of::<X86Cpl0Zone>(),
             )
             .ok_or_else(|| fail("production zone backing"))?
-            .cast::<ZoneTables>();
+            .cast::<X86Cpl0Zone>();
         // SAFETY: both pointers belong to one retained, zeroed and aligned
         // carrier metadata window. The stopped vCPU cannot race publication.
         let (table, zone) = unsafe { (&*table, &*zone) };
@@ -998,9 +1023,12 @@ impl Cpl0Carrier {
             )
             .map_err(|error| fail(format!("production reservation publication: {error:?}")))?;
         fn unexpected_boot_wake(
-            _: &ZoneTables,
+            _: &X86Cpl0Zone,
             _: Waker,
-            owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+            owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+                '_,
+                carrick_sched_core::ParkedContextWords,
+            >,
         ) {
             let mut handed = false;
             let (_, effects) = owned.deliver_handbacks(&mut |_| handed = true);
@@ -1034,6 +1062,20 @@ impl Cpl0Carrier {
                 thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
             },
         )?;
+        zone.current_or_new(
+            slot,
+            carrick_sched_core::ThreadIdentity {
+                tid: 41,
+                serial: 101,
+                mm: mm.raw(),
+                file_table: 5,
+                generation: 11,
+                affinity: 1,
+                lifecycle_page: METADATA_VA,
+                control_slot: METADATA_VA + CONTROL_OFFSET,
+            },
+        )
+        .map_err(|_| fail("production scheduler record exhausted"))?;
         Ok(())
     }
 
@@ -1189,8 +1231,8 @@ impl Cpl0Carrier {
         }
         let mut ram = GuestRam::new();
         if initial_extent_bytes.is_some() {
-            let zone_end = carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize
-                + size_of::<carrick_sched_core::ZoneTables>();
+            let zone_end =
+                carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize + size_of::<X86Cpl0Zone>();
             let region_bytes = (zone_end + 4095) & !4095;
             ram.add_window(0, META_GPA as usize, WindowKind::Private)
                 .map_err(|e| fail(e.to_string()))?;
@@ -1249,9 +1291,7 @@ impl Cpl0Carrier {
             va: DIRECT_VA + 0xc0_0000,
             gpa: 0xc0_0000,
             len: if initial_extent_bytes.is_some() {
-                ((carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize
-                    + size_of::<carrick_sched_core::ZoneTables>()
-                    + 4095)
+                ((carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize + size_of::<X86Cpl0Zone>() + 4095)
                     & !4095) as u64
             } else if interrupts {
                 0x140_0000
@@ -1274,7 +1314,7 @@ impl Cpl0Carrier {
             maps.push(Pml4MapSpec {
                 va: METADATA_VA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
                 gpa: PRODUCTION_METADATA_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
-                len: (size_of::<carrick_sched_core::ZoneTables>() as u64 + 4095) & !4095,
+                len: (size_of::<X86Cpl0Zone>() as u64 + 4095) & !4095,
                 user: false,
                 write: true,
                 exec: false,

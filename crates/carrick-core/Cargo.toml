@@ -15,6 +15,7 @@ carrick-mmu-core = { path = "../carrick-mmu-core" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-sched-core = { path = "../carrick-sched-core" }
+zerocopy.workspace = true
 
 [dev-dependencies]
 carrick-conformance-contract = { path = "../carrick-conformance-contract" }
