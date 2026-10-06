@@ -54,12 +54,20 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
         )
     };
 
+    let zone = sched.zone;
+    let observe = |key| {
+        let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
+            crate::substrate::sched::object_wait::deliver_completion(zone, slot, effects);
+        };
+        carrick_core::wait::observe_object(zone, slot, key, &completion)
+    };
+
     let target = EditWaitTarget::new(space_acc, index.index(), mm, slot);
     let outcome = coordinate_prepared_edit_wait(
         table,
         target,
         resumed,
-        sched.zone,
+        observe,
         check_conflict,
         |key, snapshot, token| sched.park_object(frame, key, snapshot, resume, token, None),
     );
