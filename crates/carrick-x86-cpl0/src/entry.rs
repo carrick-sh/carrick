@@ -308,13 +308,13 @@ mod kernel {
             frame.rax = 0;
             return;
         }
-        if frame.rax == OBSERVE_MMU_ROOT {
+        if crate::fixture_image() && frame.rax == OBSERVE_MMU_ROOT {
             use carrick_guest_arch::MmuBackend;
             let mut arch = carrick_el1::isa::x86::X86Backend;
             frame.rax = arch.live_root().map_or(0, |root| root.address().raw());
             return;
         }
-        if frame.rax == OBSERVE_PORTAL_WINDOW {
+        if crate::fixture_image() && frame.rax == OBSERVE_PORTAL_WINDOW {
             let root =
                 carrick_el1::isa::x86::hardware_live_root().map_or(0, |root| root.address().raw());
             frame.rax = u64::from(
@@ -323,7 +323,7 @@ mod kernel {
             );
             return;
         }
-        if frame.rax == OBSERVE_MMU_DRAIN {
+        if crate::fixture_image() && frame.rax == OBSERVE_MMU_DRAIN {
             use carrick_guest_arch::{
                 AddressContext, ContextGeneration, FrameGpa, GuestLen, MmGeneration, MmuBackend,
                 RootGpa, UserRange, UserVa,
@@ -347,7 +347,7 @@ mod kernel {
                 .map_or(u64::MAX, |receipt| receipt.root().address().raw());
             return;
         }
-        if frame.rax == OBSERVE_DESCRIPTOR_PROTECT {
+        if crate::fixture_image() && frame.rax == OBSERVE_DESCRIPTOR_PROTECT {
             use carrick_guest_arch::{EditOperation, EditPermissions};
             use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
             let receipt = fixture_edit(
@@ -372,7 +372,7 @@ mod kernel {
             };
             return;
         }
-        if frame.rax == OBSERVE_DESCRIPTOR_PREPARE_PUBLISH {
+        if crate::fixture_image() && frame.rax == OBSERVE_DESCRIPTOR_PREPARE_PUBLISH {
             use carrick_core::mm::transfer::resolver::PreparedPageResolver;
             use carrick_guest_arch::{
                 EditBacking, EditLeafSize, EditOperation, EditPermissions, FrameGpa, GuestLen,
@@ -447,7 +447,7 @@ mod kernel {
             };
             return;
         }
-        if frame.rax == OBSERVE_SHARED_PREPARED_FAULT {
+        if crate::fixture_image() && frame.rax == OBSERVE_SHARED_PREPARED_FAULT {
             use carrick_core::mm::transfer::resolver::NoopCowResolver;
             use carrick_el1::fault::{
                 GrantMailboxes, PreparedFaultPath, X86PreparedResolver,
@@ -569,7 +569,7 @@ mod kernel {
             unsafe { crate::rust_alloc::alloc::dealloc(ptr, layout) };
             return;
         }
-        if frame.rax == OBSERVE_SHARED_COW_FAULT {
+        if crate::fixture_image() && frame.rax == OBSERVE_SHARED_COW_FAULT {
             use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
             use carrick_el1::fault::{
                 GrantMailboxes, X86CowResolver, dispatch_x86_fault_with_prepared,
@@ -717,7 +717,7 @@ mod kernel {
             unsafe { crate::rust_alloc::alloc::dealloc(ptr, layout) };
             return;
         }
-        if frame.rax == OBSERVE_ALLOCATOR {
+        if crate::fixture_image() && frame.rax == OBSERVE_ALLOCATOR {
             let layout = match core::alloc::Layout::from_size_align(128, 64) {
                 Ok(layout) => layout,
                 Err(_) => {
