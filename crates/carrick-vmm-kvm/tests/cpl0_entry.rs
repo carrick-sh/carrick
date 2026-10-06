@@ -9,11 +9,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
-use carrick_sched_core::{SlotId, ThreadIdentity, ZoneTables};
+use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables};
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::OBSERVE_NATIVE;
 use carrick_x86::cpl0_scheduler::{
-    ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context,
+    ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
+    restore_native_context,
 };
 use std::num::NonZeroU64;
 use std::path::PathBuf;
@@ -409,9 +410,9 @@ fn x1_boot_shared_substrate() {
     let mut carrier = Cpl0Carrier::boot(&image(), [&p, dummy]).expect("real KVM + CPL0 image");
 
     // Shared substrate ZoneTables and AddressSpaces claims
-    let layout = std::alloc::Layout::new::<ZoneTables>();
+    let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
     let zone = unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+        let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
         assert!(!ptr.is_null());
         Box::from_raw(ptr)
     };
@@ -437,30 +438,34 @@ fn x1_boot_shared_substrate() {
             ..Default::default()
         })
         .unwrap();
+    let address = AddressContext {
+        root,
+        mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
+        generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+    };
+    let native = NativeContext {
+        frame: InterruptFrame {
+            gpr: [0; 15],
+            rip: carrick_vmm_kvm::cpl0_boot::USER_CODE,
+            cs: 0x23,
+            flags: 0x202,
+            rsp: 0x3_1ff0,
+            ss: 0x1b,
+        },
+        address,
+        fs_base: 0x1000,
+        gs_base: 0x2000,
+        xsave: XsaveArea::ZERO,
+    };
+    // SAFETY: this new record remains host-owned until requeue.
+    unsafe { *zone.record(record).ctx_mut() = park_native_context(&native) };
     zone.requeue_preempted(slot, record);
     let on_cpu = zone.switch_in(slot).unwrap();
     assert_eq!(on_cpu, record);
 
     let binding = ContextBinding {
         record: zone.record_ref(record),
-        context: NativeContext {
-            frame: InterruptFrame {
-                gpr: [0; 15],
-                rip: carrick_vmm_kvm::cpl0_boot::USER_CODE,
-                cs: 0x23,
-                flags: 0x202,
-                rsp: 0x3_1ff0,
-                ss: 0x1b,
-            },
-            address: AddressContext {
-                root,
-                mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
-                generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
-            },
-            fs_base: 0x1000,
-            gs_base: 0x2000,
-            xsave: XsaveArea::ZERO,
-        },
+        address,
     };
 
     // 1. Admit context under shared ZoneTables and AddressSpaces claims
@@ -488,14 +493,17 @@ fn x1_boot_shared_substrate() {
     assert_eq!(obs1.returned_stack, 0x3_1fe8);
     assert_eq!(obs1.preserved_rbx, 0xa000);
     assert_eq!(obs2.preserved_rbx, 0xdead);
-    assert_eq!(binding.context.fs_base, 0x1000);
-    assert_eq!(binding.context.gs_base, 0x2000);
+    // SAFETY: test fixture uniquely owns the zone table and no guest CPU is running.
+    let words = unsafe { *zone.record(record).ctx_mut() };
+    let restored = restore_native_context(words, binding.address).expect("restored native context");
+    assert_eq!(restored.fs_base, 0x1000);
+    assert_eq!(restored.gs_base, 0x2000);
 
     // 4. Reject recycled record / root identity (zone-record reuse/admission error detection)
     // Recycled record incarnation defect
     let mut stale = ContextBinding {
         record: binding.record,
-        context: binding.context.clone(),
+        address: binding.address,
     };
     stale.record.incarnation += 1;
     assert!(
@@ -506,9 +514,9 @@ fn x1_boot_shared_substrate() {
     // Wrong root identity defect
     let mut wrong_root = ContextBinding {
         record: binding.record,
-        context: binding.context.clone(),
+        address: binding.address,
     };
-    wrong_root.context.address.root = RootGpa::page_aligned(FrameGpa::new(0x70_0000)).unwrap();
+    wrong_root.address.root = RootGpa::page_aligned(FrameGpa::new(0x70_0000)).unwrap();
     assert!(
         !admit_context(&zone, slot, &wrong_root),
         "mismatched root must be rejected"
@@ -518,9 +526,9 @@ fn x1_boot_shared_substrate() {
     // Wrong MM identity defect
     let mut wrong_mm = ContextBinding {
         record: binding.record,
-        context: binding.context.clone(),
+        address: binding.address,
     };
-    wrong_mm.context.address.mm = MmGeneration::new(NonZeroU64::new(99).unwrap());
+    wrong_mm.address.mm = MmGeneration::new(NonZeroU64::new(99).unwrap());
     assert!(
         !admit_context(&zone, slot, &wrong_mm),
         "wrong MM must be rejected"
