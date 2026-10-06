@@ -25,6 +25,10 @@ mod x86_context_words_tests;
 #[cfg(test)]
 #[path = "isa/x86/initial_mm.rs"]
 mod x86_initial_mm_tests;
+#[cfg(test)]
+#[path = "isa/x86/interrupts.rs"]
+#[allow(dead_code)]
+mod x86_interrupt_timer_tests;
 
 #[cfg(test)]
 #[path = "isa/x86/user_tables.rs"]

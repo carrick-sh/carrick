@@ -132,10 +132,8 @@ impl InterruptBackend for X86Backend {
             let ticks = deadline
                 .map(|d| {
                     let delta = d.0.raw().saturating_sub(self.counter()?.raw()).max(1);
-                    let ticks = u128::from(delta) * u128::from(apic_hz) / u128::from(tsc_hz);
-                    u32::try_from(ticks.max(1))
-                        .map(interrupts::TimerTicks)
-                        .map_err(|_| ArchError::Unbound)
+                    interrupts::calibrated_timer_ticks(delta, apic_hz, tsc_hz)
+                        .ok_or(ArchError::Unbound)
                 })
                 .transpose()?;
             // SAFETY: the APIC rate was measured on this CPU; the one-shot
