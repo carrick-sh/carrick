@@ -42,6 +42,14 @@ rules:
         - /crates/carrick-el1/src/sched/hw.rs
         - /crates/carrick-el1/src/sched/aarch64_context.rs
         - /crates/carrick-el1/src/entry.rs
+        # Reviewed target_os=none CPL0 ISA leaves in the shared kernel: the
+        # native stack/TSC reads and named UD2 fail-closed paths. These execute
+        # in the guest and have no host operation or semantic syscall escape.
+        - /crates/carrick-el1/src/isa/x86/context.rs
+        - /crates/carrick-el1/src/isa/x86/interrupt.rs
+        - /crates/carrick-el1/src/isa/x86/mmu.rs
+        - /crates/carrick-el1/src/isa/x86/transport.rs
+        - /crates/carrick-el1/src/isa/x86/user_access.rs
         # Reviewed x86 CPL0 hardware boundary: entry/return, port I/O and halt; no host operation.
         - /crates/carrick-x86-cpl0/src/entry.rs
         # Reviewed target_os=none CPL0 hardware leaves: native IRQ/IRET and
