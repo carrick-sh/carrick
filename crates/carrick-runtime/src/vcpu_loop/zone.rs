@@ -32,6 +32,7 @@ use carrick_kernel::el1_zone::HostLockWait;
 pub(super) enum OwnerMemoryAction {
     Syscall(carrick_hal::RawSyscall),
     Terminal,
+    Fault,
 }
 
 thread_local! {
@@ -664,7 +665,7 @@ where
                     .request;
                 Some((state, ctx, request))
             }
-            OwnerMemoryAction::Terminal => None,
+            OwnerMemoryAction::Terminal | OwnerMemoryAction::Fault => None,
         };
         let context = self.state.service_kernel_context.as_ref().ok_or_else(|| {
             RuntimeError::Configuration("owner wait lost its Kernel context".to_owned())
@@ -716,6 +717,25 @@ where
                         self.phase = HvpatchProductionPhase::ResumeOwnerZone { frame };
                         Ok(exit)
                     }
+                    (OwnerMemoryAction::Fault, None) => {
+                        let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
+                            zone.record_ref(record),
+                            seq,
+                        );
+                        let continuation = carrick_kernel::kernel::continuation::BlockedContinuation::from_fault_zone_park(
+                            context,
+                            control.execution_lease_mut().map_err(RuntimeError::Trap)?,
+                            wait,
+                        ).map_err(|error| RuntimeError::Configuration(error.to_string()))?;
+                        self.phase = HvpatchProductionPhase::ResumeFaultOwner;
+                        Ok(self.suspend(
+                            HvpatchLoopSuspension::BlockedContinuation,
+                            executor::ExecutorExit::BlockedContinuation {
+                                continuation: Box::new(continuation),
+                                vfork_activation: None,
+                            },
+                        ))
+                    }
                     (OwnerMemoryAction::Terminal, None) => {
                         let wait = carrick_kernel::kernel::continuation::ZoneWait::new(
                             zone.record_ref(record),
@@ -760,6 +780,7 @@ where
                         )?;
                         self.service_outcome(engine, control, frame, outcome)
                     }
+                    OwnerMemoryAction::Fault => Ok(executor::ExecutorExit::Syscall),
                     OwnerMemoryAction::Terminal => {
                         let action = self.take_terminal_memory_action()?;
                         self.drive_terminal_memory(engine, control, action)
@@ -802,6 +823,67 @@ where
             )?,
         };
         self.service_outcome(engine, control, frame, outcome)
+    }
+
+    /// Consume the same exact owner handback as user-copy waits, preserving
+    /// the ordinary fault CPU save. Service a reserved signal at this fault
+    /// boundary now: no later syscall completion is required to deliver it.
+    pub(super) fn resume_owner_fault_zone(
+        &mut self,
+        engine: &mut E,
+        control: &mut executor::HvpatchQuantumControl<'_, '_>,
+    ) -> Result<executor::ExecutorExit, ProductionHvpatchPollError> {
+        let mut result = self.consume_owner_zone(control)?;
+        if result.completion
+            != carrick_kernel::kernel::continuation::ContinuationCompletion::ResumeFault
+        {
+            return Err(
+                RuntimeError::Configuration("owner fault resumed as a syscall".to_owned()).into(),
+            );
+        }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let interrupted_pc = if carrick_hal::ExecLevel::from_pstate(
+            engine
+                .get_reg(carrick_hal::Reg::Pstate)
+                .map_err(|error| TrapError::Hypervisor(error.to_string()))?,
+        )
+        .is_guest()
+        {
+            Some(engine.current_pc()?)
+        } else {
+            None
+        };
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let interrupted_pc = Some(engine.current_pc()?);
+        let context = self
+            .state
+            .service_kernel_context
+            .as_ref()
+            .ok_or_else(|| {
+                RuntimeError::Configuration("owner fault resume lost context".to_owned())
+            })?
+            .retain_exact();
+        if let Some(outcome) = service_signals_threaded(
+            &self.kernel,
+            &context,
+            engine,
+            self.state.this_tid,
+            self.state.fatal_image_generation,
+            None,
+            interrupted_pc,
+            None,
+            result.take_reserved_signal(),
+            self.traps,
+        )? {
+            return Ok(self.enter_terminal_with_outcome(engine, outcome));
+        }
+        if let Some(exit) = self.suspend_for_process_quiesce(engine, control)? {
+            return Ok(exit);
+        }
+        if let Some(exit) = self.suspend_for_job_control(engine, control)? {
+            return Ok(exit);
+        }
+        Ok(executor::ExecutorExit::Syscall)
     }
 
     pub(super) fn consume_owner_zone(

@@ -440,8 +440,29 @@ pub(super) fn resolve_owner_fault(
     let completed = engine
         .service_owner_fault(mm_key, generation)?
         .ok_or_else(|| TrapError::Hypervisor("owner fault selection was displaced".into()))?;
-    if completed == carrick_hal::OwnerFaultOutcome::Resolved
-        || matches!(completed, carrick_hal::OwnerFaultOutcome::Pending(_))
+    finish_owner_fault_response(mailbox, request, &completed)?;
+    Ok(Some(completed))
+}
+
+fn finish_owner_fault_response(
+    mailbox: &carrick_el1_abi::FrameGrantMailbox,
+    request: carrick_el1_abi::FrameGrantRequest,
+    completed: &carrick_hal::OwnerFaultOutcome,
+) -> Result<(), TrapError> {
+    if let carrick_hal::OwnerFaultOutcome::OwnerWait(wait) = completed
+        && wait.handle().mm().raw() != request.mm_key
+    {
+        return Err(TrapError::Hypervisor(
+            "owner fault wait names another MM".to_owned(),
+        ));
+    }
+    let address = request.fault_va;
+    if *completed == carrick_hal::OwnerFaultOutcome::Resolved
+        || matches!(
+            completed,
+            carrick_hal::OwnerFaultOutcome::Pending(_)
+                | carrick_hal::OwnerFaultOutcome::OwnerWait(_)
+        )
     {
         crate::probes::hvpatch_el1_file_fault_handoff(
             address,
@@ -461,7 +482,7 @@ pub(super) fn resolve_owner_fault(
         crate::probes::hvpatch_el1_file_fault_handoff(
             address,
             mailbox.state.load(std::sync::atomic::Ordering::Acquire),
-            if completed == carrick_hal::OwnerFaultOutcome::BusFault {
+            if *completed == carrick_hal::OwnerFaultOutcome::BusFault {
                 4
             } else {
                 3
@@ -469,7 +490,7 @@ pub(super) fn resolve_owner_fault(
         );
         publish_frame_grant_refusal(mailbox, request, carrick_el1_abi::FRAME_GRANT_ERR_DENIED);
     }
-    Ok(Some(completed))
+    Ok(())
 }
 
 fn publish_frame_grant_refusal(
@@ -2684,6 +2705,117 @@ mod first_touch_access_tests {
         assert_eq!(ring_access(Some(LeafAccess::Read)), RingAccess::Read);
         assert_eq!(ring_access(Some(LeafAccess::Write)), RingAccess::Write);
         assert_eq!(ring_access(Some(LeafAccess::Execute)), RingAccess::Execute);
+    }
+
+    #[test]
+    fn owner_fault_wait_clears_only_its_exact_request_without_denial() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use std::num::NonZeroU64;
+        let request = carrick_el1_abi::FrameGrantRequest {
+            mm_key: 5,
+            requested_len: 114688,
+            request_generation: 19,
+            fault_va: 0x6000_41bbf8,
+            access: crate::linux_abi::LINUX_PROT_WRITE,
+        };
+        let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+        let peer = carrick_el1_abi::FrameGrantMailbox::new();
+        assert!(mailbox.try_publish_request(request));
+        assert!(peer.try_publish_request(request));
+        let FrameGrantClaim::Accepted(claimed) = claim_frame_grant_request(
+            &mailbox,
+            request.mm_key,
+            request.fault_va,
+            Some(LeafAccess::Write),
+        ) else {
+            panic!("exact fault claim");
+        };
+        // SAFETY: isolated owner receipt, matching this claimed test request.
+        let handle = unsafe {
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(5).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            )
+        };
+        let wait = unsafe { PortalOwnerWait::from_owner(handle, PortalWaitCause::Editor, 84) };
+        finish_owner_fault_response(
+            &mailbox,
+            claimed,
+            &carrick_hal::OwnerFaultOutcome::OwnerWait(wait),
+        )
+        .unwrap();
+        assert!(
+            mailbox.claim_response(5, 19).is_none(),
+            "an owner wait must not publish DENIED"
+        );
+        assert_eq!(
+            mailbox.state.load(std::sync::atomic::Ordering::Acquire),
+            carrick_el1_abi::FRAME_GRANT_MAILBOX_IDLE
+        );
+        assert!(
+            matches!(
+                claim_frame_grant_request(&peer, 5, request.fault_va, Some(LeafAccess::Write)),
+                FrameGrantClaim::Accepted(_)
+            ),
+            "peer request remains untouched"
+        );
+        let next = carrick_el1_abi::FrameGrantRequest {
+            request_generation: 20,
+            ..request
+        };
+        assert!(
+            mailbox.try_publish_request(next),
+            "resumption can reselect exactly once"
+        );
+        assert!(!mailbox.try_publish_request(next));
+    }
+
+    #[test]
+    fn owner_fault_wait_from_another_mm_preserves_the_claimed_request() {
+        use carrick_el1_abi::{El1MmHandle, PortalOwnerWait, PortalWaitCause, ReservationMm};
+        use std::num::NonZeroU64;
+        let request = carrick_el1_abi::FrameGrantRequest {
+            mm_key: 5,
+            requested_len: 114688,
+            request_generation: 19,
+            fault_va: 0x6000_41bbf8,
+            access: crate::linux_abi::LINUX_PROT_WRITE,
+        };
+        let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+        assert!(mailbox.try_publish_request(request));
+        let FrameGrantClaim::Accepted(claimed) =
+            claim_frame_grant_request(&mailbox, 5, request.fault_va, Some(LeafAccess::Write))
+        else {
+            panic!("exact fault claim");
+        };
+        // SAFETY: isolated competing live owner, deliberately another MM.
+        let handle = unsafe {
+            El1MmHandle::from_admitted_owner(
+                NonZeroU64::new(1).unwrap(),
+                ReservationMm::new(6).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            )
+        };
+        let wait = unsafe { PortalOwnerWait::from_owner(handle, PortalWaitCause::Editor, 84) };
+        let result = finish_owner_fault_response(
+            &mailbox,
+            claimed,
+            &carrick_hal::OwnerFaultOutcome::OwnerWait(wait),
+        );
+        assert!(
+            result.is_err(),
+            "another live MM must not complete this fault wait"
+        );
+        assert_eq!(
+            mailbox.state.load(std::sync::atomic::Ordering::Acquire),
+            carrick_el1_abi::FRAME_GRANT_MAILBOX_HOST_WORKING
+        );
+        assert!(mailbox.claim_response(5, 19).is_none());
+        assert!(
+            mailbox.complete_resolved_owner_fault(request),
+            "this exact claim remains owned"
+        );
     }
 
     #[test]

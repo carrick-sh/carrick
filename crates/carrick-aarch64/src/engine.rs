@@ -5521,7 +5521,7 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             }
             other => other?,
         };
-        let mut grant = match prepared {
+        let grant = match prepared {
             crate::user_transfer::TransferPreparation::Grant(grant) => grant,
             crate::user_transfer::TransferPreparation::PeerResident => {
                 carrick_observability::probes::hvpatch_el1_file_fault_handoff(
@@ -5571,36 +5571,19 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
             },
             &mut || false,
         );
-        if let Some(receipt) = slot.take_receipt(window, grant.transaction()) {
-            let refusal = match receipt.outcome {
-                carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(reason)
-                | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::RolledBack(
-                    reason,
-                ) => reason as u32,
-                _ => 0,
-            };
-            let settled = grant.settle(&receipt)?;
-            carrick_observability::probes::hvpatch_el1_file_fault_handoff(
-                window.fault_page,
-                refusal,
-                if settled { 10 } else { 7 },
-            );
-            outcome?;
-            Ok(Some(if settled {
-                carrick_hal::OwnerFaultOutcome::Resolved
-            } else {
+        let completed = finish_owner_fault_supply(grant, slot, window, target, outcome)?;
+        Ok(Some(match completed {
+            crate::user_transfer::SupplyProgress::Ready => carrick_hal::OwnerFaultOutcome::Resolved,
+            crate::user_transfer::SupplyProgress::Physical(wait) => {
+                carrick_hal::OwnerFaultOutcome::Pending(wait)
+            }
+            crate::user_transfer::SupplyProgress::Declined => {
                 carrick_hal::OwnerFaultOutcome::Refused
-            }))
-        } else if slot.withdraw(window, grant.transaction()) {
-            carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 8);
-            outcome?;
-            Ok(Some(carrick_hal::OwnerFaultOutcome::Refused))
-        } else {
-            carrick_fatal::carrick_fatal!(
-                "aarch64::user_transfer",
-                "unsettled owner fault retains physical custody"
-            );
-        }
+            }
+            crate::user_transfer::SupplyProgress::OwnerWait(wait) => {
+                carrick_hal::OwnerFaultOutcome::OwnerWait(wait)
+            }
+        }))
     }
 
     fn prepare_el1_frame_grant(
@@ -9023,6 +9006,45 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         effect: &mut dyn FnMut() -> bool,
     ) -> Result<carrick_el1_abi::TrapFrame, TrapError> {
         self.transfer_service_loan()?.run_user(frame, effect)
+    }
+}
+
+pub(crate) fn finish_owner_fault_supply(
+    mut grant: Box<dyn crate::user_transfer::TransferGrant>,
+    slot: &carrick_el1_abi::PortalGrantSlot,
+    window: carrick_el1_abi::PortalGrantWindow,
+    target: crate::user_transfer::TransferTarget,
+    outcome: Result<carrick_el1_abi::TrapFrame, TrapError>,
+) -> Result<crate::user_transfer::SupplyProgress, TrapError> {
+    use crate::user_transfer::SupplyProgress;
+    if let Some(receipt) = slot.take_receipt(window, grant.transaction()) {
+        let refusal = match receipt.outcome {
+            carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(reason)
+            | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::RolledBack(reason) => {
+                reason as u32
+            }
+            _ => 0,
+        };
+        let settled = grant.settle(&receipt)?;
+        carrick_observability::probes::hvpatch_el1_file_fault_handoff(
+            window.fault_page,
+            refusal,
+            if settled { 10 } else { 7 },
+        );
+        outcome?;
+        Ok(if settled {
+            SupplyProgress::Ready
+        } else {
+            SupplyProgress::Declined
+        })
+    } else if slot.withdraw(window, grant.transaction()) {
+        carrick_observability::probes::hvpatch_el1_file_fault_handoff(window.fault_page, 0, 8);
+        crate::user_transfer::finish_unclaimed_supply(grant, target, outcome)
+    } else {
+        carrick_fatal::carrick_fatal!(
+            "aarch64::user_transfer",
+            "unsettled owner fault retains physical custody"
+        );
     }
 }
 

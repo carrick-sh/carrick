@@ -277,6 +277,9 @@ pub(super) enum HvpatchProductionPhase {
         wait: carrick_guest_mem::OwnedMemoryWait,
         _subscription: Box<dyn std::fmt::Debug + Send + Sync>,
     },
+    /// The semantic owner notification retains a fault, with the ordinary
+    /// saved CPU and no syscall completion or zone CPU substitution.
+    ResumeFaultOwner,
     ExecSiblingDrain {
         context: carrick_kernel::kernel::KernelContext,
         owner: Box<exec::PreparedExecveDrain>,
@@ -436,6 +439,7 @@ impl HvpatchProductionPhase {
             Self::ResumeTerminalPhysical { .. } => 20,
             Self::TerminalMemoryRetry { .. } => 21,
             Self::ResumeFaultPhysical { .. } => 22,
+            Self::ResumeFaultOwner => 23,
         }
     }
 }
@@ -1900,7 +1904,7 @@ where
         )
     }
 
-    fn suspend_for_process_quiesce(
+    pub(super) fn suspend_for_process_quiesce(
         &mut self,
         engine: &E,
         _control: &executor::HvpatchQuantumControl<'_, '_>,
@@ -1983,7 +1987,7 @@ where
         }
     }
 
-    fn suspend_for_job_control(
+    pub(super) fn suspend_for_job_control(
         &mut self,
         engine: &mut E,
         _control: &executor::HvpatchQuantumControl<'_, '_>,
@@ -4221,6 +4225,9 @@ where
                 HvpatchProductionPhase::ResumeOwnerZone { frame } => {
                     return self.resume_owner_zone(engine, control, frame);
                 }
+                HvpatchProductionPhase::ResumeFaultOwner => {
+                    return self.resume_owner_fault_zone(engine, control);
+                }
                 HvpatchProductionPhase::ResumeOwnerPhysical {
                     frame,
                     wait,
@@ -4961,6 +4968,14 @@ where
                             carrick_kernel::kernel::objects::BlockedReason::HostWait,
                         ),
                     ));
+                }
+                if let Some(carrick_hal::OwnerFaultOutcome::OwnerWait(wait)) = owner_fault {
+                    return self.park_owner_memory_action(
+                        engine,
+                        control,
+                        zone::OwnerMemoryAction::Fault,
+                        wait,
+                    );
                 }
                 if owner_fault == Some(carrick_hal::OwnerFaultOutcome::Resolved) {
                     return Ok(executor::ExecutorExit::Syscall);

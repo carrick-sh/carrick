@@ -321,6 +321,20 @@ The shared core bindings `aarch64_owner_fault_window_excludes_inherited_backing`
 and `x86_owner_fault_window_excludes_inherited_backing` require the same bounded
 selection rule over both descriptor geometries.
 
+`kernel.el1.anonymous-first-touch` also binds the native owner-fault
+completion's unclaimed grant wait. A concurrent owner editor is admission
+contention, not an inaccessible Linux mapping. Withdrawal releases speculative
+physical custody before carrying the exact owner, cause and revision to the
+existing notification queue; the fault mailbox clears only its own request.
+The continuation retains a fault origin, with no syscall return or restart,
+and ordinary saved CPU state. A reserved signal remains owned until immediate
+delivery at that fault boundary. VM-free bindings are
+`fault_owner_wait_releases_physical_custody_before_parking`,
+`owner_fault_wait_clears_only_its_exact_request_without_denial` and the three
+`fault_zone_capture_*` witnesses. This proves no new MMU execution, signed
+completion or cost ratio; the existing signed first-touch and fork bindings
+still require fresh exact-artifact confirmation, without changed budgets.
+
 `kernel.mm.copyout-owner-gate` covers a peer closing the MM gate between
 SELECT and PREPARE. The hardware preamble must observe the exact Gate
 producer before probing and return its owned suspension, never a raw
