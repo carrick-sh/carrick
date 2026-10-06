@@ -11664,7 +11664,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2146,
+      "line": 2136,
       "categories": [
         "description_guard"
       ],
@@ -11673,7 +11673,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2174,
+      "line": 2164,
       "categories": [
         "description_guard"
       ],
@@ -11682,7 +11682,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2247,
+      "line": 2237,
       "categories": [
         "description_guard"
       ],
@@ -11691,7 +11691,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2278,
+      "line": 2268,
       "categories": [
         "epoll"
       ],
