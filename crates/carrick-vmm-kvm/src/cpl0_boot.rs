@@ -98,6 +98,7 @@ pub struct Observation {
     pub entries: [u64; 2],
     pub publications: [u64; 2],
     pub completions: [u64; 2],
+    pub admissions: [u64; 2],
     pub kicks: u64,
     pub work_exits: u64,
     pub captured_stack: u64,
@@ -417,7 +418,9 @@ impl Cpl0Carrier {
                     ),
                     zone_address: zone_addr,
                     context_binding_address: binding_addr,
+                    slot: index as u32,
                     admitted: AtomicU32::new(0),
+                    admissions: AtomicU64::new(0),
                 });
             }
         }
@@ -669,6 +672,9 @@ impl Cpl0Carrier {
                         }),
                         completions: core::array::from_fn(|i| {
                             self.binding(i).completions.load(Ordering::Acquire)
+                        }),
+                        admissions: core::array::from_fn(|i| {
+                            self.binding(i).admissions.load(Ordering::Acquire)
                         }),
                         kicks: self.kicks,
                         work_exits: self.work_exits,

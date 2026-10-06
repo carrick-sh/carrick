@@ -300,6 +300,10 @@ fn x1_boot_shared_substrate() {
     assert_eq!(obs1.heads[0], (0xa000, 24));
     assert_eq!(obs1.forwarded, 0);
     assert_eq!(obs1.semantic_host_exits, 0);
+    assert_eq!(
+        obs1.admissions[0], 1,
+        "first syscall executes context admission"
+    );
 
     // Call 2: invalid length 23
     let obs2 = carrier.observe(0).expect("bounded native entry/return");
@@ -308,6 +312,19 @@ fn x1_boot_shared_substrate() {
         "set_robust_list(23) should return -EINVAL (-22)"
     );
     assert_eq!(obs2.heads[0], (0xa000, 24), "previous head preserved");
+    assert_eq!(
+        obs2.admissions[0], 1,
+        "second syscall from admitted context does not re-admit"
+    );
+    assert_eq!(
+        carrier
+            .zone()
+            .counters
+            .el1_space_switches
+            .load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "space installed exactly once across two syscalls"
+    );
 
     // Verify admission and occupancy installed inside CPL0
     assert_eq!(carrier.zone().installed_space(slot), mm);

@@ -84,8 +84,12 @@ pub struct CpuBinding {
     pub zone_address: u64,
     /// Published ContextBinding guest address for shared admission; 0 in legacy M2.
     pub context_binding_address: u64,
+    /// Execution slot for shared admission.
+    pub slot: u32,
     /// One-shot admission state for shared context install.
     pub admitted: AtomicU32,
+    /// Total successful context admissions performed by CPL0.
+    pub admissions: AtomicU64,
 }
 const _: () = assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
 
