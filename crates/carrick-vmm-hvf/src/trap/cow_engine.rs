@@ -308,7 +308,7 @@ fn is_exactly_el1_frame_grant(
 /// stays unregistered until then: the process alias registry holds exactly
 /// one owner per span, and retiring the predecessor by span must not take the
 /// replacement with it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub(crate) struct PendingEl1GrantPublication {
     pub(crate) completion: global_frame::PhysicalGrantCompletion,
     /// The exact grant, as settlement names it to completion or rollback.
@@ -323,7 +323,7 @@ pub(crate) struct PendingEl1GrantPublication {
 /// MM-owned ledger of [`PendingEl1GrantPublication`]s. Settlement may run on
 /// any vCPU bound to the MM, so this lives in the MM's access state, not in
 /// an engine. A leaf lock: never held while taking another.
-#[derive(Debug, Default)]
+#[derive(::core::fmt::Debug, ::core::default::Default)]
 pub(crate) struct PendingEl1GrantPublications {
     entries: Vec<PendingEl1GrantPublication>,
 }
@@ -365,7 +365,13 @@ impl PendingEl1GrantPublications {
 }
 
 /// How the registry rows of a retirement's leases stand.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 enum AliasRetirementRows {
     /// The leases are registered process aliases over the span: retire them.
     Registered,
@@ -375,7 +381,7 @@ enum AliasRetirementRows {
     NeverRegistered,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 enum AliasRetirementAuthorityState {
     Pending,
     AppliedWithReplacement,
@@ -383,7 +389,7 @@ enum AliasRetirementAuthorityState {
 
 /// A retirement attempt whose plan an out-of-guard writer made stale; it
 /// mutated nothing. `writers` names who changed the window.
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct StaleAliasRetirement {
     writers: String,
 }
@@ -4624,7 +4630,7 @@ pub(crate) fn zero_anonymous_remap_enabled() -> bool {
 /// The calling thread's hot-path visit counters at one instant; two reads
 /// bracket a census-armed maintenance operation.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) struct MmMaintenanceVisits {
     alias: u64,
     task: u64,
@@ -7595,7 +7601,13 @@ impl HvfTaskState {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum ForkMappingDisposition {
     /// Parent and child keep the same frame and the same writable permissions.
     SharedFrameWritable,
@@ -7627,7 +7639,7 @@ pub(crate) enum ForkMappingDisposition {
 /// properties and never read the plan -- so `MADV_DONTFORK`/`MADV_WIPEONFORK`
 /// changed carrick's metadata while the child still inherited the pages.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) enum ProjectedForkSpan {
     /// No omitted or zeroed range touches this mapping.
     Preserve,
@@ -7781,7 +7793,7 @@ pub(crate) fn projected_fork_mapping_disposition(
 /// What one VMM mapping becomes in the child once the fork projection has been
 /// applied on top of the mapping's own disposition.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub(crate) enum ForkMappingPlan {
     /// The child gets the mapping. `wiped` names the sub-ranges, relative to
     /// the mapping's semantic start, whose bytes must read as zero there.
@@ -7797,7 +7809,7 @@ pub(crate) enum ForkMappingPlan {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub(crate) struct ProjectedForkMapping {
     pub(crate) mapping: ThreadMappingDesc,
     pub(crate) plan: ForkMappingPlan,
@@ -8004,7 +8016,13 @@ pub(crate) fn frame_cow_preserves_guest_protection(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum FrameCowWriteRoute {
     Direct,
     CopyOnWrite,
@@ -8012,7 +8030,13 @@ pub(crate) enum FrameCowWriteRoute {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum UnarmedPermissionFaultRoute {
     NotCow,
     RetryCommittedWinner,
@@ -8020,7 +8044,13 @@ pub(crate) enum UnarmedPermissionFaultRoute {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub(crate) enum WinnerPteError {
     ShadowLiveMismatch,
 }
@@ -8165,7 +8195,7 @@ pub(crate) fn live_ipa_mapping_row(
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub(crate) struct FrameCowTrigger {
     class: carrick_observability::probes::HvpatchFrameCowTriggerClass,
     syndrome: u64,

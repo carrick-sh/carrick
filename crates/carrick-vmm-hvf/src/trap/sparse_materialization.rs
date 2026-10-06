@@ -527,7 +527,7 @@ fn publish_frame_grant_backing(
     })
 }
 
-#[derive(Debug)]
+#[derive(::core::fmt::Debug)]
 struct AllocationLayout {
     offset: u64,
     length: u64,

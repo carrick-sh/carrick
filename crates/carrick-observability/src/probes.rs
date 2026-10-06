@@ -58,7 +58,13 @@ pub enum SyscallMailboxPhase {
 }
 
 /// Result of attempting to install a private file view rather than copying it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(u32)]
 pub enum MmapLoweringOutcome {
     /// A file view was installed and the dispatcher skips its byte snapshot.
@@ -78,7 +84,7 @@ pub enum MmapLoweringOutcome {
 /// exist on `stub` targets, and the dispatcher calls `register_dtrace_probes` on
 /// EVERY platform. The `real` arm forwards `usdt::Error`'s own `Display` text
 /// verbatim, so what a user sees is unchanged.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
 pub struct ProbeRegistrationError(String);
 
 impl ProbeRegistrationError {
@@ -102,14 +108,29 @@ impl std::fmt::Display for ProbeRegistrationError {
 impl std::error::Error for ProbeRegistrationError {}
 
 /// Stable Darwin process incarnation used by birth-keyed trace records.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 pub struct HostProcessBirth {
     pid: u32,
     start_sec: i64,
     start_usec: i32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::thiserror::Error,
+)]
 pub enum HostProcessBirthError {
     #[error("host process birth PID must be nonzero")]
     ZeroPid,
@@ -203,7 +224,7 @@ pub use real::*;
 #[cfg(not(carrick_usdt_probes))]
 pub use stub::*;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug)]
 pub struct EpollMaskedProbe {
     pub origin: i32,
     pub fd: i32,
@@ -215,7 +236,9 @@ pub struct EpollMaskedProbe {
     pub last_read_avail: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(
+    ::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::default::Default,
+)]
 pub struct UlockRequeueProbe {
     pub phase: u32,
     pub from_key: u64,
@@ -241,7 +264,13 @@ pub struct UlockRequeueProbe {
 /// These ordinals are part of the DTrace provider ABI; append, never renumber.
 /// The event names the invoking or reserved Linux tid and carries the errno
 /// returned to the guest (zero at nonterminal progress/success boundaries).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchCloneThreadPhase {
     AdmissionClosed = 0,
@@ -270,7 +299,13 @@ impl HvpatchCloneThreadPhase {
 /// Persistent HVPatch executor lifecycle. These ordinals are a stable DTrace
 /// ABI: append only. `Switch` is emitted after one task is fully saved/cleared
 /// and before the successor load begins on the same executor.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchExecutorLifecyclePhase {
     Create = 0,
@@ -289,7 +324,13 @@ impl HvpatchExecutorLifecyclePhase {
 
 /// Which scheduler edge `hvpatch-scheduler-wake` records. Stable DTrace
 /// ABI: append only.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchSchedulerWakeKind {
     /// `Scheduler::wake`: a producer edge that may publish guest readiness.
@@ -307,7 +348,13 @@ impl HvpatchSchedulerWakeKind {
 
 /// Thread execution state as seen by the scheduler probes. Stable DTrace
 /// ABI: append only. `Uninitialized` is the pre-publication state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchThreadExecutionStateKind {
     Uninitialized = 0,
@@ -328,7 +375,13 @@ impl HvpatchThreadExecutionStateKind {
 /// How an execution lease settled in `hvpatch-lease-settle`. Stable DTrace
 /// ABI: append only. `ExecInvalidated` is the exec-replacement override that
 /// retires the lease regardless of the executor's own settlement.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchLeaseSettlementKind {
     Runnable = 0,
@@ -346,7 +399,13 @@ impl HvpatchLeaseSettlementKind {
 
 /// Settlement-time flag bits carried by `hvpatch-lease-settle` `arg2`.
 /// Stable DTrace ABI: append only.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchLeaseSettleFlag {
     /// A `Scheduler::wake` landed while the lease was running.
@@ -369,7 +428,13 @@ impl HvpatchLeaseSettleFlag {
 /// the companion probe. They come from independent allocators after a process
 /// fork and cannot be joined by assuming their integer values match. These
 /// ordinals are part of the DTrace provider ABI; append, never renumber.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchThreadTerminalReason {
     /// The guest issued `exit(2)` for this thread.
@@ -404,7 +469,13 @@ impl HvpatchThreadTerminalReason {
 /// Which Linux clone TID output the parent is publishing.
 ///
 /// These ordinals are part of the DTrace provider ABI; append, never renumber.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchCloneTidOutput {
     Parent = 0,
@@ -422,7 +493,13 @@ impl HvpatchCloneTidOutput {
 /// These ordinals mirror `carrick_guest_mem::MemoryError` without exporting
 /// backend error strings through the stable provider ABI. Append, never
 /// renumber.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchCloneTidWriteResult {
     Success = 0,
@@ -444,7 +521,13 @@ impl HvpatchCloneTidWriteResult {
 
 /// Stable lifecycle phases for Linux processes multiplexed inside one hvpatch VM.
 /// These ordinals are part of the DTrace provider ABI; append, never renumber.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchGuestLifecyclePhase {
     Root = 0,
@@ -469,7 +552,13 @@ impl HvpatchGuestLifecyclePhase {
 ///
 /// `detail` is phase-specific: it is the Linux wait exit code for
 /// `ProcessExit` and zero for the currently published Root/Fork/Exec events.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchGuestLifecycle {
     phase: HvpatchGuestLifecyclePhase,
     pid: i32,
@@ -491,7 +580,14 @@ pub struct HvpatchGuestLifecycle {
     detail: i64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::thiserror::Error,
+)]
 pub enum HvpatchGuestLifecycleError {
     #[error("hvpatch guest pid and tid must be positive")]
     InvalidTaskIdentity,
@@ -513,7 +609,13 @@ pub enum HvpatchGuestLifecycleError {
     InvalidPredecessorIdentity,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchGuestLifecycleArgs {
     pub phase: HvpatchGuestLifecyclePhase,
     pub pid: i32,
@@ -611,7 +713,13 @@ impl HvpatchGuestLifecycle {
 /// monotonic wall duration. Publishing the duration in the event keeps DTrace
 /// consumers stateless under hot all-syscall workloads, where dynamic-variable
 /// drops can otherwise make paired boundary captures look complete.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchSyscallService {
     pid: i32,
     tid: i32,
@@ -666,7 +774,13 @@ impl HvpatchSyscallService {
 
 /// Which memory-maintenance operation a [`HvpatchMmMaintenanceCensus`]
 /// describes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchMmMaintenanceSite {
     /// `ensure_frame_cow_write` with backing-maintenance intent: the per-page
@@ -684,7 +798,13 @@ pub enum HvpatchMmMaintenanceSite {
 /// tracks the population names a full-table walk, one that tracks the page
 /// count names per-page work, and one that stays flat is the intended
 /// indexed lookup.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchMmMaintenanceCensus {
     pub site: HvpatchMmMaintenanceSite,
     /// Linux 4 KiB pages the operation covered.
@@ -704,7 +824,13 @@ pub struct HvpatchMmMaintenanceCensus {
 /// A struct rather than eight scalars because the two populations and the two
 /// visit counts are only meaningful as a set -- a visit count without the
 /// population it was measured against says nothing about complexity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchMappingIndexCensus {
     far: u64,
     live_rows: u64,
@@ -716,7 +842,13 @@ pub struct HvpatchMappingIndexCensus {
     nanos: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchMappingIndexCensusArgs {
     pub far: u64,
     pub live_rows: u64,
@@ -776,7 +908,13 @@ impl HvpatchMappingIndexCensus {
 }
 
 /// Fatal or signal-lowered AArch64 fault with its Linux guest identity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchGuestFault {
     syndrome: u64,
     elr: u64,
@@ -837,7 +975,13 @@ impl HvpatchGuestFault {
 }
 
 /// Ordered publication states for one exact 16 KiB HVPatch frame COW.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchFrameCowPhase {
     Stage2Mapped = 0,
@@ -847,7 +991,13 @@ pub enum HvpatchFrameCowPhase {
 
 /// Authority under which a frame-COW split was requested. Append only: these
 /// ordinals are part of the signed structural-receipt ABI.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchFrameCowIntent {
     GuestVisible = 0,
@@ -858,7 +1008,13 @@ pub enum HvpatchFrameCowIntent {
 /// Why the runtime delivered an EL0 data abort as a signal instead of
 /// resolving it as an anonymous first touch (`resolve_mutating_fault`). One
 /// record per delivered fault; ordinals are read by `scripts/dtrace/`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchFirstTouchDeliverReason {
     /// The page is in no first-touch tracked extent and no grow-down VMA:
@@ -930,7 +1086,13 @@ impl HvpatchEl1RootAdmission {
 
 /// Exact authority that triggered a frame-COW transaction. Append only: these
 /// ordinals are part of the signed structural-receipt ABI.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchFrameCowTriggerClass {
     Stage1PermissionFault = 0,
@@ -948,7 +1110,13 @@ impl HvpatchFrameCowTriggerClass {
 /// Typed cause record emitted once, under the COW topology transaction, before
 /// the first physical mutation. Fault-triggered records bind FAR/ESR/TTBR0 to
 /// the same Linux task/mm identity used by the resulting COW phases.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchFrameCowTrigger {
     class: HvpatchFrameCowTriggerClass,
     pid: i32,
@@ -961,7 +1129,13 @@ pub struct HvpatchFrameCowTrigger {
     ttbr0: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchFrameCowTriggerArgs {
     pub class: HvpatchFrameCowTriggerClass,
     pub pid: i32,
@@ -1051,7 +1225,13 @@ impl HvpatchFrameCowPhase {
 }
 
 /// Authenticated structural receipt for a writer-only frame split.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchFrameCow {
     phase: HvpatchFrameCowPhase,
     intent: HvpatchFrameCowIntent,
@@ -1066,7 +1246,13 @@ pub struct HvpatchFrameCow {
     new_ipa: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchFrameCowArgs {
     pub phase: HvpatchFrameCowPhase,
     pub intent: HvpatchFrameCowIntent,
@@ -1154,7 +1340,13 @@ impl HvpatchFrameCow {
 
 /// Fork-time sharing class for one inherited frame mapping. Append only: these
 /// ordinals are part of the signed structural-receipt ABI.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchForkFrameKind {
     PrivateCow = 0,
@@ -1170,7 +1362,13 @@ impl HvpatchForkFrameKind {
 /// Authenticated fork-time proof that a child mapping initially names its
 /// parent's exact frame and global IPA. The provider emits this as two adjacent
 /// five-argument probes so macOS DTrace never loses a sixth scalar.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchForkFrameShare {
     pid: i32,
     tid: i32,
@@ -1184,7 +1382,13 @@ pub struct HvpatchForkFrameShare {
     length: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchForkFrameShareArgs {
     pub pid: i32,
     pub tid: i32,
@@ -1274,7 +1478,13 @@ impl HvpatchForkFrameShare {
 }
 
 /// Physical stage-2 lifetime transition for one global-frame IPA extent.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchGlobalFrameStage2Phase {
     Mapped = 0,
@@ -1290,7 +1500,13 @@ impl HvpatchGlobalFrameStage2Phase {
 /// Exact stage-2 map/unmap receipt used to reject overlapping live global IPAs
 /// and reuse before successful physical retirement. `host_addr` and
 /// `permissions` are nonzero map provenance and zero for an unmap.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchGlobalFrameStage2 {
     phase: HvpatchGlobalFrameStage2Phase,
     ipa: u64,
@@ -1342,7 +1558,13 @@ impl HvpatchGlobalFrameStage2 {
 }
 
 /// ASID and stage-1-root provenance for one Linux guest address space.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchGuestAddressSpace {
     pid: i32,
     asid: u32,
@@ -1353,7 +1575,13 @@ pub struct HvpatchGuestAddressSpace {
 
 /// Result of materializing one exec-image host backing. Append-only DTrace ABI
 /// ordinals.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchExecBackingPhase {
     Materialized = 0,
@@ -1371,7 +1599,13 @@ impl HvpatchExecBackingPhase {
 /// Where one immutable exec-predecessor classification was observed.
 ///
 /// These ordinals are part of the DTrace provider ABI; append, never renumber.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchExecPredecessorClassificationPhase {
     /// The runtime computed sharing from the authoritative Kernel MM leases.
@@ -1392,7 +1626,13 @@ impl HvpatchExecPredecessorClassificationPhase {
 ///
 /// The Linux PID/TID, never-reused `MmId`, and architectural ASID identify the
 /// exact predecessor. `shared` is immutable across all three phase firings.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchExecPredecessorIdentity {
     task_serial: u64,
     thread_serial: u64,
@@ -1431,7 +1671,13 @@ impl HvpatchExecPredecessorIdentity {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchExecPredecessorClassification {
     phase: HvpatchExecPredecessorClassificationPhase,
     task_serial: u64,
@@ -1497,7 +1743,13 @@ impl HvpatchExecPredecessorClassification {
 /// Low-rate lifecycle of one exact HVPatch MM lease edge.
 ///
 /// These ordinals are part of the DTrace provider ABI; append, never renumber.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchMmLeasePhase {
     SharedChildPublished = 0,
@@ -1515,7 +1767,13 @@ impl HvpatchMmLeasePhase {
 }
 
 /// Primary, five-scalar MM lease lifecycle record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchMmLeaseLifecycle {
     phase: HvpatchMmLeasePhase,
     task_pid: i32,
@@ -1568,7 +1826,13 @@ impl HvpatchMmLeaseLifecycle {
 ///
 /// For `SharedChildPublished`, `related` is the parent TaskKey. For
 /// `ExecObserved`, it is the executing ThreadKey. Other phases emit no relation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchMmLeaseRelation {
     phase: HvpatchMmLeasePhase,
     task_serial: u64,
@@ -1609,7 +1873,13 @@ impl HvpatchMmLeaseRelation {
 }
 
 /// Typed source record for `hvpatch-exec-backing`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchExecBacking {
     phase: HvpatchExecBackingPhase,
     guest_start: u64,
@@ -1658,7 +1928,13 @@ impl HvpatchExecBacking {
 
 /// Raw Hypervisor.framework stage-2 transition boundaries during one-VM exec.
 /// Append-only DTrace ABI ordinals.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchExecStage2Phase {
     UnmapBegin = 0,
@@ -1674,7 +1950,13 @@ impl HvpatchExecStage2Phase {
 }
 
 /// Typed source record for `hvpatch-exec-stage2`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchExecStage2 {
     phase: HvpatchExecStage2Phase,
     ipa: u64,
@@ -1685,7 +1967,13 @@ pub struct HvpatchExecStage2 {
 
 /// Coarse, mutually exclusive host stages inside one persistent-VM exec image
 /// replacement. These append-only ordinals are a stable DTrace ABI.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchExecReplaceStagePhase {
     AliasCleanup = 0,
@@ -1714,7 +2002,13 @@ impl HvpatchExecReplaceStagePhase {
 /// `mapping_count` and `mapped_bytes` describe the replacement image for
 /// every phase so a consumer can compare like-shaped execs without relying on
 /// process-local pointers or private Rust layout.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchExecReplaceStage {
     phase: HvpatchExecReplaceStagePhase,
     elapsed_ns: u64,
@@ -1758,7 +2052,13 @@ impl HvpatchExecReplaceStage {
 /// the Linux guest. This is deliberately separate from
 /// [`HvpatchExecReplaceStagePhase`]: `EngineReplace` encloses that engine's
 /// non-overlapping inner ledger. Ordinals are append-only DTrace ABI.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchExecRuntimeStagePhase {
     ProcState = 0,
@@ -1776,7 +2076,13 @@ impl HvpatchExecRuntimeStagePhase {
 }
 
 /// Typed source record for `hvpatch-exec-runtime-stage`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchExecRuntimeStage {
     phase: HvpatchExecRuntimeStagePhase,
     elapsed_ns: u64,
@@ -1818,7 +2124,13 @@ impl HvpatchExecRuntimeStage {
 
 /// Shared-HVF topology-lock operation classes. Ordinals are an append-only
 /// DTrace ABI so offline consumers can retain stable names across releases.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchTopologyOperation {
     InProcessFork = 0,
@@ -1843,7 +2155,13 @@ impl HvpatchTopologyOperation {
 /// Lifecycle of one topology-lock acquisition attempt. `Requested` precedes a
 /// blocking lock call, `Acquired` carries its wait time, and `Released` carries
 /// the hold time. `TryMiss` closes a nonblocking attempt that found contention.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchTopologyPhase {
     Requested = 0,
@@ -1859,7 +2177,13 @@ impl HvpatchTopologyPhase {
 }
 
 /// Typed source record for `hvpatch-topology-lock`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchTopologyLock {
     operation: HvpatchTopologyOperation,
     phase: HvpatchTopologyPhase,
@@ -1908,7 +2232,13 @@ impl HvpatchTopologyLock {
 
 /// Mutually exclusive parent-thread stages inside the in-process-fork
 /// topology-lock hold. Ordinals are append-only DTrace ABI.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchForkRuntimeStagePhase {
     Quiesce = 0,
@@ -1932,7 +2262,13 @@ impl HvpatchForkRuntimeStagePhase {
 }
 
 /// Typed source record for `hvpatch-fork-runtime-stage`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchForkRuntimeStage {
     phase: HvpatchForkRuntimeStagePhase,
     parent_pid: i32,
@@ -1982,7 +2318,13 @@ impl HvpatchForkRuntimeStage {
 /// Mutually exclusive construction stages inside an hvpatch in-process fork's
 /// process-spec build. Ordinals are append-only DTrace ABI. `Total` encloses
 /// every peer stage and therefore must not be summed with them.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchForkProcessSpecStagePhase {
     ParentPageTablesLoad = 0,
@@ -2017,7 +2359,13 @@ impl HvpatchForkProcessSpecStagePhase {
 /// table load; bytes for page-table clone, rebase, publication, frame planning,
 /// and backend finalization; mapping count for alias union and validation; zero
 /// where no useful cardinality exists.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchForkProcessSpecStage {
     phase: HvpatchForkProcessSpecStagePhase,
     child_pid: i32,
@@ -2070,7 +2418,13 @@ impl HvpatchForkProcessSpecStage {
 /// The ordinals intentionally match the append-only fork-footprint taxonomy
 /// used by the existing Phase-4 census, so consumers can join the two ledgers
 /// without translating an investigation-local enum.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchForkPrivateSnapshotRole {
     PrivateMmapArena = 1,
@@ -2106,7 +2460,13 @@ impl HvpatchForkPrivateSnapshotRole {
 }
 
 /// Host mechanism that produced one child's private mapping snapshot.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 #[repr(u32)]
 pub enum HvpatchForkPrivateSnapshotMethod {
     MachCowRemap = 0,
@@ -2124,7 +2484,13 @@ impl HvpatchForkPrivateSnapshotMethod {
 /// Keeping timing and outcome in separate five-scalar probes avoids macOS's
 /// qualified sixth-USDT-argument corruption while retaining guest identity,
 /// mapping address/size, duration, role, and mechanism.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchForkPrivateSnapshot {
     child_pid: i32,
     forking_tid: i32,
@@ -2172,7 +2538,13 @@ impl HvpatchForkPrivateSnapshot {
 }
 
 /// Classification half of the per-mapping private-snapshot DTrace record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchForkPrivateSnapshotOutcome {
     child_pid: i32,
     forking_tid: i32,
@@ -2220,7 +2592,13 @@ impl HvpatchForkPrivateSnapshotOutcome {
 }
 
 /// Typed source record for `hvpatch-fork-quiesce`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct HvpatchForkQuiesce {
     parent_pid: i32,
     forking_tid: i32,
@@ -3434,7 +3812,7 @@ macro_rules! dsr_ordinal_enum {
         }
     ) => {
         $(#[doc = $doc])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, ::core::cmp::PartialEq, ::core::cmp::Eq)]
         #[repr(u32)]
         pub enum $name {
             $($variant = $value),+
@@ -3466,7 +3844,14 @@ dsr_ordinal_enum! {
 }
 
 /// Rejected translated-range identity or executable extent.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::thiserror::Error,
+)]
 pub enum TranslatedRangeError {
     #[error("translated-range epoch must be nonzero")]
     ZeroEpoch,
@@ -3483,7 +3868,13 @@ pub enum TranslatedRangeError {
 }
 
 /// Nonzero identity for one process-image translated-range catalog.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct TranslatedRangeEpoch(NonZeroU64);
 
 impl TranslatedRangeEpoch {
@@ -3499,7 +3890,13 @@ impl TranslatedRangeEpoch {
 }
 
 /// Nonzero monotonically increasing identity for one catalog addition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct TranslatedRangeSequence(NonZeroU64);
 
 impl TranslatedRangeSequence {
@@ -3515,7 +3912,13 @@ impl TranslatedRangeSequence {
 }
 
 /// Stable nonzero identity for one loaded shared translation unit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct TranslatedUnitId(NonZeroU64);
 
 impl TranslatedUnitId {
@@ -3531,7 +3934,7 @@ impl TranslatedUnitId {
 }
 
 /// Reset the translated-range catalog for one process-image epoch.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub struct TranslatedRangeReset {
     epoch: TranslatedRangeEpoch,
 }
@@ -3568,7 +3971,7 @@ impl TranslatedRangeReset {
 /// ).unwrap();
 /// let _ = TranslatedRangeAdd::Private(shared);
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub enum TranslatedRangeAdd {
     Private(TranslatedPrivateRange),
     Shared(TranslatedSharedRange),
@@ -3602,7 +4005,7 @@ impl TranslatedRangeAdd {
 ///     range: HostVa(0x1000)..HostVa(0x2000),
 /// };
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub struct TranslatedPrivateRange {
     epoch: TranslatedRangeEpoch,
     sequence: TranslatedRangeSequence,
@@ -3640,7 +4043,7 @@ impl TranslatedPrivateRange {
 ///
 /// Its fields are private and construction requires a typed unit ID, so a
 /// caller cannot publish a shared event without unit identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub struct TranslatedSharedRange {
     epoch: TranslatedRangeEpoch,
     sequence: TranslatedRangeSequence,
@@ -3682,7 +4085,7 @@ impl TranslatedSharedRange {
 }
 
 /// Close the initial translated-range replay for one process-image epoch.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub struct TranslatedRangeReady {
     epoch: TranslatedRangeEpoch,
     final_sequence: u64,
@@ -3721,7 +4124,14 @@ fn validate_translated_range(range: &Range<HostVa>) -> Result<(), TranslatedRang
 }
 
 /// Rejected native-owned host-range identity or mapped extent.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ::thiserror::Error)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::thiserror::Error,
+)]
 pub enum NativeOwnedRangeError {
     #[error("native-owned range epoch must be nonzero")]
     ZeroEpoch,
@@ -3755,7 +4165,13 @@ pub enum NativeOwnedRangeError {
 }
 
 /// Nonzero identity for one process-image native-owned range catalog.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct NativeOwnedRangeEpoch(NonZeroU64);
 
 impl NativeOwnedRangeEpoch {
@@ -3771,7 +4187,13 @@ impl NativeOwnedRangeEpoch {
 }
 
 /// Nonzero monotonically increasing identity for one catalog addition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct NativeOwnedRangeSequence(NonZeroU64);
 
 impl NativeOwnedRangeSequence {
@@ -3787,7 +4209,13 @@ impl NativeOwnedRangeSequence {
 }
 
 /// Reset the native-owned range catalog for one process-image epoch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct NativeOwnedRangeReset {
     epoch: NativeOwnedRangeEpoch,
 }
@@ -3803,7 +4231,7 @@ impl NativeOwnedRangeReset {
 }
 
 /// Exact half-open host extent owned by the active native guest image.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub struct NativeOwnedRange {
     epoch: NativeOwnedRangeEpoch,
     sequence: NativeOwnedRangeSequence,
@@ -3839,7 +4267,13 @@ impl NativeOwnedRange {
 }
 
 /// Close a complete, nonempty native-owned range catalog.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct NativeOwnedRangeReady {
     epoch: NativeOwnedRangeEpoch,
     final_sequence: NonZeroU64,
@@ -4166,7 +4600,13 @@ mod image_publication_probe_abi {
 /// The role is never passed by a caller — [`NativeForkPhase::role`] derives it
 /// from the phase, so a child phase can never be reported under the parent
 /// role (the mis-pairing that a bare `i32` role argument invites).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(i32)]
 pub enum NativeForkRole {
     /// The forking thread, before `fork(2)` and on the parent's return path.
@@ -4212,7 +4652,13 @@ impl NativeForkRole {
 /// Discriminants are explicit and unique BY CONSTRUCTION: `rustc` rejects a
 /// duplicate enum discriminant, so this table cannot silently collide the way
 /// a list of hand-numbered `const`s can.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 #[repr(i32)]
 pub enum NativeForkPhase {
     /// Parent: waiting for the process-wide fork serialization token (the CAS
@@ -4961,7 +5407,7 @@ mod real {
     use crate::compat::{CompatEvent, SyscallArgs};
 
     #[cfg(target_os = "macos")]
-    #[derive(Clone, Debug, ::serde::Serialize)]
+    #[derive(::core::clone::Clone, ::core::fmt::Debug, ::serde::Serialize)]
     pub(crate) struct HostImageRange {
         start: u64,
         end: u64,
@@ -4969,14 +5415,14 @@ mod real {
     }
 
     #[cfg(target_os = "macos")]
-    #[derive(Clone, Debug, ::serde::Serialize)]
+    #[derive(::core::clone::Clone, ::core::fmt::Debug, ::serde::Serialize)]
     pub(crate) struct HostImageCatalog {
         pid: u32,
         ranges: Vec<HostImageRange>,
     }
 
     #[cfg(target_os = "macos")]
-    #[derive(Debug)]
+    #[derive(::core::fmt::Debug)]
     struct HostImageBase {
         pid: u32,
         base: u64,
@@ -4986,7 +5432,7 @@ mod real {
 
     /// Owned, immutable guest-image path in the exact NUL-terminated wire
     /// shape consumed by DTrace's `copyinstr`.
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
     pub struct PreparedGuestImagePath {
         wire: Box<[u8]>,
     }
@@ -5008,7 +5454,7 @@ mod real {
     /// publication after translated-range activation cannot rebuild the dyld
     /// path or reserialize the catalog.
     #[cfg(target_os = "macos")]
-    #[derive(Debug)]
+    #[derive(::core::fmt::Debug)]
     pub struct PreparedHostImagePublication {
         pid: u32,
         base: u64,
@@ -5020,7 +5466,7 @@ mod real {
     /// Cross-target shape for the real USDT arm. Dyld identity exists only on
     /// macOS, but the runtime is platform-checked with the same probe surface.
     #[cfg(not(target_os = "macos"))]
-    #[derive(Debug)]
+    #[derive(::core::fmt::Debug)]
     pub struct PreparedHostImagePublication;
 
     /// USDT probes for the carrick provider. The `usdt` crate's hard cap is
@@ -6392,7 +6838,7 @@ mod real {
         carrick_usdt::ulock__wake!(|| (std::process::id(), host_addr, iter, rc));
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(::core::clone::Clone, ::core::marker::Copy)]
     #[repr(C)]
     struct UlockRequeueWireProbe {
         pid: u64,
@@ -7916,7 +8362,7 @@ mod real {
 
     /// Raw-pointer payload for `epoll-masked`. Keep field order in sync with
     /// `scripts/dtrace/epoll-wait-debug.d`.
-    #[derive(Clone, Copy)]
+    #[derive(::core::clone::Clone, ::core::marker::Copy)]
     #[repr(C)]
     struct EpollMaskedWireProbe {
         origin: u64,
@@ -7964,7 +8410,7 @@ mod real {
 
     /// Raw-pointer payload for `epoll-rebind`. Keep field order in sync with
     /// `scripts/dtrace/epoll-wait-debug.d`.
-    #[derive(Clone, Copy)]
+    #[derive(::core::clone::Clone, ::core::marker::Copy)]
     #[repr(C)]
     struct EpollRebindProbe {
         reason: u64,
@@ -8366,7 +8812,13 @@ mod real {
         pub const WRITE_GUEST_CHECKED: u32 = 2;
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(
+        ::core::fmt::Debug,
+        ::core::clone::Clone,
+        ::core::marker::Copy,
+        ::core::cmp::PartialEq,
+        ::core::cmp::Eq,
+    )]
     struct GuestMemProbeDigest {
         checksum: u64,
         nonzero: u64,
@@ -8400,7 +8852,13 @@ mod real {
             })
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(
+        ::core::fmt::Debug,
+        ::core::clone::Clone,
+        ::core::marker::Copy,
+        ::core::cmp::PartialEq,
+        ::core::cmp::Eq,
+    )]
     struct GuestMemSubrangeConfig {
         offset: usize,
         length: usize,
@@ -8634,7 +9092,13 @@ mod real {
         carrick_usdt::vcpu__fault__gprs!(|| args());
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(
+        ::core::clone::Clone,
+        ::core::marker::Copy,
+        ::core::fmt::Debug,
+        ::core::cmp::PartialEq,
+        ::core::cmp::Eq,
+    )]
     pub struct NativeX86FaultArgs {
         pub pc: u64,
         pub fault_address: u64,
@@ -8693,7 +9157,13 @@ mod real {
     }
 
     /// Scalar payload for the opt-in native-x86 xstate transition probes.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(
+        ::core::clone::Clone,
+        ::core::marker::Copy,
+        ::core::fmt::Debug,
+        ::core::cmp::PartialEq,
+        ::core::cmp::Eq,
+    )]
     pub struct NativeX86XstateProbe {
         pub source: u64,
         pub target: u64,
@@ -9055,10 +9525,10 @@ mod stub {
     //! plain logic, not probe fires, so they keep their REAL bodies — behaviour
     //! is identical to the real arm.
 
-    #[derive(Debug)]
+    #[derive(::core::fmt::Debug)]
     pub struct PreparedHostImagePublication;
 
-    #[derive(Debug, Eq, PartialEq)]
+    #[derive(::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
     pub struct PreparedGuestImagePath {
         wire: Box<[u8]>,
     }
@@ -9409,7 +9879,13 @@ mod stub {
     stub!(native_x86_pc(pc: u64, rsp: u64, rdi: u64, rbp: u64, stack_word: u64));
     stub!(native_x86_resolve(source: u64, target: u64, rsp: u64, rdi: u64, rbp: u64));
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(
+        ::core::clone::Clone,
+        ::core::marker::Copy,
+        ::core::fmt::Debug,
+        ::core::cmp::PartialEq,
+        ::core::cmp::Eq,
+    )]
     pub struct NativeX86FaultArgs {
         pub pc: u64,
         pub fault_address: u64,
@@ -9427,7 +9903,13 @@ mod stub {
 
     /// Scalar payload for the opt-in native-x86 xstate transition probes
     /// (mirrors `real::NativeX86XstateProbe` field-for-field).
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(
+        ::core::clone::Clone,
+        ::core::marker::Copy,
+        ::core::fmt::Debug,
+        ::core::cmp::PartialEq,
+        ::core::cmp::Eq,
+    )]
     pub struct NativeX86XstateProbe {
         pub source: u64,
         pub target: u64,

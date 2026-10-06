@@ -44,7 +44,9 @@ const SUPPORTED_SETUP_FLAGS: u32 = 0;
 /// CQ ring share one mapping (IORING_FEAT_SINGLE_MMAP); the SQE array is a
 /// second mapping. All offsets are reported to the guest via io_uring_params,
 /// so carrick is free to choose them as long as params describes them honestly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(
+    Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq,
+)]
 pub struct RingLayout {
     pub sq_entries: u32,
     pub cq_entries: u32,
@@ -132,13 +134,28 @@ fn align_up_u32(v: u32, align: u32) -> u32 {
     v.div_ceil(align) * align
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::hash::Hash,
+    ::core::cmp::Ord,
+    ::core::cmp::PartialEq,
+    ::core::cmp::PartialOrd,
+)]
 pub enum IoUringRegion {
     SqCq,
     Sqes,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
 pub struct IoUringRegionLayout {
     pub guest_mmap_offset: u64,
     pub backing_offset: u64,
@@ -146,13 +163,29 @@ pub struct IoUringRegionLayout {
     pub mapped_extent: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::serde::Serialize,
+    ::serde::Deserialize,
+)]
 pub struct HostBackingIdentity {
     pub device: u64,
     pub inode: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+    ::serde::Serialize,
+    ::serde::Deserialize,
+)]
 pub struct IoUringLayoutSnapshot {
     pub sq_entries: u32,
     pub cq_entries: u32,
@@ -162,7 +195,7 @@ pub struct IoUringLayoutSnapshot {
     pub backing_len: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug, ::core::cmp::Eq, ::core::cmp::PartialEq)]
 pub struct IoUringDescriptionSnapshot {
     pub layout: IoUringLayoutSnapshot,
     pub data_identity: HostBackingIdentity,
@@ -584,7 +617,7 @@ impl crate::kernel::FileDescriptionBacking for IoUringBacking {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct IoUringMapping {
     pub description: Arc<crate::kernel::FileDescription>,
     pub region: IoUringRegion,
@@ -626,7 +659,7 @@ impl IoUringMapping {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(::core::clone::Clone, ::core::fmt::Debug)]
 pub struct IoUringMappingSnapshot {
     pub description: Arc<crate::kernel::FileDescription>,
     pub region: IoUringRegion,
