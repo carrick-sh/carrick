@@ -13,8 +13,8 @@ use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables}
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::{
     OBSERVE_ALLOCATOR, OBSERVE_DESCRIPTOR_PREPARE_PUBLISH, OBSERVE_DESCRIPTOR_PROTECT,
-    OBSERVE_FORK_TABLE_WINDOW, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE,
-    OBSERVE_PORTAL_WINDOW, OBSERVE_RETIRE_REPOINT, OBSERVE_SHARED_COW_FAULT,
+    OBSERVE_FORK_TABLE_WINDOW, OBSERVE_INITIAL_MM, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT,
+    OBSERVE_NATIVE, OBSERVE_PORTAL_WINDOW, OBSERVE_RETIRE_REPOINT, OBSERVE_SHARED_COW_FAULT,
     OBSERVE_SHARED_PREPARED_FAULT,
 };
 use carrick_x86::cpl0_scheduler::{
@@ -159,6 +159,7 @@ fn production_image_rejects_fixture_syscalls() {
         OBSERVE_PORTAL_WINDOW,
         OBSERVE_FORK_TABLE_WINDOW,
         OBSERVE_RETIRE_REPOINT,
+        OBSERVE_INITIAL_MM,
     ] {
         assert!(
             !plan.segments.iter().any(|segment| {
