@@ -37,9 +37,9 @@ impl carrick_guest_arch::ArchTypes for X86Backend {
 
 pub use context::{current_stack_slot, current_thread_cpu};
 pub use mmu::ForkDescriptorWords;
+pub(crate) use mmu::with_portal_cow_venue;
 pub(crate) use mmu::{NativeDescriptorWords, portal_descriptor_words, portal_invalidate_root};
 pub use mmu::{
     execute_native_edit_intent, hardware_live_root, portal_root_is_live, resident_leaf_matches,
-    unsupported_arm_descriptor_path,
 };
 pub use transport::{fatal_entry_binding, yield_host_effect};

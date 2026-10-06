@@ -14,7 +14,8 @@ use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::{
     OBSERVE_ALLOCATOR, OBSERVE_DESCRIPTOR_PREPARE_PUBLISH, OBSERVE_DESCRIPTOR_PROTECT,
     OBSERVE_FORK_TABLE_WINDOW, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE,
-    OBSERVE_PORTAL_WINDOW, OBSERVE_SHARED_COW_FAULT, OBSERVE_SHARED_PREPARED_FAULT,
+    OBSERVE_PORTAL_WINDOW, OBSERVE_RETIRE_REPOINT, OBSERVE_SHARED_COW_FAULT,
+    OBSERVE_SHARED_PREPARED_FAULT,
 };
 use carrick_x86::cpl0_scheduler::{
     ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
@@ -374,6 +375,23 @@ fn shared_kernel_fork_table_window_checks_each_granted_arena() {
     program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
     let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
     assert_eq!(carrier.observe(0).expect("fork table authority").result, 1);
+}
+
+#[test]
+fn shared_kernel_retired_page_repoints_without_user_publication() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(carrier.observe(0).expect("owner retirement").result, 1);
+    let leaf = carrier
+        .fixture_user_leaf_raw(0x3_4000)
+        .expect("retired leaf");
+    assert_eq!(leaf & 0x000f_ffff_ffff_f000, 0x91_5000);
+    assert_eq!(leaf & ((1 << 0) | (1 << 9)), 0, "still inaccessible");
+    assert_ne!(leaf & (1 << 8), 0, "retired predecessor preserved");
 }
 
 // Observe each task in turn while both lifecycle slots remain live. Registration

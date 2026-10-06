@@ -178,6 +178,89 @@ impl BackingMaintenance<'_> {
             }
         }
     }
+
+    /// Scrub one CPL0 retirement while preserving its invalid terminal. The
+    /// x86 owner lowers the exact repoint through an edit intent and drains
+    /// the active CR3 before the completion is exposed to the host.
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    pub fn scrub_x86<W: LiveDescriptorWords + ?Sized>(
+        self,
+        venue: &carrick_core::mm::cow::GuestCowVenue<'_, crate::cow::X86CowMmu, W>,
+        mut zero_page: impl FnMut(u64, u64),
+    ) -> Result<BackingMaintenanceProgress, MmError> {
+        use carrick_core::mm::cow::{CowRepointOp, OwnerCowMmu};
+        use carrick_mmu_core::x86::descriptor_txn::ADDRESS;
+        type Mmu = crate::cow::X86CowMmu;
+        if venue.root.raw() != self.ttbr0 & ADDRESS {
+            return Err(MmError::Stale);
+        }
+        let va = self.request.page();
+        let (backing, next) = retired_page_x86(
+            venue.words,
+            venue.root,
+            va,
+            self.request.pending().range.end(),
+        )?;
+        let Some(old_ipa) = backing else {
+            return Ok(BackingMaintenanceProgress::Complete { next });
+        };
+        let mm = self.request.handle().mm().raw();
+        let Some(grant) = venue.pool.claim(mm) else {
+            return Ok(BackingMaintenanceProgress::Supply);
+        };
+        let new_ipa = grant.physical_ipa + (old_ipa & (carrick_el1_abi::COW_GRANT_SIZE - 1));
+        let op = CowRepointOp {
+            mm_key: mm,
+            grant_epoch: grant.epoch,
+            va,
+            len: 4096,
+            old_ipa,
+            new_ipa,
+            backing: grant.backing,
+        };
+        let refuse = || {
+            if !venue.pool.abandon(&grant) {
+                crate::isa::x86::fatal_entry_binding();
+            }
+            Err(MmError::Core)
+        };
+        if grant.physical_ipa == old_ipa & !(carrick_el1_abi::COW_GRANT_SIZE - 1)
+            || !Mmu::plan_cow_repoint(venue.words, venue.root.raw(), op)
+            || !venue.residency.retire_small_span(mm, va, 4096)
+        {
+            return refuse();
+        }
+        match venue
+            .copy_window
+            .with_page(old_ipa, new_ipa, &mut zero_page)
+        {
+            Ok(()) => {}
+            Err(CowRepointOutcome::Indeterminate) => crate::isa::x86::fatal_entry_binding(),
+            Err(_) => return refuse(),
+        }
+        match Mmu::execute_cow_repoint(venue.words, venue.root.raw(), op) {
+            CowRepointOutcome::Applied {
+                flush_required: false,
+            } => {
+                if !venue.pool.complete(&CowGrantCompletion {
+                    purpose: carrick_el1_abi::CowGrantPurpose::RetiredBacking,
+                    grant,
+                    span_va: va,
+                    span_len: 4096,
+                    old_ipa,
+                    new_ipa,
+                }) {
+                    crate::isa::x86::fatal_entry_binding();
+                }
+                Ok(BackingMaintenanceProgress::Complete { next })
+            }
+            CowRepointOutcome::Applied {
+                flush_required: true,
+            }
+            | CowRepointOutcome::Indeterminate => crate::isa::x86::fatal_entry_binding(),
+            CowRepointOutcome::Refused | CowRepointOutcome::RolledBack => refuse(),
+        }
+    }
 }
 
 /// At most four live words, independent of VMA or carrier populations.
@@ -210,6 +293,42 @@ fn retired_page<W: LiveDescriptorWords + ?Sized>(
     Err(MmError::Core)
 }
 
+/// Read one retired CPL0 terminal without making its retained output user
+/// accessible. A missing upper table skips its entire absent span.
+#[cfg(any(test, all(target_os = "none", target_arch = "x86_64")))]
+pub(super) fn retired_page_x86<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    root: SubstrateGpa,
+    va: u64,
+    end: u64,
+) -> Result<(Option<u64>, u64), MmError> {
+    use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, HUGE, PREPARED, PRESENT, RETIRED};
+    let mut table = root.raw();
+    for (level, shift) in [39, 30, 21, 12].into_iter().enumerate() {
+        let word = words
+            .load(table + ((va >> shift) & 511) * 8)
+            .map_err(|_| MmError::Core)?;
+        if level == 3 {
+            if word == 0 {
+                return Ok((None, va + 4096));
+            }
+            if word & (PRESENT | PREPARED | RETIRED) != RETIRED || word & ADDRESS == 0 {
+                return Err(MmError::Fault);
+            }
+            return Ok((Some(word & ADDRESS), va + 4096));
+        }
+        if word == 0 {
+            let span = 1u64 << shift;
+            return Ok((None, ((va & !(span - 1)) + span).min(end)));
+        }
+        if word & PRESENT == 0 || word & HUGE != 0 || word & ADDRESS == 0 {
+            return Err(MmError::Fault);
+        }
+        table = word & ADDRESS;
+    }
+    Err(MmError::Core)
+}
+
 #[cfg(target_os = "none")]
 pub fn serve_backing_maintenance_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let run = |frame: &carrick_el1_abi::TrapFrame| -> Result<BackingMaintenanceProgress, MmError> {
@@ -218,6 +337,8 @@ pub fn serve_backing_maintenance_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             frame.slot,
         )
         .ok_or(MmError::Stale)?;
+        #[cfg(target_arch = "x86_64")]
+        let _ = slot;
         let request = PortalBackingMaintenance::decode(
             frame.x[1..9].try_into().map_err(|_| MmError::Invalid)?,
         )
@@ -239,14 +360,26 @@ pub fn serve_backing_maintenance_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             zone: Some(zone),
         };
         let operation = portal.begin_backing_maintenance(request, frame.slot as u32)?;
-        crate::fault::with_hardware_cow_venue(operation.ttbr0(), Some(slot), None, |venue| {
-            operation.scrub(venue, |_, destination| {
-                // SAFETY: the existing copy window maps one retained private
-                // grant page RW; the owner authenticated the invalid predecessor.
+        #[cfg(target_arch = "aarch64")]
+        let progress =
+            crate::fault::with_hardware_cow_venue(operation.ttbr0(), Some(slot), None, |venue| {
+                operation.scrub(venue, |_, destination| {
+                    // SAFETY: the existing copy window maps one retained private
+                    // grant page RW; the owner authenticated the invalid predecessor.
+                    unsafe { core::ptr::write_bytes(destination as *mut u8, 0, 4096) };
+                })
+            })
+            .map_err(|_| MmError::Core)?;
+        #[cfg(target_arch = "x86_64")]
+        let progress = crate::isa::x86::with_portal_cow_venue(operation.ttbr0(), |venue| {
+            operation.scrub_x86(venue, |_, destination| {
+                // SAFETY: the direct window resolves the private replacement
+                // page and the exact owner editor excludes another writer.
                 unsafe { core::ptr::write_bytes(destination as *mut u8, 0, 4096) };
             })
         })
-        .map_err(|_| MmError::Core)?
+        .map_err(|_| MmError::Core)?;
+        progress
     };
     frame.x[0] = match run(frame) {
         Ok(BackingMaintenanceProgress::Complete { next }) => {

@@ -72,6 +72,7 @@ pub const OBSERVE_SHARED_PREPARED_FAULT: u64 = u64::MAX - 6;
 pub const OBSERVE_SHARED_COW_FAULT: u64 = u64::MAX - 7;
 pub const OBSERVE_PORTAL_WINDOW: u64 = u64::MAX - 8;
 pub const OBSERVE_FORK_TABLE_WINDOW: u64 = u64::MAX - 9;
+pub const OBSERVE_RETIRE_REPOINT: u64 = u64::MAX - 10;
 /// Supervisor direct-window base mapping low physical RAM into the upper half.
 pub const DIRECT_VA: u64 = carrick_el1_abi::X86_CPL0_DIRECT_VA;
 /// Retained KVM fixture page-table window; the root is its first page.

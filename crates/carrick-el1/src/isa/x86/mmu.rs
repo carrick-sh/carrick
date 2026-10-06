@@ -98,6 +98,32 @@ pub fn portal_root_is_live(target: u64) -> bool {
     portal_descriptor_words(target).is_ok()
 }
 
+/// Give one owner maintenance operation the live CR3 table words and the
+/// already-retained direct copy window. No ARM service alias is constructed.
+pub(crate) fn with_portal_cow_venue<R>(
+    target: u64,
+    run: impl for<'a> FnOnce(
+        &carrick_core::mm::cow::GuestCowVenue<
+            'a,
+            crate::cow::X86CowMmu,
+            dyn LiveDescriptorWords + 'a,
+        >,
+    ) -> R,
+) -> Result<R, ArchError> {
+    let native = portal_descriptor_words(target)?;
+    let words: &dyn LiveDescriptorWords = &native;
+    let root = carrick_mmu_core::aarch64::SubstrateGpa(target);
+    let venue = carrick_core::mm::cow::GuestCowVenue {
+        publish_executable: None,
+        words,
+        root,
+        pool: carrick_el1_abi::cow_grant_pool_guest(),
+        residency: carrick_el1_abi::frame_grant_residency_guest(),
+        copy_window: carrick_core::mm::cow::CowCopyWindow::target(words, root),
+    };
+    Ok(run(&venue))
+}
+
 /// Drain all non-global translations after a portal grant under the live root.
 pub(crate) fn portal_invalidate_root(target: u64) -> Result<(), ArchError> {
     if live_root()?.address().raw() != target {
@@ -236,15 +262,6 @@ impl LiveDescriptorWords for ForkDescriptorWords {
             self.failed_drain.set(true);
         }
     }
-}
-
-/// Legacy ARM descriptor callers need a separate x86 table owner before they
-/// can interpret any descriptor; returning a CR3 here would be unsound.
-#[cold]
-#[inline(never)]
-pub fn unsupported_arm_descriptor_path() -> u64 {
-    // SAFETY: no ARM descriptor mutation may proceed against an x86 PML4.
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
 }
 
 /// Exact physical page-table window reached through a retained supervisor
