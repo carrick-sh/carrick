@@ -10,6 +10,7 @@ carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 
 carrick-sched-core = { path = "../carrick-sched-core" }
+carrick-signal-core = { path = "../carrick-signal-core" }
 
 [lints]
 workspace = true
