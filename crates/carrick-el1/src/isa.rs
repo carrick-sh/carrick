@@ -6,6 +6,7 @@ pub enum ArchError {
     Unbound,
     InvalidWidth,
     InvalidFrame,
+    InvalidContext,
     Busy,
 }
 
