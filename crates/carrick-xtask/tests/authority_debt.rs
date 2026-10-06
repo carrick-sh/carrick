@@ -151,6 +151,119 @@ impl IpcView {
     }
     root
 }
+
+fn assert_dialect_rejection(root: &std::path::Path, expected: &str) {
+    let error = carrick_xtask::authority_source::SourceCensus::load(root)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains(expected), "expected {expected}, got {error}");
+}
+
+fn restricted_dialect_error(source: &str, expected: &str) {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    if source.contains("selected.rs") {
+        std::fs::create_dir_all(src.join("parent")).unwrap();
+        write_source(
+            src.join("parent/selected.rs"),
+            "fn hidden(table: &Table) { table.read_open_files(); }",
+        )
+        .unwrap();
+    }
+    write_source(src.join("lib.rs"), source).unwrap();
+    let error = carrick_xtask::authority_source::SourceCensus::load(root.path())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(expected),
+        "expected {expected:?}, got {error}"
+    );
+    assert!(
+        error.contains("lib.rs:"),
+        "missing precise source location: {error}"
+    );
+}
+
+#[test]
+fn restricted_dialect_cfg_attr_path_is_rejected() {
+    restricted_dialect_error(
+        r#"mod parent { #[cfg_attr(all(), path="selected.rs")] mod child; }
+#[cfg(test)] #[path="parent/selected.rs"] mod test_copy;"#,
+        "conditional module path is unsupported",
+    );
+}
+
+#[test]
+fn restricted_dialect_rebound_test_is_rejected() {
+    restricted_dialect_error(
+        "use tracing::instrument as test; #[test] fn hidden(table: &Table) { table.read_open_files(); }",
+        "import may rebind built-in test",
+    );
+}
+
+#[test]
+fn restricted_dialect_glob_test_is_rejected() {
+    restricted_dialect_error(
+        "use tracing::*; #[test] fn hidden(table: &Table) { table.read_open_files(); }",
+        "glob import makes test exclusion ambiguous",
+    );
+}
+
+#[test]
+fn restricted_dialect_qualified_test_is_rejected() {
+    restricted_dialect_error(
+        "#[tracing::test] fn hidden(table: &Table) { table.read_open_files(); }",
+        "qualified test attribute is unsupported",
+    );
+}
+
+#[test]
+fn restricted_dialect_cfg_attr_test_is_rejected() {
+    restricted_dialect_error(
+        "#[cfg_attr(all(), test)] fn hidden(table: &Table) { table.read_open_files(); }",
+        "conditional test attribute is unsupported",
+    );
+}
+
+#[test]
+fn restricted_dialect_attribute_expression_is_rejected() {
+    restricted_dialect_error(
+        "#[tracing::instrument(fields(count = table.read_open_files().len()))] fn hidden(table: &Table) {}",
+        "unaudited attribute arguments",
+    );
+}
+
+#[test]
+fn restricted_dialect_renamed_operation_is_rejected() {
+    restricted_dialect_error(
+        "use x::read_open_files as r; fn hidden() { r(); }",
+        "renamed protected import read_open_files as r",
+    );
+}
+
+#[test]
+fn restricted_dialect_reexported_termination_is_rejected() {
+    restricted_dialect_error(
+        "mod x { pub use std::process::abort as read_open_files; }",
+        "renamed protected import abort as read_open_files",
+    );
+}
+
+#[test]
+fn restricted_dialect_renamed_authority_type_is_rejected() {
+    restricted_dialect_error(
+        "use OpenDescriptionRef as R; fn hidden(x: X) { R::clone(x); }",
+        "renamed protected import OpenDescriptionRef as R",
+    );
+}
+
+#[test]
+fn restricted_dialect_renamed_environment_is_rejected() {
+    restricted_dialect_error(
+        "use std::env as e; fn hidden() { e::var(\"CARRICK_MODE\"); }",
+        "renamed protected import env as e",
+    );
+}
 fn tools_root() -> &'static std::path::Path {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1150,6 +1263,10 @@ fn every_production_declaration_including_function_and_literal_macro_is_followed
             "fn access(table: &FileTable) { table.read_open_files(); }",
         )
         .unwrap();
+        if declaration.starts_with("items!") {
+            assert_dialect_rejection(root.path(), "module path in macro input is unsupported");
+            continue;
+        }
         let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
         assert_eq!(census.k1.len(), 1, "production declaration: {declaration}");
         assert!(!census.is_test_at("crates/carrick-kernel/src/shared.rs", 1, 0));
@@ -1355,9 +1472,7 @@ fn source_inclusions_in_macro_inputs_cannot_hide_production_files() {
         "fn inner(table: &FileTable) { table.read_open_files(); }",
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
-    assert_eq!(census.k1.len(), 1);
-    assert_eq!(census.k1[0].owner, "carrick_kernel::access::inner");
+    assert_dialect_rejection(root.path(), "unresolved source reference in macro input");
 }
 
 #[test]
@@ -1392,9 +1507,7 @@ fn renamed_source_inclusions_cannot_hide_production_files() {
         "fn access(table: &FileTable) { table.read_open_files(); }",
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
-    assert_eq!(census.k1.len(), 1);
-    assert_eq!(census.k1[0].owner, "carrick_kernel::access");
+    assert_dialect_rejection(root.path(), "renamed protected import include");
     write_source(src.join("lib.rs"), "use std::include as compiled; macro_rules! hidden { () => { compiled!(\"shared.rs\"); }; }").unwrap();
     assert!(carrick_xtask::authority_source::SourceCensus::load(root.path()).is_err());
 }
@@ -1427,18 +1540,7 @@ fn review_macro_input_inclusion_alias_cannot_hide_k1() {
         "fn hidden(table: &Table) { table.read_open_files(); }",
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
-    assert!(!census.is_test_at("crates/carrick-kernel/src/shared.rs", 1, 0));
-    assert!(
-        census
-            .k1
-            .iter()
-            .any(|site| site.owner == "carrick_kernel::hidden")
-    );
-    assert!(
-        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
-            .is_err()
-    );
+    assert_dialect_rejection(root.path(), "renamed protected import include");
 }
 
 #[test]
@@ -1459,7 +1561,10 @@ fn review_macro_input_inclusion_alias_cannot_hide_raw_locks() {
         carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
             .unwrap_err()
             .to_string();
-    assert!(error.contains("unknown authority"), "{error}");
+    assert!(
+        error.contains("renamed protected import include"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1479,7 +1584,10 @@ fn review_macro_input_inclusion_alias_rejects_nonliteral_paths() {
     let error = carrick_xtask::authority_source::SourceCensus::load(root.path())
         .unwrap_err()
         .to_string();
-    assert!(error.contains("nonliteral source inclusion"), "{error}");
+    assert!(
+        error.contains("renamed protected import include"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1528,12 +1636,12 @@ fn review_dsl_source_literals_mark_production_in_every_token_position() {
         )
         .unwrap();
         write_source(src.join("shared.rs"), "fn data() {}").unwrap();
-        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
-        assert!(
-            !census.is_test_file("crates/carrick-kernel/src/shared.rs")
-                && !census.is_test_at("crates/carrick-kernel/src/shared.rs", 1, 0),
-            "every source literal in macro tokens is a production reference: {invocation}"
-        );
+        if invocation.starts_with("#[cfg(test)]") {
+            let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+            assert!(census.is_test_file("crates/carrick-kernel/src/shared.rs"));
+        } else {
+            assert_dialect_rejection(root.path(), "restricted census dialect");
+        }
     }
 }
 
@@ -1620,6 +1728,18 @@ pub fn poll(table: &Table) { table.read_open_files(); }
         )
         .unwrap();
         write_source(src.join("census_child.rs"), "fn data() {}").unwrap();
+        assert_dialect_rejection(root.path(), "restricted census dialect");
+        let original = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+        let lines = original
+            .lines()
+            .filter(|line| !line.contains("pass!"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_source(
+            src.join("lib.rs"),
+            format!("const SOURCE: &str = include_str!(\"shared.rs\");\n{lines}"),
+        )
+        .unwrap();
         let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
         assert!(!census.is_test_file("crates/carrick-kernel/src/census_child.rs"));
         write_source(src.join("census_child.rs"), hidden).unwrap();
@@ -1659,6 +1779,18 @@ pub fn poll(table: &Table) { table.read_open_files(); }
         )
         .unwrap();
         write_source(src.join("census_grandchild.rs"), "fn data() {}").unwrap();
+        assert_dialect_rejection(root.path(), "restricted census dialect");
+        let original = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+        let lines = original
+            .lines()
+            .filter(|line| !line.contains("pass!"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        write_source(
+            src.join("lib.rs"),
+            format!("const SOURCE: &str = include_str!(\"shared.rs\");\n{lines}"),
+        )
+        .unwrap();
         let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
         assert!(!census.is_test_file("crates/carrick-kernel/src/census_child.rs"));
         assert!(!census.is_test_file("crates/carrick-kernel/src/census_grandchild.rs"));
@@ -1726,19 +1858,13 @@ pub fn poll(table: &Table) {{ table.read_open_files(); }}
         write_source(child, "pub mod grandchild;").unwrap();
         std::fs::create_dir_all(grandchild.parent().unwrap()).unwrap();
         write_source(&grandchild, "fn data() {}").unwrap();
-        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
-        let relative = format!("crates/carrick-kernel/src/{grandchild_file}");
-        assert!(!census.is_test_file(&relative), "descendant of {shared}");
+        assert_dialect_rejection(root.path(), "unresolved source reference in macro input");
         write_source(
             &grandchild,
             "fn hidden(table: &Table) { table.read_open_files(); }",
         )
         .unwrap();
-        assert!(
-            carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
-                .is_err(),
-            "ordinary, inline, local, macro-input and literal edges must continue to production descendants: {shared_file}: {shared}"
-        );
+        assert_dialect_rejection(root.path(), "unresolved source reference in macro input");
     }
 }
 
@@ -1776,13 +1902,20 @@ fn test(table: &Table) { table.read_open_files(); }
 "#,
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
-    assert!(!census.is_test_file("crates/carrick-kernel/src/census_child.rs"));
-    assert!(census.is_test_file("crates/carrick-kernel/src/only_tests.rs"));
+    assert_dialect_rejection(root.path(), "unresolved source reference in macro input");
+    let source = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+    write_source(
+        src.join("lib.rs"),
+        source.replace(
+            "pass! { @ \"shared.rs\"; }",
+            "const SOURCE: &str = include_str!(\"shared.rs\");",
+        ),
+    )
+    .unwrap();
+    let error = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap_err();
     assert!(
-        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
-            .is_ok(),
-        "cyclic physical references converge while cfg(test) descendants stay excluded"
+        error.to_string().contains("recursive module graph"),
+        "{error}"
     );
 }
 
@@ -1805,13 +1938,7 @@ pub fn poll(table: &Table) { table.read_open_files(); }
         "fn hidden(table: &Table) { table.read_open_files(); }",
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
-    assert!(!census.is_test_file("crates/carrick-kernel/src/hidden.rs"));
-    assert_eq!(census.k1.len(), 2);
-    assert!(
-        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
-            .is_err()
-    );
+    assert_dialect_rejection(root.path(), "test exclusion in macro input");
 }
 
 #[test]
@@ -1827,12 +1954,7 @@ pub fn poll(table: &Table) { table.read_open_files(); }
 "#,
     )
     .unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
-    assert_eq!(census.k1.len(), 2);
-    assert!(
-        carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
-            .is_err()
-    );
+    assert_dialect_rejection(root.path(), "test exclusion in macro input");
 }
 
 #[test]
@@ -1930,12 +2052,10 @@ fn review_fail_closed_test_include_cycle_does_not_seed_production() {
     assert!(census.is_test_file("crates/carrick-kernel/src/b.rs"));
     assert_eq!(census.k1.len(), 1);
     carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1)).unwrap();
-    // A production macro literal wins over the entire test-only cycle.
+    // An unresolved production literal is rejected, never promoted.
     write_source(src.join("lib.rs"), "#[cfg(test)] mod a; pass! { @ \"b.rs\" } pub fn poll(table: &Table) { table.read_open_files(); }").unwrap();
     write_source(src.join("a.rs"), "include!(\"b.rs\"); fn helper() {}").unwrap();
-    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
-    assert!(!census.is_test_file("crates/carrick-kernel/src/a.rs"));
-    assert!(!census.is_test_file("crates/carrick-kernel/src/b.rs"));
+    assert_dialect_rejection(root.path(), "unresolved source reference in macro input");
     // Production promotion cannot manufacture a logical authority owner.
     write_source(
         src.join("a.rs"),
@@ -1968,7 +2088,7 @@ production! {{ #[cfg(test)] fn hidden(this: &Dispatcher) {{ {call}; }} }}
             ),
         )
         .unwrap();
-        carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+        assert_dialect_rejection(root.path(), "test exclusion in macro input");
         assert!(
             carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
                 .is_err(),
@@ -2010,21 +2130,13 @@ pub fn poll(table: &Table) {{ table.read_open_files(); }}
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             write_source(path, "fn data() {}").unwrap();
         }
-        let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
-        assert!(
-            !census.is_test_file(&format!("crates/carrick-kernel/src/{default_file}")),
-            "{declaration}"
-        );
+        assert_dialect_rejection(root.path(), "restricted census dialect");
         write_source(
             src.join(default_file),
             "fn hidden(table: &Table) { table.read_open_files(); }",
         )
         .unwrap();
-        assert!(
-            carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1))
-                .is_err(),
-            "{declaration}"
-        );
+        assert_dialect_rejection(root.path(), "restricted census dialect");
     }
 }
 
@@ -2225,5 +2337,168 @@ fn review_macos_census_checkout_fetches_the_event_base() {
                 .any(|step| step["run"].as_str() == Some("just ci-probe-coverage-base")),
             "{job} must fetch the actual event base"
         );
+    }
+}
+
+#[test]
+fn restricted_dialect_inline_literal_path_uses_inline_directory() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    std::fs::create_dir_all(src.join("parent")).unwrap();
+    write_source(
+        src.join("lib.rs"),
+        r#"mod parent { #[path="selected.rs"] mod child; }
+#[cfg(test)] #[path="parent/selected.rs"] mod test_copy;"#,
+    )
+    .unwrap();
+    write_source(
+        src.join("parent/selected.rs"),
+        "fn access(table: &Table) { table.read_open_files(); }",
+    )
+    .unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert_eq!(census.k1.len(), 1);
+    assert_eq!(census.k1[0].owner, "carrick_kernel::parent::child::access");
+    assert!(!census.is_test_file("crates/carrick-kernel/src/parent/selected.rs"));
+}
+
+#[test]
+fn restricted_dialect_test_scope_glob_cannot_exclude_production() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(src.join("lib.rs"), "#[cfg(test)] mod tests { use tracing::*; #[test] fn helper(table: &Table) { table.read_open_files(); } } pub fn poll(table: &Table) { table.read_open_files(); }").unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert_eq!(census.k1.len(), 1);
+    assert_eq!(census.k1[0].owner, "carrick_kernel::poll");
+    carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1)).unwrap();
+}
+
+#[test]
+fn restricted_dialect_type_alias_chain_cannot_rename_authority() {
+    restricted_dialect_error(
+        "type Hidden = OpenDescriptionRef; type Other = Hidden; use Other as R; fn hidden(x: X) { R::clone(x); }",
+        "renamed protected import Other as R",
+    );
+}
+
+#[test]
+fn restricted_dialect_audited_attributes_do_not_allow_authority_or_blocks() {
+    for source in [
+        "#[error(\"bad\", table.read_open_files())] struct Error;",
+        "#[error(\"bad\", { std::process::abort(); })] struct Error;",
+        "#[arg(default_value_t = { std::env::var(\"X\") })] struct Args;",
+        "#[arg(default_value_t = std::process::abort())] struct Args;",
+    ] {
+        restricted_dialect_error(source, "unaudited attribute arguments");
+    }
+}
+
+#[test]
+fn restricted_dialect_schema_base_never_enters_legacy_census() {
+    let (root, _) = authority_cli_fixture();
+    let policy = root
+        .path()
+        .join(carrick_xtask::authority_debt::CEILINGS_PATH);
+    std::fs::write(&policy, serde_json::to_vec(&ceilings(1)).unwrap()).unwrap();
+    let lib = root.path().join("crates/carrick-kernel/src/lib.rs");
+    write_source(&lib, "not rust at all").unwrap();
+    git_fixture(root.path(), &["add", "."]);
+    git_fixture(
+        root.path(),
+        &["commit", "-qm", "schema base with unreadable source"],
+    );
+    let base = git_fixture(root.path(), &["rev-parse", "HEAD"]);
+    write_source(
+        &lib,
+        "pub fn poll(table: &Table) { table.read_open_files(); }",
+    )
+    .unwrap();
+    git_fixture(root.path(), &["add", "."]);
+    git_fixture(root.path(), &["commit", "-qm", "strict working source"]);
+    let output = authority_cli(root.path(), Some(&base), None, true);
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("PR-base ratchet passed"));
+    write_source(&lib, "use tracing::instrument as test; #[test] fn poll(table: &Table) { table.read_open_files(); }").unwrap();
+    let output = authority_cli(root.path(), Some(&base), None, true);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("import may rebind built-in test"));
+}
+
+#[test]
+fn restricted_dialect_external_test_scope_proof_never_overrides_production() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(
+        src.join("lib.rs"),
+        "#[cfg(test)] mod tests; pub fn poll(table: &Table) { table.read_open_files(); }",
+    )
+    .unwrap();
+    write_source(
+        src.join("tests.rs"),
+        "use tracing::*; #[test] fn helper(table: &Table) { table.read_open_files(); }",
+    )
+    .unwrap();
+    carrick_xtask::authority_debt::verify_source(root.path(), tools_root(), &ceilings(1)).unwrap();
+    write_source(src.join("lib.rs"), "#[cfg(test)] mod tests; const SOURCE: &str = include_str!(\"tests.rs\"); pub fn poll(table: &Table) { table.read_open_files(); }").unwrap();
+    assert_dialect_rejection(root.path(), "glob import makes test exclusion ambiguous");
+}
+
+#[test]
+fn restricted_dialect_attribute_audits_cannot_hide_callbacks_or_unknown_derives() {
+    restricted_dialect_error(
+        "#[serde(default = \"std::process::abort\")] struct Data;",
+        "protected callback in audited attribute metadata",
+    );
+    restricted_dialect_error(
+        "#[derive(Unknown)] struct Data;",
+        "unaudited derive macro Unknown",
+    );
+    restricted_dialect_error(
+        "#[unknown] fn helper() {}",
+        "unaudited attribute macro unknown",
+    );
+    restricted_dialect_error(
+        "use serde::Serialize; use unknown::Serialize; #[derive(Serialize)] struct Data;",
+        "import may rebind an audited derive macro",
+    );
+    restricted_dialect_error(
+        "use unknown::serde; #[derive(serde::Serialize)] struct Data;",
+        "import may rebind an audited macro provider",
+    );
+}
+
+#[test]
+fn restricted_dialect_final_production_closure_rejects_descendant_attributes() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(src.join("lib.rs"), "const SOURCE: &[u8] = include_bytes!(\"shared.rs\"); #[cfg(test)] #[path=\"shared.rs\"] mod test_copy; pub fn poll(table: &Table) { table.read_open_files(); }").unwrap();
+    write_source(src.join("shared.rs"), "#[path=\"child.rs\"] mod child;").unwrap();
+    write_source(src.join("child.rs"), "#[tracing::instrument(fields(count = table.read_open_files().len()))] fn hidden(table: &Table) {}").unwrap();
+    assert_dialect_rejection(root.path(), "unaudited attribute macro tracing::instrument");
+}
+
+#[test]
+fn restricted_dialect_globs_cannot_rebind_audited_macros() {
+    for source in [
+        "use external::*; #[usdt::provider] mod probes {}",
+        "use external::*; #[derive(serde::Serialize)] struct Data;",
+        "use external::*; #[error(\"bad\")] fn helper() {}",
+    ] {
+        restricted_dialect_error(source, "glob import makes audited macro binding ambiguous");
+    }
+}
+
+#[test]
+fn restricted_dialect_absolute_providers_prove_helpers_despite_globs() {
+    let root = source_fixture();
+    let src = root.path().join("crates/carrick-kernel/src");
+    write_source(src.join("lib.rs"), "use external::*; #[derive(::serde::Serialize)] #[serde(rename = \"Data\")] struct Data { #[serde(skip)] value: usize } #[::usdt::provider] mod probes {}").unwrap();
+    let census = carrick_xtask::authority_source::SourceCensus::load(root.path()).unwrap();
+    assert!(census.k1.is_empty());
+    for source in [
+        "#[derive(::serde::Serialize)] #[error(\"bad\")] struct Data;",
+        "pass! { #[derive(::serde::Serialize)] #[serde(rename = \"Data\")] struct Data; }",
+    ] {
+        restricted_dialect_error(source, "unresolved derive helper");
     }
 }

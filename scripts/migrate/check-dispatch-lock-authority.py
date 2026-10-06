@@ -276,19 +276,19 @@ def _is_test_only_attribute(tokens: Sequence[Token], start: int, end: int) -> bo
     return False
 
 
-def _opaque_macro_inputs(tokens):
+def _scope_scanner():
     spec = importlib.util.spec_from_file_location("authority_scope_cfg", Path(__file__).resolve().with_name("check-runtime-aborts.py"))
     module = sys.modules.get(spec.name)
     if module is None:
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)
-    return module.opaque_macro_inputs(tokens)
+    return module
 
 
 def production_mask(tokens: Sequence[Token]) -> list[bool]:
     """Return True for tokens that can compile when cfg(test) is disabled."""
-    opaque = _opaque_macro_inputs(tokens)
+    opaque = _scope_scanner().opaque_macro_inputs(tokens)
     production = [True] * len(tokens)
     test_scope_stack = [False]
     pending_test_attribute = False
@@ -371,6 +371,7 @@ def find_enclosing_item(tokens: Sequence[Token], target_idx: int) -> str:
 
 def scan_tokens(tokens: Sequence[Token], relative_path: str) -> list[RawLockSite]:
     """Scan a tokenized Rust file for raw lock acquisition sites."""
+    _scope_scanner().validate_test_dialect(tokens, relative_path)
     prod_mask = production_mask(tokens)
     raw_occurrences: list[tuple[int, str, str, str, int]] = []  # (line, item, category, expression, column)
 
@@ -529,7 +530,7 @@ def scan_tokens(tokens: Sequence[Token], relative_path: str) -> list[RawLockSite
     return sites
 
 
-def scan_sources(repo_root: Path) -> list[RawLockSite]:
+def scan_sources(repo_root: Path, *, test_files: Sequence[str] = ()) -> list[RawLockSite]:
     """Scan crate source trees; the Rust census resolves production owners."""
     all_sites: list[RawLockSite] = []
     # A declared kernel module can use #[path] outside its physical crate.
@@ -546,6 +547,9 @@ def scan_sources(repo_root: Path) -> list[RawLockSite]:
 
         for rs_file in files:
             relative = str(rs_file.relative_to(repo_root))
+            # Only the strict Rust census supplies this parsed parent-module proof.
+            if relative in test_files:
+                continue
             source = rs_file.read_text(encoding="utf-8")
             tokens = lex_rust(source)
             file_sites = scan_tokens(tokens, relative)

@@ -1,0 +1,86 @@
+[
+  {
+    "name": "error",
+    "reason": "thiserror-impl 2.0.20 Error derive helper: expands only Display/error formatting, never authority acquisition or process termination. Arguments remain restricted to literal format strings, field/constant projections, and zero-argument get/as_secs/as_millis/display formatting adapters; sensitive identifiers, blocks and other calls are rejected by the census. Provider: Cargo.lock thiserror-impl; src/expand.rs impl_enum/impl_struct."
+  },
+  {
+    "name": "arg",
+    "reason": "clap_derive 4.6.1 derive helper: constructs Arg metadata, never a Carrick authority operation or raw process termination. Nonliteral values are restricted by the census to constant/variant paths; blocks and calls are rejected. Provider: Cargo.lock clap_derive; src/item.rs and src/derives/args.rs."
+  },
+  {
+    "name": "serde",
+    "reason": "serde_derive 1.0.228 Serialize/Deserialize derive helper: literal metadata controls data serialization and field names; the helper does not emit authority acquisitions or raw termination. Executable arguments are rejected. Cargo.lock serde_derive, src/internals/attr.rs."
+  },
+  {
+    "name": "from",
+    "reason": "thiserror-impl 2.0.20 Error derive helper: a field conversion annotation; it emits conversion/error trait glue, not Carrick authority acquisition or raw termination. Only literal metadata is admitted. Cargo.lock thiserror-impl, src/expand.rs."
+  },
+  {
+    "name": "source",
+    "reason": "thiserror-impl 2.0.20 Error derive helper: names the error-chain field and emits Error::source projection; no authority acquisition or raw termination. Only literal metadata is admitted. Cargo.lock thiserror-impl, src/expand.rs."
+  },
+  {
+    "name": "command",
+    "reason": "clap_derive 4.6.1 derive helper: literal command metadata constructs the command schema, not authority or raw termination calls. Expressions are rejected. Cargo.lock clap_derive, src/item.rs."
+  },
+  {
+    "name": "value",
+    "reason": "clap_derive 4.6.1 ValueEnum derive helper: literal metadata sets enum value names and visibility; expansion is value matching and PossibleValue construction, never authority acquisition or raw termination. Expressions are rejected. Cargo.lock clap_derive, src/derives/value_enum.rs."
+  },
+  {
+    "name": "clap",
+    "reason": "clap_derive 4.6.1 compatibility derive helper used by the current CLI structs: literal metadata builds the same argument/command schema as arg/command helpers; no Carrick authority acquisition or raw termination. Executable arguments are rejected. Cargo.lock clap_derive, src/item.rs."
+  },
+  {
+    "name": "usdt::provider",
+    "reason": "usdt-attr-macro 0.6 provider: emits probe marshalling, registration, enablement and native assembly, not Carrick authority acquisitions or std::process abort/exit. Only literal metadata is accepted. Provider: Cargo.lock usdt-attr-macro/usdt-impl, usdt-attr-macro/src/lib.rs and usdt-impl/src/{common,linker,no-linker,empty}.rs. Probe function signatures and arguments stay visible to the ordinary census."
+  },
+  {
+    "name": "thiserror::Error",
+    "reason": "Locked thiserror Error derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: thiserror-impl 2.0.20 src/expand.rs."
+  },
+  {
+    "name": "serde::Serialize",
+    "reason": "Locked serde Serialize derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: serde_derive 1.0.228 src/{ser,de}.rs; callback metadata is separately checked."
+  },
+  {
+    "name": "serde::Deserialize",
+    "reason": "Locked serde Deserialize derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: serde_derive 1.0.228 src/{ser,de}.rs; callback metadata is separately checked."
+  },
+  {
+    "name": "clap::Args",
+    "reason": "Locked clap Args derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: clap_derive 4.6.1 src/derives/{args,parser,subcommand,value_enum}.rs."
+  },
+  {
+    "name": "clap::Parser",
+    "reason": "Locked clap Parser derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: clap_derive 4.6.1 src/derives/{args,parser,subcommand,value_enum}.rs."
+  },
+  {
+    "name": "clap::Subcommand",
+    "reason": "Locked clap Subcommand derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: clap_derive 4.6.1 src/derives/{args,parser,subcommand,value_enum}.rs."
+  },
+  {
+    "name": "clap::ValueEnum",
+    "reason": "Locked clap ValueEnum derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: clap_derive 4.6.1 src/derives/{args,parser,subcommand,value_enum}.rs."
+  },
+  {
+    "name": "zerocopy::FromBytes",
+    "reason": "Locked zerocopy FromBytes derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: zerocopy-derive 0.8.48 src/lib.rs and src/derive/."
+  },
+  {
+    "name": "zerocopy::IntoBytes",
+    "reason": "Locked zerocopy IntoBytes derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: zerocopy-derive 0.8.48 src/lib.rs and src/derive/."
+  },
+  {
+    "name": "zerocopy::Immutable",
+    "reason": "Locked zerocopy Immutable derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: zerocopy-derive 0.8.48 src/lib.rs and src/derive/."
+  },
+  {
+    "name": "zerocopy::KnownLayout",
+    "reason": "Locked zerocopy KnownLayout derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: zerocopy-derive 0.8.48 src/lib.rs and src/derive/."
+  },
+  {
+    "name": "zerocopy::Unaligned",
+    "reason": "Locked zerocopy Unaligned derive emits trait/data-layout glue, not synthesized Carrick authority acquisitions or std::process abort/exit. Input items remain scanned. Helper attributes are separately restricted/audited; arbitrary derive macros are rejected. Provider: zerocopy-derive 0.8.48 src/lib.rs and src/derive/."
+  }
+]

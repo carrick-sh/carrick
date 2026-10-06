@@ -2,6 +2,7 @@ pub mod accept;
 pub mod asm_diff;
 mod atomic_file;
 pub mod authority_debt;
+mod authority_dialect;
 pub mod authority_source;
 pub mod ci_scaler;
 pub mod cli;

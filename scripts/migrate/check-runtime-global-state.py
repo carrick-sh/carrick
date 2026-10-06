@@ -349,6 +349,7 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
         path.as_posix() if isinstance(path, (Path, PurePosixPath)) else str(path)
     )
     tokens = _tokenize(source)
+    _scope_scanner().validate_test_dialect(tokens, posix_path)
     opaque = _scope_scanner().opaque_macro_inputs(tokens)
     findings: list[Finding] = []
 
@@ -649,7 +650,7 @@ def scan_source(path: Path | str, source: str) -> tuple[Finding, ...]:
 
 
 def discover(
-    root: Path, scan_roots: Sequence[str] = DEFAULT_SCAN_ROOTS
+    root: Path, scan_roots: Sequence[str] = DEFAULT_SCAN_ROOTS, *, test_files: Sequence[str] = ()
 ) -> tuple[Finding, ...]:
     """Discover all findings across the configured crate roots."""
     all_findings: list[Finding] = []
@@ -663,6 +664,8 @@ def discover(
             if not file_path.is_file():
                 continue
             rel_path = file_path.relative_to(workspace_root).as_posix()
+            if rel_path in test_files:
+                continue
             source = file_path.read_text(encoding="utf-8")
             findings = scan_source(rel_path, source)
             all_findings.extend(findings)
@@ -724,7 +727,7 @@ def validate_concurrent_source(path: Path, source: str) -> None:
 
 
 def validate_concurrent_tree(
-    root: Path, scan_roots: Sequence[str] = DEFAULT_SCAN_ROOTS
+    root: Path, scan_roots: Sequence[str] = DEFAULT_SCAN_ROOTS, *, test_files: Sequence[str] = ()
 ) -> None:
     workspace_root = root.resolve()
     for rel_root in scan_roots:
@@ -733,6 +736,8 @@ def validate_concurrent_tree(
             continue
         for file_path in sorted(target_dir.rglob("*.rs")):
             rel_path = file_path.relative_to(workspace_root)
+            if rel_path.as_posix() in test_files:
+                continue
             validate_concurrent_source(
                 rel_path, file_path.read_text(encoding="utf-8")
             )

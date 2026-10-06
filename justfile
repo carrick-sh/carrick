@@ -226,7 +226,7 @@ lint-domains-source:
     # Discovery and structural rules run their negative fixture suites
     # before their production checks. Keep the list named
     # so adding unrelated script tests does not silently change this gate.
-    python3 -m unittest scripts/tests/test_host_authority_transitions.py scripts/tests/test_runtime_aborts.py scripts/tests/test_runtime_global_state.py scripts/tests/test_authority_debt_retirement.py
+    python3 -m unittest scripts/tests/test_host_authority_transitions.py scripts/tests/test_runtime_aborts.py scripts/tests/test_runtime_global_state.py scripts/tests/test_authority_debt_retirement.py scripts/tests/test_authority_dialect.py
     cargo test --locked -p carrick-xtask --test authority_debt
     python3 -m unittest scripts/tests/test_conformance_contract_policy.py
     {{_admit}} {{_cargo}} run -p carrick-conformance-contract --bin check-contracts -- --root .

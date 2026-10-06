@@ -311,16 +311,47 @@ fn add(actual: &mut BTreeMap<Key, u64>, family: Family, operation: &str, owner: 
         })
         .or_default() += 1;
 }
-fn discover(root: &Path, checker: &str, tools: &Path) -> Result<Value, DebtError> {
+fn discover(
+    root: &Path,
+    checker: &str,
+    tools: &Path,
+    source: &SourceCensus,
+) -> Result<Value, DebtError> {
+    // External test modules carry their proof in a parsed parent declaration.
+    // Share the strict census result, after genuine production reachability has
+    // taken precedence; lexical scanners must not infer this from file names.
+    let script = r#"
+import dataclasses, importlib.util, json, pathlib, sys
+spec = importlib.util.spec_from_file_location('working_source', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = m
+spec.loader.exec_module(m)
+root = pathlib.Path(sys.argv[2])
+test_files = set(json.loads(sys.argv[3]))
+if hasattr(m, 'scan_sources'):
+    errors = m.validate_sysv_lock_authority_rules(root)
+    if errors: raise ValueError('\n'.join(errors))
+    findings = m.scan_sources(root, test_files=test_files)
+elif hasattr(m, 'discover_runtime_aborts'):
+    findings = m.discover_runtime_aborts(root, test_files=test_files)
+    raw = [f for f in findings if f.sink == 'raw']
+    if raw: raise ValueError('raw termination forbidden: ' + raw[0].file + '::' + raw[0].function)
+else:
+    m.validate_concurrent_tree(root, test_files=test_files)
+    findings = m.discover(root, test_files=test_files)
+print(json.dumps([dataclasses.asdict(f) for f in findings]))
+"#;
+    let proof = serde_json::to_string(source.test_file_names())?;
     let output = command::run_checked(
         "python3",
         [
+            std::ffi::OsStr::new("-c"),
+            std::ffi::OsStr::new(script),
             tools
                 .join(format!("scripts/migrate/{checker}.py"))
                 .as_os_str(),
-            std::ffi::OsStr::new("--root"),
             root.as_os_str(),
-            std::ffi::OsStr::new("--discover"),
+            std::ffi::OsStr::new(&proof),
         ],
         Some(root),
     )?;
@@ -359,7 +390,12 @@ fn source_counts(
 ) -> Result<BTreeMap<Key, u64>, DebtError> {
     source.verify_task_rules()?;
     let mut actual = BTreeMap::new();
-    for row in rows(&discover(root, "check-dispatch-lock-authority", tools)?)? {
+    for row in rows(&discover(
+        root,
+        "check-dispatch-lock-authority",
+        tools,
+        source,
+    )?)? {
         let file = text(row, "file")?;
         if source.is_outside_production_at(
             file,
@@ -389,7 +425,12 @@ fn source_counts(
         let family = policy.assign(K1_FAMILIES, &site.operation, &site.owner, site.lane)?;
         add(&mut actual, family, &site.operation, &site.owner, site.lane);
     }
-    for row in rows(&discover(root, "check-runtime-global-state", tools)?)? {
+    for row in rows(&discover(
+        root,
+        "check-runtime-global-state",
+        tools,
+        source,
+    )?)? {
         let file = text(row, "file")?;
         if source.is_outside_production_at(
             file,
@@ -404,7 +445,7 @@ fn source_counts(
         let family = policy.assign(GLOBAL_FAMILIES, &operation, &owner, lane)?;
         add(&mut actual, family, &operation, &owner, lane);
     }
-    for row in rows(&discover(root, "check-runtime-aborts", tools)?)? {
+    for row in rows(&discover(root, "check-runtime-aborts", tools, source)?)? {
         let owner = finding_owner(source, row)?;
         let operation = format!("fatal:{}", text(row, "domain")?);
         let lane = source.lane(&owner)?;
@@ -497,12 +538,56 @@ fn base_policy(root: &Path, base: &str) -> Result<AuthorityDebtCeilings, DebtErr
 }
 // One-time transition from the actual PR-base ledgers. Their locations serve
 // only to recover symbolic cohorts from that revision, never as head identity.
+fn legacy_discover(root: &Path, tools: &Path, checker: &str) -> Result<Value, DebtError> {
+    if root.join(CEILINGS_PATH).exists() {
+        return fail("legacy discovery is unreachable with the ceilings schema");
+    }
+    // Archived source predates the dialect and its scanner CLI predates live
+    // discovery. Use current diagnostic positions, but omit only the new syntax
+    // rejection for this schema-absent snapshot. Any historical undercount can
+    // only tighten the base ratchet. Working-source discover() stays strict.
+    let script = r#"
+import dataclasses, importlib.util, json, pathlib, sys
+root = pathlib.Path(sys.argv[2])
+assert not (root / 'scripts/migrate/authority-debt-ceilings.json').exists()
+spec = importlib.util.spec_from_file_location('legacy_snapshot', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = m
+spec.loader.exec_module(m)
+scope = m._scope_scanner() if hasattr(m, '_scope_scanner') else m
+scope.validate_test_dialect = lambda *_: None
+if hasattr(m, 'scan_sources'):
+    findings = m.scan_sources(root)
+elif hasattr(m, 'discover_runtime_aborts'):
+    findings = m.discover_runtime_aborts(root)
+else:
+    findings = m.discover(root)
+print(json.dumps([dataclasses.asdict(f) for f in findings]))
+"#;
+    let output = command::run_checked(
+        "python3",
+        [
+            std::ffi::OsStr::new("-c"),
+            std::ffi::OsStr::new(script),
+            tools
+                .join(format!("scripts/migrate/{checker}.py"))
+                .as_os_str(),
+            root.as_os_str(),
+        ],
+        Some(root),
+    )?;
+    Ok(serde_json::from_str(&output.stdout)?)
+}
 fn legacy_policy_with_tools(root: &Path, tools: &Path) -> Result<AuthorityDebtCeilings, DebtError> {
     let canonical = root.canonicalize()?;
     let root = canonical.as_path();
-    let source = SourceCensus::load(root)?;
+    let source = SourceCensus::legacy_base(root)?;
     let mut counters = BTreeMap::<Key, u64>::new();
-    for row in rows(&discover(root, "check-dispatch-lock-authority", tools)?)? {
+    for row in rows(&legacy_discover(
+        root,
+        tools,
+        "check-dispatch-lock-authority",
+    )?)? {
         let file = text(row, "file")?;
         if source.is_outside_production_at(
             file,
@@ -616,21 +701,7 @@ fn legacy_policy_with_tools(root: &Path, tools: &Path) -> Result<AuthorityDebtCe
     // The old "test_only" label included unconditional production failpoints.
     // Filter real test scopes, rather than trusting those labels as scope.
     // The stronger zero rule applies to head, not to this historical census.
-    let output = command::run_checked(
-        "python3",
-        [
-            std::ffi::OsStr::new("-c"),
-            std::ffi::OsStr::new(
-                "import importlib.util,json,pathlib,sys; s=importlib.util.spec_from_file_location('globals',sys.argv[1]); m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); print(json.dumps([{'file':f.file,'kind':f.kind,'symbol':f.symbol,'line':f.line,'argument':f.argument,'column':f.column} for f in m.discover(pathlib.Path(sys.argv[2]))]))",
-            ),
-            tools
-                .join("scripts/migrate/check-runtime-global-state.py")
-                .as_os_str(),
-            root.as_os_str(),
-        ],
-        Some(root),
-    )?;
-    let production: Value = serde_json::from_str(&output.stdout)?;
+    let production = legacy_discover(root, tools, "check-runtime-global-state")?;
     let mut global_classes = BTreeMap::new();
     for row in rows(&read_json(&root.join("scripts/migrate/runtime-global-state.json"))?["rows"])? {
         let family: Family = serde_json::from_value(Value::String(format!(
@@ -687,7 +758,7 @@ fn legacy_policy_with_tools(root: &Path, tools: &Path) -> Result<AuthorityDebtCe
             *entry = (*entry).max(family);
         }
     }
-    for row in rows(&discover(root, "check-runtime-aborts", tools)?)? {
+    for row in rows(&legacy_discover(root, tools, "check-runtime-aborts")?)? {
         let file = text(row, "file")?;
         let key = (
             file.to_owned(),
