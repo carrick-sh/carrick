@@ -36,7 +36,7 @@ mod interrupts;
 mod progress;
 #[cfg(target_os = "none")]
 mod cpl0_scheduler {
-    pub use super::scheduler::*;
+    pub(crate) use super::scheduler::*;
 }
 #[cfg(target_os = "none")]
 mod cpl0_entry {
