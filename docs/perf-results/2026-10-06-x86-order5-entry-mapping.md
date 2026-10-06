@@ -128,6 +128,27 @@ There is no Docker oracle or runtime-ratio claim on x86-w1. X4's x86 admission
 denominator is exactly native 273. Orders 6–9 have not been admitted to x86.
 macOS compiler capture and unchanged-ARM signed packet belong to the director.
 
+## X4 executing witness
+
+The KVM X4 case boots two native tasks with the same visible ID, distinct
+execution generations/MM keys/thread serials and separate retained lifecycle
+pages. At 1/2/8 it observes 4 × scale served calls, 2 × scale publications,
+exact native returns, preserved stack/RBX, and one entry/completion per call.
+Every call receives entry and return kicks; work exits never replay effects.
+Unknown native 39 and 99, and an unloaded native-273 task, publish/complete
+nothing; the host records the explicit refusal and supplies no Linux result.
+
+A duplicate-completion image is red in real KVM after the correct first result
+and stored head: observed `[2, 0]`, expected `[1, 0]`. Restore/rebuild gives
+MATCH; full retained CPL0 entry (6 tests) and progress (2 tests) also pass.
+The VM-free ARM portion crosses the actual TrapFrame/EL1 PendingFamilies
+adapter, while x86 crosses NativeFrame's full snapshot and Linux codec.
+
+The director confirmed that executing X1–X3 MM/fork/protocol requalification
+belongs to integration with `work/x86-x1a`: those KVM targets are absent here.
+This lane requalifies its existing X1 bootstrap, complete entry/progress suites
+and the VM-free predecessor matrices; it makes no executing X1–X3 MM claim.
+
 ## Authorized mechanical MM-fence lines
 
 The director authorized only field-path changes needed for the physical ABI
