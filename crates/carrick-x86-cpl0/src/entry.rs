@@ -53,9 +53,10 @@ fixture_items! {
 core::arch::global_asm!(
     ".section .initial_boot_header, \"a\"",
     ".quad 0x3130304e55525843",
-    ".long 1",
+    ".long {version}",
     ".long 0",
     ".quad carrick_x86_initial_boot",
+    version = const carrick_el1_abi::X86_INITIAL_BOOT_VERSION,
 );
 
 #[cfg(target_os = "none")]
