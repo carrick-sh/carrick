@@ -1,7 +1,6 @@
 //! Linux lifecycle policy over neutral pool transitions and native context hooks.
 use crate::abi::entry::SyscallResult;
 use crate::abi::thread::*;
-use crate::dispatch::FamilyCompletion;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleCall {
     Exit,
@@ -201,19 +200,6 @@ pub const fn is_lifecycle_syscall(nr: usize) -> bool {
             | SYS_GETTID
             | SYS_CLONE
     )
-}
-
-/// Serve a lifecycle syscall of the running thread, or `None` to forward it
-/// unchanged. `sched` is the vCPU's in-guest scheduler when the process's
-/// zone is published (clone and exit need it). Counts what it serves.
-pub fn serve<'a>(nr: u64, native: &mut dyn LifecycleNative<'a>) -> FamilyCompletion {
-    let crate::dispatch::Family::Lifecycle(call) = crate::dispatch::route_aarch64(nr, u64::MAX)
-    else {
-        return FamilyCompletion::Forward;
-    };
-    invoke(call, native)
-        .as_ref()
-        .map_or(FamilyCompletion::Forward, lifecycle_effect)
 }
 
 /// Execute Linux policy, leaving ordinary result installation and completion
