@@ -75,21 +75,6 @@ fn zone() -> &'static ZoneTables {
     // SAFETY: carrier-retained zero-initialized common records, supervisor only.
     unsafe { &*(PROGRESS_ZONE as *const ZoneTables) }
 }
-fn read_msr(index: u32) -> u64 {
-    let low: u32;
-    let high: u32;
-    // SAFETY: qualified CPL0 FS/GS registers only.
-    unsafe {
-        core::arch::asm!("rdmsr", in("ecx") index, out("eax") low, out("edx") high, options(nostack))
-    };
-    u64::from(low) | (u64::from(high) << 32)
-}
-fn write_msr(index: u32, value: u64) {
-    // SAFETY: CPL0; bootstrap supplied canonical retained user TLS bases.
-    unsafe {
-        core::arch::asm!("wrmsr", in("ecx") index, in("eax") value as u32, in("edx") (value >> 32) as u32, options(nostack))
-    };
-}
 fn control(port: u16) {
     // SAFETY: declared fixture control/observation, no semantic request.
     unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") 0u8, options(nostack)) };
@@ -109,9 +94,9 @@ fn install(task: &ContextBinding, maintenance: carrick_guest_arch::RootGpa) {
         stop(1);
     }
     unsafe { install_root(task.context.address.root) };
-    write_msr(0xc000_0100, task.context.fs_base);
+    write_tls(NativeTlsRegister::Fs, task.context.fs_base);
     // SWAPGS has already selected the kernel binding. The other base is user.
-    write_msr(0xc000_0102, task.context.gs_base);
+    write_tls(NativeTlsRegister::UserGs, task.context.gs_base);
 }
 
 #[repr(C)]
@@ -198,8 +183,8 @@ extern "C" fn carrick_progress_interrupt(
     let root: u64;
     unsafe { core::arch::asm!("mov {}, cr3", out(reg) root, options(nostack)) };
     task.context.frame = *frame;
-    task.context.fs_base = read_msr(0xc000_0100);
-    task.context.gs_base = read_msr(0xc000_0102);
+    task.context.fs_base = read_tls(NativeTlsRegister::Fs);
+    task.context.gs_base = read_tls(NativeTlsRegister::UserGs);
     task.context.xsave = state.scratch.clone();
     let turn = state.turns as usize;
     if turn >= PROGRESS_TURNS {

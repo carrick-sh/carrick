@@ -220,3 +220,54 @@ mod tests {
         assert_eq!(id, bindings[0].record.id);
     }
 }
+
+// Qualified target_os=none native-context leaves shared by CPL0 bindings.
+#[cfg(target_os = "none")]
+#[derive(Clone, Copy)]
+pub(crate) enum NativeTlsRegister {
+    Fs,
+    UserGs,
+}
+#[cfg(target_os = "none")]
+impl NativeTlsRegister {
+    const fn msr(self) -> u32 {
+        match self {
+            Self::Fs => 0xc0000100,
+            Self::UserGs => 0xc0000102,
+        }
+    }
+}
+#[cfg(target_os = "none")]
+pub(crate) fn read_tls(register: NativeTlsRegister) -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: CPL0; only FS_BASE or the user GS retained after SWAPGS is selected.
+    unsafe {
+        core::arch::asm!("rdmsr", in("ecx") register.msr(), out("eax") low, out("edx") high, options(nostack));
+    }
+    u64::from(low) | (u64::from(high) << 32)
+}
+#[cfg(target_os = "none")]
+pub(crate) fn write_tls(register: NativeTlsRegister, value: u64) {
+    // SAFETY: qualified CPL0 context installation; canonical retained user TLS
+    // bases only. UserGs selects KERNEL_GS_BASE while SWAPGS retains kernel GS.
+    unsafe {
+        core::arch::asm!("wrmsr", in("ecx") register.msr(), in("eax") value as u32, in("edx") (value>>32) as u32, options(nostack));
+    }
+}
+#[cfg(target_os = "none")]
+pub(crate) fn save_extended(area: &mut XsaveArea) {
+    // SAFETY: stopped-host admission qualified XCR0=7 and the complete 832-byte
+    // standard image; XsaveArea has 64-byte alignment and exclusive native custody.
+    unsafe {
+        core::arch::asm!("xsave64 [{}]", in(reg) area.0.as_mut_ptr(), in("eax") 7u32, in("edx") 0u32, options(nostack));
+    }
+}
+#[cfg(target_os = "none")]
+pub(crate) fn restore_extended(area: &XsaveArea) {
+    // SAFETY: exact retained native context captured by save_extended, with the
+    // same qualified XCR0 and aligned complete image, never a foreign incarnation.
+    unsafe {
+        core::arch::asm!("xrstor64 [{}]", in(reg) area.0.as_ptr(), in("eax") 7u32, in("edx") 0u32, options(nostack));
+    }
+}
