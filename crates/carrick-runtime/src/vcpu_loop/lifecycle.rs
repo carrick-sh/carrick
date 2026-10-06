@@ -190,12 +190,12 @@ pub(crate) fn validate_hvpatch_process_prepare_boundary(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn cleanup_failed_hvpatch_initial_cpu<T>(
-    abort: impl FnOnce() -> Result<(), RuntimeError>,
+    abort_child: impl FnOnce() -> Result<(), RuntimeError>,
     context: &mut T,
     cancel_inventory: impl FnOnce(&mut T) -> Result<(), RuntimeError>,
     rollback_parent: impl FnOnce(&mut T) -> Result<(), RuntimeError>,
 ) -> Result<(), RuntimeError> {
-    let abort_error = abort().err();
+    let abort_error = abort_child().err();
     let _cancel_error = cancel_inventory(context).err();
     let rollback_error = rollback_parent(context).err();
     match (abort_error, rollback_error) {

@@ -45,7 +45,11 @@ const SUPPORTED_SETUP_FLAGS: u32 = 0;
 /// second mapping. All offsets are reported to the guest via io_uring_params,
 /// so carrick is free to choose them as long as params describes them honestly.
 #[derive(
-    Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq,
+    ::core::fmt::Debug,
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
 )]
 pub struct RingLayout {
     pub sq_entries: u32,
