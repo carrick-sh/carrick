@@ -24,3 +24,5 @@ pub use inventory::*;
 pub mod fork;
 pub use fork::*;
 
+pub mod publication;
+pub use publication::*;
