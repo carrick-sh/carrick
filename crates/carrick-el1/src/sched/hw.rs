@@ -269,14 +269,65 @@ impl ThreadCpu for HardwareCpu {
         (u64::from(hi) << 32) | u64::from(lo)
     }
     fn freq(&self) -> u64 {
-        0
+        crate::isa::x86::interrupt::tsc_frequency().map_or(0, |f| f.get())
     }
-    fn set_timer(&mut self, _cval: Option<u64>) {}
-    fn send_sgi(&mut self, _sgi1r: u64) {}
+    fn set_timer(&mut self, cval: Option<u64>) {
+        use carrick_guest_arch::InterruptBackend;
+        let deadline =
+            cval.map(|c| carrick_guest_arch::Deadline(carrick_guest_arch::CounterTick::new(c)));
+        let _ = <crate::isa::x86::X86Backend as InterruptBackend>::arm_timer(
+            &mut crate::isa::x86::X86Backend,
+            deadline,
+        );
+    }
+    fn send_sgi(&mut self, sgi1r: u64) {
+        use carrick_guest_arch::InterruptBackend;
+        let target = carrick_guest_arch::CpuTarget {
+            cpu: carrick_guest_arch::CpuId::new(sgi1r as u32),
+            generation: carrick_guest_arch::CpuGeneration::new(
+                core::num::NonZeroU64::new(1).unwrap(),
+            ),
+        };
+        let token = carrick_guest_arch::WakeToken {
+            task: carrick_guest_arch::TaskIdentity {
+                carrier: carrick_guest_arch::CarrierGeneration::new(
+                    core::num::NonZeroU64::new(1).unwrap(),
+                ),
+                task: carrick_guest_arch::TaskSerial::new(core::num::NonZeroU64::new(1).unwrap()),
+                execution: carrick_guest_arch::ExecutionGeneration::new(
+                    core::num::NonZeroU64::new(1).unwrap(),
+                ),
+            },
+            operation: carrick_guest_arch::OperationSequence::new(
+                core::num::NonZeroU64::new(1).unwrap(),
+            ),
+        };
+        let _ = <crate::isa::x86::X86Backend as InterruptBackend>::send_wake(
+            &mut crate::isa::x86::X86Backend,
+            target,
+            token,
+        );
+    }
     fn ack_irq(&mut self) -> u32 {
-        0
+        use carrick_guest_arch::InterruptBackend;
+        <crate::isa::x86::X86Backend as InterruptBackend>::ack_interrupt(
+            &mut crate::isa::x86::X86Backend,
+        )
+        .ok()
+        .flatten()
+        .map_or(0xff, |ack| ack.hardware)
     }
-    fn end_irq(&mut self, _intid: u32) {}
+    fn end_irq(&mut self, intid: u32) {
+        use carrick_guest_arch::InterruptBackend;
+        let ack = carrick_guest_arch::InterruptAck {
+            reason: carrick_guest_arch::InterruptReason::External,
+            hardware: intid,
+        };
+        let _ = <crate::isa::x86::X86Backend as InterruptBackend>::end_interrupt(
+            &mut crate::isa::x86::X86Backend,
+            ack,
+        );
+    }
     fn wait_for_interrupt(&mut self) {
         // SAFETY: parks until interrupt.
         unsafe { crate::isa::x86::interrupts::hardware::park_until_interrupt() };
