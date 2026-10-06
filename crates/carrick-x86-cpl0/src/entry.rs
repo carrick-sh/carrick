@@ -25,13 +25,10 @@ unsafe impl core::alloc::GlobalAlloc for NoAllocation {
 static ALLOCATOR: NoAllocation = NoAllocation;
 
 #[cfg(target_os = "none")]
-#[path = "../../carrick-x86/src/cpl0_entry.rs"]
-mod adapter;
+use carrick_el1::isa::x86::context::native as adapter;
 
 #[cfg(target_os = "none")]
-#[allow(dead_code)] // Includes hardware hooks reserved for the M4 owner handoff.
-#[path = "../../carrick-x86/src/interrupts.rs"]
-mod interrupts;
+use carrick_el1::isa::x86::interrupts;
 #[cfg(target_os = "none")]
 mod progress;
 #[cfg(target_os = "none")]
@@ -47,9 +44,7 @@ mod cpl0_entry {
 mod lifecycle;
 
 #[cfg(target_os = "none")]
-#[allow(dead_code)] // Included native adapter also exposes the host bootstrap API.
-#[path = "../../carrick-x86/src/cpl0_scheduler.rs"]
-mod scheduler;
+use carrick_el1::isa::x86::context::scheduler;
 
 #[cfg(target_os = "none")]
 core::arch::global_asm!(

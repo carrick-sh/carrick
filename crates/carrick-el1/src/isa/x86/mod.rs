@@ -2,7 +2,7 @@
 
 use super::ArchError;
 
-mod context;
+pub mod context;
 mod interrupt;
 mod mmu;
 mod transport;
@@ -24,8 +24,8 @@ pub const fn kernel_arch() -> impl carrick_guest_arch::KernelArch {
 
 impl carrick_guest_arch::ArchTypes for X86Backend {
     type Error = ArchError;
-    type NativeFrame = ();
-    type SavedContext = ();
+    type NativeFrame = context::native::NativeFrame;
+    type SavedContext = context::scheduler::NativeContext;
     type Root = carrick_guest_arch::RootGpa;
     type MmOwner = carrick_el1_abi::CurrentTask;
     type OwnedTranslation = ();

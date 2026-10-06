@@ -34,7 +34,24 @@ pub struct NativeFrame {
     pub rsp: u64,
 }
 const _: () = assert!(core::mem::size_of::<NativeFrame>() == 128);
-const _: () = assert!(core::mem::offset_of!(NativeFrame, rax) == 96);
+const _: () = {
+    assert!(core::mem::offset_of!(NativeFrame, r15) == 0);
+    assert!(core::mem::offset_of!(NativeFrame, r14) == 8);
+    assert!(core::mem::offset_of!(NativeFrame, r13) == 16);
+    assert!(core::mem::offset_of!(NativeFrame, r12) == 24);
+    assert!(core::mem::offset_of!(NativeFrame, rbp) == 32);
+    assert!(core::mem::offset_of!(NativeFrame, rbx) == 40);
+    assert!(core::mem::offset_of!(NativeFrame, r9) == 48);
+    assert!(core::mem::offset_of!(NativeFrame, r8) == 56);
+    assert!(core::mem::offset_of!(NativeFrame, r10) == 64);
+    assert!(core::mem::offset_of!(NativeFrame, rdx) == 72);
+    assert!(core::mem::offset_of!(NativeFrame, rsi) == 80);
+    assert!(core::mem::offset_of!(NativeFrame, rdi) == 88);
+    assert!(core::mem::offset_of!(NativeFrame, rax) == 96);
+    assert!(core::mem::offset_of!(NativeFrame, rcx) == 104);
+    assert!(core::mem::offset_of!(NativeFrame, r11) == 112);
+    assert!(core::mem::offset_of!(NativeFrame, rsp) == 120);
+};
 
 impl NativeFrame {
     pub fn snapshot(&self) -> NativeEntrySnapshot<'_, Self> {
@@ -99,7 +116,11 @@ pub struct CpuBinding {
     /// retained CPL0 control transport, not common task/scheduler authority.
     pub scheduler_witness: AtomicU64,
 }
-const _: () = assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
+const _: () = {
+    assert!(core::mem::offset_of!(CpuBinding, kernel_stack) == 0);
+    assert!(core::mem::offset_of!(CpuBinding, user_stack) == 8);
+    assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
+};
 
 #[cfg(test)]
 mod tests {

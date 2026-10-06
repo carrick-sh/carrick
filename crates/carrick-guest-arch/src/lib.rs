@@ -347,15 +347,15 @@ impl<B: ArchTypes> ArchTypes for Arch<B> {
 // Generate each sealed projection and its explicit backend extension hook from
 // one signature list, so the hardware and kernel sides cannot drift.
 macro_rules! arch_trait {
-    ($kernel:ident, $backend:ident { $(fn $name:ident($($arg:ident: $ty:ty),*) -> $out:ty;)+ }) => {
+    ($kernel:ident, $backend:ident { $(fn $name:ident $(<$lt:lifetime>)? ($($arg:ident: $ty:ty),*) -> $out:ty;)+ }) => {
         pub trait $kernel: sealed::Sealed + ArchTypes {
-            $(fn $name(&mut self, $($arg: $ty),*) -> $out;)+
+            $(fn $name $(<$lt>)? (&mut self, $($arg: $ty),*) -> $out;)+
         }
         pub trait $backend: ArchTypes {
-            $(fn $name(&mut self, $($arg: $ty),*) -> $out;)+
+            $(fn $name $(<$lt>)? (&mut self, $($arg: $ty),*) -> $out;)+
         }
         impl<B: $backend> $kernel for Arch<B> {
-            $(fn $name(&mut self, $($arg: $ty),*) -> $out { self.backend.$name($($arg),*) })+
+            $(fn $name $(<$lt>)? (&mut self, $($arg: $ty),*) -> $out { self.backend.$name($($arg),*) })+
         }
     };
 }
@@ -363,7 +363,7 @@ macro_rules! arch_trait {
 arch_trait!(EntryArch, EntryBackend {
     fn current_stack_pointer() -> Result<KernelStackPointer, Self::Error>;
     fn decode_entry(frame: &Self::NativeFrame) -> Result<EntryEvent, Self::Error>;
-    fn snapshot(frame: &Self::NativeFrame) -> Result<NativeEntrySnapshot<'_, Self::NativeFrame>, Self::Error>;
+    fn snapshot<'a>(frame: &'a Self::NativeFrame) -> Result<NativeEntrySnapshot<'a, Self::NativeFrame>, Self::Error>;
     fn set_result(frame: &mut Self::NativeFrame, result: NativeReturnWord) -> Result<(), Self::Error>;
     fn save_context(frame: &Self::NativeFrame) -> Result<Self::SavedContext, Self::Error>;
     fn load_context(frame: &mut Self::NativeFrame, saved: &Self::SavedContext) -> Result<(), Self::Error>;
