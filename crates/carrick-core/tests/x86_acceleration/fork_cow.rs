@@ -199,6 +199,32 @@ fn sample_request(parent_gen: u64) -> PortalForkRequest {
     }
 }
 
+#[test]
+fn x86_fork_inherits_one_supervisor_branch_without_copying_its_tables() {
+    let request = sample_request(1);
+    let words = TestMemory::new();
+    let root = 0x10_0000;
+    let supervisor = 0x50_0000 | PRESENT | WRITE | NX;
+    words.store(root + 511 * 8, supervisor);
+    let mut scratch = ForkScratch::new(request, 0).unwrap();
+    copy_table::<X86Mmu, _, _>(
+        &LinuxForkPolicy,
+        &words,
+        request,
+        &mut scratch,
+        ForkTableCursor {
+            table: root,
+            level: 0,
+            base: 0,
+            child_offset: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(scratch.child[511], supervisor);
+    assert_eq!(scratch.child_used, 512);
+    assert!(scratch.edits.is_empty());
+}
+
 fn sample_child_handle(mm: u64) -> El1MmHandle {
     unsafe {
         El1MmHandle::from_admitted_owner(

@@ -11,6 +11,9 @@ use carrick_guest_arch::{
 pub struct X86Mmu;
 impl OwnerForkMmu for X86Mmu {
     const ADDRESS_MASK: u64 = ADDRESS;
+    fn shared_root_start() -> usize {
+        256
+    }
     fn control_window() -> Option<(UserVa, UserVa)> {
         None
     }
