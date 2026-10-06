@@ -154,6 +154,17 @@ core::arch::global_asm!(
     "mov rsp, gs:[0]",
     "sub rsp, 4160",
     "and rsp, -64",
+    // XSAVE leaves reserved header bytes untouched; XRSTOR requires zero.
+    // RAX is already in the saved frame, so clear without changing SIMD state.
+    "xor eax, eax",
+    "mov qword ptr [rsp + 512], rax",
+    "mov qword ptr [rsp + 520], rax",
+    "mov qword ptr [rsp + 528], rax",
+    "mov qword ptr [rsp + 536], rax",
+    "mov qword ptr [rsp + 544], rax",
+    "mov qword ptr [rsp + 552], rax",
+    "mov qword ptr [rsp + 560], rax",
+    "mov qword ptr [rsp + 568], rax",
     "mov eax, 7", "xor edx, edx", "xsave64 [rsp]",
     "mov rdi, r12",
     "call carrick_x86_handle_user_page_fault",

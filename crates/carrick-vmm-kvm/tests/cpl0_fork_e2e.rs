@@ -140,3 +140,32 @@ fn static_elf_wait4_wnohang_reap_then_echild() {
     assert_eq!(observed.result, 7);
     assert_eq!(observed.semantic_host_exits, 0);
 }
+
+#[test]
+fn user_cow_fault_clears_poisoned_xsave_header() {
+    let mut elf = fork_wait_elf();
+    let child = elf
+        .windows(5)
+        .position(|bytes| bytes == [0xc6, 0x44, 0x24, 0xf0, 0xa5])
+        .expect("child COW store");
+    let mut marker = vec![0xbf, 42, 0, 0, 0, 0x48, 0xb8];
+    marker.extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_NATIVE.to_le_bytes());
+    marker.extend_from_slice(&[0x0f, 0x05]);
+    elf.splice(child..child, marker);
+    let size = elf.len() as u64;
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    let program = initial_process_program(&elf);
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("real KVM image");
+    assert_eq!(carrier.observe(0).expect("child before COW").result, 42);
+    carrier
+        .poison_user_fault_xsave_header(0)
+        .expect("poison reserved header words");
+    assert_eq!(
+        carrier
+            .observe(0)
+            .expect("resolved COW restores xstate")
+            .result,
+        7
+    );
+}

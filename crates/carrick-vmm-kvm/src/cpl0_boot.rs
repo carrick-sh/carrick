@@ -1855,6 +1855,17 @@ impl Cpl0Carrier {
 }
 
 impl Cpl0Carrier {
+    /// Poison reserved XSAVE header words while the faulting vCPU is stopped.
+    pub fn poison_user_fault_xsave_header(&mut self, index: usize) -> Result<(), TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 task"));
+        }
+        let xsave = (self.binding(index).kernel_stack - 4160) & !63;
+        self._vm
+            .write(FrameGpa::new(xsave - DIRECT_VA + 520), &[0xa5; 16])
+            .map_err(|e| fail(e.to_string()))
+    }
+
     /// Guard the 64 bytes each vCPU's old xsave frame would overwrite below
     /// its 4 KiB #PF entry stack. The vCPU1 guard is below vCPU0's saved
     /// hardware/GPR frame, so both faults may run before inspection.
