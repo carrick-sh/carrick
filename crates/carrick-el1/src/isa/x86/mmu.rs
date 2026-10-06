@@ -3,8 +3,8 @@
 use super::{ArchError, X86Backend, user_access};
 use carrick_guest_arch::{
     Access, AddressContext, CopyProgress, EditBacking, EditCowAccess, EditIntent, EditLeafSize,
-    EditOperation, EditPermissions, FrameGpa, GuestLen, MmuBackend, MmuEditBackend, RootGpa,
-    TableWindow, UserRange, UserVa,
+    EditOperation, EditPermissions, FrameGpa, GuestLen, KernelVa, MmuBackend, MmuEditBackend,
+    RootGpa, TableWindow, UserRange, UserVa,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
 use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
@@ -13,6 +13,7 @@ use carrick_mmu_core::x86::descriptor_txn::{
     InlineJournal, LeafSize, PageSpan, Permissions, execute_descriptor_txn,
 };
 use core::cell::Cell;
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -60,6 +61,53 @@ fn live_root() -> Result<RootGpa, ArchError> {
 /// the ARM TTBR path. This does not confer authority to edit that root.
 pub fn hardware_live_root() -> Result<RootGpa, ArchError> {
     live_root()
+}
+
+/// Borrow the one upper supervisor direct window for the live portal root.
+/// The portal owner authenticates the MM grant before calling this leaf.
+pub(crate) fn portal_descriptor_words(target: u64) -> Result<NativeDescriptorWords, ArchError> {
+    let root = RootGpa::page_aligned(FrameGpa::new(target)).ok_or(ArchError::Unbound)?;
+    if root.address().raw() != target {
+        return Err(ArchError::Unbound);
+    }
+    let mapped = carrick_el1_abi::X86_CPL0_DIRECT_VA
+        .checked_add(target)
+        .ok_or(ArchError::Unbound)?;
+    // SAFETY: CPL0 boot retains this single writable supervisor direct window
+    // for the full table arena; the portal owner holds the exact-MM editor.
+    let tables = unsafe {
+        TableWindow::issue(
+            root.address(),
+            KernelVa::new(mapped),
+            GuestLen::new(carrick_el1_abi::X86_CPL0_TABLE_ARENA_BYTES),
+        )
+    }
+    .ok_or(ArchError::Unbound)?;
+    NativeDescriptorWords::checked(
+        root,
+        DescriptorTxnId {
+            mm_key: NonZeroU64::MIN,
+            generation: NonZeroU64::MIN,
+        },
+        &tables,
+    )
+}
+
+/// Authenticate a portal grant's exact root against the live CPL0 CR3 and
+/// the sole supervisor table window, without conferring edit authority.
+pub fn portal_root_is_live(target: u64) -> bool {
+    portal_descriptor_words(target).is_ok()
+}
+
+/// Drain all non-global translations after a portal grant under the live root.
+pub(crate) fn portal_invalidate_root(target: u64) -> Result<(), ArchError> {
+    if live_root()?.address().raw() != target {
+        return Err(ArchError::Unbound);
+    }
+    // SAFETY: this is the active CPL0 root; live_root rejected PCID and PGE,
+    // so reloading CR3 drains every local non-global translation.
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) target, options(nostack, preserves_flags)) }
+    Ok(())
 }
 
 /// Legacy ARM descriptor callers need a separate x86 table owner before they

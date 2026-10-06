@@ -11,7 +11,10 @@ pub use carrick_core::mm::transaction::{
 use carrick_el1_abi::PinnedMetadataExtent;
 #[cfg(any(test, target_os = "none"))]
 use carrick_el1_abi::ReservationMm;
-use carrick_mmu_core::owner_mmu::Aarch64Mmu;
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+use carrick_mmu_core::owner_mmu::Aarch64Mmu as NativePortalMmu;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use carrick_mmu_core::x86::owner_mmu::X86Mmu as NativePortalMmu;
 use carrick_personality_linux::mm::LinuxReservationPolicy;
 #[cfg(target_os = "none")]
 use core::num::NonZeroU64;
@@ -38,7 +41,7 @@ impl carrick_core::mm::transaction::OwnerVenue for NativeOwnerVenue {
         carrick_personality_linux::mm::cancelled_copy_errno()
     }
 }
-pub type MmPortal<'a, P, B = Aarch64Mmu> = carrick_core::mm::transaction::MmPortal<
+pub type MmPortal<'a, P, B = NativePortalMmu> = carrick_core::mm::transaction::MmPortal<
     'a,
     P,
     LinuxReservationPolicy,
@@ -73,6 +76,7 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         return;
     };
     let _ = executor_slot;
+    #[cfg(target_arch = "aarch64")]
     use carrick_mmu_core::aarch64::descriptor_txn::{CallerInvalidatesAsid, PrimaryTableWords};
     let slots =
         unsafe { &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots) };
@@ -123,12 +127,21 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) live_ttbr, options(nomem, nostack));
     }
     #[cfg(target_arch = "x86_64")]
-    let live_ttbr = crate::isa::x86::unsupported_arm_descriptor_path();
+    let words = match crate::isa::x86::portal_descriptor_words(grant.ttbr0) {
+        Ok(words) => words,
+        Err(_) => {
+            service.complete(0, 3);
+            return;
+        }
+    };
+    #[cfg(target_arch = "aarch64")]
     let Some(table) = carrick_el1_abi::service_target_table_window(live_ttbr, grant.ttbr0) else {
         service.complete(0, 3);
         return;
     };
+    #[cfg(target_arch = "aarch64")]
     let maintenance = CallerInvalidatesAsid;
+    #[cfg(target_arch = "aarch64")]
     let words = unsafe {
         PrimaryTableWords::new(
             table.words,
@@ -138,6 +151,7 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         )
         .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
     };
+    #[cfg(target_arch = "aarch64")]
     let Ok(words) = words else {
         service.complete(0, 5);
         return;
@@ -173,6 +187,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         return;
     };
     let _ = executor_slot;
+    #[cfg(target_arch = "aarch64")]
     use carrick_mmu_core::aarch64::descriptor_txn::{CallerInvalidatesAsid, PrimaryTableWords};
     let run = |frame: &mut carrick_el1_abi::TrapFrame| -> Result<(), MmError> {
         let slots = unsafe {
@@ -215,7 +230,9 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             core::arch::asm!("mrs {}, ttbr0_el1", out(reg) live_ttbr, options(nomem, nostack));
         }
         #[cfg(target_arch = "x86_64")]
-        let live_ttbr = crate::isa::x86::unsupported_arm_descriptor_path();
+        let words =
+            crate::isa::x86::portal_descriptor_words(grant.ttbr0).map_err(|_| MmError::Stale)?;
+        #[cfg(target_arch = "aarch64")]
         let table = carrick_el1_abi::service_target_table_window(live_ttbr, grant.ttbr0)
             .ok_or(MmError::Stale)?;
         let range = carrick_el1_abi::PortalByteRange::new(frame.x[4], frame.x[5])
@@ -242,7 +259,9 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
                 frame.slot as u32,
             )?
         };
+        #[cfg(target_arch = "aarch64")]
         let maintenance = CallerInvalidatesAsid;
+        #[cfg(target_arch = "aarch64")]
         let words = unsafe {
             PrimaryTableWords::new(
                 table.words,
@@ -257,16 +276,24 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let prepared = &mut crate::fault::HardwarePreparedResolver;
         #[cfg(target_arch = "x86_64")]
         let prepared = &mut carrick_core::mm::transfer::resolver::NoopPreparedResolver;
+        #[cfg(target_arch = "x86_64")]
+        let mut cow = crate::fault::X86CowResolver {
+            pool: carrick_el1_abi::cow_grant_pool_guest(),
+            residency: carrick_el1_abi::frame_grant_residency_guest(),
+            completion: None,
+        };
+        #[cfg(target_arch = "aarch64")]
+        let mut cow = crate::fault::HardwareCowResolver {
+            publication: slots.executable(frame.slot as usize),
+            completion: None,
+            service_slot: Some(executor_slot),
+        };
         match portal.select(
             &continuation,
             &words,
             carrick_core::mm::transaction::SelectionVenues {
                 prepared,
-                cow: &mut crate::fault::HardwareCowResolver {
-                    publication: slots.executable(frame.slot as usize),
-                    completion: None,
-                    service_slot: Some(executor_slot),
-                },
+                cow: &mut cow,
                 residency: carrick_el1_abi::frame_grant_residency_guest(),
                 slot: frame.slot as u32,
             },
@@ -321,6 +348,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
 
 #[cfg(target_os = "none")]
 pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
+    #[cfg(target_arch = "aarch64")]
     use carrick_mmu_core::aarch64::descriptor_txn::PrimaryTableWords;
     // Every pre-claim failure is explicit; only a typed owner wait suspends.
     frame.x[0] = 22;
@@ -372,14 +400,20 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         core::arch::asm!("mrs {}, ttbr0_el1",out(reg)ttbr,options(nomem,nostack));
     }
     #[cfg(target_arch = "x86_64")]
-    let ttbr = crate::isa::x86::unsupported_arm_descriptor_path();
+    let words = match crate::isa::x86::portal_descriptor_words(target.grant().ttbr0) {
+        Ok(words) => words,
+        Err(_) => return,
+    };
+    #[cfg(target_arch = "aarch64")]
     let Some(table) = carrick_el1_abi::service_target_table_window(ttbr, target.grant().ttbr0)
     else {
         return;
     };
+    #[cfg(target_arch = "aarch64")]
     let maintenance = crate::fault::El1TableMaintenance {
         ttbr0: target.grant().ttbr0,
     };
+    #[cfg(target_arch = "aarch64")]
     let Ok(words) = (unsafe {
         PrimaryTableWords::new(
             table.words,
@@ -392,13 +426,18 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         return;
     };
     let root = target.grant().ttbr0;
-    if apply_grant::<Aarch64Mmu, _>(
+    if apply_grant::<NativePortalMmu, _>(
         slot,
         &words,
         carrick_el1_abi::frame_grant_residency_guest(),
         target,
         || {
+            #[cfg(target_arch = "aarch64")]
             crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, root);
+            #[cfg(target_arch = "x86_64")]
+            if crate::isa::x86::portal_invalidate_root(root).is_err() {
+                crate::isa::x86::fatal_entry_binding();
+            }
         },
     )
     .is_some()
@@ -444,8 +483,10 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             core::arch::asm!("mrs {}, ttbr0_el1",out(reg)live,options(nomem,nostack));
         }
         #[cfg(target_arch = "x86_64")]
-        let live = crate::isa::x86::unsupported_arm_descriptor_path();
-        if carrick_el1_abi::service_target_table_window(live, root).is_none() {
+        let valid = crate::isa::x86::portal_descriptor_words(root).is_ok();
+        #[cfg(target_arch = "aarch64")]
+        let valid = carrick_el1_abi::service_target_table_window(live, root).is_some();
+        if !valid {
             return Err(MmError::Stale);
         }
         let portal = MmPortal::<GuestMetadataPin> {
