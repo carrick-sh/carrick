@@ -534,25 +534,22 @@ pub struct DescriptorTxnPath<'a, X: DescriptorTxnApplier> {
 #[cfg(target_os = "none")]
 const TTBR_BADDR_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub(crate) use crate::isa::arm_edit::El1TableMaintenance;
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 pub(crate) struct El1TableMaintenance {
     pub(crate) ttbr0: u64,
 }
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for El1TableMaintenance {
     fn publish_barrier(&self) {
-        // The reviewed ASID maintenance sequence begins with `dsb ishst`,
-        // which completes the unlinked table fills for every walker in the
-        // Inner Shareable domain before the following link store. Links are
-        // rare (hierarchy growth and splits), so the trailing TLBI is cheap.
         let mut cpu = crate::sched::HardwareCpu;
         crate::sched::ThreadCpu::invalidate_asid(&mut cpu, self.ttbr0);
     }
 
     fn invalidate_range(&self, _va: u64, _len: u64) {
-        // Break-before-make needs the broken translation gone from every PE
-        // before the replacement appears. The MM's whole ASID is a superset.
         let mut cpu = crate::sched::HardwareCpu;
         crate::sched::ThreadCpu::invalidate_asid(&mut cpu, self.ttbr0);
     }
