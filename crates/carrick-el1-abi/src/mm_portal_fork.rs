@@ -465,3 +465,63 @@ mod tests {
         assert!(!request.valid());
     }
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn portal_fork_slot() {
+        assert_eq!(
+            (size_of::<PortalForkSlot>(), align_of::<PortalForkSlot>()),
+            (192, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |PortalForkSlot {
+                     state: _,
+                     request: _,
+                     parent_len: _,
+                     custody_index: _,
+                     custody: _,
+                     acknowledgment: _,
+                     completion: _,
+                     errno: _,
+                 }: PortalForkSlot| {};
+        field!(PortalForkSlot, state, AtomicU64, 0, 8, 8);
+        field!(
+            PortalForkSlot,
+            request,
+            [AtomicU64; REQUEST_WORDS],
+            8,
+            88,
+            8
+        );
+        field!(PortalForkSlot, parent_len, AtomicU64, 96, 8, 8);
+        field!(PortalForkSlot, custody_index, AtomicU64, 104, 8, 8);
+        field!(PortalForkSlot, custody, [AtomicU64; 4], 112, 32, 8);
+        field!(PortalForkSlot, acknowledgment, AtomicU64, 144, 8, 8);
+        field!(PortalForkSlot, completion, [AtomicU64; 4], 152, 32, 8);
+        field!(PortalForkSlot, errno, AtomicU64, 184, 8, 8);
+    }
+}
