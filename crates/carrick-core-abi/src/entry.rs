@@ -219,3 +219,62 @@ impl EntryHandoffReceipt {
         self.record
     }
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn execution_identity() {
+        assert_eq!(
+            (
+                size_of::<ExecutionIdentity>(),
+                align_of::<ExecutionIdentity>()
+            ),
+            (16, 8)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |ExecutionIdentity {
+                     generation: _,
+                     task: _,
+                 }: ExecutionIdentity| {};
+        field!(ExecutionIdentity, generation, AtomicU64, 0, 8, 8);
+        field!(ExecutionIdentity, task, AtomicU64, 8, 8, 8);
+    }
+
+    #[test]
+    fn execution_mm() {
+        assert_eq!(
+            (size_of::<ExecutionMm>(), align_of::<ExecutionMm>()),
+            (16, 8)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |ExecutionMm {
+                     key: _,
+                     thread_generation: _,
+                 }: ExecutionMm| {};
+        field!(ExecutionMm, key, AtomicU64, 0, 8, 8);
+        field!(ExecutionMm, thread_generation, AtomicU64, 8, 8, 8);
+    }
+}
