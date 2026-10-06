@@ -4389,7 +4389,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 1903,
+      "line": 1966,
       "categories": [
         "table_guard"
       ],
@@ -4400,7 +4400,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations.rs",
-      "line": 1934,
+      "line": 1997,
       "categories": [
         "table_guard"
       ],
@@ -4411,7 +4411,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
-      "line": 254,
+      "line": 336,
       "categories": [
         "table_guard"
       ],

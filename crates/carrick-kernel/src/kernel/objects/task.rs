@@ -1423,7 +1423,14 @@ impl Task {
         self.revision_capacity.reserve(current, 2)
     }
 
-    pub(in crate::kernel) fn consume_thread_revision(
+    pub(in crate::kernel) fn reserve_exit_participant_revision(
+        &self,
+        current: crate::kernel::TaskRevision,
+    ) -> Option<crate::kernel::revision_capacity::RevisionReservation> {
+        self.revision_capacity.reserve(current, 1)
+    }
+
+    pub(in crate::kernel) fn consume_reserved_revision(
         &self,
         reservation: &mut crate::kernel::revision_capacity::RevisionReservation,
         current: crate::kernel::TaskRevision,
