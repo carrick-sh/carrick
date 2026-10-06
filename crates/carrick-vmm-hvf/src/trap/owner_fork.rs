@@ -290,6 +290,155 @@ pub(crate) struct OwnerPhysicalForkBuilder {
 // SAFETY: like ProcessSpec, this owns physical allocations and carrier VM
 // lifetime; its pointers are resolved through retained structural owners.
 unsafe impl Send for OwnerPhysicalForkBuilder {}
+
+fn owner_fork_frame_descriptions(
+    physical: &ForkPhysicalCustody,
+    source_owners: &std::collections::BTreeMap<(u64, usize), Arc<StructuralBackingOwner>>,
+    published: &[Arc<StructuralBackingOwner>],
+    inventory: &parking_lot::Mutex<HvpatchFrameInventory>,
+    selected: &[PortalForkCustody],
+) -> Result<(Vec<ProcessMappingDesc>, Vec<ProcessInventoryDesc>), TrapError> {
+    use carrick_core::mm::frames::{ForkFrameExtent, ForkFrameInventory, FrameGpa, GuestLen};
+    let extent = |start, len| {
+        ForkFrameExtent::new(FrameGpa::new(start), GuestLen::new(len))
+            .ok_or_else(|| TrapError::Hypervisor("invalid owner fork physical extent".into()))
+    };
+    let mut mappings = Vec::new();
+    let mut inventory_mappings = Vec::new();
+    let mut inherited = ForkFrameInventory::default();
+    for custody in selected {
+        let PortalForkCustody::Frame {
+            va,
+            ipa,
+            len,
+            shared,
+        } = *custody
+        else {
+            continue;
+        };
+        let end = ipa.checked_add(len).ok_or(TrapError::MappingOverflow {
+            guest_start: va,
+            mapped_size: len,
+        })?;
+        let mut cursor = ipa;
+        while cursor < end {
+            let Some((_, allocation, record)) = physical.retain_extent(cursor, 1)? else {
+                return Err(TrapError::Hypervisor(
+                    "owner-selected child frame lost exact physical custody".into(),
+                ));
+            };
+            let mut take = (record.ipa + record.len as u64).min(end) - cursor;
+            let start = va + (cursor - ipa);
+            let perms = applevisor::memory::MemPerms::from(record.perms);
+            let source = inventory
+                .lock()
+                .extents
+                .range(..=(cursor, u64::MAX))
+                .next_back()
+                .filter(|((base, length), _)| {
+                    *base <= cursor
+                        && base
+                            .checked_add(*length)
+                            .is_some_and(|bound| cursor < bound)
+                })
+                .map(|((base, length), extent)| {
+                    take = take.min(base + length - cursor);
+                    ((*base, *length), *extent)
+                });
+            let structural = source_owners
+                .get(&(record.ipa, record.len))
+                .cloned()
+                .or_else(|| {
+                    published
+                        .iter()
+                        .find(|owner| {
+                            owner.physical_ipa == record.ipa && owner.physical_size == record.len
+                        })
+                        .cloned()
+                });
+            if source.is_none() && structural.is_none() {
+                return Err(TrapError::Hypervisor(
+                    "owner-selected physical frame has no exact inventory or structural lifetime"
+                        .into(),
+                ));
+            }
+            let backing = source
+                .map(|(_, entry)| entry.backing)
+                .unwrap_or_else(HvfVmState::private_backing_identity);
+            let owner_generation = structural.as_ref().map_or(
+                source.map_or(0, |(_, entry)| entry.stage2_owner.generation),
+                |owner| owner.epoch().raw(),
+            );
+            let physical_offset = cursor
+                .checked_sub(source.map_or(record.ipa, |(_, entry)| entry.stage2_base))
+                .ok_or_else(|| {
+                    TrapError::Hypervisor("owner fork physical offset underflow".into())
+                })?;
+            let (shared_key_base, shared_key_offset) =
+                inherited_futex_identity(backing, physical_offset)?;
+            mappings.push(ProcessMappingDesc {
+                start,
+                ipa: cursor,
+                end: start + take,
+                host: ProcessMappingHost::Borrowed {
+                    pointer: allocation.host_base(),
+                    structural_owner: structural,
+                },
+                size: take as usize,
+                physical_ipa: record.ipa,
+                physical_host_addr: allocation.host_base(),
+                physical_size: record.len,
+                inventory_backing: backing,
+                perms,
+                is_dynamic_alias: source.is_some(),
+                sharing: if shared {
+                    GuestMappingSharing::GlobalShared
+                } else {
+                    GuestMappingSharing::Private
+                },
+                guest_writable: false,
+                inherited_frame: source.map(|(_, entry)| entry.frame),
+                stage2_lease: None,
+                shared_key_base,
+                shared_key_offset,
+                owner_generation,
+            });
+            let source_extent = source.map(|(key, _)| extent(key.0, key.1)).transpose()?;
+            if let Some(inherited) = inherited
+                .select(
+                    extent(cursor, take)?,
+                    extent(record.ipa, record.len as u64)?,
+                    source_extent,
+                )
+                .map_err(|error| {
+                    TrapError::Hypervisor(format!("owner fork inventory: {error:?}"))
+                })?
+            {
+                inventory_mappings.push(ProcessInventoryDesc {
+                    gpa: inherited.start().raw(),
+                    length: inherited.len().raw(),
+                    permissions: carrick_hal::MemPerms {
+                        read: record.perms & 1 != 0,
+                        write: record.perms & 2 != 0,
+                        exec: record.perms & 4 != 0,
+                    },
+                    inherited_frame: source.map(|(_, entry)| entry.frame),
+                    inherited_mapping: source.map(|(_, entry)| entry.mapping),
+                    backing,
+                    stage2_lease: (record.ipa, record.len as u64),
+                    stage2_owner: InventoryStage2OwnerIdentity {
+                        host_addr: record.host_addr,
+                        generation: owner_generation,
+                    },
+                    fork_frame_receipt_kind: None,
+                });
+            }
+            cursor += take;
+        }
+    }
+    Ok((mappings, inventory_mappings))
+}
+
 impl ForkCustody for OwnerPhysicalForkBuilder {
     type Retention = Box<dyn Send>;
     fn retain(
@@ -334,129 +483,13 @@ impl carrick_aarch64::fork::PhysicalForkBuilder<ProcessSpec> for OwnerPhysicalFo
                 "physical Fork completion identity differs from prepared capacity".into(),
             ));
         }
-        let mut mappings = Vec::new();
-        let mut inventory_mappings = Vec::new();
-        let mut inherited = std::collections::BTreeSet::new();
-        for custody in selected {
-            let PortalForkCustody::Frame {
-                va,
-                ipa,
-                len,
-                shared,
-            } = *custody
-            else {
-                continue;
-            };
-            let end = ipa.checked_add(len).ok_or(TrapError::MappingOverflow {
-                guest_start: va,
-                mapped_size: len,
-            })?;
-            let mut cursor = ipa;
-            while cursor < end {
-                let Some((_, allocation, record)) = self.physical.retain_extent(cursor, 1)? else {
-                    return Err(TrapError::Hypervisor(
-                        "owner-selected child frame lost exact physical custody".into(),
-                    ));
-                };
-                let mut take = (record.ipa + record.len as u64).min(end) - cursor;
-                let start = va + (cursor - ipa);
-                let perms = applevisor::memory::MemPerms::from(record.perms);
-                let source = self
-                    .inventory
-                    .lock()
-                    .extents
-                    .range(..=(cursor, u64::MAX))
-                    .next_back()
-                    .filter(|((base, length), _)| {
-                        *base <= cursor
-                            && base
-                                .checked_add(*length)
-                                .is_some_and(|bound| cursor < bound)
-                    })
-                    .map(|((base, length), extent)| {
-                        take = take.min(base + length - cursor);
-                        *extent
-                    });
-                let structural = self
-                    .source_owners
-                    .get(&(record.ipa, record.len))
-                    .cloned()
-                    .or_else(|| {
-                        self.published
-                            .iter()
-                            .find(|owner| {
-                                owner.physical_ipa == record.ipa
-                                    && owner.physical_size == record.len
-                            })
-                            .cloned()
-                    });
-                if source.is_none() && structural.is_none() {
-                    return Err(TrapError::Hypervisor("owner-selected physical frame has no exact inventory or structural lifetime".into()));
-                }
-                let backing = source
-                    .map(|entry| entry.backing)
-                    .unwrap_or_else(HvfVmState::private_backing_identity);
-                let owner_generation = structural.as_ref().map_or(
-                    source.map_or(0, |entry| entry.stage2_owner.generation),
-                    |owner| owner.epoch().raw(),
-                );
-                let physical_offset = cursor
-                    .checked_sub(source.map_or(record.ipa, |entry| entry.stage2_base))
-                    .ok_or_else(|| {
-                        TrapError::Hypervisor("owner fork physical offset underflow".into())
-                    })?;
-                let (shared_key_base, shared_key_offset) =
-                    inherited_futex_identity(backing, physical_offset)?;
-                mappings.push(ProcessMappingDesc {
-                    start,
-                    ipa: cursor,
-                    end: start + take,
-                    host: ProcessMappingHost::Borrowed {
-                        pointer: allocation.host_base(),
-                        structural_owner: structural,
-                    },
-                    size: take as usize,
-                    physical_ipa: record.ipa,
-                    physical_host_addr: allocation.host_base(),
-                    physical_size: record.len,
-                    inventory_backing: backing,
-                    perms,
-                    is_dynamic_alias: source.is_some(),
-                    sharing: if shared {
-                        GuestMappingSharing::GlobalShared
-                    } else {
-                        GuestMappingSharing::Private
-                    },
-                    guest_writable: false,
-                    inherited_frame: source.map(|entry| entry.frame),
-                    stage2_lease: None,
-                    shared_key_base,
-                    shared_key_offset,
-                    owner_generation,
-                });
-                if inherited.insert((cursor, take)) {
-                    inventory_mappings.push(ProcessInventoryDesc {
-                        gpa: cursor,
-                        length: take,
-                        permissions: carrick_hal::MemPerms {
-                            read: record.perms & 1 != 0,
-                            write: record.perms & 2 != 0,
-                            exec: record.perms & 4 != 0,
-                        },
-                        inherited_frame: source.map(|entry| entry.frame),
-                        inherited_mapping: source.map(|entry| entry.mapping),
-                        backing,
-                        stage2_lease: (record.ipa, record.len as u64),
-                        stage2_owner: InventoryStage2OwnerIdentity {
-                            host_addr: record.host_addr,
-                            generation: owner_generation,
-                        },
-                        fork_frame_receipt_kind: None,
-                    });
-                }
-                cursor += take;
-            }
-        }
+        let (mut mappings, mut inventory_mappings) = owner_fork_frame_descriptions(
+            &self.physical,
+            &self.source_owners,
+            &self.published,
+            &self.inventory,
+            selected,
+        )?;
         // Table and control capacities have no host semantic projection. Their
         // fixed carrier aliases were substituted by the owner itself.
         for owner in &self.published {
@@ -672,6 +705,157 @@ impl HvfVmState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_fork_leaf_receipts_retain_cow_consumable_physical_extents() {
+        let _guard = crate::trap::foreign_mm_tests::global_state_test_lock();
+        let _stage2_stub = ScopedStage2MapTestStub::enable();
+        let custody = Arc::new(CarrierVmCustody::new_live_fixture());
+        let physical = ForkPhysicalCustody::new(custody.clone(), Arc::new(|_, _| false));
+        let va = crate::vdso::LINUX_VVAR_BASE;
+        for (mm, ipa) in [(1000_u64, va), (2000, va + 0x4000)] {
+            let mapping = GuestMapping {
+                guest_start: va,
+                ipa_start: ipa,
+                mapped_size: 0x4000,
+                offset_in_mapping: 0,
+                payload_size: 0x1000,
+                perms: carrick_mem::elf::SegmentPerms {
+                    read: true,
+                    write: false,
+                    execute: false,
+                },
+                shared: false,
+                image: Arc::new(vec![mm as u8; 0x1000]),
+                private_file_backing: None,
+            };
+            let region = map_region_raw_in(&custody, &mapping, false, true).unwrap();
+            let owner = region.structural_owner.as_ref().unwrap().clone();
+            let source_owners = std::collections::BTreeMap::from([((ipa, 0x4000), owner)]);
+            for case in 0..3 {
+                let mut parent = HvpatchFrameInventory::default();
+                let reservation = |serial, frames, mappings, events| {
+                    carrick_hal::FrameInventoryReservation::from_kernel_candidates(
+                        carrick_hal::FrameInventoryProvenance::from_kernel_entropy([0x88; 32]),
+                        carrick_hal::FrameInventoryBatch::prepare(
+                            carrick_hal::KernelTransactionId::from_kernel_allocation(
+                                NonZeroU64::new(serial).unwrap(),
+                            ),
+                            carrick_hal::FrameEventCapacity::for_event_count(events).unwrap(),
+                        )
+                        .unwrap(),
+                        frames,
+                        mappings,
+                    )
+                };
+                let frame = carrick_hal::FrameId::from_kernel_allocation(
+                    NonZeroU64::new(mm + case * 10).unwrap(),
+                );
+                let mut initial = reservation(
+                    mm + case * 10 + 1,
+                    vec![frame],
+                    vec![carrick_hal::MappingId::from_kernel_allocation(
+                        NonZeroU64::new(mm + case * 10 + 2).unwrap(),
+                    )],
+                    2,
+                );
+                let source = HvfVmState::stage_mapping_in(
+                    &custody,
+                    &mut parent,
+                    &mut initial,
+                    InventoryMappingStage {
+                        gpa: ipa,
+                        length: 0x4000,
+                        permissions: HvfVmState::region_permissions(&region),
+                        backing: InventoryBackingIdentity::Private(mm),
+                        inherited_frame: None,
+                        stage2_lease: None,
+                        stage2_owner: mapped_region_stage2_owner_identity(&region).unwrap(),
+                    },
+                )
+                .unwrap();
+                let _initial = initial.commit(());
+                let selected: Vec<_> = (0..if case == 0 { 1 } else { 4 })
+                    .map(|page| PortalForkCustody::Frame {
+                        va: va + page * 0x1000,
+                        ipa: ipa + if case == 2 { 0x1000 } else { page * 0x1000 },
+                        len: 0x1000,
+                        shared: false,
+                    })
+                    .collect();
+                let frames = Arc::clone(&parent.frames);
+                let parent = parking_lot::Mutex::new(parent);
+                let (projections, inherited) = owner_fork_frame_descriptions(
+                    &physical,
+                    &source_owners,
+                    &[],
+                    &parent,
+                    &selected,
+                )
+                .unwrap();
+                assert_eq!(projections.len(), selected.len());
+                assert!(projections.iter().all(|row| {
+                    row.size == 0x1000
+                        && row.physical_ipa == ipa
+                        && row.inherited_frame == Some(frame)
+                }));
+                let mut child = HvpatchFrameInventory::with_frames(frames);
+                let mut staged = reservation(
+                    mm + case * 10 + 3,
+                    vec![],
+                    (0..inherited.len())
+                        .map(|index| {
+                            carrick_hal::MappingId::from_kernel_allocation(
+                                NonZeroU64::new(mm + case * 10 + 4 + index as u64).unwrap(),
+                            )
+                        })
+                        .collect(),
+                    inherited.len() * 2,
+                );
+                for mapping in &inherited {
+                    HvfVmState::stage_mapping_in(
+                        &custody,
+                        &mut child,
+                        &mut staged,
+                        InventoryMappingStage {
+                            gpa: mapping.gpa,
+                            length: mapping.length,
+                            permissions: mapping.permissions,
+                            backing: mapping.backing,
+                            inherited_frame: mapping.inherited_frame,
+                            stage2_lease: Some(mapping.stage2_lease),
+                            stage2_owner: mapping.stage2_owner,
+                        },
+                    )
+                    .unwrap();
+                }
+                let _staged = staged.commit(());
+                let shape = HvfVmState::cow_inventory_split_shape(&child, ipa, false, |_| {
+                    Ok(Some(2))
+                })
+                .unwrap_or_else(|error| {
+                    panic!("owner fork mm={mm} case={case} must admit native compound COW: {error}")
+                });
+                assert_eq!(shape.old_key, (ipa, 0x4000));
+                assert_eq!(shape.old.frame, source.frame);
+                assert!(
+                    !shape.sole_owner,
+                    "the live parent must keep its physical frame"
+                );
+                assert_eq!(
+                    inherited.len(),
+                    1,
+                    "one native extent, independent of leaf or alias count"
+                );
+                assert_eq!(child.extents.len(), 1);
+                assert_eq!(parent.lock().extents.len(), 1);
+                assert_eq!(child.frames.lock().references.get(&frame), Some(&2));
+                assert_eq!(shape.old.stage2_owner, source.stage2_owner);
+                assert_eq!(shape.old.backing, source.backing);
+            }
+        }
+    }
+
     #[test]
     fn owner_fork_retains_file_futex_identity_across_physical_slices() {
         let backing = InventoryBackingIdentity::SharedFile {
