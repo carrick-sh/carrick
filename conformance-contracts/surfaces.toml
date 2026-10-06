@@ -712,10 +712,6 @@ path = "crates/carrick-kernel/src/dispatch/net/lifecycle/connect_tests/loom_mode
 contracts = ["kernel.net.connect-wake-scope"]
 
 [[surfaces]]
-path = "crates/carrick-vmm-kvm/tests/live_vcpu_x86.rs"
-contracts = ["x86.run-elf.poll"]
-
-[[surfaces]]
 path = "crates/carrick-mem/src/x86_initial_image.rs"
 contracts = ["x86.mm.initial-image"]
 
