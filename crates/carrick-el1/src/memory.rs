@@ -489,20 +489,73 @@ impl Stage1Backing {
     }
 }
 
-/// Classify `[va, va + len)` by walking the live graph rooted at `root`.
-/// `read` loads the descriptor word at a table PA, `None` outside the
-/// primary arena. Absent tables skip their whole span, so the walk is
-/// proportional to the populated terminals, not to `len`.
+/// One descriptor step of a stage-1 walk above its last level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage1Step {
+    /// The word names the next-level table at this physical address.
+    Table(u64),
+    /// The word ends the walk: empty, a block, or a leaf.
+    Terminal,
+}
+
+/// An ISA's descriptor encoding of a four-level, 4 KiB-granule stage-1
+/// graph whose venue-private terminals carry the shared
+/// [`El1PrivateLeafState`](carrick_mmu_core::aarch64::El1PrivateLeafState)
+/// vocabulary. The walk geometry (indices and spans) is shared; only the
+/// word encoding differs.
+pub trait AnonymousLeafFormat {
+    /// Interpret `word`, read at `level` (0 = root), above the last level.
+    /// The last level (3) always terminates and is never stepped.
+    fn step(word: u64, level: usize) -> Stage1Step;
+    /// The ownership state of the non-zero terminal `word` at `level`.
+    fn leaf_state(word: u64, level: usize) -> carrick_mmu_core::aarch64::El1PrivateLeafState;
+}
+
+/// The AArch64 stage-1 long-descriptor format with EL1 software tags.
+pub struct Aarch64AnonymousLeafFormat;
+
+impl AnonymousLeafFormat for Aarch64AnonymousLeafFormat {
+    fn step(word: u64, _level: usize) -> Stage1Step {
+        const VALID: u64 = 1;
+        const TABLE: u64 = 0b11;
+        const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
+        if word & (VALID | TABLE) == VALID | TABLE {
+            Stage1Step::Table(word & TABLE_PA)
+        } else {
+            Stage1Step::Terminal
+        }
+    }
+    fn leaf_state(word: u64, _level: usize) -> carrick_mmu_core::aarch64::El1PrivateLeafState {
+        carrick_mmu_core::aarch64::el1_private_leaf_state(word)
+    }
+}
+
+/// Classify `[va, va + len)` by walking the live AArch64 graph rooted at
+/// `root`; see [`classify_stage1_range_with`].
 pub fn classify_stage1_range(
     read: &dyn Fn(u64) -> Option<u64>,
     root: u64,
     va: u64,
     len: u64,
 ) -> Stage1Backing {
-    use carrick_mmu_core::aarch64::{El1PrivateLeafState, el1_private_leaf_state, indices};
-    const VALID: u64 = 1;
-    const TABLE: u64 = 0b11;
-    const TABLE_PA: u64 = 0x0000_FFFF_FFFF_F000;
+    classify_stage1_range_with::<Aarch64AnonymousLeafFormat>(read, root, va, len)
+}
+
+/// Classify `[va, va + len)` by walking the live graph rooted at `root`,
+/// whose words `F` decodes. `read` loads the descriptor word at a table PA,
+/// `None` outside the primary arena. Absent tables skip their whole span,
+/// so the walk is proportional to the populated terminals, not to `len`.
+///
+/// Always inlined into each format's wrapper, so a format's walk is
+/// optimized as one function, as the AArch64 walk was before the split.
+#[inline(always)]
+pub fn classify_stage1_range_with<F: AnonymousLeafFormat>(
+    read: &dyn Fn(u64) -> Option<u64>,
+    root: u64,
+    va: u64,
+    len: u64,
+) -> Stage1Backing {
+    use carrick_mmu_core::aarch64::{El1PrivateLeafState, indices};
     const SPANS: [u64; 4] = [1 << 39, 1 << 30, 1 << 21, PAGE_SIZE];
     let malformed = Stage1Backing::foreign(ForeignBacking::Malformed);
     let Some(end) = va.checked_add(len) else {
@@ -519,8 +572,10 @@ pub fn classify_stage1_range(
             let Some(descriptor) = read(table + index[level] as u64 * 8) else {
                 return malformed;
             };
-            if level < 3 && descriptor & (VALID | TABLE) == VALID | TABLE {
-                table = descriptor & TABLE_PA;
+            if level < 3
+                && let Stage1Step::Table(next) = F::step(descriptor, level)
+            {
+                table = next;
                 level += 1;
                 continue;
             }
@@ -529,7 +584,7 @@ pub fn classify_stage1_range(
         let span = SPANS[level];
         let next = (cursor & !(span - 1)).saturating_add(span);
         if descriptor != 0 {
-            match el1_private_leaf_state(descriptor) {
+            match F::leaf_state(descriptor, level) {
                 El1PrivateLeafState::Prepared => private = true,
                 El1PrivateLeafState::Resident => {
                     private = true;
@@ -2082,24 +2137,41 @@ mod tests {
             assert!(root(&spaces, &table, &task).pending().is_none());
         }
 
+        const A64_VALID: u64 = 1;
+        const A64_TABLE: u64 = 0b11;
+        const A64_PRIVATE: u64 = 1 << 56;
+        const A64_RETIRED: u64 = 1 << 55;
+        const A64_ROOT: u64 = 0x8000_0000;
+        /// L0[0], L1[1], L2[0] of [`aarch64_stage1_fixture`].
+        const A64_VA: u64 = 0x4000_0000;
+        const fn a64_leaf(page: usize) -> usize {
+            1536 + page
+        }
+
+        /// Four AArch64 table pages (L0, L1, L2, L3) at [`A64_ROOT`]: L3
+        /// page 0 resident, 1 prepared, 2 absent, 3 host-owned, 4 retired.
+        fn aarch64_stage1_fixture() -> Vec<u64> {
+            let (root, valid, table) = (A64_ROOT, A64_VALID, A64_TABLE);
+            let mut words = vec![0u64; 4 * 512];
+            words[0] = (root + 0x1000) | valid | table;
+            words[512 + 1] = (root + 0x2000) | valid | table;
+            words[1024] = (root + 0x3000) | valid | table;
+            words[a64_leaf(0)] = 0x9000_0000 | A64_PRIVATE | valid | table; // resident
+            words[a64_leaf(1)] = 0x9000_1000 | A64_PRIVATE | 0b10; // prepared (invalid)
+            words[a64_leaf(3)] = 0x9000_3000 | valid | table; // host-owned
+            words[a64_leaf(4)] = 0x9000_4000 | A64_PRIVATE | A64_RETIRED | 0b10; // retired
+            words
+        }
+
         #[test]
         fn stage1_range_classification_follows_the_live_terminals() {
-            const VALID: u64 = 1;
-            const TABLE: u64 = 0b11;
-            const PRIVATE: u64 = 1 << 56;
-            const RETIRED: u64 = 1 << 55;
-            let root = 0x8000_0000u64;
-            // Four table pages: L0, L1, L2, L3.
-            let mut words = vec![0u64; 4 * 512];
-            let va = 0x4000_0000u64; // L0[0], L1[1], L2[0]
-            words[0] = (root + 0x1000) | VALID | TABLE;
-            words[512 + 1] = (root + 0x2000) | VALID | TABLE;
-            words[1024] = (root + 0x3000) | VALID | TABLE;
-            let leaf = |page: usize| 1536 + page;
-            words[leaf(0)] = 0x9000_0000 | PRIVATE | VALID | TABLE; // resident
-            words[leaf(1)] = 0x9000_1000 | PRIVATE | 0b10; // prepared (invalid)
-            words[leaf(3)] = 0x9000_3000 | VALID | TABLE; // host-owned
-            words[leaf(4)] = 0x9000_4000 | PRIVATE | RETIRED | 0b10; // retired (invalid)
+            const VALID: u64 = A64_VALID;
+            const TABLE: u64 = A64_TABLE;
+            const PRIVATE: u64 = A64_PRIVATE;
+            let root = A64_ROOT;
+            let mut words = aarch64_stage1_fixture();
+            let va = A64_VA;
+            let leaf = a64_leaf;
             let classify = |words: &Vec<u64>, va: u64, len: u64| {
                 let read = |pa: u64| {
                     let offset = pa.checked_sub(root)?;
@@ -2169,6 +2241,155 @@ mod tests {
             assert_eq!(
                 cause(&words, va + 0x10000, 0x12000),
                 ForeignBacking::TooManyRuns
+            );
+        }
+
+        /// The generic walk with the AArch64 format is the AArch64 walk:
+        /// every range of the live fixture, including the edits above,
+        /// classifies identically through the wrapper.
+        #[test]
+        fn generic_classifier_with_aarch64_format_matches_the_wrapper() {
+            let mut words = aarch64_stage1_fixture();
+            let compare = |words: &Vec<u64>| {
+                let read = |pa: u64| {
+                    let offset = pa.checked_sub(A64_ROOT)?;
+                    words.get((offset / 8) as usize).copied()
+                };
+                let va = A64_VA;
+                for (start, len) in [
+                    (va, 0x1000),
+                    (va, 0x2000),
+                    (va, 0x3000),
+                    (va + 0x1000, 0x2000),
+                    (va + 0x2000, 0x1000),
+                    (va + 0x3000, 0x1000),
+                    (va + 0x4000, 0x1000),
+                    (va, 0x20_0000),
+                    (va + (1 << 21), 1 << 30),
+                    (va + (2 << 21), 0x1000),
+                    (va + 0x10000, 0x12000),
+                    (u64::MAX - 0xfff, 0x2000),
+                    (0, 0),
+                ] {
+                    assert_eq!(
+                        classify_stage1_range_with::<Aarch64AnonymousLeafFormat>(
+                            &read, A64_ROOT, start, len
+                        ),
+                        classify_stage1_range(&read, A64_ROOT, start, len),
+                        "range {start:#x}+{len:#x}"
+                    );
+                }
+            };
+            compare(&words);
+            words[1024 + 1] = (A64_ROOT + 0x10_0000) | A64_VALID | A64_TABLE;
+            words[1024 + 2] = 0x9040_0000 | A64_VALID;
+            for page in 0..9 {
+                words[a64_leaf(16 + 2 * page)] =
+                    (0x9001_0000 + page as u64 * 0x2000) | A64_PRIVATE | A64_VALID | A64_TABLE;
+            }
+            compare(&words);
+        }
+
+        /// A second encoding, x86-like: bit 0 present, bit 7 a large leaf at
+        /// levels 1 and 2, bits 9/10 the private/retired software tags, and
+        /// no table-type bit. The shared walk must consult only the format.
+        use carrick_mmu_core::aarch64::El1PrivateLeafState;
+        struct FakeLeafFormat;
+        const FAKE_PRESENT: u64 = 1;
+        const FAKE_LARGE: u64 = 1 << 7;
+        const FAKE_PRIVATE: u64 = 1 << 9;
+        const FAKE_RETIRED: u64 = 1 << 10;
+        const FAKE_PA: u64 = 0x000f_ffff_ffff_f000;
+        impl AnonymousLeafFormat for FakeLeafFormat {
+            fn step(word: u64, level: usize) -> Stage1Step {
+                let large = matches!(level, 1 | 2) && word & FAKE_LARGE != 0;
+                if word & FAKE_PRESENT != 0 && !large {
+                    Stage1Step::Table(word & FAKE_PA)
+                } else {
+                    Stage1Step::Terminal
+                }
+            }
+            fn leaf_state(word: u64, _level: usize) -> El1PrivateLeafState {
+                if word & FAKE_PRIVATE == 0 {
+                    El1PrivateLeafState::Unowned
+                } else if word & FAKE_PRESENT != 0 {
+                    El1PrivateLeafState::Resident
+                } else if word & FAKE_RETIRED != 0 {
+                    El1PrivateLeafState::Retired
+                } else if word & FAKE_PA != 0 {
+                    El1PrivateLeafState::Prepared
+                } else {
+                    El1PrivateLeafState::Malformed
+                }
+            }
+        }
+
+        #[test]
+        fn generic_classifier_walks_a_second_format() {
+            let root = 0x8000_0000u64;
+            let mut words = vec![0u64; 4 * 512];
+            let va = 0x4000_0000u64; // [0], [1], [0]
+            words[0] = (root + 0x1000) | FAKE_PRESENT;
+            words[512 + 1] = (root + 0x2000) | FAKE_PRESENT;
+            words[1024] = (root + 0x3000) | FAKE_PRESENT;
+            let leaf = |page: usize| 1536 + page;
+            words[leaf(0)] = 0x9000_0000 | FAKE_PRIVATE | FAKE_PRESENT; // resident
+            words[leaf(1)] = 0x9000_1000 | FAKE_PRIVATE; // prepared
+            words[leaf(3)] = 0x9000_3000 | FAKE_PRESENT; // host-owned
+            words[leaf(4)] = 0x9000_4000 | FAKE_PRIVATE | FAKE_RETIRED; // retired
+            words[1024 + 2] = 0x9040_0000 | FAKE_LARGE | FAKE_PRESENT; // large leaf
+            let classify = |words: &Vec<u64>, va: u64, len: u64| {
+                let read = |pa: u64| {
+                    let offset = pa.checked_sub(root)?;
+                    words.get((offset / 8) as usize).copied()
+                };
+                classify_stage1_range_with::<FakeLeafFormat>(&read, root, va, len)
+            };
+            let resident = classify(&words, va, 0x3000);
+            assert_eq!(resident.summary, RangeBacking::Private);
+            assert_eq!(resident.runs(), &[(va, va + 0x2000)]);
+            assert_eq!(
+                classify(&words, va + 0x1000, 0x1000).summary,
+                RangeBacking::Prepared
+            );
+            assert_eq!(
+                classify(&words, va + 0x2000, 0x1000).summary,
+                RangeBacking::Empty
+            );
+            assert_eq!(
+                classify(&words, va + 0x3000, 0x1000).foreign,
+                ForeignBacking::HostOwnedLeaf
+            );
+            assert_eq!(
+                classify(&words, va + 0x4000, 0x1000).summary,
+                RangeBacking::Retired
+            );
+            // The format's large bit ends the walk at level 2: a block.
+            assert_eq!(
+                classify(&words, va + (2 << 21), 0x1000).foreign,
+                ForeignBacking::Block
+            );
+            // An absent level-2 entry is one empty span, whatever its length.
+            assert_eq!(
+                classify(&words, va + (3 << 21), 1 << 29).summary,
+                RangeBacking::Empty
+            );
+            // A table outside the readable window is never taken as empty.
+            words[1024 + 1] = (root + 0x10_0000) | FAKE_PRESENT;
+            assert_eq!(
+                classify(&words, va + (1 << 21), 0x1000).foreign,
+                ForeignBacking::Malformed
+            );
+            // The same words under the AArch64 format read differently: a
+            // present word without the AArch64 table bit is a block there,
+            // so the walk takes its encoding from the format alone.
+            let read = |pa: u64| {
+                let offset = pa.checked_sub(root)?;
+                words.get((offset / 8) as usize).copied()
+            };
+            assert_eq!(
+                classify_stage1_range(&read, root, va, 0x1000).foreign,
+                ForeignBacking::Block
             );
         }
     }
