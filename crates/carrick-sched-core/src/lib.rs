@@ -398,6 +398,21 @@ pub struct ThreadCtx {
     pub fpsr: u64,
     pub fpcr: u64,
 }
+const _: () = {
+    assert!(core::mem::offset_of!(ThreadCtx, x) == 0);
+    assert!(core::mem::offset_of!(ThreadCtx, pc) == 248);
+    assert!(core::mem::offset_of!(ThreadCtx, pstate) == 256);
+    assert!(core::mem::offset_of!(ThreadCtx, sp_el0) == 264);
+    assert!(core::mem::offset_of!(ThreadCtx, tpidr_el0) == 272);
+    assert!(core::mem::offset_of!(ThreadCtx, tpidrro_el0) == 280);
+    assert!(core::mem::offset_of!(ThreadCtx, contextidr_el1) == 288);
+    assert!(core::mem::offset_of!(ThreadCtx, _pad) == 296);
+    assert!(core::mem::offset_of!(ThreadCtx, v) == 304);
+    assert!(core::mem::offset_of!(ThreadCtx, fpsr) == 816);
+    assert!(core::mem::offset_of!(ThreadCtx, fpcr) == 824);
+    assert!(core::mem::size_of::<ThreadCtx>() == 832);
+    assert!(core::mem::align_of::<ThreadCtx>() == 16);
+};
 
 /// Byte offset of [`ThreadCtx::v`] (the FP/SIMD save area).
 pub const THREAD_CTX_V_OFFSET: usize = core::mem::offset_of!(ThreadCtx, v);

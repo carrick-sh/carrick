@@ -8,9 +8,9 @@ use carrick_el1_abi::{CurrentTask, ThreadCtx, TrapFrame};
 use carrick_guest_arch::{
     Access, AddressContext, ArchTypes, CopyProgress, CounterFrequency, CounterTick, CpuId,
     CpuTarget, CrossingBackend, Deadline, EntryBackend, EntryEvent, FatalReport, FrameGpa,
-    GuestLen, InterruptAck, InterruptBackend, InterruptReason, KernelStackPointer, MmuBackend,
-    NativeEntrySnapshot, NativeReturnWord, OwnedHostRequest, RequestToken, RootGpa, UserRange,
-    UserReturn, UserVa, WakeToken,
+    GuestIsa, GuestLen, InterruptAck, InterruptBackend, InterruptReason, KernelStackPointer,
+    MmuBackend, NativeAbi, NativeEntrySnapshot, NativeReturnWord, OwnedHostRequest, RequestToken,
+    RootGpa, UserRange, UserReturn, UserVa, WakeToken,
 };
 use core::num::NonZeroU64;
 
@@ -49,11 +49,15 @@ impl EntryBackend for Aarch64Backend {
     fn decode_entry(&mut self, _frame: &TrapFrame) -> Result<EntryEvent, Self::Error> {
         Err(ArchError::Unbound)
     }
-    fn snapshot(
+    fn snapshot<'a>(
         &mut self,
-        _frame: &TrapFrame,
-    ) -> Result<NativeEntrySnapshot<'_, TrapFrame>, Self::Error> {
-        Err(ArchError::Unbound)
+        frame: &'a TrapFrame,
+    ) -> Result<NativeEntrySnapshot<'a, TrapFrame>, Self::Error> {
+        Ok(NativeEntrySnapshot {
+            isa: GuestIsa::Aarch64,
+            abi: NativeAbi::Aarch64El0,
+            frame,
+        })
     }
     fn set_result(
         &mut self,
