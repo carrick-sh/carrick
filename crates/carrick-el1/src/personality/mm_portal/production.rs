@@ -153,7 +153,7 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
 /// The host must resume this exact stack after servicing or cancelling the
 /// effect; the portal keeps its operation and semantic permit across the yield.
 #[cfg(target_os = "none")]
-pub(super) fn yield_host_effect() {
+pub(crate) fn yield_host_effect() {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!("hvc #1", clobber_abi("C"));
