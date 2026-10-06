@@ -4411,7 +4411,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/kernel/operations/exit.rs",
-      "line": 336,
+      "line": 337,
       "categories": [
         "table_guard"
       ],
