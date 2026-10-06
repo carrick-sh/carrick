@@ -1,0 +1,7 @@
+{
+  "authority": "native x86_64 Linux on x86-w1 (four-level VA layout)",
+  "kernel": "Linux-6.12.111+deb13-amd64-x86_64-with-glibc2.41",
+  "source_sha256": "d61eadda58ac9f6fa279c339a0c62ec5eb6ef2de48947d1798606c098a082a76",
+  "binary_sha256": "76132cf66f2d303b7cba8395d341a9b09d5fa3cb9da8efbaccf38f94a9bdeb4c",
+  "stdout": "mmap_null_lower_half_1=true\nmmap_null_lower_half_8=true\nmmap_null_lower_half_32=true\nmmap_fixed_0x7fffffffe000_errno=0\nmmap_fixed_0x7ffffffff000_errno=12\nmmap_fixed_0x800000000000_errno=12\nmmap_fixed_0x800000001000_errno=12\nmmap_fixed_0x1000000001000_errno=12\nmmap_fixed_0xfffffffffffff000_errno=12\n"
+}

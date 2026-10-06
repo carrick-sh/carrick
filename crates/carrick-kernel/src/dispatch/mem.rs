@@ -52,6 +52,7 @@
 pub(crate) use super::dispatcher::MemView;
 use super::*;
 use carrick_fatal::carrick_fatal;
+use carrick_hal::guest_arch::UserVaCeiling;
 use carrick_vfs::{ProcMapSharing, ProcMapsEntry};
 
 pub use fault::core_data_runs;
@@ -1150,8 +1151,9 @@ pub(super) fn find_canonical_high_va_gap(
     mem: &MemState,
     length: u64,
     congruence: MmapGrantCongruence,
+    user_ceiling: UserVaCeiling,
 ) -> Option<(u64, bool)> {
-    if length == 0 || length > (1u64 << 48) {
+    if length == 0 || length > user_ceiling.exclusive_end() {
         return None;
     }
     let mut occupied: Vec<(u64, u64)> = Vec::new();
@@ -1202,7 +1204,7 @@ pub(super) fn find_canonical_high_va_gap(
         merged.push((s, e));
     }
 
-    let high_va_top = 1u64 << 48;
+    let high_va_top = user_ceiling.exclusive_end();
     let mut candidate = crate::memory::LINUX_HIGH_VA_THRESHOLD;
 
     for (occ_start, occ_end) in merged {
@@ -1549,6 +1551,7 @@ impl<'a> MemView<'a> {
     /// delegated root can own itself (its proposal is then this syscall's
     /// host venue); every other mapping on a delegated MM is host-served and
     /// placed by the root around its nodes.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::dispatch) fn next_mmap_address(
         &self,
         requested: u64,
@@ -1557,6 +1560,7 @@ impl<'a> MemView<'a> {
         flags: u64,
         congruence: MmapGrantCongruence,
         root_eligible: bool,
+        user_ceiling: UserVaCeiling,
     ) -> Result<Option<(u64, bool)>, DispatchError> {
         {
             let authority = self.mem();
@@ -1571,10 +1575,12 @@ impl<'a> MemView<'a> {
                     flags,
                     congruence,
                     root_eligible,
+                    user_ceiling,
                 );
             }
         }
-        let granted = self.next_mmap_address_inner(requested, length, prot, flags, congruence);
+        let granted =
+            self.next_mmap_address_inner(requested, length, prot, flags, congruence, user_ceiling);
         // Grant audit: CARRICK_MMAP_GRANT_DEBUG=1 logs any non-FIXED grant that
         // overlaps a LIVE dynamic mapping, with the allocator state and caller.
         // A double-grant here scrubbed a live CPython interned-dict granule to
@@ -1637,6 +1643,7 @@ impl<'a> MemView<'a> {
         prot: u64,
         flags: u64,
         congruence: MmapGrantCongruence,
+        user_ceiling: UserVaCeiling,
     ) -> Option<(u64, bool)> {
         // Only a WRITABLE hand-out can ever leave a non-zero byte behind, so
         // only a writable hand-out raises the watermark. A `PROT_NONE` reserve
@@ -1718,7 +1725,7 @@ impl<'a> MemView<'a> {
                 }
             }
             let canonical_alias_hint =
-                aligned_hint && mmap_address_uses_alias(requested, length, layout);
+                aligned_hint && mmap_address_uses_alias(requested, length, layout, user_ceiling);
             if canonical_alias_hint {
                 let mem_authority_hint = self.mem();
                 let mem = mem_authority_hint.lock();
@@ -1783,7 +1790,7 @@ impl<'a> MemView<'a> {
             }
         }
 
-        find_canonical_high_va_gap(&mem, length, congruence)
+        find_canonical_high_va_gap(&mem, length, congruence, user_ceiling)
     }
 }
 
@@ -2475,7 +2482,15 @@ impl SyscallDispatcher {
         congruence: MmapGrantCongruence,
     ) -> Option<(u64, bool)> {
         self.mem_view()
-            .next_mmap_address(requested, length, prot, flags, congruence, false)
+            .next_mmap_address(
+                requested,
+                length,
+                prot,
+                flags,
+                congruence,
+                false,
+                UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::Aarch64),
+            )
             .expect("host-setup placement has no root to refuse")
     }
 
@@ -2738,11 +2753,16 @@ fn mprotect_range_in_identity_image(address: u64, length: u64, layout: MemoryLay
         )
 }
 
-pub(super) fn mmap_address_uses_alias(address: u64, length: u64, layout: MemoryLayout) -> bool {
+pub(super) fn mmap_address_uses_alias(
+    address: u64,
+    length: u64,
+    layout: MemoryLayout,
+    user_ceiling: UserVaCeiling,
+) -> bool {
     let Some(end) = address.checked_add(length) else {
         return false;
     };
-    if end > (1u64 << 48) {
+    if end > user_ceiling.exclusive_end() {
         return false;
     }
     if range_within(address, length, layout.mmap_base, layout.mmap_size) {
