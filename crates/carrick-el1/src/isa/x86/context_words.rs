@@ -111,6 +111,7 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use carrick_guest_arch::{ContextGeneration, MmGeneration};
+    use carrick_sched_core::{SlotId, ThreadIdentity, ZoneTables};
 
     #[test]
     fn zero_or_recycled_context_cannot_become_live_native_state() {
@@ -151,6 +152,47 @@ mod tests {
         };
         assert!(matches!(
             words.into_native(recycled),
+            Err(ArchError::InvalidContext)
+        ));
+    }
+
+    #[test]
+    fn shared_scheduler_record_carries_x86_context_without_arm_layout() {
+        let layout = std::alloc::Layout::new::<ZoneTables<ParkedContextWords>>();
+        // SAFETY: every ZoneTables field is zero-valid and the context type
+        // implements FromZeros; this allocation owns the full aligned table.
+        let zone = unsafe {
+            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables<ParkedContextWords>>();
+            assert!(!ptr.is_null());
+            std::boxed::Box::from_raw(ptr)
+        };
+        let slot = SlotId::new(0);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 11, Some(0), 0);
+        zone.enter_guest(slot);
+        let space = zone.spaces.publish_closed(11, 0x6000, 0).unwrap();
+        zone.spaces.open(space);
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                mm: 11,
+                tid: 41,
+                serial: 17,
+                generation: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        // SAFETY: the newly allocated record is owned by this fixture until
+        // requeue; no other actor can read or write its context yet.
+        unsafe { *zone.record(record).ctx_mut() = ParkedContextWords::ZERO };
+        zone.requeue_preempted(slot, record);
+        assert_eq!(zone.switch_in(slot), Some(record));
+        // SAFETY: this fixture is the only driver of the on-CPU slot.
+        assert!(matches!(
+            unsafe { *zone.record(record).ctx_mut() }.into_native(AddressContext {
+                root: RootGpa::page_aligned(FrameGpa::new(0x6000)).unwrap(),
+                mm: MmGeneration::new(NonZeroU64::new(11).unwrap()),
+                generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+            }),
             Err(ArchError::InvalidContext)
         ));
     }
