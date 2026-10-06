@@ -21,6 +21,42 @@ fn backing(pa: u64, len: usize, tag: u64) -> PreparedBacking {
 }
 
 #[test]
+fn one_memslot_authenticates_each_inventoried_frame_independently() {
+    let mut memory = CarrierMemory::create().unwrap();
+    let handle = memory
+        .install(&[backing(0x800000, 3 * PAGE as usize, 9)])
+        .unwrap()[0];
+    let first = backing(0x900000, PAGE as usize, 11).identity;
+    let second = backing(0xa00000, PAGE as usize, 12).identity;
+    memory
+        .bind_frame_identities(
+            handle,
+            &[
+                (FrameGpa::new(0x800000), first),
+                (FrameGpa::new(0x801000), second),
+            ],
+        )
+        .unwrap();
+    let map = |gpa, identity| DescriptorOp::Map {
+        span: PageSpan::new(0x4000, PAGE),
+        output: FrameGpa::new(gpa),
+        permissions: Permissions {
+            writable: true,
+            executable: false,
+            user: true,
+        },
+        size: LeafSize::Page,
+        resident: true,
+        backing: identity,
+    };
+    assert!(memory.authenticate(nz(1), map(0x800000, first)).is_ok());
+    assert!(memory.authenticate(nz(1), map(0x801000, second)).is_ok());
+    assert!(memory.authenticate(nz(1), map(0x800000, second)).is_err());
+    assert!(memory.authenticate(nz(1), map(0x801000, first)).is_err());
+    assert!(memory.authenticate(nz(1), map(0x802000, first)).is_err());
+}
+
+#[test]
 fn three_vcpus_observe_one_carrier_backing_in_order() {
     let mut machine = CarrierMachine::create_stopped(3).unwrap();
     let mut extent = BackingExtent::private(FrameGpa::new(0), PAGE as usize).unwrap();

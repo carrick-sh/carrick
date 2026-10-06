@@ -1,6 +1,6 @@
-//! Bounded M2 hardware binding: one VM, two issued live task slots, native
-//! SYSCALL entry and IRETQ return. This is not an OCI/runtime/MM-owner binding.
-//! Observation and kick doorbells are declared fixture control transport.
+//! Shared CPL0 KVM carrier and its retained guest-MM/metadata backing.
+//! Hardware fixtures and the initial production process use the same image;
+//! fixture observation ports remain separate from the production transport.
 use crate::carrier_memory::{
     BackingExtent, BackingHandle, CarrierMachine, CarrierMemory, InventoryTransaction,
     PreparedBacking,
@@ -26,7 +26,11 @@ use carrick_el1_abi::{
 };
 use carrick_guest_arch::FrameGpa;
 use carrick_guest_arch::{AddressContext, ContextGeneration, MmGeneration, RootGpa, UserVa};
+use carrick_hal::{
+    FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration, MemPerms,
+};
 use carrick_hal::{HvVcpu, TrapError, VcpuExit, VcpuKick};
+use carrick_kernel::kernel::{FrameInventoryAuthority, MmId, ObjectIdRegistry};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
 use carrick_mmu_core::x86::descriptor_txn::{
     Access, BackingIdentity, DescriptorOp, DescriptorTxn, DescriptorTxnId, LeafSize, PageSpan,
@@ -37,6 +41,7 @@ use carrick_sched_core::{SlotId, Waker, ZoneTables};
 use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
 use kvm_bindings::{KVM_MP_STATE_RUNNABLE, Msrs, kvm_mp_state, kvm_msr_entry};
+use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -53,6 +58,7 @@ const ALLOCATOR_GPA: u64 = 0x20_00000;
 const INITIAL_EXTENT_GPA: u64 = 0x40_00000;
 const KERNEL_REGION_GPA: u64 = 0x1_0000_0000;
 const INITIAL_MM_KEY: u64 = 301;
+static NEXT_EXTENT_ID: AtomicU64 = AtomicU64::new(1);
 const INITIAL_STACK_TOP: u64 = 0x7fff_0000;
 const INITIAL_STACK_SIZE: u64 = 0x1_0000;
 const COUNTERS_OFFSET: u64 = 0x1_0000;
@@ -100,11 +106,141 @@ fn append_records<T: Copy>(buffer: &mut Vec<u8>, records: &[T]) -> Result<u64, T
 }
 
 struct InitialInventory {
+    authority: FrameInventoryAuthority,
+    receipt: Option<carrick_hal::FrameInventoryApplyReceipt>,
+    frames: Vec<(FrameGpa, BackingIdentity)>,
     expected: usize,
     committed: usize,
 }
+impl InitialInventory {
+    fn stage(
+        gpas: impl IntoIterator<Item = FrameGpa>,
+    ) -> Result<(Self, Vec<X86InitialBootGrant>), TrapError> {
+        let gpas: Vec<_> = gpas.into_iter().collect();
+        let authority = FrameInventoryAuthority::new();
+        let ids = ObjectIdRegistry::new();
+        let capacity = FrameEventCapacity::for_event_count(
+            gpas.len()
+                .checked_mul(2)
+                .ok_or_else(|| fail("initial inventory capacity"))?,
+        )
+        .map_err(|error| fail(format!("initial inventory capacity: {error}")))?;
+        let mut reservation = authority
+            .reserve(&ids, gpas.len(), gpas.len(), capacity)
+            .map_err(|error| fail(format!("initial inventory reserve: {error}")))?;
+        let transaction = reservation.transaction();
+        let generation = MappingGeneration::from_backend_counter(NonZeroU64::MIN);
+        let length = FrameLength::from_mapping_extent(
+            NonZeroU64::new(4096).ok_or_else(|| fail("initial frame length"))?,
+        );
+        let mut rows = Vec::with_capacity(gpas.len());
+        for gpa in gpas {
+            let frame = reservation
+                .claim_frame()
+                .map_err(|error| fail(format!("initial frame candidate: {error}")))?;
+            let mapping = reservation
+                .claim_mapping()
+                .map_err(|error| fail(format!("initial mapping candidate: {error}")))?;
+            reservation
+                .push(FrameInventoryEvent::PrepareMapping {
+                    transaction,
+                    frame,
+                    mapping,
+                    generation,
+                    gpa: carrick_guest_mem::Gpa(gpa.raw()),
+                    length,
+                    permissions: MemPerms {
+                        read: true,
+                        write: true,
+                        exec: false,
+                    },
+                })
+                .map_err(|error| fail(format!("initial inventory prepare: {error}")))?;
+            reservation
+                .push(FrameInventoryEvent::PublishMapping {
+                    transaction,
+                    mapping,
+                    generation,
+                })
+                .map_err(|error| fail(format!("initial inventory publish: {error}")))?;
+            rows.push((gpa, frame, mapping));
+        }
+        let mm = MmId::from_raw_u64(INITIAL_MM_KEY).ok_or_else(|| fail("initial inventory MM"))?;
+        let (_, receipt) = authority
+            .apply_with_receipt(mm, reservation.commit(()))
+            .map_err(|error| fail(format!("initial inventory apply: {error}")))?;
+        let mut frames = Vec::with_capacity(rows.len());
+        let mut grants = Vec::with_capacity(rows.len());
+        for (gpa, frame, mapping) in rows {
+            if !receipt.authorizes(mapping, frame) {
+                return Err(fail("initial inventory missing mapping"));
+            }
+            let identity = BackingIdentity {
+                frame_id: NonZeroU64::new(frame.raw())
+                    .ok_or_else(|| fail("initial frame identity"))?,
+                mapping_id: NonZeroU64::new(mapping.raw())
+                    .ok_or_else(|| fail("initial mapping identity"))?,
+                owner_generation: NonZeroU64::MIN,
+                inventory_revision: NonZeroU64::new(receipt.revision())
+                    .ok_or_else(|| fail("initial inventory revision"))?,
+            };
+            frames.push((gpa, identity));
+            grants.push(X86InitialBootGrant {
+                gpa: gpa.raw(),
+                frame_id: frame.raw(),
+                mapping_id: mapping.raw(),
+                owner_generation: generation.raw(),
+                inventory_revision: receipt.revision(),
+            });
+        }
+        Ok((
+            Self {
+                authority,
+                receipt: Some(receipt),
+                frames,
+                expected: 0,
+                committed: 0,
+            },
+            grants,
+        ))
+    }
+
+    fn finish(&mut self) -> Result<(), TrapError> {
+        if self.committed != self.expected {
+            return Err(fail("initial inventory incomplete"));
+        }
+        self.receipt = None;
+        Ok(())
+    }
+}
 impl InventoryTransaction for InitialInventory {
     fn publish(&mut self) -> Result<(), crate::carrier_memory::MemoryError> {
+        let receipt = self.receipt.as_ref().ok_or_else(|| {
+            crate::carrier_memory::MemoryError("initial inventory receipt absent".into())
+        })?;
+        let snapshot = self.authority.snapshot();
+        if snapshot.revision != receipt.revision() || snapshot.mappings.len() != self.frames.len() {
+            return Err(crate::carrier_memory::MemoryError(
+                "initial inventory publication mismatch".into(),
+            ));
+        }
+        let rows: BTreeMap<_, _> = snapshot
+            .mappings
+            .iter()
+            .map(|row| (row.gpa.0, row))
+            .collect();
+        for &(gpa, identity) in &self.frames {
+            let found = rows.get(&gpa.raw()).is_some_and(|row| {
+                row.frame.raw() == identity.frame_id.get()
+                    && row.mapping.raw() == identity.mapping_id.get()
+                    && row.mm.raw() == INITIAL_MM_KEY
+            });
+            if !found {
+                return Err(crate::carrier_memory::MemoryError(
+                    "initial inventory frame missing".into(),
+                ));
+            }
+        }
         Ok(())
     }
     fn commit(
@@ -120,8 +256,24 @@ impl InventoryTransaction for InitialInventory {
         Ok(())
     }
     fn rollback(&mut self) -> Result<(), crate::carrier_memory::MemoryError> {
+        if let Some(receipt) = self.receipt.take() {
+            self.authority
+                .rollback_unpublished_apply(&receipt)
+                .map_err(|error| {
+                    crate::carrier_memory::MemoryError(format!(
+                        "initial inventory rollback: {error}"
+                    ))
+                })?;
+        }
         self.committed = 0;
         Ok(())
+    }
+}
+impl Drop for InitialInventory {
+    fn drop(&mut self) {
+        if self.receipt.is_some() && self.rollback().is_err() {
+            std::process::abort();
+        }
     }
 }
 
@@ -202,6 +354,7 @@ pub struct Cpl0Carrier {
     pub(crate) ram: Arc<GuestRam>,
     initial_extent: Option<(BackingHandle, usize)>,
     _kernel_region: Option<BackingHandle>,
+    initial_inventory: Option<InitialInventory>,
     metadata_base: NonNull<u8>,
     host_forwards: u64,
     host_yields: u64,
@@ -494,18 +647,18 @@ impl Cpl0Carrier {
         {
             return Err(fail("initial extent too small for frame grants"));
         }
-        let grants: Vec<X86InitialBootGrant> = (0..grant_count)
-            .map(|index| {
-                let gpa = INITIAL_EXTENT_GPA + (frame_offset + index * 4096) as u64;
-                X86InitialBootGrant {
-                    gpa,
-                    frame_id: 0x100,
-                    mapping_id: 0x100,
-                    owner_generation: 0x100,
-                    inventory_revision: 0x100,
-                }
-            })
-            .collect();
+        let (mut inventory, grants) = InitialInventory::stage((0..grant_count).map(|index| {
+            FrameGpa::new(INITIAL_EXTENT_GPA + (frame_offset + index * 4096) as u64)
+        }))?;
+        inventory
+            .publish()
+            .map_err(|error| fail(error.to_string()))?;
+        let (handle, _) = self
+            .initial_extent
+            .ok_or_else(|| fail("initial extent handle"))?;
+        self._vm
+            .bind_frame_identities(handle, &inventory.frames)
+            .map_err(|error| fail(error.to_string()))?;
         // The guest editor's no-op invalidation is valid only while this
         // unpublished root cannot be in any live vCPU TLB. Both vCPUs are
         // stopped here; reject a reused root before the first descriptor edit.
@@ -723,18 +876,7 @@ impl Cpl0Carrier {
                     .ok_or_else(|| fail("initial table grant"))
             })
             .collect::<Result<_, _>>()?;
-        let identity = BackingIdentity {
-            frame_id: NonZeroU64::new(0x100).ok_or_else(|| fail("initial frame identity"))?,
-            mapping_id: NonZeroU64::new(0x100).ok_or_else(|| fail("initial mapping identity"))?,
-            owner_generation: NonZeroU64::new(0x100)
-                .ok_or_else(|| fail("initial owner generation"))?,
-            inventory_revision: NonZeroU64::new(0x100)
-                .ok_or_else(|| fail("initial inventory revision"))?,
-        };
-        let mut inventory = InitialInventory {
-            expected: publications.len(),
-            committed: 0,
-        };
+        inventory.expected = publications.len();
         let mut used_tables = 0usize;
         for (index, publication) in publications.into_iter().enumerate() {
             let perms = if let Some(region) = image.regions.iter().find(|region| {
@@ -757,6 +899,17 @@ impl Cpl0Carrier {
                 return Err(fail("initial publication outside ELF and stack"));
             };
             let output = FrameGpa::new(grants[table_grants + index].gpa);
+            let grant = grants[table_grants + index];
+            let identity = BackingIdentity {
+                frame_id: NonZeroU64::new(grant.frame_id)
+                    .ok_or_else(|| fail("initial frame identity"))?,
+                mapping_id: NonZeroU64::new(grant.mapping_id)
+                    .ok_or_else(|| fail("initial mapping identity"))?,
+                owner_generation: NonZeroU64::new(grant.owner_generation)
+                    .ok_or_else(|| fail("initial owner generation"))?,
+                inventory_revision: NonZeroU64::new(grant.inventory_revision)
+                    .ok_or_else(|| fail("initial inventory revision"))?,
+            };
             let txn = DescriptorTxn {
                 id: DescriptorTxnId {
                     mm_key: mm,
@@ -782,15 +935,14 @@ impl Cpl0Carrier {
                 .checked_add(publication.tables_linked as usize)
                 .ok_or_else(|| fail("initial table receipt overflow"))?;
         }
-        if inventory.committed != inventory.expected {
-            return Err(fail("initial inventory incomplete"));
-        }
         self.publish_production_reservations(
             mm,
             root,
             reply.result_initial_break,
             reply.stack_top,
         )?;
+        inventory.finish()?;
+        self.initial_inventory = Some(inventory);
         Ok(())
     }
 
@@ -925,12 +1077,8 @@ impl Cpl0Carrier {
             .root(mm)
             .ok_or_else(|| fail("initial MM not published"))?
             .root;
-        let watchdog = Watchdog::start();
         for exits in 1..=max_exits {
             let exit = HvVcpu::run(&mut self.cpus[0])?;
-            if watchdog.expired() {
-                return Err(fail("initial process deadline"));
-            }
             let VcpuExit::IoOut {
                 port: FORWARD_PORT, ..
             } = exit
@@ -1383,8 +1531,8 @@ impl Cpl0Carrier {
             None
         };
         let initial_extent = if let Some(len) = initial_extent_bytes {
-            let identity =
-                NonZeroU64::new(0x100).ok_or_else(|| fail("initial backing identity"))?;
+            let identity = NonZeroU64::new(NEXT_EXTENT_ID.fetch_add(1, Ordering::Relaxed))
+                .ok_or_else(|| fail("initial backing identity exhausted"))?;
             let extent = BackingExtent::private(FrameGpa::new(INITIAL_EXTENT_GPA), len)
                 .map_err(|e| fail(e.to_string()))?;
             let handles = memory
@@ -1529,6 +1677,7 @@ impl Cpl0Carrier {
             ram,
             initial_extent,
             _kernel_region: kernel_region,
+            initial_inventory: None,
             metadata_base,
             host_forwards: 0,
             host_yields: 0,
