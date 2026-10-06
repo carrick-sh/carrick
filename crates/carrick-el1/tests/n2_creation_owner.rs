@@ -15,6 +15,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use carrick_el1_abi::Lifecycle;
 use core::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;

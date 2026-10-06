@@ -12,6 +12,9 @@ path = "src/lib.rs"
 workspace = true
 
 [dependencies]
+carrick-el1-abi = { path = "../carrick-el1-abi" }
+carrick-core = { path = "../carrick-core" }
+carrick-core-abi = { path = "../carrick-core-abi" }
 carrick-sched-core = { path = "../carrick-sched-core" }
 carrick-guest-arch = { path = "../carrick-guest-arch" }
 carrick-personality-linux = { path = "../carrick-personality-linux" }

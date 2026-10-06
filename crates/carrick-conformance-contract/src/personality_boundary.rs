@@ -98,6 +98,35 @@ pub const FORBIDDEN_ERRNO_SYMBOLS: &[&str] = &[
     "EDOM",
     "ERANGE",
     "LinuxErrno",
+    "LinuxCloneFlags",
+    "BlockedMask",
+    "PendingSignals",
+    "AltStack",
+    "RobustListHead",
+    "clone_flags",
+    "blocked_mask",
+    "clear_child_tid",
+    "visible_tid",
+    "robust_head",
+    "sigset_bits",
+    "eventfd_flags",
+    "epoll_events",
+    "SIG_BLOCK",
+    "SIG_UNBLOCK",
+    "SIG_SETMASK",
+    "SIGKILL",
+    "SIGSTOP",
+    "FD_CLOEXEC",
+    "O_CLOEXEC",
+    "EFD_SEMAPHORE",
+    "EFD_NONBLOCK",
+    "EFD_CLOEXEC",
+    "EPOLLIN",
+    "EPOLLOUT",
+    "EPOLLERR",
+    "EPOLLHUP",
+    "EPOLLET",
+    "EPOLLONESHOT",
 ];
 
 #[derive(Debug, Error)]
@@ -1211,6 +1240,7 @@ impl<'a> SourceCheckerVisitor<'a> {
         }
         let name = ident.to_string();
         if self.forbidden_symbols.contains(&name)
+            || name.starts_with("CLONE_")
             || name.starts_with("LINUX_")
             || name.starts_with("SYS_")
             || name == "carrick_abi"
@@ -1295,6 +1325,7 @@ impl<'a> SourceCheckerVisitor<'a> {
                 proc_macro2::TokenTree::Ident(ident) => {
                     let name = ident.to_string();
                     if self.forbidden_symbols.contains(&name)
+                        || name.starts_with("CLONE_")
                         || name.starts_with("LINUX_")
                         || name.starts_with("SYS_")
                         || name == "carrick_abi"
@@ -1763,6 +1794,28 @@ mod tests {
             )
             .unwrap();
             assert!(!report.source_violations.is_empty(), "accepted {code}");
+        }
+    }
+
+    #[test]
+    fn policy_payloads_are_rejected_in_core() {
+        for code in [
+            "pub const CLONE_VM:u64=0x100;",
+            "pub trait Hook { fn clone_flags(&self)->u64; }",
+            "pub struct Opaque { pub blocked_mask:u64 }",
+            "pub struct Opaque { pub eventfd_flags:u32, pub epoll_events:u32 }",
+            "pub const SIG_SETMASK:u64=2;",
+            "pub const EFAULT:i64=14;",
+            "pub const FD_CLOEXEC:u32=1;",
+            "pub const EFD_SEMAPHORE:u32=1;",
+            "pub const EPOLLET:u32=1<<31;",
+            "macro_rules! clone_policy { () => { CLONE_THREAD }; }",
+        ] {
+            let f = Fixture::new("src/lib.rs", code);
+            assert!(
+                matches!(f.check(), Err(BoundaryError::Violations { .. })),
+                "accepted {code}"
+            );
         }
     }
 
@@ -2359,5 +2412,34 @@ mod tests {
         let core_abi_manifest =
             fs::read_to_string(repo.join("crates/carrick-core-abi/Cargo.toml")).unwrap();
         assert!(!core_abi_manifest.contains("carrick-el1"));
+    }
+    #[test]
+    fn order6_lifecycle_has_one_shared_owner() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let pending =
+            fs::read_to_string(repo.join("crates/carrick-personality-linux/src/dispatch.rs"))
+                .unwrap();
+        assert!(
+            !pending.contains("fn lifecycle(&mut self"),
+            "order 6 must remove lifecycle from PendingFamilies"
+        );
+        let abi = fs::read_to_string(repo.join("crates/carrick-el1-abi/src/thread_lifecycle.rs"))
+            .unwrap();
+        assert!(
+            !abi.contains("pub struct ThreadControlSlot {"),
+            "Linux sidecars must leave ARM ABI"
+        );
+        let arm = fs::read_to_string(repo.join("crates/carrick-el1/src/personality/lifecycle.rs"))
+            .unwrap();
+        for body in [
+            "fn serve_clone",
+            "fn serve_exit",
+            "fn serve_sigprocmask",
+            "fn serve_sigaltstack",
+        ] {
+            assert!(!arm.contains(body), "displaced ARM policy: {body}");
+        }
+        let core = fs::read_to_string(repo.join("crates/carrick-core/src/lifecycle.rs")).unwrap();
+        assert!(core.contains("pub trait Lifecycle"));
     }
 }
