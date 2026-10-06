@@ -2423,7 +2423,7 @@ fn rx_ptrace_text_cow_case(guest: bool) {
                 carrick_mmu_core::aarch64::descriptor_txn::DescriptorOp::CowRepoint {
                     access: carrick_mmu_core::aarch64::descriptor_txn::CowRepointAccess::User {
                         writable_pages: 0,
-                        executable_pages: 0,
+                        executable_pages: 0b0011,
                     },
                     ..
                 }
@@ -5478,22 +5478,38 @@ fn structural_vvar_fork_inheritance_requires_exact_live_custody() {
 #[test]
 fn production_fork_plan_retains_structural_vvar_semantic_authority() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
-    production_fork_vvar_refresh(None);
+    production_fork_vvar_refresh(None, false, false);
 }
 
 #[test]
 fn owner_fork_refreshes_readonly_vvar_without_host_arm_ranges() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
-    production_fork_vvar_refresh(Some(4));
+    production_fork_vvar_refresh(Some(4), false, false);
 }
 
 #[test]
 fn owner_vvar_refresh_preserves_neighbors_outside_the_live_cow_arm() {
     let _guard = FOREIGN_MM_TEST_LOCK.lock();
-    production_fork_vvar_refresh(Some(1));
+    production_fork_vvar_refresh(Some(1), false, false);
 }
 
-fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
+#[test]
+fn owner_vvar_refresh_caps_real_imported_write_and_execute_intent() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    production_fork_vvar_refresh(Some(4), true, false);
+}
+
+#[test]
+fn owner_fork_adopts_native_readonly_vvar_before_refresh() {
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    production_fork_vvar_refresh(Some(4), false, true);
+}
+
+fn production_fork_vvar_refresh(
+    owner_cow_pages: Option<usize>,
+    imported_permissions: bool,
+    native_import: bool,
+) {
     let _external_alias_restore = ExternalAliasStateRestore::capture();
     let _stage2_stub = ScopedStage2MapTestStub::enable();
     let transport = Arc::new(CarrierForeignMmTransport::new());
@@ -5691,11 +5707,17 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
     };
     // Each fixture owns its root slots; pooled custody from another test
     // must never choose this test's child or grandchild address.
-    let root_slot_offset = match owner_cow_pages {
-        None => 0x40_0000,
-        Some(4) => 0x80_0000,
-        Some(1) => 0xc0_0000,
-        _ => panic!("unsupported vvar fixture shape"),
+    let root_slot_offset = if native_import {
+        0x140_0000
+    } else if imported_permissions {
+        0x100_0000
+    } else {
+        match owner_cow_pages {
+            None => 0x40_0000,
+            Some(4) => 0x80_0000,
+            Some(1) => 0xc0_0000,
+            _ => panic!("unsupported vvar fixture shape"),
+        }
     };
     let root_slot_base = crate::memory::LINUX_HVPATCH_ROOT_SLOT_BASE + root_slot_offset;
     let root_slot_size = 0x20_0000_u64;
@@ -6057,22 +6079,29 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
             .edit(
                 || panic!("prepared child tables"),
                 |editor| {
-                    for page in 0..4 {
-                        let va = vvar_ipa + page * 4096;
+                    if native_import {
                         editor
                             .manager
-                            .publish_private_pages(
-                                carrick_mmu_core::aarch64::GuestLeafPublication {
+                            .set_readonly(vvar_ipa, 4 * 4096, false, None)
+                            .expect("actual native vvar permissions before owner fork");
+                    } else {
+                        for page in 0..4 {
+                            let va = vvar_ipa + page * 4096;
+                            editor
+                                .manager
+                                .publish_private_pages(
+                                    carrick_mmu_core::aarch64::GuestLeafPublication {
+                                        va,
+                                        ipa: va,
+                                        len: 4096,
+                                        writable: imported_permissions,
+                                        executable: true,
+                                    },
                                     va,
-                                    ipa: va,
-                                    len: 4096,
-                                    writable: false,
-                                    executable: true,
-                                },
-                                va,
-                                None,
-                            )
-                            .expect("bootstrap-sealed private vvar page");
+                                    None,
+                                )
+                                .expect("bootstrap-sealed private vvar page");
+                        }
                     }
                     editor
                         .manager
@@ -6108,7 +6137,7 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
             "fixture must carry actual private COW authority: {leaf:#x}"
         );
         assert!(
-            !carrick_mmu_core::aarch64::terminal_descriptor_may_write(leaf),
+            carrick_mmu_core::aarch64::terminal_descriptor_may_write(leaf) == imported_permissions,
             "read-only vvar must carry no Linux write intent: {leaf:#x}"
         );
         child_task.cow_armed.lock().ranges.clear();
@@ -6170,6 +6199,32 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
             source_ipa: vvar_ipa,
             source_len: vvar_len,
         };
+        if native_import {
+            // Owner Fork publishes physical table custody, without the
+            // legacy fixed-VA table row. The bound resolver still retains
+            // the child's exact root arena.
+            child_task
+                .mappings
+                .retain(|row| row.start != crate::memory::LINUX_PAGE_TABLES_BASE);
+            assert!(
+                child_task
+                    .mapping_for_range_in(
+                        &transport.custody,
+                        crate::memory::LINUX_PAGE_TABLES_BASE,
+                        crate::memory::LINUX_PAGE_TABLES_SIZE as usize,
+                    )
+                    .is_none()
+            );
+            assert_eq!(
+                child_page_tables_authority.with_manager(|manager| {
+                    manager
+                        .resolver()
+                        .and_then(|resolver| resolver.host_ptr_for_range(manager.base(), 8))
+                }),
+                Some(Some(child_page_table_host)),
+                "the actual child table authority remains available"
+            );
+        }
         child_task
             .refresh_fork_process_state_in(&transport.custody, &mut service)
             .expect("owner refresh must use live private COW leaves, not host arms");
@@ -6233,6 +6288,24 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
             .is_none(),
         "successful privileged refresh must disarm the child vvar span",
     );
+    if owner_cow_pages.is_some() {
+        let leaf = child_page_tables_authority
+            .with_manager(|pt| {
+                carrick_mmu_core::aarch64::terminal_descriptor(pt.debug_walk(generation_address))
+            })
+            .unwrap();
+        assert_ne!(
+            leaf & (1 << 54),
+            0,
+            "native vvar remains NX after owner COW"
+        );
+        assert!(!carrick_mmu_core::aarch64::terminal_descriptor_may_write(
+            leaf
+        ));
+        assert!(!carrick_mmu_core::aarch64::terminal_descriptor_may_execute(
+            leaf
+        ));
+    }
     let child_private_key = (
         align_down(refreshed.ipa, CowArmedRanges::COMPOUND_SIZE),
         CowArmedRanges::COMPOUND_SIZE,
@@ -6261,6 +6334,19 @@ fn production_fork_vvar_refresh(owner_cow_pages: Option<usize>) {
         "the fresh generation must land in the child-private COW owner",
     );
     let grandchild_root_slot = root_slot_base + root_slot_size;
+    if native_import {
+        // The separate host-plan grandchild witness below deliberately uses
+        // that plan's fixed-VA projection after the owner refresh was proved
+        // without it.
+        child_task.mappings.insert(
+            prepared
+                .mappings
+                .iter()
+                .find(|row| row.start == crate::memory::LINUX_PAGE_TABLES_BASE)
+                .map(HvpatchTaskMappingState::unowned_runtime_region)
+                .expect("host-plan table projection"),
+        );
+    }
     let mut grandchild_page_tables = child_page_tables_authority
         .snapshot_image()
         .expect("refreshed child page tables");
