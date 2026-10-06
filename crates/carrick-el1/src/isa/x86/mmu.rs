@@ -16,19 +16,24 @@ impl MmuBackend for X86Backend {
     }
     fn read_user_word(
         &mut self,
-        _owner: &Self::MmOwner,
-        _address: UserVa,
-        _width: GuestLen,
+        owner: &Self::MmOwner,
+        address: UserVa,
+        width: GuestLen,
     ) -> Result<u64, Self::Error> {
-        user_access::carrick_x86_unbound_user_word()
+        match width.raw() {
+            4 => user_access::read_u32(owner, address.raw()).map(u64::from),
+            8 => user_access::read_u64(owner, address.raw()),
+            _ => return Err(ArchError::InvalidWidth),
+        }
+        .ok_or(ArchError::Unbound)
     }
     fn validate_user_access(
         &mut self,
-        _owner: &Self::MmOwner,
-        _range: UserRange,
-        _access: Access,
+        owner: &Self::MmOwner,
+        range: UserRange,
+        access: Access,
     ) -> Result<GuestLen, Self::Error> {
-        user_access::carrick_x86_unbound_user_access()
+        user_access::validate(owner, range, access)
     }
     fn install_context(&mut self, _context: AddressContext<Self::Root>) -> Result<(), Self::Error> {
         unbound()
@@ -67,10 +72,10 @@ impl MmuBackend for X86Backend {
     }
     fn copy_user_chunk(
         &mut self,
-        _transfer: &mut Self::UserTransfer,
-        _limit: GuestLen,
+        transfer: &mut Self::UserTransfer,
+        limit: GuestLen,
     ) -> Result<CopyProgress, Self::Error> {
-        user_access::carrick_x86_unbound_user_access()
+        transfer.advance(limit)
     }
     fn publish_executable(
         &mut self,
