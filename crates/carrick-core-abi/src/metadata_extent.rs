@@ -73,3 +73,16 @@ pub struct ExtentGrantReceipt {
     pub size: usize,
     pub token: u64,
 }
+
+/// Uninhabited guest metadata view: no guest path can construct a host pin.
+#[derive(Clone, Copy, Debug)]
+pub enum GuestMetadataPin {}
+// SAFETY: no instance exists; guest banks never manufacture host retention.
+unsafe impl PinnedMetadataExtent for GuestMetadataPin {
+    fn extent(&self) -> MetadataExtent {
+        match *self {}
+    }
+    fn host_base(&self) -> core::ptr::NonNull<u8> {
+        match *self {}
+    }
+}

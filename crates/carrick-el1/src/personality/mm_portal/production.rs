@@ -8,8 +8,6 @@ pub use carrick_core::mm::transaction::{
     admit_service_root, admit_transfer_service, bind_service_root, grant_target, prepare_transfer,
     serve_transfer, settle_prepared_service,
 };
-#[cfg(target_os = "none")]
-use carrick_el1_abi::PinnedMetadataExtent;
 #[cfg(any(test, target_os = "none"))]
 use carrick_el1_abi::ReservationMm;
 use carrick_mmu_core::owner_mmu::Aarch64Mmu;
@@ -51,17 +49,22 @@ pub type MmPortal<'a, P, B = Aarch64Mmu> = carrick_core::mm::transaction::MmPort
 use carrick_core::mm::frames::apply_grant;
 pub use carrick_core::mm::frames::{GrantTarget, serve_grant};
 
-#[cfg(target_os = "none")]
-pub enum GuestMetadataPin {}
-#[cfg(target_os = "none")]
-// SAFETY: uninhabited; guest identity banks never construct a host pin.
-unsafe impl PinnedMetadataExtent for GuestMetadataPin {
-    fn extent(&self) -> carrick_el1_abi::MetadataExtent {
-        match *self {}
-    }
-    fn host_base(&self) -> core::ptr::NonNull<u8> {
-        match *self {}
-    }
+pub use carrick_el1_abi::GuestMetadataPin;
+
+/// Production ARM slot facade, before table views or native HVC effects.
+pub fn admit_transfer_hw<'a>(
+    slots: &'a carrick_el1_abi::MmPortalSlots,
+    zone: &'a carrick_sched_core::ZoneTables,
+    roots: &'a crate::memory::reservations::SharedReservations,
+    slot: &'a carrick_el1_abi::PortalTransferSlot,
+) -> Result<Option<(MmPortal<'a, GuestMetadataPin>, TransferServiceAdmission<'a>)>, MmError> {
+    carrick_core::mm::transaction::admit_transfer_slot(
+        slots.carrier(),
+        roots,
+        zone,
+        slot,
+        Aarch64Mmu,
+    )
 }
 
 #[cfg(target_os = "none")]
@@ -81,18 +84,12 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         return;
     };
     let zone = unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
-    let Some(carrier) = slots.carrier() else {
-        return;
-    };
-    let portal = MmPortal::<GuestMetadataPin> {
-        backend: core::marker::PhantomData,
-        carrier,
-        roots: crate::memory::reservations::shared_guest(),
-        spaces: &zone.spaces,
-        nodes: None,
-        zone: Some(zone),
-    };
-    let Ok(Some(admission)) = admit_transfer_service(&portal, slot) else {
+    let Ok(Some((portal, admission))) = admit_transfer_hw(
+        slots,
+        zone,
+        crate::memory::reservations::shared_guest(),
+        slot,
+    ) else {
         return;
     };
     let (service, grant) = match admission {

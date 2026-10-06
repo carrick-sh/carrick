@@ -205,3 +205,50 @@ pub(super) fn prepared_copy_commit_and_cancel_never_acquire_held_root_or_editor(
     );
     drop(held_editor);
 }
+
+#[test]
+fn arm_unbound_carrier_transfer_has_exact_esrch_completion() {
+    let region = Region::new();
+    let spaces = AddressSpaces::new();
+    let mm = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = FixturePortal::new(NonZeroU64::MIN, region.table(), &spaces, &view);
+    let tables = Tables::new(ROOT, IPA, 1);
+    let transfer = portal
+        .begin(
+            portal.admitted_handle(mm, 0).unwrap(),
+            GuestVa::new(VA),
+            4096,
+            TransferIntent::UserWrite,
+            0,
+        )
+        .unwrap();
+    let request = selected(select(&portal, &transfer, &tables))
+        .request(TransferIntent::UserWrite, retained())
+        .unwrap();
+    let slots = carrick_el1_abi::MmPortalSlots::new();
+    let slot = slots.slot(0).unwrap();
+    let mut ticket = slot.submit_prepare(request).unwrap();
+    // The facade must settle before accessing the unrelated empty zone/root:
+    // missing carrier authority has exactly the former ESRCH outcome.
+    let layout = std::alloc::Layout::new::<carrick_sched_core::ZoneTables>();
+    let zone = unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout).cast::<carrick_sched_core::ZoneTables>();
+        assert!(!ptr.is_null());
+        Box::from_raw(ptr)
+    };
+    let _ = carrick_el1::personality::mm_portal::production::admit_transfer_hw(
+        &slots,
+        &zone,
+        region.table(),
+        slot,
+    );
+    let outcome = ticket
+        .take_completion()
+        .expect("unbound production ARM slot must complete rather than remain unsettled");
+    assert_eq!(outcome.operation, request.operation);
+    assert_eq!(outcome.retained, request.retained);
+    assert_eq!(outcome.completed, 0);
+    assert_eq!(outcome.errno, 3);
+    assert!(ticket.take_completion().is_none());
+}

@@ -7,7 +7,7 @@
 use carrick_core::mm::frames::serve_grant;
 use carrick_core::mm::transaction::MmError;
 use carrick_core_abi::FrameGrantResidencyTable;
-use carrick_el1_abi::{MmPortalSlots, PinnedMetadataExtent};
+use carrick_el1_abi::MmPortalSlots;
 use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorOutcome, DescriptorRefusal, LiveDescriptorWords,
 };
@@ -33,17 +33,7 @@ const _: () = assert!(
     core::mem::size_of::<crate::cpl0_scheduler::ContextBinding>() <= OWNER_CONTEXT_STRIDE as usize
 );
 
-/// Uninhabited pinned metadata extent for guest execution.
-#[derive(Clone, Copy, Debug)]
-pub enum GuestMetadataPin {}
-unsafe impl PinnedMetadataExtent for GuestMetadataPin {
-    fn extent(&self) -> carrick_core_abi::MetadataExtent {
-        match *self {}
-    }
-    fn host_base(&self) -> core::ptr::NonNull<u8> {
-        match *self {}
-    }
-}
+pub use carrick_core_abi::GuestMetadataPin;
 
 /// Direct supervisor physical descriptor words. In CPL0, page tables
 /// are identity-mapped in the supervisor page table range.

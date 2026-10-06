@@ -916,6 +916,20 @@ where
     let Some(service) = slot.claim() else {
         return Ok(None);
     };
+    admit_claimed_transfer_service(portal, service)
+}
+
+fn admit_claimed_transfer_service<'a, P, Policy, Geometry, Venue, B>(
+    portal: &MmPortal<'_, P, Policy, Geometry, Venue, B>,
+    service: carrick_core_abi::PortalTransferService<'a>,
+) -> Result<Option<TransferServiceAdmission<'a>>, MmError>
+where
+    P: PinnedMetadataExtent,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    Venue: OwnerVenue,
+    B: OwnerMmu,
+{
     let request = service.request();
     if request.operation.carrier != portal.carrier {
         service.complete(0, Venue::encode_error(MmError::Stale));
@@ -934,6 +948,41 @@ where
     }
     Ok(admit_service_root(portal, service)
         .map(|(service, grant)| TransferServiceAdmission::NeedsWords { service, grant }))
+}
+
+pub type TransferSlotResult<'a, P, Policy, Geometry, Venue, B> = Result<
+    Option<(
+        MmPortal<'a, P, Policy, Geometry, Venue, B>,
+        TransferServiceAdmission<'a>,
+    )>,
+    MmError,
+>;
+
+/// Bind the retained slot to its carrier before phase/root admission. Both
+/// native entry adapters use this exact transport, including absent authority.
+pub fn admit_transfer_slot<'a, P, Policy, Geometry, Venue, B>(
+    carrier: Option<NonZeroU64>,
+    roots: &'a SharedReservations<Policy, Geometry>,
+    zone: &'a carrick_sched_core::ZoneTables,
+    slot: &'a carrick_core_abi::PortalTransferSlot,
+    backend: B,
+) -> TransferSlotResult<'a, P, Policy, Geometry, Venue, B>
+where
+    P: PinnedMetadataExtent,
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    Venue: OwnerVenue,
+    B: OwnerMmu,
+{
+    let Some(service) = slot.claim() else {
+        return Ok(None);
+    };
+    let Some(carrier) = carrier else {
+        service.complete(0, Venue::encode_error(MmError::Stale));
+        return Err(MmError::Stale);
+    };
+    let portal = MmPortal::for_zone(carrier, roots, zone).with_mmu(backend);
+    Ok(admit_claimed_transfer_service(&portal, service)?.map(|admission| (portal, admission)))
 }
 
 /// Exact prepared settlement has no descriptor-table or live-MM gate input.

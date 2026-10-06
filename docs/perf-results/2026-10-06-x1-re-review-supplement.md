@@ -59,3 +59,29 @@ MM B's real editor against model A. Restoring pre-edit authentication omission
 changes the live PTE write bit to zero in both cases. Green keeps descriptors and
 current pending requests unchanged. Receipts:
 `target/x1-review/review2-authority-{red,green,restored-red,restored-green,arm,clippy,fmt}.log`.
+
+## Missing-carrier ARM transfer settlement
+
+`admit_transfer_slot` now owns slot claiming before checking optional carrier
+authority. Missing authority completes the exact retained request once with
+Linux ESRCH (3), before reading roots or tables. ARM's actual hardware entry
+uses `admit_transfer_hw`, which calls this shared factory. The uninhabited guest
+metadata pin type also moves to the neutral ABI, removing duplicate adapter
+definitions. Valid transfer admission keeps the same shared owner body.
+
+`arm_unbound_carrier_transfer_has_exact_esrch_completion` submits an owner-issued
+transfer through the real ARM slot facade. Restoring the old carrier-before-claim
+ordering leaves the submitted ticket unsettled and fails the completion check.
+Green verifies exact operation/retained identity, zero bytes, errno 3 and one-time
+consumption. Receipts: `target/x1-review/review2-unbound-{red,green,arm,clippy,fmt}.log`.
+
+This MOVE reduces ARM-resident `mm_portal/production.rs` from 498 to 495 lines
+(-3). The prior anonymous authority fix adds six required ARM binding lines;
+the original order-4b moves removed 109. Together the moves and review fixes
+reduce ARM resident production lines by 106 against the pre-order-4b stack.
+
+Batch verification: `target/x1-review/review2-final-focused.log` contains the
+CPL0 image build, production owner, MMU/scheduler/ABI/EL1 library, personality,
+x86, both KVM suites, focused Clippy, formatting and five fixture lock checks.
+Signed ARM validation remains with the director; the reported signed regression
+on the earlier 6051e19a2 stack is being attributed by the Mac bisect worker.
