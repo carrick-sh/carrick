@@ -1338,15 +1338,16 @@ impl MemState {
     /// covering this range. Backend preparation may write Carrick-owned file
     /// content through the owner lane while the placeholder prevents
     /// guest-visible access; settlement mirrors the final host mapping.
-    pub(in crate::dispatch::mem) fn owner_venue_reserves(&self, start: u64, end: u64) -> bool {
+    pub(in crate::dispatch::mem) fn owner_reserved_venue(
+        &self,
+    ) -> Option<(DelegatedRoot, ReservationRange)> {
         let AnonymousAuthority::Delegated(delegated) = &self.anonymous else {
-            return false;
+            return None;
         };
-        matches!(
-            delegated.venue,
-            Some(HostVenue::Reserved(range))
-                if range.start() <= start && end <= range.end()
-        )
+        match delegated.venue {
+            Some(HostVenue::Reserved(range)) => Some((delegated.root.clone(), range)),
+            _ => None,
+        }
     }
 
     fn open_venue(&mut self, venue: HostVenue) {

@@ -124,6 +124,10 @@ impl HostReservationProvider for UnavailableProvider {
     }
 }
 impl HostReservationProvider for Provider {
+    fn carrier_identity(&self) -> Result<std::num::NonZeroU64, Refusal> {
+        std::num::NonZeroU64::new(Arc::as_ptr(&self.0.table) as usize as u64).ok_or(Refusal::Stale)
+    }
+
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
         Ok(Box::new(View(self.0.clone())))
     }
@@ -440,6 +444,25 @@ fn delegated_fixed_file_map_reuses_a_retired_el1_reservation() {
     ));
     assert_eq!(fixed, guest as i64);
     assert_eq!(memory.owner_reserved_write_calls.get(), 1);
+    let (owner, range) = memory
+        .owner_reserved_write_identity
+        .get()
+        .expect("closed native admission");
+    assert_eq!(
+        owner.carrier(),
+        std::num::NonZeroU64::new(Arc::as_ptr(&root.carrier.table) as usize as u64).unwrap()
+    );
+    assert_eq!(owner.mm(), root.lock().mm());
+    assert_eq!(owner.incarnation().get(), root.lock().incarnation().raw());
+    assert_eq!(
+        range,
+        carrick_guest_mem::GuestVaRange::from_len(GuestVa(guest), 4 * PAGE as usize)
+    );
+    assert_eq!(
+        &memory.bytes
+            [(guest - memory.base) as usize..(guest - memory.base) as usize + 4 * PAGE as usize],
+        &[0x5a; 4 * PAGE as usize]
+    );
     let mapping = root.lock().mapping(guest).expect("fixed file mapping");
     assert_eq!(
         mapping.range,

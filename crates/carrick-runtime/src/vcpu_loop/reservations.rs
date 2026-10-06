@@ -73,6 +73,10 @@ fn table(access: &CarrierMetadataAccess) -> Result<&SharedReservations, Refusal>
 }
 
 impl HostReservationProvider for CarrierReservations {
+    fn carrier_identity(&self) -> Result<core::num::NonZeroU64, Refusal> {
+        self.access.carrier_identity().map_err(|_| Refusal::Stale)
+    }
+
     fn provision_metadata(&self, mm: ReservationMm) -> Result<(), Refusal> {
         // Carrier capacity publication is serialized outside all MM locks.
         let _capacity = self.capacity.lock();

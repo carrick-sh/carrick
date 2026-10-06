@@ -22,17 +22,61 @@ The kept/ported classification covers this worker's combined guarantees.
 Other owners' entire integrated history is not claimed individually reversed;
 file-table lease and clone-TID remain their owners' scope.
 
-A fresh read-only review identifies an open native file-content consumer
-defect in the imported fix: `write_existing_backing_unchecked` still calls
-the legacy-only host COW selector, and its subsequent unchecked translated
-write also enters a legacy-only host raw-copy path. Both reject an admitted
-N1 owner. The routed kernel and runtime split witnesses replace that native
-consumer and therefore cannot establish end-to-end file-mmap success.
-A native consumer red witness and owner-compatible correction remain open.
+The fresh read-only review found two native consumer refusals hidden by the
+original model witnesses: both host COW selection and unchecked translated
+copy required legacy admission. A real native consumer control on `fa98b9f9c`
+reproduces both refusals. The correction passes a borrowed exact reserved-write
+proof through the existing engine/backend interfaces and recomputes the live
+stage-1 IPA after COW. The original split-loop witness now drives the actual
+native engine/copier with kernel-minted inventory. Four independent controls
+cover COW admission, raw-copy admission, non-identity output and producer
+selection; see `native-content-controls-v1/` and `native-content-controls-v2/`.
+The native inventory negative also exposed an unarmed shared-private write;
+that path now refuses without an exclusive private claim. A fifth behavioral
+control reproduces backend count one with kernel count two; both populations
+now have to establish sole ownership under the existing frame-registry order. Positive live guest
+COW and file-map signed confirmation require a new exact bundle.
 
-The exact earlier signed `ea0b4c26b` result remains five fork failures at
-`HVPatch COW compound IPA 0x2e00000000 has no exact inventory coverage`.
-The restored extent, vvar, custody and identity ports have fresh VM-free
-proof only. Main-pass parity, copyout reuse and inotify churn require a new
-exact director bundle and the baseline per-test list from main `16df3d6f9`.
-No signed pass, landing readiness, budget relaxation or retry closure is claimed.
+## Exact signed result on fa98b9f9c
+
+Director-authorized signed acceptance and five fork tests plus three refusal
+traces ran on clean `fa98b9f9c5a965544725a77f5bb5832faa6951c2`, with its
+published bundle and forced EL1 image rebuild. The embed image SHA-256 is
+`caffed3e16027905be3ae4488b0c9398e6f5d58a403dfe8b2aea682584a684b0`;
+the CLI image is
+`181e2ed1e4442d80480a5e0633db95b21993993cfedd0a96771ed5197cc5a856`.
+Image-byte matches, artifact signatures and cleanup receipts are retained.
+
+Against the director's main `65098ea0e` baseline: 44 pass rows, 78 unexpected
+failure rows, five known fork reds failing earlier than main, one matching
+anonymous budget red, and one fresh-executable test not executed after the
+first test's watchdog. Generic shards abort early, so later individual probes
+lack results. This stack is **not landable**. These counts classify test rows,
+not every guest subprobe or every baseline test. Exact generic-shard signatures
+were not retained before the case runner re-signed package executables; raw
+logs survive, and this provenance gap remains explicit.
+
+All five focused fork workloads fail. VMA completes the parent's eight rounds
+but loses the child; fixed-over-COW fails parent-wait-f in round zero; ptrace
+options return errno 38; spawn slope and focused fork-COW raise SIGSEGV 11 before
+workload output. Main completes all five workloads and fails only serving/exit
+budgets. The earlier `0x2e00000000` inventory error is absent. Each refusal trace
+closes two child witnesses with zero refusals, two guest results, one completed
+libtest witness, zero errors and no bound expiry. Trace command exit zero is
+probe closure, not a workload pass; no refusal/check/arena line fired.
+
+Results and qualified trace rows:
+`/Volumes/carrick-build/evidence/n1-cm/fork-fa98b9f9c/results.tsv`.
+Broad per-test comparison and acceptance receipt:
+`/Volumes/carrick-build/evidence/n1-cm/main-match-fa98b9f9c/`.
+
+A separate LLDB diagnostic on the retained signed fork-COW artifact catches a
+write fault in musl `__copy_tls`, PC `0x29c604`, FAR `0x600041bbf8`, MM 5/TID 17,
+with an invalid L2 descriptor. The coherent event ring has 264 records and no
+decoding errors. An earlier capture faults at the same instruction in MM 2,
+before fork. This identifies a broader TLS/anonymous first-touch failure;
+its root cause is not yet proved. It was reported to the director before any
+anonymous-fault edits. Generic probes also expose a separate root-slot collision
+at `0x9a00400000`. Fresh-executable diagnostics retain a carrier core repeatedly
+waiting for already-exited PID 31; a copyout/reaping diagnosis remains a
+hypothesis. File-table lease and clone-TID code remain unchanged.

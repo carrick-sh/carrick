@@ -4718,6 +4718,102 @@ pub mod foreign_cow_test_support {
             })
         }
 
+        /// Exercise the production engine/native copier on fresh exclusive
+        /// backing. No vCPU is created: this fixture never executes guest code.
+        /// Its borrowed proof and retained owners cannot leave the callback.
+        pub fn with_fresh_reserved_engine_for_test<R>(
+            &mut self,
+            operation: impl for<'scope> FnOnce(
+                &mut crate::hvf_aarch64_engine::HvfAarch64Engine,
+                &carrick_guest_mem::OwnerReservedWrite<'scope>,
+            ) -> R,
+        ) -> Result<R, String> {
+            let runtime = self
+                .state
+                .cow_runtime
+                .read()
+                .clone()
+                .ok_or("fixture runtime absent")?;
+            let tables = self.state.page_tables_authority();
+            tables.edit(
+                || Err("fixture tables absent".to_owned()),
+                |editor| {
+                    editor
+                        .manager
+                        .set_writable_preserving_attributes(
+                            self.data_va,
+                            self.data_len as usize,
+                            None,
+                        )
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                },
+            )?;
+            let incarnation = std::num::NonZeroU64::MIN;
+            // SAFETY: the installed kernel snapshot and retained carrier bind
+            // this test's one admitted MM; incarnation one is fixture-owned.
+            let handle = unsafe {
+                carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                    self.transport.custody.transfer_carrier,
+                    carrick_el1_abi::ReservationMm::new(runtime.identity.mm)
+                        .ok_or("fixture MM absent")?,
+                    incarnation,
+                )
+            };
+            let resolver = self
+                .state
+                .live_resolver
+                .read()
+                .clone()
+                .ok_or("fixture resolver absent")?;
+            self.state
+                .protections
+                .select_owner(handle, || {
+                    // SAFETY: the installed resolver retains this exact live root.
+                    unsafe {
+                        tables.bind_live_backing(resolver);
+                    }
+                    Ok::<_, String>(carrick_guest_mem::OwnerMemorySelection::Immediate)
+                })
+                .map_err(|e| format!("fixture owner selection: {e:?}"))?;
+            let mut task = HvfTaskState::neutral();
+            task.mm_access = std::sync::Arc::clone(&self.state);
+            task.cow_authority = Some(runtime.authority);
+            task.cow_identity = Some(runtime.identity);
+            task.mm_root_slot = runtime.mm_root_slot;
+            task.container_root = runtime.container_root;
+            task.persistent_vm_lifecycle = true;
+            let state = HvfVmState {
+                // This VM-free fixture uses only native memory operations;
+                // no method or destructor may touch the inert VM handle.
+                _vm: std::mem::ManuallyDrop::new(unsafe { std::mem::zeroed() }),
+                task,
+                carrier_foreign_mm_transport: std::sync::Arc::new(self.transport.clone()),
+                carrier_mappings: None,
+                mailbox_slots: std::sync::Arc::new(MailboxSlotAllocator::new()),
+                syscall_transport: HvfSyscallTransport::Mailbox,
+                executor_vcpu: None,
+                cached_fork_alias_snapshot: parking_lot::Mutex::new(None),
+                last_fork_host_mapping_allocations: std::sync::atomic::AtomicU64::new(0),
+                last_fork_projection_rows_visited: std::sync::atomic::AtomicU64::new(0),
+            };
+            let mut engine =
+                crate::hvf_aarch64_engine::native_reserved_content_engine_for_test(state)
+                    .map_err(str::to_owned)?;
+            // SAFETY: this fixture has one exclusive, inaccessible host venue,
+            // no running guest and retained exact physical owners throughout.
+            Ok(unsafe {
+                carrick_guest_mem::OwnerReservedWrite::with_scope(
+                    handle,
+                    carrick_guest_mem::GuestVaRange::from_len(
+                        GuestVa(self.data_va),
+                        self.data_len as usize,
+                    ),
+                    |admission| operation(&mut engine, admission),
+                )
+            })
+        }
+
         pub fn endpoint(&self) -> carrick_hal::ForeignMmEndpoint {
             carrick_hal::ForeignMmEndpoint::for_carrier(std::sync::Arc::new(self.transport.clone()))
         }

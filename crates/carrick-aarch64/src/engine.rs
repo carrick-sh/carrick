@@ -2729,6 +2729,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         va: u64,
         len: usize,
         intent: FrameCowWriteIntent,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<(), MemoryError> {
         self.ensure_sparse_mmap_backing(va, len)?;
         let slot = self.mailbox_slot();
@@ -2746,7 +2747,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             suspended_el1_sp: self.suspended_el1_sp,
             required_invalidation: None,
         };
-        vm.ensure_frame_cow_write(va, len, intent, &mut flush)
+        vm.ensure_frame_cow_write(va, len, intent, admission, &mut flush)
             .map_err(|error| MemoryError::HostMap(format!("HVPatch frame COW: {error}")))
     }
 
@@ -3106,6 +3107,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         address: u64,
         offset: usize,
         total_len: usize,
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<(u64, Gpa, usize), MemoryError> {
         let offset_u64 = u64::try_from(offset).map_err(|_| MemoryError::OutOfBounds {
             address,
@@ -3119,12 +3121,24 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             })?;
         let page_left = (0x1000 - (va & 0xfff)) as usize;
         let len = (total_len - offset).min(page_left);
-        let ipa = self
-            .syscall_buffer_ipa(GuestVa(va), len)
-            .ok_or(MemoryError::OutOfBounds {
-                address,
-                length: total_len,
-            })?;
+        let ipa = match admission {
+            Some(admission)
+                if self.protections.owner() == Some(admission.owner())
+                    && admission.owner().mm().raw() == self.mm_generation
+                    && admission.contains(GuestVa(va), len) =>
+            {
+                self.page_tables
+                    .with_manager(|manager| manager.translate(va))
+                    .flatten()
+                    .map(Gpa)
+            }
+            Some(_) => None,
+            None => self.syscall_buffer_ipa(GuestVa(va), len),
+        }
+        .ok_or(MemoryError::OutOfBounds {
+            address,
+            length: total_len,
+        })?;
         Ok((va, ipa, len))
     }
 }
@@ -3560,6 +3574,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
         &mut self,
         address: u64,
         bytes: &[u8],
+        admission: Option<&carrick_guest_mem::OwnerReservedWrite<'_>>,
     ) -> Result<(), MemoryError> {
         let length = bytes.len();
         let mut copied = 0usize;
@@ -3573,13 +3588,32 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
                 );
                 error
             };
-            let (va, ipa, chunk_len) = self
-                .syscall_buffer_chunk(address, copied, length)
+            let (va, _, chunk_len) = self
+                .syscall_buffer_chunk(address, copied, length, admission)
                 .map_err(|error| report_fault(0, error))?;
-            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::PrivilegedInternal)
-                .map_err(|error| report_fault(1, error))?;
+            self.ensure_frame_cow_write(
+                va,
+                chunk_len,
+                FrameCowWriteIntent::PrivilegedInternal,
+                admission,
+            )
+            .map_err(|error| report_fault(1, error))?;
+            // COW may have replaced the output; authenticate the new translation.
+            let (_, ipa, after_len) =
+                self.syscall_buffer_chunk(address, copied, length, admission)?;
+            if after_len < chunk_len {
+                return Err(MemoryError::OutOfBounds {
+                    address: va,
+                    length: chunk_len,
+                });
+            }
             self.vm
-                .translated_write_unchecked(va, ipa.raw(), &bytes[copied..copied + chunk_len])
+                .translated_write_unchecked(
+                    va,
+                    ipa.raw(),
+                    &bytes[copied..copied + chunk_len],
+                    admission,
+                )
                 .map_err(|error| report_fault(2, error))?;
             copied += chunk_len;
         }
@@ -3845,18 +3879,19 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let mut out = vec![0u8; length];
         let mut copied = 0usize;
         while copied < length {
-            let (va, ipa, chunk_len) = match self.syscall_buffer_chunk(address, copied, length) {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    // `out` is already zero.
-                    let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
-                        self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
-                        return Err(error);
-                    };
-                    copied += zero;
-                    continue;
-                }
-            };
+            let (va, ipa, chunk_len) =
+                match self.syscall_buffer_chunk(address, copied, length, None) {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        // `out` is already zero.
+                        let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
+                            self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
+                            return Err(error);
+                        };
+                        copied += zero;
+                        continue;
+                    }
+                };
             let bytes = match self.vm.translated_read(va, ipa.raw(), chunk_len) {
                 Ok(bytes) => bytes,
                 Err(error) => {
@@ -3906,18 +3941,19 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         }
         let mut copied = 0usize;
         while copied < length {
-            let (va, ipa, chunk_len) = match self.syscall_buffer_chunk(address, copied, length) {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
-                        self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
-                        return Err(error);
-                    };
-                    dst[copied..copied + zero].fill(0);
-                    copied += zero;
-                    continue;
-                }
-            };
+            let (va, ipa, chunk_len) =
+                match self.syscall_buffer_chunk(address, copied, length, None) {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        let Some(zero) = self.fresh_zero_chunk(address, copied, length) else {
+                            self.trace_read_fault(address.wrapping_add(copied as u64), length, 1);
+                            return Err(error);
+                        };
+                        dst[copied..copied + zero].fill(0);
+                        copied += zero;
+                        continue;
+                    }
+                };
             if let Err(error) =
                 self.vm
                     .translated_read_into(va, ipa.raw(), &mut dst[copied..copied + chunk_len])
@@ -4013,9 +4049,9 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         let mut copied = 0usize;
         while copied < length {
             let (va, ipa, chunk_len) = self
-                .syscall_buffer_chunk(address, copied, length)
+                .syscall_buffer_chunk(address, copied, length, None)
                 .map_err(|error| report_fault(10, error))?;
-            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::GuestVisible)
+            self.ensure_frame_cow_write(va, chunk_len, FrameCowWriteIntent::GuestVisible, None)
                 .map_err(|error| report_fault(11, error))?;
             self.vm
                 .translated_write(va, ipa.raw(), &bytes[copied..copied + chunk_len])
@@ -4035,18 +4071,22 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         // default `write_bytes_unchecked` doesn't gate either). The translated IPA
         // resolves a `repoint_private` overlay to the private backing.
         self.commit_prepared_host_write(address, bytes.len(), false)?;
-        self.write_existing_backing_unchecked(address, bytes)
+        self.write_existing_backing_unchecked(address, bytes, None)
     }
 
     fn write_owner_reserved_bytes(
         &mut self,
+        admission: &carrick_guest_mem::OwnerReservedWrite<'_>,
         address: u64,
         bytes: &[u8],
     ) -> Result<(), MemoryError> {
-        if self.protections.owner().is_none() {
-            return self.write_bytes_unchecked(address, bytes);
+        if self.protections.owner() != Some(admission.owner())
+            || admission.owner().mm().raw() != self.mm_generation
+            || !admission.contains(GuestVa(address), bytes.len())
+        {
+            return Err(MemoryError::Unsupported);
         }
-        self.write_existing_backing_unchecked(address, bytes)
+        self.write_existing_backing_unchecked(address, bytes, Some(admission))
     }
 
     fn guest_range_is_writable(&self, address: u64, length: usize) -> bool {
@@ -4111,7 +4151,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
 
     fn host_ptr_for_write(&mut self, address: u64, len: usize) -> Option<*mut u8> {
         self.commit_prepared_host_write(address, len, true).ok()?;
-        self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::GuestVisible)
+        self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::GuestVisible, None)
             .ok()?;
         self.vm.host_ptr_for_write(address, len)
     }
@@ -4219,7 +4259,7 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
             // ordinary user-copy authority cannot replace it.
             return Err(MemoryError::Unsupported);
         }
-        self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::BackingMaintenance)?;
+        self.ensure_frame_cow_write(address, len, FrameCowWriteIntent::BackingMaintenance, None)?;
         self.vm.zero_backing(address, len)
     }
 

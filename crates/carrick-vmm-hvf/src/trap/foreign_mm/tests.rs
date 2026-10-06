@@ -14908,3 +14908,294 @@ fn concurrent_transfer_waits_for_exact_uncommitted_physical_grant() {
     );
     assert!(next_wait.0.is_ready());
 }
+
+#[test]
+fn native_reserved_file_content_uses_owner_cow_and_copy_admission() {
+    use carrick_aarch64::vmm::Aarch64Vmm;
+    use carrick_guest_mem::GuestMemory;
+    let _guard = FOREIGN_MM_TEST_LOCK.lock();
+    let _external = ExternalAliasStateRestore::capture();
+    let _stub = ScopedStage2MapTestStub::enable();
+    let transport = CarrierForeignMmTransport::new();
+    let installed = install_mm(
+        &transport,
+        311,
+        0x9a00_7100_0000,
+        0x9b00_7100_0000,
+        *b"keep",
+    );
+    let peer = install_mm(
+        &transport,
+        312,
+        0x9a00_7200_0000,
+        0x9b00_7200_0000,
+        *b"peer",
+    );
+    let data_key = installed.owners.0[1];
+    let (data_host, data_generation) =
+        global_frame_host_owner_identity(data_key.0, data_key.1).unwrap();
+    let peer_host = global_frame_host_owner_identity(peer.owners.0[1].0, peer.owners.0[1].1)
+        .unwrap()
+        .0;
+    // Model the fresh private backing prepared for the reserved file load,
+    // before the N1 owner is selected. These are live production table words.
+    installed
+        .state
+        .page_tables_authority()
+        .edit(
+            || Err(carrick_mmu_core::aarch64::PageTableError::BadAddress),
+            |editor| {
+                editor
+                    .manager
+                    .set_writable_preserving_attributes(TEST_VA, OWNER_LEN, None)
+            },
+        )
+        .unwrap();
+    let handle = unsafe {
+        carrick_el1_abi::El1MmHandle::from_admitted_owner(
+            transport.custody.transfer_carrier,
+            carrick_el1_abi::ReservationMm::new(311).unwrap(),
+            nonzero(1),
+        )
+    };
+    installed.state.protections.admit_owner(handle).unwrap();
+    let mut task = HvfTaskState::neutral();
+    task.mm_access = installed.state.clone();
+    task.mm_root_slot = Some(installed.owners.0[0]);
+    task.persistent_vm_lifecycle = true;
+    let mut authority = TestForeignCowAuthority::new(&installed);
+    authority.old_frame_mappings = 1;
+    task.cow_authority = Some(Arc::new(authority));
+    task.cow_identity = Some(carrick_hal::FrameCowIdentity {
+        linux_pid: 311,
+        linux_tid: 311,
+        mm: 311,
+        asid: 311,
+    });
+    task.mappings.insert(HvfMappedRegion {
+        start: TEST_VA,
+        end: TEST_VA + OWNER_LEN as u64,
+        ipa: data_key.0,
+        physical_ipa: data_key.0,
+        host_addr: data_host as *mut u8,
+        size: OWNER_LEN,
+        physical_size: OWNER_LEN,
+        perms: applevisor::memory::MemPerms::ReadWrite,
+        memory: None,
+        host_mapping: None,
+        structural_owner: None,
+        stage2_lease: None,
+        is_dynamic_alias: true,
+        sharing: GuestMappingSharing::Private,
+        guest_writable: true,
+        shared_key_base: None,
+        shared_key_offset: 0,
+        owner_generation: data_generation,
+    });
+    let mut engine = crate::hvf_aarch64_engine::native_reserved_content_engine_for_test(
+        crate::trap::budget_tests::test_vm_state(task),
+    )
+    .unwrap();
+    assert!(engine.backend().state.protections.owner().is_some());
+    // This drives the production AArch64 GuestMemory consumer and the real
+    // HVF ensure_frame_cow_write/translated_write_unchecked implementations.
+    unsafe {
+        carrick_guest_mem::OwnerReservedWrite::with_scope(
+            handle,
+            carrick_guest_mem::GuestVaRange::from_len(GuestVa(TEST_VA), OWNER_LEN),
+            |admission| {
+                let owner_write = engine.write_owner_reserved_bytes(admission, TEST_VA, b"file");
+                // The same native copier also authenticates the closed admission,
+                // post-COW IPA and exact current physical owner generation.
+                let native_copy = engine
+                    .backend_mut_for_persistent_factory()
+                    .translated_write_unchecked(TEST_VA, data_key.0, b"file", Some(admission));
+                assert!(
+                    owner_write.is_ok() && native_copy.is_ok(),
+                    "reserved native owner COW={owner_write:?}; copy={native_copy:?}"
+                );
+                assert_eq!(
+                    std::slice::from_raw_parts(data_host as *const u8, 4),
+                    b"file"
+                );
+                assert_eq!(
+                    std::slice::from_raw_parts(peer_host as *const u8, 4),
+                    b"peer",
+                    "a same-VA peer retains its own exact physical backing"
+                );
+                assert!(
+                    engine
+                        .write_owner_reserved_bytes(admission, TEST_VA + OWNER_LEN as u64, b"away")
+                        .is_err()
+                );
+                assert!(
+                    engine
+                        .backend_mut_for_persistent_factory()
+                        .translated_write_unchecked(
+                            TEST_VA,
+                            peer.owners.0[1].0,
+                            b"away",
+                            Some(admission)
+                        )
+                        .is_err(),
+                    "stale/pre-COW IPA is refused"
+                );
+                assert!(
+                    engine
+                        .backend_mut_for_persistent_factory()
+                        .translated_write_unchecked(TEST_VA, data_key.0, b"away", None)
+                        .is_err(),
+                    "ordinary native raw copy stays closed"
+                );
+                let task = &mut engine.backend_mut_for_persistent_factory().state.task;
+                let root_slot = task.mm_root_slot;
+                task.mm_root_slot = Some(peer.owners.0[0]);
+                assert!(
+                    task.validate_owner_reserved_mapping(
+                        &transport.custody,
+                        admission,
+                        TEST_VA,
+                        4,
+                        None
+                    )
+                    .is_err(),
+                    "a reused or foreign root cannot adopt the admitted operation"
+                );
+                task.mm_root_slot = root_slot;
+                let data_frame = task
+                    .frame_inventory
+                    .lock()
+                    .extents
+                    .get(&data_key)
+                    .unwrap()
+                    .frame;
+                task.frame_inventory
+                    .lock()
+                    .frames
+                    .lock()
+                    .references
+                    .insert(data_frame, 2);
+                assert!(
+                    task.validate_owner_reserved_mapping(
+                        &transport.custody,
+                        admission,
+                        TEST_VA,
+                        4,
+                        None
+                    )
+                    .is_err(),
+                    "a missing arm does not authorize a shared private frame"
+                );
+                task.frame_inventory
+                    .lock()
+                    .frames
+                    .lock()
+                    .references
+                    .insert(data_frame, 1);
+                let saved_authority = task.cow_authority.clone();
+                task.cow_authority = Some(Arc::new(TestForeignCowAuthority::new(&installed)));
+                assert!(
+                    task.validate_owner_reserved_mapping(
+                        &transport.custody,
+                        admission,
+                        TEST_VA,
+                        4,
+                        None
+                    )
+                    .is_err(),
+                    "backend reference one must not override two live kernel mappings"
+                );
+                task.cow_authority = saved_authority;
+                let old_backing = task
+                    .frame_inventory
+                    .lock()
+                    .extents
+                    .get(&data_key)
+                    .unwrap()
+                    .backing;
+                task.frame_inventory
+                    .lock()
+                    .extents
+                    .get_mut(&data_key)
+                    .unwrap()
+                    .backing = InventoryBackingIdentity::PrivateFileView(999);
+                assert!(
+                    task.validate_owner_reserved_mapping(
+                        &transport.custody,
+                        admission,
+                        TEST_VA,
+                        4,
+                        None
+                    )
+                    .is_err(),
+                    "a missing arm does not authorize a private file view"
+                );
+                task.frame_inventory
+                    .lock()
+                    .extents
+                    .get_mut(&data_key)
+                    .unwrap()
+                    .backing = old_backing;
+                assert_eq!(
+                    std::slice::from_raw_parts(data_host as *const u8, 4),
+                    b"file"
+                );
+            },
+        )
+    };
+    for stale in [
+        unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                nonzero(handle.carrier().get() + 1),
+                handle.mm(),
+                handle.incarnation(),
+            )
+        },
+        unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                handle.carrier(),
+                carrick_el1_abi::ReservationMm::new(312).unwrap(),
+                handle.incarnation(),
+            )
+        },
+        unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                handle.carrier(),
+                handle.mm(),
+                nonzero(handle.incarnation().get() + 1),
+            )
+        },
+    ] {
+        // SAFETY: deliberately stale fixture proof tests native refusal only.
+        unsafe {
+            carrick_guest_mem::OwnerReservedWrite::with_scope(
+                stale,
+                carrick_guest_mem::GuestVaRange::from_len(GuestVa(TEST_VA), OWNER_LEN),
+                |admission| {
+                    assert!(
+                        engine
+                            .write_owner_reserved_bytes(admission, TEST_VA, b"away")
+                            .is_err()
+                    );
+                    assert!(
+                        engine
+                            .backend_mut_for_persistent_factory()
+                            .translated_write_unchecked(
+                                TEST_VA,
+                                data_key.0,
+                                b"away",
+                                Some(admission)
+                            )
+                            .is_err()
+                    );
+                },
+            )
+        };
+    }
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(data_host as *const u8, 4) },
+        b"file"
+    );
+    // Keep the source owners alive until all accesses above complete.
+    drop((engine, installed, peer));
+}

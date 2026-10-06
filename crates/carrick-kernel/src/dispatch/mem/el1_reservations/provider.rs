@@ -7,6 +7,12 @@ use super::*;
 use crate::dispatch::mm_authority::DispatchMmAuthority;
 
 pub trait HostReservationProvider: Send + Sync {
+    /// Authenticate this provider's retained carrier, never a numeric MM key
+    /// obtained from another provider. An unavailable generation fails closed.
+    fn carrier_identity(&self) -> Result<core::num::NonZeroU64, Refusal> {
+        Err(Refusal::Stale)
+    }
+
     /// Called before taking an MM permit. Return MetadataRequired if the
     /// existing metadata service must provision storage before resubmission.
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal>;
@@ -79,6 +85,10 @@ pub(in crate::dispatch) struct DelegatedRoot {
 }
 
 impl DelegatedRoot {
+    pub(in crate::dispatch) fn carrier_identity(&self) -> Result<core::num::NonZeroU64, Refusal> {
+        self.provider.carrier_identity()
+    }
+
     pub(in crate::dispatch) fn provision_metadata(&self) -> Result<(), Refusal> {
         self.provider.provision_metadata(self.mm)
     }
