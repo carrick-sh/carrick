@@ -30,7 +30,7 @@ fn error(message: impl Into<String>) -> MemoryError {
 /// carrier-wide shared-zero source exists. Bytes are mutable only before Arc
 /// custody or through the exclusively stopped carrier.
 pub struct BackingExtent {
-    ram: GuestRam,
+    ram: Arc<GuestRam>,
     base: FrameGpa,
     len: usize,
 }
@@ -49,7 +49,11 @@ impl BackingExtent {
         let mut ram = GuestRam::new();
         ram.add_window(base.raw(), len, WindowKind::Private)
             .map_err(|e| error(e.to_string()))?;
-        Ok(Self { ram, base, len })
+        Ok(Self {
+            ram: Arc::new(ram),
+            base,
+            len,
+        })
     }
     pub fn initialize(&mut self, offset: usize, bytes: &[u8]) -> Result<(), MemoryError> {
         if offset
@@ -58,11 +62,31 @@ impl BackingExtent {
         {
             return Err(error("extent initialization bounds"));
         }
-        self.ram
+        Arc::get_mut(&mut self.ram)
+            .ok_or_else(|| error("extent already shared"))?
             .write_gpa(self.base.raw() + offset as u64, bytes)
             .map_err(|e| error(e.to_string()))
     }
+    fn retained_window(ram: Arc<GuestRam>, base: u64, len: usize) -> Result<Self, MemoryError> {
+        if !ram
+            .windows_for_kvm()
+            .iter()
+            .any(|(gpa, _, size)| *gpa == base && *size == len)
+        {
+            return Err(error("bootstrap window is not retained"));
+        }
+        Ok(Self {
+            ram,
+            base: FrameGpa::new(base),
+            len,
+        })
+    }
     fn ptr(&self, pa: u64, len: usize) -> Option<*mut u8> {
+        if pa < self.base.raw()
+            || pa.checked_add(len as u64)? > self.base.raw().checked_add(self.len as u64)?
+        {
+            return None;
+        }
         self.ram.host_ptr(pa, len)
     }
 }
@@ -100,6 +124,7 @@ struct Alias {
 struct Slot {
     handle: BackingHandle,
     backing: PreparedBacking,
+    bootstrap: bool,
     alias_count: usize,
     allowed: Vec<NonZeroU64>,
     drains: Vec<AddressContext<RootGpa>>,
@@ -168,10 +193,16 @@ pub struct CarrierMachine {
 
 impl CarrierMachine {
     pub fn create_stopped(vcpu_count: usize) -> Result<Self, MemoryError> {
+        Self::from_memory(CarrierMemory::create()?, vcpu_count)
+    }
+
+    pub(crate) fn from_memory(
+        mut memory: CarrierMemory,
+        vcpu_count: usize,
+    ) -> Result<Self, MemoryError> {
         if vcpu_count == 0 {
             return Err(error("carrier requires at least one vCPU"));
         }
-        let mut memory = CarrierMemory::create()?;
         let mut cpus = Vec::new();
         for _ in 0..vcpu_count {
             cpus.push(memory.vm.add_vcpu().map_err(|e| error(e.to_string()))?);
@@ -190,9 +221,45 @@ impl CarrierMachine {
     pub fn cpu_mut(&mut self, index: usize) -> Option<&mut KvmVcpu> {
         self.cpus.get_mut(index)
     }
+
+    pub(crate) fn into_parts(self) -> (Vec<KvmVcpu>, CarrierMemory) {
+        (self.cpus, self.memory)
+    }
 }
 
 impl CarrierMemory {
+    pub(crate) fn vm(&self) -> &KvmVm {
+        &self.vm
+    }
+
+    /// Bootstrap windows are fixed supervisor and initial-task backing. They
+    /// use the same slot allocator as later owner-issued guest MM extents.
+    pub(crate) fn install_bootstrap(&mut self, ram: Arc<GuestRam>) -> Result<(), MemoryError> {
+        let mut backings = Vec::new();
+        for (index, (base, _, len)) in ram.windows_for_kvm().into_iter().enumerate() {
+            let serial = NonZeroU64::new(index as u64 + 1)
+                .ok_or_else(|| error("bootstrap backing serial exhausted"))?;
+            backings.push(PreparedBacking {
+                extent: Arc::new(BackingExtent::retained_window(Arc::clone(&ram), base, len)?),
+                identity: BackingIdentity {
+                    frame_id: serial,
+                    mapping_id: serial,
+                    owner_generation: serial,
+                    inventory_revision: serial,
+                },
+            });
+        }
+        let handles = self.install(&backings)?;
+        for handle in handles {
+            let slot = self
+                .slots
+                .get_mut(&handle.slot)
+                .ok_or_else(|| error("bootstrap slot disappeared"))?;
+            slot.bootstrap = true;
+        }
+        Ok(())
+    }
+
     pub fn create() -> Result<Self, MemoryError> {
         let vm = KvmVm::create_empty().map_err(|e| error(e.to_string()))?;
         let limit = vm.carrier_slot_limit().map_err(|e| error(e.to_string()))?;
@@ -313,6 +380,7 @@ impl CarrierMemory {
                 Slot {
                     handle,
                     backing: b.clone(),
+                    bootstrap: false,
                     alias_count: 0,
                     allowed: Vec::new(),
                     drains: Vec::new(),
@@ -358,6 +426,9 @@ impl CarrierMemory {
     }
     pub fn share(&self, handle: BackingHandle) -> Result<SharedFrameEdge, MemoryError> {
         let slot = self.record(handle)?;
+        if slot.bootstrap {
+            return Err(error("bootstrap backing cannot be shared as guest data"));
+        }
         Ok(SharedFrameEdge {
             handle,
             identity: slot.backing.identity,
@@ -405,7 +476,8 @@ impl CarrierMemory {
         let slot = self
             .locate(output, op.span().len as usize)
             .ok_or_else(|| error("unbacked descriptor output"))?;
-        if slot.backing.identity != identity
+        if slot.bootstrap
+            || slot.backing.identity != identity
             || (!slot.allowed.is_empty() && !slot.allowed.contains(&mm))
         {
             return Err(error(
