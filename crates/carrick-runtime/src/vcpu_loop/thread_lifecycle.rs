@@ -1,5 +1,6 @@
 //! Carrier custody for authoritative thread lifecycle ABI storage.
 
+use carrick_el1_abi::Lifecycle;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

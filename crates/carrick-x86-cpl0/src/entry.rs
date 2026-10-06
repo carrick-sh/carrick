@@ -5,10 +5,12 @@
 #[cfg(not(target_os = "none"))]
 fn main() {}
 
-// The linked common records also link alloc-capable cores. M2 serves no
-// allocating operation; fail closed instead of inventing an x86 heap owner.
+// Linked cores expose allocation-capable APIs, but this fixture consumes
+// preprovisioned records and contexts. No native heap owner is published.
 #[cfg(target_os = "none")]
 struct NoAllocation;
+// SAFETY: no allocation or deallocation returns; unavailable heap custody
+// fails closed before any storage can be returned or reused.
 #[cfg(target_os = "none")]
 unsafe impl core::alloc::GlobalAlloc for NoAllocation {
     unsafe fn alloc(&self, _: core::alloc::Layout) -> *mut u8 {
@@ -32,6 +34,18 @@ mod adapter;
 mod interrupts;
 #[cfg(target_os = "none")]
 mod progress;
+#[cfg(target_os = "none")]
+mod cpl0_scheduler {
+    pub use super::scheduler::*;
+}
+#[cfg(target_os = "none")]
+mod cpl0_entry {
+    pub use crate::adapter::*;
+}
+#[cfg(target_os = "none")]
+#[path = "../../carrick-x86/src/cpl0_lifecycle.rs"]
+mod lifecycle;
+
 #[cfg(target_os = "none")]
 #[allow(dead_code)] // Included native adapter also exposes the host bootstrap API.
 #[path = "../../carrick-x86/src/cpl0_scheduler.rs"]
@@ -136,23 +150,56 @@ mod kernel {
         binding
             .captured_stack
             .store(call.stack.raw(), Ordering::Release);
-        match serve_canonical(
-            &call,
-            counters,
-            task,
-            &GuestLifecycleVenue,
-            Some(&binding.publications),
-        ) {
-            EntryOutcome::Served { result } | EntryOutcome::ServedWithWork { result } => {
-                frame.rax = result.raw() as u64;
-            }
-            EntryOutcome::InvalidCompletion => {
+        let lifecycle_address = binding.scheduler_witness.load(Ordering::Acquire);
+        if lifecycle_address == super::lifecycle::LIFECYCLE_LANE
+            || lifecycle_address
+                == super::lifecycle::LIFECYCLE_LANE + super::lifecycle::LIFECYCLE_STRIDE
+        {
+            // SAFETY: stopped-host bootstrap published and retains the aligned
+            // native lane/zone/page custody for this exact CPU binding.
+            let Some(mut lane) =
+                (unsafe { super::lifecycle::acquire(frame, binding, task, counters, call.args) })
+            else {
                 doorbell(FATAL_PORT, frame);
                 halt();
+            };
+            match carrick_personality_linux::dispatch::dispatch(
+                call.canonical.raw(),
+                u64::MAX,
+                &mut lane,
+            ) {
+                carrick_personality_linux::dispatch::CompletionRoute::Served => {}
+                carrick_personality_linux::dispatch::CompletionRoute::WithWork => {
+                    doorbell(WORK_PORT, frame);
+                }
+                carrick_personality_linux::dispatch::CompletionRoute::Forward => {
+                    doorbell(FORWARD_PORT, frame);
+                    halt();
+                }
+                _ => {
+                    doorbell(FATAL_PORT, frame);
+                    halt();
+                }
             }
-            EntryOutcome::Forward => {
-                doorbell(FORWARD_PORT, frame);
-                halt();
+        } else {
+            match serve_canonical(
+                &call,
+                counters,
+                task,
+                &GuestLifecycleVenue,
+                Some(&binding.publications),
+            ) {
+                EntryOutcome::Served { result } | EntryOutcome::ServedWithWork { result } => {
+                    frame.rax = result.raw() as u64;
+                }
+                EntryOutcome::InvalidCompletion => {
+                    doorbell(FATAL_PORT, frame);
+                    halt();
+                }
+                EntryOutcome::Forward => {
+                    doorbell(FORWARD_PORT, frame);
+                    halt();
+                }
             }
         }
         binding.completions.fetch_add(1, Ordering::Relaxed);
