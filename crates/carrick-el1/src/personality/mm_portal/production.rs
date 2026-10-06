@@ -123,7 +123,7 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) live_ttbr, options(nomem, nostack));
     }
     #[cfg(target_arch = "x86_64")]
-    let live_ttbr = crate::isa::x86::carrick_x86_unbound_mmu_owner();
+    let live_ttbr = crate::isa::x86::unsupported_arm_descriptor_path();
     let Some(table) = carrick_el1_abi::service_target_table_window(live_ttbr, grant.ttbr0) else {
         service.complete(0, 3);
         return;
@@ -215,7 +215,7 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             core::arch::asm!("mrs {}, ttbr0_el1", out(reg) live_ttbr, options(nomem, nostack));
         }
         #[cfg(target_arch = "x86_64")]
-        let live_ttbr = crate::isa::x86::carrick_x86_unbound_mmu_owner();
+        let live_ttbr = crate::isa::x86::unsupported_arm_descriptor_path();
         let table = carrick_el1_abi::service_target_table_window(live_ttbr, grant.ttbr0)
             .ok_or(MmError::Stale)?;
         let range = carrick_el1_abi::PortalByteRange::new(frame.x[4], frame.x[5])
@@ -368,7 +368,7 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         core::arch::asm!("mrs {}, ttbr0_el1",out(reg)ttbr,options(nomem,nostack));
     }
     #[cfg(target_arch = "x86_64")]
-    let ttbr = crate::isa::x86::carrick_x86_unbound_mmu_owner();
+    let ttbr = crate::isa::x86::unsupported_arm_descriptor_path();
     let Some(table) = carrick_el1_abi::service_target_table_window(ttbr, target.grant().ttbr0)
     else {
         return;
@@ -440,7 +440,7 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             core::arch::asm!("mrs {}, ttbr0_el1",out(reg)live,options(nomem,nostack));
         }
         #[cfg(target_arch = "x86_64")]
-        let live = crate::isa::x86::carrick_x86_unbound_mmu_owner();
+        let live = crate::isa::x86::unsupported_arm_descriptor_path();
         if carrick_el1_abi::service_target_table_window(live, root).is_none() {
             return Err(MmError::Stale);
         }

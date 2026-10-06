@@ -62,6 +62,13 @@ rules:
         - /crates/carrick-x86-cpl0/src/progress.rs
         - /crates/carrick-x86/src/cpl0_scheduler.rs
         - /crates/carrick-x86/src/interrupts.rs
+        # Reviewed CPL0 KernelArch leaves. These instructions affect only the
+        # guest CPU (CR3/TLB, IRQ, context, and fail-closed UD2); no host syscall.
+        - /crates/carrick-el1/src/isa/x86/context.rs
+        - /crates/carrick-el1/src/isa/x86/interrupt.rs
+        - /crates/carrick-el1/src/isa/x86/mmu.rs
+        - /crates/carrick-el1/src/isa/x86/transport.rs
+        - /crates/carrick-el1/src/isa/x86/user_access.rs
         # Reviewed EL1 physical effects and exact live-root authentication;
         # six-site rationale: N1 assembly receipt in the native ownership plan.
         - /crates/carrick-el1/src/fault.rs
