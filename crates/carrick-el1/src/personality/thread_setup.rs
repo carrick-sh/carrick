@@ -4,8 +4,8 @@
 //!
 //! Nothing here reads an ISA register frame, copies user memory or touches a
 //! scheduler, so the AArch64 EL1 lifecycle personality and the x86_64 CPL0
-//! entry (through [`super::common_entry`]) call the same bodies with typed
-//! arguments.
+//! entry (through [`super::common_entry`]) use this same metadata view. Linux
+//! registration policy lives in [`carrick_personality_linux::pending_lifecycle`].
 use carrick_el1_abi::{CurrentTask, EntryRef, GateState, ThreadControlSlot, ThreadLifecyclePage};
 pub use carrick_personality_linux::entry::SYS_SET_ROBUST_LIST;
 use carrick_personality_linux::pending_lifecycle::RobustListVenue;
