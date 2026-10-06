@@ -293,7 +293,8 @@ impl Cpl0Carrier {
                     5,
                 );
                 (*task)
-                    .thread_serial
+                    .mm
+                    .thread_generation
                     .store(101 + index as u64, Ordering::Release);
                 (*task).publish_lifecycle(
                     EL1_DYNAMIC_METADATA_BASE,
@@ -507,10 +508,17 @@ impl Cpl0Carrier {
                     self.kicks += 1;
                 }
                 WORK_PORT => {
-                    if self.task(index).served_with_work.swap(0, Ordering::AcqRel) == 0 {
+                    if self
+                        .task(index)
+                        .linux
+                        .served_with_work
+                        .swap(0, Ordering::AcqRel)
+                        == 0
+                    {
                         return Err(fail("work exit without completed syscall"));
                     }
                     self.task(index)
+                        .linux
                         .pending_host_work
                         .store(0, Ordering::Release);
                     self.work_exits += 1;

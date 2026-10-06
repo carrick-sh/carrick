@@ -72,26 +72,32 @@ pub const fn sgi_target_of(mpidr: u64) -> u64 {
 /// host-loaded thread) or EL1 did after a switch.
 fn identity_of(task: &CurrentTask, affinity: u64) -> ThreadIdentity {
     ThreadIdentity {
-        tid: task.task_id.load(Ordering::Relaxed),
-        serial: task.thread_serial.load(Ordering::Relaxed),
-        mm: task.zone_mm.load(Ordering::Relaxed),
-        file_table: task.file_table.load(Ordering::Relaxed),
-        generation: task.generation.load(Ordering::Relaxed),
+        tid: task.execution.task.load(Ordering::Relaxed),
+        serial: task.mm.thread_generation.load(Ordering::Relaxed),
+        mm: task.mm.key.load(Ordering::Relaxed),
+        file_table: task.linux.file_table.load(Ordering::Relaxed),
+        generation: task.execution.generation.load(Ordering::Relaxed),
         affinity,
-        lifecycle_page: task.lifecycle_page.load(Ordering::Acquire),
-        control_slot: task.control_slot.load(Ordering::Acquire),
+        lifecycle_page: task.metadata.lifecycle_page.load(Ordering::Acquire),
+        control_slot: task.metadata.control_slot.load(Ordering::Acquire),
     }
 }
 
 /// Publish the switched-in thread as the slot's running task (its process
 /// too: EL1 may have switched the vCPU to another address space).
 fn publish_identity(task: &CurrentTask, id: ThreadIdentity) {
-    task.task_id.store(id.tid, Ordering::Relaxed);
-    task.thread_serial.store(id.serial, Ordering::Relaxed);
-    task.file_table.store(id.file_table, Ordering::Relaxed);
-    task.zone_mm.store(id.mm, Ordering::Relaxed);
+    task.execution.task.store(id.tid, Ordering::Relaxed);
+    task.mm
+        .thread_generation
+        .store(id.serial, Ordering::Relaxed);
+    task.linux
+        .file_table
+        .store(id.file_table, Ordering::Relaxed);
+    task.mm.key.store(id.mm, Ordering::Relaxed);
     task.publish_lifecycle(id.lifecycle_page, id.control_slot);
-    task.generation.store(id.generation, Ordering::Release);
+    task.execution
+        .generation
+        .store(id.generation, Ordering::Release);
 }
 
 /// How a futex syscall EL1 served ended.
@@ -317,7 +323,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         // SAFETY: switch_in_full made the record OnCpu on this slot.
         let ctx = unsafe { rec.ctx_mut() };
         self.cpu.load(frame, ctx);
-        self.task.orig_arg0.store(ctx.x[0], Ordering::Relaxed);
+        self.task.linux.orig_arg0.store(ctx.x[0], Ordering::Relaxed);
         if let Some(result) = switched.result {
             frame.x[0] = result;
         }
@@ -481,7 +487,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 .fetch_add(1, Ordering::Relaxed);
             return carrick_el1_abi::Action::Forward;
         }
-        if self.task.zone_mm.load(Ordering::Acquire) == 0 {
+        if self.task.mm.key.load(Ordering::Acquire) == 0 {
             return carrick_el1_abi::Action::Served;
         }
         let (zone, slot) = (self.zone, self.slot);

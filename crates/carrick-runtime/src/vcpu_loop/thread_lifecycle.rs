@@ -232,12 +232,15 @@ mod tests {
         assert_eq!(outcome, Ok(LifecyclePublication::HostServed));
         assert_eq!(attempts.get(), 1, "exhaustion retried publication");
         assert_eq!(
-            task.lifecycle_page
+            task.metadata
+                .lifecycle_page
                 .load(std::sync::atomic::Ordering::Acquire),
             0
         );
         assert_eq!(
-            task.control_slot.load(std::sync::atomic::Ordering::Acquire),
+            task.metadata
+                .control_slot
+                .load(std::sync::atomic::Ordering::Acquire),
             0
         );
     }
