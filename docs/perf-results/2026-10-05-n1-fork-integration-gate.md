@@ -91,3 +91,11 @@ independent of selected leaf/alias population, without changing the parent.
 It distinguishes a logical COW fragment from a larger native stage-2 lease.
 Signed verification of the correction requires a new exact fixture bundle.
 File-table lease, clone-TID, copyout and brk behavior are outside this change.
+
+The correction chooses the canonical source inventory extent, or the full
+pinned structural allocation when there is no source row. The core publishes
+it once and the native adapter carries the original frame/mapping, backing,
+stage-2 lease and exact owner. `core-inventory-green.log` passes 94 focused
+tests (including the two neutral witnesses and all five native owner-fork
+tests), workspace all-target clippy, fmt-check and diff-check. This is VM-free
+proof, not a signed improvement claim.
