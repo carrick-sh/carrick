@@ -5,7 +5,7 @@
 use carrick_hal::guest_arch_binding::{GuestArchBinding, core_arch::*};
 use carrick_hal::threaded::{X86_TASK_RESUME_MAGIC, X86_TASK_RESUME_PAYLOAD_LEN};
 use carrick_vmm_kvm::carrier_cpu::KvmCarrierCpu;
-use carrick_vmm_kvm::kvm_x86_engine::KVM_X86_LAYOUT;
+use carrick_vmm_kvm::vcpu_x86::KVM_X86_LAYOUT;
 use carrick_x86::{X86VcpuSnapshot, arch_context::X86ArchContext};
 use std::num::NonZeroU64;
 
