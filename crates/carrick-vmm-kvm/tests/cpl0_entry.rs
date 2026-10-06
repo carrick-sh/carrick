@@ -157,6 +157,15 @@ fn production_cpl0_boot_retains_separate_supervisor_and_initial_extents() {
 }
 
 #[test]
+fn production_cpl0_boot_requires_smep_and_smap_on_both_cpus() {
+    let carrier = Cpl0Carrier::boot_production(0x20_000).expect("production KVM boot");
+    for slot in 0..2 {
+        let cr4 = carrier.supervisor_cr4(slot).expect("stopped CPU state");
+        assert_eq!(cr4 & ((1 << 20) | (1 << 21)), (1 << 20) | (1 << 21));
+    }
+}
+
+#[test]
 fn cpl0_forward_port_returns_host_result_through_shared_entry() {
     let mut program = vec![0x48, 0xb8];
     program.extend_from_slice(&39u64.to_le_bytes()); // getpid, forwarded
