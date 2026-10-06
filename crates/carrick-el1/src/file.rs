@@ -59,7 +59,7 @@ pub(crate) unsafe fn copy_to_user_guarded(
         }
         success != 0
     }
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    #[cfg(not(target_os = "none"))]
     {
         let _ = cur_task;
         #[cfg(test)]
@@ -70,6 +70,11 @@ pub(crate) unsafe fn copy_to_user_guarded(
             core::ptr::copy_nonoverlapping(src, dest, len);
         }
         true
+    }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        let _ = (cur_task, dest, src, len);
+        crate::isa::x86::carrick_x86_unbound_user_access()
     }
 }
 
@@ -120,7 +125,7 @@ pub(crate) unsafe fn copy_from_user_guarded(
         }
         success != 0
     }
-    #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+    #[cfg(not(target_os = "none"))]
     {
         let _ = cur_task;
         #[cfg(test)]
@@ -131,6 +136,11 @@ pub(crate) unsafe fn copy_from_user_guarded(
             core::ptr::copy_nonoverlapping(src, dest, len);
         }
         true
+    }
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        let _ = (cur_task, dest, src, len);
+        crate::isa::x86::carrick_x86_unbound_user_access()
     }
 }
 
@@ -160,7 +170,7 @@ impl MemoryValidator for HardwareValidator {
 #[cfg(target_os = "none")]
 pub struct HardwareValidator;
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl MemoryValidator for HardwareValidator {
     fn writable_bytes(&self, user_va: u64, len: usize) -> usize {
         if len == 0 {
@@ -218,6 +228,16 @@ impl MemoryValidator for HardwareValidator {
             checked += core::cmp::min(len - checked, page_remaining);
         }
         checked
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl MemoryValidator for HardwareValidator {
+    fn writable_bytes(&self, _user_va: u64, _len: usize) -> usize {
+        crate::isa::x86::carrick_x86_unbound_user_access()
+    }
+    fn readable_bytes(&self, _user_va: u64, _len: usize) -> usize {
+        crate::isa::x86::carrick_x86_unbound_user_access()
     }
 }
 

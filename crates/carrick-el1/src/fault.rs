@@ -111,13 +111,18 @@ pub struct PreparedFaultPath<'a, P: PreparedPageResolver> {
 #[cfg(target_os = "none")]
 pub struct HardwarePreparedResolver;
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 fn hardware_live_ttbr() -> u64 {
     let ttbr: u64;
     unsafe {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack));
     }
     ttbr
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn hardware_live_ttbr() -> u64 {
+    crate::isa::x86::carrick_x86_unbound_mmu_owner()
 }
 
 #[cfg(target_os = "none")]
@@ -131,7 +136,7 @@ fn hardware_target_table_window(
 /// sufficient and never flushes another executor's maintenance translations.
 #[cfg(target_os = "none")]
 struct ServiceCopyMaintenance;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopyMaintenance {
     fn publish_barrier(&self) {
         unsafe {
@@ -146,6 +151,16 @@ impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopy
             }
             core::arch::asm!("dsb ish", "isb", options(nostack));
         }
+    }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl carrick_mmu_core::aarch64::descriptor_txn::TableMaintenance for ServiceCopyMaintenance {
+    fn publish_barrier(&self) {
+        crate::isa::x86::carrick_x86_unbound_mmu_owner();
+    }
+    fn invalidate_range(&self, _va: u64, _len: u64) {
+        crate::isa::x86::carrick_x86_unbound_mmu_owner();
     }
 }
 
@@ -562,8 +577,13 @@ pub(crate) fn with_hardware_cow_venue<R>(
         publication.is_some_and(|slot| {
             slot.publish_with(
                 carrick_el1_abi::PortalExecutablePublication { grant, ipa, len },
-                || unsafe {
-                    core::arch::asm!("hvc #1", options(nostack));
+                || {
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        core::arch::asm!("hvc #1", options(nostack));
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    crate::isa::x86::carrick_x86_unbound_host_yield();
                 },
             )
         })

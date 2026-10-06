@@ -117,16 +117,27 @@ mod kernel {
     #[unsafe(no_mangle)]
     pub static CARRICK_CPL0_DOORBELL_COUNT: SpinLock<u64> = SpinLock::new(0);
 
-    fn doorbell(port: u16, frame: &mut NativeFrame) {
-        {
-            let mut count = CARRICK_CPL0_DOORBELL_COUNT.lock();
-            *count = count.wrapping_add(1);
-        }
+    // A port exit may suspend this CPU while another CPU continues. The
+    // admission value can only be produced after the lock guard is dropped.
+    struct ExitAdmission;
+
+    fn admit_exit() -> ExitAdmission {
+        let mut count = CARRICK_CPL0_DOORBELL_COUNT.lock();
+        *count = count.wrapping_add(1);
+        core::mem::drop(count);
+        ExitAdmission
+    }
+
+    fn write_port(port: u16, frame: &mut NativeFrame, _admission: ExitAdmission) {
         // SAFETY: CPL0 owns the declared control/forwarding transport.
         unsafe {
             core::arch::asm!("out dx, al", in("dx") port, in("rax") frame as *mut _ as u64,
                 options(nostack, preserves_flags));
         }
+    }
+
+    fn doorbell(port: u16, frame: &mut NativeFrame) {
+        write_port(port, frame, admit_exit());
     }
 
     #[unsafe(no_mangle)]
