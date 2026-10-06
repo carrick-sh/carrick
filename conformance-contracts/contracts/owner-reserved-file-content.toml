@@ -1,0 +1,30 @@
+schema_version = 1
+id = "kernel.mm.owner-reserved-file-content"
+title = "Reserved file mappings load content through their admitted owner venue"
+guest_surfaces = ["syscall:mmap", "syscall:fork", "kernel:guest-memory-transfer"]
+semantic_authority = ["man 2 mmap: a private file mapping initially contains its file bytes", "man 2 mmap: MAP_FIXED replaces the selected range without changing peer address spaces"]
+fixture = "delegated fixed file mapping after EL1 reservation retirement; split-loop reserved content"
+scale_points = [1]
+structural_budgets = []
+rationale = """
+An opaque host reservation excludes guest access while its host mmap operation
+prepares and loads file content. That reservation is not an ordinary user-write
+mapping. The exact reserved venue selects the existing privileged backing
+transport; other writes retain ordinary owner-portal admission. Runtime split
+adapters preserve that selected capability and the backend's refusal for a
+different destination. The routed kernel witness loads a four-page private
+file mapping at a retired EL1 reservation and observes exactly one reserved
+content write. The split-loop witness requires literal bytes to reach backing
+while ordinary unchecked writes remain refused. Forwarding adds no scan,
+allocation, retry or new physical authority. These local counts do not claim
+a registered WorkObservation, end-to-end ratio or signed acceptance.
+"""
+
+[bindings]
+vm_free = "carrick-kernel::dispatch::mem::delegated_tests::delegated_fixed_file_map_reuses_a_retired_el1_reservation; carrick-runtime::runtime::tests::split_loop_preserves_reserved_file_content_writes"
+embed = "carrick-embed::el1_host_copyout::el1_host_buffers_follow_reused_mapping_in_two_live_processes; carrick-conformance-next::inotify_lifecycle::case_inotify_watch_churn"
+
+[bindings.unresolved]
+docker = "Same-source file-mapping and loader oracle binding remains open; no Docker runs on cloudmac"
+embed_structural = "Reserved-write call count is enforced locally; no registered signed work observation"
+embed_timing = "No same-image timing ratio claimed for this transport correction"
