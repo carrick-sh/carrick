@@ -11,16 +11,17 @@ use carrick_el1_abi::{
 use carrick_guest_arch::UserVa;
 use carrick_personality_linux::abi::entry::LinuxTaskState;
 use carrick_personality_linux::abi::entry::SyscallResult;
+use carrick_personality_linux::entry::aarch64_child_vdso_identity;
 pub use carrick_personality_linux::lifecycle::*;
 pub use carrick_personality_linux::thread::{LifecycleThread, SYS_SET_ROBUST_LIST};
 
 impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> UserCopy
     for El1PendingFamilies<'_, F, C, U>
 {
-    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool {
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool {
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
-            return user.copy_in(dst, src);
+            return user.copy_in(dst, src.raw());
         }
         let Some(task) = self.current_tasks.get(self.frame.slot as usize) else {
             return false;
@@ -29,12 +30,12 @@ impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> UserCopy
             task,
             validator: &crate::file::HardwareValidator,
         }
-        .copy_in(dst, src)
+        .copy_in(dst, src.raw())
     }
-    fn copy_out(&mut self, dst: u64, src: &[u8]) -> bool {
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool {
         #[cfg(test)]
         if let Some(user) = &mut self.lifecycle_user {
-            return user.copy_out(dst, src);
+            return user.copy_out(dst.raw(), src);
         }
         let Some(task) = self.current_tasks.get(self.frame.slot as usize) else {
             return false;
@@ -43,7 +44,7 @@ impl<F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> UserCopy
             task,
             validator: &crate::file::HardwareValidator,
         }
-        .copy_out(dst, src)
+        .copy_out(dst.raw(), src)
     }
 }
 
@@ -133,15 +134,12 @@ impl<'a, F: Fn(u32) -> *mut u8, C: ThreadCpu, U: UserWord> LifecycleNative<'a>
         // SAFETY: this exact new record is unpublished and exclusively owned by this birth.
         let ctx = unsafe { record.ctx_mut() };
         zone.cpu.save(self.frame, ctx);
-        ctx.x[0] = 0;
+        ctx.x[0] = context.result.raw() as u64;
         ctx.sp_el0 = context.stack.raw();
         if let Some(tls) = context.tls {
             ctx.tpidr_el0 = tls.raw();
         }
-        // AArch64 Linux vDSO identity packing is specific to this native ABI.
-        if ctx.tpidrro_el0 != 0 {
-            ctx.tpidrro_el0 = (ctx.tpidrro_el0 & !0xffff_ffff) | u64::from(context.visible_tid);
-        }
+        ctx.tpidrro_el0 = aarch64_child_vdso_identity(ctx.tpidrro_el0, context.visible_tid);
     }
     fn enqueue_born(&mut self, record: RecordRef) {
         let Some(task) = self.current_tasks.get(self.frame.slot as usize) else {
