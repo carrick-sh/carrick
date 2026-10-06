@@ -21,6 +21,11 @@ fn current_el1_slot() -> Option<usize> {
     Some((offset / carrick_el1_abi::EL1_STACK_SIZE) as usize)
 }
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn current_el1_slot() -> Option<usize> {
+    crate::isa::x86::carrick_x86_unbound_stack_slot()
+}
+
 /// Safe thread-safe wrapper around `MetadataAllocatorCore` with IRQ save/restore spinlock.
 pub struct MetadataStorage {
     lock: SpinLock<MetadataAllocatorCore>,
@@ -355,7 +360,7 @@ unsafe impl core::alloc::GlobalAlloc for MetadataStorage {
 }
 
 /// Global EL1 kernel metadata allocator instance.
-#[cfg_attr(target_os = "none", global_allocator)]
+#[cfg_attr(all(target_os = "none", target_arch = "aarch64"), global_allocator)]
 pub static GLOBAL_ALLOCATOR: MetadataStorage = MetadataStorage::new();
 
 /// Ensure the global metadata allocator has admitted the bootstrap region.
