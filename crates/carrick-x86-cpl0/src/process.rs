@@ -27,9 +27,10 @@ const STACK_TOP: u64 = 0x7fff_0000;
 static CHILD_ORIGIN: AtomicU64 = AtomicU64::new(0);
 static CHILD_ADMITTED: AtomicU64 = AtomicU64::new(0);
 static PARENT_PENDING: AtomicU64 = AtomicU64::new(0);
-static WAIT_STATUS_VA: AtomicU64 = AtomicU64::new(0);
+static WAIT_OUTPUTS: carrick_el1::lock::SpinLock<Option<PreparedWaitOutputs>> =
+    carrick_el1::lock::SpinLock::new(None);
 static CHILD_EXIT: super::super::lifecycle::ChildExitRecord =
-    super::super::lifecycle::ChildExitRecord::new();
+    super::super::lifecycle::ChildExitRecord::new(carrick_core_abi::EntryMmKey::from_raw(PARENT_MM));
 static FORK_PUBLICATION: carrick_el1::lock::SpinLock<Option<GuestMmuPublication>> =
     carrick_el1::lock::SpinLock::new(None);
 
@@ -262,54 +263,78 @@ pub(crate) fn child_mm() -> u64 { CHILD_MM }
 pub(crate) fn parent_mm() -> u64 { PARENT_MM }
 pub(crate) fn child_pid(parent_pid: u64) -> u64 { parent_pid + 1 }
 pub(crate) fn child_exit() -> &'static super::super::lifecycle::ChildExitRecord { &CHILD_EXIT }
-pub(crate) fn wait_status_address() -> u64 { WAIT_STATUS_VA.load(Ordering::Acquire) }
-pub(crate) fn clear_wait_status() { WAIT_STATUS_VA.store(0, Ordering::Release); }
 
-pub(crate) fn prepare_wait_status(
+/// One retained parent write authority for this bounded fixture. The parent
+/// cannot edit or retire its private stack while parked behind this child.
+struct PreparedParentOutput {
+    destination: carrick_guest_arch::KernelVa,
+}
+pub(crate) struct PreparedWaitOutputs {
+    status: Option<PreparedParentOutput>,
+    rusage: Option<PreparedParentOutput>,
+}
+impl PreparedWaitOutputs {
+    pub(crate) fn complete(self, child: super::super::lifecycle::ReapedChild) {
+        if child.parent_mm().raw()!=PARENT_MM {
+            super::lifecycle_invariant_error(super::super::lifecycle::LifecycleInvariant::ExitReap);
+        }
+        // SAFETY: both exact-parent destinations were translated and retained
+        // before wait enrollment. Reap custody excludes every competing writer;
+        // this fixture has no other thread able to change the parked parent MM.
+        unsafe {
+            if let Some(output)=self.status {
+                core::ptr::write_unaligned(output.destination.raw() as *mut u32,u32::from(child.status())<<8);
+            }
+            if let Some(output)=self.rusage {
+                core::ptr::write_bytes(output.destination.raw() as *mut u8,0,carrick_syscall_abi::LINUX_RUSAGE_BYTES);
+            }
+        }
+    }
+}
+pub(crate) fn publish_wait_outputs(outputs: PreparedWaitOutputs) {
+    let mut pending=WAIT_OUTPUTS.lock();
+    if pending.is_some() { super::lifecycle_invariant_error(super::super::lifecycle::LifecycleInvariant::WaitPublication); }
+    *pending=Some(outputs);
+}
+pub(crate) fn complete_published_wait_outputs(child: super::super::lifecycle::ReapedChild) {
+    let outputs=WAIT_OUTPUTS.lock().take().unwrap_or_else(||
+        super::lifecycle_invariant_error(super::super::lifecycle::LifecycleInvariant::ExitReap));
+    outputs.complete(child);
+}
+pub(crate) fn prepare_wait_outputs(
+    lane: &mut super::super::lifecycle::NativeLane<'_>,
+    status: UserVa,
+    rusage: UserVa,
+) -> Option<PreparedWaitOutputs> {
+    let status=if status.raw()==0 { None } else { Some(prepare_parent_output(lane,status,4)?) };
+    let rusage=if rusage.raw()==0 { None } else {
+        Some(prepare_parent_output(lane,rusage,carrick_syscall_abi::LINUX_RUSAGE_BYTES)?)
+    };
+    Some(PreparedWaitOutputs { status,rusage })
+}
+fn prepare_parent_output(
     lane: &mut super::super::lifecycle::NativeLane<'_>,
     address: UserVa,
-) -> bool {
+    size: usize,
+) -> Option<PreparedParentOutput> {
     use carrick_core::mm::transfer::resolver::NoopPreparedResolver;
     use carrick_el1::fault::{GrantMailboxes, X86CowResolver, dispatch_x86_fault_with_prepared};
     use carrick_el1_abi::Action;
     use carrick_guest_arch::{Access as FaultAccess, FaultInfo};
-    if address.raw() == 0 {
-        clear_wait_status();
-        return true;
+    if address.raw()<STACK_TOP-4096 || address.raw().checked_add(size as u64).is_none_or(|end|end>STACK_TOP)
+        || lane.task.mm.key.load(Ordering::Acquire)!=PARENT_MM { return None; }
+    let root=carrick_el1::isa::x86::hardware_live_root().ok()?;
+    if translate_leaf(&InitialWords::fixture(),root,address,Access::Write,true).is_err() {
+        let mut cow=X86CowResolver { pool:&SHARED_COW_POOL,residency:residency()?,completion:None };
+        let result=dispatch_x86_fault_with_prepared(
+            0,FaultInfo {address,access:FaultAccess::Write,present:true},lane.counters,core::slice::from_ref(lane.task),
+            carrick_el1::substrate::sched::object_wait::space_access(lane.zone,lane.lane.slot),
+            GrantMailboxes::own(&super::SHARED_FAULT_MAILBOX),
+            None::<carrick_el1::fault::PreparedFaultPath<'_,NoopPreparedResolver>>,&mut cow,
+        );
+        if result!=Action::Served { return None; }
     }
-    if address.raw() < STACK_TOP - 4096 || address.raw() > STACK_TOP - 4
-        || lane.task.mm.key.load(Ordering::Acquire) != PARENT_MM
-    { return false; }
-    let Some(table) = residency() else { return false; };
-    let mut cow = X86CowResolver {
-        pool: &SHARED_COW_POOL,
-        residency: table,
-        completion: None,
-    };
-    let result = dispatch_x86_fault_with_prepared(
-        0,
-        FaultInfo { address, access: FaultAccess::Write, present: true },
-        lane.counters,
-        core::slice::from_ref(lane.task),
-        carrick_el1::substrate::sched::object_wait::space_access(lane.zone, lane.lane.slot),
-        GrantMailboxes::own(&super::SHARED_FAULT_MAILBOX),
-        None::<carrick_el1::fault::PreparedFaultPath<'_, NoopPreparedResolver>>,
-        &mut cow,
-    );
-    if result != Action::Served { return false; }
-    WAIT_STATUS_VA.store(address.raw(), Ordering::Release);
-    true
-}
-
-pub(crate) fn write_exit_status(status: u8) -> bool {
-    let address = WAIT_STATUS_VA.load(Ordering::Acquire);
-    if address == 0 { return true; }
-    let Some(root) = RootGpa::page_aligned(FrameGpa::new(0x80_0000)) else { return false; };
-    let Ok(leaf) = translate_leaf(&InitialWords::fixture(), root, UserVa::new(address), Access::Write, true) else { return false; };
-    let Some(destination) = carrick_el1_abi::X86_CPL0_DIRECT_VA.checked_add(leaf.output.raw()) else { return false; };
-    if address & 4095 > 4092 { return false; }
-    // SAFETY: the guest-owned parent COW resolution just published this exact
-    // private writable page, and four bytes stay within its retained frame.
-    unsafe { core::ptr::write_unaligned(destination as *mut u32, u32::from(status) << 8) };
-    true
+    let leaf=translate_leaf(&InitialWords::fixture(),root,address,Access::Write,true).ok()?;
+    let destination=carrick_el1_abi::X86_CPL0_DIRECT_VA.checked_add(leaf.output.raw())?;
+    Some(PreparedParentOutput { destination:carrick_guest_arch::KernelVa::new(destination) })
 }

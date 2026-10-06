@@ -56,15 +56,18 @@ const CHILD_WAIT_KEY: u64 = 0x5_0300;
 pub struct ChildWaitGuard<'a> {
     bucket: carrick_sched_core::BucketGuard<'a>,
     parent_mm: EntryMmKey,
+    exit: &'a ChildExitRecord,
 }
 impl<'a> ChildWaitGuard<'a> {
-    pub fn acquire(zone: &'a ZoneTables, parent_mm: EntryMmKey) -> Option<Self> {
+    fn acquire(zone: &'a ZoneTables, exit: &'a ChildExitRecord) -> Option<Self> {
+        let parent_mm = exit.parent_mm;
         Some(Self {
             bucket: zone.lock(
                 ZoneTables::bucket_of(parent_mm.raw(), CHILD_WAIT_KEY),
                 &BoundedSpin(1024),
             )?,
             parent_mm,
+            exit,
         })
     }
 
@@ -95,20 +98,44 @@ impl<'a> ChildWaitGuard<'a> {
 /// Exit publication requires the same owned bucket guard as wait enrollment.
 /// ```compile_fail
 /// use carrick_x86::cpl0_lifecycle::ChildExitRecord;
-/// let record = ChildExitRecord::new();
+/// let record = ChildExitRecord::new(carrick_core_abi::EntryMmKey::from_raw(77));
 /// record.publish_exit(3);
 /// ```
-pub struct ChildExitRecord(AtomicU16);
+pub struct ChildExitRecord {
+    state: AtomicU16,
+    parent_mm: EntryMmKey,
+}
+/// Unique proof that the child was consumed, required for guest output writes.
+pub struct ReapedChild {
+    status: u8,
+    parent_mm: EntryMmKey,
+}
+impl ReapedChild {
+    pub fn status(&self) -> u8 {
+        self.status
+    }
+    pub fn parent_mm(&self) -> EntryMmKey {
+        self.parent_mm
+    }
+}
 impl ChildExitRecord {
-    pub const fn new() -> Self {
-        Self(AtomicU16::new(0))
+    pub const fn new(parent_mm: EntryMmKey) -> Self {
+        Self {
+            state: AtomicU16::new(0),
+            parent_mm,
+        }
+    }
+    pub fn lock<'a>(&'a self, zone: &'a ZoneTables) -> Option<ChildWaitGuard<'a>> {
+        ChildWaitGuard::acquire(zone, self)
     }
     pub fn publish_exit(&self, guard: &ChildWaitGuard<'_>, status: u8) -> bool {
-        debug_assert_eq!(
-            guard.bucket.bucket(),
-            ZoneTables::bucket_of(guard.parent_mm.raw(), CHILD_WAIT_KEY)
-        );
-        self.0
+        if !core::ptr::eq(guard.exit, self)
+            || guard.parent_mm != self.parent_mm
+            || guard.bucket.bucket() != ZoneTables::bucket_of(self.parent_mm.raw(), CHILD_WAIT_KEY)
+        {
+            return false;
+        }
+        self.state
             .compare_exchange(
                 0,
                 u16::from(status) + 1,
@@ -118,33 +145,34 @@ impl ChildExitRecord {
             .is_ok()
     }
     pub fn exited_status(&self) -> Option<u8> {
-        let state = self.0.load(Ordering::Acquire);
+        let state = self.state.load(Ordering::Acquire);
         (1..=256).contains(&state).then(|| (state - 1) as u8)
     }
-    pub fn reap(&self, status: u8) -> bool {
-        self.0
+    pub fn reap(&self, guard: &ChildWaitGuard<'_>, status: u8) -> Option<ReapedChild> {
+        if !core::ptr::eq(guard.exit, self) {
+            return None;
+        }
+        self.state
             .compare_exchange(
                 u16::from(status) + 1,
                 257,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .ok()
+            .map(|_| ReapedChild {
+                status,
+                parent_mm: self.parent_mm,
+            })
     }
     pub fn reaped(&self) -> bool {
-        self.0.load(Ordering::Acquire) == 257
-    }
-}
-impl Default for ChildExitRecord {
-    fn default() -> Self {
-        Self::new()
+        self.state.load(Ordering::Acquire) == 257
     }
 }
 
 #[cfg(test)]
 mod process_exit_tests {
-    use super::{ChildExitRecord, ChildWaitGuard};
-    use carrick_core_abi::EntryMmKey;
+    use super::ChildExitRecord;
     use carrick_sched_core::ZoneTables;
 
     #[test]
@@ -212,7 +240,7 @@ mod process_exit_tests {
 
     #[test]
     fn child_exits_before_parent_waits_and_is_reaped_once() {
-        let record = ChildExitRecord::new();
+        let record = ChildExitRecord::new(carrick_core_abi::EntryMmKey::from_raw(77));
         // SAFETY: typed zeroed allocation preserves the ZoneTables alignment;
         // its FromZeros representation permits an empty retained fixture.
         let zone = unsafe {
@@ -221,14 +249,16 @@ mod process_exit_tests {
             assert!(!pointer.is_null());
             std::boxed::Box::from_raw(pointer)
         };
-        let guard =
-            ChildWaitGuard::acquire(&zone, EntryMmKey::from_raw(77)).expect("child wait guard");
-        assert!(ChildWaitGuard::acquire(&zone, EntryMmKey::from_raw(77)).is_none());
+        let guard = record.lock(&zone).expect("child wait guard");
+        assert!(record.lock(&zone).is_none());
+        let other = ChildExitRecord::new(carrick_core_abi::EntryMmKey::from_raw(77));
+        assert!(!other.publish_exit(&guard, 3));
+        assert!(other.reap(&guard, 3).is_none());
         assert!(record.publish_exit(&guard, 3));
         assert_eq!(record.exited_status(), Some(3));
-        assert!(record.reap(3));
+        assert!(record.reap(&guard, 3).is_some());
         assert_eq!(record.exited_status(), None);
-        assert!(!record.reap(3));
+        assert!(record.reap(&guard, 3).is_none());
     }
 }
 
@@ -702,43 +732,30 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         if !matches!(i64::from(pid.raw()), -1 | 0) && i64::from(pid.raw()) != child_pid as i64
             || options.contains(LinuxWaitOptions::WCLONE)
                 && !options.contains(LinuxWaitOptions::WALL)
+            || self.lane.contexts[1].record.is_none()
             || process::child_exit().reaped()
         {
             return returned(-10); // ECHILD
         }
-        if let Some(code) = process::child_exit().exited_status() {
-            if !process::prepare_wait_status(self, status) || !process::write_exit_status(code) {
-                return returned(-14); // EFAULT
-            }
-            if !process::child_exit().reap(code) {
-                return returned(-10);
-            }
-            process::clear_wait_status();
-            return returned(child_pid as i64);
-        }
-        if options.contains(LinuxWaitOptions::WNOHANG) {
-            return returned(0);
-        }
-        if !process::prepare_wait_status(self, status) {
-            return returned(-14);
-        }
-        let Some(guard) =
-            ChildWaitGuard::acquire(self.zone, EntryMmKey::from_raw(process::parent_mm()))
-        else {
-            process::clear_wait_status();
+        let Some(guard) = process::child_exit().lock(self.zone) else {
             return returned(-11);
         };
-        // Child exit publishes under this same bucket lock. The first check
-        // handles exit-before-wait; this one closes status preparation races.
-        if let Some(code) = process::child_exit().exited_status() {
-            drop(guard);
-            if !process::write_exit_status(code) {
-                return returned(-14);
-            }
-            if !process::child_exit().reap(code) {
+        if process::child_exit().reaped() {
+            return returned(-10);
+        }
+        let code = process::child_exit().exited_status();
+        if code.is_none() && options.contains(LinuxWaitOptions::WNOHANG) {
+            return returned(0);
+        }
+        let Some(outputs) = process::prepare_wait_outputs(self, status, UserVa::new(self.args[3]))
+        else {
+            return returned(-14);
+        };
+        if let Some(code) = code {
+            let Some(child) = process::child_exit().reap(&guard, code) else {
                 return returned(-10);
-            }
-            process::clear_wait_status();
+            };
+            outputs.complete(child);
             return returned(child_pid as i64);
         }
         let Some(record) = self
@@ -746,7 +763,6 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             .current_or_new(self.lane.slot, self.lane.parent)
             .ok()
         else {
-            process::clear_wait_status();
             return returned(-11);
         };
         let child_index = committed(
@@ -772,14 +788,13 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             },
             record,
         ) else {
-            process::clear_wait_status();
             return returned(-11);
         };
         let seq = self.zone.next_seq(record);
         if guard.enroll(record, seq, child_index).is_err() {
-            process::clear_wait_status();
             return returned(-11);
         }
+        process::publish_wait_outputs(outputs);
         self.handoff = Some(committed(
             carrick_core::entry::publish_handoff_park(
                 start,
@@ -805,12 +820,9 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             return None;
         }
         let guard = committed(
-            ChildWaitGuard::acquire(self.zone, EntryMmKey::from_raw(process::parent_mm())),
+            process::child_exit().lock(self.zone),
             LifecycleInvariant::ExitPublication,
         );
-        if process::wait_status_address() != 0 && !process::write_exit_status(status) {
-            crate::kernel::lifecycle_invariant_error(LifecycleInvariant::ExitPublication);
-        }
         committed(
             process::child_exit()
                 .publish_exit(&guard, status)
@@ -836,11 +848,11 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
             LifecycleInvariant::ExitWake,
         );
         if count != 0 {
-            committed(
-                process::child_exit().reap(status).then_some(()),
+            let child = committed(
+                process::child_exit().reap(&guard, status),
                 LifecycleInvariant::ExitReap,
             );
-            process::clear_wait_status();
+            process::complete_published_wait_outputs(child);
             self.lane.wakes += u64::from(count);
         }
         drop(guard);

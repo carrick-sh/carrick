@@ -1653,6 +1653,9 @@ pub struct LinuxRusage {
     pub ru_nivcsw: i64,
 }
 
+const _: () =
+    assert!(core::mem::size_of::<LinuxRusage>() == carrick_syscall_abi::LINUX_RUSAGE_BYTES);
+
 impl LinuxRusage {
     pub const fn zeroed() -> Self {
         Self {

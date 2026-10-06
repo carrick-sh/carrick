@@ -277,3 +277,6 @@ impl LinuxWaitOptions {
     /// set is EINVAL for `wait4`.
     pub const WAIT4_SUPPORTED: Self = Self::from_bits_retain(LINUX_WAIT4_SUPPORTED_FLAGS);
 }
+
+/// Linux 64-bit rusage contains two timevals and fourteen signed counters.
+pub const LINUX_RUSAGE_BYTES: usize = 144;
