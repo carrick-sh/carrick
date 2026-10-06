@@ -569,3 +569,84 @@ last descriptor closes. No external network endpoint is involved. The initial
 native musl/GNU qualification and exact image/binary identities are recorded in
 `target/conformance/fix-forward-20260909/packet-v3-review/`. Missing packet socket
 privilege is a fixture error, never a reason to bless a skipped or failing oracle.
+
+## Native x86 Linux oracle (stage 1)
+
+`--oracle native --lane kvm-local` runs the Linux side on the same native
+x86_64 Linux host, without a Docker client or daemon. Other lanes, operating
+systems and host ISAs are rejected before execution. Carrick and native oracle
+phases remain separate. Both sides use `seccomp=unconfined`; the native runner
+refuses an inherited host seccomp filter.
+
+```sh
+cargo build --release -p carrick-cli --no-default-features --features platform-linux
+cargo run -p carrick-conformance -- --lane kvm-local --oracle native \
+  --suite ltp-mmap01 --oracle-fill --oracle-fill-profile regression
+cargo run -p carrick-conformance -- --lane kvm-local --oracle native \
+  --tier smoke --require-cached-oracle
+```
+
+Native execution requires passwordless `sudo`, util-linux `unshare`, GNU
+`chroot`/`cp`, and mount permissions. Each command runs in fresh mount, PID,
+UTS and IPC namespaces, with a waiting PID-1 shell, a chroot, private procfs,
+devpts and shared-memory tmpfs, and only the standard null/zero/random devices.
+Namespace exit kills orphaned descendants; timeout cleanup targets only the
+spawned process group. Each invocation copies the immutable root with
+`cp -a --reflink=auto`; workloads cannot mutate the cached lower.
+
+`carrick rootfs export IMAGE --platform linux/amd64` materializes an image
+once per digest and extractor version and emits its immutable path, digest,
+image environment, command, entrypoint and working directory as JSON. It uses
+the VFS's contained OCI layer merger with native numeric ownership, modes, archive mtimes and
+special-node publication, rather than the carrier-readable metadata projection.
+Extraction fails on unsupported extended metadata or denied node creation.
+Stage 1 rejects non-root image users, bind mounts, Docker privilege/capability
+flags, tty options and unsupported security options. These are explicit
+unsupported envelopes, never substituted or cached as Linux results.
+
+Native suite results go exclusively to
+`scripts/conformance/oracle-cache.native-amd64.jsonl`. Their keys add
+`native-unshare-v1`, kernel major/minor, image digest, extractor identity and
+extractor flags. Docker keys and committed cache bytes stay unchanged,
+including historical parser fingerprints that already miss the current parser.
+Native duration evidence also has a separate sidecar.
+
+For static probe blessing, build the requested x86_64 musl binaries locally
+and run the existing ignored blessing target with an explicit selection:
+
+```sh
+CARRICK_PROBE_ORACLE=native CARRICK_PROBE_LANE=amd64 \
+CARRICK_PROBE_LIBC=musl CARRICK_PROBE_FILTER=mmapzerofill,mmapmunmap \
+  cargo test -p carrick-cli --no-default-features --features platform-linux \
+  --test conformance -- --ignored bless_probe_oracle --nocapture
+```
+
+The identical ELF executes under the native namespace/chroot envelope; musl
+requires no image. GNU blessing resolves the amd64 probe image and uses its
+loader, not host libc. Native outputs live in `probe-oracle/amd64native-{musl,gnu}`
+with `PROVENANCE.json` recording full kernel release, distro, namespace flags,
+extractor policy and source-hash scheme. Native source hashes include the probe,
+shared helper library, Cargo manifest and lockfile. Both probe-cache readers
+reject a different full kernel release. Partial re-blessing across a kernel
+change is refused so untouched entries cannot inherit new provenance.
+
+`--shard i/N` uses 1-based indices. It sorts longest-first using the committed,
+unchanged `oracle-cache.timings.jsonl`, uses one second for unknown cases, breaks
+case ties by name and load ties by shard index. It writes a `.header.json`
+sidecar containing HEAD, Carrick SHA-256, full kernel release, manifest and
+selection hashes, lane, oracle backend, timing hash, native image digest inventory hash and the complete partition.
+Default shard result paths are distinct; `--jsonl` can name an explicit path.
+
+```sh
+cargo run -p carrick-conformance -- --lane kvm-local --oracle native \
+  --tier smoke --shard 1/4 --jsonl target/conformance/shard-1.jsonl
+cargo run -p carrick-conformance -- --merge-shards \
+  target/conformance/shard-{1,2,3,4}.jsonl \
+  --jsonl target/conformance/merged.jsonl
+```
+
+Merge refuses mismatched headers, repeated shard indices or cases, unexpected
+cases and missing cases/files. Shards cannot bless a shared baseline, claim HVF
+closure, or combine with the oracle-fill maintenance command. This host-only
+oracle infrastructure does not establish Carrick x86 guest-execution parity;
+that remains a separate runtime binding and gate.

@@ -259,7 +259,7 @@ impl RunOutput {
     }
 }
 
-pub(crate) fn raw_dir() -> PathBuf {
+pub fn raw_dir() -> PathBuf {
     PathBuf::from("target/conformance/raw")
 }
 
@@ -423,10 +423,79 @@ pub fn run_docker(
     out
 }
 
+/// Run in a private writable root; the cached OCI extraction is never mutated.
+pub fn run_native(
+    suite: &Suite,
+    run_id: &str,
+    lower: &crate::native::NativeRootfs,
+) -> anyhow::Result<RunOutput> {
+    let scratch = tempfile::tempdir()?;
+    let root = scratch.path().join("root");
+    std::fs::create_dir(&root)?;
+    let result = (|| -> anyhow::Result<RunOutput> {
+        let copied = Command::new("sudo")
+            .args(["-n", "cp", "-a", "--reflink=auto", "--"])
+            .arg(lower.root.join("."))
+            .arg(&root)
+            .status()?;
+        anyhow::ensure!(copied.success(), "cannot copy native rootfs");
+        for dir in ["proc", "dev", "tmp"] {
+            let path = root.join(dir);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) => anyhow::ensure!(
+                    metadata.file_type().is_dir(),
+                    "native rootfs {dir} must be a real directory"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if let Some(probe) = &lower.probe_binary {
+            let prepared = Command::new("sudo")
+                .args(["-n", "mkdir", "-p", "--"])
+                .arg(root.join("tmp"))
+                .status()?;
+            anyhow::ensure!(prepared.success(), "cannot prepare probe rootfs");
+            let copied = Command::new("sudo")
+                .args(["-n", "cp", "--"])
+                .arg(probe)
+                .arg(root.join("tmp/p"))
+                .status()?;
+            anyhow::ensure!(copied.success(), "cannot inject identical probe ELF");
+        }
+        let rootfs = crate::native::NativeRootfs {
+            root: root.clone(),
+            ..lower.clone()
+        };
+        let argv = crate::argv::native_argv(suite, &rootfs)?;
+        let mut cmd = Command::new(&argv[0]); // nosemgrep
+        cmd.args(&argv[1..]);
+        let deadline = CarrickDeadline {
+            declared_s: suite.timeout_s,
+            effective_s: suite.timeout_s,
+            origin: DeadlineOrigin::Declared,
+        };
+        run_one(cmd, argv, deadline, run_id, Engine::Native, None)
+    })();
+    // Workloads run as namespace root and can create root-owned directories.
+    // This exact scratch is ours; never delete the shared lower or another run.
+    let cleaned = Command::new("sudo")
+        .args(["-n", "rm", "-rf", "--"])
+        .arg(&root)
+        .status()?;
+    anyhow::ensure!(
+        cleaned.success(),
+        "native rootfs cleanup failed: {}",
+        root.display()
+    );
+    result
+}
+
 #[derive(Clone, Copy)]
 enum Engine {
     Carrick,
     Docker,
+    Native,
 }
 
 #[derive(Clone)]
@@ -849,6 +918,12 @@ fn kill_scoped(
             // sudo -n is a fallback for hosts with privileged wrappers. The
             // helper's exact zero-residue receipt is required either way.
             run_hvf_cleanup(run_id)?;
+        }
+        (Engine::Native, _) => {
+            let status = Command::new("sudo")
+                .args(["-n", "kill", "-KILL", "--", &format!("-{pid}")])
+                .status()?;
+            anyhow::ensure!(status.success(), "native namespace group cleanup failed");
         }
         (Engine::Docker, _) => {
             let container = run_id.to_string();

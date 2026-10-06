@@ -318,7 +318,40 @@ pub fn extract_layer_paths_to_dir(
     paths: &[PathBuf],
     dest: &Path,
 ) -> Result<ExtractStats, RootFsError> {
+    extract_layer_paths_with_metadata(paths, dest, false)
+}
+
+/// Rootful native-oracle extraction. Reuses the OCI merge and containment
+/// authority, but publishes real Linux ownership and modes instead of Carrick's
+/// carrier-readable metadata projection. Never used in guest rootfs admission.
+#[cfg(target_os = "linux")]
+pub fn extract_native_layer_paths_to_dir(
+    paths: &[PathBuf],
+    dest: &Path,
+) -> Result<ExtractStats, RootFsError> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "native OCI extraction requires root",
+        )
+        .into());
+    }
+    let extractor = ContainedExtractor::open(dest)?;
+    if unsafe { libc::fchown(extractor.root_fd.as_raw_fd(), 0, 0) } != 0
+        || unsafe { libc::fchmod(extractor.root_fd.as_raw_fd(), 0o755) } != 0
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    extract_layer_paths_with_metadata(paths, dest, true)
+}
+
+fn extract_layer_paths_with_metadata(
+    paths: &[PathBuf],
+    dest: &Path,
+    native: bool,
+) -> Result<ExtractStats, RootFsError> {
     let mut stats = ExtractStats::default();
+    let mut directory_times = Vec::new();
     for path in paths {
         let file = fs::File::open(path)?;
         let mut buf = BufReader::new(file);
@@ -328,10 +361,17 @@ pub fn extract_layer_paths_to_dir(
         if is_gz {
             let decoder = GzDecoder::new(buf);
             let mut archive = tar::Archive::new(decoder);
-            apply_tar_to_dir(&mut archive, dest, &mut stats)?;
+            apply_tar_with_metadata(&mut archive, dest, &mut stats, native, &mut directory_times)?;
         } else {
             let mut archive = tar::Archive::new(buf);
-            apply_tar_to_dir(&mut archive, dest, &mut stats)?;
+            apply_tar_with_metadata(&mut archive, dest, &mut stats, native, &mut directory_times)?;
+        }
+    }
+    // Child publication changes directory mtimes. Restore them only after all
+    // layers; retained descriptors cannot accidentally stamp a replacement.
+    for (fd, times) in directory_times {
+        if unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
         }
     }
     Ok(stats)
@@ -702,6 +742,150 @@ impl ContainedExtractor {
         self.unlink_leaf_if_exists(&parent_fd, &leaf_c)
     }
 
+    #[cfg(target_os = "linux")]
+    fn extract_native_special(&self, path: &Path, header: &tar::Header) -> Result<(), RootFsError> {
+        let kind = header.entry_type();
+        let file_type = if kind.is_fifo() {
+            libc::S_IFIFO
+        } else if kind.is_character_special() {
+            libc::S_IFCHR
+        } else if kind.is_block_special() {
+            libc::S_IFBLK
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "unsupported native OCI entry type",
+            )
+            .into());
+        };
+        let device = if kind.is_fifo() {
+            0
+        } else {
+            libc::makedev(
+                header
+                    .device_major()?
+                    .ok_or_else(|| RootFsError::UnsafePath(path.display().to_string()))?,
+                header
+                    .device_minor()?
+                    .ok_or_else(|| RootFsError::UnsafePath(path.display().to_string()))?,
+            )
+        };
+        let (parent, leaf) = self.resolve_parent_and_leaf(path)?;
+        self.unlink_leaf_if_exists(&parent, &leaf)?;
+        if unsafe {
+            libc::mknodat(
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
+                file_type | header.mode()?,
+                device,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn publish_native_metadata(
+        &self,
+        path: &Path,
+        metadata: &NativeEntryMetadata,
+        directory_times: &mut Vec<(Arc<OwnedFd>, [libc::timespec; 2])>,
+    ) -> Result<(), RootFsError> {
+        // Hardlinks retain the target inode's metadata, not the link header.
+        if metadata.kind.is_hard_link() {
+            return Ok(());
+        }
+        let (parent, leaf) = self.resolve_parent_and_leaf(path)?;
+        if unsafe {
+            libc::utimensat(
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
+                metadata.times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if metadata.kind.is_fifo()
+            || metadata.kind.is_character_special()
+            || metadata.kind.is_block_special()
+        {
+            if unsafe {
+                libc::fchownat(
+                    parent.as_raw_fd(),
+                    leaf.as_ptr(),
+                    metadata.uid.raw(),
+                    metadata.gid.raw(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+                || unsafe {
+                    libc::fchmodat(
+                        parent.as_raw_fd(),
+                        leaf.as_ptr(),
+                        metadata.mode as libc::mode_t,
+                        0,
+                    )
+                } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            return Ok(());
+        }
+        if metadata.kind.is_symlink() {
+            if unsafe {
+                libc::fchownat(
+                    parent.as_raw_fd(),
+                    leaf.as_ptr(),
+                    metadata.uid.raw(),
+                    metadata.gid.raw(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            return Ok(());
+        }
+        let fd = if metadata.kind.is_dir() {
+            self.resolve_dir(path, false)?
+        } else {
+            let raw = unsafe {
+                libc::openat(
+                    parent.as_raw_fd(),
+                    leaf.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if raw < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Arc::new(unsafe { OwnedFd::from_raw_fd(raw) })
+        };
+        let removed = unsafe {
+            carrick_portable::fremovexattr(
+                fd.as_raw_fd(),
+                crate::fs_backend::CARRICK_MODE_XATTR.as_ptr().cast(),
+            )
+        };
+        if removed != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA) {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // chown can clear set-id bits, so exact mode publication comes last.
+        if unsafe { libc::fchown(fd.as_raw_fd(), metadata.uid.raw(), metadata.gid.raw()) } != 0
+            || unsafe { libc::fchmod(fd.as_raw_fd(), metadata.mode as libc::mode_t) } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if metadata.kind.is_dir() {
+            directory_times.push((fd, metadata.times));
+        }
+        Ok(())
+    }
+
     pub(crate) fn extract_dir(
         &self,
         path: &Path,
@@ -912,18 +1096,91 @@ impl ContainedExtractor {
     }
 }
 
+#[cfg(test)]
 fn apply_tar_to_dir<R: Read>(
     archive: &mut tar::Archive<R>,
     dest: &Path,
     stats: &mut ExtractStats,
 ) -> Result<(), RootFsError> {
+    apply_tar_with_metadata(archive, dest, stats, false, &mut Vec::new())
+}
+
+#[cfg(target_os = "linux")]
+struct NativeEntryMetadata {
+    uid: carrick_abi::HostUid,
+    gid: carrick_abi::HostGid,
+    mode: u32,
+    kind: tar::EntryType,
+    times: [libc::timespec; 2],
+}
+
+#[cfg(target_os = "linux")]
+fn native_tar_times(seconds: u64) -> Result<[libc::timespec; 2], RootFsError> {
+    let time = libc::timespec {
+        tv_sec: libc::time_t::try_from(seconds).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "archive mtime overflow")
+        })?,
+        tv_nsec: 0,
+    };
+    Ok([time, time])
+}
+
+fn apply_tar_with_metadata<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dest: &Path,
+    stats: &mut ExtractStats,
+    native: bool,
+    directory_times: &mut Vec<(Arc<OwnedFd>, [libc::timespec; 2])>,
+) -> Result<(), RootFsError> {
     let extractor = ContainedExtractor::open(dest)?;
+    #[cfg(not(target_os = "linux"))]
+    let _ = (native, &directory_times);
 
     for entry in archive.entries()? {
         let mut entry = entry?;
         let raw_path = entry.path()?.into_owned();
         let path = normalize_layer_path(&raw_path)?;
+        #[cfg(target_os = "linux")]
+        if native {
+            // Unsupported extended metadata must never silently disappear from
+            // a native authority. Tar resolves PAX path and linkpath itself;
+            // extended timestamps/identity need explicit support first.
+            if let Some(extensions) = entry.pax_extensions()? {
+                for extension in extensions {
+                    let extension = extension?;
+                    if !matches!(extension.key_bytes(), b"path" | b"linkpath" | b"size") {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Unsupported,
+                            "native oracle OCI extended metadata is not yet supported",
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+
         if path.as_os_str().is_empty() {
+            #[cfg(target_os = "linux")]
+            if native {
+                if !entry.header().entry_type().is_dir() {
+                    return Err(RootFsError::UnsafePath(raw_path.display().to_string()));
+                }
+                let uid = u32::try_from(entry.header().uid()?)
+                    .map_err(|_| RootFsError::UnsafePath(raw_path.display().to_string()))?;
+                let gid = u32::try_from(entry.header().gid()?)
+                    .map_err(|_| RootFsError::UnsafePath(raw_path.display().to_string()))?;
+                if unsafe { libc::fchown(extractor.root_fd.as_raw_fd(), uid, gid) } != 0
+                    || unsafe {
+                        libc::fchmod(extractor.root_fd.as_raw_fd(), entry.header().mode()?)
+                    } != 0
+                {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+                directory_times.push((
+                    Arc::clone(&extractor.root_fd),
+                    native_tar_times(entry.header().mtime()?)?,
+                ));
+            }
             // A layer entry for the rootfs root itself (`/` or `./`) — nothing
             // to create; the root already exists. (kaniko emits such an entry.)
             continue;
@@ -947,6 +1204,24 @@ fn apply_tar_to_dir<R: Read>(
 
         let entry_type = entry.header().entry_type();
         let mode = entry.header().mode().unwrap_or(0o644);
+        #[cfg(target_os = "linux")]
+        let native_owner = if native {
+            Some(NativeEntryMetadata {
+                uid: carrick_abi::HostUid::from(
+                    u32::try_from(entry.header().uid()?)
+                        .map_err(|_| RootFsError::UnsafePath(path.display().to_string()))?,
+                ),
+                gid: carrick_abi::HostGid::from(
+                    u32::try_from(entry.header().gid()?)
+                        .map_err(|_| RootFsError::UnsafePath(path.display().to_string()))?,
+                ),
+                mode,
+                kind: entry_type,
+                times: native_tar_times(entry.header().mtime()?)?,
+            })
+        } else {
+            None
+        };
 
         if entry_type.is_dir() {
             extractor.extract_dir(&path, mode, stats)?;
@@ -965,8 +1240,21 @@ fn apply_tar_to_dir<R: Read>(
                 .into_owned();
             extractor.extract_hardlink(&path, &link_name, stats)?;
         } else {
-            // char/block/fifo/other special — skip.
-            stats.skipped_special += 1;
+            #[cfg(target_os = "linux")]
+            if native {
+                extractor.extract_native_special(&path, entry.header())?;
+                stats.files += 1;
+            } else {
+                stats.skipped_special += 1;
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                stats.skipped_special += 1;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(metadata) = native_owner {
+            extractor.publish_native_metadata(&path, &metadata, directory_times)?;
         }
     }
     Ok(())
@@ -1901,9 +2189,93 @@ mod tests {
         })
     }
 
-    /// The immutable lower answers a directory's absences from ONE listing
-    /// once that directory has missed twice, stays exact for present names,
-    /// and never lists through a symlinked parent.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn native_oci_fifo_is_materialized_and_carrier_projection_skips_it() {
+        use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("channel").unwrap();
+        header.set_entry_type(tar::EntryType::Fifo);
+        header.set_size(0);
+        header.set_mode(0o620);
+        header.set_uid(u64::from(unsafe { libc::geteuid() }));
+        header.set_gid(u64::from(unsafe { libc::getegid() }));
+        header.set_cksum();
+        builder.append(&header, std::io::empty()).unwrap();
+        let bytes = builder.into_inner().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        apply_tar_with_metadata(
+            &mut tar::Archive::new(bytes.as_slice()),
+            scratch.path(),
+            &mut ExtractStats::default(),
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let metadata = std::fs::symlink_metadata(scratch.path().join("channel")).unwrap();
+        assert!(metadata.file_type().is_fifo());
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o620);
+        let regular = tempfile::tempdir().unwrap();
+        let mut stats = ExtractStats::default();
+        apply_tar_to_dir(
+            &mut tar::Archive::new(bytes.as_slice()),
+            regular.path(),
+            &mut stats,
+        )
+        .unwrap();
+        assert!(!regular.path().join("channel").exists());
+        assert_eq!(stats.skipped_special, 1);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn native_oci_metadata_preserves_modes_without_carrier_projection() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let scratch = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_path("private-file").unwrap();
+        header.set_size(1);
+        header.set_mode(0o100);
+        header.set_mtime(123456789);
+        header.set_uid(u64::from(unsafe { libc::geteuid() }));
+        header.set_gid(u64::from(unsafe { libc::getegid() }));
+        header.set_cksum();
+        builder.append(&header, b"x".as_slice()).unwrap();
+        let bytes = builder.into_inner().unwrap();
+        apply_tar_with_metadata(
+            &mut tar::Archive::new(bytes.as_slice()),
+            scratch.path(),
+            &mut ExtractStats::default(),
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(scratch.path().join("private-file")).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o100);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.gid(), unsafe { libc::getegid() });
+        assert_eq!(metadata.mtime(), 123456789);
+        // The regular guest extraction still preserves carrier readability.
+        let regular = tempfile::tempdir().unwrap();
+        apply_tar_to_dir(
+            &mut tar::Archive::new(bytes.as_slice()),
+            regular.path(),
+            &mut ExtractStats::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(regular.path().join("private-file"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+    }
+
+    /// The immutable lower answers absences from one listing after two misses.
     #[cfg(target_os = "macos")]
     #[test]
     fn immutable_lower_lists_a_directory_after_two_misses() {
