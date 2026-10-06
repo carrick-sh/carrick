@@ -59,6 +59,28 @@ impl carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords for X86ForkWords
 }
 
 #[test]
+fn x86_maintenance_reads_only_an_invalid_retired_leaf() {
+    use carrick_mmu_core::aarch64::SubstrateGpa;
+    use carrick_mmu_core::x86::descriptor_txn::{ADDRESS, PREPARED, RETIRED};
+    let tables = Tables::new(ROOT, 0, 0);
+    for (entry, offset) in [(0, 4096), (512, 8192), (1024, 12288)] {
+        tables.words[entry].store((ROOT + offset) | PRESENT | WRITE | USER, Ordering::Release);
+    }
+    tables.words[1536].store(IPA | RETIRED | USER, Ordering::Release);
+    let arenas = [&tables];
+    let words = X86ForkWords { arenas: &arenas };
+    assert_eq!(
+        super::maintenance::retired_page_x86(&words, SubstrateGpa(ROOT), 0, 4096).unwrap(),
+        (Some(IPA & ADDRESS), 4096)
+    );
+    tables.words[1536].store(IPA | PREPARED | USER, Ordering::Release);
+    assert_eq!(
+        super::maintenance::retired_page_x86(&words, SubstrateGpa(ROOT), 0, 4096),
+        Err(MmError::Fault)
+    );
+}
+
+#[test]
 fn x86_owner_fork_arms_private_parent_and_restores_on_abort() {
     use carrick_el1_abi::{
         PortalForkRequest, PortalForkTableArena, PortalOperation, ReservationMm,
