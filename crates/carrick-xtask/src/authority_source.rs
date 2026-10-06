@@ -2501,10 +2501,12 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = call.method.unraw().to_string();
         self.task_call(&method);
-        let description = if let syn::Expr::Field(field) = call.receiver.as_ref() {
-            semantic_tokens(&field.member) == "description"
-        } else {
-            false
+        let description = match call.receiver.as_ref() {
+            syn::Expr::Field(field) => semantic_tokens(&field.member) == "description",
+            // Audited inputs used to be token-scanned: a local description
+            // receiver is an authority guard just like a description field.
+            syn::Expr::Path(path) if self.audited_input => path.path.is_ident("description"),
+            _ => false,
         };
         if self.census.vocabulary.get(&method) == Some(&AuthorityOperation::K1)
             || (self.audited_input
