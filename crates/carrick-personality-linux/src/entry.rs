@@ -69,10 +69,36 @@ pub enum EntryOutcome {
 pub trait LinuxEntryVenue {
     fn binding(&self) -> ExecutionBinding;
     fn set_robust_list(&self, head: u64, len: u64) -> Option<i64>;
-    fn pending_work(&self) -> bool;
+    fn task_state(&self) -> &crate::abi::entry::LinuxTaskState;
     fn record_forwarded(&self, ordinal: usize);
     fn record_served(&self, ordinal: usize);
-    fn mark_completed_with_work(&self);
+}
+
+/// Shared counter/work transport over live native binding and robust-list hooks.
+pub struct SharedVenue<'a, B, R> {
+    pub binding: B,
+    pub state: &'a crate::abi::entry::LinuxTaskState,
+    pub counters: crate::dispatch::EntryCounters<'a>,
+    pub robust_list: R,
+}
+impl<B: Fn() -> ExecutionBinding, R: Fn(u64, u64) -> Option<i64>> LinuxEntryVenue
+    for SharedVenue<'_, B, R>
+{
+    fn binding(&self) -> ExecutionBinding {
+        (self.binding)()
+    }
+    fn task_state(&self) -> &crate::abi::entry::LinuxTaskState {
+        self.state
+    }
+    fn set_robust_list(&self, head: u64, len: u64) -> Option<i64> {
+        (self.robust_list)(head, len)
+    }
+    fn record_forwarded(&self, ordinal: usize) {
+        self.counters.forwarded(ordinal as u64);
+    }
+    fn record_served(&self, ordinal: usize) {
+        self.counters.served(ordinal as u64);
+    }
 }
 
 struct CommonFamilies<'a> {
@@ -89,6 +115,12 @@ impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
             return crate::dispatch::FamilyCompletion::Forward;
         }
         self.result = self.venue.set_robust_list(self.args[0], self.args[1]);
+        if self.result.is_some() {
+            self.venue
+                .task_state()
+                .orig_arg0
+                .store(self.args[0], core::sync::atomic::Ordering::Relaxed);
+        }
         self.result.map_or(
             crate::dispatch::FamilyCompletion::Forward,
             crate::dispatch::FamilyCompletion::Complete,
@@ -98,7 +130,7 @@ impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
         true
     }
     fn host_work(&self) -> bool {
-        self.venue.pending_work()
+        self.venue.task_state().has_pending_host_work()
     }
     fn record_served(&self, ordinal: u64) {
         self.venue.record_served(ordinal as usize);
@@ -107,7 +139,7 @@ impl<'a> crate::dispatch::PendingFamilies<'a> for CommonFamilies<'a> {
         self.venue.record_forwarded(ordinal as usize);
     }
     fn publish_work(&self, _: bool) {
-        self.venue.mark_completed_with_work();
+        self.venue.task_state().record_completed_with_work();
     }
 }
 

@@ -288,3 +288,133 @@ index 46c6fb4d8..61a8c37f2 100644
 +    task.mm.key.store(mm.raw(), Ordering::Release);
 +    task.mm.thread_generation.store(1101, Ordering::Release);
 ```
+
+
+## Final entry-policy cut and production census
+
+The eleven frame-independent dispatch assertions now reside in
+`carrick-personality-linux/tests/x86_wave2/dispatch.rs`; their native fixture
+hooks still execute the real `El1PendingFamilies` implementation. EL1 retains
+seven native/diagnostic dispatch witnesses. The Linux entry owner now also
+owns file/inotify fallback, original-argument publication, owed-wake lowering,
+accounted scheduler-result lowering and delegated-anonymous ordering. The
+native hooks retain validated copying, region lookup, native frames and the
+unchanged family primitives scheduled for orders 6–9. `Served` is neutral
+execution progress in core ABI, without Linux results or completion authority.
+The redundant `CurrentTask` Linux-work facades are deleted; all callers use
+its physically separate Linux state, with the same atomic ordering.
+
+| New boundary | Exact retained result / refusal / effect |
+| --- | --- |
+| IPC/futex progress → Linux transfer lowering | Forward remains Forward; Handback remains Handback (never file fallback); Idle suspends; switched return does not overwrite its successor's original argument; unswitched return records the original argument and preserves every signed result |
+| Native file operation → Linux file entry | `None` forwards without result/work/original-argument publication; `Some(i64)` preserves its exact signed value; read alone falls back to inotify after native file refusal |
+| Watch add/remove → Linux work lowering | Add never marks an owed wake; remove marks it only after a served operation with an owed wake; native result precedes original-argument store, pending-work Release publication and entry completion |
+| Anonymous delegated operation → Linux ordering | NotDelegated alone permits permission/retirement fallback; PreparedConflict enrolls once or hands back; Served/Forward preserve accounted completion/forwarding without double counters |
+| Anonymous permission/retirement → Linux result | Every returned signed result is unchanged; permission CommitOwed and retirement Retired install 0 and preserve original argument before requesting replay; the historical missing-task permission return and retirement forwarding remain distinct |
+| Native scheduler → accounted entry lowering | Returned(false), Returned(true), Idle map one-to-one to AccountedComplete, AccountedSwitched, AccountedSuspended; no new continuation ledger |
+| Lifecycle entry-work refusal → Linux diagnostic | Exact native exit (93) and clone (220) decline cells increment once, with no effect or errno change |
+
+The new real-path red control inverts the owed-wake condition in the moved
+Linux file entry. `dispatch::test_in_guest_read_queues_in_access_and_owes_an_observed_waiter_a_wake`
+then fails (Served versus ServedWithWork). Restoring that condition passes all
+nineteen Linux entry/dispatch witnesses, including the original-argument check.
+This is additional evidence to the generation, Born and physical KVM completion
+red controls recorded above.
+
+Production and tests are counted separately against integrated N1 `56bf8c0ca`.
+Count Rust source lines containing lexical tokens (including multiline literal
+contents), excluding comments/blank lines. Strict cfg(test) items and their
+attributes, test-support items, tests directories and named test files belong
+to tests; code enabled in ordinary native builds remains production. This uses
+`check-dispatch-lock-authority.py`'s existing lexer and production mask, with
+strict test-only attributes removed alongside their items.
+
+| ARM-resident source | Before production | After production | Before tests | After tests |
+| --- | ---: | ---: | ---: | ---: |
+| carrick-el1 | 8,613 | 8,614 | 15,536 | 14,715 |
+| carrick-el1-abi | 7,066 | 7,055 | 3,876 | 3,885 |
+| carrick-aarch64 | 10,491 | 10,491 | 5,229 | 5,229 |
+| Total | 26,170 | 26,160 | 24,641 | 23,829 |
+
+Net production reduction is **10 lines**; net test reduction is **812 lines**.
+This falls far short of the plan's 1,700–2,100 production forecast. The entry
+cut removes policy bodies but replaces them with explicit exact-binding,
+Born authentication, result-transport and pending-family native hooks; later
+family primitives remain in ARM as required. The eleven relocated portable
+tests account for most of the apparent source reduction and are not counted
+as production. No family primitive was moved merely to meet the forecast.
+
+The following additional MM-fence substitutions only remove displaced Linux
+state facades; there is no editor, fault, COW or portal algorithm change:
+
+```diff
+diff --git a/crates/carrick-el1/src/fault.rs b/crates/carrick-el1/src/fault.rs
+index 5ec83545b..1739c0252 100644
+--- a/crates/carrick-el1/src/fault.rs
++++ b/crates/carrick-el1/src/fault.rs
+@@ -751 +751,2 @@ pub fn drain_before_el0<X: DescriptorTxnApplier>(
+-            task.leave_served_with_work()
++            task.linux.record_completed_with_work();
++            Action::ServedWithWork
+diff --git a/crates/carrick-el1/src/personality/mm_portal/edit_wait.rs b/crates/carrick-el1/src/personality/mm_portal/edit_wait.rs
+index 7e726d885..e20b5bce7 100644
+--- a/crates/carrick-el1/src/personality/mm_portal/edit_wait.rs
++++ b/crates/carrick-el1/src/personality/mm_portal/edit_wait.rs
+@@ -86 +86 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
+-            if sched.task.has_pending_host_work() {
++            if sched.task.linux.has_pending_host_work() {
+diff --git a/crates/carrick-el1/src/personality/mm_portal/tests.rs b/crates/carrick-el1/src/personality/mm_portal/tests.rs
+index 61a8c37f2..0d353ed5b 100644
+--- a/crates/carrick-el1/src/personality/mm_portal/tests.rs
++++ b/crates/carrick-el1/src/personality/mm_portal/tests.rs
+@@ -3065 +3065 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
+-            task.mark_pending_host_work(); // deterministic leave, no WFI.
++            task.linux.mark_pending_host_work(); // deterministic leave, no WFI.
+@@ -3351 +3351 @@ fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
+-    task.mark_pending_host_work();
++    task.linux.mark_pending_host_work();
+```
+
+Reproduction (run from the repository root on the reviewed checkout):
+
+```python
+import importlib.util,json,re,subprocess,sys
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('authority_count','scripts/migrate/check-dispatch-lock-authority.py')
+m=importlib.util.module_from_spec(spec);sys.modules[spec.name]=m;spec.loader.exec_module(m)
+roots=['el1','el1-abi','aarch64']
+for ref in ['56bf8c0ca','WORKTREE']:
+ names=subprocess.check_output(['git','ls-tree','-r','--name-only','56bf8c0ca' if ref=='56bf8c0ca' else 'HEAD','crates'],text=True).splitlines()
+ totals={n:{'production':0,'test':0} for n in roots};details={}
+ for p in names:
+  owner=next((n for n in roots if p.startswith('crates/carrick-'+n+'/')),None)
+  if not owner or not p.endswith('.rs'):continue
+  s=subprocess.check_output(['git','show',ref+':'+p],text=True) if ref!='WORKTREE' else Path(p).read_text()
+  lines=s.splitlines();counted={i+1 for i,l in enumerate(lines) if l.strip() and not l.lstrip().startswith(('//','/*','*','*/'))}
+  path=Path(p);whole_test=('/tests/' in p or path.stem in ['tests','test_support'] or path.stem.endswith('_tests'))
+  tokens=m.lex_rust(s);mask=m.production_mask(tokens)
+  # The authority gate keeps an item's attribute visible for lexical checks;
+  # the source census excludes strict test-only attributes with their items.
+  for i,t in enumerate(tokens):
+   if t.text=='#' and i+1<len(tokens) and tokens[i+1].text=='[':
+    end=m._matching_delimiter(tokens,i+1,'[',']')
+    if m._is_test_only_attribute(tokens,i+2,end):
+     mask[i:end+1]=[False]*(end+1-i)
+  counted=set()
+  for t in tokens:
+   counted.update(range(t.line,t.line+t.text.count('\n')+1))
+
+  production=set()
+  if not whole_test:
+   for t,on in zip(tokens,mask):
+    if on:production.update(range(t.line,t.line+t.text.count('\n')+1))
+  prod=len(counted & production);test=len(counted)-prod
+  totals[owner]['production']+=prod;totals[owner]['test']+=test
+  details[p]={'production':prod,'test':test}
+ Path('/tmp/ord5-'+('before' if ref=='56bf8c0ca' else 'after')+'-census.json').write_text(json.dumps({'totals':totals,'files':details},indent=2)+'\n')
+ print(ref,json.dumps(totals))
+b=json.loads(Path('/tmp/ord5-before-census.json').read_text())['files'];a=json.loads(Path('/tmp/ord5-after-census.json').read_text())['files']
+for p in a:
+ d=a[p]['production']-b[p]['production']
+ if d:print(d,p)
+```

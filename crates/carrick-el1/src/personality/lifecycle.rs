@@ -139,7 +139,7 @@ pub fn serve<C: ThreadCpu, U: UserWord>(
     let served = |frame: &mut TrapFrame, result: u64, work: bool| {
         frame.x[0] = result;
         task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
-        if work || task.has_pending_host_work() {
+        if work || task.linux.has_pending_host_work() {
             carrick_personality_linux::dispatch::FamilyCompletion::CompleteWithWork(result as i64)
         } else {
             carrick_personality_linux::dispatch::FamilyCompletion::Complete(result as i64)
@@ -187,7 +187,7 @@ pub fn serve<C: ThreadCpu, U: UserWord>(
             Some(match outcome {
                 // The frame is the switched-in thread's, whose own syscall
                 // result the switch applied.
-                Served::Returned { .. } if task.has_pending_host_work() => {
+                Served::Returned { .. } if task.linux.has_pending_host_work() => {
                     carrick_personality_linux::dispatch::FamilyCompletion::SwitchedWithWork(
                         frame.x[0] as i64,
                     )
@@ -634,7 +634,7 @@ fn serve_exit<C: ThreadCpu, U: UserWord>(
     if admission.commit().is_err() {
         // Unreachable (checked above; only this thread leaves Born or
         // Published that way): the host must look at this process.
-        task.mark_pending_host_work();
+        task.linux.mark_pending_host_work();
     }
     Some(sched.run_next(frame, ETIMEDOUT_RESULT))
 }

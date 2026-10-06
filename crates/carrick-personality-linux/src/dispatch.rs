@@ -43,6 +43,114 @@ pub enum FamilyCompletion {
     AccountedSuspended,
 }
 
+/// Retained IPC/futex progress before the single entry owner settles the turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IpcServed {
+    Forward,
+    Returned { switched: bool },
+    Idle,
+    Handback,
+}
+
+impl From<carrick_core_abi::Served> for IpcServed {
+    fn from(served: carrick_core_abi::Served) -> Self {
+        match served {
+            carrick_core_abi::Served::Returned { switched } => Self::Returned { switched },
+            carrick_core_abi::Served::Idle => Self::Idle,
+        }
+    }
+}
+
+/// Preserve already-accounted MM work without completing a parked/switch turn.
+pub fn accounted_scheduler_effect(
+    served: carrick_core_abi::Served,
+    result: i64,
+) -> FamilyCompletion {
+    match served {
+        carrick_core_abi::Served::Returned { switched: true } => {
+            FamilyCompletion::AccountedSwitched(result)
+        }
+        carrick_core_abi::Served::Returned { switched: false } => {
+            FamilyCompletion::AccountedComplete(result)
+        }
+        carrick_core_abi::Served::Idle => FamilyCompletion::AccountedSuspended,
+    }
+}
+
+/// A switched frame belongs to its successor; only an unswitched return records
+/// this call's original argument. Park/handback cannot fall through to file I/O.
+pub fn transfer_effect(
+    task: &crate::abi::entry::LinuxTaskState,
+    original: u64,
+    result: i64,
+    disposition: IpcServed,
+) -> FamilyCompletion {
+    match disposition {
+        IpcServed::Returned { switched: false } => {
+            task.orig_arg0
+                .store(original, core::sync::atomic::Ordering::Relaxed);
+            FamilyCompletion::Complete(result)
+        }
+        IpcServed::Returned { switched: true } => FamilyCompletion::Switched(result),
+        IpcServed::Idle => FamilyCompletion::Suspended,
+        IpcServed::Forward => FamilyCompletion::Forward,
+        IpcServed::Handback => FamilyCompletion::Handback,
+    }
+}
+
+/// The test-control primitive already accounts its own diagnostic completion.
+/// Pending work retains the original argument without fabricating task admission.
+pub fn allocator_effect(
+    task: Option<&crate::abi::entry::LinuxTaskState>,
+    original: u64,
+    result: crate::abi::entry::SyscallResult,
+) -> FamilyCompletion {
+    if let Some(task) = task
+        && task.has_pending_host_work()
+    {
+        task.orig_arg0
+            .store(original, core::sync::atomic::Ordering::Relaxed);
+        return FamilyCompletion::CompleteWithWork(result.raw());
+    }
+    FamilyCompletion::AccountedComplete(result.raw())
+}
+
+/// Diagnostic lowering for the lifecycle entry-work refusal.
+#[derive(Clone, Copy)]
+pub struct LifecycleWorkCounters<'a> {
+    pub exit: &'a core::sync::atomic::AtomicU64,
+    pub clone: &'a core::sync::atomic::AtomicU64,
+}
+impl LifecycleWorkCounters<'_> {
+    pub fn declined(&self, ordinal: u64) {
+        let counter = match ordinal {
+            93 => self.exit,
+            220 => self.clone,
+            _ => return,
+        };
+        counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Borrowed diagnostic arrays; Linux owns their ordinal indexing/publication.
+#[derive(Clone, Copy)]
+pub struct EntryCounters<'a> {
+    pub served: &'a [core::sync::atomic::AtomicU64],
+    pub forwarded: &'a [core::sync::atomic::AtomicU64],
+}
+impl EntryCounters<'_> {
+    pub fn served(&self, ordinal: u64) {
+        if let Some(counter) = self.served.get(ordinal as usize) {
+            counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    pub fn forwarded(&self, ordinal: u64) {
+        if let Some(counter) = self.forwarded.get(ordinal as usize) {
+            counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// Temporary order-5 seam for families whose bodies move in orders 6-9.
 /// Methods disappear with their named order; implementations never select a
 /// different family and never publish entry completion.
@@ -51,11 +159,26 @@ pub trait PendingFamilies<'a> {
     fn record_source(&self) -> Option<carrick_core_abi::BornInZoneSource<'a>> {
         None
     }
-    fn prepare_anonymous(&mut self) -> Option<FamilyCompletion> {
+    fn anonymous_venue(
+        &mut self,
+    ) -> Option<&mut dyn crate::pending_anonymous::PendingAnonymousVenue> {
         None
     }
+    fn file_venue(&mut self) -> Option<&mut dyn crate::pending_file::PendingFileVenue> {
+        None
+    }
+    fn task_state(&self) -> Option<&crate::abi::entry::LinuxTaskState> {
+        None
+    }
+    fn entry_counters(&self) -> Option<EntryCounters<'_>> {
+        None
+    }
+    fn prepare_anonymous(&mut self) -> Option<FamilyCompletion> {
+        self.anonymous_venue()?.park_prepared()
+    }
     fn host_work(&self) -> bool {
-        false
+        self.task_state()
+            .is_some_and(crate::abi::entry::LinuxTaskState::has_pending_host_work)
     }
     fn resumes_operation(&self) -> bool {
         false
@@ -66,17 +189,45 @@ pub trait PendingFamilies<'a> {
     fn lifecycle_available(&self) -> bool {
         false
     }
-    fn declined_for_work(&self, _: u64) {}
-    fn record_served(&self, _: u64) {}
-    fn record_forwarded(&self, _: u64) {}
-    fn publish_work(&self, _: bool) {}
+    fn lifecycle_work_counters(&self) -> Option<LifecycleWorkCounters<'_>> {
+        None
+    }
+    fn anonymous_declined_for_work(&self, _: u64) {}
+    fn declined_for_work(&self, ordinal: u64) {
+        if let Some(counters) = self.lifecycle_work_counters() {
+            counters.declined(ordinal);
+        }
+        self.anonymous_declined_for_work(ordinal);
+    }
+    fn record_served(&self, ordinal: u64) {
+        if let Some(counters) = self.entry_counters() {
+            counters.served(ordinal);
+        }
+    }
+    fn record_forwarded(&self, ordinal: u64) {
+        if let Some(counters) = self.entry_counters() {
+            counters.forwarded(ordinal);
+        }
+    }
+    fn publish_work(&self, commit: bool) {
+        if let Some(task) = self.task_state() {
+            if commit {
+                task.record_commit_owed(task.orig_arg0.load(core::sync::atomic::Ordering::Relaxed));
+            } else {
+                task.record_completed_with_work();
+            }
+        }
+    }
     fn file_write(&mut self) -> FamilyCompletion {
-        FamilyCompletion::Forward
+        self.file_seek()
     }
 
     /// Removed by order 7.
-    fn anonymous(&mut self, _: AnonymousCall) -> FamilyCompletion {
-        FamilyCompletion::Forward
+    fn anonymous(&mut self, call: AnonymousCall) -> FamilyCompletion {
+        self.anonymous_venue()
+            .map_or(FamilyCompletion::Forward, |venue| {
+                crate::pending_anonymous::serve(call, venue)
+            })
     }
     /// Removed by order 8.
     fn read(&mut self) -> FamilyCompletion {
@@ -100,23 +251,48 @@ pub trait PendingFamilies<'a> {
     }
     /// Removed by order 9.
     fn inotify_add(&mut self) -> FamilyCompletion {
-        FamilyCompletion::Forward
+        self.file_venue()
+            .map_or(FamilyCompletion::Forward, |venue| {
+                let original = venue.original_argument0();
+                let result = venue.inotify_add();
+                crate::pending_file::watch_effect(
+                    venue,
+                    result,
+                    original,
+                    crate::pending_file::WatchEffect::Added,
+                )
+            })
     }
     /// Removed by order 9.
     fn inotify_remove(&mut self) -> FamilyCompletion {
-        FamilyCompletion::Forward
+        self.file_venue()
+            .map_or(FamilyCompletion::Forward, |venue| {
+                let original = venue.original_argument0();
+                let result = venue.inotify_remove();
+                crate::pending_file::watch_effect(
+                    venue,
+                    result,
+                    original,
+                    crate::pending_file::WatchEffect::Removed,
+                )
+            })
     }
     /// Removed by order 9.
     fn file_read(&mut self) -> FamilyCompletion {
-        FamilyCompletion::Forward
+        self.file_venue()
+            .map_or(FamilyCompletion::Forward, crate::pending_file::serve_read)
     }
     /// Removed by order 9.
     fn file_seek(&mut self) -> FamilyCompletion {
-        FamilyCompletion::Forward
+        self.file_venue()
+            .map_or(FamilyCompletion::Forward, |venue| {
+                let ordinal = venue.ordinal();
+                crate::pending_file::serve_file(venue, ordinal)
+            })
     }
     /// Removed by order 9.
     fn file_positioned(&mut self, _: u64) -> FamilyCompletion {
-        FamilyCompletion::Forward
+        self.file_seek()
     }
     /// Test-only allocator family, removed with its control ABI.
     fn allocator_control(&mut self) -> FamilyCompletion {

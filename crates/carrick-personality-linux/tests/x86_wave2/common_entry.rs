@@ -163,7 +163,7 @@ fn invalid_length_is_einval_and_changes_neither_head() {
 #[test]
 fn pending_host_work_completes_once_and_leaves_with_work() {
     let w = World::new(LifecycleHatches::ON);
-    w.tasks[1].mark_pending_host_work();
+    w.tasks[1].linux.mark_pending_host_work();
     assert!(
         matches!(w.set_robust_list(1, 0xb000, 24), EntryOutcome::ServedWithWork { result, .. } if result.raw() == 0)
     );
@@ -256,7 +256,7 @@ pub(super) fn x4_linux_common_entry() {
         for turn in 0..scale {
             for task in 0..2 {
                 let head = 0xa000 + (task as u64 * 0x1000) + turn * 0x40;
-                w.tasks[task].mark_pending_host_work();
+                w.tasks[task].linux.mark_pending_host_work();
                 let before = w.heads();
                 let result = w.set_robust_list(task, head, 24);
                 assert!(

@@ -271,7 +271,7 @@ fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser)
     };
     serve(frame, &w.counters, task, Some(sched), &*w.venue, user).map(|result| {
         use carrick_personality_linux::dispatch::{CompletionRoute, completion_route};
-        match completion_route(result, task.has_pending_host_work()) {
+        match completion_route(result, task.linux.has_pending_host_work()) {
             CompletionRoute::Served => Action::Served,
             CompletionRoute::WithWork => Action::ServedWithWork,
             CompletionRoute::Suspended => Action::Idle,
@@ -529,7 +529,7 @@ const SIGUSR1_BIT: u64 = 1 << 9; // signal 10
 fn lifecycle_setup_completes_once_before_pending_host_work() {
     for nr in [SYS_RT_SIGPROCMASK, SYS_SIGALTSTACK, SYS_SET_ROBUST_LIST] {
         let mut w = World::new(LifecycleHatches::ON);
-        w.task().mark_pending_host_work();
+        w.task().linux.mark_pending_host_work();
         let args: &[u64] = match nr {
             SYS_RT_SIGPROCMASK => &[0, 0, 0, 8],
             SYS_SIGALTSTACK => &[0, 0],
@@ -968,7 +968,7 @@ fn exit_forwards_unless_a_switched_in_non_last_thread_may_leave() {
             w.page().close_for_fork().unwrap();
         }),
         ("host work pending", |w| {
-            w.task().mark_pending_host_work();
+            w.task().linux.mark_pending_host_work();
         }),
     ];
     for (label, setup) in cases {

@@ -101,16 +101,7 @@ fn publish_identity(task: &CurrentTask, id: ThreadIdentity) {
 }
 
 /// How a futex syscall EL1 served ended.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Served {
-    /// The syscall returned; with `switched`, the caller parked and the vCPU
-    /// now runs another thread: the frame and the slot's task record are
-    /// that thread's.
-    Returned { switched: bool },
-    /// The caller parked, nothing was runnable, and host work arrived while
-    /// the vCPU idled: it leaves through the host with no thread on it.
-    Idle,
-}
+pub use carrick_core::Served;
 
 /// What the in-guest scheduler works with on one vCPU slot.
 pub struct Sched<'a, C: ThreadCpu, U: UserWord> {
@@ -181,7 +172,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if effects.misplaced {
             // A woken thread sits here but may not run here: the exit this
             // causes hands it to the host, which places it.
-            self.task.mark_pending_host_work();
+            self.task.linux.mark_pending_host_work();
         }
         if effects.queued_own {
             self.program_timer(true);
@@ -405,7 +396,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         let spin_until = self.cpu.now().saturating_add(self.ticks(IDLE_SPIN_NS));
         loop {
             self.take_irqs();
-            if self.task.has_pending_host_work() {
+            if self.task.linux.has_pending_host_work() {
                 self.counters.exit_reasons[El1ExitReason::IdleHostWork as usize]
                     .fetch_add(1, Ordering::Relaxed);
                 zone.leave_idle(slot);
@@ -459,7 +450,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             }
             match intid {
                 GIC_KICK_INTID => {
-                    self.task.mark_pending_host_work();
+                    self.task.linux.mark_pending_host_work();
                     taken.kick = true;
                 }
                 GIC_VTIMER_INTID => {
@@ -482,7 +473,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
         self.take_irqs();
-        if self.task.has_pending_host_work() {
+        if self.task.linux.has_pending_host_work() {
             self.counters.exit_reasons[El1ExitReason::InterruptHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
             return carrick_el1_abi::Action::Forward;
@@ -539,7 +530,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         timeout_result: u64,
     ) -> carrick_el1_abi::Action {
         self.take_irqs();
-        if self.task.has_pending_host_work() {
+        if self.task.linux.has_pending_host_work() {
             self.counters.exit_reasons[El1ExitReason::IdleEntryHostWork as usize]
                 .fetch_add(1, Ordering::Relaxed);
             return carrick_el1_abi::Action::Idle;

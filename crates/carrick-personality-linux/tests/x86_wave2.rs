@@ -1,6 +1,8 @@
 #![allow(clippy::panic)]
 #[path = "x86_wave2/common_entry.rs"]
 mod common_entry;
+#[path = "x86_wave2/dispatch.rs"]
+mod dispatch;
 #[test]
 fn x4_linux_common_entry() {
     common_entry::x4_linux_common_entry();

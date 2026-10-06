@@ -44,12 +44,12 @@ pub(crate) fn deliver_completion(
             && let Some(slot) = own
             && let Some(task) = carrick_el1_abi::current_task_guest(usize::from(slot.raw()))
         {
-            task.mark_pending_host_work();
+            task.linux.mark_pending_host_work();
         }
         if (deferred || (effects.queued_own && own == Some(venue)))
             && let Some(task) = carrick_el1_abi::current_task_guest(usize::from(venue.raw()))
         {
-            task.mark_pending_host_work();
+            task.linux.mark_pending_host_work();
         }
     }
     #[cfg(not(target_os = "none"))]
@@ -190,7 +190,7 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
             self.program_timer(true);
         }
         if effects.misplaced {
-            self.task.mark_pending_host_work();
+            self.task.linux.mark_pending_host_work();
         }
     }
 }
