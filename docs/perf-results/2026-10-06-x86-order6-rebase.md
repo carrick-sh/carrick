@@ -108,14 +108,17 @@ self-tests) report that the actual reviewed projection disagrees with the
 macOS compiler capture. The director must recapture the rebased source.
 Later CI stages were not executed by that stopped recipe.
 
-**macOS projection is not the only remaining lint finding.** The separate
-`check-personality-boundary` command reports nine `PendingSignals` violations
-in `carrick-signal-core/src/policy.rs`. Running the same auditor against an
-independent `git archive 7b6d15813` tree with that tree's own locked offline
-metadata reports the exact same nine file/line/column/message tuples, with
-zero additions/removals. The source blob is identical in both trees:
-`bd084c723cc4058ef5e4f4c25a8f9cce4db5983e`. These unchanged findings were not
-hidden, weakened or fixed outside the rebase fence. Full lint/CI remains red.
+**Correction: the baseline source-boundary attribution was invalid.**
+The archived baseline was scanned with order 6's newer auditor, rather than
+its own CI auditor. Identical policy blobs therefore did not prove identical
+baseline gate results. The director's exact CI scanner passes at `926ccbd46`
+and fails with nine `PendingSignals` findings at `6bb08a88d`.
+Order 6 added the forbidden-symbol check; locked all-feature metadata shows
+no shipped signal-core edge from core or core-ABI. Regardless of the trigger,
+Linux pending policy belongs in the personality, and the new correction moves
+it there without changing the scanner. See the signal-boundary correction
+report for current verification; the historical logs below are retained only
+as provenance, not baseline qualification.
 
 The final qualified CPL0 image SHA-256 is
 `8f53a192ab861dddca6eec6c630a4b5c843a47d67090f0ce55c7cb9aa38a2206`.
