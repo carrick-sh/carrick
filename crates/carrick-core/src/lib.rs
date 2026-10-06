@@ -2,6 +2,7 @@
 #![no_std]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 extern crate alloc;
+pub use carrick_core_abi::Served;
 pub mod entry;
 pub mod lifecycle;
 pub mod mm;
