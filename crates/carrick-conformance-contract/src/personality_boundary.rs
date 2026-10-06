@@ -1192,10 +1192,12 @@ impl<'a> SourceCheckerVisitor<'a> {
             return;
         }
         resolved.extend_from_slice(rest);
-        if !resolved
-            .first()
-            .is_some_and(|p| matches!(p.as_str(), "substrate" | "alloc" | "lock" | "rust_alloc"))
-        {
+        if !resolved.first().is_some_and(|p| {
+            matches!(
+                p.as_str(),
+                "substrate" | "alloc" | "lock" | "rust_alloc" | "isa"
+            )
+        }) {
             let start = span.start();
             self.violations.push(SourceViolation {
                 substrate_crate: self.substrate_crate.to_string(), file_path: self.file_path.to_path_buf(),
@@ -1769,6 +1771,39 @@ mod tests {
         fs::write(dir.join("src/orphan.rs"), "use carrick_abi::LinuxErrno;").unwrap();
         let mut report = CrateAuditReport::default();
         audit_el1_modules(&dir, &BTreeSet::new(), &mut report).unwrap();
+        assert!(!report.source_violations.is_empty());
+    }
+
+    #[test]
+    fn el1_isa_leaf_is_neutral_but_cannot_import_personality() {
+        let fixture = Fixture::new("src/isa/native.rs", "use super::ArchError;");
+        let path = fixture
+            .root
+            .path()
+            .join("crates/carrick-sched-core/src/isa/native.rs");
+        let mut report = CrateAuditReport::default();
+        audit_source_file_tree(
+            "carrick-el1",
+            &path,
+            0,
+            &BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut report,
+        )
+        .unwrap();
+        assert!(report.source_violations.is_empty());
+
+        fs::write(&path, "use crate::personality::sched;").unwrap();
+        let mut report = CrateAuditReport::default();
+        audit_source_file_tree(
+            "carrick-el1",
+            &path,
+            0,
+            &BTreeSet::new(),
+            &mut BTreeSet::new(),
+            &mut report,
+        )
+        .unwrap();
         assert!(!report.source_violations.is_empty());
     }
 
