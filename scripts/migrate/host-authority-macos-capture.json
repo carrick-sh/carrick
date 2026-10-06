@@ -4437,15 +4437,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 31953,
-        "byte_start": 31941,
+        "byte_end": 32493,
+        "byte_start": 32481,
         "column": 26,
         "column_end": 38,
         "column_start": 26,
         "file": "crates/carrick-conformance-contract/src/personality_boundary.rs",
-        "line": 928,
-        "line_end": 928,
-        "line_start": 928
+        "line": 957,
+        "line_end": 957,
+        "line_start": 957
       }
     },
     {
@@ -4456,15 +4456,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 37227,
-        "byte_start": 37215,
+        "byte_end": 37767,
+        "byte_start": 37755,
         "column": 19,
         "column_end": 31,
         "column_start": 19,
         "file": "crates/carrick-conformance-contract/src/personality_boundary.rs",
-        "line": 1099,
-        "line_end": 1099,
-        "line_start": 1099
+        "line": 1128,
+        "line_end": 1128,
+        "line_start": 1128
       }
     },
     {
@@ -5236,15 +5236,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 11058,
-        "byte_start": 11040,
+        "byte_end": 11598,
+        "byte_start": 11580,
         "column": 23,
         "column_end": 41,
         "column_start": 23,
         "file": "crates/carrick-conformance-contract/src/personality_boundary.rs",
-        "line": 329,
-        "line_end": 329,
-        "line_start": 329
+        "line": 358,
+        "line_end": 358,
+        "line_start": 358
       }
     },
     {
@@ -5255,15 +5255,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 11472,
-        "byte_start": 11454,
+        "byte_end": 12012,
+        "byte_start": 11994,
         "column": 17,
         "column_end": 35,
         "column_start": 17,
         "file": "crates/carrick-conformance-contract/src/personality_boundary.rs",
-        "line": 338,
-        "line_end": 338,
-        "line_start": 338
+        "line": 367,
+        "line_end": 367,
+        "line_start": 367
       }
     },
     {
@@ -5274,15 +5274,15 @@
         "macos-cli-default"
       ],
       "source": {
-        "byte_end": 33408,
-        "byte_start": 33390,
+        "byte_end": 33948,
+        "byte_start": 33930,
         "column": 19,
         "column_end": 37,
         "column_start": 19,
         "file": "crates/carrick-conformance-contract/src/personality_boundary.rs",
-        "line": 974,
-        "line_end": 974,
-        "line_start": 974
+        "line": 1003,
+        "line_end": 1003,
+        "line_start": 1003
       }
     },
     {
@@ -12399,9 +12399,9 @@
       }
     }
   ],
-  "rows_sha256": "c94e4b7f670c2e1e8477a71b2cc1aef7bd2ae463c11f77e0ee733425049a24ce",
+  "rows_sha256": "2f7c025fbe0e71bf89c82c36fce678c5c88cc8936260f1a3d9aa1926ba197ad5",
   "schema": 1,
-  "source_head": "7245d48af95e147368c7bf214a90e4c063cd794d",
+  "source_head": "3e00399aba527c66e5aac53b778dd0a022dcd163",
   "toolchain": {
     "clippy": "clippy 0.1.96 (ac68faa20c 2026-05-25)",
     "host_triple": "aarch64-apple-darwin",
