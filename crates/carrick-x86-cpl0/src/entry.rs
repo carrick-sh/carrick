@@ -135,6 +135,9 @@ mod kernel {
         if frame.rax == carrick_el1_abi::MM_PORTAL_GRANT_ESR {
             let res = super::mmu::serve_cpl0_grant(binding, frame.rdi as usize);
             frame.rax = res as u64;
+            if binding.return_kick.swap(0, Ordering::AcqRel) != 0 {
+                doorbell(RETURN_KICK_PORT, frame);
+            }
             return;
         }
         // SAFETY: bootstrap retains these supervisor-only records until the

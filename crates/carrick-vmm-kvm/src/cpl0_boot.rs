@@ -460,6 +460,17 @@ impl Cpl0Carrier {
                     table_memory_start: LAYOUT.pml4_base,
                     table_memory_end: 0xc0_0000,
                 });
+                if matches!(mode, BootMode::Shared { .. }) {
+                    let zone = &*ram
+                        .host_ptr(
+                            carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
+                            size_of::<ZoneTables>(),
+                        )
+                        .ok_or_else(|| fail("zone backing"))?
+                        .cast::<ZoneTables>();
+                    zone.slot(SlotId::new(index as u8))
+                        .set_sgi_target(EL1_DYNAMIC_METADATA_BASE + BINDING_OFFSET + offset);
+                }
             }
         }
         let mut vm = KvmVm::create_empty().map_err(|e| fail(e.to_string()))?;
