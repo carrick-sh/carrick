@@ -1109,6 +1109,7 @@ dependencies = [
 name = "carrick-x86-cpl0"
 version = "0.1.0"
 dependencies = [
+ "carrick-core",
  "carrick-el1",
  "carrick-el1-abi",
  "carrick-guest-arch",

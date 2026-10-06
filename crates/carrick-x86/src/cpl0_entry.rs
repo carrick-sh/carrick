@@ -80,6 +80,10 @@ pub struct CpuBinding {
     /// Private hardware witness binding; zero in normal M2 entry. This is
     /// retained CPL0 control transport, not common task/scheduler authority.
     pub scheduler_witness: AtomicU64,
+    /// Published ZoneTables guest address for shared admission; 0 in legacy M2.
+    pub zone_address: u64,
+    /// Published ContextBinding guest address for shared admission; 0 in legacy M2.
+    pub context_binding_address: u64,
 }
 const _: () = assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
 

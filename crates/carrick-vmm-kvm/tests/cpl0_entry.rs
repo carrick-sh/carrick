@@ -12,9 +12,7 @@ use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGenerati
 use carrick_sched_core::{SlotId, ThreadIdentity, ZoneTables};
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::OBSERVE_NATIVE;
-use carrick_x86::cpl0_scheduler::{
-    ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context,
-};
+use carrick_x86::cpl0_scheduler::{ContextBinding, InterruptFrame, NativeContext, XsaveArea};
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
@@ -220,15 +218,12 @@ fn entry_and_return_kicks_never_republish_or_recomplete() {
     assert_eq!(forwards, 0, "kicks cannot forward a served call");
 }
 
-#[test]
-fn x1_boot_shared_substrate() {
-    let p = program(&[(0xa000, 24), (0xdead, 23)]);
-    let dummy = &[0x0f, 0x0b];
-    let mut carrier = Cpl0Carrier::boot(&image(), [&p, dummy]).expect("real KVM + CPL0 image");
-
-    // Shared substrate ZoneTables and AddressSpaces claims
+fn make_shared_carrier(
+    p: &[u8],
+    mutate: impl FnOnce(&mut ZoneTables, &mut ContextBinding),
+) -> Result<Cpl0Carrier, carrick_hal::TrapError> {
     let layout = std::alloc::Layout::new::<ZoneTables>();
-    let zone = unsafe {
+    let mut zone = unsafe {
         let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
         assert!(!ptr.is_null());
         Box::from_raw(ptr)
@@ -259,7 +254,13 @@ fn x1_boot_shared_substrate() {
     let on_cpu = zone.switch_in(slot).unwrap();
     assert_eq!(on_cpu, record);
 
-    let binding = ContextBinding {
+    let mut xsave = XsaveArea::ZERO;
+    xsave.0[0..2].copy_from_slice(&0x37fu16.to_le_bytes());
+    xsave.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+    xsave.0[512..520].copy_from_slice(&3u64.to_le_bytes());
+    xsave.0[400..416].fill(0x31);
+
+    let mut binding = ContextBinding {
         record: zone.record_ref(record),
         context: NativeContext {
             frame: InterruptFrame {
@@ -277,13 +278,22 @@ fn x1_boot_shared_substrate() {
             },
             fs_base: 0x1000,
             gs_base: 0x2000,
-            xsave: XsaveArea::ZERO,
+            xsave,
         },
     };
 
-    // 1. Admit context under shared ZoneTables and AddressSpaces claims
-    assert!(admit_context(&zone, slot, &binding));
-    assert_eq!(zone.installed_space(slot), mm);
+    mutate(&mut zone, &mut binding);
+    Cpl0Carrier::boot_shared(&image(), p, &zone, slot, &binding)
+}
+
+#[test]
+fn x1_boot_shared_substrate() {
+    let p = program(&[(0xa000, 24), (0xdead, 23)]);
+    let slot = SlotId::new(0);
+    let mm = 11u64;
+
+    // 1. Boot one process on shared substrate via CPL0 kernel
+    let mut carrier = make_shared_carrier(&p, |_, _| {}).expect("real KVM + CPL0 image");
 
     // 2. Execute CPL3 bytes and verify shared robust-list serving
     // Call 1: valid length 24
@@ -301,58 +311,62 @@ fn x1_boot_shared_substrate() {
     );
     assert_eq!(obs2.heads[0], (0xa000, 24), "previous head preserved");
 
+    // Verify admission and occupancy installed inside CPL0
+    assert_eq!(carrier.zone().installed_space(slot), mm);
+
     // 3. Preserve native context / TLS / XSAVE
     assert_eq!(obs1.captured_stack, 0x3_1fe8);
     assert_eq!(obs1.returned_stack, 0x3_1fe8);
     assert_eq!(obs1.preserved_rbx, 0xa000);
     assert_eq!(obs2.preserved_rbx, 0xdead);
-    assert_eq!(binding.context.fs_base, 0x1000);
-    assert_eq!(binding.context.gs_base, 0x2000);
+    assert_eq!(carrier.fs_base(0).unwrap(), 0x1000);
+    assert_eq!(carrier.gs_base(0).unwrap(), 0x2000);
+    assert_eq!(&carrier.xsave(0).unwrap()[400..416], &[0x31; 16]);
 
-    // 4. Reject recycled record / root identity (zone-record reuse/admission error detection)
+    // 4. Reject recycled record / root identity in CPL0
     // Recycled record incarnation defect
-    let mut stale = ContextBinding {
-        record: binding.record,
-        context: binding.context.clone(),
-    };
-    stale.record.incarnation += 1;
-    assert!(
-        !admit_context(&zone, slot, &stale),
-        "stale incarnation must be rejected"
-    );
+    let mut stale_carrier = make_shared_carrier(&p, |_, binding| {
+        binding.record.incarnation += 1;
+    })
+    .expect("boot stale carrier");
+    let err = stale_carrier
+        .observe(0)
+        .expect_err("stale incarnation must be rejected by CPL0");
+    assert!(err.to_string().contains("CPL0 fatal / admission refusal"));
 
-    // Wrong root identity defect
-    let mut wrong_root = ContextBinding {
-        record: binding.record,
-        context: binding.context.clone(),
-    };
-    wrong_root.context.address.root = RootGpa::page_aligned(FrameGpa::new(0x70_0000)).unwrap();
-    assert!(
-        !admit_context(&zone, slot, &wrong_root),
-        "mismatched root must be rejected"
+    // Wrong root identity defect: CPL0 detects mismatch and vacates occupancy
+    let mut wrong_root_carrier = make_shared_carrier(&p, |_, binding| {
+        binding.context.address.root = RootGpa::page_aligned(FrameGpa::new(0x70_0000)).unwrap();
+    })
+    .expect("boot wrong root carrier");
+    let err = wrong_root_carrier
+        .observe(0)
+        .expect_err("mismatched root must be rejected by CPL0");
+    assert!(err.to_string().contains("CPL0 fatal / admission refusal"));
+    assert_eq!(
+        wrong_root_carrier.zone().installed_space(slot),
+        0,
+        "refusal vacates occupancy"
     );
-    assert_eq!(zone.installed_space(slot), 0, "refusal vacates occupancy");
 
     // Wrong MM identity defect
-    let mut wrong_mm = ContextBinding {
-        record: binding.record,
-        context: binding.context.clone(),
-    };
-    wrong_mm.context.address.mm = MmGeneration::new(NonZeroU64::new(99).unwrap());
-    assert!(
-        !admit_context(&zone, slot, &wrong_mm),
-        "wrong MM must be rejected"
-    );
-
-    // Re-admitting with valid binding restores space
-    assert!(admit_context(&zone, slot, &binding));
-    assert_eq!(zone.installed_space(slot), mm);
+    let mut wrong_mm_carrier = make_shared_carrier(&p, |_, binding| {
+        binding.context.address.mm = MmGeneration::new(NonZeroU64::new(99).unwrap());
+    })
+    .expect("boot wrong MM carrier");
+    let err = wrong_mm_carrier
+        .observe(0)
+        .expect_err("wrong MM must be rejected by CPL0");
+    assert!(err.to_string().contains("CPL0 fatal / admission refusal"));
 
     // Closed space defect
-    zone.release_space(slot);
-    zone.spaces.close(space);
-    assert!(
-        !admit_context(&zone, slot, &binding),
-        "closed space must be rejected"
-    );
+    let mut closed_space_carrier = make_shared_carrier(&p, |zone, _| {
+        let index = zone.spaces.find(11).unwrap();
+        zone.spaces.close(index);
+    })
+    .expect("boot closed space carrier");
+    let err = closed_space_carrier
+        .observe(0)
+        .expect_err("closed space must be rejected by CPL0");
+    assert!(err.to_string().contains("CPL0 fatal / admission refusal"));
 }

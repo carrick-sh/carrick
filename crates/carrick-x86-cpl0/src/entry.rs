@@ -23,6 +23,9 @@ unsafe impl core::alloc::GlobalAlloc for NoAllocation {
 static ALLOCATOR: NoAllocation = NoAllocation;
 
 #[cfg(target_os = "none")]
+extern crate carrick_core;
+
+#[cfg(target_os = "none")]
 #[path = "../../carrick-x86/src/cpl0_entry.rs"]
 mod adapter;
 
@@ -109,6 +112,17 @@ mod kernel {
         if !frame.valid_user_return() {
             doorbell(FATAL_PORT, frame);
             halt();
+        }
+        if binding.zone_address != 0 {
+            let zone = unsafe { &*(binding.zone_address as *const carrick_sched_core::ZoneTables) };
+            let context_binding = unsafe {
+                &*(binding.context_binding_address as *const super::scheduler::ContextBinding)
+            };
+            let slot = carrick_sched_core::SlotId::new(0);
+            if !super::scheduler::admit_context(zone, slot, context_binding) {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
         }
         if frame.rax == OBSERVE_NATIVE {
             doorbell(CONTROL_PORT, frame);

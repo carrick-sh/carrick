@@ -9,7 +9,9 @@ use carrick_el1_abi::{
 };
 use carrick_hal::{HvVcpu, HvVm, MemPerms, TrapError, VcpuExit, VcpuKick};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
+use carrick_sched_core::{SlotId, ZoneTables};
 use carrick_x86::cpl0_entry::*;
+use carrick_x86::cpl0_scheduler::ContextBinding;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
 use kvm_bindings::{Msrs, kvm_msr_entry};
 use std::path::Path;
@@ -37,6 +39,17 @@ const LAYOUT: BringupLayout = BringupLayout {
 
 fn fail(message: impl Into<String>) -> TrapError {
     TrapError::Hypervisor(message.into())
+}
+
+#[derive(Clone, Copy)]
+pub enum BootMode<'a> {
+    Normal,
+    Interrupts,
+    Shared {
+        zone: &'a ZoneTables,
+        slot: SlotId,
+        binding: &'a ContextBinding,
+    },
 }
 
 /// RAII deadline: one bounded blocking wait, one kick on expiry, always joined.
@@ -108,13 +121,31 @@ pub struct Cpl0Carrier {
 
 impl Cpl0Carrier {
     pub fn boot(image: &Path, programs: [&[u8]; 2]) -> Result<Self, TrapError> {
-        Self::boot_inner(image, programs, false)
+        Self::boot_inner(image, programs, BootMode::Normal)
+    }
+
+    pub fn boot_shared(
+        image: &Path,
+        program: &[u8],
+        zone: &ZoneTables,
+        slot: SlotId,
+        binding: &ContextBinding,
+    ) -> Result<Self, TrapError> {
+        Self::boot_inner(
+            image,
+            [program, &[0x0f, 0x0b]],
+            BootMode::Shared {
+                zone,
+                slot,
+                binding,
+            },
+        )
     }
 
     pub(crate) fn boot_inner(
         image: &Path,
         programs: [&[u8]; 2],
-        interrupts: bool,
+        mode: BootMode<'_>,
     ) -> Result<Self, TrapError> {
         let bytes = std::fs::read(image).map_err(|e| fail(format!("CPL0 image: {e}")))?;
         let plan = carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62)
@@ -123,12 +154,12 @@ impl Cpl0Carrier {
             return Err(fail("CPL0 entry outside its supervisor image"));
         }
         let mut ram = GuestRam::new();
-        ram.add_window(
-            0,
-            if interrupts { 2 * RAM_SIZE } else { RAM_SIZE },
-            WindowKind::Private,
-        )
-        .map_err(|e| fail(e.to_string()))?;
+        let ram_size = match mode {
+            BootMode::Interrupts | BootMode::Shared { .. } => 2 * RAM_SIZE,
+            BootMode::Normal => RAM_SIZE,
+        };
+        ram.add_window(0, ram_size, WindowKind::Private)
+            .map_err(|e| fail(e.to_string()))?;
         let mut maps = Vec::new();
         for segment in &plan.segments {
             let end = segment
@@ -205,9 +236,18 @@ impl Cpl0Carrier {
                 exec: false,
             });
         }
-        if interrupts {
+        if matches!(mode, BootMode::Interrupts) {
             maps.extend(crate::carrier_interrupts::supervisor_maps());
             maps.push(crate::carrier_interrupts::data_map(0));
+        } else if let BootMode::Shared { .. } = mode {
+            maps.push(Pml4MapSpec {
+                va: carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
+                gpa: carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
+                len: 0x100_0000,
+                user: false,
+                write: true,
+                exec: false,
+            });
         }
         let tables = pml4_tables(
             &maps,
@@ -217,7 +257,7 @@ impl Cpl0Carrier {
         .map_err(|e| fail(format!("CPL0 tables: {e:?}")))?;
         ram.write_gpa(LAYOUT.pml4_base, &tables)
             .map_err(|e| fail(e.to_string()))?;
-        if interrupts {
+        if matches!(mode, BootMode::Interrupts) {
             let last = maps.last_mut().ok_or_else(|| fail("progress data map"))?;
             *last = crate::carrier_interrupts::data_map(1);
             let second = pml4_tables(
@@ -268,8 +308,44 @@ impl Cpl0Carrier {
                 .ok_or_else(|| fail("counter backing"))?
                 .cast::<Counters>();
             counters.write(Counters::new());
+
+            if let BootMode::Shared { zone, binding, .. } = mode {
+                let zone_ptr = ram
+                    .host_ptr(
+                        carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
+                        size_of::<ZoneTables>(),
+                    )
+                    .ok_or_else(|| fail("zone backing"))?
+                    .cast::<ZoneTables>();
+                core::ptr::copy_nonoverlapping(zone, zone_ptr, 1);
+                let binding_ptr = ram
+                    .host_ptr(
+                        carrick_x86::cpl0_scheduler::PROGRESS_STATE,
+                        size_of::<ContextBinding>(),
+                    )
+                    .ok_or_else(|| fail("binding backing"))?
+                    .cast::<ContextBinding>();
+                core::ptr::copy_nonoverlapping(binding, binding_ptr, 1);
+            }
+
             for index in 0..2 {
                 let offset = index as u64 * STRIDE;
+                let (tid, serial, mm, generation) =
+                    if let BootMode::Shared { zone, binding, .. } = mode {
+                        if index == 0 {
+                            if let Some(record) = zone.live(binding.record) {
+                                let id = record.identity();
+                                (id.tid as u32, id.serial, id.mm, id.generation)
+                            } else {
+                                (41, 101, 11, 5)
+                            }
+                        } else {
+                            (42, 102, 12, 5)
+                        }
+                    } else {
+                        (41 + index as u32, 101 + index as u64, 11 + index as u64, 5)
+                    };
+
                 let slot = ram
                     .host_ptr(
                         META_GPA + CONTROL_OFFSET + offset,
@@ -279,7 +355,7 @@ impl Cpl0Carrier {
                     .cast::<ThreadControlSlot>();
                 slot.write(ThreadControlSlot::new());
                 (*slot).reset_for_host_birth(BlockedMask(0));
-                if !(*slot).publish_visible_tid(41 + index as u32) {
+                if !(*slot).publish_visible_tid(tid) {
                     return Err(fail("issued slot identity"));
                 }
                 let task = ram
@@ -287,18 +363,25 @@ impl Cpl0Carrier {
                     .ok_or_else(|| fail("current task backing"))?
                     .cast::<CurrentTask>();
                 task.write(CurrentTask::new());
-                (*task).set(
-                    El1TaskId::from_linux_tid(41 + index as i32),
-                    11 + index as u64,
-                    5,
-                );
-                (*task)
-                    .thread_serial
-                    .store(101 + index as u64, Ordering::Release);
+                (*task).set(El1TaskId::from_linux_tid(tid as i32), mm, generation);
+                (*task).thread_serial.store(serial, Ordering::Release);
                 (*task).publish_lifecycle(
                     EL1_DYNAMIC_METADATA_BASE,
                     EL1_DYNAMIC_METADATA_BASE + CONTROL_OFFSET + offset,
                 );
+                let (zone_addr, binding_addr) = if let BootMode::Shared { .. } = mode {
+                    if index == 0 {
+                        (
+                            carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
+                            carrick_x86::cpl0_scheduler::PROGRESS_STATE,
+                        )
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                };
+
                 let binding = ram
                     .host_ptr(META_GPA + BINDING_OFFSET + offset, size_of::<CpuBinding>())
                     .ok_or_else(|| fail("CPU binding backing"))?
@@ -315,16 +398,20 @@ impl Cpl0Carrier {
                     publications: AtomicU64::new(0),
                     completions: AtomicU64::new(0),
                     captured_stack: AtomicU64::new(0),
-                    scheduler_witness: AtomicU64::new(if interrupts && index == 0 {
-                        carrick_x86::cpl0_scheduler::PROGRESS_STATE
-                    } else {
-                        0
-                    }),
+                    scheduler_witness: AtomicU64::new(
+                        if matches!(mode, BootMode::Interrupts) && index == 0 {
+                            carrick_x86::cpl0_scheduler::PROGRESS_STATE
+                        } else {
+                            0
+                        },
+                    ),
+                    zone_address: zone_addr,
+                    context_binding_address: binding_addr,
                 });
             }
         }
         let mut vm = KvmVm::create_empty().map_err(|e| fail(e.to_string()))?;
-        if interrupts {
+        if matches!(mode, BootMode::Interrupts) {
             crate::carrier_interrupts::create_irqchip(&vm)?;
         }
         for (gpa, ptr, len) in ram.windows_for_kvm() {
@@ -377,6 +464,25 @@ impl Cpl0Carrier {
             {
                 return Err(fail("private TSS/IDT not installed"));
             }
+            if let (BootMode::Shared { binding, .. }, 0) = (mode, index) {
+                let msrs = Msrs::from_entries(&[
+                    kvm_msr_entry {
+                        index: 0xc000_0100,
+                        data: binding.context.fs_base,
+                        ..Default::default()
+                    },
+                    kvm_msr_entry {
+                        index: 0xc000_0101,
+                        data: binding.context.gs_base,
+                        ..Default::default()
+                    },
+                ])
+                .map_err(|e| fail(e.to_string()))?;
+                if cpu.fd().set_msrs(&msrs).map_err(|e| fail(e.to_string()))? != 2 {
+                    return Err(fail("TLS MSRs not installed"));
+                }
+                let _ = cpu.set_xsave(&binding.context.xsave.0)?;
+            }
         }
         let metadata_base = NonNull::new(
             ram.host_ptr(META_GPA, META_LEN as usize)
@@ -392,6 +498,65 @@ impl Cpl0Carrier {
             kicks: 0,
             work_exits: 0,
         })
+    }
+
+    pub fn zone(&self) -> &ZoneTables {
+        // SAFETY: carrier-retained common records at PROGRESS_ZONE in guest RAM.
+        let ptr = self
+            .ram
+            .host_ptr(
+                carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
+                size_of::<ZoneTables>(),
+            )
+            .unwrap_or_else(|| NonNull::dangling().as_ptr());
+        unsafe { &*ptr.cast::<ZoneTables>() }
+    }
+
+    pub fn fs_base(&self, index: usize) -> Result<u64, TrapError> {
+        let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
+            index: 0xc000_0100,
+            ..Default::default()
+        }])
+        .map_err(|e| fail(e.to_string()))?;
+        if self.cpus[index]
+            .fd()
+            .get_msrs(&mut msrs)
+            .map_err(|e| fail(e.to_string()))?
+            != 1
+        {
+            return Err(fail("KVM_GET_MSRS(FS_BASE) failed"));
+        }
+        msrs.as_slice()
+            .first()
+            .map(|entry| entry.data)
+            .ok_or_else(|| fail("empty FS_BASE"))
+    }
+
+    pub fn gs_base(&self, index: usize) -> Result<u64, TrapError> {
+        // At a CPL0 doorbell exit, swapgs has put the user GS base into KERNEL_GS_BASE.
+        let mut msrs = Msrs::from_entries(&[kvm_msr_entry {
+            index: 0xc000_0102,
+            ..Default::default()
+        }])
+        .map_err(|e| fail(e.to_string()))?;
+        if self.cpus[index]
+            .fd()
+            .get_msrs(&mut msrs)
+            .map_err(|e| fail(e.to_string()))?
+            != 1
+        {
+            return Err(fail("KVM_GET_MSRS(KERNEL_GS_BASE) failed"));
+        }
+        msrs.as_slice()
+            .first()
+            .map(|entry| entry.data)
+            .ok_or_else(|| fail("empty user GS_BASE"))
+    }
+
+    pub fn xsave(&self, index: usize) -> Result<[u8; carrick_x86::XSAVE_LEN], TrapError> {
+        self.cpus[index]
+            .get_xsave()?
+            .ok_or_else(|| fail("no xsave"))
     }
 
     /// References are private and used only while both vCPUs are stopped.
@@ -495,6 +660,9 @@ impl Cpl0Carrier {
                 FORWARD_PORT => {
                     self.host_forwards += 1;
                     return Err(fail(format!("unported CPL0 native call {}", frame.rax)));
+                }
+                FATAL_PORT => {
+                    return Err(fail("CPL0 fatal / admission refusal"));
                 }
                 ENTRY_KICK_PORT | RETURN_KICK_PORT => {
                     self.task(index).mark_pending_host_work();

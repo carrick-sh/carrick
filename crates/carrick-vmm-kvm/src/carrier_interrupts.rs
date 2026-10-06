@@ -3,7 +3,7 @@
 //! never becomes a guest task wait, timer thread or semantic syscall service.
 //! This consumes the M2 loader, not its per-task host execution loop.
 use crate::KvmVm;
-use crate::cpl0_boot::{Cpl0Carrier, Watchdog};
+use crate::cpl0_boot::{BootMode, Cpl0Carrier, Watchdog};
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
 use carrick_hal::{HvVcpu, TrapError, VcpuExit};
 use carrick_mem::pml4::Pml4MapSpec;
@@ -114,7 +114,7 @@ pub fn witness(
     programs: [&[u8]; 2],
     boundary: KickBoundary,
 ) -> Result<ProgressObservation, TrapError> {
-    let mut carrier = Cpl0Carrier::boot_inner(image, programs, true)?;
+    let mut carrier = Cpl0Carrier::boot_inner(image, programs, BootMode::Interrupts)?;
     let ram = &mut carrier.ram;
     if size_of::<ZoneTables>() > (PROGRESS_STATE - PROGRESS_ZONE) as usize
         || size_of::<ProgressState>() > (SECOND_ROOT - PROGRESS_STATE) as usize
