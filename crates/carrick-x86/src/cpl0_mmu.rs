@@ -266,14 +266,7 @@ pub fn serve_cpl0_grant(binding: &CpuBinding, slot_index: usize) -> u32 {
         }
         Err(err) => {
             binding.completions.fetch_add(1, Ordering::Relaxed);
-            match err {
-                MmError::Busy => 401,
-                MmError::Wait(_) => 402,
-                MmError::Stale => 403,
-                MmError::Invalid => 404,
-                MmError::Fault => 405,
-                _ => 408,
-            }
+            err.errno()
         }
     }
 }
@@ -293,5 +286,12 @@ mod tests {
                 Err(DescriptorRefusal::TableOutsidePrimary)
             );
         }
+    }
+
+    #[test]
+    fn cpl0_owner_refusals_use_the_linux_personality_encoding() {
+        assert_eq!(MmError::Stale.errno(), 3);
+        assert_eq!(MmError::Busy.errno(), 16);
+        assert_eq!(MmError::MetadataRequired.errno(), 11);
     }
 }
