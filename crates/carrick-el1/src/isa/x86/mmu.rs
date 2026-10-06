@@ -73,7 +73,7 @@ pub fn unsupported_arm_descriptor_path() -> u64 {
 
 /// Exact physical page-table window reached through a retained supervisor
 /// alias for a CPL0 transaction. Construction requires the caller's MM editor.
-struct NativeDescriptorWords {
+pub(crate) struct NativeDescriptorWords {
     context: AddressContext<RootGpa>,
     base: u64,
     end: u64,
@@ -82,7 +82,7 @@ struct NativeDescriptorWords {
 }
 
 impl NativeDescriptorWords {
-    fn checked(
+    pub(crate) fn checked(
         root: RootGpa,
         id: DescriptorTxnId,
         tables: &TableWindow,
