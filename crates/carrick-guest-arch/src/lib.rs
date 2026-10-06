@@ -26,6 +26,7 @@ macro_rules! ordinal {
 }
 ordinal!(
     UserVa,
+    KernelStackPointer,
     FrameGpa,
     GuestLen,
     CounterTick,
@@ -360,6 +361,7 @@ macro_rules! arch_trait {
 }
 
 arch_trait!(EntryArch, EntryBackend {
+    fn current_stack_pointer() -> Result<KernelStackPointer, Self::Error>;
     fn decode_entry(frame: &Self::NativeFrame) -> Result<EntryEvent, Self::Error>;
     fn snapshot(frame: &Self::NativeFrame) -> Result<NativeEntrySnapshot<'_, Self::NativeFrame>, Self::Error>;
     fn set_result(frame: &mut Self::NativeFrame, result: NativeReturnWord) -> Result<(), Self::Error>;
@@ -368,6 +370,9 @@ arch_trait!(EntryArch, EntryBackend {
     fn prepare_user_return(frame: &Self::NativeFrame) -> Result<UserReturn, Self::Error>;
 });
 arch_trait!(MmuArch, MmuBackend {
+    fn live_root() -> Result<Self::Root, Self::Error>;
+    fn read_user_word(owner: &Self::MmOwner, address: UserVa, width: GuestLen) -> Result<u64, Self::Error>;
+    fn validate_user_access(owner: &Self::MmOwner, range: UserRange, access: Access) -> Result<GuestLen, Self::Error>;
     fn install_context(context: AddressContext<Self::Root>) -> Result<(), Self::Error>;
     fn translate_live(owner: &Self::MmOwner, address: UserVa, access: Access) -> Result<Self::OwnedTranslation, Self::Error>;
     fn prepare_leaf_edit(owner: &Self::MmOwner, range: UserRange, translation: Self::OwnedTranslation) -> Result<Self::LeafEdit, Self::Error>;
@@ -391,6 +396,7 @@ arch_trait!(InterruptArch, InterruptBackend {
     fn current_cpu() -> CpuId;
 });
 arch_trait!(CrossingArch, CrossingBackend {
+    fn yield_host_effect() -> Result<(), Self::Error>;
     fn submit_host_request(request: OwnedHostRequest<Self::HostPayload>) -> Result<RequestToken<Self::HostTicket>, Self::Error>;
     fn consume_completion(token: RequestToken<Self::HostTicket>) -> Result<Self::HostCompletion, Self::Error>;
     fn leave_idle() -> Result<(), Self::Error>;
