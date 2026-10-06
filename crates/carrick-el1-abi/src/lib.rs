@@ -24,6 +24,8 @@ mod cow_grants;
 pub use cow_grants::*;
 mod descriptor_txn;
 pub use descriptor_txn::*;
+mod guest_mmu_publication;
+pub use guest_mmu_publication::*;
 mod delegated_notification;
 pub use delegated_notification::*;
 mod mm_portal;
