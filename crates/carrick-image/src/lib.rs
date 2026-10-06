@@ -101,7 +101,6 @@ use oci_client::manifest::{
     OciImageManifest,
 };
 use oci_client::secrets::RegistryAuth;
-use serde::{Deserialize as _, Serialize as _};
 use tokio::fs;
 
 pub use carrick_spec::{ImageConfig, ImageReference, OciBootstrapError};
@@ -214,7 +213,7 @@ impl ImageStore {
         image: &ImageReference,
         target: &PlatformTarget,
     ) -> Result<PullSummary, OciBootstrapError> {
-        let bytes = fs::read(self.image_summary_path_for(image, target)).await?;
+        let bytes = ::tokio::fs::read(self.image_summary_path_for(image, target)).await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
@@ -222,7 +221,7 @@ impl ImageStore {
         &self,
         image: &ImageReference,
     ) -> Result<PullSummary, OciBootstrapError> {
-        let bytes = fs::read(self.image_summary_path(image)).await?;
+        let bytes = ::tokio::fs::read(self.image_summary_path(image)).await?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 }
@@ -472,7 +471,7 @@ pub async fn pull_image_with_platform(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::write(&path, &layer.data).await?;
+        ::tokio::fs::write(&path, &layer.data).await?;
         layers.push(LayerSummary {
             digest,
             media_type: layer.media_type,
@@ -483,9 +482,9 @@ pub async fn pull_image_with_platform(
 
     let image_dir = store.image_dir_for(image, target);
     fs::create_dir_all(&image_dir).await?;
-    fs::write(image_dir.join("config.json"), data.config.data).await?;
+    ::tokio::fs::write(image_dir.join("config.json"), data.config.data).await?;
     if let Some(manifest) = data.manifest {
-        fs::write(
+        ::tokio::fs::write(
             image_dir.join("manifest.json"),
             serde_json::to_vec_pretty(&manifest)?,
         )
@@ -499,7 +498,7 @@ pub async fn pull_image_with_platform(
         config_size,
         layers,
     };
-    fs::write(
+    ::tokio::fs::write(
         summary.image_dir.join("carrick-image.json"),
         serde_json::to_vec_pretty(&summary)?,
     )
@@ -683,7 +682,7 @@ impl ImageStore {
         };
 
         let image_dir = summary.image_dir.clone();
-        let layer_summaries = match fs::read(image_dir.join("manifest.json")).await {
+        let layer_summaries = match ::tokio::fs::read(image_dir.join("manifest.json")).await {
             Ok(manifest_bytes) => {
                 let manifest = serde_json::from_slice::<OciImageManifest>(&manifest_bytes)?;
                 layer_summaries_in_manifest_order(&manifest, summary.layers)?
@@ -698,7 +697,7 @@ impl ImageStore {
             .collect();
 
         let config_path = image_dir.join("config.json");
-        let config = match fs::read(&config_path).await {
+        let config = match ::tokio::fs::read(&config_path).await {
             Ok(config_bytes) => serde_json::from_slice::<OciImageConfigContainer>(&config_bytes)
                 .map(|c| c.into_image_config())
                 .unwrap_or_default(),

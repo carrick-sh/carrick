@@ -1221,7 +1221,7 @@ pub fn atomic_permit_enabled() -> bool {
         2 => false,
         _ => {
             let on = atomic_permit_enabled_from_env(
-                std::env::var("CARRICK_HVF_ATOMIC_PERMIT").ok().as_deref(),
+                ::std::env::var("CARRICK_HVF_ATOMIC_PERMIT").ok().as_deref(),
             );
             FLAG.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
@@ -1232,7 +1232,7 @@ pub fn atomic_permit_enabled() -> bool {
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(super) fn admission_trace_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CARRICK_HVF_ADMISSION_TRACE").is_some())
+    *ON.get_or_init(|| ::std::env::var_os("CARRICK_HVF_ADMISSION_TRACE").is_some())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1467,7 +1467,7 @@ pub fn fpsimd_save_enabled() -> bool {
         1 => true,
         2 => false,
         _ => {
-            let on = std::env::var_os("CARRICK_NO_FPSIMD").is_none();
+            let on = ::std::env::var_os("CARRICK_NO_FPSIMD").is_none();
             FLAG.store(if on { 1 } else { 2 }, Ordering::Relaxed);
             on
         }
@@ -4348,7 +4348,7 @@ impl HvpatchTaskMmAuthority {
 
     /// Is this authority the `Active` owner of a published inventory?
     fn owns_active_inventory(&self) -> bool {
-        matches!(
+        ::std::matches!(
             &*self.inventory.lock(),
             HvpatchTaskInventoryAuthority::Active { .. }
         )
@@ -6593,7 +6593,7 @@ impl HvpatchCarrierTaskStateDirectory {
                         frames: std::sync::Arc::clone(
                             carrier_frames
                                 .as_ref()
-                                .unwrap_or_else(|| std::process::abort()),
+                                .unwrap_or_else(|| ::std::process::abort()),
                         ),
                     })),
                     None,

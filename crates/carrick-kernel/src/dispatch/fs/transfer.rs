@@ -222,7 +222,7 @@ impl<'a> FsView<'a> {
         let n = unsafe {
             // BLOCKING-IO-OK: HostPipe fds are adopted O_NONBLOCK and `avail`
             // was measured immediately before the read.
-            libc::read(
+            ::libc::read(
                 in_read.get(),
                 buf.as_mut_ptr().cast::<libc::c_void>(),
                 avail,
@@ -248,7 +248,7 @@ impl<'a> FsView<'a> {
                 let w = unsafe {
                     // BLOCKING-IO-OK: the source pipe was just drained, so this
                     // bounded restore writes back into known room.
-                    libc::write(
+                    ::libc::write(
                         write_fd.get(),
                         buf[off..].as_ptr().cast::<libc::c_void>(),
                         buf.len() - off,
@@ -267,7 +267,7 @@ impl<'a> FsView<'a> {
             let w = unsafe {
                 // BLOCKING-IO-OK: HostPipe fds are adopted O_NONBLOCK; a full
                 // destination returns EAGAIN and is handled below.
-                libc::write(
+                ::libc::write(
                     out_write.get(),
                     buf[written..copy_len].as_ptr().cast::<libc::c_void>(),
                     copy_len - written,
@@ -508,7 +508,7 @@ impl<'a> FsView<'a> {
         // BLOCKING-IO-OK: the host fd is O_NONBLOCK by construction; EAGAIN is
         // classified below rather than reaching the guest raw.
         let n = unsafe {
-            libc::read(
+            ::libc::read(
                 host_fd.get(),
                 buf.as_mut_ptr().cast::<libc::c_void>(),
                 count,

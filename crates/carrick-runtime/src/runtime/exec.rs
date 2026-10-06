@@ -193,7 +193,7 @@ pub(crate) fn load_execve_image(
     // to the matching HOST binary. See `SyscallDispatcher::exec_host_fs_fallback`.
     let host_read = |p: &str| -> Option<Vec<u8>> {
         if host_fallback {
-            std::fs::read(p).ok()
+            ::std::fs::read(p).ok()
         } else {
             None
         }

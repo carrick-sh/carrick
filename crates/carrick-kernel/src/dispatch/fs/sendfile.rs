@@ -13,7 +13,7 @@ use crate::linux_abi::LinuxErrno;
 fn darwin_copyfile_fast_path_disabled() -> bool {
     static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DISABLED.get_or_init(|| {
-        std::env::var_os("CARRICK_DARWIN_COPYFILE_FAST_PATH").is_some_and(|value| value == "0")
+        ::std::env::var_os("CARRICK_DARWIN_COPYFILE_FAST_PATH").is_some_and(|value| value == "0")
     })
 }
 

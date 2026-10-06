@@ -132,7 +132,7 @@ const EXEC_PRIVATE_FILE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn exec_private_file_cache_enabled() -> bool {
-    std::env::var_os("CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE").as_deref()
+    ::std::env::var_os("CARRICK_HVPATCH_EXEC_PRIVATE_FILE_CACHE").as_deref()
         != Some(std::ffi::OsStr::new("0"))
 }
 
@@ -158,7 +158,7 @@ fn create_exec_private_file_artifact(
     }
     static NEXT_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let sequence = NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
+    let path = ::std::env::temp_dir().join(format!(
         ".carrick-hvpatch-exec-{}-{sequence}",
         std::process::id()
     ));
@@ -267,7 +267,7 @@ pub(crate) fn attach_exec_private_file_backings(
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn lazy_exec_page_tables_enabled() -> bool {
-    std::env::var_os("CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES").as_deref()
+    ::std::env::var_os("CARRICK_HVPATCH_LAZY_EXEC_PAGE_TABLES").as_deref()
         != Some(std::ffi::OsStr::new("0"))
 }
 
@@ -276,9 +276,10 @@ impl GuestMappingPlan {
         // Default to sharing immutable ELF payloads between the loaded image and
         // mapping plan. The =0 hatch restores the pre-optimization copy so one
         // signed binary can perform a schedule-identical liveness bisection.
-        let share_payload = std::env::var_os("CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD").as_deref()
+        let share_payload = ::std::env::var_os("CARRICK_HVPATCH_SHARE_EXEC_PAYLOAD").as_deref()
             != Some(std::ffi::OsStr::new("0"));
-        let sparse_initial_stack = std::env::var_os("CARRICK_HVPATCH_SPARSE_EXEC_STACK").as_deref()
+        let sparse_initial_stack = ::std::env::var_os("CARRICK_HVPATCH_SPARSE_EXEC_STACK")
+            .as_deref()
             != Some(std::ffi::OsStr::new("0"));
         let initial_stack_pointer = address_space.initial_stack_pointer();
         let mut mappings = Vec::with_capacity(address_space.regions().len());
@@ -637,7 +638,7 @@ impl HvfVmState {
                     .filter(|mapping| !is_sparse_hvpatch_mmap_mapping(mapping))
                 {
                     #[cfg(feature = "trace-hvf")]
-                    eprintln!(
+                    ::std::eprintln!(
                         "MAP guest_start=0x{:x} mapped_size=0x{:x} payload_size=0x{:x} perms=r{}w{}x{}",
                         mapping.guest_start,
                         mapping.mapped_size,

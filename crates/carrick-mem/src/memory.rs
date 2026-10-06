@@ -198,7 +198,6 @@ use crate::linux_abi::{
     align_down_usize, align_up_u64,
 };
 use carrick_guest_mem::{CurrentMmMemory, Gpa, GuestMemory, MemoryError};
-use serde::Serialize as _;
 use zerocopy::IntoBytes;
 
 // Guest layout for the bootstrap process. HVF on Apple Silicon limits the
@@ -1427,10 +1426,12 @@ impl AddressSpace {
     pub fn load_elf_for(path: impl AsRef<Path>, machine: u16) -> Result<Self, AddressSpaceError> {
         let path = path.as_ref();
         let plan = plan_elf_load_for(path, machine)?;
-        let file = fs::read(path)?;
+        let file = ::std::fs::read(path)?;
         Ok(
-            Self::load_elf_segments_with_interpreter(&file, plan, machine, &|p| fs::read(p).ok())?
-                .with_main_file_path(path.to_string_lossy()),
+            Self::load_elf_segments_with_interpreter(&file, plan, machine, &|p| {
+                ::std::fs::read(p).ok()
+            })?
+            .with_main_file_path(path.to_string_lossy()),
         )
     }
 
@@ -5951,7 +5952,7 @@ pub fn el1_vectors_bytes_mailbox_clock(
 }
 
 fn linux_runtime_regions() -> Result<Vec<MemoryRegion>, AddressSpaceError> {
-    Ok(vec![
+    Ok(::std::vec![
         MemoryRegion {
             start: LINUX_SIGRETURN_TRAMPOLINE_BASE,
             end: LINUX_SIGRETURN_TRAMPOLINE_BASE + LINUX_SIGRETURN_TRAMPOLINE_SIZE,

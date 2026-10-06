@@ -2328,9 +2328,9 @@ fn run_amplification_compare_to(
     // Identical inputs are NOT refused, unlike `jit-shape-compare`'s: a
     // ledger differenced against itself must report exact zeros, and that is
     // the cheapest available check that the arithmetic is exact.
-    let a_bytes = fs::read(a_path)
+    let a_bytes = ::std::fs::read(a_path)
         .with_context(|| format!("read amplification ledger A {}", a_path.display()))?;
-    let b_bytes = fs::read(b_path)
+    let b_bytes = ::std::fs::read(b_path)
         .with_context(|| format!("read amplification ledger B {}", b_path.display()))?;
     let report = build_comparison(&a_bytes, &b_bytes)?;
     let bytes = serialize_comparison(&report)?;

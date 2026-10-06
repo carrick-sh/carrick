@@ -38,8 +38,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize as _, Serialize as _};
-
 use super::dto::{KernelDebugSnapshot, KernelDebugTable};
 use crate::kernel::core::Kernel;
 

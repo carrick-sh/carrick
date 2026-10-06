@@ -134,7 +134,7 @@ impl HvpatchCoreSummary {
     ) -> Result<Self> {
         let contents = fs::read_to_string(path)
             .with_context(|| format!("read HVPatch core stream {}", path.display()))?;
-        let artifact = fs::read(artifact_path).with_context(|| {
+        let artifact = ::std::fs::read(artifact_path).with_context(|| {
             format!(
                 "read explicitly supplied HVPatch core artifact {}",
                 artifact_path.display()
@@ -389,9 +389,13 @@ impl HvpatchCoreSummary {
 
     #[cfg(target_os = "macos")]
     pub(crate) fn render_human(self) -> String {
-        format!(
+        ::std::format!(
             "HVPatch core: generation={}, pid={}, tid={}, threads={}, bytes={}",
-            self.generation, self.pid, self.tid, self.threads, self.bytes
+            self.generation,
+            self.pid,
+            self.tid,
+            self.threads,
+            self.bytes
         )
     }
 }

@@ -2121,7 +2121,7 @@ pub(crate) fn container_to_json(c: &ContainerState, status: ContainerStatus) -> 
         .split_first()
         .map(|(p, a)| (p.clone(), a.to_vec()))
         .unwrap_or_default();
-    serde_json::json!({
+    ::serde_json::json!({
         "Id": c.id,
         "Name": format!("/{}", c.name.as_deref().unwrap_or("")),
         "Image": c.image,

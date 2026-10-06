@@ -24,7 +24,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .save(0),
         )];
         for _ in 0..scale {
-            script.push(Step::Sys(sys::write(slot(0), &[0x5a; 64]).ret(64)));
+            script.push(Step::Sys(
+                ::carrick_kernel_example::sys::write(slot(0), &[0x5a; 64]).ret(64),
+            ));
             script.push(Step::Sys(
                 Syscall::new(
                     "rewind",

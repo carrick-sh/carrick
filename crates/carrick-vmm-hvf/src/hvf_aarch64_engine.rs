@@ -1034,7 +1034,7 @@ impl Aarch64Vcpu for HvfAarch64Vcpu {
     fn returns_syscalls_through_resume_invalidation(&self) -> bool {
         // Mailbox transport installs the mailbox vectors, which carry the
         // resume-invalidation entry; the legacy transport does not.
-        matches!(&self.backing, HvfVcpuBacking::Live(live)
+        ::std::matches!(&self.backing, HvfVcpuBacking::Live(live)
             if live.mailbox.transport() == HvfSyscallTransport::Mailbox)
     }
 

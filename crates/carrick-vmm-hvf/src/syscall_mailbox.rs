@@ -443,7 +443,7 @@ impl MailboxBinding {
                 state,
                 session: self.read_portal_session(),
                 native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
-                args: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).args)),
+                args: core::ptr::read_volatile(::core::ptr::addr_of!((*mailbox).args)),
             })
         }
     }
@@ -553,7 +553,7 @@ impl MailboxBinding {
             let saved = active || pc >= layout.completion;
             let mut registers = Vec::new();
             let (resume_pc, pstate) = if saved {
-                let args = core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).args));
+                let args = core::ptr::read_volatile(::core::ptr::addr_of!((*mailbox).args));
                 registers.extend(args.into_iter().enumerate().map(|(i, v)| (i as u32, v)));
                 registers.extend([
                     (
@@ -752,7 +752,7 @@ impl MailboxBinding {
                 )),
                 flags: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).flags)),
                 native_nr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
-                args: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).args)),
+                args: core::ptr::read_volatile(::core::ptr::addr_of!((*mailbox).args)),
                 x8: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).native_nr)),
                 resume_pc: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).resume_pc)),
                 spsr: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).spsr)),
@@ -791,7 +791,7 @@ impl MailboxBinding {
                 core::ptr::addr_of_mut!((*mailbox).native_nr),
                 parked.native_nr,
             );
-            self.write_volatile(core::ptr::addr_of_mut!((*mailbox).args), parked.args);
+            self.write_volatile(::core::ptr::addr_of_mut!((*mailbox).args), parked.args);
             self.write_volatile(
                 core::ptr::addr_of_mut!((*mailbox).resume_pc),
                 parked.resume_pc,
@@ -969,7 +969,7 @@ impl MailboxBinding {
                 state,
                 trap_kind: core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).trap_kind)),
             };
-            let args = core::ptr::read_volatile(core::ptr::addr_of!((*mailbox).args));
+            let args = core::ptr::read_volatile(::core::ptr::addr_of!((*mailbox).args));
             let request = MailboxRequest {
                 frame: Aarch64SyscallFrame {
                     x0: args[0],

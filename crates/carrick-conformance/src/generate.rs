@@ -833,7 +833,7 @@ pub fn generate_suites(out_path: &Path, check_only: bool) -> anyhow::Result<()> 
         # re-run after a container update. tier=smoke -> fast gate\n\
         # (just conformance-quick); tier=full -> 100% coverage.\n\n";
     let body = toml::to_string(&Manifest { suite })?;
-    std::fs::write(out_path, format!("{header}{body}"))?;
+    ::std::fs::write(out_path, format!("{header}{body}"))?;
     eprintln!("wrote {} ({total} suites)", out_path.display());
     Ok(())
 }

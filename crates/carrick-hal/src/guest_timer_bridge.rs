@@ -156,7 +156,7 @@ pub fn register_kicker(
     main_tid: ThreadId,
     wake: Box<dyn Fn() + Send + Sync>,
 ) {
-    *lock() = Some(Delivery {
+    *crate::guest_timer_bridge::lock() = Some(Delivery {
         kicker,
         wake,
         main_tid,
@@ -169,7 +169,7 @@ pub fn register_kicker(
 /// timer). No-op if no run loop has registered (e.g. a unit test exercising
 /// arm/disarm only).
 pub fn deliver(signum: i32) {
-    if let Some(d) = lock().as_ref() {
+    if let Some(d) = crate::guest_timer_bridge::lock().as_ref() {
         carrick_signal_linux::publish_process_signal(signum);
         d.kicker.kick_all();
         (d.wake)();

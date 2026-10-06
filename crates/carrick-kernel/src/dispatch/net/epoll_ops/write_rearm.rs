@@ -27,7 +27,7 @@ impl IoRearm {
     pub(in crate::dispatch) fn new(target: Option<Arc<crate::kernel::FileDescription>>) -> Self {
         // epoll_ctl requires a table-backed target. None deliberately records
         // that bare stdio needs no rearm, not permission for a later fd lookup.
-        Self::write(target)
+        crate::dispatch::net::IoRearm::write(target)
     }
 
     pub(in crate::dispatch) fn write(target: Option<Arc<crate::kernel::FileDescription>>) -> Self {

@@ -229,12 +229,12 @@ pub struct ThreadWaiter {
 /// wait path must delete that registration and fall back to bounded polling.
 #[cfg(target_os = "macos")]
 fn wake_pipe_read_kevent(fd: RawFd) -> Kevent {
-    Kevent::read(fd, libc::EV_ADD | libc::EV_CLEAR)
+    crate::darwin_kqueue::Kevent::read(fd, libc::EV_ADD | libc::EV_CLEAR)
 }
 
 #[cfg(target_os = "macos")]
 fn delete_wake_pipe_registration(kq: &Kqueue, fd: RawFd) {
-    let _ = kq.apply(&[Kevent::read(fd, libc::EV_DELETE)]);
+    let _ = kq.apply(&[crate::darwin_kqueue::Kevent::read(fd, libc::EV_DELETE)]);
 }
 
 #[cfg(target_os = "macos")]
@@ -599,10 +599,10 @@ impl ThreadWaiter {
         let mut changes: Vec<Kevent> = Vec::with_capacity(fds.len() * 2);
         for &(fd, events) in fds {
             if events & libc::POLLIN != 0 {
-                changes.push(Kevent::read(fd, libc::EV_ADD));
+                changes.push(crate::darwin_kqueue::Kevent::read(fd, libc::EV_ADD));
             }
             if events & libc::POLLOUT != 0 {
-                changes.push(Kevent::write(fd, libc::EV_ADD));
+                changes.push(crate::darwin_kqueue::Kevent::write(fd, libc::EV_ADD));
             }
         }
         let cap = (changes.len() + self.signal_pipe_count()).max(1);
@@ -715,10 +715,10 @@ impl ThreadWaiter {
         let mut deletes: Vec<Kevent> = Vec::with_capacity(fds.len() * 2);
         for &(fd, events) in fds {
             if events & libc::POLLIN != 0 {
-                deletes.push(Kevent::read(fd, libc::EV_DELETE));
+                deletes.push(crate::darwin_kqueue::Kevent::read(fd, libc::EV_DELETE));
             }
             if events & libc::POLLOUT != 0 {
-                deletes.push(Kevent::write(fd, libc::EV_DELETE));
+                deletes.push(crate::darwin_kqueue::Kevent::write(fd, libc::EV_DELETE));
             }
         }
         let zero = libc::timespec {

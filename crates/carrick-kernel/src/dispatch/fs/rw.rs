@@ -930,7 +930,7 @@ impl<'a> FsView<'a> {
                     if host_wait_ref.is_some() {
                         super::resources::stage_io_rearm(
                             cx.kernel,
-                            super::net::IoRearm::read(None),
+                            crate::dispatch::net::IoRearm::read(None),
                         )?;
                     }
                     return read_host_pipe(
@@ -1024,7 +1024,7 @@ impl<'a> FsView<'a> {
             if host_wait_ref.is_some() {
                 super::resources::stage_io_rearm(
                     cx.kernel,
-                    super::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
+                    crate::dispatch::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
                 )?;
             }
             let _read_lease = if open_file.description.inspect_kind(|open| matches!(
@@ -1525,7 +1525,7 @@ impl<'a> FsView<'a> {
             if host_wait_ref.is_some() {
                 super::resources::stage_io_rearm(
                     cx.kernel,
-                    super::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
+                    crate::dispatch::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
                 )?;
             }
             let nonblocking = this.io_is_nonblocking(fd.0, 0);
@@ -1900,7 +1900,7 @@ impl<'a> FsView<'a> {
             if host_wait_ref.is_some() {
                 super::resources::stage_io_rearm(
                     cx.kernel,
-                    super::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
+                    crate::dispatch::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
                 )?;
             }
             let Some(open) = open_file.description.read_for_io() else {
@@ -2102,7 +2102,7 @@ impl<'a> FsView<'a> {
             if host_wait_ref.is_some() {
                 super::resources::stage_io_rearm(
                     cx.kernel,
-                    super::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
+                    crate::dispatch::net::IoRearm::read(Some(Arc::clone(&open_file.description))),
                 )?;
             }
             let Some(open) = open_file.description.read_for_io() else {
@@ -2306,7 +2306,7 @@ impl<'a> FsView<'a> {
             if cx.can_host_wait() {
                 super::resources::stage_io_rearm(
                     cx.kernel,
-                    super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
+                    crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
                 )?;
             }
             let Some(open) = open_file.description.write_for_io() else {
@@ -2561,7 +2561,7 @@ impl<'a> FsView<'a> {
             if cx.can_host_wait() {
                 super::resources::stage_io_rearm(
                     cx.kernel,
-                    super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
+                    crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
                 )?;
             }
             let Some(mut open) = open_file.description.write_for_io() else {
@@ -3008,7 +3008,7 @@ impl<'a> FsView<'a> {
                 if cx.can_host_wait() {
                     super::resources::stage_io_rearm(
                         cx.kernel,
-                        super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
+                        crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
                     )?;
                 }
                 let Some(io_lease) = open_file.description.retain_fd_lease() else {
@@ -3621,7 +3621,7 @@ impl<'a> FsView<'a> {
                 if cx.can_host_wait() {
                     super::resources::stage_io_rearm(
                         cx.kernel,
-                        super::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
+                        crate::dispatch::net::IoRearm::write(Some(Arc::clone(&open_file.description))),
                     )?;
                 }
                 let open = open_file.description.read_for_io();

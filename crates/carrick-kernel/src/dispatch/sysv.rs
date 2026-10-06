@@ -1677,7 +1677,8 @@ impl SysvWaitState {
     fn for_tests(blocked_id: i32) -> Result<Self, LinuxErrno> {
         let file = tempfile::NamedTempFile::new().map_err(|_| LINUX_EINVAL)?;
         let queue_path = file.path().to_path_buf();
-        std::fs::write(&queue_path, vec![0u8; MSG_QUEUE_HEADER_SIZE]).map_err(|_| LINUX_EINVAL)?;
+        ::std::fs::write(&queue_path, vec![0u8; MSG_QUEUE_HEADER_SIZE])
+            .map_err(|_| LINUX_EINVAL)?;
         let word = Arc::new(MsgQueueWaitWord::open(&queue_path)?);
         Ok(Self {
             blocked_id,
@@ -3197,7 +3198,7 @@ fn msgget_open(
         path
     };
     let queue = MsgQueueFile::new(id, key.raw(), mode, creds);
-    std::fs::write(&path, queue.serialize()).map_err(|_| LINUX_EIO)?;
+    ::std::fs::write(&path, queue.serialize()).map_err(|_| LINUX_EIO)?;
     state.message_queues.insert(
         id,
         Arc::new(MsgQueueEntry {

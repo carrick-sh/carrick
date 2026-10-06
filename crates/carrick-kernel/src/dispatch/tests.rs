@@ -8499,9 +8499,9 @@ fn a_backing_with_no_open_description_answers_generic_questions_without_aborting
     );
     assert_eq!(description.common().fd_refs(), 0);
     assert!(!description.is_epoll());
-    assert!(description.open_description().is_none());
-    assert!(description.read_for_io().is_none());
-    assert!(description.write_for_io().is_none());
+    ::std::assert!(description.open_description().is_none());
+    ::std::assert!(description.read_for_io().is_none());
+    ::std::assert!(description.write_for_io().is_none());
 
     // Exercise retain_fd_ref() and release_fd_ref() directly on FileDescription,
     // asserting common counts after each and proving default no-op hooks make a third backing valid.
@@ -8660,7 +8660,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
             state.writers, 1,
             "intermediate close must retain backing writer count"
         );
-        assert!(
+        ::std::assert!(
             matches!(&*write_desc.read(), OpenDescription::PipeWriter { .. }),
             "intermediate close must not close the OpenDescription backing"
         );
@@ -8680,7 +8680,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
             state.writers, 0,
             "final release must decrement backing writer count to 0"
         );
-        assert!(
+        ::std::assert!(
             matches!(&*write_desc.read(), OpenDescription::Closed { .. }),
             "final release must transition OpenDescription to Closed"
         );
@@ -8699,7 +8699,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
             state.readers, 1,
             "intermediate close must retain backing reader count"
         );
-        assert!(
+        ::std::assert!(
             matches!(&*read_desc.read(), OpenDescription::PipeReader { .. }),
             "intermediate close must not close reader OpenDescription backing"
         );
@@ -8714,7 +8714,7 @@ fn pipe_lifecycle_tracks_logical_fd_references_across_dup_and_close() {
             pipe.is_retired(),
             "final release retires the shared incarnation"
         );
-        assert!(
+        ::std::assert!(
             matches!(&*read_desc.read(), OpenDescription::Closed { .. }),
             "final release must transition reader OpenDescription to Closed"
         );

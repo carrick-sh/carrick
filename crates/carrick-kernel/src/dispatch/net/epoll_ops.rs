@@ -410,7 +410,7 @@ impl<'a> NetView<'a> {
         let Some(open_file) = self.open_file(fd) else {
             return false;
         };
-        matches!(
+        ::std::matches!(
             open_file.description.inspect().as_deref(),
             Some(OpenDescription::HostSocket { base, .. } | OpenDescription::InMemorySocket { base, .. }) if base.listening()
         )
@@ -418,7 +418,7 @@ impl<'a> NetView<'a> {
 
     pub(super) fn interest_is_connected_host_socket(&self, slot: &EpollInterest, fd: i32) -> bool {
         let is_host_connected = |desc: &crate::kernel::FileDescription| {
-            matches!(
+            ::std::matches!(
                 desc.inspect().as_deref(),
                 Some(OpenDescription::HostSocket { base, .. }) if !base.listening()
             )

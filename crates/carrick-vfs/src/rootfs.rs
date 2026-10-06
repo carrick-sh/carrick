@@ -93,7 +93,6 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use flate2::read::GzDecoder;
-use serde::Serialize as _;
 
 use crate::fs_backend::{FsBackend, HostFsBackend, ImmutableHostFileOpen, RealStat};
 
@@ -1968,7 +1967,7 @@ fn note_lower_miss(host: &ImmutableHostRoot, normalized: &Path) {
     // A parent already proven absent — by its own memoised negative lookup
     // or by ITS parent's listing — needs no miss count: the first name
     // beneath it settles the whole directory.
-    let parent_known_absent = matches!(
+    let parent_known_absent = ::std::matches!(
         host.dcache.lock().get(&(parent.to_path_buf(), false)),
         Some(None)
     ) || lower_listing_says_absent(host, parent);
@@ -2095,7 +2094,7 @@ fn host_dir_entry(
 
 impl LayerSource {
     pub fn from_path(path: &Path) -> Result<Self, RootFsError> {
-        let bytes = fs::read(path)?;
+        let bytes = ::std::fs::read(path)?;
         if bytes.starts_with(&[0x1f, 0x8b]) {
             Ok(Self::TarGz(bytes))
         } else {

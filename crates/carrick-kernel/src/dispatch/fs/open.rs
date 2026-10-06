@@ -19,7 +19,7 @@ use std::sync::Arc;
 fn trusted_fs_lane_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var_os("CARRICK_FS_TRUSTED_LANE").as_deref() != Some(std::ffi::OsStr::new("0"))
+        ::std::env::var_os("CARRICK_FS_TRUSTED_LANE").as_deref() != Some(std::ffi::OsStr::new("0"))
     })
 }
 

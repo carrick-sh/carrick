@@ -79,8 +79,6 @@ pub use deferred_anonymous::{
     DeferredAnonymousTransition, DeferredPrivateFileSnapshot, DeferredPrivateFileTransition,
 };
 
-use serde::{Deserialize as _, Serialize as _};
-
 pub const HOST_PAGE_GRANULE: u64 = 0x4000; // 16 KiB: the host page granule every lane shares today.
 
 /// Neutral guest-memory region lookup + the combined PROT_NONE/region access

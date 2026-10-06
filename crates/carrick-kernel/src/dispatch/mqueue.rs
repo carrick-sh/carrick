@@ -528,7 +528,7 @@ impl<'a> IpcView<'a> {
             .get(&fd)
             .map(crate::kernel::FileSlot::description)
             .ok_or(LINUX_EBADF)?;
-        let is_netlink = matches!(
+        let is_netlink = ::std::matches!(
             description.inspect().as_deref(),
             Some(OpenDescription::Netlink { .. })
         );

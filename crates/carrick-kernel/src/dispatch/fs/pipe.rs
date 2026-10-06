@@ -565,10 +565,10 @@ impl PipeInner {
     ) {
         if let Some((r, w)) = channel.get().and_then(Option::as_ref) {
             if ready && !*notified {
-                let _ = unsafe { libc::write(w.raw(), [1u8].as_ptr().cast(), 1) };
+                let _ = unsafe { ::libc::write(w.raw(), [1u8].as_ptr().cast(), 1) };
             } else if !ready && *notified {
                 let mut bytes = [0u8; 32];
-                let _ = unsafe { libc::read(r.raw(), bytes.as_mut_ptr().cast(), bytes.len()) };
+                let _ = unsafe { ::libc::read(r.raw(), bytes.as_mut_ptr().cast(), bytes.len()) };
             }
             *notified = ready;
         }
