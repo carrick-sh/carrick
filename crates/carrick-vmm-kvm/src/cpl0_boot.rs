@@ -94,6 +94,19 @@ pub struct Observation {
     pub preserved_rbx: u64,
 }
 
+/// Stopped-vCPU structural observation, including refusal paths that cannot
+/// return through the guest observation syscall. No semantic host service.
+#[derive(Debug)]
+pub struct EntryState {
+    pub bindings: [carrick_el1_abi::ExecutionBinding; 2],
+    pub heads: [(u64, u32); 2],
+    pub entries: [u64; 2],
+    pub publications: [u64; 2],
+    pub completions: [u64; 2],
+    pub served: u64,
+    pub host_forwards: u64,
+}
+
 /// The vCPUs drop before the VM, and its registered backing drops last.
 /// No run handle or host pointer escapes this fixture owner.
 pub struct Cpl0Carrier {
@@ -409,6 +422,82 @@ impl Cpl0Carrier {
     pub(crate) fn slot(&self, index: usize) -> &ThreadControlSlot {
         self.metadata(CONTROL_OFFSET + index as u64 * STRIDE)
     }
+    /// Qualify separate exact task/MM owners, even with reused visible IDs.
+    /// All vCPUs are stopped under this exclusively borrowed fixture carrier.
+    pub fn bind_execution(
+        &mut self,
+        index: usize,
+        binding: carrick_el1_abi::ExecutionBinding,
+    ) -> Result<(), TrapError> {
+        if index >= 2
+            || !binding.issued()
+            || binding.mm.raw() == 0
+            || binding.thread_generation.raw() == 0
+        {
+            return Err(fail("invalid CPL0 fixture execution binding"));
+        }
+        let tid = i32::try_from(binding.task.raw()).map_err(|_| fail("fixture task range"))?;
+        let page_offset = index as u64 * 0x4000;
+        let slot_offset = CONTROL_OFFSET + index as u64 * STRIDE;
+        // SAFETY: exclusively stopped fixture vCPUs, initialized retained and
+        // aligned metadata. Neither page/control reference escapes the owner;
+        // each task's fresh page and control slot occupy disjoint metadata.
+        unsafe {
+            self.metadata_base
+                .as_ptr()
+                .add(page_offset as usize)
+                .cast::<ThreadLifecyclePage>()
+                .write(ThreadLifecyclePage::new());
+            self.metadata_base
+                .as_ptr()
+                .add(slot_offset as usize)
+                .cast::<ThreadControlSlot>()
+                .write(ThreadControlSlot::new());
+        }
+        if !self.slot(index).publish_visible_tid(tid as u32) {
+            return Err(fail("fixture visible task publication"));
+        }
+        let task = self.task(index);
+        task.set(El1TaskId::from_linux_tid(tid), binding.generation.raw(), 5);
+        task.mm.key.store(binding.mm.raw(), Ordering::Release);
+        task.mm
+            .thread_generation
+            .store(binding.thread_generation.raw(), Ordering::Release);
+        task.publish_lifecycle(
+            EL1_DYNAMIC_METADATA_BASE + page_offset,
+            EL1_DYNAMIC_METADATA_BASE + slot_offset,
+        );
+        Ok(())
+    }
+
+    pub fn unload_execution(&mut self, index: usize) -> Result<(), TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 task"));
+        }
+        self.task(index).clear();
+        Ok(())
+    }
+
+    pub fn entry_state(&self) -> EntryState {
+        let counters: &Counters = self.metadata(COUNTERS_OFFSET);
+        EntryState {
+            bindings: core::array::from_fn(|i| {
+                let task = self.task(i);
+                carrick_core::entry::binding(&task.execution, &task.mm)
+            }),
+            heads: [self.slot(0).robust_list(), self.slot(1).robust_list()],
+            entries: core::array::from_fn(|i| self.binding(i).entries.load(Ordering::Acquire)),
+            publications: core::array::from_fn(|i| {
+                self.binding(i).publications.load(Ordering::Acquire)
+            }),
+            completions: core::array::from_fn(|i| {
+                self.binding(i).completions.load(Ordering::Acquire)
+            }),
+            served: counters.served[99].load(Ordering::Acquire),
+            host_forwards: self.host_forwards,
+        }
+    }
+
     pub fn inject_boundary_kicks(&mut self, index: usize) -> Result<(), TrapError> {
         if index >= 2 {
             return Err(fail("unknown CPL0 task"));

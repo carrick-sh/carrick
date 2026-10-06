@@ -184,7 +184,93 @@ fn two_live_tasks_serve_robust_lists_without_host_forwards() {
 
 #[test]
 fn x4_linux_common_entry() {
-    two_live_tasks_serve_robust_lists_without_host_forwards();
+    use carrick_el1_abi::{
+        EntryGeneration, EntryMmKey, EntryTaskKey, EntryThreadGeneration, ExecutionBinding,
+    };
+    for scale in [1_u64, 2, 8] {
+        let calls: [Vec<(u64, u64)>; 2] = core::array::from_fn(|task| {
+            (0..2 * scale)
+                .map(|round| {
+                    (
+                        0x0000_1234_0000_a000 + task as u64 * 0x1000 + round * 0x40,
+                        if round % 2 == 0 { 24 } else { 0x1_0000_0018 },
+                    )
+                })
+                .collect()
+        });
+        let a = program(&calls[0]);
+        let b = program(&calls[1]);
+        let mut carrier = Cpl0Carrier::boot(&image(), [&a, &b]).expect("X4 real KVM carrier");
+        let bindings = core::array::from_fn::<_, 2, _>(|task| ExecutionBinding {
+            task: EntryTaskKey::from_raw(41),
+            generation: EntryGeneration::from_raw(100 + task as u64),
+            mm: EntryMmKey::from_raw(77 + task as u64),
+            thread_generation: EntryThreadGeneration::from_raw(101 + task as u64),
+        });
+        for (task, binding) in bindings.into_iter().enumerate() {
+            carrier.bind_execution(task, binding).unwrap();
+        }
+        let mut heads = [(0, 0); 2];
+        let mut entries = [0; 2];
+        let mut publications = [0; 2];
+        for round in 0..2 * scale {
+            for task in 0..2 {
+                carrier.inject_boundary_kicks(task).unwrap();
+                let observed = carrier
+                    .observe(task)
+                    .expect("X4 bounded entry and native return");
+                entries[task] += 1;
+                if round % 2 == 0 {
+                    heads[task] = (calls[task][round as usize].0, 24);
+                    publications[task] += 1;
+                }
+                assert_eq!(observed.result, if round % 2 == 0 { 0 } else { -22 });
+                assert_eq!(observed.heads, heads);
+                assert_eq!(observed.entries, entries);
+                assert_eq!(
+                    observed.completions, entries,
+                    "one shared completion per native syscall"
+                );
+                assert_eq!(observed.publications, publications);
+                assert_eq!(observed.served, entries[0] + entries[1]);
+                assert_eq!(observed.forwarded, 0);
+                assert_eq!(observed.semantic_host_exits, 0, "no host Linux serving");
+                assert_eq!(observed.kicks, 2 * (entries[0] + entries[1]));
+                assert_eq!(observed.work_exits, entries[0] + entries[1]);
+                assert_eq!(observed.captured_stack, 0x3_1fe8 + task as u64 * 0x1_0000);
+                assert_eq!(observed.returned_stack, observed.captured_stack);
+                assert_eq!(observed.preserved_rbx, calls[task][round as usize].0);
+                assert_eq!(carrier.entry_state().bindings, bindings);
+            }
+        }
+    }
+    // Native numbers are not canonical ARM ordinals. Refusals never call a
+    // family or receive a synthetic host result; inspect the stopped owner.
+    for native in [39_u32, 99, 273] {
+        let mut code = program(&[(0xdead, 24)]);
+        let needle = [0xb8, 0x11, 0x01, 0, 0, 0x0f, 0x05];
+        let offset = code
+            .windows(needle.len())
+            .position(|bytes| bytes == needle)
+            .unwrap();
+        code[offset + 1..offset + 5].copy_from_slice(&native.to_le_bytes());
+        let peer = program(&[(0xbeef, 24)]);
+        let mut carrier = Cpl0Carrier::boot(&image(), [&code, &peer]).unwrap();
+        if native == 273 {
+            carrier.unload_execution(0).unwrap();
+        }
+        assert!(carrier.observe(0).is_err());
+        let stopped = carrier.entry_state();
+        assert_eq!(stopped.entries, [1, 0]);
+        assert_eq!(stopped.publications, [0, 0]);
+        assert_eq!(stopped.completions, [0, 0]);
+        assert_eq!(stopped.heads, [(0, 0); 2]);
+        assert_eq!(stopped.served, 0);
+        assert_eq!(
+            stopped.host_forwards, 1,
+            "one explicit refusal, no host emulation"
+        );
+    }
 }
 
 #[test]
