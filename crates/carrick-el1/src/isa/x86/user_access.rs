@@ -2,30 +2,13 @@
 
 use super::ArchError;
 use carrick_el1_abi::CurrentTask;
-use carrick_guest_arch::{CopyProgress, FrameGpa, GuestLen, RootGpa, UserVa};
+use carrick_guest_arch::{Access, CopyProgress, FrameGpa, GuestLen, RootGpa, UserRange, UserVa};
 use core::num::NonZeroU64;
 use core::ptr::NonNull;
 use core::sync::atomic::Ordering;
 
 /// A CPL0-only fixture syscall that exercises this shared kernel module.
 pub const USER_ACCESS_WITNESS: u64 = 0xffff_ffff_ffff_ff10;
-
-// Retained only until the MMU projection handoff in the next commit.
-#[cold]
-#[inline(never)]
-#[unsafe(no_mangle)]
-pub extern "C" fn carrick_x86_unbound_user_word() -> ! {
-    // SAFETY: the MMU trait cannot return a fabricated user word.
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
-}
-
-#[cold]
-#[inline(never)]
-#[unsafe(no_mangle)]
-pub extern "C" fn carrick_x86_unbound_user_access() -> ! {
-    // SAFETY: the MMU trait cannot publish an unchecked transfer result.
-    unsafe { core::arch::asm!("ud2", options(noreturn)) }
-}
 
 const PRESENT: u64 = 1;
 const WRITABLE: u64 = 1 << 1;
@@ -197,6 +180,26 @@ pub fn accessible_bytes(address: u64, len: usize, write: bool) -> usize {
         done += core::cmp::min(len - done, page_remaining);
     }
     done
+}
+
+/// Validate the live user permission prefix for the exact current task.
+pub fn validate(
+    owner: &CurrentTask,
+    range: UserRange,
+    access: Access,
+) -> Result<GuestLen, ArchError> {
+    if !current_task(owner) {
+        return Err(ArchError::Unbound);
+    }
+    let len = usize::try_from(range.len().raw()).map_err(|_| ArchError::Unbound)?;
+    let write = match access {
+        Access::Read => false,
+        Access::Write => true,
+        Access::Execute => return Err(ArchError::Unbound),
+    };
+    Ok(GuestLen::new(
+        accessible_bytes(range.start().raw(), len, write) as u64,
+    ))
 }
 
 fn page_allows(root: u64, va: u64, write: bool) -> bool {
@@ -495,6 +498,16 @@ pub fn witness(task: &CurrentTask, address: u64, mode: u64) -> u64 {
             Err(ArchError::InvalidWidth) => 0,
             _ => (-14_i64) as u64,
         },
+        13 => {
+            let stranger = CurrentTask::new();
+            let Some(range) = UserRange::checked(UserVa::new(address), GuestLen::new(16)) else {
+                return (-14_i64) as u64;
+            };
+            match backend.validate_user_access(&stranger, range, Access::Read) {
+                Err(ArchError::Unbound) => 0,
+                _ => (-14_i64) as u64,
+            }
+        }
         _ => (-22_i64) as u64,
     }
 }
