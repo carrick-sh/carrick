@@ -34,7 +34,7 @@
   },
   {
     "name": "serde",
-    "reason": "serde_derive 1.0.228 Serialize/Deserialize derive helper: literal metadata controls data serialization and field names; the helper does not emit authority acquisitions or raw termination. Executable arguments are rejected. Cargo.lock serde_derive, src/internals/attr.rs."
+    "reason": "serde_derive 1.0.228 Serialize/Deserialize helper: literal metadata controls serialization and field names. Callback-bearing options (default/with/serialize_with/deserialize_with) generate calls at expansion time; paths naming protected ambient/authority items are rejected as function references, including literal paths. Other executable arguments are rejected. Owned helper bodies remain production census inputs. Cargo.lock serde_derive, src/internals/attr.rs and src/de.rs."
   },
   {
     "name": "from",

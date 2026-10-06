@@ -253,7 +253,7 @@ def _tokenize(source: str) -> list[Token]:
         tokens.append(Token("PUNCT", c, start_pos))
         i += 1
 
-    return tokens
+    return census_verdict.canonical_tokens(tokens, source)
 
 
 def _strip_string_quotes(raw: str) -> str:

@@ -224,11 +224,11 @@ def lex_rust(source: str) -> list[Token]:
         tokens.append(Token("punct", char, line, i))
         i += 1
 
-    return [
+    return census_verdict.canonical_tokens([
         Token(token.kind, token.text, token.line, token.pos,
               token.pos - source.rfind("\n", 0, token.pos) - 1)
         for token in tokens
-    ]
+    ], source)
 
 
 def find_enclosing_item(tokens: Sequence[Token], target_idx: int) -> str:

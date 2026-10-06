@@ -98,6 +98,7 @@ pub struct SourceCensus {
     historical_snapshot: bool,
     source_hashes: BTreeMap<String, String>,
     classifications: BTreeMap<String, Vec<ItemClassification>>,
+    canonical_calls: BTreeMap<String, Vec<super::authority_dialect::CanonicalCall>>,
     test_files: std::collections::BTreeSet<String>,
     non_product_files: BTreeSet<String>,
     unbound_files: std::collections::BTreeSet<String>,
@@ -236,7 +237,7 @@ impl<'ast> Visit<'ast> for Classifications {
     }
 }
 
-fn source_hash(bytes: &[u8]) -> String {
+pub(super) fn source_hash(bytes: &[u8]) -> String {
     use sha2::Digest;
     format!("{:x}", sha2::Sha256::digest(bytes))
 }
@@ -1293,7 +1294,7 @@ impl<'ast> Visit<'ast> for DeclarationBodies<'_> {
     }
 }
 
-fn expression_test_only(expression: &syn::Expr) -> bool {
+pub(super) fn expression_test_only(expression: &syn::Expr) -> bool {
     macro_rules! attributes {
         ($($kind:ident),*) => { match expression { $(syn::Expr::$kind(value) => &value.attrs,)* _ => &[] } };
     }
@@ -1396,6 +1397,12 @@ impl SourceCensus {
                 root,
                 &parsed,
                 &result.vocabulary.keys().cloned().collect(),
+                &result
+                    .vocabulary
+                    .iter()
+                    .filter(|(_, kind)| **kind == AuthorityOperation::RawLock)
+                    .map(|(name, _)| name.clone())
+                    .collect(),
                 &test_files,
                 &provisional,
                 None,
@@ -1464,10 +1471,16 @@ impl SourceCensus {
         }
         let production = production_files(&parsed, &macro_references, production)?;
         if historical.is_none() {
-            crate::authority_dialect::validate(
+            result.canonical_calls = crate::authority_dialect::validate(
                 root,
                 &parsed,
                 &result.vocabulary.keys().cloned().collect(),
+                &result
+                    .vocabulary
+                    .iter()
+                    .filter(|(_, kind)| **kind == AuthorityOperation::RawLock)
+                    .map(|(name, _)| name.clone())
+                    .collect(),
                 &test_files,
                 &production,
                 Some(&resolved),
@@ -1575,6 +1588,7 @@ impl SourceCensus {
                     implementation: None,
                     implementation_type: None,
                     current_owner: None,
+                    audited_input: false,
                 };
                 scanner.visit_file(&syntax);
             }
@@ -1647,6 +1661,7 @@ impl SourceCensus {
                     "production": !self.test_files.contains(file),
                     "product_profile": !self.non_product_files.contains(file),
                     "items": self.classifications.get(file),
+                    "canonical_calls": self.canonical_calls.get(file).map(Vec::as_slice).unwrap_or_default(),
                 }),
             );
         }
@@ -1762,7 +1777,7 @@ struct AliasCollector<'a> {
     projections: &'a mut BTreeMap<String, BTreeSet<String>>,
     prefix: Vec<String>,
 }
-fn implementation_name(item: &syn::ItemImpl) -> String {
+pub(super) fn implementation_name(item: &syn::ItemImpl) -> String {
     let ty = semantic_tokens(&item.self_ty).replace(' ', "");
     if let Some((_, path, _)) = &item.trait_ {
         format!("<{ty} as {}>", semantic_tokens(&path).replace(' ', ""))
@@ -2076,6 +2091,7 @@ struct Scanner<'a> {
     implementation: Option<String>,
     implementation_type: Option<syn::Type>,
     current_owner: Option<String>,
+    audited_input: bool,
 }
 impl Scanner<'_> {
     fn owner(&mut self, name: &str, span: Span) -> String {
@@ -2165,7 +2181,12 @@ impl Scanner<'_> {
             }
             if let TokenTree::Ident(method) = &tokens[index] {
                 let method_name = method.unraw().to_string();
-                self.task_call(&method_name);
+                if self.census.historical_snapshot
+                    || matches!(tokens.get(index + 1), Some(TokenTree::Group(g)) if g.delimiter() == Delimiter::Parenthesis)
+                    || matches!(tokens.get(index + 1), Some(TokenTree::Punct(p)) if p.as_char() == ':')
+                {
+                    self.task_call(&method_name);
+                }
                 let description = index >= 2
                     && matches!(&tokens[index - 2], TokenTree::Ident(i) if i.unraw() == "description");
                 if matches!(
@@ -2437,16 +2458,45 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                 "authority macro {owner} has no compiler-resolved call owner"
             ));
         } else if item.ident.is_none() {
-            self.macro_tokens(item.mac.tokens.clone());
+            self.visit_macro(&item.mac);
         }
     }
     fn visit_impl_item_macro(&mut self, item: &'ast syn::ImplItemMacro) {
         if !test_only(&item.attrs) {
-            self.macro_tokens(item.mac.tokens.clone());
+            self.visit_macro(&item.mac);
         }
     }
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        self.macro_tokens(mac.tokens.clone());
+        // Historical bootstrap keeps the historical token census semantics;
+        // modern audits must never reinterpret the comparison-base counts.
+        if self.census.historical_snapshot {
+            self.macro_tokens(mac.tokens.clone());
+        } else if let Some(input) = super::authority_macro::parse(&mac.path, mac.tokens.clone()) {
+            let previous = self.audited_input;
+            self.audited_input = true;
+            input.visit(self);
+            self.audited_input = previous;
+        } else {
+            self.macro_tokens(mac.tokens.clone());
+        }
+    }
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = call.func.as_ref()
+            && (path.path.segments.len() > 1
+                || self
+                    .census
+                    .canonical_calls
+                    .get(&self.file)
+                    .is_some_and(|calls| {
+                        calls
+                            .iter()
+                            .any(|call| call.covers(path.span().byte_range()))
+                    }))
+            && let Some(segment) = path.path.segments.last()
+        {
+            self.task_call(&segment.ident.unraw().to_string());
+        }
+        visit::visit_expr_call(self, call);
     }
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         let method = call.method.unraw().to_string();
@@ -2457,6 +2507,8 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
             false
         };
         if self.census.vocabulary.get(&method) == Some(&AuthorityOperation::K1)
+            || (self.audited_input
+                && self.census.vocabulary.get(&method) == Some(&AuthorityOperation::DescriptionIo))
             || (description
                 && matches!(
                     self.census.vocabulary.get(&method),
@@ -2498,7 +2550,9 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
                 self.call(&operation, path.span());
             }
         }
-        if let Some(segment) = path.path.segments.last() {
+        if self.census.historical_snapshot
+            && let Some(segment) = path.path.segments.last()
+        {
             self.task_call(&segment.ident.unraw().to_string());
         }
         visit::visit_expr_path(self, path);
@@ -2507,6 +2561,14 @@ impl<'ast> Visit<'ast> for Scanner<'_> {
 
 fn census_inputs() -> BTreeMap<&'static str, String> {
     [
+        (
+            "rust-toolchain.toml",
+            include_bytes!("../../../rust-toolchain.toml").as_slice(),
+        ),
+        (
+            "crates/carrick-xtask/src/lib.rs",
+            include_bytes!("lib.rs").as_slice(),
+        ),
         (
             "Cargo.lock",
             include_bytes!("../../../Cargo.lock").as_slice(),
@@ -2530,6 +2592,14 @@ fn census_inputs() -> BTreeMap<&'static str, String> {
         (
             "scripts/migrate/authority-vocabulary.json",
             include_bytes!("../../../scripts/migrate/authority-vocabulary.json").as_slice(),
+        ),
+        (
+            "crates/carrick-xtask/src/authority_macro.rs",
+            include_bytes!("authority_macro.rs").as_slice(),
+        ),
+        (
+            "scripts/migrate/authority-macro-allowlist.json",
+            include_bytes!("../../../scripts/migrate/authority-macro-allowlist.json").as_slice(),
         ),
         (
             "scripts/migrate/authority-attribute-allowlist.json",

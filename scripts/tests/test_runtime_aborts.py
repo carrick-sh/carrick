@@ -421,11 +421,8 @@ define! {
     }
 }
 '''
-        rows = scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
-        self.assertEqual(
-            [(r.function, r.ordinal_in_function) for r in rows],
-            [("generated", 1)],
-        )
+        with self.assertRaisesRegex(Exception, "protected operation shape"):
+            scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
 
     def test_attributed_expression_leading_condition_blocks_keep_else_test_only(self):
         cases = [
@@ -680,11 +677,8 @@ fn outer() {
     items! { fn local() { std::process::abort(); } }
 }
 '''
-        rows = scan_abort_source(
-            Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source
-        )
-        self.assertEqual(len(rows), 2)
-        self.assertEqual(len({row.function for row in rows}), 2)
+        with self.assertRaisesRegex(Exception, "protected operation shape"):
+            scan_abort_source(Path("crates/carrick-runtime/src/vcpu_loop/mod.rs"), source)
 
     def test_hrtb_for_does_not_replace_pending_function_identity(self):
         source = r'''
