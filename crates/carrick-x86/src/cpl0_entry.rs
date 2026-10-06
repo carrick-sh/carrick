@@ -115,11 +115,14 @@ pub struct CpuBinding {
     /// Private hardware witness binding; zero in normal M2 entry. This is
     /// retained CPL0 control transport, not common task/scheduler authority.
     pub scheduler_witness: AtomicU64,
+    /// The scheduler slot issued by the stopped-host CPL0 bootstrap.
+    pub cpu_slot: u32,
 }
 const _: () = {
     assert!(core::mem::offset_of!(CpuBinding, kernel_stack) == 0);
     assert!(core::mem::offset_of!(CpuBinding, user_stack) == 8);
     assert!(core::mem::offset_of!(CpuBinding, self_address) == 16);
+    assert!(core::mem::offset_of!(CpuBinding, cpu_slot) == 88);
 };
 
 #[cfg(test)]
