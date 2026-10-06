@@ -1,4 +1,6 @@
 //! The single Linux ordinal-to-family routing table.
+use crate::abi::entry::SyscallResult;
+use crate::pending_lifecycle::{LifecycleCall, LifecycleOutcome};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnonymousCall {
@@ -15,7 +17,7 @@ pub enum Family {
     Read,
     Write,
     EpollWait,
-    Lifecycle,
+    Lifecycle(LifecycleCall),
     Futex,
     InotifyAdd,
     InotifyRemove,
@@ -245,9 +247,11 @@ pub trait PendingFamilies<'a> {
         FamilyCompletion::Forward
     }
     /// Removed by order 6.
-    fn lifecycle(&mut self, _: u64) -> FamilyCompletion {
-        FamilyCompletion::Forward
+    fn lifecycle(&mut self, _: LifecycleCall) -> Option<LifecycleOutcome> {
+        None
     }
+    fn original_argument0(&self) -> u64;
+    fn install_result(&mut self, result: SyscallResult);
     /// Removed by order 8.
     fn futex(&mut self) -> FamilyCompletion {
         FamilyCompletion::Forward
@@ -304,17 +308,28 @@ pub trait PendingFamilies<'a> {
 }
 
 /// The sole ordinal routing decision and family completion owner.
-fn serve_family(
-    family: Family,
-    ordinal: u64,
-    pending: &mut dyn PendingFamilies<'_>,
-) -> FamilyCompletion {
-    match family {
+fn serve_family(family: Family, ordinal: u64, pending: &mut dyn PendingFamilies<'_>) -> FamilyRun {
+    if let Family::Lifecycle(call) = family {
+        let original = pending.original_argument0();
+        return pending
+            .lifecycle(call)
+            .map_or(FamilyCompletion::Forward.into(), |outcome| {
+                let returned = match outcome {
+                    LifecycleOutcome::Returned { result, .. } => Some((result, original)),
+                    LifecycleOutcome::Transferred { .. } => None,
+                };
+                FamilyRun {
+                    completion: crate::pending_lifecycle::lifecycle_effect(&outcome),
+                    returned,
+                }
+            });
+    }
+    let completion = match family {
         Family::Anonymous(call) => pending.anonymous(call),
         Family::Read => pending.read(),
         Family::Write => pending.write(),
         Family::EpollWait => pending.epoll_wait(),
-        Family::Lifecycle => pending.lifecycle(ordinal),
+        Family::Lifecycle(_) => FamilyCompletion::Forward,
         Family::Futex => pending.futex(),
         Family::InotifyAdd => pending.inotify_add(),
         Family::InotifyRemove => pending.inotify_remove(),
@@ -322,7 +337,8 @@ fn serve_family(
         Family::FilePositioned => pending.file_positioned(ordinal),
         Family::AllocatorControl => pending.allocator_control(),
         Family::Unported => FamilyCompletion::Forward,
-    }
+    };
+    completion.into()
 }
 
 /// Route one AArch64 Linux ordinal. Family implementations are temporary
@@ -343,7 +359,12 @@ pub const fn route_aarch64(ordinal: u64, allocator_control: u64) -> Family {
         27 => Family::InotifyAdd,
         28 => Family::InotifyRemove,
         98 => Family::Futex,
-        93 | 132 | 135 | 99 | 178 | 220 => Family::Lifecycle,
+        93 => Family::Lifecycle(LifecycleCall::Exit),
+        132 => Family::Lifecycle(LifecycleCall::SigAltStack),
+        135 => Family::Lifecycle(LifecycleCall::SigProcMask),
+        99 => Family::Lifecycle(LifecycleCall::SetRobustList),
+        178 => Family::Lifecycle(LifecycleCall::GetTid),
+        220 => Family::Lifecycle(LifecycleCall::Clone),
         nr if allocator_control != u64::MAX && nr == allocator_control => Family::AllocatorControl,
         _ => Family::Unported,
     }
@@ -390,12 +411,26 @@ enum CompletionAuthority<'a> {
     AllocatorDiagnostic,
 }
 
+struct FamilyRun {
+    completion: FamilyCompletion,
+    returned: Option<(SyscallResult, u64)>,
+}
+impl From<FamilyCompletion> for FamilyRun {
+    fn from(completion: FamilyCompletion) -> Self {
+        Self {
+            completion,
+            returned: None,
+        }
+    }
+}
+
 fn finish<'a>(
     ordinal: u64,
-    result: FamilyCompletion,
+    run: FamilyRun,
     pending: &mut dyn PendingFamilies<'a>,
     authority: CompletionAuthority<'a>,
 ) -> CompletionRoute {
+    let result = run.completion;
     let transfers = matches!(
         result,
         FamilyCompletion::Suspended
@@ -426,6 +461,13 @@ fn finish<'a>(
     };
     if !authenticated {
         return CompletionRoute::InvalidCompletion;
+    }
+    if let Some((value, original)) = run.returned {
+        pending.install_result(value);
+        if let Some(task) = pending.task_state() {
+            task.orig_arg0
+                .store(original, core::sync::atomic::Ordering::Relaxed);
+        }
     }
     match result {
         FamilyCompletion::AccountedComplete(_)
@@ -470,19 +512,24 @@ pub fn dispatch<'a>(
     if matches!(family, Family::Anonymous(_))
         && let Some(result) = pending.prepare_anonymous()
     {
-        return finish(ordinal, result, pending, completion);
+        return finish(ordinal, result.into(), pending, completion);
     }
     let setup = pending.lifecycle_available()
-        && matches!(family, Family::Lifecycle)
+        && matches!(family, Family::Lifecycle(_))
         && matches!(ordinal, 99 | 132 | 135);
     let transfer = pending.ipc_available()
         && matches!(family, Family::Read | Family::Write | Family::EpollWait);
     if pending.host_work() && !pending.resumes_operation() && !transfer && !setup {
         pending.declined_for_work(ordinal);
-        return finish(ordinal, FamilyCompletion::Forward, pending, completion);
+        return finish(
+            ordinal,
+            FamilyCompletion::Forward.into(),
+            pending,
+            completion,
+        );
     }
     let mut result = serve_family(family, ordinal, pending);
-    if result != FamilyCompletion::Forward {
+    if result.completion != FamilyCompletion::Forward {
         return finish(ordinal, result, pending, completion);
     }
     if pending.host_work() && !setup {
@@ -492,8 +539,8 @@ pub fn dispatch<'a>(
     // File fallback follows the IPC authority's explicit decline, never a
     // retained operation's handback or completion.
     result = match family {
-        Family::Read => pending.file_read(),
-        Family::Write => pending.file_write(),
+        Family::Read => pending.file_read().into(),
+        Family::Write => pending.file_write().into(),
         _ => result,
     };
     finish(ordinal, result, pending, completion)
