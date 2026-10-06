@@ -65,6 +65,10 @@ pub const OBSERVE_MMU_ROOT: u64 = u64::MAX - 1;
 pub const OBSERVE_ALLOCATOR: u64 = u64::MAX - 2;
 /// Fixture request for a local MMU drain of the supplied user page.
 pub const OBSERVE_MMU_DRAIN: u64 = u64::MAX - 3;
+/// Fixture request for a shared-kernel x86 descriptor protection edit.
+pub const OBSERVE_DESCRIPTOR_PROTECT: u64 = u64::MAX - 4;
+/// Retained KVM fixture page-table window; the root is its first page.
+pub const FIXTURE_PML4_CAPACITY: u64 = 448 * 4096;
 
 /// Stack order is enforced by the CPL0 assembly and these compile assertions.
 #[repr(C)]
