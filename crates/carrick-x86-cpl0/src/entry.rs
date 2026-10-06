@@ -1119,7 +1119,7 @@ mod kernel {
         let Some(call) = carrick_personality_linux::entry::decode_x86_snapshot(frame.snapshot())
         else {
             doorbell(FORWARD_PORT, frame);
-            halt();
+            return;
         };
         binding
             .captured_stack
@@ -1149,7 +1149,6 @@ mod kernel {
                 }
                 carrick_personality_linux::dispatch::CompletionRoute::Forward => {
                     doorbell(FORWARD_PORT, frame);
-                    halt();
                 }
                 _ => {
                     doorbell(FATAL_PORT, frame);
@@ -1178,7 +1177,6 @@ mod kernel {
                 }
                 EntryOutcome::Forward => {
                     doorbell(FORWARD_PORT, frame);
-                    halt();
                 }
             }
         }
