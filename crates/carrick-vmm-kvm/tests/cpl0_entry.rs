@@ -148,6 +148,26 @@ fn production_cpl0_boot_retains_two_extents_in_one_carrier_vm() {
 }
 
 #[test]
+fn cpl0_forward_port_returns_host_result_through_shared_entry() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&39u64.to_le_bytes()); // getpid, forwarded
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    let result = carrier
+        .observe_with_forward(0, |frame| {
+            assert_eq!(frame.rax, 39);
+            frame.rax = 42;
+            Ok(())
+        })
+        .expect("forwarded syscall returns to EL0");
+    assert_eq!(result.result, 42);
+    assert_eq!(result.semantic_host_exits, 1);
+    assert_eq!(result.completions[0], 1);
+}
+
+#[test]
 fn production_image_rejects_fixture_syscalls() {
     let production = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0");
