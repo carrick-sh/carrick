@@ -823,6 +823,8 @@ version = "0.1.0"
 dependencies = [
  "carrick-core",
  "carrick-core-abi",
+ "carrick-el1",
+ "carrick-el1-abi",
  "carrick-guest-arch",
 ]
 
