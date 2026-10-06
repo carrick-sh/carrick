@@ -31,13 +31,6 @@ pub struct LifecycleThread<'a> {
     pub slot: &'a ThreadControlSlot,
 }
 
-/// Whether the common kernel may serve the per-thread setup calls: the
-/// hatch is on and the gate is not terminally closed (a tracer or seccomp
-/// must see them).
-pub(crate) fn setup_open(page: &ThreadLifecyclePage) -> bool {
-    page.serves_sigmask() && page.gate() != GateState::Closed
-}
-
 /// Native view of the caller's owned metadata; Linux decides gate and size policy.
 pub struct RobustListSlot<'a> {
     page: &'a ThreadLifecyclePage,

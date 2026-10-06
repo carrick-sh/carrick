@@ -28,7 +28,7 @@ use super::sched::{ETIMEDOUT_RESULT, Sched, Served, ThreadCpu, UserWord};
 pub use super::thread_setup::{
     GuestLifecycleVenue, LifecycleThread, LifecycleVenue, SYS_SET_ROBUST_LIST, guest_venue,
 };
-use super::thread_setup::{RobustListHead, RobustListLen, RobustListSlot, setup_open};
+use super::thread_setup::{RobustListHead, RobustListLen, RobustListSlot};
 use crate::file::UserCopy;
 use carrick_el1_abi::{
     AltStack, BlockedMask, BornRecord, Claim, Counters, CurrentTask, El1TaskId, EntryState,
@@ -167,6 +167,13 @@ pub fn invoke<C: ThreadCpu, U: UserWord>(
             })
         }
     }
+}
+
+/// Whether the common kernel may serve the per-thread setup calls: the
+/// hatch is on and the gate is not terminally closed (a tracer or seccomp
+/// must see them).
+fn setup_open(page: &carrick_el1_abi::ThreadLifecyclePage) -> bool {
+    page.serves_sigmask() && page.gate() != GateState::Closed
 }
 
 /// The running thread's `SP_EL0`.
