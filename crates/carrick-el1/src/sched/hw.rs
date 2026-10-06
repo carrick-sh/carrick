@@ -54,8 +54,8 @@ impl UserWord for HardwareUserWord {
     }
 
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-    fn read_u32(&self, _task: &CurrentTask, _uaddr: u64) -> Option<u32> {
-        crate::isa::x86::carrick_x86_unbound_user_word()
+    fn read_u32(&self, task: &CurrentTask, uaddr: u64) -> Option<u32> {
+        crate::isa::x86::user_access::read_u32(task, uaddr)
     }
 
     #[cfg(not(target_os = "none"))]
@@ -100,8 +100,8 @@ impl UserWord for HardwareUserWord {
     }
 
     #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-    fn read_u64(&self, _task: &CurrentTask, _uaddr: u64) -> Option<u64> {
-        crate::isa::x86::carrick_x86_unbound_user_word()
+    fn read_u64(&self, task: &CurrentTask, uaddr: u64) -> Option<u64> {
+        crate::isa::x86::user_access::read_u64(task, uaddr)
     }
 
     #[cfg(not(target_os = "none"))]

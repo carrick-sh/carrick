@@ -6,7 +6,7 @@ pub mod context;
 mod interrupt;
 mod mmu;
 mod transport;
-mod user_access;
+pub mod user_access;
 
 pub mod interrupts;
 
@@ -32,7 +32,7 @@ impl carrick_guest_arch::ArchTypes for X86Backend {
     type LeafEdit = ();
     type DrainTicket = ();
     type DrainReceipt = ();
-    type UserTransfer = ();
+    type UserTransfer = user_access::UserTransfer;
     type PublicationReceipt = ();
     type HardwareInterrupt = u32;
     type InterruptMask = interrupts::InterruptMask;
