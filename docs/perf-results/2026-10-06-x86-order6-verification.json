@@ -209,6 +209,8 @@
     "before": 9,
     "after": 9,
     "added": 0,
-    "removed": 0
+    "removed": 0,
+    "authoritative": false,
+    "correction": "Cross-version scanner comparison cannot attribute baseline failures. Exact order-5 CI scanner passes; order-6 scanner adds PendingSignals prohibition and fails at 6bb08a88d. Superseded by signal-boundary correction."
   }
 }
