@@ -233,50 +233,6 @@ pub struct InterruptAck<I> {
     pub hardware: I,
 }
 
-/// Real crossings only: no generic "dispatch this Linux syscall" request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HostRequestKind {
-    ReadBytes,
-    WriteBytes,
-    Readiness,
-    Clock,
-    Terminal,
-    Backing,
-    Control,
-}
-#[derive(Debug)]
-pub struct OwnedHostRequest<P> {
-    pub task: TaskIdentity,
-    pub operation: OperationSequence,
-    pub kind: HostRequestKind,
-    pub payload: P,
-}
-/// The backend's owned ticket carries completion custody. Copyable identity
-/// fields alone cannot manufacture or duplicate a pending completion.
-#[derive(Debug)]
-pub struct RequestToken<T> {
-    task: TaskIdentity,
-    operation: OperationSequence,
-    ticket: T,
-}
-impl<T> RequestToken<T> {
-    pub const fn new(task: TaskIdentity, operation: OperationSequence, ticket: T) -> Self {
-        Self {
-            task,
-            operation,
-            ticket,
-        }
-    }
-    pub const fn task(&self) -> TaskIdentity {
-        self.task
-    }
-    pub const fn operation(&self) -> OperationSequence {
-        self.operation
-    }
-    pub fn into_ticket(self) -> T {
-        self.ticket
-    }
-}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FatalReport {
     pub task: Option<TaskIdentity>,
@@ -302,9 +258,6 @@ pub trait ArchTypes {
     type PublicationReceipt;
     type HardwareInterrupt;
     type InterruptMask;
-    type HostPayload;
-    type HostTicket;
-    type HostCompletion;
 }
 
 /// The only kernel-facing adapter. Backend hooks are the extension point.
@@ -343,9 +296,6 @@ impl<B: ArchTypes> ArchTypes for Arch<B> {
     type PublicationReceipt = B::PublicationReceipt;
     type HardwareInterrupt = B::HardwareInterrupt;
     type InterruptMask = B::InterruptMask;
-    type HostPayload = B::HostPayload;
-    type HostTicket = B::HostTicket;
-    type HostCompletion = B::HostCompletion;
 }
 
 // Generate each sealed projection and its explicit backend extension hook from
@@ -401,9 +351,6 @@ arch_trait!(InterruptArch, InterruptBackend {
 });
 arch_trait!(CrossingArch, CrossingBackend {
     fn yield_host_effect() -> Result<(), Self::Error>;
-    fn submit_host_request(request: OwnedHostRequest<Self::HostPayload>) -> Result<RequestToken<Self::HostTicket>, Self::Error>;
-    fn consume_completion(token: RequestToken<Self::HostTicket>) -> Result<Self::HostCompletion, Self::Error>;
-    fn leave_idle() -> Result<(), Self::Error>;
     fn report_fatal(report: FatalReport) -> !;
 });
 
