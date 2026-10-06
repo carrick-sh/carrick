@@ -23,6 +23,9 @@ unsafe impl core::alloc::GlobalAlloc for NoAllocation {
 static ALLOCATOR: NoAllocation = NoAllocation;
 
 #[cfg(target_os = "none")]
+extern crate carrick_core;
+
+#[cfg(target_os = "none")]
 #[path = "../../carrick-x86/src/cpl0_entry.rs"]
 mod adapter;
 

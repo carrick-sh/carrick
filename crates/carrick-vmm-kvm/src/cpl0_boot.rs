@@ -9,7 +9,9 @@ use carrick_el1_abi::{
 };
 use carrick_hal::{HvVcpu, HvVm, MemPerms, TrapError, VcpuExit, VcpuKick};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
+use carrick_sched_core::{SlotId, ZoneTables};
 use carrick_x86::cpl0_entry::*;
+use carrick_x86::cpl0_scheduler::{ContextBinding, admit_context};
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
 use kvm_bindings::{Msrs, kvm_msr_entry};
 use std::path::Path;
@@ -109,6 +111,265 @@ pub struct Cpl0Carrier {
 impl Cpl0Carrier {
     pub fn boot(image: &Path, programs: [&[u8]; 2]) -> Result<Self, TrapError> {
         Self::boot_inner(image, programs, false)
+    }
+
+    pub fn boot_shared(
+        image: &Path,
+        program: &[u8],
+        zone: &ZoneTables,
+        slot: SlotId,
+        binding: &ContextBinding,
+    ) -> Result<Self, TrapError> {
+        if !admit_context(zone, slot, binding) {
+            return Err(fail("admit_context rejected shared claims"));
+        }
+        let record = zone
+            .live(binding.record)
+            .ok_or_else(|| fail("live record missing"))?;
+        let identity = record.identity();
+
+        let bytes = std::fs::read(image).map_err(|e| fail(format!("CPL0 image: {e}")))?;
+        let plan = carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62)
+            .map_err(|e| fail(format!("CPL0 ELF: {e}")))?;
+        if !(0x10_0000..0x20_0000).contains(&plan.entry) {
+            return Err(fail("CPL0 entry outside its supervisor image"));
+        }
+        let mut ram = GuestRam::new();
+        ram.add_window(0, RAM_SIZE, WindowKind::Private)
+            .map_err(|e| fail(e.to_string()))?;
+        let mut maps = Vec::new();
+        for segment in &plan.segments {
+            let end = segment
+                .virtual_address
+                .checked_add(segment.memory_size)
+                .ok_or_else(|| fail("CPL0 segment overflow"))?;
+            if segment.virtual_address < 0x10_0000 || end > 0x20_0000 {
+                return Err(fail("CPL0 segment outside its supervisor image"));
+            }
+            let start = segment.file_offset as usize;
+            let data = bytes
+                .get(start..start + segment.file_size as usize)
+                .ok_or_else(|| fail("CPL0 segment file bounds"))?;
+            ram.write_gpa(segment.virtual_address, data)
+                .map_err(|e| fail(e.to_string()))?;
+            let va = segment.virtual_address & !0xfff;
+            maps.push(Pml4MapSpec {
+                va,
+                gpa: va,
+                len: ((end + 0xfff) & !0xfff) - va,
+                user: false,
+                write: segment.perms.write,
+                exec: segment.perms.execute,
+            });
+        }
+        maps.push(Pml4MapSpec {
+            va: 0x20_0000,
+            gpa: 0x20_0000,
+            len: 0xa0_0000,
+            user: false,
+            write: true,
+            exec: true,
+        });
+        maps.push(Pml4MapSpec {
+            va: 0xe0_0000,
+            gpa: 0xe0_0000,
+            len: 0x20_0000,
+            user: false,
+            write: true,
+            exec: false,
+        });
+        maps.push(Pml4MapSpec {
+            va: EL1_DYNAMIC_METADATA_BASE,
+            gpa: META_GPA,
+            len: META_LEN,
+            user: false,
+            write: true,
+            exec: false,
+        });
+        if program.len() > 4096 {
+            return Err(fail("CPL0 fixture exceeds one code page"));
+        }
+        let code = binding.context.frame.rip & !0xfff;
+        ram.write_gpa(code, program)
+            .map_err(|e| fail(e.to_string()))?;
+        maps.push(Pml4MapSpec {
+            va: code,
+            gpa: code,
+            len: 4096,
+            user: true,
+            write: false,
+            exec: true,
+        });
+        let stack = binding.context.frame.rsp & !0xfff;
+        maps.push(Pml4MapSpec {
+            va: stack,
+            gpa: stack,
+            len: 8192,
+            user: true,
+            write: true,
+            exec: false,
+        });
+
+        let root_raw = binding.context.address.root.address().raw();
+        let tables = pml4_tables(&maps, root_raw, carrick_x86::X86_PML4_CAPACITY as usize)
+            .map_err(|e| fail(format!("CPL0 tables: {e:?}")))?;
+        ram.write_gpa(root_raw, &tables)
+            .map_err(|e| fail(e.to_string()))?;
+
+        let boot = <carrick_hal::x8664_arch::X8664GuestArch as carrick_hal::guest_arch::GuestArch>::bootstrap_sysregs();
+        let gdt: Vec<u8> = boot
+            .gdt
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        ram.write_gpa(LAYOUT.gdt_base, &gdt)
+            .map_err(|e| fail(e.to_string()))?;
+        carrick_x86::write_fault_tables_with(LAYOUT, |gpa, bytes| {
+            ram.write_gpa(gpa, bytes).map_err(|e| fail(e.to_string()))
+        })?;
+        for index in 0..2 {
+            let tss = carrick_x86::fault_slot_gpa(carrick_x86::fault_tss_base(LAYOUT), index)?;
+            let ist_top = IST_STACK_BASE + (index + 1) * 4096;
+            ram.write_gpa(tss + 36, &ist_top.to_le_bytes())
+                .map_err(|e| fail(e.to_string()))?;
+            let idt = carrick_x86::fault_slot_gpa(carrick_x86::fault_idt_base(LAYOUT), index)?;
+            ram.write_gpa(idt + 8 * 16 + 4, &[1])
+                .map_err(|e| fail(e.to_string()))?;
+        }
+
+        // SAFETY: private zeroed backing; typed objects fit and are aligned.
+        // They are initialized before registration or any guest execution.
+        unsafe {
+            let page = ram
+                .host_ptr(META_GPA, size_of::<ThreadLifecyclePage>())
+                .ok_or_else(|| fail("lifecycle page backing"))?
+                .cast::<ThreadLifecyclePage>();
+            page.write(ThreadLifecyclePage::new());
+
+            let counters = ram
+                .host_ptr(META_GPA + COUNTERS_OFFSET, size_of::<Counters>())
+                .ok_or_else(|| fail("counter backing"))?
+                .cast::<Counters>();
+            counters.write(Counters::new());
+
+            let slot = ram
+                .host_ptr(META_GPA + CONTROL_OFFSET, size_of::<ThreadControlSlot>())
+                .ok_or_else(|| fail("control slot backing"))?
+                .cast::<ThreadControlSlot>();
+            slot.write(ThreadControlSlot::new());
+            (*slot).reset_for_host_birth(BlockedMask(0));
+            if !(*slot).publish_visible_tid(identity.tid as u32) {
+                return Err(fail("issued slot identity"));
+            }
+
+            let task = ram
+                .host_ptr(META_GPA + TASK_OFFSET, size_of::<CurrentTask>())
+                .ok_or_else(|| fail("current task backing"))?
+                .cast::<CurrentTask>();
+            task.write(CurrentTask::new());
+            (*task).set(
+                El1TaskId::from_linux_tid(identity.tid as i32),
+                identity.mm,
+                identity.generation,
+            );
+            (*task)
+                .thread_serial
+                .store(identity.serial, Ordering::Release);
+            (*task).publish_lifecycle(
+                EL1_DYNAMIC_METADATA_BASE,
+                EL1_DYNAMIC_METADATA_BASE + CONTROL_OFFSET,
+            );
+
+            let cpu_binding = ram
+                .host_ptr(META_GPA + BINDING_OFFSET, size_of::<CpuBinding>())
+                .ok_or_else(|| fail("CPU binding backing"))?
+                .cast::<CpuBinding>();
+            cpu_binding.write(CpuBinding {
+                kernel_stack: 0xe1_0000 - 16,
+                user_stack: 0,
+                self_address: EL1_DYNAMIC_METADATA_BASE + BINDING_OFFSET,
+                task_address: EL1_DYNAMIC_METADATA_BASE + TASK_OFFSET,
+                counters_address: EL1_DYNAMIC_METADATA_BASE + COUNTERS_OFFSET,
+                entry_kick: AtomicU32::new(0),
+                return_kick: AtomicU32::new(0),
+                entries: AtomicU64::new(0),
+                publications: AtomicU64::new(0),
+                completions: AtomicU64::new(0),
+                captured_stack: AtomicU64::new(0),
+                scheduler_witness: AtomicU64::new(0),
+            });
+        }
+
+        let mut vm = KvmVm::create_empty().map_err(|e| fail(e.to_string()))?;
+        for (gpa, ptr, len) in ram.windows_for_kvm() {
+            vm.map_memory(
+                gpa,
+                ptr,
+                len,
+                MemPerms {
+                    read: true,
+                    write: true,
+                    exec: true,
+                },
+            )
+            .map_err(|e| fail(e.to_string()))?;
+        }
+        let mut a = vm.add_vcpu().map_err(|e| fail(e.to_string()))?;
+        let mut b = vm.add_vcpu().map_err(|e| fail(e.to_string()))?;
+
+        let mut layout = LAYOUT;
+        layout.trampoline_base = plan.entry;
+        layout.pml4_base = root_raw;
+        carrick_x86::program_longmode_entry(
+            &mut a,
+            layout,
+            binding.context.frame.rip,
+            binding.context.frame.rsp,
+        )?;
+        carrick_x86::program_fault_segments(&mut a, LAYOUT, 0)?;
+        a.set_syscall_msrs(
+            plan.entry,
+            boot.star,
+            boot.sfmask | (1 << 10) | (1 << 8) | (1 << 18),
+        )?;
+        let msrs = Msrs::from_entries(&[kvm_msr_entry {
+            index: 0xc000_0102,
+            data: EL1_DYNAMIC_METADATA_BASE + BINDING_OFFSET,
+            ..Default::default()
+        }])
+        .map_err(|e| fail(e.to_string()))?;
+        if a.fd().set_msrs(&msrs).map_err(|e| fail(e.to_string()))? != 1 {
+            return Err(fail("KERNEL_GS_BASE not installed"));
+        }
+        a.set_fs_base(binding.context.fs_base)?;
+        a.set_gs_base(binding.context.gs_base)?;
+        a.set_xsave(&binding.context.xsave.0)?;
+        if binding.context.frame.flags != 0 {
+            a.set_gpr(X86Reg::Rflags, binding.context.frame.flags)?;
+        }
+
+        carrick_x86::program_longmode_entry(&mut b, layout, 0x2_0000, 0x4_1ff0)?;
+        carrick_x86::program_fault_segments(&mut b, LAYOUT, 1)?;
+        b.set_syscall_msrs(
+            plan.entry,
+            boot.star,
+            boot.sfmask | (1 << 10) | (1 << 8) | (1 << 18),
+        )?;
+
+        let metadata_base = NonNull::new(
+            ram.host_ptr(META_GPA, META_LEN as usize)
+                .ok_or_else(|| fail("retained metadata backing"))?,
+        )
+        .ok_or_else(|| fail("null metadata backing"))?;
+        Ok(Self {
+            cpus: [a, b],
+            _vm: vm,
+            ram,
+            metadata_base,
+            host_forwards: 0,
+            kicks: 0,
+            work_exits: 0,
+        })
     }
 
     pub(crate) fn boot_inner(
@@ -415,6 +676,29 @@ impl Cpl0Carrier {
         self.binding(index).entry_kick.store(1, Ordering::Release);
         self.binding(index).return_kick.store(1, Ordering::Release);
         Ok(())
+    }
+
+    pub fn fs_base(&self, index: usize) -> Result<u64, TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 task"));
+        }
+        self.cpus[index].get_fs_base()
+    }
+
+    pub fn gs_base(&self, index: usize) -> Result<u64, TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 task"));
+        }
+        // At a CPL0 observation exit, swapgs has selected the kernel binding.
+        // The user GS base is held in KERNEL_GS_BASE (MSR 0xc000_0102).
+        self.cpus[index].read_msr(0xc000_0102)
+    }
+
+    pub fn xsave(&self, index: usize) -> Result<Option<[u8; carrick_x86::XSAVE_LEN]>, TrapError> {
+        if index >= 2 {
+            return Err(fail("unknown CPL0 task"));
+        }
+        self.cpus[index].get_xsave()
     }
 
     /// Run until a user fixture reports its last result. A finite exit budget
