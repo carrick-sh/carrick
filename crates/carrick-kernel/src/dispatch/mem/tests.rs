@@ -99,11 +99,13 @@ fn backend_mmap_arena_is_not_classified_as_an_alias() {
         address,
         LINUX_PAGE_SIZE,
         native_layout,
+        UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::Aarch64),
     ));
     assert!(mmap_address_uses_alias(
         address,
         LINUX_PAGE_SIZE,
         MemoryLayout::hvf_default(),
+        UserVaCeiling::for_abi(carrick_abi::LinuxGuestAbi::Aarch64),
     ));
 }
 
@@ -5932,6 +5934,265 @@ fn next_mmap_address_allocates_large_vmas_in_canonical_high_va_space() {
         MmapGrantCongruence::Any,
     );
     assert_eq!(oversized, None);
+}
+
+// kernel.mm.user-va-ceiling: metadata-only reservations must never hand the
+// x86 backend a noncanonical address, even after the low arena is crowded.
+#[test]
+fn x86_mmap_crowded_lower_half_refuses_noncanonical_gap() {
+    use carrick_conformance_contract::{
+        Completeness, ContractId, ContractObservation, ContractRegistry, ExecutionLayer,
+        SemanticAssertion, WorkMetric, WorkSnapshot, evaluate,
+    };
+    use sha2::{Digest, Sha256};
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let registry = ContractRegistry::load(root).unwrap();
+    let mut observations = Vec::new();
+    for scale in [1, 8, 32] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let length = (64u64 << 30) * scale; // Larger than the low arena; no physical allocation.
+        dispatcher.record_dynamic_mapping_with_file_offset(
+            crate::memory::LINUX_HIGH_VA_THRESHOLD,
+            (1u64 << 47) - LINUX_PAGE_SIZE - crate::memory::LINUX_HIGH_VA_THRESHOLD,
+            LinuxProtFlags::empty(),
+            ProcMapSharing::Private,
+            String::new(),
+            DynamicMappingSemantics {
+                file_page_offset: None,
+                droppable: false,
+                semantic_vmas: None,
+            },
+        );
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize)
+            .with_defer_anon(true);
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs([
+                        0,
+                        length,
+                        0,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ]),
+                )
+                .with_guest_abi(carrick_abi::LinuxGuestAbi::X86_64),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .expect("mmap dispatch");
+        let result = match outcome {
+            DispatchOutcome::Returned { value } => value,
+            DispatchOutcome::Errno { errno } => -i64::from(errno.get()),
+            other => panic!("unexpected mmap outcome {other:?}"),
+        };
+        assert_eq!(
+            result, -12,
+            "exhausted x86 lower half must return errno 12; old grant={result:#x}"
+        );
+        assert_eq!(memory.protect_calls.get(), 0, "no backend work on refusal");
+        let mut work = WorkSnapshot::new();
+        work.insert(
+            WorkMetric::HostBackendCalls,
+            memory.protect_calls.get() as u64,
+        )
+        .unwrap();
+        observations.push(ContractObservation {
+            contract_id: ContractId::new("kernel.mm.user-va-ceiling").unwrap(),
+            layer: ExecutionLayer::VmFree,
+            implementation_revision: format!(
+                "mem-sha256:{:x}",
+                Sha256::digest(include_bytes!("../mem.rs"))
+            ),
+            fixture_identity: "unit:x86-mmap-crowded-lower-half".into(),
+            scale,
+            semantic_assertions: vec![SemanticAssertion {
+                name: "exhaustion_returns_errno_12".into(),
+                passed: result == -12,
+                detail: None,
+            }],
+            work: Some(work),
+            timing: None,
+            completeness: Completeness::Complete,
+        });
+    }
+    evaluate(
+        registry.require("kernel.mm.user-va-ceiling").unwrap(),
+        &observations,
+    )
+    .unwrap();
+}
+
+#[test]
+fn x86_mmap_last_lower_half_gap_and_invalid_hint() {
+    for delegated in [false, true] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let _root = delegated.then(|| super::delegated_tests::Root::admit(&dispatcher));
+        let length = 64u64 << 30;
+        let ceiling = (1u64 << 47) - LINUX_PAGE_SIZE;
+        dispatcher.record_dynamic_mapping_with_file_offset(
+            crate::memory::LINUX_HIGH_VA_THRESHOLD,
+            ceiling - length - crate::memory::LINUX_HIGH_VA_THRESHOLD,
+            LinuxProtFlags::empty(),
+            ProcMapSharing::Private,
+            String::new(),
+            DynamicMappingSemantics {
+                file_page_offset: None,
+                droppable: false,
+                semantic_vmas: None,
+            },
+        );
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize)
+            .with_defer_anon(true);
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs([
+                        ceiling + 0x2000_0000,
+                        length,
+                        0,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ]),
+                )
+                .with_guest_abi(carrick_abi::LinuxGuestAbi::X86_64),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .expect("mmap dispatch");
+        assert_eq!(
+            returned(outcome) as u64,
+            ceiling - length,
+            "ignore a noncanonical hint and use the final lower-half gap; delegated={delegated}"
+        );
+    }
+}
+
+#[test]
+fn arm_mmap_retains_48_bit_ceiling_and_tag_stripping() {
+    let last_page = (1u64 << 48) - LINUX_PAGE_SIZE;
+    for requested in [last_page, last_page | 0xabcd_0000_0000_0000] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize)
+            .with_defer_anon(true);
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs([
+                        requested,
+                        LINUX_PAGE_SIZE,
+                        0,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                        u64::MAX,
+                        0,
+                    ]),
+                ),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .expect("ARM mmap dispatch");
+        assert_eq!(returned(outcome) as u64, last_page);
+    }
+}
+
+#[test]
+fn x86_mmap_task_size_guard_matches_native_linux() {
+    for (address, expected_errno) in [
+        ((1u64 << 47) - 2 * LINUX_PAGE_SIZE, None),
+        ((1u64 << 47) - LINUX_PAGE_SIZE, Some(12)),
+    ] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize)
+            .with_defer_anon(true);
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs([
+                        address,
+                        LINUX_PAGE_SIZE,
+                        0,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                        u64::MAX,
+                        0,
+                    ]),
+                )
+                .with_guest_abi(carrick_abi::LinuxGuestAbi::X86_64),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .expect("mmap dispatch");
+        match expected_errno {
+            None => assert_eq!(returned(outcome) as u64, address),
+            Some(errno) => assert_eq!(
+                outcome,
+                DispatchOutcome::Errno {
+                    errno: carrick_abi::LinuxErrno::new(errno),
+                },
+                "native Linux guard page at {address:#x}: errno {errno}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn x86_mmap_fixed_outside_lower_half_returns_errno_12() {
+    for (address, length) in [
+        (1u64 << 47, LINUX_PAGE_SIZE),
+        ((1u64 << 47) - LINUX_PAGE_SIZE, 2 * LINUX_PAGE_SIZE),
+        ((1u64 << 48) + LINUX_PAGE_SIZE, LINUX_PAGE_SIZE),
+        (u64::MAX - LINUX_PAGE_SIZE + 1, LINUX_PAGE_SIZE),
+    ] {
+        let mut dispatcher = SyscallDispatcher::new();
+        let mut memory = CountingMmapMemory::new(LINUX_MMAP_BASE, LINUX_PAGE_SIZE as usize)
+            .with_defer_anon(true);
+        let context = dispatcher.capture_one_task_context().expect("task context");
+        let outcome = dispatcher
+            .dispatch(
+                &context,
+                SyscallRequest::new(
+                    222,
+                    SyscallArgs([
+                        address,
+                        length,
+                        0,
+                        LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS | LINUX_MAP_FIXED,
+                        u64::MAX,
+                        0,
+                    ]),
+                )
+                .with_guest_abi(carrick_abi::LinuxGuestAbi::X86_64),
+                &mut memory,
+                &CompatReporter::default(),
+            )
+            .expect("mmap dispatch");
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Errno {
+                errno: LINUX_ENOMEM
+            },
+            "fixed range {address:#x}+{length:#x}: errno 12"
+        );
+        assert_eq!(memory.protect_calls.get(), 0);
+        assert!(dispatcher.mem().lock().dynamic_maps.is_empty());
+    }
 }
 
 #[test]
