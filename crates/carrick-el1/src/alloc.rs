@@ -23,7 +23,7 @@ fn current_el1_slot() -> Option<usize> {
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn current_el1_slot() -> Option<usize> {
-    crate::isa::x86::carrick_x86_unbound_stack_slot()
+    crate::isa::x86::current_stack_slot()
 }
 
 /// Safe thread-safe wrapper around `MetadataAllocatorCore` with IRQ save/restore spinlock.

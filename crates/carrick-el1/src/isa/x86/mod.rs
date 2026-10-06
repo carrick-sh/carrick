@@ -41,6 +41,6 @@ impl carrick_guest_arch::ArchTypes for X86Backend {
     type HostCompletion = ();
 }
 
-pub use context::{carrick_x86_unbound_stack_slot, carrick_x86_unbound_thread_cpu};
+pub use context::{current_stack_slot, current_thread_cpu};
 pub use mmu::carrick_x86_unbound_mmu_owner;
 pub use transport::{fatal_entry_binding, yield_host_effect};
