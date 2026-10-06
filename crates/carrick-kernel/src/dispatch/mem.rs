@@ -1057,7 +1057,7 @@ pub(super) fn guest_vma_overlaps_locked(mem: &MemState, start: u64, len: u64) ->
         return true;
     };
     dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len)
-        || mem.root_anonymous_overlaps(start, len)
+        || mem.root_mapping_overlaps(start, len)
         || mem
             .growdown_ranges
             .iter()
@@ -1328,7 +1328,7 @@ impl<'a> MemView<'a> {
         let authority = self.mem();
         let mem = authority.lock();
         dynamic_mapping_overlaps_sorted(&mem.dynamic_maps, start, len)
-            || mem.root_anonymous_overlaps(start, len)
+            || mem.root_mapping_overlaps(start, len)
     }
 
     /// Whether `[start, start + len)` overlaps a Linux-visible guest VMA.
