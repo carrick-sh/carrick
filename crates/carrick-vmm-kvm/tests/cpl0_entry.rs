@@ -546,3 +546,34 @@ fn x1_boot_shared_substrate() {
         "closed space must be rejected"
     );
 }
+
+fn transport_program(op: u64) -> Vec<u8> {
+    const TRANSPORT_WITNESS: u64 = 0xffff_ffff_ffff_ff20;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x48, 0xbf]); // mov rdi, op
+    bytes.extend_from_slice(&op.to_le_bytes());
+    bytes.extend_from_slice(&[0x48, 0xb8]); // mov rax, TRANSPORT_WITNESS
+    bytes.extend_from_slice(&TRANSPORT_WITNESS.to_le_bytes());
+    bytes.extend_from_slice(&[0x0f, 0x05]); // syscall into shared kernel witness
+    bytes.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]); // mov rdi, rax; mov rax, OBSERVE_NATIVE
+    bytes.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    bytes.extend_from_slice(&[0x0f, 0x05]);
+    bytes.extend_from_slice(&[0x0f, 0x0b]);
+    bytes
+}
+
+#[test]
+fn shared_kernel_transport_yield_and_fatal() {
+    let yield_prog = transport_program(0);
+    let fatal_prog = transport_program(1);
+    let mut carrier =
+        Cpl0Carrier::boot(&image(), [&yield_prog, &fatal_prog]).expect("real KVM + CPL0 image");
+    let obs = carrier.observe(0).expect("yield should resume and succeed");
+    assert_eq!(obs.result, 0);
+    assert_eq!(obs.host_yields, 1);
+    let fatal_err = carrier.observe(1).expect_err("fatal must exit with error");
+    assert!(
+        fatal_err.to_string().contains("CPL0 fatal exit"),
+        "expected fatal exit, got {fatal_err}"
+    );
+}
