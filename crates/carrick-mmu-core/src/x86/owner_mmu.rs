@@ -33,11 +33,11 @@ impl OwnerForkMmu for X86Mmu {
     fn is_user(word: u64) -> bool {
         word & USER != 0
     }
-    fn is_retired(_: u64) -> bool {
-        false
+    fn is_retired(word: u64) -> bool {
+        word & RETIRED != 0 && word & (PRESENT | PREPARED) == 0
     }
     fn is_absent_unowned(word: u64) -> bool {
-        word & (PRESENT | PREPARED) == 0
+        word & (PRESENT | PREPARED | RETIRED) == 0
     }
     fn is_owned_resident(word: u64) -> bool {
         word & (PRESENT | PREPARED | MAY_WRITE) == PRESENT | MAY_WRITE
