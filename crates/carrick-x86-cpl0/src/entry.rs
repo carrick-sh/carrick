@@ -5,24 +5,8 @@
 #[cfg(not(target_os = "none"))]
 fn main() {}
 
-// Linked cores expose allocation-capable APIs, but this fixture consumes
-// preprovisioned records and contexts. No native heap owner is published.
 #[cfg(target_os = "none")]
-struct NoAllocation;
-// SAFETY: no allocation or deallocation returns; unavailable heap custody
-// fails closed before any storage can be returned or reused.
-#[cfg(target_os = "none")]
-unsafe impl core::alloc::GlobalAlloc for NoAllocation {
-    unsafe fn alloc(&self, _: core::alloc::Layout) -> *mut u8 {
-        kernel::halt()
-    }
-    unsafe fn dealloc(&self, _: *mut u8, _: core::alloc::Layout) {
-        kernel::halt()
-    }
-}
-#[cfg(target_os = "none")]
-#[global_allocator]
-static ALLOCATOR: NoAllocation = NoAllocation;
+extern crate alloc as rust_alloc;
 
 #[cfg(target_os = "none")]
 use carrick_el1::isa::x86::context::native as adapter;
@@ -260,6 +244,64 @@ mod kernel {
         if frame.rax == OBSERVE_NATIVE {
             doorbell(CONTROL_PORT, frame);
             frame.rax = 0;
+            return;
+        }
+        if frame.rax == OBSERVE_MMU_ROOT {
+            use carrick_guest_arch::MmuBackend;
+            let mut arch = carrick_el1::isa::x86::X86Backend;
+            frame.rax = arch.live_root().map_or(0, |root| root.address().raw());
+            return;
+        }
+        if frame.rax == OBSERVE_MMU_DRAIN {
+            use carrick_guest_arch::{
+                AddressContext, ContextGeneration, FrameGpa, GuestLen, MmGeneration, MmuBackend,
+                RootGpa, UserRange, UserVa,
+            };
+            let mut arch = carrick_el1::isa::x86::X86Backend;
+            frame.rax = arch
+                .live_root()
+                .and_then(|_| {
+                    let root = RootGpa::page_aligned(FrameGpa::new(frame.rsi))
+                        .ok_or(carrick_el1::isa::ArchError::Unbound)?;
+                    let context = AddressContext {
+                        root,
+                        mm: MmGeneration::new(core::num::NonZeroU64::MIN),
+                        generation: ContextGeneration::new(core::num::NonZeroU64::MIN),
+                    };
+                    let range = UserRange::checked(UserVa::new(frame.rdi), GuestLen::new(4096))
+                        .ok_or(carrick_el1::isa::ArchError::Unbound)?;
+                    arch.request_invalidation(context, range)
+                        .and_then(|ticket| arch.ack_drain(ticket))
+                })
+                .map_or(u64::MAX, |receipt| receipt.root().address().raw());
+            return;
+        }
+        if frame.rax == OBSERVE_ALLOCATOR {
+            let layout = match core::alloc::Layout::from_size_align(128, 64) {
+                Ok(layout) => layout,
+                Err(_) => {
+                    frame.rax = 0;
+                    return;
+                }
+            };
+            // SAFETY: the global allocator returns a block of this layout;
+            // this fixture owns it exclusively until the matching dealloc.
+            let ptr = core::hint::black_box(unsafe { crate::rust_alloc::alloc::alloc(layout) });
+            if ptr.is_null() {
+                frame.rax = 0;
+                return;
+            }
+            // SAFETY: byte 127 is inside this exclusively owned allocation.
+            unsafe { core::ptr::write_volatile(ptr.add(127), 0xa5) };
+            // SAFETY: the same byte remains allocated until dealloc below.
+            let valid = (ptr as usize & 63) == 0
+                && (ptr as u64)
+                    .checked_sub(carrick_el1_abi::EL1_BOOTSTRAP_METADATA_BASE)
+                    .is_some_and(|offset| offset < carrick_el1_abi::EL1_BOOTSTRAP_METADATA_SIZE)
+                && unsafe { core::ptr::read_volatile(ptr.add(127)) } == 0xa5;
+            // SAFETY: ptr was returned for layout and has not escaped.
+            unsafe { crate::rust_alloc::alloc::dealloc(ptr, layout) };
+            frame.rax = u64::from(valid);
             return;
         }
         // SAFETY: bootstrap retains these supervisor-only records until the

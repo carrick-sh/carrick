@@ -12,6 +12,12 @@ pub const FATAL_PORT: u16 = 0xcc;
 pub const YIELD_PORT: u16 = 0xd0;
 /// Fixture observation only, outside Linux semantic serving.
 pub const OBSERVE_NATIVE: u64 = u64::MAX;
+/// Fixture observation of the shared kernel's active MMU root.
+pub const OBSERVE_MMU_ROOT: u64 = u64::MAX - 1;
+/// Fixture observation of the shared kernel allocator.
+pub const OBSERVE_ALLOCATOR: u64 = u64::MAX - 2;
+/// Fixture request for a local MMU drain of the supplied user page.
+pub const OBSERVE_MMU_DRAIN: u64 = u64::MAX - 3;
 
 /// Stack order is enforced by the CPL0 assembly and these compile assertions.
 #[repr(C)]

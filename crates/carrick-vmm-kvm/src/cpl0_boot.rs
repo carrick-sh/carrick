@@ -5,8 +5,8 @@ use crate::guest_setup::{GuestRam, WindowKind};
 use crate::{KvmKickHandle, KvmVcpu, KvmVm};
 use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
-    BlockedMask, Counters, CurrentTask, El1TaskId, ThreadControlSlot, ThreadLifecyclePage,
-    X86_CPL0_DYNAMIC_METADATA_BASE,
+    BlockedMask, Counters, CurrentTask, EL1_BOOTSTRAP_METADATA_BASE, EL1_BOOTSTRAP_METADATA_SIZE,
+    El1TaskId, ThreadControlSlot, ThreadLifecyclePage, X86_CPL0_DYNAMIC_METADATA_BASE,
 };
 use carrick_hal::{HvVcpu, HvVm, MemPerms, TrapError, VcpuExit, VcpuKick};
 use carrick_mem::pml4::{Pml4MapSpec, pml4_tables};
@@ -23,6 +23,7 @@ use std::time::Duration;
 const RAM_SIZE: usize = 16 * 1024 * 1024;
 const META_GPA: u64 = 0xc0_0000;
 const META_LEN: u64 = 0x2_0000;
+const ALLOCATOR_GPA: u64 = 0x20_00000;
 const COUNTERS_OFFSET: u64 = 0x1_0000;
 const BINDING_OFFSET: u64 = 0x8000;
 const TASK_OFFSET: u64 = 0x9000;
@@ -166,6 +167,12 @@ impl Cpl0Carrier {
             WindowKind::Private,
         )
         .map_err(|e| fail(e.to_string()))?;
+        ram.add_window(
+            ALLOCATOR_GPA,
+            EL1_BOOTSTRAP_METADATA_SIZE as usize,
+            WindowKind::Private,
+        )
+        .map_err(|e| fail(e.to_string()))?;
         let mut maps = Vec::new();
         for segment in &plan.segments {
             let end = segment
@@ -213,6 +220,14 @@ impl Cpl0Carrier {
             va: METADATA_VA,
             gpa: META_GPA,
             len: META_LEN,
+            user: false,
+            write: true,
+            exec: false,
+        });
+        maps.push(Pml4MapSpec {
+            va: EL1_BOOTSTRAP_METADATA_BASE,
+            gpa: ALLOCATOR_GPA,
+            len: EL1_BOOTSTRAP_METADATA_SIZE,
             user: false,
             write: true,
             exec: false,

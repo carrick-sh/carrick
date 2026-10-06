@@ -11,7 +11,9 @@
 use carrick_guest_arch::{AddressContext, ContextGeneration, FrameGpa, MmGeneration, RootGpa};
 use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables};
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
-use carrick_x86::cpl0_entry::OBSERVE_NATIVE;
+use carrick_x86::cpl0_entry::{
+    OBSERVE_ALLOCATOR, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE,
+};
 use carrick_x86::cpl0_scheduler::{
     ContextBinding, InterruptFrame, NativeContext, XsaveArea, admit_context, park_native_context,
     restore_native_context,
@@ -133,6 +135,62 @@ fn program(calls: &[(u64, u64)]) -> Vec<u8> {
     }
     bytes.extend_from_slice(&[0x0f, 0x0b]); // running past the fixture is a fault
     bytes
+}
+
+#[test]
+fn shared_kernel_mmu_reports_live_cr3_root() {
+    let mut program = vec![0x48, 0xb8]; // mov rax, fixture MMU observation
+    program.extend_from_slice(&OBSERVE_MMU_ROOT.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    for task in 0..2 {
+        let observed = carrier
+            .observe(task)
+            .expect("MMU root read and observation");
+        assert_eq!(observed.result as u64, 0x60_0000);
+        assert_eq!(observed.semantic_host_exits, 0);
+    }
+}
+
+#[test]
+fn shared_kernel_allocator_serves_two_live_cpl0_tasks() {
+    let mut program = vec![0x48, 0xb8];
+    program.extend_from_slice(&OBSERVE_ALLOCATOR.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&program, &program]).expect("KVM image");
+    for task in 0..2 {
+        let observed = carrier.observe(task).expect("allocator and observation");
+        assert_eq!(observed.result, 1);
+        assert_eq!(observed.semantic_host_exits, 0);
+    }
+}
+
+#[test]
+fn shared_kernel_drain_receipt_requires_the_live_root() {
+    let program = |root: u64| {
+        let mut bytes = vec![0x48, 0xbf]; // mov rdi, user page
+        bytes.extend_from_slice(&0x3_0000_u64.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xbe]); // mov rsi, requested root
+        bytes.extend_from_slice(&root.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xb8]);
+        bytes.extend_from_slice(&OBSERVE_MMU_DRAIN.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        bytes.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+        bytes
+    };
+    let good = program(0x60_0000);
+    let stale = program(0x70_0000);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&good, &stale]).expect("KVM image");
+    assert_eq!(
+        carrier.observe(0).expect("live root receipt").result as u64,
+        0x60_0000
+    );
+    assert_eq!(carrier.observe(1).expect("stale root refused").result, -1);
 }
 
 // Observe each task in turn while both lifecycle slots remain live. Registration
