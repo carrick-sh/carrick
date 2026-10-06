@@ -6,7 +6,7 @@
 #[cfg(target_os = "none")]
 use super::ThreadCpu;
 use super::UserWord;
-#[cfg(any(test, target_os = "none"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 mod aarch64_context;
 #[cfg(test)]
 pub(super) use aarch64_context::{load_frame, save_frame};
@@ -19,7 +19,7 @@ use carrick_el1_abi::{ThreadCtx, TrapFrame};
 pub struct HardwareUserWord;
 
 impl UserWord for HardwareUserWord {
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     fn read_u32(&self, task: &CurrentTask, uaddr: u64) -> Option<u32> {
         use crate::substrate::file::MemoryValidator;
         if crate::substrate::file::HardwareValidator.readable_bytes(uaddr, 4) < 4 {
@@ -53,6 +53,11 @@ impl UserWord for HardwareUserWord {
         (ok != 0).then_some(value as u32)
     }
 
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    fn read_u32(&self, _task: &CurrentTask, _uaddr: u64) -> Option<u32> {
+        crate::isa::x86::carrick_x86_unbound_user_word()
+    }
+
     #[cfg(not(target_os = "none"))]
     fn read_u32(&self, _task: &CurrentTask, uaddr: u64) -> Option<u32> {
         // Host builds (unit tests): the "user" word is host memory.
@@ -60,7 +65,7 @@ impl UserWord for HardwareUserWord {
         Some(unsafe { core::ptr::read_volatile(uaddr as *const u32) })
     }
 
-    #[cfg(target_os = "none")]
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     fn read_u64(&self, task: &CurrentTask, uaddr: u64) -> Option<u64> {
         use crate::substrate::file::MemoryValidator;
         if crate::substrate::file::HardwareValidator.readable_bytes(uaddr, 8) < 8 {
@@ -94,6 +99,11 @@ impl UserWord for HardwareUserWord {
         (ok != 0).then_some(value)
     }
 
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    fn read_u64(&self, _task: &CurrentTask, _uaddr: u64) -> Option<u64> {
+        crate::isa::x86::carrick_x86_unbound_user_word()
+    }
+
     #[cfg(not(target_os = "none"))]
     fn read_u64(&self, _task: &CurrentTask, uaddr: u64) -> Option<u64> {
         // SAFETY: tests pass the address of a live, aligned u64.
@@ -106,7 +116,7 @@ impl UserWord for HardwareUserWord {
 #[cfg(target_os = "none")]
 pub struct HardwareCpu;
 
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 impl ThreadCpu for HardwareCpu {
     fn save(&mut self, frame: &TrapFrame, ctx: &mut ThreadCtx) {
         aarch64_context::save(frame, ctx);
@@ -239,6 +249,49 @@ impl ThreadCpu for HardwareCpu {
     }
 }
 
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+impl ThreadCpu for HardwareCpu {
+    fn save(&mut self, _frame: &TrapFrame, _ctx: &mut ThreadCtx) {
+        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+    }
+    fn load(&mut self, _frame: &mut TrapFrame, _ctx: &ThreadCtx) {
+        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+    }
+    fn set_translation(&mut self, _ttbr0: u64, _ttbr1: u64) {
+        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+    }
+    fn invalidate_asid(&mut self, _ttbr0: u64) {
+        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+    }
+    fn now(&self) -> u64 {
+        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+    }
+    fn freq(&self) -> u64 {
+        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+    }
+    fn set_timer(&mut self, _cval: Option<u64>) {
+        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+    }
+    fn send_sgi(&mut self, _sgi1r: u64) {
+        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+    }
+    fn ack_irq(&mut self) -> u32 {
+        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+    }
+    fn end_irq(&mut self, _intid: u32) {
+        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+    }
+    fn wait_for_interrupt(&mut self) {
+        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+    }
+    fn spin(&mut self) {
+        core::hint::spin_loop();
+    }
+    fn own_sgi_target(&self) -> u64 {
+        crate::isa::x86::carrick_x86_unbound_thread_cpu()
+    }
+}
+
 /// Read the current stack pointer at EL1.
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline(always)]
@@ -248,6 +301,12 @@ pub fn read_current_sp() -> u64 {
         core::arch::asm!("mov {0}, sp", out(reg) sp, options(nomem, nostack));
     }
     sp
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[inline(always)]
+pub fn read_current_sp() -> u64 {
+    crate::isa::x86::carrick_x86_unbound_stack_slot()
 }
 
 /// Guard structure capturing saved DAIF interrupt flags.
@@ -293,7 +352,7 @@ pub fn restore_irq(guard: IrqGuard) {
 
 /// Non-returning native fatal transport after an entry loses its exact binding.
 /// Guest syscall replay or a return through another task is forbidden.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub(crate) fn fatal_entry_binding() -> ! {
     // SAFETY: this runs at EL1. HVC #3 is the image's fatal boundary, with
     // the established panic sentinel and no guest return/result publication.
@@ -306,4 +365,9 @@ pub(crate) fn fatal_entry_binding() -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub(crate) fn fatal_entry_binding() -> ! {
+    crate::isa::x86::carrick_x86_unbound_entry_fatal()
 }
