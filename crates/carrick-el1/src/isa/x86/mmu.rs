@@ -5,6 +5,12 @@ use carrick_guest_arch::{
     Access, AddressContext, CopyProgress, FrameGpa, GuestLen, MmuBackend, RootGpa, UserRange,
     UserVa,
 };
+use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorRefusal, LiveDescriptorWords};
+use carrick_mmu_core::x86::descriptor_txn::{
+    DescriptorOutcome, DescriptorReceipt, DescriptorTxn, InlineJournal, execute_descriptor_txn,
+};
+use core::cell::Cell;
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 const ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const CR4_PGE: u64 = 1 << 7;
@@ -59,6 +65,109 @@ pub fn hardware_live_root() -> Result<RootGpa, ArchError> {
 pub fn unsupported_arm_descriptor_path() -> u64 {
     // SAFETY: no ARM descriptor mutation may proceed against an x86 PML4.
     unsafe { core::arch::asm!("ud2", options(noreturn)) }
+}
+
+/// Exact physical page-table window retained and identity mapped for a CPL0
+/// descriptor transaction. Construction requires the caller's MM editor.
+struct NativeDescriptorWords {
+    context: AddressContext<RootGpa>,
+    base: u64,
+    end: u64,
+    failed_drain: Cell<bool>,
+}
+
+impl NativeDescriptorWords {
+    fn word(&self, pa: u64) -> Result<&AtomicU64, DescriptorRefusal> {
+        if pa & 7 != 0 || pa < self.base || pa.checked_add(8).is_none_or(|end| end > self.end) {
+            return Err(DescriptorRefusal::TableOutsidePrimary);
+        }
+        // SAFETY: the caller of execute_native_descriptor_txn retains this
+        // identity mapped and aligned table window through the transaction.
+        Ok(unsafe { &*(pa as *const AtomicU64) })
+    }
+}
+
+impl LiveDescriptorWords for NativeDescriptorWords {
+    fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+        Ok(self.word(pa)?.load(Ordering::Acquire))
+    }
+
+    fn compare_exchange(&self, pa: u64, current: u64, new: u64) -> Result<bool, DescriptorRefusal> {
+        Ok(self
+            .word(pa)?
+            .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok())
+    }
+
+    fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+        if self
+            .word(pa)?
+            .compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(DescriptorRefusal::Contended);
+        }
+        Ok(())
+    }
+
+    fn publish_barrier(&self) {
+        fence(Ordering::SeqCst);
+    }
+
+    fn invalidate_range(&self, va: u64, len: u64) {
+        let Some(range) = UserRange::checked(UserVa::new(va), GuestLen::new(len)) else {
+            self.failed_drain.set(true);
+            return;
+        };
+        let mut backend = X86Backend;
+        let drained = backend
+            .request_invalidation(self.context, range)
+            .and_then(|ticket| backend.ack_drain(ticket));
+        if drained.is_err() {
+            self.failed_drain.set(true);
+        }
+    }
+}
+
+/// Execute a journaled native x86 descriptor operation under the exact MM
+/// editor. A caller must treat `Err` as indeterminate and stop guest execution.
+///
+/// # Safety
+/// `table_base..table_base+table_bytes` must be a retained, writable, identity
+/// mapped page-table window for `txn.root`. The caller holds exclusive MM edit
+/// authority across this call and excludes concurrent hardware A/D writers.
+pub unsafe fn execute_native_descriptor_txn(
+    txn: &DescriptorTxn<'_>,
+    table_base: u64,
+    table_bytes: u64,
+) -> Result<DescriptorReceipt, ArchError> {
+    if live_root()? != txn.root
+        || table_base != txn.root.address().raw()
+        || table_bytes < 4096
+        || table_bytes & 4095 != 0
+    {
+        return Err(ArchError::Unbound);
+    }
+    let end = table_base
+        .checked_add(table_bytes)
+        .ok_or(ArchError::Unbound)?;
+    let words = NativeDescriptorWords {
+        context: AddressContext {
+            root: txn.root,
+            mm: carrick_guest_arch::MmGeneration::new(txn.id.mm_key),
+            generation: carrick_guest_arch::ContextGeneration::new(txn.id.generation),
+        },
+        base: table_base,
+        end,
+        failed_drain: Cell::new(false),
+    };
+    let guard = crate::substrate::sched::hw::disable_irq_save();
+    let receipt = execute_descriptor_txn(&words, txn, txn.root, &mut InlineJournal::new());
+    crate::substrate::sched::hw::restore_irq(guard);
+    if words.failed_drain.get() || matches!(receipt.outcome, DescriptorOutcome::Indeterminate(_)) {
+        return Err(ArchError::Busy);
+    }
+    Ok(receipt)
 }
 
 impl MmuBackend for X86Backend {
