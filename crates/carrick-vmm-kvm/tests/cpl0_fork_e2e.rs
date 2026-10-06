@@ -308,3 +308,99 @@ fn exhausted_wait_entries_return_eagain_before_parking() {
     assert_eq!(result.semantic_host_exits, 0);
     assert_eq!(carrier.lifecycle_state(0).expect("no wake").wakes, 0);
 }
+
+#[test]
+fn wait4_zeroes_the_full_rusage_record() {
+    let mut elf = fork_wait_elf();
+    let start = 0xb0 + 18;
+    // Save child PID, fill all 144 rusage bytes, and restore wait's PID.
+    let fill = [
+        0x89, 0xfb, 0x48, 0x8d, 0xbc, 0x24, 0x00, 0xff, 0xff, 0xff, 0xb9, 144, 0, 0, 0, 0xb0, 0xa5,
+        0xf3, 0xaa, 0x89, 0xdf,
+    ];
+    elf.splice(start..start, fill);
+    let r10 = elf
+        .windows(3)
+        .position(|b| b == [0x45, 0x31, 0xd2])
+        .expect("rusage argument");
+    let lea = [0x4c, 0x8d, 0x94, 0x24, 0x00, 0xff, 0xff, 0xff];
+    elf.splice(r10..r10 + 3, lea);
+    let wait_end = elf
+        .windows(7)
+        .position(|b| b == [0xb8, 61, 0, 0, 0, 0x0f, 0x05])
+        .expect("wait4")
+        + 7;
+    let check = [
+        0x48, 0x8d, 0xbc, 0x24, 0x00, 0xff, 0xff, 0xff, 0xb9, 144, 0, 0, 0, 0x31, 0xc0, 0xf3, 0xae,
+        0x75, 0,
+    ];
+    elf.splice(wait_end..wait_end, check);
+    elf[0xb0 + 15] += (fill.len() + lea.len() - 3 + check.len()) as u8;
+    let failure = elf
+        .windows(7)
+        .position(|b| b == [0xbf, 9, 0, 0, 0, 0xb8, 231])
+        .expect("failure");
+    elf[wait_end + check.len() - 1] = (failure - wait_end - check.len()) as u8;
+    let size = elf.len() as u64;
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    let program = initial_process_program(&elf);
+    let mut carrier = Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM");
+    assert_eq!(carrier.observe(0).expect("full rusage write").result, 7);
+}
+
+#[test]
+fn wait4_rejects_unwritable_rusage_without_writing_status() {
+    let mut elf = fork_wait_elf();
+    let sentinel = [0xc7, 0x44, 0x24, 0xf8, 0xa5, 0xa5, 0xa5, 0xa5];
+    elf.splice(0xb0 + 18..0xb0 + 18, sentinel);
+    let r10 = elf
+        .windows(3)
+        .position(|b| b == [0x45, 0x31, 0xd2])
+        .expect("rusage argument");
+    let mut pointer = vec![0x49, 0xba];
+    pointer.extend_from_slice(&0xdead000u64.to_le_bytes());
+    elf.splice(r10..r10 + 3, pointer.iter().copied());
+    let wait_end = elf
+        .windows(7)
+        .position(|b| b == [0xb8, 61, 0, 0, 0, 0x0f, 0x05])
+        .expect("wait4")
+        + 7;
+    // Require EFAULT and exit immediately: no child completion was consumed.
+    let check = [
+        0x83, 0xf8, 0xf2, 0x75, 22, 0x81, 0x7c, 0x24, 0xf8, 0xa5, 0xa5, 0xa5, 0xa5, 0x75, 12, 0xbf,
+        7, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0xbf, 9, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f,
+        0x05,
+    ];
+    elf.splice(wait_end..wait_end, check);
+    elf[0xb0 + 15] += (sentinel.len() + pointer.len() - 3 + check.len()) as u8;
+    let size = elf.len() as u64;
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    let program = initial_process_program(&elf);
+    let mut carrier = Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM");
+    assert_eq!(carrier.observe(0).expect("rusage EFAULT").result, 7);
+    assert_eq!(
+        carrier
+            .lifecycle_state(0)
+            .expect("child not retired")
+            .retirements,
+        0
+    );
+}
+
+#[test]
+fn wait4_without_an_admitted_child_returns_echild() {
+    let mut elf = fork_wait_elf();
+    let code = [
+        0xbf, 0xff, 0xff, 0xff, 0xff, 0x31, 0xf6, 0x31, 0xd2, 0x45, 0x31, 0xd2, 0xb8, 61, 0, 0, 0,
+        0x0f, 0x05, 0x83, 0xf8, 0xf6, 0x75, 12, 0xbf, 7, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05,
+        0xbf, 9, 0, 0, 0, 0xb8, 231, 0, 0, 0, 0x0f, 0x05, 0x0f, 0x0b,
+    ];
+    elf.truncate(0xb0);
+    elf.extend_from_slice(&code);
+    let size = elf.len() as u64;
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    let program = initial_process_program(&elf);
+    let mut carrier = Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM");
+    assert_eq!(carrier.observe(0).expect("no admitted child").result, 7);
+    assert_eq!(carrier.lifecycle_state(0).expect("no birth").births, 0);
+}
