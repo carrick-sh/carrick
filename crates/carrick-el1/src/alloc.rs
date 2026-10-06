@@ -80,7 +80,7 @@ impl MetadataStorage {
     #[cfg(target_os = "none")]
     fn mark_pending_host_work(slot: usize) {
         if let Some(task) = carrick_el1_abi::current_task_guest(slot) {
-            task.mark_pending_host_work();
+            task.linux.mark_pending_host_work();
         }
     }
 
