@@ -3,7 +3,7 @@
 // until the x86 descriptor/backing service is bound.
 use super::InitialWords;
 use carrick_el1::memory::{ReservationDisposition, decide_anonymous_syscall};
-use carrick_el1::memory::reservations::shared_x86_cpl0_guest;
+use carrick_el1::memory::reservations::{X86Cpl0Zone, shared_x86_cpl0_guest};
 use carrick_el1_abi::{
     CurrentTask, ReservationBackingReceipt, ReservationCompletion, ReservationMm, TrapFrame,
 };
@@ -14,7 +14,7 @@ use carrick_personality_linux::entry::{CanonicalCall, SyscallResult};
 use carrick_personality_linux::pending_anonymous::{
     DelegatedStep, PendingAnonymousVenue, PermissionStep, RetirementStep,
 };
-use carrick_sched_core::{SlotId, ZoneTables};
+use carrick_sched_core::SlotId;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static TABLE_START: AtomicU64 = AtomicU64::new(0);
@@ -90,7 +90,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
             + carrick_el1_abi::X86_CPL0_ZONE_OFFSET;
         // SAFETY: the carrier retains and maps the aligned zone with the
         // reservation store throughout this initial MM's execution.
-        let zone = unsafe { &*(zone_address as *const ZoneTables) };
+        let zone = unsafe { &*(zone_address as *const X86Cpl0Zone) };
         let Some(mm) = ReservationMm::new(self.task.mm.key.load(Ordering::Acquire)) else {
             return DelegatedStep::Forward;
         };
@@ -100,7 +100,7 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
         let Some(slot) = SlotId::from_index(self.frame.slot as usize) else {
             return DelegatedStep::Forward;
         };
-        let access = carrick_el1::substrate::sched::object_wait::space_access(zone, slot);
+        let access = carrick_core::wait::space_access(zone, slot, initial_release);
         let Some(grant) = access.grant(index, mm.raw()) else { return DelegatedStep::Forward; };
         let Some(root) = RootGpa::page_aligned(carrick_guest_arch::FrameGpa::new(grant.ttbr0)) else {
             return DelegatedStep::Forward;
@@ -156,6 +156,18 @@ impl PendingAnonymousVenue for X86AnonymousVenue<'_> {
     fn retirement(&mut self) -> RetirementStep { RetirementStep::Forward }
     fn install_result(&mut self, result: SyscallResult) {
         self.frame.x[0] = result.raw() as u64;
+    }
+}
+
+fn initial_release(
+    _: &X86Cpl0Zone,
+    _: carrick_sched_core::Waker,
+    owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, carrick_sched_core::ParkedContextWords>,
+) {
+    let mut handed = false;
+    let (_, effects) = owned.deliver_handbacks(&mut |_| handed = true);
+    if handed || effects != carrick_sched_core::WakeEffects::default() {
+        fatal_reservation();
     }
 }
 
