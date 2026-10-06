@@ -262,6 +262,7 @@ impl UserCopy for FaultingUser {
 fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser) -> Option<Action> {
     let task = &w.tasks[SLOT_IDX];
     let sched = Sched {
+        handoff: None,
         zone: &w.zone,
         slot: SLOT,
         task,

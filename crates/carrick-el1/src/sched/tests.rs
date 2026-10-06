@@ -85,6 +85,7 @@ fn serve_on(
         host_publish(zone, slot, task.mm.key.load(Ordering::Relaxed), None, 0);
     }
     Sched {
+        handoff: None,
         zone,
         slot,
         task,
@@ -276,6 +277,7 @@ fn host_request_during_repark(kind: Handback) {
     set_op(&mut frame, uaddr, FUTEX_WAIT_PRIVATE, 0);
     let before = frame;
     let result = Sched {
+        handoff: None,
         zone: &zone,
         slot: SLOT,
         task: &task,
@@ -545,6 +547,7 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
     // OTHER's idle loop takes the SGI and runs B.
     cpu_b.pending.push_back(GIC_RESCHED_INTID);
     let served = Sched {
+        handoff: None,
         zone: &zone,
         slot: OTHER,
         task: &task_b,
@@ -595,6 +598,7 @@ fn the_virtual_timer_preempts_a_compute_loop() {
     let a_running = (frame, cpu.regs.clone());
     let irq = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
         Sched {
+            handoff: None,
             zone: &zone,
             slot: SLOT,
             task: &task,
@@ -642,6 +646,7 @@ fn a_kick_taken_at_el0_forwards() {
     cpu.pending.push_back(GIC_KICK_INTID);
     let copy = frame;
     let action = Sched {
+        handoff: None,
         zone: &zone,
         slot: SLOT,
         task: &task,
@@ -935,6 +940,7 @@ fn a_slice_ending_before_a_host_runnable_thread_leaves_for_the_host() {
     let slice = cpu.freq / 1000 * 2;
     let irq = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
         Sched {
+            handoff: None,
             zone: &zone,
             slot: SLOT,
             task: &task,
@@ -983,6 +989,7 @@ fn the_idle_entry_runs_a_queued_thread_or_leaves_for_the_host() {
     idle_task.mm.key.store(MM, Ordering::Relaxed);
     let entry = |frame: &mut TrapFrame, cpu: &mut FakeCpu, task: &CurrentTask| {
         Sched {
+            handoff: None,
             zone: &zone,
             slot: SLOT,
             task,
@@ -1050,6 +1057,7 @@ fn an_idle_vcpu_steals_a_queued_thread() {
     };
     let mut idle_cpu = FakeCpu::default();
     let action = Sched {
+        handoff: None,
         zone: &zone,
         slot: other,
         task: &idle_task,
@@ -1408,6 +1416,7 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
     let a_pc = OperationResumePc::new(0x9000).unwrap();
     let counter = counters();
     let mut sched = Sched {
+        handoff: None,
         zone: &zone,
         slot: SLOT,
         task: &task,
@@ -1511,6 +1520,7 @@ fn el1_ipc_wait_cross_slot_wake_sends_sgi_after_queue_unlock() {
     let task = task_for(101);
     let mut cpu = FakeCpu::default();
     let mut sched = Sched {
+        handoff: None,
         zone: &zone,
         slot: SLOT,
         task: &task,
@@ -1593,6 +1603,7 @@ fn fresh_record_park_refusal_does_not_leak_unpublished_record_on_occupied_timer_
     let (frame, mut cpu) = live(0xa, 0x4000, FUTEX_WAIT_PRIVATE, 0);
     let counter = counters();
     let mut sched = Sched {
+        handoff: None,
         zone: &zone,
         slot: SLOT,
         task: &task,

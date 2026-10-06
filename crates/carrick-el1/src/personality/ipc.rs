@@ -1108,6 +1108,7 @@ mod tests {
             {
                 let zone: &ZoneTables = &self.zone;
                 let sched = Sched {
+                    handoff: None,
                     zone,
                     slot: SLOT,
                     task: &self.task,
@@ -1134,6 +1135,7 @@ mod tests {
         fn call(&mut self, frame: &mut TrapFrame) -> IpcServed {
             let zone: &ZoneTables = &self.zone;
             let mut sched = Sched {
+                handoff: None,
                 zone,
                 slot: SLOT,
                 task: &self.task,
