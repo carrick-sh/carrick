@@ -80,3 +80,12 @@ anonymous-fault edits. Generic probes also expose a separate root-slot collision
 at `0x9a00400000`. Fresh-executable diagnostics retain a carrier core repeatedly
 waiting for already-exited PID 31; a copyout/reaping diagnosis remains a
 hypothesis. File-table lease and clone-TID code remain unchanged.
+
+The native repair is committed as `506be1a74`. Its inventory refresh adds six
+mapping-text rows: one borrowed reservation-model lookup and five read-only
+checks of anonymous status, range endpoints, protection and flags. They add no
+file-authority operation. K1 taxonomy families/counts are unchanged; one
+existing dispatch-lock line moves. Compiler capture still has the same 619
+rows and row digest; only its authenticated source identity advances. The
+position-only reconciler refused the six new rows pending this explicit review;
+subsequent inventory and taxonomy checks pass with the reviewed rows retained.
