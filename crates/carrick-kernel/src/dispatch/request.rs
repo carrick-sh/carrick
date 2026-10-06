@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use carrick_abi::LinuxErrno;
 use carrick_guest_mem::CurrentMmMemory;
-use serde::Serialize;
+use serde::Serialize as _;
 
 use super::mm_mutation::MmMutationGuard;
 use super::{DispatchOutcome, MmExecutorParticipation};
@@ -13,7 +13,7 @@ pub(crate) fn threaded_independent_dispatch_supports(number: u64) -> bool {
     matches!(number, 96 | 98 | 99 | 124 | 130 | 131 | 172 | 178 | 449)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 pub struct SyscallRequest {
     /// The CANONICAL (asm-generic/aarch64) syscall number the dispatch tables
     /// switch on. Typed [`CanonicalNr`] so it cannot be swapped with

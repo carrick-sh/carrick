@@ -1,9 +1,8 @@
-use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ResourceClass {
     Build,
@@ -46,7 +45,7 @@ impl ResourceClass {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct LeaseOwner {
     pub host: String,
     pub pid: u32,

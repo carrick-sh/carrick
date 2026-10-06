@@ -1,11 +1,10 @@
 use std::path::PathBuf;
 
 use carrick_conformance_contract::{CapabilityClass, ContractId, ExecutionLayer};
-use serde::{Deserialize, Serialize};
 
 use crate::record::ResourceUsage;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(tag = "stage", rename_all = "kebab-case")]
 pub enum Stage {
     Queued,

@@ -33,7 +33,6 @@ use std::path::PathBuf;
 
 use carrick_kernel::run_state::DEFAULT_MAX_TRAPS;
 use carrick_spec::{ExecBackendRequest, FsBackendKind, PidMode};
-use clap::{Parser, Subcommand};
 
 use crate::trace_profile::TraceProfileKind;
 
@@ -73,7 +72,7 @@ impl clap::builder::TypedValueParser for ExecBackendValueParser {
     }
 }
 
-#[derive(Debug, Parser)]
+#[derive(Debug, ::clap::Parser)]
 #[command(author, version, about)]
 pub(crate) struct Cli {
     #[arg(long, env = "CARRICK_HOME", global = true, display_order = 20)]
@@ -352,7 +351,7 @@ impl Default for ExecutionArgs {
     }
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, ::clap::Subcommand)]
 pub(crate) enum Commands {
     /// Print the source identity embedded by `scripts/build-signed.sh`.
     #[command(name = "__build-source-marker", hide = true)]
@@ -868,7 +867,7 @@ pub(crate) enum Commands {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, ::clap::Subcommand)]
 pub(crate) enum VolumeCommand {
     /// Create a Docker-compatible named volume. With no NAME on macOS, create
     /// Carrick's case-sensitive APFS scratch volume.
@@ -931,7 +930,7 @@ pub(crate) enum VolumeCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, ::clap::Subcommand)]
 pub(crate) enum DebugCommand {
     /// Run the registered two-actor namespace fixture through the public Carrier.
     HostNamespaceWork {
@@ -1162,7 +1161,7 @@ pub(crate) enum ContainerGateMode {
     Concurrent,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, ::clap::Subcommand)]
 pub(crate) enum RootfsCommand {
     /// Materialize a cached immutable OCI rootfs; emit its path and image config.
     Export {
@@ -1182,7 +1181,7 @@ pub(crate) enum RootfsCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, ::clap::Subcommand)]
 pub(crate) enum SystemCommand {
     /// Show carrick disk usage (images, containers), like `docker system df`.
     Df,
@@ -1196,7 +1195,7 @@ pub(crate) enum SystemCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, ::clap::Subcommand)]
 pub(crate) enum NetworkCommand {
     /// Create a Docker-compatible network resource.
     Create {
@@ -1328,7 +1327,7 @@ mod tests {
     }
     use super::{Cli, Commands, DebugCommand};
     use crate::trace_profile::TraceProfileKind;
-    use clap::Parser;
+    use clap::Parser as _;
 
     #[test]
     fn authenticated_vm_ledger_requires_external_provenance() {

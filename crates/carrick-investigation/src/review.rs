@@ -1,22 +1,21 @@
 use carrick_conformance_contract::{ClaimId, ContractId, ExecutionLayer};
-use serde::{Deserialize, Serialize};
 
 use crate::record::Hypothesis;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct Diagnosis {
     pub root_cause: String,
     pub causal_evidence: Vec<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct ProposedCorrection {
     pub summary: String,
     pub target_components: Vec<String>,
     pub semantic_neutrality_assessment: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct ReviewPackage {
     pub failing_contract: ContractId,
     pub failing_claim: ClaimId,

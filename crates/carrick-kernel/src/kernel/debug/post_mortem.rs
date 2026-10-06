@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize as _, Serialize as _};
 
 use super::dto::{KernelDebugSnapshot, KernelDebugTable};
 use crate::kernel::core::Kernel;
@@ -90,7 +90,7 @@ const EVENT_RING_RECORDS: usize = 8192;
 /// Why the kernel was aborted. Typed, because the reader's next question is
 /// always "which invariant, on what evidence", and a string cannot be joined
 /// to the tables below it.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum AbortReason {
     /// The always-on runner invariant: no live Linux task can ever reach a
@@ -172,7 +172,7 @@ pub enum AbortReason {
 }
 
 /// Which step of the HVPatch alias install refused. Ordered as the arm runs.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HvpatchAliasInstallSite {
     /// `take_alias_inventory` returned no commit after a successful
@@ -284,7 +284,7 @@ impl AbortReason {
 }
 
 /// A zombie the abort names, in the terms `wait(2)` uses.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct ZombieSummary {
     pub id: i32,
     pub serial: u64,
@@ -308,14 +308,14 @@ impl ZombieSummary {
 }
 
 /// One captured table that did not fit the deadline. Never a silent omission.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct Truncated {
     pub section: String,
     pub reason: String,
 }
 
 /// Everything the kernel knew at the moment it was aborted.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, ::serde::Serialize, ::serde::Deserialize)]
 pub struct PostMortem {
     pub schema: String,
     pub run_id: Option<String>,
@@ -338,7 +338,7 @@ pub struct PostMortem {
     pub truncated: Vec<Truncated>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct EventRingRecord {
     pub logical_index: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]

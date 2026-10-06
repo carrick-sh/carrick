@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
-
 use crate::ResourceClass;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct CampaignBudget {
     pub max_experiments: usize,
     pub max_elapsed_seconds: u64,

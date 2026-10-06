@@ -198,8 +198,7 @@ use crate::linux_abi::{
     align_down_usize, align_up_u64,
 };
 use carrick_guest_mem::{CurrentMmMemory, Gpa, GuestMemory, MemoryError};
-use serde::Serialize;
-use thiserror::Error;
+use serde::Serialize as _;
 use zerocopy::IntoBytes;
 
 // Guest layout for the bootstrap process. HVF on Apple Silicon limits the
@@ -1147,7 +1146,7 @@ pub fn ipa_for_va(va: u64) -> u64 {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct AddressSpace {
     entry: u64,
     regions: Vec<MemoryRegion>,
@@ -1285,7 +1284,7 @@ impl RegionPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct MemoryRegion {
     pub start: u64,
     pub end: u64,
@@ -1346,7 +1345,7 @@ impl MemoryRegion {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, ::thiserror::Error)]
 pub enum AddressSpaceError {
     #[error("failed to inspect ELF load plan: {0}")]
     Elf(#[from] ElfInspectError),

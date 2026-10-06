@@ -29,7 +29,7 @@ use crate::verdict::{
     Baseline, CarrickRunFacts, ConfirmReason, PerfSummary, SerialConfirmation, SideSummary,
     SuiteReport, Verdict, classify, classify_closure,
 };
-use clap::Parser;
+use clap::Parser as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -57,7 +57,7 @@ const DEFAULT_MAX_GATING: usize = 50;
 const PERF_WARN_RATIO: f64 = 10.0;
 const PERF_CRITICAL_RATIO: f64 = 100.0;
 
-#[derive(Parser, Debug)]
+#[derive(::clap::Parser, Debug)]
 #[command(about = "Differential conformance harness (carrick vs docker)")]
 struct Args {
     /// Which tier to run: `smoke` (fast gate) or `full` (everything).
@@ -2867,7 +2867,7 @@ mod tests {
     #[test]
     fn oracle_fill_profile_defaults_to_closure_and_rejects_unknown() {
         use super::{Args, oracle, parse_oracle_fill_profile};
-        use clap::Parser;
+        use clap::Parser as _;
 
         let args = Args::parse_from(["carrick-conformance", "--oracle-fill", "--suite", "x"]);
         assert_eq!(args.oracle_fill_profile, "closure");

@@ -1,4 +1,3 @@
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[cfg(feature = "conformance-metrics")]
@@ -8,13 +7,35 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(feature = "conformance-metrics")]
 use std::sync::{Arc, Weak};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    ::serde::Deserialize,
+    ::serde::Serialize,
+)]
 pub struct WorkScopeId {
     pub raw: u64,
     pub generation: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    ::serde::Deserialize,
+    ::serde::Serialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkMetric {
     KernelDispatches,
@@ -177,7 +198,7 @@ impl WorkMetric {
     ];
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Deserialize, ::serde::Serialize)]
 pub struct WorkSnapshot {
     pub values: BTreeMap<WorkMetric, u64>,
     pub dropped_events: u64,

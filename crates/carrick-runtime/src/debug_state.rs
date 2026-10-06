@@ -10,13 +10,12 @@
 use std::path::{Path, PathBuf};
 
 use carrick_mem::memory::AddressSpace;
-use serde::Serialize;
 
 /// JSON-serialisable snapshot of the guest layout the trap engine is about
 /// to run. Written by `run-elf --debug-state-path` / `run --debug-state-path`
 /// before vCPU launch so the lldb plugin can resolve guest addresses back
 /// to image / segment context.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, ::serde::Serialize, serde::Deserialize)]
 pub struct DebugStateSnapshot {
     pub entry: u64,
     pub initial_stack_pointer: Option<u64>,
@@ -26,7 +25,7 @@ pub struct DebugStateSnapshot {
     pub regions: Vec<DebugRegionSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, ::serde::Serialize, serde::Deserialize)]
 pub struct DebugRegionSnapshot {
     pub start: u64,
     pub end: u64,

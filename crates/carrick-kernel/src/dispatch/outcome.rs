@@ -9,8 +9,7 @@ use carrick_guest_mem::{
     CurrentMmMemory, Gpa, GuestMemory, GuestVa, MemoryError, SharedFutexLocation,
 };
 use carrick_hal::HostAliasBacking;
-use serde::Serialize;
-use thiserror::Error;
+use serde::Serialize as _;
 
 use super::sysv::SysvWaitState;
 use super::wait_authority::WaitFds;
@@ -83,7 +82,7 @@ impl PartialEq for BlockingWriteTarget {
 
 impl Eq for BlockingWriteTarget {}
 
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct BlockingWrite {
     #[serde(skip_serializing)]
     pub(in crate::dispatch) target: BlockingWriteTarget,
@@ -245,7 +244,7 @@ impl std::fmt::Debug for BlockingWrite {
 /// carrick's own logical table keyed on the guest's task/description identity;
 /// the host `fcntl` transport was the retired lanes' answer, where one guest
 /// process was one host process and the host kernel could own the arbitration.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, ::serde::Serialize)]
 pub struct BlockingRecordLock {
     #[serde(skip_serializing)]
     pub(in crate::dispatch) logical: super::fs::LogicalLockWait,
@@ -432,7 +431,7 @@ pub(crate) fn try_drive_blocking_record_lock(lock: &BlockingRecordLock) -> Block
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize)]
 pub struct SharedFutexTarget {
     pub location: SharedFutexLocation,
     pub waiter_key: usize,
@@ -448,7 +447,7 @@ impl SharedFutexTarget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FdWaitCompletion {
     /// Plain fd wait completion semantics.
@@ -496,7 +495,7 @@ pub enum FdWaitCompletion {
 /// task that would wake them, and a wait that re-parks must keep the exact
 /// description, offset and completion authority it started with — restarting a
 /// partially completed operation from zero corrupts the stream.
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, PartialEq, Eq, ::serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
     /// Backend: write `value` into the guest's syscall return register, service any
@@ -1125,7 +1124,7 @@ impl GuestMemory for LinearMemory {
 
 impl CurrentMmMemory for LinearMemory {}
 
-#[derive(Debug, Error)]
+#[derive(Debug, ::thiserror::Error)]
 #[allow(private_interfaces)]
 pub enum DispatchError {
     #[error("owner memory preparation failed: {0}")]

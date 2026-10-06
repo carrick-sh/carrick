@@ -5,10 +5,11 @@ use super::{
     KernelContext, TaskKey,
     objects::{ExecutionGeneration, ThreadKey},
 };
-use serde::{Deserialize, Serialize};
 
 /// Stable operation boundaries, independent of host thread or function address.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, ::serde::Serialize, ::serde::Deserialize,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Point {
     BeforeCredentialAdmission,
@@ -65,7 +66,7 @@ pub enum Authority {
 
 /// Pointer-free authority DTO retained by a replay receipt, never used to
 /// authorize a kernel operation. Generation absence is distinct from zero.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct ThreadStamp {
     pub task_id: i32,
     pub task_serial: u64,
@@ -84,7 +85,7 @@ impl From<Subject> for ThreadStamp {
         }
     }
 }
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub enum AuthorityStamp {
     Thread(ThreadStamp),
     Object {

@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use carrick_abi::LinuxErrno;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize as _, Serialize as _};
 
 use super::{
     ExitStatus, FastPathVisibility, ProcessInfo, SyscallAction, SyscallInfo, SyscallObserver,
@@ -27,7 +27,7 @@ use crate::dispatch::Signal;
 use crate::kernel::TaskKey;
 
 /// Which resource triggered a budget exceed event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetResource {
     Processes,
@@ -62,7 +62,7 @@ pub enum ExceedAction {
 }
 
 /// Live, generation-stamped snapshot of container budget counters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 pub struct BudgetSnapshot {
     /// Monotonic generation incremented on counter mutations.
     pub generation: u64,
