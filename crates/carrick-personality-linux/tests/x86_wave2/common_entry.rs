@@ -9,7 +9,7 @@ use carrick_el1_abi::{Counters, CurrentTask};
 use carrick_el1_abi::{EntryRef, LifecycleHatches, ThreadControlSlot, ThreadLifecyclePage};
 use carrick_guest_arch::{GuestIsa, NativeOrdinal, UserVa};
 use carrick_personality_linux::entry::CanonicalOrdinal;
-use carrick_personality_linux::entry::{CanonicalCall, decode_aarch64, decode_x86_snapshot};
+use carrick_personality_linux::entry::{CanonicalCall, decode_x86_snapshot};
 use carrick_x86::cpl0_entry::NativeFrame;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::boxed::Box;
@@ -269,17 +269,37 @@ pub(super) fn x4_linux_common_entry() {
                 assert_eq!(w.tasks[task].linux.take_served_boundary(), None);
                 assert_eq!(w.heads()[task], (head, 24));
                 assert_eq!(w.heads()[1 - task], before[1 - task]);
-                let arm = decode_aarch64(99, [head, 23, 0, 0, 0, 0], 0x7fff_0000);
+                // ARM crosses its real TrapFrame adapter and the real EL1
+                // PendingFamilies implementation, preserving native registers.
+                use carrick_el1::personality::{dispatch, sched};
+                let mut frame = carrick_el1_abi::TrapFrame {
+                    slot: task as u64,
+                    esr: 0x5600_0000,
+                    ..Default::default()
+                };
+                frame.x[0] = head;
+                frame.x[1] = 23;
+                frame.x[8] = 99;
+                frame.x[19] = 0xfeed;
                 assert_eq!(
-                    served_result(serve_canonical(
-                        &arm,
+                    dispatch::dispatch_syscall_with_lifecycle(
+                        &mut frame,
                         &w.counters,
-                        &w.tasks[task],
-                        &*w.venue,
-                        Some(&w.publications)
-                    )),
-                    Some(-22)
+                        &w.tasks,
+                        &[],
+                        &[],
+                        &[],
+                        &[],
+                        &carrick_el1_abi::InotifyNameCache::new(),
+                        None::<dispatch::Zone<'_, super::NoCpu, sched::HardwareUserWord>>,
+                        None,
+                        Some(&*w.venue),
+                        |_| core::ptr::null_mut()
+                    ),
+                    carrick_el1_abi::Action::ServedWithWork
                 );
+                assert_eq!(frame.x[0] as i64, -22);
+                assert_eq!(frame.x[19], 0xfeed);
                 assert_eq!(w.heads()[task], (head, 24));
                 w.tasks[task].linux.take_served_boundary();
             }
