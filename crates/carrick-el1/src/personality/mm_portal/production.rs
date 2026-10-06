@@ -116,10 +116,14 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
     let Some((service, grant)) = admit_service_root(&portal, service) else {
         return;
     };
+    #[cfg(target_arch = "aarch64")]
     let live_ttbr: u64;
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) live_ttbr, options(nomem, nostack));
     }
+    #[cfg(target_arch = "x86_64")]
+    let live_ttbr = crate::isa::x86::carrick_x86_unbound_mmu_owner();
     let Some(table) = carrick_el1_abi::service_target_table_window(live_ttbr, grant.ttbr0) else {
         service.complete(0, 3);
         return;
@@ -150,9 +154,12 @@ pub fn serve_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
 /// effect; the portal keeps its operation and semantic permit across the yield.
 #[cfg(target_os = "none")]
 pub(super) fn yield_host_effect() {
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!("hvc #1", clobber_abi("C"));
     }
+    #[cfg(target_arch = "x86_64")]
+    crate::isa::x86::carrick_x86_unbound_host_yield();
 }
 
 /// Selection entry for a borrowed target root. Input x1..x7 is carrier, MM,
@@ -203,10 +210,14 @@ pub fn select_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             .spaces
             .grant(index, mm.raw())
             .ok_or_else(|| gate.map_or(MmError::Busy, MmError::Wait))?;
+        #[cfg(target_arch = "aarch64")]
         let live_ttbr: u64;
+        #[cfg(target_arch = "aarch64")]
         unsafe {
             core::arch::asm!("mrs {}, ttbr0_el1", out(reg) live_ttbr, options(nomem, nostack));
         }
+        #[cfg(target_arch = "x86_64")]
+        let live_ttbr = crate::isa::x86::carrick_x86_unbound_mmu_owner();
         let table = carrick_el1_abi::service_target_table_window(live_ttbr, grant.ttbr0)
             .ok_or(MmError::Stale)?;
         let range = carrick_el1_abi::PortalByteRange::new(frame.x[4], frame.x[5])
@@ -352,10 +363,14 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             return;
         }
     };
+    #[cfg(target_arch = "aarch64")]
     let ttbr: u64;
+    #[cfg(target_arch = "aarch64")]
     unsafe {
         core::arch::asm!("mrs {}, ttbr0_el1",out(reg)ttbr,options(nomem,nostack));
     }
+    #[cfg(target_arch = "x86_64")]
+    let ttbr = crate::isa::x86::carrick_x86_unbound_mmu_owner();
     let Some(table) = carrick_el1_abi::service_target_table_window(ttbr, target.grant().ttbr0)
     else {
         return;
@@ -420,10 +435,14 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             1 => bind_service_root(&zone.spaces, mm, true, frame.x[7])?,
             _ => return Err(MmError::Stale),
         };
+        #[cfg(target_arch = "aarch64")]
         let live: u64;
+        #[cfg(target_arch = "aarch64")]
         unsafe {
             core::arch::asm!("mrs {}, ttbr0_el1",out(reg)live,options(nomem,nostack));
         }
+        #[cfg(target_arch = "x86_64")]
+        let live = crate::isa::x86::carrick_x86_unbound_mmu_owner();
         if carrick_el1_abi::service_target_table_window(live, root).is_none() {
             return Err(MmError::Stale);
         }
