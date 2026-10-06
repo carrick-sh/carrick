@@ -11,6 +11,7 @@ extern crate alloc;
 extern crate std;
 
 pub mod aarch64;
+pub mod descriptor_refusal;
 
 mod host_backing;
 pub mod x86;
