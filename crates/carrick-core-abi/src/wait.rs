@@ -37,11 +37,24 @@ impl OperationResumePc {
 pub struct ObjectParked<'a> {
     zone: &'a ZoneTables,
     slot: SlotId,
+    receipt: Option<crate::EntryHandoffReceipt>,
 }
 
 impl<'a> ObjectParked<'a> {
-    pub const fn new(zone: &'a ZoneTables, slot: SlotId) -> Self {
-        Self { zone, slot }
+    pub const fn new(
+        zone: &'a ZoneTables,
+        slot: SlotId,
+        receipt: Option<crate::EntryHandoffReceipt>,
+    ) -> Self {
+        Self {
+            zone,
+            slot,
+            receipt,
+        }
+    }
+
+    pub fn take_receipt(&mut self) -> Option<crate::EntryHandoffReceipt> {
+        self.receipt.take()
     }
 
     pub const fn zone(&self) -> &'a ZoneTables {
