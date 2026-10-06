@@ -7,6 +7,128 @@ use carrick_mmu_core::x86::descriptor_txn::{NX, PRESENT, USER, WRITE};
 use carrick_sched_core::AddressSpaces;
 use core::sync::atomic::Ordering;
 
+struct X86ForkWords<'a> {
+    arenas: &'a [&'a Tables],
+}
+impl X86ForkWords<'_> {
+    fn word(
+        &self,
+        pa: u64,
+    ) -> Result<
+        &core::sync::atomic::AtomicU64,
+        carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
+    > {
+        self.arenas
+            .iter()
+            .find_map(|arena| {
+                pa.checked_sub(arena.base)
+                    .filter(|offset| offset.is_multiple_of(8))
+                    .and_then(|offset| arena.words.get(offset as usize / 8))
+            })
+            .ok_or(carrick_mmu_core::descriptor_refusal::DescriptorRefusal::TableOutsidePrimary)
+    }
+}
+impl carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords for X86ForkWords<'_> {
+    fn load(
+        &self,
+        pa: u64,
+    ) -> Result<u64, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+        Ok(self.word(pa)?.load(Ordering::Acquire))
+    }
+    fn compare_exchange(
+        &self,
+        pa: u64,
+        before: u64,
+        after: u64,
+    ) -> Result<bool, carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+        Ok(self
+            .word(pa)?
+            .compare_exchange(before, after, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok())
+    }
+    fn store_unlinked(
+        &self,
+        pa: u64,
+        value: u64,
+    ) -> Result<(), carrick_mmu_core::descriptor_refusal::DescriptorRefusal> {
+        self.word(pa)?.store(value, Ordering::Release);
+        Ok(())
+    }
+    fn publish_barrier(&self) {}
+    fn invalidate_range(&self, _: u64, _: u64) {}
+}
+
+#[test]
+fn x86_owner_fork_arms_private_parent_and_restores_on_abort() {
+    use carrick_el1_abi::{
+        PortalForkRequest, PortalForkTableArena, PortalOperation, ReservationMm,
+    };
+    use carrick_mmu_core::x86::descriptor_txn::{COW, MAY_WRITE, NX};
+    let mut region = Region::new();
+    region.add_bank();
+    let spaces = AddressSpaces::new();
+    let parent = admit(&region, &spaces, 77, ROOT, 1, 0);
+    let view = nodes(&region);
+    let portal = MmPortal::new(NonZeroU64::MIN, region.table(), &spaces, &view)
+        .with_mmu(carrick_mmu_core::x86::owner_mmu::X86Mmu);
+    let parent_tables = Tables::new(ROOT, IPA, 1);
+    for (entry, offset) in [(0, 4096), (513, 8192), (1024, 12288)] {
+        parent_tables.words[entry]
+            .store((ROOT + offset) | PRESENT | WRITE | USER, Ordering::Release);
+    }
+    let original = IPA | PRESENT | WRITE | USER | MAY_WRITE | NX;
+    parent_tables.words[1536].store(original, Ordering::Release);
+    let child = Tables::new(ROOT + 0x100000, 0, 0);
+    let supply = Tables::new(ROOT + 0x200000, 0, 0);
+    for arena in [&child, &supply] {
+        for word in arena.words.iter() {
+            word.store(0, Ordering::Release);
+        }
+    }
+    let child_index = spaces.publish_closed(78, child.base, child.base).unwrap();
+    let mut root = region
+        .table()
+        .lock_el1_resolved(spaces.find(parent.raw()).unwrap().index(), parent, &view, 0)
+        .unwrap();
+    let request = PortalForkRequest {
+        operation: PortalOperation {
+            carrier: NonZeroU64::MIN,
+            mm: parent,
+            incarnation: NonZeroU64::new(root.incarnation().raw()).unwrap(),
+            sequence: root.next_transfer_sequence().unwrap(),
+        },
+        parent_generation: root.generation(),
+        child_mm: ReservationMm::new(78).unwrap(),
+        child_tables: PortalForkTableArena::new(child.base, child.words.len() as u64 * 8).unwrap(),
+        parent_tables: PortalForkTableArena::new(supply.base, supply.words.len() as u64 * 8)
+            .unwrap(),
+        kernel_control_ipa: 0xa000_0000,
+    };
+    let layout = root.layout();
+    drop(root);
+    region
+        .table()
+        .publish(child_index.index(), request.child_mm, layout)
+        .unwrap();
+    let arenas = [&parent_tables, &child, &supply];
+    let words = X86ForkWords { arenas: &arenas };
+    let scratch = ForkScratch::new(request, portal.fork_mapping_count(parent, 0).unwrap()).unwrap();
+    let plan = portal.prepare_fork(request, scratch, &words, 0).unwrap();
+    let mut unpublished = portal.publish_fork(plan, &words, 0).unwrap();
+    let parent_leaf = parent_tables.words[1536].load(Ordering::Acquire);
+    let child_leaf = child.words[1536].load(Ordering::Acquire);
+    assert_eq!(parent_leaf & (COW | MAY_WRITE | WRITE), COW | MAY_WRITE);
+    assert_eq!(child_leaf & (COW | MAY_WRITE | WRITE), COW | MAY_WRITE);
+    assert!(spaces.grant(child_index, 78).is_none());
+    unpublished.abort(&portal, &words, 0).unwrap();
+    assert_eq!(parent_tables.words[1536].load(Ordering::Acquire), original);
+    assert!(
+        !region
+            .table()
+            .admitted(child_index.index(), request.child_mm)
+    );
+}
+
 #[test]
 fn x86_portal_grant_publishes_only_its_resident_page() {
     use carrick_mmu_core::aarch64::descriptor_txn::{
