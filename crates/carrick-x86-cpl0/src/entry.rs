@@ -276,6 +276,51 @@ mod kernel {
                 .map_or(u64::MAX, |receipt| receipt.root().address().raw());
             return;
         }
+        if frame.rax == OBSERVE_DESCRIPTOR_PROTECT {
+            use carrick_guest_arch::{FrameGpa, RootGpa};
+            use carrick_mmu_core::x86::descriptor_txn::{
+                DescriptorOp, DescriptorOutcome, DescriptorTxn, DescriptorTxnId, PageSpan,
+                Permissions,
+            };
+            let Some(root) = RootGpa::page_aligned(FrameGpa::new(0x60_0000)) else {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            };
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: core::num::NonZeroU64::MIN,
+                    generation: core::num::NonZeroU64::MIN,
+                },
+                root,
+                op: DescriptorOp::Protect {
+                    span: PageSpan::new(0x3_0000, 4096),
+                    permissions: Permissions {
+                        writable: false,
+                        executable: false,
+                        user: true,
+                    },
+                },
+                tables: &[],
+            };
+            // SAFETY: this KVM fixture exclusively owns a retained, identity
+            // mapped 448-page PML4 window while its sibling vCPU is stopped.
+            let receipt = unsafe {
+                carrick_el1::isa::x86::execute_native_descriptor_txn(
+                    &txn,
+                    root.address().raw(),
+                    FIXTURE_PML4_CAPACITY,
+                )
+            };
+            frame.rax = match receipt {
+                Ok(receipt) if matches!(receipt.outcome, DescriptorOutcome::Applied { .. }) => 1,
+                Ok(_) => 0,
+                Err(_) => {
+                    doorbell(FATAL_PORT, frame);
+                    halt();
+                }
+            };
+            return;
+        }
         if frame.rax == OBSERVE_ALLOCATOR {
             let layout = match core::alloc::Layout::from_size_align(128, 64) {
                 Ok(layout) => layout,
