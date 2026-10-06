@@ -32,9 +32,21 @@ ordinal!(
     GuestLen,
     CounterTick,
     NativeOrdinal,
+    CanonicalSyscall,
     UserFlags,
     FatalCode
 );
+
+/// Registers needed by the shared Linux syscall families. Native frames
+/// implement this directly; no ISA-shaped substitute frame is constructed.
+pub trait SyscallFrame {
+    fn canonical_ordinal(&self) -> CanonicalSyscall;
+    fn argument(&self, index: usize) -> u64;
+    fn set_result(&mut self, result: NativeReturnWord);
+    fn slot(&self) -> u64;
+    fn user_pc(&self) -> UserVa;
+    fn user_sp(&self) -> Option<UserVa>;
+}
 
 /// Supervisor addresses selected by the image ISA. Offsets within the kernel
 /// region retain the shared ABI; a guest cannot use another ISA's base here.
