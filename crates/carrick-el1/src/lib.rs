@@ -1,9 +1,9 @@
 //! Carrick guest EL1 image: neutral mechanisms and Linux personality.
 //!
 //! ISA selection: the AArch64 EL1 image and host builds compile every
-//! module. The x86_64 CPL0 image (`target_os = "none"`, `x86_64`) compiles
-//! only the frame-independent personality modules; the others still embed
-//! AArch64 frames, system registers or the EL1 allocator.
+//! module. The x86_64 CPL0 image (`target_os = "none"`, `x86_64`) also
+//! compiles the ISA-neutral lock and frame-independent personality modules;
+//! the remaining modules still embed AArch64 frames or system registers.
 #![cfg_attr(target_os = "none", no_std)]
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
 extern crate alloc as rust_alloc;
@@ -13,7 +13,6 @@ pub mod alloc;
 pub mod cow;
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub mod fault;
-#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub mod lock;
 #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
 pub mod memory;

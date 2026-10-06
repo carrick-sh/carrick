@@ -105,12 +105,18 @@ core::arch::global_asm!(
 #[cfg(target_os = "none")]
 mod kernel {
     use super::adapter::*;
+    use carrick_el1::lock::SpinLock;
     use carrick_el1::personality::common_entry::{EntryOutcome, serve_canonical};
     use carrick_el1::personality::thread_setup::GuestLifecycleVenue;
     use carrick_el1_abi::{Counters, CurrentTask};
     use core::sync::atomic::Ordering;
 
+    // The control port is shared by the carrier's CPL0 CPUs. Keep each
+    // port write within one in-guest admission, including native observations.
+    static CONTROL_PORT_LOCK: SpinLock<()> = SpinLock::new(());
+
     fn doorbell(port: u16, frame: &mut NativeFrame) {
+        let _guard = CONTROL_PORT_LOCK.lock();
         // SAFETY: CPL0 owns the declared control/forwarding transport.
         unsafe {
             core::arch::asm!("out dx, al", in("dx") port, in("rax") frame as *mut _ as u64,
