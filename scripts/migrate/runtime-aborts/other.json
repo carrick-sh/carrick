@@ -1025,6 +1025,17 @@
       "domain": "thread::clear_child_tid",
       "fingerprint": "d982339958ce78e5a18251ad1957951eda6d34aaa64191f6aa0b092668e62935",
       "sink": "fatal"
+    },
+    {
+      "file": "crates/carrick-el1/src/personality/dispatch.rs",
+      "function": "invalid_completion",
+      "ordinal_in_function": 1,
+      "fingerprint": "27be1eb3c50b8b5835098a61c7af84319958ff4a63eda039671d234bb81c29cf",
+      "verdict": "carrier_fault",
+      "failure_domain": "el1::entry_completion",
+      "rationale": "The native adapter cannot replay or return a completed family effect after exact entry binding authentication failed. Host-only fail-stop uses the shared typed fatal sink; the freestanding ARM adapter retains HVC fatal transport. This is carrier invariant corruption, never a guest errno.",
+      "sink": "fatal",
+      "domain": "el1::entry_completion"
     }
   ]
 }
