@@ -2,12 +2,14 @@
 
 use super::{ArchError, X86Backend, user_access};
 use carrick_guest_arch::{
-    Access, AddressContext, CopyProgress, FrameGpa, GuestLen, MmuBackend, RootGpa, UserRange,
-    UserVa,
+    Access, AddressContext, CopyProgress, EditBacking, EditCowAccess, EditIntent, EditLeafSize,
+    EditOperation, EditPermissions, FrameGpa, GuestLen, MmuBackend, MmuEditBackend, RootGpa,
+    UserRange, UserVa,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::{DescriptorRefusal, LiveDescriptorWords};
 use carrick_mmu_core::x86::descriptor_txn::{
-    DescriptorOutcome, DescriptorReceipt, DescriptorTxn, InlineJournal, execute_descriptor_txn,
+    DescriptorOp, DescriptorOutcome, DescriptorReceipt, DescriptorTxn, DescriptorTxnId,
+    InlineJournal, LeafSize, PageSpan, Permissions, execute_descriptor_txn,
 };
 use core::cell::Cell;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
@@ -168,6 +170,144 @@ pub unsafe fn execute_native_descriptor_txn(
         return Err(ArchError::Busy);
     }
     Ok(receipt)
+}
+
+fn native_permissions(permissions: EditPermissions) -> Result<Permissions, ArchError> {
+    // Long mode cannot express a present user mapping that denies reads while
+    // allowing a different access. Refuse that semantic intent explicitly.
+    if !permissions.readable {
+        return Err(ArchError::Unbound);
+    }
+    Ok(Permissions {
+        writable: permissions.writable,
+        executable: permissions.executable,
+        user: permissions.user,
+    })
+}
+
+fn native_backing(backing: EditBacking) -> carrick_mmu_core::x86::descriptor_txn::BackingIdentity {
+    carrick_mmu_core::x86::descriptor_txn::BackingIdentity {
+        frame_id: backing.frame_id,
+        mapping_id: backing.mapping_id,
+        owner_generation: backing.owner_generation,
+        inventory_revision: backing.inventory_revision,
+    }
+}
+
+fn native_size(size: EditLeafSize) -> LeafSize {
+    match size {
+        EditLeafSize::Page => LeafSize::Page,
+        EditLeafSize::Block2M => LeafSize::Block2M,
+        EditLeafSize::Block1G => LeafSize::Block1G,
+    }
+}
+
+/// Lower an exact editor's ISA-neutral intent to the four-level x86 engine.
+/// No unsupported permission is rounded up to a successful descriptor.
+///
+/// # Safety
+/// The table window must remain identity mapped and writable through this
+/// operation. `intent.owner()` must have been issued by the exact-MM editor,
+/// which excludes other software and hardware descriptor writers.
+pub unsafe fn execute_native_edit_intent(
+    intent: EditIntent<'_, RootGpa>,
+    table_base: u64,
+    table_bytes: u64,
+) -> Result<DescriptorReceipt, ArchError> {
+    let owner = intent.owner();
+    let span = PageSpan::new(intent.range().start().raw(), intent.range().len().raw());
+    let operation = match intent.operation() {
+        EditOperation::Prepare {
+            output,
+            permissions,
+            resident,
+            backing,
+        } => DescriptorOp::Prepare {
+            span,
+            output,
+            permissions: native_permissions(permissions)?,
+            resident: PageSpan::new(resident.start().raw(), resident.len().raw()),
+            backing: native_backing(backing),
+        },
+        EditOperation::Map {
+            output,
+            permissions,
+            size,
+            resident,
+            backing,
+        } => DescriptorOp::Map {
+            span,
+            output,
+            permissions: native_permissions(permissions)?,
+            size: native_size(size),
+            resident,
+            backing: native_backing(backing),
+        },
+        EditOperation::Publish { expected, access } => DescriptorOp::Publish {
+            span,
+            expected,
+            access: match access {
+                Access::Read => carrick_mmu_core::x86::descriptor_txn::Access::Read,
+                Access::Write => carrick_mmu_core::x86::descriptor_txn::Access::Write,
+                Access::Execute => carrick_mmu_core::x86::descriptor_txn::Access::Execute,
+            },
+        },
+        EditOperation::Protect { permissions } => DescriptorOp::Protect {
+            span,
+            permissions: native_permissions(permissions)?,
+        },
+        EditOperation::ArmCow {
+            kernel_only: false,
+            executable: false,
+            adopt_private: false,
+            excluded_len,
+            ..
+        } if excluded_len.raw() == 0 => DescriptorOp::ArmCow(span),
+        EditOperation::CowRepoint {
+            old,
+            new,
+            backing,
+            access: EditCowAccess::RecordedPrivate,
+        } => DescriptorOp::CowRepoint {
+            span,
+            old,
+            new,
+            backing: native_backing(backing),
+        },
+        EditOperation::Unmap => DescriptorOp::Unmap(span),
+        EditOperation::Coalesce { size } => DescriptorOp::Coalesce {
+            span,
+            size: native_size(size),
+        },
+        _ => return Err(ArchError::Unbound),
+    };
+    let transaction = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: owner.mm_key(),
+            generation: owner.generation(),
+        },
+        root: owner.root(),
+        op: operation,
+        tables: intent.table_grants(),
+    };
+    // SAFETY: this function's caller retains the exact editor and identity
+    // mapped table window; lowering above preserves the complete intent.
+    unsafe { execute_native_descriptor_txn(&transaction, table_base, table_bytes) }
+}
+
+impl MmuEditBackend for X86Backend {
+    type EditReceipt = DescriptorReceipt;
+
+    unsafe fn execute_edit(
+        &mut self,
+        intent: EditIntent<'_, RootGpa>,
+        table_base: FrameGpa,
+        table_bytes: GuestLen,
+    ) -> Result<Self::EditReceipt, Self::Error> {
+        // SAFETY: this trait leaf preserves the caller's exact-MM editor and
+        // retained window obligations for the native x86 transaction.
+        unsafe { execute_native_edit_intent(intent, table_base.raw(), table_bytes.raw()) }
+    }
 }
 
 impl MmuBackend for X86Backend {

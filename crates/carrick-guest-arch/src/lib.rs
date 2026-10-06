@@ -114,6 +114,161 @@ impl UserRange {
     }
 }
 
+/// Exact-MM editor custody for one in-guest descriptor transaction. A root or
+/// MM number alone cannot issue this noncopyable capability.
+pub struct EditOwner<R> {
+    root: R,
+    mm_key: NonZeroU64,
+    generation: NonZeroU64,
+}
+
+impl<R: Copy> EditOwner<R> {
+    /// # Safety
+    /// The caller holds the exact-MM editor for `mm_key` through settlement,
+    /// has authenticated `root` against the live task, and owns this operation
+    /// generation. Neither a stale root nor a borrowed editor may issue it.
+    pub unsafe fn issue(root: R, mm_key: NonZeroU64, generation: NonZeroU64) -> Self {
+        Self {
+            root,
+            mm_key,
+            generation,
+        }
+    }
+
+    pub fn root(&self) -> R {
+        self.root
+    }
+
+    pub fn mm_key(&self) -> NonZeroU64 {
+        self.mm_key
+    }
+
+    pub fn generation(&self) -> NonZeroU64 {
+        self.generation
+    }
+}
+
+/// Linux user access intent, before ISA descriptor bits are chosen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EditPermissions {
+    pub readable: bool,
+    pub writable: bool,
+    pub executable: bool,
+    pub user: bool,
+}
+
+/// Host-authenticated output backing, never inferred from a page-table word.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EditBacking {
+    pub frame_id: NonZeroU64,
+    pub mapping_id: NonZeroU64,
+    pub owner_generation: NonZeroU64,
+    pub inventory_revision: NonZeroU64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditLeafSize {
+    Page,
+    Block2M,
+    Block1G,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditCowAccess {
+    Retired,
+    RecordedPrivate,
+    User { writable_pages: u8 },
+    Kernel,
+}
+
+/// A requested descriptor operation. Each variant uses the enclosing intent's
+/// exact page-aligned VA range and carries all output and permission data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditOperation {
+    Prepare {
+        output: FrameGpa,
+        permissions: EditPermissions,
+        resident: UserRange,
+        backing: EditBacking,
+    },
+    Map {
+        output: FrameGpa,
+        permissions: EditPermissions,
+        size: EditLeafSize,
+        resident: bool,
+        backing: EditBacking,
+    },
+    Publish {
+        expected: FrameGpa,
+        access: Access,
+    },
+    Protect {
+        permissions: EditPermissions,
+    },
+    ArmCow {
+        kernel_only: bool,
+        executable: bool,
+        adopt_private: bool,
+        asid_scoped: bool,
+        excluded_ipa: FrameGpa,
+        excluded_len: GuestLen,
+    },
+    CowRepoint {
+        old: FrameGpa,
+        new: FrameGpa,
+        backing: EditBacking,
+        access: EditCowAccess,
+    },
+    Unmap,
+    Coalesce {
+        size: EditLeafSize,
+    },
+}
+
+/// ISA-neutral transaction input. The native backend validates unsupported
+/// permission combinations and physical-table grants before any live store.
+pub struct EditIntent<'a, R> {
+    owner: EditOwner<R>,
+    range: UserRange,
+    operation: EditOperation,
+    table_grants: &'a [RootGpa],
+}
+
+impl<'a, R: Copy> EditIntent<'a, R> {
+    pub fn checked(
+        owner: EditOwner<R>,
+        range: UserRange,
+        operation: EditOperation,
+        table_grants: &'a [RootGpa],
+    ) -> Option<Self> {
+        if range.is_empty() || range.start().raw() & 4095 != 0 || range.len().raw() & 4095 != 0 {
+            return None;
+        }
+        Some(Self {
+            owner,
+            range,
+            operation,
+            table_grants,
+        })
+    }
+
+    pub fn owner(&self) -> &EditOwner<R> {
+        &self.owner
+    }
+
+    pub fn range(&self) -> UserRange {
+        self.range
+    }
+
+    pub fn operation(&self) -> EditOperation {
+        self.operation
+    }
+
+    pub fn table_grants(&self) -> &[RootGpa] {
+        self.table_grants
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestIsa {
     Aarch64,
@@ -337,6 +492,50 @@ arch_trait!(MmuArch, MmuBackend {
     fn copy_user_chunk(transfer: &mut Self::UserTransfer, limit: GuestLen) -> Result<CopyProgress, Self::Error>;
     fn publish_executable(owner: &Self::MmOwner, range: UserRange) -> Result<Self::PublicationReceipt, Self::Error>;
 });
+
+/// An exact-MM descriptor edit. The intent retains its noncopyable editor
+/// authority through the native transaction and its drain receipt.
+pub trait MmuEditArch: sealed::Sealed + ArchTypes {
+    type EditReceipt;
+    /// # Safety
+    /// `table_base..table_base+table_bytes` is the retained page-table window
+    /// of the intent's root, and the caller keeps the exact editor through
+    /// receipt settlement. The backend validates the live root before stores.
+    unsafe fn execute_edit(
+        &mut self,
+        intent: EditIntent<'_, Self::Root>,
+        table_base: FrameGpa,
+        table_bytes: GuestLen,
+    ) -> Result<Self::EditReceipt, Self::Error>;
+}
+
+pub trait MmuEditBackend: ArchTypes {
+    type EditReceipt;
+    /// # Safety
+    /// The caller retains the authenticated table window and exact-MM editor
+    /// described by `intent` until the returned receipt is settled.
+    unsafe fn execute_edit(
+        &mut self,
+        intent: EditIntent<'_, Self::Root>,
+        table_base: FrameGpa,
+        table_bytes: GuestLen,
+    ) -> Result<Self::EditReceipt, Self::Error>;
+}
+
+impl<B: MmuEditBackend> MmuEditArch for Arch<B> {
+    type EditReceipt = B::EditReceipt;
+
+    unsafe fn execute_edit(
+        &mut self,
+        intent: EditIntent<'_, Self::Root>,
+        table_base: FrameGpa,
+        table_bytes: GuestLen,
+    ) -> Result<Self::EditReceipt, Self::Error> {
+        // SAFETY: this sealed adapter forwards the caller's exact editor and
+        // retained table-window obligations unchanged to the native backend.
+        unsafe { self.backend.execute_edit(intent, table_base, table_bytes) }
+    }
+}
 arch_trait!(InterruptArch, InterruptBackend {
     fn counter() -> Result<CounterTick, Self::Error>;
     fn frequency() -> Result<CounterFrequency, Self::Error>;
@@ -354,8 +553,14 @@ arch_trait!(CrossingArch, CrossingBackend {
     fn report_fatal(report: FatalReport) -> !;
 });
 
-pub trait KernelArch: sealed::Sealed + EntryArch + MmuArch + InterruptArch + CrossingArch {}
-impl<B: EntryBackend + MmuBackend + InterruptBackend + CrossingBackend> KernelArch for Arch<B> {}
+pub trait KernelArch:
+    sealed::Sealed + EntryArch + MmuArch + MmuEditArch + InterruptArch + CrossingArch
+{
+}
+impl<B: EntryBackend + MmuBackend + MmuEditBackend + InterruptBackend + CrossingBackend> KernelArch
+    for Arch<B>
+{
+}
 
 #[cfg(test)]
 mod tests {
