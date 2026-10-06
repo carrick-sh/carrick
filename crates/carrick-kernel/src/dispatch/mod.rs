@@ -625,8 +625,8 @@ macro_rules! syscall_table {
     ( $(#[doc = $doc:expr])* $vis:vis fn $name:ident ; $( $num:pat => $handler:ident ),* $(,)? ) => {
         $(#[doc = $doc])*
         $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<$crate::dispatch::SyscallHandler<M>> {
-            match carrick_abi::CanonicalNr(number) {
-                $( $num => Some(SyscallDispatcher::$handler), )*
+            match ::carrick_abi::CanonicalNr(number) {
+                $( $num => Some($crate::dispatch::SyscallDispatcher::$handler), )*
                 _ => None,
             }
         }
@@ -637,8 +637,8 @@ macro_rules! mutation_syscall_table {
     ( $(#[doc = $doc:expr])* $vis:vis fn $name:ident ; $( $num:pat => $handler:ident ),* $(,)? ) => {
         $(#[doc = $doc])*
         $vis fn $name<M: CurrentMmMemory>(number: u64) -> Option<$crate::dispatch::MutationSyscallHandler<M>> {
-            match carrick_abi::CanonicalNr(number) {
-                $( $num => Some(SyscallDispatcher::$handler), )*
+            match ::carrick_abi::CanonicalNr(number) {
+                $( $num => Some($crate::dispatch::SyscallDispatcher::$handler), )*
                 _ => None,
             }
         }
