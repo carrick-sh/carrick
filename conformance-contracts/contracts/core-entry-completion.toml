@@ -13,7 +13,11 @@ rationale = """
 The ISA adapter retains the native frame and return convention while the Linux
 personality decodes the native ordinal and arguments. Admission captures the
 exact task, execution generation, MM and thread generation in one non-copying
-completion token. Completion authenticates that complete binding. Pending
+completion token. Completion authenticates that complete binding. In-zone Born
+entries use a distinct lifetime-bound token that authenticates the exact OnCpu
+record/claim/incarnation and installed MM without fabricating host adoption.
+A switched or parked turn consumes its entry token while the existing exact
+wait record retains the continuation. Pending
 return work marks the admitted call complete exactly once; it cannot send the
 same syscall through a semantic host dispatcher. Unknown native ordinals are
 counted refusals with zero Linux-side publication.
@@ -32,7 +36,7 @@ metric = "kernel_dispatches"
 base = 0
 per_unit = 1
 layers = ["vm-free"]
-rationale = "Each admitted syscall consumes exactly one completion owner; refusal consumes none."
+rationale = "Each admitted syscall publishes exactly one semantic completion; refusals publish none."
 
 [[structural_budgets]]
 kind = "affine"
