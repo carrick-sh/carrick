@@ -24,6 +24,9 @@ const RAM_SIZE: usize = 16 * 1024 * 1024;
 const META_GPA: u64 = 0xc0_0000;
 const META_LEN: u64 = 0x2_0000;
 const ALLOCATOR_GPA: u64 = 0x20_00000;
+const RESIDENCY_GPA: u64 = 0x30_00000;
+const RESIDENCY_LEN: u64 =
+    (size_of::<carrick_el1_abi::FrameGrantResidencyTable>() as u64 + 4095) & !4095;
 const COUNTERS_OFFSET: u64 = 0x1_0000;
 const BINDING_OFFSET: u64 = 0x8000;
 const TASK_OFFSET: u64 = 0x9000;
@@ -147,7 +150,7 @@ impl Cpl0Carrier {
 
     /// Read a stopped fixture's 4 KiB terminal descriptor.
     pub fn fixture_user_leaf(&self, va: u64) -> Result<u64, TrapError> {
-        if !matches!(va, 0x3_0000 | 0x3_2000) {
+        if !matches!(va, 0x3_0000 | 0x3_2000 | 0x3_3000) {
             return Err(fail("fixture leaf outside admitted user page"));
         }
         let mut table = LAYOUT.pml4_base;
@@ -200,6 +203,21 @@ impl Cpl0Carrier {
             WindowKind::Private,
         )
         .map_err(|e| fail(e.to_string()))?;
+        ram.add_window(RESIDENCY_GPA, RESIDENCY_LEN as usize, WindowKind::Private)
+            .map_err(|e| fail(e.to_string()))?;
+        let residency = ram
+            .host_ptr(
+                RESIDENCY_GPA,
+                size_of::<carrick_el1_abi::FrameGrantResidencyTable>(),
+            )
+            .ok_or_else(|| fail("residency backing"))?;
+        // SAFETY: this retained, page-aligned KVM window is private and no
+        // vCPU has started. Construct the ABI atomics in place for the guest.
+        unsafe {
+            residency
+                .cast::<carrick_el1_abi::FrameGrantResidencyTable>()
+                .write(carrick_el1_abi::FrameGrantResidencyTable::new());
+        }
         let mut maps = Vec::new();
         for segment in &plan.segments {
             let end = segment
@@ -255,6 +273,14 @@ impl Cpl0Carrier {
             va: EL1_BOOTSTRAP_METADATA_BASE,
             gpa: ALLOCATOR_GPA,
             len: EL1_BOOTSTRAP_METADATA_SIZE,
+            user: false,
+            write: true,
+            exec: false,
+        });
+        maps.push(Pml4MapSpec {
+            va: CPL0_RESIDENCY_ALIAS_BASE,
+            gpa: RESIDENCY_GPA,
+            len: RESIDENCY_LEN,
             user: false,
             write: true,
             exec: false,
