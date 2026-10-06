@@ -1,0 +1,4 @@
+19743216a2a295a05e320b72139ae64cca19244cf7d1abe94b671600ecc216ee
+waitpid_intmin_esrch=true
+waitpid_badflags_einval=true
+waitpid_nochild_echild=true

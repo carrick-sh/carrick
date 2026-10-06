@@ -755,7 +755,7 @@ pub(crate) enum Commands {
         memory_text: String,
     },
     Rootfs {
-        #[arg(long = "layer", required = true)]
+        #[arg(long = "layer")]
         layers: Vec<PathBuf>,
         #[command(subcommand)]
         command: RootfsCommand,
@@ -1164,9 +1164,22 @@ pub(crate) enum ContainerGateMode {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum RootfsCommand {
+    /// Materialize a cached immutable OCI rootfs; emit its path and image config.
+    Export {
+        image: Option<String>,
+        #[arg(long, default_value = "linux/amd64")]
+        platform: String,
+        /// Rootful layer materialization target (used by image export).
+        #[arg(long, hide = true)]
+        destination: Option<PathBuf>,
+    },
     Summary,
-    Ls { path: PathBuf },
-    Cat { path: PathBuf },
+    Ls {
+        path: PathBuf,
+    },
+    Cat {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Subcommand)]

@@ -70,6 +70,20 @@ pub fn cached_probe_oracle(
     libc: &str,
     name: &str,
 ) -> Result<String, String> {
+    let lane_label = if lane_label == "amd64"
+        && std::env::var("CARRICK_PROBE_ORACLE").as_deref() == Ok("native")
+    {
+        "amd64native"
+    } else {
+        lane_label
+    };
+    let native = lane_label == "amd64native";
+    if native {
+        let dir = repo_root.join(format!(
+            "crates/carrick-cli/tests/probe-oracle/{lane_label}-{libc}"
+        ));
+        carrick_conformance::native::validate_probe_oracle_dir(&dir)?;
+    }
     let rel_path = format!("crates/carrick-cli/tests/probe-oracle/{lane_label}-{libc}/{name}");
     let path = repo_root.join(&rel_path);
     let raw = std::fs::read_to_string(&path).map_err(|e| {
@@ -85,7 +99,12 @@ pub fn cached_probe_oracle(
             path.display()
         )
     })?;
-    let expected_hash = probe_src_hash(repo_root, name);
+    let expected_hash = if native {
+        carrick_conformance::native::probe_source_hash(repo_root, name)
+            .map_err(|e| e.to_string())?
+    } else {
+        probe_src_hash(repo_root, name)
+    };
     if hash_line != expected_hash {
         return Err(format!(
             "stale oracle cache for probe {name:?} at {}: \
@@ -278,6 +297,26 @@ fn test_normalization() {
 
     let empty = "";
     assert_eq!(normalize(empty), "");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn test_native_cache_refuses_foreign_kernel_before_reading_output() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root
+        .path()
+        .join("crates/carrick-cli/tests/probe-oracle/amd64native-musl");
+    std::fs::create_dir_all(&dir).unwrap();
+    let provenance =
+        carrick_conformance::native::ProbeProvenance::new("foreign-kernel".into(), "test".into());
+    std::fs::write(
+        dir.join("PROVENANCE.json"),
+        serde_json::to_vec(&provenance).unwrap(),
+    )
+    .unwrap();
+    let error =
+        cached_probe_oracle(root.path(), "amd64native", "musl", "mmapzerofill").unwrap_err();
+    assert!(error.contains("provenance mismatch"), "{error}");
 }
 
 #[test]

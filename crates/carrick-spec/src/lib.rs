@@ -977,6 +977,18 @@ pub struct RunSpec {
     pub exec_backend: ExecBackendRequest,
 }
 
+/// Versioned native Linux OCI materialization authority. The native oracle key
+/// and rootfs exporter share these determinants; Docker keys omit them.
+pub const OCI_NATIVE_EXTRACTOR_ID: &str = "carrick-oci-contained-native-v1";
+pub const OCI_NATIVE_EXTRACTOR_FLAGS: &[&str] = &[
+    "numeric-owners",
+    "exact-modes",
+    "tar-mtimes",
+    "special-nodes",
+    "contained-symlinks",
+    "reject-unsupported-pax-metadata",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
