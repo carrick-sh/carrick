@@ -170,7 +170,12 @@ impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
             },
             tables: &tables[..slice.len()],
         };
-        let receipt = execute_descriptor_txn(words, &native, root, &mut InlineJournal::new());
+        // The supported grant ceiling is 256 leaves plus at most three new
+        // hierarchy links. CPL0 owns this fixed journal for the complete
+        // transaction; no heap allocator is reachable at supported sizes.
+        let mut journal_storage = [JournalEntry::default(); PlanEntries::INLINE_CAPACITY];
+        let mut journal = crate::aarch64::descriptor_txn::SliceJournal::new(&mut journal_storage);
+        let receipt = execute_descriptor_txn(words, &native, root, &mut journal);
         match receipt.outcome {
             DescriptorOutcome::Applied {
                 stores,

@@ -121,7 +121,9 @@ impl Default for PlanEntries {
 }
 
 impl PlanEntries {
-    pub const INLINE_CAPACITY: usize = 16;
+    /// One leaf per supported 256-page grant plus the three hierarchy links.
+    /// This custody is stack-owned in CPL0; larger host-only plans may spill.
+    pub const INLINE_CAPACITY: usize = 259;
 
     #[must_use]
     pub const fn new() -> Self {

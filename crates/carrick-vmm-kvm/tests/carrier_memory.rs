@@ -186,25 +186,17 @@ fn cpl0_image() -> std::path::PathBuf {
 
 fn cpl3_grant_program(data_va: u64) -> Vec<u8> {
     let mut code = Vec::new();
-    // 1. Call CPL0 grant service (slot 0)
-    code.extend_from_slice(&[0x48, 0x31, 0xff]); // xor rdi, rdi (slot 0)
-    code.extend_from_slice(&[0x48, 0xb8]); // mov rax, MM_PORTAL_GRANT_ESR
-    code.extend_from_slice(&carrick_el1_abi::MM_PORTAL_GRANT_ESR.to_le_bytes());
-    code.extend_from_slice(&[0x0f, 0x05]); // syscall
-    // Observe result: returns 22 on refusal
-    code.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]); // mov rdi, rax; mov rax, OBSERVE_NATIVE
-    code.extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_NATIVE.to_le_bytes());
-    code.extend_from_slice(&[0x0f, 0x05]); // syscall
-
-    // 2. Call CPL0 grant service (slot 0) again
-    code.extend_from_slice(&[0x48, 0x31, 0xff]); // xor rdi, rdi (slot 0)
-    code.extend_from_slice(&[0x48, 0xb8]); // mov rax, MM_PORTAL_GRANT_ESR
-    code.extend_from_slice(&carrick_el1_abi::MM_PORTAL_GRANT_ESR.to_le_bytes());
-    code.extend_from_slice(&[0x0f, 0x05]); // syscall
-    // Observe result: returns 0 on success
-    code.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]); // mov rdi, rax; mov rax, OBSERVE_NATIVE
-    code.extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_NATIVE.to_le_bytes());
-    code.extend_from_slice(&[0x0f, 0x05]); // syscall
+    // One unbound refusal followed by the 16/64/256-page owner grants. Each
+    // control boundary lets the host publish only the next authenticated slot.
+    for _ in 0..4 {
+        code.extend_from_slice(&[0x48, 0x31, 0xff]);
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&carrick_el1_abi::MM_PORTAL_GRANT_ESR.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x05]);
+        code.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        code.extend_from_slice(&carrick_x86::cpl0_entry::OBSERVE_NATIVE.to_le_bytes());
+        code.extend_from_slice(&[0x0f, 0x05]);
+    }
 
     // 3. Read byte at data_va
     code.extend_from_slice(&[0x48, 0xbb]); // mov rbx, data_va
@@ -325,7 +317,9 @@ fn x1_shared_mm_owner() {
         .unwrap();
 
     // 2. Put physical backing page at GPA 0x80_0000 with byte 0x5a
-    carrier.write_guest_bytes(0x80_0000, &[0x5a; 4096]).unwrap();
+    carrier
+        .write_guest_bytes(0x80_0000, &[0x5a; 336 * 4096])
+        .unwrap();
 
     // 3. Publish and admit anonymous memory for MM11 and MM12 at DATA_VA
     let table = unsafe {
@@ -359,7 +353,7 @@ fn x1_shared_mm_owner() {
     let access1 = carrick_x86::cpl0_mmu::X86OwnerVenue::space_access(zone, SlotId::new(0));
     let mut g1 = table.lock_in(access1, idx1, r_mm11, 0).unwrap();
     g1.import(
-        ReservationRange::new(DATA_VA, DATA_VA + 4096).unwrap(),
+        ReservationRange::new(DATA_VA, DATA_VA + 336 * 4096).unwrap(),
         ReservationProtection::READ_WRITE,
         true,
     )
@@ -391,44 +385,54 @@ fn x1_shared_mm_owner() {
     let grant_slot = portal_slots.grant(0).unwrap();
 
     let nz = |n| NonZeroU64::new(n).unwrap();
-    let txn = DescriptorTxn {
-        id: DescriptorTxnId {
-            mm_key: nz(mm11),
-            generation: nz(1),
-        },
-        root: SubstrateGpa(0x60_0000),
-        op: DescriptorOp::Prepare {
-            publication: GuestLeafPublication {
-                va: DATA_VA,
-                ipa: 0x80_0000,
-                len: 4096,
-                writable: true,
-                executable: false,
+    let make_grant = |first_page: u64, pages: u64, sequence: u64| {
+        let va = DATA_VA + first_page * 4096;
+        let len = pages * 4096;
+        let txn = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: nz(mm11),
+                generation: nz(sequence),
             },
-            resident: PageSpan::new(DATA_VA, 4096),
-            backing: BackingIdentity {
-                frame_id: nz(1),
-                mapping_id: nz(2),
-                owner_generation: nz(3),
-                inventory_revision: nz(4),
+            root: SubstrateGpa(0x60_0000),
+            op: DescriptorOp::Prepare {
+                publication: GuestLeafPublication {
+                    va,
+                    ipa: 0x80_0000 + first_page * 4096,
+                    len,
+                    writable: true,
+                    executable: false,
+                },
+                resident: PageSpan::new(va, 4096),
+                backing: BackingIdentity {
+                    frame_id: nz(sequence),
+                    mapping_id: nz(2),
+                    owner_generation: nz(3),
+                    inventory_revision: nz(4),
+                },
             },
-        },
-        tables: TableGrants::new(&[]).unwrap(),
+            tables: TableGrants::new(&[]).unwrap(),
+        };
+        let window = PortalGrantWindow {
+            operation: PortalOperation {
+                carrier: nz(1),
+                mm: r_mm11,
+                incarnation: nz(1),
+                sequence: nz(sequence),
+            },
+            generation: ReservationGeneration::new(1).unwrap(),
+            range: ReservationRange::new(va, va + len).unwrap(),
+            protection: ReservationProtection::READ_WRITE,
+            fault_page: va,
+            host_backing: None,
+            fork_sequence: None,
+        };
+        (txn, window)
     };
-    let window = PortalGrantWindow {
-        operation: PortalOperation {
-            carrier: nz(1),
-            mm: r_mm11,
-            incarnation: nz(1),
-            sequence: nz(1),
-        },
-        generation: ReservationGeneration::new(1).unwrap(),
-        range: ReservationRange::new(DATA_VA, DATA_VA + 4096).unwrap(),
-        protection: ReservationProtection::READ_WRITE,
-        fault_page: DATA_VA,
-        host_backing: None,
-        fork_sequence: None,
-    };
+    let [(txn, window), (txn64, window64), (txn256, window256)] = [
+        make_grant(0, 16, 1),
+        make_grant(16, 64, 2),
+        make_grant(80, 256, 3),
+    ];
 
     // Case 1: missing carrier authority refuses without consuming the grant.
     assert!(grant_slot.submit(window, &txn));
@@ -490,8 +494,20 @@ fn x1_shared_mm_owner() {
         "served grant must have zero semantic host forwards"
     );
 
-    // Case 3: Read hardware bytes at DATA_VA
-    let obs3 = carrier.observe(0).expect("observe 3");
+    for (pages, next_window, next_txn) in [(64, window64, txn64), (256, window256, txn256)] {
+        assert!(grant_slot.submit(next_window, &next_txn));
+        let observation = carrier.observe(0).expect("observe scaled grant");
+        assert_eq!(observation.result, 0, "{pages}-page CPL0 grant failed");
+        assert_eq!(observation.semantic_host_exits, 0);
+        let receipt = grant_slot.take_receipt(next_window, &next_txn);
+        assert!(
+            matches!(receipt, Some(r) if matches!(r.outcome, carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_))),
+            "{pages}-page grant did not complete: {receipt:?}"
+        );
+    }
+
+    // Case 3: Read hardware bytes at DATA_VA after all three grant scales.
+    let obs3 = carrier.observe(0).expect("observe hardware read");
     assert_eq!(
         obs3.result, 0x5a,
         "CPL3 must read the physically backed byte from CPL0 mapping"
