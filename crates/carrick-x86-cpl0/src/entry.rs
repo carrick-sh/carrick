@@ -51,6 +51,15 @@ fixture_items! {
 
 #[cfg(target_os = "none")]
 core::arch::global_asm!(
+    ".section .initial_boot_header, \"a\"",
+    ".quad 0x3130304e55525843",
+    ".long 1",
+    ".long 0",
+    ".quad carrick_x86_initial_boot",
+);
+
+#[cfg(target_os = "none")]
+core::arch::global_asm!(
     ".section .text.entry, \"ax\"",
     ".global carrick_x86_syscall",
     "carrick_x86_syscall:",
@@ -197,6 +206,7 @@ mod user_fault_gate {
 
 #[cfg(target_os = "none")]
 mod kernel {
+    mod initial_boot { include!("initial_boot.rs"); }
     use super::adapter::*;
     use carrick_el1::lock::SpinLock;
     use carrick_el1::personality::common_entry::{EntryOutcome, serve_canonical};
@@ -282,8 +292,13 @@ mod kernel {
     /// One stopped-carrier fixture view of the retained supervisor direct
     /// window. The production MM owner receives its table authority from the
     /// portal instead of this fixed test grant.
-    struct InitialWords;
+    struct InitialWords {
+        start: u64,
+        end: u64,
+    }
     impl InitialWords {
+        const fn fixture() -> Self { Self { start: 0x20_0000, end: 0xc0_0000 } }
+        const fn production(end: u64) -> Self { Self { start: 0x40_00000, end } }
         fn word(
             &self,
             pa: u64,
@@ -292,7 +307,9 @@ mod kernel {
             carrick_mmu_core::descriptor_refusal::DescriptorRefusal,
         > {
             use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
-            if pa & 7 != 0 || pa < 0x20_0000 || pa.checked_add(8).is_none_or(|end| end > 0xc0_0000)
+            let in_grants = pa >= self.start && pa.checked_add(8).is_some_and(|end| end <= self.end);
+            let source_root = self.start == 0x40_00000 && (0x60_0000..0x60_1000).contains(&pa);
+            if pa & 7 != 0 || !(in_grants || source_root)
             {
                 return Err(DescriptorRefusal::TableOutsidePrimary);
             }
@@ -531,7 +548,7 @@ mod kernel {
             // both disjoint zeroed frame ranges and the sole table editor.
             let loaded = unsafe {
                 install_initial_image(
-                    &InitialWords,
+                    &InitialWords::fixture(),
                     &mut frames,
                     source_root,
                     core::num::NonZeroU64::MIN,

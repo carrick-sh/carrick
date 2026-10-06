@@ -514,10 +514,10 @@ pub unsafe fn install_initial_image<W: LiveDescriptorWords + ?Sized, S: InitialF
     };
     let mut frame = [0; 20];
     frame[15] = image.stack.entry;
-    frame[16] = 0x1b; // user 64-bit code selector in the CPL0 GDT
+    frame[16] = 0x23; // user 64-bit code selector in the CPL0 GDT
     frame[17] = 0x202; // fixed bit plus interrupt enable
     frame[18] = stack.rsp;
-    frame[19] = 0x23; // user data selector in the CPL0 GDT
+    frame[19] = 0x1b; // user data selector in the CPL0 GDT
     Ok(InitialMmImage {
         address,
         context: ParkedContextWords::from_parts(frame, address, 0, 0, [0; X86_XSAVE_BYTES]),

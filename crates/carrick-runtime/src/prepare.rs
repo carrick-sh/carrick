@@ -906,25 +906,31 @@ impl PreparedRun {
         // (`.semgrep/typed-domains.yml::no-cfg-not-platform-macos`).
         #[cfg(all(feature = "platform-linux", target_arch = "x86_64"))]
         let run = if backend == ExecutionBackend::KvmX86Cpl0 {
-            let _ = (
-                &argv,
-                &env,
-                max_traps,
-                &debug_state_path,
-                &root,
-                &carrier,
-                &carrier_lease,
-            );
+            let _ = (&debug_state_path, &root, &carrier, &carrier_lease);
             let bytes = dispatcher.read_exec_file(&executable).ok_or_else(|| {
                 RuntimeError::Unsupported(format!("guest executable not found: {executable}"))
             })?;
             let image = carrick_mem::x86_initial_image::prepare_static_x86_elf(&bytes)
                 .map_err(|error| RuntimeError::Unsupported(format!("x86 ELF load: {error}")))?;
-            let mut machine = carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::boot_production()?;
-            machine.load_guest_mm(&image)?;
-            Err(RuntimeError::Unsupported(
-                "x86 CPL0 execution admission is not yet bound".to_owned(),
-            ))
+            let extent_bytes = carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::initial_extent_bytes_for(
+                &image, &argv, &env,
+            )?;
+            let mut machine =
+                carrick_vmm_kvm::cpl0_boot::Cpl0Carrier::boot_production(extent_bytes)?;
+            machine.load_guest_mm(&image, &argv, &env)?;
+            let (exit_code, traps) = machine.run_initial_process(max_traps, |fd, bytes| {
+                dispatcher.forward_stdio_bytes(fd, bytes)
+            })?;
+            Ok(RunResult {
+                exit_code,
+                terminating_signal: None,
+                stdout: dispatcher.stdout(),
+                stderr: dispatcher.stderr(),
+                traps,
+                report: crate::compat::CompatReport::default(),
+                trap_limit_hit: false,
+                terminal_reason: None,
+            })
         } else {
             Err(RuntimeError::Unsupported(format!(
                 "Linux execution backend {backend:?} is not available"
