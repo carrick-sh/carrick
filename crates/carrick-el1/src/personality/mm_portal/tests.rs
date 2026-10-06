@@ -3062,7 +3062,7 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
             task.set(El1TaskId::from_linux_tid(101), 1, 5);
             task.mm.key.store(mm.raw(), Ordering::Release);
             task.mm.thread_generation.store(1101, Ordering::Release);
-            task.mark_pending_host_work(); // deterministic leave, no WFI.
+            task.linux.mark_pending_host_work(); // deterministic leave, no WFI.
             let counters = Counters::default();
             let mut cpu = FakeCpu::default();
             let mut frame = TrapFrame::default();
@@ -3348,7 +3348,7 @@ fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
     task.set(El1TaskId::from_linux_tid(101), 1, 5);
     task.mm.key.store(mm.raw(), Ordering::Release);
     task.mm.thread_generation.store(1101, Ordering::Release);
-    task.mark_pending_host_work();
+    task.linux.mark_pending_host_work();
     let counters = Counters::default();
     let mut cpu = FakeCpu::default();
     let mut frame = TrapFrame::default();
