@@ -271,6 +271,30 @@ fn host_mmap(
     )
 }
 
+fn routed_host_mmap(
+    dispatcher: &SyscallDispatcher,
+    memory: &mut CountingMmapMemory,
+    address: u64,
+    len: u64,
+    prot: u64,
+    flags: u64,
+    fd: i32,
+) -> DispatchOutcome {
+    dispatcher
+        .dispatch_normalized_mutation_for_test(
+            &dispatcher.capture_one_task_context().unwrap(),
+            SyscallRequest::new(
+                SYS_MMAP,
+                SyscallArgs([address, len, prot, flags, fd as i64 as u64, 0]),
+            ),
+            memory,
+            &CompatReporter::default(),
+            None,
+        )
+        .expect("mmap is a claimed mutation syscall")
+        .expect("routed mmap dispatch")
+}
+
 fn arena_memory() -> CountingMmapMemory {
     CountingMmapMemory::new(LINUX_MMAP_BASE, (32 * PAGE) as usize)
 }
@@ -386,6 +410,42 @@ fn delegated_host_map_fixed_over_an_el1_reservation_replaces_it() {
                 && vma.provenance.is_private_anonymous()),
         "the root, not MemState, owns the anonymous rows"
     );
+}
+
+#[test]
+fn delegated_fixed_file_map_reuses_a_retired_el1_reservation() {
+    let dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; 4 * PAGE as usize]);
+    let mut memory = arena_memory();
+
+    let guest = root
+        .guest_mmap(
+            Placement::Anywhere,
+            4 * PAGE,
+            ReservationProtection::READ_WRITE,
+        )
+        .unwrap();
+    root.guest_munmap(guest, 4 * PAGE);
+    memory.fail_unchecked_write.set(true);
+
+    let fixed = returned(routed_host_mmap(
+        &dispatcher,
+        &mut memory,
+        guest,
+        4 * PAGE,
+        LINUX_PROT_READ | LINUX_PROT_WRITE,
+        LINUX_MAP_PRIVATE | LINUX_MAP_FIXED,
+        FILE_FD,
+    ));
+    assert_eq!(fixed, guest as i64);
+    assert_eq!(memory.owner_reserved_write_calls.get(), 1);
+    let mapping = root.lock().mapping(guest).expect("fixed file mapping");
+    assert_eq!(
+        mapping.range,
+        ReservationRange::new(guest, guest + 4 * PAGE).unwrap()
+    );
+    assert!(!mapping.anonymous);
 }
 
 #[test]

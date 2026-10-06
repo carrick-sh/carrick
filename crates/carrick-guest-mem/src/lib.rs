@@ -695,6 +695,21 @@ pub trait GuestMemory {
         self.write_bytes_raw(address, bytes)
     }
 
+    /// Write Carrick-owned mapping content while an exact host reservation
+    /// excludes guest execution and names the complete destination range.
+    ///
+    /// Owner backends may bypass the ordinary user-transfer permission check:
+    /// the opaque reservation is deliberately not a guest-readable or writable
+    /// mapping yet. Callers must hold the typed reservation through settlement;
+    /// the default preserves legacy backends' unchecked-write behavior.
+    fn write_owner_reserved_bytes(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+    ) -> Result<(), MemoryError> {
+        self.write_bytes_unchecked(address, bytes)
+    }
+
     /// Make a writable guest range resident before a privileged host copyout.
     /// Backends with eager backing need no preparation. A lazy backend must
     /// publish first-touch residency through its exact-MM authority here;
