@@ -85,16 +85,7 @@ fn production_extent_cannot_alias_kernel_metadata() {
 
 #[test]
 fn production_user_page_fault_forwards_the_original_user_frame() {
-    let mut elf = tiny_elf();
-    let mut code = vec![
-        0xbf, 1, 0, 0, 0, 0x31, 0xf6, 0x31, 0xd2, 0xb8, 1, 0, 0, 0, 0x0f, 0x05, 0x48, 0xb8,
-    ];
-    code.extend_from_slice(&0xdead000u64.to_le_bytes());
-    code.extend_from_slice(&[0xc6, 0x00, 1, 0x0f, 0x0b]);
-    elf.truncate(0xb0);
-    elf.extend_from_slice(&code);
-    let size = elf.len() as u64;
-    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    let elf = production_fault_elf();
     let plan = prepare_static_x86_elf(&elf).expect("static fault ELF");
     let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[]).expect("extent");
     let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM");
@@ -118,5 +109,49 @@ fn production_user_page_fault_forwards_the_original_user_frame() {
     assert_eq!(record.rip, 0x4000b0 + 16 + 10);
     assert_eq!(record.saved_rax, 0xdead000);
     assert_eq!(record.linux_signal(), Some((libc::SIGSEGV, 1)));
+    assert_eq!(
+        carrier.user_fault_state(0).expect("fault custody"),
+        (1, 0xdead000, 6, 0x4000b0 + 26, 6)
+    );
     assert_eq!(exits, 2);
+}
+
+fn production_fault_elf() -> Vec<u8> {
+    let mut elf = tiny_elf();
+    let mut code = vec![
+        0xbf, 1, 0, 0, 0, 0x31, 0xf6, 0x31, 0xd2, 0xb8, 1, 0, 0, 0, 0x0f, 0x05, 0x48, 0xb8,
+    ];
+    code.extend_from_slice(&0xdead000u64.to_le_bytes());
+    code.extend_from_slice(&[0xc6, 0x00, 1, 0x0f, 0x0b]);
+    elf.truncate(0xb0);
+    elf.extend_from_slice(&code);
+    let size = elf.len() as u64;
+    elf[96..104].copy_from_slice(&size.to_le_bytes());
+    elf
+}
+
+#[test]
+fn nested_kernel_fault_preserves_outer_diagnostics_and_refuses() {
+    let elf = production_fault_elf();
+    let plan = prepare_static_x86_elf(&elf).expect("fault ELF");
+    let extent = Cpl0Carrier::initial_extent_bytes_for(&plan, &[], &[]).expect("extent");
+    let mut carrier = Cpl0Carrier::boot_production(extent).expect("production KVM");
+    carrier.load_guest_mm(&plan, &[], &[]).expect("initial MM");
+    let stop = carrier
+        .run_initial_process(1, |_, _| 0)
+        .expect_err("stopped after first syscall");
+    assert!(stop.to_string().contains("exit budget exceeded"));
+    carrier
+        .invalidate_user_fault_counters_venue()
+        .expect("inject kernel venue fault");
+    let error = carrier
+        .run_initial_process(32, |_, _| 0)
+        .expect_err("nested kernel refusal");
+    assert!(error.to_string().contains("port 0xcc"), "{error:?}");
+    let (active, address, error, pc, reason) =
+        carrier.user_fault_state(0).expect("retained diagnostics");
+    assert_eq!(
+        (active, address, error, pc, reason),
+        (1, 0xdead000, 6, 0x4000b0 + 26, 8)
+    );
 }
