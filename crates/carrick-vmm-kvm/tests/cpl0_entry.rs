@@ -18,6 +18,91 @@ use carrick_x86::cpl0_scheduler::{
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
+fn user_access_program(index: u64) -> (Vec<u8>, Vec<i64>) {
+    let mapped = 0x3_1000 + index * 0x1_0000;
+    let code = 0x1_0000 + index * 0x1000;
+    let unmapped_edge = mapped + 0xff8;
+    let mut bytes = Vec::new();
+    let calls = [
+        (mapped, 2_u64, 0_i64),
+        (mapped, 0, 0x51ab_cdef_1234_5678_i64),
+        (mapped, 1, 0x51ab_cdef_1234_5678_i64),
+        (mapped, 8, 0x51ab_cdef_1234_5678_i64), // typed chunk copy-in
+        (mapped, 9, 0),                         // typed chunk copy-out
+        (mapped, 0, 0x6ace_b00c_1234_5678_i64),
+        (mapped, 10, 0), // wrong MM incarnation consumes no kernel bytes
+        (mapped, 12, 0), // unsupported word width is typed InvalidWidth
+        (mapped, 3, 0x1234_5678_i64),
+        (mapped, 4, 16),
+        (mapped, 5, 16),
+        (code, 4, 16),
+        (code, 5, 0),
+        (0x10_0000, 4, 0), // supervisor image is not a user mapping
+        (0x10_0000, 0, -14),
+        (0x10_0000, 1, -14),
+        (0x10_0000, 2, -14),
+        (unmapped_edge, 4, 8), // prefix ends at the unmapped next page
+        (unmapped_edge, 5, 8),
+        (unmapped_edge + 4, 1, -14), // preflight refuses a cross-page copy-in
+        (unmapped_edge + 4, 2, -14), // preflight refuses a cross-page copy-out
+        (0x7_0000, 0, -14),
+        (0x7_0000, 11, 0), // mapped trait returns typed fault, not zero data
+        (0x7_0000, 1, -14),
+        (0x7_0000, 2, -14),
+        (0x7_0000, 6, -14), // execute the #PF recovery path after bypassing preflight
+        (0x7_0000, 7, -14),
+        (0x7_0000, 4, 0),
+        (0x7_0000, 5, 0),
+    ];
+    for (address, mode, _) in calls {
+        bytes.extend_from_slice(&[0x48, 0xbf]); // mov rdi, user VA
+        bytes.extend_from_slice(&address.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xbe]); // mov rsi, operation
+        bytes.extend_from_slice(&mode.to_le_bytes());
+        bytes.extend_from_slice(&[0x48, 0xb8]);
+        bytes.extend_from_slice(&0xffff_ffff_ffff_ff10_u64.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05]); // syscall into shared kernel witness
+        bytes.extend_from_slice(&[0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        bytes.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        bytes.extend_from_slice(&[0x0f, 0x05]);
+    }
+    bytes.extend_from_slice(&[0x0f, 0x0b]);
+    (
+        bytes,
+        calls.into_iter().map(|(_, _, expected)| expected).collect(),
+    )
+}
+
+fn exercise_shared_kernel_user_access(smap: bool) {
+    // Before the user-access leaf was bound, the first mapped call hit UD2.
+    // Both live tasks use distinct stack pages and task-local fixup records.
+    let (a, expected_a) = user_access_program(0);
+    let (b, expected_b) = user_access_program(1);
+    let mut carrier = Cpl0Carrier::boot(&image(), [&a, &b]).expect("real KVM + shared CPL0 image");
+    if smap {
+        carrier.enable_smap().expect("guest SMAP capability");
+    }
+    for (round, (expected_a, expected_b)) in expected_a.into_iter().zip(expected_b).enumerate() {
+        for (task, expected) in [(0, expected_a), (1, expected_b)] {
+            assert_eq!(
+                carrier.observe(task).expect("bounded user access").result,
+                expected,
+                "task {task}, round {round}"
+            );
+        }
+    }
+}
+
+#[test]
+fn shared_kernel_user_access_recovers_from_bad_va() {
+    exercise_shared_kernel_user_access(false);
+}
+
+#[test]
+fn shared_kernel_user_access_restores_smap_ac() {
+    exercise_shared_kernel_user_access(true);
+}
+
 fn image() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0")

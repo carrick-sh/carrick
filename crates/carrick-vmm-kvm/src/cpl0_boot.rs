@@ -121,6 +121,23 @@ pub struct Cpl0Carrier {
 }
 
 impl Cpl0Carrier {
+    /// Enable architectural SMAP before either fixture vCPU starts. The
+    /// caller uses this only on KVM hosts whose guest CPUID advertises SMAP.
+    pub fn enable_smap(&mut self) -> Result<(), TrapError> {
+        for cpu in &mut self.cpus {
+            let mut state = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+            state.cr4 |= 1 << 21;
+            cpu.fd()
+                .set_sregs(&state)
+                .map_err(|e| fail(e.to_string()))?;
+            let observed = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
+            if observed.cr4 & (1 << 21) == 0 {
+                return Err(fail("KVM refused CR4.SMAP"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn boot(image: &Path, programs: [&[u8]; 2]) -> Result<Self, TrapError> {
         Self::boot_inner(image, programs, false)
     }
@@ -310,6 +327,7 @@ impl Cpl0Carrier {
                     .mm
                     .thread_generation
                     .store(101 + index as u64, Ordering::Release);
+                (*task).mm.key.store(201 + index as u64, Ordering::Release);
                 (*task).publish_lifecycle(
                     EL1_DYNAMIC_METADATA_BASE,
                     EL1_DYNAMIC_METADATA_BASE + CONTROL_OFFSET + offset,
