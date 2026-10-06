@@ -802,7 +802,7 @@ path = "crates/carrick-personality-linux/src/sched.rs"
 contracts = ["core.entry.completion", "kernel.el1.futex-handoff"]
 
 [[surfaces]]
-path = "crates/carrick-personality-linux/src/pending_lifecycle.rs"
+path = "crates/carrick-personality-linux/src/lifecycle.rs"
 contracts = ["core.entry.completion", "kernel.el1.thread-lifecycle"]
 
 [[surfaces]]
@@ -836,3 +836,12 @@ contracts = ["core.entry.completion", "kernel.el1.files", "kernel.el1.inotify", 
 [[surfaces]]
 path = "crates/carrick-vmm-kvm/tests/cpl0_entry.rs"
 contracts = ["core.entry.completion"]
+
+# Linux pending-signal policy and its unchanged VM-free owner contracts.
+[[surfaces]]
+path = "crates/carrick-personality-linux/src/signal.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
+
+[[surfaces]]
+path = "crates/carrick-personality-linux/tests/signal_policy_contract.rs"
+contracts = ["kernel.el1.signal-delivery-owner"]
