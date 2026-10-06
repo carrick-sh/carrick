@@ -1096,6 +1096,7 @@ dependencies = [
  "carrick-timer-core",
  "carrick-x86",
  "getrandom 0.3.4",
+ "goblin",
  "kvm-bindings",
  "kvm-ioctls",
  "libc",

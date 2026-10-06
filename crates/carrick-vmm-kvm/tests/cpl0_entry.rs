@@ -14,8 +14,8 @@ use carrick_sched_core::{ParkedContextWords, SlotId, ThreadIdentity, ZoneTables}
 use carrick_vmm_kvm::cpl0_boot::Cpl0Carrier;
 use carrick_x86::cpl0_entry::{
     OBSERVE_ALLOCATOR, OBSERVE_DESCRIPTOR_PREPARE_PUBLISH, OBSERVE_DESCRIPTOR_PROTECT,
-    OBSERVE_FORK_TABLE_WINDOW, OBSERVE_INITIAL_MM, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT,
-    OBSERVE_NATIVE, OBSERVE_PORTAL_WINDOW, OBSERVE_RETIRE_REPOINT, OBSERVE_SHARED_COW_FAULT,
+    OBSERVE_FORK_TABLE_WINDOW, OBSERVE_MMU_DRAIN, OBSERVE_MMU_ROOT, OBSERVE_NATIVE,
+    OBSERVE_PORTAL_WINDOW, OBSERVE_RETIRE_REPOINT, OBSERVE_SHARED_COW_FAULT,
     OBSERVE_SHARED_PREPARED_FAULT,
 };
 use carrick_x86::cpl0_scheduler::{
@@ -247,6 +247,28 @@ fn cpl0_rechecks_host_modified_return_frame_before_iret() {
 fn production_image_rejects_fixture_syscalls() {
     let production = PathBuf::from(env!("CARRICK_X86_CPL0_IMAGE"));
     let bytes = std::fs::read(&production).expect("production CPL0 image built");
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0-fixture");
+    let fixture_bytes = std::fs::read(&fixture).expect("fixture CPL0 image built");
+    // The fixture-only dispatch is named in the ELF symbol table. Scanning
+    // every LOAD byte for its small negative observer ordinals confuses errno
+    // values in production read-only data with executable fixture routes.
+    let has_fixture_edit = |image: &[u8]| {
+        let elf = goblin::elf::Elf::parse(image).expect("valid CPL0 ELF symbols");
+        elf.syms.iter().any(|symbol| {
+            elf.strtab
+                .get_at(symbol.st_name)
+                .is_some_and(|name| name.contains("fixture_edit"))
+        })
+    };
+    assert!(
+        has_fixture_edit(&fixture_bytes),
+        "fixture dispatch symbol missing"
+    );
+    assert!(
+        !has_fixture_edit(&bytes),
+        "fixture dispatch linked into production"
+    );
     let plan =
         carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62).expect("production CPL0 load image");
     for syscall in [
@@ -254,31 +276,15 @@ fn production_image_rejects_fixture_syscalls() {
         0xffff_ffff_ffff_ff20,
         0xffff_ffff_ffff_ff30,
         0xffff_ffff_ffff_ff40,
-        OBSERVE_NATIVE,
-        OBSERVE_MMU_ROOT,
-        OBSERVE_ALLOCATOR,
-        OBSERVE_MMU_DRAIN,
-        OBSERVE_DESCRIPTOR_PROTECT,
-        OBSERVE_DESCRIPTOR_PREPARE_PUBLISH,
-        OBSERVE_SHARED_PREPARED_FAULT,
-        OBSERVE_SHARED_COW_FAULT,
-        OBSERVE_PORTAL_WINDOW,
-        OBSERVE_FORK_TABLE_WINDOW,
-        OBSERVE_RETIRE_REPOINT,
-        OBSERVE_INITIAL_MM,
     ] {
         assert!(
-            !plan
-                .segments
-                .iter()
-                .filter(|segment| segment.perms.execute)
-                .any(|segment| {
-                    let start = segment.file_offset as usize;
-                    let end = start + segment.file_size as usize;
-                    bytes[start..end]
-                        .windows(8)
-                        .any(|window| window == syscall.to_le_bytes())
-                }),
+            !plan.segments.iter().any(|segment| {
+                let start = segment.file_offset as usize;
+                let end = start + segment.file_size as usize;
+                bytes[start..end]
+                    .windows(8)
+                    .any(|window| window == syscall.to_le_bytes())
+            }),
             "production image contains fixture syscall {syscall:#x}"
         );
     }
