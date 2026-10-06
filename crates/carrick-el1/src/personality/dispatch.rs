@@ -14,6 +14,9 @@ use carrick_el1_abi::{
     EL1_OBJECT_TABLE_BASE, EL1_OPEN_FILE_TABLE_BASE, EL1_STACK_SLOTS, EL1_ZONE_BASE,
     FD_MAP_CAPACITY, MAX_DELEGATED_INOTIFY,
 };
+#[cfg(target_os = "none")]
+use carrick_personality_linux::dispatch::AnonymousCall;
+use carrick_personality_linux::dispatch::{Family, route_aarch64};
 use core::sync::atomic::Ordering;
 
 /// T2's SVC integration point. A Work result is an owned continuation, not a
@@ -278,9 +281,20 @@ where
     let slot = frame.slot as usize;
     let cur_task = current_tasks.get(slot);
     let nr = frame.x[8] as usize;
+    let family = route_aarch64(
+        frame.x[8],
+        #[cfg(feature = "allocator-test-control")]
+        {
+            carrick_el1_abi::SYS_CARRICK_EL1_CONTROL
+        },
+        #[cfg(not(feature = "allocator-test-control"))]
+        {
+            u64::MAX
+        },
+    );
 
     #[cfg(target_os = "none")]
-    if matches!(nr, 214 | 215 | 216 | 222 | 226)
+    if matches!(family, Family::Anonymous(_))
         && let (Some(zone), Some(task), Some(zslot)) =
             (zone.as_mut(), cur_task, SlotId::from_index(slot))
     {
@@ -327,10 +341,10 @@ where
     // complete on its authoritative slot, then leave ServedWithWork; clone
     // and exit remain excluded from this exception.
     let host_work = cur_task.is_some_and(CurrentTask::has_pending_host_work);
-    let record_lifecycle_host_work = || match nr {
-        lifecycle::SYS_EXIT => counters
+    let record_lifecycle_host_work = || match family {
+        Family::Lifecycle if nr == lifecycle::SYS_EXIT => counters
             .record_lifecycle_decline(carrick_el1_abi::LifecycleDecline::ExitDispatchHostWork),
-        lifecycle::SYS_CLONE => counters
+        Family::Lifecycle if nr == lifecycle::SYS_CLONE => counters
             .record_lifecycle_decline(carrick_el1_abi::LifecycleDecline::CloneDispatchHostWork),
         _ => {}
     };
@@ -340,14 +354,11 @@ where
             .is_some_and(|record| zone.tables.record(record).has_object_operation())
     });
     let ipc_transfer =
-        matches!(nr, ipc::SYS_READ | ipc::SYS_WRITE | ipc::SYS_EPOLL_PWAIT) && ipc.is_some();
+        matches!(family, Family::Read | Family::Write | Family::EpollWait) && ipc.is_some();
     let lifecycle_setup = lifecycle.is_some()
-        && matches!(
-            nr,
-            lifecycle::SYS_RT_SIGPROCMASK
-                | lifecycle::SYS_SIGALTSTACK
-                | lifecycle::SYS_SET_ROBUST_LIST
-        );
+        && matches!(family, Family::Lifecycle)
+        && nr != lifecycle::SYS_EXIT
+        && nr != lifecycle::SYS_CLONE;
     if host_work && !resumes_operation && !ipc_transfer && !lifecycle_setup {
         record_lifecycle_host_work();
         if nr < 512 {
@@ -377,7 +388,7 @@ where
     // descriptor editors only their descriptor step. No admitted root: the
     // MM keeps the paths below unchanged.
     #[cfg(target_os = "none")]
-    if matches!(nr, 214 | 215 | 222 | 226)
+    if matches!(family, Family::Anonymous(_))
         && let (Some(zone), Some(task)) = (zone.as_mut(), cur_task)
     {
         let orig_x0 = frame.x[0];
@@ -426,7 +437,7 @@ where
     }
 
     #[cfg(target_os = "none")]
-    if nr == 226
+    if matches!(family, Family::Anonymous(AnonymousCall::Mprotect))
         && let Some(zone) = zone.as_ref()
     {
         let orig_x0 = frame.x[0];
@@ -464,7 +475,7 @@ where
     }
 
     #[cfg(target_os = "none")]
-    if nr == 215
+    if matches!(family, Family::Anonymous(AnonymousCall::Munmap))
         && let Some(zone) = zone.as_ref()
     {
         let orig_x0 = frame.x[0];
@@ -497,7 +508,7 @@ where
     // Pipe and eventfd read/write on the shared IPC objects, and
     // epoll_pwait on a zone epoll, served (and blocked) in EL1; host-backed
     // descriptions fall through unchanged.
-    if matches!(nr, ipc::SYS_READ | ipc::SYS_WRITE | ipc::SYS_EPOLL_PWAIT)
+    if matches!(family, Family::Read | Family::Write | Family::EpollWait)
         && let (Some(venue), Some(zone), Some(task), Some(zslot)) =
             (ipc, zone.as_mut(), cur_task, SlotId::from_index(slot))
     {
@@ -549,7 +560,7 @@ where
     // Thread clone/exit and the per-thread setup calls, on the lifecycle
     // page and control slots the host published.
     if let (Some(venue), Some(task)) = (lifecycle, cur_task)
-        && lifecycle::is_lifecycle_syscall(nr)
+        && matches!(family, Family::Lifecycle)
     {
         let sched = match (zone.as_mut(), SlotId::from_index(slot)) {
             (Some(zone), Some(zslot)) => Some(sched::Sched {
@@ -593,6 +604,7 @@ where
     };
     if let (Some(zone), Some(task), Some(zslot)) =
         (zone.as_mut(), cur_task, SlotId::from_index(slot))
+        && matches!(family, Family::Futex)
         && sched::is_served_futex_op(frame)
     {
         let orig_x0 = frame.x[0];
@@ -625,8 +637,8 @@ where
         }
     }
 
-    match nr {
-        27 => {
+    match family {
+        Family::InotifyAdd => {
             let orig_x0 = frame.x[0];
             if let Some(task) = cur_task {
                 let validator = file::HardwareValidator;
@@ -652,7 +664,7 @@ where
                 }
             }
         }
-        28 => {
+        Family::InotifyRemove => {
             let orig_x0 = frame.x[0];
             if let Some(task) = cur_task
                 && let Ok(res) = inotify::el1_inotify_rm_watch(
@@ -675,7 +687,7 @@ where
                 return Action::Served;
             }
         }
-        63 => {
+        Family::Read => {
             let orig_x0 = frame.x[0];
             let res = try_serve_file_syscall(
                 file_access,
@@ -718,7 +730,7 @@ where
                 return Action::Served;
             }
         }
-        62 | 64 | 67 | 68 => {
+        Family::Write | Family::FileSeek | Family::FilePositioned => {
             let orig_x0 = frame.x[0];
             if let Some(res) = try_serve_file_syscall(
                 file_access,
@@ -748,7 +760,7 @@ where
             }
         }
         #[cfg(feature = "allocator-test-control")]
-        _ if (nr as u64) == carrick_el1_abi::SYS_CARRICK_EL1_CONTROL => {
+        Family::AllocatorControl => {
             let orig_x0 = frame.x[0];
             #[cfg(target_os = "none")]
             let saved = *frame;

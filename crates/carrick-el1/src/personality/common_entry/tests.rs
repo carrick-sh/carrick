@@ -98,21 +98,24 @@ impl World {
     }
 }
 
+fn served_result(outcome: EntryOutcome) -> Option<i64> {
+    match outcome {
+        EntryOutcome::Served { result, .. } | EntryOutcome::ServedWithWork { result, .. } => {
+            Some(result.raw())
+        }
+        EntryOutcome::Forward => None,
+    }
+}
+
 #[test]
 fn two_tasks_publish_only_their_own_robust_heads() {
     let w = World::new(LifecycleHatches::ON);
     let mut previous_b = (0, 0);
     for round in 0..4_u64 {
         let (a, b) = (0xa000 + round * 0x40, 0xb000 + round * 0x40);
-        assert_eq!(
-            w.set_robust_list(0, a, 24),
-            EntryOutcome::Served(SyscallResult::new(0))
-        );
+        assert_eq!(served_result(w.set_robust_list(0, a, 24)), Some(0));
         assert_eq!(w.heads(), [(a, 24), previous_b]);
-        assert_eq!(
-            w.set_robust_list(1, b, 24),
-            EntryOutcome::Served(SyscallResult::new(0))
-        );
+        assert_eq!(served_result(w.set_robust_list(1, b, 24)), Some(0));
         assert_eq!(w.heads(), [(a, 24), (b, 24)]);
         previous_b = (b, 24);
     }
@@ -129,8 +132,8 @@ fn invalid_length_is_einval_and_changes_neither_head() {
     for len in [0, 23, 25, u64::MAX] {
         for task in 0..2 {
             assert_eq!(
-                w.set_robust_list(task, 0xdead_0000, len),
-                EntryOutcome::Served(SyscallResult::new(-22)),
+                served_result(w.set_robust_list(task, 0xdead_0000, len)),
+                Some(-22),
                 "len {len}"
             );
             assert_eq!(w.heads(), [(0xa000, 24), (0xb000, 24)]);
@@ -145,9 +148,8 @@ fn invalid_length_is_einval_and_changes_neither_head() {
 fn pending_host_work_completes_once_and_leaves_with_work() {
     let w = World::new(LifecycleHatches::ON);
     w.tasks[1].mark_pending_host_work();
-    assert_eq!(
-        w.set_robust_list(1, 0xb000, 24),
-        EntryOutcome::ServedWithWork(SyscallResult::new(0))
+    assert!(
+        matches!(w.set_robust_list(1, 0xb000, 24), EntryOutcome::ServedWithWork { result, .. } if result.raw() == 0)
     );
     assert_ne!(w.tasks[1].served_with_work.load(Ordering::Relaxed), 0);
     assert_eq!(w.tasks[0].served_with_work.load(Ordering::Relaxed), 0);
