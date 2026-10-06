@@ -1,0 +1,139 @@
+{
+  "base": "6bb08a88d0aac35c9af336a8220fa34fd2d52bd7",
+  "contract": "kernel.el1.signal-delivery-owner",
+  "red": {
+    "command": "cargo run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json",
+    "exit_code": 1,
+    "test_output_tail": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.33s\n     Running `target/debug/check-personality-boundary --root . --metadata-file target/cargo-metadata.json`\nsubstrate boundary violations detected (9 violation(s)):\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:375:11: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:382:20: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:393:8: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:473:17: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:474:18: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:502:13: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:509:21: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:512:30: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)\n  [SRC] /home/carrick/dev/wt-ord6-rebase/crates/carrick-signal-core/src/policy.rs:515:42: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)"
+  },
+  "verification": [
+    {
+      "command": "cargo metadata --locked --offline --all-features --format-version 1 > target/cargo-metadata.json",
+      "exit_code": 0,
+      "test_output_tail": null
+    },
+    {
+      "command": "cargo run -p carrick-conformance-contract --bin check-personality-boundary -- --root . --metadata-file target/cargo-metadata.json",
+      "exit_code": 0,
+      "test_output_tail": "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.30s\n     Running `target/debug/check-personality-boundary --root . --metadata-file target/cargo-metadata.json`\npersonality boundary checked: 9 substrate crate(s) clean\n  [PASS] crate `carrick-core` (shipped deps: [\"carrick-core-abi\", \"carrick-guest-arch\", \"carrick-mmu-core\", \"carrick-sched-core\", \"foldhash\", \"hashbrown\"], dev deps: [\"carrick-conformance-contract\", \"carrick-el1\", \"carrick-el1-abi\", \"carrick-personality-linux\", \"parking_lot\"], scanned files: 24)\n  [PASS] crate `carrick-core-abi` (shipped deps: [\"carrick-guest-arch\", \"carrick-mmu-core\", \"carrick-sched-core\", \"foldhash\", \"hashbrown\"], dev deps: [], scanned files: 17)\n  [PASS] crate `carrick-sched-core` (shipped deps: [], dev deps: [], scanned files: 8)\n  [PASS] crate `carrick-mmu-core` (shipped deps: [\"carrick-guest-arch\", \"foldhash\", \"hashbrown\"], dev deps: [\"carrick-mem\"], scanned files: 12)\n  [PASS] crate `carrick-signal-core` (shipped deps: [], dev deps: [], scanned files: 5)\n  [PASS] crate `carrick-timer-core` (shipped deps: [], dev deps: [], scanned files: 3)\n  [PASS] crate `carrick-fd-core` (shipped deps: [\"carrick-sched-core\"], dev deps: [\"loom\"], scanned files: 3)\n  [PASS] crate `carrick-pipe-core` (shipped deps: [], dev deps: [], scanned files: 2)\n  [PASS] crate `carrick-el1` (shipped deps: [\"carrick-core\", \"carrick-core-abi\", \"carrick-el1-abi\", \"carrick-fatal\", \"carrick-fd-core\", \"carrick-guest-arch\", \"carrick-inotify-core\", \"carrick-mmu-core\", \"carrick-personality-linux\", \"carrick-pipe-core\", \"carrick-sched-core\", \"carrick-signal-core\", \"foldhash\", \"hashbrown\", \"libc\"], dev deps: [\"carrick-aarch64\", \"carrick-hal\", \"carrick-mem\"], scanned files: 13)"
+    },
+    {
+      "command": "cargo test --locked -p carrick-core -p carrick-core-abi -p carrick-personality-linux",
+      "exit_code": 0,
+      "test_output_tail": "test crates/carrick-core/src/entry.rs - entry::admit_born_in_zone (line 129) - compile fail ... ok\ntest crates/carrick-core/src/entry.rs - entry::_ (line 325) - compile fail ... ok\ntest crates/carrick-core/src/mm/reservation.rs - mm::reservation (line 5) - compile fail ... ok\n\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s\n\n   Doc-tests carrick_core_abi\n\nrunning 2 tests\ntest crates/carrick-core-abi/src/mm/transfer.rs - mm::transfer::El1MmHandle (line 11) - compile fail ... ok\ntest crates/carrick-core-abi/src/mm/transfer.rs - mm::transfer::El1MmHandle (line 17) - compile fail ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s\n\n   Doc-tests carrick_personality_linux\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+    },
+    {
+      "command": "cargo test --locked -p carrick-el1 --lib",
+      "exit_code": 0,
+      "test_output_tail": "test substrate::sched::tests::an_owed_cow_invalidation_runs_before_the_install ... ok\ntest substrate::sched::tests::arm_fake_backend_context_trace_is_unchanged ... ok\ntest substrate::sched::tests::cancelled_on_cpu_thread_is_not_stranded_by_repark ... ok\ntest substrate::sched::tests::el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation ... ok\ntest substrate::sched::tests::el1_ipc_wait_cross_slot_wake_sends_sgi_after_queue_unlock ... ok\ntest substrate::sched::tests::fresh_record_park_refusal_does_not_leak_unpublished_record_on_occupied_timer_or_guard_error ... ok\ntest personality::mm_portal::x86_tests::x86_transfer_64_pages ... ok\ntest personality::mm_portal::x86_tests::x86_wrong_output_pin_refuses_before_preparing_copy ... ok\ntest substrate::sched::tests::signal_requested_on_cpu_is_not_lost_by_repark ... ok\ntest substrate::sched::tests::the_idle_entry_runs_a_queued_thread_or_leaves_for_the_host ... ok\ntest substrate::sched::tests::the_idle_entry_runs_no_thread_itself ... ok\ntest personality::mm_portal::x86_tests::x86_transfer_256_pages ... ok\ntest substrate::sched::tests::threads_of_another_process_are_not_woken ... ok\ntest substrate::sched::tests::the_virtual_timer_preempts_a_compute_loop ... ok\ntest substrate::sched::tests::unserved_futex_operations_forward ... ok\ntest substrate::sched::tests::timed_waits_this_vcpu_cannot_keep_forward ... ok\ntest substrate::sched::tests::queued_threads_do_not_send_other_syscalls_to_the_host ... ok\n\ntest result: ok. 228 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.64s\n"
+    },
+    {
+      "command": "cargo build --locked -p carrick-x86-cpl0 --release --target x86_64-unknown-none",
+      "exit_code": 0,
+      "test_output_tail": "    Finished `release` profile [optimized + debuginfo] target(s) in 0.16s"
+    },
+    {
+      "command": "CARRICK_RUN_ID=ord6-signal-x5-20261006 cargo test --locked -p carrick-vmm-kvm --test cpl0_lifecycle x5_shared_clone_exit -- --exact --nocapture",
+      "exit_code": 0,
+      "test_output_tail": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.15s\n     Running tests/cpl0_lifecycle.rs (target/debug/deps/cpl0_lifecycle-b11a9fd8a7af91de)\n\nrunning 1 test\nX5 births=16 per MM; CPL0 entries=96 completions=96 forwards=0; production executor-pool binding remains unqualified\nX5 births=64 per MM; CPL0 entries=384 completions=384 forwards=0; production executor-pool binding remains unqualified\nX5 births=256 per MM; CPL0 entries=1536 completions=1536 forwards=0; production executor-pool binding remains unqualified\ntest x5_shared_clone_exit ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s\n"
+    },
+    {
+      "command": "CARRICK_RUN_ID=ord6-signal-entry-20261006 cargo test --locked -p carrick-vmm-kvm --test cpl0_entry",
+      "exit_code": 0,
+      "test_output_tail": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s\n     Running tests/cpl0_entry.rs (target/debug/deps/cpl0_entry-056bc683534b4e2b)\n\nrunning 6 tests\ntest entry_and_return_kicks_never_republish_or_recomplete ... ok\ntest two_live_tasks_register_full_width_heads_without_dereferencing ... ok\ntest two_live_tasks_reject_length_with_high_bits_preserving_both_heads ... ok\ntest two_live_tasks_serve_robust_lists_without_host_forwards ... ok\ntest x1_boot_shared_substrate ... ok\ntest x4_linux_common_entry ... ok\n\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s\n"
+    },
+    {
+      "command": "CARRICK_RUN_ID=ord6-signal-progress-20261006 cargo test --locked -p carrick-vmm-kvm --test cpl0_progress",
+      "exit_code": 0,
+      "test_output_tail": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s\n     Running tests/cpl0_progress.rs (target/debug/deps/cpl0_progress-ae0d3a2ab2ca5b91)\n\nrunning 2 tests\ntest entry_kick_and_timer_preempt_two_private_contexts ... ok\ntest return_kick_and_timer_preempt_two_private_contexts ... ok\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s\n"
+    },
+    {
+      "command": "cargo clippy --locked -p carrick-personality-linux -p carrick-signal-core -p carrick-core -p carrick-core-abi -p carrick-el1 -p carrick-x86-cpl0 -p carrick-vmm-kvm --all-targets -- -D warnings",
+      "exit_code": 0,
+      "test_output_tail": "warning: `carrick-core` (test \"x86_acceleration\") generated 1 warning (1 duplicate)\nwarning: `carrick-core` (lib test) generated 1 warning (1 duplicate)\nwarning: `carrick-core` (test \"entry_completion\") generated 1 warning (1 duplicate)\nwarning: `carrick-core` (test \"x86_wave2\") generated 1 warning (1 duplicate)\nwarning: `carrick-vmm-kvm` (test \"cpl0_lifecycle\") generated 1 warning (1 duplicate)\nwarning: `carrick-vmm-kvm` (test \"live_vcpu_x86\") generated 1 warning (1 duplicate)\nwarning: `carrick-vmm-kvm` (test \"carrier_memory\") generated 1 warning (1 duplicate)\nwarning: `carrick-vmm-kvm` (lib test) generated 1 warning (1 duplicate)\nwarning: `carrick-el1` (bin \"carrick-el1\" test) generated 1 warning (1 duplicate)\nwarning: `carrick-personality-linux` (lib test) generated 1 warning (1 duplicate)\nwarning: `carrick-personality-linux` (test \"futex_policy\") generated 1 warning (1 duplicate)\nwarning: `carrick-personality-linux` (test \"signal_policy_contract\") generated 1 warning (1 duplicate)\nwarning: `carrick-el1` (bin \"carrick-el1\") generated 1 warning (1 duplicate)\nwarning: `carrick-el1` (test \"n2_creation_baseline\") generated 1 warning (1 duplicate)\nwarning: `carrick-el1` (test \"n2_creation_owner\") generated 1 warning (1 duplicate)\nwarning: `carrick-personality-linux` (test \"x86_wave2\") generated 1 warning (1 duplicate)\nwarning: `carrick-el1` (lib test) generated 1 warning (1 duplicate)\nwarning: `carrick-core-abi` (lib test) generated 1 warning (1 duplicate)\nwarning: `carrick-signal-core` (lib test) generated 1 warning (1 duplicate)\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.28s"
+    },
+    {
+      "command": "cargo test --locked -p carrick-signal-core",
+      "exit_code": 0,
+      "test_output_tail": "test fasync::tests::unarmed_fast_path_reads_no_slots ... ok\ntest fasync::tests::rearm_overwrites_owner_and_sig ... ok\ntest fasync::tests::disarm_clears_the_entry ... ok\ntest tests::arbitrary_personality_controls_unmaskable_slots ... ok\ntest tests::disposition_install_reset_is_idempotent ... ok\ntest tests::pending_selection_preserves_other_slots_and_coalesces ... ok\ntest tests::standard_coalescing_retains_first_payload_including_absence ... ok\ntest timer::tests::sequence_exhaustion_cannot_wrap_and_authenticate_an_old_ticket ... ok\ntest tests::payload_policy_is_caller_selected ... ok\ntest tests::concurrent_consumers_take_each_slot_once ... ok\ntest fasync::tests::concurrent_rearm_never_publishes_a_torn_owner ... ok\n\ntest result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s\n\n   Doc-tests carrick_signal_core\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+    },
+    {
+      "command": "just fmt-check",
+      "exit_code": 0,
+      "test_output_tail": "cargo --config 'build.rustc-wrapper=\"/usr/local/bin/sccache\"' run --locked -p carrick-xtask -- worktree-run -- cargo --config 'build.rustc-wrapper=\"/usr/local/bin/sccache\"' fmt --all -- --check\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.30s\n     Running `target/debug/carrick-xtask worktree-run -- cargo --config 'build.rustc-wrapper=\"/usr/local/bin/sccache\"' fmt --all -- --check`"
+    },
+    {
+      "command": "python3 scripts/migrate/reconcile-line-pinned-inventories.py",
+      "exit_code": 0,
+      "source_commit": "c1a4cd0c8252a7b6097c40c453616b11c9e3bd69",
+      "test_output_tail": "positions updated: 0\nrationale site references rebound: 0\ninventory rows: 661\ncapture left untouched: candidate executed ['linux-cli', 'linux-runtime'], not the capture's recorded slice\nhost-authority positions: 0 rebound\nruntime-aborts fingerprints: 0 rebound\ndispatch-lock-authority lines: 0 rebound\nk1 operation inventory: 0 rebound\nk1 callsite taxonomy: 0 rebound\ninventories reconciled; review `git diff` (positions only) and commit"
+    },
+    {
+      "command": "cargo metadata --locked --offline --format-version 1 --manifest-path fixtures/embed-el1-sched/Cargo.toml > /tmp/ord6-signal-arm-fixture-metadata.json",
+      "exit_code": 0,
+      "test_output_tail": null
+    },
+    {
+      "command": "cargo run --locked -p carrick-conformance-contract --bin check-contracts -- --root .",
+      "exit_code": 0,
+      "test_output_tail": "Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.18s\n     Running `target/debug/check-contracts --root .`\nconformance contracts checked: 99 contracts, 16 claims, 193 surfaces (inventory: 338 syscalls, 16 with claims)"
+    },
+    {
+      "command": "umask 022\nexport PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH\njust ci",
+      "exit_code": 0,
+      "test_output_tail": "test tests::picks_linux_arm64_from_multi_arch_index ... ok\ntest tests::pull_policy_follows_docker_semantics ... ok\ntest tests::rejects_arm64_v7_variant ... ok\ntest tests::returns_none_when_no_linux_arm64_present ... ok\ntest tests::skips_entry_with_no_platform_block ... ok\ntest tests::remove_image_by_spec_accepts_ref_or_id ... ok\ntest tests::tag_moved_only_when_registry_digest_differs ... ok\ntest tests::test_parse_oci_config_json ... ok\ntest tests::tag_image_creates_a_new_ref_sharing_blobs ... ok\ntest tests::load_docker_archive_tags_every_repo_tag ... ok\ntest tests::remove_image_then_gc_reclaims_unreferenced_blobs ... ok\n\ntest result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s\n\n   Doc-tests carrick_image\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+    },
+    {
+      "command": "cargo run --locked --offline --manifest-path docs/perf-results/order6-census/Cargo.toml -- .",
+      "exit_code": 0,
+      "test_output_tail": "Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s\n     Running `docs/perf-results/order6-census/target/debug/ord6-census .`\ncarrick-el1: production_physical_lines=10432, all_src_lines=25563\ncarrick-el1-abi: production_physical_lines=8053, all_src_lines=11721\ncarrick-aarch64: production_physical_lines=13468, all_src_lines=19350\nTOTAL=31953"
+    }
+  ],
+  "cpl0_sha256": "35d789e9dfc07866d6cba4b11dc4e5fb34bff2af0fd7352ee581d8b8a834b62f",
+  "move_identity": "Pending policy bodies and 18 contract bodies identical to base; imports/module location only.",
+  "neutral_closure": "Core and core-ABI normal/build dependency closures exclude signal-core under locked all-feature metadata.",
+  "limits": [
+    "No Docker or signed HVF on x86-w1; no accept or remote-accept.",
+    "KVM X5 remains a bounded two-context witness, not production executor-pool or adopted-job qualification."
+  ],
+  "diagnostics": [
+    {
+      "command": "just ci",
+      "source_commit": "c4769970d",
+      "exit_code": 1,
+      "reason": "Stale surface registry path pending_lifecycle.rs; retargeted to existing lifecycle.rs before final CI."
+    },
+    {
+      "command": "just ci",
+      "source_commit": "c1a4cd0c8252a7b6097c40c453616b11c9e3bd69",
+      "exit_code": 101,
+      "reason": "Login shells defaulted to umask 0002; tempfile directory was group-writable, rejected by observability artifact publication. Explicit required umask 022 resolves the failure without source changes.",
+      "failed_test": "vm_lifecycle::tests::artifact_publication_is_private_durable_and_no_clobber"
+    }
+  ],
+  "validation_source_commit": "c1a4cd0c8252a7b6097c40c453616b11c9e3bd69",
+  "environment": {
+    "umask": "022, explicitly applied in each final verification shell",
+    "PATH": "$HOME/.cargo/bin:$HOME/.local/bin:$PATH",
+    "host": "x86-w1"
+  },
+  "arm_delta_vs_7b6d15813": {
+    "base_production": 33658,
+    "head_production": 31953,
+    "reduction": 1705,
+    "correction_arm_source_delta": 0
+  },
+  "cleanup": "pgrep confirms no yes/stress/stress-ng or CPL0 test executables remain; no load generator was started.",
+  "validated_input_blobs": {
+    "Cargo.lock": "e5b9d92a8cb0aecd00bd4a986aa564874e0776f9",
+    "conformance-contracts/surfaces.toml": "98488e183ff61ab7a41023b8c65c28c4af324063",
+    "crates/carrick-personality-linux/Cargo.toml": "e8a6fd64a88ba3ef86e44243db8da7214fdef17e",
+    "crates/carrick-personality-linux/src/lib.rs": "9faec912428679f3a7c4a0c4a20be4bf672452e1",
+    "crates/carrick-personality-linux/src/signal.rs": "a93f8e4a80c8fe85f345a520e41946393cb3a343",
+    "crates/carrick-personality-linux/tests/signal_policy_contract.rs": "b6276022be856affc789c9491643ce13dbb53a20",
+    "crates/carrick-signal-core/src/policy.rs": "6cabeddb0d1b87a46d03305ee8859f69d13231de",
+    "crates/carrick-signal-core/tests/policy_contract.rs": null,
+    "fixtures/embed-el1-sched/Cargo.lock": "0f1a4164b0cd6692da8b09654dbb9e2b75ee631e"
+  },
+  "evidence_only_amendment": "Verification preceded the final evidence-only amendment; all Rust, Cargo and surface-registry inputs match the recorded blobs. Focused worker proof, not an acceptance receipt."
+}

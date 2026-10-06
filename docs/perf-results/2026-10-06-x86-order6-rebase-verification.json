@@ -263,13 +263,15 @@
       "  [SRC] <root>/crates/carrick-signal-core/src/policy.rs:512:30: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)",
       "  [SRC] <root>/crates/carrick-signal-core/src/policy.rs:515:42: crate `carrick-signal-core`: forbidden code `PendingSignals` (forbidden Linux personality symbol in production substrate source)"
     ],
-    "policy_git_blob": "bd084c723cc4058ef5e4f4c25a8f9cce4db5983e"
+    "policy_git_blob": "bd084c723cc4058ef5e4f4c25a8f9cce4db5983e",
+    "authoritative": false,
+    "correction": "Cross-version scanner comparison cannot attribute baseline failures. Exact order-5 CI scanner passes; order-6 scanner adds PendingSignals prohibition and fails at 6bb08a88d. Superseded by signal-boundary correction."
   },
   "gate_status": {
     "required_focused_commands": "all exit 0",
     "inventory_reconciliation": "exit 0, zero position changes, 661 rows",
     "ci": "exit 1 in lint-domains-source; three macOS projection self-tests fail",
-    "supplementary_source_boundary": "exit 1; exactly nine unchanged baseline PendingSignals violations",
+    "supplementary_source_boundary": "historical exit 1; nine PendingSignals violations; baseline attribution withdrawn",
     "macos_recapture": "director-owned, not run on worker"
   }
 }

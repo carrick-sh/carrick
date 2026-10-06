@@ -73,6 +73,7 @@ dependencies = [
  "carrick-core-abi",
  "carrick-guest-arch",
  "carrick-sched-core",
+ "carrick-signal-core",
 ]
 
 [[package]]
@@ -81,6 +82,10 @@ version = "0.1.0"
 
 [[package]]
 name = "carrick-sched-core"
+version = "0.1.0"
+
+[[package]]
+name = "carrick-signal-core"
 version = "0.1.0"
 
 [[package]]
