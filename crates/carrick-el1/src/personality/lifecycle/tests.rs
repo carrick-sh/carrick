@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 extern crate std;
+use carrick_el1_abi::Action;
 
 use super::*;
 use crate::personality::dispatch::{Zone, dispatch_syscall_with_lifecycle};
@@ -267,7 +268,15 @@ fn serve_directly(w: &mut World, frame: &mut TrapFrame, user: &mut FaultingUser)
         user: &HardwareUserWord,
         counters: &w.counters,
     };
-    serve(frame, &w.counters, task, Some(sched), &*w.venue, user)
+    serve(frame, &w.counters, task, Some(sched), &*w.venue, user).map(|result| {
+        use carrick_personality_linux::dispatch::{CompletionRoute, completion_route};
+        match completion_route(result, task.has_pending_host_work()) {
+            CompletionRoute::Served => Action::Served,
+            CompletionRoute::WithWork => Action::ServedWithWork,
+            CompletionRoute::Suspended => Action::Idle,
+            CompletionRoute::Forward => Action::Forward,
+        }
+    })
 }
 
 fn clone_args(flags: u64, parent_tid: u64, child_tid: u64) -> [u64; 5] {
