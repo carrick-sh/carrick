@@ -302,6 +302,31 @@ mod kernel {
             );
             return;
         }
+        if frame.rax == OBSERVE_FORK_TABLE_WINDOW {
+            use carrick_el1::isa::x86::ForkDescriptorWords;
+            use carrick_el1_abi::PortalForkTableArena;
+            use carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords;
+            let root =
+                carrick_el1::isa::x86::hardware_live_root().map_or(0, |root| root.address().raw());
+            let (Some(child), Some(parent)) = (
+                PortalForkTableArena::new(0x92_0000, 4096),
+                PortalForkTableArena::new(0x92_1000, 4096),
+            ) else {
+                frame.rax = 0;
+                return;
+            };
+            // SAFETY: the KVM bootstrap retains the sole upper direct window
+            // and both physical pages until this bounded witness completes.
+            frame.rax = u64::from(
+                unsafe { ForkDescriptorWords::checked(root, child, parent) }.is_ok_and(|words| {
+                    words.load(child.base).is_ok()
+                        && words.load(parent.base).is_ok()
+                        && words.load(0x92_2000).is_err()
+                        && words.drain_succeeded()
+                }),
+            );
+            return;
+        }
         if frame.rax == OBSERVE_MMU_DRAIN {
             use carrick_guest_arch::{
                 AddressContext, ContextGeneration, FrameGpa, GuestLen, MmGeneration, MmuBackend,

@@ -7,18 +7,24 @@ use carrick_el1_abi::{
     ReservationNodeFlags,
 };
 use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
+#[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+use carrick_mmu_core::owner_mmu::Aarch64Mmu as NativeForkMmu;
+use carrick_mmu_core::owner_mmu::OwnerForkMmu;
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+use carrick_mmu_core::x86::owner_mmu::X86Mmu as NativeForkMmu;
 #[cfg(target_os = "none")]
 use carrick_personality_linux::mm::MmErrorLinux;
 use core::num::NonZeroU64;
 #[cfg(not(target_os = "none"))]
 use std::vec::Vec;
 
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 const PA: u64 = 0x0000_ffff_ffff_f000;
 
 /// Check the supplied table arenas and choose the primary window that the
 /// maintenance service can address. The ordinal is returned to the host only
 /// on a stage-3 refusal.
-#[cfg(any(test, target_os = "none"))]
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(super) fn fork_table_window(
     request: PortalForkRequest,
     parent_ttbr0: u64,
@@ -42,7 +48,8 @@ pub(super) fn fork_table_window(
     })
 }
 
-pub use carrick_core::mm::fork::{ForkScratch, PreparedOwnerFork};
+pub use carrick_core::mm::fork::ForkScratch;
+pub type PreparedOwnerFork<B = NativeForkMmu> = carrick_core::mm::fork::PreparedOwnerFork<B>;
 
 #[derive(Clone, Copy, Default)]
 pub struct LinuxForkPolicy;
@@ -73,28 +80,27 @@ pub(crate) use carrick_core::mm::fork::refusal_to_fork_error;
 
 /// An unpublished memory result. Task admission chooses commit or rollback;
 /// the child gate is closed throughout, and its exact parent undo remains owned.
-pub struct UnpublishedEl1Child {
-    pub(crate) inner:
-        carrick_core::mm::fork::UnpublishedChild<carrick_mmu_core::owner_mmu::Aarch64Mmu>,
+pub struct UnpublishedEl1Child<B: OwnerForkMmu = NativeForkMmu> {
+    pub(crate) inner: carrick_core::mm::fork::UnpublishedChild<B>,
 }
 
-impl core::ops::Deref for UnpublishedEl1Child {
-    type Target = carrick_core::mm::fork::UnpublishedChild<carrick_mmu_core::owner_mmu::Aarch64Mmu>;
+impl<B: OwnerForkMmu> core::ops::Deref for UnpublishedEl1Child<B> {
+    type Target = carrick_core::mm::fork::UnpublishedChild<B>;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl core::ops::DerefMut for UnpublishedEl1Child {
+impl<B: OwnerForkMmu> core::ops::DerefMut for UnpublishedEl1Child<B> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
     }
 }
 
-impl UnpublishedEl1Child {
+impl<B: OwnerForkMmu> UnpublishedEl1Child<B> {
     pub fn commit<P: PinnedMetadataExtent>(
         &mut self,
-        portal: &MmPortal<'_, P>,
+        portal: &MmPortal<'_, P, B>,
         worker: u32,
     ) -> Result<PortalForkCompletion, MmError> {
         let request = self.inner.completion.request;
@@ -105,7 +111,7 @@ impl UnpublishedEl1Child {
 
     pub fn abort<P: PinnedMetadataExtent, W: LiveDescriptorWords + ?Sized>(
         &mut self,
-        portal: &MmPortal<'_, P>,
+        portal: &MmPortal<'_, P, B>,
         words: &W,
         worker: u32,
     ) -> Result<(), MmError> {
@@ -130,7 +136,7 @@ impl UnpublishedEl1Child {
     }
 }
 
-pub trait NativeForkPortal<P: PinnedMetadataExtent> {
+pub trait NativeForkPortal<P: PinnedMetadataExtent, B: OwnerForkMmu = NativeForkMmu> {
     fn census_fork<W: LiveDescriptorWords + ?Sized>(
         &self,
         request: PortalForkRequest,
@@ -143,15 +149,15 @@ pub trait NativeForkPortal<P: PinnedMetadataExtent> {
         scratch: ForkScratch,
         words: &W,
         worker: u32,
-    ) -> Result<PreparedOwnerFork, MmError>;
+    ) -> Result<PreparedOwnerFork<B>, MmError>;
     fn publish_fork<W: LiveDescriptorWords + ?Sized>(
         &self,
-        plan: PreparedOwnerFork,
+        plan: PreparedOwnerFork<B>,
         words: &W,
         worker: u32,
-    ) -> Result<UnpublishedEl1Child, MmError>;
+    ) -> Result<UnpublishedEl1Child<B>, MmError>;
 }
-impl<P: PinnedMetadataExtent> NativeForkPortal<P> for MmPortal<'_, P> {
+impl<P: PinnedMetadataExtent, B: OwnerForkMmu> NativeForkPortal<P, B> for MmPortal<'_, P, B> {
     /// First census the reachable graph with fixed recursion and a bounded
     /// temporary owner reservation observation. Allocate undo/table storage
     /// only after releasing editors and metadata, proportional to actual work.
@@ -215,11 +221,11 @@ impl<P: PinnedMetadataExtent> NativeForkPortal<P> for MmPortal<'_, P> {
                 })
                 .count(),
         };
-        census_table::<carrick_mmu_core::owner_mmu::Aarch64Mmu, _, _>(
+        census_table::<B, _, _>(
             &LinuxForkPolicy,
             words,
             &mappings,
-            grant.ttbr0 & PA,
+            grant.ttbr0 & B::ADDRESS_MASK,
             0,
             0,
             &mut count,
@@ -241,7 +247,7 @@ impl<P: PinnedMetadataExtent> NativeForkPortal<P> for MmPortal<'_, P> {
         mut scratch: ForkScratch,
         words: &W,
         worker: u32,
-    ) -> Result<PreparedOwnerFork, MmError> {
+    ) -> Result<PreparedOwnerFork<B>, MmError> {
         if !request.valid() || request.operation.carrier != self.carrier {
             return Err(MmError::Invalid);
         }
@@ -266,7 +272,7 @@ impl<P: PinnedMetadataExtent> NativeForkPortal<P> for MmPortal<'_, P> {
             .space_access(worker)?
             .try_begin_closed_child_edit(child_index, request.child_mm.raw(), owner)
             .ok_or(MmError::Busy)?;
-        if child_editor.grant().ttbr0 & PA != request.child_tables.base {
+        if child_editor.grant().ttbr0 & B::ADDRESS_MASK != request.child_tables.base {
             return Err(MmError::Stale);
         }
         let mut root = self.root(request.operation.mm, worker)?;
@@ -309,8 +315,8 @@ impl<P: PinnedMetadataExtent> NativeForkPortal<P> for MmPortal<'_, P> {
         if capacity_refused {
             return Err(MmError::NoMemory);
         }
-        let parent_root = grant.ttbr0 & PA;
-        copy_table::<carrick_mmu_core::owner_mmu::Aarch64Mmu, _, _>(
+        let parent_root = grant.ttbr0 & B::ADDRESS_MASK;
+        copy_table::<B, _, _>(
             &LinuxForkPolicy,
             words,
             request,
@@ -337,10 +343,10 @@ impl<P: PinnedMetadataExtent> NativeForkPortal<P> for MmPortal<'_, P> {
     /// linking any new table, then clones only the owner's reservation tree.
     fn publish_fork<W: LiveDescriptorWords + ?Sized>(
         &self,
-        plan: PreparedOwnerFork,
+        plan: PreparedOwnerFork<B>,
         words: &W,
         worker: u32,
-    ) -> Result<UnpublishedEl1Child, MmError> {
+    ) -> Result<UnpublishedEl1Child<B>, MmError> {
         let request = plan.request;
         let owner = NonZeroU64::new(u64::from(worker) + 1).ok_or(MmError::Invalid)?;
         let index = self
@@ -359,7 +365,7 @@ impl<P: PinnedMetadataExtent> NativeForkPortal<P> for MmPortal<'_, P> {
             .space_access(worker)?
             .try_begin_closed_child_edit(child_index, request.child_mm.raw(), owner)
             .ok_or(MmError::Busy)?;
-        if child_editor.grant().ttbr0 & PA != request.child_tables.base {
+        if child_editor.grant().ttbr0 & B::ADDRESS_MASK != request.child_tables.base {
             return Err(MmError::Stale);
         }
         let root = self.root(request.operation.mm, worker)?;
@@ -417,15 +423,33 @@ pub(crate) fn reconcile_pending_parent_write<W: LiveDescriptorWords + ?Sized>(
 ) -> Result<(), MmError> {
     authenticate_pending_parent_write(slot, handle, sequence)?;
     let mut pending = PENDING_FORKS.get(slot).ok_or(MmError::Invalid)?.lock();
-    pending
-        .as_mut()
-        .ok_or(MmError::Stale)?
+    let child = pending.as_mut().ok_or(MmError::Stale)?;
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    let _ = words;
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    let fork_words = {
+        let request = child.completion.request;
+        // SAFETY: this COW completion still owns the exact parent editor;
+        // the detached fork retains both physical table arenas through FINISH.
+        unsafe {
+            crate::isa::x86::ForkDescriptorWords::checked(
+                child.parent_root,
+                request.child_tables,
+                request.parent_tables,
+            )
+        }
+        .map_err(|_| MmError::Stale)?
+    };
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    let words = &fork_words;
+    child
         .reconcile_parent_write(words, completion)
         .map_err(Into::into)
 }
 
 #[cfg(target_os = "none")]
 pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
+    #[cfg(target_arch = "aarch64")]
     use carrick_mmu_core::aarch64::descriptor_txn::{CallerInvalidatesAsid, PrimaryTableWords};
     frame.x[1] = 0; // Slot claim.
     let slots =
@@ -474,12 +498,16 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             .ok_or(MmError::Busy)?;
         frame.x[1] = 3; // Physical table pool and live word access.
         frame.x[3] = grant.ttbr0; // Failure-only host diagnostic.
+        #[cfg(target_arch = "aarch64")]
         let pool = carrick_el1_abi::stage1_table_pool_window();
+        #[cfg(target_arch = "aarch64")]
         let primary = fork_table_window(request, grant.ttbr0).map_err(|check| {
             frame.x[2] = check;
             MmError::Invalid
         })?;
+        #[cfg(target_arch = "aarch64")]
         let maintenance = CallerInvalidatesAsid;
+        #[cfg(target_arch = "aarch64")]
         let words = unsafe {
             PrimaryTableWords::new(
                 primary.words,
@@ -490,6 +518,19 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             .and_then(|words| words.with_window(pool))
         }
         .map_err(|_| MmError::Core)?;
+        #[cfg(target_arch = "x86_64")]
+        let words = {
+            // SAFETY: the carrier retains the single upper direct window and
+            // both granted arenas through the exact owner fork settlement.
+            unsafe {
+                crate::isa::x86::ForkDescriptorWords::checked(
+                    grant.ttbr0,
+                    request.child_tables,
+                    request.parent_tables,
+                )
+            }
+            .map_err(|_| MmError::Stale)?
+        };
         frame.x[1] = 4; // Reachable graph census.
         let scratch = portal.census_fork(request, &words, frame.slot as u32)?;
         frame.x[1] = 5; // Owner fork preparation.
@@ -502,7 +543,13 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         }
         frame.x[1] = 7; // Parent and closed child publication.
         let child = portal.publish_fork(plan, &words, frame.slot as u32)?;
+        #[cfg(target_arch = "aarch64")]
         crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, grant.ttbr0);
+        #[cfg(target_arch = "x86_64")]
+        if !words.drain_succeeded() || crate::isa::x86::portal_invalidate_root(grant.ttbr0).is_err()
+        {
+            crate::isa::x86::fatal_entry_binding();
+        }
         let completion = child.completion();
         *pending.lock() = Some(child);
         frame.x[1] = 8; // Detached receipt publication.
@@ -523,6 +570,7 @@ pub fn serve_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
 
 #[cfg(target_os = "none")]
 pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
+    #[cfg(target_arch = "aarch64")]
     use carrick_mmu_core::aarch64::descriptor_txn::{CallerInvalidatesAsid, PrimaryTableWords};
     let result = (|| -> Result<(), MmError> {
         let slots = unsafe {
@@ -554,8 +602,10 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
         let settlement = if commit {
             child.commit(&portal, frame.slot as u32).map(|_| ())
         } else {
+            #[cfg(target_arch = "aarch64")]
             let maintenance = CallerInvalidatesAsid;
             let base = child.parent_root;
+            #[cfg(target_arch = "aarch64")]
             let words = unsafe {
                 PrimaryTableWords::new(
                     base as *mut core::sync::atomic::AtomicU64,
@@ -566,7 +616,27 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
                 .and_then(|words| words.with_window(carrick_el1_abi::stage1_table_pool_window()))
             }
             .map_err(|_| MmError::Core);
-            words.and_then(|words| child.abort(&portal, &words, frame.slot as u32))
+            #[cfg(target_arch = "x86_64")]
+            let words = {
+                // SAFETY: the detached child retains both granted table
+                // arenas, while FINISH owns the exact parent/child editors.
+                unsafe {
+                    crate::isa::x86::ForkDescriptorWords::checked(
+                        base,
+                        request.child_tables,
+                        request.parent_tables,
+                    )
+                }
+                .map_err(|_| MmError::Stale)
+            };
+            words.and_then(|words| {
+                child.abort(&portal, &words, frame.slot as u32)?;
+                #[cfg(target_arch = "x86_64")]
+                if !words.drain_succeeded() {
+                    crate::isa::x86::fatal_entry_binding();
+                }
+                Ok(())
+            })
         };
         if let Err(error) = settlement {
             *pending.lock() = Some(child);
@@ -576,7 +646,12 @@ pub fn finish_fork_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             && let Some(index) = zone.spaces.find(request.operation.mm.raw())
             && let Some(grant) = zone.spaces.grant(index, request.operation.mm.raw())
         {
+            #[cfg(target_arch = "aarch64")]
             crate::sched::ThreadCpu::invalidate_asid(&mut crate::sched::HardwareCpu, grant.ttbr0);
+            #[cfg(target_arch = "x86_64")]
+            if crate::isa::x86::portal_invalidate_root(grant.ttbr0).is_err() {
+                crate::isa::x86::fatal_entry_binding();
+            }
         }
         if !slot.complete_finish_receipt(child.completion()) {
             return Err(MmError::Stale);

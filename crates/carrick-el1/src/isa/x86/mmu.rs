@@ -8,8 +8,8 @@ use carrick_guest_arch::{
 use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
 use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
 use carrick_mmu_core::x86::descriptor_txn::{
-    DescriptorOutcome, DescriptorReceipt, DescriptorTxn, DescriptorTxnId, InlineJournal,
-    execute_descriptor_txn,
+    DescriptorOutcome, DescriptorReceipt, DescriptorTxn, DescriptorTxnId, InlineJournal, USER,
+    execute_descriptor_txn, translate_leaf,
 };
 use core::cell::Cell;
 use core::num::NonZeroU64;
@@ -107,6 +107,135 @@ pub(crate) fn portal_invalidate_root(target: u64) -> Result<(), ArchError> {
     // so reloading CR3 drains every local non-global translation.
     unsafe { core::arch::asm!("mov cr3, {}", in(reg) target, options(nostack, preserves_flags)) }
     Ok(())
+}
+
+/// Three disjoint physical table extents reached through the single retained
+/// upper supervisor direct window during an owner fork. The active root arena
+/// is read as the source; only the two host-granted arenas may be initialized.
+pub struct ForkDescriptorWords {
+    root: RootGpa,
+    existing_base: u64,
+    existing_end: u64,
+    child: carrick_el1_abi::PortalForkTableArena,
+    parent: carrick_el1_abi::PortalForkTableArena,
+    failed_drain: Cell<bool>,
+}
+
+impl ForkDescriptorWords {
+    /// # Safety
+    /// The caller retains the boot-published direct window and the owner fork
+    /// admission until completion. No actor may remap the supervisor window
+    /// or reclaim the granted physical arenas while these words are borrowed.
+    pub unsafe fn checked(
+        target: u64,
+        child: carrick_el1_abi::PortalForkTableArena,
+        parent: carrick_el1_abi::PortalForkTableArena,
+    ) -> Result<Self, ArchError> {
+        let source = portal_descriptor_words(target)?;
+        let existing_end = source.end;
+        let child_end = checked_fork_arena(&source, child)?;
+        let parent_end = checked_fork_arena(&source, parent)?;
+        if (child.base < existing_end && child_end > source.base)
+            || (parent.base < existing_end && parent_end > source.base)
+            || (child.base < parent_end && child_end > parent.base)
+        {
+            return Err(ArchError::Unbound);
+        }
+        Ok(Self {
+            root: source.context.root,
+            existing_base: source.base,
+            existing_end,
+            child,
+            parent,
+            failed_drain: Cell::new(false),
+        })
+    }
+
+    pub fn drain_succeeded(&self) -> bool {
+        !self.failed_drain.get()
+    }
+
+    fn word(&self, pa: u64) -> Result<&AtomicU64, DescriptorRefusal> {
+        let in_existing = pa >= self.existing_base
+            && pa
+                .checked_add(8)
+                .is_some_and(|end| end <= self.existing_end);
+        if pa & 7 != 0 || !(in_existing || self.child.contains(pa) || self.parent.contains(pa)) {
+            return Err(DescriptorRefusal::TableOutsidePrimary);
+        }
+        let address = carrick_el1_abi::X86_CPL0_DIRECT_VA
+            .checked_add(pa)
+            .ok_or(DescriptorRefusal::TableOutsidePrimary)?;
+        // SAFETY: checked authenticated the retained writable direct mapping
+        // of this exact physical page, and the caller owns the fork editor.
+        Ok(unsafe { &*(address as *const AtomicU64) })
+    }
+}
+
+fn checked_fork_arena(
+    source: &NativeDescriptorWords,
+    arena: carrick_el1_abi::PortalForkTableArena,
+) -> Result<u64, ArchError> {
+    let valid = carrick_el1_abi::PortalForkTableArena::new(arena.base, arena.len)
+        .ok_or(ArchError::Unbound)?;
+    let end = valid
+        .base
+        .checked_add(valid.len)
+        .ok_or(ArchError::Unbound)?;
+    for pa in (valid.base..end).step_by(4096) {
+        let va = carrick_el1_abi::X86_CPL0_DIRECT_VA
+            .checked_add(pa)
+            .ok_or(ArchError::Unbound)?;
+        let leaf = translate_leaf(
+            source,
+            source.context.root,
+            UserVa::new(va),
+            carrick_mmu_core::x86::descriptor_txn::Access::Write,
+            false,
+        )
+        .map_err(|_| ArchError::Unbound)?;
+        if leaf.output.raw() != pa || leaf.descriptor & USER != 0 {
+            return Err(ArchError::Unbound);
+        }
+    }
+    Ok(end)
+}
+
+impl LiveDescriptorWords for ForkDescriptorWords {
+    fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
+        Ok(self.word(pa)?.load(Ordering::Acquire))
+    }
+
+    fn compare_exchange(&self, pa: u64, current: u64, new: u64) -> Result<bool, DescriptorRefusal> {
+        Ok(self
+            .word(pa)?
+            .compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok())
+    }
+
+    fn store_unlinked(&self, pa: u64, value: u64) -> Result<(), DescriptorRefusal> {
+        if !(self.child.contains(pa) || self.parent.contains(pa)) {
+            return Err(DescriptorRefusal::TableOutsidePrimary);
+        }
+        if self
+            .word(pa)?
+            .compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(DescriptorRefusal::Contended);
+        }
+        Ok(())
+    }
+
+    fn publish_barrier(&self) {
+        fence(Ordering::SeqCst);
+    }
+
+    fn invalidate_range(&self, _va: u64, _len: u64) {
+        if portal_invalidate_root(self.root.address().raw()).is_err() {
+            self.failed_drain.set(true);
+        }
+    }
 }
 
 /// Legacy ARM descriptor callers need a separate x86 table owner before they
