@@ -6594,18 +6594,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:207 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:871 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
     "review_id": "HA-000752",
     "source": {
-      "byte_end": 7455,
-      "byte_start": 7442,
+      "byte_end": 35367,
+      "byte_start": 35354,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 207,
-      "line_end": 207,
-      "line_start": 207
+      "line": 871,
+      "line_end": 871,
+      "line_start": 871
     }
   },
   {
@@ -13315,18 +13315,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2264 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2274 in `close_open_file_and_free_pty`, the host result from `std::process::id` determines the guest PTY entry lifetime decided by the host-process owner PID.",
     "review_id": "HA-000498",
     "source": {
-      "byte_end": 91063,
-      "byte_start": 91047,
+      "byte_end": 91548,
+      "byte_start": 91532,
       "column": 17,
       "column_end": 33,
       "column_start": 17,
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2264,
-      "line_end": 2264,
-      "line_start": 2264
+      "line": 2274,
+      "line_end": 2274,
+      "line_start": 2274
     }
   },
   {
@@ -13344,18 +13344,18 @@
       "macos-cli-default",
       "macos-runtime-default"
     ],
-    "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2481 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
+    "rationale": "At crates/carrick-kernel/src/dispatch/mod.rs:2491 in `register_controlling_pty`, the host result from `std::process::id` determines the guest controlling PTY identity assigned to the host-process owner PID.",
     "review_id": "HA-000499",
     "source": {
-      "byte_end": 99737,
-      "byte_start": 99721,
+      "byte_end": 100222,
+      "byte_start": 100206,
       "column": 47,
       "column_end": 63,
       "column_start": 47,
       "file": "crates/carrick-kernel/src/dispatch/mod.rs",
-      "line": 2481,
-      "line_end": 2481,
-      "line_start": 2481
+      "line": 2491,
+      "line_end": 2491,
+      "line_start": 2491
     }
   },
   {
@@ -18205,18 +18205,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:67 in `Watchdog::start`, `std::thread::spawn` creates only the bounded fixture watchdog for the currently observing KVM_RUN thread. Its retained KvmKickHandle targets that host thread; the cancellation channel and Drop join retain its lifetime. It does not create a guest task or implement a guest wait, and no guest identity selects the host target.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:132 in `Watchdog::start`, `std::thread::spawn` creates only the bounded fixture watchdog for the currently observing KVM_RUN thread. Its retained KvmKickHandle targets that host thread; the cancellation channel and Drop join retain its lifetime. It does not create a guest task or implement a guest wait, and no guest identity selects the host target.",
     "review_id": "HA-000753",
     "source": {
-      "byte_end": 2734,
-      "byte_start": 2716,
+      "byte_end": 5176,
+      "byte_start": 5158,
       "column": 22,
       "column_end": 40,
       "column_start": 22,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 67,
-      "line_end": 67,
-      "line_start": 67
+      "line": 132,
+      "line_end": 132,
+      "line_start": 132
     }
   },
   {
