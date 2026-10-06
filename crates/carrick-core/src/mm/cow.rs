@@ -44,6 +44,8 @@ pub enum CowClassifyOutcome {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CowRepointOp {
+    pub mm_key: u64,
+    pub grant_epoch: u64,
     pub va: u64,
     pub len: u64,
     pub old_ipa: u64,
@@ -223,6 +225,8 @@ where
 
     let new_ipa = grant.physical_ipa + run.compound_offset;
     let op = CowRepointOp {
+        mm_key,
+        grant_epoch: grant.epoch,
         va: run.va,
         len: run.len,
         old_ipa: run.old_ipa,
