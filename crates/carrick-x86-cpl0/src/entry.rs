@@ -113,13 +113,15 @@ mod kernel {
             doorbell(FATAL_PORT, frame);
             halt();
         }
-        if binding.zone_address != 0 {
+        if binding.zone_address != 0 && binding.admitted.swap(1, Ordering::AcqRel) == 0 {
             let zone = unsafe { &*(binding.zone_address as *const carrick_sched_core::ZoneTables) };
             let context_binding = unsafe {
                 &*(binding.context_binding_address as *const super::scheduler::ContextBinding)
             };
             let slot = carrick_sched_core::SlotId::new(0);
-            if !super::scheduler::admit_context(zone, slot, context_binding) {
+            if let Err(err) = super::scheduler::admit_context_detailed(zone, slot, context_binding)
+            {
+                frame.rdi = err as u64;
                 doorbell(FATAL_PORT, frame);
                 halt();
             }

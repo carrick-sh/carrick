@@ -94,23 +94,48 @@ impl ContextBinding {
     }
 }
 
+#[repr(u64)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionError {
+    StaleRecord = 1,
+    WrongMm = 2,
+    NotOnCpu = 3,
+    ClosedSpace = 4,
+    RootMismatch = 5,
+}
+
+/// Detailed admission checking for CPL0 context installation.
+pub fn admit_context_detailed(
+    zone: &ZoneTables,
+    slot: SlotId,
+    binding: &ContextBinding,
+) -> Result<(), AdmissionError> {
+    let Some(record) = zone.live(binding.record) else {
+        return Err(AdmissionError::StaleRecord);
+    };
+    if record.identity().mm != binding.context.address.mm.raw().get() {
+        return Err(AdmissionError::WrongMm);
+    }
+    if !matches!(record.claim(), Claim::OnCpu { slot: owner, .. } if owner == slot) {
+        return Err(AdmissionError::NotOnCpu);
+    }
+    let mm = binding.context.address.mm.raw().get();
+    let Some(grant) = zone.install_space(slot, mm) else {
+        return Err(AdmissionError::ClosedSpace);
+    };
+    if grant.cow_owed.is_some() || grant.ttbr0 != binding.context.address.root.address().raw() {
+        zone.release_space(slot);
+        return Err(AdmissionError::RootMismatch);
+    }
+    Ok(())
+}
+
 /// Switch admission through the SAME occupancy/gate authority as ARM.
 /// The caller first installs its maintenance root; after this grant it must
 /// install the exact native root before restoring user state. N1's eventual
 /// root receipt validation is deliberately not synthesized here.
 pub fn admit_context(zone: &ZoneTables, slot: SlotId, binding: &ContextBinding) -> bool {
-    if !binding.owned_on(zone, slot) {
-        return false;
-    }
-    let mm = binding.context.address.mm.raw().get();
-    let Some(grant) = zone.install_space(slot, mm) else {
-        return false;
-    };
-    if grant.cow_owed.is_some() || grant.ttbr0 != binding.context.address.root.address().raw() {
-        zone.release_space(slot);
-        return false;
-    }
-    true
+    admit_context_detailed(zone, slot, binding).is_ok()
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]

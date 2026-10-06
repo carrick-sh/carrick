@@ -41,14 +41,12 @@ fn fail(message: impl Into<String>) -> TrapError {
     TrapError::Hypervisor(message.into())
 }
 
-#[derive(Clone, Copy)]
 pub enum BootMode<'a> {
     Normal,
     Interrupts,
     Shared {
-        zone: &'a ZoneTables,
         slot: SlotId,
-        binding: &'a ContextBinding,
+        setup: &'a mut dyn FnMut(&ZoneTables, &mut ContextBinding),
     },
 }
 
@@ -127,17 +125,15 @@ impl Cpl0Carrier {
     pub fn boot_shared(
         image: &Path,
         program: &[u8],
-        zone: &ZoneTables,
         slot: SlotId,
-        binding: &ContextBinding,
+        mut setup: impl FnMut(&ZoneTables, &mut ContextBinding),
     ) -> Result<Self, TrapError> {
         Self::boot_inner(
             image,
             [program, &[0x0f, 0x0b]],
             BootMode::Shared {
-                zone,
                 slot,
-                binding,
+                setup: &mut setup,
             },
         )
     }
@@ -145,7 +141,7 @@ impl Cpl0Carrier {
     pub(crate) fn boot_inner(
         image: &Path,
         programs: [&[u8]; 2],
-        mode: BootMode<'_>,
+        mut mode: BootMode<'_>,
     ) -> Result<Self, TrapError> {
         let bytes = std::fs::read(image).map_err(|e| fail(format!("CPL0 image: {e}")))?;
         let plan = carrick_mem::elf::plan_elf_load_bytes_for(&bytes, 62)
@@ -309,7 +305,7 @@ impl Cpl0Carrier {
                 .cast::<Counters>();
             counters.write(Counters::new());
 
-            if let BootMode::Shared { zone, binding, .. } = mode {
+            if let BootMode::Shared { setup, .. } = &mut mode {
                 let zone_ptr = ram
                     .host_ptr(
                         carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
@@ -317,7 +313,7 @@ impl Cpl0Carrier {
                     )
                     .ok_or_else(|| fail("zone backing"))?
                     .cast::<ZoneTables>();
-                core::ptr::copy_nonoverlapping(zone, zone_ptr, 1);
+                zone_ptr.write_bytes(0, 1);
                 let binding_ptr = ram
                     .host_ptr(
                         carrick_x86::cpl0_scheduler::PROGRESS_STATE,
@@ -325,26 +321,40 @@ impl Cpl0Carrier {
                     )
                     .ok_or_else(|| fail("binding backing"))?
                     .cast::<ContextBinding>();
-                core::ptr::copy_nonoverlapping(binding, binding_ptr, 1);
+                binding_ptr.write_bytes(0, 1);
+                setup(&*zone_ptr, &mut *binding_ptr);
             }
 
             for index in 0..2 {
                 let offset = index as u64 * STRIDE;
-                let (tid, serial, mm, generation) =
-                    if let BootMode::Shared { zone, binding, .. } = mode {
-                        if index == 0 {
-                            if let Some(record) = zone.live(binding.record) {
-                                let id = record.identity();
-                                (id.tid as u32, id.serial, id.mm, id.generation)
-                            } else {
-                                (41, 101, 11, 5)
-                            }
+                let (tid, serial, mm, generation) = if let BootMode::Shared { .. } = mode {
+                    if index == 0 {
+                        let zone = &*ram
+                            .host_ptr(
+                                carrick_x86::cpl0_scheduler::PROGRESS_ZONE,
+                                size_of::<ZoneTables>(),
+                            )
+                            .ok_or_else(|| fail("zone backing"))?
+                            .cast::<ZoneTables>();
+                        let binding = &*ram
+                            .host_ptr(
+                                carrick_x86::cpl0_scheduler::PROGRESS_STATE,
+                                size_of::<ContextBinding>(),
+                            )
+                            .ok_or_else(|| fail("binding backing"))?
+                            .cast::<ContextBinding>();
+                        if let Some(record) = zone.live(binding.record) {
+                            let id = record.identity();
+                            (id.tid as u32, id.serial, id.mm, id.generation)
                         } else {
-                            (42, 102, 12, 5)
+                            (41, 101, 11, 5)
                         }
                     } else {
-                        (41 + index as u32, 101 + index as u64, 11 + index as u64, 5)
-                    };
+                        (42, 102, 12, 5)
+                    }
+                } else {
+                    (41 + index as u32, 101 + index as u64, 11 + index as u64, 5)
+                };
 
                 let slot = ram
                     .host_ptr(
@@ -407,6 +417,7 @@ impl Cpl0Carrier {
                     ),
                     zone_address: zone_addr,
                     context_binding_address: binding_addr,
+                    admitted: AtomicU32::new(0),
                 });
             }
         }
@@ -464,7 +475,16 @@ impl Cpl0Carrier {
             {
                 return Err(fail("private TSS/IDT not installed"));
             }
-            if let (BootMode::Shared { binding, .. }, 0) = (mode, index) {
+            if let (BootMode::Shared { .. }, 0) = (&mode, index) {
+                let binding = unsafe {
+                    &*ram
+                        .host_ptr(
+                            carrick_x86::cpl0_scheduler::PROGRESS_STATE,
+                            size_of::<ContextBinding>(),
+                        )
+                        .ok_or_else(|| fail("binding backing"))?
+                        .cast::<ContextBinding>()
+                };
                 let msrs = Msrs::from_entries(&[
                     kvm_msr_entry {
                         index: 0xc000_0100,
@@ -662,7 +682,17 @@ impl Cpl0Carrier {
                     return Err(fail(format!("unported CPL0 native call {}", frame.rax)));
                 }
                 FATAL_PORT => {
-                    return Err(fail("CPL0 fatal / admission refusal"));
+                    let reason = match frame.rdi {
+                        1 => "stale record incarnation",
+                        2 => "wrong MM",
+                        3 => "not on CPU",
+                        4 => "closed space",
+                        5 => "root mismatch",
+                        other => {
+                            return Err(fail(format!("CPL0 fatal / admission refusal: {other}")));
+                        }
+                    };
+                    return Err(fail(format!("CPL0 fatal / admission refusal: {reason}")));
                 }
                 ENTRY_KICK_PORT | RETURN_KICK_PORT => {
                     self.task(index).mark_pending_host_work();

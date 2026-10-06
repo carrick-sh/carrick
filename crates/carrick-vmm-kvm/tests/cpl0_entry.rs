@@ -220,70 +220,68 @@ fn entry_and_return_kicks_never_republish_or_recomplete() {
 
 fn make_shared_carrier(
     p: &[u8],
-    mutate: impl FnOnce(&mut ZoneTables, &mut ContextBinding),
+    mutate: impl FnOnce(&ZoneTables, &mut ContextBinding),
 ) -> Result<Cpl0Carrier, carrick_hal::TrapError> {
-    let layout = std::alloc::Layout::new::<ZoneTables>();
-    let mut zone = unsafe {
-        let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
-        assert!(!ptr.is_null());
-        Box::from_raw(ptr)
-    };
     let slot = SlotId::new(0);
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, 11, Some(0), 0);
-    zone.enter_guest(slot);
+    let mut mutate_opt = Some(mutate);
+    Cpl0Carrier::boot_shared(&image(), p, slot, move |zone, binding| {
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, 11, Some(0), 0);
+        zone.enter_guest(slot);
 
-    let mm = 11u64;
-    let root = RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap();
-    let space = zone
-        .spaces
-        .publish_closed(mm, root.address().raw(), 0)
-        .unwrap();
-    zone.spaces.open(space);
+        let mm = 11u64;
+        let root = RootGpa::page_aligned(FrameGpa::new(0x60_0000)).unwrap();
+        let space = zone
+            .spaces
+            .publish_closed(mm, root.address().raw(), 0)
+            .unwrap();
+        zone.spaces.open(space);
 
-    let record = zone
-        .alloc_record(ThreadIdentity {
-            mm,
-            tid: 41,
-            serial: 101,
-            generation: 5,
-            ..Default::default()
-        })
-        .unwrap();
-    zone.requeue_preempted(slot, record);
-    let on_cpu = zone.switch_in(slot).unwrap();
-    assert_eq!(on_cpu, record);
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                mm,
+                tid: 41,
+                serial: 101,
+                generation: 5,
+                ..Default::default()
+            })
+            .unwrap();
+        zone.requeue_preempted(slot, record);
+        let on_cpu = zone.switch_in(slot).unwrap();
+        assert_eq!(on_cpu, record);
 
-    let mut xsave = XsaveArea::ZERO;
-    xsave.0[0..2].copy_from_slice(&0x37fu16.to_le_bytes());
-    xsave.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
-    xsave.0[512..520].copy_from_slice(&3u64.to_le_bytes());
-    xsave.0[400..416].fill(0x31);
+        let mut xsave = XsaveArea::ZERO;
+        xsave.0[0..2].copy_from_slice(&0x37fu16.to_le_bytes());
+        xsave.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+        xsave.0[512..520].copy_from_slice(&3u64.to_le_bytes());
+        xsave.0[400..416].fill(0x31);
 
-    let mut binding = ContextBinding {
-        record: zone.record_ref(record),
-        context: NativeContext {
-            frame: InterruptFrame {
-                gpr: [0; 15],
-                rip: carrick_vmm_kvm::cpl0_boot::USER_CODE,
-                cs: 0x23,
-                flags: 0x202,
-                rsp: 0x3_1ff0,
-                ss: 0x1b,
+        *binding = ContextBinding {
+            record: zone.record_ref(record),
+            context: NativeContext {
+                frame: InterruptFrame {
+                    gpr: [0; 15],
+                    rip: carrick_vmm_kvm::cpl0_boot::USER_CODE,
+                    cs: 0x23,
+                    flags: 0x202,
+                    rsp: 0x3_1ff0,
+                    ss: 0x1b,
+                },
+                address: AddressContext {
+                    root,
+                    mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
+                    generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
+                },
+                fs_base: 0x1000,
+                gs_base: 0x2000,
+                xsave,
             },
-            address: AddressContext {
-                root,
-                mm: MmGeneration::new(NonZeroU64::new(mm).unwrap()),
-                generation: ContextGeneration::new(NonZeroU64::new(1).unwrap()),
-            },
-            fs_base: 0x1000,
-            gs_base: 0x2000,
-            xsave,
-        },
-    };
+        };
 
-    mutate(&mut zone, &mut binding);
-    Cpl0Carrier::boot_shared(&image(), p, &zone, slot, &binding)
+        if let Some(m) = mutate_opt.take() {
+            m(zone, binding);
+        }
+    })
 }
 
 #[test]
@@ -332,7 +330,10 @@ fn x1_boot_shared_substrate() {
     let err = stale_carrier
         .observe(0)
         .expect_err("stale incarnation must be rejected by CPL0");
-    assert!(err.to_string().contains("CPL0 fatal / admission refusal"));
+    assert!(
+        err.to_string().contains("stale record incarnation"),
+        "error must report stale record incarnation: {err}"
+    );
 
     // Wrong root identity defect: CPL0 detects mismatch and vacates occupancy
     let mut wrong_root_carrier = make_shared_carrier(&p, |_, binding| {
@@ -342,7 +343,10 @@ fn x1_boot_shared_substrate() {
     let err = wrong_root_carrier
         .observe(0)
         .expect_err("mismatched root must be rejected by CPL0");
-    assert!(err.to_string().contains("CPL0 fatal / admission refusal"));
+    assert!(
+        err.to_string().contains("root mismatch"),
+        "error must report root mismatch: {err}"
+    );
     assert_eq!(
         wrong_root_carrier.zone().installed_space(slot),
         0,
@@ -357,7 +361,10 @@ fn x1_boot_shared_substrate() {
     let err = wrong_mm_carrier
         .observe(0)
         .expect_err("wrong MM must be rejected by CPL0");
-    assert!(err.to_string().contains("CPL0 fatal / admission refusal"));
+    assert!(
+        err.to_string().contains("wrong MM"),
+        "error must report wrong MM: {err}"
+    );
 
     // Closed space defect
     let mut closed_space_carrier = make_shared_carrier(&p, |zone, _| {
@@ -368,5 +375,8 @@ fn x1_boot_shared_substrate() {
     let err = closed_space_carrier
         .observe(0)
         .expect_err("closed space must be rejected by CPL0");
-    assert!(err.to_string().contains("CPL0 fatal / admission refusal"));
+    assert!(
+        err.to_string().contains("closed space"),
+        "error must report closed space: {err}"
+    );
 }
