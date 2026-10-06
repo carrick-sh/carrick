@@ -6620,18 +6620,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:133 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:185 in `Cpl0Carrier::boot`, `std::fs::read` reads only the caller-selected CPL0 bootstrap ELF, whose segments and entry are validated before the fixture registers memory or runs either vCPU; no guest syscall argument or guest identity selects this host path.",
     "review_id": "HA-000752",
     "source": {
-      "byte_end": 4216,
-      "byte_start": 4203,
+      "byte_end": 6557,
+      "byte_start": 6544,
       "column": 21,
       "column_end": 34,
       "column_start": 21,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 133,
-      "line_end": 133,
-      "line_start": 133
+      "line": 185,
+      "line_end": 185,
+      "line_start": 185
     }
   },
   {
@@ -18228,18 +18228,18 @@
       "linux-cli",
       "linux-runtime"
     ],
-    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:55 in `Watchdog::start`, `std::thread::spawn` creates only the bounded fixture watchdog for the currently observing KVM_RUN thread. Its retained KvmKickHandle targets that host thread; the cancellation channel and Drop join retain its lifetime. It does not create a guest task or implement a guest wait, and no guest identity selects the host target.",
+    "rationale": "At crates/carrick-vmm-kvm/src/cpl0_boot.rs:61 in `Watchdog::start`, `std::thread::spawn` creates only the bounded fixture watchdog for the currently observing KVM_RUN thread. Its retained KvmKickHandle targets that host thread; the cancellation channel and Drop join retain its lifetime. It does not create a guest task or implement a guest wait, and no guest identity selects the host target.",
     "review_id": "HA-000753",
     "source": {
-      "byte_end": 2081,
-      "byte_start": 2063,
+      "byte_end": 2455,
+      "byte_start": 2437,
       "column": 22,
       "column_end": 40,
       "column_start": 22,
       "file": "crates/carrick-vmm-kvm/src/cpl0_boot.rs",
-      "line": 55,
-      "line_end": 55,
-      "line_start": 55
+      "line": 61,
+      "line_end": 61,
+      "line_start": 61
     }
   },
   {
