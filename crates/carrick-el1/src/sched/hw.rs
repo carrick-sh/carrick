@@ -25,7 +25,7 @@ impl UserWord for HardwareUserWord {
         if crate::substrate::file::HardwareValidator.readable_bytes(uaddr, 4) < 4 {
             return None;
         }
-        let fixup_ptr = &task.fixup_pc as *const _ as *const u64;
+        let fixup_ptr = &task.linux.fixup_pc as *const _ as *const u64;
         let mut ok: u64 = 1;
         let value: u64;
         // SAFETY: a fault on the user word is intercepted by the EL1 fixup,
@@ -66,7 +66,7 @@ impl UserWord for HardwareUserWord {
         if crate::substrate::file::HardwareValidator.readable_bytes(uaddr, 8) < 8 {
             return None;
         }
-        let fixup_ptr = &task.fixup_pc as *const _ as *const u64;
+        let fixup_ptr = &task.linux.fixup_pc as *const _ as *const u64;
         let mut ok: u64 = 1;
         let value: u64;
         // SAFETY: a fault on the user word is intercepted by the EL1 fixup,

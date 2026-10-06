@@ -312,7 +312,28 @@ where
         carrick_personality_linux::dispatch::CompletionRoute::WithWork => Action::ServedWithWork,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended => Action::Idle,
         carrick_personality_linux::dispatch::CompletionRoute::Forward => Action::Forward,
+        carrick_personality_linux::dispatch::CompletionRoute::InvalidCompletion => {
+            invalid_completion()
+        }
     }
+}
+
+/// A completed effect must never be forwarded for syscall replay when its
+/// exact binding failed authentication. This is native fail-stop transport.
+fn invalid_completion() -> ! {
+    #[cfg(target_os = "none")]
+    {
+        // SAFETY: EL1 fatal exit is the image's established non-returning
+        // host transport, with no guest result publication or syscall replay.
+        unsafe {
+            core::arch::asm!("hvc #3", options(nostack));
+        }
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+    #[cfg(not(target_os = "none"))]
+    std::process::abort()
 }
 
 pub struct El1PendingFamilies<'a, F, C: sched::ThreadCpu, U: sched::UserWord> {
@@ -329,9 +350,18 @@ pub struct El1PendingFamilies<'a, F, C: sched::ThreadCpu, U: sched::UserWord> {
     lifecycle: Option<&'a dyn lifecycle::LifecycleVenue>,
     cache_lookup: F,
 }
-impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFamilies
-    for El1PendingFamilies<'_, F, C, U>
+impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFamilies<'a>
+    for El1PendingFamilies<'a, F, C, U>
 {
+    fn binding(&self) -> Option<carrick_el1_abi::ExecutionBinding> {
+        self.task().map(super::common_entry::execution_binding)
+    }
+    fn record_source(&self) -> Option<carrick_el1_abi::BornInZoneSource<'a>> {
+        Some(carrick_el1_abi::BornInZoneSource {
+            zone: self.zone.as_ref()?.tables,
+            slot: SlotId::from_index(self.frame.slot as usize)?,
+        })
+    }
     fn prepare_anonymous(&mut self) -> Option<FamilyCompletion> {
         #[cfg(target_os = "none")]
         {
@@ -362,8 +392,12 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFami
                     memory::reservations::shared_guest(),
                 ) {
                     return Some(match served {
-                        sched::Served::Returned { .. } => {
-                            FamilyCompletion::AccountedComplete(frame.x[0] as i64)
+                        sched::Served::Returned { switched } => {
+                            if switched {
+                                FamilyCompletion::AccountedSwitched(frame.x[0] as i64)
+                            } else {
+                                FamilyCompletion::AccountedComplete(frame.x[0] as i64)
+                            }
                         }
                         sched::Served::Idle => FamilyCompletion::AccountedSuspended,
                     });
@@ -422,8 +456,12 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFami
                             frame,
                             memory::reservations::shared_guest(),
                         ) {
-                            Some(sched::Served::Returned { .. }) => {
-                                FamilyCompletion::AccountedComplete(frame.x[0] as i64)
+                            Some(sched::Served::Returned { switched }) => {
+                                if switched {
+                                    FamilyCompletion::AccountedSwitched(frame.x[0] as i64)
+                                } else {
+                                    FamilyCompletion::AccountedComplete(frame.x[0] as i64)
+                                }
                             }
                             Some(sched::Served::Idle) => FamilyCompletion::AccountedSuspended,
                             None => FamilyCompletion::Handback,
@@ -431,7 +469,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFami
                     }
                     memory::DelegatedAnonymous::NotDelegated => {}
                     memory::DelegatedAnonymous::Served => {
-                        task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                        task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
                         return FamilyCompletion::AccountedComplete(frame.x[0] as i64);
                     }
                     memory::DelegatedAnonymous::Forward => {
@@ -468,7 +506,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFami
                     memory::MprotectDisposition::ReturnWithWork => {
                         frame.x[0] = 0;
                         if let Some(task) = cur_task {
-                            task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                            task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
                             return FamilyCompletion::CommitOwed(frame.x[0] as i64);
                         }
                         return FamilyCompletion::Complete(frame.x[0] as i64);
@@ -498,7 +536,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFami
                     memory::MunmapDisposition::Retired => {
                         frame.x[0] = 0;
                         if let Some(task) = cur_task {
-                            task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                            task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
                             return FamilyCompletion::CommitOwed(frame.x[0] as i64);
                         }
                     }
@@ -581,9 +619,13 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFami
                     // After a switch the frame is the switched-in thread's,
                     // whose own futex argument the switch recorded.
                     if !switched {
-                        task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                        task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
                     }
-                    return FamilyCompletion::Complete(frame.x[0] as i64);
+                    return if switched {
+                        FamilyCompletion::Switched(frame.x[0] as i64)
+                    } else {
+                        FamilyCompletion::Complete(frame.x[0] as i64)
+                    };
                 }
                 Some(sched::Served::Idle) => {
                     return FamilyCompletion::Suspended;
@@ -641,7 +683,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFami
                 &validator,
             ) {
                 frame.x[0] = res as u64;
-                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
                 return FamilyCompletion::Complete(frame.x[0] as i64);
             }
         }
@@ -691,7 +733,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFami
             )
         {
             frame.x[0] = res as u64;
-            task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+            task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
             claim_owed_inotify_wake(task, inotify_table);
             return FamilyCompletion::Complete(frame.x[0] as i64);
         }
@@ -763,7 +805,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFami
         if let Some(res) = res {
             frame.x[0] = res as u64;
             if let Some(task) = cur_task {
-                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
                 claim_owed_inotify_wake(task, inotify_table);
             }
             return FamilyCompletion::Complete(frame.x[0] as i64);
@@ -818,7 +860,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFami
         ) {
             frame.x[0] = res as u64;
             if let Some(task) = cur_task {
-                task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
                 if matches!(nr, 63 | 64 | 67 | 68) {
                     claim_owed_inotify_wake(task, inotify_table);
                 }
@@ -913,7 +955,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFami
         if let Some(task) = cur_task
             && task.has_pending_host_work()
         {
-            task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+            task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
             return FamilyCompletion::CompleteWithWork(frame.x[0] as i64);
         }
         FamilyCompletion::AccountedComplete(frame.x[0] as i64)
@@ -976,7 +1018,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFami
     fn publish_work(&self, commit: bool) {
         if let Some(task) = self.task() {
             if commit {
-                let _ = task.leave_commit_owed(task.orig_arg0.load(Ordering::Relaxed));
+                let _ = task.leave_commit_owed(task.linux.orig_arg0.load(Ordering::Relaxed));
             } else {
                 let _ = task.leave_served_with_work();
             }
@@ -1016,9 +1058,13 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord> El1PendingFamilies<'_, F, C, U>
                 ipc::IpcServed::Forward => {}
                 ipc::IpcServed::Returned { switched } => {
                     if !switched {
-                        task.orig_arg0.store(orig_x0, Ordering::Relaxed);
+                        task.linux.orig_arg0.store(orig_x0, Ordering::Relaxed);
                     }
-                    return FamilyCompletion::Complete(frame.x[0] as i64);
+                    return if switched {
+                        FamilyCompletion::Switched(frame.x[0] as i64)
+                    } else {
+                        FamilyCompletion::Complete(frame.x[0] as i64)
+                    };
                 }
                 ipc::IpcServed::Idle => {
                     return FamilyCompletion::Suspended;
@@ -1062,7 +1108,7 @@ where
 {
     let slot = frame.slot as usize;
     let cur_task = current_tasks.get(slot)?;
-    let file_table = cur_task.file_table.load(Ordering::Acquire);
+    let file_table = cur_task.linux.file_table.load(Ordering::Acquire);
     if file_table == 0 {
         return None;
     }
@@ -1262,7 +1308,7 @@ mod tests {
                     1,
                     slot as u64 + 1,
                 );
-                task.zone_mm.store(slot as u64 + 17, Ordering::Release);
+                task.mm.key.store(slot as u64 + 17, Ordering::Release);
             }
             for _ in 0..rounds {
                 for slot in 0..tasks.len() {
@@ -1295,7 +1341,10 @@ mod tests {
                         );
                         assert_eq!(action, Action::Forward);
                         assert_eq!(frame.x, original, "forwarding cannot consume arguments");
-                        assert_eq!(tasks[slot].served_with_work.load(Ordering::Acquire), 0);
+                        assert_eq!(
+                            tasks[slot].linux.served_with_work.load(Ordering::Acquire),
+                            0
+                        );
                     }
                 }
             }
@@ -1308,7 +1357,8 @@ mod tests {
 
     #[test]
     fn unmigrated_family_completes_once_through_linux_owner() {
-        fn requires_real_family<T: carrick_personality_linux::dispatch::PendingFamilies>() {}
+        fn requires_real_family<'a, T: carrick_personality_linux::dispatch::PendingFamilies<'a>>() {
+        }
         requires_real_family::<
             El1PendingFamilies<'_, fn(u32) -> *mut u8, sched::FakeCpu, sched::HardwareUserWord>,
         >();
@@ -1573,7 +1623,7 @@ mod tests {
 
         // Exit check test: operation succeeds, but host marked pending work during the operation.
         tasks[0].clear_pending_host_work();
-        tasks[0].served_with_work.store(0, Ordering::Relaxed);
+        tasks[0].linux.served_with_work.store(0, Ordering::Relaxed);
         let mut buf = [0u8; 16];
         let mut cache_mem = [0u8; 4096];
         let cache_ptr = cache_mem.as_mut_ptr();
@@ -1608,7 +1658,7 @@ mod tests {
 
         assert_eq!(action_write, Action::ServedWithWork);
         assert_eq!(frame_write.x[0], 16);
-        assert_eq!(tasks[0].served_with_work.load(Ordering::Relaxed), 1);
+        assert_eq!(tasks[0].linux.served_with_work.load(Ordering::Relaxed), 1);
         assert_eq!(counters.served[64].load(Ordering::Relaxed), 1);
     }
 
