@@ -153,7 +153,7 @@ impl Cpl0Carrier {
 
     /// Read a stopped fixture's 4 KiB terminal descriptor.
     pub fn fixture_user_leaf(&self, va: u64) -> Result<u64, TrapError> {
-        if va != 0x3_0000 {
+        if !matches!(va, 0x3_0000 | 0x3_2000) {
             return Err(fail("fixture leaf outside admitted user page"));
         }
         let mut table = LAYOUT.pml4_base;
