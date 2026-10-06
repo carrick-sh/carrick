@@ -215,6 +215,11 @@ mod kernel {
     #[unsafe(no_mangle)]
     pub static CARRICK_CPL0_DOORBELL_COUNT: SpinLock<u64> = SpinLock::new(0);
 
+    // The KVM fault fixture owns one exact MM and one host-backed prepared
+    // page. These records stay live across the native syscall boundary.
+    static SHARED_FAULT_MAILBOX: carrick_el1_abi::FrameGrantMailbox =
+        carrick_el1_abi::FrameGrantMailbox::new();
+
     // A port exit may suspend this CPU while another CPU continues. The
     // admission value can only be produced after the lock guard is dropped.
     struct ExitAdmission;
@@ -359,8 +364,11 @@ mod kernel {
         }
         if frame.rax == OBSERVE_DESCRIPTOR_PREPARE_PUBLISH {
             use carrick_guest_arch::{
-                Access, EditBacking, EditLeafSize, EditOperation, EditPermissions, FrameGpa,
+                EditBacking, EditLeafSize, EditOperation, EditPermissions, FrameGpa, GuestLen,
+                KernelVa,
             };
+            use carrick_core::mm::transfer::resolver::PreparedPageResolver;
+            use carrick_mmu_core::aarch64::{GuestPreparedCommit, LeafAccess};
             use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
             let one = core::num::NonZeroU64::MIN;
             let backing = EditBacking {
@@ -396,26 +404,160 @@ mod kernel {
                     halt();
                 }
             }
-            let Some(second) = core::num::NonZeroU64::new(2) else {
-                doorbell(FATAL_PORT, frame);
-                halt();
+            // SAFETY: one fixture vCPU owns the MM and its retained table
+            // alias throughout both the publication and the retry check.
+            let mut resolver = unsafe {
+                carrick_el1::fault::X86PreparedResolver::under_editor(
+                    one,
+                    KernelVa::new(DIRECT_VA + 0x60_0000),
+                    GuestLen::new(FIXTURE_PML4_CAPACITY),
+                )
             };
-            let published = fixture_edit(
+            let published = resolver.commit_prepared(
+                0x60_0000,
                 0x3_2000,
-                second,
-                EditOperation::Publish {
-                    expected: FrameGpa::new(0x9_0000),
-                    access: Access::Read,
-                },
+                0x9_0000,
+                LeafAccess::Read,
             );
-            frame.rax = match published {
-                Ok(receipt) if matches!(receipt.outcome, DescriptorOutcome::Applied { .. }) => 1,
-                Ok(_) => 0,
-                Err(_) => {
+            match published {
+                Ok(GuestPreparedCommit::Committed) => {}
+                Err(carrick_mmu_core::aarch64::GuestPreparedCommitError::RollbackFailed) => {
                     doorbell(FATAL_PORT, frame);
                     halt();
                 }
+                _ => {
+                    frame.rax = 0;
+                    return;
+                }
+            }
+            let retry = resolver.commit_prepared(
+                0x60_0000,
+                0x3_2000,
+                0x9_0000,
+                LeafAccess::Read,
+            );
+            frame.rax = match retry {
+                Ok(GuestPreparedCommit::AlreadyResident) => 1,
+                Err(carrick_mmu_core::aarch64::GuestPreparedCommitError::RollbackFailed) => {
+                    doorbell(FATAL_PORT, frame);
+                    halt();
+                }
+                _ => 0,
             };
+            return;
+        }
+        if frame.rax == OBSERVE_SHARED_PREPARED_FAULT {
+            use carrick_core::mm::transfer::resolver::NoopCowResolver;
+            use carrick_el1::fault::{
+                GrantMailboxes, PreparedFaultPath, X86PreparedResolver,
+                dispatch_x86_fault_with_prepared,
+            };
+            use carrick_el1_abi::{Action, FrameGrantResidencyIdentity};
+            use carrick_guest_arch::{
+                Access, EditBacking, EditLeafSize, EditOperation, EditPermissions, FaultInfo,
+                FrameGpa, GuestLen, KernelVa, UserVa,
+            };
+            use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
+
+            let one = core::num::NonZeroU64::MIN;
+            let prepared = fixture_edit(
+                0x3_3000,
+                one,
+                EditOperation::Map {
+                    output: FrameGpa::new(0x9_1000),
+                    permissions: EditPermissions {
+                        readable: true,
+                        writable: false,
+                        executable: false,
+                        user: true,
+                    },
+                    size: EditLeafSize::Page,
+                    resident: false,
+                    backing: EditBacking {
+                        frame_id: one,
+                        mapping_id: one,
+                        owner_generation: one,
+                        inventory_revision: one,
+                    },
+                },
+            );
+            if !matches!(
+                prepared,
+                Ok(receipt) if matches!(receipt.outcome, DescriptorOutcome::Applied { .. })
+            ) {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            // SAFETY: the lifecycle KVM carrier retains these exact records
+            // for this vCPU through the native entry and fault settlement.
+            let task = unsafe { &*(binding.task_address as *const CurrentTask) };
+            let zone = unsafe {
+                &*(super::lifecycle::LIFECYCLE_ZONE as *const carrick_sched_core::ZoneTables)
+            };
+            let mm = task.mm.key.load(Ordering::Acquire);
+            let Some(mm_key) = core::num::NonZeroU64::new(mm) else {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            };
+            // SAFETY: the KVM carrier constructed this aligned ABI table in
+            // retained supervisor memory before admitting either vCPU.
+            let residency = unsafe {
+                &*(CPL0_RESIDENCY_ALIAS_BASE
+                    as *const carrick_el1_abi::FrameGrantResidencyTable)
+            };
+            if residency
+                .publish(FrameGrantResidencyIdentity {
+                    mm_key: mm,
+                    semantic_base: 0x3_3000,
+                    physical_ipa: 0x9_1000,
+                    len: 4096,
+                    mapping_id: 1,
+                    frame_id: 1,
+                    owner_generation: 1,
+                    inventory_revision: 1,
+                })
+                .is_none()
+            {
+                doorbell(FATAL_PORT, frame);
+                halt();
+            }
+            // SAFETY: the shared dispatcher acquires this MM's exact editor
+            // before invoking the resolver, and the upper direct table window lives
+            // for the whole KVM fixture.
+            let mut resolver = unsafe {
+                X86PreparedResolver::under_editor(
+                    mm_key,
+                    KernelVa::new(DIRECT_VA + 0x60_0000),
+                    GuestLen::new(FIXTURE_PML4_CAPACITY),
+                )
+            };
+            // SAFETY: KVM retains this counter record for the bound vCPU.
+            let counters = unsafe { &*(binding.counters_address as *const Counters) };
+            let action = dispatch_x86_fault_with_prepared(
+                0,
+                FaultInfo {
+                    address: UserVa::new(0x3_3000),
+                    access: Access::Read,
+                    present: false,
+                },
+                counters,
+                core::slice::from_ref(task),
+                carrick_el1::substrate::sched::object_wait::space_access(
+                    zone,
+                    carrick_sched_core::SlotId::new(0),
+                ),
+                GrantMailboxes::own(&SHARED_FAULT_MAILBOX),
+                Some(PreparedFaultPath {
+                    residency,
+                    resolver: &mut resolver,
+                    roots: None,
+                }),
+                &mut NoopCowResolver,
+            );
+            frame.rax = u64::from(
+                action == Action::Served
+                    && residency.is_guest_committed(mm, 0x3_3000),
+            );
             return;
         }
         if frame.rax == OBSERVE_ALLOCATOR {
