@@ -30,7 +30,6 @@ use carrick_mmu_core::x86::descriptor_txn::{
 use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
 use kvm_bindings::{KVM_MP_STATE_RUNNABLE, Msrs, kvm_mp_state, kvm_msr_entry};
-use std::io::Read;
 use std::num::NonZeroU64;
 use std::path::Path;
 use std::ptr::NonNull;
@@ -473,9 +472,7 @@ impl Cpl0Carrier {
             }
         }
         let mut random = [0_u8; 16];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut source| source.read_exact(&mut random))
-            .map_err(|error| fail(format!("initial random: {error}")))?;
+        getrandom::fill(&mut random).map_err(|error| fail(format!("initial random: {error}")))?;
         let request = X86InitialBootRequest {
             magic: X86_INITIAL_BOOT_MAGIC,
             version: X86_INITIAL_BOOT_VERSION,
