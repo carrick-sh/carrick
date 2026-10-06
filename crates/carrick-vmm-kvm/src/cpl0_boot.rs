@@ -7,6 +7,9 @@ use crate::carrier_memory::{
 };
 use crate::guest_setup::{GuestRam, WindowKind};
 use crate::{KvmKickHandle, KvmVcpu};
+use carrick_el1::memory::reservations::{
+    LinuxReservationLayout, NoRootWait, X86Cpl0Reservations, X86Cpl0RootReleaseVenue,
+};
 use carrick_el1_abi::GuestMmuPublication;
 use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
@@ -14,6 +17,7 @@ use carrick_el1_abi::{
     ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE, X86_CPL0_DYNAMIC_METADATA_BASE,
     X86_CPL0_INITIAL_EXTENT_MAX_SIZE, X86_CPL0_INITIAL_EXTENT_VA, X86_CPL0_REGION_BASE,
 };
+use carrick_el1_abi::{ReservationMm, ReservationRange};
 use carrick_el1_abi::{
     X86_INITIAL_BOOT_HEADER_GPA, X86_INITIAL_BOOT_LOADED, X86_INITIAL_BOOT_MAGIC,
     X86_INITIAL_BOOT_PORT, X86_INITIAL_BOOT_VERSION, X86_INITIAL_MAX_REGIONS,
@@ -28,6 +32,8 @@ use carrick_mmu_core::x86::descriptor_txn::{
     Access, BackingIdentity, DescriptorOp, DescriptorTxn, DescriptorTxnId, LeafSize, PageSpan,
     Permissions, translate_leaf,
 };
+use carrick_sched_core::spaces::notification::{SpaceAccess, SpaceReleaseVenue};
+use carrick_sched_core::{SlotId, Waker, ZoneTables};
 use carrick_x86::cpl0_entry::*;
 use carrick_x86::{BringupLayout, X86Reg, X86Vcpu};
 use kvm_bindings::{KVM_MP_STATE_RUNNABLE, Msrs, kvm_mp_state, kvm_msr_entry};
@@ -41,7 +47,8 @@ use std::time::Duration;
 
 const RAM_SIZE: usize = 16 * 1024 * 1024;
 const META_GPA: u64 = 0xc0_0000;
-const META_LEN: u64 = 0x2_0000;
+const META_LEN: u64 = 0x10_0000;
+const PRODUCTION_METADATA_GPA: u64 = META_GPA;
 const ALLOCATOR_GPA: u64 = 0x20_00000;
 const INITIAL_EXTENT_GPA: u64 = 0x40_00000;
 const KERNEL_REGION_GPA: u64 = 0x1_0000_0000;
@@ -420,6 +427,36 @@ impl Cpl0Carrier {
         self._vm.slot_count()
     }
 
+    /// Inspect the carrier's one admitted production reservation authority.
+    /// The store and zone are two offsets into the same retained metadata
+    /// extent; a fixture carrier with no production root returns false.
+    pub fn initial_reservation_admitted(&self) -> bool {
+        let (Some(table), Some(zone), Some(mm)) = (
+            self.ram.host_ptr(
+                META_GPA + carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET,
+                size_of::<X86Cpl0Reservations>(),
+            ),
+            self.ram.host_ptr(
+                META_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<ZoneTables>(),
+            ),
+            ReservationMm::new(INITIAL_MM_KEY),
+        ) else {
+            return false;
+        };
+        // SAFETY: retained aligned carrier metadata outlives this stopped
+        // observation; both typed objects were initialized before EL0 entry.
+        let (table, zone) = unsafe {
+            (
+                &*table.cast::<X86Cpl0Reservations>(),
+                &*zone.cast::<ZoneTables>(),
+            )
+        };
+        zone.spaces
+            .find(mm.raw())
+            .is_some_and(|index| table.admitted(index.index(), mm))
+    }
+
     pub fn retained_bytes(&self) -> usize {
         self._vm.retained_bytes()
     }
@@ -685,6 +722,7 @@ impl Cpl0Carrier {
             generation: 1,
             result_table_used: 0,
             result_data_used: 0,
+            result_initial_break: 0,
         };
         staged[..size_of::<X86InitialBootRequest>()].copy_from_slice(record_bytes(&request));
         staged[regions_offset..strings_offset].copy_from_slice(unsafe {
@@ -811,6 +849,13 @@ impl Cpl0Carrier {
             || reply.result_root_gpa != grants[0].gpa
             || reply.result_table_used == 0
             || reply.result_table_used > reply.table_grant_count
+            || reply.result_initial_break
+                != image
+                    .regions
+                    .iter()
+                    .map(|region| region.end)
+                    .max()
+                    .unwrap_or(0)
             || reply.result_rsp >= reply.stack_top
             || reply.result_rsp < reply.stack_top - reply.stack_size
         {
@@ -916,6 +961,103 @@ impl Cpl0Carrier {
         if inventory.committed != inventory.expected {
             return Err(fail("initial inventory incomplete"));
         }
+        self.publish_production_reservations(
+            mm,
+            root,
+            reply.result_initial_break,
+            reply.stack_top,
+        )?;
+        Ok(())
+    }
+
+    fn publish_production_reservations(
+        &mut self,
+        mm_key: NonZeroU64,
+        root: RootGpa,
+        initial_break: u64,
+        stack_top: u64,
+    ) -> Result<(), TrapError> {
+        const ARENA_START: u64 = 0x4000_0000;
+        let heap = ReservationRange::new(initial_break, ARENA_START)
+            .ok_or_else(|| fail("initial heap layout"))?;
+        let arena = ReservationRange::new(ARENA_START, stack_top - INITIAL_STACK_SIZE)
+            .ok_or_else(|| fail("initial mmap arena layout"))?;
+        let table = self
+            .ram
+            .host_ptr(
+                META_GPA + carrick_el1_abi::X86_CPL0_RESERVATIONS_OFFSET,
+                size_of::<X86Cpl0Reservations>(),
+            )
+            .ok_or_else(|| fail("production reservation backing"))?
+            .cast::<X86Cpl0Reservations>();
+        let zone = self
+            .ram
+            .host_ptr(
+                META_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+                size_of::<ZoneTables>(),
+            )
+            .ok_or_else(|| fail("production zone backing"))?
+            .cast::<ZoneTables>();
+        // SAFETY: both pointers belong to one retained, zeroed and aligned
+        // carrier metadata window. The stopped vCPU cannot race publication.
+        let (table, zone) = unsafe { (&*table, &*zone) };
+        let mm = ReservationMm::new(mm_key.get()).ok_or_else(|| fail("reservation MM key"))?;
+        let index = zone
+            .spaces
+            .publish_closed(mm.raw(), root.address().raw(), 0)
+            .ok_or_else(|| fail("production space publication"))?;
+        table
+            .publish(
+                index.index(),
+                mm,
+                LinuxReservationLayout {
+                    heap,
+                    arena,
+                    brk: initial_break,
+                    address_limit: u64::MAX,
+                    data_limit: u64::MAX,
+                    external_address_bytes: 0,
+                    external_data_bytes: 0,
+                },
+            )
+            .map_err(|error| fail(format!("production reservation publication: {error:?}")))?;
+        fn unexpected_boot_wake(
+            _: &ZoneTables,
+            _: Waker,
+            owned: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>,
+        ) {
+            let mut handed = false;
+            let (_, effects) = owned.deliver_handbacks(&mut |_| handed = true);
+            if handed || effects != carrick_sched_core::WakeEffects::default() {
+                std::process::abort();
+            }
+        }
+        let release = SpaceReleaseVenue {
+            zone,
+            waker: Waker::Host,
+            deliver: unexpected_boot_wake,
+        };
+        X86Cpl0RootReleaseVenue::new(table, release)
+            .map_err(|error| fail(format!("production root authority: {error:?}")))?
+            .lock(index.index(), mm, &NoRootWait)
+            .and_then(|mut model| model.finish_import())
+            .map_err(|error| fail(format!("production root admission: {error:?}")))?;
+        SpaceAccess::notified(release).open(index);
+        let slot = SlotId::new(0);
+        zone.drive(slot, 1);
+        zone.publish_slot(slot, mm.raw(), Some(0), 0);
+        zone.enter_guest(slot);
+        zone.install_space(slot, mm.raw())
+            .ok_or_else(|| fail("production installed MM"))?;
+        self.bind_execution(
+            0,
+            carrick_el1_abi::ExecutionBinding {
+                task: carrick_el1_abi::EntryTaskKey::from_raw(41),
+                generation: carrick_el1_abi::EntryGeneration::from_raw(11),
+                mm: carrick_el1_abi::EntryMmKey::from_raw(mm.raw()),
+                thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
+            },
+        )?;
         Ok(())
     }
 
@@ -1080,12 +1222,22 @@ impl Cpl0Carrier {
             return Err(fail("CPL0 entry outside its supervisor image"));
         }
         let mut ram = GuestRam::new();
-        ram.add_window(
-            0,
-            if interrupts { 2 * RAM_SIZE } else { RAM_SIZE },
-            WindowKind::Private,
-        )
-        .map_err(|e| fail(e.to_string()))?;
+        if initial_extent_bytes.is_some() {
+            let zone_end = carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize
+                + size_of::<carrick_sched_core::ZoneTables>();
+            let region_bytes = (zone_end + 4095) & !4095;
+            ram.add_window(0, META_GPA as usize, WindowKind::Private)
+                .map_err(|e| fail(e.to_string()))?;
+            ram.add_window(PRODUCTION_METADATA_GPA, region_bytes, WindowKind::Private)
+                .map_err(|e| fail(e.to_string()))?;
+        } else {
+            ram.add_window(
+                0,
+                if interrupts { 2 * RAM_SIZE } else { RAM_SIZE },
+                WindowKind::Private,
+            )
+            .map_err(|e| fail(e.to_string()))?;
+        }
         ram.add_window(
             ALLOCATOR_GPA,
             EL1_BOOTSTRAP_METADATA_SIZE as usize,
@@ -1144,7 +1296,16 @@ impl Cpl0Carrier {
         maps.push(Pml4MapSpec {
             va: DIRECT_VA + 0xc0_0000,
             gpa: 0xc0_0000,
-            len: if interrupts { 0x140_0000 } else { 0x40_0000 },
+            len: if initial_extent_bytes.is_some() {
+                ((carrick_el1_abi::X86_CPL0_ZONE_OFFSET as usize
+                    + size_of::<carrick_sched_core::ZoneTables>()
+                    + 4095)
+                    & !4095) as u64
+            } else if interrupts {
+                0x140_0000
+            } else {
+                0x40_0000
+            },
             user: false,
             write: true,
             exec: false,
@@ -1157,6 +1318,16 @@ impl Cpl0Carrier {
             write: true,
             exec: false,
         });
+        if initial_extent_bytes.is_some() {
+            maps.push(Pml4MapSpec {
+                va: METADATA_VA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+                gpa: PRODUCTION_METADATA_GPA + carrick_el1_abi::X86_CPL0_ZONE_OFFSET,
+                len: (size_of::<carrick_sched_core::ZoneTables>() as u64 + 4095) & !4095,
+                user: false,
+                write: true,
+                exec: false,
+            });
+        }
         maps.push(Pml4MapSpec {
             va: X86_CPL0_BOOTSTRAP_METADATA_BASE,
             gpa: ALLOCATOR_GPA,
