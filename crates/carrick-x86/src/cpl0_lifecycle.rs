@@ -12,6 +12,8 @@ use carrick_core_abi::EntryMmKey;
 use carrick_el1_abi::{Counters, CurrentTask, EntryRef, ThreadControlSlot, ThreadLifecyclePage};
 use carrick_guest_arch::UserVa;
 use carrick_personality_linux::abi::entry::SyscallResult;
+#[cfg(target_os = "none")]
+use carrick_personality_linux::lifecycle::LifecycleOutcome;
 use carrick_personality_linux::{
     abi::thread::LifecycleDecline,
     dispatch::{EntryCounters, FamilyCompletion, PendingFamilies},
@@ -137,8 +139,43 @@ impl NativeLane<'_> {
             .position(|ctx| ctx.record == Some(reference))?;
         let identity = self.zone.record(switched.record).identity();
         let context = self.lane.contexts[index].clone();
+        #[cfg(target_os = "none")]
+        let changed_mm = self.zone.installed_space(self.lane.slot) != identity.mm;
+        #[cfg(target_os = "none")]
+        if changed_mm {
+            use carrick_guest_arch::{
+                AddressContext, ContextGeneration, FrameGpa, MmGeneration, MmuBackend, RootGpa,
+            };
+            let maintenance = RootGpa::page_aligned(FrameGpa::new(0x60_0000))?;
+            let context = AddressContext {
+                root: maintenance,
+                mm: MmGeneration::new(core::num::NonZeroU64::MIN),
+                generation: ContextGeneration::new(core::num::NonZeroU64::MIN),
+            };
+            carrick_el1::isa::x86::X86Backend
+                .install_context(context)
+                .ok()?;
+        }
         self.zone.release_space(self.lane.slot);
-        self.zone.install_space(self.lane.slot, identity.mm)?;
+        let grant = self.zone.install_space(self.lane.slot, identity.mm)?;
+        #[cfg(target_os = "none")]
+        if changed_mm {
+            use carrick_guest_arch::{
+                AddressContext, ContextGeneration, FrameGpa, MmGeneration, MmuBackend, RootGpa,
+            };
+            let root = RootGpa::page_aligned(FrameGpa::new(grant.ttbr0))?;
+            let mm = core::num::NonZeroU64::new(identity.mm)?;
+            let generation = core::num::NonZeroU64::new(identity.generation)?;
+            carrick_el1::isa::x86::X86Backend
+                .install_context(AddressContext {
+                    root,
+                    mm: MmGeneration::new(mm),
+                    generation: ContextGeneration::new(generation),
+                })
+                .ok()?;
+        }
+        #[cfg(not(target_os = "none"))]
+        let _ = grant;
         *self.frame = context.frame;
         if let Some(result) = switched.result {
             self.frame.rax = result;
@@ -329,6 +366,159 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
     }
     fn set_result(&mut self, result: SyscallResult) {
         self.frame.rax = result.raw() as u64;
+    }
+    #[cfg(target_os = "none")]
+    fn process_fork(&mut self) -> Option<LifecycleOutcome> {
+        use crate::kernel::process;
+        if !process::process_mode()
+            || self.lane.slot.raw() != 0
+            || self.task.mm.key.load(Ordering::Acquire) != process::parent_mm()
+            || self.lane.contexts[1].record.is_some()
+        {
+            return None;
+        }
+        let mut child = self.lane.parent;
+        child.tid = process::child_pid(child.tid);
+        child.serial = child.serial.checked_add(1)?;
+        child.generation = child.generation.checked_add(1)?;
+        child.mm = process::child_mm();
+        child.control_slot = child
+            .control_slot
+            .checked_add(core::mem::size_of::<ThreadControlSlot>() as u64)?;
+        let record = self.zone.alloc_record(child).ok()?;
+        let reference = self.zone.record_ref(record);
+        let parent_root = carrick_el1::isa::x86::hardware_live_root()
+            .ok()?
+            .address()
+            .raw();
+        let Some(residency) = process::residency() else {
+            self.zone.free_record(record);
+            return None;
+        };
+        if !process::publish_child_stack(residency, parent_root) {
+            self.zone.free_record(record);
+            return None;
+        }
+        let Some((child_root, publication)) = process::fork_mm(parent_root) else {
+            self.zone.free_record(record);
+            return None;
+        };
+        let Some(index) = self.zone.spaces.publish_closed(child.mm, child_root, 0) else {
+            self.zone.free_record(record);
+            return None;
+        };
+        self.zone.spaces.open(index);
+        if publication.mm_key != self.lane.parent.mm || publication.root_gpa != parent_root {
+            self.zone.free_record(record);
+            return None;
+        }
+        self.prepare_child(
+            reference,
+            ChildContext {
+                result: SyscallResult::new(0),
+                stack: UserVa::new(self.frame.rsp),
+                tls: None,
+                visible_tid: child.tid as u32,
+            },
+        );
+        self.enqueue_born(reference);
+        Some(LifecycleOutcome::Returned {
+            result: SyscallResult::new(child.tid as i64),
+            work: false,
+        })
+    }
+    #[cfg(target_os = "none")]
+    fn process_wait4(
+        &mut self,
+        pid: u64,
+        status: UserVa,
+        options: u64,
+    ) -> Option<LifecycleOutcome> {
+        use crate::kernel::process;
+        const WAIT_KEY: u64 = 0x5_0300;
+        if !process::process_mode()
+            || pid != process::child_pid(self.lane.parent.tid)
+            || options != 0
+            || self.task.mm.key.load(Ordering::Acquire) != process::parent_mm()
+        {
+            return None;
+        }
+        if !process::prepare_wait_status(self, status) {
+            return None;
+        }
+        let guard = self.zone.lock(
+            ZoneTables::bucket_of(process::parent_mm(), WAIT_KEY),
+            &BoundedSpin(1024),
+        )?;
+        let record = self
+            .zone
+            .current_or_new(self.lane.slot, self.lane.parent)
+            .ok()?;
+        let reference = self.zone.record_ref(record);
+        let mut xsave = XsaveArea::ZERO;
+        save_extended(&mut xsave);
+        self.frame.rax = pid;
+        self.lane.contexts[0] = NativeBirthContext {
+            record: Some(reference),
+            frame: *self.frame,
+            fs_base: read_tls(NativeTlsRegister::Fs),
+            gs_base: read_tls(NativeTlsRegister::UserGs),
+            xsave,
+        };
+        let start = carrick_core::entry::prepare_handoff(
+            carrick_core::entry::binding(&self.task.execution, &self.task.mm),
+            carrick_core_abi::BornInZoneSource {
+                zone: self.zone,
+                slot: self.lane.slot,
+            },
+            record,
+        )?;
+        let seq = self.zone.next_seq(record);
+        self.zone
+            .enqueue(
+                &guard,
+                record,
+                seq,
+                process::parent_mm(),
+                WAIT_KEY,
+                u32::MAX,
+                0,
+            )
+            .ok()?;
+        self.handoff = Some(carrick_core::entry::publish_handoff_park(
+            start,
+            &guard,
+            carrick_core_abi::EntryRecordGeneration(seq),
+        )?);
+        self.zone.clear_current(self.lane.slot);
+        drop(guard);
+        let progress = self.switch_next()?;
+        Some(LifecycleOutcome::Transferred {
+            progress,
+            result: SyscallResult::new(self.frame.rax as i64),
+        })
+    }
+    #[cfg(target_os = "none")]
+    fn process_exit_group(&mut self, status: u8) -> Option<LifecycleOutcome> {
+        use crate::kernel::process;
+        const WAIT_KEY: u64 = 0x5_0300;
+        if !process::process_mode()
+            || self.task.mm.key.load(Ordering::Acquire) != process::child_mm()
+            || !process::write_exit_status(status)
+            || !self.wake_word(process::parent_mm(), WAIT_KEY, u32::MAX, 1)
+        {
+            return None;
+        }
+        let record = self.zone.slot(self.lane.slot).current()?;
+        if !self.release_current(self.zone.record_ref(record)) {
+            return None;
+        }
+        let progress = self.switch_next()?;
+        self.frame.rax = process::child_pid(self.lane.parent.tid);
+        Some(LifecycleOutcome::Transferred {
+            progress,
+            result: SyscallResult::new(self.frame.rax as i64),
+        })
     }
 }
 impl FutexVenue for NativeLane<'_> {
