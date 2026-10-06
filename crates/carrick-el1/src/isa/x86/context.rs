@@ -158,65 +158,54 @@ pub fn witness(op: u64) -> u64 {
     }
 }
 
-/// Execute the x86-native TLS operation in the current task's return lane.
-/// The initial production lane has no ZoneRecord custody yet: this private
-/// TLS projection cannot become a runnable scheduler context. The same edit
-/// leaf applies to full parked contexts when scheduler custody is installed.
-pub fn arch_prctl(
-    task: &carrick_el1_abi::CurrentTask,
-    operation: Option<carrick_personality_linux::abi::x86_64::ArchPrctlOperation>,
-    address: UserVa,
-) -> Result<carrick_personality_linux::entry::SyscallResult, ArchError> {
-    use carrick_personality_linux::abi::x86_64::ArchPrctlOperation;
-    use carrick_personality_linux::entry::SyscallResult;
-    use context_words::{TlsRegister, set_tls_base, tls_base};
-    if current_cpu_binding().is_none_or(|binding| binding.task_address != task as *const _ as u64) {
-        return Err(ArchError::Unbound);
+/// Current CPU's exact-task TLS authority. It owns no scheduler record;
+/// every access reauthenticates the live binding before reading or editing MSRs.
+pub struct TaskTls<'a> {
+    task: &'a carrick_el1_abi::CurrentTask,
+}
+
+pub fn task_tls(task: &carrick_el1_abi::CurrentTask) -> Result<TaskTls<'_>, ArchError> {
+    let tls = TaskTls { task };
+    tls.authenticate()?;
+    Ok(tls)
+}
+
+impl TaskTls<'_> {
+    fn authenticate(&self) -> Result<(), ArchError> {
+        if current_cpu_binding()
+            .is_none_or(|binding| binding.task_address != self.task as *const _ as u64)
+        {
+            return Err(ArchError::Unbound);
+        }
+        Ok(())
     }
-    let Some(operation) = operation else {
-        return Ok(SyscallResult::new(-22));
-    };
-    let register = match operation {
-        ArchPrctlOperation::SetFs | ArchPrctlOperation::GetFs => TlsRegister::Fs,
-        ArchPrctlOperation::SetGs | ArchPrctlOperation::GetGs => TlsRegister::Gs,
-        // CPUID executes natively and remains enabled; this lane has no
-        // CPUID-faulting facility, matching native ENODEV on this host.
-        ArchPrctlOperation::GetCpuid => return Ok(SyscallResult::new(1)),
-        ArchPrctlOperation::SetCpuid => return Ok(SyscallResult::new(-19)),
-    };
-    // Only the running task's TLS words are captured. These zero-owner words
-    // remain private to this operation and never enter a scheduler record.
-    let mut words = ParkedContextWords::ZERO;
-    words.fs_base = scheduler::read_tls(scheduler::NativeTlsRegister::Fs);
-    words.gs_base = scheduler::read_tls(scheduler::NativeTlsRegister::UserGs);
-    Ok(SyscallResult::new(match operation {
-        ArchPrctlOperation::SetFs | ArchPrctlOperation::SetGs => {
-            if set_tls_base(&mut words, register, address).is_err() {
-                return Ok(SyscallResult::new(-1));
-            }
-            let native = match register {
-                TlsRegister::Fs => scheduler::NativeTlsRegister::Fs,
-                TlsRegister::Gs => scheduler::NativeTlsRegister::UserGs,
-            };
-            // This CPU still owns the same stopped return lane. UserGs writes
-            // KERNEL_GS_BASE after SWAPGS, preserving CPL0's active GS binding.
-            scheduler::write_tls(native, tls_base(&words, register).raw());
-            0
-        }
-        ArchPrctlOperation::GetFs | ArchPrctlOperation::GetGs => {
-            let value = tls_base(&words, register).raw().to_le_bytes();
-            // SAFETY: the retained kernel source is eight bytes. The installed
-            // task-local #PF gate and exact-MM transfer guard the user write.
-            let copied = unsafe {
-                crate::substrate::file::copy_to_user_guarded(
-                    task,
-                    address.raw() as *mut u8,
-                    value.as_ptr(),
-                    value.len(),
-                )
-            };
-            if copied { 0 } else { -14 }
-        }
-        ArchPrctlOperation::GetCpuid | ArchPrctlOperation::SetCpuid => -22,
-    }))
+
+    fn capture(&self) -> Result<ParkedContextWords, ArchError> {
+        self.authenticate()?;
+        // A private TLS projection, never a runnable scheduler context.
+        let mut words = ParkedContextWords::ZERO;
+        words.fs_base = scheduler::read_tls(scheduler::NativeTlsRegister::Fs);
+        words.gs_base = scheduler::read_tls(scheduler::NativeTlsRegister::UserGs);
+        Ok(words)
+    }
+
+    pub fn read(&self, register: context_words::TlsRegister) -> Result<UserVa, ArchError> {
+        Ok(context_words::tls_base(&self.capture()?, register))
+    }
+
+    pub fn write(
+        &self,
+        register: context_words::TlsRegister,
+        address: UserVa,
+    ) -> Result<(), ArchError> {
+        let mut words = self.capture()?;
+        context_words::set_tls_base(&mut words, register, address)?;
+        let native = match register {
+            context_words::TlsRegister::Fs => scheduler::NativeTlsRegister::Fs,
+            context_words::TlsRegister::Gs => scheduler::NativeTlsRegister::UserGs,
+        };
+        // UserGs edits KERNEL_GS_BASE after SWAPGS, retaining CPL0's GS binding.
+        scheduler::write_tls(native, context_words::tls_base(&words, register).raw());
+        Ok(())
+    }
 }
