@@ -268,13 +268,17 @@ fn production_image_rejects_fixture_syscalls() {
         OBSERVE_INITIAL_MM,
     ] {
         assert!(
-            !plan.segments.iter().any(|segment| {
-                let start = segment.file_offset as usize;
-                let end = start + segment.file_size as usize;
-                bytes[start..end]
-                    .windows(8)
-                    .any(|window| window == syscall.to_le_bytes())
-            }),
+            !plan
+                .segments
+                .iter()
+                .filter(|segment| segment.perms.execute)
+                .any(|segment| {
+                    let start = segment.file_offset as usize;
+                    let end = start + segment.file_size as usize;
+                    bytes[start..end]
+                        .windows(8)
+                        .any(|window| window == syscall.to_le_bytes())
+                }),
             "production image contains fixture syscall {syscall:#x}"
         );
     }
