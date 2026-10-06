@@ -1,6 +1,6 @@
 //! Guest fork-COW resolution with host-provisioned replacement frames.
 
-use carrick_el1_abi::{CowDecline, CowGrantCompletion, CowGrantPool, FrameGrantResidencyTable};
+use carrick_core_abi::{CowDecline, CowGrantCompletion, CowGrantVenue, FrameGrantResidencyTable};
 use carrick_mmu_core::aarch64::SubstrateGpa;
 use carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords;
 
@@ -97,7 +97,7 @@ pub trait OwnerCowMmu {
 pub struct CowCopyWindow<'a, B: OwnerCowMmu> {
     pub words: &'a dyn LiveDescriptorWords,
     pub root: SubstrateGpa,
-    pub slot: Option<&'a carrick_el1_abi::ServiceCopyLease<'a>>,
+    pub slot: Option<&'a dyn carrick_core_abi::ServiceCopyWindowLease>,
     pub default_base: u64,
     _arch: core::marker::PhantomData<B>,
 }
@@ -129,7 +129,7 @@ impl<'a, B: OwnerCowMmu> CowCopyWindow<'a, B> {
     pub fn maintenance(
         words: &'a dyn LiveDescriptorWords,
         live_root: u64,
-        slot: &'a carrick_el1_abi::ServiceCopyLease<'a>,
+        slot: &'a dyn carrick_core_abi::ServiceCopyWindowLease,
     ) -> Option<Self> {
         (live_root == B::CARRIER_MAINT_ROOT_BASE).then_some(Self {
             words,
@@ -164,10 +164,10 @@ impl<'a, B: OwnerCowMmu> CowCopyWindow<'a, B> {
 pub struct GuestCowVenue<'a, B: OwnerCowMmu, W: ?Sized> {
     pub words: &'a W,
     pub root: SubstrateGpa,
-    pub pool: &'a CowGrantPool,
+    pub pool: &'a dyn CowGrantVenue,
     pub residency: &'a FrameGrantResidencyTable,
     pub copy_window: CowCopyWindow<'a, B>,
-    pub publish_executable: Option<&'a dyn Fn(carrick_el1_abi::CowGrant, u64, u64) -> bool>,
+    pub publish_executable: Option<&'a dyn Fn(carrick_core_abi::CowGrant, u64, u64) -> bool>,
 }
 
 /// Resolve one EL0 write permission fault at `far` for `mm_key` in `venue`.
@@ -213,7 +213,7 @@ where
         return Ok(GuestCowOutcome::Declined(CowDecline::PoolEmpty));
     };
 
-    let decline = |pool: &CowGrantPool| -> Result<GuestCowOutcome, CowError> {
+    let decline = |pool: &dyn CowGrantVenue| -> Result<GuestCowOutcome, CowError> {
         if !pool.abandon(&grant) {
             return Err(CowError::Internal);
         }
@@ -257,7 +257,7 @@ where
             if flush_required {
                 invalidate_asid();
             }
-            let replacement = carrick_el1_abi::FrameGrantResidencyIdentity {
+            let replacement = carrick_core_abi::FrameGrantResidencyIdentity {
                 mm_key,
                 semantic_base: run.va,
                 physical_ipa: new_ipa,
@@ -278,7 +278,7 @@ where
                 }
             }
             let completion = CowGrantCompletion {
-                purpose: carrick_el1_abi::CowGrantPurpose::UserWrite,
+                purpose: carrick_core_abi::CowGrantPurpose::UserWrite,
                 grant,
                 span_va: run.va,
                 span_len: run.len,
