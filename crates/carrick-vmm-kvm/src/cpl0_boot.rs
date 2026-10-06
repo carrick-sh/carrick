@@ -396,6 +396,9 @@ impl Cpl0Carrier {
                         0
                     }),
                     cpu_slot: index as u32,
+                    tsc_hz: AtomicU64::new(0),
+                    wake_apic_ids: AtomicU64::new(0),
+                    apic_timer_hz: AtomicU64::new(0),
                 });
             }
         }
@@ -473,6 +476,56 @@ impl Cpl0Carrier {
                 return Err(fail("private TSS/IDT not installed"));
             }
         }
+        let mut apic_ids = [0_u16; 2];
+        for (index, cpu) in [&a, &b].into_iter().enumerate() {
+            let khz = cpu
+                .fd()
+                .get_tsc_khz()
+                .map_err(|e| fail(format!("KVM_GET_TSC_KHZ: {e}")))?;
+            let hz = u64::from(khz)
+                .checked_mul(1000)
+                .filter(|hz| *hz != 0)
+                .ok_or_else(|| fail("KVM reported no usable TSC frequency"))?;
+            let binding = ram
+                .host_ptr(
+                    META_GPA + BINDING_OFFSET + index as u64 * STRIDE,
+                    size_of::<CpuBinding>(),
+                )
+                .ok_or_else(|| fail("CPU binding backing"))?
+                .cast::<CpuBinding>();
+            // SAFETY: both vCPUs are stopped and the retained binding was
+            // initialized above; atomic publication precedes guest entry.
+            unsafe { (*binding).tsc_hz.store(hz, Ordering::Release) };
+            if interrupts {
+                let lapic = cpu
+                    .fd()
+                    .get_lapic()
+                    .map_err(|e| fail(format!("KVM_GET_LAPIC: {e}")))?;
+                let id_word = u32::from_le_bytes([
+                    lapic.regs[0x20] as u8,
+                    lapic.regs[0x21] as u8,
+                    lapic.regs[0x22] as u8,
+                    lapic.regs[0x23] as u8,
+                ]);
+                apic_ids[index] = u16::try_from((id_word >> 24) + 1)
+                    .map_err(|_| fail("APIC ID outside xAPIC destination range"))?;
+            }
+        }
+        if interrupts {
+            let encoded = u64::from(apic_ids[0]) | (u64::from(apic_ids[1]) << 16);
+            for index in 0..2 {
+                let binding = ram
+                    .host_ptr(
+                        META_GPA + BINDING_OFFSET + index as u64 * STRIDE,
+                        size_of::<CpuBinding>(),
+                    )
+                    .ok_or_else(|| fail("CPU binding backing"))?
+                    .cast::<CpuBinding>();
+                // SAFETY: no vCPU has run; this release store publishes both
+                // destinations as one coherent retained routing snapshot.
+                unsafe { (*binding).wake_apic_ids.store(encoded, Ordering::Release) };
+            }
+        }
         let metadata_base = NonNull::new(
             ram.host_ptr(META_GPA, META_LEN as usize)
                 .ok_or_else(|| fail("retained metadata backing"))?,
@@ -497,6 +550,42 @@ impl Cpl0Carrier {
     }
     pub(crate) fn binding(&self, index: usize) -> &CpuBinding {
         self.metadata(BINDING_OFFSET + index as u64 * STRIDE)
+    }
+    /// Observe the stopped fixture vCPU's local timer configuration.
+    pub fn lapic_register(&self, index: usize, offset: usize) -> Result<u32, TrapError> {
+        let cpu = self
+            .cpus
+            .get(index)
+            .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+        let lapic = cpu
+            .fd()
+            .get_lapic()
+            .map_err(|e| fail(format!("KVM_GET_LAPIC: {e}")))?;
+        let bytes = lapic
+            .regs
+            .get(offset..offset + 4)
+            .ok_or_else(|| fail("LAPIC register offset"))?;
+        Ok(u32::from_le_bytes([
+            bytes[0] as u8,
+            bytes[1] as u8,
+            bytes[2] as u8,
+            bytes[3] as u8,
+        ]))
+    }
+    /// The installed KVM CPUID capability for the stopped fixture vCPU.
+    pub fn has_tsc_deadline(&self, index: usize) -> Result<bool, TrapError> {
+        let cpu = self
+            .cpus
+            .get(index)
+            .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+        let cpuid = cpu
+            .fd()
+            .get_cpuid2(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
+            .map_err(|e| fail(format!("KVM_GET_CPUID2: {e}")))?;
+        Ok(cpuid
+            .as_slice()
+            .iter()
+            .any(|entry| entry.function == 1 && entry.ecx & (1 << 24) != 0))
     }
     fn task(&self, index: usize) -> &CurrentTask {
         self.metadata(TASK_OFFSET + index as u64 * STRIDE)
