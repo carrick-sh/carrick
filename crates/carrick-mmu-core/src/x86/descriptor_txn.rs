@@ -5,7 +5,10 @@ pub use crate::aarch64::descriptor_txn::{
 };
 pub use crate::descriptor_refusal::DescriptorRefusal;
 use alloc::{collections::BTreeMap, vec::Vec};
-use carrick_guest_arch::{FrameGpa, RootGpa, UserVa};
+use carrick_guest_arch::{
+    Access as GuestAccess, EditBacking, EditCowAccess, EditIntent, EditLeafSize, EditOperation,
+    EditPermissions, FrameGpa, RootGpa, UserVa,
+};
 
 pub const PAGE: u64 = 4096;
 pub const PRESENT: u64 = 1;
@@ -107,6 +110,109 @@ pub struct DescriptorTxn<'a> {
     pub root: RootGpa,
     pub op: DescriptorOp,
     pub tables: &'a [RootGpa],
+}
+
+impl<'a> DescriptorTxn<'a> {
+    /// Lower one exact-MM owner intent. Every unsupported Linux permission or
+    /// COW mode is rejected before planning any descriptor store.
+    pub fn from_intent(intent: &'a EditIntent<'_, RootGpa>) -> Result<Self, DescriptorRefusal> {
+        let owner = intent.owner();
+        let span = PageSpan::new(intent.range().start().raw(), intent.range().len().raw());
+        let permissions = |perms: EditPermissions| {
+            perms.readable.then_some(Permissions {
+                writable: perms.writable,
+                executable: perms.executable,
+                user: perms.user,
+            })
+        };
+        let backing = |value: EditBacking| BackingIdentity {
+            frame_id: value.frame_id,
+            mapping_id: value.mapping_id,
+            owner_generation: value.owner_generation,
+            inventory_revision: value.inventory_revision,
+        };
+        let size = |value: EditLeafSize| match value {
+            EditLeafSize::Page => LeafSize::Page,
+            EditLeafSize::Block2M => LeafSize::Block2M,
+            EditLeafSize::Block1G => LeafSize::Block1G,
+        };
+        let operation = match intent.operation() {
+            EditOperation::Prepare {
+                output,
+                permissions: requested,
+                resident,
+                backing: identity,
+            } => DescriptorOp::Prepare {
+                span,
+                output,
+                permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
+                resident: PageSpan::new(resident.start().raw(), resident.len().raw()),
+                backing: backing(identity),
+            },
+            EditOperation::Map {
+                output,
+                permissions: requested,
+                size: leaf_size,
+                resident,
+                backing: identity,
+            } => DescriptorOp::Map {
+                span,
+                output,
+                permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
+                size: size(leaf_size),
+                resident,
+                backing: backing(identity),
+            },
+            EditOperation::Publish { expected, access } => DescriptorOp::Publish {
+                span,
+                expected,
+                access: match access {
+                    GuestAccess::Read => Access::Read,
+                    GuestAccess::Write => Access::Write,
+                    GuestAccess::Execute => Access::Execute,
+                },
+            },
+            EditOperation::Protect {
+                permissions: requested,
+            } => DescriptorOp::Protect {
+                span,
+                permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
+            },
+            EditOperation::ArmCow {
+                kernel_only: false,
+                executable: false,
+                adopt_private: false,
+                excluded_len,
+                ..
+            } if excluded_len.raw() == 0 => DescriptorOp::ArmCow(span),
+            EditOperation::CowRepoint {
+                old,
+                new,
+                backing: identity,
+                access: EditCowAccess::RecordedPrivate,
+            } => DescriptorOp::CowRepoint {
+                span,
+                old,
+                new,
+                backing: backing(identity),
+            },
+            EditOperation::Unmap => DescriptorOp::Unmap(span),
+            EditOperation::Coalesce { size: leaf_size } => DescriptorOp::Coalesce {
+                span,
+                size: size(leaf_size),
+            },
+            _ => return Err(DescriptorRefusal::BadEncoding),
+        };
+        Ok(Self {
+            id: DescriptorTxnId {
+                mm_key: owner.mm_key(),
+                generation: owner.generation(),
+            },
+            root: owner.root(),
+            op: operation,
+            tables: intent.table_grants(),
+        })
+    }
 }
 #[derive(Clone, Debug)]
 pub struct DescriptorPlan {

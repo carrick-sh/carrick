@@ -5,6 +5,65 @@ use core::num::NonZeroU64;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 
+#[test]
+fn neutral_prepare_intent_publishes_one_native_page() {
+    use carrick_guest_arch::{
+        EditBacking, EditIntent, EditOperation, EditOwner, EditPermissions, GuestLen, UserRange,
+    };
+    let words = Words::new();
+    let one = NonZeroU64::MIN;
+    // SAFETY: the fixture owns the sole synthetic MM editor and live root.
+    let owner = unsafe { EditOwner::issue(root(0x1000), one, one) };
+    let range = UserRange::checked(UserVa::new(0x4000), GuestLen::new(8192)).unwrap();
+    let resident = UserRange::checked(UserVa::new(0x4000), GuestLen::new(PAGE)).unwrap();
+    let grants = [root(0x2000), root(0x3000), root(0x4000)];
+    let intent = EditIntent::checked(
+        owner,
+        range,
+        EditOperation::Prepare {
+            output: FrameGpa::new(0x8000),
+            permissions: EditPermissions {
+                readable: true,
+                writable: true,
+                executable: false,
+                user: true,
+            },
+            resident,
+            backing: EditBacking {
+                frame_id: one,
+                mapping_id: one,
+                owner_generation: one,
+                inventory_revision: one,
+            },
+        },
+        &grants,
+    )
+    .unwrap();
+    let txn = DescriptorTxn::from_intent(&intent).unwrap();
+    let receipt = execute_descriptor_txn(&words, &txn, root(0x1000), &mut InlineJournal::new());
+    assert!(matches!(receipt.outcome, DescriptorOutcome::Applied { .. }));
+    let live = translate_leaf(
+        &words,
+        root(0x1000),
+        UserVa::new(0x4000),
+        Access::Write,
+        true,
+    )
+    .unwrap();
+    assert_eq!(live.output, FrameGpa::new(0x8000));
+    assert!(matches!(
+        translate_leaf(
+            &words,
+            root(0x1000),
+            UserVa::new(0x5000),
+            Access::Read,
+            true
+        ),
+        Err(FaultClass::NotPresent)
+    ));
+    assert!(words.stores.get() > 0);
+}
+
 struct Words {
     words: RefCell<BTreeMap<u64, u64>>,
     reads: Cell<usize>,
