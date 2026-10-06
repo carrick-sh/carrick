@@ -217,6 +217,30 @@ mod kernel {
         write_port(port, frame, admit_exit());
     }
 
+    fn fixture_edit(
+        va: u64,
+        sequence: core::num::NonZeroU64,
+        operation: carrick_guest_arch::EditOperation,
+    ) -> Result<carrick_mmu_core::x86::descriptor_txn::DescriptorReceipt, carrick_el1::isa::ArchError>
+    {
+        use carrick_guest_arch::{
+            EditIntent, EditOwner, FrameGpa, GuestLen, MmuEditArch, RootGpa, UserRange, UserVa,
+        };
+        let root = RootGpa::page_aligned(FrameGpa::new(0x60_0000))
+            .ok_or(carrick_el1::isa::ArchError::Unbound)?;
+        // SAFETY: this fixture runs one vCPU at a time with the retained
+        // root, so each sequential native descriptor edit is exclusive.
+        let owner = unsafe { EditOwner::issue(root, core::num::NonZeroU64::MIN, sequence) };
+        let range = UserRange::checked(UserVa::new(va), GuestLen::new(4096))
+            .ok_or(carrick_el1::isa::ArchError::Unbound)?;
+        let intent = EditIntent::checked(owner, range, operation, &[])
+            .ok_or(carrick_el1::isa::ArchError::Unbound)?;
+        let mut arch = carrick_el1::isa::x86::Kernel::new(carrick_el1::isa::x86::X86Backend);
+        // SAFETY: KVM retains and identity maps the 448-page PML4 window;
+        // the sibling vCPU is stopped while this fixture edits it.
+        unsafe { arch.execute_edit(intent, root.address(), GuestLen::new(FIXTURE_PML4_CAPACITY)) }
+    }
+
     #[unsafe(no_mangle)]
     extern "C" fn carrick_x86_enter(frame: &mut NativeFrame, binding: &CpuBinding) {
         if !frame.valid_user_return() {
@@ -277,27 +301,11 @@ mod kernel {
             return;
         }
         if frame.rax == OBSERVE_DESCRIPTOR_PROTECT {
-            use carrick_guest_arch::{
-                EditIntent, EditOperation, EditOwner, EditPermissions, FrameGpa, GuestLen,
-                MmuEditArch, RootGpa, UserRange, UserVa,
-            };
+            use carrick_guest_arch::{EditOperation, EditPermissions};
             use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
-            let Some(root) = RootGpa::page_aligned(FrameGpa::new(0x60_0000)) else {
-                doorbell(FATAL_PORT, frame);
-                halt();
-            };
-            // SAFETY: this fixture runs one vCPU at a time with a retained
-            // root, so the native page-table editor is exclusive here.
-            let owner = unsafe {
-                EditOwner::issue(root, core::num::NonZeroU64::MIN, core::num::NonZeroU64::MIN)
-            };
-            let Some(range) = UserRange::checked(UserVa::new(0x3_0000), GuestLen::new(4096)) else {
-                doorbell(FATAL_PORT, frame);
-                halt();
-            };
-            let Some(intent) = EditIntent::checked(
-                owner,
-                range,
+            let receipt = fixture_edit(
+                0x3_0000,
+                core::num::NonZeroU64::MIN,
                 EditOperation::Protect {
                     permissions: EditPermissions {
                         readable: true,
@@ -306,18 +314,69 @@ mod kernel {
                         user: true,
                     },
                 },
-                &[],
-            ) else {
+            );
+            frame.rax = match receipt {
+                Ok(receipt) if matches!(receipt.outcome, DescriptorOutcome::Applied { .. }) => 1,
+                Ok(_) => 0,
+                Err(_) => {
+                    doorbell(FATAL_PORT, frame);
+                    halt();
+                }
+            };
+            return;
+        }
+        if frame.rax == OBSERVE_DESCRIPTOR_PREPARE_PUBLISH {
+            use carrick_guest_arch::{
+                Access, EditBacking, EditLeafSize, EditOperation, EditPermissions, FrameGpa,
+            };
+            use carrick_mmu_core::x86::descriptor_txn::DescriptorOutcome;
+            let one = core::num::NonZeroU64::MIN;
+            let backing = EditBacking {
+                frame_id: one,
+                mapping_id: one,
+                owner_generation: one,
+                inventory_revision: one,
+            };
+            let prepared = fixture_edit(
+                0x3_2000,
+                one,
+                EditOperation::Map {
+                    output: FrameGpa::new(0x9_0000),
+                    permissions: EditPermissions {
+                        readable: true,
+                        writable: false,
+                        executable: false,
+                        user: true,
+                    },
+                    size: EditLeafSize::Page,
+                    resident: false,
+                    backing,
+                },
+            );
+            match prepared {
+                Ok(receipt) if matches!(receipt.outcome, DescriptorOutcome::Applied { .. }) => {}
+                Ok(_) => {
+                    frame.rax = 0;
+                    return;
+                }
+                Err(_) => {
+                    doorbell(FATAL_PORT, frame);
+                    halt();
+                }
+            }
+            let Some(second) = core::num::NonZeroU64::new(2) else {
                 doorbell(FATAL_PORT, frame);
                 halt();
             };
-            // SAFETY: this KVM fixture exclusively owns a retained, identity
-            // mapped 448-page PML4 window while its sibling vCPU is stopped.
-            let mut arch = carrick_el1::isa::x86::Kernel::new(carrick_el1::isa::x86::X86Backend);
-            let receipt = unsafe {
-                arch.execute_edit(intent, root.address(), GuestLen::new(FIXTURE_PML4_CAPACITY))
-            };
-            frame.rax = match receipt {
+            let published = fixture_edit(
+                0x3_2000,
+                second,
+                EditOperation::Publish {
+                    expected: FrameGpa::new(0x9_0000),
+                    access: Access::Read,
+                },
+            );
+            frame.rax = match published {
                 Ok(receipt) if matches!(receipt.outcome, DescriptorOutcome::Applied { .. }) => 1,
                 Ok(_) => 0,
                 Err(_) => {
