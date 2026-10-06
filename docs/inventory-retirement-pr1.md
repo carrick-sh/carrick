@@ -43,7 +43,8 @@ it never supplies test exclusion or silently promotes a source file.
   independent proof: imports in its discarded body cannot exclude any item
   outside it. External modules carry this proof from the strict Rust census
   into retained discovery; scanners never infer it from a filename. Rust and
-  all three retained scanners enforce this boundary.
+  all three retained scanners consume this Rust verdict. Unresolved production
+  `macro_use` extern-crate imports are rejected before test exclusion.
 - Literal built-in inclusions retain physical paths and production closure.
   Rust source literals in arbitrary macro inputs are rejected, including DSL,
   nested groups and attribute tokens. Parsed test-only inclusion reachability
@@ -52,12 +53,15 @@ it never supplies test exclusion or silently promotes a source file.
 - Sensitive import renames/re-exports are rejected. The vocabulary covers
   authority operations/types, raw termination and environment access; alias
   taint closes transitively. Plain renames have no allowlist escape. Environment
-  and termination imports must use their explicit canonical paths.
+  and termination imports must use their explicit canonical paths. Sensitive
+  namespace `self` and glob imports, and unresolved unqualified protected
+  calls, are rejected.
 - Custom attributes require an entry in
   `scripts/migrate/authority-attribute-allowlist.json`. Each entry names the
   exact macro/helper and its audited provider, with a rationale for why
   expansion cannot introduce authority or raw termination. Literal metadata
-  is accepted; executable arguments also require the census's closed argument
+  does not by itself prove safe expansion; executable arguments also require
+  the census's closed argument
   grammar. `error` permits field/constant projections and zero-argument
   get/as_secs/as_millis/display adapters. `arg` permits constant/variant paths.
   Blocks, sensitive names and other calls remain errors even with an entry.
@@ -66,11 +70,58 @@ it never supplies test exclusion or silently promotes a source file.
   audited derive on the parsed item; opaque helpers and glob imports are
   rejected. This proof avoids resolving names imported by a glob.
   Derive macros also require an audited provider; standard compiler derives
-  remain built-in. Audited names cannot be rebound by imports or modules.
+  require provable bindings too. Imports, aliases, extern-crate `macro_use`
+  and ambiguous globs cannot replace those compiler bindings. Use an absolute
+  compiler provider under a production glob (for example `::core::clone::Clone`).
+  Canonical standard trait imports remain permitted, including anonymous
+  `Hash as _` imports that create no macro binding. Audited names cannot be
+  rebound by imports or modules.
   Protected callbacks in literal metadata are rejected. To add an
   entry, audit the locked implementation, document its expansion, extend the
   closed grammar only if needed, and add positive and rejection witnesses.
   Unrecognized syntax must be rewritten; it is never resolved by guessing.
+
+The clap `env` helper option generates `Arg::env`, whose locked
+`clap_builder` implementation calls `std::env::var_os` while constructing the
+command. Its audit therefore carries an operation and exact declared
+owner/key map, rather than treating it as inert metadata. The existing CLI
+configuration and conformance-harness keys are admitted at their host
+configuration owners. `CARRICK_RUN_ID` helper metadata is rejected everywhere;
+that key remains an explicit read at the LaunchContext boundary. Binding an
+audited source file into a different logical module does not transfer its
+metadata permission.
+
+## Retained scanner verdicts
+
+Rust is the single dialect and scope authority. `authority-census` emits JSON
+with dialect rejections, each source file's production status and SHA-256,
+and item/statement exclusion ranges in UTF-8 byte offsets. Standalone probe
+profile scope is recorded separately and cannot grant a test exemption to a
+retained zero rule. It also records
+compiled census/policy input hashes. A stale executable cannot emit a verdict
+for changed policy inputs. The retained scanners have no test-attribute,
+configuration-predicate or macro-scope classifiers: they mask Rust-excluded
+ranges while preserving positions, then check only their own patterns.
+
+Standalone use requires a fresh verdict:
+
+```sh
+cargo run --locked -p carrick-xtask -- authority-census > target/authority-census.json
+python3 scripts/migrate/check-runtime-aborts.py --census-verdict target/authority-census.json
+python3 scripts/migrate/check-runtime-global-state.py --census-verdict target/authority-census.json
+python3 scripts/migrate/check-dispatch-lock-authority.py --census-verdict target/authority-census.json
+```
+
+A nonempty `rejections` array fails every scanner. Missing verdicts, changed
+policy inputs, changed source bytes, changed parent/module declarations, new
+or removed files, and a different tree root also fail closed. Source-level
+scanner APIs require the same verdict and validate its tree, not just the
+scanned child's bytes. Tree scanners validate before and after discovery and
+hash each input when masking it. `authority-debt` passes the in-memory census
+verdict through a scoped temporary file, so no cached artifact grants an
+exemption. Python fixtures
+obtain fresh verdicts from the compiled Rust census; the gate already builds
+that binary before executing them.
 
 Documentation-only macro templates may forward built-in doc values, whose
 compiler expansion cannot change a module path, cfg scope or runtime body.
@@ -80,5 +131,26 @@ explicit parsed imports (or generated constants), preserving platform types.
 The schema-absent historical PR base alone uses legacy ledger-to-owner
 conversion. Working source always uses the restricted dialect; a base with
 `authority-debt-ceilings.json` reads that schema directly and cannot enter the
-legacy path. Historical undercounting can only tighten the ratchet. Remove
+legacy path. The private bootstrap emits an explicitly tagged historical Rust
+verdict; standalone working-source scanners reject that tag. It still uses the
+same pattern scanners and contains no Python scope-classification fallback.
+Historical undercounting can only tighten the ratchet. Remove
 this one-time bootstrap in the next inventory-retirement PR after #51 lands.
+
+## Census undercount repair (director ruling 2026-10-06)
+
+The single Rust classifier exposes one production operation that the retired
+Python classifier omitted. The director authorized exactly this correction;
+no existing ceiling was increased and no runtime behavior changed.
+
+| Counter | Actual base source | Why Python missed it |
+| --- | --- | --- |
+| `global_config_debug / global:env_var_os / carrick_runtime::vcpu_loop::ThreadRuntimeState<E>::new::CARRICK_TRACE_TRAPS / shared = 1` | `crates/carrick-runtime/src/vcpu_loop/mod.rs:1046`: `trace: std::env::var_os("CARRICK_TRACE_TRAPS").is_some(),` | Attributes on preceding `#[cfg(test)]` struct initializer fields leaked into this production sibling. Rust excludes each field independently. |
+
+The entire source file is identical on actual base
+`8233b5488b92b406bce8bbe4ee495c0e09b166a5` and the repaired head; SHA-256
+`6e366be31a1683d49333d250cec2afe744d8e4160823a7b977855c332955ef12`.
+This is an owned ratchet item. Reading `CARRICK_TRACE_TRAPS` in production
+runtime outside the LaunchContext boundary remains a defect for the
+director-owned follow-up; adding its census counter does not approve that
+runtime design.
