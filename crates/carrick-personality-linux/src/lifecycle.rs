@@ -54,11 +54,12 @@ use carrick_sched_core::{RecordRef, ThreadIdentity};
 use core::sync::atomic::Ordering;
 
 pub trait UserCopy {
-    fn copy_in(&mut self, dst: &mut [u8], src: u64) -> bool;
-    fn copy_out(&mut self, dst: u64, src: &[u8]) -> bool;
+    fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> bool;
+    fn copy_out(&mut self, dst: UserVa, src: &[u8]) -> bool;
 }
 
 pub struct ChildContext {
+    pub result: SyscallResult,
     pub stack: UserVa,
     pub tls: Option<UserVa>,
     pub visible_tid: u32,
@@ -107,6 +108,10 @@ pub trait LifecycleNative<'a>: UserCopy {
         identity: ThreadIdentity,
     ) -> Result<RecordRef, carrick_sched_core::Exhausted>;
     fn free_record(&mut self, record: RecordRef);
+    /// ISA-only context availability, checked before any output or pool claim.
+    fn can_prepare_child(&self, _: UserVa, _: Option<UserVa>) -> bool {
+        true
+    }
     fn prepare_child(&mut self, record: RecordRef, context: ChildContext);
     fn enqueue_born(&mut self, record: RecordRef);
     fn exit_record(&self) -> Option<ExitRecord>;
@@ -294,7 +299,7 @@ pub fn serve_sigprocmask(
     let old = thread.slot.blocked();
     let new = if set != 0 {
         let mut bytes = [0u8; 8];
-        if !user.copy_in(&mut bytes, set) {
+        if !user.copy_in(&mut bytes, UserVa::new(set)) {
             return None;
         }
         let bits = u64::from_le_bytes(bytes);
@@ -308,7 +313,7 @@ pub fn serve_sigprocmask(
     } else {
         None
     };
-    if oldset != 0 && !user.copy_out(oldset, &old.0.to_le_bytes()) {
+    if oldset != 0 && !user.copy_out(UserVa::new(oldset), &old.0.to_le_bytes()) {
         return None;
     }
     let Some(new) = new else {
@@ -350,7 +355,7 @@ fn serve_sigaltstack(
     }
     let replacement = if ss != 0 {
         let mut bytes = [0u8; STACK_T_SIZE];
-        if !user.copy_in(&mut bytes, ss) {
+        if !user.copy_in(&mut bytes, UserVa::new(ss)) {
             return None;
         }
         let [sp, flags, size] = stack_t_words(&bytes);
@@ -377,7 +382,10 @@ fn serve_sigaltstack(
             // Not on the alternate stack (checked above): no SS_ONSTACK.
             (current.sp, current.flags & !SS_ONSTACK, current.size)
         };
-        if !user.copy_out(old_ss, &stack_t_bytes([sp, u64::from(flags), size])) {
+        if !user.copy_out(
+            UserVa::new(old_ss),
+            &stack_t_bytes([sp, u64::from(flags), size]),
+        ) {
             return None;
         }
     }
@@ -400,7 +408,7 @@ impl TidOutput {
             return Some(None);
         }
         let mut preimage = [0u8; 4];
-        user.copy_in(&mut preimage, address)
+        user.copy_in(&mut preimage, UserVa::new(address))
             .then_some(Some(Self { address, preimage }))
     }
 }
@@ -420,25 +428,25 @@ impl TidOutputs {
         let Some(parent) = &self.parent else {
             return self.publish_child(&bytes, user);
         };
-        if !user.copy_out(parent.address, &bytes) {
+        if !user.copy_out(UserVa::new(parent.address), &bytes) {
             return false;
         }
         if self.publish_child(&bytes, user) {
             return true;
         }
-        let _ = user.copy_out(parent.address, &parent.preimage);
+        let _ = user.copy_out(UserVa::new(parent.address), &parent.preimage);
         false
     }
 
     fn publish_child(&self, bytes: &[u8; 4], user: &mut (impl UserCopy + ?Sized)) -> bool {
         self.child
             .as_ref()
-            .is_none_or(|child| user.copy_out(child.address, bytes))
+            .is_none_or(|child| user.copy_out(UserVa::new(child.address), bytes))
     }
 
     fn rollback(&self, user: &mut (impl UserCopy + ?Sized)) {
         for output in [&self.parent, &self.child].into_iter().flatten() {
-            let _ = user.copy_out(output.address, &output.preimage);
+            let _ = user.copy_out(UserVa::new(output.address), &output.preimage);
         }
     }
 }
@@ -461,6 +469,11 @@ fn serve_clone<'a>(
         || flags & !(THREAD_CLONE_REQUIRED | THREAD_CLONE_OPTIONAL) != 0
         || stack == 0
     {
+        return None;
+    }
+    let placement_stack = UserVa::new(stack);
+    let placement_tls = (flags & CLONE_SETTLS != 0).then_some(UserVa::new(tls));
+    if !native.can_prepare_child(placement_stack, placement_tls) {
         return None;
     }
     let binding = native.binding()?;
@@ -534,8 +547,9 @@ fn serve_clone<'a>(
     native.prepare_child(
         record,
         ChildContext {
-            stack: UserVa::new(stack),
-            tls: (flags & CLONE_SETTLS != 0).then_some(UserVa::new(tls)),
+            result: SyscallResult::new(0),
+            stack: placement_stack,
+            tls: placement_tls,
             visible_tid: identity.visible_tid,
         },
     );
@@ -644,7 +658,7 @@ fn serve_exit<'a>(
     let clear_child_tid = slot.clear_child_tid();
     if clear_child_tid != 0 {
         let status = native.result();
-        let copied = native.copy_out(clear_child_tid, &CHILD_TID_CLEAR);
+        let copied = native.copy_out(UserVa::new(clear_child_tid), &CHILD_TID_CLEAR);
         let woken =
             copied && native.wake_child_tid(EntryMmKey::from_raw(mm), UserVa::new(clear_child_tid));
         if !woken {

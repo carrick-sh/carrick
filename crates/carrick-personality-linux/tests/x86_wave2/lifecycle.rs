@@ -52,7 +52,7 @@ impl Context {
         }
     }
     fn child(&mut self, context: ChildContext) {
-        self.set_result(0);
+        self.set_result(context.result.raw());
         match self {
             Self::Arm(f, sp, tls) => {
                 *sp = context.stack.raw();
@@ -164,8 +164,8 @@ impl<'a> Turn<'a> {
     }
 }
 impl UserCopy for Turn<'_> {
-    fn copy_in(&mut self, dst: &mut [u8], address: u64) -> bool {
-        let index = match address {
+    fn copy_in(&mut self, dst: &mut [u8], address: UserVa) -> bool {
+        let index = match address.raw() {
             0x1000 => 0,
             0x1004 => 1,
             _ => return false,
@@ -176,12 +176,12 @@ impl UserCopy for Turn<'_> {
         dst.copy_from_slice(&self.words[index].to_le_bytes());
         true
     }
-    fn copy_out(&mut self, address: u64, src: &[u8]) -> bool {
-        if self.fail_copy == Some(address) {
+    fn copy_out(&mut self, address: UserVa, src: &[u8]) -> bool {
+        if self.fail_copy == Some(address.raw()) {
             self.fail_copy = None;
             return false;
         }
-        let index = match address {
+        let index = match address.raw() {
             0x1000 => 0,
             0x1004 => 1,
             _ => return false,
@@ -243,6 +243,10 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
             record.incarnation
         );
         self.process.zone.free_record(record.id);
+    }
+    fn can_prepare_child(&self, stack: UserVa, tls: Option<UserVa>) -> bool {
+        !matches!(self.context, Context::X86(..))
+            || carrick_x86::cpl0_lifecycle::child_context_supported(stack, tls)
     }
     fn prepare_child(&mut self, record: RecordRef, context: ChildContext) {
         let mut child = self.context.clone();
@@ -342,6 +346,35 @@ impl<'a> PendingFamilies<'a> for Turn<'a> {
 }
 
 pub fn x5_linux_clone_exit() {
+    // The production x86 context qualifier must refuse unavailable native
+    // stack/TLS states before any visible output, identity claim or allocation.
+    for (stack, tls) in [(1u64 << 47, 0x77770000), (0xdead0000, u64::MAX)] {
+        let process = Process::new(9);
+        let mut turn = Turn::new(&process, true);
+        let entry = process
+            .page
+            .stock(
+                0,
+                EntryIdentity {
+                    tid: 50,
+                    visible_tid: 7,
+                    thread_serial: 5050,
+                    uid_credit: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            turn.syscall(220, [FLAGS, stack, 0x1000, tls, 0x1004, 0]),
+            dispatch::CompletionRoute::Forward
+        );
+        assert_eq!(turn.words, [71, 72]);
+        assert_eq!(process.page.live(), 1);
+        assert_eq!(
+            process.page.state(0),
+            Some((entry.generation(), EntryState::Reserved))
+        );
+        assert!(turn.child.is_none());
+    }
     for x86 in [false, true] {
         for births in [16, 64, 256] {
             let a = Process::new(7);
