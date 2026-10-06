@@ -18,6 +18,10 @@ pub const HUGE: u64 = 1 << 7;
 pub const PREPARED: u64 = 1 << 9;
 pub const COW: u64 = 1 << 10;
 pub const MAY_WRITE: u64 = 1 << 11;
+/// Owner-issued private leaf; host Map leaves never carry this bit.
+pub const PRIVATE: u64 = 1 << 52;
+/// Owner-issued execute ceiling, retained when Protect sets NX.
+pub const MAY_EXEC: u64 = 1 << 53;
 /// Invalid terminal retaining the old output until owner scrub settles it.
 pub const RETIRED: u64 = 1 << 8;
 pub const NX: u64 = 1 << 63;
@@ -410,6 +414,8 @@ const FLAGS: u64 = PRESENT
     | PREPARED
     | COW
     | MAY_WRITE
+    | PRIVATE
+    | MAY_EXEC
     | NX;
 fn validate_entry(entry: u64, level: usize) -> Result<(), DescriptorRefusal> {
     if entry & !(ADDRESS | FLAGS) != 0 || (level == 0 && entry & HUGE != 0) {
@@ -421,7 +427,10 @@ fn validate_entry(entry: u64, level: usize) -> Result<(), DescriptorRefusal> {
     {
         return Err(DescriptorRefusal::Malformed);
     }
-    if level < 3 && entry & HUGE == 0 && entry & (PREPARED | COW | MAY_WRITE | RETIRED) != 0 {
+    if level < 3
+        && entry & HUGE == 0
+        && entry & (PREPARED | COW | MAY_WRITE | RETIRED | PRIVATE | MAY_EXEC) != 0
+    {
         return Err(DescriptorRefusal::Malformed);
     }
     Ok(())
@@ -628,6 +637,11 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 };
                 (output.raw() + offset)
                     | permissions(p)
+                    | if matches!(self.txn.op, DescriptorOp::Prepare { .. }) {
+                        PRIVATE | if p.executable { MAY_EXEC } else { 0 }
+                    } else {
+                        0
+                    }
                     | if resident { PRESENT } else { PREPARED }
                     | if level < 3 { HUGE } else { 0 }
             }
@@ -652,10 +666,16 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 if entry & (PRESENT | PREPARED) == 0 {
                     return Err(DescriptorRefusal::MissingTable);
                 }
+                if entry & PRIVATE == 0 {
+                    return Err(DescriptorRefusal::NotPrivateAnonymous);
+                }
                 if entry & COW != 0 {
                     return Err(DescriptorRefusal::CowArmed);
                 }
-                entry & !(WRITE | USER | NX | MAY_WRITE) | permissions(p)
+                if p.writable && entry & MAY_WRITE == 0 || p.executable && entry & MAY_EXEC == 0 {
+                    return Err(DescriptorRefusal::PermissionWidening);
+                }
+                entry & !(WRITE | USER | NX) | (permissions(p) & (WRITE | USER | NX))
             }
             DescriptorOp::ArmCow(_) => arm_cow_terminal(entry)?,
             DescriptorOp::CowRepoint { old, new, .. } => {
@@ -672,7 +692,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 }
             }
             DescriptorOp::Retire(_) => {
-                if entry & (PRESENT | PREPARED) == 0 || entry & USER == 0 {
+                if entry & (PRESENT | PREPARED) == 0 || entry & USER == 0 || entry & PRIVATE == 0 {
                     return Err(DescriptorRefusal::NotPrivateAnonymous);
                 }
                 (entry & !(PRESENT | PREPARED | COW)) | RETIRED
