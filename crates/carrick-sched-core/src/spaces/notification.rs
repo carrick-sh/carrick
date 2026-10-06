@@ -530,25 +530,18 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
 /// A space table paired with its release venue at the owning entrypoint.
 /// Source-free construction is explicit and available only to model fixtures.
 #[derive(Clone, Copy)]
-pub struct SpaceAccess<'a> {
+pub struct SpaceAccess<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     spaces: &'a super::AddressSpaces,
-    venue: Option<SpaceReleaseVenue<'a>>,
+    venue: Option<SpaceReleaseVenue<'a, C>>,
 }
-impl<'a> SpaceAccess<'a> {
-    pub fn notified(venue: SpaceReleaseVenue<'a>) -> Self {
+impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceAccess<'a, C> {
+    pub fn notified(venue: SpaceReleaseVenue<'a, C>) -> Self {
         Self {
             spaces: &venue.zone.spaces,
             venue: Some(venue),
         }
     }
-    #[cfg(any(test, feature = "host-test"))]
-    pub fn source_free(spaces: &'a super::AddressSpaces) -> Self {
-        Self {
-            spaces,
-            venue: None,
-        }
-    }
-    pub fn venue(self) -> Option<SpaceReleaseVenue<'a>> {
+    pub fn venue(self) -> Option<SpaceReleaseVenue<'a, C>> {
         self.venue
     }
     pub fn table(self) -> &'a super::AddressSpaces {
@@ -579,7 +572,7 @@ impl<'a> SpaceAccess<'a> {
             None
         };
         if let Some((venue, lease)) = release {
-            let completion = |effects: OwnedObjectWakeEffects<'_>| {
+            let completion = |effects: OwnedObjectWakeEffects<'_, C>| {
                 (venue.deliver)(venue.zone, venue.waker, effects)
             };
             let publication = lease
@@ -605,7 +598,7 @@ impl<'a> SpaceAccess<'a> {
         index: SpaceIndex,
         key: u64,
         owner: NonZeroU64,
-    ) -> Option<super::SpaceEditor<'a>> {
+    ) -> Option<super::SpaceEditor<'a, C>> {
         self.spaces
             .try_begin_edit_with_venue(index, key, owner, self.venue)
     }
@@ -614,7 +607,7 @@ impl<'a> SpaceAccess<'a> {
         index: SpaceIndex,
         key: u64,
         owner: NonZeroU64,
-    ) -> Option<super::ClosedChildEditor<'a>> {
+    ) -> Option<super::ClosedChildEditor<'a, C>> {
         self.spaces
             .try_begin_closed_child_edit_with_venue(index, key, owner, self.venue)
     }
@@ -624,7 +617,7 @@ impl<'a> SpaceAccess<'a> {
         key: u64,
         owner: NonZeroU64,
         spins: u32,
-    ) -> Option<super::SpaceEditor<'a>> {
+    ) -> Option<super::SpaceEditor<'a, C>> {
         for _ in 0..spins.max(1) {
             if let Some(editor) = self.try_begin_edit(index, key, owner) {
                 return Some(editor);
@@ -637,7 +630,17 @@ impl<'a> SpaceAccess<'a> {
         None
     }
 }
-impl core::ops::Deref for SpaceAccess<'_> {
+impl<'a> SpaceAccess<'a> {
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn source_free(spaces: &'a super::AddressSpaces) -> Self {
+        Self {
+            spaces,
+            venue: None,
+        }
+    }
+}
+
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> core::ops::Deref for SpaceAccess<'_, C> {
     type Target = super::AddressSpaces;
     fn deref(&self) -> &Self::Target {
         self.spaces
