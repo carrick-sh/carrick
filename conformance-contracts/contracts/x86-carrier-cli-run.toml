@@ -1,12 +1,13 @@
 schema_version = 1
 id = "x86.carrier.cli-run"
 title = "Linux x86_64 CLI execution uses the shared CPL0 kernel"
-guest_surfaces = ["cli:run", "vmm:kvm", "syscall:write", "syscall:exit", "syscall:mmap", "syscall:munmap", "syscall:brk", "syscall:fork", "syscall:wait4"]
+guest_surfaces = ["cli:run", "vmm:kvm", "syscall:write", "syscall:exit", "syscall:exit_group", "syscall:poll", "syscall:arch_prctl", "syscall:mmap", "syscall:munmap", "syscall:brk", "syscall:fork", "syscall:wait4"]
 semantic_authority = [
   "Native x86_64 Linux execution of the exact static ELF: write(1, hello\\n, 6) emits exactly hello\\n and exit(7) yields process status 7",
   "Native x86_64 Linux execution of the same static MM/fork/wait ELF supplies the syscall-result and output oracle",
+  "Native execution and committed hello-x86_64/oracle.expected: Rust/std musl startup initializes TLS, writes the exact hello line and exits zero",
 ]
-fixture = "carrick-cli::x86_kvm_run::mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel"
+fixture = "carrick-cli::x86_kvm_run::{mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel,musl_static_hello_runs_through_shared_kernel}"
 scale_points = [1, 2, 8]
 structural_budgets = []
 rationale = """

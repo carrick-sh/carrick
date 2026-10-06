@@ -79,8 +79,7 @@ fn empty_image_archive() -> Vec<u8> {
     archive
 }
 
-#[test]
-fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
+fn kvm_available() -> bool {
     let present = std::path::Path::new("/dev/kvm").exists();
     assert!(
         present || std::env::var_os("CARRICK_REQUIRE_KVM").is_none_or(|value| value != "1"),
@@ -93,19 +92,26 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
         // SAFETY: message is a retained byte literal and fd 2 is the test
         // process's stderr; a short write affects only this diagnostic.
         unsafe { libc::write(libc::STDERR_FILENO, message.as_ptr().cast(), message.len()) };
+        return false;
+    }
+    true
+}
+
+fn assert_shared_kernel_elf(bytes: &[u8], expected: &[u8], status: i32, run_id: &str) {
+    if !kvm_available() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("hello");
-    std::fs::write(&elf, hello_elf()).unwrap();
+    std::fs::write(&elf, bytes).unwrap();
     std::fs::set_permissions(&elf, std::fs::Permissions::from_mode(0o755)).unwrap();
     let native = Command::new(&elf)
         .timeout(Duration::from_secs(5))
         .output()
         .expect("run native x86 Linux oracle");
-    assert_eq!(native.stdout, b"hello\n");
+    assert_eq!(native.stdout, expected);
     assert!(native.stderr.is_empty());
-    assert_eq!(native.status.code(), Some(7));
+    assert_eq!(native.status.code(), Some(status));
 
     let archive = dir.path().join("image.tar");
     std::fs::write(&archive, empty_image_archive()).unwrap();
@@ -126,7 +132,7 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
     let run = Command::new(&cli)
         .timeout(Duration::from_secs(5))
         .env("CARRICK_HOME", &home)
-        .env("CARRICK_RUN_ID", "x86-kvm-hello-test")
+        .env("CARRICK_RUN_ID", run_id)
         .args([
             "run",
             "--platform",
@@ -141,13 +147,13 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
         .expect("run mounted x86 ELF through carrick");
     assert_eq!(
         run.stdout,
-        b"hello\n",
+        expected,
         "stderr: {}",
         String::from_utf8_lossy(&run.stderr)
     );
     assert_eq!(
         run.status.code(),
-        Some(7),
+        Some(status),
         "stderr: {}",
         String::from_utf8_lossy(&run.stderr)
     );
@@ -163,7 +169,7 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
     let observed = Command::new(&cli)
         .timeout(Duration::from_secs(5))
         .env("CARRICK_HOME", &home)
-        .env("CARRICK_RUN_ID", "x86-kvm-hello-receipt-test")
+        .env("CARRICK_RUN_ID", format!("{run_id}-receipt"))
         .args([
             "run",
             "--json",
@@ -177,10 +183,10 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
         ])
         .output()
         .expect("observe shared CPL0 run receipt");
-    assert_eq!(observed.status.code(), Some(7));
+    assert_eq!(observed.status.code(), Some(status));
     let envelope = observed
         .stdout
-        .strip_prefix(b"hello\n")
+        .strip_prefix(expected)
         .expect("guest stdout before JSON receipt");
     let json: serde_json::Value = serde_json::from_slice(envelope).expect("run JSON receipt");
     assert_eq!(
@@ -196,5 +202,57 @@ fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
         json["report"]["execution_witness"]["host_forwards"]
             .as_u64()
             .is_some_and(|n| n >= 2)
+    );
+}
+
+#[test]
+fn mounted_static_x86_elf_writes_hello_and_exits_seven_through_shared_kernel() {
+    assert_shared_kernel_elf(&hello_elf(), b"hello\n", 7, "x86-kvm-hello-test");
+}
+
+/// Migrated M2 coverage: compile the same Rust/std musl fixture rather than
+/// silently skipping a missing prebuilt executable. This exercises libc
+/// startup, TLS, poll and exit_group through the production shared kernel.
+#[test]
+fn musl_static_hello_runs_through_shared_kernel() {
+    if !kvm_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("hello.rs");
+    let executable = dir.path().join("hello");
+    std::fs::write(
+        &source,
+        include_str!("../../carrick-vmm-bhyve/fixtures/hello-x86_64/src/main.rs"),
+    )
+    .unwrap();
+    let compile = Command::new("rustc")
+        .timeout(Duration::from_secs(30))
+        .arg(&source)
+        .args([
+            "--edition=2021",
+            "--target",
+            "x86_64-unknown-linux-musl",
+            "-C",
+            "relocation-model=static",
+            "-C",
+            "opt-level=z",
+            "-C",
+            "panic=abort",
+            "-o",
+        ])
+        .arg(&executable)
+        .output()
+        .expect("compile migrated static musl fixture (requires Rust musl target)");
+    assert!(
+        compile.status.success(),
+        "musl fixture compile stderr: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    assert_shared_kernel_elf(
+        &std::fs::read(&executable).unwrap(),
+        include_bytes!("../../carrick-vmm-bhyve/fixtures/hello-x86_64/oracle.expected"),
+        0,
+        "x86-kvm-musl-test",
     );
 }
