@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use carrick_abi::LinuxErrno;
 use carrick_guest_mem::CurrentMmMemory;
-use serde::Serialize as _;
 
 use super::mm_mutation::MmMutationGuard;
 use super::{DispatchOutcome, MmExecutorParticipation};

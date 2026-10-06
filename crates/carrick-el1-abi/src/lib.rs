@@ -2412,7 +2412,7 @@ pub fn prepare_idle_entry(slot: usize) -> Option<u64> {
     // and the slot's vCPU is stopped (its executor calls this): nothing else
     // reads or writes that stack now.
     unsafe {
-        core::ptr::write(
+        ::core::ptr::write(
             (ptr + frame_offset) as *mut TrapFrame,
             TrapFrame {
                 slot: slot as u64,

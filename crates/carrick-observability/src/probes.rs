@@ -8876,7 +8876,7 @@ mod real {
     }
 
     fn parse_guest_mem_probe_usize_env(name: &str) -> Option<usize> {
-        let value = std::env::var(name).ok()?;
+        let value = ::std::env::var(name).ok()?;
         let value = value.trim();
         if value.is_empty() {
             return None;

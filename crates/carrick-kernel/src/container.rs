@@ -16,8 +16,6 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 
-use serde::{Deserialize as _, Serialize as _};
-
 /// Lifecycle status of a container in the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -1219,7 +1219,7 @@ impl Cpl0Carrier {
         let fixture_image = image
             .file_name()
             .is_some_and(|name| name == "carrick-x86-cpl0-fixture");
-        let bytes = std::fs::read(image).map_err(|e| fail(format!("CPL0 image: {e}")))?;
+        let bytes = ::std::fs::read(image).map_err(|e| fail(format!("CPL0 image: {e}")))?;
         Self::boot_bytes_inner(&bytes, programs, interrupts, None, fixture_image)
     }
 

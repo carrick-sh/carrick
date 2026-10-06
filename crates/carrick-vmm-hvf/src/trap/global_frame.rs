@@ -1415,8 +1415,8 @@ impl GlobalFrameOwnerPin {
         let this = std::mem::ManuallyDrop::new(self);
         // SAFETY: `this` is never dropped, so each field is moved out exactly
         // once; the logical pin's `Drop` is replaced by `release`.
-        let owner = unsafe { std::ptr::read(&this.owner) };
-        let stage2 = unsafe { std::ptr::read(&this._stage2_pin) };
+        let owner = unsafe { ::std::ptr::read(&this.owner) };
+        let stage2 = unsafe { ::std::ptr::read(&this._stage2_pin) };
         let identity = stage2.into_transferred_identity();
         debug_assert_eq!(identity, owner.record_identity);
         owner
@@ -2430,7 +2430,7 @@ unsafe impl Sync for StructuralBackingOwner {}
 pub(crate) fn fork_debug_ipa() -> Option<u64> {
     static CELL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("CARRICK_FORK_DEBUG_IPA")
+        ::std::env::var("CARRICK_FORK_DEBUG_IPA")
             .ok()
             .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
     })
@@ -2440,7 +2440,7 @@ pub(crate) fn fork_debug_ipa() -> Option<u64> {
 pub(crate) fn fork_debug_va() -> Option<u64> {
     static CELL: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *CELL.get_or_init(|| {
-        std::env::var("CARRICK_FORK_DEBUG_VA")
+        ::std::env::var("CARRICK_FORK_DEBUG_VA")
             .ok()
             .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
     })
@@ -2453,7 +2453,7 @@ pub(crate) const COW_DIAGNOSTIC_HISTORY_LIMIT: usize = 256;
 pub(crate) fn cow_refusal_diagnostics_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CARRICK_COW_REFUSAL_DIAGNOSTICS")
+        ::std::env::var("CARRICK_COW_REFUSAL_DIAGNOSTICS")
             .ok()
             .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
     })

@@ -102,7 +102,7 @@
 pub use carrick_syscall_abi::*;
 
 use bitflags::bitflags;
-use zerocopy::{FromBytes as _, Immutable, IntoBytes, KnownLayout as _, Unaligned as _};
+use zerocopy::{Immutable, IntoBytes};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum LinuxGuestAbi {

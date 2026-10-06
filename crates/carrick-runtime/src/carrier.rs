@@ -474,7 +474,7 @@ impl CarrierRuntime {
                     .to_owned(),
             ));
         }
-        if !matches!(
+        if !::std::matches!(
             *self.inner.kernel_runtime.lock(),
             CarrierKernelRuntimeSlot::Vacant
         ) {

@@ -1422,7 +1422,7 @@ fn write_record_once(dir: &Path, path: &Path, contents: &str) -> io::Result<()> 
         std::process::id(),
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::write(&temp, contents)?;
+    ::std::fs::write(&temp, contents)?;
     match fs::rename(&temp, path) {
         Ok(()) => Ok(()),
         Err(err) => {

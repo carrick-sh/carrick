@@ -294,7 +294,7 @@ impl Drop for PreparedAsidAllocatorRetirement {
             state.retirement_prepared.remove(&self.generation),
             "prepared ASID allocator retirement lost its exact generation"
         );
-        assert!(
+        ::std::assert!(
             state.live.insert(self.generation),
             "prepared ASID allocator retirement returned a generation twice"
         );

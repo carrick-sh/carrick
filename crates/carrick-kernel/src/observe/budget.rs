@@ -17,7 +17,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use carrick_abi::LinuxErrno;
-use serde::{Deserialize as _, Serialize as _};
 
 use super::{
     ExitStatus, FastPathVisibility, ProcessInfo, SyscallAction, SyscallInfo, SyscallObserver,

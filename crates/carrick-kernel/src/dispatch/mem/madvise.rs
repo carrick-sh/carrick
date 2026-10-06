@@ -771,7 +771,7 @@ impl<'a> MemView<'a> {
                             // range stays non-resident forever and `mincore` reports
                             // a written page as absent, which is the opposite of the
                             // error it used to make.
-                            if std::env::var("CARRICK_MINCORE_EXACT").as_deref() != Ok("0")
+                            if ::std::env::var("CARRICK_MINCORE_EXACT").as_deref() != Ok("0")
                                 && cx
                                     .memory
                                     .resident_pages(GuestVa(segment.start), 1, this.linux_page_size())

@@ -4098,7 +4098,9 @@ impl carrick_hal::ForeignMmReadLease for CarrierForeignMmReadLease {
         deadline: std::time::Instant,
     ) -> Result<Box<dyn carrick_hal::ForeignMmReadReceipt>, carrick_hal::ForeignMmTransportError>
     {
-        instruction_read::read(self, invocation, authority, snapshot, va, dst, deadline)
+        crate::trap::foreign_mm::instruction_read::read(
+            self, invocation, authority, snapshot, va, dst, deadline,
+        )
     }
 
     fn prepare_read_window(

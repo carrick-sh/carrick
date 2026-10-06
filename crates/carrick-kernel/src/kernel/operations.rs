@@ -8,7 +8,6 @@ use super::address::MmBackend;
 use super::clone_plan::{
     CloneObjectMode, ClonePlan, CloneTaskMode, ForkParentMode, ForkPidfdMode, VforkMode,
 };
-pub(super) use super::core;
 use super::core::{
     Kernel, KernelContext, KernelDomain, RegistryState, TaskExitSubscriber, TaskRecord,
     TaskRevision, VforkChildRelease, VforkParentWait,

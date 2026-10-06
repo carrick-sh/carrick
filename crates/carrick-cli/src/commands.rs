@@ -249,7 +249,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
                 .and_then(|needle| image.find_bytes(needle.as_bytes()));
             println!(
                 "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
+                serde_json::to_string_pretty(&::serde_json::json!({
                     "entry": image.entry(),
                     "region_count": image.regions().len(),
                     "regions": image.regions(),
@@ -348,7 +348,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
+                serde_json::to_string_pretty(&::serde_json::json!({
                     "path": path,
                     "rootfs_layers": rootfs_layers,
                     "exit_code": result.exit_code,
@@ -670,9 +670,9 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             // envelope's `stdout`/`stderr` fields are EMPTY; only a
             // `StdioMode::Captured` run (carrick-embed) populates them.
             if json {
-                println!(
+                ::std::println!(
                     "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
+                    serde_json::to_string_pretty(&::serde_json::json!({
                         "image": req.run.image_ref,
                         "command": req.run.args,
                         "store": store.root(),
@@ -796,7 +796,7 @@ pub(crate) fn run_cli(cli: Cli) -> anyhow::Result<()> {
             println!("{}", {
                 let stdout = dispatcher.stdout();
                 let stderr = dispatcher.stderr();
-                serde_json::to_string_pretty(&serde_json::json!({
+                serde_json::to_string_pretty(&::serde_json::json!({
                     "outcome": outcome,
                     "stdout": String::from_utf8_lossy(&stdout),
                     "stderr": String::from_utf8_lossy(&stderr),
@@ -1602,7 +1602,7 @@ fn run_volume_command(command: VolumeCommand) -> anyhow::Result<()> {
                 }
                 let labels = parse_key_value_args(label, "--label")?;
                 let driver_opts = parse_key_value_args(opt, "--opt")?;
-                let body = serde_json::to_vec(&serde_json::json!({
+                let body = serde_json::to_vec(&::serde_json::json!({
                     "Name": name,
                     "Driver": driver,
                     "Labels": labels,
@@ -1854,7 +1854,7 @@ fn run_network_command(command: NetworkCommand) -> anyhow::Result<()> {
                 &ip_range,
                 aux_address,
             )?;
-            let body = serde_json::to_vec(&serde_json::json!({
+            let body = serde_json::to_vec(&::serde_json::json!({
                 "Name": name,
                 "Driver": driver,
                 "Scope": scope,
@@ -1891,7 +1891,7 @@ fn run_network_command(command: NetworkCommand) -> anyhow::Result<()> {
             let ipam_config =
                 network_connect_ipam_config(ip.as_deref(), ip6.as_deref(), &link_local_ip);
             let driver_opts = parse_key_value_args(driver_opt, "--driver-opt")?;
-            let body = serde_json::to_vec(&serde_json::json!({
+            let body = serde_json::to_vec(&::serde_json::json!({
                 "Container": container,
                 "EndpointConfig": {
                     "Aliases": alias,
@@ -1909,7 +1909,7 @@ fn run_network_command(command: NetworkCommand) -> anyhow::Result<()> {
             network,
             container,
         } => {
-            let body = serde_json::to_vec(&serde_json::json!({
+            let body = serde_json::to_vec(&::serde_json::json!({
                 "Container": container,
                 "Force": force,
             }))?;

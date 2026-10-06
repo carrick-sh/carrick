@@ -564,7 +564,7 @@ fn fd_contained_under(fd: std::os::fd::RawFd, root_prefix: &str) -> bool {
 /// wedge (stale `others` count — see runtime.rs fork loop) is now fixed, so the
 /// perf win is on by default. See docs/fs-host-capstd-amplification.md.
 fn fast_fs_enabled() -> bool {
-    !matches!(
+    !::std::matches!(
         std::env::var("CARRICK_FAST_FS").as_deref(),
         Ok("0") | Ok("false")
     )
@@ -573,7 +573,7 @@ fn fast_fs_enabled() -> bool {
 /// `--fs host` stat cache enabled. Default ON (`CARRICK_FS_STATCACHE=0` opts
 /// out). See [`HostFsBackend::stat_cache`] for the speed/coherence trade-off.
 fn stat_cache_enabled() -> bool {
-    !matches!(
+    !::std::matches!(
         std::env::var("CARRICK_FS_STATCACHE").as_deref(),
         Ok("0") | Ok("false")
     )
@@ -587,7 +587,7 @@ fn stat_cache_enabled() -> bool {
 /// A/B-validated byte-identical verdicts against the blessed baseline.
 #[cfg(target_os = "linux")]
 fn overlay_enabled() -> bool {
-    matches!(
+    ::std::matches!(
         std::env::var("CARRICK_FS_OVERLAY").as_deref(),
         Ok("1") | Ok("true")
     )

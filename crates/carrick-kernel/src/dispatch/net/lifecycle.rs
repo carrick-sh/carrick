@@ -286,7 +286,7 @@ pub(in crate::dispatch) fn host_stream_socket_rdhup(host_fd: i32) -> bool {
     let Some(kq) = Kqueue::new_internal() else {
         return false;
     };
-    let add = Kevent::read(
+    let add = ::carrick_host_bsd::kqueue::Kevent::read(
         host_fd,
         carrick_portable::EV_ADD | carrick_portable::EV_ENABLE | carrick_portable::EV_CLEAR,
     );
@@ -542,7 +542,7 @@ impl<'a> NetView<'a> {
     ) -> Result<(), LinuxErrno> {
         let description = match self.open_file(guest_fd) {
             Some(open_file) => {
-                if matches!(
+                if ::std::matches!(
                     open_file.description.inspect().as_deref(),
                     Some(OpenDescription::Closed { .. }) | None
                 ) {
@@ -708,7 +708,7 @@ impl<'a> NetView<'a> {
     /// fd is missing or not a HostSocket). See `OpenDescriptionBase.connect_in_progress`.
     fn socket_connect_in_progress(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|of| {
-            matches!(of.description.inspect().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.connect_in_progress())
+            ::std::matches!(of.description.inspect().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.connect_in_progress())
         })
     }
 
@@ -1106,7 +1106,7 @@ impl<'a> NetView<'a> {
     /// True iff `fd` is a HostSocket with SO_PASSCRED enabled (audit M2).
     pub(super) fn socket_so_passcred(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|of| {
-            matches!(of.description.inspect().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_passcred())
+            ::std::matches!(of.description.inspect().as_deref(), Some(OpenDescription::HostSocket { base, .. }) if base.so_passcred())
         })
     }
 

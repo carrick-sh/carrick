@@ -386,12 +386,12 @@ pub fn inotify_watch_scenario(entries: usize) -> Result<ContractObservation, Exa
         ));
         script.push(Step::Sys(sys::close(slot(0)).ret(0)));
     }
-    script.extend(vec![
+    script.extend(::std::vec![
         Step::Sys(sys::inotify_init1(LINUX_O_NONBLOCK as i32).save(0)),
         Step::Sys(sys::inotify_add_watch(slot(0), "/watched", mask).save(1)),
         Step::Sys(sys::openat(LINUX_AT_FDCWD, "/watched/file_0.txt", 0, 0).save(2)),
-        Step::Sys(sys::write(slot(2), b"rejected").errno(carrick_abi::LINUX_EBADF)),
-        Step::Sys(sys::read(slot(0), 256).errno(carrick_abi::LINUX_EAGAIN)),
+        Step::Sys(crate::sys::write(slot(2), b"rejected").errno(carrick_abi::LINUX_EBADF)),
+        Step::Sys(crate::sys::read(slot(0), 256).errno(carrick_abi::LINUX_EAGAIN)),
         Step::Sys(sys::close(slot(2)).ret(0)),
         Step::Sys(sys::inotify_rm_watch(slot(0), slot(1)).ret(0)),
         Step::Sys(sys::close(slot(0)).ret(0)),
@@ -587,7 +587,7 @@ pub fn inotify_hotpath_scenario(iterations: usize) -> Result<ContractObservation
             Step::Sys(
                 sys::inotify_add_watch(slot(1), "/inotify09-stress", LINUX_IN_MODIFY).save(2),
             ),
-            Step::Sys(sys::write(slot(0), &[0x5a; 64]).ret(64)),
+            Step::Sys(crate::sys::write(slot(0), &[0x5a; 64]).ret(64)),
             Step::Sys(sys::lseek(slot(0), 0, LINUX_SEEK_SET).ret(0)),
             Step::Sys(sys::inotify_rm_watch(slot(1), slot(2)).ret(0)),
         ]);

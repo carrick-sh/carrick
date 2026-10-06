@@ -156,7 +156,7 @@ fn allocate_private_hva(
             "nvmm-x86: private arena could not allocate 0x{len:x} bytes from 0x{arena_size:x}"
         ))
     })?;
-    if std::env::var_os("CARRICK_NVMM_MAP_STATS").is_some() {
+    if ::std::env::var_os("CARRICK_NVMM_MAP_STATS").is_some() {
         eprintln!(
             "[NVMM-X86-ARENA] hva=0x{:x} len=0x{:x} arenas={}",
             base as usize,
@@ -179,7 +179,7 @@ fn map_private_ram_on_machine(
     let hva = allocate_private_hva(mach, arenas, len)?;
     mach.map_registered_host_ram(hva, gpa, len, prot)
         .map_err(map_err)?;
-    if std::env::var_os("CARRICK_NVMM_MAP_STATS").is_some() {
+    if ::std::env::var_os("CARRICK_NVMM_MAP_STATS").is_some() {
         eprintln!(
             "[NVMM-X86-GPA-MAP] reason={reason} gpa=0x{gpa:x} len=0x{len:x} hva=0x{:x}",
             hva as usize
@@ -350,7 +350,7 @@ impl NvmmVmm {
             prot,
             backing,
         });
-        if std::env::var_os("CARRICK_TRACE_X86_FAULTS").is_some() {
+        if ::std::env::var_os("CARRICK_TRACE_X86_FAULTS").is_some() {
             eprintln!(
                 "[NVMM-X86-MAP] va=0x{:x} gpa=0x{:x} len=0x{:x}",
                 chunk.va, chunk.gpa, chunk.len
@@ -1305,7 +1305,7 @@ impl X86Vcpu for NvmmX86Vcpu {
                 }
                 NVMM_VCPU_EXIT_MEMORY => {
                     let mem = exit.mem();
-                    if std::env::var_os("CARRICK_TRACE_X86_FAULTS").is_some() {
+                    if ::std::env::var_os("CARRICK_TRACE_X86_FAULTS").is_some() {
                         eprintln!(
                             "[NVMM-X86-MEM] gpa=0x{:x} prot=0x{:x} inst_len={}",
                             mem.gpa, mem.prot, mem.inst_len
@@ -1317,7 +1317,7 @@ impl X86Vcpu for NvmmX86Vcpu {
                     let io = exit.io();
                     if io.port == FAULT_DOORBELL_PORT {
                         let record = self.read_fault_record()?;
-                        if std::env::var_os("CARRICK_TRACE_X86_FAULTS").is_some() {
+                        if ::std::env::var_os("CARRICK_TRACE_X86_FAULTS").is_some() {
                             eprintln!("[NVMM-X86-FAULT] {record:?}");
                             if let Some(fx) = self.get_fp()? {
                                 let fcw = u16::from_le_bytes([fx[0], fx[1]]);

@@ -261,7 +261,7 @@ pub(crate) fn exec_trace_child(
     }
 
     let observed_groups = current_supplementary_groups();
-    writeln!(
+    ::std::writeln!(
         std::io::stderr().lock(),
         "{}",
         trace_child_identity_record(

@@ -1506,7 +1506,7 @@ impl<'a> FsView<'a> {
     /// no-op success, so they return false.
     fn fd_lacks_fsync(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|of| {
-            matches!(
+            ::std::matches!(
                 of.description.inspect().as_deref(),
                 Some(
                     OpenDescription::HostPipe { .. }
@@ -1642,7 +1642,7 @@ impl<'a> FsView<'a> {
             // lock is held across this write).
             // SAFETY: fd is a live inherited stdio fd; we write a sub-slice of `bytes`.
             let n = unsafe {
-                libc::write(
+                ::libc::write(
                     fd,
                     bytes[off..].as_ptr() as *const libc::c_void,
                     bytes.len() - off,
@@ -2263,7 +2263,7 @@ impl<'a> FsView<'a> {
             // A character device/pipe/socket/eventfd/timerfd/epoll/pidfd/
             // inotify/signalfd/netlink fd has no page-cache range to sync →
             // ESPIPE.
-            let is_special = matches!(
+            let is_special = ::std::matches!(
                 open_file.description.inspect().as_deref(),
                 Some(
                     OpenDescription::SyntheticDevice { .. }

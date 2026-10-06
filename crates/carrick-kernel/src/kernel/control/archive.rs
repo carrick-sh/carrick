@@ -568,7 +568,7 @@ impl CarrierArchiveControl for ArchiveRuntime {
     }
 
     fn abort(&self, capability: ArchiveCapability) -> Result<(), ArchiveControlError> {
-        Self::abort(self, capability)
+        crate::kernel::control::archive::ArchiveRuntime::abort(self, capability)
     }
 }
 

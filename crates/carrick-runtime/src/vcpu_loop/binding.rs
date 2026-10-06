@@ -26,7 +26,12 @@ use super::exec::*;
 use super::lifecycle::*;
 use super::outcome::*;
 use super::terminal::*;
-use super::threads::*;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use super::threads::{
+    PersistentProcessMemberPublication, enroll_persistent_process_member,
+    finish_persistent_process_handles,
+};
+use super::threads::{VcpuThreadRegistry, publish_unexpected_executor_failure_retirement};
 use super::wait_wake::*;
 use super::*;
 
@@ -5854,7 +5859,7 @@ pub(crate) fn trap_watchdog_wall_window() -> std::time::Duration {
     // (0.6% of the arena-churn profile) for a value that never changes.
     static WINDOW: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *WINDOW.get_or_init(|| {
-        let ms = std::env::var("CARRICK_MAX_WALL_MS")
+        let ms = ::std::env::var("CARRICK_MAX_WALL_MS")
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(30_000);

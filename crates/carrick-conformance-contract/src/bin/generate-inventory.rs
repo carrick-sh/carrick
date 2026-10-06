@@ -86,7 +86,7 @@ fn run(args: &Args) -> Result<(), String> {
             inventory.summary.without_claims
         );
     } else {
-        fs::write(&output_path, format!("{serialized}\n"))
+        ::std::fs::write(&output_path, format!("{serialized}\n"))
             .map_err(|e| format!("cannot write inventory to {}: {e}", output_path.display()))?;
         println!(
             "inventory generated at {}: {} syscalls ({} bring-up, {} deferred, {} planned; {} with claims, {} without claims)",

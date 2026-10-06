@@ -14,8 +14,6 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize as _, Serialize as _};
-
 use super::super::objects::FileDescriptionBackingSnapshot;
 use super::super::snapshot::{
     FileDescriptionSnapshotKind, KernelSnapshotV1, ObjectSnapshotClass, SnapshotFinding,

@@ -27,8 +27,6 @@ use carrick_hal::VcpuRegistry;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::terminal::CloneAdmissionChangeSubscription;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use super::threads;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use super::{Kernel, ThreadRuntimeState, executor, stamp_ns_visible_guest_tid};
 use super::{RuntimeError, SyscallDispatcher};
 use carrick_kernel::kernel::identity_page::stamp_identity_values;
@@ -59,7 +57,7 @@ pub(crate) struct HvpatchCloneThreadRequest {
 // successful guest thread clone solely to shrink the uncommon parked variant.
 #[allow(clippy::large_enum_variant)]
 pub(super) enum PersistentHvpatchCloneAttempt {
-    Complete(threads::CloneThreadSpawn),
+    Complete(crate::vcpu_loop::threads::CloneThreadSpawn),
     Wait {
         prepared: Option<carrick_kernel::kernel::PreparedThreadClone>,
         subscription: CloneRetrySubscription,
@@ -80,7 +78,7 @@ pub(super) enum CloneRetrySubscription {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(super) trait HvpatchCloneBackendOps<M: threads::CloneTidMemory> {
+pub(super) trait HvpatchCloneBackendOps<M: crate::vcpu_loop::threads::CloneTidMemory> {
     type Prepared;
     type Backend;
 
@@ -115,7 +113,10 @@ pub(super) trait HvpatchCloneBackendOps<M: threads::CloneTidMemory> {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-pub(super) fn bind_activate_child<M: threads::CloneTidMemory, O: HvpatchCloneBackendOps<M>>(
+pub(super) fn bind_activate_child<
+    M: crate::vcpu_loop::threads::CloneTidMemory,
+    O: HvpatchCloneBackendOps<M>,
+>(
     ops: &mut O,
     backend: &mut O::Backend,
     token: carrick_hal::HvpatchChildKernelToken,
@@ -588,7 +589,7 @@ where
 pub(crate) struct ProductionHvpatchCloneBackendOps;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-impl<M: threads::CloneTidMemory + 'static> HvpatchCloneBackendOps<M>
+impl<M: crate::vcpu_loop::threads::CloneTidMemory + 'static> HvpatchCloneBackendOps<M>
     for ProductionHvpatchCloneBackendOps
 {
     type Prepared = carrick_vmm_hvf::hvf_aarch64_engine::HvpatchPreparedTaskOnlyEngineState;
@@ -1202,7 +1203,7 @@ pub(crate) mod tests {
     fn production_clone_failpoints_are_exact_and_consumed_once() {
         #[derive(Default)]
         pub(crate) struct Memory(pub(crate) std::collections::BTreeMap<u64, Vec<u8>>);
-        impl threads::CloneTidMemory for Memory {
+        impl crate::vcpu_loop::threads::CloneTidMemory for Memory {
             fn read_clone_tid_bytes(
                 &self,
                 address: u64,
@@ -1580,7 +1581,7 @@ pub(crate) mod tests {
     impl CurrentMmMemory for Memory {}
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    impl threads::CloneTidMemory for Memory {
+    impl crate::vcpu_loop::threads::CloneTidMemory for Memory {
         fn read_clone_tid_bytes(
             &self,
             address: u64,

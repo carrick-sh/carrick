@@ -508,7 +508,7 @@ impl RuntimeIo {
     /// Whether fd 1/2 are the carrier's real host fds (the only mode in which
     /// a guest `F_SETFL` on stdio must reach the host descriptor).
     pub(in crate::dispatch) fn inherits_host_stdio(&self) -> bool {
-        matches!(*self.route.lock(), StdioRoute::Inherit)
+        ::std::matches!(*self.route.lock(), StdioRoute::Inherit)
     }
 
     pub(in crate::dispatch) fn fork_clone(&self) -> Self {
@@ -663,7 +663,7 @@ impl FsState {
                 // dir resolves to `/var/folders/...` (macOS), `/tmp` (Linux),
                 // honoring `$TMPDIR`, so this is portable across HVF and KVM.
                 let shm_host =
-                    std::env::temp_dir().join(format!("carrick-shm-{}", std::process::id()));
+                    ::std::env::temp_dir().join(format!("carrick-shm-{}", std::process::id()));
                 let _ = std::fs::create_dir_all(&shm_host);
                 // POSIX `/dev/shm` is a `rwxrwxrwt` (sticky, world-writable)
                 // tmpfs — `shm_open(3)`/`sem_open(3)` create world-accessible

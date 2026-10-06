@@ -6,33 +6,33 @@ pub use carrick_mem::memory::Aarch64SyscallMailbox;
 
 const _: () = assert!(core::mem::size_of::<Aarch64SyscallMailbox>() == 256);
 const _: () = assert!(core::mem::align_of::<Aarch64SyscallMailbox>() == 64);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, magic) == 0);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, version) == 8);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, size) == 12);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, generation) == 16);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, sequence) == 24);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, state) == 32);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, trap_kind) == 36);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, response_action) == 40);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, flags) == 44);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, native_nr) == 48);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, args) == 56);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, portal_quantum_epoch) == 104);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, resume_pc) == 112);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, spsr) == 120);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, fp) == 128);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, lr) == 136);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, sp) == 144);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, esr) == 152);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, return_value) == 160);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, resume_x16) == 168);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, resume_x17) == 176);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x16) == 216);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x17) == 224);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, magic) == 0);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, version) == 8);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, size) == 12);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, generation) == 16);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, sequence) == 24);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, state) == 32);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, trap_kind) == 36);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, response_action) == 40);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, flags) == 44);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, native_nr) == 48);
+const _: () = ::std::assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, args) == 56);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, portal_quantum_epoch) == 104);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, resume_pc) == 112);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, spsr) == 120);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, fp) == 128);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, lr) == 136);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, sp) == 144);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, esr) == 152);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, return_value) == 160);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, resume_x16) == 168);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, resume_x17) == 176);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x16) == 216);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x17) == 224);
 const _: () =
-    assert!(core::mem::offset_of!(Aarch64SyscallMailbox, portal_executor_generation) == 232);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, portal_task_serial) == 240);
-const _: () = assert!(core::mem::offset_of!(Aarch64SyscallMailbox, portal_mm_generation) == 248);
+    assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, portal_executor_generation) == 232);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, portal_task_serial) == 240);
+const _: () = assert!(::core::mem::offset_of!(Aarch64SyscallMailbox, portal_mm_generation) == 248);
 // The guest vector lives in `carrick-mem` (below this protocol crate in the
 // dependency graph), so it owns the instruction-immediate constants. Tie every
 // offset it emits back to this wire struct at compile time to prevent drift.
@@ -41,83 +41,83 @@ const _: () =
 const _: () =
     assert!(AARCH64_SYSCALL_MAILBOX_SLOTS == carrick_mem::memory::LINUX_SYSCALL_MAILBOX_SLOTS);
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, sequence)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, sequence)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_SEQUENCE as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, state)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, state)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_STATE as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, trap_kind)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, trap_kind)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_TRAP_KIND as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, response_action)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, response_action)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_RESPONSE_ACTION as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, flags)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, flags)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_FLAGS as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, native_nr)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, native_nr)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_NATIVE_NR as usize
 );
-const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, args)
+const _: () = ::std::assert!(
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, args)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_ARGS as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, portal_quantum_epoch)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, portal_quantum_epoch)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_PORTAL_QUANTUM_EPOCH as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, resume_pc)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, resume_pc)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_RESUME_PC as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, spsr)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, spsr)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_SPSR as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, fp)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, fp)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_FP as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, lr)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, lr)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_LR as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, sp)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, sp)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_SP as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, esr)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, esr)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_ESR as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, return_value)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, return_value)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_RETURN_VALUE as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, resume_x16)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, resume_x16)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X16 as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, resume_x17)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, resume_x17)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_RESUME_X17 as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, portal_executor_generation)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, portal_executor_generation)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_PORTAL_EXECUTOR_GENERATION as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, portal_task_serial)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, portal_task_serial)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_PORTAL_TASK_SERIAL as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, portal_mm_generation)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, portal_mm_generation)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_PORTAL_MM_GENERATION as usize
 );
 
@@ -352,19 +352,19 @@ pub const fn portal_scalar_eligible(native_nr: u64) -> bool {
 }
 
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, clock_x9)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, clock_x9)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X9 as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, clock_x10)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, clock_x10)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X10 as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, clock_x11)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, clock_x11)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X11 as usize
 );
 const _: () = assert!(
-    core::mem::offset_of!(Aarch64SyscallMailbox, clock_x12)
+    ::core::mem::offset_of!(Aarch64SyscallMailbox, clock_x12)
         == carrick_mem::memory::AARCH64_SYSCALL_MAILBOX_OFF_CLOCK_X12 as usize
 );
 const _: () = assert!(
@@ -385,60 +385,72 @@ mod tests {
     fn mailbox_layout_is_fixed() {
         assert_eq!(core::mem::size_of::<Aarch64SyscallMailbox>(), 256);
         assert_eq!(core::mem::align_of::<Aarch64SyscallMailbox>(), 64);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, magic), 0);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, version), 8);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, size), 12);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, generation), 16);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, sequence), 24);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, state), 32);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, trap_kind), 36);
+        assert_eq!(::core::mem::offset_of!(Aarch64SyscallMailbox, magic), 0);
+        assert_eq!(::core::mem::offset_of!(Aarch64SyscallMailbox, version), 8);
+        assert_eq!(::core::mem::offset_of!(Aarch64SyscallMailbox, size), 12);
         assert_eq!(
-            core::mem::offset_of!(Aarch64SyscallMailbox, response_action),
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, generation),
+            16
+        );
+        assert_eq!(::core::mem::offset_of!(Aarch64SyscallMailbox, sequence), 24);
+        assert_eq!(::core::mem::offset_of!(Aarch64SyscallMailbox, state), 32);
+        assert_eq!(
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, trap_kind),
+            36
+        );
+        assert_eq!(
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, response_action),
             40
         );
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, flags), 44);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, native_nr), 48);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, args), 56);
+        assert_eq!(::core::mem::offset_of!(Aarch64SyscallMailbox, flags), 44);
         assert_eq!(
-            core::mem::offset_of!(Aarch64SyscallMailbox, portal_quantum_epoch),
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, native_nr),
+            48
+        );
+        assert_eq!(::core::mem::offset_of!(Aarch64SyscallMailbox, args), 56);
+        assert_eq!(
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, portal_quantum_epoch),
             104
         );
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, resume_pc), 112);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, spsr), 120);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, fp), 128);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, lr), 136);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, sp), 144);
-        assert_eq!(core::mem::offset_of!(Aarch64SyscallMailbox, esr), 152);
         assert_eq!(
-            core::mem::offset_of!(Aarch64SyscallMailbox, return_value),
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, resume_pc),
+            112
+        );
+        assert_eq!(::core::mem::offset_of!(Aarch64SyscallMailbox, spsr), 120);
+        assert_eq!(::core::mem::offset_of!(Aarch64SyscallMailbox, fp), 128);
+        assert_eq!(::core::mem::offset_of!(Aarch64SyscallMailbox, lr), 136);
+        assert_eq!(::core::mem::offset_of!(Aarch64SyscallMailbox, sp), 144);
+        assert_eq!(::core::mem::offset_of!(Aarch64SyscallMailbox, esr), 152);
+        assert_eq!(
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, return_value),
             160
         );
         assert_eq!(
-            core::mem::offset_of!(Aarch64SyscallMailbox, resume_x16),
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, resume_x16),
             168
         );
         assert_eq!(
-            core::mem::offset_of!(Aarch64SyscallMailbox, resume_x17),
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, resume_x17),
             176
         );
         assert_eq!(
-            core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x16),
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x16),
             216
         );
         assert_eq!(
-            core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x17),
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, clock_tmp_x17),
             224
         );
         assert_eq!(
-            core::mem::offset_of!(Aarch64SyscallMailbox, portal_executor_generation),
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, portal_executor_generation),
             232
         );
         assert_eq!(
-            core::mem::offset_of!(Aarch64SyscallMailbox, portal_task_serial),
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, portal_task_serial),
             240
         );
         assert_eq!(
-            core::mem::offset_of!(Aarch64SyscallMailbox, portal_mm_generation),
+            ::core::mem::offset_of!(Aarch64SyscallMailbox, portal_mm_generation),
             248
         );
     }

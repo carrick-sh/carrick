@@ -659,7 +659,7 @@ impl MemState {
 pub(super) fn fork_debug_va() -> Option<u64> {
     static DEBUG_VA: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *DEBUG_VA.get_or_init(|| {
-        std::env::var("CARRICK_FORK_DEBUG_VA")
+        ::std::env::var("CARRICK_FORK_DEBUG_VA")
             .ok()
             .and_then(|raw| u64::from_str_radix(raw.trim_start_matches("0x"), 16).ok())
     })
@@ -669,7 +669,7 @@ pub(super) fn fork_debug_va() -> Option<u64> {
 /// [`fork_debug_va`] for why not per call).
 fn mmap_grant_debug() -> bool {
     static GRANT_DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *GRANT_DEBUG.get_or_init(|| std::env::var_os("CARRICK_MMAP_GRANT_DEBUG").is_some())
+    *GRANT_DEBUG.get_or_init(|| ::std::env::var_os("CARRICK_MMAP_GRANT_DEBUG").is_some())
 }
 
 /// Debug: log any `mmap_next` LOWERING that crosses `CARRICK_FORK_DEBUG_VA`.

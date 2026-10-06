@@ -456,7 +456,7 @@ fn validate_capture(
         );
     }
     if end.live != 0 {
-        bail!("HVPatch K1 final live set is {}, expected zero", end.live);
+        ::anyhow::bail!("HVPatch K1 final live set is {}, expected zero", end.live);
     }
 
     let roots = births

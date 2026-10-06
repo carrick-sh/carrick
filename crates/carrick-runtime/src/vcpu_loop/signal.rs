@@ -523,7 +523,7 @@ pub(super) fn cancel_frame_grant_request(
 fn el1_frame_grants_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CARRICK_EL1_FRAME_GRANT").map_or(true, |value| value.trim() != "0")
+        ::std::env::var("CARRICK_EL1_FRAME_GRANT").map_or(true, |value| value.trim() != "0")
     })
 }
 
@@ -556,7 +556,11 @@ impl DescriptorLaneHatch {
     pub(super) fn current() -> Self {
         static HATCH: std::sync::OnceLock<DescriptorLaneHatch> = std::sync::OnceLock::new();
         *HATCH.get_or_init(|| {
-            Self::from_env_value(std::env::var("CARRICK_EL1_DESCRIPTOR_LANE").ok().as_deref())
+            Self::from_env_value(
+                ::std::env::var("CARRICK_EL1_DESCRIPTOR_LANE")
+                    .ok()
+                    .as_deref(),
+            )
         })
     }
 }
@@ -1719,7 +1723,8 @@ pub(super) fn reconcile_guest_frame_commits<E: ThreadedEngine>(
 fn abort_on_guest_fault_signal_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var("CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL").is_ok_and(|value| value.trim() == "1")
+        ::std::env::var("CARRICK_ABORT_ON_GUEST_FAULT_SIGNAL")
+            .is_ok_and(|value| value.trim() == "1")
     })
 }
 

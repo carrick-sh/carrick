@@ -208,7 +208,7 @@ pub(crate) struct SymbolTable {
 impl SymbolTable {
     pub(crate) fn from_binary(path: &Path) -> Result<Self> {
         let buffer =
-            fs::read(path).with_context(|| format!("read binary at {}", path.display()))?;
+            ::std::fs::read(path).with_context(|| format!("read binary at {}", path.display()))?;
         Self::parse(&buffer)
     }
 

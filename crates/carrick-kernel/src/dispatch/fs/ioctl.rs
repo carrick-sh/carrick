@@ -611,7 +611,7 @@ impl<'a> FsView<'a> {
     fn ficlone_errno(&self, src_fd: i32, dst_fd: i32) -> LinuxErrno {
         let src = self.ficlone_fs(src_fd);
         let dst = self.ficlone_fs(dst_fd);
-        if std::env::var_os("CARRICK_FICLONE_DEBUG").is_some() {
+        if ::std::env::var_os("CARRICK_FICLONE_DEBUG").is_some() {
             let name = |fd: i32| {
                 self.open_file(fd)
                     .and_then(|of| {
@@ -1400,7 +1400,7 @@ impl<'a> FsView<'a> {
                         Ok(src_fd) => src_fd,
                         Err(_) => return Ok(DispatchOutcome::errno(LINUX_EBADF)),
                     };
-                    if std::env::var_os("CARRICK_FICLONE_DEBUG").is_some() {
+                    if ::std::env::var_os("CARRICK_FICLONE_DEBUG").is_some() {
                         eprintln!(
                             "FICLONEDBG enter dst_fd={} src_fd={} dst_valid={} src_valid={} src_opath={} dst_opath={}",
                             fd.0,

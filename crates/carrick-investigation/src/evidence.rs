@@ -15,7 +15,7 @@ fn invalid(message: impl ToString) -> InvestigationError {
 }
 
 pub fn hash_file(path: &Path) -> Result<String, InvestigationError> {
-    Ok(format!("{:x}", Sha256::digest(std::fs::read(path)?)))
+    Ok(::std::format!("{:x}", Sha256::digest(std::fs::read(path)?)))
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, InvestigationError> {

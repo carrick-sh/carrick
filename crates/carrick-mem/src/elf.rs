@@ -1,6 +1,5 @@
 //! ELF inspection and load-planning helpers for Linux AArch64 executables.
 
-use std::fs;
 use std::path::Path;
 
 use goblin::elf::Elf;
@@ -355,7 +354,7 @@ pub enum ElfInspectError {
 }
 
 pub fn inspect_elf(path: impl AsRef<Path>) -> Result<ElfMetadata, ElfInspectError> {
-    let bytes = fs::read(path)?;
+    let bytes = ::std::fs::read(path)?;
     inspect_elf_bytes(&bytes)
 }
 
@@ -376,7 +375,7 @@ pub fn plan_elf_load_for(
     path: impl AsRef<Path>,
     machine: u16,
 ) -> Result<LoadPlan, ElfInspectError> {
-    let bytes = fs::read(path)?;
+    let bytes = ::std::fs::read(path)?;
     plan_elf_load_bytes_for(&bytes, machine)
 }
 

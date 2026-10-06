@@ -1017,7 +1017,7 @@ impl Kernel {
             if let Some(thread) = task.thread(tid) {
                 state
                     .retired_threads
-                    .push(super::core::RetiredThreadRecord {
+                    .push(crate::kernel::core::RetiredThreadRecord {
                         _key: thread.key(),
                         _task: thread.task_key(),
                         thread: Arc::downgrade(&thread),

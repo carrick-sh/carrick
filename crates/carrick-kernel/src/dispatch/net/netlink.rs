@@ -41,7 +41,7 @@ impl<'a> NetView<'a> {
     /// True iff `fd` refers to a synthetic AF_NETLINK socket.
     pub(in crate::dispatch) fn fd_is_netlink(&self, fd: i32) -> bool {
         self.open_file(fd).is_some_and(|of| {
-            matches!(
+            ::std::matches!(
                 of.description.inspect().as_deref(),
                 Some(OpenDescription::Netlink { .. })
             )

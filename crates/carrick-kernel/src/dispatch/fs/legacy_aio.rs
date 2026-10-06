@@ -282,7 +282,10 @@ pub(super) fn io_submit<M: CurrentMmMemory>(
             Ok(value) => value,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
-        let iocb = match LegacyAioIocb::read(&*cx.memory, GuestPtr(iocb_addr)) {
+        let iocb = match crate::dispatch::fs::legacy_aio::LegacyAioIocb::read(
+            &*cx.memory,
+            GuestPtr(iocb_addr),
+        ) {
             Ok(value) => value,
             Err(errno) => return Ok(DispatchOutcome::errno(errno)),
         };
@@ -314,7 +317,7 @@ pub(super) fn io_cancel<M: CurrentMmMemory>(
     iocb: GuestPtr,
     result: GuestPtr,
 ) -> Result<DispatchOutcome, DispatchError> {
-    if LegacyAioIocb::read(&*cx.memory, iocb).is_err()
+    if crate::dispatch::fs::legacy_aio::LegacyAioIocb::read(&*cx.memory, iocb).is_err()
         || result.0 == 0
         || cx.memory.read_bytes(result.0, 32).is_err()
     {

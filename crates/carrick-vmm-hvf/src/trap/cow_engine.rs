@@ -962,7 +962,7 @@ impl HvfVmState {
     pub(crate) fn fault_window_bytes() -> u64 {
         static WINDOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         *WINDOW.get_or_init(|| {
-            std::env::var("CARRICK_FAULT_WINDOW_BYTES")
+            ::std::env::var("CARRICK_FAULT_WINDOW_BYTES")
                 .ok()
                 .and_then(|val| val.parse::<u64>().ok())
                 .filter(|&w| w >= 4096 && w.is_power_of_two())
@@ -2739,8 +2739,8 @@ impl HvfTaskState {
 fn fork_shadow_prune_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
-        !matches!(
-            std::env::var("CARRICK_FORK_SHADOW_PRUNE").as_deref(),
+        !::std::matches!(
+            ::std::env::var("CARRICK_FORK_SHADOW_PRUNE").as_deref(),
             Ok("0")
         )
     })
@@ -3410,7 +3410,7 @@ impl HvfTaskState {
                             mapping.sharing,
                         )
                     });
-                    return Err(TrapError::Hypervisor(format!(
+                    return Err(TrapError::Hypervisor(::std::format!(
                         "HVPatch private writable permission fault at VA 0x{fault_va:x} has no COW arm; mapping={mapping_shape:?} write_denied={write_denied} armed={:?}",
                         // Only the fatal path pays to materialize the list.
                         self.cow_armed.lock().ranges
@@ -4618,7 +4618,8 @@ pub(crate) fn zero_anonymous_remap_enabled() -> bool {
     {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
-            std::env::var_os("CARRICK_DSR_ZERO_REMAP").as_deref() != Some(std::ffi::OsStr::new("0"))
+            ::std::env::var_os("CARRICK_DSR_ZERO_REMAP").as_deref()
+                != Some(std::ffi::OsStr::new("0"))
         })
     }
     #[cfg(test)]
@@ -4805,7 +4806,7 @@ impl HvfVmState {
         {
             return self.ensure_frame_cow_write_routed(va, len, intent, flush_stage1);
         }
-        let before = MmMaintenanceVisits::read();
+        let before = crate::trap::cow_engine::MmMaintenanceVisits::read();
         let outcome = self.ensure_frame_cow_write_routed(va, len, intent, flush_stage1);
         self.emit_mm_maintenance_census(
             carrick_observability::probes::HvpatchMmMaintenanceSite::BackingMaintenanceRoute,
@@ -4826,7 +4827,7 @@ impl HvfVmState {
         len: usize,
         before: MmMaintenanceVisits,
     ) {
-        let after = MmMaintenanceVisits::read();
+        let after = crate::trap::cow_engine::MmMaintenanceVisits::read();
         let start = align_down(strip_pointer_tag(va), 0x1000);
         let end = strip_pointer_tag(va)
             .saturating_add(len as u64)
@@ -4969,7 +4970,7 @@ impl HvfVmState {
                             .collect()
                     })
                     .unwrap_or_default();
-                eprintln!(
+                ::std::eprintln!(
                     "[ROUTEDBG pid={:?} mm={:?} slot={:x?}] va={current:#x} intent={intent:?} \
                      armed={armed} armed_len={} \
                      no_source={retained_output_has_no_physical_source} \

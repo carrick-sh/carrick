@@ -1386,7 +1386,7 @@ pub(super) fn linux_to_host_sockopt(level: i32, optname: i32) -> Option<(i32, i3
 fn unix_socket_host_dir() -> std::path::PathBuf {
     // One directory per host boot/run, shared by all forked guest
     // processes. TMPDIR keeps the absolute path short enough for sun_path.
-    let base = std::env::temp_dir();
+    let base = ::std::env::temp_dir();
     base.join("carrick-unix-sockets")
 }
 
@@ -2420,7 +2420,7 @@ pub(in crate::dispatch) fn build_host_scm_rights(host_fds: &[i32]) -> Vec<u8> {
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         let data = libc::CMSG_DATA(cmsg) as *mut i32;
         for (i, &fd) in host_fds.iter().enumerate() {
-            std::ptr::write(data.add(i), fd);
+            ::std::ptr::write(data.add(i), fd);
         }
     }
     buf
@@ -2451,7 +2451,7 @@ pub(in crate::dispatch) fn parse_host_scm_rights_fds(
                 let count = data_len / std::mem::size_of::<i32>();
                 let data = libc::CMSG_DATA(cmsg) as *const i32;
                 for i in 0..count {
-                    fds.push(std::ptr::read(data.add(i)));
+                    fds.push(::std::ptr::read(data.add(i)));
                 }
             }
             cmsg = libc::CMSG_NXTHDR(&hmsg, cmsg);

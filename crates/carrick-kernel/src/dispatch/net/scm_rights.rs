@@ -118,7 +118,7 @@ fn park(description: Arc<FileDescription>) -> Option<(PlaceholderKey, OwnedFd)> 
     let (reader, writer) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     let key = PlaceholderKey::of_host_fd(reader.as_raw_fd())?;
     description.retain_fd_ref();
-    let mut vault = lock();
+    let mut vault = crate::dispatch::net::scm_rights::lock();
     collect(&mut vault);
     if let Some(displaced) = vault.insert(
         key,
@@ -142,7 +142,7 @@ fn park(description: Arc<FileDescription>) -> Option<(PlaceholderKey, OwnedFd)> 
 /// caller must either install it (which takes its own reference) and then
 /// `release_fd_ref`, or release it outright.
 pub(super) fn claim(key: PlaceholderKey) -> Option<Arc<FileDescription>> {
-    let mut vault = lock();
+    let mut vault = crate::dispatch::net::scm_rights::lock();
     let parked = vault.remove(&key);
     collect(&mut vault);
     parked.map(|p| p.description)
@@ -151,7 +151,7 @@ pub(super) fn claim(key: PlaceholderKey) -> Option<Arc<FileDescription>> {
 /// Release every parked description whose placeholder can no longer be
 /// received (all read-end references are gone).
 pub(super) fn gc() {
-    let mut vault = lock();
+    let mut vault = crate::dispatch::net::scm_rights::lock();
     collect(&mut vault);
 }
 

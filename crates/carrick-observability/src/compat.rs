@@ -39,7 +39,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
-use serde::{Deserialize as _, Serialize as _};
 
 /// Optional per-event probe hook, fired for every recorded [`CompatEvent`] before
 /// aggregation. A DTrace-capable backend (macOS/FreeBSD) installs its
