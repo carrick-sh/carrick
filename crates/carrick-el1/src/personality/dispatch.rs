@@ -174,6 +174,7 @@ where
         return Action::Forward;
     };
     let mut sched = sched::Sched {
+        handoff: None,
         zone: zone.tables,
         slot,
         task,
@@ -294,6 +295,7 @@ where
 {
     let ordinal = frame.x[8];
     let mut pending = El1PendingFamilies {
+        handoff: None,
         frame,
         counters,
         current_tasks,
@@ -337,6 +339,7 @@ fn invalid_completion() -> ! {
 
 pub struct El1PendingFamilies<'a, F, C: sched::ThreadCpu, U: sched::UserWord> {
     frame: &'a mut TrapFrame,
+    handoff: Option<carrick_el1_abi::EntryHandoffReceipt>,
     counters: &'a Counters,
     current_tasks: &'a [CurrentTask],
     fd_map: &'a [FdMapSlot],
@@ -352,6 +355,9 @@ pub struct El1PendingFamilies<'a, F, C: sched::ThreadCpu, U: sched::UserWord> {
 impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> PendingFamilies<'a>
     for El1PendingFamilies<'a, F, C, U>
 {
+    fn take_handoff_receipt(&mut self) -> Option<carrick_el1_abi::EntryHandoffReceipt> {
+        self.handoff.take()
+    }
     fn binding(&self) -> Option<carrick_el1_abi::ExecutionBinding> {
         self.task().map(super::common_entry::execution_binding)
     }
@@ -398,7 +404,13 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> Pending
         let cur_task = current_tasks.get(slot);
         if let (Some(venue), Some(task)) = (lifecycle, cur_task) {
             let sched = match (zone.as_mut(), SlotId::from_index(slot)) {
-                (Some(zone), Some(zslot)) => Some(native_scheduler(zone, task, counters, zslot)),
+                (Some(zone), Some(zslot)) => Some(native_scheduler(
+                    zone,
+                    task,
+                    counters,
+                    zslot,
+                    &mut self.handoff,
+                )),
                 _ => None,
             };
             let mut user = file::ValidatedCopy {
@@ -424,7 +436,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> Pending
             (zone.as_mut(), cur_task, SlotId::from_index(slot))
         {
             let orig_x0 = frame.x[0];
-            let mut sched = native_scheduler(zone, task, counters, zslot);
+            let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
             let disposition = sched
                 .serve_futex(frame)
                 .map_or(ipc::IpcServed::Forward, ipc::IpcServed::from);
@@ -455,7 +467,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> Pending
         if let (Some(zone), Some(task), Some(zslot)) =
             (zone.as_mut(), cur_task, SlotId::from_index(slot))
         {
-            let sched = native_scheduler(zone, task, counters, zslot);
+            let sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
             if let Ok(Some(operation)) = sched.take_object_operation()
                 && operation.metadata_generation().is_none()
             {
@@ -473,7 +485,7 @@ impl<'a, F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord> Pending
             {
                 let mailbox = carrick_el1_abi::metadata_mailbox_guest();
                 let generation = mailbox.request_generation();
-                let mut sched = native_scheduler(zone, task, counters, zslot);
+                let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
                 if let (Some(key), Some(operation), Some(resume)) = (
                     carrick_sched_core::object_wait::ObjectWaitKey::metadata_request(generation),
                     carrick_sched_core::object_wait::OperationToken::metadata_request(generation),
@@ -586,7 +598,7 @@ impl<F: Fn(u32) -> *mut u8, C: sched::ThreadCpu, U: sched::UserWord>
         let slot = SlotId::from_index(self.frame.slot as usize)?;
         let task = self.current_tasks.get(self.frame.slot as usize)?;
         let zone = self.zone.as_mut()?;
-        let mut sched = native_scheduler(zone, task, self.counters, slot);
+        let mut sched = native_scheduler(zone, task, self.counters, slot, &mut self.handoff);
         let served = super::mm_portal::park_prepared_edit(
             &mut sched,
             self.frame,
@@ -651,8 +663,10 @@ fn native_scheduler<'s, C: sched::ThreadCpu, U: sched::UserWord>(
     task: &'s CurrentTask,
     counters: &'s Counters,
     slot: SlotId,
+    handoff: &'s mut Option<carrick_el1_abi::EntryHandoffReceipt>,
 ) -> sched::Sched<'s, C, U> {
     sched::Sched {
+        handoff: Some(handoff),
         zone: zone.tables,
         slot,
         task,
@@ -675,7 +689,7 @@ impl<F, C: sched::ThreadCpu, U: sched::UserWord> El1PendingFamilies<'_, F, C, U>
             (ipc, zone.as_mut(), cur_task, SlotId::from_index(slot))
         {
             let orig_x0 = frame.x[0];
-            let mut sched = native_scheduler(zone, task, counters, zslot);
+            let mut sched = native_scheduler(zone, task, counters, zslot, &mut self.handoff);
             let mut user = file::ValidatedCopy {
                 task,
                 validator: &file::HardwareValidator,
@@ -997,6 +1011,182 @@ pub unsafe fn serve_locked_file_op(
 mod tests {
     use super::*;
     use core::sync::atomic::Ordering;
+
+    #[test]
+    fn stale_futex_handoffs_refuse_the_initiating_entry() {
+        use carrick_el1_abi::{Claim, ThreadIdentity};
+        use carrick_personality_linux::dispatch::CompletionRoute;
+        use carrick_sched_core::{BoundedSpin, ExecutionSlot};
+        struct StaleUser<'a> {
+            zone: &'a ZoneTables,
+            record: carrick_sched_core::RecordId,
+            identity: ThreadIdentity,
+            mutation: u8,
+        }
+        impl sched::UserWord for StaleUser<'_> {
+            fn read_u32(&self, task: &CurrentTask, _: u64) -> Option<u32> {
+                let slot = SlotId::new(0);
+                match self.mutation {
+                    0 => task.execution.generation.store(12, Ordering::Release),
+                    1 => {
+                        let mm = self.identity.mm;
+                        let address = (0x2000..0x2400)
+                            .step_by(4)
+                            .find(|address| {
+                                ZoneTables::bucket_of(mm, *address)
+                                    != ZoneTables::bucket_of(mm, 0x1000)
+                            })
+                            .unwrap();
+                        let guard = self
+                            .zone
+                            .lock(ZoneTables::bucket_of(mm, address), &BoundedSpin(1024))
+                            .unwrap();
+                        let sequence = self.zone.next_seq(self.record);
+                        self.zone
+                            .enqueue(&guard, self.record, sequence, mm, address, u32::MAX, 0)
+                            .unwrap();
+                        assert!(
+                            self.zone
+                                .publish_guest_park(&guard, slot, self.record, sequence)
+                        );
+                        self.zone.clear_current(slot);
+                        let mut effects = carrick_sched_core::WakeEffects::default();
+                        assert_eq!(
+                            self.zone
+                                .wake_placed(
+                                    &guard,
+                                    mm,
+                                    address,
+                                    u32::MAX,
+                                    1,
+                                    carrick_sched_core::Waker::El1 { slot },
+                                    &mut [],
+                                    &mut effects
+                                )
+                                .unwrap(),
+                            1
+                        );
+                        drop(guard);
+                        assert!(self.zone.switch_in(slot).is_some());
+                    }
+                    _ => {
+                        self.zone.clear_current(slot);
+                        self.zone.free_record(self.record);
+                        let replacement = self.zone.alloc_record(self.identity).unwrap();
+                        self.zone.requeue_preempted(slot, replacement);
+                        assert!(self.zone.switch_in(slot).is_some());
+                    }
+                }
+                // Bound native idle; no fake family outcome or continuation.
+                task.linux.mark_pending_host_work();
+                Some(0)
+            }
+            fn read_u64(&self, _: &CurrentTask, _: u64) -> Option<u64> {
+                None
+            }
+        }
+        for scale in [1, 2, 8] {
+            for mutation in 0..3 {
+                for switched in [false, true] {
+                    for _ in 0..scale {
+                        let layout = std::alloc::Layout::new::<ZoneTables>();
+                        // SAFETY: ZoneTables permits zero initialization, using
+                        // its exact alignment/size; Box owns the allocation.
+                        let zone = unsafe {
+                            let ptr = std::alloc::alloc_zeroed(layout).cast::<ZoneTables>();
+                            assert!(!ptr.is_null());
+                            std::boxed::Box::from_raw(ptr)
+                        };
+                        let slot = SlotId::new(0);
+                        zone.drive(slot, 3);
+                        zone.publish_slot(slot, 7, None, 0);
+                        let here = ExecutionSlot::zone(slot);
+                        zone.occupancy.vacate_any(here);
+                        assert!(zone.occupancy.replace(here, 0, 7));
+                        zone.enter_guest(slot);
+                        let space = zone.spaces.publish_closed(7, 0x7000, 0x7000).unwrap();
+                        zone.spaces.open(space);
+                        assert!(zone.install_space(slot, 7).is_some());
+                        let identity = ThreadIdentity {
+                            tid: 41,
+                            serial: 1041,
+                            mm: 7,
+                            file_table: 5,
+                            generation: if mutation == 0 { 11 } else { 0 },
+                            affinity: 0,
+                            lifecycle_page: 0x1000,
+                            control_slot: 0x2000,
+                        };
+                        let record = zone.alloc_record(identity).unwrap();
+                        zone.requeue_preempted(slot, record);
+                        assert_eq!(zone.switch_in(slot), Some(record));
+                        assert!(matches!(zone.record(record).claim(), Claim::OnCpu { .. }));
+                        if switched {
+                            let successor = zone
+                                .alloc_record(ThreadIdentity {
+                                    tid: 42,
+                                    serial: 1042,
+                                    generation: 12,
+                                    ..identity
+                                })
+                                .unwrap();
+                            zone.requeue_preempted(slot, successor);
+                        }
+                        let tasks = [CurrentTask::new()];
+                        tasks[0].set(
+                            carrick_el1_abi::El1TaskId::from_linux_tid(41),
+                            identity.generation,
+                            5,
+                        );
+                        tasks[0].mm.key.store(7, Ordering::Release);
+                        tasks[0].mm.thread_generation.store(1041, Ordering::Release);
+                        let counters = Counters::default();
+                        let mut cpu = sched::FakeCpu::default();
+                        let user = StaleUser {
+                            zone: &zone,
+                            record,
+                            identity,
+                            mutation,
+                        };
+                        let mut frame = TrapFrame::default();
+                        frame.x[..6].copy_from_slice(&[0x1000, 128, 0, 0, 0, 0]);
+                        frame.x[8] = 98;
+                        frame.elr = 0x4000;
+                        let mut pending = El1PendingFamilies {
+                            handoff: None,
+                            frame: &mut frame,
+                            counters: &counters,
+                            current_tasks: &tasks,
+                            fd_map: &[],
+                            object_table: &[],
+                            open_table: &[],
+                            inotify_table: &[],
+                            name_cache: &InotifyNameCache::new(),
+                            zone: Some(Zone {
+                                tables: &zone,
+                                cpu: &mut cpu,
+                                user: &user,
+                            }),
+                            ipc: None,
+                            lifecycle: None,
+                            cache_lookup: |_| core::ptr::null_mut(),
+                        };
+                        assert_eq!(
+                            carrick_personality_linux::dispatch::dispatch(
+                                98,
+                                u64::MAX,
+                                &mut pending
+                            ),
+                            CompletionRoute::InvalidCompletion,
+                            "mutation={mutation} switched={switched}"
+                        );
+                        assert_eq!(counters.served[98].load(Ordering::Relaxed), 0);
+                        assert_eq!(tasks[0].linux.served_with_work.load(Ordering::Acquire), 0);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn allocator_control_requires_test_feature() {

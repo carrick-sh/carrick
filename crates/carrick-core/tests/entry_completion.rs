@@ -60,17 +60,21 @@ fn suspended_turn_completes_only_through_exact_wait_owner() {
                 mm: EntryMmKey::from_raw(mm),
                 thread_generation: EntryThreadGeneration::from_raw(identity.serial),
             };
-            let entry = admit(binding).unwrap();
-            let record = zone.alloc_record(identity).unwrap();
+            let entry = admit(
+                binding,
+                Some(carrick_core_abi::BornInZoneSource { zone: &zone, slot }),
+            )
+            .unwrap();
+            let record = zone.current_or_new(slot, identity).unwrap();
             let operation = OperationToken::new(17, generation).unwrap();
             let request = ObjectParkRequest::new(key, snapshot, operation, None);
-            let parked =
+            let mut parked =
                 park_object_record(&zone, slot, request, 1024, &|_| {}, || Ok((record, false)))
                     .unwrap();
             assert!(parked.matches(&zone, slot));
             // The entry turn ends here. Its token cannot later take the
             // ordinary path; the record owns the sole remaining operation.
-            handoff(entry);
+            handoff(entry, parked.take_receipt().unwrap()).unwrap();
             assert!(zone.slot(slot).current().is_none());
             let (wake, _) = notify_object(&zone, slot, key, 1024).unwrap();
             assert_eq!(wake.queued, 1);
@@ -113,7 +117,7 @@ fn switched_record_cannot_use_captured_binding_for_ordinary_completion() {
         },
     ] {
         assert_eq!(
-            complete(admit(original).unwrap(), current),
+            complete(admit(original, None).unwrap(), current, None),
             Err(CompletionError::WrongGeneration)
         );
     }
@@ -153,7 +157,7 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
         mm: EntryMmKey::from_raw(id.mm),
         thread_generation: EntryThreadGeneration::from_raw(id.serial),
     };
-    assert!(admit(binding).is_none());
+    assert!(admit(binding, None).is_none());
     let source = BornInZoneSource { zone: &zone, slot };
     let token = admit_born_in_zone(binding, source).unwrap();
     assert_eq!(complete_born_in_zone(token, binding, source), Ok(()));
@@ -242,7 +246,10 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
         ..binding
     };
     assert!(admit_born_in_zone(adopted, source).is_none());
-    assert_eq!(complete(admit(adopted).unwrap(), adopted), Ok(()));
+    assert_eq!(
+        complete(admit(adopted, None).unwrap(), adopted, None),
+        Ok(())
+    );
     let record = zone
         .alloc_record(ThreadIdentity {
             generation: 11,
@@ -254,4 +261,60 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
     assert_eq!(zone.switch_in(slot), Some(record));
     assert!(admit_born_in_zone(binding, source).is_none());
     assert!(admit_born_in_zone(adopted, source).is_none());
+}
+
+#[test]
+fn ordinary_handoff_rejects_foreign_scheduler_owner() {
+    use carrick_core::entry::{prepare_handoff, publish_handoff_park};
+    use carrick_core_abi::{BornInZoneSource, EntryRecordGeneration};
+    let first = zone();
+    let second = zone();
+    let slot = SlotId::new(0);
+    let identity = ThreadIdentity {
+        tid: 41,
+        serial: 101,
+        mm: 7,
+        generation: 11,
+        file_table: 5,
+        ..ThreadIdentity::default()
+    };
+    for zone in [&first, &second] {
+        zone.drive(slot, 3);
+        zone.publish_slot(slot, 7, None, 0);
+        let here = ExecutionSlot::zone(slot);
+        zone.occupancy.vacate_any(here);
+        assert!(zone.occupancy.replace(here, 0, 7));
+    }
+    let binding = ExecutionBinding {
+        task: EntryTaskKey::from_raw(41),
+        generation: EntryGeneration::from_raw(11),
+        mm: EntryMmKey::from_raw(7),
+        thread_generation: EntryThreadGeneration::from_raw(101),
+    };
+    let token = admit(binding, Some(BornInZoneSource { zone: &first, slot })).unwrap();
+    let record = second.current_or_new(slot, identity).unwrap();
+    let start = prepare_handoff(
+        binding,
+        BornInZoneSource {
+            zone: &second,
+            slot,
+        },
+        record,
+    )
+    .unwrap();
+    let guard = second
+        .lock(
+            ZoneTables::bucket_of(7, 0x1000),
+            &carrick_sched_core::BoundedSpin(1024),
+        )
+        .unwrap();
+    let sequence = second.next_seq(record);
+    second
+        .enqueue(&guard, record, sequence, 7, 0x1000, u32::MAX, 0)
+        .unwrap();
+    let receipt = publish_handoff_park(start, &guard, EntryRecordGeneration(sequence)).unwrap();
+    assert_eq!(
+        handoff(token, receipt),
+        Err(CompletionError::WrongGeneration)
+    );
 }

@@ -73,6 +73,18 @@ where
             return Err((err, request.operation));
         }
     };
+    let identity = zone.record(record).identity();
+    let binding = carrick_core_abi::ExecutionBinding {
+        task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid),
+        generation: carrick_core_abi::EntryGeneration::from_raw(identity.generation),
+        mm: carrick_core_abi::EntryMmKey::from_raw(identity.mm),
+        thread_generation: carrick_core_abi::EntryThreadGeneration::from_raw(identity.serial),
+    };
+    let start = crate::entry::prepare_handoff(
+        binding,
+        carrick_core_abi::BornInZoneSource { zone, slot },
+        record,
+    );
     let seq = zone.next_seq(record);
     if request.deadline.is_some() && zone.arm_timer(slot, record, seq).is_err() {
         drop(guard);
@@ -94,7 +106,11 @@ where
     drop(guard);
     zone.clear_current(slot);
     zone.counters.el1_parks.fetch_add(1, Ordering::Relaxed);
-    Ok(ObjectParked::new(zone, slot))
+    Ok(ObjectParked::new(
+        zone,
+        slot,
+        start.map(crate::entry::HandoffStart::published),
+    ))
 }
 
 /// Authenticate exact record ownership, identity and address space, then take the operation token.

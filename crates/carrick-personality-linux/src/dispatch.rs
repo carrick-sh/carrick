@@ -155,6 +155,9 @@ impl EntryCounters<'_> {
 /// Methods disappear with their named order; implementations never select a
 /// different family and never publish entry completion.
 pub trait PendingFamilies<'a> {
+    fn take_handoff_receipt(&mut self) -> Option<carrick_core_abi::EntryHandoffReceipt> {
+        None
+    }
     fn binding(&self) -> Option<carrick_core_abi::ExecutionBinding>;
     fn record_source(&self) -> Option<carrick_core_abi::BornInZoneSource<'a>> {
         None
@@ -382,7 +385,7 @@ pub fn completion_route(completion: FamilyCompletion, pending: bool) -> Completi
 // It is an explicitly enabled diagnostic, never a guest Linux admission and
 // never a fabricated task/MM identity. Its routing still has this one owner.
 enum CompletionAuthority<'a> {
-    Entry(carrick_core_abi::EntryCompletion),
+    Entry(carrick_core_abi::EntryCompletion<'a>),
     BornInZone(carrick_core_abi::BornEntryCompletion<'a>),
     AllocatorDiagnostic,
 }
@@ -390,7 +393,7 @@ enum CompletionAuthority<'a> {
 fn finish<'a>(
     ordinal: u64,
     result: FamilyCompletion,
-    pending: &dyn PendingFamilies<'a>,
+    pending: &mut dyn PendingFamilies<'a>,
     authority: CompletionAuthority<'a>,
 ) -> CompletionRoute {
     let transfers = matches!(
@@ -402,17 +405,17 @@ fn finish<'a>(
             | FamilyCompletion::AccountedSwitched(_)
     );
     let authenticated = match authority {
-        CompletionAuthority::Entry(token) if transfers => {
-            carrick_core::entry::handoff(token);
-            true
-        }
+        CompletionAuthority::Entry(token) if transfers => pending
+            .take_handoff_receipt()
+            .is_some_and(|receipt| carrick_core::entry::handoff(token, receipt).is_ok()),
         CompletionAuthority::BornInZone(token) if transfers => {
-            carrick_core::entry::handoff_born_in_zone(token);
-            true
+            pending.take_handoff_receipt().is_some_and(|receipt| {
+                carrick_core::entry::handoff_born_in_zone(token, receipt).is_ok()
+            })
         }
-        CompletionAuthority::Entry(token) => pending
-            .binding()
-            .is_some_and(|live| carrick_core::entry::complete(token, live).is_ok()),
+        CompletionAuthority::Entry(token) => pending.binding().is_some_and(|live| {
+            carrick_core::entry::complete(token, live, pending.record_source()).is_ok()
+        }),
         CompletionAuthority::BornInZone(token) => pending
             .binding()
             .zip(pending.record_source())
@@ -448,7 +451,7 @@ pub fn dispatch<'a>(
 ) -> CompletionRoute {
     let family = route_aarch64(ordinal, control);
     let completion = match pending.binding().and_then(|binding| {
-        if let Some(token) = carrick_core::entry::admit(binding) {
+        if let Some(token) = carrick_core::entry::admit(binding, pending.record_source()) {
             Some(CompletionAuthority::Entry(token))
         } else {
             pending
