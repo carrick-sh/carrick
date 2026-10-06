@@ -172,7 +172,5 @@ fn initial_release(
 }
 
 fn fatal_reservation() -> ! {
-    // SAFETY: a pending MM proposal that cannot be released cannot forward.
-    unsafe { core::arch::asm!("out dx, al", in("dx") super::FATAL_PORT, in("al") 0_u8, options(nostack, preserves_flags)); }
-    super::halt()
+    super::initial_boot::fatal_boot()
 }
