@@ -87,8 +87,10 @@ target builds.
   the HVF trap engine, vCPU coordination, fork/exec address-space management,
   signal injection/restoration glue, and USDT probe provider.
 - `carrick-vmm-kvm` is the Linux/KVM backend. It contains KVM machine/vCPU
-  wrappers, aarch64 KVM support, x86_64 KVM support, kick/futex/fork/timer
-  backend glue, and standalone `run-elf` surfaces for target-host bring-up.
+  wrappers, aarch64 KVM support, x86_64 shared-kernel CPL0 carrier support,
+  and kick/futex/fork/timer backend glue. Standalone `run-elf` remains ARM-only;
+  x86 guests use `carrick run --platform linux/amd64`. See the
+  [standalone x86 retirement](retirements/x86-kvm-run-elf.md).
 - `carrick-vmm-bhyve` is the FreeBSD/bhyve backend. On x86_64 it uses bhyve
   through the shared `carrick-x86` engine and supplies FreeBSD-specific
   kick/futex/fork/timer/signal glue.
