@@ -313,3 +313,33 @@ def run_self_tests() -> bool:
 class DispatchLockFixtures(unittest.TestCase):
     def test_retained_lock_fixtures(self):
         self.assertTrue(run_self_tests())
+
+
+class ProductionSysvOwners(unittest.TestCase):
+    def source(self, test_only=False):
+        return 'impl IpcView {' + ''.join(
+            ('#[cfg(test)] ' if test_only and name == 'with_sysv_process_mut' else '')
+            + 'pub(in crate::dispatch::sysv) fn ' + name + '() {}'
+            for name in ['with_state', 'with_state_mut', 'lock_sysv_process', 'with_sysv_process', 'with_sysv_process_mut']
+        ) + '}'
+
+    def check(self, source):
+        return validate_sysv_lock_authority_rules(REPO_ROOT, {
+            'crates/carrick-kernel/src/dispatch/sysv.rs': source,
+        })
+
+    def test_rust_excluded_test_helper_is_not_a_required_production_owner(self):
+        self.assertEqual(self.check(self.source(test_only=True)), [])
+
+    def test_production_helper_discovery_remains_required(self):
+        source = self.source(test_only=True).replace(
+            'pub(in crate::dispatch::sysv) fn with_sysv_process() {}', ''
+        )
+        self.assertTrue(any('missing SysV rule owner/helper discovery' in error for error in self.check(source)))
+
+    def test_mutating_helper_if_production_keeps_its_visibility_rule(self):
+        source = self.source().replace(
+            'pub(in crate::dispatch::sysv) fn with_sysv_process_mut()',
+            'pub(crate) fn with_sysv_process_mut()'
+        )
+        self.assertTrue(any('with_sysv_process_mut' in error and 'unauthorized visibility' in error for error in self.check(source)))

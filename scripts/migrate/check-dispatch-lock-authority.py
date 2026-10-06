@@ -513,7 +513,11 @@ def validate_sysv_lock_authority_rules(
                         f"crates/carrick-kernel/src/dispatch/sysv.rs: helper '{fn_name}' has unauthorized visibility '{vis_str}' (must be exact 'pub(in crate::dispatch::sysv)')"
                     )
 
-    missing = expected_restricted_fns - seen_helpers
+    # with_sysv_process_mut is a cfg(test) fixture helper in production source,
+    # so it has no production owner to require. If it becomes production, the
+    # same visibility and cross-module rules above/below still apply.
+    required_production_helpers = expected_restricted_fns - {"with_sysv_process_mut"}
+    missing = required_production_helpers - seen_helpers
     if missing:
         errors.append(f"missing SysV rule owner/helper discovery: {sorted(missing)}")
     paired_source = get_source("crates/carrick-kernel/src/dispatch/sysv/lock_authority.rs")

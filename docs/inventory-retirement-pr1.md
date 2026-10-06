@@ -154,3 +154,22 @@ This is an owned ratchet item. Reading `CARRICK_TRACE_TRAPS` in production
 runtime outside the LaunchContext boundary remains a defect for the
 director-owned follow-up; adding its census counter does not approve that
 runtime design.
+
+
+## Production SysV helper contract repair
+
+The Rust production mask exposed a mistaken required-owner assertion for
+`with_sysv_process_mut`. History and blame confirm that no production lock
+responsibility disappeared: commit `9dad96736adcfb55443a0019709d95e9d9c07d35`
+introduced this helper already under built-in `#[cfg(test)]`.
+`f95c9d049989657912d8d2f3788cfb518633b654` moved the same discipline into
+`IpcView`; `c2228d660c` later required every helper spelling without excluding
+that test-only definition.
+
+| Contract | Production owners and evidence | Correction |
+| --- | --- | --- |
+| SysV process and namespace lock discipline | `IpcView::lock_sysv_process` at `sysv.rs:2030` acquires the process mutex and creates `SysvProcessGuard`; mutable shmat, remap, exit, fork and shmdt paths still call it at lines 2053, 2136, 2152, 2187 and 2441. `SysvProcessGuard::namespace_permit` exclusively borrows that guard before `SysvNamespacePermit::lock_paired`. | Require the four production helpers `with_state`, `with_state_mut`, `lock_sysv_process`, `with_sysv_process`, plus the paired `lock_paired` owner. Do not require the test-only mutation helper as a production owner; any production definition still receives its exact visibility and cross-module checks. |
+
+Rust-proof fixtures cover the test-only shape, deletion of a required
+production helper, and unauthorized visibility on a production mutation
+helper. No runtime code or ceiling changes accompany this contract correction.
