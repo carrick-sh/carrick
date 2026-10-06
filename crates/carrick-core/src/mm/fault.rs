@@ -114,12 +114,15 @@ pub fn owner_fault_plan<
     };
     let mut plan = root.fork_transfer_fault_plan(address.raw(), target, access, fork_sequence)?;
     let table = hardware_root.address().raw();
+    let fault_page = plan.fault_page;
     let unbacked = |va: u64| -> Result<bool, Refusal> {
         // VALID can still be clear for a host-published grant's untouched
         // pages. Its live residency owns the physical range, so a later VMA
         // extension must stop before that range instead of selecting an
-        // overlapping grant and refusing the new fault page.
-        if residency.table.lookup(residency.mm.raw(), va).is_some() {
+        // overlapping grant. The fault page itself must reach the host's
+        // exact-generation peer-resident alias retry; treating it as a
+        // neighbor returns Busy without any release producer.
+        if va != fault_page && residency.table.lookup(residency.mm.raw(), va).is_some() {
             return Ok(false);
         }
         let mut table = table;
