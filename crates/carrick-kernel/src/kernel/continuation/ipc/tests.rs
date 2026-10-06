@@ -290,6 +290,8 @@ struct OwnerDestination<'a> {
     object: IpcObjectHandle,
     prepares: usize,
     suspend_at: Option<usize>,
+    peer_drain_at: Option<(usize, Fd, Fd)>,
+    peer_bytes: Vec<u8>,
 }
 
 impl carrick_guest_mem::CurrentMmMemory for OwnerDestination<'_> {}
@@ -329,6 +331,36 @@ impl GuestMemory for OwnerDestination<'_> {
         assert_eq!(ranges.len(), 1);
         assert!(ranges[0].len() <= 4096);
         self.prepares += 1;
+        if let Some((at, reader, writer)) = self.peer_drain_at
+            && at == self.prepares
+        {
+            let unread = self.world.unread(self.object);
+            let token = self
+                .world
+                .operation(reader, IpcOpKind::PipeRead, unread as u64, 63);
+            self.world.hand_back(&token, IpcHandback::Continue, 0, 0);
+            let mut op = self.world.region.operation(&token).unwrap();
+            op.task = IpcTaskKey(2);
+            op.mm = IpcMmKey(8);
+            self.world.region.update_operation(&token, op).unwrap();
+            let mut peer_memory = memory(&[]);
+            assert!(matches!(
+                complete_handback(self.world.region, token, IpcMmKey(8), &mut peer_memory, None, &Wakes::default()).unwrap(),
+                IpcHostOutcome::Complete { result, .. } if result == unread as i64
+            ));
+            self.peer_bytes = peer_memory.read_bytes(BUF, unread).unwrap();
+            let description = self
+                .world
+                .region
+                .fd(HostIpcWait)
+                .close(self.world.table, writer)
+                .unwrap()
+                .expect("last writer");
+            self.world
+                .region
+                .release_backing(description.backing, &HostIpcWait)
+                .unwrap();
+        }
         if self.suspend_at == Some(self.prepares) {
             #[derive(Debug)]
             struct Pending;
@@ -393,6 +425,8 @@ fn el1_ipc_owner_destination_is_prepared_before_pipe_consumption() {
         object,
         prepares: 0,
         suspend_at: None,
+        peer_drain_at: None,
+        peer_bytes: Vec::new(),
     };
     assert_eq!(
         complete_handback(
@@ -443,6 +477,8 @@ fn el1_ipc_owner_wait_retains_endpoint_and_committed_read_prefix() {
         object,
         prepares: 0,
         suspend_at: Some(2),
+        peer_drain_at: None,
+        peer_bytes: Vec::new(),
     };
     let token = match complete_handback(
         world.region,
@@ -499,6 +535,60 @@ fn el1_ipc_owner_wait_retains_endpoint_and_committed_read_prefix() {
 }
 
 #[test]
+fn el1_ipc_owner_peer_drain_and_final_writer_close_preserve_read_prefix() {
+    let world = world();
+    let (reader, writer, object) = world.pipe();
+    let bytes: Vec<u8> = (0..5000).map(|at| (at % 251) as u8).collect();
+    {
+        let mut guard = world.region.lock(object, &HostIpcWait).unwrap();
+        assert_eq!(
+            guard.pipe().unwrap().try_write(&bytes).result,
+            Ok(bytes.len())
+        );
+    }
+    let token = world.operation(reader, IpcOpKind::PipeRead, bytes.len() as u64, 63);
+    world.hand_back(&token, IpcHandback::Continue, 0, 0);
+    let mut destination = OwnerDestination {
+        memory: memory(&[]),
+        world: &world,
+        object,
+        prepares: 0,
+        suspend_at: None,
+        peer_drain_at: Some((2, reader, writer)),
+        peer_bytes: Vec::new(),
+    };
+    let outcome = complete_handback(
+        world.region,
+        token,
+        MM,
+        &mut destination,
+        None,
+        &Wakes::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        destination.memory.read_bytes(BUF, 4096).unwrap(),
+        bytes[..4096]
+    );
+    assert_eq!(destination.peer_bytes, bytes[4096..]);
+    assert_eq!(world.unread(object), 0);
+    assert_eq!(destination.prepares, 2);
+    assert_eq!(
+        outcome,
+        IpcHostOutcome::Complete {
+            result: 4096,
+            sigpipe: false
+        },
+        "EOF after peer drain cannot erase a committed read prefix"
+    );
+    assert_eq!(
+        world.holds(reader),
+        1,
+        "both operations released their pins"
+    );
+}
+
+#[test]
 fn el1_ipc_owner_empty_source_waits_without_preparing_destination() {
     let world = world();
     let (reader, _writer, object) = world.pipe();
@@ -510,6 +600,8 @@ fn el1_ipc_owner_empty_source_waits_without_preparing_destination() {
         object,
         prepares: 0,
         suspend_at: None,
+        peer_drain_at: None,
+        peer_bytes: Vec::new(),
     };
     let outcome = complete_handback(
         world.region,
