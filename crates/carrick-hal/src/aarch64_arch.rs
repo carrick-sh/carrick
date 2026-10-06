@@ -127,6 +127,10 @@ impl GuestArch for Aarch64GuestArch {
         carrick_abi::LinuxGuestAbi::Aarch64
     }
 
+    fn user_va_ceiling() -> crate::guest_arch::UserVaCeiling {
+        crate::guest_arch::UserVaCeiling::new(1 << 48)
+    }
+
     fn vdso_bytes() -> Vec<u8> {
         carrick_mem::vdso::vdso_image_bytes()
     }
