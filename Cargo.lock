@@ -333,6 +333,7 @@ name = "carrick-abi"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.1",
+ "carrick-syscall-abi",
  "serde",
  "zerocopy",
 ]
@@ -956,6 +957,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "carrick-syscall-abi"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.11.1",
+ "serde",
 ]
 
 [[package]]
