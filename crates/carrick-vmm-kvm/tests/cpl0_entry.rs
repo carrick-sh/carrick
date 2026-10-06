@@ -114,6 +114,22 @@ fn shared_kernel_user_access_restores_smap_ac() {
     exercise_shared_kernel_user_access(true);
 }
 
+#[test]
+fn user_access_walks_the_second_live_root() {
+    let mut program = vec![0x48, 0xbf]; // mov rdi, user data VA
+    program.extend_from_slice(&carrick_x86::cpl0_scheduler::PROGRESS_DATA.to_le_bytes());
+    program.extend_from_slice(&[0x48, 0xbe]); // mov rsi, read_u64 operation
+    program.extend_from_slice(&0_u64.to_le_bytes());
+    program.extend_from_slice(&[0x48, 0xb8]); // mov rax, user-access witness
+    program.extend_from_slice(&0xffff_ffff_ffff_ff10_u64.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+    program.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+    program.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    let mut carrier =
+        Cpl0Carrier::boot_lifecycle(&image(), [&program, &program]).expect("KVM image");
+    assert_eq!(carrier.observe(1).expect("second-root user read").result, 0);
+}
+
 fn image() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0-fixture")
@@ -162,6 +178,23 @@ fn production_image_rejects_fixture_syscalls() {
         err.to_string().contains("unported CPL0 native call"),
         "{err}"
     );
+}
+
+#[test]
+fn production_interrupt_boot_serves_an_ordinary_syscall() {
+    let production = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/x86_64-unknown-none/release/carrick-x86-cpl0");
+    let first = program(&[(0x2345, 24)]);
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(&production, [&first, &first]).expect("KVM image");
+    let err = carrier
+        .observe(0)
+        .expect_err("production observer call must forward after the ordinary syscall");
+    assert!(
+        err.to_string().contains("unported CPL0 native call"),
+        "{err}"
+    );
+    assert_eq!(carrier.robust_list_head(0).expect("task head"), 0x2345);
 }
 
 fn program(calls: &[(u64, u64)]) -> Vec<u8> {
