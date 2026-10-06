@@ -364,7 +364,12 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     }
 }
 
-impl<Policy: ReservationPolicy, Geometry: ReservationGeometry> Reservations<'_, Policy, Geometry> {
+impl<
+    Policy: ReservationPolicy,
+    Geometry: ReservationGeometry,
+    C: Copy + Send + Sync + zerocopy::FromZeros,
+> Reservations<'_, Policy, Geometry, C>
+{
     /// Consume the MM guard before asking the existing allocator for capacity.
     /// MetadataRequired leaves the Linux operation uncommitted; service the
     /// allocator request at the ordinary host boundary, then reacquire/redecide.

@@ -149,11 +149,11 @@ pub fn notify_object(
 }
 
 /// Bind space release notification authority for zone and execution slot.
-pub fn space_access<'a>(
-    zone: &'a ZoneTables,
+pub fn space_access<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
+    zone: &'a ZoneTables<C>,
     slot: SlotId,
-    deliver: fn(&ZoneTables, Waker, OwnedObjectWakeEffects<'_>),
-) -> SpaceAccess<'a> {
+    deliver: fn(&ZoneTables<C>, Waker, OwnedObjectWakeEffects<'_, C>),
+) -> SpaceAccess<'a, C> {
     SpaceAccess::notified(SpaceReleaseVenue {
         zone,
         waker: Waker::El1 { slot },
