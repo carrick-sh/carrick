@@ -3177,3 +3177,15 @@ fn write_eventfd(_this: &SyscallDispatcher, bytes: &[u8], state: &EventFdState) 
 
 #[cfg(test)]
 include!("tests.rs");
+
+impl SyscallDispatcher {
+    /// Complete a shared-kernel host-crossing fd 1/2 write through this run's
+    /// existing stdio route after its guest MM owner has copied the bytes.
+    pub fn forward_stdio_bytes(&self, fd: i32, bytes: &[u8]) -> i64 {
+        match self.fs_view().write_stdio_sink(fd, bytes) {
+            DispatchOutcome::Returned { value } => value,
+            DispatchOutcome::Errno { errno } => errno.guest_retval(),
+            _ => carrick_abi::LINUX_EIO.guest_retval(),
+        }
+    }
+}
