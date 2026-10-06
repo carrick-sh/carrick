@@ -440,28 +440,6 @@ impl MmuBackend for X86Backend {
         unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags)) }
         Ok(())
     }
-    fn translate_live(
-        &mut self,
-        _owner: &Self::MmOwner,
-        _address: UserVa,
-        _access: Access,
-    ) -> Result<Self::OwnedTranslation, Self::Error> {
-        Err(ArchError::Unbound)
-    }
-    fn prepare_leaf_edit(
-        &mut self,
-        _owner: &Self::MmOwner,
-        _range: UserRange,
-        _translation: Self::OwnedTranslation,
-    ) -> Result<Self::LeafEdit, Self::Error> {
-        Err(ArchError::Unbound)
-    }
-    fn apply_leaf_edit(&mut self, _edit: &mut Self::LeafEdit) -> Result<(), Self::Error> {
-        Err(ArchError::Unbound)
-    }
-    fn undo_leaf_edit(&mut self, _edit: Self::LeafEdit) -> Result<(), Self::Error> {
-        Err(ArchError::Unbound)
-    }
     fn request_invalidation(
         &mut self,
         context: AddressContext<Self::Root>,
@@ -510,12 +488,5 @@ impl MmuBackend for X86Backend {
         limit: GuestLen,
     ) -> Result<CopyProgress, Self::Error> {
         transfer.advance(limit)
-    }
-    fn publish_executable(
-        &mut self,
-        _owner: &Self::MmOwner,
-        _range: UserRange,
-    ) -> Result<Self::PublicationReceipt, Self::Error> {
-        Err(ArchError::Unbound)
     }
 }
