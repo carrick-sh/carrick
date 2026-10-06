@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
+import importlib.util
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +28,27 @@ class HostAuthorityEscapeHatchTest(unittest.TestCase):
         subprocess.run(
             ["git", "init", "-q"], cwd=self.root, check=True, capture_output=True
         )
+        # The launcher also validates the complete carrier topology. Preserve
+        # its real reviewed inputs when testing a small escape-hatch overlay.
+        spec = importlib.util.spec_from_file_location(
+            "carrier_fixture_contract",
+            ROOT / "scripts/migrate/check-carrier-only-process-invariant.py",
+        )
+        contract = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = contract
+        spec.loader.exec_module(contract)
+        paths = {Path("Cargo.toml")}
+        paths.update(
+            Path(identity[0])
+            for limits in (
+                contract.CARRIER_BIRTH_LIMITS, contract.CARRIER_SUBSTRATE_LIMITS,
+                contract.REVIEWED_OPERATOR_LIMITS, contract.REVIEWED_PROBE_LIMITS,
+            )
+            for identity in limits
+        )
+        paths.update(Path(path) for path in contract.TEST_SOURCE_PATHS)
+        paths.update(Path(path) for path in contract.TEST_SOURCE_PARENTS.values())
+        self.topology_paths = paths
         (self.root / ".semgrep").mkdir()
         shutil.copy2(TYPED_CONFIG, self.root / ".semgrep" / TYPED_CONFIG.name)
         if not ESCAPE_CONFIG.is_file():
@@ -45,9 +68,15 @@ class HostAuthorityEscapeHatchTest(unittest.TestCase):
         semgrep_bin: Path | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        for relative in self.topology_paths:
+            destination = self.root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, destination)
         for relative, body in files.items():
             path = self.root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
+            if Path(relative) in self.topology_paths:
+                body = path.read_text(encoding="utf-8") + "\n" + body
             path.write_text(body, encoding="utf-8")
 
         env = os.environ.copy()
