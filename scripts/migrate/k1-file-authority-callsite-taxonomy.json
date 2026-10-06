@@ -1909,7 +1909,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 226,
+      "line": 231,
       "categories": [
         "description_guard"
       ],
@@ -1920,7 +1920,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 392,
+      "line": 410,
       "categories": [
         "description_backing",
         "mapping"
@@ -1932,7 +1932,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 888,
+      "line": 906,
       "categories": [
         "description_guard"
       ],
@@ -1943,7 +1943,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 1672,
+      "line": 1691,
       "categories": [
         "description_guard"
       ],
@@ -1954,7 +1954,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 1679,
+      "line": 1698,
       "categories": [
         "description_guard"
       ],
@@ -1965,7 +1965,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 1694,
+      "line": 1713,
       "categories": [
         "description_guard"
       ],
@@ -1976,7 +1976,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/mmap.rs",
-      "line": 2044,
+      "line": 2063,
       "categories": [
         "description_guard"
       ],
@@ -1987,7 +1987,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 1225,
+      "line": 1227,
       "categories": [
         "table_guard"
       ],
@@ -1998,7 +1998,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 1393,
+      "line": 1395,
       "categories": [
         "table_guard"
       ],
@@ -2009,7 +2009,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 1408,
+      "line": 1410,
       "categories": [
         "table_guard"
       ],
@@ -2020,7 +2020,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 1433,
+      "line": 1435,
       "categories": [
         "table_guard"
       ],
@@ -2031,7 +2031,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 1483,
+      "line": 1485,
       "categories": [
         "table_guard"
       ],
@@ -2042,7 +2042,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/tests.rs",
-      "line": 1644,
+      "line": 1646,
       "categories": [
         "table_guard"
       ],
