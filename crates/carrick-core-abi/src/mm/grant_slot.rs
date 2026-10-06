@@ -163,3 +163,48 @@ pub trait GrantSlotVenue {
     fn carrier(&self) -> Option<core::num::NonZeroU64>;
     fn grant(&self, slot: usize) -> Option<&PortalGrantSlot>;
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn portal_grant_slot() {
+        assert_eq!(
+            (size_of::<PortalGrantSlot>(), align_of::<PortalGrantSlot>()),
+            (512, 64)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |PortalGrantSlot {
+                     state: _,
+                     window: _,
+                     fault_generation: _,
+                     descriptor: _,
+                 }: PortalGrantSlot| {};
+        field!(PortalGrantSlot, state, AtomicU64, 0, 8, 8);
+        field!(PortalGrantSlot, window, [AtomicU64; 13], 8, 104, 8);
+        field!(PortalGrantSlot, fault_generation, AtomicU64, 112, 8, 8);
+        field!(PortalGrantSlot, descriptor, DescriptorTxnSlot, 128, 384, 64);
+    }
+}

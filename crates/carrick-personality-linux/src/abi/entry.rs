@@ -132,3 +132,68 @@ impl SyscallResult {
         self.0
     }
 }
+
+// Literal wire layout captured from 3fd7862be on a 64-bit host.
+// Keep these values fixed when moving the shared kernel implementation.
+#[cfg(test)]
+mod layout_manifest {
+    use super::*;
+    use core::mem::{align_of, offset_of, size_of};
+
+    macro_rules! field {
+        ($record:ty, $field:ident, $ty:ty, $offset:literal, $size:literal, $align:literal) => {
+            // Type-check the manifest's field type without constructing a record.
+            let _ = |record: &$record| {
+                let _: &$ty = &record.$field;
+            };
+            assert_eq!(
+                (
+                    offset_of!($record, $field),
+                    size_of::<$ty>(),
+                    align_of::<$ty>()
+                ),
+                ($offset, $size, $align),
+                concat!(stringify!($record), "::", stringify!($field))
+            );
+        };
+    }
+
+    #[test]
+    fn linux_task_state() {
+        assert_eq!(
+            (size_of::<LinuxTaskState>(), align_of::<LinuxTaskState>()),
+            (32, 8)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |LinuxTaskState {
+                     file_table: _,
+                     fixup_pc: _,
+                     orig_arg0: _,
+                     pending_host_work: _,
+                     served_with_work: _,
+                 }: LinuxTaskState| {};
+        field!(LinuxTaskState, file_table, AtomicU64, 0, 8, 8);
+        field!(LinuxTaskState, fixup_pc, AtomicU64, 8, 8, 8);
+        field!(LinuxTaskState, orig_arg0, AtomicU64, 16, 8, 8);
+        field!(LinuxTaskState, pending_host_work, AtomicU32, 24, 4, 4);
+        field!(LinuxTaskState, served_with_work, AtomicU32, 28, 4, 4);
+    }
+
+    #[test]
+    fn linux_task_metadata() {
+        assert_eq!(
+            (
+                size_of::<LinuxTaskMetadata>(),
+                align_of::<LinuxTaskMetadata>()
+            ),
+            (16, 8)
+        );
+        // Exhaustive pattern makes newly added fields require a manifest entry.
+        let _ = |LinuxTaskMetadata {
+                     lifecycle_page: _,
+                     control_slot: _,
+                 }: LinuxTaskMetadata| {};
+        field!(LinuxTaskMetadata, lifecycle_page, AtomicU64, 0, 8, 8);
+        field!(LinuxTaskMetadata, control_slot, AtomicU64, 8, 8, 8);
+    }
+}
