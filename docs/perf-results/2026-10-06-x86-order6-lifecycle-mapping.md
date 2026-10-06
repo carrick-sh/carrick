@@ -25,6 +25,14 @@ family. ARM policy bodies are deleted in the extraction commit. The EL1 ABI
 module is a re-export; it contains no retained ABI implementation or tests.
 `AtomicEntry` is transparent over the original atomic state word; the pool,
 page and control layouts and lifecycle protocol version 6 remain unchanged.
+Independent base/current ABI observations both report hash `0x3ff0698f9f1a67f1`
+and the same 24 lifecycle size/alignment/offset facts.
+
+Linux also selects child result zero and the AArch64 vDSO tid packing.
+The native hooks only install those selected values. Typed `UserVa` addresses
+cross the lifecycle copy boundary. The FS/GS and XSAVE instruction bodies live
+in the existing reviewed native scheduler leaf and are shared by both CPL0
+bindings; displaced instruction bodies are deleted.
 
 Native seams retain `ExecutionBinding`, `RecordRef` (id plus incarnation),
 `ThreadIdentity`, `EntryRef` (index plus generation), `EntryMmKey`, `UserVa`
@@ -64,6 +72,7 @@ by Linux; unsupported native/binding cases remain explicit refusals.
 | Disabled altstack old-value serialization | `(sp=0, flags=2, size=0)`, result 0 | Same 24-byte output, result 0 |
 | Enabled off-stack altstack query/replacement | 0, little-endian 24-byte layout, ONSTACK cleared | Same |
 | Clone threads disabled, low exit-signal byte nonzero, missing required flags, unknown flag, null stack | Forward | Forward |
+| Native x86 stack/TLS cannot satisfy its qualified 48-bit return convention | Unported ordinal forwards | Forward before copyout, pool claim or record allocation; ARM hook unchanged |
 | Clone exact MM absent | Forward | Forward |
 | Clone parent/child output preimage unavailable | Forward before pool claim | Same |
 | Claim pool empty / gate closed / invalid state | Forward; empty-pool decline retained | Same |
@@ -131,6 +140,8 @@ controls (restored before green verification) produce these specific reds:
   `Some((1, Born))`, expected `Some((1, Published))`.
 - Linux `CHILD_TID_CLEAR = 1`: X5 Linux wake hook sees 1, expected 0,
   failing `clear before wake` in the production exit path.
+- Native context qualifier forced to accept an unavailable stack/TLS: shared
+  Linux dispatch returns Served, expected Forward with unchanged outputs/pool.
 - Native child FS installation selects the wrong retained word: actual KVM
   child output is 0, expected 62720 (`0xf500`).
 - Native successor XSAVE restore suppressed: actual child XMM words retain
@@ -176,15 +187,15 @@ credit.
 
 | Crate | Before `0f476ce7a` | After | Net reduction |
 | --- | ---: | ---: | ---: |
-| carrick-el1 | 10,950 | 10,397 | 553 |
+| carrick-el1 | 10,950 | 10,395 | 555 |
 | carrick-el1-abi | 9,311 | 8,053 | 1,258 |
 | carrick-aarch64 | 13,468 | 13,468 | 0 |
-| **Production total** | **33,729** | **31,918** | **1,811** |
+| **Production total** | **33,729** | **31,916** | **1,813** |
 
-All `src/` lines (including tests) fall from 58,578 to 56,272: **2,306**.
-That lies in the plan's 2,100–2,600 source-and-witness forecast, 94 below its
-2,400 central estimate. The requested production-only reduction is 289 below
-the lower forecast bound and 589 below the central estimate. The difference
+All `src/` lines (including tests) fall from 58,578 to 56,270: **2,308**.
+That lies in the plan's 2,100–2,600 source-and-witness forecast, 92 below its
+2,400 central estimate. The requested production-only reduction is 287 below
+the lower forecast bound and 587 below the central estimate. The difference
 is moved ABI assertions, retained ARM frame fixtures and the native hook seam;
 no reduction credit is taken for runtime constants, new X5 witnesses or new
 x86 bindings. The old ARM policy owner is not retained for those fixtures.
