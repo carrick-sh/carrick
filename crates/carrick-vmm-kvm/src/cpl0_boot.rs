@@ -45,6 +45,7 @@ const LAYOUT: BringupLayout = BringupLayout {
     gdt_base: 0x50_0000,
     pml4_base: 0x60_0000,
 };
+const _: () = assert!(FIXTURE_PML4_CAPACITY == carrick_x86::X86_PML4_CAPACITY);
 
 fn fail(message: impl Into<String>) -> TrapError {
     TrapError::Hypervisor(message.into())
@@ -148,6 +149,33 @@ impl Cpl0Carrier {
             }
         }
         Ok(())
+    }
+
+    /// Read a stopped fixture's 4 KiB terminal descriptor.
+    pub fn fixture_user_leaf(&self, va: u64) -> Result<u64, TrapError> {
+        if va != 0x3_0000 {
+            return Err(fail("fixture leaf outside admitted user page"));
+        }
+        let mut table = LAYOUT.pml4_base;
+        for shift in [39, 30, 21, 12] {
+            let address = table + ((va >> shift) & 511) * 8;
+            let ptr = self
+                .ram
+                .host_ptr(address, 8)
+                .ok_or_else(|| fail("fixture descriptor outside table backing"))?
+                .cast::<u64>();
+            // SAFETY: the vCPUs are stopped at a fixture control exit and the
+            // guest table backing remains mapped until carrier teardown.
+            let entry = unsafe { ptr.read_volatile() };
+            if entry & 1 == 0 || (shift == 30 || shift == 21) && entry & (1 << 7) != 0 {
+                return Err(fail("fixture requires a present 4 KiB leaf"));
+            }
+            if shift == 12 {
+                return Ok(entry);
+            }
+            table = entry & 0x000f_ffff_ffff_f000;
+        }
+        Err(fail("fixture leaf walk incomplete"))
     }
 
     pub fn boot(image: &Path, programs: [&[u8]; 2]) -> Result<Self, TrapError> {
