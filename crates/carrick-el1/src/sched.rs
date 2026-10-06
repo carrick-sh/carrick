@@ -111,6 +111,7 @@ pub struct Sched<'a, C: ThreadCpu, U: UserWord> {
     pub cpu: &'a mut C,
     pub user: &'a U,
     pub counters: &'a Counters,
+    pub handoff: Option<&'a mut Option<carrick_el1_abi::EntryHandoffReceipt>>,
 }
 
 /// What [`Sched::take_irqs`] acknowledged.
@@ -122,6 +123,11 @@ pub struct IrqsTaken {
 }
 
 impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
+    pub(crate) fn record_handoff(&mut self, receipt: Option<carrick_el1_abi::EntryHandoffReceipt>) {
+        if let Some(destination) = self.handoff.as_deref_mut() {
+            *destination = receipt;
+        }
+    }
     fn current_record(&self) -> Result<carrick_el1_abi::RecordId, carrick_sched_core::Exhausted> {
         let record = self.zone.current_or_new(
             self.slot,
@@ -219,6 +225,17 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             }
             return None;
         }
+        let Some(start) = carrick_core::entry::prepare_handoff(
+            carrick_core::entry::binding(&self.task.execution, &self.task.mm),
+            carrick_el1_abi::BornInZoneSource { zone, slot },
+            record,
+        ) else {
+            drop(guard);
+            if fresh {
+                zone.discard_unpublished(slot, record);
+            }
+            return None;
+        };
         // SAFETY: this vCPU runs the thread `record` holds (a fresh home
         // record, or the switched-in `OnCpu` one); nobody else may touch it
         // until the park below is published.
@@ -245,7 +262,12 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return None;
         }
         zone.set_deadline(record, deadline.unwrap_or(0));
-        if !zone.publish_guest_park(&guard, slot, record, seq) {
+        let receipt = carrick_core::entry::publish_handoff_park(
+            start,
+            &guard,
+            carrick_el1_abi::EntryRecordGeneration(seq),
+        );
+        if receipt.is_none() {
             drop(guard);
             if fresh {
                 zone.discard_unpublished(slot, record);
@@ -253,6 +275,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return None;
         }
         drop(guard);
+        self.record_handoff(receipt);
         zone.clear_current(slot);
         zone.counters.el1_parks.fetch_add(1, Ordering::Relaxed);
         Some(self.run_next(frame, timeout_result))

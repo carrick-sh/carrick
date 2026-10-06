@@ -134,10 +134,11 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     /// nothing else on this vCPU: host work is pending here, and the host
     /// settles the parked thread at this boundary (its enrollment samples
     /// pending signals). All caller locks must be released.
-    pub fn leave_after_object_park(&mut self, parked: ObjectParked<'_>) -> Option<Served> {
+    pub fn leave_after_object_park(&mut self, mut parked: ObjectParked<'_>) -> Option<Served> {
         if !parked.matches(self.zone, self.slot) {
             return None;
         }
+        self.record_handoff(parked.take_receipt());
         self.counters.exit_reasons[carrick_el1_abi::El1ExitReason::IdleHostWork as usize]
             .fetch_add(1, Ordering::Relaxed);
         Some(Served::Idle)
@@ -148,12 +149,13 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
     pub fn resume_after_object_park(
         &mut self,
         frame: &mut TrapFrame,
-        parked: ObjectParked<'_>,
+        mut parked: ObjectParked<'_>,
         timeout_result: u64,
     ) -> Option<Served> {
         if !parked.matches(self.zone, self.slot) {
             return None;
         }
+        self.record_handoff(parked.take_receipt());
         Some(self.run_next(frame, timeout_result))
     }
 
