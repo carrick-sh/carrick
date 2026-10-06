@@ -40,6 +40,8 @@ mod cpl0_entry {
     pub use crate::adapter::*;
 }
 #[cfg(target_os = "none")]
+const _: () = assert!(core::mem::offset_of!(adapter::CpuBinding, task_address) == 24);
+#[cfg(target_os = "none")]
 #[path = "../../carrick-x86/src/cpl0_lifecycle.rs"]
 mod lifecycle;
 
@@ -96,6 +98,101 @@ core::arch::global_asm!(
     "swapgs",
     "iretq",
 );
+
+#[cfg(target_os = "none")]
+core::arch::global_asm!(
+    ".global carrick_x86_page_fault_fixup",
+    "carrick_x86_page_fault_fixup:",
+    "push rax",
+    "push rdx",
+    // Error code, RIP and CS follow the two saved scratch registers.
+    "cmp qword ptr [rsp + 32], 8",
+    "jne 9f",
+    "mov rax, qword ptr gs:[24]", // CpuBinding.task_address
+    "test rax, rax",
+    "jz 9f",
+    "mov rdx, qword ptr [rax + 24]", // CurrentTask.linux.fixup_pc
+    "test rdx, rdx",
+    "jz 9f",
+    "mov qword ptr [rsp + 24], rdx",
+    "pop rdx",
+    "pop rax",
+    "add rsp, 8", // discard #PF error code
+    "iretq",
+    "9:",
+    "ud2", // an unguarded kernel/user fault is fatal
+);
+
+#[cfg(target_os = "none")]
+mod user_fault_gate {
+    use crate::interrupts;
+
+    #[repr(C, packed)]
+    struct Idtr {
+        limit: u16,
+        base: u64,
+    }
+
+    unsafe extern "C" {
+        fn carrick_x86_page_fault_fixup();
+    }
+
+    pub struct GateGuard {
+        slot: *mut u8,
+        previous: [u8; 16],
+    }
+
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            // SAFETY: the same CPL0 CPU owns this private IDT. Mask IF while
+            // restoring a multi-byte gate, then restore this lane's prior IF.
+            unsafe {
+                let mask = interrupts::hardware::mask_interrupts();
+                for (i, byte) in self.previous.into_iter().enumerate() {
+                    core::ptr::write_volatile(self.slot.add(i), byte);
+                }
+                interrupts::hardware::restore_interrupts(mask);
+            }
+        }
+    }
+
+    /// Install the CPL0 #PF fixup on this CPU's private IDT before any
+    /// guarded user access. SYSCALL has masked IF and the IDT is retained by
+    /// the image owner until this CPU retires.
+    pub fn install() -> GateGuard {
+        // SAFETY: CPL0 owns this CPU's IF; a gate update is not atomic.
+        let mask = unsafe { interrupts::hardware::mask_interrupts() };
+        let mut idtr = Idtr { limit: 0, base: 0 };
+        // SAFETY: SIDT is legal at CPL0 and writes exactly the packed record.
+        unsafe { core::arch::asm!("sidt [{}]", in(reg) &raw mut idtr, options(nostack)) };
+        let base = idtr.base;
+        if u64::from(idtr.limit) < 15 * 16 - 1 {
+            // SAFETY: an undersized IDT cannot support recoverable #PF.
+            unsafe { core::arch::asm!("ud2", options(noreturn)) }
+        }
+        let entry = carrick_x86_page_fault_fixup as *const () as u64;
+        let mut bytes = [0_u8; 16];
+        bytes[0..2].copy_from_slice(&(entry as u16).to_le_bytes());
+        bytes[2..4].copy_from_slice(&8_u16.to_le_bytes());
+        bytes[5] = 0x8e;
+        bytes[6..8].copy_from_slice(&((entry >> 16) as u16).to_le_bytes());
+        bytes[8..12].copy_from_slice(&((entry >> 32) as u32).to_le_bytes());
+        let slot = (base + 14 * 16) as *mut u8;
+        let mut previous = [0_u8; 16];
+        // SAFETY: each CPU owns its private, supervisor-mapped IDT page. IF
+        // is masked through SYSCALL and no other CPU can read this gate.
+        unsafe {
+            for (i, byte) in previous.iter_mut().enumerate() {
+                *byte = core::ptr::read_volatile(slot.add(i));
+            }
+            for (i, byte) in bytes.into_iter().enumerate() {
+                core::ptr::write_volatile(slot.add(i), byte);
+            }
+            interrupts::hardware::restore_interrupts(mask);
+        }
+        GateGuard { slot, previous }
+    }
+}
 
 #[cfg(target_os = "none")]
 mod kernel {
@@ -169,6 +266,11 @@ mod kernel {
         // VM/vCPUs retire; each binding names its issued current task.
         let task = unsafe { &*(binding.task_address as *const CurrentTask) };
         let counters = unsafe { &*(binding.counters_address as *const Counters) };
+        let _user_fault_gate = super::user_fault_gate::install();
+        if frame.rax == carrick_el1::isa::x86::user_access::USER_ACCESS_WITNESS {
+            frame.rax = carrick_el1::isa::x86::user_access::witness(task, frame.rdi, frame.rsi);
+            return;
+        }
         binding.entries.fetch_add(1, Ordering::Relaxed);
         let scheduler_witness =
             binding.scheduler_witness.load(Ordering::Acquire) == super::scheduler::PROGRESS_STATE;
