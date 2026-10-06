@@ -655,6 +655,14 @@ impl<V: X86Vmm> GuestMemory for X86EngineCore<V> {
     }
 
     fn protect_range(&mut self, address: u64, len: usize, prot: u64) -> Result<(), MemoryError> {
+        // Guest mmap/mprotect must fail before a VMM touches backing or PML4.
+        // The shared dispatcher also serves AArch64's wider address layout.
+        if carrick_mem::pml4::X86UserRange::checked(GuestVa(address), len as u64).is_err() {
+            return Err(MemoryError::OutOfBounds {
+                address,
+                length: len,
+            });
+        }
         // A non-PROT_NONE MAP_FIXED|MAP_PRIVATE|MAP_ANON landing OUTSIDE the eager
         // mmap arena / image regions (a guest placing a mapping at a high identity
         // VA) needs a host backing slot before the guest can touch it. The aarch64
@@ -1283,6 +1291,11 @@ impl<V: X86Vmm> SyscallTrap for X86EngineCore<V> {
         payload: &[u8],
         backing: HostAliasBacking,
     ) -> Result<(), TrapError> {
+        carrick_mem::pml4::X86UserRange::checked(va, len).map_err(|error| {
+            TrapError::Hypervisor(format!(
+                "carrick-x86: alias outside lower-half user range: {error:?}"
+            ))
+        })?;
         // Mapping provenance is published by the runtime only after this
         // backend install and every requested leaf protection succeed. Do not
         // infer it from `backing` here: the dispatch outcome is the
@@ -2294,6 +2307,35 @@ mod tests {
             !engine.protections().unwrap().range_no_access(addr, 0x10),
             "set_no_access(false) clears the range"
         );
+    }
+
+    #[test]
+    fn x86_guest_mmap_and_mprotect_reject_high_half_before_vmm() {
+        let mut engine = X86EngineCore::from_parts(TestVmm, TestVcpu::default(), test_layout());
+        assert!(engine.protect_range(0x40_0000, 0x1000, 0).is_ok());
+        for (address, len) in [
+            ((1 << 47) - 0x1000, 0x2000),
+            (1 << 47, 0x1000),
+            (0xffff_ffff_8000_0000, 0x1000),
+        ] {
+            assert!(matches!(
+                engine.protect_range(address, len, 0),
+                Err(MemoryError::OutOfBounds { address: denied, length })
+                    if denied == address && length == len
+            ));
+            let error = engine
+                .map_host_alias(
+                    GuestVa(address),
+                    Gpa(0x10_0000),
+                    len as u64,
+                    &[],
+                    HostAliasBacking::Anonymous {
+                        sharing: carrick_hal::HostAliasSharing::Private,
+                    },
+                )
+                .expect_err("high user alias must be rejected before VMM install");
+            assert!(format!("{error:?}").contains("outside lower-half user range"));
+        }
     }
 
     #[test]
