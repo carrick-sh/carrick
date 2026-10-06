@@ -81,6 +81,35 @@ struct NativeDescriptorWords {
 }
 
 impl NativeDescriptorWords {
+    fn checked(
+        root: RootGpa,
+        id: DescriptorTxnId,
+        tables: &TableWindow,
+    ) -> Result<Self, ArchError> {
+        let base = tables.physical().raw();
+        let bytes = tables.bytes().raw();
+        if live_root()? != root
+            || base != root.address().raw()
+            || bytes < 4096
+            || bytes & 4095 != 0
+            || tables.mapped().raw() < KERNEL_CANONICAL_BASE
+        {
+            return Err(ArchError::Unbound);
+        }
+        let end = base.checked_add(bytes).ok_or(ArchError::Unbound)?;
+        Ok(Self {
+            context: AddressContext {
+                root,
+                mm: carrick_guest_arch::MmGeneration::new(id.mm_key),
+                generation: carrick_guest_arch::ContextGeneration::new(id.generation),
+            },
+            base,
+            end,
+            mapped: tables.mapped().raw(),
+            failed_drain: Cell::new(false),
+        })
+    }
+
     fn word(&self, pa: u64) -> Result<&AtomicU64, DescriptorRefusal> {
         if pa & 7 != 0 || pa < self.base || pa.checked_add(8).is_none_or(|end| end > self.end) {
             return Err(DescriptorRefusal::TableOutsidePrimary);
@@ -149,30 +178,7 @@ pub unsafe fn execute_native_descriptor_txn(
     txn: &DescriptorTxn<'_>,
     tables: &TableWindow,
 ) -> Result<DescriptorReceipt, ArchError> {
-    let table_base = tables.physical().raw();
-    let table_bytes = tables.bytes().raw();
-    if live_root()? != txn.root
-        || table_base != txn.root.address().raw()
-        || table_bytes < 4096
-        || table_bytes & 4095 != 0
-        || tables.mapped().raw() < KERNEL_CANONICAL_BASE
-    {
-        return Err(ArchError::Unbound);
-    }
-    let end = table_base
-        .checked_add(table_bytes)
-        .ok_or(ArchError::Unbound)?;
-    let words = NativeDescriptorWords {
-        context: AddressContext {
-            root: txn.root,
-            mm: carrick_guest_arch::MmGeneration::new(txn.id.mm_key),
-            generation: carrick_guest_arch::ContextGeneration::new(txn.id.generation),
-        },
-        base: table_base,
-        end,
-        mapped: tables.mapped().raw(),
-        failed_drain: Cell::new(false),
-    };
+    let words = NativeDescriptorWords::checked(txn.root, txn.id, tables)?;
     let guard = crate::substrate::sched::hw::disable_irq_save();
     let receipt = execute_descriptor_txn(&words, txn, txn.root, &mut InlineJournal::new());
     crate::substrate::sched::hw::restore_irq(guard);
@@ -180,6 +186,39 @@ pub unsafe fn execute_native_descriptor_txn(
         return Err(ArchError::Busy);
     }
     Ok(receipt)
+}
+
+/// Confirm that a published user leaf already names the expected frame and
+/// permits the faulting access, after a competing editor committed it.
+///
+/// # Safety
+/// The caller retains the exact-MM editor and the supervisor table alias
+/// while this read-only walk executes. The root is authenticated live.
+pub unsafe fn resident_leaf_matches(
+    root: RootGpa,
+    tables: &TableWindow,
+    address: UserVa,
+    expected: FrameGpa,
+    access: Access,
+) -> Result<bool, ArchError> {
+    let id = DescriptorTxnId {
+        mm_key: core::num::NonZeroU64::MIN,
+        generation: core::num::NonZeroU64::MIN,
+    };
+    let words = NativeDescriptorWords::checked(root, id, tables)?;
+    let native_access = match access {
+        Access::Read => carrick_mmu_core::x86::descriptor_txn::Access::Read,
+        Access::Write => carrick_mmu_core::x86::descriptor_txn::Access::Write,
+        Access::Execute => carrick_mmu_core::x86::descriptor_txn::Access::Execute,
+    };
+    Ok(carrick_mmu_core::x86::descriptor_txn::translate_leaf(
+        &words,
+        root,
+        address,
+        native_access,
+        true,
+    )
+    .is_ok_and(|leaf| leaf.size == 4096 && leaf.output == expected))
 }
 
 fn native_permissions(permissions: EditPermissions) -> Result<Permissions, ArchError> {
