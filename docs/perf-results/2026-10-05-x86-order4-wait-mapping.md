@@ -40,3 +40,11 @@ This extraction leaves Linux policy (syscall numbers, errno lowering like ESRCH/
 4. **Owned continuations**:
    - `OperationToken` cannot be forged or replayed from raw integers; it is tracked through `ObjectParked` and returned on wake.
    - Resumption entry PC (`OperationResumePc`) preserves the exact instruction address (e.g. SVC entry) without re-evaluating or re-parsing user descriptors.
+
+5. **Caller-supplied observation venue (no lost wakeups)**:
+   - `coordinate_prepared_edit_wait` takes caller-supplied `observe: FnMut(ObjectWaitKey) -> Result<ObjectWaitSnapshot, ObjectWaitError>`, delegating queue observation and wake effect delivery (`deliver_completion`) to the caller venue.
+   - Prevents silent drop of wake effects when observing completion-enabled keys with pending notifications.
+
+6. **Deferred context save and allocation (no leaked fresh records)**:
+   - `park_object_record` validates deadline admissibility (`may_time_park`) and acquires the object wait guard before invoking the `save_context` closure.
+   - Early refusals (`Occupied` or guard error) return immediately without allocating a home record or saving execution context, preventing unpublished record leaks.

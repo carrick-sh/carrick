@@ -101,29 +101,32 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         operation: OperationToken,
         deadline: Option<u64>,
     ) -> Result<ObjectParked<'a>, (ObjectWaitError, OperationToken)> {
-        let fresh = self.zone.slot(self.slot).current().is_none();
-        let record = match self.current_record() {
-            Ok(record) => record,
-            Err(_) => return Err((ObjectWaitError::Exhausted, operation)),
-        };
-        // SAFETY: this is the slot's current record or its newly allocated
-        // home record. Only this CPU owns its context until publish below.
-        let ctx = unsafe { self.zone.record(record).ctx_mut() };
-        self.cpu.save(frame, ctx);
-        ctx.pc = resume.raw();
+        let zone = self.zone;
+        let slot = self.slot;
         let completion = |effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_>| {
-            deliver_completion(self.zone, self.slot, effects)
+            deliver_completion(zone, slot, effects)
         };
         let request =
             carrick_core::wait::ObjectParkRequest::new(key, snapshot, operation, deadline);
         carrick_core::wait::park_object_record(
-            self.zone,
-            self.slot,
-            record,
-            fresh,
+            zone,
+            slot,
             request,
             EL1_ZONE_LOCK_SPINS,
             &completion,
+            || {
+                let fresh = zone.slot(slot).current().is_none();
+                let record = match self.current_record() {
+                    Ok(record) => record,
+                    Err(_) => return Err(ObjectWaitError::Exhausted),
+                };
+                // SAFETY: this is the slot's current record or its newly allocated
+                // home record. Only this CPU owns its context until publish below.
+                let ctx = unsafe { zone.record(record).ctx_mut() };
+                self.cpu.save(frame, ctx);
+                ctx.pc = resume.raw();
+                Ok((record, fresh))
+            },
         )
     }
 

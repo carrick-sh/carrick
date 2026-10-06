@@ -43,15 +43,17 @@ pub fn object_wait_expired(zone: &ZoneTables, slot: SlotId) -> bool {
 
 /// Save and park a pending operation record without switching while caller locks
 /// might still be live. On Changed the caller rechecks the predicate.
-pub fn park_object_record<'a>(
+pub fn park_object_record<'a, S>(
     zone: &'a ZoneTables,
     slot: SlotId,
-    record: RecordId,
-    fresh: bool,
     request: ObjectParkRequest,
     spins: u32,
     completion: &dyn Fn(OwnedObjectWakeEffects<'_>),
-) -> Result<ObjectParked<'a>, (ObjectWaitError, OperationToken)> {
+    save_context: S,
+) -> Result<ObjectParked<'a>, (ObjectWaitError, OperationToken)>
+where
+    S: FnOnce() -> Result<(RecordId, bool), ObjectWaitError>,
+{
     if request.deadline.is_some() && !may_time_park(zone, slot) {
         return Err((ObjectWaitError::Occupied, request.operation));
     }
@@ -64,6 +66,13 @@ pub fn park_object_record<'a>(
         Ok(guard) => guard,
         Err(error) => return Err((error, request.operation)),
     };
+    let (record, fresh) = match save_context() {
+        Ok(pair) => pair,
+        Err(err) => {
+            drop(guard);
+            return Err((err, request.operation));
+        }
+    };
     let seq = zone.next_seq(record);
     if request.deadline.is_some() && zone.arm_timer(slot, record, seq).is_err() {
         drop(guard);
@@ -72,10 +81,7 @@ pub fn park_object_record<'a>(
         }
         return Err((ObjectWaitError::Occupied, request.operation));
     }
-    let deadline_ticks = match request.deadline {
-        Some(d) => d,
-        None => 0,
-    };
+    let deadline_ticks = request.deadline.unwrap_or_default();
     if let Err(error) =
         guard.park_until(request.snapshot, record, request.operation, deadline_ticks)
     {
@@ -142,17 +148,18 @@ pub fn space_access<'a>(
 /// Coordinate a conflicting reservation edit wait: validates active wait key,
 /// detects overlap against prepared proposals, releases root lock before enrollment,
 /// and retries if the predicate changed before the park was published.
-pub fn coordinate_prepared_edit_wait<P, G, C, F, T>(
+pub fn coordinate_prepared_edit_wait<P, G, O, C, F, T>(
     table: &crate::mm::reservation::SharedReservations<P, G>,
     target: EditWaitTarget<'_>,
     resumed: Option<OperationToken>,
-    zone: &ZoneTables,
+    mut observe: O,
     mut check_conflict: C,
     mut park: F,
 ) -> EditWaitOutcome<T>
 where
     P: carrick_core_abi::ReservationPolicy,
     G: carrick_core_abi::ReservationGeometry,
+    O: FnMut(ObjectWaitKey) -> Result<ObjectWaitSnapshot, ObjectWaitError>,
     C: FnMut(&mut crate::mm::reservation::Reservations<'_, P, G>) -> Option<bool>,
     F: FnMut(
         ObjectWaitKey,
@@ -180,7 +187,7 @@ where
 
         // Source custody is established at root admission. Contention here
         // must never try to bind a queue while retaining this root guard.
-        let snapshot = match observe_object(zone, target.slot, key, &|_| {}) {
+        let snapshot = match observe(key) {
             Ok(s) => s,
             Err(_) => return EditWaitOutcome::Refused,
         };
