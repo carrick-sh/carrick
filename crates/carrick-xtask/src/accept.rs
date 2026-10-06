@@ -184,6 +184,13 @@ pub struct StepSpec {
 
 pub const HOST_STEPS: &[StepSpec] = &[
     StepSpec {
+        name: "fixture-locks",
+        program: "just",
+        args: &["check-fixture-locks"],
+        env: &[],
+        log_name: "00-fixture-locks.log",
+    },
+    StepSpec {
         name: "test-kernel",
         program: "just",
         args: &["test-kernel"],
@@ -235,6 +242,13 @@ pub const HOST_STEPS: &[StepSpec] = &[
 ];
 
 pub const LINUX_PORTABLE_STEPS: &[StepSpec] = &[
+    StepSpec {
+        name: "fixture-locks",
+        program: "just",
+        args: &["check-fixture-locks"],
+        env: &[],
+        log_name: "00-fixture-locks.log",
+    },
     StepSpec {
         name: "test-kernel",
         program: "just",
@@ -1764,6 +1778,7 @@ mod tests {
         assert_eq!(
             steps.iter().map(|s| s.name).collect::<Vec<_>>(),
             vec![
+                "fixture-locks",
                 "test-kernel",
                 "portable-tests",
                 "kvm-tests",
