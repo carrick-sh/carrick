@@ -313,9 +313,15 @@ mod kernel {
             {
                 return Err(DescriptorRefusal::TableOutsidePrimary);
             }
-            // SAFETY: Cpl0Carrier retains this one supervisor direct mapping
-            // for the VM lifetime; this guest fixture owns the stopped sibling.
-            Ok(unsafe { &*((DIRECT_VA + pa) as *const core::sync::atomic::AtomicU64) })
+            let mapped = if in_grants && self.start == carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA {
+                carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_VA
+                    + (pa - carrick_el1_abi::X86_CPL0_INITIAL_EXTENT_GPA)
+            } else {
+                DIRECT_VA + pa
+            };
+            // SAFETY: Cpl0Carrier retains this supervisor mapping for the VM
+            // lifetime; the MM owner holds the stopped sibling and exact grant.
+            Ok(unsafe { &*(mapped as *const core::sync::atomic::AtomicU64) })
         }
     }
     impl carrick_mmu_core::x86::descriptor_txn::LiveDescriptorWords for InitialWords {

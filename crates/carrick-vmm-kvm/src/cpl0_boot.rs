@@ -12,6 +12,7 @@ use carrick_el1_abi::Lifecycle;
 use carrick_el1_abi::{
     BlockedMask, Counters, CurrentTask, EL1_BOOTSTRAP_METADATA_SIZE, El1TaskId, ThreadControlSlot,
     ThreadLifecyclePage, X86_CPL0_BOOTSTRAP_METADATA_BASE, X86_CPL0_DYNAMIC_METADATA_BASE,
+    X86_CPL0_INITIAL_EXTENT_MAX_SIZE, X86_CPL0_INITIAL_EXTENT_VA, X86_CPL0_REGION_BASE,
 };
 use carrick_el1_abi::{
     X86_INITIAL_BOOT_HEADER_GPA, X86_INITIAL_BOOT_LOADED, X86_INITIAL_BOOT_MAGIC,
@@ -43,6 +44,7 @@ const META_GPA: u64 = 0xc0_0000;
 const META_LEN: u64 = 0x2_0000;
 const ALLOCATOR_GPA: u64 = 0x20_00000;
 const INITIAL_EXTENT_GPA: u64 = 0x40_00000;
+const KERNEL_REGION_GPA: u64 = 0x1_0000_0000;
 const INITIAL_MM_KEY: u64 = 301;
 const INITIAL_STACK_TOP: u64 = 0x7fff_0000;
 const INITIAL_STACK_SIZE: u64 = 0x1_0000;
@@ -192,6 +194,7 @@ pub struct Cpl0Carrier {
     pub(crate) _vm: CarrierMemory,
     pub(crate) ram: Arc<GuestRam>,
     initial_extent: Option<(BackingHandle, usize)>,
+    _kernel_region: Option<BackingHandle>,
     metadata_base: NonNull<u8>,
     host_forwards: u64,
     host_yields: u64,
@@ -210,7 +213,7 @@ impl Cpl0Carrier {
     ) -> Result<usize, TrapError> {
         const PAGE: usize = 4096;
         const STACK_PAGES: usize = 16;
-        const MAX_BYTES: usize = 512 * 1024 * 1024;
+        const MAX_BYTES: usize = X86_CPL0_INITIAL_EXTENT_MAX_SIZE as usize;
         let mut image_pages = 0usize;
         let mut initialized = 0usize;
         for region in &image.regions {
@@ -355,7 +358,10 @@ impl Cpl0Carrier {
     /// by the hardware fixtures. Guest MM publication follows while stopped.
     pub fn boot_production(initial_extent_bytes: usize) -> Result<Self, TrapError> {
         const IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/carrick-x86-cpl0"));
-        if initial_extent_bytes == 0 || !initial_extent_bytes.is_multiple_of(4096) {
+        if initial_extent_bytes == 0
+            || initial_extent_bytes > X86_CPL0_INITIAL_EXTENT_MAX_SIZE as usize
+            || !initial_extent_bytes.is_multiple_of(4096)
+        {
             return Err(fail("invalid initial guest MM extent size"));
         }
         Self::boot_bytes_inner(IMAGE, [&[], &[]], false, Some(initial_extent_bytes), false)
@@ -574,7 +580,7 @@ impl Cpl0Carrier {
             .get_regs()
             .map_err(|error| fail(error.to_string()))?;
         regs.rip = header.entry_va;
-        regs.rdi = DIRECT_VA + INITIAL_EXTENT_GPA;
+        regs.rdi = X86_CPL0_INITIAL_EXTENT_VA;
         regs.rsp = kernel_stack;
         regs.rflags = 2;
         cpu.fd()
@@ -596,7 +602,7 @@ impl Cpl0Carrier {
             self.cpus[0].append_debug_state(&mut detail);
             return Err(fail(detail));
         }
-        if self.cpus[0].get_gpr(X86Reg::Rax)? != DIRECT_VA + INITIAL_EXTENT_GPA {
+        if self.cpus[0].get_gpr(X86Reg::Rax)? != X86_CPL0_INITIAL_EXTENT_VA {
             return Err(fail("production initial MM request pointer"));
         }
         let reply = self
@@ -955,9 +961,19 @@ impl Cpl0Carrier {
         });
         if let Some(len) = initial_extent_bytes {
             maps.push(Pml4MapSpec {
-                va: DIRECT_VA + INITIAL_EXTENT_GPA,
+                va: X86_CPL0_INITIAL_EXTENT_VA,
                 gpa: INITIAL_EXTENT_GPA,
                 len: len as u64,
+                user: false,
+                write: true,
+                exec: false,
+            });
+        }
+        if initial_extent_bytes.is_some() {
+            maps.push(Pml4MapSpec {
+                va: X86_CPL0_REGION_BASE,
+                gpa: KERNEL_REGION_GPA,
+                len: carrick_el1_abi::EL1_REGION_SIZE,
                 user: false,
                 write: true,
                 exec: false,
@@ -1163,6 +1179,28 @@ impl Cpl0Carrier {
         memory
             .install_bootstrap(Arc::clone(&ram))
             .map_err(|e| fail(e.to_string()))?;
+        let kernel_region = if initial_extent_bytes.is_some() {
+            let identity = NonZeroU64::new(0x101).ok_or_else(|| fail("kernel region identity"))?;
+            let extent = BackingExtent::private(
+                FrameGpa::new(KERNEL_REGION_GPA),
+                carrick_el1_abi::EL1_REGION_SIZE as usize,
+            )
+            .map_err(|e| fail(e.to_string()))?;
+            let handles = memory
+                .install(&[PreparedBacking {
+                    extent: Arc::new(extent),
+                    identity: BackingIdentity {
+                        frame_id: identity,
+                        mapping_id: identity,
+                        owner_generation: identity,
+                        inventory_revision: identity,
+                    },
+                }])
+                .map_err(|e| fail(e.to_string()))?;
+            Some(handles[0])
+        } else {
+            None
+        };
         let initial_extent = if let Some(len) = initial_extent_bytes {
             let identity =
                 NonZeroU64::new(0x100).ok_or_else(|| fail("initial backing identity"))?;
@@ -1309,6 +1347,7 @@ impl Cpl0Carrier {
             _vm: vm,
             ram,
             initial_extent,
+            _kernel_region: kernel_region,
             metadata_base,
             host_forwards: 0,
             host_yields: 0,
