@@ -1876,7 +1876,7 @@
     },
     {
       "file": "crates/carrick-kernel/src/dispatch/mem/backing/tests.rs",
-      "line": 525,
+      "line": 651,
       "categories": [
         "table_guard"
       ],
