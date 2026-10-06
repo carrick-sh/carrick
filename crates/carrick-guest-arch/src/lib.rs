@@ -447,12 +447,9 @@ pub trait ArchTypes {
     type Context: Copy + Send + Sync + zerocopy::FromZeros;
     type Root: Copy + Eq;
     type MmOwner;
-    type OwnedTranslation;
-    type LeafEdit;
     type DrainTicket;
     type DrainReceipt;
     type UserTransfer;
-    type PublicationReceipt;
     type HardwareInterrupt;
     type InterruptMask;
 }
@@ -485,12 +482,9 @@ impl<B: ArchTypes> ArchTypes for Arch<B> {
     type Context = B::Context;
     type Root = B::Root;
     type MmOwner = B::MmOwner;
-    type OwnedTranslation = B::OwnedTranslation;
-    type LeafEdit = B::LeafEdit;
     type DrainTicket = B::DrainTicket;
     type DrainReceipt = B::DrainReceipt;
     type UserTransfer = B::UserTransfer;
-    type PublicationReceipt = B::PublicationReceipt;
     type HardwareInterrupt = B::HardwareInterrupt;
     type InterruptMask = B::InterruptMask;
 }
@@ -525,14 +519,9 @@ arch_trait!(MmuArch, MmuBackend {
     fn read_user_word(owner: &Self::MmOwner, address: UserVa, width: GuestLen) -> Result<u64, Self::Error>;
     fn validate_user_access(owner: &Self::MmOwner, range: UserRange, access: Access) -> Result<GuestLen, Self::Error>;
     fn install_context(context: AddressContext<Self::Root>) -> Result<(), Self::Error>;
-    fn translate_live(owner: &Self::MmOwner, address: UserVa, access: Access) -> Result<Self::OwnedTranslation, Self::Error>;
-    fn prepare_leaf_edit(owner: &Self::MmOwner, range: UserRange, translation: Self::OwnedTranslation) -> Result<Self::LeafEdit, Self::Error>;
-    fn apply_leaf_edit(edit: &mut Self::LeafEdit) -> Result<(), Self::Error>;
-    fn undo_leaf_edit(edit: Self::LeafEdit) -> Result<(), Self::Error>;
     fn request_invalidation(context: AddressContext<Self::Root>, range: UserRange) -> Result<Self::DrainTicket, Self::Error>;
     fn ack_drain(ticket: Self::DrainTicket) -> Result<Self::DrainReceipt, Self::Error>;
     fn copy_user_chunk(transfer: &mut Self::UserTransfer, limit: GuestLen) -> Result<CopyProgress, Self::Error>;
-    fn publish_executable(owner: &Self::MmOwner, range: UserRange) -> Result<Self::PublicationReceipt, Self::Error>;
 });
 
 /// An exact-MM descriptor edit. The intent retains its noncopyable editor
