@@ -23,6 +23,10 @@ pub struct SavedSyscallContext {
 
 const _: () = assert!(core::mem::align_of::<scheduler::XsaveArea>() == 64);
 
+#[path = "context_words.rs"]
+pub mod context_words;
+pub use context_words::ParkedContextWords;
+
 impl EntryBackend for X86Backend {
     fn current_stack_pointer(&mut self) -> Result<KernelStackPointer, Self::Error> {
         let sp: u64;
