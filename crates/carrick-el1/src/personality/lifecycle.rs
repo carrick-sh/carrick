@@ -15,7 +15,8 @@
 //! * `rt_sigprocmask`, `sigaltstack`, `set_robust_list` on the thread's
 //!   [`ThreadControlSlot`](carrick_el1_abi::ThreadControlSlot);
 //!   `set_robust_list` through the ISA-neutral body in
-//!   [`super::thread_setup`], which the x86_64 CPL0 entry shares.
+//!   [`carrick_personality_linux::pending_lifecycle`], over the native
+//!   metadata view in [`super::thread_setup`], which x86_64 CPL0 also uses.
 //!
 //! Every case EL1 cannot answer exactly as the host lane would (an error
 //! return, a user copy that faults here, a closed gate, a traced or seccomp
