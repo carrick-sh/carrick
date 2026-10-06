@@ -112,7 +112,7 @@ pub struct PreparedFaultPath<'a, P: PreparedPageResolver> {
 pub struct HardwarePreparedResolver;
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-fn hardware_live_ttbr() -> u64 {
+pub(crate) fn hardware_live_ttbr() -> u64 {
     let ttbr: u64;
     unsafe {
         core::arch::asm!("mrs {}, ttbr0_el1", out(reg) ttbr, options(nomem, nostack));
