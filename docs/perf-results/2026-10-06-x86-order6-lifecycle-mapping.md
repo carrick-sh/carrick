@@ -224,3 +224,41 @@ errors occur both here and in an isolated `0f476ce7a` checkout. The diagnostic
 multisets are identical, with zero additions/removals. Focused shared/native
 owner crates and kernel/kernel-example all-target Clippy pass. This does not
 confer a macOS runtime all-target or signed result.
+
+## Final worker gate result
+
+Source commit `7d720ba614158bc55f0475605076a0f308f24dc5` passes the four A
+commands, moved ABI AL (20), native ARM AL (20), participant AL (7), exact
+VM-free X5 targets and exact KVM X5 after rebuilding the image. Retained
+entry (3), Linux wave-2 (20), KVM entry (6), extended context (2), focused
+all-target Clippy, `just clippy` and `just fmt-check` pass. The required
+fixture metadata loop produces no output. No load generators or lifecycle
+test processes remain.
+
+The qualified image SHA-256 is
+`ec8f072203c92b3f301ecc1371677d138701ffdc86cc1657b13c9abe85979f83`.
+This ELF carries no GNU build-id; identity is its content hash. The structured
+worker record is `2026-10-06-x86-order6-verification.json`; it is not an
+acceptance receipt.
+
+**`just lint-domains` is not green.** Its assembly and local structural
+checks pass, but three authority artifact self-tests fail because the
+committed Mac capture and seven moved inventory spans disagree. The
+clean Linux reconciler cannot authoritatively update Mac spans. The guarded
+`just remote-recapture --ref 7d720ba614158bc55f0475605076a0f308f24dc5`
+attempt fails before remote contact: `cloudmac` does not resolve here.
+A reachable Mac recapture and its reviewed patch are required. No capture
+was fabricated and no gate exception was added.
+
+The later source-boundary command also fails with nine `PendingSignals`
+findings in unchanged `carrick-signal-core/src/policy.rs`. An isolated
+`0f476ce7a` source scan reports the exact same nine diagnostics, with zero
+additions/removals. The other remaining lint recipe checks (contracts,
+locks, participants, aborts, K1 and serial-host inventory) pass separately.
+The full lint result remains red; these supplementary checks do not confer
+a gate pass.
+
+PR #68 advanced to `3207564aa` during final verification. The director was
+asked to supply the settled rebase target. This work retains its approved
+`0f476ce7a` base pending that instruction; no later order-5 fixes are claimed
+as integrated. A kept/ported/dropped audit remains required on that rebase.
