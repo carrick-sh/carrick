@@ -21,6 +21,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Harden registry transport against intermittent network errors without retrying tests.
+  CARGO_HTTP_MULTIPLEXING: "false"   # avoid HTTP/2 framing failures against the crates.io index
+  CARGO_NET_RETRY: "10"              # transport retries for registry/download fetches only
   RUST_BACKTRACE: 1
   CARRICK_PROBE_COVERAGE_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
 
