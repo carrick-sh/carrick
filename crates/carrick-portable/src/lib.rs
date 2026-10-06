@@ -1435,49 +1435,6 @@ pub fn peer_credentials(host_fd: i32) -> std::io::Result<PeerCredentials> {
     }
 }
 
-/// Re-export a constant that has a real (possibly differently-named) equivalent
-/// on every platform. Two-way form: `port_alias!(NAME => bsd_name, linux_name)`
-/// uses `bsd_name` on the BSD family (macOS, FreeBSD, NetBSD — for constants all
-/// three share under the same libc name) and `linux_name` everywhere else.
-/// Three-way form: `port_alias!(NAME => mac_name, freebsd_name, linux_name)` for
-/// constants where macOS and FreeBSD use different libc names; here NetBSD takes
-/// the `linux_name` arm by default — when NetBSD needs a *different* name, add an
-/// explicit `netbsd =` clause: `port_alias!(NAME => mac, freebsd, linux, netbsd = nb)`.
-///
-/// NetBSD is a BSD, so it shares most constants with the `bsd_name` position
-/// (e.g. `PT_*`); the explicit-`netbsd` form covers the deltas (e.g. NetBSD has
-/// no `CLOCK_*_RAW`, so `CLOCK_UPTIME_RAW` maps to `CLOCK_MONOTONIC`).
-macro_rules! port_alias {
-    // BSD family (macOS + FreeBSD + NetBSD) share the same name; Linux differs.
-    ($name:ident => $bsd:ident, $other:ident) => {
-        #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
-        pub use libc::$bsd as $name;
-        #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
-        pub use libc::$other as $name;
-    };
-    // macOS / FreeBSD / (Linux + NetBSD) each take a distinct name.
-    ($name:ident => $mac:ident, $bsd:ident, $linux:ident) => {
-        #[cfg(target_os = "freebsd")]
-        pub use libc::$bsd as $name;
-        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
-        pub use libc::$linux as $name;
-        #[cfg(target_os = "macos")]
-        pub use libc::$mac as $name;
-    };
-    // As the three-way form, but with an explicit NetBSD name distinct from all
-    // three (NetBSD does not take the Linux arm).
-    ($name:ident => $mac:ident, $bsd:ident, $linux:ident, netbsd = $nb:ident) => {
-        #[cfg(target_os = "freebsd")]
-        pub use libc::$bsd as $name;
-        #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
-        pub use libc::$linux as $name;
-        #[cfg(target_os = "macos")]
-        pub use libc::$mac as $name;
-        #[cfg(target_os = "netbsd")]
-        pub use libc::$nb as $name;
-    };
-}
-
 // Darwin name -> Linux equivalent. Re-exported as the Darwin name so call sites
 // keep reading naturally; the value is the platform-native libc constant.
 //
@@ -1486,9 +1443,24 @@ macro_rules! port_alias {
 //   NetBSD has no CLOCK_*_RAW/UPTIME clock, so map to CLOCK_MONOTONIC.
 // TCP_KEEPALIVE: macOS name; FreeBSD/Linux/NetBSD all use TCP_KEEPIDLE (NetBSD
 //   has no TCP_KEEPALIVE, so it correctly takes the `linux` = TCP_KEEPIDLE arm).
-port_alias!(CLOCK_UPTIME_RAW => CLOCK_UPTIME_RAW, CLOCK_UPTIME_PRECISE, CLOCK_MONOTONIC_RAW, netbsd = CLOCK_MONOTONIC);
-port_alias!(TCP_KEEPALIVE => TCP_KEEPALIVE, TCP_KEEPIDLE, TCP_KEEPIDLE);
-port_alias!(AF_LINK => AF_LINK, AF_PACKET);
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::AF_LINK;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub use libc::AF_PACKET as AF_LINK;
+#[cfg(target_os = "netbsd")]
+pub use libc::CLOCK_MONOTONIC as CLOCK_UPTIME_RAW;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub use libc::CLOCK_MONOTONIC_RAW as CLOCK_UPTIME_RAW;
+#[cfg(target_os = "freebsd")]
+pub use libc::CLOCK_UPTIME_PRECISE as CLOCK_UPTIME_RAW;
+#[cfg(target_os = "macos")]
+pub use libc::CLOCK_UPTIME_RAW;
+#[cfg(target_os = "macos")]
+pub use libc::TCP_KEEPALIVE;
+#[cfg(target_os = "freebsd")]
+pub use libc::TCP_KEEPIDLE as TCP_KEEPALIVE;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+pub use libc::TCP_KEEPIDLE as TCP_KEEPALIVE;
 
 // TCP_NOPUSH: macOS/FreeBSD name; Linux uses TCP_CORK. NetBSD's libc bindings
 // (libc 0.2.x) do NOT export TCP_NOPUSH even though <netinet/tcp.h> defines it,
@@ -1506,10 +1478,22 @@ pub use libc::TCP_CORK as TCP_NOPUSH;
 // the `bsd` arm of the two-way form. Used to drive the *host* ptrace when
 // emulating the guest's ptrace; the request type also differs (Darwin `c_int`
 // vs Linux `c_uint`), which the native re-export resolves automatically.
-port_alias!(PT_TRACE_ME => PT_TRACE_ME, PTRACE_TRACEME);
-port_alias!(PT_CONTINUE => PT_CONTINUE, PTRACE_CONT);
-port_alias!(PT_KILL => PT_KILL, PTRACE_KILL);
-port_alias!(PT_DETACH => PT_DETACH, PTRACE_DETACH);
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::PT_CONTINUE;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::PT_DETACH;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::PT_KILL;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::PT_TRACE_ME;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub use libc::PTRACE_CONT as PT_CONTINUE;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub use libc::PTRACE_DETACH as PT_DETACH;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub use libc::PTRACE_KILL as PT_KILL;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub use libc::PTRACE_TRACEME as PT_TRACE_ME;
 
 /// `siginfo_t` field accessors. Darwin exposes `si_pid`/`si_uid`/`si_status` as
 /// plain fields; the `libc` crate exposes them as *methods* on Linux (the
@@ -1538,45 +1522,66 @@ siginfo_accessor!(si_status -> libc::c_int);
 
 /// kqueue flag/filter/fflag constants. BSD-only; on Linux these are typed
 /// placeholders (see the module doc) carrying the canonical BSD numeric value.
-/// On the kqueue hosts (macOS, FreeBSD, NetBSD) the real `libc` constant is
-/// re-exported, so its type and value match that host's `struct kevent`:
-/// NetBSD's `flags`/`filter` are `u32` and its `EVFILT_READ` is 0, not the
-/// 4.4BSD -1. On Linux a typed placeholder carrying the canonical 4.4BSD
-/// numeric value is used.
-macro_rules! port_kqueue {
-    ($ty:ty: $($name:ident = $val:expr),+ $(,)?) => {
-        $(
-            #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
-            pub use libc::$name;
-            #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
-            pub const $name: $ty = $val;
-        )+
-    };
-}
-
-// Linux placeholder types follow macOS/FreeBSD: kevent.flags (EV_*) u16,
-// kevent.filter (EVFILT_*) i16, kevent.fflags (NOTE_*) u32; values are the
-// canonical 4.4BSD numbers.
-port_kqueue!(u16:
-    EV_ADD = 0x0001,
-    EV_DELETE = 0x0002,
-    EV_ENABLE = 0x0004,
-    EV_ONESHOT = 0x0010,
-    EV_CLEAR = 0x0020,
-    EV_ERROR = 0x4000,
-    EV_EOF = 0x8000,
-);
-port_kqueue!(i16:
-    EVFILT_READ = -1,
-    EVFILT_WRITE = -2,
-);
-port_kqueue!(u32:
-    NOTE_DELETE = 0x0000_0001,
-    NOTE_WRITE = 0x0000_0002,
-    NOTE_EXTEND = 0x0000_0004,
-    NOTE_ATTRIB = 0x0000_0008,
-    NOTE_RENAME = 0x0000_0020,
-);
+/// On macOS and FreeBSD the real `libc` constant is re-exported; on Linux a
+/// typed placeholder carrying the canonical 4.4BSD numeric value is used.
+// kevent.flags (EV_*) are u16, kevent.filter (EVFILT_*) i16, kevent.fflags
+// (NOTE_*) u32. Linux placeholder values are the canonical 4.4BSD numbers.
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::EV_ADD;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const EV_ADD: u16 = 0x0001;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::EV_DELETE;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const EV_DELETE: u16 = 0x0002;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::EV_ENABLE;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const EV_ENABLE: u16 = 0x0004;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::EV_ONESHOT;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const EV_ONESHOT: u16 = 0x0010;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::EV_CLEAR;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const EV_CLEAR: u16 = 0x0020;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::EV_ERROR;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const EV_ERROR: u16 = 0x4000;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::EV_EOF;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const EV_EOF: u16 = 0x8000;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::EVFILT_READ;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const EVFILT_READ: i16 = -1;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::EVFILT_WRITE;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const EVFILT_WRITE: i16 = -2;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::NOTE_DELETE;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const NOTE_DELETE: u32 = 0x0000_0001;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::NOTE_WRITE;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const NOTE_WRITE: u32 = 0x0000_0002;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::NOTE_EXTEND;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const NOTE_EXTEND: u32 = 0x0000_0004;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::NOTE_ATTRIB;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const NOTE_ATTRIB: u32 = 0x0000_0008;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+pub use libc::NOTE_RENAME;
+#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+pub const NOTE_RENAME: u32 = 0x0000_0020;
 
 #[cfg(all(test, target_os = "freebsd"))]
 mod freebsd_const_tests {

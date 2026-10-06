@@ -1,13 +1,11 @@
-use std::env;
 use std::path::PathBuf;
-use std::process;
 
 use carrick_conformance_contract::personality_boundary::{
     BoundaryConfig, check_substrate_boundary,
 };
 
 fn parse_args() -> Result<(PathBuf, BoundaryConfig), String> {
-    let mut args = env::args().skip(1);
+    let mut args = std::env::args().skip(1);
     let mut root = PathBuf::from(".");
     let mut config = BoundaryConfig::default();
 
@@ -31,7 +29,7 @@ fn parse_args() -> Result<(PathBuf, BoundaryConfig), String> {
             println!(
                 "Usage: check-personality-boundary [--root <PATH>] [--metadata-file <PATH>] [--metadata-json <JSON>]"
             );
-            process::exit(0);
+            std::process::exit(0);
         } else {
             return Err(format!("unknown argument: {arg}"));
         }
@@ -44,7 +42,7 @@ fn main() {
         Ok(res) => res,
         Err(e) => {
             eprintln!("error: {e}");
-            process::exit(1);
+            std::process::exit(1);
         }
     };
 
@@ -66,7 +64,7 @@ fn main() {
         }
         Err(err) => {
             eprintln!("{err}");
-            process::exit(1);
+            std::process::exit(1);
         }
     }
 }

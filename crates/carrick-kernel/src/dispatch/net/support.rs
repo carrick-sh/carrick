@@ -1100,11 +1100,11 @@ mod netbsd_sockopt {
     Copy,
     PartialEq,
     Eq,
-    zerocopy::FromBytes,
-    zerocopy::IntoBytes,
-    zerocopy::KnownLayout,
-    zerocopy::Immutable,
-    zerocopy::Unaligned,
+    ::zerocopy::FromBytes,
+    ::zerocopy::IntoBytes,
+    ::zerocopy::KnownLayout,
+    ::zerocopy::Immutable,
+    ::zerocopy::Unaligned,
 )]
 struct HostIpMreqSource {
     multiaddr: [u8; 4],
